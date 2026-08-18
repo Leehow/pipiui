@@ -354,12 +354,6 @@ async function atomicWrite(path: string, source: Buffer | string, mode = 0o600):
   }
 }
 
-async function immutableBackup(path: string, source: Buffer, sha: string): Promise<string> {
-  const backup = `${path}.pipiui-shared-v1.${sha}.${randomUUID()}.bak`;
-  await exclusiveWrite(backup, source);
-  return backup;
-}
-
 interface RegularFileSnapshot {
   path: string;
   source: Buffer;
@@ -438,6 +432,92 @@ async function exclusiveSymlink(target: string, path: string): Promise<void> {
   }
 }
 
+async function exclusiveLink(from: string, to: string): Promise<void> {
+  try {
+    await link(from, to);
+  } catch (error) {
+    if (errnoCode(error) === "EEXIST") {
+      throw new Error(`Refusing to overwrite concurrent models.json at ${to}`);
+    }
+    throw error;
+  }
+}
+
+interface FileIdentity {
+  dev: number;
+  ino: number;
+  sourceSha256: string;
+}
+
+async function writeModelsTemp(directory: string, source: Buffer): Promise<string> {
+  const temporary = join(directory, `.models-${randomUUID()}.tmp`);
+  await exclusiveWrite(temporary, source, 0o600);
+  return temporary;
+}
+
+async function readFileIdentity(path: string, label: string): Promise<FileIdentity> {
+  const regular = await readStableRegularFile(path, label);
+  if (!regular) throw new Error(`Missing ${label} at ${path}`);
+  return {
+    dev: regular.stat.dev,
+    ino: regular.stat.ino,
+    sourceSha256: sha256(regular.source),
+  };
+}
+
+function samePublishedIdentity(regular: { source: Buffer; stat: Stats }, identity: FileIdentity): boolean {
+  return regular.stat.dev === identity.dev
+    && regular.stat.ino === identity.ino
+    && sha256(regular.source) === identity.sourceSha256;
+}
+
+async function hardlinkOrCopyBackup(path: string, expectedSha: string): Promise<string> {
+  const backup = `${path}.pipiui-shared-v1.${expectedSha}.${randomUUID()}.bak`;
+  try {
+    await link(path, backup);
+  } catch {
+    const regular = await readStableRegularFile(path, "canonical models.json");
+    if (!regular) throw new Error(`Missing canonical models.json at ${path}`);
+    await exclusiveWrite(backup, regular.source, 0o600);
+  }
+  await ensureRegularFileMode(backup, 0o600, "canonical models.json backup");
+  const copied = await readStableRegularFile(backup, "canonical models.json backup");
+  if (!copied || sha256(copied.source) !== expectedSha) {
+    throw new Error(`Refusing changed canonical models.json backup at ${backup}`);
+  }
+  return backup;
+}
+
+async function rollbackPublishedCanonical(options: {
+  canonicalPath: string;
+  publishedIdentity: FileIdentity | null;
+  restoreFrom: string | null;
+}): Promise<void> {
+  const current = await readStableRegularFile(options.canonicalPath, "canonical models.json", { allowMissing: true });
+  const ours = Boolean(current && options.publishedIdentity && samePublishedIdentity(current, options.publishedIdentity));
+  if (current && !ours) {
+    throw new Error(`Refusing to overwrite concurrent models.json at ${options.canonicalPath}`);
+  }
+  if (!options.restoreFrom) return;
+  if (ours) {
+    const aside = `${options.canonicalPath}.pipiui-rollback-${randomUUID()}.tmp`;
+    await rename(options.canonicalPath, aside);
+    const restored = await exclusiveRestoreRegular(options.restoreFrom, options.canonicalPath);
+    if (restored) {
+      await rm(aside, { force: true });
+      return;
+    }
+    await rm(aside, { force: true }).catch(() => undefined);
+    throw new Error(`Refusing to overwrite concurrent models.json at ${options.canonicalPath}`);
+  }
+  if (!current) {
+    const restored = await exclusiveRestoreRegular(options.restoreFrom, options.canonicalPath);
+    if (!restored) {
+      throw new Error(`Refusing to overwrite concurrent models.json at ${options.canonicalPath}`);
+    }
+  }
+}
+
 async function quarantineRegularFile(snapshot: RegularFileSnapshot, label: string): Promise<string> {
   const backup = `${snapshot.path}.pipiui-shared-v1.${snapshot.sourceSha256}.${randomUUID()}.bak`;
   await rename(snapshot.path, backup);
@@ -490,6 +570,8 @@ type SharedModelsMigrationStep =
   | { name: "sources-read" }
   | { name: "snapshots-verified" }
   | { name: "backups-created" }
+  | { name: "before-canonical-publish" }
+  | { name: "after-canonical-quarantine" }
   | { name: "canonical-written" }
   | { name: "before-project-link"; projectModelsPath: string; index: number }
   | { name: "project-link-installed"; projectModelsPath: string; index: number }
@@ -585,20 +667,13 @@ async function installProjectCanonicalLink(
   try {
     await exclusiveSymlink(canonicalPath, project.path);
     project.linked = true;
-    await rm(quarantine, { force: true });
-    project.symlinkQuarantinePath = null;
   } catch (error) {
     if (!await pathExists(project.path)) {
       try {
         await exclusiveSymlink(rawTarget, project.path);
-        await rm(quarantine, { force: true });
-        project.symlinkQuarantinePath = null;
       } catch (restoreError) {
         throw wrapMigrationError(error, [restoreError]);
       }
-    } else {
-      await rm(quarantine, { force: true }).catch(() => undefined);
-      project.symlinkQuarantinePath = null;
     }
     throw error;
   }
@@ -625,9 +700,13 @@ async function rollbackProjectModels(
   if (project.symlinkQuarantinePath && !await pathExists(project.path)) {
     const previous = await readlink(project.symlinkQuarantinePath);
     await exclusiveSymlink(previous, project.path);
-    await rm(project.symlinkQuarantinePath, { force: true });
-    project.symlinkQuarantinePath = null;
   }
+}
+
+async function cleanupProjectSymlinkQuarantine(project: ProjectModelsSource): Promise<void> {
+  if (!project.symlinkQuarantinePath) return;
+  await rm(project.symlinkQuarantinePath, { force: true });
+  project.symlinkQuarantinePath = null;
 }
 
 export async function migrateSharedProjectModels(options: {
@@ -641,8 +720,11 @@ export async function migrateSharedProjectModels(options: {
   const canonicalPath = join(canonicalAgentDir, "models.json");
   const canonicalInputPath = join(canonicalAgentInput, "models.json");
 
-  const canonicalRegular = await readStableRegularFile(canonicalPath, "canonical models.json", { allowMissing: true });
-  if (canonicalRegular) await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+  let canonicalRegular = await readStableRegularFile(canonicalPath, "canonical models.json", { allowMissing: true });
+  if (canonicalRegular) {
+    await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+    canonicalRegular = await readStableRegularFile(canonicalPath, "canonical models.json");
+  }
   const canonicalSource = canonicalRegular?.source ?? null;
   const canonicalSourceSha = canonicalSource ? sha256(canonicalSource) : null;
   const canonicalValue: JsonValue = canonicalSource ? parseModels(canonicalSource, canonicalPath) : { providers: {} };
@@ -719,20 +801,37 @@ export async function migrateSharedProjectModels(options: {
   await options.onMigrationStep?.({ name: "snapshots-verified" });
 
   let canonicalBackup: string | null = null;
+  let canonicalQuarantinePath: string | null = null;
   let canonicalReplaced = false;
+  let publishedIdentity: FileIdentity | null = null;
+  let publishTemp: string | null = null;
   const manifestPath = join(canonicalAgentDir, SHARED_MODELS_MANIFEST);
+  const discardPublishTemp = async () => {
+    if (!publishTemp) return;
+    await rm(publishTemp, { force: true }).catch(() => undefined);
+    publishTemp = null;
+  };
   try {
-    // With no initial canonical, publish the fully merged catalog before any project mutation.
-    // Once this stable pathname exists it is deliberately not part of rollback: readers must
-    // never observe ENOENT, even if a later backup/link/manifest step fails.
+    // With no initial canonical, no-replace-publish the merged catalog before any project
+    // mutation. Once this stable pathname exists it is deliberately not part of rollback:
+    // coordinated readers must never observe ENOENT after the first successful publish.
     if (!canonicalSource) {
-      await atomicWrite(canonicalPath, result);
+      publishTemp = await writeModelsTemp(canonicalAgentDir, result);
+      await options.onMigrationStep?.({ name: "before-canonical-publish" });
+      try {
+        await exclusiveLink(publishTemp, canonicalPath);
+      } catch (error) {
+        await discardPublishTemp();
+        throw error;
+      }
+      await discardPublishTemp();
+      publishedIdentity = await readFileIdentity(canonicalPath, "canonical models.json");
       await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
       await options.onMigrationStep?.({ name: "canonical-written" });
     }
 
     if (projectsToLink.some((project) => project.source !== null) && canonicalSource) {
-      canonicalBackup = await immutableBackup(canonicalPath, canonicalSource, canonicalSourceSha!);
+      canonicalBackup = await hardlinkOrCopyBackup(canonicalPath, canonicalSourceSha!);
     }
     for (const project of projectsToLink) {
       await assertPreparedProjectHome(project.home);
@@ -743,10 +842,44 @@ export async function migrateSharedProjectModels(options: {
     }
 
     await options.onMigrationStep?.({ name: "backups-created" });
-    if (canonicalNeedsWrite && canonicalSource) {
-      // The canonical is never moved aside. Atomic rename over its stable pathname means
-      // concurrent readers observe either the complete old file or the complete new file.
-      await atomicWrite(canonicalPath, result);
+    if (canonicalNeedsWrite && canonicalSource && canonicalRegular) {
+      const snapshot = snapshotFromRegular(canonicalPath, canonicalRegular);
+      await assertSnapshotUnchanged(snapshot, "canonical models.json");
+      if (!canonicalBackup) {
+        canonicalBackup = await hardlinkOrCopyBackup(canonicalPath, canonicalSourceSha!);
+      }
+      publishTemp = await writeModelsTemp(canonicalAgentDir, result);
+      await options.onMigrationStep?.({ name: "before-canonical-publish" });
+      await assertSnapshotUnchanged(snapshot, "canonical models.json");
+      canonicalQuarantinePath = `${canonicalPath}.pipiui-shared-v1.${canonicalSourceSha}.${randomUUID()}.quarantine`;
+      await rename(canonicalPath, canonicalQuarantinePath);
+      try {
+        const moved = await readStableRegularFile(canonicalQuarantinePath, "canonical models.json quarantine");
+        if (
+          !moved
+          || moved.stat.dev !== snapshot.dev
+          || moved.stat.ino !== snapshot.ino
+          || sha256(moved.source) !== snapshot.sourceSha256
+          || !moved.source.equals(snapshot.source)
+        ) {
+          throw new Error(`Refusing changed canonical models.json after quarantine at ${canonicalPath}`);
+        }
+        await options.onMigrationStep?.({ name: "after-canonical-quarantine" });
+        await exclusiveLink(publishTemp, canonicalPath);
+      } catch (error) {
+        await discardPublishTemp();
+        if (!await pathExists(canonicalPath)) {
+          const restored = await exclusiveRestoreRegular(canonicalQuarantinePath, canonicalPath);
+          if (!restored) {
+            throw wrapMigrationError(error, [
+              new Error(`Refusing to overwrite concurrent models.json at ${canonicalPath}`),
+            ]);
+          }
+        }
+        throw error;
+      }
+      await discardPublishTemp();
+      publishedIdentity = await readFileIdentity(canonicalPath, "canonical models.json");
       await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
       canonicalReplaced = true;
       await options.onMigrationStep?.({ name: "canonical-written" });
@@ -777,6 +910,10 @@ export async function migrateSharedProjectModels(options: {
     await options.onMigrationStep?.({ name: "before-manifest-write" });
     await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+    for (const project of projectsToLink) await cleanupProjectSymlinkQuarantine(project);
+    if (canonicalQuarantinePath && canonicalQuarantinePath !== canonicalBackup) {
+      await rm(canonicalQuarantinePath, { force: true });
+    }
     return manifest;
   } catch (error) {
     const rollbackErrors: unknown[] = [];
@@ -787,14 +924,18 @@ export async function migrateSharedProjectModels(options: {
         rollbackErrors.push(rollbackError);
       }
     }
-    if (canonicalReplaced && canonicalSource) {
+    if (canonicalReplaced) {
       try {
-        await atomicWrite(canonicalPath, canonicalSource);
-        await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+        await rollbackPublishedCanonical({
+          canonicalPath,
+          publishedIdentity,
+          restoreFrom: canonicalQuarantinePath ?? canonicalBackup,
+        });
       } catch (rollbackError) {
         rollbackErrors.push(rollbackError);
       }
     }
+    await discardPublishTemp();
     throw wrapMigrationError(error, rollbackErrors);
   }
 }
@@ -808,7 +949,7 @@ export async function ensureProjectPiHome(options: {
   projectRoot: string;
   credentialSeedDir?: string;
   deferModelsMigration?: boolean;
-}): Promise<{ agentDir: string; sessionsDir: string }> {
+}): Promise<{ agentDir: string; sessionsDir: string; realProjectRoot: string }> {
   const home = await prepareProjectHome(options.projectRoot);
   const agentDir = home.agentDir.path;
   const sessions = await prepareDirectoryComponent(home.agentDir, "sessions", "project sessions", "project .pi/agent");
@@ -843,5 +984,5 @@ export async function ensureProjectPiHome(options: {
       projectRoots: [options.projectRoot],
     });
   }
-  return { agentDir, sessionsDir };
+  return { agentDir, sessionsDir, realProjectRoot: home.projectRoot.path };
 }

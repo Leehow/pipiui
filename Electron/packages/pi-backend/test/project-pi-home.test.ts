@@ -34,6 +34,7 @@ describe("project Pi home", () => {
 
     const home = await ensureProjectPiHome({ projectRoot: project, credentialSeedDir: seed });
     const realProject = await realpath(project);
+    expect(home.realProjectRoot).toBe(realProject);
     expect(home.agentDir).toBe(join(realProject, ".pi", "agent"));
     expect(home.sessionsDir).toBe(join(realProject, ".pi", "agent", "sessions"));
     expect(sanitizePiSettings({ packages: ["x"], skills: ["y"], theme: "light" })).toEqual({ theme: "light" });
@@ -266,8 +267,14 @@ describe("project Pi home", () => {
       projectRoots: [second, linkedProject, first],
       onMigrationStep: async (step) => {
         // Once published, the stable canonical pathname may never disappear. It can still
-        // be absent at the pre-mutation read/verify hooks when this run creates it.
-        if (step.name !== "sources-read" && step.name !== "snapshots-verified") {
+        // be absent at the pre-mutation read/verify hooks when this run creates it, and
+        // during the controlled quarantine→no-replace-link window of an existing replace.
+        if (
+          step.name !== "sources-read"
+          && step.name !== "snapshots-verified"
+          && step.name !== "before-canonical-publish"
+          && step.name !== "after-canonical-quarantine"
+        ) {
           expect((await lstat(stableCanonical)).isFile()).toBe(true);
           await expect(readFile(stableCanonical, "utf8")).resolves.toBeTruthy();
         }
@@ -459,7 +466,7 @@ describe("project Pi home", () => {
   });
 
   it.each(["regular", "symlink"] as const)(
-    "keeps a concurrent %s created after quarantine and does not overwrite it", 
+    "keeps a concurrent %s created after quarantine and does not overwrite it",
     async (kind) => {
       root = await mkdtemp(join(tmpdir(), `pipi-model-concurrent-${kind}-`));
       const seed = join(root, "profile");
@@ -568,5 +575,171 @@ describe("project Pi home", () => {
     expect(backups).toHaveLength(1);
     expect(await readFile(join(agentDir, backups[0]), "utf8")).toBe(original);
     expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
+  });
+
+  it("keeps a concurrent create when the initial canonical is missing", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-missing-create-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const concurrent = '{"providers":{"concurrent":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(project, { recursive: true });
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: seed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name !== "before-canonical-publish") return;
+        await writeFile(join(seed, "models.json"), concurrent);
+      },
+    })).rejects.toThrow(/concurrent models\.json/);
+    expect(await readFile(join(seed, "models.json"), "utf8")).toBe(concurrent);
+    expect((await lstat(join(seed, "models.json"))).isFile()).toBe(true);
+  });
+
+  it.each(["in-place", "replace"] as const)(
+    "keeps a concurrent %s of an existing canonical before publish",
+    async (kind) => {
+      root = await mkdtemp(join(tmpdir(), `pipi-model-canonical-${kind}-`));
+      const seed = join(root, "profile");
+      const project = join(root, "project");
+      const original = '{"providers":{"canonical":{}}}\n';
+      const newer = '{"providers":{"external":{}}}\n';
+      await mkdir(seed, { recursive: true });
+      await mkdir(projectPiAgentDir(project), { recursive: true });
+      await writeFile(join(seed, "models.json"), original);
+      await writeFile(join(projectPiAgentDir(project), "models.json"), '{"providers":{"project":{}}}\n');
+
+      await expect(migrateSharedProjectModels({
+        canonicalAgentDir: seed,
+        projectRoots: [project],
+        onMigrationStep: async (step) => {
+          if (step.name !== "before-canonical-publish") return;
+          if (kind === "in-place") {
+            await writeFile(join(seed, "models.json"), newer);
+            return;
+          }
+          const replacement = join(seed, ".models-replaced.tmp");
+          await writeFile(replacement, newer);
+          await rename(replacement, join(seed, "models.json"));
+        },
+      })).rejects.toThrow("changed canonical models.json");
+      expect(await readFile(join(seed, "models.json"), "utf8")).toBe(newer);
+      expect(await readFile(join(projectPiAgentDir(project), "models.json"), "utf8")).toBe('{"providers":{"project":{}}}\n');
+    },
+  );
+
+  it("does not replace a concurrent occupant after canonical quarantine", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-canonical-eexist-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const original = '{"providers":{"canonical":{}}}\n';
+    const occupant = '{"providers":{"occupant":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(seed, "models.json"), original);
+    await writeFile(join(projectPiAgentDir(project), "models.json"), '{"providers":{"project":{}}}\n');
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: seed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name !== "after-canonical-quarantine") return;
+        await writeFile(join(seed, "models.json"), occupant);
+      },
+    })).rejects.toThrow(/concurrent models\.json/);
+    expect(await readFile(join(seed, "models.json"), "utf8")).toBe(occupant);
+    expect((await lstat(join(seed, "models.json"))).isFile()).toBe(true);
+    const backups = (await readdir(seed)).filter((name) => name.includes(".bak") || name.includes(".quarantine"));
+    expect(backups.length).toBeGreaterThan(0);
+    expect(await readFile(join(seed, backups[0]), "utf8")).toBe(original);
+    expect(await readFile(join(projectPiAgentDir(project), "models.json"), "utf8")).toBe('{"providers":{"project":{}}}\n');
+  });
+
+  it("keeps an external rewrite during rollback instead of restoring over it", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-rollback-rewrite-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const original = '{"providers":{"canonical":{}}}\n';
+    const rewritten = '{"providers":{"rewritten":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(seed, "models.json"), original);
+    await writeFile(join(projectPiAgentDir(project), "models.json"), '{"providers":{"project":{}}}\n');
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: seed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name === "canonical-written") {
+          await writeFile(join(seed, "models.json"), rewritten);
+        }
+        if (step.name === "before-manifest-write") throw new Error("injected failure at before-manifest-write");
+      },
+    })).rejects.toThrow(/injected failure at before-manifest-write;[\s\S]*concurrent models\.json/);
+    expect(await readFile(join(seed, "models.json"), "utf8")).toBe(rewritten);
+    const backups = (await readdir(seed)).filter((name) => name.includes(".bak") || name.includes(".quarantine"));
+    expect(backups.length).toBeGreaterThan(0);
+    expect(await readFile(join(seed, backups[0]), "utf8")).toBe(original);
+  });
+
+  it.each([
+    { kind: "alias-link" as const, failAt: "project-link-installed" as const },
+    { kind: "alias-link" as const, failAt: "before-manifest-write" as const },
+    { kind: "stale-temp-link" as const, failAt: "project-link-installed" as const },
+    { kind: "stale-temp-link" as const, failAt: "before-manifest-write" as const },
+  ])("restores the exact $kind target after $failAt", async ({ kind, failAt }) => {
+    root = await mkdtemp(join(tmpdir(), `pipi-model-${kind}-${failAt}-`));
+    const realSeed = join(root, "profile");
+    const aliasSeed = join(root, "profile-alias");
+    const project = join(root, "project");
+    await mkdir(realSeed, { recursive: true });
+    await symlink(realSeed, aliasSeed);
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(realSeed, "models.json"), '{"providers":{}}\n');
+    const projectModels = join(projectPiAgentDir(project), "models.json");
+    const rawTarget = kind === "alias-link"
+      ? join(aliasSeed, "models.json")
+      : join(aliasSeed, ".models.json-interrupted.tmp");
+    await symlink(rawTarget, projectModels);
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: aliasSeed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name === failAt) throw new Error(`injected failure at ${failAt}`);
+      },
+    })).rejects.toThrow(`injected failure at ${failAt}`);
+    expect((await lstat(projectModels)).isSymbolicLink()).toBe(true);
+    expect(await readlink(projectModels)).toBe(rawTarget);
+    expect((await readdir(projectPiAgentDir(project))).some((name) => name.startsWith(".models-alias-"))).toBe(true);
+  });
+
+  it("does not restore an alias link over a later occupant", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-alias-occupant-"));
+    const realSeed = join(root, "profile");
+    const aliasSeed = join(root, "profile-alias");
+    const project = join(root, "project");
+    const occupant = '{"providers":{"occupant":{}}}\n';
+    await mkdir(realSeed, { recursive: true });
+    await symlink(realSeed, aliasSeed);
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(realSeed, "models.json"), '{"providers":{}}\n');
+    const projectModels = join(projectPiAgentDir(project), "models.json");
+    const rawTarget = join(aliasSeed, "models.json");
+    await symlink(rawTarget, projectModels);
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: aliasSeed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name !== "before-manifest-write") return;
+        await rm(projectModels);
+        await writeFile(projectModels, occupant);
+        throw new Error("injected failure at before-manifest-write");
+      },
+    })).rejects.toThrow("injected failure at before-manifest-write");
+    expect((await lstat(projectModels)).isFile()).toBe(true);
+    expect(await readFile(projectModels, "utf8")).toBe(occupant);
   });
 });

@@ -99,6 +99,75 @@ describe("isolated project Pi homes", () => {
     expect((await lstat(join(projectPiAgentDir(alpha), "models.json"))).isSymbolicLink()).toBe(true);
   });
 
+  it("exposes a migrated project provider on the first catalog read", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-model-catalog-"));
+    const host = join(root, "host-profile");
+    const project = join(root, "project");
+    await mkdir(host, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(host, "pipiui-settings.json"), JSON.stringify({
+      projectPathsVersion: 1,
+      projectPathsCanonicalMigrationVersion: 1,
+      projectPaths: [project],
+    }));
+    await writeFile(join(host, "models.json"), JSON.stringify({ providers: {} }));
+    await writeFile(join(projectPiAgentDir(project), "models.json"), JSON.stringify({
+      providers: {
+        slab: {
+          apiKey: "sk-project",
+          models: [{ id: "only", name: "Only", reasoning: true }],
+        },
+      },
+    }));
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+    const models = await backend.handle("listModels", []) as Array<{ provider: string; id: string }>;
+    expect(models.map((model) => `${model.provider}/${model.id}`)).toContain("slab/only");
+  });
+
+  it("refreshes the catalog after adding a project with new providers", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-model-refresh-"));
+    const host = join(root, "host-profile");
+    const project = join(root, "project");
+    await mkdir(host, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(host, "models.json"), JSON.stringify({ providers: {} }));
+    await writeFile(join(projectPiAgentDir(project), "models.json"), JSON.stringify({
+      providers: {
+        slab: {
+          apiKey: "sk-project",
+          models: [{ id: "only", name: "Only", reasoning: true }],
+        },
+      },
+    }));
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+    const before = await backend.handle("listModels", []) as Array<{ provider: string; id: string }>;
+    expect(before.map((model) => `${model.provider}/${model.id}`)).not.toContain("slab/only");
+    await backend.handle("addProject", [project]);
+    const after = await backend.handle("listModels", []) as Array<{ provider: string; id: string }>;
+    expect(after.map((model) => `${model.provider}/${model.id}`)).toContain("slab/only");
+  });
+
   it("writes new sessions and spawns Pi inside the opened project, not a shared host profile", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-project-isolation-"));
     const host = join(root, "host-profile");
@@ -178,7 +247,8 @@ describe("isolated project Pi homes", () => {
     await mkdir(host, { recursive: true });
     await symlink(realProject, alias);
     await writeFile(join(otherProject, "SENTINEL"), "external-sentinel\n");
-    const captured: Array<{ env: NodeJS.ProcessEnv }> = [];
+    const captured: Array<{ env: NodeJS.ProcessEnv; cwd?: string }> = [];
+    const revealed: string[] = [];
     backend = createPiHostBackend({
       agentDir: host,
       sessionsRoot: join(root, "host-sessions"),
@@ -186,8 +256,11 @@ describe("isolated project Pi homes", () => {
       profileMode: "isolated",
       canonicalProjectPaths: async () => undefined,
       piPath: "node",
+      revealPath: async (path) => {
+        revealed.push(path);
+      },
       spawn: (_bin, _args, options) => {
-        captured.push({ env: options.env });
+        captured.push({ env: options.env, cwd: options.cwd });
         return spawn(
           process.execPath,
           [new URL("./fake-pi.mjs", import.meta.url).pathname],
@@ -197,6 +270,10 @@ describe("isolated project Pi homes", () => {
     });
 
     const added = await backend.handle("addProject", [alias]) as { id: string };
+    await mkdir(join(realProject, ".pi"), { recursive: true });
+    await writeFile(join(realProject, ".pi", "mcp.json"), JSON.stringify({
+      mcpServers: { local: { command: "true" } },
+    }));
     await rm(alias);
     await symlink(otherProject, alias);
 
@@ -204,7 +281,8 @@ describe("isolated project Pi homes", () => {
     const listed = await backend.handle("listSessions", [added.id]) as Array<{ id: string }>;
     expect(listed.map((session) => session.id)).toEqual([created.id]);
 
-    const realSessions = join(await realpath(realProject), ".pi", "agent", "sessions");
+    const realRoot = await realpath(realProject);
+    const realSessions = join(realRoot, ".pi", "agent", "sessions");
     const files = (await readdir(realSessions)).filter((name) => name.endsWith(".jsonl"));
     expect(files).toHaveLength(1);
     expect(JSON.parse((await readFile(join(realSessions, files[0]), "utf8")).split("\n")[0])).toEqual(
@@ -213,15 +291,22 @@ describe("isolated project Pi homes", () => {
     await expect(readdir(join(otherProject, ".pi", "agent", "sessions"))).rejects.toMatchObject({ code: "ENOENT" });
 
     await backend.handle("setFirecrawlPdfApiKey", [added.id, "fc-test-key"]);
-    expect(await readFile(join(await realpath(realProject), ".pi", "agent", "web-search.json"), "utf8")).toContain("fc-test-key");
+    expect(await readFile(join(realRoot, ".pi", "agent", "web-search.json"), "utf8")).toContain("fc-test-key");
     await expect(readFile(join(otherProject, ".pi", "agent", "web-search.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
 
+    await backend.handle("revealProject", [added.id]);
+    expect(revealed).toEqual([realRoot]);
+    const mcp = await backend.handle("listUserMcpServers", [added.id]) as Array<{ name: string }>;
+    expect(mcp.map((server) => server.name)).toEqual(["local"]);
+
     await backend.handle("sendPrompt", [created.id, "go"]);
-    const env = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id)?.env ?? captured.at(-1)?.env;
-    expect(env?.PI_CODING_AGENT_DIR).toBe(join(await realpath(realProject), ".pi", "agent"));
-    expect(env?.PI_CODING_AGENT_SESSION_DIR).toBe(realSessions);
-    expect(env?.PI_CODING_AGENT_DIR).not.toBe(join(otherProject, ".pi", "agent"));
+    const spawned = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id) ?? captured.at(-1);
+    expect(spawned?.cwd).toBe(realRoot);
+    expect(spawned?.env.PI_CODING_AGENT_DIR).toBe(join(realRoot, ".pi", "agent"));
+    expect(spawned?.env.PI_CODING_AGENT_SESSION_DIR).toBe(realSessions);
+    expect(spawned?.env.PI_CODING_AGENT_DIR).not.toBe(join(otherProject, ".pi", "agent"));
+    expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
   });
 
   it("serializes canonical models writers, keeps fields, and recovers after a failed job", async () => {
