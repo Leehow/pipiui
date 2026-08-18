@@ -6,7 +6,7 @@ import { createPiHostBackend } from "../src/index.js";
 
 let root = "";
 afterEach(async () => {
-  if (root) await rm(root, { recursive: true, force: true });
+  if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   root = "";
 });
 
@@ -24,6 +24,8 @@ describe("explicit local document reads", () => {
     await writeFile(path, "# Real document\n\nLoaded from disk.\n");
 
     expect(await backend.handle("listDocuments", [])).toEqual([]);
+    await backend.handle("watchDocument", [path]);
+    expect(await backend.handle("listDocuments", [])).toMatchObject([{ id: path, path, name: "notes.markdown", kind: "markdown" }]);
     expect(await backend.handle("readDocument", [path])).toMatchObject({
       id: path,
       name: "notes.markdown",
@@ -81,6 +83,22 @@ describe("explicit local document reads", () => {
     await expect(backend.handle("readDocument", [join(root, "missing.md")])).rejects.toMatchObject({ code: "document_not_found" });
     await expect(backend.handle("readDocument", [oversized])).rejects.toMatchObject({ code: "document_too_large" });
     await expect(backend.handle("readDocument", [oversizedPdf])).rejects.toMatchObject({ code: "document_too_large" });
+    await backend.close();
+  });
+
+  it("notifyDocumentsDropped without a session degrades without throwing", async () => {
+    const backend = await fixture();
+    await expect(backend.handle("notifyDocumentsDropped", ["", [join(root, "notes.md")]])).resolves.toBeUndefined();
+    await backend.close();
+  });
+
+  it("does not enqueue a queued user message when the session is already busy", async () => {
+    const backend = await fixture();
+    const path = join(root, "notes.md");
+    await writeFile(path, "# Visible from the panel\n\n幼儿姓名：测试。\n");
+    (backend as { queue: { markBusy(sessionId: string): number } }).queue.markBusy("s1");
+    await backend.handle("notifyDocumentsDropped", ["s1", [path]]);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
     await backend.close();
   });
 });

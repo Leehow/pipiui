@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import { createIpcHost, PIPI_HOST_IPC_CHANNEL, type IpcRendererLike, type PipiHostAPI } from '@pipi/host-api'
 import {
   PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
@@ -30,6 +30,7 @@ export interface RemoteControlIpcRendererLike {
 export function exposePipiHost(contextBridge: ContextBridgeLike, ipc: IpcRendererLike): PipiHostAPI {
   const host = createIpcHost(ipc, PIPI_HOST_IPC_CHANNEL, { openExternal: true, openDocumentExternally: true, projectDirectoryPicker: true, computerUsePermissions: true, updateCenter: true })
   contextBridge.exposeInMainWorld('pipiHost', host)
+  contextBridge.exposeInMainWorld('pipiPathForFile', (file: File) => webUtils.getPathForFile(file))
   return host
 }
 
@@ -59,6 +60,7 @@ exposePipiRemoteControl(contextBridge, ipcRenderer)
 declare global {
   interface Window {
     pipiHost: PipiHostAPI
+    pipiPathForFile?: (file: File) => string
     pipiRemoteControl: PipiRemoteControlAPI
   }
 }
