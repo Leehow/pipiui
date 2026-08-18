@@ -5,7 +5,77 @@ export type CompactFileChange = {
 	payloadChars: number;
 	addedChars: number;
 	removedChars: number;
+	addedLines?: number;
+	removedLines?: number;
 };
+
+const LINE_DIFF_INPUT_LIMIT = 4000;
+
+export function logicalLines(text: string): string[] {
+	if (!text) return [];
+	const lines = text.split("\n");
+	if (text.endsWith("\n")) lines.pop();
+	return lines;
+}
+
+function arraysEqual(a: string[], b: string[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+function lcsLength(oldLines: string[], newLines: string[]): number {
+	const n = oldLines.length;
+	const m = newLines.length;
+	let prev = new Array<number>(m + 1).fill(0);
+	let curr = new Array<number>(m + 1).fill(0);
+	for (let i = 1; i <= n; i++) {
+		for (let j = 1; j <= m; j++) {
+			curr[j] =
+				oldLines[i - 1] === newLines[j - 1] ? prev[j - 1]! + 1 : Math.max(prev[j]!, curr[j - 1]!);
+		}
+		const swap = prev;
+		prev = curr;
+		curr = swap;
+		curr.fill(0);
+	}
+	return prev[m]!;
+}
+
+export function hunkLineCounts(oldText: string, newText: string): { added: number; removed: number } {
+	const oldL = logicalLines(oldText);
+	const newL = logicalLines(newText);
+	if (arraysEqual(oldL, newL)) return { added: 0, removed: 0 };
+	if (oldL.length + newL.length > LINE_DIFF_INPUT_LIMIT) {
+		return { added: newL.length, removed: oldL.length };
+	}
+	const lcs = lcsLength(oldL, newL);
+	return { added: newL.length - lcs, removed: oldL.length - lcs };
+}
+
+function editLineTotals(args: Record<string, unknown>): { added: number; removed: number } {
+	const hunks: { oldText: string; newText: string }[] = [];
+	if (Array.isArray(args.edits)) {
+		for (const item of args.edits) {
+			if (!item || typeof item !== "object") continue;
+			const rec = item as Record<string, unknown>;
+			if (typeof rec.oldText === "string" && typeof rec.newText === "string") {
+				hunks.push({ oldText: rec.oldText, newText: rec.newText });
+			}
+		}
+	}
+	if (hunks.length === 0 && typeof args.oldText === "string" && typeof args.newText === "string") {
+		hunks.push({ oldText: args.oldText, newText: args.newText });
+	}
+	let added = 0;
+	let removed = 0;
+	for (const hunk of hunks) {
+		const counts = hunkLineCounts(hunk.oldText, hunk.newText);
+		added += counts.added;
+		removed += counts.removed;
+	}
+	return { added, removed };
+}
 
 function pathOf(args: Record<string, unknown>, raw = ""): string {
 	const path = args.path ?? args.file_path;
@@ -91,6 +161,8 @@ export function compactFileChangeFromArgs(name: string, args: Record<string, unk
 			payloadChars: content.length,
 			addedChars: content.length,
 			removedChars: 0,
+			addedLines: logicalLines(content).length,
+			removedLines: 0,
 		};
 	}
 	const added = Array.isArray(args.edits)
@@ -103,7 +175,15 @@ export function compactFileChangeFromArgs(name: string, args: Record<string, unk
 		: typeof args.oldText === "string"
 			? args.oldText.length
 			: 0;
-	return { path: pathOf(args), payloadChars: added, addedChars: added, removedChars: removed };
+	const lines = editLineTotals(args);
+	return {
+		path: pathOf(args),
+		payloadChars: added,
+		addedChars: added,
+		removedChars: removed,
+		addedLines: lines.added,
+		removedLines: lines.removed,
+	};
 }
 
 export function compactFileChangeFromPartial(name: string, raw: string): CompactFileChange | null {
@@ -117,11 +197,30 @@ export function compactFileChangeFromPartial(name: string, raw: string): Compact
 			payloadChars: content.length,
 			addedChars: content.length,
 			removedChars: 0,
+			addedLines: logicalLines(content).length,
+			removedLines: 0,
 		};
 	}
-	const added = scrapeAll("newText", raw).reduce((sum, part) => sum + part.length, 0);
-	const removed = scrapeAll("oldText", raw).reduce((sum, part) => sum + part.length, 0);
-	return { path: pathOf({}, raw), payloadChars: added, addedChars: added, removedChars: removed };
+	const newParts = scrapeAll("newText", raw);
+	const oldParts = scrapeAll("oldText", raw);
+	const added = newParts.reduce((sum, part) => sum + part.length, 0);
+	const removed = oldParts.reduce((sum, part) => sum + part.length, 0);
+	const pairCount = Math.min(oldParts.length, newParts.length);
+	let addedLines = 0;
+	let removedLines = 0;
+	for (let i = 0; i < pairCount; i++) {
+		const counts = hunkLineCounts(oldParts[i]!, newParts[i]!);
+		addedLines += counts.added;
+		removedLines += counts.removed;
+	}
+	return {
+		path: pathOf({}, raw),
+		payloadChars: added,
+		addedChars: added,
+		removedChars: removed,
+		addedLines,
+		removedLines,
+	};
 }
 
 export function stringifyCompactFileChange(stats: CompactFileChange, extra?: Record<string, unknown>): string {
@@ -130,6 +229,8 @@ export function stringifyCompactFileChange(stats: CompactFileChange, extra?: Rec
 		payloadChars: stats.payloadChars,
 		addedChars: stats.addedChars,
 		removedChars: stats.removedChars,
+		addedLines: stats.addedLines ?? 0,
+		removedLines: stats.removedLines ?? 0,
 		...extra,
 	});
 }
