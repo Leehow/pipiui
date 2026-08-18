@@ -91,7 +91,9 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       role: "assistant",
       content: [{ type: "text", text: "PASS" }],
       stopReason: command.message === "tool-use-still-streaming" ? "toolUse" : "stop",
-      timestamp: Date.now(),
+      timestamp: command.message === "iso-timestamp-without-settled"
+        ? new Date().toISOString()
+        : Date.now(),
       responseId: `response-${command.message}`,
     };
     const persistFinal = () => {
@@ -124,7 +126,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         output: JSON.stringify({ outcome: "completed", summary: "done" }),
         at: "2026-08-17T00:00:02.000Z",
       } }), 25);
-    } else if (command.message === "final-without-settled") {
+    } else if (command.message === "final-without-settled" || command.message === "iso-timestamp-without-settled") {
       isStreaming = false;
     } else if (command.message === "final-with-reentry") {
       pendingMessageCount = 1;
@@ -134,6 +136,12 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       }, 25);
     } else if (command.message === "persisted-final-late-settled") {
       setTimeout(() => send({ type: "agent_settled" }), 25);
+    } else if (command.message === "final-pending-then-clear") {
+      pendingMessageCount = 1;
+      persistFinal();
+      setTimeout(() => {
+        pendingMessageCount = 0;
+      }, 80);
     }
     return;
   }

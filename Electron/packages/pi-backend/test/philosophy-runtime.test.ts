@@ -147,6 +147,13 @@ describe("vendored philosophy: delivery", () => {
     expect(result.skipped.find((s) => s.id === "typo")?.reason).toMatch(/names nobody that exists/);
   });
 
+  it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
+    expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
+    expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
+      /visible terminal is not another route to the withheld shell/,
+    );
+  });
+
   it("delivers same-turn independent-call discipline to boss and lead on every model", () => {
     const sameTurn = layers.find((l) => l.id === "same-turn");
     expect(sameTurn, "Electron-only same-turn layer must exist").toBeTruthy();

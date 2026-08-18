@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiHostBackend } from "../src/index.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
 async function eventually(check: () => boolean | Promise<boolean>, timeoutMs = 1_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -350,6 +350,62 @@ describe("PiHostBackend terminal projection", () => {
     await backend.handle("sendPrompt", ["s1", "persisted-final-late-settled"]);
     await eventually(() => statuses.includes("settled"));
     await new Promise(resolve => setTimeout(resolve, 150));
+
+    off();
+    expect(statuses).toEqual(["started", "settled"]);
+    await backend.close();
+  });
+
+  it("settles a missed agent_settled turn and drains a user message queued in that window", async () => {
+    const backend = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") statuses.push(event.event.status);
+    });
+
+    await backend.handle("sendPrompt", ["s1", "persisted-final-stuck-streaming"]);
+    const queued = await backend.handle("enqueueMessage", ["s1", "做吧"]) as { outcome: string };
+    expect(queued.outcome).toBe("queued");
+
+    await eventually(() => statuses.includes("settled"));
+    await eventually(async () => ((await backend.handle("listQueue", ["s1"])) as unknown[]).length === 0);
+
+    off();
+    expect(statuses.filter(status => status === "started").length).toBeGreaterThanOrEqual(2);
+    await backend.close();
+  });
+
+  it("retries missed-settled reconciliation when a user message queues after the first attempt aborted", async () => {
+    const backend = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") statuses.push(event.event.status);
+    });
+
+    await backend.handle("sendPrompt", ["s1", "final-pending-then-clear"]);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(statuses).toEqual(["started"]);
+
+    const queued = await backend.handle("enqueueMessage", ["s1", "做吧"]) as { outcome: string };
+    expect(queued.outcome).toBe("queued");
+
+    await eventually(() => statuses.includes("settled"), 2_000);
+    await eventually(async () => ((await backend.handle("listQueue", ["s1"])) as unknown[]).length === 0);
+
+    off();
+    expect(statuses.filter(status => status === "started").length).toBeGreaterThanOrEqual(2);
+    await backend.close();
+  });
+
+  it("reconciles a final idle assistant turn when message_end timestamp is an ISO string", async () => {
+    const backend = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") statuses.push(event.event.status);
+    });
+
+    await backend.handle("sendPrompt", ["s1", "iso-timestamp-without-settled"]);
+    await eventually(() => statuses.includes("settled"));
 
     off();
     expect(statuses).toEqual(["started", "settled"]);

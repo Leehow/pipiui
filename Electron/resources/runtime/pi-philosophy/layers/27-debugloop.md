@@ -48,15 +48,13 @@ the diagnosis dies. "The button does nothing" is not a brief.
 
 ## The terminal is an instrument, not a faster shell
 
-It is present by default because debugging needs a surface you can watch while work happens.
-That is the entire mandate, and it is narrow.
+Last-resort only. Never a substitute for `read`, `ls`, `git`, `grep`, `find`, or `bash`.
+If the shell is absent, dispatch a worker — do not type the command into the pane.
+It is present because debugging needs a surface you can watch while work happens.
 
-- One-shot commands — build, test, lint, git, any script that ends — are `bash`. Its output
-  is captured, attributed and reviewable; text you typed into a pane is none of those.
-- The terminal earns its use exactly when the process outlives the command: a server you
-  tail, a TUI, an SSH session, a REPL you interrogate, a prompt that waits for an answer.
-- Reaching for it because it feels more direct than the right tool is the drift it is watched
-  for. Same job, worse record.
+- One-shot commands — build, test, lint, git, any script that ends — are `bash`.
+- Use it only when the process outlives the command: a server you tail, a TUI, SSH, a REPL,
+  a prompt waiting for an answer.
 
 ## A screen you can open is never a desktop task
 
