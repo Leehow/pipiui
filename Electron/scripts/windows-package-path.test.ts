@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
-import { findDelayimpLibDir, unsignedBuilderArgs, windowsMsvcEnv, windowsNativeRebuildEnv, writeWindowsPtyBuildProps } from './package-electron-target.mjs'
+import { findDelayimpLibDir, findWindowsSdkLibDirs, unsignedBuilderArgs, windowsMsvcEnv, windowsNativeRebuildEnv, writeWindowsPtyBuildProps } from './package-electron-target.mjs'
 
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
@@ -35,6 +35,7 @@ describe('Windows package and CI path', () => {
     expect(windowsMsvcEnv('win32')).toEqual({})
     expect(windowsMsvcEnv('darwin')).toEqual({})
     expect(findDelayimpLibDir({})).toBeUndefined()
+    expect(findWindowsSdkLibDirs({ PIPIUI_WINDOWS_KITS_LIB: '/tmp/no-such-kits' })).toEqual([])
     expect(writeWindowsPtyBuildProps('/tmp/no-such-electron', undefined)).toEqual([])
     expect(packager).toContain('windowsNativeRebuildEnv')
     expect(packager).toContain('windowsMsvcEnv')

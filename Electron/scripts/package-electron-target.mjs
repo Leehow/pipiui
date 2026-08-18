@@ -100,13 +100,32 @@ export function findDelayimpLibDir(env = process.env) {
   return undefined
 }
 
-export function writeWindowsPtyBuildProps(root, libDir) {
-  if (!libDir) return []
+const defaultWindowsKitsLib = 'C:\\Program Files (x86)\\Windows Kits\\10\\Lib'
+
+export function findWindowsSdkLibDirs(env = process.env) {
+  const kits = env.PIPIUI_WINDOWS_KITS_LIB || defaultWindowsKitsLib
+  if (!existsSync(kits)) return []
+  const versions = readdirSync(kits, { withFileTypes: true })
+    .filter(entry => entry.isDirectory())
+    .map(entry => entry.name)
+    .sort()
+    .reverse()
+  for (const version of versions) {
+    const um = join(kits, version, 'um', 'x64')
+    const ucrt = join(kits, version, 'ucrt', 'x64')
+    if (existsSync(join(um, 'kernel32.lib'))) return [um, existsSync(ucrt) ? ucrt : undefined].filter(Boolean)
+  }
+  return []
+}
+
+export function writeWindowsPtyBuildProps(root, libDirs) {
+  const dirsToAdd = (Array.isArray(libDirs) ? libDirs : [libDirs]).filter(Boolean)
+  if (dirsToAdd.length === 0) return []
   const props = `<?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
     <SpectreMitigation>false</SpectreMitigation>
-    <LibraryPath>${libDir};$(LibraryPath)</LibraryPath>
+    <LibraryPath>${dirsToAdd.join(';')};$(LibraryPath)</LibraryPath>
   </PropertyGroup>
 </Project>
 `
@@ -143,11 +162,11 @@ function main() {
   console.log(`Packaging with persistent embedded runtime ${key}`)
   Object.assign(releaseEnv, windowsMsvcEnv(options.platform, releaseEnv))
   if (options.platform === 'win32') {
-    const libDir = findDelayimpLibDir(releaseEnv)
-    const written = writeWindowsPtyBuildProps(electronRoot, libDir)
-    if (libDir) {
-      releaseEnv.LIB = `${libDir}${releaseEnv.LIB ? `;${releaseEnv.LIB}` : ''}`
-      console.log(`Windows native rebuild LIB+=${libDir} props=${written.length}`)
+    const libDirs = [findDelayimpLibDir(releaseEnv), ...findWindowsSdkLibDirs(releaseEnv)].filter(Boolean)
+    const written = writeWindowsPtyBuildProps(electronRoot, libDirs)
+    if (libDirs.length) {
+      releaseEnv.LIB = `${libDirs.join(';')}${releaseEnv.LIB ? `;${releaseEnv.LIB}` : ''}`
+      console.log(`Windows native rebuild LIB+=${libDirs.join(';')} props=${written.length}`)
     }
   }
   run(process.execPath, [
