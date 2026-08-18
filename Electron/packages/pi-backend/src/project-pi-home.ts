@@ -8,13 +8,16 @@ import {
   type Stats,
 } from "node:fs";
 import {
+  link,
   lstat,
   mkdir,
   open,
+  readlink,
   realpath,
   rename,
   rm,
   symlink,
+  unlink,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
@@ -134,6 +137,22 @@ export function sanitizePiSettings(raw: unknown): Record<string, unknown> {
   return settings;
 }
 
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+async function openNoFollow(path: string, flags: number) {
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  try {
+    return await open(path, flags | noFollow);
+  } catch (error) {
+    // O_NOFOLLOW is not implemented on every Electron target. The fallback still fstats
+    // before reading, so a path swapped to a symlink cannot expose its target bytes.
+    if (!noFollow || !["EINVAL", "ENOTSUP"].includes(errnoCode(error) ?? "")) throw error;
+    return await open(path, flags);
+  }
+}
+
 async function readStableRegularFile(
   path: string,
   label: string,
@@ -144,28 +163,32 @@ async function readStableRegularFile(
     try {
       before = await lstat(path);
     } catch (error) {
-      if (options.allowMissing && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if (options.allowMissing && errnoCode(error) === "ENOENT") return null;
       throw error;
     }
   }
   if (!before.isFile()) throw new Error(`Refusing unsafe ${label} type at ${path}`);
 
-  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
   let handle;
   try {
-    try {
-      handle = await open(path, fsConstants.O_RDONLY | noFollow);
-    } catch (error) {
-      // O_NOFOLLOW is not implemented on every Electron target. The fallback still fstats
-      // before reading, so a path swapped to a symlink cannot expose its target bytes.
-      if (!noFollow || !["EINVAL", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
-      handle = await open(path, fsConstants.O_RDONLY);
-    }
+    handle = await openNoFollow(path, fsConstants.O_RDONLY);
     const opened = await handle.stat();
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error(`Refusing changed ${label} at ${path}`);
     }
     return { source: await handle.readFile(), stat: opened };
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function ensureRegularFileMode(path: string, mode: number, label: string): Promise<void> {
+  let handle;
+  try {
+    handle = await openNoFollow(path, fsConstants.O_RDONLY);
+    const opened = await handle.stat();
+    if (!opened.isFile()) throw new Error(`Refusing unsafe ${label} type at ${path}`);
+    await handle.chmod(mode);
   } finally {
     await handle?.close().catch(() => undefined);
   }
@@ -337,38 +360,138 @@ async function immutableBackup(path: string, source: Buffer, sha: string): Promi
   return backup;
 }
 
-async function atomicLink(
-  canonicalPath: string,
-  projectPath: string,
-  temporaryCreated?: (temporaryPath: string) => void | Promise<void>,
-): Promise<void> {
-  const temporary = join(resolve(projectPath, ".."), `.models-link-${randomUUID()}.tmp`);
+interface RegularFileSnapshot {
+  path: string;
+  source: Buffer;
+  sourceSha256: string;
+  dev: number;
+  ino: number;
+  mode: number;
+}
+
+type ProjectModelsKind = "regular" | "missing" | "already-linked" | "alias-link" | "stale-temp-link";
+
+function resolveLinkTarget(linkPath: string, target: string): string {
+  return resolve(dirname(linkPath), target);
+}
+
+function snapshotFromRegular(path: string, regular: { source: Buffer; stat: Stats }): RegularFileSnapshot {
+  return {
+    path,
+    source: regular.source,
+    sourceSha256: sha256(regular.source),
+    dev: regular.stat.dev,
+    ino: regular.stat.ino,
+    mode: regular.stat.mode,
+  };
+}
+
+function sameIdentity(left: { dev: number; ino: number; mode: number }, right: { dev: number; ino: number; mode: number }): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode;
+}
+
+async function assertSnapshotUnchanged(snapshot: RegularFileSnapshot, label: string): Promise<void> {
+  const current = await lstat(snapshot.path);
+  if (!current.isFile() || !sameIdentity(current, snapshot)) {
+    throw new Error(`Refusing changed ${label} at ${snapshot.path}`);
+  }
+  const regular = await readStableRegularFile(snapshot.path, label, { expectedStat: current });
+  if (
+    !regular
+    || !sameIdentity(regular.stat, snapshot)
+    || sha256(regular.source) !== snapshot.sourceSha256
+    || !regular.source.equals(snapshot.source)
+  ) {
+    throw new Error(`Refusing changed ${label} at ${snapshot.path}`);
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
   try {
-    // Only the link filename is temporary. Its target is always the stable canonical path;
-    // linking a canonical temp/backup can strand projects when that transient file disappears.
-    await symlink(canonicalPath, temporary);
-    await temporaryCreated?.(temporary);
-    await rename(temporary, projectPath);
+    await lstat(path);
+    return true;
   } catch (error) {
-    await rm(temporary, { force: true }).catch(() => undefined);
+    if (errnoCode(error) === "ENOENT") return false;
     throw error;
   }
+}
+
+/** Restore `from` onto a vacant `to` without replacing an unknown occupant. */
+async function exclusiveRestoreRegular(from: string, to: string): Promise<boolean> {
+  try {
+    await link(from, to);
+    return true;
+  } catch (error) {
+    if (errnoCode(error) === "EEXIST") return false;
+    throw error;
+  }
+}
+
+async function exclusiveSymlink(target: string, path: string): Promise<void> {
+  try {
+    await symlink(target, path);
+  } catch (error) {
+    if (errnoCode(error) === "EEXIST") {
+      throw new Error(`Refusing to overwrite concurrent models.json at ${path}`);
+    }
+    throw error;
+  }
+}
+
+async function quarantineRegularFile(snapshot: RegularFileSnapshot, label: string): Promise<string> {
+  const backup = `${snapshot.path}.pipiui-shared-v1.${snapshot.sourceSha256}.${randomUUID()}.bak`;
+  await rename(snapshot.path, backup);
+  try {
+    const moved = await readStableRegularFile(backup, `${label} backup`);
+    if (
+      !moved
+      || moved.stat.dev !== snapshot.dev
+      || moved.stat.ino !== snapshot.ino
+      || sha256(moved.source) !== snapshot.sourceSha256
+      || !moved.source.equals(snapshot.source)
+    ) {
+      throw new Error(`Refusing changed ${label} after quarantine at ${snapshot.path}`);
+    }
+    await ensureRegularFileMode(backup, 0o600, `${label} backup`);
+    return backup;
+  } catch (error) {
+    const restored = await exclusiveRestoreRegular(backup, snapshot.path);
+    if (restored) await unlink(backup).catch(() => undefined);
+    throw error;
+  }
+}
+
+function wrapMigrationError(error: unknown, rollbackErrors: unknown[]): Error {
+  if (rollbackErrors.length === 0) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  const primary = error instanceof Error ? error.message : String(error);
+  const details = rollbackErrors.map((item) => (item instanceof Error ? item.message : String(item))).join("; ");
+  const wrapped = new Error(`${primary}; rollback failed: ${details}`);
+  if (error instanceof Error) wrapped.cause = error;
+  return wrapped;
 }
 
 interface ProjectModelsSource {
   projectRoot: string;
   home: PreparedProjectHome;
   path: string;
+  kind: ProjectModelsKind;
   source: Buffer | null;
   sourceSha256: string | null;
-  alreadyLinked: boolean;
+  snapshot: RegularFileSnapshot | null;
+  expectedLinkTarget: string | null;
   backupPath: string | null;
+  symlinkQuarantinePath: string | null;
+  linked: boolean;
 }
 
 type SharedModelsMigrationStep =
+  | { name: "sources-read" }
+  | { name: "snapshots-verified" }
   | { name: "backups-created" }
   | { name: "canonical-written" }
-  | { name: "temporary-project-link-created"; projectModelsPath: string; temporaryPath: string; index: number }
+  | { name: "before-project-link"; projectModelsPath: string; index: number }
   | { name: "project-link-installed"; projectModelsPath: string; index: number }
   | { name: "before-manifest-write" };
 
@@ -377,6 +500,136 @@ type SharedModelsMigrationStep =
  * then atomically replace project catalogs with links to it. The optional hook exists
  * only to make every mutation boundary fault-injectable in temp-fixture tests.
  */
+function emptyProjectSource(
+  projectRoot: string,
+  home: PreparedProjectHome,
+  path: string,
+  kind: ProjectModelsKind,
+  extra: Partial<ProjectModelsSource> = {},
+): ProjectModelsSource {
+  return {
+    projectRoot,
+    home,
+    path,
+    kind,
+    source: null,
+    sourceSha256: null,
+    snapshot: null,
+    expectedLinkTarget: null,
+    backupPath: null,
+    symlinkQuarantinePath: null,
+    linked: false,
+    ...extra,
+  };
+}
+
+function isStaleCanonicalTemp(
+  target: string,
+  canonicalAgentDir: string,
+  canonicalAgentInput: string,
+): boolean {
+  const targetName = basename(target);
+  return (dirname(target) === canonicalAgentDir || dirname(target) === canonicalAgentInput)
+    && targetName.startsWith(".")
+    && targetName.endsWith(".tmp");
+}
+
+async function assertProjectUnchanged(project: ProjectModelsSource): Promise<void> {
+  if (project.kind === "regular" && project.snapshot) {
+    await assertSnapshotUnchanged(project.snapshot, "project models.json");
+    return;
+  }
+  if (project.kind === "missing") {
+    if (await pathExists(project.path)) {
+      throw new Error(`Refusing changed project models.json at ${project.path}`);
+    }
+    return;
+  }
+  if (project.kind === "alias-link" || project.kind === "stale-temp-link") {
+    const current = await lstat(project.path);
+    if (!current.isSymbolicLink()) {
+      throw new Error(`Refusing changed project models.json at ${project.path}`);
+    }
+    if (await readlink(project.path) !== project.expectedLinkTarget) {
+      throw new Error(`Refusing changed project models.json symlink at ${project.path}`);
+    }
+  }
+}
+
+async function installProjectCanonicalLink(
+  project: ProjectModelsSource,
+  canonicalPath: string,
+): Promise<void> {
+  if (project.kind === "regular" || project.kind === "missing") {
+    await exclusiveSymlink(canonicalPath, project.path);
+    project.linked = true;
+    return;
+  }
+
+  const current = await lstat(project.path);
+  if (!current.isSymbolicLink()) {
+    throw new Error(`Refusing changed project models.json at ${project.path}`);
+  }
+  const rawTarget = await readlink(project.path);
+  if (rawTarget === canonicalPath) {
+    project.linked = true;
+    return;
+  }
+  if (rawTarget !== project.expectedLinkTarget) {
+    throw new Error(`Refusing changed project models.json symlink at ${project.path}`);
+  }
+
+  const quarantine = join(dirname(project.path), `.models-alias-${randomUUID()}.tmp`);
+  await rename(project.path, quarantine);
+  project.symlinkQuarantinePath = quarantine;
+  try {
+    await exclusiveSymlink(canonicalPath, project.path);
+    project.linked = true;
+    await rm(quarantine, { force: true });
+    project.symlinkQuarantinePath = null;
+  } catch (error) {
+    if (!await pathExists(project.path)) {
+      try {
+        await exclusiveSymlink(rawTarget, project.path);
+        await rm(quarantine, { force: true });
+        project.symlinkQuarantinePath = null;
+      } catch (restoreError) {
+        throw wrapMigrationError(error, [restoreError]);
+      }
+    } else {
+      await rm(quarantine, { force: true }).catch(() => undefined);
+      project.symlinkQuarantinePath = null;
+    }
+    throw error;
+  }
+}
+
+async function rollbackProjectModels(
+  project: ProjectModelsSource,
+  canonicalPath: string,
+): Promise<void> {
+  await assertPreparedProjectHome(project.home);
+  const current = await pathExists(project.path) ? await lstat(project.path) : null;
+  const currentTarget = current?.isSymbolicLink() ? await readlink(project.path) : null;
+
+  if (project.linked && current?.isSymbolicLink() && currentTarget === canonicalPath) {
+    await unlink(project.path);
+  }
+
+  if (project.kind === "regular" && project.backupPath) {
+    if (await pathExists(project.path)) return;
+    await exclusiveRestoreRegular(project.backupPath, project.path);
+    return;
+  }
+
+  if (project.symlinkQuarantinePath && !await pathExists(project.path)) {
+    const previous = await readlink(project.symlinkQuarantinePath);
+    await exclusiveSymlink(previous, project.path);
+    await rm(project.symlinkQuarantinePath, { force: true });
+    project.symlinkQuarantinePath = null;
+  }
+}
+
 export async function migrateSharedProjectModels(options: {
   canonicalAgentDir: string;
   projectRoots: string[];
@@ -389,6 +642,7 @@ export async function migrateSharedProjectModels(options: {
   const canonicalInputPath = join(canonicalAgentInput, "models.json");
 
   const canonicalRegular = await readStableRegularFile(canonicalPath, "canonical models.json", { allowMissing: true });
+  if (canonicalRegular) await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
   const canonicalSource = canonicalRegular?.source ?? null;
   const canonicalSourceSha = canonicalSource ? sha256(canonicalSource) : null;
   const canonicalValue: JsonValue = canonicalSource ? parseModels(canonicalSource, canonicalPath) : { providers: {} };
@@ -399,7 +653,7 @@ export async function migrateSharedProjectModels(options: {
     try {
       canonicalRoots.push(await realpath(resolve(candidate)));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      if (errnoCode(error) !== "ENOENT") throw error;
     }
   }
   const roots = [...new Set(canonicalRoots)].sort();
@@ -413,29 +667,38 @@ export async function migrateSharedProjectModels(options: {
     try {
       const stat = await lstat(path);
       if (stat.isSymbolicLink()) {
-        const target = resolve(agentDir, readlinkSync(path));
-        const linked = target === canonicalPath || target === canonicalInputPath;
-        if (linked) {
-          projects.push({ projectRoot, home, path, source: null, sourceSha256: null, alreadyLinked: true, backupPath: null });
+        const rawTarget = readlinkSync(path);
+        if (rawTarget === canonicalPath) {
+          projects.push(emptyProjectSource(projectRoot, home, path, "already-linked", { expectedLinkTarget: rawTarget }));
+          continue;
+        }
+        const resolvedTarget = resolveLinkTarget(path, rawTarget);
+        const aliasOfCanonical = rawTarget === canonicalInputPath
+          || resolvedTarget === canonicalInputPath
+          || resolvedTarget === canonicalPath;
+        if (aliasOfCanonical) {
+          projects.push(emptyProjectSource(projectRoot, home, path, "alias-link", { expectedLinkTarget: rawTarget }));
           continue;
         }
         // Repair only the exact class of link left by the interrupted legacy migration:
         // a hidden, same-canonical-directory temp target. Never follow or read that target.
-        const targetName = basename(target);
-        const staleCanonicalTemp = (dirname(target) === canonicalAgentDir || dirname(target) === canonicalAgentInput)
-          && targetName.startsWith(".")
-          && targetName.endsWith(".tmp");
-        if (!staleCanonicalTemp) throw new Error(`Refusing untrusted project models.json symlink at ${path}`);
-        projects.push({ projectRoot, home, path, source: null, sourceSha256: null, alreadyLinked: false, backupPath: null });
+        if (!isStaleCanonicalTemp(resolvedTarget, canonicalAgentDir, canonicalAgentInput)) {
+          throw new Error(`Refusing untrusted project models.json symlink at ${path}`);
+        }
+        projects.push(emptyProjectSource(projectRoot, home, path, "stale-temp-link", { expectedLinkTarget: rawTarget }));
         continue;
       }
       const regular = await readStableRegularFile(path, "project models.json", { expectedStat: stat });
-      const source = regular!.source;
-      merged = mergeMissing(merged, parseModels(source, path), [], conflicts);
-      projects.push({ projectRoot, home, path, source, sourceSha256: sha256(source), alreadyLinked: false, backupPath: null });
+      const snapshot = snapshotFromRegular(path, regular!);
+      merged = mergeMissing(merged, parseModels(snapshot.source, path), [], conflicts);
+      projects.push(emptyProjectSource(projectRoot, home, path, "regular", {
+        source: snapshot.source,
+        sourceSha256: snapshot.sourceSha256,
+        snapshot,
+      }));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      projects.push({ projectRoot, home, path, source: null, sourceSha256: null, alreadyLinked: false, backupPath: null });
+      if (errnoCode(error) !== "ENOENT") throw error;
+      projects.push(emptyProjectSource(projectRoot, home, path, "missing"));
     }
   }
 
@@ -444,52 +707,55 @@ export async function migrateSharedProjectModels(options: {
     ? Buffer.from(`${JSON.stringify(merged, null, 2)}\n`)
     : canonicalSource!;
   const resultSha = sha256(result);
-  const projectsToLink = projects.filter((project) => !project.alreadyLinked);
-  if (!canonicalNeedsWrite && projectsToLink.length === 0) return null;
+  const projectsToLink = projects.filter((project) => project.kind !== "already-linked");
+  if (!canonicalNeedsWrite && projectsToLink.length === 0) {
+    if (canonicalRegular) await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+    return null;
+  }
 
   for (const project of projects) await assertPreparedProjectHome(project.home);
-
-  // With no initial canonical, publish the fully merged catalog before any project mutation.
-  // Once this stable pathname exists it is deliberately not part of rollback: readers must
-  // never observe ENOENT, even if a later backup/link/manifest step fails.
-  if (!canonicalSource) {
-    await atomicWrite(canonicalPath, result);
-    await options.onMigrationStep?.({ name: "canonical-written" });
-  }
+  await options.onMigrationStep?.({ name: "sources-read" });
+  for (const project of projectsToLink) await assertProjectUnchanged(project);
+  await options.onMigrationStep?.({ name: "snapshots-verified" });
 
   let canonicalBackup: string | null = null;
-  if (projectsToLink.some((project) => project.source !== null) && canonicalSource) {
-    canonicalBackup = await immutableBackup(canonicalPath, canonicalSource, canonicalSourceSha!);
-  }
-  for (const project of projectsToLink) {
-    await assertPreparedProjectHome(project.home);
-    if (project.source) project.backupPath = await immutableBackup(project.path, project.source, project.sourceSha256!);
-  }
-
-  const replaced: ProjectModelsSource[] = [];
   let canonicalReplaced = false;
   const manifestPath = join(canonicalAgentDir, SHARED_MODELS_MANIFEST);
   try {
+    // With no initial canonical, publish the fully merged catalog before any project mutation.
+    // Once this stable pathname exists it is deliberately not part of rollback: readers must
+    // never observe ENOENT, even if a later backup/link/manifest step fails.
+    if (!canonicalSource) {
+      await atomicWrite(canonicalPath, result);
+      await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+      await options.onMigrationStep?.({ name: "canonical-written" });
+    }
+
+    if (projectsToLink.some((project) => project.source !== null) && canonicalSource) {
+      canonicalBackup = await immutableBackup(canonicalPath, canonicalSource, canonicalSourceSha!);
+    }
+    for (const project of projectsToLink) {
+      await assertPreparedProjectHome(project.home);
+      await assertProjectUnchanged(project);
+      if (project.kind === "regular" && project.snapshot) {
+        project.backupPath = await quarantineRegularFile(project.snapshot, "project models.json");
+      }
+    }
+
     await options.onMigrationStep?.({ name: "backups-created" });
     if (canonicalNeedsWrite && canonicalSource) {
       // The canonical is never moved aside. Atomic rename over its stable pathname means
       // concurrent readers observe either the complete old file or the complete new file.
       await atomicWrite(canonicalPath, result);
+      await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
       canonicalReplaced = true;
       await options.onMigrationStep?.({ name: "canonical-written" });
     }
     for (let index = 0; index < projectsToLink.length; index += 1) {
       const project = projectsToLink[index];
       await assertPreparedProjectHome(project.home);
-      await atomicLink(canonicalPath, project.path, async (temporaryPath) => {
-        await options.onMigrationStep?.({
-          name: "temporary-project-link-created",
-          projectModelsPath: project.path,
-          temporaryPath,
-          index,
-        });
-      });
-      replaced.push(project);
+      await options.onMigrationStep?.({ name: "before-project-link", projectModelsPath: project.path, index });
+      await installProjectCanonicalLink(project, canonicalPath);
       await options.onMigrationStep?.({ name: "project-link-installed", projectModelsPath: project.path, index });
     }
     const manifest: SharedModelsMigrationManifest = {
@@ -510,24 +776,26 @@ export async function migrateSharedProjectModels(options: {
     };
     await options.onMigrationStep?.({ name: "before-manifest-write" });
     await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
     return manifest;
   } catch (error) {
-    for (const project of replaced.reverse()) {
+    const rollbackErrors: unknown[] = [];
+    for (const project of [...projectsToLink].reverse()) {
       try {
-        await assertPreparedProjectHome(project.home);
-        if (project.source && project.backupPath) {
-          await atomicWrite(project.path, project.source);
-        } else {
-          await rm(project.path, { force: true });
-        }
-      } catch {
-        // Never traverse a project-home ancestor that changed during migration.
+        await rollbackProjectModels(project, canonicalPath);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
       }
     }
     if (canonicalReplaced && canonicalSource) {
-      await atomicWrite(canonicalPath, canonicalSource).catch(() => undefined);
+      try {
+        await atomicWrite(canonicalPath, canonicalSource);
+        await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
     }
-    throw error;
+    throw wrapMigrationError(error, rollbackErrors);
   }
 }
 

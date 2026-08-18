@@ -1,4 +1,4 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -202,6 +202,8 @@ describe("project Pi home", () => {
     await mkdir(projectPiAgentDir(project), { recursive: true });
     await writeFile(join(seed, "models.json"), '{"providers":{}}');
     await symlink(relative(projectPiAgentDir(project), join(seed, "models.json")), join(projectPiAgentDir(project), "models.json"));
+    await migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] });
+    expect(await readlink(join(projectPiAgentDir(project), "models.json"))).toBe(join(await realpath(seed), "models.json"));
     expect(await migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] })).toBeNull();
 
     await rm(join(projectPiAgentDir(project), "models.json"));
@@ -230,7 +232,7 @@ describe("project Pi home", () => {
   const rollbackCases = ([false, true] as const).flatMap((canonicalInitiallyMissing) => ([
     "backups-created",
     "canonical-written",
-    "temporary-project-link-created",
+    "before-project-link",
     "project-link-installed",
     "before-manifest-write",
   ] as const).map((failAt) => ({ canonicalInitiallyMissing, failAt })));
@@ -263,12 +265,14 @@ describe("project Pi home", () => {
       canonicalAgentDir: seed,
       projectRoots: [second, linkedProject, first],
       onMigrationStep: async (step) => {
-        // Regression for the interrupted live attempt: the stable canonical pathname may
-        // never disappear, and temporary links may never target a canonical temp/backup.
-        expect((await lstat(stableCanonical)).isFile()).toBe(true);
-        await expect(readFile(stableCanonical, "utf8")).resolves.toBeTruthy();
-        if (step.name === "temporary-project-link-created") {
-          expect(await readlink(step.temporaryPath)).toBe(stableCanonical);
+        // Once published, the stable canonical pathname may never disappear. It can still
+        // be absent at the pre-mutation read/verify hooks when this run creates it.
+        if (step.name !== "sources-read" && step.name !== "snapshots-verified") {
+          expect((await lstat(stableCanonical)).isFile()).toBe(true);
+          await expect(readFile(stableCanonical, "utf8")).resolves.toBeTruthy();
+        }
+        if (step.name === "before-project-link") {
+          await expect(lstat(step.projectModelsPath)).rejects.toMatchObject({ code: "ENOENT" });
         }
         if (step.name === "project-link-installed") {
           expect(await readlink(step.projectModelsPath)).toBe(stableCanonical);
@@ -391,5 +395,178 @@ describe("project Pi home", () => {
     await ensureProjectPiHome({ projectRoot: project, credentialSeedDir: seed });
     expect(JSON.parse(await readFile(join(projectPiAgentDir(project), "settings.json"), "utf8"))).toEqual({ theme: "light" });
     await expect(readFile(join(projectPiAgentDir(project), "auth.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("aborts when project models.json is modified in place after the initial read", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-inplace-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const external = join(root, "external-sentinel");
+    const projectModels = join(projectPiAgentDir(project), "models.json");
+    const original = '{"providers":{"old":{}}}\n';
+    const newer = '{"providers":{"newer-inplace":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(seed, "models.json"), '{"providers":{"canonical":{}}}\n');
+    await writeFile(projectModels, original);
+    await writeFile(external, "EXTERNAL-SENTINEL");
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: seed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name === "sources-read") await writeFile(projectModels, newer);
+      },
+    })).rejects.toThrow("changed project models.json");
+    expect(await readFile(projectModels, "utf8")).toBe(newer);
+    expect((await lstat(projectModels)).isFile()).toBe(true);
+    expect(await readFile(join(seed, "models.json"), "utf8")).toBe('{"providers":{"canonical":{}}}\n');
+    expect((await readdir(seed)).filter((name) => name.includes(".bak"))).toEqual([]);
+    expect((await readdir(projectPiAgentDir(project))).filter((name) => name.includes(".bak"))).toEqual([]);
+    expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
+  });
+
+  it("aborts when project models.json is atomically replaced after the initial read", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-atomic-replace-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const external = join(root, "external-sentinel");
+    const projectModels = join(projectPiAgentDir(project), "models.json");
+    const original = '{"providers":{"old":{}}}\n';
+    const newer = '{"providers":{"newer-replaced":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(seed, "models.json"), '{"providers":{"canonical":{}}}\n');
+    await writeFile(projectModels, original);
+    await writeFile(external, "EXTERNAL-SENTINEL");
+
+    await expect(migrateSharedProjectModels({
+      canonicalAgentDir: seed,
+      projectRoots: [project],
+      onMigrationStep: async (step) => {
+        if (step.name === "sources-read") {
+          const replacement = join(projectPiAgentDir(project), ".models-replaced.tmp");
+          await writeFile(replacement, newer);
+          await rename(replacement, projectModels);
+        }
+      },
+    })).rejects.toThrow("changed project models.json");
+    expect(await readFile(projectModels, "utf8")).toBe(newer);
+    expect((await lstat(projectModels)).isFile()).toBe(true);
+    expect(await readFile(join(seed, "models.json"), "utf8")).toBe('{"providers":{"canonical":{}}}\n');
+    expect((await readdir(projectPiAgentDir(project))).filter((name) => name.includes(".bak"))).toEqual([]);
+    expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
+  });
+
+  it.each(["regular", "symlink"] as const)(
+    "keeps a concurrent %s created after quarantine and does not overwrite it", 
+    async (kind) => {
+      root = await mkdtemp(join(tmpdir(), `pipi-model-concurrent-${kind}-`));
+      const seed = join(root, "profile");
+      const project = join(root, "project");
+      const external = join(root, "external-sentinel");
+      const projectModels = join(projectPiAgentDir(project), "models.json");
+      const original = '{"providers":{"original":{}}}\n';
+      const concurrent = '{"providers":{"concurrent":{}}}\n';
+      await mkdir(seed, { recursive: true });
+      await mkdir(projectPiAgentDir(project), { recursive: true });
+      await writeFile(join(seed, "models.json"), '{"providers":{"canonical":{}}}\n');
+      await writeFile(projectModels, original);
+      await writeFile(external, "EXTERNAL-SENTINEL");
+
+      await expect(migrateSharedProjectModels({
+        canonicalAgentDir: seed,
+        projectRoots: [project],
+        onMigrationStep: async (step) => {
+          if (step.name !== "before-project-link") return;
+          if (kind === "regular") await writeFile(projectModels, concurrent);
+          else await symlink(external, projectModels);
+        },
+      })).rejects.toThrow(/concurrent models\.json/);
+      if (kind === "regular") {
+        expect((await lstat(projectModels)).isFile()).toBe(true);
+        expect(await readFile(projectModels, "utf8")).toBe(concurrent);
+      } else {
+        expect((await lstat(projectModels)).isSymbolicLink()).toBe(true);
+        expect(await readlink(projectModels)).toBe(external);
+      }
+      const backups = (await readdir(projectPiAgentDir(project))).filter((name) => name.endsWith(".bak"));
+      expect(backups).toHaveLength(1);
+      expect(await readFile(join(projectPiAgentDir(project), backups[0]), "utf8")).toBe(original);
+      expect((await stat(join(projectPiAgentDir(project), backups[0]))).mode & 0o777).toBe(0o600);
+      expect(await readFile(join(seed, "models.json"), "utf8")).toBe('{"providers":{"canonical":{}}}\n');
+      expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
+    },
+  );
+
+  it("repairs a canonical input-alias link to the real stable canonical", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-alias-repair-"));
+    const realSeed = join(root, "profile");
+    const aliasSeed = join(root, "profile-alias");
+    const project = join(root, "project");
+    const external = join(root, "external-sentinel");
+    await mkdir(realSeed, { recursive: true });
+    await symlink(realSeed, aliasSeed);
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(realSeed, "models.json"), '{"providers":{}}\n');
+    await writeFile(external, "EXTERNAL-SENTINEL");
+    await symlink(join(aliasSeed, "models.json"), join(projectPiAgentDir(project), "models.json"));
+
+    const manifest = await migrateSharedProjectModels({ canonicalAgentDir: aliasSeed, projectRoots: [project] });
+    const stable = join(await realpath(realSeed), "models.json");
+    expect(await readlink(join(projectPiAgentDir(project), "models.json"))).toBe(stable);
+    expect(manifest?.projects).toHaveLength(1);
+    expect(await migrateSharedProjectModels({ canonicalAgentDir: aliasSeed, projectRoots: [project] })).toBeNull();
+    expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
+  });
+
+  it("tightens an unchanged 0644 canonical to 0600 on the already-linked early return", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-canonical-mode-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    await mkdir(seed, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    const canonical = join(seed, "models.json");
+    await writeFile(canonical, '{"providers":{}}\n');
+    await chmod(canonical, 0o644);
+    const stable = join(await realpath(seed), "models.json");
+    await symlink(stable, join(projectPiAgentDir(project), "models.json"));
+    expect((await stat(canonical)).mode & 0o777).toBe(0o644);
+
+    expect(await migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] })).toBeNull();
+    expect((await stat(canonical)).mode & 0o777).toBe(0o600);
+    expect(await readlink(join(projectPiAgentDir(project), "models.json"))).toBe(stable);
+  });
+
+  it("reports rollback failures instead of swallowing them", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-rollback-error-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    const external = join(root, "external-sentinel");
+    const agentDir = projectPiAgentDir(project);
+    const original = '{"providers":{"original":{}}}\n';
+    await mkdir(seed, { recursive: true });
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(join(seed, "models.json"), '{"providers":{"canonical":{}}}\n');
+    await writeFile(join(agentDir, "models.json"), original);
+    await writeFile(external, "EXTERNAL-SENTINEL");
+
+    try {
+      await expect(migrateSharedProjectModels({
+        canonicalAgentDir: seed,
+        projectRoots: [project],
+        onMigrationStep: async (step) => {
+          if (step.name !== "before-manifest-write") return;
+          await chmod(agentDir, 0o000);
+          throw new Error("injected failure at before-manifest-write");
+        },
+      })).rejects.toThrow(/injected failure at before-manifest-write;[\s\S]*rollback failed/);
+    } finally {
+      await chmod(agentDir, 0o700).catch(() => undefined);
+    }
+    const backups = (await readdir(agentDir)).filter((name) => name.endsWith(".bak"));
+    expect(backups).toHaveLength(1);
+    expect(await readFile(join(agentDir, backups[0]), "utf8")).toBe(original);
+    expect(await readFile(external, "utf8")).toBe("EXTERNAL-SENTINEL");
   });
 });
