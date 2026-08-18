@@ -9,13 +9,18 @@
 
 export type SessionActivity = "idle" | "busy" | "quiet";
 
+/**
+ * There is deliberately no `vanished` kind. A vanished worker's terminal receipt rides
+ * the confirmed done channel, not this gate: admission for heartbeat/stall keys off
+ * `workerRunning`, which is false for the very worker that just stopped running — the
+ * shape that dropped the last worker's interruption and left the Boss waiting forever.
+ */
 export type RuntimeSignalKind =
 	| "heartbeat"
 	| "stall"
 	| "done"
 	| "reminder"
-	| "blocked"
-	| "vanished";
+	| "blocked";
 
 export interface SignalAdmissionInput {
 	kind: RuntimeSignalKind;
@@ -50,7 +55,6 @@ export function admitSignal(input: SignalAdmissionInput): Admission {
 	switch (input.kind) {
 		case "heartbeat":
 		case "stall":
-		case "vanished":
 			return input.workerRunning ? "send" : "drop";
 		case "reminder":
 			return input.episodeOpen ? "send" : "drop";

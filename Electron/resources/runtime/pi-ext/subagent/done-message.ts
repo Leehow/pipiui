@@ -147,6 +147,23 @@ export type WaveSnapshot = {
 	overflow?: number;
 };
 
+/**
+ * The still-running snapshot taken at one worker's terminal event. It is what tells the
+ * Boss whether to stay silent or close out, so every terminal receipt carries it —
+ * a completion and an interruption alike.
+ */
+export function formatWaveLine(wave: WaveSnapshot): string {
+	const listed = wave.workers;
+	const overflow = wave.overflow ?? 0;
+	const n = listed.length + overflow;
+	if (n === 0) {
+		return "Wave: 0 other workers still running — every dispatched worker is terminal; if no further work is needed, give the user exactly one complete final closeout now (in their language).";
+	}
+	const names = listed.map((w) => `${w.name} ${w.elapsed}`);
+	const more = overflow > 0 ? `, …and ${overflow} more` : "";
+	return `Wave: ${n} other worker(s) still running (${names.join(", ")}${more}) — do NOT give the user any conclusion, summary, or progress update yet; continue orchestration and wait for their [subagent-done] events.`;
+}
+
 export function formatSubagentDoneMessage(
 	result: DoneMessageResult,
 	extra?: { aborted?: boolean; error?: string; runId?: string; wave?: WaveSnapshot },
@@ -168,22 +185,7 @@ export function formatSubagentDoneMessage(
 		`[subagent-done] agentId=${result.agentId ?? "?"} runId=${extra?.runId ?? "?"} name=${result.agent} ok=${ok} verified=${verified} cost=${cost} turns=${result.usage.turns ?? 0}${result.resumed ? " resumed=true" : ""}`,
 		`Title: ${title}`,
 	];
-	if (extra?.wave) {
-		const listed = extra.wave.workers;
-		const overflow = extra.wave.overflow ?? 0;
-		const n = listed.length + overflow;
-		if (n === 0) {
-			lines.push(
-				"Wave: 0 other workers still running — every dispatched worker is terminal; if no further work is needed, give the user exactly one complete final closeout now (in their language).",
-			);
-		} else {
-			const names = listed.map((w) => `${w.name} ${w.elapsed}`);
-			const more = overflow > 0 ? `, …and ${overflow} more` : "";
-			lines.push(
-				`Wave: ${n} other worker(s) still running (${names.join(", ")}${more}) — do NOT give the user any conclusion, summary, or progress update yet; continue orchestration and wait for their [subagent-done] events.`,
-			);
-		}
-	}
+	if (extra?.wave) lines.push(formatWaveLine(extra.wave));
 	if (verified === "none") {
 		if (!att && result.verifyDropped) {
 			// Read-only role: the report IS the deliverable, so re-dispatching to make a
@@ -249,4 +251,39 @@ export function getResultOutput(result: DoneMessageResult): string {
 		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 	}
 	return getFinalOutput(result.messages) || "(no output)";
+}
+
+export interface InterruptedMessageInput {
+	agentId: string;
+	runId: string;
+	name: string;
+	title: string;
+	/** Why the runtime declared it vanished (dead pid / never attached a pid). */
+	reason: string;
+	cost?: number;
+	turns?: number;
+	wave?: WaveSnapshot;
+}
+
+/**
+ * Terminal receipt for a worker that vanished mid-run.
+ *
+ * An interruption ends that worker's episode exactly as a completion does, and the Boss
+ * is normally parked waiting for one more receipt. Routing it through the confirmed done
+ * channel — instead of a one-shot heartbeat that the admission gate drops precisely
+ * because the worker is no longer running — is what keeps the wave able to reach zero.
+ */
+export function formatSubagentInterruptedMessage(input: InterruptedMessageInput): string {
+	const cost = typeof input.cost === "number" ? input.cost.toFixed(4) : "0";
+	const lines = [
+		`[subagent-done] agentId=${input.agentId} runId=${input.runId} name=${input.name} ok=false interrupted=true verified=none cost=${cost} turns=${input.turns ?? 0}`,
+		`Title: ${input.title}`,
+	];
+	if (input.wave) lines.push(formatWaveLine(input.wave));
+	lines.push(
+		`Interrupted: ${input.reason}`,
+		"This worker produced no final report. An interruption is not a failure: its stored conversation is intact.",
+		`Handling: this is a worker event, not a new user request. Call one unfiltered subagent_status() if this turn has none yet, then choose exactly one — re-dispatch the same agentId to continue where it left off, dispatch a replacement by a materially different route, or ask the user. If this episode's work no longer matters, close it with subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) so no reminders follow. Do not stay silent waiting for a further event from this worker: it will send none. Once the Wave line above says 0 other workers are running and no further work is needed, give the user exactly one complete final closeout in their language.`,
+	);
+	return lines.join("\n");
 }

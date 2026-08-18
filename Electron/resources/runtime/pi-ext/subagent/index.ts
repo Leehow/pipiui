@@ -114,6 +114,8 @@ import {
 	verifiedStateFor,
 	doneCapForResult,
 	formatSubagentDoneMessage,
+	formatSubagentInterruptedMessage,
+	type WaveSnapshot,
 	formatChainVerifyPrefix,
 	getFinalOutput,
 	isFailedResult,
@@ -179,6 +181,14 @@ import {
 	type AgentBridgeEventPayloadV1,
 } from "./host-bridge.ts";
 import { applyCappedStreamText } from "./stream-part-text.ts";
+import {
+	type CpuSample,
+	type LivenessVerdict,
+	classifyCpuProgress,
+	formatCpuEvidence,
+	readProcessTable,
+	sampleSubtreeCpu,
+} from "./worker-liveness.ts";
 import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
 import {
 	addEstimateChars,
@@ -2069,6 +2079,18 @@ interface RunningAgentHandle {
 	readOnly?: boolean;
 	/** True when the boss turn is awaiting this worker inline (chain / sync dispatch). */
 	syncWait?: boolean;
+	/**
+	 * Set when the worker's last stdout was an assistant message that asked for tools, i.e.
+	 * the silence that follows is the tools running. Without this the stall detector cannot
+	 * tell explained silence from a wedge, and every tool call longer than the threshold —
+	 * a build, a test sweep, a baseline verify — reported a healthy worker as stalled.
+	 */
+	toolWaitSince?: number;
+	/** Tool names the worker is waiting on, for the state line. */
+	toolWaitNames?: string[];
+	/** Latest subtree CPU sample and the one before it; the pair is the progress evidence. */
+	cpuSample?: CpuSample;
+	cpuSamplePrevious?: CpuSample;
 }
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
@@ -2085,6 +2107,21 @@ function noteAgentActivity(agentId: string, runId?: string): void {
 	handle.lastActivityAt = Date.now();
 	handle.lastStallNotifyAt = 0;
 	handle.stallNotifyCount = 0;
+	// Output after a tool request is the tool results coming back. The stdout handler
+	// notes activity before the scanner parses the chunk, so the message_end that opens
+	// the next tool wait re-arms this immediately afterwards.
+	handle.toolWaitSince = undefined;
+	handle.toolWaitNames = undefined;
+	handle.cpuSample = undefined;
+	handle.cpuSamplePrevious = undefined;
+}
+
+/** The worker asked for tools; the silence until the results arrive is expected. */
+function noteAgentToolWait(agentId: string, runId: string, names: string[]): void {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return;
+	handle.toolWaitSince = Date.now();
+	handle.toolWaitNames = names.length > 0 ? names : undefined;
 }
 
 /** Claim one bounded, interval-spaced stall notification for this idle episode. */
@@ -2123,11 +2160,51 @@ function deleteRunningAgentHandle(agentId: string, runId: string): void {
 	if (handle && (handle.runId === runId || handle.runId === undefined)) runningAgents.delete(agentId);
 }
 
-function stalledInfoFor(agentId: string, now: number): { stalled: boolean; idleSec: number } {
+/**
+ * Quiet is not the same as stalled. A worker inside a tool call is quiet by
+ * construction, so silence only counts as a stall once nothing explains it —
+ * or once the CPU evidence says the explained wait stopped making progress.
+ */
+function stalledInfoFor(agentId: string, now: number): {
+	stalled: boolean;
+	idleSec: number;
+	inTool?: { names: string[]; forSec: number };
+	verdict?: LivenessVerdict;
+} {
 	const handle = runningAgents.get(agentId);
 	if (!handle || handle.finalizing) return { stalled: false, idleSec: 0 };
 	const idleSec = Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000));
-	return { stalled: idleSec * 1000 >= STALL_THRESHOLD_MS, idleSec };
+	const quiet = idleSec * 1000 >= STALL_THRESHOLD_MS;
+	const verdict = handle.cpuSample
+		? classifyCpuProgress(handle.cpuSamplePrevious, handle.cpuSample)
+		: undefined;
+	if (handle.toolWaitSince === undefined) return { stalled: quiet, idleSec, verdict };
+	const inTool = {
+		names: handle.toolWaitNames ?? ["tool"],
+		forSec: Math.max(0, Math.floor((now - handle.toolWaitSince) / 1000)),
+	};
+	// Measured lack of progress overrides the explanation: a build that wedged is
+	// still inside its tool call, and that is exactly the case the Boss must catch.
+	const stalled = quiet && (verdict === "no-progress" || verdict === "gone");
+	return { stalled, idleSec, inTool, verdict };
+}
+
+/** Refresh the subtree CPU pair for one quiet worker. Callers pass a shared `ps` table. */
+function sampleWorkerCpu(handle: RunningAgentHandle, rows: ReturnType<typeof readProcessTable>, now: number): void {
+	if (handle.pid === undefined) return;
+	const sample = sampleSubtreeCpu(rows, handle.pid, now);
+	handle.cpuSamplePrevious = handle.cpuSample;
+	handle.cpuSample = sample;
+}
+
+function cpuEvidenceFor(agentId: string): string | undefined {
+	const handle = runningAgents.get(agentId);
+	if (!handle?.cpuSample) return undefined;
+	return formatCpuEvidence(
+		classifyCpuProgress(handle.cpuSamplePrevious, handle.cpuSample),
+		handle.cpuSamplePrevious,
+		handle.cpuSample,
+	);
 }
 
 function formatJobStateWithStall(job: JobRecord, now: number): string {
@@ -2136,7 +2213,16 @@ function formatJobStateWithStall(job: JobRecord, now: number): string {
 	}
 	if (handleForRun(job.agentId, job.runId)?.finalizing) return "finalizing";
 	const info = stalledInfoFor(job.agentId, now);
-	return info.stalled ? `running (stalled, idle ${info.idleSec}s)` : "running";
+	if (info.stalled) {
+		const why = info.inTool
+			? `stalled in ${info.inTool.names.join("+")} for ${info.inTool.forSec}s`
+			: `stalled, idle ${info.idleSec}s`;
+		return `running (${why})`;
+	}
+	// Naming the tool and how long it has been in it is what lets the Boss judge
+	// this against the task instead of guessing why the worker went quiet.
+	if (info.inTool) return `running (in ${info.inTool.names.join("+")} for ${info.inTool.forSec}s)`;
+	return "running";
 }
 
 /** Compact state tag for a heartbeat worker line; the verbose status view keeps idle detail. */
@@ -2144,7 +2230,9 @@ function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle,
 	if (handle.finalizing) return "finalizing";
 	const job = jobRegistry.get(agentId);
 	if (!job || job.runId !== handle.runId || job.state === "running") {
-		return stalledInfoFor(agentId, now).stalled ? "running(stalled)" : "running";
+		const info = stalledInfoFor(agentId, now);
+		if (info.stalled) return "running(stalled)";
+		return info.inTool ? `running(in ${info.inTool.names.join("+")} ${info.inTool.forSec}s)` : "running";
 	}
 	return job.state;
 }
@@ -2675,6 +2763,28 @@ function formatElapsedMs(ms: number): string {
 	return `${h}h${rm}m`;
 }
 
+/** Wave cap for the still-running list carried on every terminal receipt. */
+const WAVE_CAP = 8;
+
+/**
+ * Running workers at the moment one worker went terminal. Shared by completion and
+ * interruption receipts so both let the Boss make the same speak-or-wait decision.
+ */
+function currentWaveSnapshot(now: number): WaveSnapshot {
+	const running = [...jobRegistry.values()]
+		.filter((j) => j.state === "running")
+		.sort((a, b) => a.startedAt - b.startedAt);
+	const overflow = Math.max(0, running.length - WAVE_CAP);
+	return {
+		workers: running.slice(0, WAVE_CAP).map((j) => ({
+			agentId: j.agentId,
+			name: j.name,
+			elapsed: formatElapsedMs(now - j.startedAt),
+		})),
+		...(overflow > 0 ? { overflow } : {}),
+	};
+}
+
 /** Compact live snapshot of in-flight background workers, for the boss system prompt.
  *  Returns null when nothing is in flight (zero cost in the normal case). */
 function formatInFlightWorkersBlock(now: number): string | null {
@@ -2933,6 +3043,9 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		}
 		if (job.state === "running") {
 			lines.push(`activity: ${job.activity || "(starting/idle)"}`);
+			// The measurement the Boss otherwise has to go improvise in a terminal.
+			const evidence = cpuEvidenceFor(job.agentId);
+			if (evidence) lines.push(`liveness: ${evidence}`);
 		} else {
 			const stored = job.resultText || "(no result stored)";
 			// Head-keep like the done message: the report's structured sections come first.
@@ -4135,6 +4248,13 @@ function sendDoneWithConfirmation(
 
 /** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
 function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
+	// The durable channel can only address a bound Pi session. A nested leader (depth > 0)
+	// and a terminal-only pi never bind one, and sendDoneWithConfirmation refuses an entry
+	// with an empty sessionId — silently swallowing the receipt. Degrade to the one-shot.
+	if (!doneDeliveryPiSessionId) {
+		deliverSubagentDone(pi, text);
+		return;
+	}
 	const obligation = createDoneObligation(agentId, runId, text);
 	if (obligation.state === "observed" || obligation.state === "fulfilled" || obligation.state === "delivered") return;
 	// Duplicate close/finalize callbacks for the same completion share one in-flight promise.
@@ -4252,21 +4372,7 @@ function notifySubagentDone(
 	const runId = result.agentId
 		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
 		: undefined;
-	const WAVE_CAP = 8;
-	const now = Date.now();
-	const running = [...jobRegistry.values()]
-		.filter((j) => j.state === "running")
-		.sort((a, b) => a.startedAt - b.startedAt);
-	const overflow = Math.max(0, running.length - WAVE_CAP);
-	const wave = {
-		workers: running.slice(0, WAVE_CAP).map((j) => ({
-			agentId: j.agentId,
-			name: j.name,
-			elapsed: formatElapsedMs(now - j.startedAt),
-		})),
-		...(overflow > 0 ? { overflow } : {}),
-	};
-	const extraWithWave = { ...extra, wave };
+	const extraWithWave = { ...extra, wave: currentWaveSnapshot(Date.now()) };
 	const text = formatSubagentDoneMessage(result, runId ? { ...extraWithWave, runId } : extraWithWave);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
 	if (result.agentId && runId) {
@@ -5491,6 +5597,10 @@ async function runSingleAgent(
 							}
 							providerWait.noteToolBatch(toolCallIds);
 						runtimePendingTools = toolNames;
+						// This message asked for tools, so the stdout silence that follows is the
+						// tools running, not a wedge. Claimed here rather than on stopReason so a
+						// provider that omits `toolUse` still gets the same explained window.
+						if (toolNames.length > 0) noteAgentToolWait(pipiuiAgentId, runId, toolNames);
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -7254,20 +7364,51 @@ export default function (pi: ExtensionAPI) {
 				handle.pid === undefined
 					? `process never attached a pid after ${elapsed}; treated as interrupted (vanished)`
 					: `process gone after ${elapsed}, no result reported`;
+			// Capture before markWorkerInterrupted drops the handle; the receipt is
+			// addressed to this exact episode and needs its runId.
+			const runId = handle.runId ?? jobRegistry.get(agentId)?.runId;
+			const name = handle.name ?? jobRegistry.get(agentId)?.name ?? "?";
 			if (!markWorkerInterrupted(agentId, reason)) continue;
-			deliverSubagentDone(
-				pi,
-				[
-					`[subagent-heartbeat] outstanding=${runningAgents.size} vanished=1 stalled=0`,
-					`  ${agentId} (${title}) — ${reason}, state=interrupted`,
-					"A vanished worker was interrupted, not failed: its stored conversation is intact, so re-dispatch that same agentId to continue where it left off.",
-				].join("\n"),
-			);
+			const job = jobRegistry.get(agentId);
+			// An interruption is this worker's terminal event, so it owes the Boss the same
+			// confirmed receipt a completion does. The old one-shot rode the heartbeat
+			// prefix and was dropped by admission whenever no worker was left running —
+			// i.e. exactly when the Boss had nothing else to wait for and hung (2026-08-15).
+			const text = formatSubagentInterruptedMessage({
+				agentId,
+				runId: runId ?? "?",
+				name,
+				title,
+				reason,
+				cost: job?.cost,
+				turns: job?.turns,
+				wave: currentWaveSnapshot(now),
+			});
+			if (runId) deliverConfirmedDone(pi, agentId, runId, text);
+			else deliverSubagentDone(pi, text);
+		}
+
+		// (2b) Progress evidence for every quiet worker, from one shared `ps` table.
+		// Sampled before the stall pass so `stalledInfoFor` can let measured progress
+		// excuse a long tool call and, just as importantly, refuse to excuse a wedge.
+		const quietWorkers = [...runningAgents.values()].filter(
+			(handle) => !handle.finalizing
+				&& handle.pid !== undefined
+				&& now - handle.lastActivityAt >= STALL_THRESHOLD_MS,
+		);
+		if (quietWorkers.length > 0) {
+			const rows = readProcessTable();
+			if (rows.length > 0) for (const handle of quietWorkers) sampleWorkerCpu(handle, rows, now);
 		}
 
 		// (3) stall 推送 / 复推 / 预裁决 abort
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing) continue;
+			// Explained, measurably-progressing silence is not a stall and must not spend a
+			// notification — nor march toward the auto-abort. Crying wolf on every long build
+			// is what taught the Boss to discount the signal in the first place.
+			const stallInfo = stalledInfoFor(agentId, now);
+			if (stallInfo.inTool && !stallInfo.stalled) continue;
 			const idleMs = now - handle.lastActivityAt;
 			const action = decideStallWatchdogAction({
 				idleMs,
@@ -7314,8 +7455,12 @@ export default function (pi: ExtensionAPI) {
 				// session waiting for a stall that may never happen — and it is more likely to
 				// be followed here, next to the thing it is about.
 				[
-					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine}`,
-					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (say why) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s${stallInfo.inTool ? ` in=${stallInfo.inTool.names.join("+")} for=${stallInfo.inTool.forSec}s` : ""} last=${lastLine}`,
+					// The evidence is attached to the signal so "keep waiting" has to answer to a
+					// measurement instead of a guess. This message now only fires when nothing
+					// explains the silence, or when the CPU says the explained wait stopped moving.
+					`Liveness: ${cpuEvidenceFor(agentId) ?? "no CPU measurement available for this worker"}.`,
+					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
 			);
