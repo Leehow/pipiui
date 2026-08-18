@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
@@ -45,9 +45,28 @@ describe('Windows package and CI path', () => {
     expect(props).not.toContain('LibraryPath')
     expect(windowsNativeRebuildEnv('win32', '/repo/Electron').ForceImportBeforeCppTargets).toBe(join('/repo/Electron', 'Directory.Build.props'))
     expect(windowsNativeRebuildEnv('darwin', '/repo/Electron')).toEqual({})
-    expect(windowsMsvcEnv('win32')).toEqual({})
     expect(windowsMsvcEnv('darwin')).toEqual({})
-    expect(findDelayimpLibDir({})).toBeUndefined()
+    const isolated = mkdtempSync(join(tmpdir(), 'pipiui-delayimp-'))
+    try {
+      const fakeVcvars = join(isolated, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat')
+      mkdirSync(dirname(fakeVcvars), { recursive: true })
+      writeFileSync(fakeVcvars, '')
+      const missingLib = join(isolated, 'missing-lib')
+      mkdirSync(missingLib)
+      const isolatedEnv = { PIPIUI_VCVARS64: fakeVcvars, PIPIUI_MSVC_LIB_DIR: missingLib }
+      expect(windowsMsvcEnv('win32', isolatedEnv)).toEqual({})
+      expect(findDelayimpLibDir(isolatedEnv)).toBeUndefined()
+      const presentLib = join(isolated, 'present-lib')
+      mkdirSync(presentLib)
+      writeFileSync(join(presentLib, 'delayimp.lib'), '')
+      expect(findDelayimpLibDir({ PIPIUI_VCVARS64: fakeVcvars, PIPIUI_MSVC_LIB_DIR: presentLib })).toBe(presentLib)
+      const versionedLib = join(isolated, 'VC', 'Tools', 'MSVC', '14.44.35207', 'lib', 'x64')
+      mkdirSync(versionedLib, { recursive: true })
+      writeFileSync(join(versionedLib, 'delayimp.lib'), '')
+      expect(findDelayimpLibDir({ PIPIUI_VCVARS64: fakeVcvars })).toBe(versionedLib)
+    } finally {
+      rmSync(isolated, { recursive: true, force: true })
+    }
     expect(packager).toContain('windowsNativeRebuildEnv')
     expect(packager).toContain('windowsMsvcEnv')
     expect(packager).toContain('appendWindowsLibDir')
