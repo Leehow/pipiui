@@ -46,6 +46,22 @@
             "result": "Effort vocabulary is documented, not probed: the relay is user-configured, so values are taken from the official API contract."
           }
         },
+        "qwen3.7-plus": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Hand-curated against the jellytoken OpenAI-compatible Chat Completions contract: reasoning_effort accepts low | medium | high for some reasoning models. off is omitted so an unset/off level sends no reasoning_effort. xhigh/max are omitted (not in the documented vocabulary).",
+            "verifiedAt": "2026-08-15T00:00:00Z",
+            "acceptedValues": ["low", "medium", "high"],
+            "rejectedValues": ["off", "minimal", "xhigh", "max"],
+            "result": "Effort vocabulary is documented, not probed: the relay is user-configured, so values are taken from the official API contract."
+          }
+        },
         "deepseek-v4-pro": {
           "reasoning": true,
           "thinkingLevelMap": {

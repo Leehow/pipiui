@@ -62,6 +62,7 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
   const [compatUrl, setCompatUrl] = useState('')
   const [compatKey, setCompatKey] = useState('')
   const [compatModelId, setCompatModelId] = useState('')
+  const [compatContextWindow, setCompatContextWindow] = useState('')
   const [compatBusy, setCompatBusy] = useState(false)
   const [compatError, setCompatError] = useState<string | null>(null)
   const mountedRef = useRef(false)
@@ -204,10 +205,15 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
     const apiKey = compatKey.trim()
     const modelId = compatModelId.trim()
     if (!name || !baseUrl || !apiKey || !modelId || compatBusy) return
+    const parsedWindow = Number.parseInt(compatContextWindow.trim(), 10)
+    const payload: { name: string; baseUrl: string; apiKey: string; modelId: string; contextWindow?: number } = { name, baseUrl, apiKey, modelId }
+    if (compatContextWindow.trim() && Number.isInteger(parsedWindow) && parsedWindow > 0) {
+      payload.contextWindow = parsedWindow
+    }
     setCompatBusy(true)
     setCompatError(null)
     try {
-      const result = await hostMethod(host, 'addOpenAICompatibleProvider')({ name, baseUrl, apiKey, modelId })
+      const result = await hostMethod(host, 'addOpenAICompatibleProvider')(payload)
       if (!result || typeof result !== 'object' || typeof (result as { providerId?: unknown }).providerId !== 'string') {
         throw hostUpdateError('addOpenAICompatibleProvider')
       }
@@ -215,6 +221,7 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
       setCompatUrl('')
       setCompatKey('')
       setCompatModelId('')
+      setCompatContextWindow('')
       onAdded()
       loadProviders()
     } catch (err) {
@@ -222,7 +229,7 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
     } finally {
       setCompatBusy(false)
     }
-  }, [compatBusy, compatKey, compatModelId, compatName, compatUrl, host, loadProviders, onAdded])
+  }, [compatBusy, compatContextWindow, compatKey, compatModelId, compatName, compatUrl, host, loadProviders, onAdded])
 
   const activeProvider = providers?.find(provider => provider.id === session?.providerId)
   const retry = () => loadProviders()
@@ -281,6 +288,8 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
           <input id="provider-compat-key" data-testid="provider-compat-key" type="password" value={compatKey} onChange={e => setCompatKey(e.target.value)} placeholder="sk-…" autoComplete="off" />
           <label htmlFor="provider-compat-model">模型 id</label>
           <input id="provider-compat-model" data-testid="provider-compat-model" value={compatModelId} onChange={e => setCompatModelId(e.target.value)} placeholder="gpt-4o-mini" autoComplete="off" />
+          <label htmlFor="provider-compat-context">上下文窗口（可选）</label>
+          <input id="provider-compat-context" data-testid="provider-compat-context" inputMode="numeric" value={compatContextWindow} onChange={e => setCompatContextWindow(e.target.value)} placeholder="131072" autoComplete="off" />
           {compatError && <div className="provider-login-error" data-testid="provider-compat-error">{compatError}</div>}
           <div className="provider-login-form-actions">
             <button type="submit" className="provider-login-submit" data-testid="provider-compat-save" disabled={!canSaveCompat}>{compatBusy ? '保存中…' : '保存'}</button>

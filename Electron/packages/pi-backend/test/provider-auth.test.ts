@@ -51,7 +51,11 @@ async function tempAgent(): Promise<string> {
 
 describe("provider auth via pi ModelRuntime bridge", () => {
   let root = "";
-  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }) });
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+  });
 
   it("lists auth-capable providers with credential metadata from auth.json (never key values)", async () => {
     root = await tempAgent();
@@ -135,6 +139,7 @@ describe("provider auth via pi ModelRuntime bridge", () => {
 
   it("persists an OpenAI-compatible custom provider into models.json and lists its model", async () => {
     root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
     const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
     const saved = await backend.handle("addOpenAICompatibleProvider", [{
       name: "My Proxy",
@@ -154,6 +159,65 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(models.map(model => `${model.provider}/${model.id}`)).toContain("my-proxy/gpt-4o-mini");
   });
 
+  it("persists probed context_length as contextWindow", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe("https://proxy.example/v1/models");
+      expect(init?.headers).toMatchObject({ Authorization: "Bearer sk-literal" });
+      return {
+        ok: true,
+        json: async () => ({ data: [{ id: "qwen3.7-plus", context_length: 131072 }] }),
+      };
+    }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Jelly",
+      baseUrl: "https://proxy.example/v1/",
+      apiKey: "sk-literal",
+      modelId: "qwen3.7-plus",
+    }]);
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jelly.models[0]).toMatchObject({
+      id: "qwen3.7-plus",
+      contextWindow: 131072,
+    });
+  });
+
+  it("still adds a compat provider when the catalog probe fails", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("timeout"); }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Jelly",
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk-literal",
+      modelId: "qwen3.7-plus",
+    }]);
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jelly.models[0]).toEqual({ id: "qwen3.7-plus", name: "qwen3.7-plus", reasoning: true });
+    expect(disk.providers.jelly.models[0].contextWindow).toBeUndefined();
+  });
+
+  it("lets an explicit contextWindow win over the catalog probe", async () => {
+    root = await tempAgent();
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [{ id: "qwen3.7-plus", context_length: 8192 }] }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Jelly",
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk-literal",
+      modelId: "qwen3.7-plus",
+      contextWindow: 131072,
+    }]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jelly.models[0].contextWindow).toBe(131072);
+  });
+
   it("keeps an env-configured model available when its provider credentials are removed", async () => {
     root = await tempAgent();
     await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "O1", reasoning: true }] } } }));
@@ -165,5 +229,111 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(runtime.logouts).toEqual(["openai"]);
     expect(state).toMatchObject({ model: { provider: "openai", id: "o1" } });
     expect((await backend.handle("getModelState", []))).toMatchObject({ model: { provider: "openai", id: "o1" } });
+  });
+
+  it("backfills missing contextWindow on existing openai-completions providers after catalog load", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        jellytoken: {
+          api: "openai-completions",
+          baseUrl: "https://proxy.example/v1/",
+          apiKey: "sk-literal",
+          models: [{ id: "qwen3.7-plus", name: "qwen3.7-plus", reasoning: true }],
+        },
+      },
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [{ id: "qwen3.7-plus", context_length: 262144 }] }),
+    })));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jellytoken.models[0].contextWindow).toBe(262144);
+  });
+
+  it("leaves models.json untouched when the backfill probe fails and still loads the catalog", async () => {
+    root = await tempAgent();
+    const original = {
+      providers: {
+        jellytoken: {
+          api: "openai-completions",
+          baseUrl: "https://proxy.example/v1",
+          apiKey: "sk-literal",
+          models: [{ id: "qwen3.7-plus", name: "qwen3.7-plus", reasoning: true }],
+        },
+      },
+    };
+    await writeFile(join(root, "models.json"), JSON.stringify(original));
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    const models = await backend.handle("listModels", []) as { provider: string; id: string }[];
+    await backend.compatContextBackfill;
+    expect(models.map(m => `${m.provider}/${m.id}`)).toContain("jellytoken/qwen3.7-plus");
+    expect(JSON.parse(await readFile(join(root, "models.json"), "utf8"))).toEqual(original);
+  });
+
+  it("probes each baseUrl only once per backend lifetime", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        jellytoken: {
+          api: "openai-completions",
+          baseUrl: "https://proxy.example/v1",
+          apiKey: "sk-literal",
+          models: [
+            { id: "qwen-a", name: "qwen-a", reasoning: true },
+            { id: "qwen-b", name: "qwen-b", reasoning: true },
+          ],
+        },
+      },
+    }));
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [
+        { id: "qwen-a", context_length: 100000 },
+        { id: "qwen-b", context_length: 200000 },
+      ] }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    await backend.handle("listModels", []);
+    await backend.refreshModelCatalog();
+    await backend.compatContextBackfill;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("never overwrites an existing contextWindow during backfill", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        jellytoken: {
+          api: "openai-completions",
+          baseUrl: "https://proxy.example/v1",
+          apiKey: "sk-literal",
+          models: [
+            { id: "keep", name: "keep", reasoning: true, contextWindow: 64000 },
+            { id: "fill", name: "fill", reasoning: true },
+          ],
+        },
+      },
+    }));
+    vi.stubGlobal("fetch", vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ data: [
+        { id: "keep", context_length: 8 },
+        { id: "fill", context_length: 131072 },
+      ] }),
+    })));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jellytoken.models.find((m: any) => m.id === "keep").contextWindow).toBe(64000);
+    expect(disk.providers.jellytoken.models.find((m: any) => m.id === "fill").contextWindow).toBe(131072);
   });
 });

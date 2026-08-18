@@ -312,6 +312,13 @@ describe('Electron Pi profile', () => {
             input: ['text'],
             contextWindow: 200000,
             maxTokens: 16384
+          }, {
+            id: 'qwen3.7-plus',
+            name: 'Qwen 3.7 Plus',
+            reasoning: false,
+            input: ['text'],
+            contextWindow: 200000,
+            maxTokens: 16384
           }]
         }
       }
@@ -342,6 +349,20 @@ describe('Electron Pi profile', () => {
       compat: { supportsReasoningEffort: true, thinkingFormat: 'deepseek' }
     })
 
+    const qwen = runtime.getModel('jellytoken', 'qwen3.7-plus')
+    expect(qwen).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: 'low',
+        low: 'low',
+        medium: 'medium',
+        high: 'high'
+      },
+      compat: { supportsReasoningEffort: true }
+    })
+    expect(qwen?.thinkingLevelMap?.off).toBeUndefined()
+    expect(qwen?.compat).not.toHaveProperty('thinkingFormat')
+
     const { streamSimple } = await import('@earendil-works/pi-ai/api/openai-completions')
     const capture = async (reasoning?: string) => {
       let payload: Record<string, unknown> | undefined
@@ -367,5 +388,29 @@ describe('Electron Pi profile', () => {
     expect(await capture('medium')).toMatchObject({ reasoning_effort: 'high' })
     // With no level requested, off:null must not silently disable thinking wholesale.
     expect(await capture()).not.toHaveProperty('thinking')
+
+    const captureQwen = async (reasoning?: string) => {
+      let payload: Record<string, unknown> | undefined
+      const stream = streamSimple(qwen as any, {
+        messages: [{ role: 'user', content: 'probe', timestamp: Date.now() }]
+      }, {
+        apiKey: 'not-sent',
+        ...(reasoning ? { reasoning } : {}),
+        maxTokens: 1,
+        onPayload: value => {
+          payload = value as unknown as Record<string, unknown>
+          throw new Error('payload captured before network')
+        }
+      })
+      await stream.result().catch(() => undefined)
+      expect(payload).toBeDefined()
+      return payload!
+    }
+    expect(await captureQwen('minimal')).toMatchObject({ reasoning_effort: 'low' })
+    expect(await captureQwen('low')).toMatchObject({ reasoning_effort: 'low' })
+    expect(await captureQwen('medium')).toMatchObject({ reasoning_effort: 'medium' })
+    expect(await captureQwen('high')).toMatchObject({ reasoning_effort: 'high' })
+    expect(await captureQwen('off')).not.toHaveProperty('reasoning_effort')
+    expect(await captureQwen('off')).not.toHaveProperty('thinking')
   })
 })

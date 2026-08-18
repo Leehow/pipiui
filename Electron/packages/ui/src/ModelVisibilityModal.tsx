@@ -310,7 +310,7 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
             : tab === 'updates'
               ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
             : tab === 'extensions'
-              ? <ExtensionsPane addOpen={extensionsAddOpen} onCloseAdd={() => setExtensionsAddOpen(false)} />
+              ? <ExtensionsPane host={host} addOpen={extensionsAddOpen} onCloseAdd={() => setExtensionsAddOpen(false)} />
             : view === 'add'
               ? <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
               : <>
