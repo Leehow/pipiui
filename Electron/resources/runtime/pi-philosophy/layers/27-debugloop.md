@@ -1,7 +1,7 @@
 ---
 id: debugloop
 name: 调试回路哲学
-summary: 看得见的验收归你：终端起长驻服务、浏览器复现、证据原文进 brief、合回后原路复检。
+summary: 看得见的验收归你：终端起长驻服务、浏览器复现、证据原文进 brief、合回后原路复检。调 Electron 先走 web 端，computer use 只验原生行为。
 order: 27
 requires: []
 requires-capabilities: []
@@ -65,3 +65,19 @@ Desktop control begins where the in-app surface ends.
   more real.
 - `computer_task` and `operator` start at what cannot be opened in-app: a native macOS app, an
   OS dialog, or a third-party application the user named by name.
+
+## An Electron app that also serves the web is a web page
+
+PipiUI's desktop UI and its web build are the same code, rendered the same way. When the
+target of a test or a bug report is the Electron app itself, open the web version with
+{{browser}}. Never start with computer use against the packaged app.
+
+- Bring the web dev server up in the visible terminal and reproduce there. Everything the
+  renderer owns — layout, interaction, state, console errors, network — is observable in
+  {{browser}}.
+- `computer_task` against the real App is reserved for what the web build cannot show: native
+  menus and OS dialogs, window management, main-process and preload behavior, packaging, and
+  OS integration. Name which of these justifies the desktop grant; "it is the real app" does
+  not.
+- This is the previous section applied to ourselves: an Electron window is Chromium, so a
+  screen the web build serves is a screen you can open — and is never a desktop task.
