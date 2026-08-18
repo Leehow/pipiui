@@ -123,6 +123,11 @@ export function expiredArchivedSessionIds(archivedSessionIds: readonly string[],
   return archivedSessionIds.filter(id => now - timestamps[id] >= ARCHIVE_RETENTION_MS)
 }
 
+function isUnknownSessionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /^unknown session(?:\s|$)/.test(message)
+}
+
 function readSidebarPreferences(key: string): SidebarPreferences | null {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(key) ?? 'null')
@@ -213,7 +218,9 @@ function reconcileModelStateWithCatalog(state: ModelState, catalog: readonly Mod
   }
 }
 
-/** Swift-style priority: live main turn > session-bound subagents > terminal agent states > observed stream state > idle.
+/** Swift-style priority: live activity (selected streaming / observed running / running subagents)
+ *  > terminal agent attention badges (failed/stalled/interrupted)
+ *  > observed terminal status > completed > idle.
  *  observed is live-updated for every session via `subscribeAllStreams` (older hosts stay selected-only).
  *  A leftover `running` on a non-selected row must not hide a background subagent badge. */
 export function sidebarStatusForSession(sessionId: string, selectedSessionId: string, streaming: boolean, observedStatus: SessionStatus | undefined, agents: readonly AgentSummary[]): { status: SessionStatus; subagentCount?: number } {
@@ -222,6 +229,7 @@ export function sidebarStatusForSession(sessionId: string, selectedSessionId: st
   const linked = agents.filter(agent => agent.sessionId === sessionId)
   const runningCount = linked.filter(agent => agent.state === 'running').length
   if (runningCount > 0) return { status: 'subagents-running', subagentCount: runningCount }
+  if (observedStatus === 'running') return { status: 'running' }
   // Selected session: the user is viewing it, so terminal-status notifications
   // (red dot) are consumed — only live activity (running / subagents) stays visible.
   if (selected) return { status: 'idle' }
@@ -991,6 +999,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // header toggles / quick rail flip these to show the panes as overlays.
   const [narrowPanes, setNarrowPanes] = useState<{ sidebar: boolean; tools: boolean }>({ sidebar: false, tools: false })
   const [subagentsRunningCount, setSubagentsRunningCount] = useState(0)
+  const subagentRunEpochRef = useRef({ sessionId: '', count: 0, turnEpoch: 0 })
   /** Turn-start anchor for the background-subagent tail indicator (phase=tool, no stop). */
   const [subagentWaitingStartedAt, setSubagentWaitingStartedAt] = useState<number | null>(null)
   const [sidebarExpandedIds, setSidebarExpandedIds] = useState<string[]>([])
@@ -1074,6 +1083,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // `settled`/`stopped`. The ref is a same-tick guard so repeated started
   // status events keep the first waitingStartedAt stable.
   const activeUserTurnRef = useRef(false)
+  // Monotonic renderer-local generation for the selected main turn. Terminal
+  // subagent projection may be the only close signal we receive; binding its
+  // reconciliation to this epoch prevents a late prior-task terminal from
+  // closing a newer prompt.
+  const mainTurnEpochRef = useRef(0)
   // True only between an authoritative `started` and `settled`/`stopped`.
   // A late `streaming` (pi queue_update after settle) must not reopen the turn.
   const mainTurnOpenRef = useRef(false)
@@ -1109,6 +1123,30 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (subagentsRunningCount > 0) setSubagentWaitingStartedAt(current => current ?? Date.now())
     else setSubagentWaitingStartedAt(null)
   }, [subagentsRunningCount])
+  useEffect(() => {
+    const previous = subagentRunEpochRef.current
+    if (previous.sessionId !== selectedSession) {
+      subagentRunEpochRef.current = { sessionId: selectedSession, count: subagentsRunningCount, turnEpoch: mainTurnEpochRef.current }
+      return
+    }
+    if (previous.count === 0 && subagentsRunningCount > 0) {
+      subagentRunEpochRef.current = { sessionId: selectedSession, count: subagentsRunningCount, turnEpoch: mainTurnEpochRef.current }
+      return
+    }
+    subagentRunEpochRef.current = { ...previous, count: subagentsRunningCount }
+    if (
+      previous.count > 0
+      && subagentsRunningCount === 0
+      && previous.turnEpoch === mainTurnEpochRef.current
+      && mainTurnOpenRef.current
+    ) {
+      // A Computer Task can durably settle all of its agents even when the
+      // selected main-stream `settled` event is lost. Re-read the authoritative
+      // JSONL; the existing history/live-revision gates decide whether this
+      // exact turn is terminal and refuse to close a newer one.
+      setHistoryRefreshKey(key => key + 1)
+    }
+  }, [selectedSession, subagentsRunningCount])
   const sessionQueue = useSessionQueue(host, selectedSession, streaming)
   const selectedObservedStatus = observedSessionStatuses[selectedSession]
   const selectedObservedRunning = selectedObservedStatus === 'running'
@@ -1275,7 +1313,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (archiveCleanupInFlightRef.current.has(sessionId)) continue
         archiveCleanupInFlightRef.current.add(sessionId)
         try {
-          await host.deleteSession(sessionId)
+          try {
+            await host.deleteSession(sessionId)
+          } catch (error) {
+            // Already-gone sessions are the cleanup goal. Keep retrying only for
+            // transient host/filesystem failures, not for a missing session file.
+            if (!isUnknownSessionError(error)) {
+              setProjectError(`自动删除过期归档失败：${error instanceof Error ? error.message : String(error)}`)
+              continue
+            }
+          }
           locallyCreatedSessionIdsRef.current.delete(sessionId)
           const archivedSet = new Set(archivedSessionIds)
           const fallback = sessions.find(session => session.id !== sessionId && !archivedSet.has(session.id))
@@ -1288,10 +1335,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             setSelectedSession(fallback?.id ?? '')
             if (fallback) setSelectedProject(fallback.projectId)
           }
-        } catch (error) {
-          // Keep the archive entry and timestamp so a transient host/filesystem
-          // failure retries instead of pretending the destructive cleanup worked.
-          setProjectError(`自动删除过期归档失败：${error instanceof Error ? error.message : String(error)}`)
         } finally {
           archiveCleanupInFlightRef.current.delete(sessionId)
         }
@@ -1392,6 +1435,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (contextChanged) {
       activeUserTurnRef.current = false
       mainTurnOpenRef.current = false
+      mainTurnEpochRef.current += 1
       turnJustSettledRef.current = false
       // Restore a visited transcript this tick so switching back does not flash
       // empty and wait for another JSONL parse on the host.
@@ -1583,6 +1627,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           mutateLocalTranscript(items => [...items, { id: crypto.randomUUID(), role: 'user', content: pending.prompt, images: pending.attachments?.length ? pending.attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now() }])
           activeUserTurnRef.current = true
           mainTurnOpenRef.current = true
+          mainTurnEpochRef.current += 1
           applyObservedStatus(pending.sessionId, 'running')
           setStreaming(true)
           setWaitingStartedAt(Date.now())
@@ -1665,6 +1710,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         const subagentSignal = parseSubagentSignal(event.content)
         const drainedPrompt = !pendingEcho && Boolean(event.content.trim())
         if (subagentSignal || drainedPrompt) {
+          // A host-drained prompt is a new completion epoch even if a lost
+          // settle left the prior turn marked open. Its later agent terminal
+          // must never reconcile the new prompt against old history.
+          if (!pendingEcho) mainTurnEpochRef.current += 1
+          // A host-drained prompt is a new completion epoch even if a lost
+          // settle left the prior turn marked open. Its later agent terminal
+          // must never reconcile the new prompt against old history.
           if (!activeUserTurnRef.current) {
             activeUserTurnRef.current = true
             mainTurnOpenRef.current = true
@@ -1693,6 +1745,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         applyObservedStatus(event.sessionId, sidebarStatus)
         if (event.status === 'started' || event.status === 'streaming') {
           if (event.status === 'started') {
+            if (!mainTurnOpenRef.current) mainTurnEpochRef.current += 1
             mainTurnOpenRef.current = true
             turnJustSettledRef.current = false
             const continued = reopenAssistantForNextCompletion(messagesRef.current)
@@ -1825,6 +1878,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
     })
     const unsubscribe = host.subscribeStream(selectedSession, event => {
+      if (event.sessionId !== selectedSessionRef.current) return
       coalescer.push(event)
     })
     return () => {
@@ -1924,6 +1978,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now() }])
       activeUserTurnRef.current = true
       mainTurnOpenRef.current = true
+      mainTurnEpochRef.current += 1
       // The sidebar row of a backgrounded session must flip to 进行中 before the
       // first status event arrives — a send followed by an immediate switch away
       // would otherwise look idle for the whole turn.

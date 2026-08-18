@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AgentSummary, PipiHostAPI, QueuedMessage, StreamEvent } from '@pipi/host-api'
+import type { AgentEvent, AgentSummary, HistoryEntry, PipiHostAPI, QueuedMessage, StreamEvent } from '@pipi/host-api'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -176,5 +176,70 @@ describe('selected-session working stop control', () => {
     expect(screen.getByLabelText('发送消息')).toBeTruthy()
     expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
     expect(screen.queryByTestId('stats-streaming')).toBeNull()
+  })
+
+  it('reconciles a locally sent Computer Task when its terminal agent projection arrives without main-stream settle', async () => {
+    const base = createMockHost()
+    const streamListeners = new Map<string, (event: StreamEvent) => void>()
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    let terminalHistory: HistoryEntry[] | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      sendPrompt: vi.fn(async () => undefined),
+      listQueue: async () => [],
+      getSessionHistory: async (sessionId, before, limit) => terminalHistory && sessionId === 'layout'
+        ? terminalHistory
+        : base.getSessionHistory(sessionId, before, limit),
+      listAgents: async () => [],
+      subscribeStream: (sessionId, listener) => {
+        streamListeners.set(sessionId, listener)
+        return () => { if (streamListeners.get(sessionId) === listener) streamListeners.delete(sessionId) }
+      },
+      subscribeAgents: listener => { agentListeners.add(listener); return () => { agentListeners.delete(listener) } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const layoutRow = await waitFor(() => {
+      const row = container.querySelector('[data-session-id="layout"]')
+      expect(row).toBeTruthy()
+      return row!
+    })
+    fireEvent.click(layoutRow)
+    await waitFor(() => expect(streamListeners.get('layout')).toBeDefined())
+
+    const input = screen.getByLabelText('消息输入框')
+    fireEvent.change(input, { target: { value: 'keeper-fullrun-terminal' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalledWith('layout', 'keeper-fullrun-terminal'))
+
+    const running: AgentSummary = {
+      agentId: 'computer-root',
+      runId: 'computer-run',
+      sessionId: 'layout',
+      name: 'computer-use-leader',
+      task: 'Computer Task',
+      state: 'running',
+      createdAt: 10,
+    }
+    act(() => {
+      for (const listener of agentListeners) listener({ type: 'agent', agent: running })
+      streamListeners.get('layout')?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: 'keeper-fullrun 已通过' })
+    })
+    await screen.findByText('keeper-fullrun 已通过')
+    await waitFor(() => expect(screen.getByLabelText('1 个运行中的 subagent')).toBeTruthy())
+
+    terminalHistory = [
+      { id: 'terminal-user', role: 'user', content: 'keeper-fullrun-terminal', timestamp: 20 },
+      { id: 'terminal-assistant', role: 'assistant', content: 'keeper-fullrun 已通过', timestamp: 30 },
+    ]
+    act(() => {
+      streamListeners.get('layout')?.({ type: 'queue_update', sessionId: 'layout', queue: [] })
+      for (const listener of agentListeners) listener({ type: 'agent', agent: { ...running, state: 'ok', endedAt: 30 } })
+    })
+
+    await waitFor(() => expect(screen.queryByLabelText('1 个运行中的 subagent')).toBeNull())
+    await waitFor(() => expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…'))
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
   })
 })

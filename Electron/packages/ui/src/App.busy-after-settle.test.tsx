@@ -26,6 +26,42 @@ afterEach(() => {
 })
 
 describe('settled turn stays idle after a late streaming status', () => {
+  it('does not bind an in-flight status from the previously selected session to the terminal session', async () => {
+    let selectedListener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      getProjectPaths: async () => ['/fixture'],
+      listProjects: async () => [{ id: 'fixture', name: 'Fixture', path: '/fixture' }],
+      listSessions: async () => [
+        { id: 'active-session', projectId: 'fixture', name: 'Active session', updatedAt: 2 },
+        { id: 'terminal-session', projectId: 'fixture', name: 'Terminal session', updatedAt: 1 },
+      ],
+      getSessionHistory: async sessionId => sessionId === 'terminal-session'
+        ? [{ id: 'terminal-answer', role: 'assistant', content: 'Durable terminal answer', timestamp: 1 }]
+        : [],
+      getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [], archivedSessionIds: [], archivedSessionTimestamps: {}, orderedSessionIds: [], sessionOrderVersion: 2 }),
+      subscribeStream: (_sessionId, callback) => { selectedListener = callback; return () => undefined },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('Active session')
+    await waitFor(() => expect(selectedListener).toBeDefined())
+
+    fireEvent.click(container.querySelector('[data-session-id="terminal-session"]')!)
+    await screen.findByText('Durable terminal answer')
+    await waitFor(() => expect(document.title).toBe('Terminal session'))
+
+    // The IPC transport filters subscriptions by session, but an event which
+    // already entered the renderer callback may finish after selection changed.
+    act(() => {
+      selectedListener?.({ type: 'status', sessionId: 'active-session', status: 'started', pendingFollowUps: ['still running'] })
+    })
+
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+  })
+
   it('does not reopen the composer as busy when queue_update arrives after settle', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()

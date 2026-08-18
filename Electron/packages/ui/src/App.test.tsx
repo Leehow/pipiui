@@ -137,6 +137,31 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getByText('已归档')).toBeTruthy()
   })
 
+  it('drops an expired archive when the session is already gone instead of toasting unknown session', async () => {
+    const host = createMockHost()
+    const remove = vi.fn(async () => { throw new Error('unknown session layout') })
+    const save = vi.fn(async (preferences: SidebarSessionPreferences) => preferences)
+    host.deleteSession = remove
+    host.getSidebarSessionPreferences = vi.fn(async (): Promise<SidebarSessionPreferences> => ({
+      pinnedSessionIds: [],
+      archivedSessionIds: ['layout', 'agent-run'],
+      archivedSessionTimestamps: { layout: Date.now() - ARCHIVE_RETENTION_MS },
+      orderedSessionIds: [],
+      sessionOrderVersion: 2
+    }))
+    host.setSidebarSessionPreferences = save
+
+    render(<App host={host} />)
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('layout'))
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.archivedSessionIds.length === 1
+      && value.archivedSessionIds[0] === 'agent-run'
+      && !('layout' in (value.archivedSessionTimestamps ?? {}))
+    )).toBe(true))
+    expect(screen.queryByText(/自动删除过期归档失败/)).toBeNull()
+  })
+
   it('constrains the real sidebar grid item and the shell row to the viewport', () => {
     const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
     expect(css).toMatch(/\.pipiui-shell\s*\{[^}]*grid-template-rows:minmax\(0,1fr\)/s)
@@ -827,6 +852,7 @@ describe('PipiUI Electron main layout', () => {
     expect(narrow899).not.toMatch(/\.composer-stats\{[^}]*margin-left:0/)
     // 720px breakpoint: auto-collapse hides panes, re-expanded panes become overlays
     const narrow = css.match(/@media \(max-width:720px\)\{[^\n]*\}/)?.[0] ?? ''
+    expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed\.tools-collapsed\{[^}]*grid-template-columns:0 minmax\(0,1fr\) 0/)
     expect(narrow).toContain('position:fixed')
     expect(narrow).toContain('width:min(86vw,340px)')
     expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed \.sb-root[^}]*display:none/)
@@ -1764,6 +1790,10 @@ describe('PipiUI Electron main layout', () => {
     expect(sidebarStatusForSession('subtask', 'selected', false, 'running', agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
     expect(sidebarStatusForSession('subtask', 'subtask', false, 'running', agents).status).toBe('running')
     expect(sidebarStatusForSession('idle-running', 'selected', false, 'running', []).status).toBe('running')
+    // After switching away: sessionId !== selectedSessionId, observed still running — keep spinner over red badges.
+    expect(sidebarStatusForSession('interrupted', 'selected', false, 'running', agents).status).toBe('running')
+    expect(sidebarStatusForSession('failed', 'selected', false, 'running', agents).status).toBe('running')
+    expect(sidebarStatusForSession('stalled', 'selected', false, 'running', agents).status).toBe('running')
     expect(sidebarStatusForSession('failed', 'selected', false, undefined, agents).status).toBe('failed')
     expect(sidebarStatusForSession('stalled', 'selected', false, undefined, agents).status).toBe('stalled')
     expect(sidebarStatusForSession('interrupted', 'selected', false, undefined, agents).status).toBe('interrupted')
