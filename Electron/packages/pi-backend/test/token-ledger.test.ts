@@ -89,7 +89,7 @@ describe("token-ledger format (Swift TokenLedger parity)", () => {
 describe("per-session last-known context persistence", () => {
   let root = "";
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { createPiHostBackend } from "../src/index.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
 async function setup(paths = ["haoli"]): Promise<{ agent: string; sessions: string; projects: Record<string, string> }> {
   root = await mkdtemp(join(tmpdir(), "pipi-project-paths-"));

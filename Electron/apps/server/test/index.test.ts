@@ -172,6 +172,10 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
     expect(pairPage.status).toBe(200);
     expect(pairHTML).not.toContain(pairingURL.hash.slice(1));
     expect(pairHTML).toContain("location.hash");
+    expect(pairHTML).toContain("location.pathname+location.hash");
+    expect(pairHTML).toContain("location.reload()");
+    expect(pairHTML).not.toContain('location.replace("/")');
+    expect(pairHTML).not.toContain('replaceState(null,"","/")');
 
     const claim = await fetch(`${origin}${pairingURL.pathname}/claim`, {
       method: "POST",
@@ -186,6 +190,11 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
     const html = await index.text();
     expect(index.status).toBe(200);
     expect(html).toContain('<div id="root">');
+    const pairAfterClaim = await fetch(`${origin}${pairingURL.pathname}`, { headers: { Cookie: cookie! } });
+    const pairAfterHTML = await pairAfterClaim.text();
+    expect(pairAfterClaim.status).toBe(200);
+    expect(pairAfterHTML).toContain('<div id="root">');
+    expect(pairAfterHTML).not.toContain("正在安全连接服务器");
     const asset = html.match(/src="(\/assets\/[^\"]+\.js)"/)?.[1];
     expect(asset).toBeTruthy();
     const assetResponse = await fetch(`${origin}${asset}`, { headers: { Cookie: cookie! } });
@@ -269,8 +278,11 @@ else console.log(JSON.stringify({ok:false,error:"unsupported test command"}));
     const queued = await host.enqueueMessage("session-1", "remote queued", [{ dataBase64: "aGVsbG8=", mimeType: "image/png", name: "remote.png", width: 320 }]);
     expect(queued).toMatchObject({ outcome: "queued", message: { state: "queued", attachments: [expect.objectContaining({ width: 320 })] } });
     expect(await host.listQueue("session-1")).toEqual(expect.arrayContaining([expect.objectContaining({ text: "remote queued" })]));
+    // a1c64472: a user stop takes effect immediately and no longer FIFO-drains.
+    // The queued item must survive the stop rather than be auto-sent behind it.
     await host.stop("session-1");
-    await eventuallyAsync(async () => (await host.listQueue("session-1")).length === 0);
+    await eventuallyAsync(async () => (await host.listQueue("session-1")).some((item: any) => item.text === "remote queued"));
+    expect(await host.listQueue("session-1")).toEqual(expect.arrayContaining([expect.objectContaining({ text: "remote queued" })]));
     offQueue();
     unsubscribe();
     expect(queueEvents.some(event => event.queue.some((item: any) => item.text === "remote queued"))).toBe(true);

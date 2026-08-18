@@ -8,7 +8,7 @@ import { createPiHostBackend } from "../src/index.js";
 describe("fresh Pi session Computer Use orchestration", () => {
   let root = "";
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

@@ -16,7 +16,7 @@ function authRuntime(models: Array<{ provider: string; id: string; name?: string
 
 describe('Computer Agent role model settings', () => {
   let root = ''
-  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }) })
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) })
   it('advertises terminal as a real role and materializes its independent setting', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))
     const backend = createPiHostBackend({ agentDir: join(root, 'agent'), env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })

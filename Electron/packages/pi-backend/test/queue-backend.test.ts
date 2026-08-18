@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend, FileQueueStore } from "../src/index.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
 async function eventually(check: () => boolean, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;

@@ -34,7 +34,7 @@ const silentAuth = {
 describe("idle live Pi reclamation", () => {
   let root = "";
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

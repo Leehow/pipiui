@@ -19,7 +19,7 @@ describe("pi spawn env injects the configured profile .env (T17 parity)", () => 
     // tree; fire-and-forget persists racing rm recreate agentDir (ENOTEMPTY).
     await currentBackend?.close().catch(() => undefined);
     currentBackend = undefined;
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

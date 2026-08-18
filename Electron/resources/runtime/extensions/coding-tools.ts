@@ -2,17 +2,6 @@ import { readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
-export const INSPECTION_TOOL_NAMES = ["grep", "find", "ls"] as const;
-
-export function activateInspectionTools(activeTools: readonly string[]): string[] {
-	if (!activeTools.includes("read")) return [...activeTools];
-	const names = [...activeTools];
-	for (const name of INSPECTION_TOOL_NAMES) {
-		if (!names.includes(name)) names.push(name);
-	}
-	return names;
-}
-
 export function workerCodingToolsArgs(
 	extensionPath: string | undefined,
 	options: { computerWorker?: boolean } = {},

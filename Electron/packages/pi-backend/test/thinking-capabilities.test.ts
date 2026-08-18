@@ -9,7 +9,7 @@ describe("model thinking capability contract", () => {
   let root = "";
 
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   });
 
   it("materializes mapped levels and preserves the standard fallback for the real xai/grok-4.6 catalog shape", async () => {

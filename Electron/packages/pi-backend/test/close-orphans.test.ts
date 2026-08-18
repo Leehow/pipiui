@@ -27,7 +27,7 @@ async function eventually(check: () => boolean, timeoutMs = 3000): Promise<void>
 describe("PiHostBackend close() process reaping", () => {
   let root = "";
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

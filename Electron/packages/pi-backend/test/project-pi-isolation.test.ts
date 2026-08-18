@@ -15,7 +15,7 @@ describe("isolated project Pi homes", () => {
     if (!root) return;
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
-        await rm(root, { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
         break;
       } catch (error) {
         if (attempt === 4) throw error;

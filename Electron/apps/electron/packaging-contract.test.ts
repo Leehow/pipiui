@@ -53,8 +53,12 @@ describe('macOS packaging contract', () => {
     expect(embedded?.filter).toBeUndefined()
     expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.6')
     expect(runtimePreparer).toContain("const hermesPackageName = 'pi-hermes-memory'")
-    expect(runtimePreparer).toContain("npm_config_runtime: 'electron'")
-    expect(runtimePreparer).toContain("npm_config_disturl: 'https://electronjs.org/headers'")
+    // Native modules must be built for the ABI that will actually load them. 4875076d
+    // split this by platform: macOS runs the embedded runtime as standalone Node, while
+    // the other targets load it inside Electron via ELECTRON_RUN_AS_NODE.
+    expect(runtimePreparer).toContain("npm_config_runtime: platform === 'darwin' ? 'node' : 'electron'")
+    expect(runtimePreparer).toContain("npm_config_target: platform === 'darwin' ? metadata.version : electronVersion")
+    expect(runtimePreparer).toContain("npm_config_disturl: platform === 'darwin' ? 'https://nodejs.org/dist' : 'https://electronjs.org/headers'")
     expect(runtimePreparer).toContain('npm_config_arch: arch')
   })
 
@@ -63,6 +67,29 @@ describe('macOS packaging contract', () => {
   // and can be dropped only with negation patterns. electron-vite bundles every
   // import except the ones externalizeDepsPlugin leaves as bare requires, so the
   // packaged asar needs exactly those and nothing else.
+  /**
+   * `createRequire(<expr>)("x")`. The argument nests its own parens
+   * (`createRequire(require("url").pathToFileURL(__filename).href)`), so walk the
+   * balance rather than letting a wildcard run past the real closing paren into an
+   * unrelated call further down the bundle.
+   */
+  const createRequireSpecifiers = (source: string): string[] => {
+    const specifiers: string[] = []
+    const opener = /\bcreateRequire\(/g
+    for (let match = opener.exec(source); match; match = opener.exec(source)) {
+      let depth = 1
+      let i = match.index + match[0].length
+      for (; i < source.length && depth > 0; i++) {
+        if (source[i] === '(') depth++
+        else if (source[i] === ')') depth--
+      }
+      if (depth !== 0) continue
+      const call = /^\("([^"]+)"\)/.exec(source.slice(i))
+      if (call) specifiers.push(call[1])
+    }
+    return specifiers
+  }
+
   const bundledExternals = () => {
     const mainOut = resolve(import.meta.dirname, 'out/main')
     if (!existsSync(mainOut)) return undefined
@@ -71,7 +98,16 @@ describe('macOS packaging contract', () => {
     for (const file of readdirSync(mainOut)) {
       if (!file.endsWith('.js')) continue
       const source = readFileSync(resolve(mainOut, file), 'utf8')
-      for (const [, specifier] of source.matchAll(/\brequire\("([^"]+)"\)/g)) {
+      // Two bare-require forms survive bundling: the plain `require("x")` electron-vite
+      // emits for externalized deps, and `createRequire(...)("x")` for a dependency the
+      // source loads lazily (terminal-host does this for node-pty). Missing the second
+      // form reads as "nothing needs this package" and invites dropping a package the
+      // packaged app really loads at runtime.
+      const specifiers = [
+        ...[...source.matchAll(/\brequire\("([^"]+)"\)/g)].map(match => match[1]),
+        ...createRequireSpecifiers(source),
+      ]
+      for (const specifier of specifiers) {
         if (specifier.startsWith('.') || specifier.startsWith('node:')) continue
         if (builtins.has(specifier) || specifier === 'electron') continue
         found.add(specifier)

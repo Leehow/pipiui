@@ -136,7 +136,7 @@ describe("main-only Hermes runtime ownership", () => {
       await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.3" }));
       expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBeUndefined();
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
   });
 });
@@ -347,7 +347,7 @@ describe("bridge-free subagent orchestration", () => {
 
 describe("installed runtime tree", () => {
   let root = "";
-  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
   it("resolves only what the app actually installed", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-runtime-"));
@@ -459,7 +459,7 @@ describe("user-added Pi extensions", () => {
       expect(userExtensionMounts(undefined)).toEqual([]);
       expect(assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter: "/runtime/update.ts", runtimeInfo: "/runtime/info.ts" } }).args).toEqual(["-e", "/runtime/update.ts", "-e", "/runtime/info.ts"]);
     } finally {
-      await rm(root, { recursive: true, force: true });
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
   });
 });

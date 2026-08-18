@@ -7,7 +7,7 @@ import { createPiHostBackend } from "../src/index.js";
 describe("vision model persistence", () => {
   let root = "";
   afterEach(async () => {
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   });
   it("round-trips the selected vision model into pipiui-settings.json and the vision.json bridge, and clears on null", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-vision-model-"));

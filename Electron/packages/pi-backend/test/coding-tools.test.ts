@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  activateInspectionTools,
   readPathIfDirectory,
   readToolDescription,
   rewriteReadToolText,
@@ -14,7 +13,7 @@ import codingToolsExtension from "../../../resources/runtime/extensions/pipiui-c
 
 let root = "";
 afterEach(async () => {
-  if (root) await rm(root, { recursive: true, force: true });
+  if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
   root = "";
 });
 
@@ -96,25 +95,6 @@ describe("readToolDescription", () => {
   });
 });
 
-describe("activateInspectionTools", () => {
-  it("adds ls, grep, and find when the session already has read", () => {
-    expect(activateInspectionTools(["read", "bash", "edit", "write"])).toEqual([
-      "read",
-      "bash",
-      "edit",
-      "write",
-      "grep",
-      "find",
-      "ls",
-    ]);
-  });
-
-  it("does not invent inspection tools for a session that has no read", () => {
-    expect(activateInspectionTools(["terminal_execute"])).toEqual(["terminal_execute"]);
-    expect(activateInspectionTools([])).toEqual([]);
-  });
-});
-
 describe("workerCodingToolsArgs", () => {
   it("is the same gate the worker spawn uses", async () => {
     const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
@@ -193,31 +173,25 @@ describe("pipiui-coding-tools extension", () => {
     expect(text).not.toMatch(/more lines in file/);
   });
 
-  it("does not call action methods while the factory runs — Pi rejects that and exits", async () => {
+  // 1b3158ab removed the session_start force-activation: replaying a getActiveTools()
+  // snapshot raced with worker tool registration and locked subagent sessions read-only.
+  // Inspection tools come from --tools now, so this extension must never touch the
+  // active tool set — not during loading, and not from a lifecycle hook afterwards.
+  it("never touches the active tool set — it only replaces the read tool", () => {
     const loadingError = new Error(
       "Failed to load extension: Extension runtime not initialized. Action methods cannot be called during extension loading. Hint: Start without extensions using \"pi -ne\".",
     );
-    let loading = true;
-    const activeTools = ["read", "bash", "edit", "write"];
     const pi = {
-      getActiveTools: vi.fn(() => {
-        if (loading) throw loadingError;
-        return [...activeTools];
-      }),
-      setActiveTools: vi.fn((names: string[]) => {
-        if (loading) throw loadingError;
-        activeTools.splice(0, activeTools.length, ...names);
-      }),
+      getActiveTools: vi.fn(() => { throw loadingError; }),
+      setActiveTools: vi.fn(() => { throw loadingError; }),
       on: vi.fn(),
       registerTool: vi.fn(),
     };
     expect(() => codingToolsExtension(pi as never)).not.toThrow();
     expect(pi.setActiveTools).not.toHaveBeenCalled();
     expect(pi.getActiveTools).not.toHaveBeenCalled();
-    loading = false;
-    const start = (pi.on as ReturnType<typeof vi.fn>).mock.calls.find(([event]) => event === "session_start")?.[1];
-    expect(start).toBeTypeOf("function");
-    start();
-    expect(pi.setActiveTools).toHaveBeenCalledWith(["read", "bash", "edit", "write", "grep", "find", "ls"]);
+    expect(pi.on).not.toHaveBeenCalled();
+    expect(pi.registerTool).toHaveBeenCalledOnce();
+    expect((pi.registerTool as ReturnType<typeof vi.fn>).mock.calls[0][0].name).toBe("read");
   });
 });

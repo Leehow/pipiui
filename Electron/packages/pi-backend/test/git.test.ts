@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { checkoutBranch, createPiHostBackend, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, probeGitBinary, validateBranchName } from "../src/index.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
 async function repository(): Promise<string> {
   root = await mkdtemp(join(tmpdir(), "pipi-git-"));

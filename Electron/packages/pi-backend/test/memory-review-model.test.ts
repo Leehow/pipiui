@@ -12,7 +12,7 @@ describe("Hermes review model spawn wiring", () => {
   afterEach(async () => {
     await backend?.close().catch(() => undefined);
     backend = undefined;
-    if (root) await rm(root, { recursive: true, force: true });
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     root = "";
   });
 

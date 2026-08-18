@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { FileQueueStore } from "../src/queue-store.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
 const item = (state: "queued" | "sending" | "failed", error?: string) => ({
   id: "message-1",

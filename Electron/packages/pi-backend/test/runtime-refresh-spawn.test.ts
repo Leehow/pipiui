@@ -15,7 +15,7 @@ const repoSources = new URL("../../../resources/runtime/", import.meta.url).path
  */
 describe("runtime tree refresh across spawns", () => {
   let root = "";
-  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = "" });
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = "" });
 
   it("picks up a philosophy edit on the next session without restarting the host", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-refresh-"));
@@ -44,8 +44,10 @@ describe("runtime tree refresh across spawns", () => {
     });
 
     await backend.handle("sendPrompt", ["session-1", "first"]);
-    const philosophy = args[args.indexOf("-e") + 1];
-    expect(philosophy).toBe(join(runtimeRoot, "pi-philosophy", "philosophy.ts"));
+    // Several extensions are mounted with -e and their order is the spawn's business,
+    // not this test's: select by path so adding another mount cannot break it.
+    const extensions = args.flatMap((arg, index) => (arg === "-e" ? [args[index + 1]] : []));
+    expect(extensions).toContain(join(runtimeRoot, "pi-philosophy", "philosophy.ts"));
     const layer = join(runtimeRoot, "pi-philosophy", "layers", "30-orchestration.md");
     expect(await readFile(layer, "utf8")).not.toContain("REFRESH-PROBE");
 

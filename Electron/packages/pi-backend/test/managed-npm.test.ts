@@ -25,7 +25,7 @@ describe("ensureManagedPackage", () => {
       expect(await ensureManagedPackage(web, root, { run: npmIsForbidden })).toEqual({ package: web.name, state: "present" });
       // The mount lookup finds the same tree the installer just accepted.
       expect(resolveSpawnPaths(root).webSearch).toBe(join(root, "managed-npm", `${web.name}-${web.version}`, "node_modules", web.name, "dist", "index.js"));
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("declines to install a package the user already registered with pi", async () => {
@@ -35,7 +35,7 @@ describe("ensureManagedPackage", () => {
       await writeFile(settings, JSON.stringify({ packages: [`${web.name}@0.19.0`] }));
       expect(globallyRegistered(web.name, settings)).toBe(true);
       expect(globallyRegistered("pi-mcp-extension", settings)).toBe(false);
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("reports a missing npm instead of leaving an unexplained gap in the mounted extensions", async () => {
@@ -43,7 +43,7 @@ describe("ensureManagedPackage", () => {
     try {
       const result = await ensureManagedPackage(web, root, { resolveNpm: () => undefined });
       expect(result).toEqual({ package: web.name, state: "failed", detail: "npm is unavailable on PATH" });
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("installs the pinned version and refuses to claim success when npm writes nothing", async () => {
@@ -63,7 +63,7 @@ describe("ensureManagedPackage", () => {
         run: async () => { await seedPackage(root, web.name, web.version); return { status: 0, detail: "" } }
       });
       expect(installed).toEqual({ package: web.name, state: "installed" });
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("finds npm even when PATH is the minimal set a Finder launch inherits", () => {
@@ -76,6 +76,6 @@ describe("ensureManagedPackage", () => {
       await writeFile(join(root, "empty.json"), "{}");
       expect(globallyRegistered(web.name, join(root, "empty.json"))).toBe(false);
       expect(globallyRegistered(web.name, join(root, "absent.json"))).toBe(false);
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });

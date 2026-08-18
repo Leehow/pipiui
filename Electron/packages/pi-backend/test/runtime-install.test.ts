@@ -24,7 +24,7 @@ describe("syncTree", () => {
       await utimes(join(source, "index.ts"), new Date(), new Date(Date.now() + 5000));
       expect(syncTree(source, dest).installed).toEqual([dest]);
       expect(await readFile(join(dest, "index.ts"), "utf8")).toBe("export const a = 2\n");
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("leaves the previous tree in place when the source is missing", async () => {
@@ -35,7 +35,7 @@ describe("syncTree", () => {
       const report = syncTree(join(root, "gone"), dest);
       expect(report.failures.length).toBe(1);
       expect(await readFile(join(dest, "keep.ts"), "utf8")).toBe("old\n");
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });
 
@@ -48,7 +48,7 @@ describe("treeSignature", () => {
       await mkdir(join(root, "node_modules"));
       await writeFile(join(root, "node_modules", "b.js"), "b\n");
       expect(treeSignature(root)).toBe(before);
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });
 
@@ -73,7 +73,7 @@ describe("installRuntimeTree", () => {
       expect(await readFile(join(root, "extensions", "pipiui-update-center.ts"), "utf8")).toContain('pi.on("input"');
       expect(await readFile(join(root, "extensions", "pipiui-electron-webview.ts"), "utf8")).toContain("sessionCapability: CAPABILITY");
       expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension"]));
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
   it("names each unresolved asset rather than installing a partial tree in silence", async () => {
@@ -81,6 +81,6 @@ describe("installRuntimeTree", () => {
     try {
       const report = installRuntimeTree({}, root);
       expect(report.failures).toEqual(["runtime source root: no source path resolved"]);
-    } finally { await rm(root, { recursive: true, force: true }) }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });

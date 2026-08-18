@@ -131,7 +131,7 @@ describe('SubagentModelModal', () => {
     render(<SubagentModelModal host={host} current={null} visibility={visibility()} onClose={() => undefined} />)
     await screen.findByTestId('subagent-agent-explore')
     expect(screen.queryByText('正在加载 Subagent 模型设置…')).toBeNull()
-	expect(screen.getAllByTestId(/^subagent-agent-/)).toHaveLength(10)
+	expect(screen.getAllByTestId(/^subagent-agent-/)).toHaveLength(8)
 	expect(screen.getByRole('heading', { name: 'Computer Use Agents' })).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-computer-use-leader')).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
@@ -168,14 +168,14 @@ describe('SubagentModelModal', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'explore 0 模型' }).textContent).toContain('GPT-5'))
     fireEvent.change(screen.getByLabelText('explore 0 思考强度'), { target: { value: 'high' } })
 
-    fireEvent.click(screen.getByRole('button', { name: 'plan 0 模型' }))
-    fireEvent.click(screen.getByTestId('subagent-model-option-plan-0-anthropic-claude-sonnet-4'))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'plan 0 模型' }).textContent).toContain('Claude'))
-    fireEvent.click(within(screen.getByTestId('subagent-agent-plan')).getByRole('button', { name: /添加备用模型/ }))
-    await waitFor(() => expect(screen.getAllByTestId(/^subagent-chain-plan-/)).toHaveLength(2))
-    fireEvent.click(screen.getByRole('button', { name: 'plan 1 模型' }))
-    expect(screen.queryByTestId('subagent-model-option-plan-1-deepseek-deepseek-v3')).toBeNull()
-    expect(screen.getByTestId('subagent-model-option-plan-1-openai-gpt-5')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'reviewer 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-reviewer-0-anthropic-claude-sonnet-4'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('Claude'))
+    fireEvent.click(within(screen.getByTestId('subagent-agent-reviewer')).getByRole('button', { name: /添加备用模型/ }))
+    await waitFor(() => expect(screen.getAllByTestId(/^subagent-chain-reviewer-/)).toHaveLength(2))
+    fireEvent.click(screen.getByRole('button', { name: 'reviewer 1 模型' }))
+    expect(screen.queryByTestId('subagent-model-option-reviewer-1-deepseek-deepseek-v3')).toBeNull()
+    expect(screen.getByTestId('subagent-model-option-reviewer-1-openai-gpt-5')).toBeTruthy()
 
     await waitFor(async () => {
       expect(await host.getSubagentModels?.()).toMatchObject({
@@ -183,7 +183,7 @@ describe('SubagentModelModal', () => {
 		'computer-verifier': [{ model: 'anthropic/claude-sonnet-4' }],
 		'computer-terminal': [{ model: 'openai/gpt-5' }],
         explore: [{ model: 'openai/gpt-5', thinking: 'high' }],
-        plan: [{ model: 'anthropic/claude-sonnet-4' }, { model: 'openai/gpt-5' }]
+        reviewer: [{ model: 'anthropic/claude-sonnet-4' }, { model: 'openai/gpt-5' }]
       })
     })
 

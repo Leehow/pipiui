@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { LeaseManager } from "../src/lease.js";
 
 let root = "";
-afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); root = ""; });
+afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 async function managers() {
   root = await mkdtemp(join(tmpdir(), "pipi-lease-"));
   const path = join(root, "session.jsonl");

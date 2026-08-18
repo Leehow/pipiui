@@ -125,7 +125,7 @@ if (process.argv[2] === "serve") {
 
 describe("external Pi model runtime", () => {
   let root = "";
-  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true }); });
+  afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); });
 
   it("uses the external helper and overlays .env under a Finder-like sparse environment without exposing values", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-external-auth-"));
