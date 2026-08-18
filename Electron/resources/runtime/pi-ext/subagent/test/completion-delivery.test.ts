@@ -11,7 +11,7 @@ import {
 	queueCompletionAfterCutIn,
 	queueCompletionNotification,
 } from "../completion-notification.ts";
-import { deliveryRetryDue, DeliveryObligationStore } from "../delivery-obligation.ts";
+import { deliveryRetryDue, holdConfirmedDoneDelivery, DeliveryObligationStore } from "../delivery-obligation.ts";
 
 test("completion notification is a quiet exact-run custom message that wakes the Boss", () => {
 	const calls: unknown[][] = [];
@@ -419,5 +419,15 @@ test("runtime finalizes status before using the custom completion channel", () =
 	assert.match(source, /pi\.on\("message_end"[\s\S]*?setTimeout\([\s\S]*?sessionManager\.getBranch\(\)/);
 	assert.doesNotMatch(source.slice(source.indexOf('pi.on("session_start"'), source.indexOf("registerSessionRecallTool")), /sessionManager\.getEntries\(\)/);
 	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?deliveryRetryDue\(/);
+	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?flushAfterSettle:\s*true/);
 	assert.match(source, /const existing = pendingDone\.get\(obligation\.id\);[\s\S]*?deliveryRetryDue\(\s*existing\.obligation/);
+});
+
+test("settle flush sends held confirmed dones even after the first receipt flips busy", () => {
+	assert.equal(holdConfirmedDoneDelivery({ quiet: true, busy: false }), true);
+	assert.equal(holdConfirmedDoneDelivery({ quiet: true, busy: true }, { flushAfterSettle: true }), true);
+	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: true }), true);
+	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: true }, { flushAfterSettle: true }), false);
+	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: false }), false);
+	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: false }, { flushAfterSettle: true }), false);
 });

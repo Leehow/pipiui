@@ -14,7 +14,7 @@ import {
 import { BrowserSessionHost, installBrowserNativeTrace, mountBrowserShellView, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
-import { importLegacyPiProfile, installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
+import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
 import { EMBEDDED_NODE_VERSION, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
@@ -145,21 +145,20 @@ if (app) {
       userData
     })
     const computer = new CuaDriverHost(assets.cuaDriver, display)
-    // Runtime and mutable Pi state both belong to this Electron profile. A bounded one-time copy
-    // preserves continuity from releases that shared ~/.pi/agent, without continuing to couple
-    // either installation after migration.
+    // Host chrome (queues, pipiui-settings, model catalog) stays under this Electron
+    // profile. Coding Pi homes are per opened project: `{project}/.pi/agent`. Never
+    // import or share `~/.pi/agent`.
     const runtimeRoot = process.env.PIPIUI_RUNTIME_ROOT ?? join(userData, 'runtime')
     const piProfile = resolveElectronPiProfile(userData)
-    // Profile migration, bundled model-capability overrides, and the runtime-tree
-    // install do not gate the window or the backend's IPC wiring, so they run in
-    // the background in parallel with window load instead of blocking createWindow.
+    // Bundled model-capability overrides and the runtime-tree install do not gate
+    // the window or the backend's IPC wiring, so they run in the background in
+    // parallel with window load instead of blocking createWindow.
     // Data-ordering is preserved two ways: (a) installRuntimeTree is re-run per
     // session/model spawn (refreshRuntimeTree), so it never needs to finish before
     // the first list-models; (b) once the profile/capability install lands, the
     // backend's model catalog is invalidated and reloaded via refreshModelCatalog so
     // the UI's next listModels sees the bundled capability overrides.
     const profileInstall = (async () => {
-      await importLegacyPiProfile(piProfile)
       if (!assets.sourceRoot) throw new Error('PipiUI runtime source is unavailable for model capability initialization')
       await installBundledModelCapabilityOverrides(
         piProfile,

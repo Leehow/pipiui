@@ -85,9 +85,11 @@ import {
 } from "./desktop-tool-policy.mjs";
 import {
 	deliveryRetryDue,
+	holdConfirmedDoneDelivery,
 	DeliveryObligationStore,
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
+import { formatUnfilteredOmissionNote, selectUnfilteredJobs } from "./job-status-list.ts";
 import {
 	admitSignal,
 	classifyRuntimeSignal,
@@ -165,7 +167,9 @@ import {
 	bindCanonicalComputerAgents,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
+	decideDispatchBackground,
 	decideRuntimeBudgetExpiry,
+	decideStallWatchdogAction,
 	normalizeGeneralPurposeExecutionPolicy,
 	runtimeRolePolicyForAgent,
 } from "./runtime-policy.ts";
@@ -437,9 +441,10 @@ function recordSubagentDispatchStats(
 ): void {
 	try {
 		const configuredPath = process.env.PIPI_SUBAGENT_STATS_PATH;
+		const projectAgent = process.env.PI_CODING_AGENT_DIR || path.join(process.cwd(), ".pi", "agent");
 		const statsPath =
 			configuredPath === undefined
-				? path.join(os.homedir(), ".pi", "agent", "subagent-stats.jsonl")
+				? path.join(projectAgent, "subagent-stats.jsonl")
 				: configuredPath.trim();
 		if (!statsPath) return;
 
@@ -1278,8 +1283,9 @@ function parseSubagentModelChain(value: unknown): SubagentModelOverride[] {
 function loadSubagentModelOverrides(): Record<string, SubagentModelChain> {
 	const files = Array.from(new Set([
 		process.env.PIPIUI_SUBAGENT_MODELS_FILE,
-		path.join(os.homedir(), ".pi/agent/pipiui-subagent-models-runtime.json"),
-		path.join(os.homedir(), "Library/Application Support/PipiUI/subagent-models.json"),
+		process.env.PI_CODING_AGENT_DIR
+			? path.join(process.env.PI_CODING_AGENT_DIR, "pipiui-subagent-models-runtime.json")
+			: undefined,
 	].filter((file): file is string => !!file)));
 	for (const file of files) try {
 		const raw = fs.readFileSync(file, "utf-8");
@@ -1875,6 +1881,10 @@ const AUTO_COMPACT_KEEP_TOKENS = 20_000;
 const AUTO_COMPACT_MIN_MESSAGES = 3;
 /** Max messages kept by compaction (bounds the walk when usage tokens are missing). */
 const AUTO_COMPACT_MAX_MESSAGES = 12;
+/** Current-dispatch task text kept verbatim in the auto-resume compaction summary. */
+const AUTO_COMPACT_TASK_SUMMARY_CHARS = 4_000;
+/** Image content size heuristic (chars) for the per-message token estimate. */
+const AUTO_COMPACT_IMAGE_CHARS = 4_800;
 
 /**
  * Transient network / upstream API failures worth auto-resuming the worker session.
@@ -2057,6 +2067,8 @@ interface RunningAgentHandle {
 	worktreePath?: string;
 	worktreeBranch?: string;
 	readOnly?: boolean;
+	/** True when the boss turn is awaiting this worker inline (chain / sync dispatch). */
+	syncWait?: boolean;
 }
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
@@ -2828,11 +2840,16 @@ function formatResumableSection(exclude: Set<string>): string[] {
 	];
 }
 
-function formatHistoricalSection(exclude: Set<string>): string[] {
+function historicalWorkerCount(exclude: Set<string>): number {
+	const stored = new Set(resumableAgentIds());
+	return readAgentSliceMetadata().filter((item) => !exclude.has(item.agentId) && !stored.has(item.agentId)).length;
+}
+
+function formatHistoricalSection(exclude: Set<string>, cap = 8): string[] {
 	const stored = new Set(resumableAgentIds());
 	const history = readAgentSliceMetadata()
 		.filter((item) => !exclude.has(item.agentId) && !stored.has(item.agentId))
-		.slice(0, 100);
+		.slice(0, cap);
 	if (history.length === 0) return [];
 	const rows = history.map((item) => {
 		const task = item.task.replace(/\s+/g, " ").trim().slice(0, 120) || "(task unavailable)";
@@ -2932,7 +2949,14 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			? "No running subagent jobs."
 			: "No subagent jobs recorded in this process.";
 		// A restarted main session has an empty registry while stored conversations remain.
-		return opts.onlyRunning ? head : [head, ...formatResumableSection(new Set()), ...formatHistoricalSection(new Set())].join("\n");
+		if (opts.onlyRunning) return head;
+		const historical = historicalWorkerCount(new Set());
+		return [
+			head,
+			...formatResumableSection(new Set()),
+			...formatHistoricalSection(new Set(), 8),
+			...formatUnfilteredOmissionNote(0, Math.max(0, historical - 8)),
+		].join("\n");
 	}
 
 	// running first, then newest endedAt/startedAt
@@ -2945,9 +2969,10 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		return bt - at;
 	});
 
+	const selected = selectUnfilteredJobs(jobs);
 	const header = `| agentId | runId | name | state | turns | cost | elapsed | preview |`;
 	const sep = `| --- | --- | --- | --- | --- | --- | --- | --- |`;
-	const rows = jobs.map((j) => {
+	const rows = selected.listed.map((j) => {
 		const elapsed =
 			j.state === "running"
 				? formatElapsedMs(now - j.startedAt)
@@ -2973,13 +2998,14 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		).slice(0, 80);
 		return `| ${j.agentId} | ${j.runId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
+	const listedIds = new Set(jobs.map((j) => j.agentId));
 	return [
 		header,
 		sep,
 		...rows,
 		...formatQueuedSection(now),
-		...formatResumableSection(new Set(jobs.map((j) => j.agentId))),
-		...formatHistoricalSection(new Set(jobs.map((j) => j.agentId))),
+		...formatResumableSection(listedIds),
+		...formatUnfilteredOmissionNote(selected.omittedEnded, historicalWorkerCount(listedIds)),
 	].join("\n");
 }
 
@@ -3453,13 +3479,72 @@ function compactionEntryId(): string {
 }
 
 /**
+ * A message entry's user-role text (string content or first text block).
+ */
+function entryUserText(entry: any): string {
+	if (entry?.type !== "message" || entry.message?.role !== "user") return "";
+	const content = entry.message.content;
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		const block = content.find((b: any) => b?.type === "text" && typeof b.text === "string");
+		if (block) return block.text;
+	}
+	return "";
+}
+
+/**
+ * Per-message size estimate for the kept-tail walk: pi's own chars/4 heuristic over
+ * the entry's own content (text/thinking/toolCall args; images ≈1200 tokens). Never
+ * usage.totalTokens — that field is the cumulative context size at that point, so
+ * accumulating it in an 80k+ context saturated the budget after one assistant
+ * message and shrank the kept window to the tail of a single turn.
+ */
+function estimateMessageEntryTokens(entry: any): number {
+	const message = entry?.message;
+	if (!message) return 0;
+	let chars = 0;
+	const content = message.content;
+	if (typeof content === "string") {
+		chars = content.length;
+	} else if (Array.isArray(content)) {
+		for (const block of content) {
+			if (!block || typeof block !== "object") continue;
+			if (block.type === "text" && typeof block.text === "string") chars += block.text.length;
+			else if (block.type === "thinking" && typeof block.thinking === "string") chars += block.thinking.length;
+			else if (block.type === "image") chars += AUTO_COMPACT_IMAGE_CHARS;
+			else if (block.type === "toolCall") {
+				chars += String(block.name ?? "").length;
+				try {
+					chars += JSON.stringify(block.arguments ?? {}).length;
+				} catch {
+					// Unserializable args only undercount this one message.
+				}
+			}
+		}
+	}
+	return Math.ceil(chars / 4);
+}
+
+function clipAutoCompactText(text: string): string {
+	const value = (text ?? "").trim();
+	if (value.length <= AUTO_COMPACT_TASK_SUMMARY_CHARS) return value;
+	return `${value.slice(0, AUTO_COMPACT_TASK_SUMMARY_CHARS - 1).trimEnd()}…`;
+}
+
+/**
  * Append a pi-native `{"type":"compaction",...}` entry to the session jsonl before an
  * auto-resume re-spawn, so the worker restarts from a compacted context instead of dying
  * on a full one. Append-only: never rewrites the file, never breaks the parent chain —
  * pi's buildContextEntries drops everything before `firstKeptEntryId` on resume and renders
  * `summary` as one user text. Any failure returns false: compaction must never block resume.
+ *
+ * The summary MUST carry the CURRENT dispatch's task (`taskText`). A worker session is
+ * reused across dispatches (`--session-id pipiui-<agentId>`), so the chain's first user
+ * message is usually an OLDER dispatch's task; a resumed worker that only sees it loses
+ * the job it was actually running. Empty `taskText` falls back to the latest
+ * "Task:"-prefixed user message, then the first user message.
  */
-function appendSessionCompaction(
+export function appendSessionCompaction(
 	sessionDir: string,
 	sessionId: string,
 	taskText: string,
@@ -3503,40 +3588,30 @@ function appendSessionCompaction(
 		}
 		chain.reverse();
 
-		// Walk the chain backwards from the leaf, accumulating usage.totalTokens (assistant
-		// messages only; 0 otherwise) until we keep KEEP_TOKENS or MAX_MESSAGES messages.
+		// Walk the chain backwards from the leaf, estimating each message by its own
+		// content size, until KEEP_TOKENS or MAX_MESSAGES. firstKeptEntryId is therefore
+		// a real ~20k-token tail, not the last few entries of one turn.
 		const kept: any[] = [];
 		let acc = 0;
 		for (let i = chain.length - 1; i >= 0; i--) {
 			if (chain[i].type !== "message") continue;
 			kept.push(chain[i]);
-			acc += chain[i].message?.usage?.totalTokens ?? 0;
+			acc += estimateMessageEntryTokens(chain[i]);
 			if (acc >= AUTO_COMPACT_KEEP_TOKENS || kept.length >= AUTO_COMPACT_MAX_MESSAGES) break;
 		}
 		kept.reverse(); // kept[0] = earliest kept message
 		if (kept.length < AUTO_COMPACT_MIN_MESSAGES) return false;
 		const firstKeptEntryId = kept[0].id;
 
-		// Summary: the chain's first user message (the original task), truncated.
-		// content may be a string or an array of blocks ({type:"text",text} etc.).
-		let summary = "";
-		for (const e of chain) {
-			if (e.type !== "message" || e.message?.role !== "user") continue;
-			const content = e.message.content;
-			if (typeof content === "string") {
-				summary = content;
-			} else if (Array.isArray(content)) {
-				const textBlock = content.find((b: any) => b?.type === "text" && typeof b.text === "string");
-				if (textBlock) summary = textBlock.text;
-			}
-			if (summary) break;
-		}
-		summary = summary.slice(0, 400);
-		if (summary) {
-			summary += "\n[pipiui] 早期上下文已压缩；请基于以上任务描述继续。";
-		} else {
-			summary = "任务描述见上方会话开头（已压缩）。";
-		}
+		const fallbackTask =
+			entryUserText([...chain].reverse().find((e) => entryUserText(e).startsWith("Task:")))
+			|| entryUserText(chain.find((e) => entryUserText(e)));
+		const taskSummary = clipAutoCompactText(
+			(typeof taskText === "string" && taskText.trim()) || fallbackTask,
+		);
+		const summary = taskSummary
+			? `当前任务（本次派发）：\n${taskSummary}\n\n[pipiui] 早期上下文已压缩；以上是当前任务全文，请基于它继续。被压缩掉的原始记录可用 session_recall 工具检索本会话 JSONL。`
+			: "任务描述见上方会话开头（已压缩）。";
 
 		fs.appendFileSync(
 			files[files.length - 1],
@@ -3853,7 +3928,7 @@ function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
 			}
 			if (!entry.inFlight && deliveryRetryDue(
 				entry.obligation, now, DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS,
-			)) sendDoneWithConfirmation(pi, entry, true);
+			)) sendDoneWithConfirmation(pi, entry, true, { flushAfterSettle: true });
 		}
 	}, 0);
 	pendingDoneSettledRetryTimer.unref?.();
@@ -3977,13 +4052,14 @@ function sendDoneWithConfirmation(
 	pi: ExtensionAPI,
 	entry: PendingDoneEntry,
 	isRetry: boolean,
+	options?: { flushAfterSettle?: boolean },
 ): void {
 	let obligation = entry.obligation;
 	if (obligation.state === "fulfilled" || obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
-	// Host-stop quiet: hold the receipt without burning a delivery attempt; the retry
-	// pass after quiet release (next real user input) delivers it.
-	if (hostStopQuiet) return;
-	if (bossTurnBusy) return;
+	// Host-stop quiet always holds. A live Boss turn also holds, except the
+	// just-idle settle flush which must send every sibling before the first
+	// receipt flips bossTurnBusy and would otherwise stall the rest.
+	if (holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options)) return;
 	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return;
 	const now = Date.now();
 	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
@@ -4712,6 +4788,10 @@ async function runSingleAgent(
 		disabledTools: loadDisabledTools(),
 		hasDesktopCapability: desktopGrant.granted,
 		hasMemoryBrokerCapability: !!terminalMemoryBrokerEnvironment,
+		// The subagent extension that registers session_recall is mounted below
+		// (`-e PIPIUI_SUBAGENT_EXT`); without recall a compacted worker cannot
+		// find its own task back from the raw JSONL.
+		hasSessionRecall: Boolean(PIPIUI_SUBAGENT_EXT),
 		allowRecursiveDelegation: runtimePolicy.allowRecursiveDelegation,
 		availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,
 	});
@@ -4811,6 +4891,7 @@ async function runSingleAgent(
 			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 			readOnly: Boolean(agent.traits.readOnly),
+			syncWait: !isBackground,
 		});
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
@@ -4987,8 +5068,9 @@ async function runSingleAgent(
 						isCurrentRun: (candidateRunId) => handleForRun(pipiuiAgentId, candidateRunId) !== undefined,
 						onTimeout() {
 							// Budget expiry is progress-aware: a producing worker silently earns
-							// another budget; a stalled one earns the boss one diagnostic plus one
-							// final budget; only a second stalled expiry aborts.
+							// another budget; a stalled background worker earns one diagnostic plus
+							// one final budget; a stalled sync-wait aborts on the first expiry
+							// because the boss turn cannot receive that diagnostic.
 							const now = Date.now();
 							const handle = handleForRun(pipiuiAgentId, runId);
 							const idleMs = handle ? Math.max(0, now - handle.lastActivityAt) : Number.POSITIVE_INFINITY;
@@ -4996,6 +5078,7 @@ async function runSingleAgent(
 								idleMs,
 								progressGraceMs: STALL_THRESHOLD_MS,
 								notified: runtimeTimeoutNotified,
+								syncWait: handle?.syncWait === true,
 							});
 							if (expiry === "abort") {
 								runtimeTimedOut = true;
@@ -5807,6 +5890,7 @@ async function runSingleAgent(
 			exitCode: currentResult.exitCode,
 			stopReason: currentResult.stopReason,
 			errorMessage: currentResult.errorMessage,
+			hadMessages: currentResult.messages.length > 0,
 		});
 		return currentResult;
 	} finally {
@@ -5841,7 +5925,7 @@ const AGENT_ID_DESCRIPTION =
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 const DESKTOP_PARAM_DESCRIPTION =
-	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed an app and genuinely needs a visual UI acceptance check). Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
+	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed a UI that the built-in browser tool CANNOT open — a native macOS app or an OS dialog — and genuinely needs a visual acceptance check). If the changed screen loads in the built-in browser tool, ui-verify does NOT apply: check it there yourself and grant nothing. Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
 	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]. The runtime queue holds this task until every named agent succeeds; a failed or never-dispatched dependency holds the item and reports [subagent-blocked] instead of starting it.';
 const SCOPE_DESCRIPTION =
@@ -6410,6 +6494,18 @@ function computerWorkerAgentId(taskId: string, role: "operator" | "computer-term
 	return `${prefix}-${digest}`;
 }
 
+function computerWorkerDispatchFailureCode(input: {
+	fatalCode?: "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled";
+	hadMessages?: boolean;
+	taskAborted: boolean;
+}): string | undefined {
+	// The parent tool signal owns cancellation. A child that was already running may
+	// have persisted tool calls/results before that signal arrives; synthesizing a
+	// second failed start/end row rewrites that real episode as a prestart failure.
+	if (input.taskAborted) return undefined;
+	return input.fatalCode ?? (input.hadMessages ? "gui_child_failed" : "gui_child_prestart_failed");
+}
+
 class ComputerPlanInvestigationError extends Error {
 	readonly diagnostic: ComputerPlanAdmissionDiagnostic;
 	readonly attempts: number;
@@ -6562,7 +6658,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				const leader = agentName === "computer-use-leader";
 				const effectiveSignal = childSignal ? AbortSignal.any([taskSignal, childSignal]) : taskSignal;
 				try {
-					const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, undefined,
+					const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, onUpdate,
 						(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
 						{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, contextWindow, background: false });
 					const episode = childEpisode(agentName, result, result.exitCode === 0 && !result.errorMessage ? "completed" : "failed");
@@ -6763,7 +6859,12 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 							}, COMPUTER_WORKER_STALL_TIMEOUT_MS); } catch (error) {
 							if (failedEpisode && !(error as { episode?: ComputerAgentEpisode })?.episode) Object.assign(error as object, { episode: failedEpisode });
 							const diagnostic = error as { agentId?: string; runId?: string; resolvedModel?: string; hadMessages?: boolean };
-								const failureCode = computerWorkerFatalCodes.get(workerKey) ?? (diagnostic.hadMessages ? "gui_child_failed" : "gui_child_prestart_failed");
+							const failureCode = computerWorkerDispatchFailureCode({
+								fatalCode: computerWorkerFatalCodes.get(workerKey),
+								hadMessages: diagnostic.hadMessages,
+								taskAborted: taskSignal.aborted,
+							});
+							if (!failureCode) throw error;
 							if (diagnostic.agentId && diagnostic.runId) {
 								await postPipiuiReport({ kind: "start", agentId: diagnostic.agentId, runId: diagnostic.runId, parentId: taskId, toolCallId, name: agentName, task: "Computer Worker dispatch diagnostic", depth: PIPIUI_DEPTH + 2, model: diagnostic.resolvedModel ?? null, title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task" });
 								await postTerminalPipiuiReport({ kind: "end", agentId: diagnostic.agentId, runId: diagnostic.runId, ok: false, output: failureCode });
@@ -7120,8 +7221,9 @@ export default function (pi: ExtensionAPI) {
 	// 1) done 重投：仅 Pi 明确拒绝/抛错或首个 Boss assistant 失败后的 pending/failed；
 	//    queued/observed 可能仍在健康长 turn 中，当前进程绝不按墙钟重复。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推，推一次后从 runningAgents 删除。
-	// 3) stall 复推：idle ≥ 120s 即推 [subagent-stalled]，同一无活动片段最多首次 + 两次复推，
-	//    每次仍至少间隔 5 分钟；有新活动后 noteAgentActivity 复位计数和时间戳，重新武装。
+		// 3) stall 复推 / 预裁决：idle ≥ 120s 时，同步等待立刻 abort（否则信号被 hold 形成死锁）；
+		//    后台 worker 先推 [subagent-stalled]，同一无活动片段最多 STALL_RENOTIFY_MAX 次，
+		//    每次仍至少间隔 5 分钟；次数用尽仍无进展则 abort，而不是永远挂着。
 	// 4) 长跑检查点：仍在出活的 worker 按 10 / +20 / +30 分钟墙钟叫醒 Boss，带上最近 activity。
 	// 5) interrupted/aborted/failed + stored context：idle ≥ NUDGE_SECS 推 [subagent-interrupted-reminder]，
 	//    再于 RENUDGE_SECS 复推一次后沉默；同 agentId 再 dispatch 为 running 时字段被清零。
@@ -7163,19 +7265,49 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		// (3) stall 推送 / 复推
+		// (3) stall 推送 / 复推 / 预裁决 abort
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing) continue;
 			const idleMs = now - handle.lastActivityAt;
-			if (idleMs < STALL_THRESHOLD_MS) continue;
-			// 同一无活动片段最多推 STALL_RENOTIFY_MAX 次；每次仍至少间隔 5 分钟。
-			if (!claimStallNotification(handle, now)) continue;
+			const action = decideStallWatchdogAction({
+				idleMs,
+				stallThresholdMs: STALL_THRESHOLD_MS,
+				notifyCount: handle.stallNotifyCount,
+				maxNotifies: STALL_RENOTIFY_MAX,
+				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
+				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
+				syncWait: handle.syncWait === true,
+			});
+			if (action === "ignore") continue;
 			const idleSec = Math.floor(idleMs / 1000);
 			const job = jobRegistry.get(agentId);
 			const title =
 				handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
 			const activityRaw = job?.activity?.trim() || "";
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
+			if (action === "abort") {
+				const aborted = abortRunningAgent(agentId);
+				if (!aborted.ok) continue;
+				if (handle.syncWait !== true) {
+					deliverSubagentDone(
+						pi,
+						[
+							`[subagent-blocked] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine} auto-aborted after stall`,
+							`This worker was auto-aborted after stall. Query subagent_status({agentId:"${agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Do not treat this message as a new user request.`,
+						].join("\n"),
+					);
+				}
+				pipiuiReport({
+					kind: "stalled",
+					agentId,
+					runId: handle.runId,
+					stalled: true,
+					idle: idleSec,
+					activity: `auto-aborted after stall: ${lastLine}`,
+				});
+				continue;
+			}
+			if (!claimStallNotification(handle, now)) continue;
 			deliverSubagentDone(
 				pi,
 				// Handling rides with the event rather than sitting in the cached prefix all
@@ -7342,9 +7474,9 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Status",
 		description: [
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
-			"The unfiltered view also includes persisted historical worker task/result summaries after process or Boss restart, so the Boss can inspect exact prior work and choose an agentId semantically instead of creating duplicates.",
+			"The unfiltered view lists every running job plus the most recent ended jobs (same cap as a Wave line). Older or historical workers are omitted with a count; inspect one with subagent_status({agentId, full:true}).",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
-			"Before a user-facing conclusion, one unfiltered status call per turn is enough: it lists every job. Do not call again for each [subagent-done]. Keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
+			"Before a user-facing conclusion, one unfiltered status call per turn is enough for the current wave. Do not call again for each [subagent-done]. Keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
 			"Do not busy-loop poll; one unfiltered check per turn is enough.",
 		].join(" "),
@@ -7432,20 +7564,19 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			const requestAgentIds = new Set<string>();
-			// Default background at boss depth for single/parallel; chain and nested always sync.
-			// While the fan-out layer is on, background is not the caller's to switch off: a boss
-			// that blocks on every dispatch is running a fake fan-out, and the guard has to be
-			// here rather than in the prompt — models do pass background:false regardless of what
-			// the system prompt says.
-			const forcedBackground = PIPIUI_DEPTH === 0 && !isChain && fanoutLayerActive();
-			const wantBg = forcedBackground || (params.background ?? (PIPIUI_DEPTH === 0 && !isChain));
-			const useBackground = Boolean(wantBg && !isChain && PIPIUI_DEPTH === 0);
-			const bgIgnoredWarning =
-				params.background === true && (PIPIUI_DEPTH > 0 || isChain)
-					? "Warning: background:true ignored (nested depth>0 or chain mode always runs synchronously).\n\n"
-					: params.background === false && forcedBackground
-						? "Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use chain if you genuinely need ordered synchronous steps, or turn off the 瀑布流 layer in Settings.\n\n"
-						: "";
+			// Default background at boss depth for single/parallel; multi-step chain stays
+			// sync so `{previous}` can be substituted. Fan-out also forces a one-step chain
+			// into the background — that is not ordered work, and waiting on it deadlocks
+			// stall recovery because signals are held while the boss turn is busy.
+			const dispatchBackground = decideDispatchBackground({
+				depth: PIPIUI_DEPTH,
+				isChain,
+				chainLength: params.chain?.length ?? 0,
+				fanoutActive: fanoutLayerActive(),
+				requestedBackground: params.background,
+			});
+			const useBackground = dispatchBackground.useBackground;
+			const bgIgnoredWarning = dispatchBackground.warning;
 
 			// action=resolve: close one exact old terminal episode without changing state/verify.
 			if (params.action === "resolve") {
@@ -7800,6 +7931,69 @@ export default function (pi: ExtensionAPI) {
 			);
 
 			if (params.chain && params.chain.length > 0) {
+				if (useBackground) {
+					const step = params.chain[0]!;
+					const agentName = step.agent;
+					const task = (step.task ?? step.prompt ?? "").replace(/\{previous\}/g, "");
+					const agentCfg = agents.find((a) => a.name === agentName);
+					if (!agentCfg) {
+						const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+						return {
+							content: [
+								{
+									type: "text",
+									text: `Unknown agent: "${agentName}". Available agents: ${available}.`,
+								},
+							],
+							details: makeDetails("chain")([]),
+							isError: true,
+						};
+					}
+					const agentId = step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
+					startBackgroundAgent(
+						agentName,
+						task,
+						step.cwd,
+						agentId,
+						"single",
+						step.title,
+						step.verify,
+						step.thinking,
+						undefined,
+						step.desktop,
+						undefined,
+						step.worktree,
+						step.noWorktreeReason,
+						step.heartbeatSecs,
+						step.timeoutSecs,
+					);
+					const placeholder: SingleResult = {
+						agent: agentName,
+						agentId,
+						agentSource: agentCfg.source,
+						task,
+						title: step.title,
+						exitCode: -1,
+						messages: [],
+						stderr: "",
+						usage: emptyUsage(),
+						model: resolveAgentModel(agentName, agentCfg.model, sessionModel),
+					};
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									dispatchNudgePrefix +
+									bgIgnoredWarning +
+									formatStartedMessage([
+										{ agentId, name: agentName, task, title: step.title },
+									]),
+							},
+						],
+						details: makeDetails("chain", { background: true, agentIds: [agentId] })([placeholder]),
+					};
+				}
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 
@@ -8583,8 +8777,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Run ordered worker steps. Each chain item needs prompt (the full brief) and description (3-5 word label). A step may reference the prior step's output as {previous}.",
 		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
 		promptGuidelines: [
-			"Use subagent_chain only for genuinely ordered steps; independent tasks belong in multiple subagent calls in one response.",
-			"Chain steps run synchronously in order; do not use a chain to serialize work that is actually independent.",
+			"Use subagent_chain only for genuinely ordered multi-step work; a one-step chain is dispatched in the background while fan-out is on.",
+			"Independent tasks belong in multiple subagent calls in one response, not a one-step chain used as a wait.",
 		],
 		parameters: SubagentChainParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentChainParams),

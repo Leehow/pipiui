@@ -87,6 +87,19 @@ import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
+import {
+  ensureProjectPiHome,
+  projectPiAgentDir,
+  projectPiSessionsDir,
+  sanitizePiSettingsFile,
+} from "./project-pi-home.js";
+export {
+  ensureProjectPiHome,
+  projectPiAgentDir,
+  projectPiSessionsDir,
+  sanitizePiSettings,
+  sanitizePiSettingsFile,
+} from "./project-pi-home.js";
 export {
   ProactiveCompactionPolicy,
   ProactiveCompactionScheduler,
@@ -1718,6 +1731,15 @@ export class PiHostBackend implements HostBackend {
       }
     };
     await walk(this.root);
+    if (this.profileMode === "isolated") {
+      try {
+        for (const project of await this.loadProjectPaths()) {
+          await walk(projectPiSessionsDir(project));
+        }
+      } catch {
+        /* a missing project list must not hide host-root sessions */
+      }
+    }
     const seen = new Set<string>();
     const result: SessionMeta[] = [];
     for (const path of files) {
@@ -2295,6 +2317,18 @@ export class PiHostBackend implements HostBackend {
         `session is read-only: held by ${status.holder?.holder ?? "another writer"}`,
       );
   }
+  private isolatedProjectPaths(cwd: string): { agentDir?: string; sessionsRoot?: string } {
+    if (this.profileMode !== "isolated") return {};
+    return {
+      agentDir: projectPiAgentDir(cwd),
+      sessionsRoot: projectPiSessionsDir(cwd),
+    };
+  }
+  private async ensureIsolatedProjectHome(projectRoot: string): Promise<void> {
+    if (this.profileMode !== "isolated") return;
+    await sanitizePiSettingsFile(join(this.agentDir, "settings.json")).catch(() => false);
+    await ensureProjectPiHome({ projectRoot, credentialSeedDir: this.agentDir });
+  }
   private async newSession(projectId: string, name?: string): Promise<Session> {
     // Session creation needs only local configuration. The optional authenticated runtime
     // catalog may involve network-backed provider discovery and must never gate a sidebar click.
@@ -2305,7 +2339,10 @@ export class PiHostBackend implements HostBackend {
     const p = projects.find((x) => x.id === projectId);
     if (!p) throw new Error(`unknown project ${projectId}`);
     const id = crypto.randomUUID();
-    const dir = join(this.root, encodeURIComponent(p.path));
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(p.path);
+    const dir = this.profileMode === "isolated"
+      ? projectPiSessionsDir(p.path)
+      : join(this.root, encodeURIComponent(p.path));
     await fs.mkdir(dir, { recursive: true });
     const path = join(
       dir,
@@ -2495,12 +2532,12 @@ export class PiHostBackend implements HostBackend {
         );
       }
     }
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(found.header.cwd);
     const output = assemblePiSpawn({
       sessionPath: found.path,
       cwd: found.header.cwd,
       runtimeRoot: this.runtimeRoot,
-      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
-      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      ...this.isolatedProjectPaths(found.header.cwd),
       resourceMode: this.resourceMode,
       features: this.features,
       paths: resolveSpawnPaths(this.refreshRuntimeTree(), {
@@ -3437,6 +3474,9 @@ export class PiHostBackend implements HostBackend {
     });
     this.projectPaths = saved;
     this.projectPathsLoaded = Promise.resolve();
+    if (this.profileMode === "isolated") {
+      for (const projectRoot of saved) await this.ensureIsolatedProjectHome(projectRoot);
+    }
     return [...saved];
   }
   private async addProject(value: unknown): Promise<Project> {
@@ -3444,6 +3484,7 @@ export class PiHostBackend implements HostBackend {
       throw new Error("project path 必须是非空 string");
     const paths = await this.loadProjectPaths();
     if (!paths.includes(value)) await this.saveProjectPaths([value, ...paths]);
+    await this.ensureIsolatedProjectHome(value);
     await this.loadProjectNames();
     return this.project(value);
   }
@@ -3984,10 +4025,10 @@ export class PiHostBackend implements HostBackend {
     attachments: PromptAttachment[],
     userText?: string,
   ): Promise<string | undefined> {
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(live.cwd);
     const isolated = assemblePiSpawn({
       cwd: live.cwd,
-      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
-      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      ...this.isolatedProjectPaths(live.cwd),
       resourceMode: "explicit",
       features: {},
       paths: {},
@@ -4140,10 +4181,10 @@ export class PiHostBackend implements HostBackend {
   }
 
   private async refineAutomaticSessionTitle(live: Live, userMessage: string): Promise<void> {
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(live.cwd);
     const isolated = assemblePiSpawn({
       cwd: live.cwd,
-      agentDir: this.profileMode === "isolated" ? this.agentDir : undefined,
-      sessionsRoot: this.profileMode === "isolated" ? this.root : undefined,
+      ...this.isolatedProjectPaths(live.cwd),
       resourceMode: "explicit",
       features: {},
       paths: {},

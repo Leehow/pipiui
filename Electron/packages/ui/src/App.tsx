@@ -712,6 +712,7 @@ export function createMockHost(): PipiHostAPI {
     removeQueuedMessage: async () => { throw new Error('mock queue is unavailable') },
     promoteQueuedMessage: async () => { throw new Error('mock queue is unavailable') },
     steerQueuedMessage: async () => { throw new Error('mock queue is unavailable') },
+    cutInQueuedMessage: async () => { throw new Error('mock queue is unavailable') },
     retryQueuedMessage: async () => { throw new Error('mock queue is unavailable') },
     subscribeStream: (sessionId, listener) => { const bucket = listeners.get(sessionId) ?? new Set(); bucket.add(listener); listeners.set(sessionId, bucket); return () => bucket.delete(listener) },
     subscribeAllStreams: listener => { allStreamListeners.add(listener); return () => allStreamListeners.delete(listener) },
@@ -1492,6 +1493,20 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       openResumeWait(liveMessages, historyMessages)
     }
+    const restoreOpenHop = (snapshot: ChatMessage[], live: ChatMessage[]): ChatMessage[] => {
+      if (!mainTurnOpenRef.current) return snapshot
+      if (historyConfirmsLostSettle(snapshot, live)) return snapshot
+      const liveLast = live[live.length - 1]
+      if (!liveLast || liveLast.role !== 'assistant' || !assistantEndedAwaitingModel(liveLast)) return snapshot
+      return reopenAssistantForNextCompletion(snapshot, { includeHistoryMergedToolHop: true })
+    }
+    const applyRestoredOpenHop = (snapshot: ChatMessage[]) => {
+      const restored = restoreOpenHop(snapshot, messagesRef.current)
+      if (restored === messagesRef.current) return
+      messagesBySessionRef.current.set(selectedSession, restored)
+      messagesRef.current = restored
+      setMessages(restored)
+    }
     const applyHistory = (entries: HistoryEntry[], scrollToNewest: boolean) => {
       if (historyLoadRef.current !== request) return
       const reconciliation = reconcileHistorySnapshot(
@@ -1518,26 +1533,29 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       if (reconciliation.status === 'unchanged') {
         resumeOrCloseLostSettle(reconciliation.messages)
+        applyRestoredOpenHop(messagesRef.current)
         return
       }
       const next = reconciliation.messages
       historyFingerprintBySessionRef.current.set(selectedSession, reconciliation.fingerprint)
       if (transcriptFingerprint(messagesRef.current) === reconciliation.fingerprint) {
         resumeOrCloseLostSettle(next)
+        applyRestoredOpenHop(messagesRef.current)
         return
       }
       const liveBefore = messagesRef.current
-      messagesBySessionRef.current.set(selectedSession, next)
-      setMessages(next)
-      messagesRef.current = next
+      const restored = restoreOpenHop(next, liveBefore)
+      messagesBySessionRef.current.set(selectedSession, restored)
+      setMessages(restored)
+      messagesRef.current = restored
       if (resumedRunning) {
         if (historyConfirmsLostSettle(next, liveBefore)) closeLostSettle()
-        else openResumeWait(liveBefore, next)
+        else openResumeWait(liveBefore, restored)
       } else {
-        const last = next[next.length - 1]
+        const last = restored[restored.length - 1]
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
       }
-      if (scrollToNewest) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, next.length - 1), align: 'end', behavior: 'auto' }))
+      if (scrollToNewest) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, restored.length - 1), align: 'end', behavior: 'auto' }))
     }
     if (cached !== undefined) requestAnimationFrame(() => transcriptRef.current?.scrollToIndex({ index: Math.max(0, cached.length - 1), align: 'end', behavior: 'auto' }))
     // Cache is an immediate rendering optimization, never the source of truth.
@@ -2520,7 +2538,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
-        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.steer(id).catch(() => undefined) }} />
+        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
         <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={sessionQueue.busy} readOnly={leaseReadOnly} leaseOwner={leaseReadOnly ? leaseOwnerLabel(lease) : undefined} onTakeover={async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
@@ -2562,6 +2580,9 @@ function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages:
   if (!historyLast || !assistantLooksSettled(historyLast)) return false
   const liveLast = liveMessages[liveMessages.length - 1]
   if (!liveLast || liveLast.role !== 'assistant') return true
+  // Text-then-tools is still the silent next hop. JSONL stores that as
+  // content+finished tools, which looks settled and must not close the wait.
+  if (assistantEndedAwaitingModel(liveLast)) return false
   if ((liveLast.content ?? '').trim() !== (historyLast.content ?? '').trim()) return false
   return Boolean(liveLast.streaming)
 }

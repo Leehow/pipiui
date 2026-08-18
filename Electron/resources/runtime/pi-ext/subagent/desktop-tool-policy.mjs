@@ -20,6 +20,14 @@ export function isDelegationTool(name) {
 /** App-issued one-run capability may add only this read-only broker tool. */
 export const MEMORY_BROKER_TOOL_NAME = "memory_query";
 
+/**
+ * Read-only recall of this session's own compacted-out JSONL history. Granted by
+ * the dispatch (not frontmatter) whenever the subagent extension that registers
+ * the tool is mounted for the child: a worker whose context was compacted has no
+ * other way to find its own task.
+ */
+export const SESSION_RECALL_TOOL_NAME = "session_recall";
+
 /** Per-task Computer Use grants a boss may attach to a dispatch. Omission = no grant. */
 export const DESKTOP_GRANT_VALUES = Object.freeze(["user-requested", "ui-verify"]);
 
@@ -60,7 +68,7 @@ This dispatch explicitly authorized desktop steps (computer / open_application) 
 - When the user requested a visible App/GUI operation, you MUST use open_application and computer for those desktop steps.
 - If the user named Chrome, Safari, another external browser, or "my browser", you MUST use exactly that browser: open_application to pin it, then computer batches. Never substitute the built-in browser tool for a user-named external browser.
 - The grant authorizes only the necessary desktop steps for THIS task; it does not expand the task scope. You may not self-grant, extend, or propagate desktop access to other agents, sessions, or future tasks.
-- For a ui-verify grant: use desktop only for the visual acceptance check of the app just built/changed in this task, then return to normal tools.
+- For a ui-verify grant: use desktop only for the visual acceptance check of the app just built/changed in this task, then return to normal tools. It covers only a screen the built-in browser tool cannot open; anything that loads in the built-in browser tool is checked there, never here.
 - Pack desktop actions: one batch must complete each coherent sequence (click → type → confirm). Single-action batches are the expensive round-trip anti-pattern; split only when the next step genuinely depends on seeing the previous result.`;
 
 const RESERVED_DESKTOP_TOOLS = new Set(RESERVED_DESKTOP_TOOL_NAMES);
@@ -164,6 +172,7 @@ export function resolveSubagentToolSelection({
 	disabledTools,
 	hasDesktopCapability,
 	hasMemoryBrokerCapability = false,
+	hasSessionRecall = false,
 	allowRecursiveDelegation,
 	availableExtensionTools = [],
 }) {
@@ -194,6 +203,11 @@ export function resolveSubagentToolSelection({
 		// read-only query. There are no broker durable-write tool names here.
 		if (hasMemoryBrokerCapability && !disabled.has(MEMORY_BROKER_TOOL_NAME)) {
 			allowed.add(MEMORY_BROKER_TOOL_NAME);
+		}
+		// Same host-issued pattern for self-continuity: the subagent extension is
+		// mounted (hasSessionRecall), so the name is never dead in the allowlist.
+		if (hasSessionRecall && !disabled.has(SESSION_RECALL_TOOL_NAME)) {
+			allowed.add(SESSION_RECALL_TOOL_NAME);
 		}
 		return allowed.size > 0
 			? { flag: "--tools", names: [...allowed] }

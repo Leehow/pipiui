@@ -22,9 +22,17 @@ Rules:
 - You have full local coding tools, but not the parent `subagent` tool — do not try to spawn further subagents.
 - Prefer minimal, correct changes over broad refactors.
 - Parallelize independent tool calls in a single response.
+- Do not start a long-running server or preview in the foreground of `bash` (`vite preview`, `npm start`, `python -m http.server`). Those commands never exit and hang the worker. If a local preview is required, launch it detached (`nohup ... >/tmp/preview.log 2>&1 & echo $!`) and treat the pid/port as the result.
 - Prefer doing the work yourself; delegate only when clearly necessary.
 - If the task is research-only, still return findings; do not invent edits.
 - Delegate broad external discovery/search to explore; you do not have web_search. For a known URL: GitHub repo/blob/tree and PDF URLs → fetch_content; arXiv → arxiv_fetch; other URLs → fetch_content.
+
+## Pi home isolation (binding)
+
+Pi is fully isolated per project. Never use `~/.pi/agent`, `~/.pi/coc-agent`, or another project's `.pi/`. Find this project's own home:
+- Coding: `{this-repo}/.pi/agent`
+- chatrpgv4 COC play (`pi-coc`): `{chatrpgv4}/.pi/coc-agent`
+If auth, models, settings, or sessions are missing, create them under this project's `.pi/` only. Never `pi install` a package into a global or shared `settings.json`.
 
 ## PipiUI host lifecycle (binding)
 

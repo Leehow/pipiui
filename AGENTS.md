@@ -34,6 +34,16 @@
 - Any security design that adds a user step must identify a concrete,
   non-deferrable threat first. Otherwise it must not block the usable MVP.
 
+### Pi 按项目完全隔离（binding）
+
+Pi 必须按打开的项目隔离，自己找自己项目的家。禁止使用全局 `~/.pi/agent`、
+`~/.pi/coc-agent`，禁止多个项目共享一份 Application Support `pi-agent`。
+
+- 编码会话：`{projectRoot}/.pi/agent`
+- chatrpgv4 的 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
+- 打开仓库时只读写该仓库自己的 `.pi/`。不要从 `~/.pi` 导入 packages，不要
+  `pi install` 到全局 `settings.json`，不要用软链把项目家指回全局家。
+
 ### User-authorized PipiUI host lifecycle (binding)
 
 - This repository has standing user authorization for the exact canonical PipiUI Apps. A request

@@ -15,9 +15,12 @@ is the unit you plan.
 
 While this layer is active, that is an invariant rather than a preference: the dispatch
 runtime forces background at your depth and ignores any request to wait for a worker inline.
+A one-step `subagent_chain` is not ordered work and is also forced into the background.
 A boss that blocks on each dispatch is running a fake fan-out — it pays the full cost of
 delegation and collects none of the concurrency. Do not try to serialize a wave by asking for
-a synchronous dispatch.
+a synchronous dispatch. Use `blockedBy` or a genuine multi-step chain only when a later step
+must read `{previous}`. A stalled worker that a turn is waiting on is aborted so recovery
+signals are not held behind that wait.
 
 ## Hand over the whole chain, not the first step
 

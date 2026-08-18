@@ -69,8 +69,8 @@ requirements) selecting who receives it. Composed into the system prompt per rol
 
 **Skill root**:
 A directory the skill loader walks for `SKILL.md` files. Bundled root first (so user skills
-cannot shadow bundled workflows), then `PIPIUI_SKILL_ROOTS`, `~/.pi/agent/skills`, and
-settings entries.
+cannot shadow bundled workflows), then `PIPIUI_SKILL_ROOTS`, the opened project's
+`.pi/agent/skills`, and that project's settings entries. Never `~/.pi`.
 
 **Worktree ownership**:
 `.pi/worktrees/*` on `pipiui/*` branches belong to the in-app `SubagentStore`; external

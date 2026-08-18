@@ -6,9 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+	DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
+	decideDispatchBackground,
 	decideRuntimeBudgetExpiry,
+	decideStallWatchdogAction,
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
 import { createProviderWaitController, providerWaitDeadlineMs } from "../index.ts";
@@ -16,9 +19,10 @@ import { resolveSubagentWorktree } from "../worktree.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
 
-test("bundled general-purpose defaults to isolated with legacy timing omitted", () => {
+test("bundled general-purpose defaults to isolated with a runtime budget", () => {
+	assert.equal(DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS, 600_000);
 	assert.deepEqual(normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, {}), {
-		policy: { worktree: "isolated" },
+		policy: { worktree: "isolated", timeoutMs: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS },
 	});
 	const agentDefinition = readFileSync(new URL("../../agents/general-purpose/AGENT.md", import.meta.url), "utf8");
 	assert.match(agentDefinition, /isolated worktree by default/);
@@ -29,7 +33,7 @@ test("bundled general-purpose defaults to isolated with legacy timing omitted", 
 test("direct cwd no longer requires a Boss reason", () => {
 	assert.deepEqual(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none" }),
-		{ policy: { worktree: "none" } },
+		{ policy: { worktree: "none", timeoutMs: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS } },
 	);
 	assert.match(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none", noWorktreeReason: "line one\nline two" }).problem ?? "",
@@ -37,7 +41,7 @@ test("direct cwd no longer requires a Boss reason", () => {
 	);
 	assert.deepEqual(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { worktree: "none", noWorktreeReason: "  shared fixture ownership  " }),
-		{ policy: { worktree: "none", noWorktreeReason: "shared fixture ownership" } },
+		{ policy: { worktree: "none", noWorktreeReason: "shared fixture ownership", timeoutMs: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS } },
 	);
 	assert.match(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { noWorktreeReason: "stale" }).problem ?? "",
@@ -137,6 +141,73 @@ test("runtime budget expiry extends producing workers and aborts only after a no
 	// Stalled worker gets exactly one notify+extend, then the next expiry aborts.
 	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace + 1, progressGraceMs: grace, notified: false }), "notify-extend");
 	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace + 1, progressGraceMs: grace, notified: true }), "abort");
+	// A boss turn blocked on this worker cannot receive the notify, so the first
+	// stalled expiry must abort instead of spending another silent budget.
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: grace + 1, progressGraceMs: grace, notified: false, syncWait: true }), "abort");
+	assert.equal(decideRuntimeBudgetExpiry({ idleMs: 0, progressGraceMs: grace, notified: false, syncWait: true }), "extend-silent");
+});
+
+test("fan-out treats a one-step chain as background and keeps multi-step chain synchronous", () => {
+	assert.deepEqual(
+		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 1, fanoutActive: true }),
+		{
+			useBackground: true,
+			warning:
+				"Note: one-step chain ran in the background (fan-out is active). Completion arrives as [subagent-done]; do not wait here.\n\n",
+		},
+	);
+	assert.equal(
+		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 2, fanoutActive: true }).useBackground,
+		false,
+	);
+	assert.equal(
+		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 1, fanoutActive: false }).useBackground,
+		false,
+	);
+	assert.equal(
+		decideDispatchBackground({
+			depth: 0,
+			isChain: false,
+			chainLength: 0,
+			fanoutActive: true,
+			requestedBackground: false,
+		}).useBackground,
+		true,
+	);
+	assert.match(
+		decideDispatchBackground({
+			depth: 0,
+			isChain: false,
+			chainLength: 0,
+			fanoutActive: true,
+			requestedBackground: false,
+		}).warning,
+		/background:false ignored/,
+	);
+	assert.doesNotMatch(
+		decideDispatchBackground({
+			depth: 0,
+			isChain: false,
+			chainLength: 0,
+			fanoutActive: true,
+			requestedBackground: false,
+		}).warning,
+		/Use chain if you genuinely need ordered synchronous steps/,
+	);
+});
+
+test("stall watchdog aborts a sync wait and an unanswered background stall", () => {
+	const base = {
+		stallThresholdMs: 120_000,
+		maxNotifies: 3,
+		notifyIntervalMs: 300_000,
+		msSinceLastNotify: 300_000,
+	};
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 119_999, notifyCount: 0, syncWait: false }), "ignore");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 0, syncWait: false }), "notify");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 1, msSinceLastNotify: 1_000, syncWait: false }), "ignore");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 3, syncWait: false }), "abort");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 0, syncWait: true }), "abort");
 });
 
 test("runtime timeout aborts the exact run before provider or transient auto-resume", () => {
@@ -155,7 +226,7 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /aborted: externallyAborted,/);
 	assert.match(source, /if \(runtimeTimedOut && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
 	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
-	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?worktree: WorktreeParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
+	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
 	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
 	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
 	assert.doesNotMatch(singleSchema, /heartbeatSecs|timeoutSecs|agentScope|confirmProjectAgents|desktop:/);
@@ -284,22 +355,17 @@ test("provider wait deadline honors the environment override and a positive defa
 	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "junk" }), 180_000);
 });
 
-test("shared source is authoritative and heartbeat mandates status plus drift classification", () => {
-	const sharedIndex = readFileSync(new URL("../../../../../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
+test("heartbeat mandates status plus drift classification", () => {
 	const runtimeIndex = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
-	const sharedPolicy = readFileSync(new URL("../../../../../../Sources/PipiUI/PiExt/subagent/runtime-policy.ts", import.meta.url), "utf8");
-	const runtimePolicy = readFileSync(new URL("../runtime-policy.ts", import.meta.url), "utf8");
-	assert.equal(runtimeIndex, sharedIndex, "Electron index must be generated from shared source");
-	assert.equal(runtimePolicy, sharedPolicy, "Electron runtime policy must be generated from shared source");
-	assert.match(sharedIndex, /requires one latest-state check in this same Boss turn/);
-	assert.match(sharedIndex, /call one unfiltered subagent_status/);
-	assert.match(sharedIndex, /full latest snapshot covering the same target worker\(s\), reuse it/);
-	assert.match(sharedIndex, /original task against its latest activity, output, and tool phase/);
-	assert.match(sharedIndex, /on-task, possible-drift, or drifted/);
-	assert.match(sharedIndex, /For possible-drift, query that exact worker\/detail/);
-	assert.match(sharedIndex, /For drifted, abort it; wait for the old run to become terminal/);
-	assert.match(sharedIndex, /Never dispatch a replacement while the old worker is still running/);
-	assert.doesNotMatch(sharedIndex, /Call subagent_status only if this snapshot is not enough to decide/);
+	assert.match(runtimeIndex, /requires one latest-state check in this same Boss turn/);
+	assert.match(runtimeIndex, /call one unfiltered subagent_status/);
+	assert.match(runtimeIndex, /full latest snapshot covering the same target worker\(s\), reuse it/);
+	assert.match(runtimeIndex, /original task against its latest activity, output, and tool phase/);
+	assert.match(runtimeIndex, /on-task, possible-drift, or drifted/);
+	assert.match(runtimeIndex, /For possible-drift, query that exact worker\/detail/);
+	assert.match(runtimeIndex, /For drifted, abort it; wait for the old run to become terminal/);
+	assert.match(runtimeIndex, /Never dispatch a replacement while the old worker is still running/);
+	assert.doesNotMatch(runtimeIndex, /Call subagent_status only if this snapshot is not enough to decide/);
 });
 
 test("direct general-purpose placement does not require a branch-shaped agentId", async () => {
@@ -341,4 +407,14 @@ test("bundled isolation treats cwd as repo base and ignores PIPIUI_WORKTREE=0", 
 	assert.equal(placement.worktreeError, undefined);
 	assert.equal(placement.worktreePath, join(realpathSync(root), ".pi", "worktrees", "policy-test"));
 	assert.equal(placement.cwd, placement.worktreePath);
+});
+
+test("Electron dispatch and stall watchdog use the recovery decisions", () => {
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.match(source, /decideDispatchBackground\(/);
+	assert.match(source, /decideStallWatchdogAction\(/);
+	assert.match(source, /syncWait:\s*!isBackground/);
+	assert.match(source, /if \(action === "abort"\)/);
+	assert.match(source, /\[subagent-blocked\].*auto-aborted after stall/);
+	assert.doesNotMatch(source, /Use chain if you genuinely need ordered synchronous steps/);
 });

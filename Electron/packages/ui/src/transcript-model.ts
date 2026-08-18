@@ -389,12 +389,29 @@ export function assistantLooksSettled(message: Pick<ChatMessage, 'role' | 'conte
   return Boolean(message.content?.trim() || message.error?.trim())
 }
 
+function historyMergedToolHop(message: Pick<ChatMessage, 'role' | 'content' | 'activities' | 'thinking' | 'tools'>): boolean {
+  if (message.role !== 'assistant') return false
+  const activities = activitiesFromMessage(message)
+  let last: TranscriptActivity | undefined
+  for (const activity of activities) {
+    if (activity.type === 'text' && !activity.content) continue
+    last = activity
+  }
+  return last?.type === 'tool' && Boolean(last.tool.finished)
+}
+
 /** Re-open the last tool-ended assistant so the next silent model hop still
  *  shows a live Thinking card instead of a pile of 已完成 steps. */
-export function reopenAssistantForNextCompletion(messages: ChatMessage[]): ChatMessage[] {
+export function reopenAssistantForNextCompletion(
+  messages: ChatMessage[],
+  options?: { includeHistoryMergedToolHop?: boolean },
+): ChatMessage[] {
   const index = messages.findLastIndex(message => message.role === 'assistant')
-  if (index < 0 || !assistantEndedAwaitingModel(messages[index])) return messages
+  if (index < 0) return messages
   const message = messages[index]
+  if (!assistantEndedAwaitingModel(message) && !(options?.includeHistoryMergedToolHop && historyMergedToolHop(message))) {
+    return messages
+  }
   const activities = (message.activities ?? activitiesFromMessage(message)).map(activity => activity.type === 'tool'
     ? { ...activity, tool: { ...activity.tool } }
     : { ...activity })

@@ -55,6 +55,17 @@ async function loadComputerWorkerFailureCodeParser() {
   ]);
 }
 
+async function loadComputerWorkerDispatchFailureClassifier() {
+  const source = await readFile(electronSubagentURL, "utf8");
+  const start = source.indexOf("function computerWorkerDispatchFailureCode(");
+  const end = source.indexOf("function registerComputerTaskTool", start);
+  assert.ok(start >= 0 && end > start, "Computer Worker dispatch failure classifier must remain discoverable");
+  const javascript = ts.transpileModule(source.slice(start, end), {
+    compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function(`${javascript}\nreturn computerWorkerDispatchFailureCode;`)();
+}
+
 async function loadComputerVerifierAttestationParser() {
   const source = await readFile(subagentURL, "utf8");
   const start = source.indexOf("function parseComputerJSON(");
@@ -577,6 +588,24 @@ test("GUI dispatch exposes only closed lifecycle failure stages to Leader recove
 	assert.match(source, /runComputerWorkerWithStallDeadline/);
 	assert.match(source, /deadlineAt = Date\.now\(\) \+ COMPUTER_WORKER_STALL_TIMEOUT_MS/);
 	assert.match(source, /privateSkillPaths,[\s\S]*deadlineAt/);
+});
+
+test("an externally cancelled GUI child that already produced tool activity is not rewritten as a prestart failure", async () => {
+  const classify = await loadComputerWorkerDispatchFailureClassifier();
+  assert.equal(classify({ taskAborted: true, hadMessages: true }), undefined);
+  assert.equal(classify({ taskAborted: false, hadMessages: false }), "gui_child_prestart_failed");
+  assert.equal(classify({ taskAborted: false, hadMessages: true }), "gui_child_failed");
+  assert.equal(classify({ taskAborted: false, hadMessages: true, fatalCode: "computer_worker_runtime_timeout" }), "computer_worker_runtime_timeout");
+
+  const source = await readFile(electronSubagentURL, "utf8");
+  const runChildStart = source.indexOf("const runChild = async");
+  const runLeaderStart = source.indexOf("const runLeader = async", runChildStart);
+  assert.ok(runChildStart >= 0 && runLeaderStart > runChildStart);
+  const runChild = source.slice(runChildStart, runLeaderStart);
+  assert.match(runChild, /runSingleAgent\([\s\S]*?effectiveSignal,\s*onUpdate,\s*\(results\)/,
+    "nested planner/operator progress must reach the parent computer_task tool update callback");
+  assert.match(source, /Subagent was aborted[\s\S]*hadMessages:\s*currentResult\.messages\.length > 0/,
+    "an aborted child must preserve whether it had already started producing durable messages");
 });
 
 test("bundled read-only Operator uses direct placement and cannot hit writable agentId admission", async () => {

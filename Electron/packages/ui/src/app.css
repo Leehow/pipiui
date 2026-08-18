@@ -342,6 +342,10 @@ body{overscroll-behavior:none}
   font-size: .86em;   /* 跟随 --md-fs，文档面板变窄时一起缩 */
   line-height: 1.55;
 }
+/* Streamdown 把每一 token 行映成 pre>code 的直接子 span（Tailwind `block`）。
+   本仓没有 Tailwind，span 保持 inline，多行 ASCII/代码图被摊成一行横滑。
+   只打行包裹，不打行内 token span。 */
+.markdown [data-streamdown="code-block-body"] pre > code > span { display: block; }
 
 .markdown strong { font-weight: 650; color: var(--text-strong); }
 .markdown a {

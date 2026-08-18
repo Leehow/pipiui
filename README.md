@@ -4,7 +4,7 @@
 
 ## 功能
 
-- **左侧栏**：项目文件夹管理（持久化）+ 每个项目的历史会话列表（从 `~/.pi/agent/sessions/` 自动发现，显示会话名和时间）
+- **左侧栏**：项目文件夹管理（持久化）+ 每个项目的历史会话列表（从该项目 `{project}/.pi/agent/sessions/` 发现，显示会话名和时间）
 - **会话**：新建 / 点击恢复历史会话；每个打开的会话独立一个 `pi --mode rpc` 子进程，后台会话继续运行（绿点表示正在生成）
 - **聊天区**：用户气泡、Markdown 正文（含围栏代码块）、Thinking 折叠块、工具调用卡片（bash/read/edit 图标、实时流式输出、成功/失败状态、可展开）
 - **输入栏**：Enter 发送；生成中消息进入会话 follow-up 队列（完成后按序发送），可「撤回编辑」；停止按钮在有队列时为「中止并发送队首」；模型/thinking 菜单；多图附件（粘贴/拖入/选文件预览，经 RPC `images` 发给模型；用户/助手/工具图片可点击放大、右键「在访达中显示 / 打开 / 存储…」）
@@ -86,7 +86,7 @@ Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 
 
 ## API key 与凭据管理
 
-所有 API key 统一存放在 `~/.pi/agent/.env`（0600，原子写入）：模型 key 在 spawn 会话子进程时注入环境（改 key 需重启会话生效），搜索 key 每次搜索热读即时生效；OAuth 凭据永远留在 pi 自己的 `auth.json`（refresh token 轮转）。首次启动自动把 `auth.json` 里的旧 `api_key` 条目迁入 `.env`（备份 `auth.json.pipiui-bak`，`.env` 已有值优先）。设置页 key 输入框不回显、留空即不修改，`.env` 与 `auth.json` 双份残留时给出冲突警告 + 一键清理。终端里直接用 pi TUI 需在 shell rc 里 source 该文件。详见 [`docs/key-management.md`](./docs/key-management.md)。
+所有 API key 存放在当前项目 `{project}/.pi/agent/.env`（0600），OAuth 凭据在该项目的 `auth.json`。禁止使用全局 `~/.pi/agent`。详见 [`docs/key-management.md`](./docs/key-management.md)。
 
 ## 构建运行
 

@@ -32,16 +32,12 @@ If both appear in one request, do MCP first, then the Pi package.
 
 ## MCP — write the config Pi actually reads
 
-`pi-mcp-extension@1.5.0` (the copy PipiUI mounts) loads:
+`pi-mcp-extension@1.5.0` (the copy PipiUI mounts) loads `{cwd}/.pi/mcp.json`
+for this project. Pi homes are per-project. Never write `~/.pi/agent/mcp.json`
+or any other global/shared Pi home.
 
-1. `{cwd}/.pi/mcp.json` — this project only
-2. `~/.pi/agent/mcp.json` — all projects on this machine
-
-It does **not** read `$PI_CODING_AGENT_DIR/mcp.json`. Do not write MCP config
-into the Electron profile directory expecting the client to see it.
-
-Default to `~/.pi/agent/mcp.json` so every PipiUI session can use it. Use the
-project file only when the user said this project only.
+Do not write MCP config into the Electron Application Support profile
+expecting the client to see it. Default to `{cwd}/.pi/mcp.json`.
 
 Read the existing file first. Keep every current `mcpServers` entry. Merge the
 new server by name. Create the file if it is missing:

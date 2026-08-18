@@ -55,6 +55,7 @@ describe("vendored philosophy: structure", () => {
       "research",
       "planning",
       "craft",
+      "debugloop",
       "domain",
       "orchestration",
       "same-turn",
@@ -119,6 +120,7 @@ describe("vendored philosophy: delivery", () => {
       "research",
       "planning",
       "craft",
+      "debugloop",
       "domain",
       "orchestration",
       "same-turn",
@@ -175,7 +177,11 @@ describe("vendored philosophy: delivery", () => {
     // session recall) and the deepseek-scoped thinking-discipline layer, which are
     // load-bearing here and cost the difference. Raised again for the domain-memory layer
     // (CONTEXT.md vocabulary + ADR gate), which pays for itself in re-derived terminology.
+    // Raised again (~1k) for the debug-loop layer: the boss is the only holder of the
+    // in-app browser and the visible terminal, so the browser/terminal/dispatch round trip
+    // has no other place to live — a worker that cannot see the screen cannot be told the
+    // rule, and the evidence-verbatim discipline is what stops a blind worker guessing.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(13200);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(14600);
   });
 });

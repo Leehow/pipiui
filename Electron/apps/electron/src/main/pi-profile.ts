@@ -1,5 +1,4 @@
 import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 
 export const PI_PROFILE_MIGRATION_MARKER = '.pipiui-profile-migration-v1.json'
@@ -271,8 +270,9 @@ async function copySanitizedSettings(source: string, destination: string): Promi
  */
 export async function importLegacyPiProfile(
   profile: ElectronPiProfile,
-  legacyAgentDir = join(homedir(), '.pi', 'agent')
-): Promise<'imported' | 'already-complete' | 'skipped-initialized'> {
+  legacyAgentDir?: string
+): Promise<'imported' | 'already-complete' | 'skipped-initialized' | 'skipped-no-source'> {
+  if (!legacyAgentDir) return 'skipped-no-source'
   const existing = await directoryEntries(profile.agentDir)
   if (existing?.includes(PI_PROFILE_MIGRATION_MARKER)) {
     // Read the marker so an unreadable/corrupt completion record does not silently masquerade

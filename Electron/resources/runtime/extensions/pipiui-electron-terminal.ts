@@ -1,7 +1,6 @@
 // PipiUI shared terminal tool. Dormant outside an authenticated Electron session.
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
-import { TerminalVisibility } from './terminal-visibility.ts'
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT
 const CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY
@@ -26,7 +25,7 @@ const result = (value: any) => ({ content: [{ type: 'text' as const, text: JSON.
 export default function (pi: ExtensionAPI) {
   if (!PORT || !CAPABILITY) return
   pi.registerTool({
-    name: 'terminal', label: 'Terminal', description: 'Control exact visible shared SSH/REPL/TUI terminals. Actions: list, open, observe, wait, send, key, resize, close, request_private_input, help. The main session can type, open, resize, and close terminals. Mutations require terminal_id + fresh snapshot_id.',
+    name: 'terminal', label: 'Terminal', description: 'Control exact visible shared SSH/REPL/TUI terminals. For processes that outlive the command — a dev server you tail, a TUI, an SSH session, a REPL, a prompt awaiting input — so you can watch them while other work happens. One-shot commands (build, test, lint, git, any script that ends) belong in bash, whose output is captured and attributed. Actions: list, open, observe, wait, send, key, resize, close, request_private_input, help. The main session can type, open, resize, and close terminals. Mutations require terminal_id + fresh snapshot_id.',
     parameters: Type.Object({
       action: Type.String(), terminal_id: Type.Optional(Type.String()), snapshot_id: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
       cols: Type.Optional(Type.Number({ minimum: 2, maximum: 500 })), rows: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
@@ -40,23 +39,5 @@ export default function (pi: ExtensionAPI) {
       if (['send','key','resize','close','request_private_input'].includes(params.action) && (!params.terminal_id || !params.snapshot_id)) return result({ ok: false, error: `${params.action} requires terminal_id and snapshot_id`, help: HELP })
       return result(await bridge(params as Record<string, unknown>, signal))
     }
-  })
-
-  const visibility = new TerminalVisibility()
-  const apply = (text?: string | null) => {
-    const current = pi.getActiveTools()
-    const next = text === undefined && !visibility.revealed
-      ? visibility.hide(current)
-      : visibility.nextActiveTools(text ?? null, current)
-    if (visibility.shouldCallSetActiveTools(current, next)) pi.setActiveTools(next)
-  }
-  pi.on('session_start', async () => {
-    visibility.revealed = false
-    const current = pi.getActiveTools()
-    const next = visibility.hide(current)
-    if (visibility.shouldCallSetActiveTools(current, next)) pi.setActiveTools(next)
-  })
-  pi.on('input', async (event) => {
-    apply(event.text)
   })
 }

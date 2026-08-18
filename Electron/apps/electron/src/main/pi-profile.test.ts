@@ -105,6 +105,13 @@ describe('Electron Pi profile', () => {
     expect(await readFile(join(profile.agentDir, 'settings.json'), 'utf8')).toBe(installedSettings)
   })
 
+  it('never imports a global ~/.pi home unless a source directory is explicit', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-no-global-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    expect(await importLegacyPiProfile(profile)).toBe('skipped-no-source')
+    await expect(readdir(profile.agentDir)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('does not merge legacy state into an initialized destination', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-profile-initialized-'))
     const legacy = join(root, 'legacy')

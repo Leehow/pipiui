@@ -21,6 +21,10 @@ implementation worker. The runtime runs you in the main session cwd without crea
 an agent branch or worktree, and removes the `subagent` tool from your capabilities.
 Do not attempt to delegate recursively.
 
+## Pi home isolation (binding)
+
+Pi is fully isolated per project. Never use `~/.pi/agent`, `~/.pi/coc-agent`, or another project's `.pi/`. This repo's coding home is `{this-repo}/.pi/agent`. Never install or leave packages in a global Pi `settings.json`.
+
 Your job is to reconcile the existing Boss ledger with authoritative runtime and Git
 state after all expected implementation/review workers have stopped. Inspect every
 relevant agent outcome, persisted branch/path, registered worktree, verification result,

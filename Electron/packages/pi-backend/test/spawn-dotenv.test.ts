@@ -142,8 +142,8 @@ describe("pi spawn env injects the configured profile .env (T17 parity)", () => 
       "explicit",
     );
     await backend.handle("sendPrompt", ["session-1", "go"]);
-    expect(env().PI_CODING_AGENT_DIR).toBe(join(root, "agent"));
-    expect(env().PI_CODING_AGENT_SESSION_DIR).toBe(join(root, "sessions"));
+    expect(env().PI_CODING_AGENT_DIR).toBe(join(root, "project", ".pi", "agent"));
+    expect(env().PI_CODING_AGENT_SESSION_DIR).toBe(join(root, "project", ".pi", "agent", "sessions"));
     expect(command().args).toEqual(expect.arrayContaining([
       "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
     ]));

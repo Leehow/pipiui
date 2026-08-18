@@ -69,6 +69,19 @@ export function deliveryRetryDue(
 	return record.attempts === 0 || now - record.lastAttemptAt >= minimumIntervalMs;
 }
 
+/** Confirmed [subagent-done] must not enter Pi's follow-up queue during a live
+ *  Boss turn (2026-08-15 receipt storm). The idle settle flush is the one
+ *  exception: the first receipt immediately sets busy, and later siblings in
+ *  the same flush must still go out. */
+export function holdConfirmedDoneDelivery(
+	activity: { quiet: boolean; busy: boolean },
+	options?: { flushAfterSettle?: boolean },
+): boolean {
+	if (activity.quiet) return true;
+	if (activity.busy && !options?.flushAfterSettle) return true;
+	return false;
+}
+
 function processIsAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);

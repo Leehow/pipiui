@@ -25,7 +25,7 @@ import {
 } from "./compose.ts";
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const AGENT_DIR = path.join(os.homedir(), ".pi", "agent");
+const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(process.cwd(), ".pi", "agent");
 const CONFIG_FILE = path.join(AGENT_DIR, "philosophy.json");
 const USER_LAYERS_DIR = path.join(AGENT_DIR, "philosophy-user");
 

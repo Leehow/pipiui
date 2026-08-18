@@ -910,6 +910,9 @@ describe('PipiUI Electron main layout', () => {
     expect(css).toMatch(/\.markdown :not\(pre\) > code \{[^}]*overflow-wrap: anywhere;/)
     // Markdown code blocks scroll horizontally; tool output keeps wrapping.
     expect(css).toMatch(/\.markdown pre \{[^}]*white-space: pre;/)
+    // Streamdown line wrappers are direct child spans of pre>code; without
+    // Tailwind `block` they stay inline and flatten ASCII diagrams.
+    expect(css).toMatch(/\.markdown \[data-streamdown="code-block-body"\] pre > code > span \{ display: block; \}/)
     expect(css).toMatch(/\.tool-card pre,\.tool-result\{[^}]*white-space:pre-wrap/)
   })
 
@@ -2045,14 +2048,14 @@ describe('PipiUI Electron main layout', () => {
     const updateQueuedMessage = vi.fn(async (_sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]) => ({ ...queue.find(item => item.id === messageId)!, text, attachments: attachments ?? [] }))
     const removeQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => queue.find(item => item.id === messageId)!)
     const retryQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({ ...queue.find(item => item.id === messageId)!, state: 'queued' as const, error: undefined }))
-    const steerQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({ ...queue.find(item => item.id === messageId)!, state: 'sending' as const }))
+    const cutInQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({ ...queue.find(item => item.id === messageId)!, state: 'sending' as const }))
     const host: PipiHostAPI = {
       ...base,
       listQueue: async sessionId => sessionId === 'welcome' ? queue : [],
       updateQueuedMessage,
       removeQueuedMessage,
       retryQueuedMessage,
-      steerQueuedMessage,
+      cutInQueuedMessage,
       subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } }
     }
     render(<App host={host} />)
@@ -2073,7 +2076,7 @@ describe('PipiUI Electron main layout', () => {
     await act(async () => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
     expect(await screen.findByTestId('queue-steer-0')).toBeTruthy()
     fireEvent.click(screen.getByTestId('queue-steer-0'))
-    await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
   })
 })
 

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AgentEvent, PipiHostAPI, StreamEvent } from '@pipi/host-api'
+import type { AgentEvent, HistoryEntry, PipiHostAPI, StreamEvent } from '@pipi/host-api'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -44,7 +44,8 @@ describe('active-turn waiting placeholder', () => {
     act(() => { listener?.({ type: 'tool_result', sessionId: 'welcome', toolCallId: 'bash-1', content: 'ok', isError: false }) })
     const outer = await screen.findByRole('button', { name: /2 个步骤/ })
     expect(outer.getAttribute('aria-expanded')).toBe('true')
-    expect(screen.getByRole('button', { name: /^Thinking/ }).textContent).toContain('运行中')
+    expect(outer.textContent).toContain('运行中')
+    expect(screen.getByRole('button', { name: /^Thinking/ }).closest('[data-activity-card="thinking"]')).toBeTruthy()
 
     // …and folds when the turn settles, even without a direct user send.
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
@@ -249,8 +250,8 @@ describe('active-turn waiting placeholder', () => {
     const liveThinking = screen.getByRole('button', { name: /^Thinking/ })
     expect(liveThinking.closest('[data-activity-card="thinking"]')).toBeTruthy()
     expect(liveThinking.getAttribute('aria-expanded')).toBe('true')
-    expect(liveThinking.textContent).toContain('运行中')
-    expect(liveThinking.textContent).not.toContain('已完成')
+    expect(screen.getByRole('button', { name: /个步骤/ }).textContent).toContain('运行中')
+    expect(screen.getByRole('button', { name: /个步骤/ }).textContent).not.toContain('已完成')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
 
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '设计方案可以定了' }) })
@@ -275,5 +276,80 @@ describe('active-turn waiting placeholder', () => {
     act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'b', content: 'ok', isError: false }) })
     expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking')
     expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
+  })
+
+  it('keeps the silent next-hop thinking card after a history refresh when the last worker finishes', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    let layoutHistory: HistoryEntry[] = [
+      { id: 'u2', role: 'user', content: '给我个方案', timestamp: 1 },
+    ]
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+      subscribeAgents: callback => { agentListeners.add(callback); return () => { agentListeners.delete(callback) } },
+      listAgents: async sessionId => sessionId && sessionId !== 'layout' ? base.listAgents(sessionId) : [],
+      getSessionHistory: async sessionId => sessionId === 'layout' ? layoutHistory : base.getSessionHistory(sessionId),
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['[subagent-done] agentId=a1 name=explore ok=true'] }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '两路已结束，直接取回完整报告。' }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'status-1', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'status-2', name: 'subagent_status', delta: '{}' }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'status-1', content: 'ok', isError: false }) })
+    act(() => { listener?.({ type: 'tool_result', sessionId: 'layout', toolCallId: 'status-2', content: 'ok', isError: false }) })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
+      expect(screen.getByRole('button', { name: /个步骤/ }).textContent).toContain('运行中')
+    })
+
+    layoutHistory = [
+      { id: 'u2', role: 'user', content: '给我个方案', timestamp: 1 },
+      {
+        id: 'a-tools',
+        role: 'assistant',
+        content: '两路已结束，直接取回完整报告。',
+        thinking: '先取回报告',
+        tools: [
+          { id: 'status-1', name: 'subagent_status', input: '{}' },
+          { id: 'status-2', name: 'subagent_status', input: '{}' },
+        ],
+        timestamp: 2,
+      },
+      { id: 'r1', role: 'tool', content: 'ok', toolCallId: 'status-1', toolName: 'subagent_status', timestamp: 3 },
+      { id: 'r2', role: 'tool', content: 'ok', toolCallId: 'status-2', toolName: 'subagent_status', timestamp: 4 },
+    ]
+
+    const worker = {
+      agentId: 'explore-last',
+      runId: 'run-1',
+      sessionId: 'layout',
+      name: 'explore',
+      role: 'explore' as const,
+      title: '调研',
+      task: '调研',
+      state: 'running' as const,
+      createdAt: Date.now() - 20_000,
+    }
+    act(() => { for (const push of agentListeners) push({ type: 'agent', agent: worker }) })
+    await waitFor(() => expect(agentListeners.size).toBeGreaterThan(0))
+    act(() => { for (const push of agentListeners) push({ type: 'agent', agent: { ...worker, state: 'ok', endedAt: Date.now() } }) })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('waiting-placeholder').textContent).toContain('模型正在思考')
+      const steps = screen.getByRole('button', { name: /个步骤/ })
+      expect(steps.textContent).toContain('运行中')
+      expect(steps.textContent).not.toContain('已完成')
+    })
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
   })
 })

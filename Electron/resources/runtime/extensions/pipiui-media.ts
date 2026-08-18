@@ -3,7 +3,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 
 const OFFICIAL_V1 = "https://api.x.ai/v1";
@@ -89,17 +88,12 @@ function readXaiTokenFromAuthFile(filePath: string): string | undefined {
   }
 }
 
-/** Env key → PI_CODING_AGENT_DIR/auth.json → ~/.pi/agent/auth.json. Never log the value. */
+/** Env key → this project's PI_CODING_AGENT_DIR/auth.json. Never log the value. Never `~/.pi`. */
 function resolveXaiToken(): string | undefined {
   const fromEnv = clean(process.env.XAI_API_KEY);
   if (fromEnv) return fromEnv;
-  const agentDir = clean(process.env.PI_CODING_AGENT_DIR);
-  if (agentDir) {
-    const fromAgent = readXaiTokenFromAuthFile(path.join(agentDir, "auth.json"));
-    if (fromAgent) return fromAgent;
-  }
-  const home = clean(process.env.HOME) || os.homedir();
-  return readXaiTokenFromAuthFile(path.join(home, ".pi", "agent", "auth.json"));
+  const agentDir = clean(process.env.PI_CODING_AGENT_DIR) || path.join(process.cwd(), ".pi", "agent");
+  return readXaiTokenFromAuthFile(path.join(agentDir, "auth.json"));
 }
 
 function redact(text: string, secret: string | undefined): string {

@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { MANAGED_PACKAGES, type ManagedPackage } from "./spawn-assembly.js";
 
@@ -20,7 +19,8 @@ export type ManagedInstall = { package: string; state: "installed" | "present" |
  * would load the same extension twice. Not installing it is what keeps it unmounted, since
  * `resolveSpawnPaths` only mounts what is actually on disk.
  */
-export function globallyRegistered(pkg: string, settingsPath: string = join(homedir(), ".pi", "agent", "settings.json")): boolean {
+export function globallyRegistered(pkg: string, settingsPath?: string): boolean {
+  if (!settingsPath) return false;
   try {
     const packages = JSON.parse(readFileSync(settingsPath, "utf8"))?.packages;
     if (!Array.isArray(packages)) return false;
@@ -70,7 +70,7 @@ export async function ensureManagedPackage(
 ): Promise<ManagedInstall> {
   const { name, version } = entry;
   const env = deps.env ?? process.env;
-  if (globallyRegistered(name, deps.settingsPath)) return { package: name, state: "skipped", detail: "registered in ~/.pi/agent/settings.json" };
+  if (globallyRegistered(name, deps.settingsPath)) return { package: name, state: "skipped", detail: "registered in project settings.json" };
   const dir = join(runtimeRoot, "managed-npm", `${name}-${version}`);
   if (installedVersion(dir, name) === version) return { package: name, state: "present" };
   const npm = (deps.resolveNpm ?? resolveNpmExecutable)(env);

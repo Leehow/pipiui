@@ -74,8 +74,9 @@ function isGlmMainModel(): boolean {
 
 /**
  * Resolve the GLM API key using the same precedence chain as account-usage-core's
- * apiKey()/GLM adapter: env → ~/.pi/agent/auth.json (zai-coding-cn, then zai, then glm)
- * → home-relative key files. Returns undefined when nothing usable is found (silent skip).
+ * apiKey()/GLM adapter: env → this project's PI_CODING_AGENT_DIR/auth.json
+ * (zai-coding-cn, then zai, then glm). Never `~/.pi`. Returns undefined when
+ * nothing usable is found (silent skip).
  */
 async function resolveApiKey(): Promise<string | undefined> {
   // 1. Environment variables, iterated in account-usage-core order.
@@ -92,9 +93,10 @@ async function resolveApiKey(): Promise<string | undefined> {
     if (value) return value;
   }
 
-  // 2. ~/.pi/agent/auth.json — { "<providerId>": { key|access|access_token } }.
+  // 2. This project's Pi home auth.json — { "<providerId>": { key|access|access_token } }.
   try {
-    const text = await readFile(join(homedir(), ".pi", "agent", "auth.json"), "utf8");
+    const agentDir = process.env.PI_CODING_AGENT_DIR || join(process.cwd(), ".pi", "agent");
+    const text = await readFile(join(agentDir, "auth.json"), "utf8");
     const root = asObject(JSON.parse(text));
     for (const id of ["zai-coding-cn", "zai", "glm"]) {
       const entry = asObject(root?.[id]);

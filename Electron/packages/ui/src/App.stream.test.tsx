@@ -63,7 +63,8 @@ describe('stream message reducer', () => {
     const finishedTool = screen.getByRole('button', { name: /bash · npm test/ })
     expect(finishedTool.getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByText('passed')).toBeNull()
-    expect(screen.getAllByRole('button', { name: /^Thinking/ }).some(button => button.textContent?.includes('运行中'))).toBe(true)
+    expect(screen.getByRole('button', { name: /5 个步骤/ }).textContent).toContain('运行中')
+    expect(screen.getAllByRole('button', { name: /^Thinking/ }).some(button => button.closest('[data-activity-card="thinking"]'))).toBe(true)
 
     messages = finishStreamingMessage(messages)
     rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
@@ -462,7 +463,8 @@ describe('active tool-card semantics', () => {
     expect(screen.queryByTestId('active-tool')).toBeNull()
     expect(screen.getByRole('button', { name: /2 个步骤/ }).getAttribute('aria-expanded')).toBe('true')
     expect(screen.getByRole('button', { name: /bash · ls -la/ }).getAttribute('aria-expanded')).toBe('false')
-    expect(screen.getByRole('button', { name: /^Thinking/ }).textContent).toContain('运行中')
+    expect(screen.getByRole('button', { name: /2 个步骤/ }).textContent).toContain('运行中')
+    expect(screen.getByRole('button', { name: /^Thinking/ }).closest('[data-activity-card="thinking"]')).toBeTruthy()
     // Settled: both the outer card and the finished tool fold back to collapsed.
     messages = finishStreamingMessage(messages)
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)

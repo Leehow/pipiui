@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -121,6 +121,25 @@ describe('transcript model', () => {
         { type: 'tool', contentIndex: 1, tool: { id: 'read', name: 'read', input: '{}', startedAt: 1, finished: true } },
       ],
     })).toBe(false)
+  })
+
+  it('reopens a history-merged tool hop when the live turn is still waiting for the next completion', () => {
+    const history: ChatMessage[] = [{
+      id: 'a-tools',
+      role: 'assistant',
+      content: '两路已结束，直接取回完整报告。',
+      thinking: '先取回报告',
+      tools: [
+        { id: 'status-1', name: 'subagent_status', input: '{}', startedAt: 1, finished: true },
+        { id: 'status-2', name: 'subagent_status', input: '{}', startedAt: 1, finished: true },
+      ],
+    }]
+    expect(assistantEndedAwaitingModel(history[0])).toBe(false)
+    expect(reopenAssistantForNextCompletion(history)).toBe(history)
+    const restored = reopenAssistantForNextCompletion(history, { includeHistoryMergedToolHop: true })
+    expect(restored).not.toBe(history)
+    expect(restored[0]?.streaming).toBe(true)
+    expect(restored[0]?.activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(true)
   })
 
   it('keeps same-index thinking from later assistant messages as separate activities', () => {

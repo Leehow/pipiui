@@ -35,6 +35,64 @@ export interface GeneralPurposeExecutionPolicy {
 	timeoutMs?: number;
 }
 
+/** Default GP budget: producing workers extend silently; a stalled one can be aborted. */
+export const DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS = 600_000;
+
+export type StallWatchdogAction = "ignore" | "notify" | "abort";
+
+/**
+ * Fan-out makes background a runtime invariant. A one-step chain is not ordered
+ * work, so it must not be a synchronous wait hatch. Multi-step chains still
+ * run synchronously so `{previous}` can be substituted.
+ */
+export function decideDispatchBackground(input: {
+	depth: number;
+	isChain: boolean;
+	chainLength: number;
+	fanoutActive: boolean;
+	requestedBackground?: boolean;
+}): { useBackground: boolean; warning: string } {
+	const orderedChain = input.isChain && input.chainLength > 1;
+	const forcedBackground = input.depth === 0 && input.fanoutActive && !orderedChain;
+	const defaultBackground = input.depth === 0 && !input.isChain;
+	const wantBg = forcedBackground || (input.requestedBackground ?? defaultBackground);
+	const useBackground = Boolean(wantBg && !orderedChain && input.depth === 0);
+	let warning = "";
+	if (input.requestedBackground === true && (input.depth > 0 || orderedChain)) {
+		warning =
+			"Warning: background:true ignored (nested depth>0 or multi-step chain always runs synchronously).\n\n";
+	} else if (input.requestedBackground === false && forcedBackground) {
+		warning =
+			"Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. A one-step chain is not ordered work. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use a multi-step chain or blockedBy for genuine dependencies, or turn off the 瀑布流 layer in Settings.\n\n";
+	} else if (input.isChain && input.chainLength === 1 && forcedBackground) {
+		warning =
+			"Note: one-step chain ran in the background (fan-out is active). Completion arrives as [subagent-done]; do not wait here.\n\n";
+	}
+	return { useBackground, warning };
+}
+
+/**
+ * Stall recovery must not depend on an idle boss turn. A sync wait that is
+ * already stalled cannot receive the notify letter, so abort immediately. A
+ * background worker that exhausted unanswered stall notifies is also aborted
+ * instead of hanging forever.
+ */
+export function decideStallWatchdogAction(input: {
+	idleMs: number;
+	stallThresholdMs: number;
+	notifyCount: number;
+	maxNotifies: number;
+	msSinceLastNotify: number;
+	notifyIntervalMs: number;
+	syncWait: boolean;
+}): StallWatchdogAction {
+	if (input.idleMs < input.stallThresholdMs) return "ignore";
+	if (input.syncWait) return "abort";
+	if (input.notifyCount >= input.maxNotifies) return "abort";
+	if (input.notifyCount > 0 && input.msSinceLastNotify < input.notifyIntervalMs) return "ignore";
+	return "notify";
+}
+
 export type GeneralPurposeExecutionPolicyResult =
 	| { policy?: GeneralPurposeExecutionPolicy; problem?: undefined }
 	| { policy?: undefined; problem: string };
@@ -77,11 +135,8 @@ export function normalizeGeneralPurposeExecutionPolicy(
 	if (heartbeatProblem) return { problem: heartbeatProblem };
 	const timeoutProblem = boundedInteger(overrides.timeoutSecs, "timeoutSecs", 30, 604800);
 	if (timeoutProblem) return { problem: timeoutProblem };
-	if (
-		overrides.heartbeatSecs !== undefined &&
-		overrides.timeoutSecs !== undefined &&
-		overrides.heartbeatSecs >= overrides.timeoutSecs
-	) {
+	const effectiveTimeoutSecs = overrides.timeoutSecs ?? DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS / 1000;
+	if (overrides.heartbeatSecs !== undefined && overrides.heartbeatSecs >= effectiveTimeoutSecs) {
 		return { problem: "heartbeatSecs must be less than timeoutSecs when both are provided." };
 	}
 
@@ -90,7 +145,10 @@ export function normalizeGeneralPurposeExecutionPolicy(
 			worktree,
 			...(noWorktreeReason ? { noWorktreeReason } : {}),
 			...(overrides.heartbeatSecs !== undefined ? { heartbeatMs: overrides.heartbeatSecs * 1000 } : {}),
-			...(overrides.timeoutSecs !== undefined ? { timeoutMs: overrides.timeoutSecs * 1000 } : {}),
+			timeoutMs:
+				overrides.timeoutSecs !== undefined
+					? overrides.timeoutSecs * 1000
+					: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS,
 		},
 	};
 }
@@ -150,8 +208,10 @@ export function decideRuntimeBudgetExpiry(input: {
 	idleMs: number;
 	progressGraceMs: number;
 	notified: boolean;
+	syncWait?: boolean;
 }): RuntimeBudgetExpiryDecision {
 	if (input.idleMs <= input.progressGraceMs) return "extend-silent";
+	if (input.syncWait) return "abort";
 	return input.notified ? "abort" : "notify-extend";
 }
 

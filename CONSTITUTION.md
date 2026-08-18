@@ -75,6 +75,14 @@ Prefer release package via `make-app.sh` for the double-clickable app, but only 
 - 不破坏现有 `make-app.sh` 行为；脚本保持 `set -e` 与可执行位。
 - 声称完成前：有命令级证据（构建/打包输出 + `build/PipiUI.app` 时间戳），禁止口头「应该好了」。
 
+## 6. Pi 按项目完全隔离（强制）
+
+Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不是所有项目共用的 Application Support `pi-agent`。
+
+- PipiUI 编码：`{projectRoot}/.pi/agent`
+- chatrpgv4 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
+- 自己找自己项目的 `.pi/`。禁止从 `~/.pi` 导入 packages，禁止跨项目共享 Pi 家。
+
 ---
 
 **权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` · `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`（仅有的可运行包）

@@ -32,17 +32,22 @@ const PIPIUI_BUILT_IN_SKILL_ROOT = process.env.PIPIUI_BUILT_IN_SKILL_ROOT;
 
 /**
  * PipiUI's own skills are first so a same-named user skill cannot replace a bundled workflow.
- * The user's explicit PIPIUI_SKILL_ROOTS override, normal Pi root, and settings roots remain
- * discoverable afterwards. First root wins in loadCatalog, just as before for user roots.
+ * The user's explicit PIPIUI_SKILL_ROOTS override and this project's `.pi/agent`
+ * skills/settings remain discoverable afterwards. Never `~/.pi`. First root wins.
  */
+function projectAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR || path.join(process.cwd(), ".pi", "agent");
+}
+
 function skillRoots(): string[] {
   const roots: string[] = PIPIUI_BUILT_IN_SKILL_ROOT ? [PIPIUI_BUILT_IN_SKILL_ROOT] : [];
   const override = process.env.PIPIUI_SKILL_ROOTS;
   if (override) roots.push(...override.split(path.delimiter).filter(Boolean).map(homePath));
-  roots.push(path.join(os.homedir(), ".pi/agent/skills"));
+  const agentDir = projectAgentDir();
+  roots.push(path.join(agentDir, "skills"));
   try {
     const settings = JSON.parse(
-      fs.readFileSync(path.join(os.homedir(), ".pi/agent/settings.json"), "utf-8"),
+      fs.readFileSync(path.join(agentDir, "settings.json"), "utf-8"),
     ) as { skills?: unknown };
     if (Array.isArray(settings.skills)) {
       for (const entry of settings.skills) {
@@ -50,7 +55,7 @@ function skillRoots(): string[] {
       }
     }
   } catch {
-    // No settings file / unreadable: the normal user root above still applies.
+    // No project settings file / unreadable: bundled and override roots still apply.
   }
   return roots.filter((root, index) => root && roots.indexOf(root) === index);
 }
