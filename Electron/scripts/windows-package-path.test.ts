@@ -32,6 +32,13 @@ describe('Windows package and CI path', () => {
     expect(packager).toContain('unsignedBuilderArgs')
   })
 
+  it('pins the Windows CI runner to VS 2022 so node-gyp can rebuild Electron natives', () => {
+    expect(workflow).toMatch(/platform: win[\s\S]*?os: windows-2022/)
+    expect(workflow).toContain('os: windows-2022')
+    expect(workflow).not.toMatch(/os: windows-latest/)
+    expect(workflow).not.toMatch(/os: windows-2025/)
+  })
+
   it('routes the Windows CI job through runtime prepare and the shared target packager', () => {
     expect(workspacePackage.scripts['test:win']).toContain('windows-package-path.test.ts')
     expect(workflow).toContain('runtime:prepare:win')

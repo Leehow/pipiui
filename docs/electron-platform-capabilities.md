@@ -43,7 +43,7 @@
     明确报错（AppImage 仍正常产出）。deb 请在 ubuntu CI（workflow linux job）
     或 Linux 主机上构建；CI 有同样的大小守卫步骤。
 - CI：`.github/workflows/electron.yml` 三平台 matrix
-  （macos-latest / windows-latest / ubuntu-22.04）：
+  （macos-latest / windows-2022 / ubuntu-22.04）：
   `npm ci` → `npm test` → `npm run build` → `electron-builder --<platform>` → 上传产物。
   按 AGENTS.md 非主工作区规则，CI 不上传裸 macOS `.app` 目录，只上传
   dmg/zip/exe/AppImage/deb；CI 构建/测试本身允许。

@@ -33,7 +33,10 @@ jobs:
             os: macos-latest
             args: --mac
           - platform: win
-            os: windows-latest
+            # windows-latest drifted to VS 18 / Server 2025; node-gyp cannot
+            # parse that toolset (version undefined) and better-sqlite3 then
+            # fails to rebuild for Electron 43. Keep the win job on VS 2022.
+            os: windows-2022
             args: --win --x64
             nodePlatform: win32
           - platform: linux
