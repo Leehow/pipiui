@@ -62,6 +62,12 @@ import {
   type QueuedMessage,
 } from "./message-queue.js";
 import { FileQueueStore, type QueueStore } from "./queue-store.js";
+import {
+  StopEscalationScheduler,
+  readProcessIdentity,
+  type StopEscalationDelays,
+  type StopEscalationHooks,
+} from "./stop-escalation.js";
 import { QuotaStore, parseDotEnv } from "./quota.js";
 import {
   appendLedgerRecord,
@@ -237,6 +243,11 @@ export {
 } from "./message-queue.js";
 export { FileQueueStore, type QueueStore } from "./queue-store.js";
 export {
+  DEFAULT_STOP_ESCALATION_DELAYS,
+  StopEscalationScheduler,
+  listDescendantPids,
+} from "./stop-escalation.js";
+export {
   ledgerLine,
   parseLedgerLine,
   readLedgerFile,
@@ -336,6 +347,12 @@ export type PiBackendOptions = {
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
   canonicalProjectPaths?: () => Promise<string[] | undefined>;
+  /** Injectable abort-unresponsive kill ladder (tests). */
+  stopEscalation?: StopEscalationScheduler;
+  stopEscalationHooks?: StopEscalationHooks;
+  stopEscalationDelays?: StopEscalationDelays;
+  /** Max wait for abort RPC ack before emitting stopped (default 1500ms). */
+  abortAckTimeoutMs?: number;
   /** Open a project folder in the OS file manager. Defaults to open/explorer/xdg-open. */
   revealPath?: (path: string) => Promise<void>;
 };
@@ -1235,6 +1252,8 @@ export class PiHostBackend implements HostBackend {
   /** Resident external-pi worker (when authHelperPath is used); stopped on backend close. */
   private externalAuthRuntime?: ExternalAuthRuntime;
   private queue: SessionMessageQueue;
+  private stopEscalation: StopEscalationScheduler;
+  private abortAckTimeoutMs: number;
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
   private toolBatchTelemetry: ToolBatchTelemetry;
@@ -1289,6 +1308,9 @@ export class PiHostBackend implements HostBackend {
         this.dispatchQueuedMessage(id, payload, behavior),
       onChange: (id, items) => this.queueChanged(id, items),
     });
+    this.stopEscalation = options.stopEscalation
+      ?? new StopEscalationScheduler(options.stopEscalationHooks, options.stopEscalationDelays);
+    this.abortAckTimeoutMs = options.abortAckTimeoutMs ?? 1_500;
     this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
       onPlanEvent: (event, sessionId) => this.planEvent(event, sessionId),
@@ -1484,6 +1506,7 @@ export class PiHostBackend implements HostBackend {
     this.persistAgentLogs();
     this.persistAgents();
     this.closed = true;
+    this.stopEscalation.cancelAll();
     this.stopOrphanReconcileTimer();
     // Stop the resident external-pi worker if one was spawned during this run.
     this.externalAuthRuntime?.stop();
@@ -1599,6 +1622,68 @@ export class PiHostBackend implements HostBackend {
     await this.loadQueue(id);
     await new Promise<void>((resolve) => setImmediate(resolve));
     if (!this.closed) await this.queue.notifyIdle(id, epoch);
+  }
+  /**
+   * Host abort: write abort, emit stopped quickly, escalate hung descendants,
+   * sweep agents in the background. User stop never FIFO-drains.
+   */
+  private async abortSessionTurn(
+    sessionId: string,
+    options: { drain: false | "cutIn" },
+  ): Promise<void> {
+    const live = this.live.get(sessionId);
+    if (live) live.hostAbortedTurn = true;
+    if (options.drain === false && !this.queue.hasPendingCutIn(sessionId)) {
+      this.queue.suppressIdleDrain(sessionId);
+    }
+    const abortLive = this.live.get(sessionId);
+    const abortPid = abortLive?.process?.pid;
+    if (abortPid !== undefined && this.childStillRunning(abortLive?.process)) {
+      this.stopEscalation.start(
+        sessionId,
+        {
+          piPid: abortPid,
+          piIdentity: readProcessIdentity(abortPid),
+        },
+      () => {
+        const current = this.live.get(sessionId);
+        if (!current) {
+          this.stream({ type: "status", sessionId, status: "stopped", pendingFollowUps: [] });
+          return;
+        }
+        if (current.terminalEpoch !== current.turnEpoch) {
+          this.projectTurnTerminal(current, "stopped");
+        }
+      },
+      );
+    }
+    try {
+      await Promise.race([
+        this.command(sessionId, { type: "abort" }).catch(() => undefined),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, this.abortAckTimeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {
+      /* process already gone */
+    }
+    const after = this.live.get(sessionId);
+    this.stream({
+      type: "status",
+      sessionId,
+      status: "stopped",
+      pendingFollowUps: after?.followUps ?? live?.followUps ?? [],
+    });
+    after?.compaction.settleTurn();
+    void this.sweepSessionAgents(sessionId);
+  }
+  private async cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage> {
+    const message = await this.queue.cutInMessage(sessionId, messageId);
+    if (this.queue.hasPendingCutIn(sessionId)) {
+      await this.abortSessionTurn(sessionId, { drain: "cutIn" });
+    }
+    return message;
   }
   private async enqueueMessage(
     id: string,
@@ -1975,6 +2060,12 @@ export class PiHostBackend implements HostBackend {
           params[0] as string,
           params[1] as string,
         );
+      case "cutInQueuedMessage":
+        await this.loadQueue(params[0] as string);
+        return this.cutInQueuedMessage(
+          params[0] as string,
+          params[1] as string,
+        );
       case "retryQueuedMessage":
         await this.loadQueue(params[0] as string);
         return this.queue.retryMessage(
@@ -1984,27 +2075,7 @@ export class PiHostBackend implements HostBackend {
       case "stop":
         {
           const sessionId = params[0] as string;
-          const live = this.live.get(sessionId);
-          if (live) live.hostAbortedTurn = true;
-          try {
-            await this.command(sessionId, { type: "abort" });
-          } catch (error) {
-            if (live) live.hostAbortedTurn = false;
-            throw error;
-          }
-          // Stop must stop the whole session, not only the model turn: sweep this
-          // session's background subagents so a late [subagent-done] cannot restart
-          // turns the user already stopped (2026-08-15 receipt storm). The sweep also
-          // arms the extension's host-stop quiet gate via /subagent_abort_all.
-          await this.sweepSessionAgents(sessionId);
-          this.stream({
-            type: "status",
-            sessionId,
-            status: "stopped",
-            pendingFollowUps: live?.followUps ?? [],
-          });
-          live?.compaction.settleTurn();
-          await this.queueIdle(sessionId);
+          await this.abortSessionTurn(sessionId, { drain: false });
           return undefined;
         }
       case "queueFollowUp":
@@ -2383,9 +2454,16 @@ export class PiHostBackend implements HostBackend {
   }
   private ensure(id: string): Promise<Live> {
     const live = this.live.get(id);
-    if (live) return Promise.resolve(live);
+    if (live && this.childStillRunning(live.process)) return Promise.resolve(live);
+    if (live && !this.childStillRunning(live.process)) {
+      return (live.exit ?? Promise.resolve()).then(() => {
+        if (this.live.get(id) === live) this.live.delete(id);
+        return this.ensure(id);
+      });
+    }
     const inFlight = this.ensureInFlight.get(id);
     if (inFlight) return inFlight;
+    this.stopEscalation.cancel(id);
     const attempt = this.spawnLive(id).finally(() => {
       this.ensureInFlight.delete(id);
     });
@@ -2514,7 +2592,7 @@ export class PiHostBackend implements HostBackend {
         if (this.live.get(id) === live) this.live.delete(id);
         resolveExit();
         this.reconcileOrphanedNow(id);
-        if (!this.closed) void this.queueIdle(id);
+        if (!this.closed) void this.queueIdle(id, live.turnEpoch);
       };
       const lease = this.leases.get(id);
       if (lease) void lease.release().catch(() => undefined).finally(finish);
@@ -2802,6 +2880,7 @@ export class PiHostBackend implements HostBackend {
     if (epoch === undefined || live.terminalEpoch === epoch) return false;
     live.terminalEpoch = epoch;
     live.pendingFinalReconciliation = undefined;
+    this.stopEscalation.cancel(live.session.id);
     // The durable agent index is authoritative at a terminal boundary. Replay
     // its current session view so a renderer that missed an end event cannot
     // retain a stale running projection. Real live agents remain live here;

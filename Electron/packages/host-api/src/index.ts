@@ -433,7 +433,7 @@ export interface PipiHostAPI {
   getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
-  listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
+  listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
   stop(sessionId: string): Promise<void>; queueFollowUp(sessionId: string, prompt: string): Promise<void>; subscribeStream(sessionId: string, listener: (event: StreamEvent) => void): Unsubscribe;
   /** Optional compatibility extension: observe stream events from every session without changing the selected-session subscription. */
   subscribeAllStreams?(listener: (event: StreamEvent) => void): Unsubscribe;
@@ -607,6 +607,7 @@ function apiFrom(
     removeQueuedMessage: (sessionId, messageId) => invoke("removeQueuedMessage", sessionId, messageId),
     promoteQueuedMessage: (sessionId, messageId) => invoke("promoteQueuedMessage", sessionId, messageId),
     steerQueuedMessage: (sessionId, messageId) => invoke("steerQueuedMessage", sessionId, messageId),
+    cutInQueuedMessage: (sessionId, messageId) => invoke("cutInQueuedMessage", sessionId, messageId),
     retryQueuedMessage: (sessionId, messageId) => invoke("retryQueuedMessage", sessionId, messageId),
     stop: sessionId => invoke("stop", sessionId),
     queueFollowUp: (sessionId, prompt) => invoke("queueFollowUp", sessionId, prompt),

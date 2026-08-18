@@ -81,6 +81,10 @@ type SessionState = {
   dispatching: boolean;
   /** Current dispatch acknowledgement; exposed for legacy direct-send compatibility. */
   dispatchPromise?: Promise<void>;
+  /** Cut-in waiting for the aborted turn to settle; at most one per session. */
+  pendingCutIn?: QueuedMessage;
+  /** Aborted turn epoch: idle for this epoch must not FIFO-drain until a new turn starts. */
+  suppressDrainEpoch?: number;
 };
 
 /** Deep copy used both for input snapshots and for values returned to callers. */
@@ -105,7 +109,7 @@ export class SessionMessageQueue {
   private state(sessionId: string): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false }; 
+      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false };
       this.sessions.set(sessionId, session);
     }
     return session;
@@ -155,7 +159,22 @@ export class SessionMessageQueue {
 
   /** Snapshot of the active items for the session (queued, sending, failed). */
   listQueue(sessionId: string): QueuedMessage[] {
-    return this.state(sessionId).items.map((item) => snapshot(item));
+    const session = this.state(sessionId);
+    const items = session.items.map((item) => snapshot(item));
+    if (session.pendingCutIn && !items.some((item) => item.id === session.pendingCutIn!.id)) {
+      items.push(snapshot(session.pendingCutIn));
+    }
+    return items;
+  }
+
+  hasPendingCutIn(sessionId: string): boolean {
+    return this.state(sessionId).pendingCutIn !== undefined;
+  }
+
+  /** User-initiated stop: idles for the current turn must not FIFO-drain. */
+  suppressIdleDrain(sessionId: string): void {
+    const session = this.state(sessionId);
+    session.suppressDrainEpoch = session.turnEpoch;
   }
 
   /**
@@ -176,6 +195,8 @@ export class SessionMessageQueue {
     session.turnEpoch = 0;
     session.dispatching = false;
     session.dispatchPromise = undefined;
+    session.pendingCutIn = undefined;
+    session.suppressDrainEpoch = undefined;
     this.changed(sessionId);
   }
 
@@ -265,6 +286,40 @@ export class SessionMessageQueue {
     }
   }
 
+  /**
+   * Cut-in: send this item as the next turn. Idle sessions dispatch immediately.
+   * Busy sessions park the item as `pendingCutIn` (state sending) and expect the
+   * host to abort the current turn; the next `notifyIdle` sends only this item.
+   * A second cut-in while one is pending is rejected and the other item stays queued.
+   */
+  async cutInMessage(sessionId: string, id: string): Promise<QueuedMessage> {
+    const session = this.state(sessionId);
+    if (session.pendingCutIn) {
+      throw new Error(`session ${sessionId} already has a cut-in in progress`);
+    }
+    const index = session.items.findIndex((item) => item.id === id);
+    if (index < 0) throw new Error(`unknown queued message ${id}`);
+    const current = session.items[index];
+    if (current.state === "sending") throw new Error(`message ${id} is already sending`);
+    if (session.dispatching) throw new Error(`session ${sessionId} is already delivering a message`);
+    if (!session.turnActive) {
+      const promoted = freeze({ ...current, state: "queued" as const, error: undefined });
+      session.items.splice(index, 1);
+      session.items.unshift(promoted);
+      const delivery = this.send(sessionId, promoted, this.drainBehavior);
+      session.dispatchPromise = delivery.then(() => undefined);
+      await delivery;
+      if (session.dispatchPromise) session.dispatchPromise = undefined;
+      const stored = session.items.find((item) => item.id === id);
+      return snapshot(stored ?? { ...promoted, state: "sending" as const });
+    }
+    const sending = freeze({ ...current, state: "sending" as const, error: undefined });
+    session.items.splice(index, 1);
+    session.pendingCutIn = sending;
+    this.changed(sessionId);
+    return snapshot(sending);
+  }
+
   /** Retry a failed item: restore it to `queued` at the head and clear its error. */
   retryMessage(sessionId: string, id: string): QueuedMessage {
     const session = this.state(sessionId);
@@ -285,6 +340,7 @@ export class SessionMessageQueue {
     const session = this.state(sessionId);
     session.turnActive = true;
     session.turnEpoch += 1;
+    session.suppressDrainEpoch = undefined;
     return session.turnEpoch;
   }
 
@@ -299,7 +355,27 @@ export class SessionMessageQueue {
     const session = this.state(sessionId);
     if (epoch !== undefined && epoch !== session.turnEpoch) return;
     session.turnActive = false;
+    if (session.pendingCutIn) {
+      await this.dispatchPendingCutIn(sessionId);
+      return;
+    }
+    if (session.suppressDrainEpoch !== undefined && session.suppressDrainEpoch === session.turnEpoch) {
+      return;
+    }
     await this.drain(sessionId);
+  }
+
+  private async dispatchPendingCutIn(sessionId: string): Promise<void> {
+    const session = this.state(sessionId);
+    const item = session.pendingCutIn;
+    if (!item || session.dispatching || session.turnActive) return;
+    session.pendingCutIn = undefined;
+    session.items.unshift(freeze({ ...item, state: "queued" as const, error: undefined }));
+    const delivery = this.send(sessionId, session.items[0], this.drainBehavior);
+    const acknowledgement = delivery.then(() => undefined);
+    session.dispatchPromise = acknowledgement;
+    await delivery;
+    if (session.dispatchPromise === acknowledgement) session.dispatchPromise = undefined;
   }
 
   /**
@@ -337,6 +413,8 @@ export class SessionMessageQueue {
       await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments }, behavior);
       if (index >= 0 && session.items[index]?.id === item.id) session.items.splice(index, 1);
       session.turnActive = true;
+      session.turnEpoch += 1;
+      session.suppressDrainEpoch = undefined;
       this.changed(sessionId);
       return true;
     } catch (error) {

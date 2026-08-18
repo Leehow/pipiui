@@ -59,6 +59,13 @@ describe("PiHostBackend message queue integration", () => {
     ]);
 
     await backend.handle("stop", ["s1"]);
+    await eventually(() => events.some(event => event.queue?.length === 2));
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ text: "first" }),
+      expect.objectContaining({ text: "second" }),
+    ]);
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queue.notifyIdle("s1");
     await eventually(() => (backend as any).queue?.listQueue("s1").length === 0);
     off();
     const snapshots = events.map(event => event.queue.map((item: any) => item.text).join(","));
@@ -85,6 +92,8 @@ describe("PiHostBackend message queue integration", () => {
     const failed = await backend.handle("enqueueMessage", ["s1", "__queue_fail__"]) as any;
     expect(failed.outcome).toBe("queued");
     await backend.handle("stop", ["s1"]);
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queue.notifyIdle("s1");
     await eventually(() => ((backend as any).queue.listQueue("s1")[0]?.state) === "failed");
     const failedItem = (await backend.handle("listQueue", ["s1"]) as any[])[0];
     expect(failedItem).toMatchObject({ text: "__queue_fail__", state: "failed", error: "queue dispatch failed" });
@@ -137,6 +146,8 @@ describe("PiHostBackend message queue integration", () => {
     const queued = await backend.handle("enqueueMessage", ["s1", "继续"]) as any;
     expect(queued).toMatchObject({ outcome: "queued", message: { text: "继续" } });
     await backend.handle("stop", ["s1"]);
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queue.notifyIdle("s1");
     await eventually(() => events.some(event =>
       event.status === "started" && event.pendingFollowUps?.includes("继续"),
     ));
@@ -256,6 +267,117 @@ describe("PiHostBackend message queue integration", () => {
     await eventually(() => events.some(event => event.status === "settled" || event.status === "stopped"));
     off();
     expect(events.some(event => event.status === "settled")).toBe(true);
+    await backend.close();
+  });
+
+  it("user stop emits stopped promptly and does not drain the queue", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const queued = await backend.handle("enqueueMessage", ["s1", "stay queued"]) as any;
+    expect(queued.outcome).toBe("queued");
+    const started = Date.now();
+    await backend.handle("stop", ["s1"]);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(events.some(event => event.status === "stopped")).toBe(true);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "stay queued", state: "queued" }),
+    ]);
+    off();
+    await backend.close();
+  });
+
+  it("cutIn while busy aborts and dispatches only the chosen item", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const sending: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel !== "stream" || event.event.type !== "queue_update") return;
+      for (const item of event.event.queue ?? []) {
+        if (item.state === "sending" && !sending.includes(item.text)) sending.push(item.text);
+      }
+    });
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const head = await backend.handle("enqueueMessage", ["s1", "fifo-head"]) as any;
+    const chosen = await backend.handle("enqueueMessage", ["s1", "cut-in-me"]) as any;
+    expect(head.outcome).toBe("queued");
+    await backend.handle("cutInQueuedMessage", ["s1", chosen.message.id]);
+    await eventually(() => sending.includes("cut-in-me"));
+    expect(sending.filter(text => text === "fifo-head" || text === "cut-in-me")[0]).toBe("cut-in-me");
+    off();
+    await backend.close();
+  });
+
+  it("cutIn while idle dispatches immediately", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const head = await backend.handle("enqueueMessage", ["s1", "fifo-head"]) as any;
+    const chosen = await backend.handle("enqueueMessage", ["s1", "idle-cut"]) as any;
+    await backend.handle("stop", ["s1"]);
+    await (backend as any).queue.notifyIdle("s1");
+    await backend.handle("cutInQueuedMessage", ["s1", chosen.message.id]);
+    await eventually(() => {
+      const items = (backend as any).queue.listQueue("s1");
+      return items.length === 1 && items[0].id === head.message.id;
+    });
+    expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["fifo-head"]);
+    await backend.close();
+  });
+
+  it("rejects a second cutIn while one is pending", async () => {
+    const setup = await fixture();
+    const backend = createPiHostBackend({
+      agentDir: setup.agentDir,
+      sessionsRoot: setup.sessionsRoot,
+      runtimeRoot: root,
+      piPath: process.execPath,
+      abortAckTimeoutMs: 20,
+      spawn: (_bin, _args, options) => spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as any,
+    });
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const a = await backend.handle("enqueueMessage", ["s1", "first-cut"]) as any;
+    const b = await backend.handle("enqueueMessage", ["s1", "second-cut"]) as any;
+    // Park first cut-in without waiting for abort settle by marking busy path only.
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queue.cutInMessage("s1", a.message.id);
+    await expect((backend as any).queue.cutInMessage("s1", b.message.id)).rejects.toThrow(/cut-in in progress/);
+    const listed = (backend as any).queue.listQueue("s1");
+    expect(listed.some((item: any) => item.id === b.message.id && item.state === "queued")).toBe(true);
+    await backend.close();
+  });
+
+  it("repeated settle and process-exit idle after stop do not drain", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const queued = await backend.handle("enqueueMessage", ["s1", "stay queued"]) as any;
+    await backend.handle("stop", ["s1"]);
+    await (backend as any).queueIdle("s1");
+    await (backend as any).queueIdle("s1");
+    await (backend as any).queue.notifyIdle("s1");
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "stay queued", state: "queued" }),
+    ]);
+    await backend.close();
+  });
+
+  it("stale process-exit queueIdle after a newer turn does not clear busy or drain", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const queued = await backend.handle("enqueueMessage", ["s1", "stay"]) as any;
+    const staleEpoch = (backend as any).live.get("s1")?.turnEpoch;
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queueIdle("s1", staleEpoch);
+    expect((backend as any).queue.isBusy("s1")).toBe(true);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "stay", state: "queued" }),
+    ]);
     await backend.close();
   });
 });

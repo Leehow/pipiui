@@ -435,6 +435,78 @@ describe("SessionMessageQueue", () => {
     await idle;
   });
 
+  it("cutIn while idle dispatches the chosen item, not FIFO head", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.restoreQueue("s1", [
+      { id: "a", sessionId: "s1", text: "head", attachments: [], createdAt: 1, state: "queued" },
+      { id: "b", sessionId: "s1", text: "chosen", attachments: [], createdAt: 2, state: "queued" },
+    ]);
+    const cut = queue.cutInMessage("s1", "b");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["chosen"]);
+    host.pending[0].resolve(undefined);
+    await cut;
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["head"]);
+  });
+
+  it("cutIn while busy parks pendingCutIn and notifyIdle sends only that item", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    queue.enqueue("s1", { text: "head" });
+    const chosen = queue.enqueue("s1", { text: "chosen" }).message;
+    const parked = await queue.cutInMessage("s1", chosen.id);
+    expect(parked.state).toBe("sending");
+    expect(host.calls).toHaveLength(0);
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["chosen"]);
+    host.pending[0].resolve(undefined);
+    await idle;
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["head"]);
+  });
+
+  it("rejects a second cutIn while one is pending and leaves the other queued", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    const a = queue.enqueue("s1", { text: "A" }).message;
+    const b = queue.enqueue("s1", { text: "B" }).message;
+    await queue.cutInMessage("s1", a.id);
+    await expect(queue.cutInMessage("s1", b.id)).rejects.toThrow(/cut-in in progress/);
+    expect(queue.listQueue("s1").some((item) => item.id === b.id && item.state === "queued")).toBe(true);
+  });
+
+  it("user suppressIdleDrain skips FIFO after abort settle", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    queue.enqueue("s1", { text: "stay" });
+    queue.suppressIdleDrain("s1");
+    await queue.notifyIdle("s1");
+    await queue.notifyIdle("s1");
+    expect(host.calls).toHaveLength(0);
+    expect(queue.listQueue("s1")[0].text).toBe("stay");
+    expect(queue.isBusy("s1")).toBe(false);
+  });
+
+  it("process-exit idle after cut-in send does not clear the new turn", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const aborted = queue.markBusy("s1");
+    queue.enqueue("s1", { text: "head" });
+    const chosen = queue.enqueue("s1", { text: "chosen" }).message;
+    await queue.cutInMessage("s1", chosen.id);
+    const settle = queue.notifyIdle("s1", aborted);
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["chosen"]);
+    host.pending[0].resolve(undefined);
+    await settle;
+    expect(queue.isBusy("s1")).toBe(true);
+    await queue.notifyIdle("s1", aborted);
+    expect(queue.isBusy("s1")).toBe(true);
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["head"]);
+    expect(host.calls).toHaveLength(1);
+  });
+
   it("honors a custom drain behavior", () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch, drainBehavior: "follow_up" });
