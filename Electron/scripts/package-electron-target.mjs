@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -72,7 +72,7 @@ export function windowsMsvcEnv(platform, env = process.env) {
   if (platform !== 'win32' || process.platform !== 'win32') return {}
   const vcvars = resolveVcvars64(env)
   if (!vcvars) return {}
-  const result = spawnSync(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${vcvars}" >nul && set`], { encoding: 'utf8', windowsHide: true })
+  const result = spawnSync(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `call "${vcvars}" >nul && set`], { encoding: 'utf8', windowsHide: true })
   const imported = {}
   for (const line of (result.stdout || '').split(/\r?\n/)) {
     const index = line.indexOf('=')
@@ -82,6 +82,44 @@ export function windowsMsvcEnv(platform, env = process.env) {
     imported[key] = line.slice(index + 1)
   }
   return imported
+}
+
+export function findDelayimpLibDir(env = process.env) {
+  const vcvars = resolveVcvars64(env)
+  const msvcRoot = vcvars ? resolve(dirname(vcvars), '..', '..', 'Tools', 'MSVC') : undefined
+  const roots = [env.PIPIUI_MSVC_LIB_DIR, msvcRoot].filter(Boolean)
+  for (const root of roots) {
+    if (existsSync(join(root, 'delayimp.lib'))) return root
+    if (!existsSync(root)) continue
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const libDir = join(root, entry.name, 'lib', 'x64')
+      if (existsSync(join(libDir, 'delayimp.lib'))) return libDir
+    }
+  }
+  return undefined
+}
+
+export function writeWindowsPtyBuildProps(root, libDir) {
+  if (!libDir) return []
+  const props = `<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <PropertyGroup>
+    <SpectreMitigation>false</SpectreMitigation>
+    <LibraryPath>${libDir};$(LibraryPath)</LibraryPath>
+  </PropertyGroup>
+</Project>
+`
+  const dirs = [
+    join(root, 'node_modules', 'node-pty'),
+    join(root, 'node_modules', 'node-pty', 'build'),
+    join(root, 'node_modules', 'node-pty', 'build', 'deps', 'winpty', 'src')
+  ]
+  for (const dir of dirs) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'Directory.Build.props'), props)
+  }
+  return dirs
 }
 
 function main() {
@@ -103,6 +141,15 @@ function main() {
     '--check'
   ], { env: releaseEnv })
   console.log(`Packaging with persistent embedded runtime ${key}`)
+  Object.assign(releaseEnv, windowsMsvcEnv(options.platform, releaseEnv))
+  if (options.platform === 'win32') {
+    const libDir = findDelayimpLibDir(releaseEnv)
+    const written = writeWindowsPtyBuildProps(electronRoot, libDir)
+    if (libDir) {
+      releaseEnv.LIB = `${libDir}${releaseEnv.LIB ? `;${releaseEnv.LIB}` : ''}`
+      console.log(`Windows native rebuild LIB+=${libDir} props=${written.length}`)
+    }
+  }
   run(process.execPath, [
     join(electronRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
     ...options.builderArgs,
@@ -111,7 +158,6 @@ function main() {
     cwd: join(electronRoot, 'apps', 'electron'),
     env: {
       ...releaseEnv,
-      ...windowsMsvcEnv(options.platform, releaseEnv),
       ...windowsNativeRebuildEnv(options.platform, electronRoot, releaseEnv),
       PIPIUI_EMBEDDED_RUNTIME_TARGET: key
     }

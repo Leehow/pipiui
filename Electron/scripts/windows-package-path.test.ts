@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
-import { unsignedBuilderArgs, windowsMsvcEnv, windowsNativeRebuildEnv } from './package-electron-target.mjs'
+import { findDelayimpLibDir, unsignedBuilderArgs, windowsMsvcEnv, windowsNativeRebuildEnv, writeWindowsPtyBuildProps } from './package-electron-target.mjs'
 
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
@@ -34,8 +34,11 @@ describe('Windows package and CI path', () => {
     expect(windowsNativeRebuildEnv('darwin', '/repo/Electron')).toEqual({})
     expect(windowsMsvcEnv('win32')).toEqual({})
     expect(windowsMsvcEnv('darwin')).toEqual({})
+    expect(findDelayimpLibDir({})).toBeUndefined()
+    expect(writeWindowsPtyBuildProps('/tmp/no-such-electron', undefined)).toEqual([])
     expect(packager).toContain('windowsNativeRebuildEnv')
     expect(packager).toContain('windowsMsvcEnv')
+    expect(packager).toContain('findDelayimpLibDir')
   })
 
   it('drops forceCodeSigning only for unsigned Windows/Linux packaging', () => {
