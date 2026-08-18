@@ -1,5 +1,34 @@
 import { useEffect, useState } from 'react'
+import type { PipiHostAPI, UserMcpServer } from '@pipi/host-api'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
+
+const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
+
+function hostFromWindow(): PipiHostAPI | undefined {
+  return typeof window === 'undefined' ? undefined : (window as Window & { pipiHost?: PipiHostAPI }).pipiHost
+}
+
+function lastProjectId(): string | undefined {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(LAST_SESSION_STORAGE_KEY) ?? 'null')
+    if (!value || typeof value !== 'object') return undefined
+    const projectId = (value as { projectId?: unknown }).projectId
+    return typeof projectId === 'string' && projectId ? projectId : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function loadUserMcpServers(host: PipiHostAPI | undefined): Promise<UserMcpServer[]> {
+  if (!host?.listUserMcpServers) return []
+  let projectId = lastProjectId()
+  if (!projectId) {
+    const projects = await host.listProjects()
+    projectId = projects[0]?.id
+  }
+  if (!projectId) return []
+  return await host.listUserMcpServers(projectId)
+}
 
 type CopiedKey = 'mcp' | 'pi' | null
 
@@ -76,7 +105,19 @@ export function ExtensionsAddDialog({ onClose }: { onClose: () => void }) {
   )
 }
 
-export function ExtensionsPane({ addOpen, onCloseAdd }: { addOpen: boolean; onCloseAdd: () => void }) {
+export function ExtensionsPane({ addOpen, onCloseAdd, host }: { addOpen: boolean; onCloseAdd: () => void; host?: PipiHostAPI }) {
+  const [servers, setServers] = useState<UserMcpServer[]>([])
+
+  useEffect(() => {
+    let cancelled = false
+    void loadUserMcpServers(host ?? hostFromWindow()).then(rows => {
+      if (!cancelled) setServers(rows)
+    }).catch(() => {
+      if (!cancelled) setServers([])
+    })
+    return () => { cancelled = true }
+  }, [host])
+
   return (
     <div className="extensions-pane" data-testid="extensions-pane">
       <section className="update-center-group" data-testid="extensions-builtin">
@@ -103,8 +144,22 @@ export function ExtensionsPane({ addOpen, onCloseAdd }: { addOpen: boolean; onCl
             <h3>你添加的</h3>
             <p>外部 MCP 服务和第三方 Pi 扩展。点右上角添加，复制一句话到主界面即可。</p>
           </div>
+          {servers.length > 0 && <span>{servers.length} 项</span>}
         </header>
-        <div className="model-modal-state" data-testid="extensions-user-empty">还没有额外添加的 MCP 或 Pi 扩展。</div>
+        {servers.length === 0
+          ? <div className="model-modal-state" data-testid="extensions-user-empty">还没有额外添加的 MCP 或 Pi 扩展。</div>
+          : (
+            <div className="update-center-group-items" data-testid="extensions-user-list">
+              {servers.map(server => (
+                <div className="update-center-row" key={server.name} data-testid={`extensions-item-mcp-${server.name}`}>
+                  <div className="update-center-name">
+                    <strong>{server.name}</strong>
+                    <span>{server.transport} · {server.summary}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
       </section>
       {addOpen && <ExtensionsAddDialog onClose={onCloseAdd} />}
     </div>

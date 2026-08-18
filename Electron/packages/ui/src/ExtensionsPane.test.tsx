@@ -2,6 +2,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
+import type { PipiHostAPI, UserMcpServer } from '@pipi/host-api'
 import { ExtensionsPane } from './ExtensionsPane'
 
 let originalClipboard: PropertyDescriptor | undefined
@@ -24,6 +25,19 @@ describe('ExtensionsPane', () => {
     expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
     expect(screen.getByTestId('extensions-user-empty').textContent).toContain('还没有额外添加')
     expect(screen.queryByTestId('extensions-add-dialog')).toBeNull()
+  })
+
+  it('lists project mcpServers from the host without secrets', async () => {
+    const listUserMcpServers = vi.fn(async (): Promise<UserMcpServer[]> => [
+      { name: 'officecli', transport: 'stdio', summary: 'officecli mcp' },
+    ])
+    const host = { listUserMcpServers, listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }] } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-item-mcp-officecli')).toBeTruthy()
+    expect(screen.getByTestId('extensions-item-mcp-officecli').textContent).toContain('officecli')
+    expect(screen.getByTestId('extensions-item-mcp-officecli').textContent).toContain('officecli mcp')
+    expect(screen.queryByTestId('extensions-user-empty')).toBeNull()
+    expect(listUserMcpServers).toHaveBeenCalled()
   })
 
   it('opens the add dialog with copy-paste prompts the main session can handle', async () => {
