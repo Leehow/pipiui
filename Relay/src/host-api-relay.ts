@@ -727,7 +727,13 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       }
       const pair = req.method === "GET" ? PAIR_PATH_RE.exec(url.pathname) : null;
       if (pair && knowsRoom(pair[1].toLowerCase())) {
-        servePairPage(res, pair[1].toLowerCase());
+        const roomID = pair[1].toLowerCase();
+        const granted = authorize(req.headers.cookie);
+        if (granted && granted.roomID === roomID) {
+          void serveStatic(res, "/");
+          return true;
+        }
+        servePairPage(res, roomID);
         return true;
       }
       if (reservedPublicPath(url.pathname)) return false;

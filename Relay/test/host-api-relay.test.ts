@@ -185,6 +185,10 @@ test("v2 pairing claim sets HttpOnly cookie and never puts the fragment on the p
     assert.doesNotMatch(html, new RegExp(secretA));
     assert.match(html, /location\.hash/);
     assert.match(html, /\/pair\/.+\/claim/);
+    assert.match(html, /location\.pathname\+location\.hash/);
+    assert.match(html, /location\.reload\(\)/);
+    assert.doesNotMatch(html, /location\.replace\("\/"\)/);
+    assert.doesNotMatch(html, /replaceState\(null,"","\/"\)/);
     assert.doesNotMatch(html, /tunnel-browser/);
 
     const rejected = await claim(relay.origin, roomID, secretB);
@@ -202,6 +206,16 @@ test("v2 pairing claim sets HttpOnly cookie and never puts the fragment on the p
     assert.match(setCookie ?? "", /SameSite=Strict/i);
     assert.match(setCookie ?? "", /Secure/i);
     assert.doesNotMatch(setCookie ?? "", new RegExp(secretA));
+
+    const reloaded = await fetch(`${relay.origin}/pair/${roomID}`, {
+      headers: { Cookie: cookieHeader(setCookie) },
+    });
+    const reloadedHTML = await reloaded.text();
+    assert.equal(reloaded.status, 200);
+    assert.doesNotMatch(reloadedHTML, /正在安全连接服务器/);
+    assert.match(reloadedHTML, /data-fallback="browser-ui-missing"/);
+    const stillInterstitial = await fetch(`${relay.origin}/pair/${roomID}`);
+    assert.match(await stillInterstitial.text(), /正在安全连接服务器/);
   } finally {
     host.close();
     await relay.close();
@@ -643,6 +657,11 @@ test("static UI fallback when the browser build is missing, and serves files whe
     const html = await page.text();
     assert.equal(page.status, 200);
     assert.match(html, /data-browser-ui="ok"/);
+    const pairAfterClaim = await fetch(`${present.origin}/pair/${room2}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(pairAfterClaim.status, 200);
+    assert.match(await pairAfterClaim.text(), /data-browser-ui="ok"/);
     const asset = await fetch(`${present.origin}/assets/app.js`, { headers: { Cookie: cookie } });
     assert.equal(asset.status, 200);
     assert.equal(await asset.text(), "window.__PIPIUI_BROWSER__=true;");

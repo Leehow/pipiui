@@ -20,7 +20,7 @@ export const GRANT_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 export const DEFAULT_V2_LIMITS = {
   maxRooms: 4_096,
   maxClients: 8_192,
-  maxRequestBytes: 256 * 1_024,
+  maxRequestBytes: 8 * 1_024 * 1_024,
   maxResponseBytes: 8 * 1_024 * 1_024,
   maxInflight: 32,
   maxQueuedBytes: 8 * 1_024 * 1_024,
@@ -207,7 +207,7 @@ export function pairPageHTML(roomID: string, nonce: string): string {
 <meta name="referrer" content="no-referrer"><title>PipiUI 配对</title>
 <style nonce="${nonce}">body{font:16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#17181c;color:#f4f5f7;display:grid;place-items:center;min-height:100vh;margin:0}main{max-width:32rem;padding:2rem}p{color:#c9cbd1}.error{color:#ff9b9b}</style>
 </head><body><main><h1>PipiUI 远程会话</h1><p id="status" role="status">正在安全连接服务器…</p></main>
-<script nonce="${nonce}">(()=>{"use strict";const pairID=${encodedID};const status=document.getElementById("status");const secret=location.hash.startsWith("#")?location.hash.slice(1):"";if(!/^[0-9a-f]{64}$/.test(secret)){status.textContent="链接无效或密钥缺失；请使用完整配对链接。";status.className="error";return;}fetch("/pair/"+pairID+"/claim",{method:"POST",credentials:"same-origin",headers:{"content-type":"application/json"},body:JSON.stringify({secret})}).then(response=>{if(!response.ok)throw new Error("pairing rejected");history.replaceState(null,"","/");location.replace("/");}).catch(()=>{status.textContent="配对失败或链接已过期。";status.className="error";});})();</script>
+<script nonce="${nonce}">(()=>{"use strict";const pairID=${encodedID};const status=document.getElementById("status");const secret=location.hash.startsWith("#")?location.hash.slice(1):"";if(!/^[0-9a-f]{64}$/.test(secret)){status.textContent="链接无效或密钥缺失；请使用完整配对链接。";status.className="error";return;}fetch("/pair/"+pairID+"/claim",{method:"POST",credentials:"same-origin",headers:{"content-type":"application/json"},body:JSON.stringify({secret})}).then(response=>{if(!response.ok)throw new Error("pairing rejected");history.replaceState(null,"",location.pathname+location.hash);location.reload();}).catch(()=>{status.textContent="配对失败或链接已过期。";status.className="error";});})();</script>
 </body></html>`;
 }
 
