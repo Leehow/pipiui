@@ -328,6 +328,31 @@ describe("subagent lifecycle → AgentSummary", () => {
     ]);
   });
 
+  it("does not persist the durable agent index on every streamed log_delta", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    await (backend as any).agentsWrite;
+    const persist = vi.spyOn(backend as any, "persistAgents");
+    for (let i = 1; i <= 80; i++) {
+      deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "text", text: "x".repeat(i) });
+    }
+    expect(persist).not.toHaveBeenCalled();
+    persist.mockRestore();
+  });
+
+  it("coalesces persistAgents bursts to one snapshot write", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    await (backend as any).agentsWrite;
+    const { promises: fs } = await import("node:fs");
+    const writeFile = vi.spyOn(fs, "writeFile");
+    for (let i = 0; i < 40; i++) (backend as any).persistAgents();
+    await (backend as any).agentsWrite;
+    const indexWrites = writeFile.mock.calls.filter(([path]) => String(path).includes("pipiui-agent-index.json"));
+    expect(indexWrites.length).toBe(1);
+    writeFile.mockRestore();
+  });
+
   it("qualifies cached and live logs by the exact session, agent, and run", async () => {
     const { backend, events } = await harness();
     const deliverFor = (sessionId: string, payload: Record<string, unknown>) =>

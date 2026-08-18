@@ -1,4 +1,5 @@
 import readline from "node:readline";
+import fs from "node:fs";
 
 const send = value => process.stdout.write(JSON.stringify(value) + "\n");
 let isStreaming = false;
@@ -35,16 +36,95 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     respond(command);
     isStreaming = true;
     send({ type: "agent_start" });
+    if (command.message === "delayed-durable-terminal-agent-replay" || command.message === "terminal-rows-with-orphan-previews") {
+      send({ type: "agent_event", event: {
+        kind: "start", agentId: "root", runId: "root-run", parentId: null,
+        name: "computer-use-leader", role: "computer-use-leader", title: "Run GUI task",
+        task: "Run GUI task", depth: 1, at: "2026-08-17T00:00:01.000Z",
+      } });
+      send({ type: "agent_event", event: {
+        kind: "end", agentId: "root", runId: "root-run", ok: false,
+        at: "2026-08-17T00:00:02.000Z",
+      } });
+      send({ type: "agent_event", event: {
+        kind: "start", agentId: "operator", runId: "operator-run", parentId: "root",
+        name: "operator", role: "operator", title: "Operate GUI",
+        task: "Operate GUI", depth: 2, at: "2026-08-17T00:00:03.000Z",
+      } });
+      send({ type: "agent_event", event: {
+        kind: "end", agentId: "operator", runId: "operator-run", ok: true,
+        output: JSON.stringify({ outcome: "completed", summary: "done" }),
+        at: "2026-08-17T00:00:04.000Z",
+      } });
+      if (command.message === "terminal-rows-with-orphan-previews") {
+        send({ type: "agent_event", event: {
+          kind: "log_delta", agentId: "root", runId: "root-run",
+          contentIndex: 0, itemType: "thinking", text: "late exact-run preview",
+        } });
+        send({ type: "agent_event", event: {
+          kind: "log_delta", agentId: "root", runId: "orphan-root-preview",
+          contentIndex: 0, itemType: "thinking", text: "late preview",
+        } });
+        send({ type: "agent_event", event: {
+          kind: "log_delta", agentId: "operator", runId: "orphan-operator-preview",
+          contentIndex: 0, itemType: "text", text: "late preview",
+        } });
+        send({ type: "agent_event", event: {
+          kind: "closeout", agentId: "operator", runId: "operator-run",
+          disposition: "cleaned", reason: "cleaned after terminal",
+        } });
+      }
+    } else if (command.message === "final-before-agent-terminal") {
+      send({ type: "agent_event", event: {
+        kind: "start", agentId: "active", runId: "active-run", parentId: null,
+        name: "operator", role: "operator", title: "Finishing operation",
+        task: "Finishing operation", depth: 1, at: "2026-08-17T00:00:01.000Z",
+      } });
+    } else if (command.message === "final-with-real-running-agent") {
+      send({ type: "agent_event", event: {
+        kind: "start", agentId: "active", runId: "active-run", parentId: null,
+        name: "operator", role: "operator", title: "Still operating",
+        task: "Still operating", depth: 1, at: "2026-08-17T00:00:01.000Z",
+      } });
+    }
+    const finalMessage = {
+      role: "assistant",
+      content: [{ type: "text", text: "PASS" }],
+      stopReason: command.message === "tool-use-still-streaming" ? "toolUse" : "stop",
+      timestamp: Date.now(),
+      responseId: `response-${command.message}`,
+    };
+    const persistFinal = () => {
+      if (!process.env.PIPIUI_TEST_SESSION_PATH) return;
+      const durableMessage = command.message === "persisted-final-identity-mismatch"
+        ? { ...finalMessage, responseId: "different-response" }
+        : finalMessage;
+      fs.appendFileSync(process.env.PIPIUI_TEST_SESSION_PATH, `${JSON.stringify({
+        type: "message",
+        id: "durable-assistant-entry",
+        parentId: null,
+        message: durableMessage,
+        timestamp: new Date().toISOString(),
+      })}\n`);
+    };
+    if (command.message.startsWith("persisted-final-") || command.message === "terminal-rows-with-orphan-previews" || command.message === "final-with-real-running-agent" || command.message === "final-before-agent-terminal") {
+      persistFinal();
+    } else if (command.message === "delayed-persisted-final-stuck-streaming") {
+      setTimeout(persistFinal, 50);
+    } else if (command.message === "delayed-durable-terminal-agent-replay") {
+      setTimeout(persistFinal, 650);
+    }
     send({
       type: "message_end",
-      message: {
-        id: "assistant-final",
-        role: "assistant",
-        content: [{ type: "text", text: "PASS" }],
-        stopReason: "stop",
-      },
+      message: finalMessage,
     });
-    if (command.message === "final-without-settled") {
+    if (command.message === "final-before-agent-terminal") {
+      setTimeout(() => send({ type: "agent_event", event: {
+        kind: "end", agentId: "active", runId: "active-run", ok: true,
+        output: JSON.stringify({ outcome: "completed", summary: "done" }),
+        at: "2026-08-17T00:00:02.000Z",
+      } }), 25);
+    } else if (command.message === "final-without-settled") {
       isStreaming = false;
     } else if (command.message === "final-with-reentry") {
       pendingMessageCount = 1;
@@ -52,6 +132,8 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
         pendingMessageCount = 0;
         send({ type: "agent_start" });
       }, 25);
+    } else if (command.message === "persisted-final-late-settled") {
+      setTimeout(() => send({ type: "agent_settled" }), 25);
     }
     return;
   }

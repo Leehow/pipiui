@@ -1,5 +1,5 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
-import { createReadStream, createWriteStream, existsSync, readFileSync, promises as fs } from "node:fs";
+import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, watch, writeSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -395,6 +395,8 @@ type Live = {
   turnEpoch?: number;
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
+  /** Exact final assistant awaiting the last real subagent terminal event. */
+  pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
@@ -476,6 +478,7 @@ function resolveMarkers(textContent: string, screenshots?: Map<string, { data: s
 }
 const emitFrame = (listeners: Set<(e: HostEvent) => void>, event: HostEvent) =>
   listeners.forEach((l) => l(event));
+let projectionDebugBackendSerial = 0;
 function asTime(value: any): number {
   const n = Date.parse(value ?? "");
   return Number.isFinite(n) ? n : Date.now();
@@ -913,6 +916,91 @@ async function readHistory(
     return readHistoryFallback(path, before, limit);
   }
 }
+
+const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
+type FinalAssistantIdentity = { timestamp: number; responseId?: string };
+async function isLatestDurableFinalAssistant(path: string, identity: FinalAssistantIdentity): Promise<boolean> {
+  try {
+    const stat = await fs.stat(path);
+    const length = Math.min(stat.size, TERMINAL_DURABILITY_TAIL_BYTES);
+    if (length <= 0) return false;
+    const start = stat.size - length;
+    const handle = await fs.open(path, "r");
+    let text = "";
+    try {
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, start);
+      text = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally {
+      await handle.close();
+    }
+    const lines = text.split("\n");
+    if (start > 0) lines.shift();
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index].trim();
+      if (!line) continue;
+      let entry: any;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry?.type !== "message") continue;
+      const message = entry.message;
+      return message?.role === "assistant"
+        && message.stopReason === "stop"
+        && message.timestamp === identity.timestamp
+        && (identity.responseId === undefined || message.responseId === identity.responseId);
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+async function waitForLatestDurableFinalAssistant(
+  path: string,
+  identity: FinalAssistantIdentity,
+  timeoutMs = 30_000,
+): Promise<boolean> {
+  if (await isLatestDurableFinalAssistant(path, identity)) return true;
+  return new Promise<boolean>((resolve) => {
+    let complete = false;
+    let checking = false;
+    let checkAgain = false;
+    let watcher: ReturnType<typeof watch> | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (matched: boolean) => {
+      if (complete) return;
+      complete = true;
+      if (timer) clearTimeout(timer);
+      watcher?.close();
+      resolve(matched);
+    };
+    const check = async () => {
+      if (complete) return;
+      if (checking) {
+        checkAgain = true;
+        return;
+      }
+      checking = true;
+      do {
+        checkAgain = false;
+        if (await isLatestDurableFinalAssistant(path, identity)) {
+          finish(true);
+          return;
+        }
+      } while (!complete && checkAgain);
+      checking = false;
+    };
+    try {
+      watcher = watch(path, { persistent: false }, () => void check());
+      watcher.on("error", () => finish(false));
+    } catch {
+      finish(false);
+      return;
+    }
+    timer = setTimeout(() => finish(false), timeoutMs);
+    timer.unref?.();
+    // Close the gap between the initial read and watcher registration.
+    void check();
+  });
+}
 function dirId(path: string) {
   return Buffer.from(path).toString("base64url");
 }
@@ -1043,6 +1131,13 @@ function isCachedAgentLog(value: unknown): value is CachedAgentLog {
 export class PiHostBackend implements HostBackend {
   readonly protocolVersion = 2 as const;
   private listeners = new Set<(event: HostEvent) => void>();
+  private readonly projectionDebugBackendTag = `backend#${projectionDebugBackendSerial += 1}`;
+  private projectionDebugSessionSerial = 0;
+  private projectionDebugAgentSerial = 0;
+  private projectionDebugSessionTags = new Map<string, string>();
+  private projectionDebugAgentTags = new Map<string, string>();
+  private projectionDebugProvenance = new Map<string, string>();
+  private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
   private leases = new Map<string, LeaseManager>();
   /**
@@ -1066,6 +1161,9 @@ export class PiHostBackend implements HostBackend {
    * reconstruct a completed subagent's transcript without a live subscription. */
   private agentLogCache = new Map<string, CachedAgentLog[]>();
   private agentLogsPersistTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Coalesce durable index writes: a log_delta burst must not retain one snapshot string per event. */
+  private agentsPersistDirty = false;
+  private agentsPersistInflight = false;
   /** Cache-first stats refreshes that must settle during graceful close. */
   private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
@@ -1259,7 +1357,86 @@ export class PiHostBackend implements HostBackend {
   }
   subscribe(listener: (event: HostEvent) => void) {
     this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
+    this.projectionDebug("subscribe", { listeners: this.listeners.size });
+    return () => {
+      this.listeners.delete(listener);
+      this.projectionDebug("unsubscribe", { listeners: this.listeners.size });
+    };
+  }
+  private projectionDebugEnabled(): boolean {
+    return Boolean(this.env?.PIPIUI_STREAM_DEBUG);
+  }
+  private projectionDebugFile(): string | undefined {
+    if (!this.projectionDebugEnabled()) return undefined;
+    if (this.projectionDebugFilePath !== undefined) return this.projectionDebugFilePath ?? undefined;
+    const candidate = this.env?.PIPIUI_STREAM_DEBUG_FILE;
+    try {
+      const stat = typeof candidate === "string" && isAbsolute(candidate) ? lstatSync(candidate) : undefined;
+      this.projectionDebugFilePath = typeof candidate === "string"
+        && isAbsolute(candidate)
+        && stat?.isFile()
+        && !stat.isSymbolicLink()
+        ? candidate
+        : null;
+    } catch {
+      this.projectionDebugFilePath = null;
+    }
+    return this.projectionDebugFilePath ?? undefined;
+  }
+  private projectionDebugLine(line: string, output: "log" | "warn" = "warn"): void {
+    if (!this.projectionDebugEnabled()) return;
+    const bounded = line.slice(0, 1_999);
+    console[output](bounded);
+    const path = this.projectionDebugFile();
+    if (!path) return;
+    let descriptor: number | undefined;
+    try {
+      descriptor = openSync(path, fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW);
+      writeSync(descriptor, `${bounded}\n`, undefined, "utf8");
+    } catch {
+      // Debug observability is never product behavior. A removed, replaced, or
+      // unwritable sink must not affect the host or create a new file.
+    } finally {
+      if (descriptor !== undefined) {
+        try { closeSync(descriptor); } catch { /* best-effort diagnostic sink */ }
+      }
+    }
+  }
+  private projectionDebugSessionTag(sessionId?: string): string {
+    if (!sessionId) return "session#none";
+    let tag = this.projectionDebugSessionTags.get(sessionId);
+    if (!tag) {
+      tag = `session#${this.projectionDebugSessionSerial += 1}`;
+      this.projectionDebugSessionTags.set(sessionId, tag);
+    }
+    return tag;
+  }
+  private projectionDebugAgentTag(key: string): string {
+    let tag = this.projectionDebugAgentTags.get(key);
+    if (!tag) {
+      tag = `key#${this.projectionDebugAgentSerial += 1}`;
+      this.projectionDebugAgentTags.set(key, tag);
+    }
+    return tag;
+  }
+  private projectionDebugActive(sessionId?: string): { active: number; activeKeys: string } {
+    const rows = [...this.agents.entries()]
+      .filter(([, agent]) => (!sessionId || agent.sessionId === sessionId) && this.isLiveAgentState(agent.state))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const visible = rows.slice(0, 12).map(([key, agent]) =>
+      `${this.projectionDebugAgentTag(key)}:${agent.state}:${this.projectionDebugProvenance.get(key) ?? "unknown"}`);
+    return {
+      active: rows.length,
+      activeKeys: `${visible.join(",") || "none"}${rows.length > visible.length ? `,+${rows.length - visible.length}` : ""}`,
+    };
+  }
+  private projectionDebug(reason: string, fields: Record<string, string | number | boolean | undefined> = {}): void {
+    if (!this.projectionDebugEnabled()) return;
+    const suffix = Object.entries(fields)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key}=${String(value).replace(/\s+/g, "_").slice(0, 256)}`)
+      .join(" ");
+    this.projectionDebugLine(`[projection-debug] backend=${this.projectionDebugBackendTag} reason=${reason}${suffix ? ` ${suffix}` : ""}`);
   }
   private childStillRunning(child?: ChildProcessWithoutNullStreams): boolean {
     return Boolean(child && child.exitCode === null && !child.signalCode);
@@ -1305,6 +1482,7 @@ export class PiHostBackend implements HostBackend {
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
     this.persistAgentLogs();
+    this.persistAgents();
     this.closed = true;
     this.stopOrphanReconcileTimer();
     // Stop the resident external-pi worker if one was spawned during this run.
@@ -1911,17 +2089,15 @@ export class PiHostBackend implements HostBackend {
         const rows = [...this.agents.values()].filter(
           (agent) => !sessionId || agent.sessionId === sessionId,
         );
-        if (params[1] === "history") return rows;
-        const current = new Map<string, AgentSummary>();
-        for (const agent of rows) {
-          const key = `${agent.sessionId ?? ""}\u0000${agent.agentId}`;
-          const previous = current.get(key);
-          if (!previous || Number(this.isLiveAgentState(agent.state)) > Number(this.isLiveAgentState(previous.state)) ||
-            (this.isLiveAgentState(agent.state) === this.isLiveAgentState(previous.state) && (agent.createdAt ?? 0) > (previous.createdAt ?? 0))) {
-            current.set(key, agent);
-          }
-        }
-        return [...current.values()];
+        const result = params[1] === "history" ? rows : this.currentAgentSummaries(rows);
+        const active = this.projectionDebugActive(sessionId);
+        this.projectionDebug("list_agents", {
+          session: this.projectionDebugSessionTag(sessionId),
+          history: params[1] === "history",
+          rows: result.length,
+          ...active,
+        });
+        return result;
       }
       case "getAgentLogs": {
         const agentId = params[0] as string;
@@ -2365,7 +2541,7 @@ export class PiHostBackend implements HostBackend {
     return live;
   }
   private lines(live: Live, chunk: string) {
-    if (process.env.PIPIUI_STREAM_DEBUG) console.log(`[stream-debug] stdout chunk sid=${live.session.id} t=${Date.now()} bytes=${chunk.length}`);
+    if (this.projectionDebugEnabled()) this.projectionDebugLine(`[stream-debug] stdout session=${this.projectionDebugSessionTag(live.session.id)} t=${Date.now()} bytes=${chunk.length}`, "log");
     live.buffer += chunk;
     let at;
     while ((at = live.buffer.indexOf("\n")) >= 0) {
@@ -2415,6 +2591,7 @@ export class PiHostBackend implements HostBackend {
       // in the same stdout chunk. An async markBusy lets the settle run with a
       // stale epoch and drop the drain that should release the next queued item.
       live.turnEpoch = this.queue.markBusy(id);
+      live.pendingFinalReconciliation = undefined;
       if (!this.queueLoads.has(id)) {
         void this.loadQueue(id).then(() => {
           if (this.live.get(id) !== live) return;
@@ -2496,8 +2673,8 @@ export class PiHostBackend implements HostBackend {
           segment: live.messageEpoch,
           delta: d.delta ?? "",
         });
-      if (process.env.PIPIUI_STREAM_DEBUG && (d.type === "text_delta" || d.type === "thinking_delta"))
-        console.log(`[stream-debug] emit ${d.type} sid=${id} t=${Date.now()} len=${(d.delta ?? "").length}`);
+      if (this.projectionDebugEnabled() && (d.type === "text_delta" || d.type === "thinking_delta"))
+        this.projectionDebugLine(`[stream-debug] emit ${d.type} session=${this.projectionDebugSessionTag(id)} t=${Date.now()} len=${(d.delta ?? "").length}`, "log");
       if (d.type === "toolcall_start") {
         // Name/id are stripped from RPC start/delta events. Emit a provisional
         // card immediately so a long think is not followed by a silent wait
@@ -2587,7 +2764,26 @@ export class PiHostBackend implements HostBackend {
           part?.type === "toolCall" || part?.type === "tool_call" || part?.type === "tool_use"))
       ) {
         const epoch = live.turnEpoch;
-        if (epoch !== undefined) void this.reconcileFinalAssistantTurn(live, epoch);
+        const timestamp = Number(message.timestamp);
+        const identity = Number.isFinite(timestamp) && timestamp > 0
+          ? {
+              timestamp,
+              ...(typeof message.responseId === "string" && message.responseId
+                ? { responseId: message.responseId }
+                : {}),
+            }
+          : undefined;
+        if (epoch !== undefined && identity) {
+          live.pendingFinalReconciliation = { epoch, identity };
+          this.projectionDebug("final_seen", {
+            session: this.projectionDebugSessionTag(id),
+            epoch,
+            terminalEpoch: live.terminalEpoch,
+            listeners: this.listeners.size,
+            ...this.projectionDebugActive(id),
+          });
+          void this.reconcileFinalAssistantTurn(live, epoch, identity);
+        }
       }
     } else if (e.type === "tool_execution_end") {
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
@@ -2605,11 +2801,45 @@ export class PiHostBackend implements HostBackend {
     const epoch = live.turnEpoch;
     if (epoch === undefined || live.terminalEpoch === epoch) return false;
     live.terminalEpoch = epoch;
+    live.pendingFinalReconciliation = undefined;
+    // The durable agent index is authoritative at a terminal boundary. Replay
+    // its current session view so a renderer that missed an end event cannot
+    // retain a stale running projection. Real live agents remain live here;
+    // this does not clear or rewrite any agent state.
+    const replay = this.currentAgentSummaries(
+      [...this.agents.values()].filter(agent => agent.sessionId === live.session.id),
+    );
+    this.projectionDebug("terminal_replay", {
+      session: this.projectionDebugSessionTag(live.session.id),
+      epoch,
+      status,
+      rows: replay.length,
+      listeners: this.listeners.size,
+      ...this.projectionDebugActive(live.session.id),
+    });
+    for (const agent of replay) {
+      const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
+      this.projectionDebug("agent_broadcast", {
+        source: "terminal_replay",
+        key: this.projectionDebugAgentTag(key),
+        state: agent.state,
+        provenance: this.projectionDebugProvenance.get(key) ?? "unknown",
+        listeners: this.listeners.size,
+      });
+      this.agent({ type: "agent", agent });
+    }
     this.stream({
       type: "status",
       sessionId: live.session.id,
       status,
       pendingFollowUps: live.followUps,
+    });
+    this.projectionDebug("terminal_projected", {
+      session: this.projectionDebugSessionTag(live.session.id),
+      epoch,
+      status,
+      listeners: this.listeners.size,
+      ...this.projectionDebugActive(live.session.id),
     });
     void this.queueIdle(live.session.id, epoch);
     // A compact lifecycle that omitted its end event must not wedge the
@@ -2618,29 +2848,120 @@ export class PiHostBackend implements HostBackend {
     if (pushStats) void this.pushSessionStats(live.session.id);
     return true;
   }
-  private async reconcileFinalAssistantTurn(live: Live, epoch: number): Promise<void> {
-    // Let any normal agent_settled / queued immediate re-entry already present
-    // in the same stdout batch win before asking Pi for its authoritative state.
-    await new Promise<void>(resolve => setImmediate(resolve));
-    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) return;
-    let state: any;
-    try {
-      state = await this.command(live.session.id, { type: "get_state" });
-    } catch {
-      return;
-    }
-    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) return;
+  private terminalReconciliationHasPendingWork(live: Live, state: any): boolean {
     const hasActionableQueue = this.queue.listQueue(live.session.id).some(item => item.state === "queued" || item.state === "sending");
-    if (
-      state?.isStreaming !== false
-      || state?.pendingMessageCount !== 0
+    const hasRunningAgent = [...this.agents.values()].some(agent =>
+      agent.sessionId === live.session.id && (agent.state === "running" || agent.state === "stalled"));
+    return state?.pendingMessageCount !== 0
       || state?.isCompacting === true
       || live.followUps.length > 0
       || live.pendingDrainPrompt !== undefined
       || live.compactionHoldsQueue === true
       || live.compaction.isCompacting
       || hasActionableQueue
-    ) return;
+      || hasRunningAgent;
+  }
+  private debugTerminalReconciliation(
+    live: Live,
+    epoch: number,
+    reason: string,
+    state?: any,
+    durableFinal?: boolean,
+  ): void {
+    if (!this.projectionDebugEnabled()) return;
+    const actionableQueueCount = this.queue.listQueue(live.session.id)
+      .filter(item => item.state === "queued" || item.state === "sending").length;
+    const runningAgentCount = [...this.agents.values()].filter(agent =>
+      agent.sessionId === live.session.id && (agent.state === "running" || agent.state === "stalled")).length;
+    this.projectionDebugLine(
+      `[terminal-reconcile] reason=${reason}`
+      + ` backend=${this.projectionDebugBackendTag}`
+      + ` session=${this.projectionDebugSessionTag(live.session.id)}`
+      + ` epoch=${epoch}`
+      + ` epochCurrent=${live.turnEpoch === epoch}`
+      + ` epochTerminal=${live.terminalEpoch === epoch}`
+      + ` streaming=${String(state?.isStreaming)}`
+      + ` compacting=${String(state?.isCompacting)}`
+      + ` pending=${String(state?.pendingMessageCount)}`
+      + ` followUps=${live.followUps.length}`
+      + ` queue=${actionableQueueCount}`
+      + ` agents=${runningAgentCount}`
+      + ` activeKeys=${this.projectionDebugActive(live.session.id).activeKeys}`
+      + ` listeners=${this.listeners.size}`
+      + ` compactionHold=${live.compactionHoldsQueue === true}`
+      + ` compactionLive=${live.compaction.isCompacting}`
+      + ` durable=${String(durableFinal)}`,
+    );
+  }
+  private async reconcileFinalAssistantTurn(live: Live, epoch: number, identity: FinalAssistantIdentity): Promise<void> {
+    this.projectionDebug("reconcile_invoke", {
+      session: this.projectionDebugSessionTag(live.session.id),
+      epoch,
+      terminalEpoch: live.terminalEpoch,
+      listeners: this.listeners.size,
+      ...this.projectionDebugActive(live.session.id),
+    });
+    // Let any normal agent_settled / queued immediate re-entry already present
+    // in the same stdout batch win before asking Pi for its authoritative state.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+      this.debugTerminalReconciliation(live, epoch, "initial_fence");
+      return;
+    }
+    let state: any;
+    try {
+      state = await this.command(live.session.id, { type: "get_state" });
+    } catch {
+      this.debugTerminalReconciliation(live, epoch, "first_state_error");
+      return;
+    }
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+      this.debugTerminalReconciliation(live, epoch, "first_state_fence", state);
+      return;
+    }
+    if (this.terminalReconciliationHasPendingWork(live, state)) {
+      this.debugTerminalReconciliation(live, epoch, "first_state_pending", state);
+      return;
+    }
+    if (state?.isStreaming === false) {
+      this.debugTerminalReconciliation(live, epoch, "idle_settle", state);
+      this.projectTurnTerminal(live, "settled", true);
+      return;
+    }
+    // Pi can persist the final assistant message but omit agent_settled while
+    // its in-memory isStreaming flag remains stale. Require exact durable
+    // evidence, then a short stable interval and a second authoritative state
+    // check before projecting terminal. A real queued re-entry, worker, tool
+    // continuation, compaction, or late agent_settled wins every fence.
+    const durableFinal = await waitForLatestDurableFinalAssistant(live.path, identity);
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+      this.debugTerminalReconciliation(live, epoch, "durable_wait_fence", state, durableFinal);
+      return;
+    }
+    if (!durableFinal) {
+      this.debugTerminalReconciliation(live, epoch, "durable_missing", state, false);
+      return;
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+      this.debugTerminalReconciliation(live, epoch, "stable_wait_fence", state, true);
+      return;
+    }
+    try {
+      state = await this.command(live.session.id, { type: "get_state" });
+    } catch {
+      this.debugTerminalReconciliation(live, epoch, "second_state_error", undefined, true);
+      return;
+    }
+    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+      this.debugTerminalReconciliation(live, epoch, "second_state_fence", state, true);
+      return;
+    }
+    if (this.terminalReconciliationHasPendingWork(live, state)) {
+      this.debugTerminalReconciliation(live, epoch, "second_state_pending", state, true);
+      return;
+    }
+    this.debugTerminalReconciliation(live, epoch, "durable_settle", state, true);
     this.projectTurnTerminal(live, "settled", true);
   }
   private async command(id: string, body: Rpc) {
@@ -4190,7 +4511,9 @@ export class PiHostBackend implements HostBackend {
           agent.endedAt = agent.endedAt ?? restartedAt;
           normalized = true;
         }
-        this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), agent);
+        const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
+        this.agents.set(key, agent);
+        this.projectionDebugProvenance.set(key, "durable_load");
       }
       if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
         if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
@@ -4246,14 +4569,31 @@ export class PiHostBackend implements HostBackend {
   }
   private persistAgents(): void {
     if (this.closed) return;
-    const target = this.agentsFile();
-    const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
+    this.agentsPersistDirty = true;
+    this.enqueuePersistAgents();
+  }
+  private enqueuePersistAgents(): void {
+    if (this.agentsPersistInflight || !this.agentsPersistDirty) return;
+    this.agentsPersistInflight = true;
     this.agentsWrite = this.agentsWrite.then(async () => {
-      await fs.mkdir(dirname(target), { recursive: true });
-      const tmp = `${target}.tmp-${process.pid}`;
-      await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
-      await fs.rename(tmp, target);
-    }).catch(error => console.warn(`[pipi-agents] unable to persist durable index: ${error?.message ?? error}`));
+      try {
+        while (this.agentsPersistDirty) {
+          this.agentsPersistDirty = false;
+          const target = this.agentsFile();
+          const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
+          await fs.mkdir(dirname(target), { recursive: true });
+          const tmp = `${target}.tmp-${process.pid}`;
+          await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
+          await fs.rename(tmp, target);
+        }
+      } finally {
+        this.agentsPersistInflight = false;
+        if (this.agentsPersistDirty) this.enqueuePersistAgents();
+      }
+    }).catch(error => {
+      this.agentsPersistInflight = false;
+      console.warn(`[pipi-agents] unable to persist durable index: ${error?.message ?? error}`);
+    });
   }
   private async getAgent(id: string) {
     // Commands predate session-qualified ids. Prefer an active matching row, then the newest;
@@ -4286,6 +4626,18 @@ export class PiHostBackend implements HostBackend {
   }
   private isLiveAgentState(state: AgentSummary["state"]): boolean {
     return state === "running" || state === "stalled";
+  }
+  private currentAgentSummaries(rows: AgentSummary[]): AgentSummary[] {
+    const current = new Map<string, AgentSummary>();
+    for (const agent of rows) {
+      const key = `${agent.sessionId ?? ""}\u0000${agent.agentId}`;
+      const previous = current.get(key);
+      if (!previous || Number(this.isLiveAgentState(agent.state)) > Number(this.isLiveAgentState(previous.state)) ||
+        (this.isLiveAgentState(agent.state) === this.isLiveAgentState(previous.state) && (agent.createdAt ?? 0) > (previous.createdAt ?? 0))) {
+        current.set(key, agent);
+      }
+    }
+    return [...current.values()];
   }
   private stopOrphanReconcileTimer(): void {
     if (!this.orphanReconcileTimer) return;
@@ -4543,6 +4895,9 @@ export class PiHostBackend implements HostBackend {
   private mapAgentEvent(raw: any, sessionId?: string) {
     const key = this.agentKey(raw.agentId, sessionId, raw.runId);
     const current = this.agents.get(key);
+    const eventKind = ["start", "end", "update", "usage", "log", "log_delta", "closeout"].includes(raw.kind)
+      ? String(raw.kind)
+      : "unknown";
     if (raw.kind === "closeout") {
       if (
         !current ||
@@ -4556,8 +4911,33 @@ export class PiHostBackend implements HostBackend {
         closeout: raw.reason ?? current.closeout,
       };
       this.agents.set(key, agent);
+      this.projectionDebugProvenance.set(key, eventKind);
+      this.projectionDebug("agent_event", {
+        session: this.projectionDebugSessionTag(sessionId),
+        kind: eventKind,
+        key: this.projectionDebugAgentTag(key),
+        before: current.state,
+        after: agent.state,
+      });
+      this.projectionDebug("agent_broadcast", {
+        source: "event",
+        key: this.projectionDebugAgentTag(key),
+        state: agent.state,
+        provenance: eventKind,
+        listeners: this.listeners.size,
+      });
       this.agent({ type: "agent", agent });
       this.persistAgents();
+      return;
+    }
+    if (raw.kind !== "start" && !current) {
+      this.projectionDebug("agent_event", {
+        session: this.projectionDebugSessionTag(sessionId),
+        kind: eventKind,
+        key: this.projectionDebugAgentTag(key),
+        before: "missing",
+        after: "ignored",
+      });
       return;
     }
     const reportedName = raw.name ?? current?.name;
@@ -4642,6 +5022,14 @@ export class PiHostBackend implements HostBackend {
       contextWindowTokens: positiveWindow(usage?.contextWindow) ?? positiveWindow(raw.contextWindow) ?? (sameRun ? current?.contextWindowTokens : undefined) ?? (sessionId ? this.sessionContextLastKnown.get(sessionId)?.contextWindow : undefined),
     };
     this.agents.set(key, agent);
+    this.projectionDebugProvenance.set(key, eventKind);
+    this.projectionDebug("agent_event", {
+      session: this.projectionDebugSessionTag(sessionId),
+      kind: eventKind,
+      key: this.projectionDebugAgentTag(key),
+      before: current?.state ?? "missing",
+      after: agent.state,
+    });
     const lifecycle =
       raw.worktreeLifecycle ??
       (raw.worktreePath
@@ -4691,8 +5079,32 @@ export class PiHostBackend implements HostBackend {
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
     }
+    this.projectionDebug("agent_broadcast", {
+      source: "event",
+      key: this.projectionDebugAgentTag(key),
+      state: agent.state,
+      provenance: eventKind,
+      listeners: this.listeners.size,
+    });
     this.agent({ type: "agent", agent });
-    this.persistAgents();
+    // Streaming log_delta is preview-only. Persisting the whole index on every
+    // 50ms flush queued one JSON snapshot per event and froze the Electron main
+    // process (100% CPU, multi-GB heap) once a few workers were live.
+    if (raw.kind !== "log_delta") this.persistAgents();
+    if (terminal && sessionId) {
+      const live = this.live.get(sessionId);
+      const pending = live?.pendingFinalReconciliation;
+      if (live && pending && live.turnEpoch === pending.epoch && live.terminalEpoch !== pending.epoch) {
+        this.projectionDebug("terminal_retry", {
+          session: this.projectionDebugSessionTag(sessionId),
+          epoch: pending.epoch,
+          key: this.projectionDebugAgentTag(key),
+          state: agent.state,
+          ...this.projectionDebugActive(sessionId),
+        });
+        void this.reconcileFinalAssistantTurn(live, pending.epoch, pending.identity);
+      }
+    }
   }
   /** Lease surface deliberately remains absent: no lease is acquired/released in this backend. */
 }
