@@ -14,7 +14,7 @@ import {
 	decideStallWatchdogAction,
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
-import { createProviderWaitController, providerWaitDeadlineMs } from "../index.ts";
+import { createProviderWaitController, decideProviderStallRecovery, providerWaitDeadlineMs } from "../index.ts";
 import { resolveSubagentWorktree } from "../worktree.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
@@ -348,11 +348,61 @@ test("provider wait deadline covers initial wait and mid-stream silence, never t
 	assert.equal(s.timers.size, 0);
 });
 
+test("an id-less tool batch keeps the deadline armed instead of disarming the run", () => {
+	const timers = new Map<number, { callback: () => void; delay: number }>();
+	const timeouts: string[] = [];
+	let nextId = 1;
+	const controller = createProviderWaitController({
+		model: "test-model",
+		deadlineMs: 1_000,
+		schedule(callback, delay) {
+			const id = nextId++;
+			timers.set(id, { callback, delay });
+			return id as unknown as ReturnType<typeof setTimeout>;
+		},
+		cancel: (timer) => { timers.delete(timer as unknown as number); },
+		onPhase: () => {},
+		onTimeout: () => timeouts.push(controller.phase()),
+	});
+	// A text-only turn, and a provider that emitted tool calls without ids, both land here.
+	// Neither will ever produce a tool result, so neither may leave the wait unguarded.
+	for (const batch of [[], ["", ""]]) {
+		controller.noteToolBatch(batch);
+		assert.equal(controller.phase(), "model-active");
+		assert.equal(timers.size, 1, "an id-less batch must leave exactly one deadline armed");
+	}
+	const armed = [...timers.entries()].at(-1)!;
+	timers.delete(armed[0]);
+	armed[1].callback();
+	assert.deepEqual(timeouts, ["model-active"]);
+});
+
+test("provider stall recovery spends a clustered budget before giving up", () => {
+	const decide = (resumeCount: number) =>
+		decideProviderStallRecovery({ timedOut: true, wasAborted: false, resumeCount });
+	assert.equal(decideProviderStallRecovery({ timedOut: false, wasAborted: false, resumeCount: 0 }), "not-provider-stall");
+	assert.equal(decideProviderStallRecovery({ timedOut: true, wasAborted: true, resumeCount: 0 }), "aborted");
+	// One resume left the second stall of a cluster to a human; the budget now covers a
+	// short bad patch, and each resume advances the model chain when one exists.
+	assert.deepEqual([decide(0), decide(1), decide(2)], ["resume", "resume", "resume"]);
+	assert.equal(decide(3), "terminal-failed");
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	const resumeBranch = source.slice(
+		source.indexOf('if (providerRecovery === "resume") {'),
+		source.indexOf("resumeAgentHandle(pipiuiAgentId, runId);", source.indexOf('if (providerRecovery === "resume") {')),
+	);
+	assert.match(resumeBranch, /resolveAgentModelChainEntry\(agentName, modelChainIndex \+ 1\)/);
+	assert.match(resumeBranch, /rewriteSpawnModelArgs\(args, stallChainEntry\.model, stallThinking\)/);
+	assert.match(resumeBranch, /\(provider stall\)/);
+});
+
 test("provider wait deadline honors the environment override and a positive default", () => {
-	assert.equal(providerWaitDeadlineMs({}), 180_000);
+	// 82s is the observed peak for a healthy wait, so the default keeps ~40s of headroom
+	// while still recovering a minute earlier than a human notices the run has gone quiet.
+	assert.equal(providerWaitDeadlineMs({}), 120_000);
 	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "45000" }), 45_000);
-	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "0" }), 180_000);
-	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "junk" }), 180_000);
+	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "0" }), 120_000);
+	assert.equal(providerWaitDeadlineMs({ PIPIUI_PROVIDER_WAIT_TIMEOUT_MS: "junk" }), 120_000);
 });
 
 test("heartbeat mandates status plus drift classification", () => {

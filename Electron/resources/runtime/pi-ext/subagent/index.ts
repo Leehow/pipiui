@@ -1795,8 +1795,13 @@ const AUTO_RESUME_CONTEXT_HINT_TOKENS = 100_000;
  * The guard is not reliable on its own: a silently-dropped proxied stream keeps the socket
  * ESTABLISHED and can outlive it, so this deadline also covers initial and mid-stream waits.
  */
-const PROVIDER_WAIT_TIMEOUT_MS_DEFAULT = 180_000;
-const PROVIDER_WAIT_AUTO_RESUME_MAX = 1;
+const PROVIDER_WAIT_TIMEOUT_MS_DEFAULT = 120_000;
+/**
+ * Stalls arrive in clusters: one observed cluster resumed onto the same model and went
+ * silent again inside three minutes. A single resume therefore always lands the second
+ * stall on the user, so the budget covers a short bad patch instead of one dropped stream.
+ */
+const PROVIDER_WAIT_AUTO_RESUME_MAX = 3;
 export function providerWaitDeadlineMs(env: Record<string, string | undefined> = process.env): number {
 	const configured = Number.parseInt(env.PIPIUI_PROVIDER_WAIT_TIMEOUT_MS || "", 10);
 	return Number.isFinite(configured) && configured > 0
@@ -1848,9 +1853,17 @@ export function createProviderWaitController(options: {
 	armDeadline();
 	return {
 		noteToolBatch(toolCallIds: string[]) {
-			clearTimer();
 			pending = new Set(toolCallIds.filter(Boolean));
-			if (pending.size > 0) setPhase("running-tool");
+			// No usable ids means no tool result will ever arrive to re-arm: either a
+			// text-only turn, or a provider that emitted tool calls without ids. Clearing
+			// unconditionally here disarmed the deadline for the rest of the run and left a
+			// silently-dropped stream to hang until a human noticed, so keep it armed.
+			if (pending.size === 0) {
+				armDeadline();
+				return;
+			}
+			clearTimer();
+			setPhase("running-tool");
 		},
 		noteToolResult(toolCallId: string) {
 			if (currentPhase !== "running-tool" || !pending.delete(toolCallId) || pending.size > 0) return;
@@ -5597,6 +5610,20 @@ async function runSingleAgent(
 							}
 							providerWait.noteToolBatch(toolCallIds);
 						runtimePendingTools = toolNames;
+						// Tool calls without ids cannot be matched against their results, so the
+						// wait can never re-enter running-tool. Say so instead of letting the run
+						// look healthy while only the deadline is holding it up.
+						if (toolNames.length > 0 && toolCallIds.length === 0) {
+							pipiuiReport({
+								kind: "log",
+								agentId: pipiuiAgentId,
+								runId,
+								items: [{
+									itemType: "text",
+									text: `[pipiui] provider emitted ${toolNames.length} tool call(s) with no id: ${toolNames.join(", ")}`,
+								}],
+							});
+						}
 						// This message asked for tools, so the stdout silence that follows is the
 						// tools running, not a wedge. Claimed here rather than on stopReason so a
 						// provider that omits `toolUse` still gets the same explained window.
@@ -5705,7 +5732,31 @@ async function runSingleAgent(
 				providerStallResumeCount++;
 				currentResult.stopReason = undefined;
 				currentResult.errorMessage = undefined;
-				pipiuiActivity = `provider stall auto-resume ${providerStallResumeCount}/${PROVIDER_WAIT_AUTO_RESUME_MAX}`;
+				// A provider that just went silent tends to stay silent, so a stall resume
+				// advances the chain when one exists rather than re-dialling the same model.
+				const stallChainEntry = resolveAgentModelChainEntry(agentName, modelChainIndex + 1);
+				const stallProgress = `provider stall auto-resume ${providerStallResumeCount}/${PROVIDER_WAIT_AUTO_RESUME_MAX}`;
+				if (stallChainEntry) {
+					const stalledModel = resolveAgentModelChainEntry(agentName, modelChainIndex)?.model ?? "?";
+					modelChainIndex++;
+					const stallThinking = resolveFallbackThinking(stallChainEntry, taskThinking);
+					rewriteSpawnModelArgs(args, stallChainEntry.model, stallThinking);
+					currentResult.model = stallThinking
+						? stripModelThinkingSuffix(stallChainEntry.model)
+						: stallChainEntry.model;
+					autoResumeCount = 0; // the new model gets its own same-model resume budget
+					const stallNote = `model fallback: ${stalledModel} -> ${stallChainEntry.model} (provider stall)`;
+					modelFallbackNotes.push(`\n[pipiui] ${stallNote}`);
+					pipiuiActivity = `${stallProgress} 换模：${stallNote}`;
+					pipiuiReport({
+						kind: "log",
+						agentId: pipiuiAgentId,
+						runId,
+						items: [{ itemType: "text", text: `[pipiui] ${stallNote}` }],
+					});
+				} else {
+					pipiuiActivity = stallProgress;
+				}
 				resumeAgentHandle(pipiuiAgentId, runId);
 				pipiuiUpdate(true);
 				const waitSignal = signal ? AbortSignal.any([signal, dispatchAbort.signal]) : dispatchAbort.signal;
