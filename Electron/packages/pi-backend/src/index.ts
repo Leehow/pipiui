@@ -1499,7 +1499,6 @@ export class PiHostBackend implements HostBackend {
   private projectModelsInitialized?: Promise<void>;
   private profileInitialization: Promise<void>;
   private modelsWrite: CanonicalModelsWriteQueue;
-  private writingCanonicalModels = false;
   private isolatedHomes = new Map<string, IsolatedProjectHome>();
   private projectNames: Record<string, string> = {};
   private projectNamesLoaded?: Promise<void>;
@@ -1535,17 +1534,7 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
-    const sharedWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
-    this.modelsWrite = {
-      enqueue: (job) => sharedWrite.enqueue(async () => {
-        this.writingCanonicalModels = true;
-        try {
-          return await job();
-        } finally {
-          this.writingCanonicalModels = false;
-        }
-      }),
-    };
+    this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
       () => undefined,
       () => undefined,
@@ -2586,12 +2575,16 @@ export class PiHostBackend implements HostBackend {
     }
     this.documentInjections.setPending(id, injection, supported);
   }
-  /** Git operations run in a known project work tree only — never in an id-derived path. */
-  private async projectPath(projectId: string): Promise<string> {
+  /** Configured display path: project identity, settings keys, and returned `path`. */
+  private async configuredProject(projectId: string): Promise<Project> {
     const projects = (await this.handle("listProjects", [])) as Project[];
     const project = projects.find((item) => item.id === projectId);
     if (!project) throw new Error(`unknown project ${projectId}`);
-    return this.verifiedProjectRoot(project.path);
+    return project;
+  }
+  /** Git operations run in a known project work tree only — never in an id-derived path. */
+  private async projectPath(projectId: string): Promise<string> {
+    return this.verifiedProjectRoot((await this.configuredProject(projectId)).path);
   }
   /**
    * Add-project-time git probe/init run in a directory the user just picked in
@@ -3941,13 +3934,14 @@ export class PiHostBackend implements HostBackend {
     const trimmed = name.trim();
     if (!trimmed) throw new Error("项目名称不能为空");
     if (trimmed.length > 120) throw new Error("项目名称过长");
-    const path = await this.projectPath(projectId);
+    const project = await this.configuredProject(projectId);
+    const displayPath = project.path;
     const names = await this.loadProjectNames();
     const next = { ...names };
-    if (trimmed === (basename(path) || path)) delete next[path];
-    else next[path] = trimmed;
+    if (trimmed === (basename(displayPath) || displayPath)) delete next[displayPath];
+    else next[displayPath] = trimmed;
     await this.saveProjectNames(next);
-    return this.project(path, next);
+    return this.project(displayPath, next);
   }
   private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
     if (typeof projectId !== "string" || !projectId.trim()) return [];
@@ -4256,10 +4250,20 @@ export class PiHostBackend implements HostBackend {
       merged.set(currentKey, current);
     this.models = [...merged.values()];
   }
+  private awaitCanonicalModelsIdle(): Promise<void> {
+    return this.modelsWrite.enqueue(async () => undefined);
+  }
+  /** Renderer/API catalog reads wait for isolated init and the current write-queue tail. */
   private async loadModelCatalog(includeCurrent = true): Promise<void> {
-    if (this.profileMode === "isolated" && !this.writingCanonicalModels) {
+    if (this.profileMode === "isolated") {
       await this.loadProjectPaths();
+      await this.awaitCanonicalModelsIdle();
+      this.invalidateModelCatalog();
     }
+    await this.loadModelCatalogUnsafe(includeCurrent);
+  }
+  /** Queue-job catalog reread. Must not await the write queue it is already running on. */
+  private async loadModelCatalogUnsafe(includeCurrent = true): Promise<void> {
     await this.loadConfiguredModels();
     await this.mergeRuntimeModels(includeCurrent);
     this.applyManualModelSelection(await this.loadManualModelSelection());
@@ -4301,14 +4305,24 @@ export class PiHostBackend implements HostBackend {
     this.modelCatalogReady = true;
     this.scheduleCompatContextBackfill();
   }
+  private invalidateModelCatalog(): void {
+    this.modelsLoaded = undefined;
+    this.runtimeModelsPromise = undefined;
+    this.modelCatalogReady = false;
+  }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
     includeCurrent = true,
   ): Promise<Model[]> {
-    this.modelsLoaded = undefined;
-    this.runtimeModelsPromise = undefined;
-    this.modelCatalogReady = false;
+    this.invalidateModelCatalog();
     await this.loadModelCatalog(includeCurrent);
+    return this.models;
+  }
+  private async refreshModelsAfterAuthChangeUnsafe(
+    includeCurrent = true,
+  ): Promise<Model[]> {
+    this.invalidateModelCatalog();
+    await this.loadModelCatalogUnsafe(includeCurrent);
     return this.models;
   }
   /**
@@ -4322,10 +4336,13 @@ export class PiHostBackend implements HostBackend {
    * while the constructor's preload is still in flight (it only replaces the result).
    */
   async refreshModelCatalog(): Promise<Model[]> {
-    this.modelsLoaded = undefined;
-    this.runtimeModelsPromise = undefined;
-    this.modelCatalogReady = false;
+    this.invalidateModelCatalog();
     await this.loadModelCatalog(true);
+    return this.models;
+  }
+  private async refreshModelCatalogUnsafe(): Promise<Model[]> {
+    this.invalidateModelCatalog();
+    await this.loadModelCatalogUnsafe(true);
     return this.models;
   }
   private slugifyProviderId(name: string): string {
@@ -4423,7 +4440,7 @@ export class PiHostBackend implements HostBackend {
       };
       catalog.providers = providers;
       await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
-      await this.refreshModelsAfterAuthChange(false);
+      await this.refreshModelsAfterAuthChangeUnsafe(false);
       return { providerId: uniqueId };
     });
   }
@@ -4534,7 +4551,7 @@ export class PiHostBackend implements HostBackend {
       }
       return;
     }
-    await this.refreshModelCatalog();
+    await this.refreshModelCatalogUnsafe();
   }
 
   private async removeProviderCredentials(

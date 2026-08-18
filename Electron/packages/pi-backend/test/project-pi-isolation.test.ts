@@ -168,6 +168,104 @@ describe("isolated project Pi homes", () => {
     expect(after.map((model) => `${model.provider}/${model.id}`)).toContain("slab/only");
   });
 
+  it("holds external listModels until a blocked migration finishes and does not reuse a stale cache", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-model-catalog-wait-"));
+    const host = join(root, "host-profile");
+    const project = join(root, "project");
+    await mkdir(host, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(host, "models.json"), JSON.stringify({ providers: {} }));
+    await writeFile(join(projectPiAgentDir(project), "models.json"), JSON.stringify({
+      providers: {
+        slab: {
+          apiKey: "sk-project",
+          models: [{ id: "only", name: "Only", reasoning: true }],
+        },
+      },
+    }));
+    const inner = createCanonicalModelsWriteQueue();
+    let gate = Promise.resolve();
+    let releaseGate = () => undefined;
+    const queue = {
+      enqueue<T>(job: () => Promise<T>): Promise<T> {
+        return inner.enqueue(async () => {
+          await gate;
+          return job();
+        });
+      },
+    };
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalModelsWrite: queue,
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+    const before = await backend.handle("listModels", []) as Array<{ provider: string; id: string }>;
+    expect(before.map((model) => `${model.provider}/${model.id}`)).not.toContain("slab/only");
+
+    gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const adding = backend.handle("addProject", [project]);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    let listed = false;
+    const listing = backend.handle("listModels", []).then((value) => {
+      listed = true;
+      return value as Array<{ provider: string; id: string }>;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(listed).toBe(false);
+    releaseGate();
+    await adding;
+    const models = await listing;
+    expect(listed).toBe(true);
+    expect(models.map((model) => `${model.provider}/${model.id}`)).toContain("slab/only");
+  });
+
+  it("renames an alias-backed project without changing its configured identity", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-alias-rename-"));
+    const host = join(root, "host-profile");
+    const realProject = join(root, "real-project");
+    const alias = join(root, "alias-project");
+    await mkdir(realProject, { recursive: true });
+    await mkdir(host, { recursive: true });
+    await symlink(realProject, alias);
+    await writeFile(join(realProject, "SENTINEL"), "external-sentinel\n");
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+    });
+    const added = await backend.handle("addProject", [alias]) as { id: string; path: string };
+    expect(added.path).toBe(alias);
+    const renamed = await backend.handle("renameProject", [added.id, "Alias Display"]) as {
+      id: string;
+      name: string;
+      path: string;
+    };
+    expect(renamed.id).toBe(added.id);
+    expect(renamed.path).toBe(alias);
+    expect(renamed.name).toBe("Alias Display");
+    const listed = await backend.handle("listProjects", []) as Array<{ id: string; name: string; path: string }>;
+    expect(listed).toEqual([expect.objectContaining({
+      id: added.id,
+      name: "Alias Display",
+      path: alias,
+    })]);
+    const settings = JSON.parse(await readFile(join(host, "pipiui-settings.json"), "utf8"));
+    expect(settings.projectPaths).toEqual([alias]);
+    expect(settings.projectNames[alias]).toBe("Alias Display");
+    expect(settings.projectNames[await realpath(realProject)]).toBeUndefined();
+    expect(await readFile(join(realProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
+  });
+
   it("writes new sessions and spawns Pi inside the opened project, not a shared host profile", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-project-isolation-"));
     const host = join(root, "host-profile");
