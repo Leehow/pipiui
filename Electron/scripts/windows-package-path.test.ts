@@ -28,7 +28,11 @@ describe('Windows package and CI path', () => {
   })
 
   it('routes the Windows CI job through runtime prepare and the shared target packager', () => {
+    expect(workspacePackage.scripts['test:win']).toContain('windows-package-path.test.ts')
     expect(workflow).toContain('runtime:prepare:win')
+    expect(workflow).toContain('npm run test:win')
+    expect(workflow).toMatch(/if: matrix\.platform != 'win'[\s\S]*npm test/)
+    expect(workflow).toMatch(/if: matrix\.platform == 'win'[\s\S]*npm run test:win/)
     expect(workflow).toContain('package-electron-target.mjs --platform win32 --arch x64')
     expect(workflow).toContain('fetch-cua-driver.mjs')
     expect(workflow).toMatch(/if: matrix\.platform == 'win'[\s\S]*package-electron-target\.mjs/)

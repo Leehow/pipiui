@@ -67,8 +67,16 @@ jobs:
         run: npm run build
 
       - name: Test
+        if: matrix.platform != 'win'
         working-directory: Electron
         run: npm test
+
+      # Full workspace tests assume macOS paths, /bin/ps, and Computer Use.
+      # Windows packaging is gated on the package-path contract instead.
+      - name: Test Windows package path
+        if: matrix.platform == 'win'
+        working-directory: Electron
+        run: npm run test:win
 
       # build/ is gitignored, so build/icon.icns only exists after a local
       # make-icon.sh run; regenerate it on macOS runners (sips + iconutil are

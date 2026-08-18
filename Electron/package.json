@@ -23,6 +23,7 @@
     "dev:browser": "npm run build -w @pipi/host-api && npm run build -w @pipiui/ui && npm run build -w @pipi/pi-backend && npm run build -w @pipiui/server && PIPIUI_SERVER_HOST=127.0.0.1 PIPIUI_SERVER_PORT=5173 PIPIUI_SERVER_PUBLIC_ORIGIN=http://localhost:5173 npm run start -w @pipiui/server",
     "build": "npm run build -w @pipi/host-api && npm run build -w @pipiui/ui && npm run build -w @pipi/pi-backend && npm run build -w @pipiui/server && npm run build -w @pipiui/electron",
     "test": "vitest run --exclude '**/dist/**' --exclude 'resources/runtime/**'",
+    "test:win": "vitest run --exclude **/dist/** --exclude resources/runtime/** scripts/windows-package-path.test.ts scripts/fetch-cua-driver.test.ts apps/electron/packaging-contract.test.ts apps/electron/src/main/terminal-host.test.ts packages/pi-backend/test/pipiui-firecrawl-pdf.test.ts",
     "package": "npm run package:mac",
     "package:mac": "npm run build && npm run package:mac -w @pipiui/electron",
     "package:win": "npm run build && npm run package:win -w @pipiui/electron",
