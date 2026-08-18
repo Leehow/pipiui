@@ -41,6 +41,7 @@ export class LeaseManager {
   private readonly instanceId = crypto.randomUUID();
   private timer?: NodeJS.Timeout;
   private owned = false;
+  private acquireChain: Promise<void> = Promise.resolve();
 
   constructor(options: LeaseManagerOptions) {
     this.sessionId = options.sessionId;
@@ -63,6 +64,26 @@ export class LeaseManager {
   }
   private expired(record: LeaseRecord): boolean { return !Number.isFinite(Date.parse(record.expiresAt)) || Date.parse(record.expiresAt) <= this.now(); }
   private same(record: LeaseRecord): boolean { return record.instanceId === this.instanceId; }
+  /** Same-host PID is gone (ESRCH). A live peer in this process keeps its own instanceId. */
+  private holderGone(record: LeaseRecord): boolean {
+    if (record.hostname !== this.host) return false;
+    if (!Number.isInteger(record.pid) || record.pid <= 0) return true;
+    if (record.pid === this.pid) return false;
+    try {
+      process.kill(record.pid, 0);
+      return false;
+    } catch (error: any) {
+      return error?.code === "ESRCH";
+    }
+  }
+  private reclaimable(record: LeaseRecord | undefined): boolean {
+    return Boolean(record && (this.expired(record) || this.holderGone(record)));
+  }
+  private claim(record: LeaseRecord): LeaseStatus {
+    this.owned = true;
+    this.startHeartbeat();
+    return { sessionId: this.sessionId, writable: true, holder: record };
+  }
   private startHeartbeat(): void { if (!this.timer) this.timer = setInterval(() => { void this.heartbeat(); }, this.heartbeatMs); this.timer.unref?.(); }
   private stopHeartbeat(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
@@ -71,7 +92,7 @@ export class LeaseManager {
     // No lease means no competing writer. Returning `owned` here made every
     // freshly opened session read-only before Electron had acquired anything.
     if (!holder) return { sessionId: this.sessionId, writable: true };
-    if (this.expired(holder)) {
+    if (this.reclaimable(holder)) {
       await fs.rm(this.leasePath, { force: true });
       return { sessionId: this.sessionId, writable: true };
     }
@@ -80,6 +101,12 @@ export class LeaseManager {
   }
 
   async acquire(): Promise<LeaseStatus> {
+    const next = this.acquireChain.then(() => this.acquireUnlocked(), () => this.acquireUnlocked());
+    this.acquireChain = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private async acquireUnlocked(): Promise<LeaseStatus> {
     if (this.owned) { await this.heartbeat(); return this.query(); }
     await fs.mkdir(dirname(this.leasePath), { recursive: true });
     const record = this.record();
@@ -87,15 +114,14 @@ export class LeaseManager {
       const file = await fs.open(this.leasePath, "wx");
       await file.writeFile(JSON.stringify(record));
       await file.close();
-      this.owned = true;
-      this.startHeartbeat();
-      return { sessionId: this.sessionId, writable: true, holder: record };
+      return this.claim(record);
     } catch (error: any) {
       if (error?.code !== "EEXIST") throw error;
       const current = await this.read();
-      if (current && this.expired(current)) {
+      if (current && this.same(current)) return this.claim(current);
+      if (this.reclaimable(current)) {
         await fs.rm(this.leasePath, { force: true });
-        return this.acquire();
+        return this.acquireUnlocked();
       }
       return { sessionId: this.sessionId, writable: false, holder: current };
     }

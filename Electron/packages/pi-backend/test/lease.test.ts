@@ -43,4 +43,33 @@ describe("LeaseManager", () => {
     expect((await first.heartbeat()).writable).toBe(false);
     await second.release();
   });
+  it("reclaims its own lease file after a lost in-memory owned flag", async () => {
+    const [first] = await managers();
+    expect((await first.acquire()).writable).toBe(true);
+    (first as unknown as { owned: boolean }).owned = false;
+    expect((await first.acquire()).writable).toBe(true);
+    await first.release();
+  });
+  it("serializes concurrent acquire on the same manager so none lose to themselves", async () => {
+    const [first] = await managers();
+    const results = await Promise.all(Array.from({ length: 16 }, () => first.acquire()));
+    expect(results.every((result) => result.writable)).toBe(true);
+    await first.release();
+  });
+  it("recovers a same-host lease whose holder pid is gone", async () => {
+    const { hostname } = await import("node:os");
+    const [first] = await managers();
+    await writeFile(first.leasePath, JSON.stringify({
+      protocolVersion: 1,
+      holder: "pipiui-electron",
+      pid: 999_999_999,
+      hostname: hostname(),
+      instanceId: "dead-process",
+      acquiredAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    expect((await first.acquire()).writable).toBe(true);
+    await first.release();
+  });
 });
