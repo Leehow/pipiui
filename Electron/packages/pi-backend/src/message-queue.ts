@@ -412,8 +412,15 @@ export class SessionMessageQueue {
     try {
       await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments }, behavior);
       if (index >= 0 && session.items[index]?.id === item.id) session.items.splice(index, 1);
+      // Mint an epoch only when this delivery is the thing that starts the turn.
+      // A cut-in send needs one, so the aborted turn's late idle cannot clear the
+      // turn it just started. But when the host already marked the session busy —
+      // pi emitted agent_start before this dispatch resolved — the epoch exists and
+      // the host is holding it; a second mint here would strand the host on a stale
+      // epoch, its settle's notifyIdle would be rejected, and the session would stay
+      // turnActive forever: no FIFO drain and no idle-time compaction ever again.
+      if (!session.turnActive) session.turnEpoch += 1;
       session.turnActive = true;
-      session.turnEpoch += 1;
       session.suppressDrainEpoch = undefined;
       this.changed(sessionId);
       return true;
