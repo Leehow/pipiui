@@ -148,10 +148,14 @@ describe('macOS packaging contract', () => {
     expect(fetchCua).toContain("await rm(join(targetDir, CUA_DRIVER_HELPER_APP)")
     // PIPIUI_EMBEDDED_RUNTIME_TARGET is `<platform>-<arch>`, so whatever the fetch
     // step lays down has to be keyed the same way the packaging step reads it.
-    for (const [script, platform] of [['package:mac', 'darwin'], ['package:win', 'win32'], ['package:linux', 'linux']] as const) {
+    for (const [script, platform] of [['package:mac', 'darwin'], ['package:linux', 'linux']] as const) {
       expect(packageJSON.scripts[script]).toContain(`CUA_TARGET_PLATFORM=${platform}`)
       expect(packageJSON.scripts[script]).toContain('fetch-cua-driver.mjs')
     }
+    // cmd.exe cannot parse Unix `VAR=value cmd` prefixes; win32 defaults come
+    // from process.platform / process.arch inside fetch-cua-driver.mjs.
+    expect(packageJSON.scripts['package:win']).toContain('fetch-cua-driver.mjs')
+    expect(packageJSON.scripts['package:win']).not.toContain('CUA_TARGET_PLATFORM=')
   })
 
   it('checks and selects exactly one persistent target without preparing during release', () => {

@@ -18,7 +18,7 @@
     "verify:preload": "node verify-preload.mjs",
     "package": "npm run package:mac",
     "package:mac": "CUA_TARGET_PLATFORM=darwin node ../../scripts/fetch-cua-driver.mjs && node ../../scripts/package-electron-target.mjs --platform darwin --arch x64 -- --mac --x64 && node ../../scripts/package-electron-target.mjs --platform darwin --arch arm64 -- --mac --arm64",
-    "package:win": "CUA_TARGET_PLATFORM=win32 CUA_TARGET_ARCH=x64 node ../../scripts/fetch-cua-driver.mjs && node ../../scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64",
+    "package:win": "node ../../scripts/fetch-cua-driver.mjs && node ../../scripts/package-electron-target.mjs --platform win32 --arch x64 -- --win --x64",
     "package:linux": "CUA_TARGET_PLATFORM=linux CUA_TARGET_ARCH=x64 node ../../scripts/fetch-cua-driver.mjs && node ../../scripts/package-electron-target.mjs --platform linux --arch x64 -- --linux --x64"
   },
   "dependencies": {
