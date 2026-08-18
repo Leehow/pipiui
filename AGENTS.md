@@ -39,12 +39,12 @@
 Pi 必须按打开的项目隔离，自己找自己项目的家。禁止使用全局 `~/.pi/agent`、
 `~/.pi/coc-agent`，禁止把整个 Application Support `pi-agent` 当项目家。
 
-- App-home canonical：所有打开项目指向 App profile 同一份 `.env`、`auth.json`、`models.json`
-- 项目 Pi home 隔离：`settings.json`、`trust.json`、`models-store.json`、sessions、project skills/memory/resources/extensions/packages 等仍位于 `{projectRoot}/.pi/agent`
-- App 宿主管理状态不重路由：project list、调度队列、telemetry、worktree/agent projection 等 bookkeeping 仍可位于 App profile
+- 项目隔离：每个打开项目的 sessions、skills、memory、resources、settings.json、trust.json、models-store.json 只存在于 `{projectRoot}/.pi/agent`，禁止跨写其他项目
+- 明确例外（App-profile canonical）：所有打开项目共享 Electron App profile `pi-agent` 同一份 `.env`、`auth.json`、`models.json`
+- 明确例外（host bookkeeping）：project list、调度队列、telemetry、agent-worktree projection 可留在 App profile
 - 新项目不得从 App profile 播种 `trust.json`；已有项目 trust 决定不得删除或改写
 - chatrpgv4 的 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
-- 项目作用域数据不得跨写其他项目或全局 `~/.pi`；仅上述 App-profile canonical 文件与明确列出的 host bookkeeping 可写 App profile。不要从 `~/.pi` 导入 packages，不要 `pi install` 到全局 `settings.json`，不要把整个项目家软链回全局家。
+- 禁止使用或写入全局 `~/.pi`。不要从 `~/.pi` 导入 packages，不要 `pi install` 到全局 `settings.json`，不要把整个项目家软链回全局家。
 
 ### User-authorized PipiUI host lifecycle (binding)
 

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -173,6 +173,7 @@ describe('Electron Pi profile', () => {
 
     expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
     const installed = await readFile(join(profile.agentDir, 'models.json'), 'utf8')
+    expect((await lstat(join(profile.agentDir, 'models.json'))).mode & 0o777).toBe(0o600)
     expect(await readFile(join(projectAgentDir, 'models.json'), 'utf8')).toBe(installed)
     const parsed = JSON.parse(installed)
     expect(parsed.topLevelUserField).toEqual({ retained: true })
@@ -200,6 +201,10 @@ describe('Electron Pi profile', () => {
     expect(parsed.providers.generic.modelOverrides.reasoner.thinkingLevelMap.off).toBeUndefined()
     expect(parsed.providers.untouched).toEqual({ apiKey: 'OTHER_KEY' })
     expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+    expect(await readFile(join(profile.agentDir, 'models.json'), 'utf8')).toBe(installed)
+    await chmod(join(profile.agentDir, 'models.json'), 0o644)
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+    expect((await lstat(join(profile.agentDir, 'models.json'))).mode & 0o777).toBe(0o600)
     expect(await readFile(join(profile.agentDir, 'models.json'), 'utf8')).toBe(installed)
 
     const upgraded = JSON.parse(await readFile(snapshotPath, 'utf8'))

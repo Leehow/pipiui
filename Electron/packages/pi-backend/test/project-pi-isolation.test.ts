@@ -1,15 +1,16 @@
 import { spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { createPiHostBackend } from "../src/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCanonicalModelsWriteQueue, createPiHostBackend } from "../src/index.js";
 import { projectPiAgentDir, projectPiSessionsDir } from "../src/project-pi-home.js";
 
 describe("isolated project Pi homes", () => {
   let root = "";
   let backend: ReturnType<typeof createPiHostBackend> | undefined;
   afterEach(async () => {
+    vi.unstubAllGlobals();
     await backend?.close().catch(() => undefined);
     backend = undefined;
     if (!root) return;
@@ -65,8 +66,37 @@ describe("isolated project Pi homes", () => {
       capabilityInstalled: true,
       winner: "alpha",
     });
+    expect((await lstat(join(host, "models.json"))).mode & 0o777).toBe(0o600);
     expect((await lstat(join(projectPiAgentDir(alpha), "models.json"))).isSymbolicLink()).toBe(true);
     expect((await lstat(join(projectPiAgentDir(zeta), "models.json"))).isSymbolicLink()).toBe(true);
+  });
+
+  it("keeps project migration moving when the optional capability job fails", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-model-degrade-"));
+    const host = join(root, "host-profile");
+    const alpha = join(root, "alpha");
+    await mkdir(host, { recursive: true });
+    await mkdir(projectPiAgentDir(alpha), { recursive: true });
+    await writeFile(join(host, "pipiui-settings.json"), JSON.stringify({
+      projectPathsVersion: 1,
+      projectPathsCanonicalMigrationVersion: 1,
+      projectPaths: [alpha],
+    }));
+    await writeFile(join(host, "models.json"), '{"providers":{}}');
+    await writeFile(join(projectPiAgentDir(alpha), "models.json"), '{"winner":"alpha"}');
+    const profileInitialization = Promise.reject(new Error("capability exploded"));
+    void profileInitialization.catch(() => undefined);
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      profileInitialization,
+      canonicalProjectPaths: async () => undefined,
+    });
+    await backend.handle("listProjects", []);
+    expect(JSON.parse(await readFile(join(host, "models.json"), "utf8"))).toMatchObject({
+      winner: "alpha",
+    });
+    expect((await lstat(join(projectPiAgentDir(alpha), "models.json"))).isSymbolicLink()).toBe(true);
   });
 
   it("writes new sessions and spawns Pi inside the opened project, not a shared host profile", async () => {
@@ -131,8 +161,156 @@ describe("isolated project Pi homes", () => {
 
     await backend.handle("sendPrompt", [created.id, "go"]);
     const env = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id)?.env ?? captured.at(-1)?.env;
-    expect(env?.PI_CODING_AGENT_DIR).toBe(projectPiAgentDir(project));
-    expect(env?.PI_CODING_AGENT_SESSION_DIR).toBe(projectSessions);
+    const realProject = await realpath(project);
+    expect(env?.PI_CODING_AGENT_DIR).toBe(join(realProject, ".pi", "agent"));
+    expect(env?.PI_CODING_AGENT_SESSION_DIR).toBe(join(realProject, ".pi", "agent", "sessions"));
     expect(env?.PI_CODING_AGENT_DIR).not.toBe(host);
+  });
+
+  it("keeps the ensured real project home after the projectRoot alias is retargeted", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-alias-home-"));
+    const host = join(root, "host-profile");
+    const realProject = join(root, "real-project");
+    const otherProject = join(root, "other-project");
+    const alias = join(root, "alias-project");
+    await mkdir(realProject, { recursive: true });
+    await mkdir(otherProject, { recursive: true });
+    await mkdir(host, { recursive: true });
+    await symlink(realProject, alias);
+    await writeFile(join(otherProject, "SENTINEL"), "external-sentinel\n");
+    const captured: Array<{ env: NodeJS.ProcessEnv }> = [];
+    backend = createPiHostBackend({
+      agentDir: host,
+      sessionsRoot: join(root, "host-sessions"),
+      runtimeRoot: join(root, "runtime"),
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+      piPath: "node",
+      spawn: (_bin, _args, options) => {
+        captured.push({ env: options.env });
+        return spawn(
+          process.execPath,
+          [new URL("./fake-pi.mjs", import.meta.url).pathname],
+          options,
+        ) as any;
+      },
+    });
+
+    const added = await backend.handle("addProject", [alias]) as { id: string };
+    await rm(alias);
+    await symlink(otherProject, alias);
+
+    const created = await backend.handle("newSession", [added.id, "Keep real"]) as { id: string };
+    const listed = await backend.handle("listSessions", [added.id]) as Array<{ id: string }>;
+    expect(listed.map((session) => session.id)).toEqual([created.id]);
+
+    const realSessions = join(await realpath(realProject), ".pi", "agent", "sessions");
+    const files = (await readdir(realSessions)).filter((name) => name.endsWith(".jsonl"));
+    expect(files).toHaveLength(1);
+    expect(JSON.parse((await readFile(join(realSessions, files[0]), "utf8")).split("\n")[0])).toEqual(
+      expect.objectContaining({ id: created.id, cwd: alias }),
+    );
+    await expect(readdir(join(otherProject, ".pi", "agent", "sessions"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    await backend.handle("setFirecrawlPdfApiKey", [added.id, "fc-test-key"]);
+    expect(await readFile(join(await realpath(realProject), ".pi", "agent", "web-search.json"), "utf8")).toContain("fc-test-key");
+    await expect(readFile(join(otherProject, ".pi", "agent", "web-search.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
+
+    await backend.handle("sendPrompt", [created.id, "go"]);
+    const env = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id)?.env ?? captured.at(-1)?.env;
+    expect(env?.PI_CODING_AGENT_DIR).toBe(join(await realpath(realProject), ".pi", "agent"));
+    expect(env?.PI_CODING_AGENT_SESSION_DIR).toBe(realSessions);
+    expect(env?.PI_CODING_AGENT_DIR).not.toBe(join(otherProject, ".pi", "agent"));
+  });
+
+  it("serializes canonical models writers, keeps fields, and recovers after a failed job", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-models-write-queue-"));
+    const host = join(root, "host-profile");
+    const project = join(root, "proj");
+    await mkdir(host, { recursive: true });
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(host, "pipiui-settings.json"), JSON.stringify({
+      projectPathsVersion: 1,
+      projectPathsCanonicalMigrationVersion: 1,
+      projectPaths: [],
+    }));
+    await writeFile(join(host, "models.json"), JSON.stringify({
+      keep: "canonical",
+      providers: {
+        existing: {
+          api: "openai-completions",
+          baseUrl: "https://probe.example/v1",
+          apiKey: "sk-existing",
+          models: [{ id: "already", name: "already", reasoning: true }],
+        },
+      },
+    }));
+    await writeFile(join(projectPiAgentDir(project), "models.json"), JSON.stringify({
+      winner: "project",
+      providers: {},
+    }));
+
+    const queue = createCanonicalModelsWriteQueue();
+    const seen: string[] = [];
+    await Promise.all([
+      queue.enqueue(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        seen.push("first");
+      }),
+      queue.enqueue(async () => {
+        seen.push("second");
+      }),
+    ]);
+    expect(seen).toEqual(["first", "second"]);
+    await expect(queue.enqueue(async () => {
+      throw new Error("injected writer failure");
+    })).rejects.toThrow("injected writer failure");
+
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      const href = String(url);
+      if (href.includes("probe.example")) {
+        return { ok: true, json: async () => ({ data: [{ id: "already", context_length: 111 }] }) };
+      }
+      if (href.includes("proxy.example")) {
+        return { ok: true, json: async () => ({ data: [{ id: "gpt-4o-mini", context_length: 222 }] }) };
+      }
+      return { ok: false, json: async () => ({}) };
+    }));
+
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalModelsWrite: queue,
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+
+    await Promise.all([
+      backend.handle("addProject", [project]),
+      backend.handle("addOpenAICompatibleProvider", [{
+        name: "My Proxy",
+        baseUrl: "https://proxy.example/v1",
+        apiKey: "sk-literal",
+        modelId: "gpt-4o-mini",
+      }]),
+    ]);
+    await backend.compatContextBackfill;
+
+    const disk = JSON.parse(await readFile(join(host, "models.json"), "utf8"));
+    expect(disk.keep).toBe("canonical");
+    expect(disk.winner).toBe("project");
+    expect(disk.providers.existing.models[0]).toMatchObject({ id: "already", contextWindow: 111 });
+    expect(disk.providers["my-proxy"]).toMatchObject({
+      api: "openai-completions",
+      baseUrl: "https://proxy.example/v1",
+      models: [expect.objectContaining({ id: "gpt-4o-mini", contextWindow: 222 })],
+    });
+    expect((await lstat(join(host, "models.json"))).mode & 0o777).toBe(0o600);
   });
 });

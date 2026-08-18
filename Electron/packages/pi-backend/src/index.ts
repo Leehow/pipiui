@@ -98,8 +98,6 @@ import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
   migrateSharedProjectModels,
-  projectPiAgentDir,
-  projectPiSessionsDir,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
 export {
@@ -321,6 +319,70 @@ type ProcFactory = (
   args: string[],
   options: any,
 ) => ChildProcessWithoutNullStreams;
+
+export interface CanonicalModelsWriteQueue {
+  enqueue<T>(job: () => Promise<T>): Promise<T>;
+}
+
+/** One App-owned FIFO for every canonical models.json read-modify-atomic-write. */
+export function createCanonicalModelsWriteQueue(): CanonicalModelsWriteQueue {
+  let tail: Promise<void> = Promise.resolve();
+  return {
+    enqueue<T>(job: () => Promise<T>): Promise<T> {
+      const run = tail.then(job, job);
+      tail = run.then(() => undefined, () => undefined);
+      return run;
+    },
+  };
+}
+
+async function tightenCanonicalFileMode(path: string): Promise<void> {
+  let stat;
+  try {
+    stat = await fs.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (!stat.isFile()) return;
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+  let handle;
+  try {
+    try {
+      handle = await fs.open(path, fsConstants.O_RDWR | noFollow);
+    } catch (error) {
+      if (!noFollow || !["EINVAL", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      handle = await fs.open(path, fsConstants.O_RDWR);
+    }
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+      throw new Error("canonical models path changed during permission tighten");
+    }
+    await handle.chmod(0o600);
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+async function writeCanonicalModelsFile(path: string, contents: string): Promise<void> {
+  await fs.mkdir(dirname(path), { recursive: true });
+  const temporary = join(dirname(path), `.${basename(path)}-${process.pid}-${Date.now()}-${crypto.randomUUID()}.tmp`);
+  try {
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      await handle.writeFile(contents, { encoding: "utf8" });
+      await handle.chmod(0o600);
+    } finally {
+      await handle.close();
+    }
+    await fs.rename(temporary, path);
+    await tightenCanonicalFileMode(path);
+  } catch (error) {
+    await fs.rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
 export type PiBackendOptions = {
   /** Explicit Pi process invocation. Packaged Electron supplies bundled Node + unpacked Pi CLI. */
   piCommand?: PiCommand;
@@ -341,6 +403,8 @@ export type PiBackendOptions = {
   agentDir?: string;
   /** App-profile writes that must finish before shared models migration starts. */
   profileInitialization?: Promise<unknown>;
+  /** Shared App-owned serializer for every canonical models.json writer. */
+  canonicalModelsWrite?: CanonicalModelsWriteQueue;
   /** Bind Pi children to agentDir/sessionsRoot instead of inheriting their ambient profile. */
   profileMode?: "default" | "isolated";
   /** Disable Pi's ambient resource discovery while retaining explicit mounts assembled here. */
@@ -1427,7 +1491,8 @@ export class PiHostBackend implements HostBackend {
   private projectPathsLoaded?: Promise<void>;
   private projectModelsInitialized?: Promise<void>;
   private profileInitialization: Promise<void>;
-  private sharedModelsWrite: Promise<void> = Promise.resolve();
+  private modelsWrite: CanonicalModelsWriteQueue;
+  private isolatedHomes = new Map<string, { agentDir: string; sessionsDir: string }>();
   private projectNames: Record<string, string> = {};
   private projectNamesLoaded?: Promise<void>;
   private revealPath: (path: string) => Promise<void>;
@@ -1462,7 +1527,11 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(() => undefined);
+    if (options.profileInitialization !== undefined) {
+      void this.modelsWrite.enqueue(() => this.profileInitialization);
+    }
     this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
     this.piCommand = options.piCommand
@@ -1554,6 +1623,13 @@ export class PiHostBackend implements HostBackend {
     // Preload the pi SessionManager module at startup: otherwise the first session open after
     // launch pays its ~1s dynamic-import cost and the chat appears to stall before painting.
     void loadSessionManager();
+    // Isolated init enqueues capability (if provided) then deterministic project migration
+    // before the constructor catalog preload can schedule a later models writer.
+    if (this.profileMode === "isolated") {
+      void this.loadProjectPaths()
+        .then(() => this.refreshModelCatalog())
+        .catch(() => undefined);
+    }
     // Preload the model catalog at startup so opening Settings or the Subagent
     // modal never stalls on "正在加载模型": the costly `list-models` child-process
     // spawn overlaps with window load, and the resolved catalog is cached
@@ -1561,9 +1637,6 @@ export class PiHostBackend implements HostBackend {
     // instead of re-spawning. Errors are swallowed here — they resurface on the
     // next on-demand listModels, and the cache self-clears on failure.
     void this.loadModelCatalog().catch(() => undefined);
-    // The same promise is awaited by project/session operations, so this eager pass handles all
-    // persisted complete paths as one deterministic batch without making constructor async.
-    if (this.profileMode === "isolated") void this.loadProjectPaths().catch(() => undefined);
     void this.index().catch(() => undefined);
   }
   subscribe(listener: (event: HostEvent) => void) {
@@ -1922,7 +1995,8 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode === "isolated") {
       try {
         for (const project of await this.loadProjectPaths()) {
-          await walk(projectPiSessionsDir(project));
+          const home = this.lookupIsolatedHome(project);
+          if (home) await walk(home.sessionsDir);
         }
       } catch {
         /* a missing project list must not hide host-root sessions */
@@ -2567,31 +2641,51 @@ export class PiHostBackend implements HostBackend {
         `session is read-only: held by ${status.holder?.holder ?? "another writer"}`,
       );
   }
+  private lookupIsolatedHome(projectRoot: string): { agentDir: string; sessionsDir: string } | undefined {
+    return this.isolatedHomes.get(projectRoot) ?? this.isolatedHomes.get(resolve(projectRoot));
+  }
+  private rememberIsolatedHome(projectRoot: string, home: { agentDir: string; sessionsDir: string }): void {
+    this.isolatedHomes.set(projectRoot, home);
+    this.isolatedHomes.set(resolve(projectRoot), home);
+    this.isolatedHomes.set(dirname(dirname(home.agentDir)), home);
+  }
   private isolatedProjectPaths(cwd: string): { agentDir?: string; sessionsRoot?: string } {
     if (this.profileMode !== "isolated") return {};
+    const home = this.lookupIsolatedHome(cwd);
+    if (!home) return {};
     return {
-      agentDir: projectPiAgentDir(cwd),
-      sessionsRoot: projectPiSessionsDir(cwd),
+      agentDir: home.agentDir,
+      sessionsRoot: home.sessionsDir,
     };
   }
   private migrateSharedModels(projectRoots: string[]): Promise<void> {
-    const run = this.sharedModelsWrite
-      .catch(() => undefined)
-      .then(() => this.profileInitialization)
-      .then(() => migrateSharedProjectModels({ canonicalAgentDir: this.agentDir, projectRoots }))
-      .then(() => undefined);
-    this.sharedModelsWrite = run;
-    return run;
+    return this.modelsWrite.enqueue(async () => {
+      await migrateSharedProjectModels({ canonicalAgentDir: this.agentDir, projectRoots });
+    }).then(() => undefined);
   }
-  private async ensureIsolatedProjectHome(projectRoot: string): Promise<void> {
-    if (this.profileMode !== "isolated") return;
+  private async ensureIsolatedProjectHome(
+    projectRoot: string,
+    options?: { migrate?: boolean },
+  ): Promise<{ agentDir: string; sessionsDir: string } | undefined> {
+    if (this.profileMode !== "isolated") return undefined;
+    const cached = this.lookupIsolatedHome(projectRoot);
+    if (cached) {
+      if (options?.migrate !== false) {
+        await this.migrateSharedModels([dirname(dirname(cached.agentDir))]);
+      }
+      return cached;
+    }
     await sanitizePiSettingsFile(join(this.agentDir, "settings.json")).catch(() => false);
-    await ensureProjectPiHome({
+    const home = await ensureProjectPiHome({
       projectRoot,
       credentialSeedDir: this.agentDir,
       deferModelsMigration: true,
     });
-    await this.migrateSharedModels([projectRoot]);
+    this.rememberIsolatedHome(projectRoot, home);
+    if (options?.migrate !== false) {
+      await this.migrateSharedModels([dirname(dirname(home.agentDir))]);
+    }
+    return home;
   }
   private async newSession(projectId: string, name?: string): Promise<Session> {
     // Session creation needs only local configuration. The optional authenticated runtime
@@ -2603,9 +2697,11 @@ export class PiHostBackend implements HostBackend {
     const p = projects.find((x) => x.id === projectId);
     if (!p) throw new Error(`unknown project ${projectId}`);
     const id = crypto.randomUUID();
-    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(p.path);
-    const dir = this.profileMode === "isolated"
-      ? projectPiSessionsDir(p.path)
+    const isolated = this.profileMode === "isolated"
+      ? await this.ensureIsolatedProjectHome(p.path)
+      : undefined;
+    const dir = isolated
+      ? isolated.sessionsDir
       : join(this.root, encodeURIComponent(p.path));
     await fs.mkdir(dir, { recursive: true });
     const path = join(
@@ -3752,7 +3848,12 @@ export class PiHostBackend implements HostBackend {
     }
     await this.projectPathsLoaded;
     if (this.profileMode === "isolated" && !this.projectModelsInitialized) {
-      const initialization = this.migrateSharedModels(this.projectPaths);
+      const realRoots: string[] = [];
+      for (const projectRoot of this.projectPaths) {
+        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false });
+        if (home) realRoots.push(dirname(dirname(home.agentDir)));
+      }
+      const initialization = this.migrateSharedModels(realRoots);
       this.projectModelsInitialized = initialization;
       try {
         await initialization;
@@ -3775,14 +3876,12 @@ export class PiHostBackend implements HostBackend {
     this.projectPaths = saved;
     this.projectPathsLoaded = Promise.resolve();
     if (this.profileMode === "isolated") {
+      const realRoots: string[] = [];
       for (const projectRoot of saved) {
-        await ensureProjectPiHome({
-          projectRoot,
-          credentialSeedDir: this.agentDir,
-          deferModelsMigration: true,
-        });
+        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false });
+        if (home) realRoots.push(dirname(dirname(home.agentDir)));
       }
-      const initialization = this.migrateSharedModels(saved);
+      const initialization = this.migrateSharedModels(realRoots);
       this.projectModelsInitialized = initialization;
       try {
         await initialization;
@@ -3992,8 +4091,9 @@ export class PiHostBackend implements HostBackend {
     if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
     const path = await this.projectPath(projectId);
     if (this.profileMode === "isolated") {
-      await this.ensureIsolatedProjectHome(path);
-      return projectPiAgentDir(path);
+      const home = await this.ensureIsolatedProjectHome(path);
+      if (!home) throw new Error("isolated project home is unavailable");
+      return home.agentDir;
     }
     return this.agentDir;
   }
@@ -4250,58 +4350,62 @@ export class PiHostBackend implements HostBackend {
       providerId = `custom-${providerId}`;
     }
 
-    const modelsPath = join(this.agentDir, "models.json");
-    let catalog: any = { providers: {} };
-    try {
-      catalog = JSON.parse(await fs.readFile(modelsPath, "utf8"));
-    } catch (error: any) {
-      if (error?.code !== "ENOENT") throw new Error(`无法读取 models.json：${error instanceof Error ? error.message : String(error)}`);
-    }
-    if (!catalog || typeof catalog !== "object") catalog = { providers: {} };
-    const providers = catalog.providers && typeof catalog.providers === "object" ? catalog.providers : {};
-    let uniqueId = providerId;
-    let n = 2;
-    while (providers[uniqueId] && providers[uniqueId]?.baseUrl !== baseUrl) {
-      uniqueId = `${providerId}-${n++}`;
-    }
-    const existing = providers[uniqueId] && typeof providers[uniqueId] === "object" ? providers[uniqueId] : {};
-    const models = Array.isArray(existing.models) ? [...existing.models] : [];
     let contextWindow = explicitContextWindow;
     if (contextWindow === undefined) {
       contextWindow = await probeCompatContextWindow(baseUrl, apiKey, modelId);
     }
-    const existingIndex = models.findIndex((m: any) => m && m.id === modelId);
-    if (existingIndex < 0) {
-      models.push({
-        id: modelId,
-        name: modelId,
-        reasoning: true,
-        ...(contextWindow !== undefined ? { contextWindow } : {}),
-      });
-    } else if (contextWindow !== undefined && parsePositiveInt(models[existingIndex]?.contextWindow) === undefined) {
-      models[existingIndex] = { ...models[existingIndex], contextWindow };
-    }
-    providers[uniqueId] = {
-      ...existing,
-      baseUrl,
-      api: "openai-completions",
-      apiKey,
-      models,
-    };
-    catalog.providers = providers;
-    const temporary = join(this.agentDir, `.models.json-${process.pid}-${Date.now()}.tmp`);
-    await fs.mkdir(this.agentDir, { recursive: true });
-    await fs.writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`);
-    await fs.rename(temporary, modelsPath);
-    await this.refreshModelsAfterAuthChange(false);
-    return { providerId: uniqueId };
+    return this.modelsWrite.enqueue(async () => {
+      const modelsPath = join(this.agentDir, "models.json");
+      let catalog: any = { providers: {} };
+      try {
+        catalog = JSON.parse(await fs.readFile(modelsPath, "utf8"));
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") throw new Error(`无法读取 models.json：${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!catalog || typeof catalog !== "object") catalog = { providers: {} };
+      const providers = catalog.providers && typeof catalog.providers === "object" ? catalog.providers : {};
+      let uniqueId = providerId;
+      let n = 2;
+      while (providers[uniqueId] && providers[uniqueId]?.baseUrl !== baseUrl) {
+        uniqueId = `${providerId}-${n++}`;
+      }
+      const existing = providers[uniqueId] && typeof providers[uniqueId] === "object" ? providers[uniqueId] : {};
+      const models = Array.isArray(existing.models) ? [...existing.models] : [];
+      const existingIndex = models.findIndex((m: any) => m && m.id === modelId);
+      if (existingIndex < 0) {
+        models.push({
+          id: modelId,
+          name: modelId,
+          reasoning: true,
+          ...(contextWindow !== undefined ? { contextWindow } : {}),
+        });
+      } else if (contextWindow !== undefined && parsePositiveInt(models[existingIndex]?.contextWindow) === undefined) {
+        models[existingIndex] = { ...models[existingIndex], contextWindow };
+      }
+      providers[uniqueId] = {
+        ...existing,
+        baseUrl,
+        api: "openai-completions",
+        apiKey,
+        models,
+      };
+      catalog.providers = providers;
+      await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
+      await this.refreshModelsAfterAuthChange(false);
+      return { providerId: uniqueId };
+    });
   }
 
   private scheduleCompatContextBackfill(): void {
     if (this.compatContextBackfill) return;
-    this.compatContextBackfill = this.backfillCompatContextWindows().catch((error) => {
-      console.warn("compat provider context backfill failed", error);
-    });
+    const ready = this.profileMode === "isolated"
+      ? (this.projectModelsInitialized ?? Promise.resolve()).catch(() => undefined)
+      : Promise.resolve();
+    this.compatContextBackfill = ready
+      .then(() => this.modelsWrite.enqueue(() => this.backfillCompatContextWindows()))
+      .catch((error) => {
+        console.warn("compat provider context backfill failed", error);
+      });
   }
 
   private resolveLiteralApiKey(raw: unknown): string | undefined {
@@ -4385,15 +4489,16 @@ export class PiHostBackend implements HostBackend {
         providers[need.providerId] = { ...(providers[need.providerId] as object), models: nextModels };
       }
     }
-    if (!wrote) return;
+    if (!wrote) {
+      await tightenCanonicalFileMode(modelsPath);
+      return;
+    }
     try {
-      const temporary = join(this.agentDir, `.models.json-${process.pid}-${Date.now()}.tmp`);
-      await fs.writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`);
-      await fs.rename(temporary, modelsPath);
+      await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
     } catch (error) {
       if (!this.modelsJsonUnwritableWarned) {
         this.modelsJsonUnwritableWarned = true;
-        console.warn("compat provider context backfill skipped: models.json is not writable", error);
+        console.warn("compat provider context backfill skipped: models.json is not writable");
       }
       return;
     }

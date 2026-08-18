@@ -1,4 +1,5 @@
-import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
+import { constants as fsConstants } from 'node:fs'
+import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 
 export const PI_PROFILE_MIGRATION_MARKER = '.pipiui-profile-migration-v1.json'
@@ -169,6 +170,53 @@ export function mergeBundledModelCapabilityOverrides(
   return result
 }
 
+async function tightenCanonicalSecretFileMode(path: string): Promise<void> {
+  let stat
+  try {
+    stat = await lstat(path)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  if (!stat.isFile()) return
+  const noFollow = fsConstants.O_NOFOLLOW ?? 0
+  let handle
+  try {
+    try {
+      handle = await open(path, fsConstants.O_RDWR | noFollow)
+    } catch (error) {
+      if (!noFollow || !['EINVAL', 'ENOTSUP'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error
+      handle = await open(path, fsConstants.O_RDWR)
+    }
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) {
+      throw new Error('canonical models path changed during permission tighten')
+    }
+    await handle.chmod(0o600)
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function writeCanonicalSecretFile(path: string, contents: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true })
+  const temporary = join(dirname(path), `.${basename(path)}-${process.pid}-${Date.now()}-${crypto.randomUUID()}.tmp`)
+  try {
+    const handle = await open(temporary, 'wx', 0o600)
+    try {
+      await handle.writeFile(contents, { encoding: 'utf8' })
+      await handle.chmod(0o600)
+    } finally {
+      await handle.close()
+    }
+    await rename(temporary, path)
+    await tightenCanonicalSecretFileMode(path)
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined)
+    throw error
+  }
+}
+
 /** Install the bundled capability layer before Pi ModelRuntime reads models.json. */
 export async function installBundledModelCapabilityOverrides(
   profile: ElectronPiProfile,
@@ -205,23 +253,15 @@ export async function installBundledModelCapabilityOverrides(
   try { previousProvenance = await readFile(provenancePath, 'utf8') } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
   }
-  if (original === merged && previousProvenance === provenance) return 'unchanged'
-  const temporary = join(profile.agentDir, `.models.json-${process.pid}-${Date.now()}.tmp`)
-  const provenanceTemporary = join(profile.agentDir, `.model-capabilities-${process.pid}-${Date.now()}.tmp`)
-  try {
-    if (original !== merged) {
-      await writeFile(temporary, merged, { flag: 'wx' })
-      await rename(temporary, modelsPath)
-    }
-    if (previousProvenance !== provenance) {
-      await writeFile(provenanceTemporary, provenance, { flag: 'wx' })
-      await rename(provenanceTemporary, provenancePath)
-    }
-  } catch (error) {
-    await rm(temporary, { force: true }).catch(() => undefined)
-    await rm(provenanceTemporary, { force: true }).catch(() => undefined)
-    throw error
+  if (original === merged && previousProvenance === provenance) {
+    if (original) await tightenCanonicalSecretFileMode(modelsPath)
+    if (previousProvenance) await tightenCanonicalSecretFileMode(provenancePath)
+    return 'unchanged'
   }
+  if (original !== merged) await writeCanonicalSecretFile(modelsPath, merged)
+  else if (original) await tightenCanonicalSecretFileMode(modelsPath)
+  if (previousProvenance !== provenance) await writeCanonicalSecretFile(provenancePath, provenance)
+  else if (previousProvenance) await tightenCanonicalSecretFileMode(provenancePath)
   return 'updated'
 }
 

@@ -1,7 +1,7 @@
 import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
+import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
 import {
   PIPI_HOST_IPC_CHANNEL,
   PIPI_HOST_PROTOCOL_VERSION,
@@ -153,18 +153,22 @@ if (app) {
     // Bundled model-capability overrides and the runtime-tree install do not gate
     // the window or the backend's IPC wiring, so they run in the background in
     // parallel with window load instead of blocking createWindow.
-    // Data-ordering is preserved two ways: (a) installRuntimeTree is re-run per
-    // session/model spawn (refreshRuntimeTree), so it never needs to finish before
-    // the first list-models; (b) once the profile/capability install lands, the
-    // backend's model catalog is invalidated and reloaded via refreshModelCatalog so
-    // the UI's next listModels sees the bundled capability overrides.
-    const profileInstall = (async () => {
-      if (!assets.sourceRoot) throw new Error('PipiUI runtime source is unavailable for model capability initialization')
-      await installBundledModelCapabilityOverrides(
-        piProfile,
-        join(assets.sourceRoot, 'model-capabilities', 'models-dev-reasoning-options.json')
-      )
-    })()
+    // Data-ordering: one App-owned models write queue runs capability first
+    // (optional; failure degrades to the existing canonical file), then the
+    // backend's deterministic project migration, then refreshModelCatalog.
+    // installRuntimeTree is independently re-run per spawn (refreshRuntimeTree).
+    const modelsWriteQueue = createCanonicalModelsWriteQueue()
+    const profileInstall = modelsWriteQueue.enqueue(async () => {
+      try {
+        if (!assets.sourceRoot) throw new Error('PipiUI runtime source is unavailable for model capability initialization')
+        await installBundledModelCapabilityOverrides(
+          piProfile,
+          join(assets.sourceRoot, 'model-capabilities', 'models-dev-reasoning-options.json')
+        )
+      } catch (error) {
+        console.error('[pipi-install] profile/capability install failed:', error)
+      }
+    })
     // Runtime tree install overlaps with window load and the first list-models load.
     // It is a warm-up only: refreshRuntimeTree re-runs it before every spawn.
     void Promise.resolve().then(() => {
@@ -190,6 +194,7 @@ if (app) {
       runtimeRoot,
       agentDir: piProfile.agentDir,
       sessionsRoot: piProfile.sessionsRoot,
+      canonicalModelsWrite: modelsWriteQueue,
       profileInitialization: profileInstall,
       profileMode: 'isolated',
       resourceMode: 'explicit',
@@ -240,16 +245,9 @@ if (app) {
     registerRemoteControlIpc(ipcMain, remoteControl)
     void remoteControl.restore()
     createWindow(browser, () => terminalHost.closeAll())
-    // Once the background profile/capability install lands, invalidate + reload the
-    // backend model catalog so the UI's next listModels reflects the bundled
-    // capability overrides even if the constructor's preload ran on empty models.json.
-    profileInstall.then(
-      () => {
-        try { void piBackend.refreshModelCatalog() }
-        catch (error) { console.warn(`[pipi-install] model catalog refresh failed: ${error}`) }
-      },
-      (error) => console.error('[pipi-install] profile/capability install failed:', error)
-    )
+    // Capability is the first models-write job. Isolated backend init then migrates
+    // project catalogs and refreshes the model catalog; do not refresh here or the
+    // UI can observe pre-migration canonical state.
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
       if (BaseWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
