@@ -100,32 +100,27 @@ export function findDelayimpLibDir(env = process.env) {
   return undefined
 }
 
-const defaultWindowsKitsLib = 'C:\\Program Files (x86)\\Windows Kits\\10\\Lib'
+const libEnvKeys = ['LIB', 'LIBPATH']
 
-export function findWindowsSdkLibDirs(env = process.env) {
-  const kits = env.PIPIUI_WINDOWS_KITS_LIB || defaultWindowsKitsLib
-  if (!existsSync(kits)) return []
-  const versions = readdirSync(kits, { withFileTypes: true })
-    .filter(entry => entry.isDirectory())
-    .map(entry => entry.name)
-    .sort()
-    .reverse()
-  for (const version of versions) {
-    const um = join(kits, version, 'um', 'x64')
-    const ucrt = join(kits, version, 'ucrt', 'x64')
-    if (existsSync(join(um, 'kernel32.lib'))) return [um, existsSync(ucrt) ? ucrt : undefined].filter(Boolean)
+/** Keep vcvars INCLUDE/LIB/LIBPATH intact; only append delayimp if missing. */
+export function appendWindowsLibDir(env, libDir) {
+  const next = { ...env }
+  if (!libDir) return next
+  for (const key of libEnvKeys) {
+    const current = next[key] || ''
+    const parts = current.split(';').filter(Boolean)
+    if (parts.includes(libDir)) continue
+    next[key] = parts.length ? `${current.replace(/;+$/, '')};${libDir}` : libDir
   }
-  return []
+  return next
 }
 
-export function writeWindowsPtyBuildProps(root, libDirs) {
-  const dirsToAdd = (Array.isArray(libDirs) ? libDirs : [libDirs]).filter(Boolean)
-  if (dirsToAdd.length === 0) return []
+/** Spectre only. Never set LibraryPath here — that drops the SDK/UCRT dirs vcvars already provided. */
+export function writeWindowsPtyBuildProps(root) {
   const props = `<?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
     <SpectreMitigation>false</SpectreMitigation>
-    <LibraryPath>${dirsToAdd.join(';')};$(LibraryPath)</LibraryPath>
   </PropertyGroup>
 </Project>
 `
@@ -162,12 +157,10 @@ function main() {
   console.log(`Packaging with persistent embedded runtime ${key}`)
   Object.assign(releaseEnv, windowsMsvcEnv(options.platform, releaseEnv))
   if (options.platform === 'win32') {
-    const libDirs = [findDelayimpLibDir(releaseEnv), ...findWindowsSdkLibDirs(releaseEnv)].filter(Boolean)
-    const written = writeWindowsPtyBuildProps(electronRoot, libDirs)
-    if (libDirs.length) {
-      releaseEnv.LIB = `${libDirs.join(';')}${releaseEnv.LIB ? `;${releaseEnv.LIB}` : ''}`
-      console.log(`Windows native rebuild LIB+=${libDirs.join(';')} props=${written.length}`)
-    }
+    const delayimpDir = findDelayimpLibDir(releaseEnv)
+    Object.assign(releaseEnv, appendWindowsLibDir(releaseEnv, delayimpDir))
+    const written = writeWindowsPtyBuildProps(electronRoot)
+    if (delayimpDir) console.log(`Windows native rebuild append delayimp LIB ${delayimpDir} spectre-props=${written.length}`)
   }
   run(process.execPath, [
     join(electronRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
