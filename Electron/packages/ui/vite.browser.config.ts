@@ -14,6 +14,7 @@ export default defineConfig({
   plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
   build: {
     outDir: 'dist/browser',
-    emptyOutDir: true
+    emptyOutDir: true,
+    target: ['es2017', 'chrome64', 'safari11', 'firefox67']
   }
 })

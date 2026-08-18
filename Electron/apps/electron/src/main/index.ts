@@ -235,7 +235,7 @@ if (app) {
     const remoteControl = createRemoteControlService({
       backend,
       userDataDir: userData,
-      relayOrigin: process.env.PIPIUI_RELAY_ORIGIN || 'https://pipi.aichattrpg.com'
+      relayOrigin: process.env.PIPIUI_RELAY_ORIGIN || 'https://remote.deepwood.cn'
     })
     registerRemoteControlIpc(ipcMain, remoteControl)
     void remoteControl.restore()

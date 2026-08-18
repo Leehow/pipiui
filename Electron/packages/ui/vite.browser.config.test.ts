@@ -26,6 +26,10 @@ describe('browser file-viewer build avoids renderer-chunk TDZ', () => {
     expect(browserConfig.build?.emptyOutDir).toBe(true)
   })
 
+  it('targets conservative engines so older mobile WebViews can parse the bundle', () => {
+    expect(browserConfig.build?.target).toEqual(['es2017', 'chrome64', 'safari11', 'firefox67'])
+  })
+
   it('still publishes offline viewer assets below dist/browser/file-viewer', () => {
     const target = resolveFileViewerCopyAssetsTarget('build', fileViewerAssetOptions.copyAssets, {
       projectRoot: dirname(fileURLToPath(import.meta.url)),

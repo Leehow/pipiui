@@ -435,7 +435,9 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   }
 
   const reset = async (relayOrigin?: string) => {
-    const origin = (relayOrigin ?? stored?.relayOrigin ?? options.relayOrigin ?? '').replace(/\/$/, '')
+    const optionOrigin = (options.relayOrigin ?? '').replace(/\/$/, '')
+    const storedOrigin = stored?.relayOrigin
+    const origin = (relayOrigin ?? (storedOrigin && optionOrigin && storedOrigin !== optionOrigin ? optionOrigin : storedOrigin) ?? optionOrigin).replace(/\/$/, '')
     if (!origin) throw new Error('relay origin is required')
     stopping = true
     runToken += 1
