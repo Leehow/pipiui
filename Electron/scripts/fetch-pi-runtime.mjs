@@ -189,6 +189,11 @@ async function pruneRuntimeTree(root, { platform, arch }) {
     for (const entry of entries) {
       const path = join(dir, entry.name)
       if (entry.isDirectory()) {
+        if (entry.name === '.bin') {
+          await rm(path, { recursive: true, force: true })
+          removed += 1
+          continue
+        }
         if (holdsPrebuilds && !keptPrebuilds.has(entry.name)) {
           await rm(path, { recursive: true, force: true })
           removed += 1
@@ -483,6 +488,8 @@ async function buildRuntime({ asset, destination, key, platform, arch, runtimesR
 
     const nodeModules = join(piLib, 'node_modules')
     await rm(join(nodeModules, 'pipiui-electron-workspace'), { recursive: true, force: true })
+    // npm links the prefix package back to itself; 7za then fails the Windows NSIS archive.
+    await rm(join(nodeModules, 'pipiui-embedded-pi-runtime'), { recursive: true, force: true })
     const piCli = join(nodeModules, '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
     if (!(await isFile(piCli))) throw new Error('Installed Pi package has no dist/cli.js')
 

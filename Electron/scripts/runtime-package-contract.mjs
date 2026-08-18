@@ -42,6 +42,9 @@ export async function inspectEmbeddedRuntimeTree(root, maxBytes = EMBEDDED_RUNTI
       if (entry.name === 'pipiui-electron-workspace') {
         return { ok: false, reason: `runtime contains the Electron source workspace at ${rel}`, bytes, files }
       }
+      if (entry.name === 'pipiui-embedded-pi-runtime') {
+        return { ok: false, reason: `runtime contains the staging package self-link at ${rel}`, bytes, files }
+      }
       if (entry.isDirectory()) {
         stack.push(path)
         continue

@@ -51,7 +51,8 @@ describe('macOS packaging contract', () => {
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/pdf-inspector/node_modules',
-      to: 'pipiui-runtime/pdf-inspector/node_modules'
+      to: 'pipiui-runtime/pdf-inspector/node_modules',
+      filter: ['**/*', '!**/.bin', '!**/.bin/**']
     }))
     expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
     expect(embedded?.filter).toBeUndefined()

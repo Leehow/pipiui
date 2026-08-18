@@ -34,6 +34,8 @@ describe('Windows package and CI path', () => {
     expect(runtimePreparer).toContain("'--no-workspaces'")
     expect(runtimePreparer).toContain('cwd: piLib')
     expect(runtimePreparer).toContain("npm_config_workspaces: 'false'")
+    expect(runtimePreparer).toContain("join(nodeModules, 'pipiui-embedded-pi-runtime')")
+    expect(runtimePreparer).toContain("entry.name === '.bin'")
   })
 
   it('pins the Windows CI runner to VS 2022 so node-gyp can rebuild Electron natives', () => {
