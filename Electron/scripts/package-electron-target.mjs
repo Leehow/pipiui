@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -54,6 +55,35 @@ export function windowsNativeRebuildEnv(platform, root = electronRoot, env = pro
   }
 }
 
+const defaultVcvars64 = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat'
+const defaultVswhere = 'C:\\Program Files (x86)\\Microsoft Visual Studio\\Installer\\vswhere.exe'
+
+export function resolveVcvars64(env = process.env) {
+  if (env.PIPIUI_VCVARS64 && existsSync(env.PIPIUI_VCVARS64)) return env.PIPIUI_VCVARS64
+  if (existsSync(defaultVcvars64)) return defaultVcvars64
+  if (!existsSync(defaultVswhere)) return undefined
+  const found = spawnSync(defaultVswhere, ['-latest', '-products', '*', '-find', 'VC\\Auxiliary\\Build\\vcvars64.bat'], { encoding: 'utf8' })
+  const path = (found.stdout || '').trim().split(/\r?\n/).find(Boolean)
+  return path && existsSync(path) ? path : undefined
+}
+
+/** Import vcvars64 so electron-rebuild/link can see delayimp.lib and the MSVC LIB path. */
+export function windowsMsvcEnv(platform, env = process.env) {
+  if (platform !== 'win32' || process.platform !== 'win32') return {}
+  const vcvars = resolveVcvars64(env)
+  if (!vcvars) return {}
+  const result = spawnSync(env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${vcvars}" >nul && set`], { encoding: 'utf8', windowsHide: true })
+  const imported = {}
+  for (const line of (result.stdout || '').split(/\r?\n/)) {
+    const index = line.indexOf('=')
+    if (index <= 0) continue
+    const key = line.slice(0, index)
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue
+    imported[key] = line.slice(index + 1)
+  }
+  return imported
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2))
   if (options.help) { usage(); return }
@@ -81,6 +111,7 @@ function main() {
     cwd: join(electronRoot, 'apps', 'electron'),
     env: {
       ...releaseEnv,
+      ...windowsMsvcEnv(options.platform, releaseEnv),
       ...windowsNativeRebuildEnv(options.platform, electronRoot, releaseEnv),
       PIPIUI_EMBEDDED_RUNTIME_TARGET: key
     }

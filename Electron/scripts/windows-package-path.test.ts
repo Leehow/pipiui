@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import workspacePackage from '../package.json'
 import packageJSON from '../apps/electron/package.json'
-import { unsignedBuilderArgs, windowsNativeRebuildEnv } from './package-electron-target.mjs'
+import { unsignedBuilderArgs, windowsMsvcEnv, windowsNativeRebuildEnv } from './package-electron-target.mjs'
 
 describe('Windows package and CI path', () => {
   const workflow = readFileSync(resolve(import.meta.dirname, '../../.github/workflows/electron.yml'), 'utf8')
@@ -32,7 +32,10 @@ describe('Windows package and CI path', () => {
     expect(props).toContain('<SpectreMitigation>false</SpectreMitigation>')
     expect(windowsNativeRebuildEnv('win32', '/repo/Electron').ForceImportBeforeCppTargets).toBe('/repo/Electron/Directory.Build.props')
     expect(windowsNativeRebuildEnv('darwin', '/repo/Electron')).toEqual({})
+    expect(windowsMsvcEnv('win32')).toEqual({})
+    expect(windowsMsvcEnv('darwin')).toEqual({})
     expect(packager).toContain('windowsNativeRebuildEnv')
+    expect(packager).toContain('windowsMsvcEnv')
   })
 
   it('drops forceCodeSigning only for unsigned Windows/Linux packaging', () => {
