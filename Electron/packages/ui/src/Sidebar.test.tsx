@@ -489,6 +489,14 @@ describe('Sidebar', () => {
     await waitFor(() => expect(within(s1 as HTMLElement).queryByRole('textbox', { name: '会话名称' })).toBeNull())
   })
 
+  it('optically centers the wordmark across the full topbar and keeps the hamburger clickable', () => {
+    const css = readFileSync(join(import.meta.dirname, 'sidebar.css'), 'utf8')
+    expect(css).toMatch(/\.sb-topbar\{[^}]*position:relative/)
+    expect(css).toMatch(/\.sb-brand-wordmark\{[^}]*position:absolute[^}]*inset:0/)
+    expect(css).toMatch(/\.sb-brand-wordmark\{[^}]*justify-content:center/)
+    expect(css).toMatch(/\.sb-pane-toggle\{[^}]*-webkit-app-region:no-drag/)
+  })
+
   it('hides the status caption and overlays the hover actions on the right corner (Swift parity CSS)', () => {
     const css = readFileSync(join(import.meta.dirname, 'sidebar.css'), 'utf8')
     // The status caption (time/subtitle) fades on hover/focus so the actions own that corner.

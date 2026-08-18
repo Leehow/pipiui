@@ -6,9 +6,14 @@ import type { VirtuosoHandle } from 'react-virtuoso'
 import { Transcript } from './Transcript'
 import type { ChatMessage } from './transcript-model'
 
+const virtuosoProps: { initialTopMostItemIndex?: number } = {}
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
-  return { Virtuoso: React.forwardRef(({ data, itemContent }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element }, ref) => { React.useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
+  return { Virtuoso: React.forwardRef(({ data, itemContent, initialTopMostItemIndex }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; initialTopMostItemIndex?: number }, ref) => {
+    virtuosoProps.initialTopMostItemIndex = initialTopMostItemIndex
+    React.useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }))
+    return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div>
+  }) }
 })
 vi.mock('streamdown', () => ({ Streamdown: ({ children }: { children: unknown }) => <>{children}</> }))
 vi.mock('@streamdown/code', () => ({ code: {} }))
@@ -23,6 +28,16 @@ const messages: ChatMessage[] = [
 ]
 
 describe('Transcript waiting layout', () => {
+  it('starts Virtuoso at the newest message so a first open is not stuck at the oldest', () => {
+    const transcriptRef = createRef<VirtuosoHandle>()
+    const history: ChatMessage[] = [
+      { id: 'old', role: 'user', content: '旧历史', timestamp: 1 },
+      { id: 'new', role: 'assistant', content: '最新回复', timestamp: 2 },
+    ]
+    render(<Transcript messages={history} transcriptRef={transcriptRef} {...handlers} />)
+    expect(virtuosoProps.initialTopMostItemIndex).toBe(1)
+  })
+
   it('marks the transcript tail as waiting so CSS can lift the last message footer', () => {
     const transcriptRef = createRef<VirtuosoHandle>()
     const view = render(<Transcript messages={messages} transcriptRef={transcriptRef} {...handlers} />)

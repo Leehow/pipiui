@@ -9,9 +9,25 @@ export function isAcceptedImageMime(mimeType: string): boolean {
   return (ACCEPTED_IMAGE_TYPES as readonly string[]).includes(mimeType)
 }
 
+const IMAGE_EXT_MIME: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+}
+
+/** Resolve MIME: declared type, or iOS album files with an empty type + image extension. */
+export function imageMimeForFile(file: File): string {
+  if (isAcceptedImageMime(file.type)) return file.type
+  if (file.type) return ''
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? ''
+  return IMAGE_EXT_MIME[ext] ?? ''
+}
+
 /** Returns a user-facing error message, or null when the file is acceptable. */
 export function validateAttachment(file: File): string | null {
-  if (!isAcceptedImageMime(file.type)) {
+  if (!imageMimeForFile(file)) {
     return `不支持的图片格式：${file.name}`
   }
   if (file.size > MAX_ATTACHMENT_BYTES) {
@@ -123,7 +139,7 @@ export function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
     for (let i = 0; i < bytes.length; i += 0x8000) {
       binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
     }
-    return { dataBase64: btoa(binary), mimeType: file.type, name: file.name }
+    return { dataBase64: btoa(binary), mimeType: imageMimeForFile(file) || file.type || 'image/png', name: file.name }
   })
 }
 

@@ -2,7 +2,7 @@ import { memo, type ReactNode } from 'react'
 import { ActivityCard } from './ActivityCard'
 import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
-import { fileChangeDeltaLabel, fileChangeTokenStats, liveTokenLabel } from './file-change-tokens'
+import { fileChangeTokenStats, finishedFileChangeDeltaLabel, liveTokenLabel } from './file-change-tokens'
 import { estimateTokens, formatCompactTokens } from './session-stats-format'
 import { DocumentReferenceCards } from './DocumentReferenceCards'
 import { LiveSubagentCard } from './LiveSubagentCard'
@@ -40,7 +40,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
     : toolDisplaySummary(tool.name, tool.input)
   const completedElapsed = elapsed(tool.startedAt, tool.finishedAt ?? tool.startedAt)
   const stats = !tool.error ? fileChangeTokenStats(tool.name, tool.input ?? '') : null
-  const delta = stats && tool.finished ? fileChangeDeltaLabel(stats.addedChars, stats.removedChars) : undefined
+  const delta = stats && tool.finished ? finishedFileChangeDeltaLabel(stats) : undefined
   const live = stats && !tool.finished ? liveTokenLabel(stats.payloadChars) : undefined
   const baseMeta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
   const meta: ReactNode = delta

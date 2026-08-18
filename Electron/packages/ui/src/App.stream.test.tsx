@@ -504,7 +504,7 @@ describe('active tool-card semantics', () => {
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
     const writeCard = screen.getByRole('button', { name: /write · a.ts/ }).textContent ?? ''
-    expect(writeCard).toMatch(/\+4/)
+    expect(writeCard).toMatch(/\+1/)
     expect(writeCard).not.toMatch(/\u2212/)
     view.unmount()
   })
@@ -522,7 +522,7 @@ describe('active tool-card semantics', () => {
     view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
     const card = screen.getByRole('button', { name: /edit · b.ts/ }).textContent ?? ''
-    expect(card).toMatch(/\+2/)
+    expect(card).toMatch(/\+1/)
     expect(card).toMatch(/\u22121/)
     view.unmount()
   })

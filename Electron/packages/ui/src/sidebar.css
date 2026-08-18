@@ -35,6 +35,7 @@
 
 /* ── Pane title row / Search ───────────────────────────── */
 .sb-topbar{
+  position:relative;
   display:flex;
   align-items:center;
   justify-content:flex-end;
@@ -44,7 +45,14 @@
   border-bottom:1px solid var(--sb-border);
 }
 .sb-brand-wordmark{
-  margin-right:auto;
+  position:absolute;
+  inset:0;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  pointer-events:none;
+  margin:0;
+  text-align:center;
   color:var(--sb-text-strong);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
   font-size:17px;
@@ -54,6 +62,7 @@
   white-space:nowrap;
 }
 .sb-brand-wordmark span{color:#13b8d3}
+.sb-pane-toggle{position:relative;z-index:1;-webkit-app-region:no-drag}
 .sb-search{
   display:flex;
   align-items:center;
