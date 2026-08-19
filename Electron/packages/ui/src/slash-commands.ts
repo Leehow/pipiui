@@ -12,6 +12,10 @@ export type SlashAction =
   | { kind: 'open-model-manager' }
   /** Compact the session context now, via the host's `compact` method. */
   | { kind: 'compact' }
+  /** Transform then send as a normal user prompt (formal-planning trigger). */
+  | { kind: 'send-plan' }
+  /** Send the raw composer text as a normal prompt (runtime /goal extension). */
+  | { kind: 'send-prompt' }
   /** Reserved for future rounds: /thinking, /new … */
   | { kind: 'not-implemented' }
 
@@ -29,9 +33,22 @@ export interface SlashCommandDef {
  *   { name: 'new',      description: '新建会话',   action: { kind: 'not-implemented' } }
  * with their own action kinds.
  */
+export const PLAN_PROMPT_WITH_ARGS =
+  '请为以下目标制定正式计划并发布，等我批准后再执行：'
+export const PLAN_PROMPT_BARE =
+  '请把当前目标整理成正式计划并发布，等我批准后再执行。'
+
+/** User-visible prompt that satisfies philosophy formal-planning (explicit plan request). */
+export function planPromptFromArgs(args: string): string {
+  const goal = args.trim()
+  return goal ? `${PLAN_PROMPT_WITH_ARGS}${goal}` : PLAN_PROMPT_BARE
+}
+
 export const slashCommands: readonly SlashCommandDef[] = [
   { name: 'model', description: '管理模型可见性', action: { kind: 'open-model-manager' } },
-  { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } }
+  { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } },
+  { name: 'plan', description: '为目标制定正式计划', action: { kind: 'send-plan' } },
+  { name: 'goal', description: '设定自主完成的目标', action: { kind: 'send-prompt' } }
 ]
 
 export function slashCommandByName(name: string): SlashCommandDef | undefined {

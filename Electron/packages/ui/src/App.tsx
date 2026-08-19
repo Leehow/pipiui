@@ -34,7 +34,7 @@ import { useSessionQueue } from './useSessionQueue'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice } from './compaction-notice'
-import { filterSlashCommands, parseSlashInvocation, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
+import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useUpdateCenter } from './useUpdateCenter'
@@ -2998,6 +2998,13 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     } else if (command.action.kind === 'compact') {
       onCompact()
       persistDraft('')
+    } else if (command.action.kind === 'send-plan' || command.action.kind === 'send-prompt') {
+      const invocation = parseSlashInvocation(draft)
+      const args = invocation?.name === command.name ? invocation.args : ''
+      const outgoing = command.action.kind === 'send-plan'
+        ? planPromptFromArgs(args)
+        : (draft.trim() || `/${command.name}`)
+      void dispatchSend(outgoing)
     }
   }
 
@@ -3036,12 +3043,9 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     ignoreComposerFileDrag(event)
   }
 
-  const submit = async () => {
+  const dispatchSend = async (outgoing: string) => {
     if (readOnly) return
-    const invocation = parseSlashInvocation(draft)
-    const command = invocation ? slashCommandByName(invocation.name) : undefined
-    if (command) { executeSlash(command); return }
-    const hasText = draft.trim() !== ''
+    const hasText = outgoing.trim() !== ''
     if (!hasText && attachments.length === 0) return
     if (attachments.length > 0 && modelState?.model && modelState.model.supportsImages === false) {
       // 识图路由开启且已选识图模型时放行：图片交给识图模型识别后路由给主线文字模型
@@ -3052,7 +3056,6 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       }
     }
     setSendError(null)
-    const outgoing = hasText ? draft : ''
     const outgoingAttachments = attachments.slice()
     // Clear immediately. sendPrompt/enqueue can sit on ensure+RPC for seconds
     // while the optimistic bubble is already visible; waiting to clear after
@@ -3076,6 +3079,13 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       onAttachmentsChange?.(outgoingAttachments)
       setSendError(`发送失败：${err instanceof Error ? err.message : String(err)}`)
     }
+  }
+  const submit = async () => {
+    if (readOnly) return
+    const invocation = parseSlashInvocation(draft)
+    const command = invocation ? slashCommandByName(invocation.name) : undefined
+    if (command) { executeSlash(command); return }
+    await dispatchSend(draft.trim() !== '' ? draft : '')
   }
   const onKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Escape') {

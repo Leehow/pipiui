@@ -2610,6 +2610,36 @@ describe('composer slash commands and model management', () => {
     expect(sendPrompt).not.toHaveBeenCalled()
   })
 
+  it('sends a transformed formal-plan prompt for /plan with args', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/plan 实现登录' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请为以下目标制定正式计划并发布，等我批准后再执行：实现登录'))
+    expect(composer.value).toBe('')
+  })
+
+  it('sends the bare formal-plan prompt for /plan with no args', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/plan' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请把当前目标整理成正式计划并发布，等我批准后再执行。'))
+    expect(composer.value).toBe('')
+  })
+
+  it('sends /goal status as the raw prompt without transforming it', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    fireEvent.change(composer, { target: { value: '/goal status' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '/goal status'))
+    expect(composer.value).toBe('')
+  })
+
   it('navigates the slash menu with arrows, completes with Tab, dismisses with Esc', async () => {
     const composer = await renderChat(createMockHost())
     fireEvent.change(composer, { target: { value: '/m' } })
