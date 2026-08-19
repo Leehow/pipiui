@@ -1,0 +1,8 @@
+{
+  "name": "@narumitw/pi-tui-kit",
+  "version": "0.56.0",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": { ".": { "import": "./dist/index.js" } }
+}

@@ -4,9 +4,9 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:pa
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
-export type Feature = "philosophy"|"plan"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
+export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -80,7 +80,7 @@ env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile}
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
-if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}
+if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}
 if(!input.bridgePort){appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
@@ -299,6 +299,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     skillLoader:fileIfPresent(extensions,"pipiui-skillloader.ts"),
     builtInSkills:existsSync(join(runtimeRoot,"built-in-skills"))?join(runtimeRoot,"built-in-skills"):undefined,
     planRuntime:fileIfPresent(extensions,"pipiui-plan-runtime.ts"),
+    goalRuntime:declaredEntrypoint(join(runtimeRoot,"pi-goal")),
     searchScope:fileIfPresent(extensions,"pipiui-search-scope.ts"),
     codexServerTools:fileIfPresent(extensions,"pipiui-codex-server-tools.ts"),
     claudeServerTools:fileIfPresent(extensions,"pipiui-claude-server-tools.ts"),
