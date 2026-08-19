@@ -264,7 +264,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
   })
 
-  it('opens the follow-up wait from a late [subagent-done] card after a bare started is ignored', async () => {
+  it('does not reopen busy on a late [subagent-done] after a settled final answer', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
@@ -273,17 +273,77 @@ describe('settled turn stays idle after a late streaming status', () => {
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
-    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '最终答复已经写完了' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    expect(screen.getByText('最终答复已经写完了')).toBeTruthy()
+
+    act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'done-late', content: '[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n找到了设置页' }) })
+    expect((await screen.findByTestId('subagent-signal-card')).getAttribute('data-signal-kind')).toBe('done')
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it('does not reopen busy on late heartbeat or stalled projections after settle', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '结论已经落地' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+
+    act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'hb-late', content: '[subagent-heartbeat] outstanding=0 vanished=0 stalled=0' }) })
+    act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'st-late', content: '[subagent-stalled] agentId=a1 title=探索 idle=120s last=thinking' }) })
+    expect(screen.getAllByTestId('subagent-signal-card').length).toBeGreaterThan(0)
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+  })
+
+  it('opens a follow-up wait for a real triggerTurn after a late [subagent-done], then clears on settled', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '先派一个探索' }) })
-    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
     await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
 
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started' }) })
     expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
 
     act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'done-1', content: '[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n找到了设置页' }) })
-    expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('followup')
-    expect(screen.getByTestId('waiting-placeholder').textContent).toContain('正在处理子任务结果')
+    expect((await screen.findByTestId('subagent-signal-card')).getAttribute('data-signal-kind')).toBe('done')
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['[subagent-done] agentId=a1 name=explore ok=true\nTitle: 探索\nResult:\n找到了设置页'] }) })
+    const followUpWait = await screen.findByTestId('waiting-placeholder')
+    expect(followUpWait.getAttribute('data-phase')).toBe('followup')
+    expect(followUpWait.textContent).toContain('正在处理子任务结果')
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 2 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
   })
 
   it('reopens a live wait when a queued 继续 user_message arrives after a ghost started', async () => {

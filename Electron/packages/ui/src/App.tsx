@@ -1797,12 +1797,17 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (next !== messagesRef.current) transcriptLiveRevisionRef.current += 1
         messagesRef.current = next
         setMessages(next)
-        // A real follow-up (queue drain or [subagent-done]) can land after a
+        // A real follow-up (queue drain or a triggerTurn wake) can land after a
         // bare `started` was ignored as a ghost. Reopen the turn so later
-        // tools in the same tick are not dropped as `turnClosed`.
+        // tools in the same tick are not dropped as `turnClosed`. A late
+        // terminal/heartbeat/stalled `[subagent-*]` row after a closed turn is
+        // only a projection — it has no new epoch or later settle.
         const subagentSignal = parseSubagentSignal(event.content)
         const drainedPrompt = !pendingEcho && Boolean(event.content.trim())
-        if (subagentSignal || drainedPrompt) {
+        const alreadyRunning = mainTurnOpenRef.current
+          || activeUserTurnRef.current
+          || observedSessionStatusesRef.current[event.sessionId] === 'running'
+        if ((subagentSignal || drainedPrompt) && shouldOpenTurnOnUserMessage(event.content, alreadyRunning)) {
           // A host-drained prompt is a new completion epoch even if a lost
           // settle left the prior turn marked open. Its later agent terminal
           // must never reconcile the new prompt against old history.
@@ -1950,7 +1955,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const unsubscribeBackground = host.subscribeAllStreams?.(event => {
       if (event.sessionId === selectedSession) return
       if (event.type === 'user_message') {
-        if (parseSubagentSignal(event.content) || event.content.trim()) {
+        if (shouldOpenTurnOnUserMessage(event.content, observedSessionStatusesRef.current[event.sessionId] === 'running')) {
           applyObservedStatus(event.sessionId, 'running')
         }
         return
@@ -2724,6 +2729,19 @@ function shouldOpenWaitOnStarted(messages: ChatMessage[], pendingFollowUps?: str
   if (last.role === 'user') return true
   if (last.role === 'assistant' && Boolean(last.streaming)) return true
   return last.role === 'assistant' && assistantEndedAwaitingModel(last)
+}
+
+/** After a closed turn these kinds are transcript projections, not a Boss wake. */
+function isSettledSubagentProjection(signal: { kind: string } | null | undefined): boolean {
+  return signal?.kind === 'done' || signal?.kind === 'heartbeat' || signal?.kind === 'stalled'
+}
+
+/** Queue-drain text and already-running turns still open processing. A late
+ *  terminal/heartbeat/stalled `[subagent-*]` after idle must wait for `started`. */
+function shouldOpenTurnOnUserMessage(content: string, alreadyRunning: boolean): boolean {
+  const signal = parseSubagentSignal(content)
+  if (isSettledSubagentProjection(signal) && !alreadyRunning) return false
+  return Boolean(signal || content.trim())
 }
 
 function ResizeHandle({ label, side, onPointerDown }: { label: string; side?: 'left' | 'right'; onPointerDown: (event: React.PointerEvent) => void }) { return <div className={`resize-handle${side ? ` resize-handle-${side}` : ''}`} role="separator" aria-label={label} onPointerDown={onPointerDown} /> }

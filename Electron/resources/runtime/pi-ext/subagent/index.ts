@@ -102,6 +102,12 @@ import {
 	queueCompletionAfterCutIn,
 } from "./completion-notification.ts";
 import {
+	claimStallNotification,
+	confirmStallNotification,
+	isStallWakeSignal,
+	queueStallAfterCutIn,
+} from "./stall-notification.ts";
+import {
 	formatSecretaryCommitResult,
 	runSecretaryCommit,
 } from "./secretary-commit.ts";
@@ -2064,6 +2070,8 @@ interface RunningAgentHandle {
 	lastStallNotifyAt: number;
 	/** 本无活动片段已推送 [subagent-stalled] 的次数；有新活动后复位为 0。 */
 	stallNotifyCount: number;
+	/** One in-flight stall wake; failed/held sends leave stallNotifyCount unchanged. */
+	stallNotifyInFlight?: boolean;
 	/** Successful wall-clock check-ins delivered for this dispatch. */
 	checkinCount?: number;
 	/** One in-flight follow-up; failed sends leave checkinCount unchanged so the 30s poll retries. */
@@ -2121,6 +2129,7 @@ function noteAgentActivity(agentId: string, runId?: string): void {
 	handle.lastActivityAt = Date.now();
 	handle.lastStallNotifyAt = 0;
 	handle.stallNotifyCount = 0;
+	handle.stallNotifyInFlight = false;
 	// Output after a tool request is the tool results coming back. The stdout handler
 	// notes activity before the scanner parses the chunk, so the message_end that opens
 	// the next tool wait re-arms this immediately afterwards.
@@ -2138,18 +2147,6 @@ function noteAgentToolWait(agentId: string, runId: string, names: string[]): voi
 	handle.toolWaitNames = names.length > 0 ? names : undefined;
 }
 
-/** Claim one bounded, interval-spaced stall notification for this idle episode. */
-function claimStallNotification(handle: RunningAgentHandle, now: number): boolean {
-	if (handle.stallNotifyCount >= STALL_RENOTIFY_MAX) return false;
-	if (
-		handle.lastStallNotifyAt > 0 &&
-		now - handle.lastStallNotifyAt < STALL_RENOTIFY_INTERVAL_MS
-	)
-		return false;
-	handle.lastStallNotifyAt = now;
-	handle.stallNotifyCount++;
-	return true;
-}
 
 function markAgentFinalizing(agentId: string, runId: string): void {
 	const handle = handleForRun(agentId, runId);
@@ -4134,8 +4131,31 @@ function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 			continue;
 		}
 		sent = true;
+		if (isStallWakeSignal(kind)) {
+			void deliverStallWake(pi, text).then((ok) => {
+				if (kind === "stall") confirmStallDelivery(text, ok);
+			});
+			continue;
+		}
 		void trySendUserMessage(pi, text);
 	}
+}
+
+/** Stall/recovery must wake a settled Boss; sendUserMessage(followUp) only queues. */
+async function deliverStallWake(pi: ExtensionAPI, text: string): Promise<boolean> {
+	if (hostStopQuiet) return false;
+	return queueStallAfterCutIn(pi, text, {
+		waitForCutIn: awaitCutInHoldRelease,
+		shouldSend: () => !hostStopQuiet && admitOrHoldRuntimeSignal(text),
+	});
+}
+
+function confirmStallDelivery(text: string, delivered: boolean): void {
+	const agentId = /(?:^|\s)agentId=([A-Za-z0-9_-]+)/.exec(text)?.[1];
+	if (!agentId) return;
+	const handle = runningAgents.get(agentId);
+	if (!handle) return;
+	confirmStallNotification(handle, delivered);
 }
 
 function logDonePersistenceFailure(action: string, obligationId: string, err: unknown): void {
@@ -7483,7 +7503,7 @@ export default function (pi: ExtensionAPI) {
 				const aborted = abortRunningAgent(agentId);
 				if (!aborted.ok) continue;
 				if (handle.syncWait !== true) {
-					deliverSubagentDone(
+					void deliverStallWake(
 						pi,
 						[
 							`[subagent-blocked] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine} auto-aborted after stall`,
@@ -7501,8 +7521,8 @@ export default function (pi: ExtensionAPI) {
 				});
 				continue;
 			}
-			if (!claimStallNotification(handle, now)) continue;
-			deliverSubagentDone(
+			if (!claimStallNotification(handle, now, STALL_RENOTIFY_MAX, STALL_RENOTIFY_INTERVAL_MS)) continue;
+			void deliverStallWake(
 				pi,
 				// Handling rides with the event rather than sitting in the cached prefix all
 				// session waiting for a stall that may never happen — and it is more likely to
@@ -7516,7 +7536,7 @@ export default function (pi: ExtensionAPI) {
 					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
 				].join("\n"),
-			);
+			).then((ok) => confirmStallNotification(handle, ok));
 			pipiuiReport({
 				kind: "stalled",
 				agentId,
