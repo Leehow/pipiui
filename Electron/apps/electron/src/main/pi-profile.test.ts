@@ -26,6 +26,14 @@ describe('Electron Pi profile', () => {
     })
   })
 
+  it('keeps the Linux App-profile under ~/.config/@pipiui/electron', () => {
+    expect(resolveStableElectronUserDataPath('/home/me/.config')).toBe(join('/home/me/.config', '@pipiui/electron'))
+    expect(resolveElectronPiProfile(join('/home/me/.config', '@pipiui/electron'))).toEqual({
+      agentDir: join('/home/me/.config', '@pipiui/electron', 'pi-agent'),
+      sessionsRoot: join('/home/me/.config', '@pipiui/electron', 'pi-agent', 'sessions')
+    })
+  })
+
   it('keeps the historical Electron profile when the display name is PipiUI', () => {
     expect(ELECTRON_USER_DATA_DIRNAME).toBe('@pipiui/electron')
     expect(resolveStableElectronUserDataPath('/Users/me/Library/Application Support')).toBe(

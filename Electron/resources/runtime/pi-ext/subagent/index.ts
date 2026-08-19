@@ -26,6 +26,8 @@ import {
 	stringifyCompactFileChange,
 } from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
+import { applySessionMountsToWorkerEnv, installEnvKeyProvider, workerEnvFromVault } from "../../extensions/secret-vault-core.ts";
+installEnvKeyProvider();
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -494,11 +496,21 @@ const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
 const PIPIUI_SESSION_CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
 const PIPIUI_HOST_PROTOCOL = process.env.PIPIUI_HOST_PROTOCOL;
 
+export function vaultWorkerChildEnv(
+	parent: NodeJS.ProcessEnv = process.env,
+	extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+	const dir = parent.PIPIUI_SECRET_VAULT_DIR;
+	const sessionId = parent.PIPIUI_SESSION_ID || parent.PIPIUI_SESSION_KEY;
+	const mounts = dir && sessionId ? workerEnvFromVault(dir, sessionId) : {};
+	return applySessionMountsToWorkerEnv({ ...parent, ...extra }, mounts);
+}
+
 function pipiuiChildProcessEnv(
 	extra: Record<string, string | undefined> = {},
 	preserveComputerCapability = false,
 ): Record<string, string | undefined> {
-	const env = { ...process.env, ...extra };
+	const env = { ...vaultWorkerChildEnv(process.env, extra) };
 	const terminalWorkerEnvKeys = new Set<string>(TERMINAL_WORKER_ENV_KEYS);
 	// A broker connection/capability is one dispatch generation only. Never let a
 	// verifier, helper, or nested child inherit the main token or another run's

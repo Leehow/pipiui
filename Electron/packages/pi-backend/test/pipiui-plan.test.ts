@@ -74,6 +74,11 @@ describe("pipiui plan tools", () => {
 
     const approved = parse(await first.plan_approve.execute("3", { planId: "plan-a" }, undefined, undefined, ctx));
     expect(approved.ok).toBe(true);
+    expect(approved.guidance).toMatch(/Never hand the whole plan to a single general-purpose worker/);
+    expect(approved.guidance).toMatch(/dispatch one worker per independent task in the SAME turn/);
+    expect(approved.guidance).toMatch(/1\. implement/);
+    expect(approved.guidance).toMatch(/2\. test/);
+    expect(approved.guidance).toMatch(/plan_task_update/);
     expect(approved.plan.lifecycle).toBe("approved");
     expect(approved.plan.approvedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 

@@ -72,4 +72,7 @@ untouched: grilling is never a gate for ordinary work.
    to revise with feedback is Adjust; a refusal or cancellation is Ignore. Do not dispatch
    business-code work, start task updates, or otherwise execute the plan until an approval has
    been classified as Execute. Adjust revises and republishes the plan; Ignore cancels it and
-   ends this plan path.
+   ends this plan path. On an approval classified as Execute, the published task list is the
+   dispatch manifest: dispatch one worker per independent task, all in the same turn, and
+   serialize only real dependencies. Handing a multi-task plan to a single general-purpose
+   worker is a fan-out violation. Drive `plan_task_update` as each task's worker starts and ends.

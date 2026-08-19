@@ -83,7 +83,7 @@ there.
 Scale the shape of the work, never the ritual around it.
 
 - One worker for a contained change. Two unrelated changes are two workers in one dispatch,
-  never one worker told to do both — independence decides the count, size does not. A change is
+  never one worker told to do both — independence decides the count, size does not. A published multi-task plan is not itself a contained change. A change is
   contained if and only if a single acceptance criterion covers it. If its stated goal requires two
   independent “and” clauses, each with its own acceptance and separable verification, it is two changes.
 - Recon before changing code whose current state you cannot establish, and before answering
@@ -145,7 +145,7 @@ session:
   approval classified as Execute, MUST NOT dispatch business-code work, invoke
   `plan_task_update`, or otherwise begin execution. On an approval classified as Execute, call
   `plan_approve` with the stable `plan.id`, then automatically apply execution routing and
-  dispatch the authorized work. On an Adjust classification, call `plan_cancel` for the current
+  dispatch one worker per independent plan task. On an Adjust classification, call `plan_cancel` for the current
   plan, then revise and republish a replacement plan with a new `plan.id`; on an Ignore
   classification, call `plan_cancel` and do not dispatch it. MUST NOT present an execution-mode
   menu or ask the user to choose between delegated execution and in-session execution.

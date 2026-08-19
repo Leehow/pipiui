@@ -188,6 +188,9 @@ describe('macOS packaging contract', () => {
     expect(workspacePackage.scripts['runtime:prepare:win']).toContain('--platform win32')
     expect(workspacePackage.scripts['runtime:prepare:win']).toContain('--arch x64')
     expect(workspacePackage.scripts['runtime:check:win']).toContain('--check')
+    expect(workspacePackage.scripts['runtime:prepare:linux']).toContain('--platform linux')
+    expect(workspacePackage.scripts['runtime:prepare:linux']).toContain('--arch x64')
+    expect(workspacePackage.scripts['runtime:check:linux']).toContain('--check')
     expect(packageJSON.scripts.predev).toBe('node ../../scripts/fetch-pi-runtime.mjs')
     expect(packageJSON.scripts['predev:watch']).toBe('node ../../scripts/fetch-pi-runtime.mjs')
   })
@@ -357,5 +360,42 @@ describe('macOS packaging contract', () => {
       expect(asset.archive).toContain('node-v22.19.0-')
       expect(asset.sha256).toMatch(/^[a-f0-9]{64}$/)
     }
+  })
+})
+
+describe('Linux secret vault packaging contract', () => {
+  const workflow = readFileSync(resolve(import.meta.dirname, '../../../.github/workflows/electron.yml'), 'utf8')
+  const smoke = readFileSync(resolve(import.meta.dirname, '../../scripts/check-linux-secret-vault-package.mjs'), 'utf8')
+  const runtimeFilter = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')?.filter ?? []
+
+  it('ships vault runtime files in the linux extraResources tree and never a sibling plaintext key', () => {
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime',
+      to: 'pipiui-runtime'
+    }))
+    expect(runtimeFilter).toContain('**/*')
+    expect(runtimeFilter.some(pattern => pattern === '!**/*.ts' || pattern === '!*.ts')).toBe(false)
+    expect(existsSync(resolve(import.meta.dirname, '../../resources/runtime/extensions/pipiui-secret-vault.ts'))).toBe(true)
+    expect(existsSync(resolve(import.meta.dirname, '../../resources/runtime/extensions/secret-vault-core.ts'))).toBe(true)
+    expect(existsSync(resolve(import.meta.dirname, '../../resources/runtime/extensions/secret-vault.key'))).toBe(false)
+    expect(packageJSON.build.linux.target).toEqual([
+      { target: 'AppImage', arch: ['x64'] },
+      { target: 'deb', arch: ['x64'] },
+    ])
+  })
+
+  it('packages linux x64 through package-electron-target instead of the empty-deb mac path', () => {
+    expect(packageJSON.scripts['package:linux']).toContain('package-electron-target.mjs --platform linux --arch x64')
+    expect(packageJSON.scripts['package:linux']).not.toContain('apps/electron/dist')
+    expect(workflow).toContain('package-electron-target.mjs --platform linux --arch x64')
+    expect(workflow).toContain('runtime:prepare:linux')
+    expect(workflow).toContain('test:secret-vault')
+    expect(workflow).toContain('check-linux-secret-vault-package.mjs')
+    expect(workflow).not.toMatch(/working-directory: Electron\/apps\/electron[\s\S]*npx electron-builder \$\{\{ matrix.args \}\}[\s\S]*platform == 'linux'/
+    )
+    expect(smoke).toContain('pipiui-secret-vault.ts')
+    expect(smoke).toContain('secret-vault-core.ts')
+    expect(smoke).toContain('secret-vault.key')
+    expect(smoke).toContain('amd64')
   })
 })

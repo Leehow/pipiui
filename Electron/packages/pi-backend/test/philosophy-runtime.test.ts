@@ -147,6 +147,16 @@ describe("vendored philosophy: delivery", () => {
     expect(result.skipped.find((s) => s.id === "typo")?.reason).toMatch(/names nobody that exists/);
   });
 
+  it("treats an approved plan as a per-task dispatch manifest", () => {
+    const planning = layers.find((l) => l.id === "planning")!.body;
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(planning).toMatch(/dispatch manifest/);
+    expect(planning).toMatch(/one worker per independent task/);
+    expect(planning).toMatch(/fan-out violation/);
+    expect(orchestration).toMatch(/one worker per independent plan task/);
+    expect(orchestration).toMatch(/published multi-task plan is not itself/);
+  });
+
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
     expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
     expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
@@ -189,6 +199,6 @@ describe("vendored philosophy: delivery", () => {
     // has no other place to live — a worker that cannot see the screen cannot be told the
     // rule, and the evidence-verbatim discipline is what stops a blind worker guessing.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(14600);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(14800);
   });
 });

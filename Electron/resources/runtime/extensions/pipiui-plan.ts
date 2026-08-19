@@ -251,7 +251,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_publish",
     label: "Plan Publish",
-    description: "Publish a structured execution plan with a stable unique plan.id and ordered tasks. Replaces transcript-only planning when formal planning is required.",
+    description: "Publish a structured execution plan with a stable unique plan.id and ordered tasks. Replaces transcript-only planning when formal planning is required. Split tasks so each can be independently dispatched; after approval, each independent task gets its own worker.",
     promptSnippet: "Publish a structured plan with stable plan.id and tasks",
     parameters: Type.Object({
       plan: Type.Object({
@@ -297,7 +297,20 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const outcome = await approvePlan(cwdOf(ctx), params.planId);
-      return result(outcome, !outcome.ok);
+      if (!outcome.ok) return result(outcome, true);
+      const listed = outcome.plan.tasks
+        .map((task, index) => `${index + 1}. ${task.title}`)
+        .join("\n");
+      return result({
+        ...outcome,
+        guidance: [
+          "Never hand the whole plan to a single general-purpose worker.",
+          "dispatch one worker per independent task in the SAME turn.",
+          "Drive plan_task_update as each task's worker starts and ends.",
+          "Tasks:",
+          listed,
+        ].join(" "),
+      });
     },
   });
 

@@ -544,6 +544,21 @@ export interface PipiHostAPI {
   getPaddleOcrStatus?(projectId: string): Promise<{ hasKey: boolean }>;
   /** Pass a new token or null to clear. Never returned back to the renderer. */
   setPaddleOcrAccessToken?(projectId: string, token: string | null): Promise<{ hasKey: boolean }>;
+  /** Global App-profile vault metadata. Values never cross this boundary. Mounts are the current session only. */
+  listSecretVault?(sessionId: string): Promise<{ secrets: Array<{ id: string; name: string; envName: string; createdAt: string }>; mounts: Array<{ secretId: string; envName: string; name: string }>; sessionId: string }>;
+  putSecretVault?(input: { name: string; envName: string; value: string; sessionId: string }): Promise<{ secret: { id: string; name: string; envName: string; createdAt: string }; mount: { secretId: string; envName: string }; sessionId: string }>;
+  mountSecretVault?(sessionId: string, secret: string, envName?: string): Promise<{ sessionId: string; mount: { secretId: string; envName: string } }>;
+  unmountSecretVault?(sessionId: string, secret: string): Promise<{ sessionId: string; removed: boolean }>;
+  deleteSecretVault?(secret: string): Promise<{ deleted: boolean }>;
+  /** Pure Linux/macOS encryption-availability diagnosis. Never returns secret values. */
+  diagnoseSecretVault?(): Promise<{
+    available: boolean;
+    kind: 'available' | 'missing-packages' | 'session-bus-unavailable' | 'secret-service-unreachable' | 'keyring-locked' | 'no-graphical-session' | 'encryption-unavailable';
+    message: string;
+    installHint?: string;
+    retryable: boolean;
+    platform: string;
+  }>;
   listAgentDefinitions?(): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
@@ -716,6 +731,12 @@ function apiFrom(
     setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
     getPaddleOcrStatus: projectId => invoke("getPaddleOcrStatus", projectId),
     setPaddleOcrAccessToken: (projectId, token) => invoke("setPaddleOcrAccessToken", projectId, token),
+    listSecretVault: sessionId => invoke("listSecretVault", sessionId),
+    putSecretVault: input => invoke("putSecretVault", input),
+    mountSecretVault: (sessionId, secret, envName) => invoke("mountSecretVault", sessionId, secret, envName),
+    unmountSecretVault: (sessionId, secret) => invoke("unmountSecretVault", sessionId, secret),
+    deleteSecretVault: secret => invoke("deleteSecretVault", secret),
+    diagnoseSecretVault: () => invoke("diagnoseSecretVault"),
     listAgentDefinitions: () => invoke("listAgentDefinitions"),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
