@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PipiUI — pi coding agent 的图形界面</title>
+  <meta name="description" content="PipiUI 是 pi coding agent 的图形界面，支持 macOS 14+、Windows 10/11 与 Linux。项目会话、流式工具卡片、内置浏览器、Subagent 与远程接管。">
+  <style>
+    :root {
+      --bg: #0f1115;
+      --surface: #181b22;
+      --card: #1e222c;
+      --line: #2a3040;
+      --text: #eceef3;
+      --muted: #9aa3b5;
+      --accent: #7c9cff;
+      --accent-2: #5eead4;
+      --mac: #7c9cff;
+      --win: #f5c26b;
+      --linux: #5eead4;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font-family: "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", system-ui, sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #1c2744 0%, transparent 55%),
+                  radial-gradient(900px 500px at 100% 0%, #16332e 0%, transparent 50%),
+                  var(--bg);
+      color: var(--text);
+      line-height: 1.65;
+      min-height: 100vh;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 48px 22px 72px; }
+    header { margin-bottom: 40px; }
+    .eyebrow {
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      font-size: 12px;
+      color: var(--accent-2);
+      margin: 0 0 10px;
+    }
+    h1 {
+      font-size: clamp(36px, 6vw, 56px);
+      letter-spacing: -0.04em;
+      margin: 0 0 12px;
+      font-weight: 680;
+    }
+    .lead { font-size: 18px; color: var(--muted); max-width: 38em; margin: 0; }
+    .downloads {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 16px;
+      margin: 36px 0 20px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 22px;
+    }
+    .card h2 { margin: 0 0 6px; font-size: 20px; }
+    .meta { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+    .alt { margin: 12px 0 0; font-size: 13px; }
+    .alt a { color: var(--muted); }
+    .btn {
+      display: inline-block;
+      padding: 10px 16px;
+      border-radius: 10px;
+      font-weight: 600;
+      text-decoration: none;
+      color: #0c1018;
+    }
+    .btn:hover { text-decoration: none; filter: brightness(1.06); }
+    .btn-mac { background: var(--mac); }
+    .btn-win { background: var(--win); }
+    .btn-linux { background: var(--linux); }
+    .btn-gh {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--line);
+      margin-top: 4px;
+    }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    section { margin-top: 48px; }
+    section h2 { font-size: 22px; margin: 0 0 16px; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .feat {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 16px 14px;
+    }
+    .feat h3 { margin: 0 0 6px; font-size: 15px; }
+    .feat p { margin: 0; color: var(--muted); font-size: 14px; }
+    footer {
+      margin-top: 56px;
+      color: var(--muted);
+      font-size: 13px;
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+    }
+    @media (max-width: 720px) {
+      .downloads, .grid { grid-template-columns: 1fr; }
+      .wrap { padding-top: 32px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <p class="eyebrow">Open source · macOS / Windows / Linux</p>
+      <h1>PipiUI</h1>
+      <p class="lead">pi coding agent 的图形界面。管理项目与会话，看着工具实时流式输出，也可以从手机或浏览器远程接管。</p>
+    </header>
+
+    <div class="downloads">
+      <article class="card">
+        <h2>macOS 版</h2>
+        <p class="meta">Electron · macOS 14+ · 2026-08-18 · 267 MB</p>
+        <a class="btn btn-mac" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-latest.zip">下载 zip</a>
+      </article>
+      <article class="card">
+        <h2>Windows 版</h2>
+        <p class="meta">Windows 10/11 x64 · NSIS .exe · 2026-08-18 · 约 196 MiB</p>
+        <a class="btn btn-win" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-windows-latest.exe">下载 exe</a>
+        <p class="alt"><a href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-windows-2026-08-18.exe">2026-08-18 版</a></p>
+      </article>
+      <article class="card">
+        <h2>Linux 版</h2>
+        <p class="meta">amd64 · .deb · 2026-08-16 · 178 MB</p>
+        <a class="btn btn-linux" href="https://pipi.aichattrpg.com/downloads/PipiUI-Electron-linux-latest.deb">下载 deb</a>
+      </article>
+    </div>
+    <div class="actions">
+      <a class="btn btn-gh" href="https://github.com/Leehow/pipiui">GitHub 仓库</a>
+    </div>
+
+    <section>
+      <h2>特性</h2>
+      <div class="grid">
+        <div class="feat">
+          <h3>项目与会话</h3>
+          <p>多会话并行，后台会话继续跑，费用与上下文实时可见。</p>
+        </div>
+        <div class="feat">
+          <h3>流式聊天</h3>
+          <p>Markdown、工具卡片实时输出、Thinking 折叠块，斜杠命令补全。</p>
+        </div>
+        <div class="feat">
+          <h3>内置浏览器</h3>
+          <p>面板 + pi browser 工具：navigate / content / eval / console / screenshot。</p>
+        </div>
+        <div class="feat">
+          <h3>Subagent 与 Boss</h3>
+          <p>实时树状面板；Boss 大组长模式自动派工扇出。</p>
+        </div>
+        <div class="feat">
+          <h3>Computer Use</h3>
+          <p>可选的 macOS 桌面控制，需要时再打开。</p>
+        </div>
+        <div class="feat">
+          <h3>远程接管</h3>
+          <p>手机或浏览器经透明 relay 接管会话（remote.deepwood.cn）。</p>
+        </div>
+        <div class="feat">
+          <h3>附件与链接</h3>
+          <p>多图附件、路径链接，会话里直接打开本地文件。</p>
+        </div>
+        <div class="feat">
+          <h3>Memory</h3>
+          <p>学习循环扩展，把项目习惯沉淀下来。</p>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      主力发行版为 Electron（macOS / Windows / Linux）。Swift 原生版已冻结，不再主推。
+    </footer>
+  </div>
+</body>
+</html>
