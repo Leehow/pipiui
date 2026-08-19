@@ -268,7 +268,7 @@ export class ComputerWorkerBroker {
       grant.noProgress = undefined;
     }
 	    if (request.operation === "openApplication" && ![request.payload.bundle_identifier, request.payload.application_name].some((value) => typeof value === "string" && value.trim().length > 0)) throw new Error("openApplication requires an exact application identity");
-		if (request.operation === "observe") {
+		if (request.operation === "observe" && grant.role !== "computer-use-agent") {
 			grant.consecutiveObservations += 1;
 			if (grant.consecutiveObservations > MAX_CONSECUTIVE_OBSERVATIONS) {
 				this.#markFatal(grant, "computer_worker_no_progress");
@@ -313,10 +313,19 @@ export class ComputerWorkerBroker {
 			try { result = await Promise.race([runtimeRequest, deadline]); }
 			catch (error) {
 				const driverTimedOut = error && typeof error === "object" && (error as { code?: unknown }).code === "cua_driver_rpc_timeout";
-				const fatalCode = timedOut || driverTimedOut ? "computer_worker_runtime_timeout" : callerAborted || controller.signal.aborted ? "computer_worker_request_cancelled" : undefined;
-				if (fatalCode) {
-					this.#markFatal(grant, fatalCode);
-					throw new Error(fatalCode);
+				if (timedOut || driverTimedOut) {
+					if (grant.role !== "computer-use-agent") {
+						this.#markFatal(grant, "computer_worker_runtime_timeout");
+						throw new Error("computer_worker_runtime_timeout");
+					}
+					throw Object.assign(new Error("computer_worker_runtime_timeout"), {
+						code: "computer_worker_runtime_timeout",
+						recoverable: true,
+					});
+				}
+				if (callerAborted || controller.signal.aborted) {
+					this.#markFatal(grant, "computer_worker_request_cancelled");
+					throw new Error("computer_worker_request_cancelled");
 				}
 				throw error;
 			} finally { if (timeout) clearTimeout(timeout); grant.busy = false; grant.controllers.delete(controller); signal?.removeEventListener("abort", abort); }

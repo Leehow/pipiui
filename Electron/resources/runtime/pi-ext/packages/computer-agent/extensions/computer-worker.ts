@@ -108,7 +108,9 @@ export function registerComputerWorkerTools(
     const result = await response.json() as Record<string, any>;
     if (!response.ok || result.ok === false) {
 			const code = String(result.error ?? `computer worker broker returned ${response.status}`);
-			if (code === "computer_worker_runtime_timeout" || code === "computer_worker_request_cancelled" || code === "computer_worker_no_progress") fatalCode = code;
+			const fatalForRole = code === "computer_worker_request_cancelled"
+				|| (config.role !== "computer-use-agent" && (code === "computer_worker_runtime_timeout" || code === "computer_worker_no_progress"));
+			if (fatalForRole) fatalCode = code as typeof fatalCode;
       throw new Error(code);
     }
     observation = result;

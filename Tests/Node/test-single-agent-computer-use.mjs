@@ -18,6 +18,7 @@ import {
   canonicalSensitiveApplicationPolicy,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/workflows.ts";
 import { ComputerWorkerBroker } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/worker-broker.ts";
+import { ComputerWorkerBrokerServer } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/worker-broker-server.ts";
 import {
   registerComputerWorkerTools,
   toolNamesForComputerUseAgent,
@@ -105,6 +106,154 @@ test("Computer Use Agent broker grant carries no raw Host capability and mounts 
     PIPIUI_COMPUTER_WORKER_ROLE: "computer-use-agent",
   });
   assert.deepEqual(registered, toolNamesForComputerUseAgent());
+});
+
+test("Computer Use Agent may take more than three fresh observations and continue", async () => {
+  let runtimeCalls = 0;
+  const broker = new ComputerWorkerBroker({
+    tokenFactory: () => "o".repeat(48),
+    request: async () => observation(`observe-budget-${++runtimeCalls}`),
+  });
+  const issued = broker.issue({
+    taskId: "single-observe-budget",
+    stepId: "episode",
+    runId: "single-observe-budget-run",
+    role: "computer-use-agent",
+    goal: "Wait for the application to become ready, then continue",
+  });
+
+  for (let index = 0; index < 5; index += 1) {
+    const fresh = await broker.execute(issued.token, { operation: "observe", payload: { fresh: true } });
+    assert.equal(fresh.observationId, `observe-budget-${index + 1}`);
+  }
+  const result = await broker.execute(issued.token, {
+    operation: "actionBlock",
+    payload: {
+      intent: "continue after benign observation changes",
+      actions: [{ id: "continue", type: "key", keys: ["RETURN"] }],
+    },
+  });
+
+  assert.equal(result.outcome, "completed");
+  assert.equal(runtimeCalls, 6);
+});
+
+test("Computer Use Agent reconciles a mutation transport timeout without poisoning its grant", async () => {
+  const runtimeRequests = [];
+  const fatalEvents = [];
+  const broker = new ComputerWorkerBroker({
+    requestTimeoutMs: 10,
+    tokenFactory: () => "u".repeat(48),
+    onFatal: (event) => fatalEvents.push(event),
+    request: async (request) => {
+      runtimeRequests.push(request);
+      if (runtimeRequests.length === 2) return new Promise(() => {});
+      return observation(`timeout-recovery-${runtimeRequests.length}`);
+    },
+  });
+  const issued = broker.issue({
+    taskId: "single-timeout",
+    stepId: "episode",
+    runId: "single-timeout-run",
+    role: "computer-use-agent",
+    goal: "Save once, then continue",
+  });
+  await broker.execute(issued.token, { operation: "observe", payload: { fresh: true } });
+  const block = {
+    intent: "save and continue",
+    actions: [
+      { id: "save", type: "key", keys: ["CMD", "S"], consequential: true },
+      { id: "tail", type: "key", keys: ["RETURN"] },
+    ],
+  };
+
+  const first = await broker.execute(issued.token, { operation: "actionBlock", payload: block });
+  assert.equal(first.outcome, "outcome_unknown");
+  assert.equal(first.stopReason, "outcome_unknown");
+  assert.deepEqual(first.completedActionIds, []);
+  assert.deepEqual(first.skippedActionIds, ["tail"]);
+  assert.equal(first.effects[0].actionId, "save");
+  assert.equal(first.effects[0].status, "unknown");
+  assert.equal(first.checkpoint.pendingUnknownEffects.length, 1);
+  assert.equal(first.checkpoint.pendingUnknownEffects[0].actionId, "save");
+  assert.equal(runtimeRequests.length, 2, "the block tail is not dispatched after an unknown mutation effect");
+
+  const replay = await broker.execute(issued.token, { operation: "actionBlock", payload: block });
+  assert.equal(replay.outcome, "stopped");
+  assert.equal(replay.stopReason, "consequential_effect_pending");
+  assert.equal(runtimeRequests.length, 2, "a consequential unknown effect is not blindly replayed");
+
+  const reconciled = await broker.execute(issued.token, { operation: "observe", payload: { fresh: true } });
+  assert.equal(reconciled.observationId, "timeout-recovery-3");
+  assert.equal(reconciled.checkpoint.pendingUnknownEffects.length, 1);
+  assert.deepEqual(fatalEvents, []);
+});
+
+test("Computer Use Agent observe transport timeout is recoverable on the same grant", async () => {
+  let calls = 0;
+  const fatalEvents = [];
+  const broker = new ComputerWorkerBroker({
+    tokenFactory: () => "r".repeat(48),
+    onFatal: (event) => fatalEvents.push(event),
+    request: async () => {
+      calls += 1;
+      if (calls === 1) throw Object.assign(new Error("private typed transport timeout"), { code: "cua_driver_rpc_timeout" });
+      return observation("observe-timeout-recovered");
+    },
+  });
+  const server = new ComputerWorkerBrokerServer(broker);
+  await server.start();
+  try {
+    const issued = server.issue({
+      taskId: "single-observe-timeout",
+      stepId: "episode",
+      runId: "single-observe-timeout-run",
+      role: "computer-use-agent",
+      goal: "Observe until the application is stable",
+    });
+    const registered = [];
+    registerComputerWorkerTools({ registerTool: (tool) => registered.push(tool) }, issued.environment);
+    const desktopObserve = registered.find(({ name }) => name === "desktop_observe");
+
+    await assert.rejects(desktopObserve.execute("timed-out", { fresh: true }, undefined), /^Error: computer_worker_runtime_timeout$/);
+    const recovered = await desktopObserve.execute("reconciled", { fresh: true }, undefined);
+    assert.equal(recovered.details.observationId, "observe-timeout-recovered");
+    assert.equal(calls, 2);
+    assert.deepEqual(fatalEvents, []);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("legacy timeout and Computer Use Agent cancellation remain fatal at the child tool boundary", async () => {
+  const registerObserve = (role, firstError) => {
+    const registered = [];
+    let fetchCalls = 0;
+    registerComputerWorkerTools({ registerTool: (tool) => registered.push(tool) }, {
+      PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
+      PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "f".repeat(48),
+      PIPIUI_COMPUTER_WORKER_ROLE: role,
+    }, async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify(fetchCalls === 1
+        ? { ok: false, error: firstError }
+        : observation(`${role}-unexpected-retry`)), {
+        status: fetchCalls === 1 ? 500 : 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    return { observe: registered.find(({ name }) => name === "desktop_observe"), fetchCalls: () => fetchCalls };
+  };
+
+  const legacy = registerObserve("gui-operator", "computer_worker_runtime_timeout");
+  await assert.rejects(legacy.observe.execute("legacy-timeout", { fresh: true }, undefined), /^Error: computer_worker_runtime_timeout$/);
+  await assert.rejects(legacy.observe.execute("legacy-retry", { fresh: true }, undefined), /^Error: computer_worker_runtime_timeout$/);
+  assert.equal(legacy.fetchCalls(), 1);
+
+  const cancelled = registerObserve("computer-use-agent", "computer_worker_request_cancelled");
+  await assert.rejects(cancelled.observe.execute("single-cancelled", { fresh: true }, undefined), /^Error: computer_worker_request_cancelled$/);
+  await assert.rejects(cancelled.observe.execute("single-retry", { fresh: true }, undefined), /^Error: computer_worker_request_cancelled$/);
+  assert.equal(cancelled.fetchCalls(), 1);
 });
 
 test("Workflow learning requires Host-verified checkpoint conditions, not only the Agent final claim", async () => {

@@ -274,10 +274,21 @@ export async function runGuardedActionBlock(
         ? await executeWaitUntil(action, current, context.execute, context.signal)
         : await context.execute([resolved.action!], context.signal) as Record<string, any>;
     } catch (error) {
+      const errorCode = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+        ? (error as { code: string }).code
+        : undefined;
+      const consequentialTimeout = errorCode === "computer_worker_runtime_timeout"
+        && isMutation(action)
+        && action.consequential !== false;
       current = {
         ...current,
         ok: false,
-        runtimeError: { code: "runtime_error", message: error instanceof Error ? error.message : String(error), requiresObservation: true },
+        ...(consequentialTimeout ? { outcomeUnknown: true } : {}),
+        runtimeError: {
+          code: consequentialTimeout ? "mutation_outcome_unknown" : errorCode ?? "runtime_error",
+          message: error instanceof Error ? error.message : String(error),
+          requiresObservation: true,
+        },
       };
     }
     const barrier = barrierFromRuntime(current, before);
