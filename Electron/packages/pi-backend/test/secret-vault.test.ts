@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  applySessionMountsToMainEnv,
   applySessionMountsToWorkerEnv,
   atomicWriteFile,
   configureVaultKeyProvider,
@@ -180,6 +181,10 @@ describe("secret vault", () => {
       EXISTING: "keep",
       OPENAI_API_KEY: "from-dotenv",
     };
+    const main = applySessionMountsToMainEnv(parent, workerEnvFromVault(dir, "session-1"));
+    expect(main.TOKEN_A).toBe("aaaaaaaaaaaa");
+    expect(main.TOKEN_B).toBeUndefined();
+    expect(main.PIPIUI_VAULT_DEK).toBe(dek.toString("base64"));
     const child = applySessionMountsToWorkerEnv(parent, workerEnvFromVault(dir, "session-1"));
     expect(child.TOKEN_A).toBe("aaaaaaaaaaaa");
     expect(child.TOKEN_B).toBeUndefined();

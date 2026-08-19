@@ -78,7 +78,7 @@ import {
 } from "./stop-escalation.js";
 import { QuotaStore, parseDotEnv } from "./quota.js";
 import {
-  applySessionMountsToWorkerEnv,
+  applySessionMountsToMainEnv,
   configureVaultKeyProvider,
   createSessionEnvRefreshGate,
   deleteSecret,
@@ -461,6 +461,7 @@ export type PiBackendOptions = {
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
   /** Electron injects safeStorage-backed DEK provider. Absent = fail closed. */ vaultKeyProvider?: VaultKeyProvider;
   /** Optional OS-level encryption diagnosis; never blocks ordinary chat. */ vaultAvailability?: () => VaultDiagnosis;
+  /** App-profile canonical vault directory. Never derived from a project agentDir. */ vaultDir?: string;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -1523,6 +1524,7 @@ export class PiHostBackend implements HostBackend {
   private managedNodeModulesRoot?: string;
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
+  private vaultDir: string;
   private vaultKeyProvider: VaultKeyProvider;
   private vaultAvailability?: () => VaultDiagnosis;
   private features: SpawnFeatures;
@@ -1594,6 +1596,7 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.vaultDir = options.vaultDir ?? this.agentDir;
     this.vaultKeyProvider = options.vaultKeyProvider ?? envKeyProvider(options.env ?? process.env);
     this.vaultAvailability = options.vaultAvailability;
     configureVaultKeyProvider(this.vaultKeyProvider);
@@ -2160,12 +2163,12 @@ export class PiHostBackend implements HostBackend {
       hit.limit === limit
     )
       return hit.entries;
-    const entries = await readHistory(path, before, limit, this.agentDir, sessionId);
+    const entries = await readHistory(path, before, limit, this.vaultDir, sessionId);
     this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, before, limit, entries });
     return entries;
   }
   private sessionSecrets(sessionId: string): RevealedSecret[] {
-    try { return revealMountedSecrets(this.agentDir, sessionId); }
+    try { return revealMountedSecrets(this.vaultDir, sessionId); }
     catch { return []; }
   }
   private sessionFileExclusive(sessionId: string): ExclusiveSessionWork {
@@ -2606,15 +2609,15 @@ export class PiHostBackend implements HostBackend {
         const sessionId = String(params[0] ?? "");
         return {
           sessionId,
-          secrets: listSecretMeta(this.agentDir),
-          mounts: listSessionMounts(this.agentDir, sessionId),
+          secrets: listSecretMeta(this.vaultDir),
+          mounts: listSessionMounts(this.vaultDir, sessionId),
         };
       }
       case "putSecretVault": {
         this.assertVaultReady();
         const input = params[0] as { name: string; envName: string; value: string; sessionId: string };
-        const secret = await putSecret(this.agentDir, input);
-        const mount = await mountSecret(this.agentDir, String(input.sessionId), secret.id);
+        const secret = await putSecret(this.vaultDir, input);
+        const mount = await mountSecret(this.vaultDir, String(input.sessionId), secret.id);
         this.requestSessionEnvRefresh(String(input.sessionId));
         await this.redactSessionFile(String(input.sessionId)).catch((error) => {
           console.error("[secret-vault] session redaction failed", error);
@@ -2626,19 +2629,19 @@ export class PiHostBackend implements HostBackend {
       case "mountSecretVault": {
         this.assertVaultReady();
         const sessionId = String(params[0]);
-        const mount = await mountSecret(this.agentDir, sessionId, String(params[1]), params[2] ? String(params[2]) : undefined);
+        const mount = await mountSecret(this.vaultDir, sessionId, String(params[1]), params[2] ? String(params[2]) : undefined);
         await this.refreshSessionChildEnv(sessionId);
         return { sessionId, mount };
       }
       case "unmountSecretVault": {
         const sessionId = String(params[0]);
-        const removed = await unmountSecret(this.agentDir, sessionId, String(params[1]));
+        const removed = await unmountSecret(this.vaultDir, sessionId, String(params[1]));
         await this.refreshSessionChildEnv(sessionId);
         return { sessionId, removed };
       }
       case "deleteSecretVault": {
-        const affected = new Set([...Object.keys(loadVault(this.agentDir).mounts), ...this.live.keys()]);
-        const deleted = await deleteSecret(this.agentDir, String(params[0]));
+        const affected = new Set([...Object.keys(loadVault(this.vaultDir).mounts), ...this.live.keys()]);
+        const deleted = await deleteSecret(this.vaultDir, String(params[0]));
         for (const sessionId of affected) this.requestSessionEnvRefresh(sessionId);
         for (const sessionId of affected) await this.flushSessionEnvRefresh(sessionId);
         return { deleted };
@@ -3147,6 +3150,7 @@ export class PiHostBackend implements HostBackend {
       computerDescriptor: computerCapability
         ? this.computerDescriptor
         : undefined,
+      vaultDir: this.vaultDir,
       vaultDek: this.vaultDek(),
     });
     // close() may race a cache-first background resume before the child is
@@ -3168,12 +3172,14 @@ export class PiHostBackend implements HostBackend {
       // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
       // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
-        applySessionMountsToWorkerEnv(
+        // Main Pi must keep the host-injected DEK so pipiui-secret-vault can encrypt.
+        // Workers go through applySessionMountsToWorkerEnv and never see the DEK.
+        applySessionMountsToMainEnv(
           mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
             ...output.env,
             ...(this.piCommand.env ?? {}),
           }),
-          workerEnvFromVault(this.agentDir, id),
+          workerEnvFromVault(this.vaultDir, id),
         ),
         this.piCommand.executable,
       ),

@@ -374,7 +374,8 @@ export function workerEnvFromVault(dir: string, sessionId: string): Record<strin
   return env;
 }
 
-export function applySessionMountsToWorkerEnv(
+/** Main Pi RPC env: merge session mounts and keep the host-injected DEK. */
+export function applySessionMountsToMainEnv(
   parent: NodeJS.ProcessEnv,
   mounts: Record<string, string>,
 ): Record<string, string> {
@@ -382,9 +383,18 @@ export function applySessionMountsToWorkerEnv(
   for (const [key, value] of Object.entries(parent)) {
     if (value !== undefined) env[key] = value;
   }
+  for (const [key, value] of Object.entries(mounts)) env[key] = value;
+  return env;
+}
+
+/** Worker/subagent env: same mounts, but never inherit the DEK. */
+export function applySessionMountsToWorkerEnv(
+  parent: NodeJS.ProcessEnv,
+  mounts: Record<string, string>,
+): Record<string, string> {
+  const env = applySessionMountsToMainEnv(parent, mounts);
   delete env.PIPIUI_VAULT_DEK;
   delete env.PIPIUI_SECRET_VAULT_DEK;
-  for (const [key, value] of Object.entries(mounts)) env[key] = value;
   return env;
 }
 

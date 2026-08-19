@@ -195,6 +195,7 @@ if (app) {
       authHelperPath: assets.sourceRoot ? join(assets.sourceRoot, 'auth', 'pi-auth-helper.mjs') : undefined,
       runtimeRoot,
       agentDir: piProfile.agentDir,
+      vaultDir: piProfile.agentDir,
       vaultKeyProvider: createElectronVaultKeyProvider(userData),
       vaultAvailability: () => diagnoseElectronVault(),
       sessionsRoot: piProfile.sessionsRoot,

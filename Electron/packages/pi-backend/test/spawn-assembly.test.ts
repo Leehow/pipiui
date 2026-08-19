@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assemblePiSpawn, isElectronNodeShim, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
-import { applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
+import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
 describe("runtime info extension mount", () => {
@@ -592,34 +592,74 @@ describe("withToolPath and the Electron node shim", () => {
 describe("secret vault spawn contract", () => {
   const secretVault = "/runtime/extensions/pipiui-secret-vault.ts";
 
-  it("mounts the vault extension and pins the App-profile directory", () => {
+  it("mounts the vault extension and pins the explicit App-profile vault directory", () => {
     const { args, env } = assemblePiSpawn({
       cwd: "/tmp/project",
-      agentDir: "/electron/pi-agent",
+      agentDir: "/project/.pi/agent",
+      vaultDir: "/electron/pi-agent",
       sessionId: "sess-1",
       paths: { secretVault },
     });
     expect(args).toEqual(["-e", secretVault]);
+    expect(env.PI_CODING_AGENT_DIR).toBe("/project/.pi/agent");
     expect(env.PIPIUI_SECRET_VAULT_DIR).toBe("/electron/pi-agent");
     expect(env.PIPIUI_SESSION_ID).toBe("sess-1");
+  });
+
+  it("never derives the vault directory from a project agentDir", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      agentDir: "/project/.pi/agent",
+      sessionId: "sess-1",
+      paths: { secretVault },
+    });
+    expect(env.PI_CODING_AGENT_DIR).toBe("/project/.pi/agent");
+    expect(env.PIPIUI_SECRET_VAULT_DIR).toBeUndefined();
   });
 
   it("injects an in-memory DEK and strips inherited vault keys", () => {
     const { env } = assemblePiSpawn({
       cwd: "/tmp/project",
-      agentDir: "/electron/pi-agent",
+      agentDir: "/project/.pi/agent",
+      vaultDir: "/electron/pi-agent",
       sessionId: "sess-1",
       vaultDek: "ZGVr", 
       paths: { secretVault },
     });
     expect(env.PIPIUI_VAULT_DEK).toBe("ZGVr");
+    expect(env.PIPIUI_SECRET_VAULT_DIR).toBe("/electron/pi-agent");
     expect(sanitizeEnvironment({ PIPIUI_SECRET_VAULT_DIR: "/stale", PIPIUI_VAULT_DEK: "leak", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 
-  it("injects only the current session mounts and strips DEK from the child env", () => {
+  it("keeps the host-injected DEK after main-session mounts are merged", () => {
     const { env } = assemblePiSpawn({
       cwd: "/tmp/project",
-      agentDir: "/electron/pi-agent",
+      agentDir: "/project/.pi/agent",
+      vaultDir: "/electron/pi-agent",
+      sessionId: "sess-1",
+      vaultDek: "ZGVr",
+      paths: { secretVault },
+    });
+    const main = applySessionMountsToMainEnv(
+      mergedSpawnEnvironment(
+        { PATH: "/usr/bin", OPENAI_API_KEY: "from-dotenv", TOKEN_B: "parent-b" },
+        { OPENAI_API_KEY: "from-dotenv" },
+        env,
+      ),
+      { TOKEN_A: "aaaaaaaaaaaa" },
+    );
+    expect(main.TOKEN_A).toBe("aaaaaaaaaaaa");
+    expect(main.TOKEN_B).toBe("parent-b");
+    expect(main.OPENAI_API_KEY).toBe("from-dotenv");
+    expect(main.PIPIUI_VAULT_DEK).toBe("ZGVr");
+    expect(main.PIPIUI_SECRET_VAULT_DIR).toBe("/electron/pi-agent");
+  });
+
+  it("strips DEK from worker/subagent env while keeping session mounts", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      agentDir: "/project/.pi/agent",
+      vaultDir: "/electron/pi-agent",
       sessionId: "sess-1",
       vaultDek: "ZGVr",
       paths: { secretVault },
