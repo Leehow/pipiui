@@ -141,10 +141,12 @@ test("Computer Use Agent may take more than three fresh observations and continu
 test("Computer Use Agent reconciles a mutation transport timeout without poisoning its grant", async () => {
   const runtimeRequests = [];
   const fatalEvents = [];
+  const cancellations = [];
   const broker = new ComputerWorkerBroker({
     requestTimeoutMs: 10,
     tokenFactory: () => "u".repeat(48),
     onFatal: (event) => fatalEvents.push(event),
+    cancelRuntime: async (event) => cancellations.push(event),
     request: async (request) => {
       runtimeRequests.push(request);
       if (runtimeRequests.length === 2) return new Promise(() => {});
@@ -177,6 +179,12 @@ test("Computer Use Agent reconciles a mutation transport timeout without poisoni
   assert.equal(first.checkpoint.pendingUnknownEffects.length, 1);
   assert.equal(first.checkpoint.pendingUnknownEffects[0].actionId, "save");
   assert.equal(runtimeRequests.length, 2, "the block tail is not dispatched after an unknown mutation effect");
+  assert.deepEqual(cancellations, [{
+    taskId: "single-timeout",
+    stepId: "episode",
+    runId: "single-timeout-run",
+    reason: "computer_worker_runtime_timeout",
+  }], "a timed-out Host mutation is cancelled before the same agent reconciles fresh state");
 
   const replay = await broker.execute(issued.token, { operation: "actionBlock", payload: block });
   assert.equal(replay.outcome, "stopped");
@@ -187,6 +195,87 @@ test("Computer Use Agent reconciles a mutation transport timeout without poisoni
   assert.equal(reconciled.observationId, "timeout-recovery-3");
   assert.equal(reconciled.checkpoint.pendingUnknownEffects.length, 1);
   assert.deepEqual(fatalEvents, []);
+});
+
+test("accessibility targets accept the macOS description field used by Calculator buttons", async () => {
+  const calls = [];
+  const calculator = observation("calculator-before", {
+    target: { bundleId: "com.apple.calculator", appName: "Calculator", pid: 99, window_id: 4 },
+    accessibility: {
+      snapshot_id: "calculator-snapshot",
+      windows: [{ id: 4, role: "AXWindow" }],
+      elements: [{ role: "AXButton", description: "全部清除", element_index: 8 }],
+    },
+  });
+  const result = await runGuardedActionBlock({
+    intent: "clear Calculator",
+    actions: [{ id: "clear", type: "click", target: { by: "accessibility", role: "AXButton", name: "全部清除" } }],
+  }, {
+    taskId: "calculator-description",
+    runId: "calculator-description-run",
+    maturity: "cold",
+    checkpoint: createTaskCheckpoint({ taskId: "calculator-description", goal: "clear Calculator" }),
+    observation: calculator,
+    execute: async (actions) => {
+      calls.push(actions);
+      return { ...calculator, observationId: "calculator-after", ok: true };
+    },
+  });
+  assert.equal(result.outcome, "completed");
+  assert.equal(calls[0][0].element_index, 8);
+  assert.equal(calls[0][0].snapshot_id, "calculator-snapshot");
+});
+
+test("visual regions are observation-bound coordinates instead of an always-failing pseudo locator", async () => {
+  const calls = [];
+  const checkpoint = createTaskCheckpoint({ taskId: "visual-region", goal: "click visible button" });
+  const result = await runGuardedActionBlock({
+    intent: "click the visually identified button",
+    actions: [{
+      id: "visual-click",
+      type: "click",
+      target: {
+        by: "visual",
+        description: "blue Continue button",
+        observationId: "visual-before",
+        region: { x: 100, y: 200, width: 40, height: 20 },
+      },
+    }],
+  }, {
+    taskId: "visual-region",
+    runId: "visual-region-run",
+    maturity: "cold",
+    checkpoint,
+    observation: observation("visual-before"),
+    execute: async (actions) => {
+      calls.push(actions);
+      return { ...observation("visual-after"), ok: true };
+    },
+  });
+  assert.equal(result.outcome, "completed");
+  assert.deepEqual(calls[0][0].coordinate, [120, 210]);
+
+  const stale = await runGuardedActionBlock({
+    intent: "do not click a stale visual region",
+    actions: [{
+      id: "stale-visual",
+      type: "click",
+      target: {
+        by: "visual",
+        description: "old button",
+        observationId: "old-observation",
+        region: { x: 0, y: 0, width: 20, height: 20 },
+      },
+    }],
+  }, {
+    taskId: "stale-visual",
+    runId: "stale-visual-run",
+    maturity: "cold",
+    checkpoint: createTaskCheckpoint({ taskId: "stale-visual", goal: "do not click stale UI" }),
+    observation: observation("fresh-observation"),
+    execute: async () => { throw new Error("stale visual action reached Runtime"); },
+  });
+  assert.equal(stale.stopReason, "stale_locator");
 });
 
 test("Computer Use Agent observe transport timeout is recoverable on the same grant", async () => {

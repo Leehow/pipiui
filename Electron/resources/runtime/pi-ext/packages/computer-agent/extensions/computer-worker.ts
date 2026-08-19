@@ -155,7 +155,7 @@ export function registerComputerWorkerTools(
     const targetSchema = {
       oneOf: [
         objectSchema({ by: { const: "accessibility" }, role: { type: "string" }, name: { type: "string" }, value: { type: "string" } }, ["by", "role"]),
-        objectSchema({ by: { const: "visual" }, description: { type: "string" }, region: objectSchema({ x: { type: "number" }, y: { type: "number" }, width: { type: "number" }, height: { type: "number" } }, ["x", "y", "width", "height"]) }, ["by", "description"]),
+        objectSchema({ by: { const: "visual" }, description: { type: "string" }, observationId: { type: "string" }, region: objectSchema({ x: { type: "number" }, y: { type: "number" }, width: { type: "number", exclusiveMinimum: 0 }, height: { type: "number", exclusiveMinimum: 0 } }, ["x", "y", "width", "height"]) }, ["by", "description", "observationId", "region"]),
         objectSchema({ by: { const: "coordinate" }, x: { type: "number" }, y: { type: "number" }, observationId: { type: "string" } }, ["by", "x", "y", "observationId"]),
       ],
     };

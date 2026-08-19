@@ -11,6 +11,8 @@ describe('ComputerUsePanel', () => {
     const host = createMockHost()
     render(<ComputerUsePanel host={host} onClose={() => undefined} />)
     const toggle = await screen.findByRole('switch', { name: '启用 Computer Use' })
+    expect(screen.getByText('管理单个 Computer Use Agent 的桌面控制总开关。')).toBeTruthy()
+    expect(screen.getByText(/它自行规划、操作、恢复并核验/)).toBeTruthy()
     expect(toggle.getAttribute('aria-checked')).toBe('false')
     fireEvent.click(toggle)
     await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('true'))

@@ -1809,6 +1809,7 @@ function cancelInterruptedReminders(agentId: string, runId?: string): void {
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
+const COMPUTER_USE_SYNC_RECOVERY_GRACE_MS = 10 * 60_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
 /** Max automatic re-spawns after a retryable transport/API death (total runs = 1 + this). */
 const AUTO_RESUME_MAX = 2;
@@ -6608,6 +6609,9 @@ async function ensureComputerWorkerBroker(): Promise<InstanceType<ComputerAgentM
 		if (!activeProjectPiHome || !path.isAbsolute(activeProjectPiHome)) throw new Error("Computer Use requires the backend-resolved active project Pi home");
 		computerWorkerBrokerServer = new ComputerWorkerBrokerServer(new ComputerWorkerBroker({
 			request: computerRuntimeRequest,
+			cancelRuntime: async () => {
+				await computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000));
+			},
 			workflowMemory: new WorkflowMemoryStore(activeProjectPiHome),
 			onFatal: ({ taskId, stepId, code }) => {
 				const key = computerWorkerKey(taskId, stepId);
@@ -7670,6 +7674,7 @@ export default function (pi: ExtensionAPI) {
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
+				...(handle.name === "computer-use" ? { syncRecoveryGraceMs: COMPUTER_USE_SYNC_RECOVERY_GRACE_MS } : {}),
 			});
 			if (action === "ignore") continue;
 			const idleSec = Math.floor(idleMs / 1000);

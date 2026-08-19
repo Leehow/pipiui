@@ -20,7 +20,7 @@ export type StateBarrierReason =
 
 export type SemanticTarget =
   | { by: "accessibility"; role: string; name?: string; value?: string }
-  | { by: "visual"; description: string; region?: { x: number; y: number; width: number; height: number } }
+  | { by: "visual"; description: string; observationId: string; region: { x: number; y: number; width: number; height: number } }
   | { by: "coordinate"; x: number; y: number; observationId: string };
 
 export type ActionBlockAction = Record<string, unknown> & {
@@ -104,6 +104,14 @@ export function validateActionBlockRequest(request: ActionBlockRequest, maturity
         throw new Error("wait_until requires a condition and bounded timeoutMs");
       }
     }
+    if (action.target?.by === "visual") {
+      const { observationId: targetObservationId, region } = action.target;
+      if (!targetObservationId || !region
+        || ![region.x, region.y, region.width, region.height].every((value) => Number.isFinite(value))
+        || region.width <= 0 || region.height <= 0) {
+        throw new Error("visual targets require a fresh observationId and a finite positive region");
+      }
+    }
   }
   const mutations = request.actions.filter(isMutation).length;
   const limit = mutationLimitFor(maturity);
@@ -125,6 +133,11 @@ function snapshotId(observation: Record<string, any>): string | undefined {
 
 function normalizedRole(value: unknown): string {
   return String(value ?? "").replace(/^AX/i, "").toLowerCase();
+}
+
+function accessibilityNames(element: Record<string, any>): string[] {
+  return [element.name, element.description, element.label, element.title, element.text]
+    .filter((value) => typeof value === "string" && value.length > 0);
 }
 
 function topologySignature(observation: Record<string, any>): string {
@@ -153,7 +166,12 @@ type ResolvedAction = { action?: Record<string, unknown>; barrier?: StateBarrier
 function resolveAction(action: ActionBlockAction, observation: Record<string, any>): ResolvedAction {
   const { id: _id, target, consequential: _consequential, condition: _condition, timeoutMs: _timeoutMs, ...wire } = action;
   if (!target) return { action: wire };
-  if (target.by === "visual") return { barrier: "locator_missing" };
+  if (target.by === "visual") {
+    if (target.observationId !== observationId(observation)) return { barrier: "stale_locator" };
+    const { x, y, width, height } = target.region;
+    if (![x, y, width, height].every((value) => Number.isFinite(value)) || width <= 0 || height <= 0) return { barrier: "stale_locator" };
+    return { action: { ...wire, coordinate: [x + width / 2, y + height / 2] } };
+  }
   if (target.by === "coordinate") {
     if (target.observationId !== observationId(observation)) return { barrier: "stale_locator" };
     if (![target.x, target.y].every((value) => typeof value === "number" && Number.isFinite(value))) return { barrier: "stale_locator" };
@@ -162,7 +180,7 @@ function resolveAction(action: ActionBlockAction, observation: Record<string, an
   const elements = Array.isArray(observation.accessibility?.elements) ? observation.accessibility.elements : [];
   const matches = elements.filter((element: any) =>
     normalizedRole(element.role) === normalizedRole(target.role)
-    && (target.name === undefined || String(element.name ?? "") === target.name)
+    && (target.name === undefined || accessibilityNames(element).includes(target.name))
     && (target.value === undefined || String(element.value ?? "") === target.value));
   if (matches.length === 0) return { barrier: "locator_missing" };
   if (matches.length > 1) return { barrier: "locator_ambiguous" };

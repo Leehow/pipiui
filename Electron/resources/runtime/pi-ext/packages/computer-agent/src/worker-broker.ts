@@ -33,6 +33,13 @@ export type ComputerRuntimeAdapter = {
   request(request: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>>;
 };
 
+type RuntimeCancellationEvent = {
+  taskId: string;
+  stepId: string;
+  runId: string;
+  reason: "computer_worker_runtime_timeout";
+};
+
 type GrantRecord = {
   taskId: string;
   stepId: string;
@@ -102,6 +109,7 @@ export class ComputerWorkerBroker {
   readonly #grants = new Map<string, GrantRecord>();
 		readonly #requestTimeoutMs: number;
 	readonly #onFatal?: (event: { taskId: string; stepId: string; runId: string; code: ComputerWorkerFatalCode }) => void;
+  readonly #cancelRuntime?: (event: RuntimeCancellationEvent) => Promise<void> | void;
   readonly #workflowMemory?: WorkflowMemoryStore;
 
   constructor(input: {
@@ -109,12 +117,14 @@ export class ComputerWorkerBroker {
     tokenFactory?: () => string;
 			requestTimeoutMs?: number;
 		onFatal?: (event: { taskId: string; stepId: string; runId: string; code: ComputerWorkerFatalCode }) => void;
+    cancelRuntime?: (event: RuntimeCancellationEvent) => Promise<void> | void;
     workflowMemory?: WorkflowMemoryStore;
   }) {
     this.#runtime = { request: input.request };
     this.#tokenFactory = input.tokenFactory ?? (() => randomBytes(32).toString("base64url"));
 			this.#requestTimeoutMs = Math.min(120_000, Math.max(10, input.requestTimeoutMs ?? 35_000));
 		this.#onFatal = input.onFatal;
+    this.#cancelRuntime = input.cancelRuntime;
     this.#workflowMemory = input.workflowMemory;
   }
 
@@ -318,6 +328,12 @@ export class ComputerWorkerBroker {
 						this.#markFatal(grant, "computer_worker_runtime_timeout");
 						throw new Error("computer_worker_runtime_timeout");
 					}
+					await Promise.resolve(this.#cancelRuntime?.({
+						taskId: grant.taskId,
+						stepId: grant.stepId,
+						runId: grant.runId,
+						reason: "computer_worker_runtime_timeout",
+					})).catch(() => {});
 					throw Object.assign(new Error("computer_worker_runtime_timeout"), {
 						code: "computer_worker_runtime_timeout",
 						recoverable: true,
