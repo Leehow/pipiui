@@ -4,11 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import firecrawlPdf, {
-  FIRECRAWL_PARSE_URL,
   FIRECRAWL_PDF_TOOL,
   MAX_PDF_BYTES,
-  OCR_KEY_HINT,
   OCR_MODE_NEEDS_KEY,
+  OCR_SKIPPED_NOTE,
   downloadPdfBytes,
   executeFirecrawlPdf,
   resolvePdfSource,
@@ -72,10 +71,12 @@ describe("pipiui-firecrawl-pdf local extraction", () => {
       pageCount: 1,
       pagesNeedingOcr: [],
     }));
-    const result = await executeFirecrawlPdf({ source: pdf }, { apiKey: null, inspect });
+    const ocrFn = vi.fn(async () => ({ ok: true as const, text: "should not run" }));
+    const result = await executeFirecrawlPdf({ source: pdf }, { apiKey: null, inspect, ocrFn });
     expect(result.isError).toBeUndefined();
     expect(result.content[0].text).toContain("Hello Inspector");
     expect(inspect).toHaveBeenCalledOnce();
+    expect(ocrFn).not.toHaveBeenCalled();
   });
 
   it("downloads a URL PDF and extracts it locally without a key", async () => {
@@ -107,9 +108,9 @@ describe("pipiui-firecrawl-pdf local extraction", () => {
         inspect: async () => ({ engine: "native", pdfType: "Scanned", markdown: "", pageCount: 3, pagesNeedingOcr: [0, 1, 2] }),
       },
     );
-    expect(scanned.isError).toBe(true);
-    expect(scanned.content[0].text).toBe(OCR_KEY_HINT);
-    expect(scanned.content[0].text).not.toMatch(/未配置 Firecrawl API Key/);
+    expect(scanned.isError).toBeUndefined();
+    expect(scanned.content[0].text).toContain(OCR_SKIPPED_NOTE);
+    expect(scanned.content[0].text).toContain("OCR 未执行");
 
     const mixed = await executeFirecrawlPdf(
       { source: pdf },
@@ -120,60 +121,62 @@ describe("pipiui-firecrawl-pdf local extraction", () => {
     );
     expect(mixed.isError).toBeUndefined();
     expect(mixed.content[0].text).toContain("visible text");
-    expect(mixed.content[0].text).toContain("建议 OCR");
-    expect(mixed.content[0].text).toContain("无需 Key");
+    expect(mixed.content[0].text).toContain("OCR 未执行");
   });
 
-  it("auto with a key calls cloud parse only when OCR is indicated", async () => {
+  it("auto with a token calls PaddleOCR only when OCR is indicated", async () => {
     root = await mkdtemp(join(tmpdir(), "fc-auto-"));
     const pdf = join(root, "a.pdf");
     await writeFile(pdf, TEXT_PDF);
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ success: true, data: { markdown: "ocr cloud" } }), { status: 200 }));
+    const ocrFn = vi.fn(async (filePath: string) => {
+      expect(filePath).toBe(pdf);
+      return { ok: true as const, text: "ocr paddle" };
+    });
     const ocr = await executeFirecrawlPdf(
       { source: pdf, mode: "auto" },
       {
-        apiKey: "fc-secret",
-        fetchImpl: fetchImpl as never,
+        apiKey: "ast-secret",
+        ocrFn,
         inspect: async () => ({ engine: "native", pdfType: "Scanned", markdown: "", pageCount: 2, pagesNeedingOcr: [0, 1] }),
       },
     );
-    expect(ocr.content[0].text).toBe("ocr cloud");
-    expect(fetchImpl.mock.calls[0]?.[0]).toBe(FIRECRAWL_PARSE_URL);
+    expect(ocr.content[0].text).toBe("ocr paddle");
+    expect(ocrFn).toHaveBeenCalledOnce();
 
-    fetchImpl.mockClear();
+    ocrFn.mockClear();
     const text = await executeFirecrawlPdf(
       { source: pdf, mode: "auto" },
       {
-        apiKey: "fc-secret",
-        fetchImpl: fetchImpl as never,
+        apiKey: "ast-secret",
+        ocrFn,
         inspect: async () => ({ engine: "native", pdfType: "TextBased", markdown: "local only", pageCount: 1, pagesNeedingOcr: [] }),
       },
     );
     expect(text.content[0].text).toContain("local only");
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ocrFn).not.toHaveBeenCalled();
   });
 
-  it("fast never calls the cloud even with a key; ocr without a key keeps local extract available", async () => {
+  it("fast never calls OCR even with a token; ocr without a token errors clearly", async () => {
     root = await mkdtemp(join(tmpdir(), "fc-fast-"));
     const pdf = join(root, "a.pdf");
     await writeFile(pdf, TEXT_PDF);
-    const fetchImpl = vi.fn(async () => new Response("nope", { status: 500 }));
+    const ocrFn = vi.fn(async () => ({ ok: true as const, text: "nope" }));
     const fast = await executeFirecrawlPdf(
       { source: pdf, mode: "fast" },
       {
-        apiKey: "fc-secret",
-        fetchImpl: fetchImpl as never,
+        apiKey: "ast-secret",
+        ocrFn,
         inspect: async () => ({ engine: "native", pdfType: "Scanned", markdown: "fast text", pageCount: 1, pagesNeedingOcr: [0] }),
       },
     );
     expect(fast.content[0].text).toContain("fast text");
-    expect(fast.content[0].text).toContain("fast 模式不调用云端");
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fast.content[0].text).toContain("fast 模式永不调用 OCR");
+    expect(ocrFn).not.toHaveBeenCalled();
 
-    const ocr = await executeFirecrawlPdf({ source: pdf, mode: "ocr" }, { apiKey: null, fetchImpl: fetchImpl as never });
+    const ocr = await executeFirecrawlPdf({ source: pdf, mode: "ocr" }, { apiKey: null, ocrFn });
     expect(ocr.content[0].text).toBe(OCR_MODE_NEEDS_KEY);
-    expect(ocr.content[0].text).toContain("auto/fast");
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(ocr.content[0].text).toContain("缺少 PaddleOCR Token");
+    expect(ocrFn).not.toHaveBeenCalled();
   });
 
   it("rejects oversize downloads, non-PDF bodies, and bad URLs", async () => {

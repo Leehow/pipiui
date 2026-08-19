@@ -93,7 +93,7 @@ import {
 import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-telemetry.js";
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
-import { firecrawlPdfHasKey, writeFirecrawlApiKey } from "./firecrawl-pdf-key.js";
+import { paddleocrHasKey, writePaddleocrAccessToken } from "./paddleocr-key.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
@@ -2426,10 +2426,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadVisionEnabled();
       case "setVisionEnabled":
         return this.saveVisionEnabled(params[0]);
-      case "getFirecrawlPdfStatus":
-        return this.loadFirecrawlPdfStatus(params[0]);
-      case "setFirecrawlPdfApiKey":
-        return this.saveFirecrawlPdfApiKey(params[0], params[1]);
+      case "getPaddleOcrStatus":
+        return this.loadPaddleOcrStatus(params[0]);
+      case "setPaddleOcrAccessToken":
+        return this.savePaddleOcrAccessToken(params[0], params[1]);
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -4110,7 +4110,7 @@ export class PiHostBackend implements HostBackend {
     this.visionEnabledLoaded = Promise.resolve();
     return value;
   }
-  private async firecrawlPdfAgentDir(projectId: unknown): Promise<string> {
+  private async paddleOcrAgentDir(projectId: unknown): Promise<string> {
     if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
     const path = await this.projectPath(projectId);
     if (this.profileMode === "isolated") {
@@ -4120,14 +4120,14 @@ export class PiHostBackend implements HostBackend {
     }
     return this.agentDir;
   }
-  private async loadFirecrawlPdfStatus(projectId: unknown): Promise<{ hasKey: boolean }> {
-    const agentDir = await this.firecrawlPdfAgentDir(projectId);
-    return { hasKey: await firecrawlPdfHasKey(agentDir) };
+  private async loadPaddleOcrStatus(projectId: unknown): Promise<{ hasKey: boolean }> {
+    const agentDir = await this.paddleOcrAgentDir(projectId);
+    return { hasKey: await paddleocrHasKey(agentDir) };
   }
-  private async saveFirecrawlPdfApiKey(projectId: unknown, apiKey: unknown): Promise<{ hasKey: boolean }> {
-    if (apiKey !== null && typeof apiKey !== "string") throw new Error("apiKey 必须是 string 或 null");
-    const agentDir = await this.firecrawlPdfAgentDir(projectId);
-    const hasKey = await writeFirecrawlApiKey(agentDir, apiKey);
+  private async savePaddleOcrAccessToken(projectId: unknown, token: unknown): Promise<{ hasKey: boolean }> {
+    if (token !== null && typeof token !== "string") throw new Error("token 必须是 string 或 null");
+    const agentDir = await this.paddleOcrAgentDir(projectId);
+    const hasKey = await writePaddleocrAccessToken(agentDir, token);
     return { hasKey };
   }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {

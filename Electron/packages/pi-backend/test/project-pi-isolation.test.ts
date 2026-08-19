@@ -388,9 +388,9 @@ describe("isolated project Pi homes", () => {
     );
     await expect(readdir(join(otherProject, ".pi", "agent", "sessions"))).rejects.toMatchObject({ code: "ENOENT" });
 
-    await backend.handle("setFirecrawlPdfApiKey", [added.id, "fc-test-key"]);
-    expect(await readFile(join(realRoot, ".pi", "agent", "web-search.json"), "utf8")).toContain("fc-test-key");
-    await expect(readFile(join(otherProject, ".pi", "agent", "web-search.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await backend.handle("setPaddleOcrAccessToken", [added.id, "ast-test-key"]);
+    expect(await readFile(join(realRoot, ".pi", "agent", "paddleocr.json"), "utf8")).toContain("ast-test-key");
+    await expect(readFile(join(otherProject, ".pi", "agent", "paddleocr.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
 
     await backend.handle("revealProject", [added.id]);

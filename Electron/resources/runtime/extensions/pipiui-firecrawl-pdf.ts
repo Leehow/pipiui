@@ -8,22 +8,21 @@ import {
   indicatesOcr,
   type LocalInspectResult,
 } from "./pdf-inspector-local.ts";
+import { callPaddleocrVl } from "./paddleocr-mcp-client.ts";
 
 export const FIRECRAWL_PDF_TOOL = "pipiui_firecrawl_pdf";
-export const FIRECRAWL_PARSE_URL = "https://api.firecrawl.dev/v2/parse";
-export const FIRECRAWL_SCRAPE_URL = "https://api.firecrawl.dev/v2/scrape";
 export const MAX_PDF_BYTES = 50 * 1024 * 1024;
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 300_000;
 export const MIN_PAGES = 1;
 export const MAX_PAGES = 10_000;
 export const MAX_ERROR_CHARS = 400;
-export const WEB_SEARCH_CONFIG_NAME = "web-search.json";
-export const FIRECRAWL_API_KEY_FIELD = "firecrawlApiKey";
-export const OCR_KEY_HINT =
-  "这是扫描件/图片页，本地文本提取没有可用正文。可选：在设置 → 通用 → Firecrawl OCR Key（选填）中配置密钥后，用 mode=ocr 或 auto 走云端 OCR。普通文字型 PDF 无需 Key，可继续用 auto/fast 本地解析。";
+export const PADDLEOCR_CONFIG_NAME = "paddleocr.json";
+export const PADDLEOCR_TOKEN_FIELD = "aistudioAccessToken";
+export const OCR_SKIPPED_NOTE =
+  "OCR 未执行：未配置 PaddleOCR AI Studio Token。文字型 PDF 仍使用本地提取，不会上传。可在设置 → MCP / 扩展 → PaddleOCR-VL-1.6 中配置。";
 export const OCR_MODE_NEEDS_KEY =
-  "mode=ocr 需要可选的 Firecrawl OCR Key。本地文字提取（auto/fast）无需 Key，仍可用于文字型 PDF。申请：https://www.firecrawl.dev/app/api-keys";
+  "缺少 PaddleOCR Token：mode=ocr 需要在设置 → MCP / 扩展 → PaddleOCR-VL-1.6 配置 AI Studio Access Token。文字型 PDF 请用 auto/fast 本地提取，不会上传。申请：https://aistudio.baidu.com/account/accessToken";
 
 export type PdfParseMode = "auto" | "fast" | "ocr";
 
@@ -38,19 +37,19 @@ function asObject(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
 }
 
-export function readFirecrawlApiKeyFromConfig(raw: unknown): string | undefined {
-  const key = asObject(raw)?.[FIRECRAWL_API_KEY_FIELD];
+export function readPaddleocrTokenFromConfig(raw: unknown): string | undefined {
+  const key = asObject(raw)?.[PADDLEOCR_TOKEN_FIELD];
   if (typeof key !== "string") return undefined;
   const trimmed = key.trim();
   return trimmed || undefined;
 }
 
-export async function loadFirecrawlApiKey(agentDir = process.env.PI_CODING_AGENT_DIR): Promise<string | undefined> {
+export async function loadPaddleocrToken(agentDir = process.env.PI_CODING_AGENT_DIR): Promise<string | undefined> {
   if (!agentDir) return undefined;
   try {
     const { join } = await import("node:path");
-    const text = await readFile(join(agentDir, WEB_SEARCH_CONFIG_NAME), "utf8");
-    return readFirecrawlApiKeyFromConfig(JSON.parse(text));
+    const text = await readFile(join(agentDir, PADDLEOCR_CONFIG_NAME), "utf8");
+    return readPaddleocrTokenFromConfig(JSON.parse(text));
   } catch {
     return undefined;
   }
@@ -85,7 +84,6 @@ export function looksLikePdfName(name: string): boolean {
   return name.toLowerCase().split("?")[0]?.endsWith(".pdf") === true;
 }
 
-/** Firecrawl expects a filename; extensionless locals still upload as a safe .pdf name. */
 export function uploadFilename(path: string): string {
   const base = path.split("/").pop()?.trim() || "";
   return looksLikePdfName(base) ? base : "document.pdf";
@@ -130,36 +128,6 @@ export function resolvePdfSource(raw: string): ResolvedPdfSource | { error: stri
   return { kind: "local", path };
 }
 
-function parserOptions(mode: PdfParseMode, maxPages?: number) {
-  const parser: Record<string, unknown> = { type: "pdf", mode };
-  if (maxPages !== undefined) parser.maxPages = maxPages;
-  return [parser];
-}
-
-export function firecrawlErrorText(status: number, body: unknown, secret?: string): string {
-  const object = asObject(body);
-  const raw =
-    (typeof object?.error === "string" && object.error) ||
-    (typeof object?.message === "string" && object.message) ||
-    (typeof object?.details === "string" && object.details) ||
-    (typeof body === "string" ? body : "");
-  const prefix = status > 0 ? `Firecrawl ${status}` : "Firecrawl";
-  if (!raw.trim()) return sanitizePublicError(`${prefix}: 解析失败`, secret);
-  return sanitizePublicError(`${prefix}: ${raw}`, secret);
-}
-
-export function extractParsedMarkdown(body: unknown): { markdown: string; numPages?: number; totalPages?: number } | { error: string } {
-  const object = asObject(body);
-  if (!object) return { error: "Firecrawl 返回了无法解析的响应" };
-  if (object.success === false) return { error: firecrawlErrorText(0, object) };
-  const data = asObject(object.data) ?? object;
-  const markdown = typeof data.markdown === "string" ? data.markdown : typeof object.markdown === "string" ? object.markdown : "";
-  if (!markdown.trim()) return { error: "Firecrawl 未返回 PDF 正文（markdown 为空）" };
-  const metadata = asObject(data.metadata) ?? asObject(object.metadata);
-  const numPages = typeof metadata?.numPages === "number" ? metadata.numPages : typeof data.numPages === "number" ? data.numPages : undefined;
-  const totalPages = typeof metadata?.totalPages === "number" ? metadata.totalPages : typeof data.totalPages === "number" ? data.totalPages : undefined;
-  return { markdown, numPages, totalPages };
-}
 
 export async function readLocalPdfBytes(
   path: string,
@@ -248,43 +216,34 @@ export async function downloadPdfBytes(options: {
   return { ok: true, bytes };
 }
 
-export async function parseCloudPdf(options: {
-  bytes: Uint8Array;
-  filename?: string;
-  apiKey: string;
-  maxPages?: number;
-  timeout: number;
-  fetchImpl?: typeof fetch;
-}): Promise<{ ok: true; markdown: string; numPages?: number; totalPages?: number } | { ok: false; error: string }> {
-  const form = new FormData();
-  form.append("file", new Blob([options.bytes], { type: "application/pdf" }), options.filename || "document.pdf");
-  const parseOptions: Record<string, unknown> = {
-    formats: ["markdown"],
-    timeout: options.timeout,
-    parsers: parserOptions("ocr", options.maxPages),
-  };
-  form.append("options", new Blob([JSON.stringify(parseOptions)], { type: "application/json" }));
-  const fetchImpl = options.fetchImpl ?? fetch;
-  let response: Response;
-  try {
-    response = await fetchImpl(FIRECRAWL_PARSE_URL, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${options.apiKey}` },
-      body: form,
-      signal: AbortSignal.timeout(options.timeout + 5_000),
-    });
-  } catch (error) {
-    const name = error instanceof Error ? error.name : "";
-    if (name === "TimeoutError" || name === "AbortError") {
-      return { ok: false, error: sanitizePublicError("Firecrawl 请求超时", options.apiKey) };
-    }
-    return { ok: false, error: sanitizePublicError(`无法连接 Firecrawl：${error instanceof Error ? error.message : String(error)}`, options.apiKey) };
+export type PaddleocrVlFn = (filePath: string, token: string) => Promise<{ ok: true; text: string } | { ok: false; error: string }>;
+
+async function ocrWithPaddleocr(options: {
+  localPath?: string;
+  bytes: Buffer;
+  filename: string;
+  token: string;
+  ocrFn?: PaddleocrVlFn;
+}): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const ocrFn = options.ocrFn ?? ((filePath, token) => callPaddleocrVl({ filePath, token }));
+  if (options.localPath) {
+    const result = await ocrFn(options.localPath, options.token);
+    if (!result.ok) return { ok: false, error: sanitizePublicError(result.error, options.token) };
+    return { ok: true, text: result.text };
   }
-  const body = await response.json().catch(() => undefined);
-  if (!response.ok) return { ok: false, error: firecrawlErrorText(response.status, body, options.apiKey) };
-  const extracted = extractParsedMarkdown(body);
-  if ("error" in extracted) return { ok: false, error: sanitizePublicError(extracted.error, options.apiKey) };
-  return { ok: true, ...extracted };
+  const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "pipiui-paddleocr-"));
+  const path = join(dir, options.filename || "document.pdf");
+  try {
+    await writeFile(path, options.bytes);
+    const result = await ocrFn(path, options.token);
+    if (!result.ok) return { ok: false, error: sanitizePublicError(result.error, options.token) };
+    return { ok: true, text: result.text };
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 function toolResult(text: string, isError = false) {
@@ -304,9 +263,10 @@ export async function executeFirecrawlPdf(
     inspect?: InspectPdfFn;
     fetchImpl?: typeof fetch;
     apiKey?: string | null;
+    ocrFn?: PaddleocrVlFn;
   } = {},
 ): Promise<{ content: [{ type: "text"; text: string }]; details: Record<string, never>; isError?: boolean }> {
-  const apiKey = deps.apiKey === undefined ? await loadFirecrawlApiKey() : deps.apiKey || undefined;
+  const apiKey = deps.apiKey === undefined ? await loadPaddleocrToken() : deps.apiKey || undefined;
   const resolved = resolvePdfSource(String(params.source ?? ""));
   if ("error" in resolved) return toolResult(resolved.error, true);
   const mode = normalizePdfMode(params.mode);
@@ -319,11 +279,13 @@ export async function executeFirecrawlPdf(
 
   let bytes: Buffer;
   let filename = "document.pdf";
+  let localPath: string | undefined;
   if (resolved.kind === "local") {
     const loaded = await readLocalPdfBytes(resolved.path);
     if (!loaded.ok) return toolResult(loaded.error, true);
     bytes = loaded.bytes;
     filename = uploadFilename(resolved.path);
+    localPath = resolved.path;
   } else {
     const loaded = await downloadPdfBytes({ url: resolved.url, timeout, fetchImpl: deps.fetchImpl });
     if (!loaded.ok) return toolResult(loaded.error, true);
@@ -332,11 +294,19 @@ export async function executeFirecrawlPdf(
 
   const inspect = deps.inspect ?? ((data, options) => inspectPdfWithOfficial(data, options));
 
-  if (mode === "ocr") {
-    const cloud = await parseCloudPdf({ bytes, filename, apiKey: apiKey!, maxPages: pages, timeout, fetchImpl: deps.fetchImpl });
-    if (!cloud.ok) return toolResult(cloud.error, true);
-    return toolResult(cloud.markdown);
-  }
+  const runOcr = async () => {
+    const ocr = await ocrWithPaddleocr({
+      localPath,
+      bytes,
+      filename,
+      token: apiKey!,
+      ocrFn: deps.ocrFn,
+    });
+    if (!ocr.ok) return toolResult(ocr.error, true);
+    return toolResult(ocr.text);
+  };
+
+  if (mode === "ocr") return runOcr();
 
   let local: LocalInspectResult;
   try {
@@ -349,22 +319,17 @@ export async function executeFirecrawlPdf(
   const ocrIndicated = indicatesOcr(local);
 
   if (mode === "fast") {
-    if (!text) return toolResult(OCR_KEY_HINT, true);
     const note = ocrIndicated
-      ? `\n--- 部分页面可能需要 OCR（${local.pagesNeedingOcr.join(",") || local.pdfType}）；fast 模式不调用云端。 ---`
+      ? `\n--- 部分页面可能需要 OCR（${local.pagesNeedingOcr.join(",") || local.pdfType}）；fast 模式永不调用 OCR。 ---`
       : "";
+    if (!text) return toolResult(`${OCR_SKIPPED_NOTE}${note}`, true);
     return toolResult(formatLocalMarkdown(local, note));
   }
 
-  if (mode === "auto" && ocrIndicated && apiKey) {
-    const cloud = await parseCloudPdf({ bytes, filename, apiKey, maxPages: pages, timeout, fetchImpl: deps.fetchImpl });
-    if (!cloud.ok) return toolResult(cloud.error, true);
-    return toolResult(cloud.markdown);
-  }
+  if (mode === "auto" && ocrIndicated && apiKey) return runOcr();
 
-  if (!text) return toolResult(OCR_KEY_HINT, true);
-  const note = ocrIndicated && !apiKey
-    ? `\n--- 已本地提取文字。以下页建议 OCR 但未配置可选 OCR Key：${local.pagesNeedingOcr.join(",") || local.pdfType}。普通文字提取无需 Key。 ---`
+  const note = ocrIndicated
+    ? `\n--- ${OCR_SKIPPED_NOTE} 建议 OCR 页：${local.pagesNeedingOcr.join(",") || local.pdfType}。 ---`
     : "";
   return toolResult(formatLocalMarkdown(local, note));
 }
@@ -374,13 +339,13 @@ export default function (pi: ExtensionAPI) {
     name: FIRECRAWL_PDF_TOOL,
     label: "Firecrawl PDF",
     description:
-      "Extract Markdown from a local PDF path, file:// PDF, or http(s) PDF URL using Firecrawl pdf-inspector locally. " +
-      "No API key is required for text PDFs. Optional Firecrawl OCR Key is only used when auto detects image-only pages or mode=ocr. " +
-      "Opening the document panel does not parse or upload. Modes: auto (default), fast (local only), ocr (cloud, needs key).",
-    promptSnippet: "Parse PDF locally with pipiui_firecrawl_pdf; OCR key is optional",
+      "Extract Markdown from a local PDF path, file:// PDF, or http(s) PDF URL using local pdf-inspector. " +
+      "Text PDFs never use OCR. auto only calls built-in PaddleOCR-VL-1.6 when local parse indicatesOcr and a project token exists. " +
+      "fast never OCRs. ocr requires a PaddleOCR token. Opening the document panel does not parse or upload.",
+    promptSnippet: "Parse PDF locally with pipiui_firecrawl_pdf; PaddleOCR token is optional",
     promptGuidelines: [
       "Use pipiui_firecrawl_pdf for PDF content. Do not use read on PDF bytes.",
-      "Text PDFs are extracted locally and never uploaded. Cloud OCR runs only for scanned/image pages when a key is configured, or when mode=ocr.",
+      "Text PDFs are extracted locally and never uploaded. PaddleOCR runs only for scanned/image pages when a token is configured, or when mode=ocr.",
       "Opening the right-hand document panel does not parse or upload the PDF.",
     ],
     parameters: Type.Object(

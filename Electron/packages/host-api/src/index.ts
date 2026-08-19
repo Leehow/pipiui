@@ -540,10 +540,10 @@ export interface PipiHostAPI {
    */
   getVisionEnabled?(): Promise<boolean>;
   setVisionEnabled?(enabled: boolean): Promise<boolean>;
-  /** Project-scoped Firecrawl PDF OCR key. Renderer only receives hasKey, never the secret. */
-  getFirecrawlPdfStatus?(projectId: string): Promise<{ hasKey: boolean }>;
-  /** Pass a new key or null to clear. Never returned back to the renderer. */
-  setFirecrawlPdfApiKey?(projectId: string, apiKey: string | null): Promise<{ hasKey: boolean }>;
+  /** Project-scoped PaddleOCR AI Studio token. Renderer only receives hasKey, never the secret. */
+  getPaddleOcrStatus?(projectId: string): Promise<{ hasKey: boolean }>;
+  /** Pass a new token or null to clear. Never returned back to the renderer. */
+  setPaddleOcrAccessToken?(projectId: string, token: string | null): Promise<{ hasKey: boolean }>;
   listAgentDefinitions?(): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
@@ -714,8 +714,8 @@ function apiFrom(
     setVisionModel: ref => invoke("setVisionModel", ref),
     getVisionEnabled: () => invoke("getVisionEnabled"),
     setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
-    getFirecrawlPdfStatus: projectId => invoke("getFirecrawlPdfStatus", projectId),
-    setFirecrawlPdfApiKey: (projectId, apiKey) => invoke("setFirecrawlPdfApiKey", projectId, apiKey),
+    getPaddleOcrStatus: projectId => invoke("getPaddleOcrStatus", projectId),
+    setPaddleOcrAccessToken: (projectId, token) => invoke("setPaddleOcrAccessToken", projectId, token),
     listAgentDefinitions: () => invoke("listAgentDefinitions"),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),

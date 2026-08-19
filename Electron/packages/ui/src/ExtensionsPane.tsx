@@ -105,7 +105,100 @@ export function ExtensionsAddDialog({ onClose }: { onClose: () => void }) {
   )
 }
 
-export function ExtensionsPane({ addOpen, onCloseAdd, host }: { addOpen: boolean; onCloseAdd: () => void; host?: PipiHostAPI }) {
+const PADDLEOCR_APPLY_URL = 'https://aistudio.baidu.com/account/accessToken'
+
+function PaddleOcrBuiltinRow({ host, projectId }: { host?: PipiHostAPI; projectId?: string }) {
+  const [draft, setDraft] = useState('')
+  const [hasKey, setHasKey] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const resolvedHost = host ?? hostFromWindow()
+  const available = Boolean(resolvedHost?.getPaddleOcrStatus && resolvedHost?.setPaddleOcrAccessToken)
+
+  const refresh = async () => {
+    if (!resolvedHost?.getPaddleOcrStatus || !projectId) {
+      setHasKey(false)
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    try {
+      const status = await resolvedHost.getPaddleOcrStatus(projectId)
+      setHasKey(Boolean(status?.hasKey))
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void refresh() }, [projectId, resolvedHost])
+
+  const save = async (next: string | null) => {
+    if (!resolvedHost?.setPaddleOcrAccessToken || !projectId) return
+    setSaving(true)
+    try {
+      const status = await resolvedHost.setPaddleOcrAccessToken(projectId, next)
+      setHasKey(Boolean(status?.hasKey))
+      setDraft('')
+      setError(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="update-center-row" data-testid="extensions-item-paddleocr" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 8 }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, alignItems: 'flex-start' }}>
+        <div className="update-center-name">
+          <strong>PaddleOCR-VL-1.6</strong>
+          <span>扫描 PDF / 图片页 OCR（uvx paddleocr-mcp）</span>
+        </div>
+        <span className="update-center-status upToDate" data-testid="paddleocr-builtin-status">已内置</span>
+      </div>
+      {!available ? (
+        <p className="vision-picker-hint" data-testid="paddleocr-unsupported">当前连接不支持 PaddleOCR Token 设置。</p>
+      ) : (
+        <>
+          {loading ? <p className="vision-picker-hint" data-testid="paddleocr-loading">正在读取配置…</p> : (
+            <p className="vision-picker-hint" data-testid="paddleocr-status">{hasKey ? '已配置 Token' : '尚未配置 Token'}</p>
+          )}
+          {error && (
+            <div className="model-modal-error" role="alert" data-testid="paddleocr-error">
+              <span>{error}</span>
+              <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="paddleocr-error-close" onClick={() => setError(null)}>×</button>
+            </div>
+          )}
+          <label className="vision-model-select-row" style={{ display: 'flex', flexDirection: 'column', gap: 5, color: 'var(--muted)', fontSize: 11 }}>
+            <span>AI Studio Access Token</span>
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={hasKey ? '输入新 Token 以替换' : '粘贴 Access Token'}
+              value={draft}
+              disabled={!projectId || saving}
+              data-testid="paddleocr-token-input"
+              onChange={event => setDraft(event.target.value)}
+              style={{ width: '100%', padding: '5px', border: '1px solid var(--border-strong)', borderRadius: 6, color: 'var(--text)', background: 'var(--surface-input)', fontSize: 11 }}
+            />
+          </label>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" className="model-modal-add" disabled={!projectId || saving || !draft.trim()} data-testid="paddleocr-save" onClick={() => void save(draft)}>保存</button>
+            <button type="button" className="model-modal-refresh" disabled={!projectId || saving || !hasKey} data-testid="paddleocr-clear" onClick={() => void save(null)}>清除</button>
+            <button type="button" className="model-modal-refresh" data-testid="paddleocr-apply" onClick={() => void resolvedHost?.openExternal?.(PADDLEOCR_APPLY_URL)}>申请 Key</button>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOpen: boolean; onCloseAdd: () => void; host?: PipiHostAPI; projectId?: string }) {
   const [servers, setServers] = useState<UserMcpServer[]>([])
 
   useEffect(() => {
@@ -126,7 +219,7 @@ export function ExtensionsPane({ addOpen, onCloseAdd, host }: { addOpen: boolean
             <h3>已内置</h3>
             <p>PipiUI 会话会加载 Pi 的 MCP 扩展，用来连接外部 MCP 服务。</p>
           </div>
-          <span>1 项</span>
+          <span>2 项</span>
         </header>
         <div className="update-center-group-items">
           <div className="update-center-row" data-testid="extensions-item-pi-mcp">
@@ -136,6 +229,7 @@ export function ExtensionsPane({ addOpen, onCloseAdd, host }: { addOpen: boolean
             </div>
             <span className="update-center-status upToDate">已内置</span>
           </div>
+          <PaddleOcrBuiltinRow host={host} projectId={projectId ?? lastProjectId()} />
         </div>
       </section>
       <section className="update-center-group" data-testid="extensions-user">

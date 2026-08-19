@@ -23,6 +23,7 @@ describe('ExtensionsPane', () => {
     render(<ExtensionsPane addOpen={false} onCloseAdd={() => undefined} />)
     expect(screen.getByTestId('extensions-pane')).toBeTruthy()
     expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
+    expect(screen.getByTestId('extensions-item-paddleocr').textContent).toContain('PaddleOCR-VL-1.6')
     expect(screen.getByTestId('extensions-user-empty').textContent).toContain('还没有额外添加')
     expect(screen.queryByTestId('extensions-add-dialog')).toBeNull()
   })
@@ -55,6 +56,28 @@ describe('ExtensionsPane', () => {
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith(PI_EXTENSION_ADD_PROMPT))
     fireEvent.click(screen.getByRole('button', { name: '关闭添加说明' }))
     expect(onCloseAdd).toHaveBeenCalledTimes(1)
+  })
+
+  it('saves a project-scoped PaddleOCR token without echoing it and opens the apply URL', async () => {
+    const getPaddleOcrStatus = vi.fn(async () => ({ hasKey: false }))
+    const setPaddleOcrAccessToken = vi.fn(async (_projectId: string, token: string | null) => ({ hasKey: Boolean(token) }))
+    const openExternal = vi.fn(async () => undefined)
+    const host = {
+      getPaddleOcrStatus,
+      setPaddleOcrAccessToken,
+      openExternal,
+      listUserMcpServers: async () => [],
+      listProjects: async () => [{ id: 'project-1', name: 'demo', path: '/tmp/demo' }],
+    } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="project-1" addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('paddleocr-status')).toBeTruthy()
+    fireEvent.change(screen.getByTestId('paddleocr-token-input'), { target: { value: 'ast-secret-should-not-echo' } })
+    fireEvent.click(screen.getByTestId('paddleocr-save'))
+    await waitFor(() => expect(setPaddleOcrAccessToken).toHaveBeenCalledWith('project-1', 'ast-secret-should-not-echo'))
+    expect(screen.queryByText('ast-secret-should-not-echo')).toBeNull()
+    expect(screen.getByTestId('paddleocr-status').textContent).toContain('已配置')
+    fireEvent.click(screen.getByTestId('paddleocr-apply'))
+    expect(openExternal).toHaveBeenCalledWith('https://aistudio.baidu.com/account/accessToken')
   })
 
   it('closes the add dialog on Escape without bubbling to the settings modal', () => {
