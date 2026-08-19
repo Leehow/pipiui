@@ -42,6 +42,27 @@ async function ready(listeners: Map<string, (event: StreamEvent) => void>) {
 }
 
 describe('selected-session working stop control', () => {
+  it('closes the composer immediately even when host.stop never resolves', async () => {
+    const stop = vi.fn(() => new Promise<void>(() => undefined))
+    const { host, listeners } = controlledHost({ stop, listAgents: async () => [] })
+    render(<App host={host} />)
+    await ready(listeners)
+
+    act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
+    act(() => { listeners.get('welcome')?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '还在写' }) })
+    expect(await screen.findByLabelText('停止生成')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).not.toBe('给 PipiUI 发送消息…')
+
+    fireEvent.click(screen.getAllByLabelText('停止生成')[0])
+    await waitFor(() => expect(stop).toHaveBeenCalledWith('welcome'))
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.queryByLabelText('正在停止')).toBeNull()
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(screen.getByText('还在写')).toBeTruthy()
+  })
+
   it('shows for a restored observed-running session and routes one pending stop to the exact session', async () => {
     let resolveStop: (() => void) | undefined
     const stop = vi.fn(() => new Promise<void>(resolve => { resolveStop = resolve }))
@@ -61,28 +82,29 @@ describe('selected-session working stop control', () => {
       return button!
     })
     fireEvent.click(stopButton)
-    fireEvent.click(screen.getByLabelText('正在停止'))
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.queryByLabelText('正在停止')).toBeNull()
     await waitFor(() => expect(stop).toHaveBeenCalledTimes(1))
     expect(stop).toHaveBeenCalledWith('welcome')
-    expect((screen.getByLabelText('正在停止') as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
 
     act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'stopped' }) })
     resolveStop?.()
-    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
     expect(screen.getByLabelText('发送消息')).toBeTruthy()
   })
 
   it('recovers from stop rejection with a dismissible error and re-enabled stop', async () => {
     const stop = vi.fn(async () => { throw new Error('host refused') })
     const { host, listeners } = controlledHost({ stop })
-    const { container } = render(<App host={host} />)
+    render(<App host={host} />)
     await ready(listeners)
     act(() => { listeners.get('welcome')?.({ type: 'status', sessionId: 'welcome', status: 'started', pendingFollowUps: ['host'] }) })
 
-    const composerStop = () => container.querySelector('.send.stop') as HTMLButtonElement
-    fireEvent.click(composerStop())
+    fireEvent.click((await screen.findAllByLabelText('停止生成'))[0])
     expect(await screen.findByText('停止失败：host refused')).toBeTruthy()
-    expect(composerStop().disabled).toBe(false)
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
     fireEvent.click(screen.getByTestId('composer-error-close'))
     expect(screen.queryByText('停止失败：host refused')).toBeNull()
   })

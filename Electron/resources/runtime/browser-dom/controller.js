@@ -743,6 +743,32 @@
     return { entry };
   }
 
+  function resolveElement(token) {
+    if (typeof token !== "string" || token.length === 0) {
+      const error = new Error("el() requires a snapshot element token; observe again.");
+      error.code = "stale_snapshot";
+      throw error;
+    }
+    const snapshot = state.activeSnapshot;
+    if (!snapshot) {
+      const error = new Error("The browser snapshot is stale; observe again.");
+      error.code = "stale_snapshot";
+      throw error;
+    }
+    const entry = snapshot.map.get(token);
+    if (!entry || !entry.element) {
+      const error = new Error("The requested element is no longer in the active snapshot.");
+      error.code = "stale_snapshot";
+      throw error;
+    }
+    if (!entry.element.isConnected) {
+      const error = new Error("The requested element is no longer connected; observe again.");
+      error.code = "stale_snapshot";
+      throw error;
+    }
+    return entry.element;
+  }
+
   function nativeValueSetter(element, value) {
     const prototype = element.localName === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
@@ -1250,7 +1276,7 @@
   }
 
   Object.defineProperty(globalThis, API_NAME, {
-    value: Object.freeze({ dispatch }),
+    value: Object.freeze({ dispatch, resolveElement }),
     configurable: false,
     enumerable: false,
     writable: false,

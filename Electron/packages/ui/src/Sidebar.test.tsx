@@ -351,6 +351,18 @@ describe('Sidebar', () => {
     expect(row.classList.contains('sb-selected')).toBe(true)
     fireEvent.click(row)
     expect(props.onSelectSession).toHaveBeenCalledWith('s2')
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('fires session select and new-session callbacks on the first click', () => {
+    const props = defaultProps()
+    render(<Sidebar {...props} />)
+    fireEvent.click(screen.getByText('s1').closest('.sb-session')!)
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+    expect(props.onSelectSession).toHaveBeenCalledWith('s1')
+    fireEvent.click(screen.getAllByRole('button', { name: /demo-project 新建会话/ })[0])
+    expect(props.onNewSession).toHaveBeenCalledTimes(1)
+    expect(props.onNewSession).toHaveBeenCalledWith('p1')
   })
 
   it.each([
@@ -542,6 +554,39 @@ describe('Sidebar', () => {
     expect(screen.getByText('arch1')).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: /取消归档/ }))
     expect(onUnarchive).toHaveBeenCalledWith('arch1')
+  })
+
+  it('labels external rows with a dedicated source icon and hides Pi-only actions', () => {
+    const onPin = vi.fn()
+    const onRename = vi.fn()
+    const onArchive = vi.fn()
+    const onSelect = vi.fn()
+    render(<Sidebar {...defaultProps({
+      pinnedSessions: [],
+      onPinSession: onPin,
+      onRenameSession: onRename,
+      onArchiveSession: onArchive,
+      onSelectSession: onSelect,
+      projects: [{
+        id: 'p1',
+        name: 'demo-project',
+        sessions: [
+          session({ id: 's1' }),
+          session({ id: 'ext:claude:abc', title: 'Claude 记录', source: 'claude', provider: 'claude' }),
+        ],
+      }],
+    })} />)
+    const external = document.querySelector('[data-session-id="ext:claude:abc"]') as HTMLElement
+    expect(external.getAttribute('data-session-source')).toBe('claude')
+    expect(external.getAttribute('aria-label')).toBe('Anthropic/Claude · Claude 记录')
+    expect(external.getAttribute('title')).toBe('Anthropic/Claude · Claude 记录')
+    expect(within(external).getByTestId('session-source-claude')).toBeTruthy()
+    expect(within(external).queryByRole('button', { name: '置顶' })).toBeNull()
+    expect(within(external).queryByRole('button', { name: '修改标题' })).toBeNull()
+    expect(within(external).queryByRole('button', { name: '归档会话' })).toBeNull()
+    fireEvent.click(external)
+    expect(onSelect).toHaveBeenCalledWith('ext:claude:abc')
+    expect(screen.getByTestId('session-source-pi')).toBeTruthy()
   })
 })
 

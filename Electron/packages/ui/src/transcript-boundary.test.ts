@@ -19,12 +19,20 @@ describe('transcript architecture boundary', () => {
     ]) expect(source).not.toMatch(definition)
   })
 
-  it('opens MessageList at the newest item and only first-page history asks Virtuoso to follow the tail', () => {
-    expect(transcriptSource()).toMatch(/initialTopMostItemIndex=\{Math\.max\(0, messages\.length - 1\)\}/)
-    const source = appSource()
-    expect(source).toMatch(/applyHistory\(accumulated, !loadedPage\)/)
-    expect(source).toMatch(/requestAnimationFrame\(\(\) => requestAnimationFrame\(\(\) => transcriptRef\.current\?\.scrollToIndex/)
-    expect(source).not.toMatch(/applyHistory\(accumulated, true\)/)
+  it('gives Transcript sole ownership of bounded tail pinning across every history page', () => {
+    const transcript = transcriptSource()
+    expect(transcript).toMatch(/firstItemIndex=\{firstItemIndex\}/)
+    expect(transcript).toMatch(/computeItemKey=\{transcriptItemKey\}/)
+    expect(transcript).toMatch(/initialTopMostItemIndex=\{\{ index: 'LAST', align: 'end' \}\}/)
+    expect(transcript).toMatch(/const virtuosoRef = useRef<VirtuosoHandle \| null>\(null\)/)
+    expect(transcript).toMatch(/totalListHeightChanged=\{onListHeightChanged\}/)
+    expect(transcript).toMatch(/TRANSCRIPT_PIN_MAX_ATTEMPTS/)
+    expect(transcript).not.toMatch(/requestAnimationFrame\(\(\) => requestAnimationFrame/)
+
+    const app = appSource()
+    expect(app).toMatch(/applyHistory\(accumulated\)/)
+    expect(app).not.toMatch(/idleTranscriptRef|transcriptRef\.current\?\.scrollToIndex/)
+    expect(app).not.toMatch(/applyHistory\(accumulated,\s*(?:true|!loadedPage)/)
   })
 
   it('does not prop-drill live agent inventories into transcript rendering or reducers', () => {

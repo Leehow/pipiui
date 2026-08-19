@@ -169,7 +169,7 @@ export function formatSubagentDoneMessage(
 	extra?: { aborted?: boolean; error?: string; runId?: string; wave?: WaveSnapshot },
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
-	const ok = !isFailedResult(result) && !aborted && !extra?.error;
+	const ok = isHostEndOk(result, { aborted }) && !extra?.error;
 	const att = result.verify;
 	// `ok` stays process-level; `verified` reflects only the runtime-attested verify command.
 	const verified = verifiedStateFor(result, extra);
@@ -242,8 +242,20 @@ export function getFinalOutput(messages: Message[]): string {
 	return "";
 }
 
-export function isFailedResult(result: DoneMessageResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+/**
+ * Host-aligned terminal success. Must stay identical to `endOk` in index.ts:
+ * `exitCode === 0 && !errorMessage && !wasAborted`.
+ */
+export function isHostEndOk(
+	result: Pick<DoneMessageResult, "exitCode" | "errorMessage" | "stopReason">,
+	extra?: { aborted?: boolean },
+): boolean {
+	const aborted = extra?.aborted ?? result.stopReason === "aborted";
+	return result.exitCode === 0 && !result.errorMessage && !aborted;
+}
+
+export function isFailedResult(result: Pick<DoneMessageResult, "exitCode" | "errorMessage" | "stopReason">): boolean {
+	return !isHostEndOk(result) || result.stopReason === "error";
 }
 
 export function getResultOutput(result: DoneMessageResult): string {

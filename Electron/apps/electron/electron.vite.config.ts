@@ -6,13 +6,14 @@ import { fileViewerRenderers, type FileViewerRenderersPluginOptions } from '@fil
 
 // Workspace packages must be bundled into the main/preload output so the
 // packaged app.asar never resolves @pipi/* through node_modules at runtime.
-const workspacePkgs = ['@pipi/pi-backend', '@pipi/host-api', '@pipiui/ui']
+const workspacePkgs = ['@pipi/pi-backend', '@pipi/host-api', '@pipiui/ui', '@pipiui/server']
 
 // This file lives at apps/electron/electron.vite.config.ts.
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const uiPackageRoot = resolve(workspaceRoot, 'packages/ui')
 const piBackendSourceEntry = resolve(workspaceRoot, 'packages/pi-backend/src/index.ts')
 const hostApiSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/index.ts')
+const serverSourceEntry = resolve(workspaceRoot, 'apps/server/src/index.ts')
 // Resolve @pipiui/ui straight to the UI package source (not its prebuilt
 // dist): electron-vite's dev watcher then tracks packages/ui/src edits for
 // HMR (component + CSS reload) and the renderer never depends on a
@@ -53,12 +54,19 @@ const devWatch = process.env.NODE_ENV_ELECTRON_VITE === 'development'
 
 const hostSourceAliases = [
   { find: '@pipi/pi-backend', replacement: piBackendSourceEntry },
-  { find: '@pipi/host-api', replacement: hostApiSourceEntry }
+  { find: '@pipi/host-api', replacement: hostApiSourceEntry },
+  { find: '@pipiui/server', replacement: serverSourceEntry }
 ]
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin({ exclude: workspacePkgs })],
+    // Vite stubs optional `require('bufferutil')` / `utf-8-validate` as `{}`.
+    // Force ws onto its JS fallbacks so unmask/mask stay functions.
+    define: {
+      'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1'),
+      'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1')
+    },
+    plugins: [externalizeDepsPlugin({ exclude: [...workspacePkgs, 'express', 'ws'] })],
     resolve: { alias: hostSourceAliases },
     build: { watch: devWatch }
   },

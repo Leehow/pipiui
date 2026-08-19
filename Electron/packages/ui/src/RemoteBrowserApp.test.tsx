@@ -90,10 +90,15 @@ describe('RemoteBrowserApp', () => {
 
     sockets[0].emit('close', { code: 1006, reason: '' })
     await waitFor(() => expect(sockets.length).toBeGreaterThan(1))
-    expect(delays[0]).toBe(500)
-    await waitFor(() => expect(screen.getByTestId('remote-lifecycle').getAttribute('data-phase')).toBe('reconnecting'))
+    expect(delays[0]).toBeGreaterThanOrEqual(500)
+    expect(delays[0]).toBeLessThanOrEqual(750)
+    expect(screen.queryByTestId('remote-lifecycle')).toBeNull()
     sockets[1].emit('open')
     await waitFor(() => expect(screen.queryByTestId('remote-lifecycle')).toBeNull())
+    sockets[1].emit('close', { code: 1006, reason: '' })
+    await waitFor(() => expect(sockets.length).toBeGreaterThan(2))
+    expect(delays[1]).toBeGreaterThanOrEqual(500)
+    expect(delays[1]).toBeLessThanOrEqual(750)
     const methods = sockets[1].send.mock.calls.map(call => {
       try { return JSON.parse(String(call[0])).method } catch { return undefined }
     })
@@ -245,5 +250,93 @@ describe('RemoteBrowserApp', () => {
     await waitFor(() => expect(screen.getByText('鉴权失败')).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: '重试连接' }))
     await waitFor(() => expect(screen.getByText('鉴权失败')).toBeTruthy())
+  })
+
+  it('closes the previous socket before reclaim and reconnect', async () => {
+    const sockets: FakeSocket[] = []
+    sessionStorage.setItem('pipiui:remote-pair', JSON.stringify({ pairID, secret }))
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/claim')) return new Response(null, { status: 204 })
+      if (url.includes(`/pair/${pairID}`)) return new Response('', { status: 200 })
+      throw new Error(url)
+    })
+    render(
+      <RemoteBrowserApp
+        location={{ protocol: 'http:', host: 'relay.test', pathname: '/', hash: '' }}
+        fetch={fetchImpl as unknown as typeof fetch}
+        socket={() => {
+          const socket = new FakeSocket()
+          sockets.push(socket)
+          return socket as any
+        }}
+        schedule={(fn) => {
+          fn()
+          return 1
+        }}
+        cancel={vi.fn()}
+      />,
+    )
+    await waitFor(() => expect(sockets.length).toBe(1))
+    sockets[0].emit('error', { code: 1006, reason: '401 pairing required' })
+    sockets[0].emit('close', { code: 1006, reason: '401 pairing required' })
+    await waitFor(() => expect(sockets.length).toBeGreaterThan(1))
+    expect(sockets[0].close).toHaveBeenCalled()
+    expect(sockets.filter(item => item.close.mock.calls.length === 0).length).toBeLessThanOrEqual(1)
+  })
+
+  it('holds reconnecting banner for hysteresis then shows it', async () => {
+    const sockets: FakeSocket[] = []
+    render(
+      <RemoteBrowserApp
+        location={{ protocol: 'http:', host: 'relay.test', pathname: '/', hash: '' }}
+        hysteresisMs={20}
+        socket={() => {
+          const socket = new FakeSocket()
+          sockets.push(socket)
+          return socket as any
+        }}
+        schedule={() => 1}
+        cancel={vi.fn()}
+      />,
+    )
+    await waitFor(() => expect(sockets.length).toBe(1))
+    sockets[0].emit('open')
+    await waitFor(() => expect(document.querySelector('.pipiui-shell')).toBeTruthy())
+    sockets[0].emit('close', { code: 1006, reason: '' })
+    expect(screen.queryByTestId('remote-lifecycle')).toBeNull()
+    await waitFor(() => expect(screen.getByTestId('remote-lifecycle').getAttribute('data-phase')).toBe('reconnecting'))
+    expect(screen.getByText('正在重新连接…')).toBeTruthy()
+  })
+
+  it('reconnects immediately on visibilitychange when not connected', async () => {
+    const sockets: FakeSocket[] = []
+    const pending: Array<() => void> = []
+    render(
+      <RemoteBrowserApp
+        location={{ protocol: 'http:', host: 'relay.test', pathname: '/', hash: '' }}
+        socket={() => {
+          const socket = new FakeSocket()
+          sockets.push(socket)
+          return socket as any
+        }}
+        schedule={(fn) => {
+          pending.push(fn)
+          return pending.length
+        }}
+        cancel={vi.fn()}
+      />,
+    )
+    await waitFor(() => expect(sockets.length).toBe(1))
+    sockets[0].emit('open')
+    await waitFor(() => expect(document.querySelector('.pipiui-shell')).toBeTruthy())
+    sockets[0].emit('close', { code: 1006, reason: '' })
+    expect(pending.length).toBeGreaterThan(0)
+    const before = sockets.length
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    pending[pending.length - 1]()
+    await waitFor(() => expect(sockets.length).toBeGreaterThan(before))
+    expect(sockets[0].close).toHaveBeenCalled()
   })
 })

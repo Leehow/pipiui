@@ -229,7 +229,7 @@ test("unauthenticated browser UI and /ws are rejected", async () => {
   try {
     const root = await fetch(`${relay.origin}/`);
     assert.equal(root.status, 200);
-    assert.match(await root.text(), /请在 Mac 上生成一个新的远程链接/);
+    assert.match(await root.text(), /pi coding agent 的图形界面/);
 
     const denied = await new Promise<number>((resolve, reject) => {
       const socket = new WebSocket(relay.browserURL);
@@ -687,6 +687,37 @@ test("v2 pair page is not used for ordinary Swift tunnel rooms", async () => {
     assert.equal(pairCookie(randomBytes(32).toString("base64url"), 60, true).includes("Secure"), true);
     assert.equal(createHash("sha256").update(secretA, "utf8").digest("hex"), hashHex(secretA));
   } finally {
+    await relay.close();
+  }
+});
+
+test("v2 inbound app ping counts as alive without a websocket pong", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture({ v2Limits: { heartbeatMs: 80 } });
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  const cookie = cookieHeader((await claim(relay.origin, roomID, secretA)).headers.get("set-cookie"));
+  const browser = new WebSocket(relay.browserURL, {
+    headers: { Cookie: cookie },
+    autoPong: false,
+  } as WebSocket.ClientOptions);
+  installQueue(browser);
+  await once(browser, "open");
+  await nextFrame(host);
+  try {
+    const closed = once(browser, "close");
+    const keepAlive = setInterval(() => {
+      browser.send(JSON.stringify({ v: 2, type: "ping", at: Date.now() }));
+    }, 40);
+    const raced = await Promise.race([
+      closed.then(() => "closed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("open"), 280)),
+    ]);
+    clearInterval(keepAlive);
+    assert.equal(raced, "open");
+    assert.equal(browser.readyState, WebSocket.OPEN);
+  } finally {
+    browser.close();
+    host.close();
     await relay.close();
   }
 });

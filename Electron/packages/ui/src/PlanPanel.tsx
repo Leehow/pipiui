@@ -90,6 +90,9 @@ export function PlanPanel({ host, sessionId, visible = true, headerSlot, onProgr
   const [plans, setPlans] = useState<PlanSnapshot[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
+  // Skip reporting while the next session's snapshot is in flight so a reset to
+  // [] cannot flicker the rail tab off before getPlans returns.
+  const [hydrated, setHydrated] = useState(false)
   const sessionRef = useRef(sessionId)
   sessionRef.current = sessionId
   const onHasPlansChangeRef = useRef(onHasPlansChange)
@@ -102,6 +105,7 @@ export function PlanPanel({ host, sessionId, visible = true, headerSlot, onProgr
   useEffect(() => {
     setPlans([])
     setError(null)
+    setHydrated(false)
     if (!sessionId || !host.getPlans) return
     let cancelled = false
     setLoading(true)
@@ -109,12 +113,12 @@ export function PlanPanel({ host, sessionId, visible = true, headerSlot, onProgr
       .then(loaded => {
         if (cancelled) return
         setPlans(sortPlans(loaded))
-        onHasPlansChangeRef.current?.(sessionId, loaded.length > 0)
+        setHydrated(true)
       })
       .catch(loadError => {
         if (cancelled) return
         setError(loadError instanceof Error ? loadError.message : String(loadError))
-        onHasPlansChangeRef.current?.(sessionId, false)
+        setHydrated(true)
       })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
@@ -123,15 +127,27 @@ export function PlanPanel({ host, sessionId, visible = true, headerSlot, onProgr
   useEffect(() => {
     if (!host.subscribePlans) return
     return host.subscribePlans((event: PlanEvent) => {
-      onHasPlansChangeRef.current?.(event.sessionId, true)
       // Events arrive for every session the host runs; keep the panel to its own.
-      if (event.sessionId !== sessionRef.current) return
+      if (event.sessionId !== sessionRef.current) {
+        // Without that session's full list we can only promote: a live event
+        // may reveal the tab on switch. A settled snapshot must not hide it
+        // while another plan in that session may still be live.
+        if (planIsLive(event.plan)) onHasPlansChangeRef.current?.(event.sessionId, true)
+        return
+      }
       apply(event.plan)
     })
   }, [host, apply])
 
   const live = useMemo(() => plans.filter(planIsLive), [plans])
   const settled = useMemo(() => plans.filter(plan => !planIsLive(plan)), [plans])
+
+  // The rail tab follows unfinished plans only. Historical completed/cancelled
+  // plans stay in the panel data but must not keep the tab visible.
+  useEffect(() => {
+    if (!sessionId || !hydrated) return
+    onHasPlansChangeRef.current?.(sessionId, live.length > 0)
+  }, [sessionId, live, hydrated])
 
   // The rail badge tracks unfinished plans only; a settled plan stops advertising itself.
   useEffect(() => {

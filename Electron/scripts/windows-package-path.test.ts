@@ -54,7 +54,7 @@ describe('Windows package and CI path', () => {
     expect(workflow).toContain('package-electron-target.mjs --platform win32 --arch x64')
     expect(workflow).toContain('fetch-cua-driver.mjs')
     expect(workflow).toMatch(/if: matrix\.platform == 'win'[\s\S]*package-electron-target\.mjs/)
-    expect(workflow).toMatch(/if: matrix\.platform != 'win'[\s\S]*npx electron-builder/)
+    expect(workflow).toMatch(/if: matrix\.platform == 'mac'[\s\S]*npx --maxsockets 3 electron-builder/)
     expect(packager).toContain('assertEmbeddedRuntimeTree')
     expect(packager).toContain('assertFreshWindowsInstallerBudget')
   })

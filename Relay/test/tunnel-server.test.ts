@@ -32,13 +32,14 @@ function installFrameQueue(socket: WebSocket) {
   });
 }
 
-async function fixture(downloadsDir?: string) {
+async function fixture(downloadsDir?: string, heartbeatMs?: number) {
   const instance = createTunnelServer({
     host: "127.0.0.1",
     port: 0,
     publicOrigin: "http://127.0.0.1",
     tunnelURL: "ws://127.0.0.1/tunnel/ws",
     downloadsDir,
+    heartbeatMs,
   });
   instance.server.listen(0, "127.0.0.1");
   await once(instance.server, "listening");
@@ -567,6 +568,47 @@ test("browser may arrive just before host without letting wrong secret consume",
     valid.close();
     host.close();
     wrong.close();
+    await relay.close();
+  }
+});
+
+test("inbound frames count as alive without a websocket pong", async () => {
+  const relay = await fixture(undefined, 80);
+  const opts = { autoPong: false } as WebSocket.ClientOptions;
+  const host = new WebSocket(relay.socketURL, opts);
+  const browser = new WebSocket(relay.socketURL, opts);
+  installFrameQueue(host);
+  installFrameQueue(browser);
+  await once(host, "open");
+  await once(browser, "open");
+  try {
+    hello(host, "host");
+    await nextFrame(host);
+    const bReady = nextFrame(browser);
+    const hReady = nextFrame(host);
+    hello(browser, "browser");
+    await bReady;
+    await hReady;
+    const closed = once(browser, "close");
+    const keepAlive = setInterval(() => {
+      const requestID = crypto.randomUUID();
+      browser.send(JSON.stringify({
+        v: 1, type: "request", requestID, command: "index", body: {},
+      }));
+      host.send(JSON.stringify({
+        v: 1, type: "response", requestID, status: 200, body: {},
+      }));
+    }, 40);
+    const raced = await Promise.race([
+      closed.then(() => "closed"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("open"), 280)),
+    ]);
+    clearInterval(keepAlive);
+    assert.equal(raced, "open");
+    assert.equal(browser.readyState, WebSocket.OPEN);
+  } finally {
+    host.close();
+    browser.close();
     await relay.close();
   }
 });

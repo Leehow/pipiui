@@ -1,5 +1,7 @@
 import { useMemo, useState, type DragEvent } from 'react'
 import { ProviderLogo } from './ProviderLogo'
+import { SessionSourceIcon } from './SessionSourceIcon'
+import { isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 import './sidebar.css'
 import gearIcon from './sf-icons/gearshape.png'
@@ -87,6 +89,8 @@ export interface SidebarSession {
   title: string
   provider: string
   modelId?: string
+  /** Session origin. Absent/`pi` keeps the live model logo; external sources use dedicated marks. */
+  source?: SessionSource
   status: SessionStatus
   /** Running background-subagent count; meaningful only for `subagents-running`. */
   subagentCount?: number
@@ -231,11 +235,17 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   onDrop?: (event: DragEvent, session: SidebarSession) => void
 }) {
   const [renaming, setRenaming] = useState(false)
-  const actions = (onPin || onRename || onArchive) ? (
+  const external = isExternalSidebarSource(session.source)
+  const source = session.source ?? 'pi'
+  const rowLabel = sessionRowLabel(session.title, source)
+  const canPin = !external && onPin
+  const canRename = !external && onRename
+  const canArchive = !external && onArchive
+  const actions = (canPin || canRename || canArchive) ? (
     <span className="sb-session-actions">
-      {onPin && <button type="button" className="sb-session-action" aria-label={isPinned ? '取消置顶' : '置顶'} title={isPinned ? '取消置顶' : '置顶'} onClick={event => { event.stopPropagation(); onPin(session.id) }}><SfIconPin filled={isPinned} /></button>}
-      {onRename && <button type="button" className="sb-session-action" aria-label="修改标题" title="修改标题" onClick={event => { event.stopPropagation(); setRenaming(true) }}><SfIconPencil /></button>}
-      {onArchive && <button type="button" className="sb-session-action" aria-label="归档会话" title="归档会话" onClick={event => { event.stopPropagation(); onArchive(session.id) }}><SfIconArchive /></button>}
+      {canPin && <button type="button" className="sb-session-action" aria-label={isPinned ? '取消置顶' : '置顶'} title={isPinned ? '取消置顶' : '置顶'} onClick={event => { event.stopPropagation(); onPin(session.id) }}><SfIconPin filled={isPinned} /></button>}
+      {canRename && <button type="button" className="sb-session-action" aria-label="修改标题" title="修改标题" onClick={event => { event.stopPropagation(); setRenaming(true) }}><SfIconPencil /></button>}
+      {canArchive && <button type="button" className="sb-session-action" aria-label="归档会话" title="归档会话" onClick={event => { event.stopPropagation(); onArchive(session.id) }}><SfIconArchive /></button>}
     </span>
   ) : null
   return (
@@ -245,20 +255,25 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       className={`sb-session${selected ? ' sb-selected' : ''}`}
       data-testid="session-row"
       data-session-id={session.id}
+      data-session-source={source}
       data-status={session.status}
-      draggable={renaming ? false : draggable}
+      draggable={renaming || external ? false : draggable}
       data-dragging={dragging || undefined}
       data-drop-placement={dropPlacement}
       aria-current={selected ? 'true' : undefined}
+      aria-label={rowLabel}
+      title={rowLabel}
       onClick={() => { if (!renaming) onSelect(session.id) }}
       onKeyDown={event => { if (!renaming && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(session.id) } }}
-      onDragStart={event => onDragStart?.(event, session)}
+      onDragStart={event => { if (!external) onDragStart?.(event, session) }}
       onDragEnd={onDragEnd}
       onDragOver={event => onDragOver?.(event, session)}
       onDrop={event => onDrop?.(event, session)}
     >
-      <ProviderLogo provider={session.provider} modelId={session.modelId} size={13} />
-      {renaming && onRename
+      {external
+        ? <SessionSourceIcon source={source} size={13} />
+        : <span className="sb-session-source" data-source="pi" data-testid="session-source-pi" role="img" aria-label={sessionSourceLabel('pi')} title={sessionSourceLabel('pi')}><ProviderLogo provider={session.provider} modelId={session.modelId} size={13} /></span>}
+      {renaming && canRename && onRename
         ? <InlineSessionTitleEditor value={session.title} ariaLabel="会话名称" className="sb-session-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} />
         : <span className="sb-session-title">{session.title}</span>}
       <span className="sb-status" data-status={session.status} aria-label={statusCaption(session)} hidden={renaming}>

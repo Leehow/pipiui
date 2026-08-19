@@ -21,6 +21,8 @@ export type BridgeHandlers = {
   onBrowserAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   onTerminalAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
+  /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
+  onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
 };
 
 /** Agent logs are the largest payload; anything past this is refused, not buffered. */
@@ -162,6 +164,20 @@ export class HostBridge {
       else if (body.action === "plan_event") this.handlers.onPlanEvent?.(event as Record<string, unknown>, sessionId);
       else if (body.action === "browser_action") return this.reply(response, 200, await (this.handlers.onBrowserAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "browser host unavailable" })));
       else if (body.action === "terminal_action") return this.reply(response, 200, await (this.handlers.onTerminalAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "terminal host unavailable" })));
+      else if (body.action === "vault_action") {
+        try {
+          return this.reply(response, 200, {
+            ok: true,
+            result: await (this.handlers.onVaultAction?.(event as Record<string, unknown>, sessionId)
+              ?? Promise.reject(new Error("vault host unavailable"))),
+          });
+        } catch (error) {
+          return this.reply(response, 200, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       else return this.reply(response, 400, { ok: false, error: `unsupported action ${String(body.action)}` });
     } catch (error) {
       // A handler fault is this host's problem; never make the worker's reporting call fail.

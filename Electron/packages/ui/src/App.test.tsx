@@ -787,6 +787,75 @@ describe('PipiUI Electron main layout', () => {
     expect(container.querySelector('.pipiui-shell')!.className).not.toContain('sidebar-collapsed')
   })
 
+  it('keeps traffic-light inset on the tool header in browser fullscreen', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    expect(css).toContain('.pipiui-shell.electron-chrome.browser-workspace-fullscreen .tool-panel-header{padding-left:88px}')
+    expect(css).toContain('.electron-chrome .sb-topbar{padding-left:88px}')
+  })
+
+  it('opens Browser as a wide adjustable IDE split while keeping chat visible', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByRole('button', { name: 'Browser' }))
+    await screen.findByTestId('browser-panel')
+    const shell = container.querySelector('.pipiui-shell') as HTMLElement
+    expect(shell.className).toContain('browser-workspace')
+    expect(shell.className).not.toContain('browser-workspace-fullscreen')
+    expect(container.querySelector('.chat-column')).toBeTruthy()
+    expect(container.querySelector('.resize-handle-right')).toBeTruthy()
+    const browserWidth = Number.parseInt(shell.style.getPropertyValue('--tools-w'), 10)
+    expect(browserWidth).toBeGreaterThanOrEqual(520)
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ browserTools: browserWidth })
+  })
+
+  it('browser fullscreen hides sidebar and chat then restores without changing expanded tools', async () => {
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByRole('button', { name: 'Browser' }))
+    await screen.findByTestId('browser-panel')
+    const shell = container.querySelector('.pipiui-shell')!
+    expect(shell.className).not.toContain('tools-collapsed')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ toolsCollapsed: false, sidebarCollapsed: false })
+    fireEvent.click(screen.getByTestId('browser-workspace-fullscreen'))
+    expect(shell.className).toContain('browser-workspace-fullscreen')
+    expect(shell.className).not.toContain('tools-collapsed')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ toolsCollapsed: false, sidebarCollapsed: false })
+    fireEvent.click(screen.getByTestId('browser-workspace-fullscreen'))
+    expect(shell.className).not.toContain('browser-workspace-fullscreen')
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    expect(shell.className).not.toContain('tools-collapsed')
+    expect(container.querySelector('.chat-column')).toBeTruthy()
+    expect(screen.getByTestId('sidebar')).toBeTruthy()
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ toolsCollapsed: false, sidebarCollapsed: false })
+  })
+
+  it('browser fullscreen leaves a persisted toolsCollapsed=true preference untouched', async () => {
+    localStorage.setItem('pipiui:eui-pane-widths', JSON.stringify({ sidebar: 258, tools: 368, sidebarCollapsed: true, toolsCollapsed: true }))
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    expect(shell.className).toContain('tools-collapsed')
+    expect(shell.className).toContain('sidebar-collapsed')
+    fireEvent.click(screen.getByLabelText('展开右栏'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Browser' }))
+    await screen.findByTestId('browser-workspace-fullscreen')
+    const persistedAfterOpen = JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)
+    fireEvent.click(screen.getByTestId('browser-workspace-fullscreen'))
+    expect(shell.className).toContain('browser-workspace-fullscreen')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({
+      toolsCollapsed: persistedAfterOpen.toolsCollapsed,
+      sidebarCollapsed: persistedAfterOpen.sidebarCollapsed
+    })
+    fireEvent.click(screen.getByTestId('browser-workspace-fullscreen'))
+    expect(shell.className).not.toContain('browser-workspace-fullscreen')
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({
+      toolsCollapsed: persistedAfterOpen.toolsCollapsed,
+      sidebarCollapsed: persistedAfterOpen.sidebarCollapsed
+    })
+    expect(shell.className).toContain('sidebar-collapsed')
+    expect(shell.className).not.toContain('tools-collapsed')
+  })
+
   it('renders the floating quick rail over the chat column and toggles/closes tools', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
@@ -854,6 +923,28 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByLabelText('展开左栏'))
     expect(screen.getByLabelText('收起左栏')).toBeTruthy()
     fireEvent.click(screen.getByLabelText('收起左栏'))
+    expect(shell.className).toContain('sidebar-collapsed')
+    vi.unstubAllGlobals()
+  })
+
+  it('collapses the narrow sidebar overlay after selecting a session or creating one', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const host = createMockHost()
+    const newSession = vi.spyOn(host, 'newSession')
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    const layoutRow = screen.getAllByTestId('session-row').find(row => row.textContent?.includes('布局与流式消息'))!
+    fireEvent.click(layoutRow)
+    expect(layoutRow.getAttribute('aria-current')).toBe('true')
+    expect(shell.className).toContain('sidebar-collapsed')
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    fireEvent.click(screen.getAllByRole('button', { name: /新建会话/ })[0])
+    await waitFor(() => expect(newSession).toHaveBeenCalled())
     expect(shell.className).toContain('sidebar-collapsed')
     vi.unstubAllGlobals()
   })
@@ -1095,9 +1186,9 @@ describe('PipiUI Electron main layout', () => {
       click(name)
       if (name === 'Browser') {
         browserOpened = true
-        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 900, y: 50, width: 380, height: 750, visible: true }]))
+        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', expect.objectContaining({ x: 900, y: 50, width: 380, height: 750, visible: true, mode: 'desktop' })]))
       } else if (browserOpened) {
-        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }]))
+        await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', expect.objectContaining({ x: 0, y: 0, width: 0, height: 0, visible: false, mode: 'desktop' })]))
       }
     }
     expect(screen.getByTestId('browser-panel')).toBeTruthy()
@@ -1195,7 +1286,7 @@ describe('PipiUI Electron main layout', () => {
     // Logs stream in via subscribeAgentLog; wait for the unified step card
     // (thinking + read combined, like the main agent transcript).
     await within(subagentTranscript).findByRole('button', { name: /个步骤/ })
-    // expandSteps keeps only the outer card open; nested ordinary tools stay folded.
+    // expandSteps opens the latest outer card; nested ordinary tools stay folded.
     const readDetail = await within(subagentTranscript).findByRole('button', { name: /^read/ })
     expect(readDetail.getAttribute('aria-expanded')).toBe('false')
     expect(within(subagentTranscript).queryByText(/已读取主界面实现/)).toBeNull()
@@ -2323,6 +2414,32 @@ describe('session switch transcript cache', () => {
     expect(welcomeTranscript?.hidden).toBe(false)
     expect(layoutTranscript?.hidden).toBe(true)
     expect(welcomeLoads).toBe(2)
+  })
+
+  it('does not paint the previous session transcript into an uncached session slot', async () => {
+    const base = createMockHost()
+    const extra = { id: 'fresh', projectId: 'pipiui', name: '全新会话', updatedAt: 0 }
+    let releaseFresh: ((entries: HistoryEntry[]) => void) | undefined
+    const host: PipiHostAPI = {
+      ...base,
+      listSessions: async projectId => {
+        const listed = await base.listSessions(projectId)
+        return projectId === 'pipiui' ? [...listed, extra] : listed
+      },
+      getSessionHistory: async sessionId => {
+        if (sessionId === 'fresh') return new Promise(resolve => { releaseFresh = resolve })
+        return base.getSessionHistory(sessionId)
+      },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    fireEvent.click(container.querySelector('[data-session-id="fresh"]')!)
+    await waitFor(() => expect(container.querySelector('[data-session-id="fresh"]')?.getAttribute('aria-current')).toBe('true'))
+    const freshSlot = container.querySelector('[data-session-transcript="fresh"]')
+    expect(freshSlot).toBeTruthy()
+    expect(freshSlot?.textContent ?? '').not.toContain('请实现 Electron 三栏主界面。')
+    expect(freshSlot?.textContent ?? '').not.toContain('左栏宽度要能持久化。')
+    releaseFresh?.([])
   })
 
   it('does not refetch history when opening a new empty session', async () => {
@@ -3665,6 +3782,60 @@ describe('composer thinking selector', () => {
     await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('cold-grok', 'medium'))
   })
 
+  it('updates the thinking chip immediately and rolls back when the host fails', async () => {
+    const base = createMockHost()
+    let release!: (state: ModelState) => void
+    const setThinkingLevel = vi.fn(() => new Promise<ModelState>(resolve => { release = resolve }))
+    const getSessionStats = vi.fn(base.getSessionStats)
+    const getQuotaSnapshot = vi.fn(async () => null)
+    const host: PipiHostAPI = { ...base, setThinkingLevel, getSessionStats, getQuotaSnapshot }
+    await renderChat(host)
+    await waitFor(() => expect(getSessionStats).toHaveBeenCalled())
+    const statsCalls = getSessionStats.mock.calls.length
+    const quotaCalls = getQuotaSnapshot.mock.calls.length
+    const chip = await screen.findByTestId('thinking-chip')
+    expect(chip.textContent).toContain('medium')
+    fireEvent.click(chip.querySelector('.thinking-chip-level')!)
+    fireEvent.click(await screen.findByTestId('thinking-row-high'))
+    expect(screen.getByTestId('thinking-chip').textContent).toContain('high')
+    expect(getSessionStats.mock.calls.length).toBe(statsCalls)
+    expect(getQuotaSnapshot.mock.calls.length).toBe(quotaCalls)
+    await act(async () => {
+      release({ model: (await host.getModelState()).model, thinkingLevel: 'high', availableThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high'] })
+    })
+    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('welcome', 'high'))
+    expect(screen.getByTestId('thinking-chip').textContent).toContain('high')
+    expect(getSessionStats.mock.calls.length).toBe(statsCalls)
+    expect(getQuotaSnapshot.mock.calls.length).toBe(quotaCalls)
+  })
+
+  it('rolls thinking level back and still skips stats refresh on failure', async () => {
+    const base = createMockHost()
+    const setThinkingLevel = vi.fn(async () => { throw new Error('thinking rpc failed') })
+    const getSessionStats = vi.fn(base.getSessionStats)
+    const host: PipiHostAPI = { ...base, setThinkingLevel, getSessionStats }
+    await renderChat(host)
+    await waitFor(() => expect(getSessionStats).toHaveBeenCalled())
+    const statsCalls = getSessionStats.mock.calls.length
+    fireEvent.click((await screen.findByTestId('thinking-chip')).querySelector('.thinking-chip-level')!)
+    fireEvent.click(await screen.findByTestId('thinking-row-high'))
+    expect(await screen.findByText(/切换思考级别失败：thinking rpc failed/)).toBeTruthy()
+    expect(screen.getByTestId('thinking-chip').textContent).toContain('medium')
+    expect(getSessionStats.mock.calls.length).toBe(statsCalls)
+  })
+
+  it('still refreshes session stats when switching models', async () => {
+    const base = createMockHost()
+    const getSessionStats = vi.fn(base.getSessionStats)
+    const host: PipiHostAPI = { ...base, getSessionStats }
+    await renderChat(host)
+    await waitFor(() => expect(getSessionStats).toHaveBeenCalled())
+    const statsCalls = getSessionStats.mock.calls.length
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId('quick-row-openai-gpt-5'))
+    await waitFor(() => expect(getSessionStats.mock.calls.length).toBeGreaterThan(statsCalls))
+  })
+
   it('closes the thinking menu with Escape or the backdrop', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
@@ -3806,5 +3977,50 @@ describe('model provider add (pi auth flow)', () => {
     fireEvent.click(screen.getByTestId('provider-login-cancel'))
     await waitFor(() => expect(screen.queryByTestId('provider-login')).toBeNull())
     expect(screen.getByTestId('provider-row-github-copilot')).toBeTruthy()
+  })
+
+  it('opens debug URL in the embedded browser and switches to Browser', async () => {
+    const host = createMockHost()
+    const newTab = vi.spyOn(host.browser!, 'newTab')
+    const api = {
+      getState: async () => ({ enabled: false, status: 'idle' as const, pairUrl: null, roomID: null, relayOrigin: null, hostEpoch: null, generation: null, debugEnabled: false, debugUrl: null }),
+      start: async () => api.getState(),
+      stop: async () => api.getState(),
+      reset: async () => api.getState(),
+      startDebug: async () => ({ enabled: false, status: 'idle' as const, pairUrl: null, roomID: null, relayOrigin: null, hostEpoch: null, generation: null, debugEnabled: true, debugUrl: 'http://127.0.0.1:8765/' }),
+      stopDebug: async () => api.getState(),
+      invoke: async () => api.getState(),
+      subscribe: () => () => undefined
+    }
+    ;(window as Window & { pipiRemoteControl?: typeof api }).pipiRemoteControl = api
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(screen.getByRole('button', { name: '远程控制' }))
+    fireEvent.click(await screen.findByRole('switch', { name: '本地 Debug 模式' }))
+    await waitFor(() => expect(newTab).toHaveBeenCalledWith('welcome', { url: 'http://127.0.0.1:8765/' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Browser' }).className).toContain('active'))
+    Reflect.deleteProperty(window, 'pipiRemoteControl')
+  })
+
+  it('does not throw when opening a debug URL without a selected session', async () => {
+    const host = createMockHost()
+    host.listSessions = async () => []
+    const newTab = vi.spyOn(host.browser!, 'newTab')
+    const api = {
+      getState: async () => ({ enabled: false, status: 'idle' as const, pairUrl: null, roomID: null, relayOrigin: null, hostEpoch: null, generation: null, debugEnabled: true, debugUrl: 'http://127.0.0.1:8765/' }),
+      start: async () => api.getState(),
+      stop: async () => api.getState(),
+      reset: async () => api.getState(),
+      startDebug: async () => api.getState(),
+      stopDebug: async () => api.getState(),
+      invoke: async () => api.getState(),
+      subscribe: () => () => undefined
+    }
+    ;(window as Window & { pipiRemoteControl?: typeof api }).pipiRemoteControl = api
+    render(<App host={host} />)
+    fireEvent.click(await screen.findByRole('button', { name: '远程控制' }))
+    fireEvent.click(await screen.findByRole('button', { name: '打开本地界面' }))
+    expect(newTab).not.toHaveBeenCalled()
+    Reflect.deleteProperty(window, 'pipiRemoteControl')
   })
 })

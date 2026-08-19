@@ -32,6 +32,7 @@ import { PerMainRepoSerialQueueV1 } from "./queue.ts";
 import { evaluateAutoMergeReadinessV1 } from "./policy.ts";
 import {
 	sweepLeftoverWorktreesV1,
+	type LeftoverWorktreeLeaseHooksV1,
 	type LeftoverWorktreeSweepInputV1,
 	type LeftoverWorktreeSweepSummaryV1,
 } from "./sweep.ts";
@@ -94,6 +95,8 @@ export type WorktreeFinalizationServiceOptionsV1 = {
 	 * Failures here must never fail finalization.
 	 */
 	onMerged?: (event: WorktreeMergedEventV1) => void | Promise<void>;
+	/** Live/persisted leases must block post-merge worktree removal. */
+	lease?: LeftoverWorktreeLeaseHooksV1;
 };
 
 export type WorktreeMergedEventV1 = {
@@ -212,6 +215,7 @@ export class WorktreeFinalizationServiceV1 {
 	private readonly logger: WorktreeFinalizationLoggerV1;
 	private readonly postMergeVerify?: PostMergeVerifyRunnerV1;
 	private readonly onMerged?: WorktreeFinalizationServiceOptionsV1["onMerged"];
+	private readonly lease?: LeftoverWorktreeLeaseHooksV1;
 	private readonly verifyTimeoutMs: number;
 	private readonly abortSignal?: AbortSignal;
 	private readonly terminationGraceMs: number;
@@ -230,6 +234,7 @@ export class WorktreeFinalizationServiceV1 {
 		this.logger = options.logger ?? {};
 		this.postMergeVerify = options.postMergeVerify;
 		this.onMerged = options.onMerged;
+		this.lease = options.lease;
 	}
 
 	/** Reap settled leftover `.pi/worktrees` entries without racing a live finalization. */
@@ -548,25 +553,88 @@ export class WorktreeFinalizationServiceV1 {
 	}
 
 	private async cleanupAfterIntegration(input: WorktreeFinalizationInputV1): Promise<CleanupOutcome> {
-		let removed: GitOperationResultV1;
+		let cleanupClaim: { release(): void | Promise<void> } | undefined;
+		if (this.lease?.claimCleanup) {
+			try {
+				const claimed = await this.lease.claimCleanup(input.agentId);
+				if (!claimed.ok) {
+					return {
+						disposition: "retained-worktree",
+						needsFixer: true,
+						messages: [
+							claimed.status === "live"
+								? "integration succeeded, but another live lease still owns the worktree"
+								: `integration succeeded, but cleanup could not claim the worktree lease: ${claimed.message}`,
+						],
+					};
+				}
+				cleanupClaim = claimed.claim;
+			} catch (error) {
+				return {
+					disposition: "retained-worktree",
+					needsFixer: true,
+					messages: [`integration succeeded, but lease claim failed: ${error instanceof Error ? error.message : String(error)}`],
+				};
+			}
+		} else if (this.lease) {
+			try {
+				const status = await this.lease.inspect(input.agentId);
+				if (status === "live") {
+					return {
+						disposition: "retained-worktree",
+						needsFixer: true,
+						messages: ["integration succeeded, but another live lease still owns the worktree"],
+					};
+				}
+				if (status === "blocked") {
+					return {
+						disposition: "retained-worktree",
+						needsFixer: true,
+						messages: ["integration succeeded, but the worktree lease could not be inspected safely"],
+					};
+				}
+				if (status === "stale") {
+					try {
+						await this.lease.reapStale?.(input.agentId);
+					} catch {
+						/* best-effort */
+					}
+				}
+			} catch (error) {
+				return {
+					disposition: "retained-worktree",
+					needsFixer: true,
+					messages: [`integration succeeded, but lease inspection failed: ${error instanceof Error ? error.message : String(error)}`],
+				};
+			}
+		}
 		try {
-			removed = await this.adapter.removeWorktree(input.mainCwd, input.worktree.path);
-		} catch (error) {
-			return {
-				disposition: "failed",
-				needsFixer: false,
-				needsUser: true,
-				messages: [`integration succeeded, but Git adapter worktree removal rejected: ${error instanceof Error ? error.message : String(error)}`],
-			};
+			let removed: GitOperationResultV1;
+			try {
+				removed = await this.adapter.removeWorktree(input.mainCwd, input.worktree.path);
+			} catch (error) {
+				return {
+					disposition: "failed",
+					needsFixer: false,
+					needsUser: true,
+					messages: [`integration succeeded, but Git adapter worktree removal rejected: ${error instanceof Error ? error.message : String(error)}`],
+				};
+			}
+			if (!removed.ok) {
+				return {
+					disposition: "retained-worktree",
+					needsFixer: true,
+					messages: [`integration succeeded, but non-force worktree removal failed: ${operationDetail(removed)}`],
+				};
+			}
+			return this.cleanupBranchAfterRemoval(input);
+		} finally {
+			try {
+				await cleanupClaim?.release();
+			} catch {
+				/* lease release is best-effort after Git settled */
+			}
 		}
-		if (!removed.ok) {
-			return {
-				disposition: "retained-worktree",
-				needsFixer: true,
-				messages: [`integration succeeded, but non-force worktree removal failed: ${operationDetail(removed)}`],
-			};
-		}
-		return this.cleanupBranchAfterRemoval(input);
 	}
 
 	private async cleanupBranchAfterRemoval(input: WorktreeFinalizationInputV1): Promise<CleanupOutcome> {

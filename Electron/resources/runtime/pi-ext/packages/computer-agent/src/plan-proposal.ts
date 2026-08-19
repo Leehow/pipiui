@@ -269,7 +269,27 @@ function explicitAbsolutePaths(goal: string): string[] {
     .filter((candidate) => /^(?:\/Users\/|\/tmp\/|\/var\/|\/private\/|\/Volumes\/)/.test(candidate) && path.isAbsolute(candidate) && path.normalize(candidate) === candidate);
 }
 
+const GOAL_MENTION_CLAUSE_BOUNDARY = /[。.!?;；\n]+|\b(?:but|however|yet)\b|(?:但是|但|不过|然而)/giu;
+const OPERATOR_MUTATING_OBJECTIVE = /(?<!-)\b(?:open|launch|navigate|visit|click|press|select|choose|type|enter|input|fill|save|submit)\b(?!-)|打开|启动|进入|导航|点击|按下|选择|输入|填写|保存|提交/i;
+
+function goalAffirmativelyMentions(goal: string, pattern: RegExp): boolean {
+  return [...goal.matchAll(new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`))]
+    .some((match) => {
+      const clausePrefix = goal.slice(Math.max(0, match.index! - 64), match.index).split(GOAL_MENTION_CLAUSE_BOUNDARY).at(-1) ?? "";
+      const negated = /(?:不要|不得|禁止|无需|不用|不使用|无须)(?:再)?(?:使用|安排|调用|派发)?[^。.!?;；\n]{0,48}$/i.test(clausePrefix)
+        || /\b(?:without|no|do\s+not|don't|must\s+not)(?:\s+(?:use|using|spawn|dispatch))?[^.!?;\n]{0,48}$/i.test(clausePrefix);
+      return !negated;
+    });
+}
+
+function operatorObjectiveMutatesGui(objective: string): boolean {
+  return OPERATOR_MUTATING_OBJECTIVE.test(objective);
+}
+
 export function validateComputerPlanGoalBindings(plan: GoalBoundPlan, goal: string): void {
+  if (goalAffirmativelyMentions(goal, /\bterminal worker\b|\bcomputer-terminal\b/i)) {
+    throw new Error("Computer Task accepts only Cua desktop actions; terminal/file/shell/bootstrap work belongs to the Boss");
+  }
   validateComputerPlanCuaOnly(plan);
   const paths = new Set(explicitAbsolutePaths(goal));
   if (paths.size > 0) {
@@ -292,36 +312,31 @@ export function validateComputerPlanGoalBindings(plan: GoalBoundPlan, goal: stri
       if (![...paths].some((candidate) => step.objective.includes(candidate))) throw new Error("Terminal Worker objective must preserve the exact explicit user path");
     }
   }
-  const affirmativelyMentions = (pattern: RegExp) => [...goal.matchAll(new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`))]
-    .some((match) => {
-      const clausePrefix = goal.slice(Math.max(0, match.index! - 64), match.index).split(/[。.!?;；\n]/).at(-1) ?? "";
-      const negated = /(?:不要|不得|禁止|无需|不用|不使用|无须)(?:再)?(?:使用|安排|调用|派发)?[^。.!?;；\n]{0,48}$/i.test(clausePrefix)
-        || /\b(?:without|no|do\s+not|don't|must\s+not)(?:\s+(?:use|using|spawn|dispatch))?[^.!?;\n]{0,48}$/i.test(clausePrefix);
-      return !negated;
-    });
   const requestedRoles = [
-    { role: "terminal-worker", requested: affirmativelyMentions(/\bterminal worker\b|\bcomputer-terminal\b/i) },
-    { role: "gui-operator", requested: affirmativelyMentions(/\bgui operator\b|\boperator\b|图形(?:化)?操作/i) },
-    { role: "verifier", requested: affirmativelyMentions(/\bcomputer-verifier\b|\bverifier\b|独立验证/i) },
+    { role: "gui-operator", requested: goalAffirmativelyMentions(goal, /\bgui operator\b|\boperator\b|图形(?:化)?操作/i) },
+    { role: "verifier", requested: goalAffirmativelyMentions(goal, /\bcomputer-verifier\b|\bverifier\b|独立验证/i) },
   ].filter((entry) => entry.requested);
   for (const { role } of requestedRoles) if (!plan.steps.some((step) => step.role === role)) throw new Error(`Computer Plan omitted explicitly requested ${role}`);
-  if (/textedit/i.test(goal) && !plan.steps.some((step) => step.role === "gui-operator" && /textedit/i.test(step.objective))) throw new Error("Computer Plan omitted the explicitly requested TextEdit operation");
   const terminal = plan.steps.find((step) => step.role === "terminal-worker");
   const operator = plan.steps.find((step) => step.role === "gui-operator");
   const verifier = plan.steps.find((step) => step.role === "verifier");
   if (terminal && operator && !operator.dependsOn.includes(terminal.id)) throw new Error("GUI Operator must depend on the requested Terminal Worker step");
-  if (operator && verifier) {
-    const stepsById = new Map(plan.steps.map((step) => [step.id, step]));
-    const pending = [...verifier.dependsOn];
-    const visited = new Set<string>();
-    while (pending.length > 0) {
-      const dependencyId = pending.pop()!;
-      if (visited.has(dependencyId)) continue;
-      visited.add(dependencyId);
-      if (dependencyId === operator.id) break;
-      pending.push(...(stepsById.get(dependencyId)?.dependsOn ?? []));
+  if (verifier) {
+    const mutatingOperators = plan.steps.filter((step) => step.role === "gui-operator" && operatorObjectiveMutatesGui(step.objective));
+    if (mutatingOperators.length > 0) {
+      const stepsById = new Map(plan.steps.map((step) => [step.id, step]));
+      const pending = [...verifier.dependsOn];
+      const visited = new Set<string>();
+      while (pending.length > 0) {
+        const dependencyId = pending.pop()!;
+        if (visited.has(dependencyId)) continue;
+        visited.add(dependencyId);
+        pending.push(...(stepsById.get(dependencyId)?.dependsOn ?? []));
+      }
+      if (mutatingOperators.some((step) => !visited.has(step.id))) {
+        throw new Error("Verifier must depend on the requested GUI Operator step");
+      }
     }
-    if (!visited.has(operator.id)) throw new Error("Verifier must depend on the requested GUI Operator step");
   }
   if (terminal && plan.procedureContext) {
     for (const [name, value] of Object.entries(plan.procedureContext.parameters)) {

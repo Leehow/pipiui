@@ -120,6 +120,12 @@ async function runWithStallDeadline<T>(
   progress?: StallProgressOptions,
 ): Promise<T> {
   const operation = Promise.resolve().then(run);
+  // Attach settlement handlers immediately so a late resolve/reject cannot
+  // become an unhandled rejection after this wrapper has already closed.
+  const settled = operation.then(
+    (value) => ({ kind: "fulfilled" as const, value }),
+    (error) => ({ kind: "rejected" as const, error }),
+  );
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stalled = false;
   let extensionUsed = false;
@@ -127,7 +133,12 @@ async function runWithStallDeadline<T>(
     const arm = () => {
       timer = setTimeout(() => {
         const now = Date.now();
-        const lastProgressAt = progress?.lastProgressAt();
+        let lastProgressAt: number | undefined;
+        try {
+          lastProgressAt = progress?.lastProgressAt();
+        } catch {
+          lastProgressAt = undefined;
+        }
         if (
           progress
           && !extensionUsed
@@ -149,17 +160,10 @@ async function runWithStallDeadline<T>(
   });
   try {
     const outcome = await Promise.race([
-      operation.then(
-        (value) => ({ kind: "fulfilled" as const, value }),
-        (error) => ({ kind: "rejected" as const, error }),
-      ),
+      settled,
       deadline.then(() => ({ kind: "stalled" as const })),
     ]);
     if (outcome.kind === "stalled" || stalled) {
-      await operation.then(
-        () => undefined,
-        () => undefined,
-      );
       throw Object.assign(new Error(failureCode), { failureCode });
     }
     if (outcome.kind === "fulfilled") return outcome.value;
@@ -200,7 +204,7 @@ export type ComputerTaskResult = {
   planRevisions: number;
   episodes?: ComputerAgentEpisode[];
   investigation?: {
-    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "manual_intervention" | "fail_fast" | "cancelled";
+    stage: "task_verification" | "recovery_exhausted" | "recovery_plan" | "plan_dependencies" | "manual_intervention" | "fail_fast" | "cancelled" | "leader_runtime";
     code: "task_conditions_not_verified" | "worker_postconditions_not_verified" | "worker_failed" | "worker_blocked" | "worker_outcome_unknown" | "recovery_plan_invalid" | "unresolved_dependencies" | "target_state_mismatch" | "task_cancelled" | ComputerWorkerFailureCode;
     recoveryAttempts: number;
     failedConditions: Array<{ conditionId: string; kind: ComputerPostcondition["kind"]; outcome: "not_verified" | "unknown" }>;
@@ -224,8 +228,8 @@ export type ComputerTaskResult = {
 
 /**
  * A final Leader prose pass is presentation-only once the Coordinator has
- * produced a verified success. Its stall must not replace that closed result
- * (or its worker episodes) with a synthetic leader-runtime failure.
+ * produced a closed result. Its stall or failure must not replace that result
+ * (or its worker episodes) or hang the already-finished Computer Task.
  */
 export async function finalizeComputerTaskWithOptionalSummary(
   result: ComputerTaskResult,
@@ -239,11 +243,9 @@ export async function finalizeComputerTaskWithOptionalSummary(
   ) return { result };
   try {
     return { result, leaderSummary: await summarize() };
-  } catch (error) {
-    if (result.outcome === "succeeded" && (error as { failureCode?: unknown })?.failureCode === "computer_leader_stalled") {
-      return { result };
-    }
-    throw error;
+  } catch {
+    if (result.outcome === "succeeded") return { result };
+    return { result, leaderSummary: result.summary };
   }
 }
 
@@ -806,9 +808,26 @@ export class ComputerAgentCoordinator {
         });
         if (signal?.aborted) return finishCancelled();
         this.#validatePlan(plan);
-      } catch {
+      } catch (error) {
         if (signal?.aborted) return finishCancelled();
+        const failureCode = error && typeof error === "object" && COMPUTER_WORKER_FAILURE_CODES.includes((error as { failureCode?: unknown }).failureCode as ComputerWorkerFailureCode)
+          ? (error as { failureCode: ComputerWorkerFailureCode }).failureCode
+          : undefined;
         const verification = taskVerification();
+        if (failureCode) {
+          const blocked: ComputerTaskResult = {
+            outcome: "blocked",
+            summary: failureCode === "computer_leader_stalled"
+              ? "Computer Task recovery Leader stalled"
+              : "Computer Task recovery Leader failed",
+            verification,
+            planRevisions: revisions,
+            investigation: investigation("leader_runtime", failureCode, verification),
+            ...(episodes.length ? { episodes: structuredClone(episodes) } : {}),
+          };
+          this.#emit({ type: "task_finished", taskId, outcome: blocked.outcome });
+          return blocked;
+        }
         const blocked: ComputerTaskResult = {
           outcome: "blocked",
           summary: "Computer Task recovery plan was invalid after worker failure",

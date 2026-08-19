@@ -254,7 +254,7 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
           <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : tab === 'secrets' ? '密钥库' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : tab === 'secrets' ? '全局加密密钥库。列表只有名称，明文只注入已挂载会话的 Worker 环境。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : tab === 'secrets' ? '仅当前进程内存，退出 App 后清除。列表只有名称，明文只注入已挂载会话的 Worker 环境。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
           <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
             {tab === 'extensions' && <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => setExtensionsAddOpen(true)}>＋ 添加</button>}

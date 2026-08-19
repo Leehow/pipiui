@@ -21,7 +21,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
-import { inspectAgentLease, reapStaleAgentLease } from "./agent-lease.ts";
+import {
+	claimAgentCleanupLease,
+	inspectAgentLease,
+	reapStaleAgentLease,
+	releaseAgentCleanupLease,
+} from "./agent-lease.ts";
 
 /** Swift parity: three fixer attempts; the third switches to a fresh context. */
 export const MAX_RECOVERY_ATTEMPTS = 3;
@@ -173,6 +178,36 @@ function leftoverWorktreeActiveAgentIds(store: WorktreeRecoveryStoreV1): Set<str
 	return active;
 }
 
+function leftoverSweepLeaseHooks(mainCwd: string) {
+	return {
+		inspect(agentId: string) {
+			return inspectAgentLease(mainCwd, agentId).status;
+		},
+		reapStale(agentId: string) {
+			return reapStaleAgentLease(mainCwd, agentId);
+		},
+		claimCleanup(agentId: string) {
+			const claimed = claimAgentCleanupLease(mainCwd, agentId, "leftover-sweep");
+			if (!claimed.lease) {
+				return {
+					ok: false as const,
+					status: inspectAgentLease(mainCwd, agentId).status,
+					message: claimed.problem,
+				};
+			}
+			return {
+				ok: true as const,
+				claim: {
+					releaseOnEnd: claimed.created,
+					release() {
+						releaseAgentCleanupLease(claimed);
+					},
+				},
+			};
+		},
+	};
+}
+
 async function runLeftoverWorktreeSweep(store: WorktreeRecoveryStoreV1): Promise<void> {
 	const mainCwd = recoveryStoreMainCwd(store);
 	if (!mainCwd) return;
@@ -190,14 +225,7 @@ async function runLeftoverWorktreeSweep(store: WorktreeRecoveryStoreV1): Promise
 		}).sweepLeftovers({
 			mainCwd,
 			activeAgentIds: leftoverWorktreeActiveAgentIds(store),
-			lease: {
-				inspect(agentId) {
-					return inspectAgentLease(mainCwd, agentId).status;
-				},
-				reapStale(agentId) {
-					return reapStaleAgentLease(mainCwd, agentId);
-				},
-			},
+			lease: leftoverSweepLeaseHooks(mainCwd),
 		});
 	} catch (error) {
 		console.warn("[pipiui-subagent] worktree leftover sweep failed", error);

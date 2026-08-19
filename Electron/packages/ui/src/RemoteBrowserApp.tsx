@@ -4,7 +4,10 @@ import { createWsHost, type WebSocketLike } from '@pipi/host-api'
 import { App, createMockHost } from './App'
 import { safeExternalURL, type BrowserSocket } from './browser-host'
 import {
+  BROWSER_APP_PING_MS,
+  PHASE_HYSTERESIS_MS,
   classifyRemoteClose,
+  displayRemotePhase,
   nextReconnectDelayMs,
   parsePairLocation,
   phaseLabel,
@@ -29,6 +32,7 @@ export type RemoteBrowserAppOptions = {
   now?: () => number
   schedule?: (fn: () => void, ms: number) => number
   cancel?: (id: number) => void
+  hysteresisMs?: number
 }
 
 type SocketClose = { code?: number; reason?: string }
@@ -111,6 +115,23 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
     setAttempt(value => value + 1)
   }, [])
 
+  const [displayPhase, setDisplayPhase] = useState<RemotePhase>(phase)
+  useEffect(() => {
+    const reconnectable = Boolean(closeCopy?.reconnect) || phase === 'reconnecting'
+    const next = displayRemotePhase(phase, reconnectable)
+    if (next === 'connected' || next === 'connecting' || next === 'pairing') {
+      setDisplayPhase(next)
+      return
+    }
+    if (next === 'disconnected' && closeCopy && !closeCopy.reconnect) {
+      setDisplayPhase('disconnected')
+      return
+    }
+    const wait = options.hysteresisMs ?? PHASE_HYSTERESIS_MS
+    const id = window.setTimeout(() => setDisplayPhase('reconnecting'), wait)
+    return () => window.clearTimeout(id)
+  }, [phase, closeCopy, options.hysteresisMs])
+
   useEffect(() => {
     stopRef.current = false
     const opts = optionsRef.current
@@ -134,8 +155,12 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
 
     let reconnectAttempt = 0
     let timer = 0
+    let pingTimer = 0
+    let hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden'
+    let pendingReconnect = false
     let activeSocket: BrowserSocket | undefined
     let lastControl: string | undefined
+    let controlListener: ((raw: unknown) => void) | undefined
 
     const applyClose = (kind: ReturnType<typeof classifyRemoteClose>) => {
       const copy = remoteCloseCopy(kind)
@@ -171,22 +196,47 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
     const shouldAutoReclaim = (kind: RemoteCloseKind) =>
       kind === 'auth' || kind === 'transient' || kind === 'unknown'
 
+    const stopPing = () => {
+      if (pingTimer) {
+        window.clearInterval(pingTimer)
+        pingTimer = 0
+      }
+    }
+
+    const retireSocket = (socket?: BrowserSocket) => {
+      if (!socket) return
+      stopPing()
+      if (controlListener) {
+        socket.removeEventListener('message', controlListener)
+        controlListener = undefined
+      }
+      try { socket.close() } catch { /* ignore */ }
+      if (activeSocket === socket) activeSocket = undefined
+    }
+
     const attachControlListener = (socket: BrowserSocket) => {
       const onMessage = (raw: unknown) => {
         const type = readControlType(raw)
         if (type) lastControl = type
       }
+      controlListener = onMessage
       socket.addEventListener('message', onMessage)
       return onMessage
+    }
+
+    const openFreshSocket = (): BrowserSocket => {
+      if (activeSocket) retireSocket(activeSocket)
+      const socket = socketFactory(wsURL)
+      activeSocket = socket
+      lastControl = undefined
+      attachControlListener(socket)
+      return socket
     }
 
     const openSocket = async (mode: 'connecting' | 'reconnecting'): Promise<BrowserSocket | null> => {
       if (stopRef.current) return null
       setPhase(mode === 'reconnecting' ? 'reconnecting' : 'connecting')
-      const socket = socketFactory(wsURL)
-      activeSocket = socket
-      lastControl = undefined
-      attachControlListener(socket)
+      const socket = openFreshSocket()
       try {
         await waitForSocket(socket)
         return socket
@@ -206,10 +256,7 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
           if (!(await runClaim(stored))) return null
           if (stopRef.current) return null
           setPhase(mode === 'reconnecting' ? 'reconnecting' : 'connecting')
-          const retrySocket = socketFactory(wsURL)
-          activeSocket = retrySocket
-          lastControl = undefined
-          attachControlListener(retrySocket)
+          const retrySocket = openFreshSocket()
           try {
             await waitForSocket(retrySocket)
             return retrySocket
@@ -263,6 +310,10 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       setHost(nextHost)
       setPhase('connected')
       setCloseCopy(null)
+      stopPing()
+      pingTimer = window.setInterval(() => {
+        try { socket.send(JSON.stringify({ v: 2, type: 'ping', at: Date.now() })) } catch { /* ignore */ }
+      }, BROWSER_APP_PING_MS)
       const onStop = (event?: SocketClose) => {
         socket.removeEventListener('close', onStop)
         socket.removeEventListener('error', onStop)
@@ -293,30 +344,65 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
       socket.addEventListener('error', onStop)
     }
 
-    const scheduleReconnect = () => {
+    const scheduleReconnect = (immediate = false) => {
       if (stopRef.current) return
       setPhase('reconnecting')
-      const delay = nextReconnectDelayMs(reconnectAttempt)
-      reconnectAttempt += 1
+      cancel(timer)
+      timer = 0
+      if (hidden && !immediate) {
+        pendingReconnect = true
+        return
+      }
+      pendingReconnect = false
+      const delay = immediate ? 0 : nextReconnectDelayMs(reconnectAttempt)
+      if (!immediate) reconnectAttempt += 1
+      else reconnectAttempt = 0
       timer = schedule(() => { void connect('reconnecting') }, delay)
+    }
+
+    const onForeground = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        hidden = true
+        if (timer) {
+          cancel(timer)
+          timer = 0
+          pendingReconnect = true
+        }
+        return
+      }
+      hidden = false
+      if (stopRef.current) return
+      const open = activeSocket && (activeSocket.readyState === 0 || activeSocket.readyState === 1)
+      if (open) return
+      scheduleReconnect(true)
+    }
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', onForeground)
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pageshow', onForeground)
     }
 
     void connect('connecting')
     return () => {
       stopRef.current = true
       cancel(timer)
-      activeSocket?.close()
+      stopPing()
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onForeground)
+      if (typeof window !== 'undefined') window.removeEventListener('pageshow', onForeground)
+      retireSocket(activeSocket)
     }
   }, [attempt])
 
-  if (host && phase === 'connected') return <App host={host} />
+  if (host && displayPhase === 'connected') return <App host={host} />
 
-  if (host && (phase === 'reconnecting' || phase === 'disconnected')) {
+  if (host && (displayPhase === 'reconnecting' || displayPhase === 'disconnected')) {
     return (
       <div className="remote-browser-shell">
-        <div className="remote-browser-banner" role="status" data-testid="remote-lifecycle" data-phase={phase} data-recovery="v2">
-          <strong>{closeCopy?.title ?? phaseLabel(phase)}</strong>
-          {closeCopy && <span>{closeCopy.detail}</span>}
+        <div className="remote-browser-banner" role="status" data-testid="remote-lifecycle" data-phase={displayPhase} data-recovery="v2">
+          <strong>{displayPhase === 'reconnecting' ? phaseLabel('reconnecting') : (closeCopy?.title ?? phaseLabel(displayPhase))}</strong>
+          {closeCopy && displayPhase === 'disconnected' && <span>{closeCopy.detail}</span>}
           <button type="button" onClick={retry}>{closeCopy?.action ?? '立即重试'}</button>
         </div>
         <App host={host} />
@@ -325,7 +411,7 @@ export function RemoteBrowserApp(options: RemoteBrowserAppOptions = {}) {
   }
 
   return (
-    <main className="browser-host-state" role={error ? 'alert' : 'status'} data-testid="remote-lifecycle" data-phase={phase} data-recovery="v2">
+    <main className="browser-host-state" role={error ? 'alert' : 'status'} data-testid="remote-lifecycle" data-phase={displayPhase} data-recovery="v2">
       {error ? (
         <section className="browser-host-error">
           <h1>{closeCopy?.title ?? '网页未连接到 Pi'}</h1>

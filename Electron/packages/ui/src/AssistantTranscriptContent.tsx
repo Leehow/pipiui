@@ -109,7 +109,8 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
       const groupTools = segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
       const hasThinking = segment.activities.some(activity => activity.type === 'thinking')
       const groupRunning = running && index === lastStepsIndex
-      return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={failed && !running && index === lastStepsIndex} meta={failed && !running && index === lastStepsIndex ? '失败' : undefined} defaultExpanded={stepsExpanded}>{segment.activities.map((activity, activityIndex) => {
+      const groupExpanded = expandSteps ? index === lastStepsIndex && !activeTool : stepsExpanded
+      return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={failed && !running && index === lastStepsIndex} meta={failed && !running && index === lastStepsIndex ? '失败' : undefined} defaultExpanded={groupExpanded}>{segment.activities.map((activity, activityIndex) => {
         const pendingThinking = activity.type === 'thinking' && activity.id === PENDING_THINKING_ID
         const live = Boolean(message.streaming && index === lastStepsIndex && !activeTool && (
           activity.type === 'thinking'

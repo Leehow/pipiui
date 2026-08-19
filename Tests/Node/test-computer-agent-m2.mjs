@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   ComputerAgentCoordinator,
   evaluatePostconditions,
+  finalizeComputerTaskWithOptionalSummary,
   projectComputerWorkerResult,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/coordinator.ts";
 import {
@@ -385,15 +386,17 @@ test("a silent GUI child is aborted and returned to Leader recovery as a closed 
   ).finally(() => { settled = true; });
 
   await stalled;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, false, "stall wrapper settled before GUI child cleanup");
-
-  const outcome = await result;
+  const outcome = await Promise.race([
+    result,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("stall wrapper hung waiting for GUI child")), 30)),
+  ]);
+  assert.equal(settled, true, "stall wrapper must close without waiting for an abort-ignoring child");
+  assert.equal(cleanupDone, false, "late child settlement is not part of the closed stall");
   assert.equal(aborted, 1);
-  assert.equal(cleanupDone, true);
   assert.equal(outcome.status, "rejected");
   assert.equal(outcome.error?.message, "gui_child_stalled");
   assert.equal(outcome.error?.failureCode, "gui_child_stalled");
+  await new Promise((resolve) => setTimeout(resolve, 30));
 });
 
 test("a silent Computer Use Leader is aborted and returned to the Boss as a closed stalled failure", async () => {
@@ -418,15 +421,17 @@ test("a silent Computer Use Leader is aborted and returned to the Boss as a clos
   ).finally(() => { settled = true; });
 
   await stalled;
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(settled, false, "stall wrapper settled before Computer Use Leader cleanup");
-
-  const outcome = await result;
+  const outcome = await Promise.race([
+    result,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("stall wrapper hung waiting for Leader child")), 30)),
+  ]);
+  assert.equal(settled, true, "stall wrapper must close without waiting for an abort-ignoring Leader");
+  assert.equal(cleanupDone, false, "late Leader settlement is not part of the closed stall");
   assert.equal(aborted, 1);
-  assert.equal(cleanupDone, true);
   assert.equal(outcome.status, "rejected");
   assert.equal(outcome.error?.message, "computer_leader_stalled");
   assert.equal(outcome.error?.failureCode, "computer_leader_stalled");
+  await new Promise((resolve) => setTimeout(resolve, 30));
 });
 
 test("an incrementally producing Computer Use Leader receives one bounded completion window", async () => {
@@ -491,6 +496,131 @@ test("a stall deadline keeps its typed failure when abort synchronously settles 
       && error?.failureCode === "computer_leader_stalled",
   );
   assert.equal(aborted, 1);
+});
+
+test("a stall deadline returns without awaiting an abort-ignoring child and swallows late rejection", async () => {
+  let rejectLate;
+  const hung = new Promise((_resolve, reject) => { rejectLate = reject; });
+  const unhandled = [];
+  const onUnhandled = (reason) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      runComputerWorkerWithStallDeadline(() => hung, () => {}, 15),
+      (error) => error?.message === "gui_child_stalled" && error?.failureCode === "gui_child_stalled",
+    );
+    assert.ok(Date.now() - started < 200, "stall wrapper must not wait for a never-settling child");
+    rejectLate(new Error("late private rejection"));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(unhandled.length, 0, "late child rejection must not become unhandled");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("failed worker plus recovery Leader stall closes as a diagnosed leader-runtime result", async () => {
+  const events = [];
+  let replans = 0;
+  const plan = {
+    goal: "show the target",
+    mode: "direct",
+    successConditions: [{ kind: "visible_text", contains: "target" }],
+    steps: [{ id: "operate", role: "gui-operator", objective: "show target", dependsOn: [], postconditions: [{ kind: "visible_text", contains: "target" }] }],
+  };
+  const coordinator = new ComputerAgentCoordinator({
+    maxReplans: 2,
+    planner: {
+      plan: async () => plan,
+      replan: async () => {
+        replans += 1;
+        return runComputerLeaderWithStallDeadline(() => new Promise(() => {}), () => {}, 15);
+      },
+    },
+    dispatcher: { dispatch: async () => ({ outcome: "failed", summary: "gui failed", failureCode: "gui_child_failed" }) },
+    onEvent: (event) => events.push(event),
+  });
+  const started = Date.now();
+  const result = await coordinator.run({ goal: plan.goal, taskId: "leader-replan-stall" });
+  assert.ok(Date.now() - started < 500, "replan Leader stall must close the task in bounded time");
+  assert.equal(replans, 1);
+  assert.equal(result.outcome, "blocked");
+  assert.equal(result.summary, "Computer Task recovery Leader stalled");
+  assert.equal(result.investigation?.stage, "leader_runtime");
+  assert.equal(result.investigation?.code, "computer_leader_stalled");
+  assert.notEqual(result.investigation?.code, "recovery_plan_invalid");
+  assert.equal(result.investigation?.workerAttempts?.[0]?.failureCode, "gui_child_failed");
+  assert.deepEqual(events.filter((event) => event.type === "task_finished"), [
+    { type: "task_finished", taskId: "leader-replan-stall", outcome: "blocked" },
+  ]);
+});
+
+test("a stalled optional summary keeps blocked and failed coordinator results", async () => {
+  const blocked = {
+    outcome: "blocked",
+    summary: "Computer Task blocked",
+    verification: { status: "not_verified", conditionResults: [] },
+    planRevisions: 1,
+    investigation: {
+      stage: "recovery_exhausted",
+      code: "worker_failed",
+      recoveryAttempts: 1,
+      failedConditions: [],
+      workerAttempts: [{ stepId: "operate", role: "gui-operator", outcome: "failed", verification: "unknown" }],
+    },
+  };
+  const failed = {
+    outcome: "failed",
+    summary: "Computer Task failed",
+    verification: { status: "not_verified", conditionResults: [] },
+    planRevisions: 0,
+  };
+  let blockedAttempts = 0;
+  const blockedFinal = await finalizeComputerTaskWithOptionalSummary(blocked, async () => {
+    blockedAttempts += 1;
+    throw Object.assign(new Error("summary timed out"), { failureCode: "computer_leader_stalled" });
+  });
+  assert.equal(blockedAttempts, 1);
+  assert.equal(blockedFinal.result, blocked);
+  assert.equal(blockedFinal.leaderSummary, "Computer Task blocked");
+
+  const failedFinal = await finalizeComputerTaskWithOptionalSummary(failed, async () => {
+    throw new Error("summary writer crashed");
+  });
+  assert.equal(failedFinal.result, failed);
+  assert.equal(failedFinal.leaderSummary, "Computer Task failed");
+});
+
+test("a throwing lastProgressAt getter still closes as a bounded stall", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    runComputerLeaderWithStallDeadline(
+      () => new Promise(() => {}),
+      () => {},
+      15,
+      { lastProgressAt: () => { throw new Error("progress clock failed"); }, progressGraceMs: 30_000 },
+    ),
+    (error) => error?.message === "computer_leader_stalled" && error?.failureCode === "computer_leader_stalled",
+  );
+  assert.ok(Date.now() - started < 200, "a throwing progress getter must not lose the stall deadline");
+});
+
+test("Electron Computer Use Leader and planning skill stay CUA-only", async () => {
+  const leader = await readFile(new URL("../../Electron/resources/runtime/pi-ext/agents/computer-use-leader/AGENT.md", import.meta.url), "utf8");
+  const planning = await readFile(new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/skills/computer-task-planning/SKILL.md", import.meta.url), "utf8");
+  const agent = await readFile(new URL("../../Electron/resources/runtime/pi-ext/agents/computer-use/AGENT.md", import.meta.url), "utf8");
+  assert.match(leader, /Worker interface map/);
+  assert.match(leader, /GUI Operator/);
+  assert.match(leader, /terminal_write_file/);
+  assert.match(planning, /Operator and\/or Verifier/);
+  assert.match(planning, /observation-only goals may be Verifier-only/i);
+  assert.match(planning, /Verifier depends on an Operator only when it verifies a prior GUI mutation/i);
+  assert.match(planning, /Finder, TextEdit, or a file picker/);
+  assert.match(planning, /never add `terminal-worker`, `file_exists`, or `terminalPolicy`/);
+  assert.match(planning, /Do not bounce visible GUI file open\/save\/picker work to the Boss/);
+  assert.match(agent, /single Computer Use Agent/);
+  assert.match(agent, /desktop_run_action_block/);
+  assert.doesNotMatch(agent, /Never flatten the Terminal policy fields/);
 });
 
 test("Verifier cannot override the authoritative broker envelope to execute mutation", async () => {

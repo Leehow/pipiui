@@ -58,7 +58,7 @@ async function loadComputerWorkerFailureCodeParser() {
 async function loadComputerWorkerDispatchFailureClassifier() {
   const source = await readFile(electronSubagentURL, "utf8");
   const start = source.indexOf("function computerWorkerDispatchFailureCode(");
-  const end = source.indexOf("function registerComputerTaskTool", start);
+  const end = source.indexOf("function registerLegacyComputerTaskTool", start);
   assert.ok(start >= 0 && end > start, "Computer Worker dispatch failure classifier must remain discoverable");
   const javascript = ts.transpileModule(source.slice(start, end), {
     compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 },
@@ -183,12 +183,12 @@ test("Verifier output admits only exact requested closed postcondition attestati
 test("embedded packaged Pi loads the canonical Computer Agent extension", async () => {
   const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
   const executable = fileURLToPath(new URL(`../../Electron/.embedded-runtimes/darwin-${process.arch}/pi/bin/pi`, import.meta.url));
-  const extension = fileURLToPath(new URL("../../Sources/PipiUI/PiExt/subagent", import.meta.url));
+  const extension = fileURLToPath(new URL("../../Electron/resources/runtime/pi-ext/subagent", import.meta.url));
   const child = spawn(executable, ["--mode", "rpc", "--no-session", "-e", extension], {
     cwd: repoRoot,
     env: {
       ...process.env,
-      PIPIUI_AGENTS_DIR: fileURLToPath(new URL("../../Sources/PipiUI/PiExt/agents", import.meta.url)),
+      PIPIUI_AGENTS_DIR: fileURLToPath(new URL("../../Electron/resources/runtime/pi-ext/agents", import.meta.url)),
       PIPIUI_MAIN_CWD: repoRoot,
       PIPIUI_SUBAGENT_EXT: extension,
     },
@@ -206,22 +206,22 @@ test("embedded packaged Pi loads the canonical Computer Agent extension", async 
   assert.doesNotMatch(stderr, /Failed to load extension|ParseError/);
 });
 
-test("embedded Pi canonical Operator receives the complete private Computer Worker allowlist", async () => {
+test("embedded Pi canonical Computer Use Agent receives only the Desktop Agent Interface", async () => {
   const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
   const executable = fileURLToPath(new URL(`../../Electron/.embedded-runtimes/darwin-${process.arch}/pi/bin/pi`, import.meta.url));
-  const agentsDirectory = fileURLToPath(new URL("../../Sources/PipiUI/PiExt/agents", import.meta.url));
-  const agentsModule = new URL("../../Sources/PipiUI/PiExt/subagent/agents.ts", import.meta.url).href;
-  const workerModule = new URL("../../Sources/PipiUI/PiExt/packages/computer-agent/extensions/computer-worker.ts", import.meta.url).href;
-  const workerExtension = fileURLToPath(new URL("../../Sources/PipiUI/PiExt/packages/computer-agent/extensions/computer-worker.ts", import.meta.url));
+  const agentsDirectory = fileURLToPath(new URL("../../Electron/resources/runtime/pi-ext/agents", import.meta.url));
+  const agentsModule = new URL("../../Electron/resources/runtime/pi-ext/subagent/agents.ts", import.meta.url).href;
+  const workerModule = new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/extensions/computer-worker.ts", import.meta.url).href;
+  const workerExtension = fileURLToPath(new URL("../../Electron/resources/runtime/pi-ext/packages/computer-agent/extensions/computer-worker.ts", import.meta.url));
   const root = await mkdtemp(join(tmpdir(), "pipiui-operator-tools-"));
   const guard = join(root, "index.ts");
-  const expected = ["desktop_observe", "desktop_locate", "desktop_verify", "desktop_open_application", "desktop_typeahead", "desktop_act"];
+  const expected = ["desktop_observe", "desktop_open_application", "desktop_run_action_block"];
   await writeFile(guard, [
     `import { discoverBundledAgentsFromDirectory } from ${JSON.stringify(agentsModule)};`,
     `import { toolNamesForComputerWorkerRole } from ${JSON.stringify(workerModule)};`,
-    `const operator = discoverBundledAgentsFromDirectory(${JSON.stringify(agentsDirectory)}).agents.find((agent) => agent.name === "operator");`,
-    `const tools = toolNamesForComputerWorkerRole("gui-operator");`,
-    `if (!operator || JSON.stringify(tools) !== ${JSON.stringify(JSON.stringify(expected))}) throw new Error(JSON.stringify({ operator: operator?.name, tools }));`,
+    `const operator = discoverBundledAgentsFromDirectory(${JSON.stringify(agentsDirectory)}).agents.find((agent) => agent.name === "computer-use");`,
+    `const tools = toolNamesForComputerWorkerRole("computer-use-agent");`,
+    `if (!operator || operator.capabilities.delegation || JSON.stringify(tools) !== ${JSON.stringify(JSON.stringify(expected))}) throw new Error(JSON.stringify({ operator: operator?.name, tools }));`,
     `export default function () {}`,
   ].join("\n"));
   try {
@@ -231,7 +231,7 @@ test("embedded Pi canonical Operator receives the complete private Computer Work
         ...process.env,
         PIPIUI_COMPUTER_WORKER_BROKER_URL: "http://127.0.0.1:1/v1/computer-worker",
         PIPIUI_COMPUTER_WORKER_BROKER_TOKEN: "x".repeat(48),
-        PIPIUI_COMPUTER_WORKER_ROLE: "gui-operator",
+        PIPIUI_COMPUTER_WORKER_ROLE: "computer-use-agent",
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -400,6 +400,13 @@ test("Computer Use role manifests never pin a provider or model and runtime mirr
     const canonical = await readFile(new URL(`../../Sources/PipiUI/PiExt/agents/${role}/AGENT.md`, import.meta.url), "utf8");
     const runtime = await readFile(new URL(`../../Electron/resources/runtime/pi-ext/agents/${role}/AGENT.md`, import.meta.url), "utf8");
     assert.doesNotMatch(canonical, /^model:\s*\S+/m, `${role} must follow explicit settings/main model`);
+    assert.doesNotMatch(runtime, /^model:\s*\S+/m, `${role} Electron manifest must follow explicit settings/main model`);
+    if (role === "computer-use-leader") {
+      assert.match(runtime, /Worker interface map/);
+      assert.match(runtime, /GUI Operator/);
+      assert.match(runtime, /terminal_write_file/);
+      continue;
+    }
     assert.equal(runtime, canonical, `${role} runtime manifest must mirror canonical source`);
 		if (role === "operator") {
 			assert.match(canonical, /desktop changes must use `desktop_open_application` \/ `desktop_act`/);
@@ -417,16 +424,16 @@ test("Computer Use role manifests never pin a provider or model and runtime mirr
   }
 });
 
-test("actual canonical discovery admits all four private Computer roles without diagnostics", async () => {
-  const directory = fileURLToPath(new URL("../../Sources/PipiUI/PiExt/agents", import.meta.url));
+test("actual canonical discovery admits the single Computer Use Agent without diagnostics", async () => {
+  const directory = fileURLToPath(new URL("../../Electron/resources/runtime/pi-ext/agents", import.meta.url));
   const executable = fileURLToPath(new URL(`../../Electron/.embedded-runtimes/darwin-${process.arch}/pi/bin/pi`, import.meta.url));
-  const agentsModule = new URL("../../Sources/PipiUI/PiExt/subagent/agents.ts", import.meta.url).href;
+  const agentsModule = new URL("../../Electron/resources/runtime/pi-ext/subagent/agents.ts", import.meta.url).href;
   const root = await mkdtemp(join(tmpdir(), "pipiui-canonical-discovery-"));
   const extension = join(root, "index.ts");
   await writeFile(extension, [
     `import { discoverBundledAgentsFromDirectory } from ${JSON.stringify(agentsModule)};`,
     `const discovery = discoverBundledAgentsFromDirectory(${JSON.stringify(directory)});`,
-    `const roles = new Set(["computer-use-leader", "operator", "computer-verifier", "computer-terminal"]);`,
+    `const roles = new Set(["computer-use"]);`,
     `const errors = discovery.diagnostics.filter((item) => item.severity === "error" && roles.has(item.agentName));`,
     `const found = discovery.agents.filter((agent) => roles.has(agent.name)).map((agent) => agent.name);`,
     `if (errors.length || found.length !== roles.size) throw new Error(JSON.stringify({ errors, found }));`,
@@ -569,12 +576,12 @@ test("terminal dispatch uses only its attenuated host tool broker and mounts sco
   for (const key of ["BROKER_URL", "BROKER_TOKEN"]) assert.match(source, new RegExp(`PIPIUI_TERMINAL_WORKER_${key}`));
 });
 
-test("nested Computer roles hot-read the Electron canonical qualified model runtime before following main", async () => {
-  const source = await readFile(subagentURL, "utf8");
-  assert.match(source, /\.pi\/agent\/pipiui-subagent-models-runtime\.json/);
+test("the Computer Use Agent uses the normal session-model resolver in its single episode", async () => {
+  const source = await readFile(electronSubagentURL, "utf8");
+  assert.match(source, /path\.join\(process\.env\.PI_CODING_AGENT_DIR, "pipiui-subagent-models-runtime\.json"\)/);
   assert.match(source, /const explicit = overrides\[agentName\]\?\.models\[0\]/);
-  assert.match(source, /if \(explicit\?\.model\) \{\s*return explicit\.model;/);
-  assert.match(source, /const agentName = role === "verifier" \? "computer-verifier" : "operator"/);
+  assert.match(source, /runSingleAgent\(ctx\.cwd, computerAgents, "computer-use"/);
+  assert.match(source, /sessionModel: formatCtxModel\(ctx\.model\)/);
 });
 
 test("GUI dispatch exposes only closed lifecycle failure stages to Leader recovery", async () => {
@@ -687,32 +694,29 @@ test("Terminal Worker final contract preserves closed failures without reporting
 	assert.match(terminalBranch, /computerWorkerFailureCodeFromOutput\(text\)/);
 });
 
-test("Computer Task continuity is Boss-selected and role-aware instead of taskKey routing or fresh workers", async () => {
-  const source = await readFile(subagentURL, "utf8");
-  const computerTaskStart = source.indexOf('name: "computer_task"');
+test("Computer Task starts one fresh private episode and exposes no continuity routing", async () => {
+  const source = await readFile(electronSubagentURL, "utf8");
+  const computerTaskStart = source.indexOf('function registerComputerTaskTool');
   const computerTaskEnd = source.indexOf("export default function", computerTaskStart);
   assert.ok(computerTaskStart >= 0 && computerTaskEnd > computerTaskStart);
   const computerTask = source.slice(computerTaskStart, computerTaskEnd);
 
-  assert.match(computerTask, /agentId:\s*Type\.Optional/);
-  assert.match(computerTask, /selectComputerTaskLeaderAgentId\(params\.agentId/);
-  assert.match(computerTask, /retainContext:\s*true/);
-  assert.match(computerTask, /computerWorkerAgentId\(taskId,\s*"operator"\)/);
-  assert.match(computerTask, /computerWorkerAgentId\(taskId,\s*"computer-terminal"\)/);
-  assert.match(computerTask, /role === "verifier"[\s\S]*fresh:\s*true/);
-  assert.doesNotMatch(computerTask, /fresh:\s*true\s*\}\);?[\s\n]*if \(result\.exitCode/, "runChild must not force every private role cold");
+  assert.doesNotMatch(computerTask, /agentId:\s*Type\.Optional|selectComputerTaskLeaderAgentId|computerWorkerAgentId|computer-use-leader/);
+  assert.match(computerTask, /fresh:\s*true/);
+  assert.match(computerTask, /retainContext:\s*false/);
+  assert.match(computerTask, /computerAgent:\s*\{/);
+  assert.match(computerTask, /episodeCount:\s*1/);
   assert.doesNotMatch(source, /taskKey|TASK_KEY_DESCRIPTION|selectTaskKeyAgentIdentity/);
 });
 
-test("Electron Computer Task projects a closed recovery policy into the coordinator request", async () => {
+test("Electron Computer Task removes the old public recovery policy and coordinator route", async () => {
   const source = await readFile(electronSubagentURL, "utf8");
-  const start = source.indexOf("const computerTaskParameters =");
-  const end = source.indexOf("const result = await coordinator.run", start) + 180;
+  const start = source.indexOf("function registerComputerTaskTool");
+  const end = source.indexOf("function registerLedgerNoteTool", start);
   assert.ok(start >= 0 && end > start, "Electron Computer Task policy wiring seam must remain discoverable");
   const computerTask = source.slice(start, end);
-  assert.match(computerTask, /recoveryPolicy:\s*Type\.Optional[\s\S]*Type\.Literal\("fail_fast"\)/);
-  assert.match(computerTask, /normalizeComputerTaskRecoveryPolicy\(params\.goal,\s*params\.recoveryPolicy\)/);
-  assert.match(computerTask, /coordinator\.run\(\{\s*goal:\s*params\.goal,\s*taskId,\s*recoveryPolicy\s*\}/);
+  assert.doesNotMatch(computerTask, /recoveryPolicy|ComputerAgentCoordinator|coordinator\.run/);
+  assert.match(computerTask, /goal: Type\.String/);
 });
 
 test("Computer Task exact identities resume only a Leader and derive stable subordinate ids", async () => {

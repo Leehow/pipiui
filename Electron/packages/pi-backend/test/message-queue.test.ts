@@ -489,6 +489,50 @@ describe("SessionMessageQueue", () => {
     expect(queue.isBusy("s1")).toBe(false);
   });
 
+  it("noteAbort restores a hung sending drain to queued and ignores a late dispatch ack", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const result = queue.enqueue("s1", { text: "对啊，参数填错就是大问题啊" });
+    expect(result.outcome).toBe("dispatched");
+    expect(queue.listQueue("s1")[0].state).toBe("sending");
+    expect(queue.isBusy("s1")).toBe(true);
+
+    queue.noteAbort("s1");
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ id: result.message.id, text: "对啊，参数填错就是大问题啊", state: "queued" }),
+    ]);
+    expect(queue.isBusy("s1")).toBe(false);
+
+    host.pending[0].resolve(undefined);
+    await flush();
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ id: result.message.id, state: "queued" }),
+    ]);
+    expect(queue.isBusy("s1")).toBe(false);
+  });
+
+  it("noteAbort restores a parked cut-in to queued and does not send it on the aborted epoch", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const aborted = queue.markBusy("s1");
+    queue.enqueue("s1", { text: "fifo-head" });
+    const chosen = queue.enqueue("s1", { text: "cut-in-me" }).message;
+    await queue.cutInMessage("s1", chosen.id);
+    expect(queue.listQueue("s1").find((item) => item.id === chosen.id)?.state).toBe("sending");
+
+    queue.noteAbort("s1");
+    expect(queue.listQueue("s1").find((item) => item.id === chosen.id)).toMatchObject({
+      text: "cut-in-me",
+      state: "queued",
+    });
+    expect(host.calls).toHaveLength(0);
+
+    await queue.notifyIdle("s1", aborted);
+    expect(host.calls).toHaveLength(0);
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["cut-in-me", "fifo-head"]);
+    expect(queue.listQueue("s1").every((item) => item.state === "queued")).toBe(true);
+  });
+
   it("process-exit idle after cut-in send does not clear the new turn", async () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch });

@@ -208,6 +208,8 @@ test("stall watchdog aborts a sync wait and an unanswered background stall", () 
 	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 1, msSinceLastNotify: 1_000, syncWait: false }), "ignore");
 	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 3, syncWait: false }), "abort");
 	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 0, syncWait: true }), "abort");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 120_000, notifyCount: 0, syncWait: true, syncRecoveryGraceMs: 600_000 }), "ignore");
+	assert.equal(decideStallWatchdogAction({ ...base, idleMs: 600_000, notifyCount: 0, syncWait: true, syncRecoveryGraceMs: 600_000 }), "abort");
 });
 
 test("runtime timeout aborts the exact run before provider or transient auto-resume", () => {

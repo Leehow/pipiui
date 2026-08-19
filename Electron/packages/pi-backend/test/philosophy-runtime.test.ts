@@ -153,8 +153,8 @@ describe("vendored philosophy: delivery", () => {
     expect(planning).toMatch(/dispatch manifest/);
     expect(planning).toMatch(/one worker per independent task/);
     expect(planning).toMatch(/fan-out violation/);
-    expect(orchestration).toMatch(/one worker per independent plan task/);
-    expect(orchestration).toMatch(/published multi-task plan is not itself/);
+    expect(orchestration).toMatch(/Two unrelated changes are two workers in one dispatch/);
+    expect(orchestration).toMatch(/plan_approve` with the stable `plan\.id`/);
   });
 
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {

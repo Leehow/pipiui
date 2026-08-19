@@ -65,7 +65,7 @@ export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose
         <header className="settings-modal-header">
           <div>
             <h2>Computer Use（桌面控制）</h2>
-            <p>管理 Operator subagent 的桌面控制总开关。</p>
+            <p>管理单个 Computer Use Agent 的桌面控制总开关。</p>
           </div>
           <button className="settings-modal-close" aria-label="关闭桌面控制" onClick={onClose}>×</button>
         </header>
@@ -84,7 +84,7 @@ export function ComputerUsePanel({ host, onClose }: { host: PipiHostAPI; onClose
                 <span />
               </button>
             </div>
-            <p className="computer-use-description">打开后桌面工具只注入给带 desktop 授权的 subagent（operator）；主会话不持有 computer 工具。</p>
+            <p className="computer-use-description">打开后，三个受控桌面工具只注入给单个 Computer Use Agent；它自行规划、操作、恢复并核验，主会话不直接持有 computer 工具。</p>
             <div className="computer-use-permissions" aria-label="桌面权限">
               <PermissionRow title="屏幕录制" kind="screenRecording" granted={state.screenRecording} opening={opening === 'screenRecording'} onOpen={host.openComputerUsePermission ? openPermission : undefined} />
               <PermissionRow title="辅助功能" kind="accessibility" granted={state.accessibility} opening={opening === 'accessibility'} onOpen={host.openComputerUsePermission ? openPermission : undefined} />

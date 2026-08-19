@@ -458,6 +458,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
   };
 
   const handleMessage = (peer: Peer, raw: Buffer | string, isBinary: boolean): void => {
+    peer.alive = true;
     if (isBinary) {
       closePeer(peer, 1003, "text frames required");
       return;

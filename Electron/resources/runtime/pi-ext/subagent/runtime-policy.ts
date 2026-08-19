@@ -85,9 +85,14 @@ export function decideStallWatchdogAction(input: {
 	msSinceLastNotify: number;
 	notifyIntervalMs: number;
 	syncWait: boolean;
+	/** A bounded recovery window for sync agents whose own tool protocol has timeouts and reconciliation. */
+	syncRecoveryGraceMs?: number;
 }): StallWatchdogAction {
 	if (input.idleMs < input.stallThresholdMs) return "ignore";
-	if (input.syncWait) return "abort";
+	if (input.syncWait) {
+		if (input.syncRecoveryGraceMs !== undefined && input.idleMs < input.syncRecoveryGraceMs) return "ignore";
+		return "abort";
+	}
 	if (input.notifyCount >= input.maxNotifies) return "abort";
 	if (input.notifyCount > 0 && input.msSinceLastNotify < input.notifyIntervalMs) return "ignore";
 	return "notify";

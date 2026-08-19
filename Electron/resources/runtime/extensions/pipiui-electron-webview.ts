@@ -12,6 +12,11 @@ const CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
 const REQUEST_TIMEOUT_MS = 35_000;
 const CANCEL_TIMEOUT_MS = 1_500;
 
+export const BROWSER_TOOL_DECLARED_ACTIONS = [
+  "navigate", "observe", "wait", "click", "input", "type", "select", "scroll",
+  "content", "eval", "script", "console", "screenshot", "back", "forward", "reload", "help",
+] as const;
+
 async function cancelBridgeRequest(requestID: string): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CANCEL_TIMEOUT_MS);
@@ -80,6 +85,9 @@ function bridgeFailure(r: any) {
 }
 
 function formatObservation(r: any): string {
+  if (r?.target === "both" && r.desktop && r.mobile) {
+    return ["=== desktop ===", formatObservation({ ...r.desktop, target: undefined }), "", "=== mobile ===", formatObservation({ ...r.mobile, target: undefined })].join("\n");
+  }
   const lines = [
     `URL: ${r.url || ""}`,
     `Title: ${r.title || ""}`,
@@ -108,14 +116,15 @@ const HELP = [
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
   "                        localhost defaults to http. Settles on didFinish + a short network-idle",
   "                        window (resource timing heuristic). Returns a fresh observation.",
-  "observe {scope?}        Snapshot interactive DOM. scope='viewport' (default) or 'page'.",
+  "observe {scope?,target?} Snapshot interactive DOM. scope='viewport' (default) or 'page'.",
+  "                        target='active' (default), 'desktop', 'mobile', or 'both'.",
   "wait {mode?, selector?, timeout?, idle_ms?, snapshot_id?, element_index|element_token?}",
   "                        mode='selector' (default when selector/target given): wait until a CSS",
   "                        selector is visible, or a snapshot element target is valid again.",
   "                        mode='idle' (default otherwise): wait until document.readyState is",
   "                        complete and Performance resource timing stays quiet for idle_ms",
-  "                        (default 400ms). timeout is seconds (default 10, max 30). On success",
-  "                        returns a fresh observation; on timeout code=browser_wait_timeout.",
+  "                        (default 400ms). timeout is seconds (default 5, max 25). On success",
+  "                        returns a fresh observation; on timeout code=timeout.",
   "click {snapshot_id, element_index|element_token}",
   "input {snapshot_id, element_index|element_token, text}",
   "select {snapshot_id, element_index|element_token, option}",
@@ -129,12 +138,17 @@ const HELP = [
   "eval {js}               Page-DOM only. Never string literals / keep-alive; use observe then click/input.",
   "                        WARNING: can read DOM values and secrets directly. Avoid on",
   "                        auth/checkout pages; prefer observe/click/input.",
-  "console {clear?}        Console output (log/info/warn/error), JS exceptions and failed",
-  "                        navigations since the last clear. clear=true empties the buffer.",
-  "screenshot              Screenshot of the current page, returned as an image you can look at.",
-  "                        WARNING: pixels are not redacted — passwords/OTP/card numbers visible",
-  "                        on screen will appear in the image. Avoid capturing auth/checkout UI",
-  "                        unless the user explicitly needs a visual check.",
+  "script {js}             Async page script with await/return, step(label), and el(token).",
+  "                        25s deadline; results are JSON-safe and truncated (~20k). Failures",
+  "                        include stack/line/steps; side effects are not rolled back.",
+  "console {clear?, since_seq?, level?, limit?}",
+  "                        Console output (log/info/warn/error) for the current virtual tab.",
+  "                        Cursor is since_seq; limit caps at 200. clear=true empties the buffer.",
+  "screenshot {target?}    Screenshot of the current page, returned as an image you can look at.",
+  "                        target='active' (default), 'desktop', 'mobile', or 'both'. both returns",
+  "                        two image parts labeled desktop/mobile. WARNING: pixels are not redacted",
+  "                        — passwords/OTP/card numbers visible on screen will appear in the image.",
+  "                        Avoid capturing auth/checkout UI unless the user explicitly needs a visual check.",
   "",
   "Structured DOM covers the main document, open shadow roots, and one same-origin iframe level.",
   "Use screenshot or Computer Use for cross-origin iframes, closed shadow roots, Canvas/WebGL.",
@@ -144,9 +158,15 @@ const HELP = [
   "for uploads.",
   "Sensitive-field heuristics cover password/OTP/payment-ish controls but do NOT guarantee",
   "capture of SSN, ID numbers, cardholder name, or CAPTCHA fields; when unsure, hand off.",
+  "target                  Optional viewport: active (default), desktop, mobile, both.",
+  "                        observe/screenshot support both. click/input/type/select/scroll/eval/",
+  "                        content/console/wait reject both — specify desktop or mobile.",
+  "                        Snapshot IDs and element tokens are viewport-scoped; do not mix them.",
+  "For frontend/responsive-layout implementation or debugging, before claiming responsive visual acceptance, run observe target='both' for structured inspection, then screenshot target='both' and visually review the two labeled desktop/mobile images.",
+  "Ordinary browsing may keep target='active' (default).",
   "This tool always controls the built-in WebView. For Chrome, use open_application then computer;",
   "the user selects the tab and you must re-observe title/URL/screenshot/AX before each write batch.",
-  "back | forward | reload Navigate the active built-in browser tab.",
+  "back | forward | reload Navigate the built-in browser tab (keeps desktop/mobile in sync).",
   "help                    This text.",
 ].join("\n");
 
@@ -160,12 +180,14 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
-      "actions: navigate, observe, wait, click, input, type, select, scroll, content, eval, console, screenshot, back, forward, reload, help. " +
+      "actions: navigate, observe, wait, click, input, type, select, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
       "eval is page-DOM only (no literals/keep-alive). Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
+      "Optional target selects active (default), desktop, mobile, or both (observe/screenshot only). " +
+      "Ordinary browsing may use target=active (default). For frontend or responsive-layout implementation/debugging, before claiming responsive visual acceptance, call observe with target=both for structured inspection, then screenshot with target=both and visually review both labeled desktop/mobile images. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({
-        description: "navigate | observe | wait | click | input | select | scroll | content | eval | console | screenshot | back | forward | reload | help",
+        description: "navigate | observe | wait | click | input | select | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
       }),
       url: Type.Optional(Type.String()),
       js: Type.Optional(Type.String()),
@@ -184,18 +206,29 @@ export default function (pi: ExtensionAPI) {
       ])),
       amount: Type.Optional(Type.Number({ minimum: 0.1, maximum: 10 })),
       selector: Type.Optional(Type.String()),
-      timeout: Type.Optional(Type.Number({ minimum: 0.05, maximum: 30 })),
+      timeout: Type.Optional(Type.Number({ minimum: 0.05, maximum: 25 })),
       idle_ms: Type.Optional(Type.Number({ minimum: 50, maximum: 5000 })),
+      since_seq: Type.Optional(Type.Number()),
+      level: Type.Optional(Type.String()),
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+      target: Type.Optional(Type.Union([
+        Type.Literal("active"), Type.Literal("desktop"), Type.Literal("mobile"), Type.Literal("both"),
+      ])),
     }),
     async execute(_id, params, signal) {
+      const target = params.target;
+      const targetParams = target ? { target } : {};
+      if (target === "both" && ["click", "input", "type", "select", "scroll", "eval", "content", "console", "wait"].includes(params.action)) {
+        return text(`browser ${params.action} cannot target both viewports; specify target=desktop or target=mobile.\n\n${HELP}`);
+      }
       switch (params.action) {
         case "navigate": {
           if (!params.url) return text('browser navigate requires "url".\n\n' + HELP);
-          const r = await bridge("navigate", { url: params.url, scope: params.scope ?? "viewport" }, signal);
+          const r = await bridge("navigate", { url: params.url, scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "observe": {
-          const r = await bridge("observe", { scope: params.scope ?? "viewport" }, signal);
+          const r = await bridge("observe", { scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "wait": {
@@ -226,6 +259,7 @@ export default function (pi: ExtensionAPI) {
           const r = await bridge("wait", {
             mode,
             scope: params.scope ?? "viewport",
+            ...targetParams,
             ...(typeof params.selector === "string" ? { selector: params.selector } : {}),
             ...(typeof params.timeout === "number" ? { timeout: params.timeout } : {}),
             ...(typeof params.idle_ms === "number" ? { idle_ms: params.idle_ms } : {}),
@@ -237,7 +271,7 @@ export default function (pi: ExtensionAPI) {
         }
         case "type": {
           if (!params.selector || typeof params.text !== "string") return text("browser type requires selector and text.\n\n" + HELP);
-          const r = await bridge("type", { selector: params.selector, text: params.text, scope: params.scope ?? "viewport" }, signal);
+          const r = await bridge("type", { selector: params.selector, text: params.text, scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "click":
@@ -256,6 +290,7 @@ export default function (pi: ExtensionAPI) {
           }
           const r = await bridge(params.action, {
             scope: params.scope ?? "viewport",
+            ...targetParams,
             snapshot_id: params.snapshot_id,
             ...(hasIndex ? { element_index: params.element_index } : { element_token: params.element_token }),
             ...(params.action === "input" ? { text: params.text } : {}),
@@ -272,6 +307,7 @@ export default function (pi: ExtensionAPI) {
           }
           const r = await bridge("scroll", {
             scope: params.scope ?? "viewport",
+            ...targetParams,
             direction: params.direction ?? "down",
             amount: params.amount ?? 0.8,
             ...(hasTarget ? {
@@ -282,7 +318,7 @@ export default function (pi: ExtensionAPI) {
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "content": {
-          const r = await bridge("content", { mode: params.mode ?? "text" }, signal);
+          const r = await bridge("content", { mode: params.mode ?? "text", ...targetParams }, signal);
           if (!r.ok) return bridgeFailure(r);
           const suffix = r.truncated ? "\n\n[content truncated at 100000 chars]" : "";
           return text((r.content || "(empty page)") + suffix);
@@ -297,28 +333,50 @@ export default function (pi: ExtensionAPI) {
                 HELP,
             );
           }
-          const r = await bridge("eval", { js: params.js }, signal);
+          const r = await bridge("eval", { js: params.js, ...targetParams }, signal);
           if (!r.ok) return bridgeFailure(r);
           return text(String(r.result ?? "undefined"));
         }
+        case "script": {
+          if (!params.js) return text('browser script requires "js".\n\n' + HELP);
+          const r = await bridge("script", { js: params.js, ...targetParams }, signal);
+          if (!r.ok) return bridgeFailure(r);
+          return text(JSON.stringify(r, null, 2), r);
+        }
         case "console": {
-          const r = await bridge("console", { clear: params.clear ?? false }, signal);
+          const r = await bridge("console", {
+            clear: params.clear ?? false,
+            ...targetParams,
+            ...(typeof (params as { since_seq?: number }).since_seq === "number" ? { since_seq: (params as { since_seq?: number }).since_seq } : {}),
+            ...(typeof (params as { level?: string }).level === "string" ? { level: (params as { level?: string }).level } : {}),
+            ...(typeof (params as { limit?: number }).limit === "number" ? { limit: (params as { limit?: number }).limit } : {}),
+          }, signal);
           if (!r.ok) return bridgeFailure(r);
           const logs: string[] = r.logs || [];
           return text(logs.length ? logs.join("\n") : "(console is empty)");
         }
         case "screenshot": {
-          const r = await bridge("screenshot", {}, signal);
+          const r = await bridge("screenshot", { ...targetParams }, signal);
           if (!r.ok) return bridgeFailure(r);
+          if (Array.isArray(r.images) && r.images.length > 0) {
+            const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string; viewport?: string }> = [];
+            for (const image of r.images) {
+              const viewport = typeof image.viewport === "string" ? image.viewport : "page";
+              const size = typeof image.width === "number" && typeof image.height === "number" ? ` ${image.width}x${image.height}` : "";
+              content.push({ type: "text", text: `${viewport}${size}` });
+              content.push({ type: "image", data: image.base64, mimeType: image.mimeType || "image/png", viewport });
+            }
+            return { content, details: { target: r.target || "both", images: r.images } };
+          }
           return {
-            content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png" }],
-            details: {},
+            content: [{ type: "image" as const, data: r.base64, mimeType: r.mimeType || "image/png", ...(r.viewport ? { viewport: r.viewport } : {}) }],
+            details: r.viewport ? { viewport: r.viewport } : {},
           };
         }
         case "back":
         case "forward":
         case "reload": {
-          const r = await bridge(params.action, { scope: params.scope ?? "viewport" }, signal);
+          const r = await bridge(params.action, { scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "help":

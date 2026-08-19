@@ -15,6 +15,7 @@ import {
   type RemoteControlCommand,
   type RemoteControlState
 } from './remote-control.js'
+import { createRemoteDebugService } from './remote-debug.js'
 
 const PAIR_COOKIE = 'pipiui_pair'
 
@@ -350,5 +351,38 @@ describe('createRemoteControlService', () => {
     await handler?.({ sender }, { type: 'getState' })
     await handler?.({ sender }, { type: 'stop' })
     expect(sent.some(item => item.status === 'stopped')).toBe(true)
+  })
+
+  it('exposes debug start/stop/state without relay tokens', async () => {
+    const sent: RemoteControlState[] = []
+    const sender = { send: (_channel: string, state: RemoteControlState) => { sent.push(state) } }
+    let handler: ((event: { sender: typeof sender }, command: RemoteControlCommand) => Promise<RemoteControlState>) | undefined
+    const ipc = {
+      handle(_channel: string, listener: typeof handler) {
+        handler = listener
+      }
+    }
+    const dir = await userData()
+    const ui = join(dir, 'ui')
+    const { mkdir, writeFile } = await import('node:fs/promises')
+    await mkdir(ui)
+    await writeFile(join(ui, 'index.html'), '<!doctype html><title>d</title>', 'utf8')
+    const debug = createRemoteDebugService({ backend: mockBackend(), staticDir: ui })
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: 'http://127.0.0.1:9'
+    })
+    services.push(service)
+    registerRemoteControlIpc(ipc as never, service, 'pipi-remote-control:v1', 'pipi-remote-control:event', debug)
+    const started = await handler?.({ sender }, { type: 'startDebug' })
+    expect(started?.debugEnabled).toBe(true)
+    expect(started?.debugUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/$/)
+    expect(started?.enabled).toBe(false)
+    expect(JSON.stringify(started)).not.toMatch(/hostToken|pairSecret/)
+    expect(sent.some(item => item.debugEnabled)).toBe(true)
+    const stopped = await handler?.({ sender }, { type: 'stopDebug' })
+    expect(stopped?.debugEnabled).toBe(false)
+    await debug.close()
   })
 })

@@ -1,6 +1,8 @@
 /** Versioned, transport-neutral contract used by every Pipi UI. */
 export * from "./plan.js";
+export * from "./external-session.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
+import type { ExternalSession, ExternalSessionHistory } from "./external-session.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -387,11 +389,55 @@ export type BrowserTab = { id: string; title: string; url: string; isLoading: bo
 export type BrowserTabsSnapshot = { tabs: BrowserTab[]; activeTabId?: string };
 /** Lightweight MVP snapshot; agent-browser will later populate an accessibility/text payload. */
 export type BrowserSnapshot = { tabId: string; url: string; title: string; isLoading: boolean; text?: string };
-export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string };
-export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string };
+export type BrowserToolTarget = "active" | "desktop" | "mobile" | "both";
+export type BrowserViewMode = "desktop" | "mobile" | "compare";
+export type BrowserViewportKind = "desktop" | "mobile";
+export type BrowserMobileDeviceId = "responsive" | "iphone-se" | "iphone-14-pro" | "iphone-15-pro-max" | "pixel-7" | "galaxy-s23";
+export type BrowserMobileDevicePreset = {
+  id: BrowserMobileDeviceId;
+  label: string;
+  width: number;
+  height: number;
+  deviceScaleFactor: number;
+  userAgent: string;
+};
+export const BROWSER_DESKTOP_VIEWPORT = { width: 1280, height: 800 } as const;
+export const BROWSER_MOBILE_VIEWPORT = { width: 390, height: 844 } as const;
+const IPHONE_SAFARI_UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+const PIXEL_7_UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36";
+const GALAXY_S23_UA = "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.230 Mobile Safari/537.36";
+export const BROWSER_MOBILE_DEVICES: readonly BrowserMobileDevicePreset[] = [
+  { id: "responsive", label: "响应式 / 自定义", width: 390, height: 844, deviceScaleFactor: 2, userAgent: IPHONE_SAFARI_UA },
+  { id: "iphone-se", label: "iPhone SE", width: 375, height: 667, deviceScaleFactor: 2, userAgent: IPHONE_SAFARI_UA },
+  { id: "iphone-14-pro", label: "iPhone 14 Pro", width: 393, height: 852, deviceScaleFactor: 3, userAgent: IPHONE_SAFARI_UA },
+  { id: "iphone-15-pro-max", label: "iPhone 15 Pro Max", width: 430, height: 932, deviceScaleFactor: 3, userAgent: IPHONE_SAFARI_UA },
+  { id: "pixel-7", label: "Pixel 7", width: 412, height: 915, deviceScaleFactor: 2.625, userAgent: PIXEL_7_UA },
+  { id: "galaxy-s23", label: "Samsung Galaxy S23", width: 360, height: 780, deviceScaleFactor: 3, userAgent: GALAXY_S23_UA }
+];
+export function browserMobileDeviceById(id: string | undefined): BrowserMobileDevicePreset {
+  return BROWSER_MOBILE_DEVICES.find(item => item.id === id) ?? BROWSER_MOBILE_DEVICES[0]!;
+}
+export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
+export type BrowserToolImage = { viewport: BrowserViewportKind; base64: string; mimeType: string; width?: number; height?: number };
+export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string; images?: BrowserToolImage[] };
 export type BrowserTabOptions = { url?: string };
-export type BrowserViewBounds = { x: number; y: number; width: number; height: number; visible?: boolean };
-export type BrowserEvent = ({ type: "tabs"; snapshot: BrowserTabsSnapshot } | { type: "reveal" } | { type: "error"; message: string }) & { sessionId: string };
+export type BrowserViewSlot = { x: number; y: number; width: number; height: number };
+/** Backward-compatible presentation envelope; Electron renders it in a separate framed child window. */
+export type BrowserMobileOverlay = {
+  visible: boolean;
+  applyDeviceEmulation?: boolean;
+  deviceId?: BrowserMobileDeviceId | string;
+  viewport?: { width: number; height: number };
+  deviceScaleFactor?: number;
+  userAgent?: string;
+};
+export type BrowserViewBounds = { x: number; y: number; width: number; height: number; visible?: boolean; mode?: BrowserViewMode; slots?: { desktop?: BrowserViewSlot; mobile?: BrowserViewSlot }; mobileOverlay?: BrowserMobileOverlay };
+export type BrowserEvent = (
+  | { type: "tabs"; snapshot: BrowserTabsSnapshot }
+  | { type: "reveal" }
+  | { type: "error"; message: string }
+  | { type: "mobile-window"; open: boolean; deviceId?: BrowserMobileDeviceId | string }
+) & { sessionId: string };
 
 /**
  * Optional desktop-browser extension. `loadURL` is the navigation command;
@@ -466,6 +512,11 @@ export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
   listProjects(): Promise<Project[]>; listSessions(projectId: string): Promise<Session[]>;
   /**
+   * Read-only sessions written by other local agents for this project cwd.
+   * Never mixed into `listSessions` and never leaseable / deletable / sendable.
+   */
+  listExternalSessions?(projectId: string): Promise<ExternalSession[]>;
+  /**
    * Durable explicit sidebar project list. On its first read the host migrates
    * discovered JSONL cwd values once; afterwards even an explicit [] stays
    * empty across restarts until callers add a path again.
@@ -487,6 +538,12 @@ export interface PipiHostAPI {
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
   /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
   getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
+  /**
+   * Read-only external history. Sources that cannot safely expose plaintext
+   * return `metadata` / `summary` with empty `entries` instead of scanning
+   * credential, account, token, FTS, or message-body stores.
+   */
+  getExternalSessionHistory?(sessionId: string, before?: number | string, limit?: number): Promise<ExternalSessionHistory>;
   getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
@@ -550,7 +607,7 @@ export interface PipiHostAPI {
   mountSecretVault?(sessionId: string, secret: string, envName?: string): Promise<{ sessionId: string; mount: { secretId: string; envName: string } }>;
   unmountSecretVault?(sessionId: string, secret: string): Promise<{ sessionId: string; removed: boolean }>;
   deleteSecretVault?(secret: string): Promise<{ deleted: boolean }>;
-  /** Pure Linux/macOS encryption-availability diagnosis. Never returns secret values. */
+  /** Memory-vault availability. Always available; never returns secret values. */
   diagnoseSecretVault?(): Promise<{
     available: boolean;
     kind: 'available' | 'missing-packages' | 'session-bus-unavailable' | 'secret-service-unreachable' | 'keyring-locked' | 'no-graphical-session' | 'encryption-unavailable';
@@ -669,6 +726,7 @@ function apiFrom(
     protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
     listProjects: () => invoke("listProjects"),
     listSessions: projectId => invoke("listSessions", projectId),
+    listExternalSessions: projectId => invoke("listExternalSessions", projectId),
     getProjectPaths: () => invoke("getProjectPaths"),
     setProjectPaths: paths => invoke("setProjectPaths", paths),
     pickProjectDirectory: () => invoke("pickProjectDirectory"),
@@ -689,6 +747,9 @@ function apiFrom(
     getSessionHistory: (sessionId, before, limit) => before === undefined
       ? invoke("getSessionHistory", sessionId)
       : invoke("getSessionHistory", sessionId, before, limit),
+    getExternalSessionHistory: (sessionId, before, limit) => before === undefined
+      ? invoke("getExternalSessionHistory", sessionId)
+      : invoke("getExternalSessionHistory", sessionId, before, limit),
     getSessionLease: sessionId => invoke("getSessionLease", sessionId),
     forceTakeoverSessionLease: sessionId => invoke("forceTakeoverSessionLease", sessionId),
     sendPrompt: (sessionId, prompt, attachments) => attachments?.length ? invoke("sendPrompt", sessionId, prompt, attachments) : invoke("sendPrompt", sessionId, prompt),

@@ -407,6 +407,36 @@ describe("isolated project Pi homes", () => {
     expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
   });
 
+  it("lists remaining projects when a saved path no longer exists", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-project-missing-list-"));
+    const host = join(root, "host-profile");
+    const alive = join(root, "alive");
+    const gone = join(root, "conpi");
+    await mkdir(host, { recursive: true });
+    await mkdir(projectPiAgentDir(alive), { recursive: true });
+    await writeFile(join(host, "pipiui-settings.json"), JSON.stringify({
+      projectPathsVersion: 1,
+      projectPathsCanonicalMigrationVersion: 1,
+      projectPaths: [gone, alive],
+    }));
+    await writeFile(join(host, "models.json"), '{"providers":{}}');
+    await writeFile(join(projectPiAgentDir(alive), "models.json"), '{"winner":"alive"}');
+    backend = createPiHostBackend({
+      agentDir: host,
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+    });
+
+    await expect(backend.handle("listProjects", [])).resolves.toEqual([
+      expect.objectContaining({ path: gone, name: "conpi" }),
+      expect.objectContaining({ path: alive, name: "alive" }),
+    ]);
+    await expect(backend.handle("getProjectPaths", [])).resolves.toEqual([gone, alive]);
+    expect((await lstat(join(projectPiAgentDir(alive), "models.json"))).isSymbolicLink()).toBe(true);
+    expect(JSON.parse(await readFile(join(host, "models.json"), "utf8"))).toMatchObject({ winner: "alive" });
+    await expect(lstat(gone)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("serializes canonical models writers, keeps fields, and recovers after a failed job", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-models-write-queue-"));
     const host = join(root, "host-profile");

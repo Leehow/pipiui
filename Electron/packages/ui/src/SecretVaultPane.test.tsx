@@ -18,6 +18,7 @@ describe('SecretVaultPane', () => {
     const deleteSecretVault = vi.fn(async () => ({ deleted: true }))
     render(<SecretVaultPane sessionId="sess-1" host={{ listSecretVault, putSecretVault, mountSecretVault, unmountSecretVault, deleteSecretVault }} />)
     await waitFor(() => expect(screen.getByTestId('secret-vault-item-OPENAI_API_KEY').textContent).toContain('openai'))
+    expect(screen.getByTestId('secret-vault-help').textContent).toContain('仅当前进程内存')
     fireEvent.change(screen.getByTestId('secret-vault-name'), { target: { value: 'openai' } })
     fireEvent.change(screen.getByTestId('secret-vault-env'), { target: { value: 'OPENAI_API_KEY' } })
     fireEvent.change(screen.getByTestId('secret-vault-value'), { target: { value: 'sk-live-supersecret' } })
@@ -33,61 +34,18 @@ describe('SecretVaultPane', () => {
     await waitFor(() => expect(deleteSecretVault).toHaveBeenCalledWith('1'))
   })
 
-  it('shows a closable Linux diagnosis with copyable install hint and retry', async () => {
-    const diagnoseSecretVault = vi.fn()
-      .mockResolvedValueOnce({
-        available: false,
-        kind: 'missing-packages' as const,
-        message: '系统密钥服务不可用。请先安装 gnome-keyring。',
-        installHint: 'sudo apt install gnome-keyring libsecret-1-0 libsecret-tools',
-        retryable: true,
-        platform: 'linux',
-      })
-      .mockResolvedValueOnce({
-        available: true,
-        kind: 'available' as const,
-        message: '系统密钥服务可用。',
-        retryable: true,
-        platform: 'linux',
-      })
+  it('does not show keyring diagnosis or disable save', async () => {
     const listSecretVault = vi.fn(async () => ({ secrets: [], mounts: [], sessionId: 'sess-1' }))
-    const writeText = vi.fn(async () => undefined)
-    Object.assign(navigator, { clipboard: { writeText } })
     render(<SecretVaultPane sessionId="sess-1" host={{
       listSecretVault,
       putSecretVault: vi.fn(),
       mountSecretVault: vi.fn(),
       unmountSecretVault: vi.fn(),
       deleteSecretVault: vi.fn(),
-      diagnoseSecretVault,
     }} />)
-    await waitFor(() => expect(screen.getByTestId('secret-vault-diagnosis-message').textContent).toContain('gnome-keyring'))
-    expect(screen.getByTestId('secret-vault-install-hint').textContent).toContain('sudo apt install')
-    expect(screen.getByTestId('secret-vault-save').hasAttribute('disabled')).toBe(true)
-    expect(listSecretVault).not.toHaveBeenCalled()
-    fireEvent.click(screen.getByTestId('secret-vault-copy-hint'))
-    await waitFor(() => expect(writeText).toHaveBeenCalledWith('sudo apt install gnome-keyring libsecret-1-0 libsecret-tools'))
-    fireEvent.click(screen.getByTestId('secret-vault-retry'))
-    await waitFor(() => expect(diagnoseSecretVault).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(listSecretVault).toHaveBeenCalled())
     expect(screen.queryByTestId('secret-vault-diagnosis')).toBeNull()
-  })
-
-  it('lets the user close a Linux diagnosis without blocking later chat-only use', async () => {
-    render(<SecretVaultPane sessionId="sess-1" host={{
-      listSecretVault: vi.fn(async () => ({ secrets: [], mounts: [], sessionId: 'sess-1' })),
-      putSecretVault: vi.fn(),
-      diagnoseSecretVault: vi.fn(async () => ({
-        available: false,
-        kind: 'no-graphical-session' as const,
-        message: '当前没有图形桌面会话。',
-        retryable: true,
-        platform: 'linux',
-      })),
-    }} />)
-    await waitFor(() => expect(screen.getByTestId('secret-vault-diagnosis')).toBeTruthy())
-    fireEvent.click(screen.getByTestId('secret-vault-diagnosis-close'))
-    expect(screen.queryByTestId('secret-vault-diagnosis')).toBeNull()
-    expect(screen.getByTestId('secret-vault-pane')).toBeTruthy()
+    expect(screen.queryByTestId('secret-vault-retry')).toBeNull()
+    expect(screen.getByTestId('secret-vault-save').hasAttribute('disabled')).toBe(false)
   })
 })

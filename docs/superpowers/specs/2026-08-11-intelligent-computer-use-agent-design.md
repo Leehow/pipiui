@@ -1,7 +1,14 @@
 # PipiUI 智能 Computer Use Agent 设计规格
 
+> **已取代：禁止按本文继续实现。** 2026-08-19 起，Computer Use 的智能编排与学习以
+> [`2026-08-19-single-agent-computer-use-design.md`](2026-08-19-single-agent-computer-use-design.md)
+> 为唯一设计来源。本文仅保留为现有 Leader + 固定 Worker 架构的历史记录；底层 Runtime
+> 不变量仍以 [`docs/computer-use.md`](../../computer-use.md) 和
+> [`docs/computer-runtime-v1.md`](../../computer-runtime-v1.md) 为准。
+
 日期：2026-08-11  
-状态：待批准执行  
+状态：已归档，由 2026-08-19 单 Agent 规格取代
+
 适用宿主：Swift PipiUI、Electron PipiUI、未来实现 Computer Runtime 的其他 UI  
 关联文档：[`docs/computer-runtime-v1.md`](../../computer-runtime-v1.md)、[`docs/computer-use.md`](../../computer-use.md)、[`docs/superpowers/specs/2026-07-25-computer-use-design.md`](2026-07-25-computer-use-design.md)
 

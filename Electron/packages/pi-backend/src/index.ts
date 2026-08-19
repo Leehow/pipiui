@@ -38,7 +38,9 @@ import {
   type ThinkingLevel,
   type ThinkingLevelMap,
   type UserMcpServer,
+  type WorktreeLifecycle,
   type WorktreeStatus,
+  isExternalSessionId,
 } from "@pipi/host-api";
 import { PlanStore, readPlanStore } from "./plan-store.js";
 import { readUserMcpServers } from "./user-mcp-servers.js";
@@ -79,13 +81,12 @@ import {
 import { QuotaStore, parseDotEnv } from "./quota.js";
 import {
   applySessionMountsToMainEnv,
-  configureVaultKeyProvider,
   createSessionEnvRefreshGate,
   deleteSecret,
-  envKeyProvider,
   listSecretMeta,
   listSessionMounts,
   loadVault,
+  memoryVaultDiagnosis,
   mountSecret,
   putSecret,
   createSessionRedactionGate,
@@ -93,15 +94,12 @@ import {
   redactSessionJsonl,
   workerEnvFromVault,
   redactText,
-  revealMountedSecrets,
+  revealRedactionSecrets,
   StreamRedactor,
   unmountSecret,
-  vaultDiagnosisFor,
-  VaultEncryptionError,
   type ExclusiveSessionWork,
   type RevealedSecret,
   type VaultDiagnosis,
-  type VaultKeyProvider,
 } from "./secret-vault.js";
 import {
   appendLedgerRecord,
@@ -127,6 +125,11 @@ import {
   migrateSharedProjectModels,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
+import {
+  listExternalSessionsForProject,
+  readExternalSessionHistory,
+  type ExternalSessionRoots,
+} from "./external-sessions.js";
 export {
   ensureProjectPiHome,
   migrateSharedProjectModels,
@@ -169,6 +172,17 @@ export {
   type BridgeHandlers,
 } from "./bridge.js";
 export { DEFAULT_FEATURES } from "./features.js";
+export {
+  listExternalSessionsForProject,
+  openReadonlySqlite,
+  queryReadonlySqlite,
+  readExternalSessionHistory,
+  resolveExternalSessionRoots,
+  EXTERNAL_SQLITE_FORBIDDEN_TABLES,
+  OPENCODE_SESSION_COLUMNS,
+  ZCODE_TASK_COLUMNS,
+  type ExternalSessionRoots,
+} from "./external-sessions.js";
 
 const MAX_TEXT_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_BINARY_DOCUMENT_BYTES = 50 * 1024 * 1024;
@@ -459,9 +473,7 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
-  /** Electron injects safeStorage-backed DEK provider. Absent = fail closed. */ vaultKeyProvider?: VaultKeyProvider;
-  /** Optional OS-level encryption diagnosis; never blocks ordinary chat. */ vaultAvailability?: () => VaultDiagnosis;
-  /** App-profile canonical vault directory. Never derived from a project agentDir. */ vaultDir?: string;
+  /** In-memory vault namespace key. Never used as a disk path. */ vaultDir?: string;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -474,6 +486,8 @@ export type PiBackendOptions = {
   abortAckTimeoutMs?: number;
   /** Open a project folder in the OS file manager. Defaults to open/explorer/xdg-open. */
   revealPath?: (path: string) => Promise<void>;
+  /** Read-only roots for other local agents. Tests inject a temp home; production uses $HOME. */
+  externalSessionRoots?: ExternalSessionRoots;
 };
 
 async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
@@ -1077,7 +1091,7 @@ async function readHistoryFallback(
       continue;
     }
     if (!wanted.has(entry?.id)) continue;
-    const secrets = vaultDir && sessionId ? revealMountedSecrets(vaultDir, sessionId) : [];
+    const secrets = vaultDir && sessionId ? revealRedactionSecrets(vaultDir, sessionId) : [];
     const mapped = visibleHistoryEntry(entry, secrets);
     if (!mapped) continue;
     mappedById.set(mapped.id, mapped);
@@ -1268,6 +1282,18 @@ const positiveWindow = (value: any): number | undefined => {
 };
 /** pi model refs are `provider/id`; `start` may send null before the model resolves. */
 const modelRef = (value: any): string | undefined => nonEmpty(value);
+const WORKTREE_LIFECYCLES = new Set<WorktreeLifecycle>([
+  "none",
+  "active",
+  "pendingReview",
+  "merged",
+  "mergedCleanupPending",
+  "discarded",
+]);
+const parseWorktreeLifecycle = (value: unknown): WorktreeLifecycle | undefined =>
+  typeof value === "string" && WORKTREE_LIFECYCLES.has(value as WorktreeLifecycle)
+    ? (value as WorktreeLifecycle)
+    : undefined;
 const providerOf = (ref?: string): string | undefined => {
   const provider = ref?.split("/")[0];
   return provider && provider !== ref ? provider : undefined;
@@ -1525,8 +1551,6 @@ export class PiHostBackend implements HostBackend {
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
   private vaultDir: string;
-  private vaultKeyProvider: VaultKeyProvider;
-  private vaultAvailability?: () => VaultDiagnosis;
   private features: SpawnFeatures;
   private profileMode: "default" | "isolated";
   private resourceMode: "default" | "explicit";
@@ -1590,6 +1614,7 @@ export class PiHostBackend implements HostBackend {
   private compactionConfiguration?: ProactiveCompactionConfiguration;
   private canonicalProjectPaths: () => Promise<string[] | undefined>;
   private terminalSessionDeleted?: (sessionId: string) => void;
+  private externalSessionRoots: ExternalSessionRoots;
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
@@ -1597,9 +1622,6 @@ export class PiHostBackend implements HostBackend {
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.vaultDir = options.vaultDir ?? this.agentDir;
-    this.vaultKeyProvider = options.vaultKeyProvider ?? envKeyProvider(options.env ?? process.env);
-    this.vaultAvailability = options.vaultAvailability;
-    configureVaultKeyProvider(this.vaultKeyProvider);
     this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
       () => undefined,
@@ -1628,6 +1650,7 @@ export class PiHostBackend implements HostBackend {
     this.env = options.env ?? process.env;
     this.canonicalProjectPaths = options.canonicalProjectPaths ?? (() => swiftCanonicalProjectPaths(this.env));
     this.revealPath = options.revealPath ?? defaultRevealPath;
+    this.externalSessionRoots = options.externalSessionRoots ?? {};
     const queueRoot =
       options.agentDir || !options.sessionsRoot
         ? join(this.agentDir, "pipiui-queues")
@@ -1671,6 +1694,7 @@ export class PiHostBackend implements HostBackend {
         }
         return result
       },
+      onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
     });
     if (options.authRuntime) {
       this.authRuntimePromise = Promise.resolve(options.authRuntime);
@@ -1986,8 +2010,8 @@ export class PiHostBackend implements HostBackend {
     }
   }
   /**
-   * Host abort: write abort, emit stopped quickly, escalate hung descendants,
-   * sweep agents in the background. User stop never FIFO-drains.
+   * Host abort: emit stopped immediately, write abort without waiting for ack,
+   * escalate hung descendants in the background. User stop never FIFO-drains.
    */
   private async abortSessionTurn(
     sessionId: string,
@@ -1995,40 +2019,15 @@ export class PiHostBackend implements HostBackend {
   ): Promise<void> {
     const live = this.live.get(sessionId);
     if (live) live.hostAbortedTurn = true;
-    if (options.drain === false && !this.queue.hasPendingCutIn(sessionId)) {
+    if (options.drain === false) {
+      // User stop owns the queue: a hung prompt or parked cut-in must not keep
+      // the composer locked on `sending`. Cut-in abort leaves pendingCutIn so
+      // the next real idle can dispatch it.
+      this.queue.noteAbort(sessionId);
+      this.rejectPendingCommands(sessionId, new Error("session stopped"));
+      if (live) live.pendingDrainPrompt = undefined;
+    } else if (!this.queue.hasPendingCutIn(sessionId)) {
       this.queue.suppressIdleDrain(sessionId);
-    }
-    const abortLive = this.live.get(sessionId);
-    const abortPid = abortLive?.process?.pid;
-    if (abortPid !== undefined && this.childStillRunning(abortLive?.process)) {
-      this.stopEscalation.start(
-        sessionId,
-        {
-          piPid: abortPid,
-          piIdentity: readProcessIdentity(abortPid),
-        },
-      () => {
-        const current = this.live.get(sessionId);
-        if (!current) {
-          this.stream({ type: "status", sessionId, status: "stopped", pendingFollowUps: [] });
-          return;
-        }
-        if (current.terminalEpoch !== current.turnEpoch) {
-          this.projectTurnTerminal(current, "stopped");
-        }
-      },
-      );
-    }
-    try {
-      await Promise.race([
-        this.command(sessionId, { type: "abort" }).catch(() => undefined),
-        new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, this.abortAckTimeoutMs);
-          timer.unref?.();
-        }),
-      ]);
-    } catch {
-      /* process already gone */
     }
     const after = this.live.get(sessionId);
     this.stream({
@@ -2040,6 +2039,31 @@ export class PiHostBackend implements HostBackend {
     });
     after?.compaction.settleTurn();
     void this.sweepSessionAgents(sessionId);
+    const abortPid = after?.process?.pid ?? live?.process?.pid;
+    if (abortPid !== undefined && this.childStillRunning(after?.process ?? live?.process)) {
+      queueMicrotask(() => {
+        const current = this.live.get(sessionId);
+        if (!current || !this.childStillRunning(current.process)) return;
+        this.stopEscalation.start(
+          sessionId,
+          {
+            piPid: abortPid,
+            piIdentity: readProcessIdentity(abortPid),
+          },
+          () => {
+            const liveNow = this.live.get(sessionId);
+            if (!liveNow) {
+              this.stream({ type: "status", sessionId, status: "stopped", pendingFollowUps: [] });
+              return;
+            }
+            if (liveNow.terminalEpoch !== liveNow.turnEpoch) {
+              this.projectTurnTerminal(liveNow, "stopped");
+            }
+          },
+        );
+      });
+    }
+    void this.command(sessionId, { type: "abort" }).catch(() => undefined);
   }
   private async cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage> {
     const message = await this.queue.cutInMessage(sessionId, messageId);
@@ -2053,6 +2077,7 @@ export class PiHostBackend implements HostBackend {
     text: string,
     attachments?: PromptAttachment[],
   ): Promise<QueueEnqueueResult> {
+    if (isExternalSessionId(id)) throw new Error("external session is read-only");
     await this.loadQueue(id);
     const result = this.queue.enqueue(id, { text, attachments });
     if (result.outcome === "dispatched") await this.queue.waitForDispatch(id);
@@ -2142,6 +2167,7 @@ export class PiHostBackend implements HostBackend {
   }
   /** Index metadata only. A known id must not walk the session tree again. */
   private async findSession(id: string) {
+    if (isExternalSessionId(id)) throw new Error("external session is read-only");
     const cached = this.sessionById.get(id);
     if (cached) return cached;
     await this.index();
@@ -2168,7 +2194,7 @@ export class PiHostBackend implements HostBackend {
     return entries;
   }
   private sessionSecrets(sessionId: string): RevealedSecret[] {
-    try { return revealMountedSecrets(this.vaultDir, sessionId); }
+    try { return revealRedactionSecrets(this.vaultDir, sessionId); }
     catch { return []; }
   }
   private sessionFileExclusive(sessionId: string): ExclusiveSessionWork {
@@ -2223,23 +2249,21 @@ export class PiHostBackend implements HostBackend {
     this.requestSessionEnvRefresh(sessionId);
     await this.flushSessionEnvRefresh(sessionId);
   }
-  private vaultDek(): string | undefined {
-    try { return this.vaultKeyProvider.getDek().toString("base64"); }
-    catch { return undefined; }
-  }
   private diagnoseVault(): VaultDiagnosis {
-    if (this.vaultAvailability) return this.vaultAvailability();
-    try {
-      this.vaultKeyProvider.getDek();
-      return vaultDiagnosisFor("available");
-    } catch {
-      return vaultDiagnosisFor("encryption-unavailable");
-    }
+    return memoryVaultDiagnosis();
   }
-  private assertVaultReady(): void {
-    const diagnosis = this.diagnoseVault();
-    if (diagnosis.available) return;
-    throw new VaultEncryptionError(diagnosis.kind, diagnosis.message);
+  private async dispatchVaultHostMethod(event: Record<string, unknown>, sessionId: string): Promise<unknown> {
+    const method = String(event.method ?? "");
+    const params = Array.isArray(event.params) ? event.params : [];
+    if (method === "listSecretVault") return this.handle("listSecretVault", [sessionId]);
+    if (method === "putSecretVault") {
+      const input = { ...((params[0] && typeof params[0] === "object") ? params[0] as Record<string, unknown> : {}), sessionId };
+      return this.handle("putSecretVault", [input]);
+    }
+    if (method === "mountSecretVault") return this.handle("mountSecretVault", [sessionId, params[1] ?? params[0], params[2]]);
+    if (method === "unmountSecretVault") return this.handle("unmountSecretVault", [sessionId, params[1] ?? params[0]]);
+    if (method === "deleteSecretVault") return this.handle("deleteSecretVault", [params[0]]);
+    throw new Error(`unsupported vault host method ${method}`);
   }
   private async confirmSessionMeta(meta: SessionMeta): Promise<SessionMeta> {
     try {
@@ -2422,6 +2446,14 @@ export class PiHostBackend implements HostBackend {
           })
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }
+      case "listExternalSessions": {
+        const project = await this.configuredProject(params[0] as string);
+        return listExternalSessionsForProject(
+          project.path,
+          this.externalSessionRoots,
+          this.env.HOME,
+        );
+      }
       case "newSession":
         return this.newSession(
           params[0] as string,
@@ -2474,6 +2506,18 @@ export class PiHostBackend implements HostBackend {
           before,
           limit,
           session.header.id,
+        );
+      }
+      case "getExternalSessionHistory": {
+        const sessionId = params[0] as string;
+        const paths = await this.loadProjectPaths();
+        return readExternalSessionHistory(
+          sessionId,
+          paths,
+          this.externalSessionRoots,
+          params[1] as number | string | undefined,
+          params[2] as number | undefined,
+          this.env.HOME,
         );
       }
       case "getSessionLease": {
@@ -2614,7 +2658,6 @@ export class PiHostBackend implements HostBackend {
         };
       }
       case "putSecretVault": {
-        this.assertVaultReady();
         const input = params[0] as { name: string; envName: string; value: string; sessionId: string };
         const secret = await putSecret(this.vaultDir, input);
         const mount = await mountSecret(this.vaultDir, String(input.sessionId), secret.id);
@@ -2627,7 +2670,6 @@ export class PiHostBackend implements HostBackend {
         return { secret, mount, sessionId: input.sessionId };
       }
       case "mountSecretVault": {
-        this.assertVaultReady();
         const sessionId = String(params[0]);
         const mount = await mountSecret(this.vaultDir, sessionId, String(params[1]), params[2] ? String(params[2]) : undefined);
         await this.refreshSessionChildEnv(sessionId);
@@ -2743,6 +2785,7 @@ export class PiHostBackend implements HostBackend {
           plan: this.planRuntimeAvailable(),
           retainedWorktreeDisposition: false,
           compact: true,
+          externalSessions: true,
         };
     }
   }
@@ -2890,7 +2933,7 @@ export class PiHostBackend implements HostBackend {
   }
   private async ensureIsolatedProjectHome(
     projectRoot: string,
-    options?: { migrate?: boolean },
+    options?: { migrate?: boolean; allowMissing?: boolean },
   ): Promise<IsolatedProjectHome | undefined> {
     if (this.profileMode !== "isolated") return undefined;
     const cached = this.lookupIsolatedHome(projectRoot);
@@ -2901,11 +2944,20 @@ export class PiHostBackend implements HostBackend {
       return cached;
     }
     await sanitizePiSettingsFile(join(this.agentDir, "settings.json")).catch(() => false);
-    const prepared = await ensureProjectPiHome({
-      projectRoot,
-      credentialSeedDir: this.agentDir,
-      deferModelsMigration: true,
-    });
+    let prepared: Awaited<ReturnType<typeof ensureProjectPiHome>>;
+    try {
+      prepared = await ensureProjectPiHome({
+        projectRoot,
+        credentialSeedDir: this.agentDir,
+        deferModelsMigration: true,
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        if (options?.allowMissing) return undefined;
+        throw new Error(`项目文件夹不存在：${projectRoot}`);
+      }
+      throw error;
+    }
     const home: IsolatedProjectHome = {
       displayPath: projectRoot,
       realProjectRoot: prepared.realProjectRoot,
@@ -3151,7 +3203,6 @@ export class PiHostBackend implements HostBackend {
         ? this.computerDescriptor
         : undefined,
       vaultDir: this.vaultDir,
-      vaultDek: this.vaultDek(),
     });
     // close() may race a cache-first background resume before the child is
     // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
@@ -3172,8 +3223,7 @@ export class PiHostBackend implements HostBackend {
       // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
       // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
-        // Main Pi must keep the host-injected DEK so pipiui-secret-vault can encrypt.
-        // Workers go through applySessionMountsToWorkerEnv and never see the DEK.
+        // Main Pi and UI share the host in-memory vault. Workers only inherit mounted env vars.
         applySessionMountsToMainEnv(
           mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
             ...output.env,
@@ -3732,6 +3782,14 @@ export class PiHostBackend implements HostBackend {
     this.debugTerminalReconciliation(live, epoch, "durable_settle", state, true);
     this.projectTurnTerminal(live, "settled", true);
   }
+  private rejectPendingCommands(sessionId: string, error: Error): void {
+    const live = this.live.get(sessionId);
+    if (!live) return;
+    for (const [id, pending] of live.pending) {
+      live.pending.delete(id);
+      pending.reject(error);
+    }
+  }
   private writeCommand(live: Live, body: Rpc) {
     return new Promise<any>((resolve, reject) => {
       const req = crypto.randomUUID();
@@ -4133,7 +4191,7 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode === "isolated" && !this.projectModelsInitialized) {
       const realRoots: string[] = [];
       for (const projectRoot of this.projectPaths) {
-        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false });
+        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false, allowMissing: true });
         if (home) realRoots.push(home.realProjectRoot);
       }
       const initialization = this.migrateSharedModels(realRoots);
@@ -4161,7 +4219,7 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode === "isolated") {
       const realRoots: string[] = [];
       for (const projectRoot of saved) {
-        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false });
+        const home = await this.ensureIsolatedProjectHome(projectRoot, { migrate: false, allowMissing: true });
         if (home) realRoots.push(home.realProjectRoot);
       }
       const initialization = this.migrateSharedModels(realRoots);
@@ -4523,7 +4581,6 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode === "isolated") {
       await this.loadProjectPaths();
       await this.awaitCanonicalModelsIdle();
-      this.invalidateModelCatalog();
     }
     await this.loadModelCatalogUnsafe(includeCurrent);
   }
@@ -5240,7 +5297,7 @@ export class PiHostBackend implements HostBackend {
     return next;
   }
   private async setThinking(sessionId: string, level: ThinkingLevel) {
-    await this.loadModelCatalog();
+    if (!this.modelCatalogReady) await this.loadModelCatalog();
     const raw =
       this.sessionModelStates.get(sessionId) ??
       this.sessionModelSnapshots.get(sessionId);
@@ -5267,21 +5324,17 @@ export class PiHostBackend implements HostBackend {
     if (!availableThinkingLevels.includes(level))
       throw new Error(`thinking level ${level} is unavailable`);
     if (this.live.has(sessionId) || this.ensureInFlight.has(sessionId)) {
-      const live = await this.ensure(sessionId);
+      await this.ensure(sessionId);
       await this.command(sessionId, { type: "set_thinking_level", level });
-      await this.refreshState(live);
-      const refreshed = this.sessionModelStates.get(sessionId)!;
       const catalog = this.models.find(
-        (item) => item.provider === refreshed.model.provider && item.id === refreshed.model.id,
+        (item) => item.provider === model.provider && item.id === model.id,
       );
       const state = {
-        model: catalog ?? refreshed.model,
+        model: catalog ?? model,
         thinkingLevel: level,
         availableThinkingLevels: thinkingLevelsForModel(
           catalog ?? model,
-          refreshed.availableThinkingLevels.length > 0
-            ? refreshed.availableThinkingLevels
-            : availableThinkingLevels,
+          availableThinkingLevels,
         ),
       };
       this.sessionModelStates.set(sessionId, state);
@@ -5974,6 +6027,46 @@ export class PiHostBackend implements HostBackend {
 			);
 		});
 	}
+  private projectWorktreeFromEvent(raw: any, state: AgentSummary["state"]): void {
+    const previous = this.worktrees.get(raw.agentId);
+    const explicit = parseWorktreeLifecycle(raw.worktreeLifecycle);
+    const settled =
+      previous &&
+      (previous.lifecycle === "merged" ||
+        previous.lifecycle === "mergedCleanupPending" ||
+        previous.lifecycle === "discarded");
+    const fallback =
+      raw.worktreePath
+        ? state === "running"
+          ? "active"
+          : settled
+            ? previous.lifecycle
+            : "pendingReview"
+        : undefined;
+    const lifecycle = explicit ?? fallback;
+    if (!lifecycle) return;
+    const status: WorktreeStatus = {
+      agentId: raw.agentId,
+      path: raw.worktreePath ?? previous?.path,
+      branch: raw.worktreeBranch ?? previous?.branch,
+      error: raw.worktreeError ?? previous?.error,
+      lifecycle,
+      merge:
+        lifecycle === "pendingReview"
+          ? "ready"
+          : lifecycle === "merged" || lifecycle === "mergedCleanupPending"
+            ? "merged"
+            : "unavailable",
+      discard:
+        lifecycle === "pendingReview"
+          ? "ready"
+          : lifecycle === "discarded"
+            ? "discarded"
+            : "unavailable",
+    };
+    this.worktrees.set(raw.agentId, status);
+    this.agent({ type: "worktree", status });
+  }
   private mapAgentEvent(raw: any, sessionId?: string) {
     const key = this.agentKey(raw.agentId, sessionId, raw.runId);
     const current = this.agents.get(key);
@@ -6009,6 +6102,7 @@ export class PiHostBackend implements HostBackend {
         listeners: this.listeners.size,
       });
       this.agent({ type: "agent", agent });
+      this.projectWorktreeFromEvent(raw, agent.state);
       this.persistAgents();
       return;
     }
@@ -6112,36 +6206,7 @@ export class PiHostBackend implements HostBackend {
       before: current?.state ?? "missing",
       after: agent.state,
     });
-    const lifecycle =
-      raw.worktreeLifecycle ??
-      (raw.worktreePath
-        ? state === "running"
-          ? "active"
-          : "pendingReview"
-        : undefined);
-    if (lifecycle) {
-      const status: WorktreeStatus = {
-        agentId: agent.agentId,
-        path: raw.worktreePath ?? this.worktrees.get(agent.agentId)?.path,
-        branch: raw.worktreeBranch ?? this.worktrees.get(agent.agentId)?.branch,
-        error: raw.worktreeError ?? this.worktrees.get(agent.agentId)?.error,
-        lifecycle,
-        merge:
-          lifecycle === "pendingReview"
-            ? "ready"
-            : lifecycle === "merged"
-              ? "merged"
-              : "unavailable",
-        discard:
-          lifecycle === "pendingReview"
-            ? "ready"
-            : lifecycle === "discarded"
-              ? "discarded"
-              : "unavailable",
-      };
-      this.worktrees.set(agent.agentId, status);
-      this.agent({ type: "worktree", status });
-    }
+    this.projectWorktreeFromEvent(raw, state);
     const logSessionId = agent.sessionId;
     if (raw.kind === "log_delta" && logSessionId) {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
@@ -6194,13 +6259,9 @@ export function createPiHostBackend(options: PiBackendOptions = {}) {
   return new PiHostBackend(options);
 }
 export {
-  configureVaultKeyProvider,
-  createSealedDekProvider,
-  memoryKeyProvider,
-  ubuntuVaultInstallHint,
+  memoryVaultDiagnosis,
+  resetInMemoryVault,
   vaultDiagnosisFor,
-  VaultEncryptionError,
   type VaultDiagnosis,
   type VaultDiagKind,
-  type VaultKeyProvider,
 } from "./secret-vault.js";

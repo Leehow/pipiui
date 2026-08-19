@@ -15,6 +15,7 @@ import {
   type RemoteControlState,
   type RemoteControlStatus
 } from './remote-control-ipc.js'
+import type { RemoteDebugService, RemoteDebugState } from './remote-debug.js'
 
 export {
   PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
@@ -147,8 +148,10 @@ function parseStored(raw: unknown, fallbackOrigin?: string): RemoteControlStored
   }
 }
 
-function defaultBackoff(attempt: number): number {
-  return Math.min(16_000, 500 * 2 ** Math.max(0, attempt))
+function defaultBackoff(attempt: number, rng: () => number = Math.random): number {
+  const spread = Math.min(15_000, 500 * 2 ** Math.max(0, attempt))
+  const delay = Math.round((0.5 + rng()) * spread)
+  return Math.min(15_000, Math.max(500, delay))
 }
 
 function defaultSleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -494,22 +497,42 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
 
 export type RemoteControlService = ReturnType<typeof createRemoteControlService>
 
+function mergeRemoteState(relay: RemoteControlState, debug?: RemoteDebugState): RemoteControlState {
+  return {
+    ...relay,
+    debugEnabled: debug?.debugEnabled ?? false,
+    debugUrl: debug?.debugUrl ?? null,
+    ...(debug?.debugError ? { debugError: debug.debugError } : {})
+  }
+}
+
 export function registerRemoteControlIpc(
   ipc: RemoteControlIpcMainLike,
   service: RemoteControlService,
   channel = PIPI_REMOTE_CONTROL_IPC_CHANNEL,
-  eventChannel = PIPI_REMOTE_CONTROL_EVENT_CHANNEL
+  eventChannel = PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
+  debug?: RemoteDebugService
 ): void {
   const renderers = new Set<{ send(channel: string, state: RemoteControlState): void }>()
-  service.subscribe(state => {
+  const publish = (state: RemoteControlState) => {
     for (const renderer of renderers) renderer.send(eventChannel, state)
-  })
+  }
+  service.subscribe(state => publish(mergeRemoteState(state, debug?.getState())))
+  debug?.subscribe(debugState => publish(mergeRemoteState(service.getState(), debugState)))
   ipc.handle(channel, async (event, command) => {
     renderers.add(event.sender)
     const type = command?.type
-    if (type === 'start') return service.start(command.relayOrigin)
-    if (type === 'stop') return service.stop()
-    if (type === 'reset') return service.reset(command.relayOrigin)
-    return service.getState()
+    if (type === 'start') return mergeRemoteState(await service.start(command.relayOrigin), debug?.getState())
+    if (type === 'stop') return mergeRemoteState(await service.stop(), debug?.getState())
+    if (type === 'reset') return mergeRemoteState(await service.reset(command.relayOrigin), debug?.getState())
+    if (type === 'startDebug') {
+      const next = debug ? await debug.start() : { debugEnabled: false, debugUrl: null, debugError: 'debug service unavailable' }
+      return mergeRemoteState(service.getState(), next)
+    }
+    if (type === 'stopDebug') {
+      const next = debug ? await debug.stop() : { debugEnabled: false, debugUrl: null }
+      return mergeRemoteState(service.getState(), next)
+    }
+    return mergeRemoteState(service.getState(), debug?.getState())
   })
 }

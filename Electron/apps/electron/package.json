@@ -33,6 +33,7 @@
     "@file-viewer/vite-plugin": "^2.2.8",
     "@pipi/host-api": "file:../../packages/host-api",
     "@pipi/pi-backend": "file:../../packages/pi-backend",
+    "@pipiui/server": "file:../server",
     "@pipiui/ui": "file:../../packages/ui",
     "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
@@ -87,6 +88,10 @@
       {
         "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
         "to": "pipiui-embedded"
+      },
+      {
+        "from": "../../packages/ui/dist/browser",
+        "to": "browser-ui"
       }
     ],
     "directories": {

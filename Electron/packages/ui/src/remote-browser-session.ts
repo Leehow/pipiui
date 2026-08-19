@@ -123,9 +123,22 @@ export function remoteCloseCopy(kind: RemoteCloseKind): RemoteCloseCopy {
   }
 }
 
-export function nextReconnectDelayMs(attempt: number): number {
+export const RECONNECT_BASE_MS = 500
+export const RECONNECT_CAP_MS = 15_000
+export const PHASE_HYSTERESIS_MS = 2_000
+export const BROWSER_APP_PING_MS = 20_000
+
+/** Full jitter: rand(0.5, 1.5) * min(cap, base*2^n), floored at base and capped. */
+export function nextReconnectDelayMs(attempt: number, rng: () => number = Math.random): number {
   const n = Math.max(0, attempt)
-  return Math.min(16_000, 500 * 2 ** n)
+  const spread = Math.min(RECONNECT_CAP_MS, RECONNECT_BASE_MS * 2 ** n)
+  const delay = Math.round((0.5 + rng()) * spread)
+  return Math.min(RECONNECT_CAP_MS, Math.max(RECONNECT_BASE_MS, delay))
+}
+
+export function displayRemotePhase(phase: RemotePhase, reconnectable: boolean): RemotePhase {
+  if (phase === 'disconnected' && reconnectable) return 'reconnecting'
+  return phase
 }
 
 export function phaseLabel(phase: RemotePhase): string {

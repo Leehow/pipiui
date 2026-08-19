@@ -77,6 +77,30 @@ describe('PlanPanel', () => {
     expect(screen.getAllByTestId('plan-card')).toHaveLength(1)
   })
 
+  it('promotes another session from a live event but does not demote it from a settled one', async () => {
+    const onHasPlansChange = vi.fn()
+    const { host, push } = hostWith([plan()])
+    render(<PlanPanel host={host} sessionId="s1" onHasPlansChange={onHasPlansChange} />)
+    await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('s1', true))
+    onHasPlansChange.mockClear()
+
+    push({ type: 'plan', sessionId: 'other', kind: 'plan_publish', plan: plan({ id: 'plan-2', title: '别的会话' }) })
+    await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('other', true))
+
+    push({
+      type: 'plan',
+      sessionId: 'other',
+      kind: 'plan_task_update',
+      plan: plan({
+        id: 'plan-2',
+        title: '别的会话',
+        tasks: [{ id: 'a', title: '收尾', state: 'completed' }],
+      }),
+    })
+    expect(onHasPlansChange).not.toHaveBeenCalledWith('other', false)
+    expect(onHasPlansChange).toHaveBeenLastCalledWith('other', true)
+  })
+
   it('separates finished and cancelled plans from the live one', async () => {
     const done = plan({ id: 'plan-done', title: '已完成的计划', tasks: [{ id: 'a', title: '收尾', state: 'completed' }] })
     const cancelled = plan({ id: 'plan-x', title: '被取消的计划', lifecycle: 'cancelled', cancelReason: '需求变了' })
@@ -125,6 +149,35 @@ describe('PlanPanel', () => {
     await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('s1', false))
     push({ type: 'plan', sessionId: 's1', kind: 'plan_publish', plan: plan() })
     await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('s1', true))
+  })
+
+  it('does not treat historical settled plans as a reason to show the rail tab', async () => {
+    const onHasPlansChange = vi.fn()
+    const settled = plan({
+      id: 'plan-done',
+      title: '已完成的计划',
+      tasks: [{ id: 'a', title: '收尾', state: 'completed' }],
+    })
+    const { host, push } = hostWith([settled])
+    render(<PlanPanel host={host} sessionId="s1" onHasPlansChange={onHasPlansChange} />)
+
+    await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('s1', false))
+    push({ type: 'plan', sessionId: 's1', kind: 'plan_publish', plan: plan() })
+    await waitFor(() => expect(onHasPlansChange).toHaveBeenCalledWith('s1', true))
+    push({
+      type: 'plan',
+      sessionId: 's1',
+      kind: 'plan_task_update',
+      plan: plan({
+        updatedAt: '2026-08-18T02:00:00.000Z',
+        tasks: [
+          { id: 'a', title: '定义契约', state: 'completed' },
+          { id: 'b', title: '实现面板', state: 'completed' },
+          { id: 'c', title: '补测试', state: 'skipped' },
+        ],
+      }),
+    })
+    await waitFor(() => expect(onHasPlansChange).toHaveBeenLastCalledWith('s1', false))
   })
 
   it('surfaces a failed read instead of pretending the session has no plan', async () => {

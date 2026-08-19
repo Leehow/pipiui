@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI) {
     name: "plan_approve",
     label: "Plan Approve",
     description: "Mark the published plan approved after the user accepts it. Call with the same plan.id from plan_publish.",
-    promptSnippet: "Approve the published plan after user Execute",
+    promptSnippet: "Approve the published plan after the user clicks 批准 or clearly approves",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
     }),

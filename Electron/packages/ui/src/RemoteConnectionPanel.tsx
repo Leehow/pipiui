@@ -20,6 +20,9 @@ export type RemoteControlState = {
   hostEpoch: number | null
   generation: number | null
   error?: string
+  debugEnabled?: boolean
+  debugUrl?: string | null
+  debugError?: string
 }
 
 export type PipiRemoteControlAPI = {
@@ -28,6 +31,8 @@ export type PipiRemoteControlAPI = {
   start(relayOrigin?: string): Promise<RemoteControlState>
   stop(): Promise<RemoteControlState>
   reset(relayOrigin?: string): Promise<RemoteControlState>
+  startDebug?: () => Promise<RemoteControlState>
+  stopDebug?: () => Promise<RemoteControlState>
   subscribe(listener: (state: RemoteControlState) => void): () => void
 }
 
@@ -40,6 +45,12 @@ const IDLE: RemoteControlState = {
   hostEpoch: null,
   generation: null
 }
+
+export const REMOTE_SELF_HOST_LESSON_KEY = 'pipiui.remoteSelfHostLesson'
+export const REMOTE_SELF_HOST_LESSON_DISMISSED = 'dismissed'
+export const DEFAULT_RELAY_ORIGIN = 'https://remote.deepwood.cn'
+export const REMOTE_SELF_HOST_PROMPT =
+  '我想自己搭建远程链接服务器。请按仓库 Relay/README.md 和 skill self-host-relay，先问我云服务器的 SSH 登录方式和域名，再把 Relay 和 browser-ui 传上去配好 HTTPS。完成后告诉我在「远程控制」里填哪个 https 地址。不要用 remote.deepwood.cn。'
 
 export function statusLabel(status: RemoteControlStatus): string {
   switch (status) {
@@ -66,19 +77,53 @@ export function remoteControlFromWindow(win: Window & { pipiRemoteControl?: Pipi
   return api
 }
 
+export function isHttpOrigin(value: string): boolean {
+  try {
+    const url = new URL(value.trim())
+    return url.protocol === 'http:' || url.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function lessonWasDismissed(): boolean {
+  try {
+    return localStorage.getItem(REMOTE_SELF_HOST_LESSON_KEY) === REMOTE_SELF_HOST_LESSON_DISMISSED
+  } catch {
+    return false
+  }
+}
+
+function persistLessonDismissed(): void {
+  try {
+    localStorage.setItem(REMOTE_SELF_HOST_LESSON_KEY, REMOTE_SELF_HOST_LESSON_DISMISSED)
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
 export function RemoteConnectionPanel({
   onClose,
-  remoteControl
+  onAskPipiui,
+  onOpenDebugUrl,
+  remoteControl,
+  hysteresisMs,
 }: {
   onClose: () => void
+  onAskPipiui?: (prompt: string) => void
+  onOpenDebugUrl?: (url: string) => void
   remoteControl?: PipiRemoteControlAPI | null
+  hysteresisMs?: number
 }) {
   const api = remoteControl === undefined ? remoteControlFromWindow() : remoteControl
   const [state, setState] = useState<RemoteControlState>(IDLE)
+  const [shownStatus, setShownStatus] = useState<RemoteControlStatus>(IDLE.status)
   const [loading, setLoading] = useState(Boolean(api))
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [originDraft, setOriginDraft] = useState(DEFAULT_RELAY_ORIGIN)
+  const [lessonOpen, setLessonOpen] = useState(false)
 
   useEffect(() => {
     if (!api) {
@@ -87,20 +132,42 @@ export function RemoteConnectionPanel({
     }
     let active = true
     void api.getState().then(next => {
-      if (active) setState(next)
+      if (active) {
+        setState(next)
+        if (next.relayOrigin) setOriginDraft(next.relayOrigin)
+      }
     }).catch(err => {
       if (active) setError(`读取状态失败：${err instanceof Error ? err.message : String(err)}`)
     }).finally(() => {
       if (active) setLoading(false)
     })
     const unsubscribe = api.subscribe?.(next => {
-      if (active) setState(next)
+      if (active) {
+        setState(next)
+        if (next.relayOrigin) setOriginDraft(next.relayOrigin)
+      }
     })
     return () => {
       active = false
       unsubscribe?.()
     }
   }, [api])
+
+  useEffect(() => {
+    const next = state.status
+    if (next === 'ready' || next === 'paired' || next === 'connecting' || next === 'idle' || next === 'stopped') {
+      setShownStatus(next)
+      return
+    }
+    if (next === 'reconnecting' && shownStatus !== 'ready' && shownStatus !== 'paired') {
+      setShownStatus('reconnecting')
+      return
+    }
+    const id = window.setTimeout(() => {
+      setShownStatus(next === 'error' && shownStatus === 'reconnecting' ? 'reconnecting' : next)
+    }, hysteresisMs ?? 2_000)
+    return () => window.clearTimeout(id)
+  }, [state.status, shownStatus])
 
   const qr = useMemo(() => {
     if (!state.pairUrl) return null
@@ -111,15 +178,50 @@ export function RemoteConnectionPanel({
     }
   }, [state.pairUrl])
 
+  const dismissLesson = () => {
+    persistLessonDismissed()
+    setLessonOpen(false)
+  }
+
+  const askPipiuiToSelfHost = () => {
+    persistLessonDismissed()
+    setLessonOpen(false)
+    onAskPipiui?.(REMOTE_SELF_HOST_PROMPT)
+  }
+
   const toggle = async () => {
     if (!api || busy) return
     setBusy(true)
     setError(null)
     try {
-      const next = state.enabled ? await api.stop() : await api.start()
+      const origin = isHttpOrigin(originDraft) ? originDraft.trim() : undefined
+      const next = state.enabled ? await api.stop() : await api.start(origin)
       setState(next)
     } catch (err) {
       setError(`${state.enabled ? '关闭' : '开启'}失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const applyOrigin = async () => {
+    if (!api || busy) return
+    const origin = originDraft.trim()
+    if (!isHttpOrigin(origin)) {
+      setError('请填写以 http:// 或 https:// 开头的服务器地址')
+      return
+    }
+    if (state.enabled) {
+      const ok = window.confirm('更换服务器后旧链接失效，确定？')
+      if (!ok) return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const next = state.enabled ? await api.reset(origin) : await api.start(origin)
+      setState(next)
+    } catch (err) {
+      setError(`应用服务器地址失败：${err instanceof Error ? err.message : String(err)}`)
     } finally {
       setBusy(false)
     }
@@ -133,6 +235,30 @@ export function RemoteConnectionPanel({
       window.setTimeout(() => setCopied(false), 1600)
     } catch (err) {
       setError(`复制失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  const openDebugUrl = (url?: string | null) => {
+    if (!url) return
+    try {
+      onOpenDebugUrl?.(url)
+    } catch {
+      /* no selected session / host — URL stays visible */
+    }
+  }
+
+  const toggleDebug = async () => {
+    if (!api?.startDebug || !api.stopDebug || busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      const next = state.debugEnabled ? await api.stopDebug() : await api.startDebug()
+      setState(next)
+      if (!state.debugEnabled && next.debugEnabled && next.debugUrl) openDebugUrl(next.debugUrl)
+    } catch (err) {
+      setError(`${state.debugEnabled ? '关闭' : '开启'} Debug 失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -167,10 +293,26 @@ export function RemoteConnectionPanel({
           <div className="settings-modal-empty">正在加载远程控制…</div>
         ) : (
           <div className="settings-modal-body computer-use-body">
+            <div className="remote-origin-row">
+              <label className="remote-pair-label" htmlFor="remote-relay-origin">服务器地址</label>
+              <div className="remote-origin-fields">
+                <input
+                  id="remote-relay-origin"
+                  className="remote-origin-input"
+                  data-testid="remote-relay-origin"
+                  value={originDraft}
+                  onChange={event => setOriginDraft(event.target.value)}
+                  placeholder={DEFAULT_RELAY_ORIGIN}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button type="button" aria-label="应用服务器地址" disabled={busy} onClick={() => void applyOrigin()}>应用</button>
+              </div>
+            </div>
             <div className="computer-use-toggle-row">
               <div>
                 <strong>开启远程控制</strong>
-                <p data-testid="remote-control-status">{statusLabel(state.status)}</p>
+                <p data-testid="remote-control-status">{statusLabel(shownStatus)}</p>
               </div>
               <button
                 type="button"
@@ -184,15 +326,39 @@ export function RemoteConnectionPanel({
                 <span />
               </button>
             </div>
+            {api.startDebug && api.stopDebug && (
+              <div className="computer-use-toggle-row" data-testid="remote-debug-block">
+                <div>
+                  <strong>本地 Debug 模式</strong>
+                  <p data-testid="remote-debug-status">{state.debugEnabled ? '已开启' : '未开启'}</p>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={Boolean(state.debugEnabled)}
+                  aria-label="本地 Debug 模式"
+                  className={`computer-use-switch${state.debugEnabled ? ' enabled' : ''}`}
+                  disabled={busy}
+                  onClick={() => void toggleDebug()}
+                >
+                  <span />
+                </button>
+              </div>
+            )}
+            {state.debugUrl && (
+              <div className="remote-pair-block" data-testid="remote-debug-url-block">
+                <label className="remote-pair-label" htmlFor="remote-debug-url">本地界面</label>
+                <code id="remote-debug-url" className="remote-pair-url" data-testid="remote-debug-url">{state.debugUrl}</code>
+                <div className="remote-pair-actions">
+                  <button type="button" aria-label="打开本地界面" onClick={() => openDebugUrl(state.debugUrl)}>打开本地界面</button>
+                </div>
+              </div>
+            )}
+            {state.debugError && <div className="settings-modal-error" role="alert" data-testid="remote-debug-error">{state.debugError}</div>}
+            <button type="button" className="remote-lesson-reopen" onClick={() => setLessonOpen(true)}>用自己的网站搭建</button>
             {state.status === 'ready' && <p className="computer-use-description">已连上 Relay，等待浏览器扫描或打开配对链接。</p>}
             {state.pairUrl && (
               <div className="remote-pair-block">
-                <label className="remote-pair-label" htmlFor="remote-pair-url">配对链接</label>
-                <code id="remote-pair-url" className="remote-pair-url" data-testid="remote-pair-url">{state.pairUrl}</code>
-                <div className="remote-pair-actions">
-                  <button type="button" aria-label="复制配对链接" onClick={() => void copyLink()}>{copied ? '已复制' : '复制链接'}</button>
-                  <button type="button" aria-label="重新生成链接" disabled={busy} onClick={() => void regenerate()}>重新生成链接</button>
-                </div>
                 {qr && (
                   <div
                     className="remote-pair-qr"
@@ -201,10 +367,31 @@ export function RemoteConnectionPanel({
                     dangerouslySetInnerHTML={{ __html: qr }}
                   />
                 )}
+                <label className="remote-pair-label" htmlFor="remote-pair-url">配对链接</label>
+                <code id="remote-pair-url" className="remote-pair-url" data-testid="remote-pair-url">{state.pairUrl}</code>
+                <div className="remote-pair-actions">
+                  <button type="button" aria-label="复制配对链接" onClick={() => void copyLink()}>{copied ? '已复制' : '复制链接'}</button>
+                  <button type="button" aria-label="重新生成链接" disabled={busy} onClick={() => void regenerate()}>重新生成链接</button>
+                </div>
               </div>
             )}
             {state.error && <div className="settings-modal-error" role="alert">{state.error}</div>}
             {error && <div className="settings-modal-error" role="alert">{error}</div>}
+          </div>
+        )}
+        {lessonOpen && (
+          <div className="remote-lesson-overlay" data-testid="remote-self-host-lesson" role="dialog" aria-labelledby="remote-lesson-title">
+            <div className="remote-lesson-card">
+              <h2 id="remote-lesson-title">用自己的网站也能远程控制</h2>
+              <p>现在可以用官方服务器，打开开关就能配对。</p>
+              <p>若要用<strong>自己的网站</strong>，不必自己会部署：点「让 PipiUI 帮我搭建」，在聊天里告诉它云服务器怎么登录、域名是什么。</p>
+              <p>需要事先有：一台能 SSH 的云服务器 + 一条指到它的域名。</p>
+              <p>搭好后把 <code>https://你的域名</code> 填进「服务器地址」。</p>
+              <div className="remote-lesson-actions">
+                <button type="button" className="remote-lesson-primary" onClick={askPipiuiToSelfHost}>让 PipiUI 帮我搭建</button>
+                <button type="button" className="remote-lesson-secondary" onClick={dismissLesson}>先用现在的服务器</button>
+              </div>
+            </div>
           </div>
         )}
       </section>

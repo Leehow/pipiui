@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -15,8 +15,8 @@ import { dirname, join } from "node:path";
 
 export const VAULT_FILE = "secret-vault.json";
 export const VAULT_KEY_FILE = "secret-vault.key";
-const ALGO = "aes-256-gcm";
 export const MIN_SECRET_LEN = 8;
+export const MEMORY_VAULT_MESSAGE = "密钥仅保存在当前 App 主进程内存中，退出 App 后清除。";
 
 export type VaultDiagKind =
   | "available"
@@ -36,15 +36,6 @@ export type VaultDiagnosis = {
   platform: NodeJS.Platform;
 };
 
-export class VaultEncryptionError extends Error {
-  readonly code: VaultDiagKind;
-  constructor(kind: VaultDiagKind, message = "vault encryption unavailable") {
-    super(message);
-    this.name = "VaultEncryptionError";
-    this.code = kind;
-  }
-}
-
 export function posixFileSecurity(): boolean {
   return process.platform !== "win32";
 }
@@ -56,40 +47,24 @@ export function ensureSecureDirectory(dir: string): void {
   }
 }
 
-export function ubuntuVaultInstallHint(): string {
-  return "sudo apt install gnome-keyring libsecret-1-0 libsecret-tools";
-}
-
-export function vaultDiagnosisMessage(kind: VaultDiagKind): string {
-  switch (kind) {
-    case "available":
-      return "系统密钥服务可用。";
-    case "missing-packages":
-      return "系统密钥服务不可用。请先安装并启动 gnome-keyring 与 libsecret（含 libsecret-tools），解锁登录密钥环后再点「重试检测」。普通聊天不受影响。";
-    case "session-bus-unavailable":
-      return "当前没有可用的桌面会话总线。请在已登录的图形桌面会话中打开 PipiUI，不要在纯 SSH、容器或无桌面环境使用密钥库。普通聊天仍可继续。";
-    case "secret-service-unreachable":
-      return "无法连接到系统密钥服务（Secret Service）。请确认已安装并启动 gnome-keyring，然后解锁密钥环后再点「重试检测」。普通聊天不受影响。";
-    case "keyring-locked":
-      return "系统密钥环已锁定。请在桌面会话中解锁登录密钥环后再点「重试检测」。普通聊天不受影响。";
-    case "no-graphical-session":
-      return "当前没有图形桌面会话。密钥库需要已登录并解锁的桌面会话；普通聊天仍可继续使用。";
-    default:
-      return "系统密钥服务不可用。请安装/启动并解锁 Secret Service 后再使用密钥库。普通聊天不受影响。";
-  }
-}
-
-export function vaultDiagnosisFor(kind: VaultDiagKind, platform: NodeJS.Platform = process.platform): VaultDiagnosis {
+export function memoryVaultDiagnosis(platform: NodeJS.Platform = process.platform): VaultDiagnosis {
   return {
-    available: kind === "available",
-    kind,
-    message: vaultDiagnosisMessage(kind),
-    installHint: kind === "missing-packages" || kind === "encryption-unavailable" || kind === "secret-service-unreachable"
-      ? ubuntuVaultInstallHint()
-      : undefined,
-    retryable: true,
+    available: true,
+    kind: "available",
+    message: MEMORY_VAULT_MESSAGE,
+    retryable: false,
     platform,
   };
+}
+
+/** @deprecated Memory vault is always available; kept for leftover diagnosis callers. */
+export function vaultDiagnosisMessage(_kind: VaultDiagKind = "available"): string {
+  return MEMORY_VAULT_MESSAGE;
+}
+
+/** @deprecated Memory vault is always available; kept for leftover diagnosis callers. */
+export function vaultDiagnosisFor(_kind: VaultDiagKind = "available", platform: NodeJS.Platform = process.platform): VaultDiagnosis {
+  return memoryVaultDiagnosis(platform);
 }
 
 export type VaultSecretMeta = {
@@ -102,9 +77,7 @@ export type VaultSecretMeta = {
 export type VaultMount = { secretId: string; envName: string };
 
 export type VaultSecretRecord = VaultSecretMeta & {
-  nonce: string;
-  tag: string;
-  ciphertext: string;
+  value: string;
 };
 
 export type VaultDocument = {
@@ -114,57 +87,12 @@ export type VaultDocument = {
   mounts: Record<string, VaultMount[]>;
 };
 
-export type VaultKeyProvider = {
-  getDek(): Buffer;
-};
-
-export type BytesCipher = {
-  available(): boolean;
-  seal(plain: Buffer): Buffer;
-  open(sealed: Buffer): Buffer;
-};
-
-let keyProvider: VaultKeyProvider | undefined;
+const stores = new Map<string, VaultDocument>();
 const writeQueues = new Map<string, Promise<unknown>>();
 
-export function configureVaultKeyProvider(provider: VaultKeyProvider | undefined): void {
-  keyProvider = provider;
-}
-
-export function memoryKeyProvider(dek = randomBytes(32)): VaultKeyProvider {
-  return { getDek: () => dek };
-}
-
-export function envKeyProvider(env: NodeJS.ProcessEnv = process.env): VaultKeyProvider {
-  return {
-    getDek() {
-      const raw = env.PIPIUI_VAULT_DEK;
-      if (!raw) throw new VaultEncryptionError("encryption-unavailable");
-      const dek = Buffer.from(raw, "base64");
-      if (dek.length !== 32) throw new VaultEncryptionError("encryption-unavailable");
-      return dek;
-    },
-  };
-}
-
-export function createSealedDekProvider(sealedPath: string, cipher: BytesCipher): VaultKeyProvider {
-  let cached: Buffer | undefined;
-  return {
-    getDek() {
-      if (cached) return cached;
-      if (!cipher.available()) throw new VaultEncryptionError("encryption-unavailable");
-      if (existsSync(sealedPath)) {
-        cached = cipher.open(readFileSync(sealedPath));
-        if (cached.length !== 32) throw new VaultEncryptionError("encryption-unavailable");
-        return cached;
-      }
-      const dek = randomBytes(32);
-      ensureSecureDirectory(dirname(sealedPath));
-      atomicWriteFile(sealedPath, cipher.seal(dek));
-      cached = dek;
-      return dek;
-    },
-  };
+export function resetInMemoryVault(dir?: string): void {
+  if (dir) stores.delete(dir);
+  else stores.clear();
 }
 
 export function vaultPaths(dir: string): { file: string; key: string } {
@@ -179,28 +107,24 @@ function emptyVault(): VaultDocument {
   return { version: 1, revision: 0, secrets: [], mounts: {} };
 }
 
-function requireDek(): Buffer {
-  if (!keyProvider) throw new VaultEncryptionError("encryption-unavailable");
-  const dek = keyProvider.getDek();
-  if (!dek || dek.length !== 32) throw new VaultEncryptionError("encryption-unavailable");
-  return dek;
+function vaultOf(dir: string): VaultDocument {
+  const existing = stores.get(dir);
+  if (existing) return existing;
+  const created = emptyVault();
+  stores.set(dir, created);
+  return created;
 }
 
 export function loadVault(dir: string): VaultDocument {
-  const { file } = vaultPaths(dir);
-  if (!existsSync(file)) return emptyVault();
-  try {
-    const raw = JSON.parse(readFileSync(file, "utf8")) as VaultDocument;
-    if (raw?.version !== 1 || !Array.isArray(raw.secrets)) return emptyVault();
-    return {
-      version: 1,
-      revision: typeof raw.revision === "number" ? raw.revision : 0,
-      secrets: raw.secrets,
-      mounts: raw.mounts && typeof raw.mounts === "object" ? raw.mounts : {},
-    };
-  } catch {
-    return emptyVault();
-  }
+  const vault = vaultOf(dir);
+  return {
+    version: 1,
+    revision: vault.revision,
+    secrets: vault.secrets.map((secret) => ({ ...secret })),
+    mounts: Object.fromEntries(
+      Object.entries(vault.mounts).map(([sessionId, mounts]) => [sessionId, mounts.map((mount) => ({ ...mount }))]),
+    ),
+  };
 }
 
 export function atomicWriteFile(path: string, data: string | Buffer): void {
@@ -240,47 +164,22 @@ function serializeDir<T>(dir: string, work: () => T): Promise<T> {
 }
 
 export function saveVault(dir: string, vault: VaultDocument): void {
-  const { file, key } = vaultPaths(dir);
-  if (existsSync(key)) {
-    try { unlinkSync(key); } catch { /* leftover insecure key must not remain */ }
-  }
-  ensureSecureDirectory(dir);
-  atomicWriteFile(file, JSON.stringify(vault, null, 2));
-}
-
-function encrypt(plaintext: string): Pick<VaultSecretRecord, "nonce" | "tag" | "ciphertext"> {
-  const nonce = randomBytes(12);
-  const cipher = createCipheriv(ALGO, requireDek(), nonce);
-  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  return {
-    nonce: nonce.toString("base64"),
-    tag: cipher.getAuthTag().toString("base64"),
-    ciphertext: ciphertext.toString("base64"),
-  };
-}
-
-export function decryptSecret(_dir: string, record: VaultSecretRecord): string {
-  const decipher = createDecipheriv(ALGO, requireDek(), Buffer.from(record.nonce, "base64"));
-  decipher.setAuthTag(Buffer.from(record.tag, "base64"));
-  return Buffer.concat([
-    decipher.update(Buffer.from(record.ciphertext, "base64")),
-    decipher.final(),
-  ]).toString("utf8");
+  stores.set(dir, {
+    version: 1,
+    revision: vault.revision,
+    secrets: vault.secrets.map((secret) => ({ ...secret })),
+    mounts: Object.fromEntries(
+      Object.entries(vault.mounts).map(([sessionId, mounts]) => [sessionId, mounts.map((mount) => ({ ...mount }))]),
+    ),
+  });
 }
 
 async function mutateVault<T>(dir: string, mutate: (vault: VaultDocument) => T): Promise<T> {
   return serializeDir(dir, () => {
-    for (let attempt = 0; attempt < 8; attempt++) {
-      const vault = loadVault(dir);
-      const revision = vault.revision;
-      const result = mutate(vault);
-      const latest = loadVault(dir);
-      if (latest.revision !== revision) continue;
-      vault.revision = revision + 1;
-      saveVault(dir, vault);
-      return result;
-    }
-    throw new Error("vault write conflict");
+    const vault = vaultOf(dir);
+    const result = mutate(vault);
+    vault.revision += 1;
+    return result;
   });
 }
 
@@ -293,7 +192,6 @@ export async function putSecret(
   if (!name) throw new Error("name is required");
   if (!isSafeEnvName(envName)) throw new Error("envName must match [A-Z][A-Z0-9_]{0,63}");
   if (input.value.length < MIN_SECRET_LEN) throw new Error(`value must be at least ${MIN_SECRET_LEN} characters`);
-  const sealed = encrypt(input.value);
   return mutateVault(dir, (vault) => {
     const existing = input.id
       ? vault.secrets.find((s) => s.id === input.id)
@@ -304,7 +202,7 @@ export async function putSecret(
       name,
       envName,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
-      ...sealed,
+      value: input.value,
     };
     vault.secrets = [...vault.secrets.filter((s) => s.id !== id && s.envName !== envName), record];
     return { id: record.id, name: record.name, envName: record.envName, createdAt: record.createdAt };
@@ -342,8 +240,8 @@ export async function deleteSecret(dir: string, secretIdOrName: string): Promise
     const secret = vault.secrets.find((s) => s.id === secretIdOrName || s.name === secretIdOrName || s.envName === secretIdOrName);
     if (!secret) return false;
     vault.secrets = vault.secrets.filter((s) => s.id !== secret.id);
-    for (const [sessionId, mounts] of Object.entries(vault.mounts)) {
-      vault.mounts[sessionId] = mounts.filter((m) => m.secretId !== secret.id);
+    for (const [sid, mounts] of Object.entries(vault.mounts)) {
+      vault.mounts[sid] = mounts.filter((m) => m.secretId !== secret.id);
     }
     return true;
   });
@@ -364,8 +262,34 @@ export function revealMountedSecrets(dir: string, sessionId: string): RevealedSe
   return (vault.mounts[sessionId] ?? []).flatMap((m) => {
     const secret = vault.secrets.find((s) => s.id === m.secretId);
     if (!secret) return [];
-    return [{ id: secret.id, name: secret.name, envName: m.envName, value: decryptSecret(dir, secret) }];
+    return [{ id: secret.id, name: secret.name, envName: m.envName, value: secret.value }];
   });
+}
+
+export function revealRedactionSecrets(dir: string, sessionId?: string): RevealedSecret[] {
+  const vault = loadVault(dir);
+  const byKey = new Map<string, RevealedSecret>();
+  for (const secret of vault.secrets) {
+    byKey.set(`${secret.id}:${secret.envName}`, {
+      id: secret.id,
+      name: secret.name,
+      envName: secret.envName,
+      value: secret.value,
+    });
+  }
+  if (sessionId) {
+    for (const mount of vault.mounts[sessionId] ?? []) {
+      const secret = vault.secrets.find((item) => item.id === mount.secretId);
+      if (!secret) continue;
+      byKey.set(`${secret.id}:${mount.envName}`, {
+        id: secret.id,
+        name: secret.name,
+        envName: mount.envName,
+        value: secret.value,
+      });
+    }
+  }
+  return [...byKey.values()];
 }
 
 export function workerEnvFromVault(dir: string, sessionId: string): Record<string, string> {
@@ -374,7 +298,6 @@ export function workerEnvFromVault(dir: string, sessionId: string): Record<strin
   return env;
 }
 
-/** Main Pi RPC env: merge session mounts and keep the host-injected DEK. */
 export function applySessionMountsToMainEnv(
   parent: NodeJS.ProcessEnv,
   mounts: Record<string, string>,
@@ -384,10 +307,12 @@ export function applySessionMountsToMainEnv(
     if (value !== undefined) env[key] = value;
   }
   for (const [key, value] of Object.entries(mounts)) env[key] = value;
+  delete env.PIPIUI_VAULT_DEK;
+  delete env.PIPIUI_SECRET_VAULT_DEK;
   return env;
 }
 
-/** Worker/subagent env: same mounts, but never inherit the DEK. */
+/** Worker/subagent env: same mounts, but never inherit a DEK. */
 export function applySessionMountsToWorkerEnv(
   parent: NodeJS.ProcessEnv,
   mounts: Record<string, string>,
@@ -562,8 +487,4 @@ export function vaultDirFromEnv(env: NodeJS.ProcessEnv = process.env): string | 
 
 export function sessionIdFromEnv(env: NodeJS.ProcessEnv = process.env): string {
   return env.PIPIUI_SESSION_ID || env.PIPIUI_SESSION_KEY || "default";
-}
-
-export function installEnvKeyProvider(env: NodeJS.ProcessEnv = process.env): void {
-  configureVaultKeyProvider(envKeyProvider(env));
 }

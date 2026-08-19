@@ -12,6 +12,10 @@ let prompted = false;
 let omitUsage = false;
 let failStats = false;
 let heldTurn = false;
+/** Abort acks but does not settle — reproduces a stuck cut-in / sending item. */
+let silentAbort = false;
+/** Delay abort RPC ack so host stop must not wait on it. */
+let slowAbort = false;
 /** Context occupancy the next get_session_stats reports; drives proactive compaction. */
 let contextTokens = null;
 let failCompact = false;
@@ -41,8 +45,11 @@ function emitTurn(message, images) {
     send({ type: "message_end" });
     send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "reflect" } });
   }
-  if (message !== "__hold__") send({ type: "agent_settled" });
-  else heldTurn = true;
+  if (message !== "__hold__" && message !== "__hold_stuck__") send({ type: "agent_settled" });
+  else {
+    heldTurn = true;
+    silentAbort = message === "__hold_stuck__";
+  }
 }
 
 readline.createInterface({ input: process.stdin }).on("line", line => {
@@ -79,10 +86,12 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return;
   }
   if (command.type === "prompt") {
+    if (command.message === "__no_ack__") return;
     if (command.message === "__queue_fail__") return response(command.type, command.id, false, undefined, "queue dispatch failed");
     if (heldTurn && !command.streamingBehavior) {
       return response(command.type, command.id, false, undefined, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
     }
+    if (command.message === "__slow_abort__") slowAbort = true;
     prompted = true;
     if (command.message === "no-usage") omitUsage = true;
     if (command.message === "fail-stats") failStats = true;
@@ -185,14 +194,21 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return;
   }
   if (command.type === "follow_up") {
+    if (command.message === "__no_ack__") return;
     ok();
     send({ type: "queue_update", followUp: [command.message] });
     return;
   }
   if (command.type === "abort") {
     heldTurn = false;
-    ok();
-    send({ type: "agent_settled" });
+    const finish = () => {
+      ok();
+      if (!silentAbort) send({ type: "agent_settled" });
+      silentAbort = false;
+      slowAbort = false;
+    };
+    if (slowAbort) setTimeout(finish, 200);
+    else finish();
     return;
   }
   if (command.type === "set_model") {

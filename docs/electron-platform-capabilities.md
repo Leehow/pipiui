@@ -9,14 +9,14 @@
 | 能力 | macOS (darwin) | Windows (win32) | Linux (linux) | 判定位置 |
 |---|---|---|---|---|
 | revealInFinder | ✅ | ❌ 隐藏 | ❌ 隐藏 | `packages/pi-backend`：`capabilities` → `revealInFinder: process.platform === 'darwin'`；UI 由 `capabilities.revealInFinder` 门控（`packages/ui` 的 `canRevealInFinder`） |
-| computerUse | ❌ v1 声明关闭（Swift 版保留 macOS Computer Use） | ❌ | ❌ | `capabilities` → `computerUse: false`；跨平台移植独立排期 |
+| computerUse | ✅ opt-in；单个 `computer-use` episode + macOS Cua Runtime v1 | ❌ | ❌ | `packages/pi-backend`：仅在 feature、descriptor 和 runtime usable 同时成立时返回 true；Windows/Linux driver 移植未实现 |
 | terminal（xterm） | ✅ node-pty | ✅ node-pty | ✅ node-pty（glibc ≤ 2.35） | 已入包；Linux `pty.node` 必须在 Ubuntu 22.04（glibc 2.35）上编译 |
 | 应用生命周期 | ✅ 关闭全部窗口不退出（macOS 惯例，dock 激活重建） | ✅ 全部窗口关闭即退出 | ✅ 同 win | `index.ts`：`if (process.platform !== 'darwin') app.quit()` |
 | 安装形态 | .app / dmg / zip（x64+arm64） | NSIS .exe（x64） | AppImage + deb（x64） | `apps/electron/package.json` build.target |
-| 密钥库（safeStorage） | ✅ 系统钥匙串 | ❌ 本轮不处理 | ✅ Ubuntu 22.04/24.04 x64 桌面会话 + Secret Service；缺依赖 fail-closed，普通聊天可用 | `apps/electron/src/main/linux-secret-service.ts`；用户说明见 [`electron-secret-vault-linux.md`](./electron-secret-vault-linux.md) |
+| 密钥库（进程内存） | ✅ 仅当前 App 主进程 RAM，退出清除 | ✅ 同左 | ✅ 同左；不依赖钥匙串 / Secret Service | `packages/pi-backend/src/secret-vault.ts`；说明见 [`electron-secret-vault-linux.md`](./electron-secret-vault-linux.md) |
 | 图标 | `build/icon.icns`（`scripts/make-icon.sh` 从 `assets/brand/app-icon.png` 生成，macOS 工具链；build/ 被 gitignore，CI mac job 先行再生成） | `assets/icons/512x512.png`（app-builder 自动转 .ico，≥256px） | `assets/icons/` 目录（16–1024 完整 png 集，deb/AppImage 各尺寸齐全） | 图标集提交在 `Electron/apps/electron/assets/icons/`（sips 生成一次，CI 无需工具链）；win/linux 由 app-builder 自动转换 |
 | 默认 shell | zsh | cmd / PowerShell（node-pty 需 conpty） | bash / sh | 按 `process.platform` 选择 |
-| 路径 | `~/.pi/agent`、`~/Library/Application Support/PipiUI` | `%USERPROFILE%\.pi\agent`、`%APPDATA%` | `~/.pi/agent`、`~/.config` | ⚠️ `packages/pi-backend/src/spawn-assembly.ts` 目前硬编码 `~/Library/Application Support/PipiUI`（search-grants、subagent-models 等）；win/linux 需改为平台路径（已排期，未在本轮实现） |
+| 路径 | `{projectRoot}/.pi/agent` + App profile shared auth/model files | `%USERPROFILE%` project path（Computer Use 不可用） | project-local `.pi/agent`（Computer Use 不可用） | Computer Use Workflow Memory 只用 backend-resolved active project Pi home；不使用全局 `~/.pi` 或 App-profile Procedure Store |
 | 文件/分隔符 | POSIX、LF | 反斜杠路径、CRLF | POSIX、LF | JSONL 写入统一 `\n`（与 pi 兼容）；`node:path` 处理分隔符 |
 | pi 进程解析 | PATH 中的 `pi`（`PiBackendOptions.piPath` 可注入） | 需 `pi.exe` 在 PATH | 需 `pi` 在 PATH | `packages/pi-backend` 默认 `"pi"`；win/linux 安装指引另列 |
 | 代码签名 | 无（CI 禁自动发现证书） | 无 | 无 | CI `CSC_IDENTITY_AUTO_DISCOVERY=false`；正式发布按平台接 notary/证书 |

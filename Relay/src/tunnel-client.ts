@@ -13,6 +13,7 @@ export type CommandResult = { status: number; body: JSONValue };
 export type TunnelStatus =
   | { kind: "connecting" }
   | { kind: "connected" }
+  | { kind: "reconnecting" }
   | { kind: "replaced" }
   | { kind: "invalidated" }
   | { kind: "error"; message: string }
@@ -24,6 +25,15 @@ export interface TunnelClientOptions {
   secret: string;
   requestTimeoutMs?: number;
   onStatus?: (status: TunnelStatus) => void;
+  random?: () => number;
+  schedule?: (fn: () => void, ms: number) => number;
+  cancel?: (id: number) => void;
+}
+
+function nextReconnectDelayMs(attempt: number, rng: () => number): number {
+  const spread = Math.min(15_000, 500 * 2 ** Math.max(0, attempt));
+  const delay = Math.round((0.5 + rng()) * spread);
+  return Math.min(15_000, Math.max(500, delay));
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
@@ -38,6 +48,9 @@ export class TunnelClient {
   private socket: WebSocket | null = null;
   private connected = false;
   private revoked = false;
+  private terminal = false;
+  private reconnectAttempt = 0;
+  private reconnectTimer = 0;
   private readonly pending = new Map<string, PendingEntry>();
 
   constructor(private readonly options: TunnelClientOptions) {}
@@ -50,10 +63,47 @@ export class TunnelClient {
     this.options.onStatus?.(status);
   }
 
+  private schedule(fn: () => void, ms: number): number {
+    return (this.options.schedule ?? ((cb, delay) => window.setTimeout(cb, delay)))(fn, ms);
+  }
+
+  private cancelTimer(): void {
+    if (!this.reconnectTimer) return;
+    (this.options.cancel ?? ((id) => window.clearTimeout(id)))(this.reconnectTimer);
+    this.reconnectTimer = 0;
+  }
+
+  private retireSocket(): void {
+    const socket = this.socket;
+    this.socket = null;
+    if (!socket) return;
+    socket.onopen = null;
+    socket.onerror = null;
+    socket.onclose = null;
+    socket.onmessage = null;
+    try { socket.close(); } catch { /* ignore */ }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.revoked || this.terminal) return;
+    this.setStatus({ kind: "reconnecting" });
+    this.cancelTimer();
+    const delay = nextReconnectDelayMs(this.reconnectAttempt, this.options.random ?? Math.random);
+    this.reconnectAttempt += 1;
+    this.reconnectTimer = this.schedule(() => {
+      this.reconnectTimer = 0;
+      this.connect();
+    }, delay);
+  }
+
   connect(): void {
+    if (this.revoked || this.terminal) return;
+    this.cancelTimer();
+    this.retireSocket();
     const socket = new WebSocket(this.options.tunnelURL);
     this.socket = socket;
-    this.setStatus({ kind: "connecting" });
+    if (!this.connected && this.reconnectAttempt === 0) this.setStatus({ kind: "connecting" });
+    else this.setStatus({ kind: "reconnecting" });
     socket.onopen = () => {
       socket.send(JSON.stringify({
         v: 1,
@@ -64,19 +114,18 @@ export class TunnelClient {
       }));
     };
     socket.onerror = () => {
-      // The onclose handler surfaces the failure; keep the same semantics as
-      // the original client (an error status is shown).
-      this.setStatus({ kind: "error", message: "服务器隧道连接失败" });
+      // Close follows; do not flash a separate error status.
     };
     socket.onclose = (event) => {
       this.connected = false;
       this.failPending("连接已断开");
       if (this.revoked) return;
       if (event?.reason === "replaced") {
+        this.terminal = true;
         this.setStatus({ kind: "replaced" });
         return;
       }
-      this.setStatus({ kind: "closed" });
+      this.scheduleReconnect();
     };
     socket.onmessage = (event) => {
       this.onMessage(socket, String(event.data));
@@ -105,16 +154,21 @@ export class TunnelClient {
     }
     if (frame.type === "ready") {
       this.connected = true;
+      this.reconnectAttempt = 0;
       this.setStatus({ kind: "connected" });
       return;
     }
     if (frame.type === "replaced") {
       this.connected = false;
+      this.terminal = true;
+      this.cancelTimer();
       this.setStatus({ kind: "replaced" });
       return;
     }
     if (frame.type === "invalidated") {
       this.connected = false;
+      this.terminal = true;
+      this.cancelTimer();
       this.setStatus({ kind: "invalidated" });
       return;
     }
@@ -173,11 +227,13 @@ export class TunnelClient {
   revoke(): void {
     this.revoked = true;
     this.connected = false;
+    this.cancelTimer();
     this.socket?.close(1000, "revoked by browser");
   }
 
   close(): void {
     this.revoked = true;
+    this.cancelTimer();
     this.socket?.close(1000, "page closed");
   }
 }

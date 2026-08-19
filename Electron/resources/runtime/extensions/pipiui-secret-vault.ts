@@ -1,18 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  deleteSecret,
-  installEnvKeyProvider,
-  listSecretMeta,
-  listSessionMounts,
-  mountSecret,
-  putSecret,
+  invokeVaultHostMethod,
   redactJsonValue,
   redactText,
-  revealMountedSecrets,
+  secretsFromProcessEnv,
   sessionIdFromEnv,
-  unmountSecret,
-  vaultDirFromEnv,
+  type VaultMount,
+  type VaultSecretMeta,
 } from "./secret-vault-core.ts";
 
 function result(value: unknown, isError = false) {
@@ -23,41 +18,40 @@ function result(value: unknown, isError = false) {
   };
 }
 
-function requireDir(): string {
-  const dir = vaultDirFromEnv();
-  if (!dir) throw new Error("PIPIUI_SECRET_VAULT_DIR is not set");
-  return dir;
-}
-
 function sessionIdOf(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): string {
   return ctx?.sessionManager?.getSessionId?.() || sessionIdFromEnv();
 }
 
-function sessionSecrets(sessionId: string) {
-  return revealMountedSecrets(requireDir(), sessionId);
+const knownEnvNames = new Set<string>();
+
+function rememberEnvName(envName: string | undefined) {
+  if (envName) knownEnvNames.add(envName);
 }
 
-function redactKnown(text: string, sessionId: string): string {
+function sessionSecrets() {
+  return secretsFromProcessEnv([...knownEnvNames]);
+}
+
+function redactKnown(text: string): string {
   try {
-    return redactText(text, sessionSecrets(sessionId));
+    return redactText(text, sessionSecrets());
   } catch {
     return text;
   }
 }
 
 export default function (pi: ExtensionAPI) {
-  installEnvKeyProvider();
   if (process.env.PIPIUI_AGENT_DEPTH && process.env.PIPIUI_AGENT_DEPTH !== "0") return;
 
-  pi.on("before_provider_request", (event, ctx) => {
+  pi.on("before_provider_request", (event, _ctx) => {
     try {
-      const secrets = sessionSecrets(sessionIdOf(ctx));
+      const secrets = sessionSecrets();
       if (secrets.length === 0) return;
       if (event && typeof event === "object" && "payload" in event) {
         (event as { payload: unknown }).payload = redactJsonValue((event as { payload: unknown }).payload, secrets);
       }
     } catch (error) {
-      console.error("[secret-vault] provider redaction failed", error);
+      console.error("[secret-vault] provider redaction failed", error instanceof Error ? error.name : "error");
     }
   });
 
@@ -76,12 +70,17 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const sessionId = sessionIdOf(ctx);
       try {
-        const meta = await putSecret(requireDir(), params);
-        const mounted = await mountSecret(requireDir(), sessionId, meta.id);
-        process.env[mounted.envName] = params.value;
-        return result({ ok: true, secret: meta, mount: mounted, sessionId });
+        const hosted = await invokeVaultHostMethod("putSecretVault", [{
+          name: params.name,
+          envName: params.envName,
+          value: params.value,
+          sessionId,
+        }]) as { secret: VaultSecretMeta; mount: VaultMount; sessionId: string };
+        rememberEnvName(hosted.mount?.envName ?? hosted.secret?.envName);
+        if (hosted.mount?.envName) process.env[hosted.mount.envName] = params.value;
+        return result({ ok: true, secret: hosted.secret, mount: hosted.mount, sessionId: hosted.sessionId ?? sessionId });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error), sessionId) }, true);
+        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
       }
     },
   });
@@ -95,15 +94,20 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       const sessionId = sessionIdOf(ctx);
       try {
-        const dir = requireDir();
+        const listed = await invokeVaultHostMethod("listSecretVault", [sessionId]) as {
+          secrets: VaultSecretMeta[];
+          mounts: Array<VaultMount & { name: string }>;
+          sessionId: string;
+        };
+        for (const mount of listed.mounts ?? []) rememberEnvName(mount.envName);
         return result({
           ok: true,
-          secrets: listSecretMeta(dir),
-          mounts: listSessionMounts(dir, sessionId),
-          sessionId,
+          secrets: listed.secrets,
+          mounts: listed.mounts,
+          sessionId: listed.sessionId ?? sessionId,
         });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error), sessionId) }, true);
+        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
       }
     },
   });
@@ -122,12 +126,14 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const sessionId = sessionIdOf(ctx);
       try {
-        const mount = await mountSecret(requireDir(), sessionId, params.secret, params.envName);
-        const revealed = revealMountedSecrets(requireDir(), sessionId).find((item) => item.id === mount.secretId);
-        if (revealed) process.env[mount.envName] = revealed.value;
-        return result({ ok: true, sessionId, mount });
+        const hosted = await invokeVaultHostMethod("mountSecretVault", [sessionId, params.secret, params.envName]) as {
+          sessionId: string;
+          mount: VaultMount;
+        };
+        rememberEnvName(hosted.mount?.envName);
+        return result({ ok: true, sessionId: hosted.sessionId ?? sessionId, mount: hosted.mount });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error), sessionId) }, true);
+        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
       }
     },
   });
@@ -143,15 +149,26 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const sessionId = sessionIdOf(ctx);
       try {
-        const mounts = listSessionMounts(requireDir(), sessionId);
-        const removed = await unmountSecret(requireDir(), sessionId, params.secret);
-        const leftover = new Set(listSessionMounts(requireDir(), sessionId).map((item) => item.envName));
-        for (const mount of mounts) {
-          if (!leftover.has(mount.envName)) delete process.env[mount.envName];
+        const listed = await invokeVaultHostMethod("listSecretVault", [sessionId]) as {
+          mounts: Array<VaultMount & { name: string }>;
+        };
+        const hosted = await invokeVaultHostMethod("unmountSecretVault", [sessionId, params.secret]) as {
+          sessionId: string;
+          removed: boolean;
+        };
+        const leftover = new Set(
+          ((await invokeVaultHostMethod("listSecretVault", [sessionId]) as { mounts: Array<VaultMount> }).mounts ?? [])
+            .map((item) => item.envName),
+        );
+        for (const mount of listed.mounts ?? []) {
+          if (!leftover.has(mount.envName)) {
+            delete process.env[mount.envName];
+            knownEnvNames.delete(mount.envName);
+          }
         }
-        return result({ ok: true, sessionId, removed });
+        return result({ ok: true, sessionId: hosted.sessionId ?? sessionId, removed: hosted.removed });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error), sessionId) }, true);
+        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
       }
     },
   });
@@ -167,15 +184,23 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const sessionId = sessionIdOf(ctx);
       try {
-        const mounts = listSessionMounts(requireDir(), sessionId);
-        const deleted = await deleteSecret(requireDir(), params.secret);
-        const leftover = new Set(listSessionMounts(requireDir(), sessionId).map((item) => item.envName));
-        for (const mount of mounts) {
-          if (!leftover.has(mount.envName)) delete process.env[mount.envName];
+        const listed = await invokeVaultHostMethod("listSecretVault", [sessionId]) as {
+          mounts: Array<VaultMount & { name: string }>;
+        };
+        const hosted = await invokeVaultHostMethod("deleteSecretVault", [params.secret]) as { deleted: boolean };
+        const leftover = new Set(
+          ((await invokeVaultHostMethod("listSecretVault", [sessionId]) as { mounts: Array<VaultMount> }).mounts ?? [])
+            .map((item) => item.envName),
+        );
+        for (const mount of listed.mounts ?? []) {
+          if (!leftover.has(mount.envName)) {
+            delete process.env[mount.envName];
+            knownEnvNames.delete(mount.envName);
+          }
         }
-        return result({ ok: true, deleted });
+        return result({ ok: true, deleted: hosted.deleted });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error), sessionId) }, true);
+        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
       }
     },
   });

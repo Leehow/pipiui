@@ -39,8 +39,7 @@ describe("fresh Pi session Computer Use orchestration", () => {
       })}\n`,
     );
 
-    let actualArgs: string[] = [];
-    let actualEnv: NodeJS.ProcessEnv = {};
+    const spawns: { args: string[]; env: NodeJS.ProcessEnv }[] = [];
     const backend = createPiHostBackend({
       sessionsRoot,
       runtimeRoot,
@@ -49,8 +48,7 @@ describe("fresh Pi session Computer Use orchestration", () => {
       computerDescriptor: { displayID: 7, width: 1440, height: 900 },
       computerUsable: () => true,
       spawn: (_bin, args, options) => {
-        actualArgs = args;
-        actualEnv = options.env;
+        spawns.push({ args: [...args], env: { ...options.env } });
         return spawn(
           process.execPath,
           [new URL("./fake-pi.mjs", import.meta.url).pathname],
@@ -60,17 +58,20 @@ describe("fresh Pi session Computer Use orchestration", () => {
     });
 
     await backend.handle("sendPrompt", ["session-1", "show the desktop"]);
-    expect(actualArgs).toEqual(
+    const sessionSpawn = spawns.find((entry) => entry.env.PIPIUI_COMPUTER_EXT === extension)
+      ?? spawns.find((entry) => entry.args.includes(subagentDir));
+    expect(sessionSpawn, "main session spawn (not the tool-free title helper)").toBeTruthy();
+    expect(sessionSpawn!.args).toEqual(
       expect.arrayContaining(["--mode", "rpc", "-e", subagentDir]),
     );
-    expect(actualArgs).not.toContain(extension);
-    expect(actualEnv).toMatchObject({
+    expect(sessionSpawn!.args).not.toContain(extension);
+    expect(sessionSpawn!.env).toMatchObject({
       PIPIUI_COMPUTER_EXT: extension,
       PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1",
       PIPIUI_COMPUTER_DISPLAY_ID: "7",
       PIPIUI_COMPUTER_WIDTH: "1440",
       PIPIUI_COMPUTER_HEIGHT: "900",
     });
-    expect(actualEnv.PIPIUI_COMPUTER_CAPABILITY).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(sessionSpawn!.env.PIPIUI_COMPUTER_CAPABILITY).toMatch(/^[A-Za-z0-9_-]{43}$/);
   });
 });

@@ -22,7 +22,34 @@ describe('SubagentSignalCard MessageView integration', () => {
     const disclosure = screen.getByRole('button', { name: /已完成 · 修复列表.*验证失败/ })
     expect(disclosure.getAttribute('aria-expanded')).toBe('false')
     expect(container.querySelector('.subagent-signal-warning')).toBeTruthy()
+    expect(container.querySelector('[data-activity-status="warning"]')).toBeTruthy()
+    expect(container.querySelector('.activity-card-result')).toBeNull()
+    expect(disclosure.querySelector('.activity-status')?.textContent).toBe('!')
+    expect(disclosure.querySelector('.activity-status')?.textContent).not.toBe('✓')
     expect(screen.queryByText('Result:', { exact: true })).toBeNull()
+  })
+
+  it('renders ok=false as an error card with × and 失败, not a green check', () => {
+    const message: ChatMessage = { id: 'failed', role: 'user', content: '[subagent-done] name=worker ok=false verified=none\nTitle: 超时\nResult:\nruntime_timeout: no progress', timestamp: 1 }
+    const { container } = render(<MessageView message={message} {...handlers} />)
+    const disclosure = screen.getByRole('button', { name: /失败 · 超时/ })
+    expect(container.querySelector('.subagent-signal-error')).toBeTruthy()
+    expect(container.querySelector('[data-activity-status="error"]')).toBeTruthy()
+    expect(container.querySelector('.activity-card-error')).toBeTruthy()
+    expect(container.querySelector('.activity-card-result')).toBeNull()
+    expect(disclosure.querySelector('.activity-status')?.textContent).toBe('×')
+    expect(disclosure.textContent).toContain('失败')
+    expect(disclosure.textContent).not.toMatch(/已完成/)
+  })
+
+  it('renders ok=true verified=pass as a green success card', () => {
+    const message: ChatMessage = { id: 'ok', role: 'user', content: '[subagent-done] name=worker ok=true verified=pass\nTitle: 文档\nResult:\nok', timestamp: 1 }
+    const { container } = render(<MessageView message={message} {...handlers} />)
+    const disclosure = screen.getByRole('button', { name: /已完成 · 文档.*验证通过/ })
+    expect(container.querySelector('.subagent-signal-success')).toBeTruthy()
+    expect(container.querySelector('[data-activity-status="ok"]')).toBeTruthy()
+    expect(container.querySelector('.activity-card-result')).toBeTruthy()
+    expect(disclosure.querySelector('.activity-status')?.textContent).toBe('✓')
   })
 
   it('expands detail and keeps document reference cards clickable', () => {

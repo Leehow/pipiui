@@ -62,6 +62,8 @@ function statusText(status: TunnelStatus): { text: string; tone: string } {
       return { text: "已被接管·刷新恢复", tone: "bad" };
     case "invalidated":
       return { text: "链接已失效", tone: "bad" };
+    case "reconnecting":
+      return { text: "正在重新连接…", tone: "" };
     case "error":
       return { text: "连接失败", tone: "error" };
     case "closed":

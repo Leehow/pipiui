@@ -1,5 +1,5 @@
 /**
- * Parse the Computer Use Leader's text side-channels into structured views.
+ * Parse Computer Use episode text side-channels into structured views.
  *
  * Three surfaces carry plan/task data as plain text today (the tool `details`
  * object never survives the host RPC hop):
@@ -52,7 +52,7 @@ export type ComputerTaskResultView = {
   summary: string
   episodes: ComputerEpisodeView[]
   plan?: ComputerPlanView
-  verification?: { status: string; conditionResults: Array<{ conditionId: string; outcome: string }> }
+  verification?: { status: string; conditionResults: Array<{ conditionId: string; outcome: string }>; claims?: Array<{ claim: string; evidenceRef: string }> }
   investigation?: { stage?: string; code?: string; workerAttempts: ComputerWorkerAttemptView[] }
 }
 
@@ -71,6 +71,7 @@ const CONDITION_KINDS = ['visible_text', 'element_exists', 'file_exists', 'visua
 
 export function computerRoleLabel(role: string | undefined): string {
   switch (role) {
+    case 'computer-use-agent': return 'Computer Use'
     case 'gui-operator': return '操作'
     case 'verifier': return '核验'
     case 'terminal-worker': return '终端'
@@ -325,12 +326,16 @@ export function parseComputerTaskResult(text: string): ComputerTaskResultView | 
   if (!isRecord(envelope) || !Array.isArray(envelope.episodeLedger)) return null
   const episodes = envelope.episodeLedger.map(episodeFromRecord).filter((episode): episode is ComputerEpisodeView => episode !== null)
   const plan = planFromParsed(envelope.plan) ?? undefined
-  const verification = isRecord(envelope.verification) && typeof envelope.verification.status === 'string' && Array.isArray(envelope.verification.conditionResults)
+  const verification = isRecord(envelope.verification) && typeof envelope.verification.status === 'string'
     ? {
         status: String(envelope.verification.status),
-        conditionResults: envelope.verification.conditionResults.flatMap((item) => {
+        conditionResults: (Array.isArray(envelope.verification.conditionResults) ? envelope.verification.conditionResults : []).flatMap((item) => {
           if (!isRecord(item) || typeof item.conditionId !== 'string' || typeof item.outcome !== 'string') return []
           return [{ conditionId: item.conditionId, outcome: item.outcome }]
+        }),
+        claims: (Array.isArray(envelope.verification.claims) ? envelope.verification.claims : []).flatMap((item) => {
+          if (!isRecord(item) || typeof item.claim !== 'string' || typeof item.evidenceRef !== 'string') return []
+          return [{ claim: item.claim, evidenceRef: item.evidenceRef }]
         }),
       }
     : undefined
@@ -378,12 +383,13 @@ export function computerStepStatuses(result: ComputerTaskResultView): Array<{ st
   })
 }
 
-/** Root episode = the computer-use-leader entry with a `cancelled`/`completed`/`blocked` outcome. */
+/** Root episode is the single Computer Use Agent; legacy Leader envelopes remain readable. */
 export function computerTaskOutcome(result: ComputerTaskResultView): { label: string; ok: boolean } {
-  const root = result.episodes.find(episode => episode.name === 'computer-use-leader')
+  const root = result.episodes.find(episode => episode.name === 'computer-use' || episode.role === 'computer-use-agent')
+    ?? result.episodes.find(episode => episode.name === 'computer-use-leader')
   const outcome = root?.outcome
-  if (outcome === 'completed') return { label: '任务完成', ok: true }
+  if (outcome === 'completed' || outcome === 'succeeded') return { label: '任务完成', ok: true }
   if (outcome === 'cancelled') return { label: '任务已取消', ok: false }
-  if (root?.terminalState === 'stalled') return { label: '主管超时受阻', ok: false }
+  if (root?.terminalState === 'stalled') return { label: 'Agent 超时受阻', ok: false }
   return { label: '任务受阻', ok: false }
 }

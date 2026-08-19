@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -142,8 +143,9 @@ describe("pi spawn env injects the configured profile .env (T17 parity)", () => 
       "explicit",
     );
     await backend.handle("sendPrompt", ["session-1", "go"]);
-    expect(env().PI_CODING_AGENT_DIR).toBe(join(root, "project", ".pi", "agent"));
-    expect(env().PI_CODING_AGENT_SESSION_DIR).toBe(join(root, "project", ".pi", "agent", "sessions"));
+    const isolatedHome = realpathSync(join(root, "project", ".pi", "agent"));
+    expect(realpathSync(env().PI_CODING_AGENT_DIR!)).toBe(isolatedHome);
+    expect(realpathSync(env().PI_CODING_AGENT_SESSION_DIR!)).toBe(join(isolatedHome, "sessions"));
     expect(command().args).toEqual(expect.arrayContaining([
       "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
     ]));

@@ -242,6 +242,57 @@ describe("subagent lifecycle → AgentSummary", () => {
     });
   });
 
+  it("projects an explicit merged lifecycle instead of pendingReview from a leftover path", async () => {
+    const { deliver, backend, events } = await harness();
+    deliver(START);
+    deliver({
+      ...END,
+      worktreePath: "/tmp/wt",
+      worktreeBranch: "pipiui/worker-a1",
+      worktreeLifecycle: "merged",
+      worktreeFinalization: "disposition=merged merge=merged cleanup=cleaned phase=completed",
+    });
+    const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
+    expect(worktree?.status).toMatchObject({ lifecycle: "merged", merge: "merged", discard: "unavailable" });
+    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({ lifecycle: "merged", merge: "merged" });
+  });
+
+  it("keeps pendingReview for retained/needs-fixer and accepts legacy path-only ends", async () => {
+    const { deliver, backend } = await harness();
+    deliver(START);
+    deliver({
+      ...END,
+      worktreePath: "/tmp/wt",
+      worktreeBranch: "pipiui/worker-a1",
+      worktreeLifecycle: "pendingReview",
+      worktreeFinalization: "disposition=needs-fixer merge=not-attempted cleanup=not-attempted phase=recovery",
+    });
+    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
+      lifecycle: "pendingReview",
+      merge: "ready",
+      discard: "ready",
+    });
+    deliver({
+      ...START,
+      agentId: "legacy",
+      runId: "r-legacy",
+      worktreePath: "/tmp/legacy",
+      worktreeBranch: "pipiui/legacy",
+    });
+    deliver({
+      kind: "end",
+      agentId: "legacy",
+      runId: "r-legacy",
+      ok: true,
+      output: "ok",
+      worktreePath: "/tmp/legacy",
+    });
+    await expect(backend.handle("getWorktreeStatus", ["legacy"])).resolves.toMatchObject({
+      lifecycle: "pendingReview",
+      merge: "ready",
+    });
+  });
+
   it("publishes the worktree lifecycle the panel badges read", async () => {
     const { deliver, events } = await harness();
     deliver(START);

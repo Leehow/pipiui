@@ -15,7 +15,8 @@ async function started() {
     onPlanEvent: (event, sessionId) => received.push({ channel: "plan", sessionId, payload: event }),
     onBrowserAction: async (event, sessionId) => { received.push({ channel: "browser", sessionId, payload: event }); return { ok: true, text: "page text" } },
     onTerminalAction: async (event, sessionId) => { received.push({ channel: "terminal", sessionId, payload: event }); return { ok: true, terminalId: "term-1" } },
-    onComputerAction: async (event, sessionId) => { received.push({ channel: "computer", sessionId, payload: event }); return { ok: true, screenshotId: "shot" } }
+    onComputerAction: async (event, sessionId) => { received.push({ channel: "computer", sessionId, payload: event }); return { ok: true, screenshotId: "shot" } },
+    onVaultAction: async (event, sessionId) => { received.push({ channel: "vault", sessionId, payload: event }); return { secrets: [{ id: "1", name: "demo", envName: "DEMO_TOKEN" }], mounts: [], sessionId } }
   });
   const port = await bridge.listen();
   return { port, received, bridge: bridge! };
@@ -68,6 +69,27 @@ describe("HostBridge", () => {
     const response = await post(port, { schemaVersion: 1, sessionCapability: capability, action: "browser_action", event: { action: "observe" } });
     expect(await response.json()).toEqual({ ok: true, text: "page text" });
     expect(received).toContainEqual({ channel: "browser", sessionId: "session-1", payload: { action: "observe" } });
+  });
+
+  it("routes vault actions to existing host methods without echoing values", async () => {
+    const { port, received, bridge } = await started();
+    const capability = bridge.register("session-1");
+    const response = await post(port, {
+      schemaVersion: 1,
+      sessionCapability: capability,
+      action: "vault_action",
+      event: { method: "listSecretVault", params: ["forged"] },
+    });
+    expect(await response.json()).toEqual({
+      ok: true,
+      result: { secrets: [{ id: "1", name: "demo", envName: "DEMO_TOKEN" }], mounts: [], sessionId: "session-1" },
+    });
+    expect(JSON.stringify(received.at(-1))).not.toMatch(/sk-|ghp_|password=/i);
+    expect(received.at(-1)).toEqual({
+      channel: "vault",
+      sessionId: "session-1",
+      payload: { method: "listSecretVault", params: ["forged"] },
+    });
   });
 
   it("derives terminal ownership only from the authenticated capability", async () => {

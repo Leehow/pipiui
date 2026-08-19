@@ -56,6 +56,8 @@ export type WorktreeFinalizationInputV1 = {
 		state: WorktreeTerminalStateV1;
 	};
 	verify?: WorktreeVerifyMetadataV1;
+	/** Boss/runtime acceptance re-entry. Does not skip ownership, dirty, or verify checks. */
+	acceptance?: { source: "boss" };
 };
 
 export type WorktreeOwnershipDispositionV1 =
@@ -429,6 +431,9 @@ export function decodeWorktreeFinalizationInputV1(raw: unknown): WorktreeDecodeR
 		},
 		terminal: { state: terminalState as WorktreeTerminalStateV1 },
 		...(verify ? { verify } : {}),
+		...(raw.acceptance && isRecord(raw.acceptance) && raw.acceptance.source === "boss"
+			? { acceptance: { source: "boss" as const } }
+			: {}),
 	}, diagnostics);
 }
 

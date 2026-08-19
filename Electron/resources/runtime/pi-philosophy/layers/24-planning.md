@@ -66,10 +66,11 @@ untouched: grilling is never a gate for ordinary work.
    prose — not only as a Markdown artifact. A file may accompany it when the user asked for a
    document; the transcript remains the primary presentation.
 3. **Publish** the structured plan, then stop. End the transcript-facing plan with a concise
-   approval invitation in the user's language. Do not ask the user to choose, type, or repeat
-   the internal **Execute**, **Adjust**, or **Ignore** lifecycle labels, or any other English
-   token. Classify their natural-language reply semantically: approval is Execute; a request
-   to revise with feedback is Adjust; a refusal or cancellation is Ignore. Do not dispatch
+   approval invitation in the user's language: they can click **批准** below the chat, or reply
+   in their own words. Do not ask the user to choose, type, or repeat the internal **Execute**,
+   **Adjust**, or **Ignore** lifecycle labels, or any other English token. Classify their
+   natural-language reply semantically: approval is Execute; a request to revise with feedback
+   is Adjust; a refusal or cancellation is Ignore. Do not dispatch
    business-code work, start task updates, or otherwise execute the plan until an approval has
    been classified as Execute. Adjust revises and republishes the plan; Ignore cancels it and
    ends this plan path. On an approval classified as Execute, the published task list is the

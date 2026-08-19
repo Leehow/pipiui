@@ -2,7 +2,7 @@ import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, syste
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
-import { createElectronVaultKeyProvider, diagnoseElectronVault, probeElectronVaultAtStartup } from './secret-vault-key.js'
+
 import {
   PIPI_HOST_IPC_CHANNEL,
   PIPI_HOST_PROTOCOL_VERSION,
@@ -13,6 +13,7 @@ import {
   type HostWireFrame
 } from '@pipi/host-api'
 import { BrowserSessionHost, installBrowserNativeTrace, mountBrowserShellView, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
+import { BrowserMobileWindowController } from './browser-mobile-window.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
@@ -24,7 +25,13 @@ import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
-import { createRemoteControlService, registerRemoteControlIpc } from './remote-control.js'
+import {
+  createRemoteControlService,
+  PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
+  PIPI_REMOTE_CONTROL_IPC_CHANNEL,
+  registerRemoteControlIpc
+} from './remote-control.js'
+import { createRemoteDebugService, resolveRemoteDebugStaticDir } from './remote-debug.js'
 export { createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
 export interface IpcMainLike {
@@ -83,14 +90,24 @@ function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
     }
   })
   const unmountShellView = mountBrowserShellView(window as any, shellView as any)
-  browser.attachToWindow((rawView, visible) => {
-    routeBrowserView(rawView, visible, window as any)
+  const mobileWindows = new BrowserMobileWindowController(
+    window,
+    options => new BaseWindow(options as any) as any,
+    (sessionId, size) => browser.mobileWindowResized(sessionId, size),
+    sessionId => browser.mobileWindowClosed(sessionId)
+  )
+  browser.attachToWindow((sessionId, rawView, placement, kind, device) => {
+    if (kind === 'mobile') return mobileWindows.present(sessionId, rawView, placement, device)
+    routeBrowserView(rawView, placement, window as any)
+  })
+  window.on('close', () => {
+    browser.detachWindow()
+    mobileWindows.dispose()
+    unmountShellView()
+    if (!shellView.webContents.isDestroyed()) shellView.webContents.close()
   })
   window.on('closed', () => {
     onClosed()
-    browser.detachWindow()
-    unmountShellView()
-    if (!shellView.webContents.isDestroyed()) shellView.webContents.close()
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -115,8 +132,9 @@ if (app) {
       writeFileSync(browserDebugPath, '')
       installBrowserNativeTrace(entry => appendFileSync(browserDebugPath, `${JSON.stringify(entry)}\n`))
     }
-    // One BrowserTabsHost owns exactly one WebContentsView at a time. Its
-    // `partition` constructor slot is reserved for future BrowserContext Spaces.
+    // Each browser session owns one real target-site WebContentsView per
+    // viewport: desktop embeds in the IDE split and mobile lives in its child
+    // window. Both views share the session partition and synchronized tab URL.
     const browser = new BrowserSessionHost(options => {
       const view = new WebContentsView(options)
       if (browserDebugPath) view.setBackgroundColor('#ff00ff')
@@ -182,7 +200,6 @@ if (app) {
     // Browser-cookie quota providers (Qwen Token Plan) read their session cookies
     // from the built-in browser partitions; everything else keeps file defaults.
     const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData), readCursorAuth: readCursorAccessToken })
-    probeElectronVaultAtStartup()
     const piBackend = createPiHostBackend({
       piCommand: assets.piCommand,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
@@ -196,8 +213,6 @@ if (app) {
       runtimeRoot,
       agentDir: piProfile.agentDir,
       vaultDir: piProfile.agentDir,
-      vaultKeyProvider: createElectronVaultKeyProvider(userData),
-      vaultAvailability: () => diagnoseElectronVault(),
       sessionsRoot: piProfile.sessionsRoot,
       canonicalModelsWrite: modelsWriteQueue,
       profileInitialization: profileInstall,
@@ -247,8 +262,22 @@ if (app) {
       userDataDir: userData,
       relayOrigin: process.env.PIPIUI_RELAY_ORIGIN || 'https://remote.deepwood.cn'
     })
-    registerRemoteControlIpc(ipcMain, remoteControl)
+    const remoteDebug = createRemoteDebugService({
+      backend,
+      staticDir: resolveRemoteDebugStaticDir({
+        packaged: app.isPackaged,
+        resourcesPath: process.resourcesPath
+      })
+    })
+    registerRemoteControlIpc(
+      ipcMain,
+      remoteControl,
+      PIPI_REMOTE_CONTROL_IPC_CHANNEL,
+      PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
+      remoteDebug
+    )
     void remoteControl.restore()
+    app.on('before-quit', () => { void remoteDebug.close() })
     createWindow(browser, () => terminalHost.closeAll())
     // Capability is the first models-write job. Isolated backend init then migrates
     // project catalogs and refreshes the model catalog; do not refresh here or the

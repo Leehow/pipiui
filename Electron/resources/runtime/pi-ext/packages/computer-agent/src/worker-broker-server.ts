@@ -2,7 +2,8 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
   ComputerWorkerBroker,
-  type ComputerWorkerRole,
+  type ComputerDesktopRole,
+  type ComputerWorkerOperation,
   type IssuedComputerWorkerGrant,
 } from "./worker-broker.ts";
 
@@ -50,7 +51,7 @@ export class ComputerWorkerBrokerServer {
         const payload = body.payload;
         if (
           !token
-          || !["observe", "locate", "mutate", "openApplication"].includes(String(operation))
+          || !["observe", "locate", "mutate", "openApplication", "actionBlock"].includes(String(operation))
           || !payload
           || typeof payload !== "object"
           || Array.isArray(payload)
@@ -60,7 +61,7 @@ export class ComputerWorkerBrokerServer {
           return;
         }
         const result = await this.#broker.execute(token, {
-          operation: operation as "observe" | "locate" | "mutate" | "openApplication",
+          operation: operation as ComputerWorkerOperation,
           payload: payload as Record<string, unknown>,
         });
         response.statusCode = 200;
@@ -88,7 +89,8 @@ export class ComputerWorkerBrokerServer {
     taskId: string;
     stepId: string;
     runId: string;
-    role: ComputerWorkerRole;
+    role: ComputerDesktopRole;
+    goal?: string;
   }): IssuedComputerWorkerGrant {
     if (!this.#url) throw new Error("computer worker broker server is not started");
     const issued = this.#broker.issue(input);
@@ -109,6 +111,9 @@ export class ComputerWorkerBrokerServer {
     return this.#broker.consumeExecutions(taskId, stepId);
   }
   observation(taskId: string, stepId: string) { return this.#broker.observation(taskId, stepId); }
+  checkpoint(taskId: string, stepId: string) { return this.#broker.checkpoint(taskId, stepId); }
+  actionBlocks(taskId: string, stepId: string) { return this.#broker.actionBlocks(taskId, stepId); }
+  recordTaskSuccess(taskId: string, stepId: string) { return this.#broker.recordTaskSuccess(taskId, stepId); }
 
   revokeTask(taskId: string): void {
     this.#broker.revokeTask(taskId);

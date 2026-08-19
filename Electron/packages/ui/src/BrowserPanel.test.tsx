@@ -174,7 +174,7 @@ describe('BrowserPanel', () => {
     await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', expect.objectContaining({ visible: true })))
 
     rerender(<BrowserPanel host={host} sessionId="welcome" occluded />)
-    await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }))
+    await waitFor(() => expect(setViewBounds).toHaveBeenCalledWith('welcome', expect.objectContaining({ x: 0, y: 0, width: 0, height: 0, visible: false, mode: 'desktop' })))
 
     rerender(<BrowserPanel host={host} sessionId="welcome" occluded={false} />)
     await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true }))
@@ -190,10 +190,10 @@ describe('BrowserPanel', () => {
     expect(setViewBounds).not.toHaveBeenCalled()
 
     rerender(panel('welcome', true))
-    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 0, y: 0, width: 0, height: 0, visible: false }]))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ x: 0, y: 0, width: 0, height: 0, visible: false, mode: 'desktop' }))
 
     rerender(panel('welcome', false))
-    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)).toEqual(['welcome', { x: 400, y: 100, width: 800, height: 600, visible: true }]))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ x: 400, y: 100, width: 800, height: 600, visible: true, mode: 'desktop' }))
   })
 
   it('hides the empty-tab hint once a real URL is present and shows host load errors', async () => {
@@ -235,6 +235,96 @@ describe('BrowserPanel', () => {
     panelListener?.({ type: 'reveal', sessionId: 'welcome' })
     await waitFor(() => expect(setViewBounds.mock.calls.length).toBeGreaterThan(before))
     expect(setViewBounds.mock.calls.at(-1)?.[0]).toBe('welcome')
-    expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true })
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ visible: true, mode: 'desktop' })
+  })
+
+  it('keeps the desktop surface unchanged while opening and closing the native mobile window', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    renderPanel(host)
+    expect(screen.queryByRole('radio', { name: 'Desktop' })).toBeNull()
+    expect(screen.queryByRole('radio', { name: 'Compare' })).toBeNull()
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({
+      visible: true,
+      mode: 'desktop',
+      x: 400, y: 100, width: 800, height: 600,
+      mobileOverlay: expect.objectContaining({ visible: false })
+    }))
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).not.toHaveProperty('slots')
+
+    const desktopBounds = setViewBounds.mock.calls.at(-1)?.[1]
+    fireEvent.click(await screen.findByTestId('browser-mobile-window-toggle'))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({
+      visible: true,
+      mode: 'desktop',
+      x: 400, y: 100, width: 800, height: 600,
+      mobileOverlay: expect.objectContaining({ visible: true, applyDeviceEmulation: true })
+    }))
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).not.toHaveProperty('slots')
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({
+      x: desktopBounds?.x,
+      y: desktopBounds?.y,
+      width: desktopBounds?.width,
+      height: desktopBounds?.height
+    })
+    expect(screen.queryByTestId('browser-mobile-overlay')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('browser-mobile-window-toggle'))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].mobileOverlay?.visible).toBe(false))
+  })
+
+  it('changes only the native mobile window device preset', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    renderPanel(host)
+    fireEvent.click(await screen.findByTestId('browser-mobile-window-toggle'))
+    fireEvent.change(screen.getByLabelText('手机设备'), { target: { value: 'pixel-7' } })
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].mobileOverlay!).toMatchObject({
+      visible: true,
+      deviceId: 'pixel-7',
+      viewport: { width: 412, height: 915 }
+    }))
+  })
+
+  it('reflects a native titlebar close event without changing desktop bounds', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    const original = host.browser!.subscribe.bind(host.browser)
+    let listener: ((event: BrowserEvent) => void) | undefined
+    host.browser!.subscribe = next => {
+      listener = next
+      return original(next)
+    }
+    renderPanel(host)
+    fireEvent.click(await screen.findByTestId('browser-mobile-window-toggle'))
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].mobileOverlay?.visible).toBe(true))
+    listener?.({ type: 'mobile-window', sessionId: 'welcome', open: false, deviceId: 'responsive' })
+    await waitFor(() => expect(screen.getByTestId('browser-mobile-window-toggle').getAttribute('aria-pressed')).toBe('false'))
+    expect(setViewBounds.mock.calls.at(-1)?.[1]).toMatchObject({ x: 400, y: 100, width: 800, height: 600 })
+  })
+
+  it('invokes workspace fullscreen without toggling tools collapse', async () => {
+    const host = createMockHost()
+    const onToggle = vi.fn()
+    render(<BrowserPanel host={host} sessionId="welcome" onToggleWorkspaceFullscreen={onToggle} workspaceFullscreen={false} />)
+    fireEvent.click(await screen.findByTestId('browser-workspace-fullscreen'))
+    expect(onToggle).toHaveBeenCalledTimes(1)
+  })
+
+  it('sends distinct device presets to the host', async () => {
+    const host = createMockHost()
+    const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
+    renderPanel(host)
+    fireEvent.click(await screen.findByTestId('browser-mobile-window-toggle'))
+    const select = await screen.findByLabelText('手机设备')
+    fireEvent.change(select, { target: { value: 'iphone-se' } })
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].mobileOverlay).toMatchObject({
+      deviceId: 'iphone-se', viewport: { width: 375, height: 667 }, deviceScaleFactor: 2
+    }))
+    fireEvent.change(select, { target: { value: 'iphone-15-pro-max' } })
+    await waitFor(() => expect(setViewBounds.mock.calls.at(-1)?.[1].mobileOverlay).toMatchObject({
+      deviceId: 'iphone-15-pro-max', viewport: { width: 430, height: 932 }, deviceScaleFactor: 3
+    }))
+    expect((select as HTMLSelectElement).value).toBe('iphone-15-pro-max')
   })
 })

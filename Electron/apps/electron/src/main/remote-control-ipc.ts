@@ -19,6 +19,9 @@ export type RemoteControlState = {
   hostEpoch: number | null
   generation: number | null
   error?: string
+  debugEnabled?: boolean
+  debugUrl?: string | null
+  debugError?: string
 }
 
 export type RemoteControlCommand =
@@ -26,3 +29,5 @@ export type RemoteControlCommand =
   | { type: 'start'; relayOrigin?: string }
   | { type: 'stop' }
   | { type: 'reset'; relayOrigin?: string }
+  | { type: 'startDebug' }
+  | { type: 'stopDebug' }

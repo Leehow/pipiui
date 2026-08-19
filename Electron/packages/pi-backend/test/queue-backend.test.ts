@@ -6,17 +6,38 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createPiHostBackend, FileQueueStore } from "../src/index.js";
+import { defaultStopEscalationHooks } from "../src/stop-escalation.js";
 
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
 
-async function eventually(check: () => boolean, timeoutMs = 3_000): Promise<void> {
+async function eventually(check: () => boolean | Promise<boolean>, timeoutMs = 3_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (check()) return;
+    if (await check()) return;
     await new Promise(resolve => setTimeout(resolve, 10));
   }
   throw new Error("condition was not met before timeout");
+}
+
+function trackSweeps(backend: any) {
+  const inflight = new Set<Promise<unknown>>();
+  const original = backend.sweepSessionAgents.bind(backend);
+  backend.sweepSessionAgents = (sessionId: string) => {
+    const work = Promise.resolve(original(sessionId));
+    inflight.add(work);
+    void work.finally(() => inflight.delete(work));
+    return work;
+  };
+  return {
+    async waitForIdle() {
+      while (inflight.size > 0) await Promise.allSettled([...inflight]);
+    },
+  };
+}
+
+function isAbortLike(text: string): boolean {
+  return text.includes('"type":"abort"') || text.includes("/subagent_abort_all");
 }
 
 async function fixture() {
@@ -270,6 +291,65 @@ describe("PiHostBackend message queue integration", () => {
     await backend.close();
   });
 
+  it("user stop unwinds a parked cut-in when Pi never settles", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__hold_stuck__"]);
+    const queued = await backend.handle("enqueueMessage", ["s1", "unstick me"]) as any;
+    expect(queued.outcome).toBe("queued");
+    await backend.handle("cutInQueuedMessage", ["s1", queued.message.id]);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "sending" }),
+    ]);
+    const started = Date.now();
+    await backend.handle("stop", ["s1"]);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(events.some(event => event.status === "stopped")).toBe(true);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "queued" }),
+    ]);
+    off();
+    await backend.close();
+  });
+
+  it("user stop unwinds a hung prompt dispatch that never acks", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    await backend.handle("sendPrompt", ["s1", "hello"]);
+    void backend.handle("enqueueMessage", ["s1", "__no_ack__"]);
+    await eventually(() => {
+      const items = (backend as any).queue.listQueue("s1") as Array<{ state: string; text: string }>;
+      return items.some(item => item.text === "__no_ack__" && item.state === "sending");
+    });
+    const started = Date.now();
+    await backend.handle("stop", ["s1"]);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ text: "__no_ack__", state: "queued" }),
+    ]);
+    await backend.close();
+  });
+
+  it("user stop emits stopped without waiting for abort ack", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const events: any[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") events.push(event.event);
+    });
+    await backend.handle("sendPrompt", ["s1", "__slow_abort__"]);
+    const started = Date.now();
+    await backend.handle("stop", ["s1"]);
+    expect(Date.now() - started).toBeLessThan(50);
+    expect(events.some(event => event.status === "stopped")).toBe(true);
+    off();
+    await backend.close();
+  });
+
   it("user stop emits stopped promptly and does not drain the queue", async () => {
     const setup = await fixture();
     const backend = setup.create();
@@ -371,13 +451,183 @@ describe("PiHostBackend message queue integration", () => {
     const backend = setup.create();
     await backend.handle("sendPrompt", ["s1", "__hold__"]);
     const queued = await backend.handle("enqueueMessage", ["s1", "stay"]) as any;
-    const staleEpoch = (backend as any).live.get("s1")?.turnEpoch;
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ id: queued.message.id, text: "stay", state: "queued" }),
+    ]);
+    const staleEpoch = (backend as any).queue.state("s1").turnEpoch;
     (backend as any).queue.markBusy("s1");
     await (backend as any).queueIdle("s1", staleEpoch);
     expect((backend as any).queue.isBusy("s1")).toBe(true);
     expect(await backend.handle("listQueue", ["s1"])).toEqual([
       expect.objectContaining({ id: queued.message.id, text: "stay", state: "queued" }),
     ]);
+    await backend.close();
+  });
+
+  it("cut-in after SIGKILL waits for the old pi close before sending the next command", async () => {
+    const setup = await fixture();
+    const children: ReturnType<typeof spawn>[] = [];
+    const writes: { pid: number | undefined; text: string }[] = [];
+    const kills: { pid: number; signal: NodeJS.Signals }[] = [];
+    const dyingPids = new Set<number>();
+    let releaseKill: (() => void) | undefined;
+    const hooks = defaultStopEscalationHooks();
+    const backend = createPiHostBackend({
+      agentDir: setup.agentDir,
+      sessionsRoot: setup.sessionsRoot,
+      runtimeRoot: root,
+      piPath: process.execPath,
+      abortAckTimeoutMs: 20,
+      stopEscalationDelays: { termDescendantsMs: 8, killDescendantsMs: 8, killPiMs: 8 },
+      stopEscalationHooks: {
+        ...hooks,
+        listDescendants: () => [],
+        kill: (pid, signal) => {
+          kills.push({ pid, signal });
+          if (signal === "SIGKILL" && children[0]?.pid === pid) {
+            dyingPids.add(pid);
+            releaseKill = () => hooks.kill(pid, signal);
+            return;
+          }
+          hooks.kill(pid, signal);
+        },
+      },
+      spawn: (_bin, _args, options) => {
+        const child = spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options);
+        const stdin = child.stdin as any;
+        const originalWrite = stdin.write.bind(stdin);
+        stdin.write = (chunk: any, encoding?: any, cb?: any) => {
+          const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+          writes.push({ pid: child.pid, text });
+          const isAbort = text.includes('"type":"abort"');
+          const isPrompt = text.includes('"type":"prompt"');
+          if (isAbort || (isPrompt && child.pid !== undefined && dyingPids.has(child.pid))) {
+            if (typeof encoding === "function") encoding();
+            else if (typeof cb === "function") cb();
+            return true;
+          }
+          return originalWrite(chunk, encoding, cb);
+        };
+        children.push(child);
+        return child as any;
+      },
+    });
+
+    const sweeps = trackSweeps(backend as any);
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const oldPid = children[0]?.pid;
+    expect(oldPid).toEqual(expect.any(Number));
+    const fifo = await backend.handle("enqueueMessage", ["s1", "fifo-head"]) as any;
+    const chosen = await backend.handle("enqueueMessage", ["s1", "cut-in-after-kill"]) as any;
+    expect(fifo.outcome).toBe("queued");
+
+    const cutIn = backend.handle("cutInQueuedMessage", ["s1", chosen.message.id]);
+    await eventually(() =>
+      kills.some(item => item.pid === oldPid && item.signal === "SIGKILL")
+      && (backend as any).live.get("s1")?.exiting === true,
+    );
+
+    const promptTo = (pid: number | undefined) => writes.filter(item =>
+      item.pid === pid && item.text.includes('"type":"prompt"') && item.text.includes("cut-in-after-kill"));
+    const sessionPid = () => (backend as any).live.get("s1")?.process?.pid as number | undefined;
+    expect(promptTo(oldPid)).toEqual([]);
+    expect(sessionPid()).toBe(oldPid);
+    expect(children[0].exitCode).toBeNull();
+    expect((await backend.handle("listQueue", ["s1"]) as any[]).some(item =>
+      item.id === chosen.message.id && String(item.error ?? "").includes("SIGKILL"),
+    )).toBe(false);
+
+    expect(releaseKill).toEqual(expect.any(Function));
+    releaseKill!();
+    await cutIn;
+    await sweeps.waitForIdle();
+    await eventually(() => {
+      const nextPid = sessionPid();
+      return nextPid !== undefined && nextPid !== oldPid && promptTo(nextPid).length > 0;
+    });
+    await sweeps.waitForIdle();
+
+    const nextPid = sessionPid();
+    expect(nextPid).not.toBe(oldPid);
+    expect(promptTo(oldPid)).toEqual([]);
+    expect(promptTo(nextPid)).toHaveLength(1);
+    expect(writes.filter(item => item.pid === nextPid && isAbortLike(item.text))).toEqual([]);
+    await eventually(() => !(backend as any).queue.listQueue("s1").some((item: any) => item.id === chosen.message.id));
+    const leftover = await backend.handle("listQueue", ["s1"]) as any[];
+    expect(leftover.some(item => String(item.error ?? "").includes("SIGKILL"))).toBe(false);
+    expect(leftover.some(item => item.id === fifo.message.id && item.state === "failed")).toBe(false);
+    await backend.close();
+  });
+
+  it("stop after exiting does not spawn a replacement or abort a new pid", async () => {
+    const setup = await fixture();
+    const children: ReturnType<typeof spawn>[] = [];
+    const writes: { pid: number | undefined; text: string }[] = [];
+    const backend = createPiHostBackend({
+      agentDir: setup.agentDir,
+      sessionsRoot: setup.sessionsRoot,
+      runtimeRoot: root,
+      piPath: process.execPath,
+      abortAckTimeoutMs: 20,
+      spawn: (_bin, _args, options) => {
+        const child = spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options);
+        const stdin = child.stdin as any;
+        const originalWrite = stdin.write.bind(stdin);
+        stdin.write = (chunk: any, encoding?: any, cb?: any) => {
+          const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString();
+          writes.push({ pid: child.pid, text });
+          return originalWrite(chunk, encoding, cb);
+        };
+        children.push(child);
+        return child as any;
+      },
+    });
+    const sweeps = trackSweeps(backend as any);
+
+    await backend.handle("sendPrompt", ["s1", "__agent_running__"]);
+    const oldPid = children[0]?.pid;
+    expect(oldPid).toEqual(expect.any(Number));
+    await eventually(async () => {
+      const agents = await backend.handle("listAgents", ["s1"]) as any[];
+      return agents.some(agent => agent.agentId === "agent-1" && agent.state === "running");
+    });
+    const running = ((await backend.handle("listAgents", ["s1"]) as any[]).find(agent => agent.agentId === "agent-1"));
+    expect(running?.state).toBe("running");
+
+    children[0].kill("SIGKILL");
+    await eventually(() => children[0].exitCode !== null || children[0].signalCode !== null);
+    await eventually(() => (backend as any).live.get("s1") === undefined);
+    const stored = [...(backend as any).agents.values()].find((agent: any) => agent.agentId === "agent-1");
+    expect(stored).toBeTruthy();
+    (backend as any).agents.set(
+      (backend as any).agentKey(stored.agentId, stored.sessionId, stored.runId),
+      {
+        ...stored,
+        state: "running",
+        stalled: false,
+        endedAt: undefined,
+        closeout: undefined,
+        updatedAt: Date.now(),
+      },
+    );
+    expect(((await backend.handle("listAgents", ["s1"]) as any[]).find(agent => agent.agentId === "agent-1")?.state)).toBe("running");
+    const spawnCount = children.length;
+    expect(spawnCount).toBeGreaterThanOrEqual(1);
+    const abortLikeBefore = writes.filter(item => isAbortLike(item.text)).length;
+
+    await backend.handle("stop", ["s1"]);
+    await sweeps.waitForIdle();
+
+    expect(children).toHaveLength(spawnCount);
+    expect((backend as any).live.get("s1")).toBeUndefined();
+    const after = (await backend.handle("listAgents", ["s1"]) as any[]).find(agent => agent.agentId === "agent-1");
+    expect(after).toMatchObject({
+      agentId: "agent-1",
+      state: "aborted",
+      closeout: expect.stringMatching(/无主 Agent 进程/),
+    });
+    expect(writes.filter(item => isAbortLike(item.text))).toHaveLength(abortLikeBefore);
+    expect(writes.filter(item => item.pid !== oldPid && isAbortLike(item.text))).toEqual([]);
     await backend.close();
   });
 });

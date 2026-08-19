@@ -97,7 +97,8 @@ export function evaluateAutoMergeReadinessV1(
 			["automatic merge skipped: ownership mismatch"],
 		);
 	}
-	if (input.terminal.state !== "ok") {
+	const bossAccepted = input.acceptance?.source === "boss";
+	if (input.terminal.state !== "ok" && !bossAccepted) {
 		const nextAction = input.terminal.state === "aborted" || input.terminal.state === "interrupted"
 			? "resume-worker"
 			: "retry-finalization";

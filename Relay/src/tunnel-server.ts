@@ -12,6 +12,7 @@ import {
 import type { HostAPIV2Limits } from "./host-api-v2.js";
 
 const PAIR_PATH = /^\/pair\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+const PAIR_PREFIX = /^\/pair(?:\/|$)/;
 const ROOM_ID = PAIR_PATH;
 const DOWNLOAD_SEGMENT = "[A-Za-z0-9][A-Za-z0-9._-]{0,60}";
 const DOWNLOAD_PATH = new RegExp(
@@ -62,6 +63,7 @@ export interface TunnelServerOptions {
   v2TTLMs?: number;
   v2Limits?: Partial<HostAPIV2Limits>;
   v2SecureCookies?: boolean;
+  heartbeatMs?: number;
 }
 
 export function tunnelOptionsFromEnvironment(
@@ -107,6 +109,48 @@ function browserAsset(): string {
   const selected = candidates.find((candidate) => existsSync(candidate));
   if (!selected) throw new Error("Tunnel browser bundle missing; run npm run bundle");
   return readFileSync(selected, "utf8");
+}
+
+function landingPagePath(): string | undefined {
+  const candidates = [
+    new URL("../site/index.html", import.meta.url),
+    new URL("../../docs/site/index.html", import.meta.url),
+  ];
+  const selected = candidates.find((candidate) => existsSync(candidate));
+  return selected ? fileURLToPath(selected) : undefined;
+}
+
+function landingPageHTML(): Buffer {
+  const path = landingPagePath();
+  if (path) return readFileSync(path);
+  return Buffer.from(
+    "<!doctype html><meta charset=utf-8><title>PipiUI</title><p>PipiUI 是 pi coding agent 的图形界面。</p>",
+    "utf8",
+  );
+}
+
+function pairMissingHTML(): string {
+  return "<!doctype html><meta charset=utf-8><title>PipiUI 远程</title><p>这个配对链接无效。请在 Mac 上生成一个新的远程链接。</p>";
+}
+
+function sendHTML(
+  req: IncomingMessage,
+  res: ServerResponse,
+  html: string | Buffer,
+  extra?: Record<string, string>,
+): void {
+  const body = typeof html === "string" ? Buffer.from(html, "utf8") : html;
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Content-Length", String(body.length));
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) res.setHeader(key, value);
+  }
+  if (req.method === "HEAD") {
+    res.end();
+    return;
+  }
+  res.end(body);
 }
 
 function browserCSSAsset(): string {
@@ -268,40 +312,49 @@ export function createTunnelServer(options: TunnelServerOptions) {
     res.setHeader("Referrer-Policy", "no-referrer");
     res.setHeader("X-Content-Type-Options", "nosniff");
     const url = new URL(req.url ?? "/", options.publicOrigin);
-    if (req.method === "GET" && url.pathname === "/healthz") {
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/healthz") {
       return json(res, 200, { ok: true });
     }
     if (v2.handleRequest(req, res, url)) return;
-    if (req.method === "GET" && url.pathname === "/") {
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      return res.end("<!doctype html><meta charset=utf-8><title>PipiUI Remote</title><p>请在 Mac 上生成一个新的远程链接。</p>");
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/") {
+      return sendHTML(req, res, landingPageHTML());
     }
-    if (req.method === "GET" && url.pathname === "/assets/tunnel-browser.js") {
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/assets/tunnel-browser.js") {
+      const body = browserAsset();
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/javascript; charset=utf-8");
-      return res.end(browserAsset());
+      res.setHeader("Content-Length", String(Buffer.byteLength(body)));
+      return req.method === "HEAD" ? res.end() : res.end(body);
     }
-    if (req.method === "GET" && url.pathname === "/assets/tunnel-browser.css") {
+    if ((req.method === "GET" || req.method === "HEAD") && url.pathname === "/assets/tunnel-browser.css") {
+      const body = browserCSSAsset();
       res.statusCode = 200;
       res.setHeader("Content-Type", "text/css; charset=utf-8");
-      return res.end(browserCSSAsset());
+      res.setHeader("Content-Length", String(Buffer.byteLength(body)));
+      return req.method === "HEAD" ? res.end() : res.end(body);
     }
     const download = DOWNLOAD_PATH.exec(url.pathname);
     if (download && (req.method === "GET" || req.method === "HEAD")) {
       return void serveDownload(download[1], downloadsRoot, req, res);
     }
-    const pair = req.method === "GET" ? PAIR_PATH.exec(url.pathname) : null;
-    if (pair) {
-      const nonce = randomBytes(18).toString("base64");
-      const connectOrigin = new URL(options.tunnelURL).origin;
-      res.statusCode = 200;
-      res.setHeader("Content-Type", "text/html; charset=utf-8");
-      res.setHeader(
-        "Content-Security-Policy",
-        `default-src 'none'; script-src 'nonce-${nonce}' 'self'; style-src 'nonce-${nonce}' 'self'; connect-src ${connectOrigin}; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`,
-      );
-      return res.end(pairPage(pair[1].toLowerCase(), options.tunnelURL, nonce));
+    if (req.method === "GET" || req.method === "HEAD") {
+      const pair = PAIR_PATH.exec(url.pathname);
+      if (pair) {
+        const nonce = randomBytes(18).toString("base64");
+        const connectOrigin = new URL(options.tunnelURL).origin;
+        return sendHTML(
+          req,
+          res,
+          pairPage(pair[1].toLowerCase(), options.tunnelURL, nonce),
+          {
+            "Content-Security-Policy":
+              `default-src 'none'; script-src 'nonce-${nonce}' 'self'; style-src 'nonce-${nonce}' 'self'; connect-src ${connectOrigin}; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`,
+          },
+        );
+      }
+      if (PAIR_PREFIX.test(url.pathname)) {
+        return sendHTML(req, res, pairMissingHTML());
+      }
     }
     return json(res, 404, { error: "not found" });
   });
@@ -375,6 +428,7 @@ export function createTunnelServer(options: TunnelServerOptions) {
     client.helloTimer.unref();
     clients.add(client);
     socket.on("message", (raw, isBinary) => {
+      client.alive = true;
       if (isBinary) return closeClient(client);
       const bytes = Buffer.byteLength(raw as Buffer);
       if (bytes > (client.role === "host" ? MAX_RESPONSE_BYTES : MAX_REQUEST_BYTES)) {
@@ -552,7 +606,7 @@ export function createTunnelServer(options: TunnelServerOptions) {
       client.alive = false;
       client.socket.ping();
     }
-  }, 25_000);
+  }, options.heartbeatMs ?? 25_000);
   heartbeat.unref();
 
   return {

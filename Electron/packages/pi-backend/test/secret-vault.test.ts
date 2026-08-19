@@ -1,45 +1,37 @@
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   applySessionMountsToMainEnv,
   applySessionMountsToWorkerEnv,
-  atomicWriteFile,
-  configureVaultKeyProvider,
-  createSealedDekProvider,
   createSessionEnvRefreshGate,
   createSessionRedactionGate,
   createSessionWriteBarrier,
   deleteSecret,
-  ensureSecureDirectory,
   listSecretMeta,
   listSessionMounts,
   loadVault,
-  memoryKeyProvider,
+  memoryVaultDiagnosis,
   mountSecret,
   putSecret,
   redactSessionJsonl,
   redactText,
+  resetInMemoryVault,
   revealMountedSecrets,
   StreamRedactor,
   unmountSecret,
-  VaultEncryptionError,
-  vaultDiagnosisFor,
+  vaultPaths,
   workerEnvFromVault,
-} from "../../../resources/runtime/extensions/secret-vault-core.ts";
+} from "../src/secret-vault.js";
 
 describe("secret vault", () => {
   const dirs: string[] = [];
-  const dek = Buffer.alloc(32, 7);
 
-  beforeEach(() => {
-    configureVaultKeyProvider(memoryKeyProvider(dek));
-  });
   afterEach(async () => {
-    configureVaultKeyProvider(undefined);
+    resetInMemoryVault();
     await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
   });
 
@@ -49,39 +41,18 @@ describe("secret vault", () => {
     return dir;
   }
 
-  it("encrypts values without a sibling key file and survives restart with a separate sealed DEK", async () => {
+  it("puts into process memory without writing vault files or needing a DEK", async () => {
     const dir = await tmp();
-    const sealedDir = await tmp();
-    const sealedPath = join(sealedDir, "dek.sealed");
-    const store = new Map<string, Buffer>();
-    configureVaultKeyProvider(createSealedDekProvider(sealedPath, {
-      available: () => true,
-      seal: (plain) => {
-        const token = Buffer.from(`sealed:${plain.toString("base64")}`);
-        store.set(token.toString("base64"), plain);
-        return token;
-      },
-      open: (sealed) => store.get(sealed.toString("base64")) ?? Buffer.alloc(0),
-    }));
+    const leftover = join(dir, "secret-vault.json");
+    writeFileSync(leftover, "{\"version\":1,\"secrets\":[]}");
     await putSecret(dir, { name: "openai", envName: "OPENAI_API_KEY", value: "sk-live-supersecret" });
     expect(existsSync(join(dir, "secret-vault.key"))).toBe(false);
-    expect(readFileSync(join(dir, "secret-vault.json"), "utf8")).not.toContain("sk-live-supersecret");
-    expect(existsSync(sealedPath)).toBe(true);
-    configureVaultKeyProvider(createSealedDekProvider(sealedPath, {
-      available: () => true,
-      seal: (plain) => Buffer.from(`sealed:${plain.toString("base64")}`),
-      open: (sealed) => store.get(sealed.toString("base64")) ?? Buffer.alloc(0),
-    }));
-    expect(revealMountedSecrets(dir, "none")).toEqual([]);
+    expect(existsSync(join(dir, "secret-vault-dek.sealed"))).toBe(false);
+    expect(readFileSync(leftover, "utf8")).toBe("{\"version\":1,\"secrets\":[]}");
+    expect(listSecretMeta(dir)).toEqual([expect.objectContaining({ name: "openai", envName: "OPENAI_API_KEY" })]);
     await mountSecret(dir, "s1", "openai");
     expect(revealMountedSecrets(dir, "s1")[0]?.value).toBe("sk-live-supersecret");
-  });
-
-  it("fails closed when encryption is unavailable and never writes a key file", async () => {
-    const dir = await tmp();
-    configureVaultKeyProvider({ getDek: () => { throw new Error("vault encryption unavailable"); } });
-    await expect(putSecret(dir, { name: "x", envName: "X_TOKEN", value: "abcdefghij" })).rejects.toThrow(/unavailable/);
-    expect(existsSync(join(dir, "secret-vault.key"))).toBe(false);
+    expect(JSON.stringify(listSecretMeta(dir))).not.toContain("sk-live-supersecret");
   });
 
   it("mounts per session and injects only that session's worker env", async () => {
@@ -97,7 +68,7 @@ describe("secret vault", () => {
     expect(workerEnvFromVault(dir, "session-1")).toEqual({});
   });
 
-  it("deletes globally and serializes concurrent writes atomically", async () => {
+  it("deletes globally and serializes concurrent writes", async () => {
     const dir = await tmp();
     await Promise.all(Array.from({ length: 12 }, (_, index) => putSecret(dir, {
       name: `n${index}`,
@@ -168,7 +139,7 @@ describe("secret vault", () => {
     expect(text).not.toContain("ghp_historysecret");
   });
 
-  it("constructs a real child env with only the current session mounts", async () => {
+  it("constructs a real child env with only the current session mounts and no DEK", async () => {
     const dir = await tmp();
     await putSecret(dir, { name: "a", envName: "TOKEN_A", value: "aaaaaaaaaaaa" });
     await putSecret(dir, { name: "b", envName: "TOKEN_B", value: "bbbbbbbbbbbb" });
@@ -177,14 +148,14 @@ describe("secret vault", () => {
       PATH: process.env.PATH,
       PIPIUI_SECRET_VAULT_DIR: dir,
       PIPIUI_SESSION_ID: "session-1",
-      PIPIUI_VAULT_DEK: dek.toString("base64"),
+      PIPIUI_VAULT_DEK: "should-not-survive",
       EXISTING: "keep",
       OPENAI_API_KEY: "from-dotenv",
     };
     const main = applySessionMountsToMainEnv(parent, workerEnvFromVault(dir, "session-1"));
     expect(main.TOKEN_A).toBe("aaaaaaaaaaaa");
     expect(main.TOKEN_B).toBeUndefined();
-    expect(main.PIPIUI_VAULT_DEK).toBe(dek.toString("base64"));
+    expect(main.PIPIUI_VAULT_DEK).toBeUndefined();
     const child = applySessionMountsToWorkerEnv(parent, workerEnvFromVault(dir, "session-1"));
     expect(child.TOKEN_A).toBe("aaaaaaaaaaaa");
     expect(child.TOKEN_B).toBeUndefined();
@@ -195,14 +166,12 @@ describe("secret vault", () => {
     const spawned = spawnSync(process.execPath, ["-e", script], { env: child as NodeJS.ProcessEnv, encoding: "utf8" });
     expect(spawned.status).toBe(0);
     expect(JSON.parse(spawned.stdout)).toEqual({ a: "aaaaaaaaaaaa", dot: "from-dotenv" });
-    const afterRedactionStop = applySessionMountsToWorkerEnv(parent, workerEnvFromVault(dir, "session-1"));
-    expect(afterRedactionStop.TOKEN_A).toBe("aaaaaaaaaaaa");
-    expect(afterRedactionStop.PIPIUI_VAULT_DEK).toBeUndefined();
-    expect(afterRedactionStop.PIPIUI_SECRET_VAULT_DEK).toBeUndefined();
     await mountSecret(dir, "session-1", "b");
     const afterMount = applySessionMountsToWorkerEnv(parent, workerEnvFromVault(dir, "session-1"));
     expect(afterMount.TOKEN_A).toBe("aaaaaaaaaaaa");
     expect(afterMount.TOKEN_B).toBe("bbbbbbbbbbbb");
+    expect(afterMount.PIPIUI_VAULT_DEK).toBeUndefined();
+    expect(afterMount.PIPIUI_SECRET_VAULT_DEK).toBeUndefined();
     await unmountSecret(dir, "session-1", "a");
     const afterUnmount = applySessionMountsToWorkerEnv(parent, workerEnvFromVault(dir, "session-1"));
     expect(afterUnmount.TOKEN_A).toBeUndefined();
@@ -270,31 +239,15 @@ describe("secret vault", () => {
     expect(writerLive ? "reused" : "respawned").toBe("respawned");
   });
 
-  it("writes vault files 0600 into a 0700 directory and cleans leftover temps", async () => {
+  it("never writes vault files even when leftover ciphertext already exists", async () => {
     const dir = await tmp();
-    ensureSecureDirectory(dir);
-    if (process.platform !== "win32") expect(statSync(dir).mode & 0o777).toBe(0o700);
+    const { file, key } = vaultPaths(dir);
+    writeFileSync(file, "old-ciphertext");
     await putSecret(dir, { name: "perm", envName: "PERM_TOKEN", value: "abcdefghijkl" });
-    const file = join(dir, "secret-vault.json");
-    if (process.platform !== "win32") expect(statSync(file).mode & 0o777).toBe(0o600);
-    const leftover = join(dir, "secret-vault.json.tmp-orphan");
-    writeFileSync(leftover, "partial");
-    atomicWriteFile(file, readFileSync(file));
-    expect(existsSync(leftover)).toBe(true);
-    expect(existsSync(join(dir, "secret-vault.key"))).toBe(false);
-  });
-
-  it("fails closed with a classified error and recovers when encryption returns", async () => {
-    const dir = await tmp();
-    configureVaultKeyProvider({
-      getDek: () => { throw new VaultEncryptionError("encryption-unavailable"); },
-    });
-    await expect(putSecret(dir, { name: "x", envName: "X_TOKEN", value: "abcdefghij" })).rejects.toBeInstanceOf(VaultEncryptionError);
-    expect(existsSync(join(dir, "secret-vault.key"))).toBe(false);
-    configureVaultKeyProvider(memoryKeyProvider(dek));
-    await putSecret(dir, { name: "x", envName: "X_TOKEN", value: "abcdefghij" });
-    expect(listSecretMeta(dir)).toEqual([expect.objectContaining({ envName: "X_TOKEN" })]);
-    expect(vaultDiagnosisFor("missing-packages").installHint).toContain("gnome-keyring");
+    expect(readFileSync(file, "utf8")).toBe("old-ciphertext");
+    expect(existsSync(key)).toBe(false);
+    expect(memoryVaultDiagnosis().available).toBe(true);
+    expect(memoryVaultDiagnosis().message).toContain("仅保存在当前 App 主进程内存");
   });
 
   it("does not rewrite when the session writer stop is not confirmed", async () => {

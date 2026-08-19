@@ -284,3 +284,53 @@ test("a stalled optional final summary cannot downgrade verified work or discard
     { agentId: "verifier-stable", runId: "verifier-run", role: "verifier" },
   ]);
 });
+
+test("a stalled optional summary keeps blocked and failed coordinator results", async () => {
+  const blocked = {
+    outcome: "blocked",
+    summary: "Computer Task blocked",
+    verification: { status: "not_verified", conditionResults: [] },
+    planRevisions: 1,
+    investigation: {
+      stage: "recovery_exhausted",
+      code: "worker_failed",
+      recoveryAttempts: 1,
+      failedConditions: [],
+      workerAttempts: [{ stepId: "operate", role: "gui-operator", outcome: "failed", verification: "unknown" }],
+    },
+  };
+  const failed = {
+    outcome: "failed",
+    summary: "Computer Task failed",
+    verification: { status: "not_verified", conditionResults: [] },
+    planRevisions: 0,
+  };
+  const cancelled = {
+    outcome: "cancelled",
+    summary: "Computer Task cancelled",
+    verification: { status: "not_verified", conditionResults: [] },
+    planRevisions: 0,
+    investigation: { stage: "cancelled", code: "task_cancelled", recoveryAttempts: 0, failedConditions: [], workerAttempts: [] },
+  };
+
+  let blockedAttempts = 0;
+  const blockedFinal = await finalizeComputerTaskWithOptionalSummary(blocked, async () => {
+    blockedAttempts += 1;
+    throw Object.assign(new Error("summary timed out"), { failureCode: "computer_leader_stalled" });
+  });
+  assert.equal(blockedAttempts, 1);
+  assert.equal(blockedFinal.result, blocked);
+  assert.equal(blockedFinal.leaderSummary, "Computer Task blocked");
+
+  const failedFinal = await finalizeComputerTaskWithOptionalSummary(failed, async () => {
+    throw new Error("summary writer crashed");
+  });
+  assert.equal(failedFinal.result, failed);
+  assert.equal(failedFinal.leaderSummary, "Computer Task failed");
+
+  const cancelledFinal = await finalizeComputerTaskWithOptionalSummary(cancelled, async () => {
+    throw Object.assign(new Error("summary timed out"), { failureCode: "computer_leader_stalled" });
+  });
+  assert.equal(cancelledFinal.result, cancelled);
+  assert.equal(cancelledFinal.leaderSummary, "Computer Task cancelled");
+});

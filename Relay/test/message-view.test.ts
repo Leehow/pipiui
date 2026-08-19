@@ -1,8 +1,14 @@
+import { createRequire } from "node:module";
 import assert from "node:assert/strict";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { test } from "node:test";
-import { MessageView } from "../src/message-view.js";
+
+const require = createRequire(import.meta.url);
+require.extensions[".css"] = (module) => {
+  module.exports = {};
+};
+const { MessageView } = await import("../src/message-view.js");
 
 function renderMessage(message: unknown, live = false): string {
   return renderToStaticMarkup(

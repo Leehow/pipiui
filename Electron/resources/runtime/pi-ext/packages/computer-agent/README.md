@@ -1,16 +1,26 @@
 # PipiUI Computer Agent
 
-UI-neutral coordination and scoped Worker-tool primitives for PipiUI Computer Tasks.
+UI-neutral single-agent intelligence and scoped Host-tool primitives for PipiUI Computer Tasks.
 The host Runtime remains the only Cua/TCC authority; this package never starts a
 desktop driver directly.
 
-Milestone 2 adds:
+The normal Electron `computer_task` path now uses one private `computer-use` episode:
 
-- fixed GUI Operator, Terminal Worker, and Verifier roles with no lateral dispatch;
-- a dedicated bounded Terminal extension with no general shell, filesystem, or desktop capability;
-- task-local artifact references and compressed Worker verdicts;
-- a closed-schema, versioned JSON Procedure Store with canonical sensitive-policy injection, host executed-trajectory/replay receipts, independent replay promotion, drift repair, and monotonic suspension;
-- a read-only compatibility adapter for existing `computer_recipe` retrieval.
+- its public schema contains only `goal` and the child has no delegation or agent-management tools;
+- ordinary relevant task tools remain available, while the Desktop Agent Interface is only
+  `desktop_observe`, `desktop_open_application`, and `desktop_run_action_block`;
+- guarded blocks bind semantic targets just in time, stop on Runtime barriers, preserve
+  `outcome_unknown`, and enforce Cold/Candidate/Practiced mutation limits of 2/4/12;
+- a Host Task Checkpoint preserves constraints, success conditions, verified facts, pending unknown
+  effects, active target/workflow, and evidence references across recovery;
+- Workflow Memory schema v2 lives under the backend-resolved active project Pi home, recalls at most
+  three entries, promotes after two independent successes, suspends on drift/failure, parameterizes
+  task values, isolates corrupt records, and never auto-imports the legacy global Procedure Store.
+
+The former Leader, GUI Operator, Terminal Worker, Verifier, Procedure Host, and coordinator modules
+remain temporarily as unreachable compatibility code for older internal tests and imports. The normal
+`registerComputerTaskTool` does not call them, does not accept their public parameters, and does not
+inject their global store.
 
 The public seams are exported from `src/index.ts`. Hosts keep ownership of runtime
 grants, task cancellation, durable store paths, and UI event projection. A Terminal
@@ -22,7 +32,7 @@ local pathname itself; all four operations are typed broker requests. The host
 owns cwd/write-root/executable/command-budget enforcement and descriptor-relative
 filesystem safety.
 
-Procedure compilation never consumes a planner draft. The host must project a
+Compatibility Procedure compilation never consumes a planner draft. The host must project a
 verified executed trajectory, issue an opaque receipt, inject the canonical
 sensitive-application predicate, and verify replay receipts bound to Procedure
 ID/version, nonempty independent task/run identities, and fresh Postconditions.

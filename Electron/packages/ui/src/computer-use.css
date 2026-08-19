@@ -6,7 +6,20 @@
 .computer-use-body{display:flex;flex-direction:column;gap:12px}.computer-use-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:10px;border-radius:8px;background:color-mix(in srgb,var(--text) 4%,transparent)}.computer-use-toggle-row strong{font-size:12px;color:var(--text-strong)}.computer-use-toggle-row p{margin:2px 0 0;color:var(--muted);font-size:11px}
 .computer-use-switch{width:38px;height:22px;padding:2px;border-radius:11px;background:var(--border-strong);transition:background .15s}.computer-use-switch span{display:block;width:18px;height:18px;border-radius:50%;background:#fff;transition:transform .15s}.computer-use-switch.enabled{background:var(--accent)}.computer-use-switch.enabled span{transform:translateX(16px)}.computer-use-switch:disabled{cursor:default;opacity:.6}
 .computer-use-description{margin:0;color:var(--muted);font-size:11.5px;line-height:1.55;overflow-wrap:anywhere}.computer-use-permissions{display:grid;gap:7px}.computer-use-permission-row{display:flex;min-width:0;align-items:center;gap:7px;padding:8px;border:1px solid var(--border);border-radius:7px;font-size:11px}.computer-use-permission-status{display:grid;width:17px;height:17px;flex:none;place-items:center;border-radius:50%;font-weight:700}.computer-use-permission-status.granted{color:#fff;background:var(--success)}.computer-use-permission-status.denied{color:#fff;background:var(--danger)}.computer-use-permission-status.unknown{color:var(--muted);background:var(--surface-hover)}.computer-use-permission-label{margin-left:auto;color:var(--muted);white-space:nowrap}.computer-use-permission-row button{padding:3px 8px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border));border-radius:5px;color:var(--accent);background:var(--accent-soft);font-size:11px;font-weight:600}.computer-use-permission-row button:hover:not(:disabled){border-color:var(--accent);background:color-mix(in srgb,var(--accent) 22%,transparent)}.computer-use-permission-row button:disabled{cursor:default;color:var(--subtle);border-color:var(--border);background:transparent}
-.remote-connection-panel{width:min(420px,calc(100vw - 40px))}
+.remote-connection-panel{position:relative;display:flex;flex-direction:column;width:min(420px,calc(100vw - 40px));max-height:inherit;min-height:0}
+.remote-connection-panel .settings-modal-body{flex:1;min-height:0;overflow:auto}
+.remote-origin-row{display:flex;flex-direction:column;gap:6px}
+.remote-origin-fields{display:flex;gap:8px}
+.remote-origin-input{flex:1;min-width:0;padding:6px 8px;border:1px solid var(--border);border-radius:7px;color:var(--text-strong);background:color-mix(in srgb,var(--text) 4%,transparent);font-size:12px}
+.remote-origin-fields button{flex:none;padding:4px 10px;border:1px solid color-mix(in srgb,var(--accent) 45%,var(--border));border-radius:5px;color:var(--accent);background:var(--accent-soft);font-size:11px;font-weight:600}
+.remote-lesson-reopen{align-self:flex-start;padding:0;border:0;background:transparent;color:var(--accent);font-size:11px;font-weight:600}
+.remote-lesson-overlay{position:absolute;inset:0;z-index:2;display:grid;place-items:center;padding:16px;background:rgb(0 0 0 / 40%)}
+.remote-lesson-card{max-height:100%;overflow:auto;padding:16px;border:1px solid var(--border-strong);border-radius:12px;background:var(--surface-raised);box-shadow:0 12px 32px rgb(0 0 0 / 28%)}
+.remote-lesson-card h2{margin:0 0 8px;color:var(--text-strong);font-size:14px}
+.remote-lesson-card p{margin:0 0 8px;color:var(--muted);font-size:12px;line-height:1.55}
+.remote-lesson-actions{display:flex;flex-direction:column;gap:8px;margin-top:10px}
+.remote-lesson-primary{padding:8px 12px;border:0;border-radius:7px;color:#fff;background:var(--accent);font-size:13px;font-weight:600}
+.remote-lesson-secondary{padding:6px 12px;border:1px solid var(--border);border-radius:7px;color:var(--text-strong);background:transparent;font-size:12px}
 .remote-pair-block{display:flex;flex-direction:column;gap:8px}
 .remote-pair-label{color:var(--text-strong);font-size:12px;font-weight:600}
 .remote-pair-url{display:block;padding:8px;border:1px solid var(--border);border-radius:7px;color:var(--text-strong);background:color-mix(in srgb,var(--text) 4%,transparent);font-size:11px;line-height:1.45;overflow-wrap:anywhere;user-select:all}

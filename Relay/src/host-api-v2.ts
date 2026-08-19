@@ -29,6 +29,7 @@ export const DEFAULT_V2_LIMITS = {
   maxClaimAttemptsPerIP: 30,
   frameWindowMs: 1_000,
   maxFramesPerWindow: 120,
+  // Any inbound WS frame (including app ping) refreshes liveness; pong still counts.
   heartbeatMs: 25_000,
 } as const;
 

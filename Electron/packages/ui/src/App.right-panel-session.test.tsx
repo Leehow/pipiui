@@ -56,7 +56,9 @@ describe('the right panel belongs to the selected session', () => {
 
     await selectSession('布局与流式消息')
 
-    expect(await screen.findByText('布局会话的计划')).toBeTruthy()
+    const planPanel = await screen.findByTestId('plan-panel')
+    expect(planPanel.textContent).toContain('布局会话的计划')
+    expect(screen.getByTestId('plan-approval-bar').textContent).toContain('布局会话的计划')
     expect(screen.queryByText('欢迎会话的计划')).toBeNull()
     expect(getPlans).toHaveBeenCalledWith('layout')
   })

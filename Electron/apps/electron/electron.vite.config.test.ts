@@ -64,6 +64,7 @@ describe('main-process development watch stability', () => {
       const targetAliases: AliasEntry[] = target.resolve.alias
       expect(toPosix(targetAliases.find((a) => a.find === '@pipi/pi-backend')!.replacement)).toMatch(/packages\/pi-backend\/src\/index\.ts$/)
       expect(toPosix(targetAliases.find((a) => a.find === '@pipi/host-api')!.replacement)).toMatch(/packages\/host-api\/src\/index\.ts$/)
+      expect(toPosix(targetAliases.find((a) => a.find === '@pipiui/server')!.replacement)).toMatch(/apps\/server\/src\/index\.ts$/)
     }
   })
 

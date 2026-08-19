@@ -8,6 +8,11 @@ import workspacePackage from '../../package.json'
 import packageJSON from './package.json'
 
 describe('macOS packaging contract', () => {
+  it('defines WS_NO_BUFFER_UTIL and WS_NO_UTF_8_VALIDATE so bundled ws skips empty native stubs', () => {
+    const viteConfig = readFileSync(resolve(import.meta.dirname, 'electron.vite.config.ts'), 'utf8')
+    expect(viteConfig).toMatch(/'process\.env\.WS_NO_BUFFER_UTIL':\s*JSON\.stringify\('1'\)/)
+    expect(viteConfig).toMatch(/'process\.env\.WS_NO_UTF_8_VALIDATE':\s*JSON\.stringify\('1'\)/)
+  })
   const wrapper = readFileSync(resolve(import.meta.dirname, '../../../scripts/build-electron-app.sh'), 'utf8')
   const targetPackager = readFileSync(resolve(import.meta.dirname, '../../scripts/package-electron-target.mjs'), 'utf8')
   const runtimePreparer = readFileSync(resolve(import.meta.dirname, '../../scripts/fetch-pi-runtime.mjs'), 'utf8')

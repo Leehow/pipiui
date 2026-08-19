@@ -528,4 +528,100 @@ describe("model thinking capability contract", () => {
     await expect(backend.handle("setThinkingLevel", ["orphan-session", "xhigh"])).rejects.toThrow(/unavailable/);
     await backend.close();
   });
+
+  it("thinking-only setThinkingLevel does not reload catalog or request available models", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-thinking-no-catalog-reload-"));
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "project");
+    const sessionDir = join(root, "sessions", "project");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+      defaultProvider: "xai",
+      defaultModel: "grok-4.6",
+      defaultThinkingLevel: "low",
+    }));
+    await writeFile(
+      join(sessionDir, "session.jsonl"),
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "grok-session",
+        timestamp: "2026-08-13T00:30:28.961Z",
+        cwd,
+      }) + "\n",
+    );
+    const catalogModel = {
+      provider: "xai",
+      id: "grok-4.6",
+      name: "Grok 4.6",
+      api: "openai-completions",
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: "minimal",
+        low: "low",
+        medium: "medium",
+        high: "high",
+        xhigh: "xhigh",
+        max: null,
+      },
+      compat: { supportsReasoningEffort: true },
+      input: ["text", "image"],
+    };
+    let getAvailableCalls = 0;
+    let availableModelsRpc = 0;
+    const backend = createPiHostBackend({
+      agentDir,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+      piPath: "node",
+      env: { XAI_TEST_KEY: "present" },
+      spawn: (_bin, _args, options) => {
+        const child = spawn(
+          "/usr/local/bin/node",
+          [new URL("./fake-pi-grok46.mjs", import.meta.url).pathname],
+          { ...options, env: { ...options.env, PATH: "/usr/local/bin:/usr/bin:/bin" } },
+        );
+        const stdin = child.stdin;
+        const original = stdin.write.bind(stdin);
+        stdin.write = ((chunk: any, encoding?: any, cb?: any) => {
+          const text = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+          if (text.includes("get_available_models")) availableModelsRpc += 1;
+          return original(chunk, encoding, cb);
+        }) as typeof stdin.write;
+        return child as any;
+      },
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => {
+          getAvailableCalls += 1;
+          return [catalogModel];
+        },
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+
+    await backend.handle("listModels", []);
+    await (backend as any).ensure("grok-session");
+    const availableAfterHydrate = getAvailableCalls;
+    const modelsRpcAfterEnsure = availableModelsRpc;
+    expect(availableAfterHydrate).toBeGreaterThan(0);
+    expect(modelsRpcAfterEnsure).toBeGreaterThan(0);
+
+    expect(await backend.handle("setThinkingLevel", ["grok-session", "high"])).toMatchObject({
+      thinkingLevel: "high",
+      availableThinkingLevels: ["minimal", "low", "medium", "high", "xhigh"],
+    });
+    expect(getAvailableCalls).toBe(availableAfterHydrate);
+    expect(availableModelsRpc).toBe(modelsRpcAfterEnsure);
+
+    await backend.handle("setModel", ["grok-session", "xai", "grok-4.6"]);
+    expect(availableModelsRpc).toBeGreaterThan(modelsRpcAfterEnsure);
+    await backend.close();
+  });
 });

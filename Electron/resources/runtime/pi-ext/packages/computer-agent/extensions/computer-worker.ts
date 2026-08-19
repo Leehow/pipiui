@@ -1,6 +1,6 @@
 import { desktopModelActionSchema } from "../src/desktop-actions.ts";
 
-type WorkerRole = "gui-operator" | "terminal-worker" | "verifier";
+type WorkerRole = "gui-operator" | "terminal-worker" | "verifier" | "computer-use-agent";
 type WorkerEnvironment = Record<string, string | undefined>;
 type RegisteredTool = {
   name: string;
@@ -21,11 +21,16 @@ const objectSchema = (properties: Record<string, unknown>, required: string[] = 
 });
 
 export function toolNamesForComputerWorkerRole(role: WorkerRole): string[] {
+  if (role === "computer-use-agent") return toolNamesForComputerUseAgent();
   if (role === "terminal-worker") return [];
   const observation = ["desktop_observe", "desktop_locate", "desktop_verify"];
   return role === "gui-operator"
     ? [...observation, "desktop_open_application", "desktop_typeahead", "desktop_act"]
     : observation;
+}
+
+export function toolNamesForComputerUseAgent(): string[] {
+  return ["desktop_observe", "desktop_open_application", "desktop_run_action_block"];
 }
 
 function validEnvironment(env: WorkerEnvironment): {
@@ -37,7 +42,7 @@ function validEnvironment(env: WorkerEnvironment): {
   const token = env.PIPIUI_COMPUTER_WORKER_BROKER_TOKEN;
   const role = env.PIPIUI_COMPUTER_WORKER_ROLE;
   if (!url?.startsWith("http://127.0.0.1:") || !token || token.length < 32) return undefined;
-  if (role !== "gui-operator" && role !== "verifier") return undefined;
+  if (role !== "gui-operator" && role !== "verifier" && role !== "computer-use-agent") return undefined;
   return { url, token, role };
 }
 
@@ -86,7 +91,7 @@ export function registerComputerWorkerTools(
 	const locatedInteractiveBindings = new Map<string, { role: string; name: string }>();
 
   const request = async (
-    operation: "observe" | "locate" | "mutate" | "openApplication",
+    operation: "observe" | "locate" | "mutate" | "openApplication" | "actionBlock",
     payload: Record<string, unknown>,
     signal?: AbortSignal,
 	): Promise<Record<string, any>> => {
@@ -103,7 +108,9 @@ export function registerComputerWorkerTools(
     const result = await response.json() as Record<string, any>;
     if (!response.ok || result.ok === false) {
 			const code = String(result.error ?? `computer worker broker returned ${response.status}`);
-			if (code === "computer_worker_runtime_timeout" || code === "computer_worker_request_cancelled" || code === "computer_worker_no_progress") fatalCode = code;
+			const fatalForRole = code === "computer_worker_request_cancelled"
+				|| (config.role !== "computer-use-agent" && (code === "computer_worker_runtime_timeout" || code === "computer_worker_no_progress"));
+			if (fatalForRole) fatalCode = code as typeof fatalCode;
       throw new Error(code);
     }
     observation = result;
@@ -118,13 +125,76 @@ export function registerComputerWorkerTools(
     name: "desktop_observe",
     label: "Desktop Observe",
     description: "Capture one fresh observation of the exact pinned target. This tool cannot mutate the desktop.",
-    parameters: objectSchema({ fresh: { type: "boolean" } }),
+    parameters: objectSchema({
+      fresh: { type: "boolean" },
+      constraints: { type: "array", maxItems: 32, items: { type: "string", minLength: 1, maxLength: 500 } },
+      successConditions: {
+        type: "array", maxItems: 32,
+        items: objectSchema({
+          actionId: { type: "string" }, kind: { enum: ["visible_text", "element_exists", "element_value", "application"] },
+          contains: { type: "string" }, role: { type: "string" }, name: { type: "string" }, value: { type: "string" }, bundleId: { type: "string" },
+        }, ["kind"]),
+      },
+    }),
 		executionMode: "sequential",
     async execute(_id, params, signal) {
-      const result = await request("observe", { fresh: params?.fresh !== false }, signal);
+      const result = await request("observe", {
+        fresh: params?.fresh !== false,
+        ...(config.role === "computer-use-agent" && Array.isArray(params?.constraints) ? { constraints: params.constraints } : {}),
+        ...(config.role === "computer-use-agent" && Array.isArray(params?.successConditions) ? { successConditions: params.successConditions } : {}),
+      }, signal);
       return { content: contentForResult(result), details: { observationId: result.observationId ?? result.screenshotId } };
     },
   });
+
+  if (config.role === "computer-use-agent") {
+    const conditionSchema = objectSchema({
+      actionId: { type: "string" }, kind: { enum: ["visible_text", "element_exists", "element_value", "application"] },
+      contains: { type: "string" }, role: { type: "string" }, name: { type: "string" }, value: { type: "string" }, bundleId: { type: "string" },
+    }, ["kind"]);
+    const targetSchema = {
+      oneOf: [
+        objectSchema({ by: { const: "accessibility" }, role: { type: "string" }, name: { type: "string" }, value: { type: "string" } }, ["by", "role"]),
+        objectSchema({ by: { const: "visual" }, description: { type: "string" }, observationId: { type: "string" }, region: objectSchema({ x: { type: "number" }, y: { type: "number" }, width: { type: "number", exclusiveMinimum: 0 }, height: { type: "number", exclusiveMinimum: 0 } }, ["x", "y", "width", "height"]) }, ["by", "description", "observationId", "region"]),
+        objectSchema({ by: { const: "coordinate" }, x: { type: "number" }, y: { type: "number" }, observationId: { type: "string" } }, ["by", "x", "y", "observationId"]),
+      ],
+    };
+    const blockActionSchema = objectSchema({
+      id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,80}$" },
+      type: { enum: ["click", "left_click", "right_click", "middle_click", "double_click", "triple_click", "invoke_menu", "type", "key", "keypress", "scroll", "wait", "wait_until", "screenshot"] },
+      target: targetSchema, consequential: { type: "boolean" }, text: { type: "string" }, key: { type: "string" }, keys: { type: "array", maxItems: 8, items: { type: "string" } },
+      path: { type: "array", maxItems: 16, items: { type: "string" } }, direction: { enum: ["up", "down", "left", "right"] }, scroll_direction: { enum: ["up", "down", "left", "right"] },
+      amount: { type: "number" }, scroll_amount: { type: "number" }, duration: { type: "number" }, duration_ms: { type: "number" }, condition: conditionSchema, timeoutMs: { type: "number", maximum: 120000 },
+    }, ["id", "type"]);
+    pi.registerTool({
+      name: "desktop_open_application",
+      label: "Desktop Open Application",
+      description: "Open or activate one exact application. Host pins the exact Runtime target and returns only project-local Workflow Memory recall.",
+      parameters: objectSchema({ bundle_identifier: { type: "string" }, application_name: { type: "string" } }),
+      executionMode: "sequential",
+      async execute(_id, params, signal) {
+        const result = await request("openApplication", params, signal);
+        return { content: contentForResult(result), details: { target: result.target, workflowRecall: result.workflowRecall, actionBlockMaturity: result.actionBlockMaturity } };
+      },
+    });
+    pi.registerTool({
+      name: "desktop_run_action_block",
+      label: "Desktop Run Guarded Action Block",
+      description: "Run one Host-guarded coherent action block. Semantic targets bind just in time; Host enforces maturity pacing, fresh-state barriers, receipts, checkpoint reconciliation, and unknown-effect no-replay.",
+      parameters: objectSchema({
+        intent: { type: "string", minLength: 1, maxLength: 1000 },
+        actions: { type: "array", minItems: 1, maxItems: 64, items: blockActionSchema },
+        expectedEffects: { type: "array", maxItems: 64, items: conditionSchema },
+      }, ["intent", "actions"]),
+      executionMode: "sequential",
+      async execute(_id, params, signal) {
+        const result = await request("actionBlock", params, signal);
+        observation = result.observation;
+        return { content: contentForResult(result), details: { outcome: result.outcome, stopReason: result.stopReason, receiptRef: result.receiptRef, checkpoint: result.checkpoint } };
+      },
+    });
+    return;
+  }
 
   pi.registerTool({
     name: "desktop_locate",

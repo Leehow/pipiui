@@ -27,6 +27,9 @@
  *   swallows them.
  * - `steerMessage` injects an item into a running turn (`steer` behavior) and
  *   removes it on success; failures are retained with their error.
+ * - `noteAbort` (user Stop) restores in-flight `sending` items — including a
+ *   parked cut-in — to `queued` and suppresses FIFO drain for that epoch. A
+ *   late dispatch ack must not swallow the restored message.
  * - `updateMessage`/`removeMessage`/`promoteMessage`/`retryMessage` only touch
  *   items that are `queued` or `failed` — never an item already being sent.
  *
@@ -85,6 +88,8 @@ type SessionState = {
   pendingCutIn?: QueuedMessage;
   /** Aborted turn epoch: idle for this epoch must not FIFO-drain until a new turn starts. */
   suppressDrainEpoch?: number;
+  /** Bumped by `noteAbort` so a late dispatch ack cannot remove or fail the restored item. */
+  deliveryEpoch: number;
 };
 
 /** Deep copy used both for input snapshots and for values returned to callers. */
@@ -109,7 +114,7 @@ export class SessionMessageQueue {
   private state(sessionId: string): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false };
+      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false, deliveryEpoch: 0 };
       this.sessions.set(sessionId, session);
     }
     return session;
@@ -178,6 +183,30 @@ export class SessionMessageQueue {
   }
 
   /**
+   * User-initiated stop. Restore every in-flight `sending` item (drain or
+   * parked cut-in) to `queued`, suppress FIFO drain for this epoch, and
+   * invalidate the current delivery so a late dispatch ack cannot swallow
+   * the restored message.
+   */
+  noteAbort(sessionId: string): void {
+    const session = this.state(sessionId);
+    session.suppressDrainEpoch = session.turnEpoch;
+    session.deliveryEpoch += 1;
+    const restore = (item: QueuedMessage) => freeze({ ...item, state: "queued" as const, error: undefined });
+    if (session.pendingCutIn) {
+      const item = session.pendingCutIn;
+      session.pendingCutIn = undefined;
+      if (!session.items.some(candidate => candidate.id === item.id)) {
+        session.items.unshift(restore(item));
+      }
+    }
+    session.items = session.items.map(item => item.state === "sending" ? restore(item) : item);
+    session.dispatching = false;
+    session.dispatchPromise = undefined;
+    this.changed(sessionId);
+  }
+
+  /**
    * Restore persisted actionable items. A process restart cannot know whether a
    * previous `sending` RPC reached pi, so such entries conservatively become
    * `queued`; only `queued` and `failed` survive the restore.
@@ -197,6 +226,7 @@ export class SessionMessageQueue {
     session.dispatchPromise = undefined;
     session.pendingCutIn = undefined;
     session.suppressDrainEpoch = undefined;
+    session.deliveryEpoch += 1;
     this.changed(sessionId);
   }
 
@@ -267,22 +297,27 @@ export class SessionMessageQueue {
       return snapshot(session.items[0]);
     }
     session.dispatching = true;
+    const deliveryEpoch = session.deliveryEpoch;
     const sending = freeze({ ...current, state: "sending" as const, error: undefined });
     session.items[index] = sending;
     this.changed(sessionId);
     try {
       await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments }, "steer");
+      if (session.deliveryEpoch !== deliveryEpoch) return snapshot(sending);
       if (session.items[index]?.id === id) session.items.splice(index, 1); // injected into the running turn
       this.changed(sessionId);
       return snapshot(sending);
     } catch (error) {
+      if (session.deliveryEpoch !== deliveryEpoch) return snapshot(sending);
       const failed = freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
       if (session.items[index]?.id === id) session.items[index] = failed;
       this.changed(sessionId);
       return snapshot(failed);
     } finally {
-      session.dispatching = false;
-      if (!session.turnActive) void this.drain(sessionId);
+      if (session.deliveryEpoch === deliveryEpoch) {
+        session.dispatching = false;
+        if (!session.turnActive) void this.drain(sessionId);
+      }
     }
   }
 
@@ -389,11 +424,13 @@ export class SessionMessageQueue {
     if (session.dispatching || session.turnActive) return;
     const index = session.items.findIndex((item) => item.state === "queued");
     if (index < 0) return;
+    const deliveryEpoch = session.deliveryEpoch;
     const delivery = this.send(sessionId, session.items[index], this.drainBehavior);
     const acknowledgement = delivery.then(() => undefined);
     session.dispatchPromise = acknowledgement;
     const delivered = await delivery;
     if (session.dispatchPromise === acknowledgement) session.dispatchPromise = undefined;
+    if (session.deliveryEpoch !== deliveryEpoch) return;
     if (!delivered && !session.turnActive && !session.dispatching) await this.drain(sessionId);
   }
 
@@ -405,12 +442,14 @@ export class SessionMessageQueue {
   private async send(sessionId: string, item: QueuedMessage, behavior: DispatchBehavior): Promise<boolean> {
     const session = this.state(sessionId);
     session.dispatching = true;
+    const deliveryEpoch = session.deliveryEpoch;
     const sending = freeze({ ...item, state: "sending" as const, error: undefined });
     const index = session.items.findIndex((candidate) => candidate.id === item.id);
     if (index >= 0) session.items[index] = sending;
     this.changed(sessionId);
     try {
       await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments }, behavior);
+      if (session.deliveryEpoch !== deliveryEpoch) return false;
       if (index >= 0 && session.items[index]?.id === item.id) session.items.splice(index, 1);
       // Mint an epoch only when this delivery is the thing that starts the turn.
       // A cut-in send needs one, so the aborted turn's late idle cannot clear the
@@ -425,11 +464,12 @@ export class SessionMessageQueue {
       this.changed(sessionId);
       return true;
     } catch (error) {
+      if (session.deliveryEpoch !== deliveryEpoch) return false;
       if (index >= 0 && session.items[index]?.id === item.id) session.items[index] = freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
       this.changed(sessionId);
       return false;
     } finally {
-      session.dispatching = false;
+      if (session.deliveryEpoch === deliveryEpoch) session.dispatching = false;
     }
   }
 }

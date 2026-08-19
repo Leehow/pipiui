@@ -50,10 +50,17 @@ describe('remote browser session', () => {
     expect(remoteCloseCopy('transient').reconnect).toBe(true)
   })
 
-  it('uses exponential backoff and Chinese phase labels', () => {
-    expect(nextReconnectDelayMs(0)).toBe(500)
-    expect(nextReconnectDelayMs(1)).toBe(1000)
-    expect(nextReconnectDelayMs(5)).toBe(16_000)
+  it('uses full-jitter backoff in range and Chinese phase labels', () => {
+    expect(nextReconnectDelayMs(0, () => 0)).toBe(500)
+    expect(nextReconnectDelayMs(0, () => 1)).toBe(750)
+    expect(nextReconnectDelayMs(1, () => 0)).toBe(500)
+    expect(nextReconnectDelayMs(1, () => 1)).toBe(1_500)
+    expect(nextReconnectDelayMs(8, () => 1)).toBe(15_000)
+    for (let n = 0; n < 6; n++) {
+      const delay = nextReconnectDelayMs(n, () => 0.3)
+      expect(delay).toBeGreaterThanOrEqual(500)
+      expect(delay).toBeLessThanOrEqual(15_000)
+    }
     expect(phaseLabel('pairing')).toBe('正在配对…')
     expect(phaseLabel('reconnecting')).toBe('正在重新连接…')
   })

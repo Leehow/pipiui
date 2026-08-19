@@ -1003,6 +1003,9 @@ describe('SubagentPanel', () => {
 
     await screen.findByText('先读 A')
     expect(screen.getByText('再读 B')).toBeTruthy()
+    for (const button of screen.getAllByRole('button', { name: /个步骤/ })) {
+      if (button.getAttribute('aria-expanded') === 'false') fireEvent.click(button)
+    }
     const thinkingCards = screen.getAllByRole('button', { name: /^Thinking/ })
     expect(thinkingCards).toHaveLength(2)
     const timeline = [...document.querySelectorAll('[data-testid="subagent-transcript"] [data-activity-card="thinking"], [data-testid="subagent-transcript"] [data-activity-card="tool"], [data-testid="subagent-transcript"] [data-transcript-segment="text"]')]

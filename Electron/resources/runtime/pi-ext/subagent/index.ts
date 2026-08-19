@@ -26,8 +26,7 @@ import {
 	stringifyCompactFileChange,
 } from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
-import { applySessionMountsToWorkerEnv, installEnvKeyProvider, workerEnvFromVault } from "../../extensions/secret-vault-core.ts";
-installEnvKeyProvider();
+import { applySessionMountsToWorkerEnv } from "../../extensions/secret-vault-core.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -58,7 +57,7 @@ import {
 } from "../packages/computer-agent/src/index.ts";
 import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/terminal-policy.ts";
 import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeComputerTaskRecoveryPolicy, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
-import { toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
+import { toolNamesForComputerUseAgent, toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -127,6 +126,7 @@ import {
 	formatChainVerifyPrefix,
 	getFinalOutput,
 	isFailedResult,
+	isHostEndOk,
 	getResultOutput,
 } from "./done-message.ts";
 import {
@@ -154,6 +154,8 @@ import {
 	bindWorktreeMergedHook,
 	closeoutDispositionFor,
 	finalizeWorktreeIfOwned,
+	lifecycleForFinalization,
+	reenterFinalizeOnBossAccept,
 	summarizeFinalization,
 	terminalStateForFinalization,
 } from "./worktree-finalize.ts";
@@ -500,10 +502,7 @@ export function vaultWorkerChildEnv(
 	parent: NodeJS.ProcessEnv = process.env,
 	extra: Record<string, string | undefined> = {},
 ): Record<string, string | undefined> {
-	const dir = parent.PIPIUI_SECRET_VAULT_DIR;
-	const sessionId = parent.PIPIUI_SESSION_ID || parent.PIPIUI_SESSION_KEY;
-	const mounts = dir && sessionId ? workerEnvFromVault(dir, sessionId) : {};
-	return applySessionMountsToWorkerEnv({ ...parent, ...extra }, mounts);
+	return applySessionMountsToWorkerEnv({ ...parent, ...extra }, {});
 }
 
 function pipiuiChildProcessEnv(
@@ -611,6 +610,7 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // get_search_content. Provider-hosted search may also reach workers through pi's own
 // extension discovery; this pinned route makes research delegable for other providers.
 const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
+const PIPIUI_WEBVIEW_EXT = process.env.PIPIUI_WEBVIEW_EXT;
 const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
 const PIPIUI_OFFICE_DOC_SHOT_GATE_EXT = process.env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
@@ -1227,6 +1227,14 @@ interface RunSingleAgentOptions {
 		extensionPath: string;
 		toolNames: string[];
 	};
+	/** Runtime-owned single Computer Use Agent route. It inherits ordinary non-management tools. */
+	computerAgent?: {
+		environment: Record<string, string>;
+		extensionPath: string;
+		toolNames: string[];
+	};
+	/** Host-selected episode generation, used to bind runtime receipts to the visible child run. */
+	runId?: string;
 	/** Explicit bundled private skills; additive under --no-skills. */
 	privateSkillPaths?: string[];
 }
@@ -1771,6 +1779,8 @@ interface JobRecord {
 	closeoutDisposition?: "cleaned";
 	closeoutReason?: string;
 	closeoutAt?: number;
+	worktreePath?: string;
+	worktreeBranch?: string;
 }
 
 interface InterruptedReminder {
@@ -1800,6 +1810,7 @@ function cancelInterruptedReminders(agentId: string, runId?: string): void {
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
+const COMPUTER_USE_SYNC_RECOVERY_GRACE_MS = 10 * 60_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
 /** Max automatic re-spawns after a retryable transport/API death (total runs = 1 + this). */
 const AUTO_RESUME_MAX = 2;
@@ -2414,15 +2425,64 @@ function resolveSubagentEpisode(
  * Queue it after any outstanding end report for this agent so Swift cannot observe a resolved
  * closeout while its row still appears running.
  */
-function reportResolvedCloseout(job: JobRecord): Promise<void> {
-	if (!isHandledJob(job)) return Promise.resolve();
-	return postTerminalPipiuiReport({
+async function reportResolvedCloseout(job: JobRecord): Promise<void> {
+	if (!isHandledJob(job)) return;
+	let worktreeLifecycle: string | undefined;
+	let worktreeFinalization: string | undefined;
+	try {
+		const state = await reenterFinalizeOnBossAccept({
+			agentId: job.agentId,
+			runId: job.runId,
+			mainCwd: PIPIUI_MAIN_CWD,
+			worktreePath: job.worktreePath,
+			worktreeBranch: job.worktreeBranch,
+			role: job.name === "secretary" ? "secretary" : "worker",
+			terminalState: terminalStateForFinalization({
+				ok: job.state === "ok",
+				aborted: job.state === "aborted",
+				interrupted: job.state === "interrupted",
+			}),
+			...(job.verify
+				? {
+					verify: {
+						command: job.verify.command,
+						exitCode: job.verify.timedOut ? -1 : (job.verify.exitCode ?? -1),
+					},
+				}
+				: {}),
+		});
+		if (state) {
+			worktreeFinalization = summarizeFinalization(state);
+			worktreeLifecycle = lifecycleForFinalization(state);
+			recordCloseoutDisposition({
+				mainCwd: PIPIUI_MAIN_CWD,
+				sessionKey: PIPIUI_SESSION,
+				agentId: job.agentId,
+				disposition: closeoutDispositionFor(state),
+				reason: state.result.recovery.reason || worktreeFinalization,
+			});
+			applyWorktreeRecovery(state, {
+				agentId: job.agentId,
+				name: job.name,
+				branch: job.worktreeBranch,
+				worktreePath: job.worktreePath,
+				verifyCommand: job.verify?.command,
+			});
+		}
+	} catch (error) {
+		worktreeFinalization = `finalization error: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	await postTerminalPipiuiReport({
 		kind: "closeout",
 		agentId: job.agentId,
 		runId: job.runId,
 		disposition: "cleaned",
 		reason: job.closeoutReason ?? "Boss marked this episode handled",
 		closeoutAt: job.closeoutAt ?? Date.now(),
+		...(worktreeFinalization ? { worktreeFinalization } : {}),
+		...(worktreeLifecycle ? { worktreeLifecycle } : {}),
+		...(job.worktreePath ? { worktreePath: job.worktreePath } : {}),
+		...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
 	});
 }
 
@@ -2519,6 +2579,8 @@ type JobFinalizeFields = {
 	turns?: number;
 	activity?: string;
 	verify?: VerifyAttestation;
+	worktreePath?: string;
+	worktreeBranch?: string;
 	/** Only watchdog disappearance settle uses this; the real terminal callback may replace it. */
 	provisional?: boolean;
 };
@@ -2575,6 +2637,8 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 				? truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP)
 				: existing?.resultText,
 		verify: fields.verify ?? existing?.verify,
+		worktreePath: fields.worktreePath ?? existing?.worktreePath,
+		worktreeBranch: fields.worktreeBranch ?? existing?.worktreeBranch,
 		...(existing?.closeoutDisposition === "cleaned"
 			? {
 					closeoutDisposition: existing.closeoutDisposition,
@@ -4605,7 +4669,7 @@ async function runSingleAgent(
 	const callerAgentId = options?.agentId?.trim() || undefined;
 	const pipiuiAgentId = callerAgentId ?? generatePipiuiAgentId();
 	// Capture this invocation's generation before any early failure path can return a result.
-	const runId = DeliveryObligationStore.runId();
+	const runId = options?.runId ?? DeliveryObligationStore.runId();
 	const isBackground = options?.background === true;
 	localAgentReservations.add(pipiuiAgentId);
 
@@ -4934,7 +4998,7 @@ async function runSingleAgent(
 	const normalToolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
-		declaredTools: agent.tools?.filter(
+		declaredTools: options?.computerAgent ? undefined : agent.tools?.filter(
 			(t) => runtimePolicy.allowRecursiveDelegation || !isDelegationTool(t),
 		),
 		disabledTools: loadDisabledTools(),
@@ -4968,6 +5032,10 @@ async function runSingleAgent(
 		args.push("-e", PIPIUI_COMPUTER_EXT);
 	}
 	if (options?.computerWorker) args.push("-e", options.computerWorker.extensionPath);
+	if (options?.computerAgent) {
+		args.push("-e", options.computerAgent.extensionPath);
+		if (PIPIUI_WEBVIEW_EXT) args.push("-e", PIPIUI_WEBVIEW_EXT);
+	}
 	for (const skillPath of options?.privateSkillPaths ?? []) args.push("--skill", skillPath);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
 	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
@@ -5168,6 +5236,8 @@ async function runSingleAgent(
 						? { PIPIUI_COMPUTER_MEMORY_ENABLED: "1" }
 						: {}),
 					...(options?.computerWorker?.environment ?? {}),
+					...(options?.computerAgent?.environment ?? {}),
+					...(options?.computerAgent ? { PIPIUI_AGENT_NO_DELEGATION: "1" } : {}),
 					// Scope marker read by the philosophy package. An agent that delegates needs the
 					// orchestration layers; every other dispatched agent must not get them — depth
 					// alone cannot tell the two apart, and a worker taught to fan out would fight
@@ -5947,7 +6017,7 @@ async function runSingleAgent(
 			// so the done message can say "skipped" instead of "no verify in brief".
 			currentResult.verifySkipped = true;
 		}
-		const endOk = exitCode === 0 && !currentResult.errorMessage && !wasAborted;
+		const endOk = isHostEndOk(currentResult, { aborted: wasAborted });
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
 		// Notes appended after slice so they survive the -8000 tail trim on long outputs.
 		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
@@ -5992,6 +6062,8 @@ async function runSingleAgent(
 			turns: currentResult.usage.turns,
 			activity: pipiuiActivity,
 			verify: currentResult.verify,
+			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
+			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 		});
 		// Candidate evidence comes only from the final assistant text. It never
 		// reads stream previews, tool results, stderr, or a non-terminal run.
@@ -6011,6 +6083,7 @@ async function runSingleAgent(
 		// a host that handed finalization to pi must not see "ok" while the branch is still
 		// unmerged. A host that kept finalization gets undefined here and is unaffected.
 		let finalization: string | undefined;
+		let worktreeLifecycle: string | undefined;
 		try {
 			const state = await finalizeWorktreeIfOwned({
 				agentId: pipiuiAgentId,
@@ -6033,6 +6106,7 @@ async function runSingleAgent(
 			});
 			if (state) {
 				finalization = summarizeFinalization(state);
+				worktreeLifecycle = lifecycleForFinalization(state);
 				// A non-empty state means pi is the finalizer, so pi also owns the closeout row.
 				// The Swift app writes its own from its own lifecycle; only one of them ever runs.
 				recordCloseoutDisposition({
@@ -6069,6 +6143,7 @@ async function runSingleAgent(
 			contextTokens: currentResult.usage.contextTokens,
 			stopReason: currentResult.stopReason ?? null,
 			...(finalization ? { worktreeFinalization: finalization } : {}),
+			...(worktreeLifecycle ? { worktreeLifecycle } : {}),
 			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 			...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
@@ -6588,9 +6663,15 @@ function computerObservationFromRuntime(raw: any): ComputerWorkerResult["observa
 
 async function ensureComputerWorkerBroker(): Promise<InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]>> {
 	if (!computerWorkerBrokerServer) {
-		const { ComputerWorkerBroker, ComputerWorkerBrokerServer } = await loadComputerAgentModule();
+		const { ComputerWorkerBroker, ComputerWorkerBrokerServer, WorkflowMemoryStore } = await loadComputerAgentModule();
+		const activeProjectPiHome = process.env.PIPIUI_ACTIVE_PROJECT_PI_HOME || process.env.PI_CODING_AGENT_DIR;
+		if (!activeProjectPiHome || !path.isAbsolute(activeProjectPiHome)) throw new Error("Computer Use requires the backend-resolved active project Pi home");
 		computerWorkerBrokerServer = new ComputerWorkerBrokerServer(new ComputerWorkerBroker({
 			request: computerRuntimeRequest,
+			cancelRuntime: async () => {
+				await computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000));
+			},
+			workflowMemory: new WorkflowMemoryStore(activeProjectPiHome),
 			onFatal: ({ taskId, stepId, code }) => {
 				const key = computerWorkerKey(taskId, stepId);
 				computerWorkerFatalCodes.set(key, code);
@@ -6728,7 +6809,7 @@ function computerPlanInvestigationReport(error: ComputerPlanInvestigationError) 
 	};
 }
 
-function registerComputerTaskTool(pi: ExtensionAPI): void {
+function registerLegacyComputerTaskTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
 	assertComputerAgentRuntimeContract();
 	let continuationObligationId: string | undefined;
@@ -7188,6 +7269,155 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	});
 }
 
+type SingleComputerTaskResult = {
+	outcome: "succeeded" | "blocked" | "failed" | "cancelled";
+	summary: string;
+	verification: {
+		status: "verified" | "unverified" | "partial";
+		claims: Array<{ claim: string; evidenceRef: string }>;
+	};
+	handoff?: string;
+};
+
+function parseSingleComputerTaskResult(text: string, fallback: SingleComputerTaskResult): SingleComputerTaskResult {
+	const value = parseComputerJSON(text);
+	if (!value || !["succeeded", "blocked", "failed", "cancelled"].includes(String(value.outcome))
+		|| typeof value.summary !== "string" || !value.summary.trim()
+		|| !value.verification || !["verified", "unverified", "partial"].includes(String(value.verification.status))
+		|| !Array.isArray(value.verification.claims)) return fallback;
+	const claims = value.verification.claims.flatMap((item: any) =>
+		item && typeof item.claim === "string" && typeof item.evidenceRef === "string"
+			? [{ claim: item.claim.slice(0, 500), evidenceRef: item.evidenceRef.slice(0, 500) }]
+			: []).slice(0, 32);
+	return {
+		outcome: value.outcome,
+		summary: value.summary.trim().slice(0, 2_000),
+		verification: { status: value.verification.status, claims },
+		...(typeof value.handoff === "string" && value.handoff.trim() ? { handoff: value.handoff.trim().slice(0, 1_000) } : {}),
+	};
+}
+
+function registerComputerTaskTool(pi: ExtensionAPI): void {
+	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
+	assertComputerAgentRuntimeContract();
+	let continuationObligationId: string | undefined;
+	let continuationAbortRequested = false;
+	const continuationWatchdog = createComputerTaskContinuationWatchdog({
+		deadlineMs: COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
+		onContinue() {
+			const obligationId = continuationObligationId;
+			if (!obligationId) return;
+			const timer = setTimeout(() => {
+				if (continuationObligationId === obligationId) queueComputerTaskContinuation(pi, obligationId);
+			}, 0);
+			timer.unref?.();
+		},
+	});
+	pi.on("tool_result", (event, ctx) => {
+		if (event.toolName !== "computer_task") return;
+		continuationObligationId = event.toolCallId;
+		continuationAbortRequested = false;
+		continuationWatchdog.arm(() => { continuationAbortRequested = true; ctx.abort(); });
+	});
+	pi.on("message_update", (event) => {
+		if (event.message.role !== "assistant" || !isComputerTaskAssistantActivity(event)) return;
+		continuationWatchdog.noteAssistantActivity();
+		if (!continuationAbortRequested) continuationObligationId = undefined;
+	});
+	pi.on("agent_settled", () => {
+		const requested = continuationWatchdog.noteSettled();
+		if (!requested && !continuationAbortRequested) continuationObligationId = undefined;
+		continuationAbortRequested = false;
+	});
+	pi.on("context", (event) => {
+		if (!continuationObligationId) return;
+		const messages = stripComputerTaskContinuationTrigger(event.messages, continuationObligationId);
+		if (messages === event.messages) return;
+		continuationObligationId = undefined;
+		return { messages };
+	});
+	pi.on("session_shutdown", () => { continuationWatchdog.dispose(); continuationObligationId = undefined; });
+
+	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
+		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
+	}, { additionalProperties: false }));
+	pi.registerTool({
+		name: "computer_task",
+		label: "Computer Task",
+		description: "Complete one desktop goal through one private Computer Use Agent episode that plans, operates, reconciles, recovers, and verifies without delegation.",
+		parameters: computerTaskParameters,
+		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			params = omitNulls(params);
+			const goal = String(params.goal).trim();
+			const taskId = `computer-use-${randomUUID()}`;
+			const runId = DeliveryObligationStore.runId();
+			const stepId = "episode";
+			const controller = new AbortController();
+			const taskSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task ${taskId} is already running`);
+			runningComputerTasks.set(taskId, { runId, controller });
+			let broker: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
+			try {
+				const discovery = discoverAgents(ctx.cwd, "user");
+				const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
+				if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Use Agent failed validation");
+				const canonicalAgent = canonicalDiscovery.agents.find((agent) => agent.name === "computer-use" && agent.origin === "bundled");
+				if (!canonicalAgent || canonicalAgent.capabilities.delegation) throw new Error("Canonical non-delegating Computer Use Agent is unavailable");
+				const computerAgents = [canonicalAgent];
+				broker = await ensureComputerWorkerBroker();
+				const issued = broker.issue({ taskId, stepId, runId, role: "computer-use-agent", goal });
+				const child = await runSingleAgent(ctx.cwd, computerAgents, "computer-use", goal, undefined, undefined, taskSignal, onUpdate,
+					(results) => ({ mode: "single", agentScope: "bundled", projectAgentsDir: discovery.projectAgentsDir, results }),
+					{
+						toolCallId: _toolCallId,
+						agentId: taskId,
+						parentAgentId: PIPIUI_PARENT,
+						depth: PIPIUI_DEPTH + 1,
+						fresh: true,
+						retainContext: false,
+						runId,
+						sessionModel: formatCtxModel(ctx.model),
+						contextWindow: ctxContextWindow(ctx.model as { contextWindow?: number } | undefined),
+						background: false,
+						computerAgent: { environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerUseAgent() },
+					});
+				const fallback: SingleComputerTaskResult = taskSignal.aborted
+					? { outcome: "cancelled", summary: "Computer Task was cancelled.", verification: { status: "unverified", claims: [] } }
+					: { outcome: "failed", summary: child.errorMessage || child.stderr || "Computer Use Agent did not return a valid result.", verification: { status: "unverified", claims: [] } };
+				const projected = child.exitCode === 0 && !child.errorMessage
+					? parseSingleComputerTaskResult(getFinalOutput(child.messages) || child.stderr, fallback)
+					: fallback;
+				if (projected.outcome === "succeeded" && projected.verification.status === "verified") await broker.recordTaskSuccess(taskId, stepId);
+				const checkpoint = broker.checkpoint(taskId, stepId);
+				const episode = {
+					agentId: child.agentId,
+					runId: child.runId,
+					parentId: PIPIUI_PARENT,
+					name: "computer-use",
+					role: "computer-use-agent",
+					terminalState: child.stopReason ?? (child.exitCode === 0 ? "ok" : "failed"),
+					result: { outcome: projected.outcome, summary: projected.summary },
+				};
+				const details = {
+					...projected,
+					taskId,
+					runId,
+					episodeCount: 1,
+					episode,
+					checkpoint,
+				};
+				const envelope = { episodeLedger: [episode], verification: projected.verification, checkpoint };
+				return { content: [{ type: "text", text: `${projected.summary}\n\nEpisode ledger:\n${JSON.stringify(envelope)}` }], details };
+			} finally {
+				broker?.revokeTask(taskId);
+				if (taskSignal.aborted) await computerRuntimeRequest({ action: "computer_cancel" }).catch(() => {});
+				if (runningComputerTasks.get(taskId)?.runId === runId) runningComputerTasks.delete(taskId);
+			}
+		},
+	});
+}
+
 /**
  * The Boss's ledger write, restored as a tool that can reach nothing else.
  *
@@ -7503,6 +7733,7 @@ export default function (pi: ExtensionAPI) {
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
+				...(handle.name === "computer-use" ? { syncRecoveryGraceMs: COMPUTER_USE_SYNC_RECOVERY_GRACE_MS } : {}),
 			});
 			if (action === "ignore") continue;
 			const idleSec = Math.floor(idleMs / 1000);

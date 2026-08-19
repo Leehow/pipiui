@@ -29,6 +29,12 @@ describe('parseSubagentSignal', () => {
     })
   })
 
+  it('marks process-failed done as error, not success', () => {
+    expect(parseSubagentSignal('[subagent-done] name=worker ok=false verified=none\nTitle: 超时\nResult:\nruntime_timeout')).toMatchObject({
+      kind: 'done', tone: 'error', summary: '失败 · 超时',
+    })
+  })
+
   it('marks aborted done and recovered/re-delivery wrappers', () => {
     expect(parseSubagentSignal('[subagent-done] name=worker ok=false aborted=true verified=none\nResult:\nstopped')).toMatchObject({ tone: 'warning', summary: '已中止 · worker' })
     const retry = parseSubagentSignal('(re-delivery #2: previous done not confirmed)\n[subagent-done] name=worker ok=false verified=none\nResult:\nfailed')

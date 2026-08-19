@@ -80,6 +80,87 @@ test("Computer Task admission rejects every non-Cua worker and action", () => {
   }), /Computer Task accepts only Cua desktop actions/, "raw role admission must precede terminal policy validation");
 });
 
+test("explicit computer-terminal request is non-CUA and is not repaired as a missing role", () => {
+  const observeOnly = {
+    steps: [{ id: "verify", role: "verifier", objective: "Observe the front window", dependsOn: [], postconditions: [visible] }],
+    successConditions: [visible],
+  };
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(observeOnly, "Use Verifier to independently verify the front window"));
+  try {
+    validateComputerPlanGoalBindings(observeOnly, "Use computer-terminal to inspect /tmp/notes.txt, then independently verify");
+    assert.fail("explicit terminal request must not be treated as a missing-role repair");
+  } catch (error) {
+    const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
+    assert.equal(diagnostic.code, "non_cua_worker_not_allowed");
+    assert.equal(shouldRepairComputerPlanAdmission(diagnostic), false);
+    assert.notEqual(diagnostic.code, "required_role_missing");
+  }
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(observeOnly, "不要使用 computer-terminal；由 Verifier 独立验证前台窗口"));
+
+  try {
+    validateComputerPlanGoalBindings(observeOnly, "Do not use Operator, but use computer-terminal to inspect /tmp/notes.txt");
+    assert.fail("contrast-clause terminal request must stay non-CUA");
+  } catch (error) {
+    const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
+    assert.equal(diagnostic.code, "non_cua_worker_not_allowed");
+    assert.equal(shouldRepairComputerPlanAdmission(diagnostic), false);
+  }
+  try {
+    validateComputerPlanGoalBindings(observeOnly, "不要使用 Operator，但是使用 computer-terminal 检查 /tmp/notes.txt");
+    assert.fail("Chinese contrast-clause terminal request must stay non-CUA");
+  } catch (error) {
+    assert.equal(diagnoseComputerPlanAdmissionFailure(error).code, "non_cua_worker_not_allowed");
+  }
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(
+    observeOnly,
+    "Do not use Operator, but independently verify the already-open TextEdit window",
+  ), "negated Operator before a contrast must not require an Operator step");
+});
+
+test("TextEdit observation does not force an Operator and only mutating Operators bind the Verifier", () => {
+  const verifierOnly = {
+    steps: [{ id: "verify", role: "verifier", objective: "Independently verify the already-open TextEdit window", dependsOn: [], postconditions: [visible] }],
+    successConditions: [visible],
+  };
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(
+    verifierOnly,
+    "Use Verifier to independently verify the already-open TextEdit window",
+  ));
+  assert.throws(
+    () => validateComputerPlanGoalBindings(verifierOnly, "Use GUI Operator to inspect TextEdit, then independently verify"),
+    /explicitly requested gui-operator/i,
+  );
+
+  const observeOperator = {
+    steps: [
+      { id: "look", role: "gui-operator", objective: "Inspect the already-open TextEdit window", dependsOn: [], postconditions: [visible] },
+      { id: "verify", role: "verifier", objective: "Independently verify the visible text", dependsOn: [], postconditions: [visible] },
+    ],
+    successConditions: [visible],
+  };
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(
+    observeOperator,
+    "Use GUI Operator to inspect the already-open TextEdit window, then Verifier to independently verify",
+  ));
+
+  const mutatingOperator = {
+    steps: [
+      { id: "open", role: "gui-operator", objective: "Open the TextEdit document", dependsOn: [], postconditions: [visible] },
+      { id: "verify", role: "verifier", objective: "Independently verify the visible text", dependsOn: [], postconditions: [visible] },
+    ],
+    successConditions: [visible],
+  };
+  assert.throws(
+    () => validateComputerPlanGoalBindings(mutatingOperator, "Use GUI Operator to open TextEdit, then Verifier to independently verify"),
+    /Verifier must depend on the requested GUI Operator step/,
+  );
+  mutatingOperator.steps[1].dependsOn = ["open"];
+  assert.doesNotThrow(() => validateComputerPlanGoalBindings(
+    mutatingOperator,
+    "Use GUI Operator to open TextEdit, then Verifier to independently verify",
+  ));
+});
+
 test("Computer Task admission distinguishes prohibited non-Cua actions from requested ones per clause", () => {
   const candidate = (objective) => ({
     steps: [

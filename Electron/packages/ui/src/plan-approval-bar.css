@@ -1,0 +1,44 @@
+.plan-approval-bar{
+  display:flex;
+  min-width:0;
+  align-items:center;
+  gap:8px;
+  margin:0 0 8px;
+  padding:7px 10px;
+  border:1px solid var(--border-strong);
+  border-radius:10px;
+  background:var(--surface-raised);
+}
+.plan-approval-bar-label{
+  flex:none;
+  padding:1px 6px;
+  border-radius:999px;
+  color:var(--warning);
+  background:color-mix(in srgb,var(--warning) 16%,transparent);
+  font-size:10px;
+  font-weight:650;
+  white-space:nowrap;
+}
+.plan-approval-bar-title{
+  min-width:0;
+  flex:1;
+  overflow:hidden;
+  color:var(--text);
+  text-overflow:ellipsis;
+  white-space:nowrap;
+  font-size:12px;
+}
+.plan-approval-bar-actions{display:flex;flex:none;align-items:center;gap:6px}
+.plan-approval-bar-approve{
+  appearance:none;
+  border:1px solid transparent;
+  border-radius:999px;
+  padding:3px 11px;
+  font:inherit;
+  font-size:12px;
+  font-weight:650;
+  cursor:pointer;
+  color:#fff;
+  background:var(--accent);
+}
+.plan-approval-bar-approve:hover{filter:brightness(1.06)}

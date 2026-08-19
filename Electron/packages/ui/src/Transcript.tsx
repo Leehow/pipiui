@@ -1,4 +1,4 @@
-import { forwardRef, memo, useEffect, useMemo, useState } from 'react'
+import { forwardRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
 import { AssistantTranscriptContent } from './AssistantTranscriptContent'
@@ -12,34 +12,215 @@ import { parseSubagentNotice } from './subagent-notice'
 import { parseSubagentSignal } from './subagent-signal'
 import { TruncatedText } from './TruncatedText'
 import type { ChatMessage } from './transcript-model'
+import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PIN_MAX_ATTEMPTS, transcriptDataIndex, transcriptMessageIdentity } from './transcript-scroll'
 
 export type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
 type DocumentOpenProps = { documentBasePath?: string; onOpenDocument?: (path: string) => void }
 type SubagentOpenProps = { onOpenSubagents?: (agentId?: string) => void }
 
-export function Transcript({ messages, transcriptRef, waiting, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
+function transcriptItemKey(index: number, message: ChatMessage) {
+  return `${index}:${message.id}`
+}
+
+function assignVirtuosoRef(ref: React.RefObject<VirtuosoHandle> | undefined, value: VirtuosoHandle | null) {
+  if (ref) (ref as React.MutableRefObject<VirtuosoHandle | null>).current = value
+}
+
+export function Transcript({ messages, transcriptRef, waiting, active = true, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
   messages: ChatMessage[]
-  transcriptRef: React.RefObject<VirtuosoHandle>
+  /** Optional bridge for the active slot. Every Transcript still owns its handle. */
+  transcriptRef?: React.RefObject<VirtuosoHandle>
   waiting?: { startedAt: number; phase: WaitingPhase; detail?: string; onStop?: () => void }
+  active?: boolean
 } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers) {
   const [atBottom, setAtBottom] = useState(true)
   const [seekingId, setSeekingId] = useState<string | null>(null)
+  const activeRef = useRef(active)
+  const atBottomRef = useRef(true)
+  const followIntentRef = useRef(true)
+  const userDetachedRef = useRef(false)
+  const userDetachedSawAwayRef = useRef(false)
+  const pendingPinRef = useRef(false)
+  const pinGenerationRef = useRef(0)
+  const pinIssuedGenerationRef = useRef(-1)
+  const pinAttemptsRef = useRef(0)
+  const pinFrameRef = useRef<number | null>(null)
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null)
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null)
+  activeRef.current = active
+
+  const clearPinFrame = useCallback(() => {
+    if (pinFrameRef.current !== null) cancelAnimationFrame(pinFrameRef.current)
+    pinFrameRef.current = null
+    pinAttemptsRef.current = 0
+  }, [])
+  const requestPin = useCallback(() => {
+    if (!activeRef.current || !followIntentRef.current) return
+    pinGenerationRef.current += 1
+    pinIssuedGenerationRef.current = -1
+    pendingPinRef.current = true
+    pinAttemptsRef.current = 0
+    if (pinFrameRef.current !== null) return
+    const attempt = () => {
+      pinFrameRef.current = null
+      if (!activeRef.current || !followIntentRef.current || !pendingPinRef.current) return
+      const generation = pinGenerationRef.current
+      const handle = virtuosoRef.current
+      if (handle) {
+        // Mark before invoking Virtuoso because a test double (or a future
+        // synchronous implementation) may report atBottom from this call.
+        pinIssuedGenerationRef.current = generation
+        handle.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })
+      }
+      pinAttemptsRef.current += 1
+      if (pendingPinRef.current && pinAttemptsRef.current < TRANSCRIPT_PIN_MAX_ATTEMPTS) {
+        pinFrameRef.current = requestAnimationFrame(attempt)
+      }
+    }
+    pinFrameRef.current = requestAnimationFrame(attempt)
+  }, [])
+  const cancelFollow = useCallback(() => {
+    if (!activeRef.current) return
+    followIntentRef.current = false
+    userDetachedRef.current = true
+    userDetachedSawAwayRef.current = !atBottomRef.current
+    pendingPinRef.current = false
+    clearPinFrame()
+    setAtBottom(false)
+  }, [clearPinFrame])
+  const setVirtuosoHandle = useCallback((handle: VirtuosoHandle | null) => {
+    const previous = virtuosoRef.current
+    virtuosoRef.current = handle
+    if (!transcriptRef || !activeRef.current) return
+    if (handle) assignVirtuosoRef(transcriptRef, handle)
+    else if (transcriptRef.current === previous) assignVirtuosoRef(transcriptRef, null)
+  }, [transcriptRef])
+
   const prompts = useMemo(() => buildRailPrompts(messages), [messages])
   const { activeId: viewportActiveId, containerRef } = useActivePromptId(prompts, atBottom)
   const activeId = seekingId ?? viewportActiveId
   useEffect(() => { if (atBottom) setSeekingId(null) }, [atBottom])
-  const jump = (index: number, id: string) => { setSeekingId(id); transcriptRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' }) }
-  const returnLatest = () => { setSeekingId(null); transcriptRef.current?.scrollToIndex({ index: Math.max(0, messages.length - 1), align: 'end', behavior: 'smooth' }); setAtBottom(true) }
-  return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef}>
+  useLayoutEffect(() => {
+    if (!active) {
+      pendingPinRef.current = false
+      clearPinFrame()
+      return
+    }
+    followIntentRef.current = true
+    userDetachedRef.current = false
+    userDetachedSawAwayRef.current = false
+    setSeekingId(null)
+    requestPin()
+  }, [active, clearPinFrame, requestPin])
+  useLayoutEffect(() => {
+    if (active && followIntentRef.current) requestPin()
+  }, [active, messages, requestPin])
+  useLayoutEffect(() => {
+    if (!active || !transcriptRef) return
+    const handle = virtuosoRef.current
+    assignVirtuosoRef(transcriptRef, handle)
+    return () => {
+      if (transcriptRef.current === handle) assignVirtuosoRef(transcriptRef, null)
+    }
+  }, [active, transcriptRef])
+  useEffect(() => {
+    const node = containerRef.current
+    if (!node || typeof ResizeObserver === 'undefined') return
+    let width = -1
+    let height = -1
+    const observer = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        if (entry.contentRect.width === width && entry.contentRect.height === height) continue
+        width = entry.contentRect.width
+        height = entry.contentRect.height
+        requestPin()
+      }
+    })
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [containerRef, requestPin])
+  useEffect(() => () => clearPinFrame(), [clearPinFrame])
+
+  const handleAtBottom = (value: boolean) => {
+    if (!activeRef.current) return
+    atBottomRef.current = value
+    if (!value) {
+      if (userDetachedRef.current) userDetachedSawAwayRef.current = true
+      setAtBottom(false)
+      return
+    }
+    // A hidden slot can replay an old true before the activation RAF runs.
+    // Only a true after this generation actually issued LAST may finish it.
+    if (pendingPinRef.current && pinIssuedGenerationRef.current !== pinGenerationRef.current) return
+    // Ignore a stale true delivered between the upward gesture and Virtuoso's
+    // first measured-away callback. A later false→true is a real return.
+    if (userDetachedRef.current && !userDetachedSawAwayRef.current) return
+    userDetachedRef.current = false
+    userDetachedSawAwayRef.current = false
+    setAtBottom(true)
+    followIntentRef.current = true
+    pendingPinRef.current = false
+    clearPinFrame()
+  }
+  const jump = (index: number, id: string) => {
+    cancelFollow()
+    setSeekingId(id)
+    virtuosoRef.current?.scrollToIndex({ index, align: 'start', behavior: 'smooth' })
+  }
+  const returnLatest = () => {
+    followIntentRef.current = true
+    userDetachedRef.current = false
+    userDetachedSawAwayRef.current = false
+    setSeekingId(null)
+    requestPin()
+  }
+  const handleWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY < 0) cancelFollow()
+  }
+  const handleTouchStart = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0]
+    touchStartRef.current = touch ? { x: touch.clientX, y: touch.clientY } : null
+  }
+  const handleTouchMove = (event: React.TouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0]
+    const start = touchStartRef.current
+    if (!touch || !start) return
+    const deltaX = touch.clientX - start.x
+    const deltaY = touch.clientY - start.y
+    if (deltaY >= 14 && deltaY > Math.abs(deltaX)) cancelFollow()
+  }
+  return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef} onWheelCapture={handleWheel} onTouchStartCapture={handleTouchStart} onTouchMoveCapture={handleTouchMove}>
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />
-    <MessageList ref={transcriptRef} messages={messages} atBottom={atBottom} onAtBottom={setAtBottom} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />
+    <MessageList ref={setVirtuosoHandle} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />
     {waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}
-    {!atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
+    {active && !atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
 }
 
-export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; atBottom: boolean; onAtBottom: (value: boolean) => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ messages, atBottom, onAtBottom, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }, ref) {
-  return <div className="message-list" data-testid="message-scroll"><Virtuoso ref={ref} data={messages} initialTopMostItemIndex={Math.max(0, messages.length - 1)} followOutput={() => atBottom ? 'auto' : false} atBottomStateChange={onAtBottom} alignToBottom itemContent={(index, message) => { const next = messages[index + 1]; const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant')); return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} /> }} /></div>
+export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; active?: boolean; shouldFollow: () => boolean; onAtBottom: (value: boolean) => void; onListHeightChanged: () => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ messages, active = true, shouldFollow, onAtBottom, onListHeightChanged, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }, ref) {
+  const ids = useMemo(() => messages.map(transcriptMessageIdentity), [messages])
+  const previousIdsRef = useRef<readonly string[]>([])
+  const firstItemIndexRef = useRef(TRANSCRIPT_FIRST_ITEM_BASE)
+  const firstItemIndex = nextTranscriptFirstItemIndex(firstItemIndexRef.current, previousIdsRef.current, ids)
+  firstItemIndexRef.current = firstItemIndex
+  previousIdsRef.current = ids
+  return <div className="message-list" data-testid="message-scroll"><Virtuoso
+    ref={ref}
+    data={messages}
+    firstItemIndex={firstItemIndex}
+    computeItemKey={transcriptItemKey}
+    initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
+    followOutput={() => active && shouldFollow() ? 'auto' : false}
+    atBottomStateChange={onAtBottom}
+    totalListHeightChanged={onListHeightChanged}
+    alignToBottom
+    itemContent={(index, message) => {
+      const dataIndex = transcriptDataIndex(index, firstItemIndex)
+      const next = messages[dataIndex + 1]
+      const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant'))
+      return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} />
+    }}
+  /></div>
 }))
 
 function messageTime(timestamp?: number): string { if (!timestamp) return ''; const date = new Date(timestamp); const pad = (value: number) => String(value).padStart(2, '0'); return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}` }

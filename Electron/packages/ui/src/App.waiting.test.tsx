@@ -114,7 +114,7 @@ describe('active-turn waiting placeholder', () => {
     // immediately, before any host status event.
     const waiting = await screen.findByTestId('waiting-placeholder')
     expect(waiting.getAttribute('data-phase')).toBe('awaiting')
-    // The inline stop delegates to host.stop; the stopped status cleans up.
+    // The inline stop closes the wait immediately and fires host.stop.
     fireEvent.click(screen.getByTestId('waiting-stop'))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('layout'))
     await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())

@@ -38,19 +38,19 @@ test("trusted coordinator compilation rejects forged application and ambiguous b
   assert.equal((await runtime.recordCoordinatorExecution(base)).state, "candidate");
 });
 
-test("registered computer_task keeps natural-language goal UX plus optional exact Leader continuity", async () => {
-  const source = await readFile(new URL("../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
-  assert.match(source, /parameters: Type\.Object\(\{[\s\S]{0,200}goal: Type\.String[\s\S]{0,300}agentId: Type\.Optional/);
-  assert.doesNotMatch(source, /parameters: Type\.Object\(\{ goal:[\s\S]{0,300}(?:bundleId|parameterBindings)/);
-  assert.match(source, /ProcedureHostRuntime\.open/);
-  assert.match(source, /recordCoordinatorExecution/);
-  assert.match(source, /procedureContext\.application/);
-  assert.match(source, /procedureContext\.parameters/);
-  assert.match(source, /runningComputerTasks\.set\(taskId, \{ runId: coordinatorRunId, controller: taskController \}\)/);
+test("registered Electron computer_task exposes only a goal and one Computer Use Agent episode", async () => {
+  const source = await readFile(new URL("../../Electron/resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
+  const start = source.indexOf("function registerComputerTaskTool(");
+  const end = source.indexOf("function registerLedgerNoteTool", start);
+  const normalPath = source.slice(start, end);
+  assert.match(normalPath, /Type\.Object\(\{\s*goal: Type\.String/);
+  assert.doesNotMatch(normalPath, /agentId: Type\.Optional|recoveryPolicy|procedureContext/);
+  assert.match(normalPath, /runSingleAgent\(ctx\.cwd, computerAgents, "computer-use"/);
+  assert.match(normalPath, /episodeCount: 1/);
+  assert.match(normalPath, /runningComputerTasks\.set\(taskId, \{ runId, controller \}\)/);
   assert.match(source, /const computerTask = runningComputerTasks\.get\(agentId\)[\s\S]{0,160}computerTask\.controller\.abort\(\)/);
-  assert.match(source, /coordinator\.run\(\{ goal: params\.goal, taskId \}, taskSignal\)/);
-  assert.match(source, /result\.outcome === "cancelled"[\s\S]{0,300}aborted: true[\s\S]{0,160}Computer Task cancelled/);
-  assert.match(source, /runningComputerTasks\.get\(taskId\)\?\.runId === coordinatorRunId[\s\S]{0,120}runningComputerTasks\.delete\(taskId\)/);
+  assert.match(normalPath, /taskSignal\.aborted[\s\S]{0,200}outcome: "cancelled"/);
+  assert.match(normalPath, /runningComputerTasks\.get\(taskId\)\?\.runId === runId[\s\S]{0,120}runningComputerTasks\.delete\(taskId\)/);
 });
 
 test("real Terminal child tools proxy to one-run Host execution and authoritative audit", async () => {

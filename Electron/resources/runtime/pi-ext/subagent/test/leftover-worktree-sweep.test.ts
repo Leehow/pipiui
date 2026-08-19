@@ -5,9 +5,18 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { inspectAgentLease, reapStaleAgentLease } from "../agent-lease.ts";
+import {
+	acquireAgentLease,
+	claimAgentCleanupLease,
+	inspectAgentLease,
+	reapStaleAgentLease,
+	releaseAgentCleanupLease,
+} from "../agent-lease.ts";
 import { NodeGitWorktreeAdapter } from "../../subagent-host/worktree/adapter.ts";
-import { sweepLeftoverWorktreesV1 } from "../../subagent-host/worktree/sweep.ts";
+import {
+	setLeftoverSweepHooksForTests,
+	sweepLeftoverWorktreesV1,
+} from "../../subagent-host/worktree/sweep.ts";
 import { resetLeftoverWorktreeSweepForTests, WorktreeRecoveryStoreV1 } from "../worktree-recovery.ts";
 
 function git(cwd: string, args: string[]): void {
@@ -26,6 +35,36 @@ function makeRepo(): string {
 	git(root, ["add", "README.md"]);
 	git(root, ["commit", "-m", "base"]);
 	return root;
+}
+
+function sweepLeaseHooks(root: string) {
+	return {
+		inspect(agentId: string) {
+			return inspectAgentLease(root, agentId).status;
+		},
+		reapStale(agentId: string) {
+			return reapStaleAgentLease(root, agentId);
+		},
+		claimCleanup(agentId: string) {
+			const claimed = claimAgentCleanupLease(root, agentId, "leftover-sweep");
+			if (!claimed.lease) {
+				return {
+					ok: false as const,
+					status: inspectAgentLease(root, agentId).status,
+					message: claimed.problem,
+				};
+			}
+			return {
+				ok: true as const,
+				claim: {
+					releaseOnEnd: claimed.created,
+					release() {
+						releaseAgentCleanupLease(claimed);
+					},
+				},
+			};
+		},
+	};
 }
 
 function addWorker(root: string, agentId: string): { path: string; branch: string } {
@@ -76,10 +115,7 @@ test("sweep removes an already-integrated leftover and an empty orphan, keeps di
 			info(event, fields) { events.push({ event, fields }); },
 			warn(event, fields) { events.push({ event, fields }); },
 		},
-		lease: {
-			inspect(agentId) { return inspectAgentLease(root, agentId).status; },
-			reapStale(agentId) { return reapStaleAgentLease(root, agentId); },
-		},
+		lease: sweepLeaseHooks(root),
 	});
 
 	assert.equal(summary.pruned, 2, JSON.stringify(summary.items));
@@ -140,4 +176,28 @@ test("sweep skips an in-flight fixer worktree even when its lease is already sta
 	assert.equal(summary.pruned, 0);
 	assert.equal(summary.items[0]?.disposition, "kept-active");
 	assert.equal(existsSync(fixer.path), true);
+});
+
+test("sweep does not delete a worktree that becomes live after the unlocked precheck", async (t) => {
+	const root = makeRepo();
+	t.after(() => {
+		setLeftoverSweepHooksForTests();
+		rmSync(root, { recursive: true, force: true });
+	});
+	const leftover = addWorker(root, "race-live");
+	setLeftoverSweepHooksForTests({
+		afterLeasePrecheck(agentId) {
+			if (agentId !== "race-live") return;
+			const raced = acquireAgentLease(root, agentId);
+			assert.ok(raced.lease, raced.problem);
+		},
+	});
+	const summary = await sweepLeftoverWorktreesV1({
+		mainCwd: root,
+		adapter: new NodeGitWorktreeAdapter(),
+		lease: sweepLeaseHooks(root),
+	});
+	assert.equal(existsSync(leftover.path), true);
+	assert.equal(inspectAgentLease(root, "race-live").status, "live");
+	assert.ok(summary.items.some((item) => item.agentId === "race-live" && item.disposition === "kept-live"));
 });

@@ -862,6 +862,36 @@ describe('browser transport extension', () => {
     ]))
     unsubscribe()
   })
+
+  it('accepts optional overlay bounds, slots, and a backward-compatible tool target', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+    const browser = createIpcHost(ipc).browser
+    if (!browser) throw new Error('browser extension unavailable')
+    await browser.setViewBounds('session-a', {
+      x: 1, y: 2, width: 3, height: 4, visible: true, mode: 'desktop',
+      slots: { desktop: { x: 1, y: 2, width: 3, height: 4 }, mobile: { x: 2, y: 3, width: 1, height: 2 } },
+      mobileOverlay: { visible: true, applyDeviceEmulation: true, deviceId: 'iphone-se', viewport: { width: 375, height: 667 }, deviceScaleFactor: 2 }
+    })
+    const legacyRequest = { action: 'observe' }
+    const bothRequest = { action: 'screenshot', target: 'both' as const }
+    expect(legacyRequest).toMatchObject({ action: 'observe' })
+    expect(bothRequest.target).toBe('both')
+    expect(calls).toEqual([
+      { method: 'browserSetViewBounds', params: ['session-a', {
+        x: 1, y: 2, width: 3, height: 4, visible: true, mode: 'desktop',
+        slots: { desktop: { x: 1, y: 2, width: 3, height: 4 }, mobile: { x: 2, y: 3, width: 1, height: 2 } },
+        mobileOverlay: { visible: true, applyDeviceEmulation: true, deviceId: 'iphone-se', viewport: { width: 375, height: 667 }, deviceScaleFactor: 2 }
+      }] }
+    ])
+  })
 })
 
 describe('Electron-native project directory picker extension', () => {
@@ -937,11 +967,10 @@ describe('secret vault host contract', () => {
             type: 'response',
             ok: true,
             result: {
-              available: false,
-              kind: 'missing-packages',
-              message: '系统密钥服务不可用。',
-              installHint: 'sudo apt install gnome-keyring libsecret-1-0 libsecret-tools',
-              retryable: true,
+              available: true,
+              kind: 'available',
+              message: '密钥仅保存在当前 App 主进程内存中，退出 App 后清除。',
+              retryable: false,
               platform: 'linux',
             },
           }
@@ -962,7 +991,7 @@ describe('secret vault host contract', () => {
     }
     const host = createIpcHost(ipc)
     const diagnosis = await host.diagnoseSecretVault?.()
-    expect(diagnosis?.kind).toBe('missing-packages')
+    expect(diagnosis?.kind).toBe('available')
     expect(JSON.stringify(diagnosis)).not.toMatch(/sk-|ghp_|password=/i)
     const listed = await host.listSecretVault?.('sess-1')
     expect(listed?.secrets[0]?.envName).toBe('OPENAI_API_KEY')

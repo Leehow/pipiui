@@ -88,6 +88,29 @@ export interface FinalizeWorktreeRequest {
 	terminalState: WorktreeTerminalStateV1;
 	/** The worker's attested verify, kept for audit. `argv` is the only form the runner executes. */
 	verify?: { command?: string; argv?: string[]; exitCode?: number };
+	/** Boss/runtime re-entry after accept/resolve. Reuses the same ownership/readiness checks. */
+	acceptance?: { source: "boss" };
+}
+
+const rememberedFinalizations = new Map<string, FinalizeWorktreeRequest>();
+const rememberedStates = new Map<string, WorktreeFinalizationStateV1>();
+
+function rememberKey(agentId: string, runId: string): string {
+	return `${agentId}\0${runId}`;
+}
+
+function rememberFinalization(request: FinalizeWorktreeRequest): void {
+	rememberedFinalizations.set(rememberKey(request.agentId, request.runId), request);
+}
+
+export function rememberedFinalizationFor(agentId: string, runId: string): FinalizeWorktreeRequest | undefined {
+	return rememberedFinalizations.get(rememberKey(agentId, runId));
+}
+
+/** Test-only: drop remembered re-entry requests. */
+export function resetRememberedFinalizationsForTests(): void {
+	rememberedFinalizations.clear();
+	rememberedStates.clear();
 }
 
 /**
@@ -104,10 +127,55 @@ export async function finalizeWorktreeIfOwned(
 	if (!piOwnsWorktreeFinalization(env)) return undefined;
 	const { mainCwd, worktreePath, worktreeBranch } = request;
 	if (!mainCwd || !worktreePath || !worktreeBranch) return undefined;
+	rememberFinalization(request);
 
 	// Lazy: the audited Git service loads only for a host that asked pi to run it.
 	const { finalizeWorktreeV1 } = await import("../subagent-host/worktree/index.ts");
-	return finalizeWorktreeV1(
+	const {
+		inspectAgentLease,
+		reapStaleAgentLease,
+		claimAgentCleanupLease,
+		releaseAgentCleanupLease,
+	} = await import("./agent-lease.ts");
+	const previous = rememberedStates.get(rememberKey(request.agentId, request.runId));
+	const options = {
+		postMergeVerify: piPostMergeVerifyRunner,
+		...(onMergedHook ? { onMerged: onMergedHook } : {}),
+		lease: {
+			inspect(agentId: string) {
+				return inspectAgentLease(mainCwd, agentId).status;
+			},
+			reapStale(agentId: string) {
+				return reapStaleAgentLease(mainCwd, agentId);
+			},
+			claimCleanup(agentId: string) {
+				const claimed = claimAgentCleanupLease(mainCwd, agentId, request.runId);
+				if (!claimed.lease) {
+					const status = inspectAgentLease(mainCwd, agentId).status;
+					return { ok: false as const, status, message: claimed.problem };
+				}
+				return {
+					ok: true as const,
+					claim: {
+						releaseOnEnd: claimed.created,
+						release() {
+							releaseAgentCleanupLease(claimed);
+						},
+					},
+				};
+			},
+		},
+	};
+	if (
+		previous &&
+		(previous.result.merge === "merged" || previous.result.merge === "already-integrated")
+	) {
+		const { WorktreeFinalizationServiceV1 } = await import("../subagent-host/worktree/index.ts");
+		const state = await new WorktreeFinalizationServiceV1(options).retry(previous);
+		rememberedStates.set(rememberKey(request.agentId, request.runId), state);
+		return state;
+	}
+	const state = await finalizeWorktreeV1(
 		{
 			schemaVersion: 1,
 			agentId: request.agentId,
@@ -125,15 +193,40 @@ export async function finalizeWorktreeIfOwned(
 			},
 			terminal: { state: request.terminalState },
 			...(request.verify ? { verify: request.verify } : {}),
+			...(request.acceptance ? { acceptance: request.acceptance } : {}),
 		},
 		// The attested verify must also run AFTER integration, in main, or a broken merge can
 		// silently land. The runner executes legacy string commands; argv-only hosts keep the
 		// service's own shell-less path.
-		{
-			postMergeVerify: piPostMergeVerifyRunner,
-			...(onMergedHook ? { onMerged: onMergedHook } : {}),
-		},
+		options,
 	);
+	rememberedStates.set(rememberKey(request.agentId, request.runId), state);
+	return state;
+}
+
+/** Re-run the same owned finalizer after Boss accept/resolve. Idempotent. */
+export async function reenterFinalizeOnBossAccept(input: {
+	agentId: string;
+	runId: string;
+	mainCwd?: string;
+	worktreePath?: string;
+	worktreeBranch?: string;
+	role?: WorktreeOwnerRoleV1;
+	terminalState?: WorktreeTerminalStateV1;
+	verify?: FinalizeWorktreeRequest["verify"];
+}): Promise<WorktreeFinalizationStateV1 | undefined> {
+	const remembered = rememberedFinalizationFor(input.agentId, input.runId);
+	return finalizeWorktreeIfOwned({
+		agentId: input.agentId,
+		runId: input.runId,
+		mainCwd: input.mainCwd ?? remembered?.mainCwd,
+		worktreePath: input.worktreePath ?? remembered?.worktreePath,
+		worktreeBranch: input.worktreeBranch ?? remembered?.worktreeBranch,
+		role: input.role ?? remembered?.role ?? "worker",
+		terminalState: input.terminalState ?? remembered?.terminalState ?? "ok",
+		...(input.verify ?? remembered?.verify ? { verify: input.verify ?? remembered?.verify } : {}),
+		acceptance: { source: "boss" },
+	});
 }
 
 /** Map the extension's own terminal vocabulary onto the finalization contract's. */
@@ -168,4 +261,24 @@ export function closeoutDispositionFor(
 export function summarizeFinalization(state: WorktreeFinalizationStateV1): string {
 	const { result } = state;
 	return `disposition=${result.disposition} merge=${result.merge} cleanup=${result.cleanup} phase=${state.phase}`;
+}
+
+export type WorktreeLifecycleProjectionV1 =
+	| "active"
+	| "pendingReview"
+	| "merged"
+	| "mergedCleanupPending"
+	| "discarded";
+
+/** Map a settled finalization onto the host worktree lifecycle. */
+export function lifecycleForFinalization(state: WorktreeFinalizationStateV1): WorktreeLifecycleProjectionV1 {
+	const merged = state.result.merge === "merged" || state.result.merge === "already-integrated";
+	if (merged && state.result.cleanup === "cleaned" && state.result.disposition === "merged") {
+		return "merged";
+	}
+	if (merged && (state.result.cleanup === "retained-worktree" || state.result.cleanup === "failed")) {
+		return "mergedCleanupPending";
+	}
+	if (merged && state.result.disposition === "merged") return "merged";
+	return "pendingReview";
 }
