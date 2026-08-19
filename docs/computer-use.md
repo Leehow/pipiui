@@ -3,9 +3,21 @@
 可替换策略与公开 Runtime API 见
 [`computer-runtime-v1.md`](./computer-runtime-v1.md)。
 
-状态（2026-07-27）：Cua Driver 集成、工具协议、精确目标、坐标变换、取消路径和自动测试已实现。真实打包 App 的 TCC 归属、TextEdit/Finder/Xcode/Simulator 操作仍须在主 checkout 手工验收，不能由 `swift test` 代替。
+状态（2026-08-19）：Electron 默认路径已切换为单个 Computer Use Agent episode；Cua Driver Runtime v1 的精确目标、坐标变换、mutex、取消、急停、输入清理和 `outcome_unknown` 语义保持不变。真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由 worktree 的 Node/TypeScript 测试代替。
 
 ## 架构
+
+主会话只暴露 `computer_task({goal})`。每次调用创建一个私有 `computer-use` 子 episode，由同一个 Agent 完成规划、操作、恢复和验证；它没有 `subagent`、agent management 或其他 delegation 工具。旧 Leader → GUI Operator / Terminal Worker / Verifier 层级不再是普通入口。
+
+子 episode 继承当前 Pi 会话中适用的普通非管理工具，但桌面能力只通过三个小接口提供：
+
+1. `desktop_observe`：新鲜观察，并把约束与成功条件写入 Host Task Checkpoint；
+2. `desktop_open_application`：按 Runtime v1 固定精确目标，并检索当前项目的 Workflow Memory；
+3. `desktop_run_action_block`：执行 Host guarded block，逐动作 fresh-state 对账和 receipt，在 modal、窗口/target 漂移、stale locator、人工接管或未知后果处停止尾部。
+
+Host 对 Cold/Candidate/Practiced block 分别限制最多 2/4/12 个 mutation，Runtime v1 的 64-action 技术上限不变。Checkpoint 保存目标、约束、成功条件、已验证事实、未知后果、活动应用/Workflow 和 evidence refs；恢复必须跳过已满足动作，只执行最短安全后缀，consequential `outcome_unknown` 不得盲重放。
+
+Workflow Memory schema v2 只写入 backend 解析出的 `{activeProjectPiHome}/computer-use/`。第一次独立自主成功生成 Candidate，第二个不同 task/run 的成功晋升 Practiced；连续漂移/失败或一次未知后果会 Suspended。每次最多召回一个 Workflow 和两个 Recovery Lesson，敏感应用不学习，任务值在持久化前参数化，损坏记录隔离，旧 App-profile/global Procedure Store 不自动导入。
 
 PipiUI 的 `computer` 与 `open_application` 仍是 provider 可移植的自定义工具；Anthropic 支持的模型会在 provider 边界改写为官方 `computer_20251124`。v1 不假设 Pi 能处理 OpenAI 原生 `computer_call` / `computer_call_output`。
 
@@ -129,13 +141,13 @@ PIPIUI_CUA_DRIVER_PATH=/absolute/path/to/cua-driver swift run
 
 自动测试覆盖真实 Unix socket 的 fake MCP initialize/host attribution、timeout 后 generation teardown/reap/自动重启、parent-liveness launch flags、精确 bundle、primary window 消失但 sibling 存活、session-pinned AX token、模型生命周期/AX/像素路由指引、数值边界、overlay/hold/double/triple 语义、最终观察失败的 unknown-outcome、真实 foreground/focus metadata、坐标/letterbox、急停无队列阻塞、固定 artifact/hash、nested signing 顺序与输入框不抢焦点。
 
-所有工具卡的 AppKit/SwiftUI 文本布局输入都有独立的 display-only 硬预算：展开最多 12,000 UTF-16 units，折叠最多 4,000，并显示明确截断提示；`ToolRun` / session 原始数据不因此改写。`computer` 与 `open_application` 的截图不会触发工具卡自动展开，避免历史或新结果在未点击时立即排版大段 AX 内容。
+Electron 的 Computer Task 面板只应显示一个 `computer-use` episode；Task Checkpoint、guarded-block receipts 和 Workflow 状态属于结构化详情，不应伪装成多个子 Agent。截图不会因为新结果自动展开，避免历史或新结果立即排版大段 AX 内容。
 
 仍需在主 checkout 单独完成：
 
-1. `./make-app.sh`，核对 helper 与外层 App 签名/entitlements 和产物 freshness；
+1. 通过 `pipiui-electron-build` 在主 checkout 生成 canonical `build/PipiUI Electron.app`，核对 helper、外层 App 签名/entitlements 和产物 freshness；
 2. PipiUI 单一 TCC 归属与权限重启；
-3. TextEdit 中英文输入与保存、Finder 文件操作、Xcode Run、Simulator 无账号流程；
+3. TextEdit 编辑保存、Finder 文件操作、浏览器表单、Office 编辑导出和跨工具任务；
 4. 两个真实 Pi session 并发、急停和 target-loss；
 5. 登录、Touch ID、密码提示只返回 user handoff。
 6. 公开分发前生成精确 v0.12.5 dependency notices/MPL source package；本地打包验收不能替代该 release gate。

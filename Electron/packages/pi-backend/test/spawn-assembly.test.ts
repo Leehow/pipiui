@@ -261,17 +261,24 @@ describe("worktree finalization ownership", () => {
 });
 
 describe("Computer Agent host contract", () => {
-  it("provides the persistent Procedure Store and Cua version only from host assembly", () => {
+  it("provides only the active project Pi home and Cua version from host assembly", () => {
     const { env } = assemblePiSpawn({
       cwd: "/tmp/project",
+      agentDir: "/tmp/project/.pi/agent",
       features: { subagent: true, computerUse: true },
       paths: { subagentDir: "/ext/subagent", computerUse: "/ext/computer.ts" },
       bridgePort: 1234,
       computerCapability: "cap",
       computerDescriptor: { displayID: 1, width: 100, height: 100 },
     });
-    expect(env.PIPIUI_COMPUTER_PROCEDURE_STORE).toMatch(/\/Library\/Application Support\/PipiUI\/computer-agent\/procedures\.json$/);
+    expect(env.PIPIUI_ACTIVE_PROJECT_PI_HOME).toBe("/tmp/project/.pi/agent");
+    expect(env.PIPIUI_COMPUTER_PROCEDURE_STORE).toBeUndefined();
     expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.20.0");
+  });
+
+  it("exports the enabled browser route for the single Computer Use Agent child", () => {
+    const { env } = assemblePiSpawn({ cwd: "/tmp/project", features: { browser: true }, paths: { webview: "/ext/webview.ts" }, bridgePort: 1234 });
+    expect(env.PIPIUI_WEBVIEW_EXT).toBe("/ext/webview.ts");
   });
 
   it("strips inherited terminal broker and Cua contract values", () => {

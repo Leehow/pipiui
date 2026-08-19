@@ -6,9 +6,8 @@ import { ProviderLogo } from './ProviderLogo'
 import type { ModelVisibilityController } from './useModelVisibility'
 import './subagent-models.css'
 
-const COMPUTER_USE_AGENT_NAMES = new Set(['computer-use-leader', 'operator', 'computer-verifier', 'computer-terminal'])
-const VISUAL_COMPUTER_USE_AGENT_NAMES = new Set(['operator', 'computer-verifier'])
-const COMPUTER_USE_WORKER_ORDER = ['operator', 'computer-verifier', 'computer-terminal']
+const COMPUTER_USE_AGENT_NAMES = new Set(['computer-use', 'computer-use-leader', 'operator', 'computer-verifier', 'computer-terminal'])
+const VISUAL_COMPUTER_USE_AGENT_NAMES = new Set(['computer-use'])
 
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
 export function SubagentModelModal({ host, current, visibility, onClose }: { host: PipiHostAPI; current: Model | null; visibility: ModelVisibilityController; onClose: () => void }) {
@@ -26,10 +25,7 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
-  const computerUseLeader = agents.find(agent => agent.name === 'computer-use-leader')
-  const computerUseWorkers = COMPUTER_USE_WORKER_ORDER
-    .map(name => agents.find(agent => agent.name === name))
-    .filter((agent): agent is AgentDefinition => Boolean(agent))
+  const computerUseAgent = agents.find(agent => agent.name === 'computer-use')
   const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
 
   useEffect(() => {
@@ -121,14 +117,10 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
               <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
               {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
             </section>
-            {(computerUseLeader || computerUseWorkers.length > 0) && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
-              <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agents</h3><span>Leader 主管下属专用执行与验证 Agent</span></div>
+            {computerUseAgent && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
+              <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agent</h3><span>单个 Agent 完成规划、操作、恢复与验证</span></div>
               <div className="subagent-computer-use-tree">
-                {computerUseLeader && <AgentRow hierarchy="leader" agent={computerUseLeader} chain={settings[computerUseLeader.name] ?? []} models={candidateModels} saving={saving === computerUseLeader.name} onSave={save} />}
-                {computerUseWorkers.length > 0 && <div className="subagent-computer-use-children" role="group" aria-label="Computer Use Leader 的子 Agent">
-                  <div className="subagent-computer-use-branch-label"><span aria-hidden="true">↳</span> Leader 调度</div>
-                  {computerUseWorkers.map(agent => <AgentRow hierarchy="worker" key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
-                </div>}
+                <AgentRow agent={computerUseAgent} chain={settings[computerUseAgent.name] ?? []} models={candidateModels} saving={saving === computerUseAgent.name} onSave={save} />
               </div>
             </section>}
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}

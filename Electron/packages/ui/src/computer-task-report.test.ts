@@ -110,6 +110,19 @@ describe('parseComputerTaskResult', () => {
     expect(computerStepStatuses(view!)).toHaveLength(0)
   })
 
+  it('projects the single Computer Use Agent episode and its evidence claims', () => {
+    const envelope = JSON.stringify({
+      episodeLedger: [{ agentId: 'computer-use-1', runId: 'run-1', parentId: null, name: 'computer-use', role: 'computer-use-agent', terminalState: 'ok', result: { outcome: 'succeeded', summary: 'Saved' } }],
+      verification: { status: 'verified', claims: [{ claim: 'The saved value is visible', evidenceRef: 'observation:9' }] },
+    })
+    const view = parseComputerTaskResult(`Saved\n\nEpisode ledger:\n${envelope}`)!
+    expect(view.episodes).toHaveLength(1)
+    expect(view.episodes[0]).toMatchObject({ role: 'computer-use-agent', outcome: 'succeeded' })
+    expect(view.verification?.claims).toEqual([{ claim: 'The saved value is visible', evidenceRef: 'observation:9' }])
+    expect(computerTaskOutcome(view)).toEqual({ label: '任务完成', ok: true })
+    expect(computerRoleLabel('computer-use-agent')).toBe('Computer Use')
+  })
+
   it('returns null for missing marker or malformed ledger', () => {
     expect(parseComputerTaskResult('Just prose, no ledger.')).toBeNull()
     expect(parseComputerTaskResult('S\n\nEpisode ledger:\nnot json')).toBeNull()

@@ -40,7 +40,8 @@ export const ComputerTaskResultCard = memo(function ComputerTaskResultCard({ res
   const title = goalText.length > GOAL_LIMIT ? `${goalText.slice(0, GOAL_LIMIT)}…` : goalText
   const openSubagents = (event: React.MouseEvent) => {
     event.stopPropagation()
-    onOpenSubagents?.(result.episodes.find(episode => episode.name === 'computer-use-leader')?.agentId)
+    onOpenSubagents?.(result.episodes.find(episode => episode.name === 'computer-use' || episode.role === 'computer-use-agent')?.agentId
+      ?? result.episodes.find(episode => episode.name === 'computer-use-leader')?.agentId)
   }
   return <section className={`activity-card activity-card-tool computer-card computer-result-card${outcome.ok ? '' : ' computer-card-error'}`} data-testid="computer-result-card">
     <button className="computer-card-head" onClick={onOpenSubagents ? openSubagents : undefined} title={onOpenSubagents ? '打开 Subagents 面板' : undefined}>
@@ -77,6 +78,14 @@ export const ComputerTaskResultCard = memo(function ComputerTaskResultCard({ res
             <span>{condition.text}</span>
           </div>
         })}
+      </div>}
+      {(result.verification?.claims?.length ?? 0) > 0 && <div className="computer-condition-list">
+        <div className="computer-section-label">验证证据</div>
+        {result.verification!.claims!.map((claim, index) => <div key={`${claim.evidenceRef}:${index}`} className="computer-condition-row">
+          <span className="computer-condition-mark verified" aria-hidden="true">✓</span>
+          <span>{claim.claim}</span>
+          <small className="computer-step-meta"> · {claim.evidenceRef}</small>
+        </div>)}
       </div>}
       <details className="computer-raw">
         <summary>技术详情</summary>

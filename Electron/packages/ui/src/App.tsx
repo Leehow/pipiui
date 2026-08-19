@@ -666,10 +666,7 @@ export function createMockHost(): PipiHostAPI {
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.' },
     { name: 'general-purpose', description: 'Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason.' },
     { name: 'reviewer', description: 'Read-only code review specialist for quality and security.' },
-    { name: 'computer-use-leader', description: 'Computer Use supervisor. Plans, recovers, and returns the final report.' },
-    { name: 'operator', description: 'Computer-use desktop worker. Performs macOS desktop operations and returns a compressed text verdict; does not edit code files.' },
-    { name: 'computer-verifier', description: 'Observe-only Computer Use verifier for fresh postcondition checks.' },
-    { name: 'computer-terminal', description: 'Bounded terminal worker using an attenuated one-run Host tool broker; receives no desktop capability.' },
+    { name: 'computer-use', description: 'Single Computer Use Agent. Plans, operates, reconciles, recovers, and verifies without delegation.' },
     { name: 'secretary', description: 'Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.' },
   ]
   const emit = (sessionId: string, event: StreamEvent) => {

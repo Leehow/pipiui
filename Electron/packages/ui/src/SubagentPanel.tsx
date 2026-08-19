@@ -142,6 +142,7 @@ const profileNames: Record<string, string> = {
   plan: '规划',
   secretary: '收尾秘书',
   'long-test': '长时测试',
+  'computer-use': '电脑操作 Agent',
   'computer-use-leader': '电脑操作主管',
   'computer-terminal': '终端操作',
   'computer-verifier': '操作验证',
@@ -204,6 +205,7 @@ function shortTaskLabel(task: string): string {
 function agentListSubtitle(agent: Agent): string {
   const title = agent.title?.trim()
   if (title) return localizedTaskSummary(title)
+  if (agent.name === 'computer-use' || agent.role === 'computer-use-agent') return '规划、操作并核验桌面任务'
   if (agent.name === 'computer-use-leader' || agent.role === 'computer-use-leader') return '协调并核验桌面操作任务'
   if (agent.name === 'computer-terminal') return '执行受限终端步骤'
   if (agent.name === 'computer-verifier') return '核验桌面操作结果'

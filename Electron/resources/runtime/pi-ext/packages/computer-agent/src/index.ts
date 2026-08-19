@@ -9,3 +9,6 @@ export * from "./terminal-broker.ts";
 export * from "./artifacts.ts";
 export * from "./plan.ts";
 export * from "./workers.ts";
+export * from "./checkpoint.ts";
+export * from "./action-block.ts";
+export * from "./workflows.ts";

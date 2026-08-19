@@ -35,7 +35,9 @@
 
 ## Computer Use（macOS 桌面控制，opt-in）
 
-设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只导出 `PIPIUI_COMPUTER_*` 环境（供嵌套派发 host-check），**不**挂载 `computer` / `open_application`；桌面工具仅注入给带 desktop 授权的 subagent（`operator`）。
+设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只看到 `computer_task({goal})`；每次调用创建一个私有、不可委派的 `computer-use` episode，由同一个 Agent 完成规划、操作、状态恢复和验证。它继承会话中适用的普通非管理工具，桌面侧只看到 `desktop_observe`、`desktop_open_application` 和 Host-guarded `desktop_run_action_block`，不会拿到 raw Host capability。
+
+Guarded block 采用语义 just-in-time binding，按 Workflow 成熟度限制 Cold/Candidate/Practiced 为 2/4/12 次 mutation，并在 modal、target/window 漂移、stale locator、人工接管或 `outcome_unknown` 时停止剩余动作。Task Checkpoint 支持跳过用户已完成的步骤和最短安全后缀恢复；Workflow Memory v2 只位于当前项目 `.pi/agent/computer-use`，两次独立成功后晋升 Practiced，敏感应用不学习，也不会导入旧全局 Procedure Store。
 
 底部 `desktopcomputer` 按钮是 PipiUI 唯一的产品授权开关。打开即进入无限制模式：PipiUI 不做逐会话、逐应用、高风险、敏感文本/快捷键或破坏性写操作确认；PipiUI 自身、Terminal、System Settings、密码管理器、未知应用以及历史持久 deny 都走同一条无提示路径。普通鼠标、键盘和滚动输入不会暂停或取消操作。只保留 macOS Screen Recording/Accessibility TCC、手动/`⌥⇧Esc` 急停、实际执行期间的 process-global mutex，以及目标 PID/焦点/动态代码身份、窗口截图、坐标、event-post、取消和 held-input 清理等技术校验。每个 batch 或 `open_application` 成功、失败或取消落定后都会释放互斥槽；每批动作结束给模型一张新截图，PNG 只保存在进程内存中，不写入 pi 会话 JSONL。
 
