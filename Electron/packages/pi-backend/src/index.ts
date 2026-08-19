@@ -77,6 +77,32 @@ import {
 } from "./stop-escalation.js";
 import { QuotaStore, parseDotEnv } from "./quota.js";
 import {
+  applySessionMountsToWorkerEnv,
+  configureVaultKeyProvider,
+  createSessionEnvRefreshGate,
+  createSessionRedactionGate,
+  createSessionWriteBarrier,
+  deleteSecret,
+  envKeyProvider,
+  listSecretMeta,
+  listSessionMounts,
+  loadVault,
+  mountSecret,
+  putSecret,
+  redactSessionJsonl,
+  redactText,
+  revealMountedSecrets,
+  StreamRedactor,
+  unmountSecret,
+  vaultDiagnosisFor,
+  VaultEncryptionError,
+  workerEnvFromVault,
+  type ExclusiveSessionWork,
+  type RevealedSecret,
+  type VaultDiagnosis,
+  type VaultKeyProvider,
+} from "./secret-vault.js";
+import {
   appendLedgerRecord,
   latestContextBySession,
   readLedgerFile,
@@ -432,6 +458,8 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
+  /** Electron injects safeStorage-backed DEK provider. Absent = fail closed. */ vaultKeyProvider?: VaultKeyProvider;
+  /** Optional OS-level encryption diagnosis; never blocks ordinary chat. */ vaultAvailability?: () => VaultDiagnosis;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -466,6 +494,7 @@ type Live = {
   cwd: string;
   process?: ChildProcessWithoutNullStreams;
   exit?: Promise<void>;
+  exiting?: boolean;
   exitError?: PiExitedError;
   buffer: string;
   stderrTail: string;
@@ -501,6 +530,7 @@ type Live = {
   turnEpoch?: number;
   /** Concatenated `text_delta` for the in-flight assistant message. */
   streamedAssistantText?: string;
+  streamRedactors?: { text: Map<number, StreamRedactor>; thinking: Map<number, StreamRedactor>; tool: Map<number, StreamRedactor> };
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
   /** Exact final assistant awaiting the last real subagent terminal event. */
@@ -1402,6 +1432,17 @@ export class PiHostBackend implements HostBackend {
   private projectionDebugProvenance = new Map<string, string>();
   private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
+  private sessionFileBarriers = new Map<string, ExclusiveSessionWork>();
+  private readonly sessionRedact = createSessionRedactionGate({
+    hasWork: (sessionId) => this.sessionSecrets(sessionId).length > 0,
+    canRewrite: (sessionId) => this.canRewriteSessionFile(sessionId),
+    confirmWriterIdle: (sessionId) => this.closeQuietSessionWriter(sessionId),
+    rewrite: (sessionId) => this.rewriteSessionSecrets(sessionId),
+  });
+  private readonly sessionEnvRefresh = createSessionEnvRefreshGate({
+    canRefresh: (sessionId) => this.canRewriteSessionFile(sessionId),
+    stopWriter: (sessionId) => this.closeQuietSessionWriter(sessionId),
+  });
   private readonly planStore = new PlanStore();
   private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
@@ -1465,6 +1506,8 @@ export class PiHostBackend implements HostBackend {
   private managedNodeModulesRoot?: string;
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
+  private vaultKeyProvider: VaultKeyProvider;
+  private vaultAvailability?: () => VaultDiagnosis;
   private features: SpawnFeatures;
   private profileMode: "default" | "isolated";
   private resourceMode: "default" | "explicit";
@@ -1534,6 +1577,9 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.vaultKeyProvider = options.vaultKeyProvider ?? envKeyProvider(options.env ?? process.env);
+    this.vaultAvailability = options.vaultAvailability;
+    configureVaultKeyProvider(this.vaultKeyProvider);
     this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
       () => undefined,
@@ -1886,6 +1932,15 @@ export class PiHostBackend implements HostBackend {
     await this.loadQueue(id);
     await new Promise<void>((resolve) => setImmediate(resolve));
     if (!this.closed) await this.queue.notifyIdle(id, epoch);
+    if (!this.closed) {
+      try {
+        await this.flushSessionRedact(id);
+        await this.flushSessionEnvRefresh(id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[vault-diag] session rewrite failed", message);
+      }
+    }
   }
   /**
    * Host abort: write abort, emit stopped quickly, escalate hung descendants,
@@ -2141,6 +2196,80 @@ export class PiHostBackend implements HostBackend {
       thinkingLevel: resolveThinkingLevel(s.thinkingLevel ?? base.thinkingLevel, availableThinkingLevels, base.thinkingLevel) ?? "off",
       availableThinkingLevels,
     };
+  }
+  private sessionSecrets(sessionId: string): RevealedSecret[] {
+    try { return revealMountedSecrets(this.agentDir, sessionId); }
+    catch { return []; }
+  }
+  private sessionFileExclusive(sessionId: string): ExclusiveSessionWork {
+    const existing = this.sessionFileBarriers.get(sessionId);
+    if (existing) return existing;
+    const created = createSessionWriteBarrier();
+    this.sessionFileBarriers.set(sessionId, created);
+    return created;
+  }
+  private canRewriteSessionFile(sessionId: string): boolean {
+    const live = this.live.get(sessionId);
+    if (live && this.childStillRunning(live.process)) return this.isSessionQuiet(sessionId);
+    return !this.queue.isBusy(sessionId) && this.queue.listQueue(sessionId).length === 0;
+  }
+  private async closeQuietSessionWriter(sessionId: string): Promise<boolean> {
+    const live = this.live.get(sessionId);
+    if (!live || !this.childStillRunning(live.process)) return true;
+    if (!this.isSessionQuiet(sessionId)) return false;
+    live.exiting = true;
+    live.compaction.dispose();
+    await this.stopLiveProcess(live);
+    await (live.exit ?? Promise.resolve());
+    if (this.childStillRunning(live.process)) return false;
+    if (this.live.get(sessionId) === live) this.live.delete(sessionId);
+    return true;
+  }
+  private async rewriteSessionSecrets(sessionId: string): Promise<void> {
+    const secrets = this.sessionSecrets(sessionId);
+    if (secrets.length === 0) return;
+    const path = this.live.get(sessionId)?.path ?? (await this.findSession(sessionId).catch(() => undefined))?.path;
+    if (!path) throw new Error("session file unavailable for redaction");
+    await redactSessionJsonl(path, secrets);
+    this.historyCache.delete(path);
+  }
+  private requestSessionRedact(sessionId: string): void {
+    this.sessionRedact.request(sessionId);
+  }
+  private async flushSessionRedact(sessionId: string): Promise<void> {
+    await this.sessionFileExclusive(sessionId)(() => this.sessionRedact.flush(sessionId));
+  }
+  private async redactSessionFile(sessionId: string): Promise<void> {
+    this.requestSessionRedact(sessionId);
+    await this.flushSessionRedact(sessionId);
+  }
+  private requestSessionEnvRefresh(sessionId: string): void {
+    this.sessionEnvRefresh.request(sessionId);
+  }
+  private async flushSessionEnvRefresh(sessionId: string): Promise<void> {
+    await this.sessionFileExclusive(sessionId)(() => this.sessionEnvRefresh.flush(sessionId));
+  }
+  private async refreshSessionChildEnv(sessionId: string): Promise<void> {
+    this.requestSessionEnvRefresh(sessionId);
+    await this.flushSessionEnvRefresh(sessionId);
+  }
+  private vaultDek(): string | undefined {
+    try { return this.vaultKeyProvider.getDek().toString("base64"); }
+    catch { return undefined; }
+  }
+  private diagnoseVault(): VaultDiagnosis {
+    if (this.vaultAvailability) return this.vaultAvailability();
+    try {
+      this.vaultKeyProvider.getDek();
+      return vaultDiagnosisFor("available");
+    } catch {
+      return vaultDiagnosisFor("encryption-unavailable");
+    }
+  }
+  private assertVaultReady(): void {
+    const diagnosis = this.diagnoseVault();
+    if (diagnosis.available) return;
+    throw new VaultEncryptionError(diagnosis.kind, diagnosis.message);
   }
   private project(path: string, names = this.projectNames): Project {
     return { id: dirId(path), name: displayNameFor(path, names), path };
@@ -2430,6 +2559,49 @@ export class PiHostBackend implements HostBackend {
         return this.loadPaddleOcrStatus(params[0]);
       case "setPaddleOcrAccessToken":
         return this.savePaddleOcrAccessToken(params[0], params[1]);
+      case "diagnoseSecretVault":
+        return this.diagnoseVault();
+      case "listSecretVault": {
+        const sessionId = String(params[0] ?? "");
+        return {
+          sessionId,
+          secrets: listSecretMeta(this.agentDir),
+          mounts: listSessionMounts(this.agentDir, sessionId),
+        };
+      }
+      case "putSecretVault": {
+        this.assertVaultReady();
+        const input = params[0] as { name: string; envName: string; value: string; sessionId: string };
+        const secret = await putSecret(this.agentDir, input);
+        const mount = await mountSecret(this.agentDir, String(input.sessionId), secret.id);
+        this.requestSessionEnvRefresh(String(input.sessionId));
+        await this.redactSessionFile(String(input.sessionId)).catch((error) => {
+          console.error("[vault-diag] session rewrite failed", error instanceof Error ? error.message : String(error));
+          throw error;
+        });
+        await this.flushSessionEnvRefresh(String(input.sessionId));
+        return { secret, mount, sessionId: input.sessionId };
+      }
+      case "mountSecretVault": {
+        this.assertVaultReady();
+        const sessionId = String(params[0]);
+        const mount = await mountSecret(this.agentDir, sessionId, String(params[1]), params[2] ? String(params[2]) : undefined);
+        await this.refreshSessionChildEnv(sessionId);
+        return { sessionId, mount };
+      }
+      case "unmountSecretVault": {
+        const sessionId = String(params[0]);
+        const removed = await unmountSecret(this.agentDir, sessionId, String(params[1]));
+        await this.refreshSessionChildEnv(sessionId);
+        return { sessionId, removed };
+      }
+      case "deleteSecretVault": {
+        const affected = new Set([...Object.keys(loadVault(this.agentDir).mounts), ...this.live.keys()]);
+        const deleted = await deleteSecret(this.agentDir, String(params[0]));
+        for (const sessionId of affected) this.requestSessionEnvRefresh(sessionId);
+        for (const sessionId of affected) await this.flushSessionEnvRefresh(sessionId);
+        return { deleted };
+      }
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -2932,6 +3104,7 @@ export class PiHostBackend implements HostBackend {
       computerDescriptor: computerCapability
         ? this.computerDescriptor
         : undefined,
+      vaultDek: this.vaultDek(),
     });
     // close() may race a cache-first background resume before the child is
     // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
@@ -2952,10 +3125,13 @@ export class PiHostBackend implements HostBackend {
       // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
       // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
-        mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
-          ...output.env,
-          ...(this.piCommand.env ?? {}),
-        }),
+        applySessionMountsToWorkerEnv(
+          mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
+            ...output.env,
+            ...(this.piCommand.env ?? {}),
+          }),
+          workerEnvFromVault(this.agentDir, id),
+        ),
         this.piCommand.executable,
       ),
       stdio: ["pipe", "pipe", "pipe"],
@@ -3155,24 +3331,37 @@ export class PiHostBackend implements HostBackend {
       live.followUps = e.followUp ?? [];
     } else if (e.type === "message_update") {
       const d = e.assistantMessageEvent ?? {};
+      const secrets = this.sessionSecrets(id);
+      live.streamRedactors ??= { text: new Map(), thinking: new Map(), tool: new Map() };
+      const redactor = (kind: "text" | "thinking" | "tool", index: number) => {
+        const bag = live.streamRedactors![kind];
+        const existing = bag.get(index);
+        if (existing) return existing;
+        const created = new StreamRedactor(secrets);
+        bag.set(index, created);
+        return created;
+      };
       if (d.type === "text_delta") {
-        live.streamedAssistantText = (live.streamedAssistantText ?? "") + (d.delta ?? "");
+        const delta = redactor("text", d.contentIndex ?? 0).push(d.delta ?? "");
+        live.streamedAssistantText = (live.streamedAssistantText ?? "") + delta;
         this.stream({
           type: "text",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
           segment: live.messageEpoch,
-          delta: d.delta ?? "",
+          delta,
         });
       }
-      if (d.type === "thinking_delta")
+      if (d.type === "thinking_delta") {
+        const delta = redactor("thinking", d.contentIndex ?? 0).push(d.delta ?? "");
         this.stream({
           type: "thinking",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
           segment: live.messageEpoch,
-          delta: d.delta ?? "",
+          delta,
         });
+      }
       if (this.projectionDebugEnabled() && (d.type === "text_delta" || d.type === "thinking_delta"))
         this.projectionDebugLine(`[stream-debug] emit ${d.type} session=${this.projectionDebugSessionTag(id)} t=${Date.now()} len=${(d.delta ?? "").length}`, "log");
       if (d.type === "toolcall_start") {
@@ -3192,10 +3381,8 @@ export class PiHostBackend implements HostBackend {
         });
       } else if (d.type === "toolcall_delta") {
         const index = d.contentIndex ?? 0;
-        live.toolArgs.set(
-          index,
-          (live.toolArgs.get(index) ?? "") + (d.delta ?? ""),
-        );
+        const delta = redactor("tool", index).push(d.delta ?? "");
+        live.toolArgs.set(index, (live.toolArgs.get(index) ?? "") + delta);
         this.stream({
           type: "tool_call",
           sessionId: id,
@@ -3203,18 +3390,20 @@ export class PiHostBackend implements HostBackend {
           segment: live.messageEpoch,
           toolCallId: `content-${index}`,
           name: "tool",
-          delta: d.delta ?? "",
+          delta,
         });
       } else if (d.type === "toolcall_end") {
         const index = d.contentIndex ?? 0;
-        const buffered = live.toolArgs.get(index) ?? "";
+        const tail = live.streamRedactors?.tool.get(index)?.flush() ?? "";
+        live.streamRedactors?.tool.delete(index);
+        const buffered = (live.toolArgs.get(index) ?? "") + tail;
         live.toolArgs.delete(index);
         const call = d.toolCall ?? {};
         const args =
           call.arguments != null && typeof call.arguments === "object"
-            ? JSON.stringify(call.arguments)
+            ? redactText(JSON.stringify(call.arguments), secrets)
             : typeof call.arguments === "string"
-              ? call.arguments
+              ? redactText(call.arguments, secrets)
               : buffered;
         this.stream({
           type: "tool_call",
@@ -3229,9 +3418,17 @@ export class PiHostBackend implements HostBackend {
     } else if (e.type === "message_end") {
       const endingEpoch = live.messageEpoch;
       const endedMessage = e.message ?? {};
+      const secrets = this.sessionSecrets(id);
       if (endedMessage.role === "assistant") {
-        const fullText = assistantVisibleText(endedMessage.content);
-        const already = live.streamedAssistantText ?? "";
+        const flushed = [...(live.streamRedactors?.text.values() ?? [])].map((item) => item.flush()).join("");
+        live.streamRedactors?.text.clear();
+        live.streamRedactors?.thinking.forEach((item) => {
+          const tail = item.flush();
+          if (tail) this.stream({ type: "thinking", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: tail });
+        });
+        live.streamRedactors?.thinking.clear();
+        const fullText = redactText(assistantVisibleText(endedMessage.content), secrets);
+        const already = (live.streamedAssistantText ?? "") + flushed;
         if (fullText && (!already || (fullText.startsWith(already) && fullText.length > already.length))) {
           this.stream({
             type: "text",
@@ -5924,3 +6121,14 @@ export class PiHostBackend implements HostBackend {
 export function createPiHostBackend(options: PiBackendOptions = {}) {
   return new PiHostBackend(options);
 }
+export {
+  configureVaultKeyProvider,
+  createSealedDekProvider,
+  memoryKeyProvider,
+  ubuntuVaultInstallHint,
+  vaultDiagnosisFor,
+  VaultEncryptionError,
+  type VaultDiagnosis,
+  type VaultDiagKind,
+  type VaultKeyProvider,
+} from "./secret-vault.js";

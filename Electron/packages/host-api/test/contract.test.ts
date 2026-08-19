@@ -923,3 +923,51 @@ describe('Electron-native update center extension', () => {
     expect(calls).toEqual([{ method: 'checkForUpdates', params: [] }])
   })
 })
+
+describe('secret vault host contract', () => {
+  it('routes vault metadata and diagnosis without leaking values', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        if (request.method === 'diagnoseSecretVault') {
+          return {
+            protocolVersion: 2,
+            id: request.id,
+            type: 'response',
+            ok: true,
+            result: {
+              available: false,
+              kind: 'missing-packages',
+              message: '系统密钥服务不可用。',
+              installHint: 'sudo apt install gnome-keyring libsecret-1-0 libsecret-tools',
+              retryable: true,
+              platform: 'linux',
+            },
+          }
+        }
+        if (request.method === 'listSecretVault') {
+          return {
+            protocolVersion: 2,
+            id: request.id,
+            type: 'response',
+            ok: true,
+            result: { sessionId: request.params[0], secrets: [{ id: '1', name: 'openai', envName: 'OPENAI_API_KEY', createdAt: 't' }], mounts: [] },
+          }
+        }
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { deleted: true } }
+      },
+      on: () => undefined,
+      removeListener: () => undefined,
+    }
+    const host = createIpcHost(ipc)
+    const diagnosis = await host.diagnoseSecretVault?.()
+    expect(diagnosis?.kind).toBe('missing-packages')
+    expect(JSON.stringify(diagnosis)).not.toMatch(/sk-|ghp_|password=/i)
+    const listed = await host.listSecretVault?.('sess-1')
+    expect(listed?.secrets[0]?.envName).toBe('OPENAI_API_KEY')
+    expect(JSON.stringify(listed)).not.toContain('sk-live')
+    await host.deleteSecretVault?.('1')
+    expect(calls.map(call => call.method)).toEqual(['diagnoseSecretVault', 'listSecretVault', 'deleteSecretVault'])
+  })
+})

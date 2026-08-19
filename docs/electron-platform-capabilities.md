@@ -13,6 +13,7 @@
 | terminal（xterm） | ✅ node-pty | ✅ node-pty | ✅ node-pty（glibc ≤ 2.35） | 已入包；Linux `pty.node` 必须在 Ubuntu 22.04（glibc 2.35）上编译 |
 | 应用生命周期 | ✅ 关闭全部窗口不退出（macOS 惯例，dock 激活重建） | ✅ 全部窗口关闭即退出 | ✅ 同 win | `index.ts`：`if (process.platform !== 'darwin') app.quit()` |
 | 安装形态 | .app / dmg / zip（x64+arm64） | NSIS .exe（x64） | AppImage + deb（x64） | `apps/electron/package.json` build.target |
+| 密钥库（safeStorage） | ✅ 系统钥匙串 | ❌ 本轮不处理 | ✅ Ubuntu 22.04/24.04 x64 桌面会话 + Secret Service；缺依赖 fail-closed，普通聊天可用 | `apps/electron/src/main/linux-secret-service.ts`；用户说明见 [`electron-secret-vault-linux.md`](./electron-secret-vault-linux.md) |
 | 图标 | `build/icon.icns`（`scripts/make-icon.sh` 从 `assets/brand/app-icon.png` 生成，macOS 工具链；build/ 被 gitignore，CI mac job 先行再生成） | `assets/icons/512x512.png`（app-builder 自动转 .ico，≥256px） | `assets/icons/` 目录（16–1024 完整 png 集，deb/AppImage 各尺寸齐全） | 图标集提交在 `Electron/apps/electron/assets/icons/`（sips 生成一次，CI 无需工具链）；win/linux 由 app-builder 自动转换 |
 | 默认 shell | zsh | cmd / PowerShell（node-pty 需 conpty） | bash / sh | 按 `process.platform` 选择 |
 | 路径 | `~/.pi/agent`、`~/Library/Application Support/PipiUI` | `%USERPROFILE%\.pi\agent`、`%APPDATA%` | `~/.pi/agent`、`~/.config` | ⚠️ `packages/pi-backend/src/spawn-assembly.ts` 目前硬编码 `~/Library/Application Support/PipiUI`（search-grants、subagent-models 等）；win/linux 需改为平台路径（已排期，未在本轮实现） |
