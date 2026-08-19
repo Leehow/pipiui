@@ -2,6 +2,7 @@ import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, syste
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
+import { createElectronVaultKeyProvider, diagnoseElectronVault, probeElectronVaultAtStartup } from './secret-vault-key.js'
 import {
   PIPI_HOST_IPC_CHANNEL,
   PIPI_HOST_PROTOCOL_VERSION,
@@ -181,6 +182,7 @@ if (app) {
     // Browser-cookie quota providers (Qwen Token Plan) read their session cookies
     // from the built-in browser partitions; everything else keeps file defaults.
     const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData), readCursorAuth: readCursorAccessToken })
+    probeElectronVaultAtStartup()
     const piBackend = createPiHostBackend({
       piCommand: assets.piCommand,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
@@ -193,6 +195,8 @@ if (app) {
       authHelperPath: assets.sourceRoot ? join(assets.sourceRoot, 'auth', 'pi-auth-helper.mjs') : undefined,
       runtimeRoot,
       agentDir: piProfile.agentDir,
+      vaultKeyProvider: createElectronVaultKeyProvider(userData),
+      vaultAvailability: () => diagnoseElectronVault(),
       sessionsRoot: piProfile.sessionsRoot,
       canonicalModelsWrite: modelsWriteQueue,
       profileInitialization: profileInstall,

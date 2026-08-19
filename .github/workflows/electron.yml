@@ -74,6 +74,11 @@ jobs:
         working-directory: Electron
         run: npm test
 
+      - name: Test Secret Vault
+        if: matrix.platform != 'win'
+        working-directory: Electron
+        run: npm run test:secret-vault
+
       # Full workspace tests assume macOS paths, /bin/ps, and Computer Use.
       # Windows packaging is gated on the package-path contract instead.
       - name: Test Windows package path
@@ -97,10 +102,25 @@ jobs:
         working-directory: Electron
         run: npm run runtime:prepare:win
 
-      - name: Package (${{ matrix.platform }})
-        if: matrix.platform != 'win'
+      - name: Package macOS
+        if: matrix.platform == 'mac'
         working-directory: Electron/apps/electron
-        run: npx electron-builder ${{ matrix.args }} --config.directories.output=../../../build
+        run: npx --maxsockets 3 electron-builder ${{ matrix.args }} --config.directories.output=../../../build
+
+      - name: Prepare Linux embedded runtime
+        if: matrix.platform == 'linux'
+        working-directory: Electron
+        run: npm run runtime:prepare:linux
+
+      - name: Package Linux x64
+        if: matrix.platform == 'linux'
+        working-directory: Electron
+        env:
+          CUA_TARGET_PLATFORM: linux
+          CUA_TARGET_ARCH: x64
+        run: |
+          node scripts/fetch-cua-driver.mjs
+          node scripts/package-electron-target.mjs --platform linux --arch x64 -- --linux --x64
 
       - name: Package Windows (shared target packager)
         if: matrix.platform == 'win'
@@ -112,15 +132,10 @@ jobs:
           node scripts/fetch-cua-driver.mjs
           node scripts/package-electron-target.mjs --platform win32 --arch x64 -- ${{ matrix.args }}
 
-      - name: Sanity-check deb artifact (stub guard)
+      - name: Smoke-check Linux vault package
         if: matrix.platform == 'linux'
-        shell: bash
-        run: |
-          DEB=$(ls build/pipiui_e_*_amd64.deb 2>/dev/null | head -1)
-          if [ -z "$DEB" ]; then echo "deb artifact missing" >&2; exit 1; fi
-          SIZE=$(stat -c %s "$DEB" 2>/dev/null || stat -f %z "$DEB")
-          if [ "$SIZE" -lt 1024 ]; then echo "deb is a stub ($SIZE bytes); fpm failed" >&2; exit 1; fi
-          echo "deb OK: $DEB ($SIZE bytes)"
+        working-directory: Electron
+        run: node scripts/check-linux-secret-vault-package.mjs
 
       - name: Reject too-new glibc in pty.node
         if: matrix.platform == 'linux'

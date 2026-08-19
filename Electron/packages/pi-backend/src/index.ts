@@ -71,11 +71,38 @@ import {
 import { FileQueueStore, type QueueStore } from "./queue-store.js";
 import {
   StopEscalationScheduler,
+  defaultStopEscalationHooks,
   readProcessIdentity,
   type StopEscalationDelays,
   type StopEscalationHooks,
 } from "./stop-escalation.js";
 import { QuotaStore, parseDotEnv } from "./quota.js";
+import {
+  applySessionMountsToWorkerEnv,
+  configureVaultKeyProvider,
+  createSessionEnvRefreshGate,
+  deleteSecret,
+  envKeyProvider,
+  listSecretMeta,
+  listSessionMounts,
+  loadVault,
+  mountSecret,
+  putSecret,
+  createSessionRedactionGate,
+  createSessionWriteBarrier,
+  redactSessionJsonl,
+  workerEnvFromVault,
+  redactText,
+  revealMountedSecrets,
+  StreamRedactor,
+  unmountSecret,
+  vaultDiagnosisFor,
+  VaultEncryptionError,
+  type ExclusiveSessionWork,
+  type RevealedSecret,
+  type VaultDiagnosis,
+  type VaultKeyProvider,
+} from "./secret-vault.js";
 import {
   appendLedgerRecord,
   latestContextBySession,
@@ -432,6 +459,8 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
+  /** Electron injects safeStorage-backed DEK provider. Absent = fail closed. */ vaultKeyProvider?: VaultKeyProvider;
+  /** Optional OS-level encryption diagnosis; never blocks ordinary chat. */ vaultAvailability?: () => VaultDiagnosis;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -501,10 +530,13 @@ type Live = {
   turnEpoch?: number;
   /** Concatenated `text_delta` for the in-flight assistant message. */
   streamedAssistantText?: string;
+  streamRedactors?: { text: Map<number, StreamRedactor>; thinking: Map<number, StreamRedactor>; tool: Map<number, StreamRedactor> };
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
   /** Exact final assistant awaiting the last real subagent terminal event. */
   pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
+  /** SIGKILL/close in flight: do not write another RPC to this child. */
+  exiting?: boolean;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
@@ -888,18 +920,28 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   }
   return result;
 }
-function visibleHistoryEntry(entry: any): HistoryEntry | undefined {
-  if (entry?.type === "message") return historyEntryFromMessage(entry);
+function redactHistoryEntry(entry: HistoryEntry | undefined, secrets: RevealedSecret[]): HistoryEntry | undefined {
+  if (!entry || secrets.length === 0) return entry;
+  return {
+    ...entry,
+    content: redactText(entry.content, secrets),
+    ...(entry.thinking ? { thinking: redactText(entry.thinking, secrets) } : {}),
+    ...(entry.errorMessage ? { errorMessage: redactText(entry.errorMessage, secrets) } : {}),
+    ...(entry.tools ? { tools: entry.tools.map((tool) => ({ ...tool, input: redactText(tool.input, secrets) })) } : {}),
+  };
+}
+function visibleHistoryEntry(entry: any, secrets: RevealedSecret[] = []): HistoryEntry | undefined {
+  if (entry?.type === "message") return redactHistoryEntry(historyEntryFromMessage(entry), secrets);
   if (isVisibleCustomMessage(entry)) {
     const content = text(entry.content);
     if (!content) return undefined;
-    return { id: entry.id, role: "user", content, timestamp: asTime(entry.timestamp) };
+    return { id: entry.id, role: "user", content: redactText(content, secrets), timestamp: asTime(entry.timestamp) };
   }
   if (entry?.type === "compaction") {
     return {
       id: entry.id,
       role: "compaction",
-      content: typeof entry.summary === "string" ? entry.summary : "",
+      content: redactText(typeof entry.summary === "string" ? entry.summary : "", secrets),
       timestamp: asTime(entry.timestamp),
     };
   }
@@ -1011,6 +1053,8 @@ async function readHistoryFallback(
   before: number | string = 0,
   limit = 500,
   matchSessionManagerContext = false,
+  vaultDir?: string,
+  sessionId?: string,
 ): Promise<HistoryEntry[]> {
   const visibleIds = await activeVisibleIds(path, matchSessionManagerContext);
   const end = typeof before === "string"
@@ -1032,7 +1076,8 @@ async function readHistoryFallback(
       continue;
     }
     if (!wanted.has(entry?.id)) continue;
-    const mapped = visibleHistoryEntry(entry);
+    const secrets = vaultDir && sessionId ? revealMountedSecrets(vaultDir, sessionId) : [];
+    const mapped = visibleHistoryEntry(entry, secrets);
     if (!mapped) continue;
     mappedById.set(mapped.id, mapped);
   }
@@ -1079,6 +1124,8 @@ async function readHistory(
   path: string,
   before: number | string = 0,
   limit = 500,
+  vaultDir?: string,
+  sessionId?: string,
 ): Promise<HistoryEntry[]> {
   const stat = await fs.stat(path);
   const large = stat.size > SESSION_MANAGER_MAX_BYTES;
@@ -1087,7 +1134,7 @@ async function readHistory(
       `[pipi-backend] SessionManager skipped for ${path}: ${stat.size} bytes exceeds bounded history limit`,
     );
   }
-  return readHistoryFallback(path, before, limit, large);
+  return readHistoryFallback(path, before, limit, large, vaultDir, sessionId);
 }
 
 const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
@@ -1402,6 +1449,17 @@ export class PiHostBackend implements HostBackend {
   private projectionDebugProvenance = new Map<string, string>();
   private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
+  private sessionFileBarriers = new Map<string, ExclusiveSessionWork>();
+  private readonly sessionRedact = createSessionRedactionGate({
+    hasWork: (sessionId) => this.sessionSecrets(sessionId).length > 0,
+    canRewrite: (sessionId) => this.canRewriteSessionFile(sessionId),
+    confirmWriterIdle: (sessionId) => this.closeQuietSessionWriter(sessionId),
+    rewrite: (sessionId) => this.rewriteSessionSecrets(sessionId),
+  });
+  private readonly sessionEnvRefresh = createSessionEnvRefreshGate({
+    canRefresh: (sessionId) => this.canRewriteSessionFile(sessionId),
+    stopWriter: (sessionId) => this.closeQuietSessionWriter(sessionId),
+  });
   private readonly planStore = new PlanStore();
   private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
@@ -1465,6 +1523,8 @@ export class PiHostBackend implements HostBackend {
   private managedNodeModulesRoot?: string;
   private runtimeAssets?: RuntimeAssets;
   private agentDir: string;
+  private vaultKeyProvider: VaultKeyProvider;
+  private vaultAvailability?: () => VaultDiagnosis;
   private features: SpawnFeatures;
   private profileMode: "default" | "isolated";
   private resourceMode: "default" | "explicit";
@@ -1534,6 +1594,9 @@ export class PiHostBackend implements HostBackend {
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
+    this.vaultKeyProvider = options.vaultKeyProvider ?? envKeyProvider(options.env ?? process.env);
+    this.vaultAvailability = options.vaultAvailability;
+    configureVaultKeyProvider(this.vaultKeyProvider);
     this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
       () => undefined,
@@ -1573,8 +1636,15 @@ export class PiHostBackend implements HostBackend {
         this.dispatchQueuedMessage(id, payload, behavior),
       onChange: (id, items) => this.queueChanged(id, items),
     });
+    const stopHooks = options.stopEscalationHooks ?? defaultStopEscalationHooks();
     this.stopEscalation = options.stopEscalation
-      ?? new StopEscalationScheduler(options.stopEscalationHooks, options.stopEscalationDelays);
+      ?? new StopEscalationScheduler({
+        ...stopHooks,
+        kill: (pid, signal) => {
+          if (signal === "SIGKILL") this.markLiveExitingByPid(pid);
+          stopHooks.kill(pid, signal);
+        },
+      }, options.stopEscalationDelays);
     this.abortAckTimeoutMs = options.abortAckTimeoutMs ?? 1_500;
     this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
@@ -1724,6 +1794,20 @@ export class PiHostBackend implements HostBackend {
   }
   private childStillRunning(child?: ChildProcessWithoutNullStreams): boolean {
     return Boolean(child && child.exitCode === null && !child.signalCode);
+  }
+  private liveProcessUsable(live: Live): boolean {
+    return !live.exiting && this.childStillRunning(live.process);
+  }
+  private markLiveExitingByPid(pid: number): void {
+    for (const live of this.live.values()) {
+      if (live.process?.pid === pid) live.exiting = true;
+    }
+  }
+  private async awaitUnusableLiveExit(id: string): Promise<void> {
+    const live = this.live.get(id);
+    if (!live || this.liveProcessUsable(live)) return;
+    await (live.exit ?? Promise.resolve());
+    if (this.live.get(id) === live) this.live.delete(id);
   }
 
   /** EOF first; if the child ignores it (or is not Node), SIGTERM then SIGKILL. */
@@ -1885,7 +1969,18 @@ export class PiHostBackend implements HostBackend {
     if (this.closed) return;
     await this.loadQueue(id);
     await new Promise<void>((resolve) => setImmediate(resolve));
+    await this.awaitUnusableLiveExit(id);
     if (!this.closed) await this.queue.notifyIdle(id, epoch);
+    if (!this.closed) {
+      try {
+        await this.flushSessionRedact(id);
+        await this.flushSessionEnvRefresh(id);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("[secret-vault] session redaction failed", message);
+        this.stream({ type: "error", sessionId: id, content: `secret redaction failed: ${message}` });
+      }
+    }
   }
   /**
    * Host abort: write abort, emit stopped quickly, escalate hung descendants,
@@ -2054,7 +2149,7 @@ export class PiHostBackend implements HostBackend {
   private async locate(id: string) {
     return this.confirmSessionMeta(await this.findSession(id));
   }
-  private async readHistoryCached(path: string, before: number | string, limit: number): Promise<HistoryEntry[]> {
+  private async readHistoryCached(path: string, before: number | string, limit: number, sessionId?: string): Promise<HistoryEntry[]> {
     const stat = await fs.stat(path);
     const hit = this.historyCache.get(path);
     if (
@@ -2065,9 +2160,83 @@ export class PiHostBackend implements HostBackend {
       hit.limit === limit
     )
       return hit.entries;
-    const entries = await readHistory(path, before, limit);
+    const entries = await readHistory(path, before, limit, this.agentDir, sessionId);
     this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, before, limit, entries });
     return entries;
+  }
+  private sessionSecrets(sessionId: string): RevealedSecret[] {
+    try { return revealMountedSecrets(this.agentDir, sessionId); }
+    catch { return []; }
+  }
+  private sessionFileExclusive(sessionId: string): ExclusiveSessionWork {
+    const existing = this.sessionFileBarriers.get(sessionId);
+    if (existing) return existing;
+    const created = createSessionWriteBarrier();
+    this.sessionFileBarriers.set(sessionId, created);
+    return created;
+  }
+  private canRewriteSessionFile(sessionId: string): boolean {
+    const live = this.live.get(sessionId);
+    if (live && this.liveProcessUsable(live)) return this.isSessionQuiet(sessionId);
+    return !this.queue.isBusy(sessionId) && this.queue.listQueue(sessionId).length === 0;
+  }
+  private async closeQuietSessionWriter(sessionId: string): Promise<boolean> {
+    const live = this.live.get(sessionId);
+    if (!live || !this.liveProcessUsable(live)) return true;
+    if (!this.isSessionQuiet(sessionId)) return false;
+    live.exiting = true;
+    live.compaction.dispose();
+    await this.stopLiveProcess(live);
+    await (live.exit ?? Promise.resolve());
+    if (this.childStillRunning(live.process)) return false;
+    if (this.live.get(sessionId) === live) this.live.delete(sessionId);
+    return true;
+  }
+  private async rewriteSessionSecrets(sessionId: string): Promise<void> {
+    const secrets = this.sessionSecrets(sessionId);
+    if (secrets.length === 0) return;
+    const path = this.live.get(sessionId)?.path ?? (await this.findSession(sessionId).catch(() => undefined))?.path;
+    if (!path) throw new Error("session file unavailable for redaction");
+    await redactSessionJsonl(path, secrets);
+    this.historyCache.delete(path);
+  }
+  private requestSessionRedact(sessionId: string): void {
+    this.sessionRedact.request(sessionId);
+  }
+  private async flushSessionRedact(sessionId: string): Promise<void> {
+    await this.sessionFileExclusive(sessionId)(() => this.sessionRedact.flush(sessionId));
+  }
+  private async redactSessionFile(sessionId: string): Promise<void> {
+    this.requestSessionRedact(sessionId);
+    await this.flushSessionRedact(sessionId);
+  }
+  private requestSessionEnvRefresh(sessionId: string): void {
+    this.sessionEnvRefresh.request(sessionId);
+  }
+  private async flushSessionEnvRefresh(sessionId: string): Promise<void> {
+    await this.sessionFileExclusive(sessionId)(() => this.sessionEnvRefresh.flush(sessionId));
+  }
+  private async refreshSessionChildEnv(sessionId: string): Promise<void> {
+    this.requestSessionEnvRefresh(sessionId);
+    await this.flushSessionEnvRefresh(sessionId);
+  }
+  private vaultDek(): string | undefined {
+    try { return this.vaultKeyProvider.getDek().toString("base64"); }
+    catch { return undefined; }
+  }
+  private diagnoseVault(): VaultDiagnosis {
+    if (this.vaultAvailability) return this.vaultAvailability();
+    try {
+      this.vaultKeyProvider.getDek();
+      return vaultDiagnosisFor("available");
+    } catch {
+      return vaultDiagnosisFor("encryption-unavailable");
+    }
+  }
+  private assertVaultReady(): void {
+    const diagnosis = this.diagnoseVault();
+    if (diagnosis.available) return;
+    throw new VaultEncryptionError(diagnosis.kind, diagnosis.message);
   }
   private async confirmSessionMeta(meta: SessionMeta): Promise<SessionMeta> {
     try {
@@ -2301,6 +2470,7 @@ export class PiHostBackend implements HostBackend {
           session.path,
           before,
           limit,
+          session.header.id,
         );
       }
       case "getSessionLease": {
@@ -2430,6 +2600,49 @@ export class PiHostBackend implements HostBackend {
         return this.loadPaddleOcrStatus(params[0]);
       case "setPaddleOcrAccessToken":
         return this.savePaddleOcrAccessToken(params[0], params[1]);
+      case "diagnoseSecretVault":
+        return this.diagnoseVault();
+      case "listSecretVault": {
+        const sessionId = String(params[0] ?? "");
+        return {
+          sessionId,
+          secrets: listSecretMeta(this.agentDir),
+          mounts: listSessionMounts(this.agentDir, sessionId),
+        };
+      }
+      case "putSecretVault": {
+        this.assertVaultReady();
+        const input = params[0] as { name: string; envName: string; value: string; sessionId: string };
+        const secret = await putSecret(this.agentDir, input);
+        const mount = await mountSecret(this.agentDir, String(input.sessionId), secret.id);
+        this.requestSessionEnvRefresh(String(input.sessionId));
+        await this.redactSessionFile(String(input.sessionId)).catch((error) => {
+          console.error("[secret-vault] session redaction failed", error);
+          throw error;
+        });
+        await this.flushSessionEnvRefresh(String(input.sessionId));
+        return { secret, mount, sessionId: input.sessionId };
+      }
+      case "mountSecretVault": {
+        this.assertVaultReady();
+        const sessionId = String(params[0]);
+        const mount = await mountSecret(this.agentDir, sessionId, String(params[1]), params[2] ? String(params[2]) : undefined);
+        await this.refreshSessionChildEnv(sessionId);
+        return { sessionId, mount };
+      }
+      case "unmountSecretVault": {
+        const sessionId = String(params[0]);
+        const removed = await unmountSecret(this.agentDir, sessionId, String(params[1]));
+        await this.refreshSessionChildEnv(sessionId);
+        return { sessionId, removed };
+      }
+      case "deleteSecretVault": {
+        const affected = new Set([...Object.keys(loadVault(this.agentDir).mounts), ...this.live.keys()]);
+        const deleted = await deleteSecret(this.agentDir, String(params[0]));
+        for (const sessionId of affected) this.requestSessionEnvRefresh(sessionId);
+        for (const sessionId of affected) await this.flushSessionEnvRefresh(sessionId);
+        return { deleted };
+      }
       case "listAgentDefinitions":
         return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
       case "listModels":
@@ -2793,13 +3006,15 @@ export class PiHostBackend implements HostBackend {
         await this.command(sessionId, { type: "set_session_name", name: title });
         live.session = { ...live.session, name: title, updatedAt: Date.now() };
       } else {
-        await fs.appendFile(session.path, `${JSON.stringify({
-          type: "session_info",
-          id: crypto.randomUUID(),
-          parentId: await lastJsonlEntryId(session.path),
-          timestamp,
-          name: title,
-        })}\n`);
+        await this.sessionFileExclusive(sessionId)(async () => {
+          await fs.appendFile(session.path, `${JSON.stringify({
+            type: "session_info",
+            id: crypto.randomUUID(),
+            parentId: await lastJsonlEntryId(session.path),
+            timestamp,
+            name: title,
+          })}\n`);
+        });
       }
     } catch (error) {
       this.manualTitleOverrides.delete(sessionId);
@@ -2866,8 +3081,8 @@ export class PiHostBackend implements HostBackend {
   }
   private ensure(id: string): Promise<Live> {
     const live = this.live.get(id);
-    if (live && this.childStillRunning(live.process)) return Promise.resolve(live);
-    if (live && !this.childStillRunning(live.process)) {
+    if (live && this.liveProcessUsable(live)) return Promise.resolve(live);
+    if (live && !this.liveProcessUsable(live)) {
       return (live.exit ?? Promise.resolve()).then(() => {
         if (this.live.get(id) === live) this.live.delete(id);
         return this.ensure(id);
@@ -2932,6 +3147,7 @@ export class PiHostBackend implements HostBackend {
       computerDescriptor: computerCapability
         ? this.computerDescriptor
         : undefined,
+      vaultDek: this.vaultDek(),
     });
     // close() may race a cache-first background resume before the child is
     // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
@@ -2952,10 +3168,13 @@ export class PiHostBackend implements HostBackend {
       // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
       // that `listModels` sees via the auth runtime resolve in the RPC session too.
       env: withToolPath(
-        mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
-          ...output.env,
-          ...(this.piCommand.env ?? {}),
-        }),
+        applySessionMountsToWorkerEnv(
+          mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
+            ...output.env,
+            ...(this.piCommand.env ?? {}),
+          }),
+          workerEnvFromVault(this.agentDir, id),
+        ),
         this.piCommand.executable,
       ),
       stdio: ["pipe", "pipe", "pipe"],
@@ -3109,8 +3328,10 @@ export class PiHostBackend implements HostBackend {
         turnEpoch: live.turnEpoch,
       });
     } else if (e.type === "agent_settled") {
+      this.requestSessionRedact(id);
       this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled", true);
     } else if (e.type === "agent_stopped" || e.type === "agent_error") {
+      this.requestSessionRedact(id);
       this.projectTurnTerminal(live, "stopped");
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
@@ -3155,24 +3376,37 @@ export class PiHostBackend implements HostBackend {
       live.followUps = e.followUp ?? [];
     } else if (e.type === "message_update") {
       const d = e.assistantMessageEvent ?? {};
+      const secrets = this.sessionSecrets(id);
+      live.streamRedactors ??= { text: new Map(), thinking: new Map(), tool: new Map() };
+      const redactor = (kind: "text" | "thinking" | "tool", index: number) => {
+        const bag = live.streamRedactors![kind];
+        const existing = bag.get(index);
+        if (existing) return existing;
+        const created = new StreamRedactor(secrets);
+        bag.set(index, created);
+        return created;
+      };
       if (d.type === "text_delta") {
-        live.streamedAssistantText = (live.streamedAssistantText ?? "") + (d.delta ?? "");
+        const delta = redactor("text", d.contentIndex ?? 0).push(d.delta ?? "");
+        live.streamedAssistantText = (live.streamedAssistantText ?? "") + delta;
         this.stream({
           type: "text",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
           segment: live.messageEpoch,
-          delta: d.delta ?? "",
+          delta,
         });
       }
-      if (d.type === "thinking_delta")
+      if (d.type === "thinking_delta") {
+        const delta = redactor("thinking", d.contentIndex ?? 0).push(d.delta ?? "");
         this.stream({
           type: "thinking",
           sessionId: id,
           contentIndex: d.contentIndex ?? 0,
           segment: live.messageEpoch,
-          delta: d.delta ?? "",
+          delta,
         });
+      }
       if (this.projectionDebugEnabled() && (d.type === "text_delta" || d.type === "thinking_delta"))
         this.projectionDebugLine(`[stream-debug] emit ${d.type} session=${this.projectionDebugSessionTag(id)} t=${Date.now()} len=${(d.delta ?? "").length}`, "log");
       if (d.type === "toolcall_start") {
@@ -3192,10 +3426,8 @@ export class PiHostBackend implements HostBackend {
         });
       } else if (d.type === "toolcall_delta") {
         const index = d.contentIndex ?? 0;
-        live.toolArgs.set(
-          index,
-          (live.toolArgs.get(index) ?? "") + (d.delta ?? ""),
-        );
+        const delta = redactor("tool", index).push(d.delta ?? "");
+        live.toolArgs.set(index, (live.toolArgs.get(index) ?? "") + delta);
         this.stream({
           type: "tool_call",
           sessionId: id,
@@ -3203,18 +3435,20 @@ export class PiHostBackend implements HostBackend {
           segment: live.messageEpoch,
           toolCallId: `content-${index}`,
           name: "tool",
-          delta: d.delta ?? "",
+          delta,
         });
       } else if (d.type === "toolcall_end") {
         const index = d.contentIndex ?? 0;
-        const buffered = live.toolArgs.get(index) ?? "";
+        const tail = live.streamRedactors?.tool.get(index)?.flush() ?? "";
+        live.streamRedactors?.tool.delete(index);
+        const buffered = (live.toolArgs.get(index) ?? "") + tail;
         live.toolArgs.delete(index);
         const call = d.toolCall ?? {};
         const args =
           call.arguments != null && typeof call.arguments === "object"
-            ? JSON.stringify(call.arguments)
+            ? redactText(JSON.stringify(call.arguments), secrets)
             : typeof call.arguments === "string"
-              ? call.arguments
+              ? redactText(call.arguments, secrets)
               : buffered;
         this.stream({
           type: "tool_call",
@@ -3229,9 +3463,17 @@ export class PiHostBackend implements HostBackend {
     } else if (e.type === "message_end") {
       const endingEpoch = live.messageEpoch;
       const endedMessage = e.message ?? {};
+      const secrets = this.sessionSecrets(id);
       if (endedMessage.role === "assistant") {
-        const fullText = assistantVisibleText(endedMessage.content);
-        const already = live.streamedAssistantText ?? "";
+        const flushed = [...(live.streamRedactors?.text.values() ?? [])].map((item) => item.flush()).join("");
+        live.streamRedactors?.text.clear();
+        live.streamRedactors?.thinking.forEach((item) => {
+          const tail = item.flush();
+          if (tail) this.stream({ type: "thinking", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: tail });
+        });
+        live.streamRedactors?.thinking.clear();
+        const fullText = redactText(assistantVisibleText(endedMessage.content), secrets);
+        const already = (live.streamedAssistantText ?? "") + flushed;
         if (fullText && (!already || (fullText.startsWith(already) && fullText.length > already.length))) {
           this.stream({
             type: "text",
@@ -3240,6 +3482,8 @@ export class PiHostBackend implements HostBackend {
             segment: endingEpoch,
             delta: already ? fullText.slice(already.length) : fullText,
           });
+        } else if (flushed) {
+          this.stream({ type: "text", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: flushed });
         }
         live.streamedAssistantText = "";
       }
@@ -3258,7 +3502,7 @@ export class PiHostBackend implements HostBackend {
             type: "user_message",
             sessionId: id,
             id: typeof message.id === "string" ? message.id : typeof e.id === "string" ? e.id : undefined,
-            content,
+            content: redactText(content, secrets),
           });
         }
       }
@@ -3271,7 +3515,7 @@ export class PiHostBackend implements HostBackend {
           typeof message.errorMessage === "string" && message.errorMessage
             ? message.errorMessage
             : undefined;
-        if (content) this.stream({ type: "error", sessionId: id, content });
+        if (content) this.stream({ type: "error", sessionId: id, content: redactText(content, secrets) });
       }
       if (
         message.role === "assistant"
@@ -3482,13 +3726,7 @@ export class PiHostBackend implements HostBackend {
     this.debugTerminalReconciliation(live, epoch, "durable_settle", state, true);
     this.projectTurnTerminal(live, "settled", true);
   }
-  private async command(id: string, body: Rpc) {
-    const live = await this.ensure(id);
-    const child = live.process;
-    if (child && (child.exitCode !== null || child.signalCode)) {
-      await live.exit;
-      throw live.exitError ?? new PiExitedError(child.exitCode, child.signalCode, live.stderrTail);
-    }
+  private writeCommand(live: Live, body: Rpc) {
     return new Promise<any>((resolve, reject) => {
       const req = crypto.randomUUID();
       live.pending.set(req, { resolve, reject });
@@ -3496,6 +3734,27 @@ export class PiHostBackend implements HostBackend {
         JSON.stringify({ id: req, ...body }) + "\n",
       );
     });
+  }
+  private async command(id: string, body: Rpc, retried = false): Promise<any> {
+    if (body.type === "abort") {
+      const live = this.live.get(id);
+      if (!live || !this.liveProcessUsable(live)) return;
+      return this.writeCommand(live, body);
+    }
+    const live = await this.ensure(id);
+    if (!this.liveProcessUsable(live)) {
+      await (live.exit ?? Promise.resolve());
+      if (this.live.get(id) === live) this.live.delete(id);
+      if (retried) {
+        throw live.exitError ?? new PiExitedError(
+          live.process?.exitCode ?? null,
+          live.process?.signalCode ?? null,
+          live.stderrTail,
+        );
+      }
+      return this.command(id, body, true);
+    }
+    return this.writeCommand(live, body);
   }
   /** Pi model ids are not provider-unique. Never silently accept a same-id sibling. */
   private async selectExactModel(live: Live, provider: string, modelId: string) {
@@ -4924,27 +5183,29 @@ export class PiHostBackend implements HostBackend {
     const status = await this.leaseFor(meta).acquire();
     if (!status.writable)
       throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
-    const parentId = await lastJsonlEntryId(meta.path);
-    await fs.appendFile(
-      meta.path,
-      `${JSON.stringify({
-        ...row,
-        id: crypto.randomUUID(),
-        parentId,
-        timestamp: new Date().toISOString(),
-      })}\n`,
-    );
-    const stat = await fs.stat(meta.path);
-    this.rememberSessionMeta(
-      {
-        ...meta,
-        updatedAt: Date.now(),
-        model: row.type === "model_change" ? { provider: row.provider, modelId: row.modelId } : meta.model,
-        thinkingLevel: row.type === "thinking_level_change" ? row.thinkingLevel : meta.thinkingLevel,
-      },
-      stat.size,
-      stat.mtimeMs,
-    );
+    await this.sessionFileExclusive(sessionId)(async () => {
+      const parentId = await lastJsonlEntryId(meta.path);
+      await fs.appendFile(
+        meta.path,
+        `${JSON.stringify({
+          ...row,
+          id: crypto.randomUUID(),
+          parentId,
+          timestamp: new Date().toISOString(),
+        })}\n`,
+      );
+      const stat = await fs.stat(meta.path);
+      this.rememberSessionMeta(
+        {
+          ...meta,
+          updatedAt: Date.now(),
+          model: row.type === "model_change" ? { provider: row.provider, modelId: row.modelId } : meta.model,
+          thinkingLevel: row.type === "thinking_level_change" ? row.thinkingLevel : meta.thinkingLevel,
+        },
+        stat.size,
+        stat.mtimeMs,
+      );
+    });
   }
   private async setModel(sessionId: string, provider: string, modelId: string) {
     await this.loadModelCatalog();
@@ -5385,8 +5646,7 @@ export class PiHostBackend implements HostBackend {
   }
   private liveSessionProcess(sessionId: string): Live | undefined {
     const live = this.live.get(sessionId);
-    if (!live?.process) return undefined;
-    if (live.process.exitCode !== null || live.process.signalCode) return undefined;
+    if (!live || !this.liveProcessUsable(live)) return undefined;
     return live;
   }
   private lastObservedAt(agent: AgentSummary): number | undefined {
@@ -5509,16 +5769,19 @@ export class PiHostBackend implements HostBackend {
     const running = [...this.agents.values()].filter(
       (agent) => agent.sessionId === sessionId && agent.state === "running",
     );
-    const live = this.liveSessionProcess(sessionId);
-    if (!live) {
+    const target = this.live.get(sessionId);
+    if (!target || !this.liveProcessUsable(target)) {
       for (const agent of running) {
         this.forceAbortAgent(agent, "宿主停止时无主 Agent 进程，已在界面结束该子任务");
       }
       return;
     }
     try {
+      if (!this.liveProcessUsable(target)) {
+        throw new Error("宿主停止时目标进程已退出");
+      }
       await this.withAgentCommandTimeout(
-        this.command(sessionId, { type: "prompt", message: "/subagent_abort_all", streamingBehavior: "followUp" }),
+        this.writeCommand(target, { type: "prompt", message: "/subagent_abort_all", streamingBehavior: "followUp" }),
         5_000,
         "停止扫场请求在 5 秒内未被主 Agent 接收",
       );
@@ -5924,3 +6187,14 @@ export class PiHostBackend implements HostBackend {
 export function createPiHostBackend(options: PiBackendOptions = {}) {
   return new PiHostBackend(options);
 }
+export {
+  configureVaultKeyProvider,
+  createSealedDekProvider,
+  memoryKeyProvider,
+  ubuntuVaultInstallHint,
+  vaultDiagnosisFor,
+  VaultEncryptionError,
+  type VaultDiagnosis,
+  type VaultDiagKind,
+  type VaultKeyProvider,
+} from "./secret-vault.js";

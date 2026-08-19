@@ -88,6 +88,8 @@ Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 
 
 所有 API key 存放在当前项目 `{project}/.pi/agent/.env`（0600），OAuth 凭据在该项目的 `auth.json`。禁止使用全局 `~/.pi/agent`。详见 [`docs/key-management.md`](./docs/key-management.md)。
 
+设置 → **密钥库** 是全局加密密钥库（Electron `safeStorage`）。Linux x64（Ubuntu 22.04/24.04 桌面会话）需要自行安装并解锁系统密钥服务；缺依赖时密钥库 fail-closed，普通聊天不受影响。见 [`docs/electron-secret-vault-linux.md`](./docs/electron-secret-vault-linux.md)。
+
 ## 构建运行
 
 **宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建唯一的 `build/PipiUI.app`；其他 worktree 只能编译/测试，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而主工作区 `.app` 仍旧时，不得宣称「可打开 App」。
