@@ -27,8 +27,6 @@
  * always return `agent.state.messages`, never the pre-compact snapshot.
  */
 
-import { createRequire } from "node:module";
-
 const INSTALLED = Symbol.for("pipiui.midTurnCompaction.installed");
 const WRAPPED = Symbol.for("pipiui.midTurnCompaction.wrapped");
 const COMPACTING = Symbol.for("pipiui.midTurnCompaction.compacting");
@@ -351,28 +349,20 @@ export function installMidTurnCompactionGuard(sessionClass?: MidTurnSessionCtor)
 	return true;
 }
 
-function loadAgentSessionCtor(): MidTurnSessionCtor | undefined {
+/**
+ * Extension entry: patch `AgentSession.prototype` once.
+ *
+ * Must receive the live class from an ESM import. `@earendil-works/pi-coding-agent`
+ * is ESM-only (`exports.import` only), so `createRequire` throws
+ * `ERR_PACKAGE_PATH_NOT_EXPORTED` and the guard never installs.
+ */
+export function registerMidTurnCompactionGuard(sessionClass?: MidTurnSessionCtor): void {
 	try {
-		const require = createRequire(import.meta.url);
-		const mod = require("@earendil-works/pi-coding-agent") as {
-			AgentSession?: MidTurnSessionCtor;
-		};
-		if (mod?.AgentSession) return mod.AgentSession;
-	} catch {
-		// Tests and hermetic runs must not need this package at import time.
-	}
-	return undefined;
-}
-
-/** Extension entry: install the prototype guard once. Applies at every depth. */
-export function registerMidTurnCompactionGuard(): void {
-	try {
-		const ctor = loadAgentSessionCtor();
-		if (!ctor) {
+		if (!sessionClass) {
 			console.error(`${LOG_PREFIX} AgentSession not found; mid-turn guard not installed`);
 			return;
 		}
-		installMidTurnCompactionGuard(ctor);
+		installMidTurnCompactionGuard(sessionClass);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(`${LOG_PREFIX} install failed: ${message}`);

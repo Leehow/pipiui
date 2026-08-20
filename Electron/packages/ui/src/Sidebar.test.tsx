@@ -607,6 +607,7 @@ describe('Sidebar', () => {
         name: 'demo-project',
         sessions: [
           session({ id: 's1' }),
+          session({ id: 's-adopted', title: 'Adopted', adoptedFromSource: 'claude' }),
           session({ id: 'ext:claude:abc', title: 'Claude 记录', source: 'claude', provider: 'claude' }),
         ],
       }],
@@ -616,15 +617,21 @@ describe('Sidebar', () => {
     expect(external.getAttribute('aria-label')).toBe('Anthropic/Claude · Claude 记录')
     expect(external.getAttribute('title')).toBe('Anthropic/Claude · Claude 记录')
     expect(within(external).getByTestId('session-source-claude')).toBeTruthy()
-    expect(within(external).getByTestId('session-external-badge').textContent).toBe('外部')
+    const externalMark = within(external).getByTestId('session-external-badge')
+    expect(externalMark.getAttribute('aria-label')).toBe('外部会话')
+    expect(externalMark.textContent).not.toContain('外部')
     const piRow = document.querySelector('[data-session-id="s1"]') as HTMLElement
     expect(within(piRow).queryByTestId('session-external-badge')).toBeNull()
+    expect(within(piRow).queryByTestId('adopted-source-badge')).toBeNull()
+    const adoptedRow = document.querySelector('[data-session-id="s-adopted"]') as HTMLElement
+    expect(within(adoptedRow).getByTestId('adopted-source-badge').textContent).toContain('Claude → Pi')
+    expect(within(adoptedRow).queryByTestId('session-external-badge')).toBeNull()
     expect(within(external).queryByRole('button', { name: '置顶' })).toBeNull()
     expect(within(external).queryByRole('button', { name: '修改标题' })).toBeNull()
     expect(within(external).queryByRole('button', { name: '归档会话' })).toBeNull()
     fireEvent.click(external)
     expect(onSelect).toHaveBeenCalledWith('ext:claude:abc')
-    expect(screen.getByTestId('session-source-pi')).toBeTruthy()
+    expect(screen.getAllByTestId('session-source-pi').length).toBeGreaterThan(0)
   })
 })
 

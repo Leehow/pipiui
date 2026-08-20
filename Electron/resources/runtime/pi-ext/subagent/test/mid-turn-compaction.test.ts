@@ -5,6 +5,7 @@ import {
 	compactMessagesIfNeeded,
 	estimateNextRequestTokens,
 	installMidTurnCompactionGuard,
+	registerMidTurnCompactionGuard,
 	shouldCompactBeforeProvider,
 	wrapAgentTransformContext,
 	type MidTurnMessage,
@@ -245,4 +246,19 @@ test("compaction.enabled === false skips even when over the window", async () =>
 	const out = await compactMessagesIfNeeded(session, messages);
 	assert.equal(session.compactCalls.length, 0);
 	assert.equal(out, messages);
+});
+
+test("registerMidTurnCompactionGuard installs the provided session class without requiring the package", (t) => {
+	const errors: string[] = [];
+	t.mock.method(console, "error", (...args: unknown[]) => {
+		errors.push(args.map(String).join(" "));
+	});
+	class ProvidedSession {
+		async _runAgentPrompt() {
+			return "ran";
+		}
+	}
+	registerMidTurnCompactionGuard(ProvidedSession);
+	assert.deepEqual(errors, []);
+	assert.equal(installMidTurnCompactionGuard(ProvidedSession), false);
 });

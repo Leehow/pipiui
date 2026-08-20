@@ -108,6 +108,16 @@ describe('external session aggregation', () => {
     expect(within(group).getByTestId('session-source-zcode')).toBeTruthy()
     expect(within(group).getByTestId('session-source-pi')).toBeTruthy()
     expect(within(group).getByLabelText('Anthropic/Claude · Claude 新')).toBeTruthy()
+    for (const row of within(group).getAllByTestId('session-row')) {
+      const id = row.getAttribute('data-session-id') ?? ''
+      if (id.startsWith('ext:')) {
+        const mark = within(row).getByTestId('session-external-badge')
+        expect(mark.getAttribute('aria-label')).toBe('外部会话')
+        expect(mark.textContent).not.toContain('外部')
+      } else {
+        expect(within(row).queryByTestId('session-external-badge')).toBeNull()
+      }
+    }
   })
 
   it('loads read-only external history without touching Pi session APIs', async () => {

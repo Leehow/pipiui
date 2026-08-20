@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
 	formatSubagentDoneMessage,
+	getResultOutput,
 	isFailedResult,
 	isHostEndOk,
 	type DoneMessageResult,
@@ -55,4 +56,22 @@ test("clean exitCode=0 without errorMessage emits ok=true", () => {
 	const text = formatSubagentDoneMessage(minimalResult(), { runId: "run-ok" });
 	assert.match(text, /\[subagent-done\][^\n]* ok=true /);
 	assert.doesNotMatch(text, /\[subagent-done\][^\n]* ok=false /);
+});
+
+test("failed result prefers assistant text over session-start stderr", () => {
+	const stderr = [
+		"Warning: No project session found with id 'pipiui-asset-card-openai'; creating a new session with that id.",
+		"[pipiui-mid-turn-compaction] AgentSession not found; mid-turn guard not installed",
+	].join("\n");
+	const result = minimalResult({
+		exitCode: 1,
+		stderr,
+		messages: [
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "I edited the asset card renderer" }],
+			} as DoneMessageResult["messages"][number],
+		],
+	});
+	assert.equal(getResultOutput(result), "I edited the asset card renderer");
 });

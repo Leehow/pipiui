@@ -276,11 +276,16 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       onDrop={event => onDrop?.(event, session)}
     >
       {external
-        ? <SessionSourceIcon source={source} size={13} />
+        ? <span className="sb-session-external-badge" data-testid="session-external-badge" aria-label="外部会话" title="外部会话">
+            <SessionSourceIcon source={source} size={13} />
+          </span>
         : <span className="sb-session-source" data-source="pi" data-testid="session-source-pi" role="img" aria-label={sessionSourceLabel('pi')} title={sessionSourceLabel('pi')}><ProviderLogo provider={session.provider} modelId={session.modelId} size={13} /></span>}
       {renaming && canRename && onRename
         ? <InlineSessionTitleEditor value={session.title} ariaLabel="会话名称" className="sb-session-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} />
-        : <span className="sb-session-title">{session.title}{session.adoptedFromSource ? <span className="sb-adopted-badge" data-testid="adopted-source-badge">{adoptedSourceBadge(session.adoptedFromSource)}</span> : null}</span>}
+        : <span className="sb-session-title-line">
+            <span className="sb-session-title">{session.title}</span>
+            {!external && session.adoptedFromSource ? <span className="sb-adopted-badge" data-testid="adopted-source-badge">{adoptedSourceBadge(session.adoptedFromSource)}</span> : null}
+          </span>}
       <span className="sb-status" data-status={session.status} aria-label={statusCaption(session)} hidden={renaming}>
         <StatusGlyph status={session.status} count={session.subagentCount ?? 0} />
         <span className="sb-status-text">{statusCaption(session)}</span>

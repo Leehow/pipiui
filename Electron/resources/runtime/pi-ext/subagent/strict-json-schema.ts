@@ -360,6 +360,52 @@ function applyAliasesToRecord(value: JsonSchema): JsonSchema {
 	return out;
 }
 
+function isChainWrapper(value: unknown): value is JsonSchema {
+	if (!isRecord(value)) return false;
+	if (!Array.isArray(value.chain) || value.chain.length === 0) return false;
+	return !hasNonEmptyString(value.prompt) && !hasNonEmptyString(value.task);
+}
+
+function flattenChainItems(items: unknown[]): unknown[] {
+	const out: unknown[] = [];
+	for (const item of items) {
+		if (isChainWrapper(item)) out.push(...flattenChainItems(item.chain));
+		else out.push(item);
+	}
+	return out;
+}
+
+function firstWrapperBoolean(items: unknown[], key: "background" | "run_in_background"): boolean | undefined {
+	for (const item of items) {
+		if (!isChainWrapper(item)) continue;
+		if (typeof item[key] === "boolean") return item[key];
+		const nested = firstWrapperBoolean(item.chain, key);
+		if (nested !== undefined) return nested;
+	}
+	return undefined;
+}
+
+/**
+ * Models sometimes emit `subagent_chain({ chain: [{ background, chain: [steps] }] })`
+ * instead of `subagent_chain({ chain: [steps], background })`. prepareNode then
+ * drops the inner `chain` (unknown on ChainItem) and validation sees `[{}]`,
+ * which triggers a long GLM retry on a huge session.
+ */
+function unwrapNestedChainRecord(value: JsonSchema): JsonSchema {
+	if (!Array.isArray(value.chain) || value.chain.length === 0) return value;
+	if (!value.chain.some(isChainWrapper)) return value;
+	const out: JsonSchema = { ...value, chain: flattenChainItems(value.chain) };
+	if (out.background == null) {
+		const hoisted = firstWrapperBoolean(value.chain, "background");
+		if (hoisted !== undefined) out.background = hoisted;
+	}
+	if (out.run_in_background == null) {
+		const hoisted = firstWrapperBoolean(value.chain, "run_in_background");
+		if (hoisted !== undefined) out.run_in_background = hoisted;
+	}
+	return out;
+}
+
 /**
  * Bidirectional Grok Build ↔ PipiUI dispatch names.
  * Public schema is {prompt, description, subagent_type, isolation, …};
@@ -367,7 +413,7 @@ function applyAliasesToRecord(value: JsonSchema): JsonSchema {
  */
 export function adoptGrokBuildDispatch<T>(value: T): T {
 	if (!isRecord(value)) return value;
-	const out = applyAliasesToRecord(value);
+	const out = applyAliasesToRecord(unwrapNestedChainRecord(value));
 	if (Array.isArray(out.tasks)) {
 		out.tasks = out.tasks.map((item) => (isRecord(item) ? applyAliasesToRecord(item) : item));
 	}
@@ -405,11 +451,24 @@ export function remapUnknownSubagentType<T>(value: T, knownNames: ReadonlySet<st
 	return out as T;
 }
 
+function dropEmptyChainItems(value: JsonSchema): JsonSchema {
+	if (!Array.isArray(value.chain)) return value;
+	const chain = value.chain.filter((item) => {
+		if (!isRecord(item)) return false;
+		return hasNonEmptyString(item.prompt) || hasNonEmptyString(item.task) || hasNonEmptyString(item.description);
+	});
+	if (chain.length === value.chain.length) return value;
+	return { ...value, chain };
+}
+
 export function sanitizeStrictToolArguments(schema: unknown, args: unknown): unknown {
 	const aliased = adoptGrokBuildDispatch(args);
 	const stripped = omitNulls(aliased);
 	if (typeof stripped !== "object" || stripped === null || Array.isArray(stripped)) return stripped;
-	return prepareStrictToolArguments(schema, stripped);
+	const prepared = prepareStrictToolArguments(schema, stripped);
+	if (!isRecord(prepared)) return prepared;
+	if (!isRecord(schema) || !isRecord(schema.properties) || !isRecord(schema.properties.chain)) return prepared;
+	return dropEmptyChainItems(prepared);
 }
 
 export function bindSanitizeStrictToolArguments(schema: unknown): (args: unknown) => unknown {

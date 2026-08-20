@@ -274,7 +274,7 @@ export function isFailedResult(result: Pick<DoneMessageResult, "exitCode" | "err
 
 export function getResultOutput(result: DoneMessageResult): string {
 	if (isFailedResult(result)) {
-		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
+		return result.errorMessage || getFinalOutput(result.messages) || result.stderr || "(no output)";
 	}
 	return getFinalOutput(result.messages) || "(no output)";
 }
