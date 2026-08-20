@@ -43,6 +43,13 @@ function xaiCompletionsContext() {
   };
 }
 
+function withSession(ctx: Record<string, unknown>, sessionId = "sess-grok-cache-1") {
+  return {
+    ...ctx,
+    sessionManager: { getSessionId: () => sessionId },
+  };
+}
+
 function responsesPayload(overrides: Record<string, unknown> = {}) {
   return {
     model: "grok-4.6",
@@ -169,6 +176,47 @@ describe("pipiui-xai-server-tools", () => {
         openaiCtx,
       ),
     ).toBeUndefined();
+  });
+
+  it("pins every xAI request to a stable x-grok-conv-id from the session", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeHeaders = handlers.get("before_provider_headers")?.[0];
+    expect(beforeHeaders).toBeTypeOf("function");
+
+    const sessionId = "e0d2432a-87fa-48a8-82b8-0eee12a9ed08";
+    const headers: Record<string, string | null> = { Authorization: "Bearer x" };
+    beforeHeaders?.(
+      { type: "before_provider_headers", headers },
+      withSession(xaiResponsesContext(), sessionId),
+    );
+    expect(headers["x-grok-conv-id"]).toBe(sessionId);
+    expect(headers.Authorization).toBe("Bearer x");
+
+    const completionsHeaders: Record<string, string | null> = {};
+    beforeHeaders?.(
+      { type: "before_provider_headers", headers: completionsHeaders },
+      withSession(xaiCompletionsContext(), sessionId),
+    );
+    expect(completionsHeaders["x-grok-conv-id"]).toBe(sessionId);
+
+    const openaiHeaders: Record<string, string | null> = {};
+    beforeHeaders?.(
+      { type: "before_provider_headers", headers: openaiHeaders },
+      withSession({ model: { provider: "openai", api: "openai-responses", id: "gpt-4.1" } }, sessionId),
+    );
+    expect(openaiHeaders).not.toHaveProperty("x-grok-conv-id");
+  });
+
+  it("sets prompt_cache_key on xAI Responses to the same conversation id", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const sessionId = "pipiui-xai";
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      withSession(xaiResponsesContext(), sessionId),
+    ) as Record<string, unknown> | undefined;
+
+    expect(result?.prompt_cache_key).toBe(sessionId);
   });
 
   it("remaps every xai catalog model onto openai-responses at session_start", async () => {

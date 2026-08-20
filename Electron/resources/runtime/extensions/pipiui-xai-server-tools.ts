@@ -12,6 +12,10 @@
 // Incompatible relays must fail visibly — no silent fallback to Pipi
 // pi-web-access web_search.
 //
+// Prompt cache: every xAI request is pinned with `x-grok-conv-id` (and
+// Responses `prompt_cache_key`) set to the Pi session id so Grok hits the
+// same cache replica across tool-loop turns.
+//
 // It also captures api.x.ai's `x-ratelimit-*` response headers (the only
 // programmatic quota signal left for SuperGrok/X Premium OAuth accounts) into
 // `<agentDir>/grok-rate-limits.json` for the host's Grok 账号额度 pill.
@@ -39,6 +43,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isXaiProvider(model: { provider?: string } | undefined): boolean {
   return (model?.provider || "").toLowerCase() === "xai";
+}
+
+/** Stable per-session id for xAI prompt-cache affinity. */
+function grokConversationId(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): string | undefined {
+  const id = ctx?.sessionManager?.getSessionId?.();
+  if (typeof id !== "string") return undefined;
+  const trimmed = id.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function isXaiResponsesRequest(
@@ -171,11 +183,15 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
+    const conversationId = grokConversationId(ctx);
+
     if (isXaiResponsesRequest(model, event.payload)) {
       const payload = withoutSearchParameters(event.payload);
       return {
         ...payload,
         tools: mergeHostedWebSearch(payload.tools),
+        // Responses sticky routing: same id as x-grok-conv-id.
+        ...(conversationId ? { prompt_cache_key: conversationId } : {}),
       };
     }
 
@@ -194,6 +210,16 @@ export default function (pi: ExtensionAPI) {
     if (Object.prototype.hasOwnProperty.call(event.payload, "search_parameters")) {
       return withoutSearchParameters(event.payload as ProviderPayload);
     }
+  });
+
+  // xAI prompt cache is per-server. Without this header, Chat Completions (and
+  // some Responses hops) land on a cold replica and report cacheRead≈128 even
+  // when the prefix is unchanged. Same session id as prompt_cache_key.
+  pi.on("before_provider_headers", (event, ctx) => {
+    if (!isXaiProvider(ctx.model)) return;
+    const conversationId = grokConversationId(ctx);
+    if (!conversationId) return;
+    event.headers["x-grok-conv-id"] = conversationId;
   });
 
   pi.on("after_provider_response", (event, ctx) => {
