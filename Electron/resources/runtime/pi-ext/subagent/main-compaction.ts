@@ -585,26 +585,168 @@ function extractTextBlocks(content: unknown): string {
 		.trim();
 }
 
-const COMPACTION_LLM_PROMPT = (
+/** Continuation-checkpoint headings the LLM fast path must emit. */
+export const COMPACTION_CHECKPOINT_HEADINGS = [
+	"Goal",
+	"Constraints",
+	"Progress",
+	"Key Decisions",
+	"Files and Verification",
+	"Errors and Open Questions",
+	"Next Steps",
+	"Critical Context",
+] as const;
+
+export const COMPACTION_LLM_MIN_SUMMARY_CHARS = 80;
+
+const CHECKPOINT_HEADING_RE = (heading: string): RegExp =>
+	new RegExp(`^##\\s+${heading}\\s*$`, "im");
+
+export function extractMarkdownSection(markdown: string, heading: string): string {
+	if (typeof markdown !== "string" || !markdown) return "";
+	const re = CHECKPOINT_HEADING_RE(heading);
+	const match = re.exec(markdown);
+	if (!match) return "";
+	const start = match.index + match[0].length;
+	const rest = markdown.slice(start);
+	const next = /^##\s+/m.exec(rest);
+	return (next ? rest.slice(0, next.index) : rest).trim();
+}
+
+export function listPresentCheckpointHeadings(markdown: string): string[] {
+	const text = typeof markdown === "string" ? markdown : "";
+	return COMPACTION_CHECKPOINT_HEADINGS.filter((heading) => CHECKPOINT_HEADING_RE(heading).test(text));
+}
+
+function extractMappedDeterministicSection(deterministic: string, heading: string): string {
+	switch (heading) {
+		case "Goal":
+			return extractMarkdownSection(deterministic, "Goal");
+		case "Constraints":
+		case "Key Decisions":
+			return extractMarkdownSection(deterministic, "Constraints & Decisions");
+		case "Progress":
+			return extractMarkdownSection(deterministic, "In-Flight / Verification / Closeout");
+		case "Files and Verification": {
+			const files = extractMarkdownSection(deterministic, "Files");
+			const inflight = extractMarkdownSection(deterministic, "In-Flight / Verification / Closeout");
+			return [files, inflight].filter(Boolean).join("\n\n");
+		}
+		case "Errors and Open Questions":
+			return extractMarkdownSection(deterministic, "Errors & Open Loops");
+		case "Next Steps":
+			return extractMarkdownSection(deterministic, "Next Steps");
+		case "Critical Context":
+			return [
+				extractMarkdownSection(deterministic, "User Corrections"),
+				extractMarkdownSection(deterministic, "Previous Summary"),
+				extractMarkdownSection(deterministic, "Recent Timeline"),
+			].filter(Boolean).join("\n\n");
+		default:
+			return "";
+	}
+}
+
+export interface CompactionLlmQuality {
+	accept: boolean;
+	merge: boolean;
+	present: string[];
+	missing: string[];
+}
+
+/** Minimal quality gate: never adopt empty, tiny, or unstructured prose. */
+export function evaluateCompactionLlmSummary(text: string): CompactionLlmQuality {
+	const summary = typeof text === "string" ? text.trim() : "";
+	const present = listPresentCheckpointHeadings(summary);
+	const missing = COMPACTION_CHECKPOINT_HEADINGS.filter((h) => !present.includes(h));
+	const hasKey =
+		present.includes("Goal") && present.includes("Progress") && present.includes("Next Steps");
+	if (!summary || summary.length < COMPACTION_LLM_MIN_SUMMARY_CHARS) {
+		return { accept: false, merge: false, present, missing };
+	}
+	if (present.length === 0) {
+		return { accept: false, merge: false, present, missing };
+	}
+	if (missing.length === 0) {
+		return { accept: true, merge: false, present, missing };
+	}
+	if (hasKey) {
+		return { accept: false, merge: true, present, missing };
+	}
+	return { accept: false, merge: false, present, missing };
+}
+
+export function mergeCheckpointSummary(llmSummary: string, deterministic: string): string {
+	const present = listPresentCheckpointHeadings(llmSummary);
+	const extras = COMPACTION_CHECKPOINT_HEADINGS.filter((h) => !present.includes(h)).map((heading) => {
+		const mapped =
+			extractMarkdownSection(deterministic, heading) ||
+			extractMappedDeterministicSection(deterministic, heading);
+		return `## ${heading}\n${mapped || "（见 deterministic fallback）"}`;
+	});
+	return `${llmSummary.trim()}\n\n${extras.join("\n\n")}`.trim();
+}
+
+export function newCompactionLlmSessionId(): string {
+	try {
+		if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+			return crypto.randomUUID();
+		}
+	} catch {
+		// fall through
+	}
+	return `pipiui-compaction-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+export function buildCompactionLlmPrompt(
 	serialized: string,
-	previousContext: string,
+	previousSummary: string,
 	reason: string,
-): string => `You are a conversation summarizer for a long coding session. Create a concise
-structured summary that replaces the old conversation history, so work can continue
-without re-reading it. Capture:
-1. The main goal and constraints
-2. Key decisions and their rationale
-3. Files read/modified and important technical state
-4. Current progress, blockers, and open questions
-5. Next steps
+): string {
+	const hasPrevious = typeof previousSummary === "string" && previousSummary.trim().length > 0;
+	const updateRules = hasPrevious
+		? `
+This is an UPDATE of a previous continuation checkpoint. Rules:
+- Keep facts that are still true.
+- Update status (Progress Done / In Progress / Blocked).
+- Drop resolved blockers and stale next steps.
+- Do not stack or repeat multiple generations of summaries.
+- Do not copy the previous summary verbatim as a nested dump.
 
-The summary must be self-contained; the full history below will be discarded.
-Output structured markdown with ## sections. Keep it under 4000 tokens.
-${previousContext}
+<previous-summary>
+${previousSummary.trim()}
+</previous-summary>
+`
+		: "\nNo previous summary. Write a fresh continuation checkpoint.\n";
+	return `You are writing a continuation checkpoint that REPLACES the conversation history below.
+The full history will be discarded. Output structured markdown only, using these exact ## headings in order:
 
-<conversation trigger="${reason}">
+## Goal
+## Constraints
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Files and Verification
+## Errors and Open Questions
+## Next Steps
+## Critical Context
+
+Preserve verbatim (do not paraphrase or invent):
+- User corrections and non-negotiable constraints
+- Exact file paths and symbols
+- Error strings
+- Test evidence and its credibility (pass/fail, command, exit code)
+- Worker agentId / worktree / status
+Do not treat a plan as completed work. Keep it under 4000 tokens.
+${updateRules}
+Trigger: ${reason}
+
+<conversation>
 ${serialized}
 </conversation>`;
+}
 
 export interface SessionBeforeCompactEventLike {
 	preparation?: CompactPreparationLike;
@@ -689,9 +831,6 @@ export async function handleSessionBeforeCompact(
 							typeof preparation.previousSummary === "string"
 								? preparation.previousSummary
 								: "";
-						const previousContext = previous
-							? `\nPrevious summary for context:\n${previous}`
-							: "";
 						// Scale the serialization to the model's context window so a
 						// small-window model never receives an oversized prompt.
 						const budget = serializationBudgetForModel(model);
@@ -714,9 +853,9 @@ export async function handleSessionBeforeCompact(
 										content: [
 											{
 												type: "text" as const,
-												text: COMPACTION_LLM_PROMPT(
+												text: buildCompactionLlmPrompt(
 													llmSerialized,
-													previousContext,
+													previous,
 													event.reason ?? "auto",
 												),
 											},
@@ -737,6 +876,8 @@ export async function handleSessionBeforeCompact(
 								reasoning: "off" as never,
 								maxTokens: COMPACTION_LLM_MAX_OUTPUT_TOKENS,
 								signal: combined.signal,
+								cacheRetention: "none",
+								sessionId: newCompactionLlmSessionId(),
 							},
 						);
 						const summary = extractTextBlocks(response.content).slice(
@@ -747,19 +888,36 @@ export async function handleSessionBeforeCompact(
 						// provider that ignores the abort must not have its late
 						// response accepted after the cap.
 						if (summary && !event.signal?.aborted && !combined.signal.aborted) {
-							return {
-								compaction: {
-									summary,
-									firstKeptEntryId: preparation.firstKeptEntryId,
-									tokensBefore: preparation.tokensBefore,
-									usage: (response as { usage?: unknown }).usage,
-									details: {
-										source: "pipiui",
-										mode: "llm-fast",
-										reason: event.reason ?? "auto",
+							const gate = evaluateCompactionLlmSummary(summary);
+							if (gate.accept || gate.merge) {
+								const adopted = gate.merge
+									? mergeCheckpointSummary(
+											summary,
+											buildDeterministicSummary({
+												serialized,
+												previousSummary: preparation.previousSummary,
+												fileOps: preparation.fileOps,
+												tokensBefore: preparation.tokensBefore,
+												messageCount: messages.length,
+												reason: event.reason ?? "auto",
+											}),
+									  )
+									: summary;
+								return {
+									compaction: {
+										summary: adopted,
+										firstKeptEntryId: preparation.firstKeptEntryId,
+										tokensBefore: preparation.tokensBefore,
+										usage: (response as { usage?: unknown }).usage,
+										details: {
+											source: "pipiui",
+											mode: "llm-fast",
+											reason: event.reason ?? "auto",
+											...(gate.merge ? { qualityGate: "merged" } : {}),
+										},
 									},
-								},
-							};
+								};
+							}
 						}
 					} finally {
 						combined.cleanup();
