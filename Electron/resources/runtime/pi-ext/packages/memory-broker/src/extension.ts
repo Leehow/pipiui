@@ -22,6 +22,8 @@ import {
   type MemoryBrokerPackageIdentity,
 } from "./runtime-identity.ts";
 import { MemoryAdminService } from "./memory-admin.ts";
+import { IngestionStateReporter, type IngestionUnwiredReason } from "./ingestion-state.ts";
+import { compactFailureMemoryAtShutdown } from "./memory-watermark.ts";
 import { MemoryRuntimeMetricsCollector } from "./runtime-metrics.ts";
 import type {
   ChildCapabilityInput,
@@ -306,6 +308,10 @@ export async function installMemoryBrokerExtension(
   let operatorApplicationScope: OperatorComputerApplicationScope | undefined;
   let catalog: MemoryCatalog | undefined;
   let curatorScheduler: MemoryCuratorScheduler | undefined;
+  // Publishes whether candidates are actually reaching the catalog. Without it
+  // "no subagent submitted anything" and "every submission was discarded" are
+  // indistinguishable from outside: the catalog just stops growing, silently.
+  let ingestionReporter: IngestionStateReporter | undefined;
   let retrieval: RetrievalRuntimeAdapter | undefined;
   let admin: MemoryAdminService | undefined;
   const runtimeMetrics = new MemoryRuntimeMetricsCollector();
@@ -411,6 +417,22 @@ export async function installMemoryBrokerExtension(
           const curator = MemoryCurator.create({ mode: "main", catalog, hermes: catalogBackend.catalogPort, reviewer, metrics: runtimeMetrics, timeoutMs: CURATOR_REVIEW_TIMEOUT_MS + 2_000 });
           if (curator) curatorScheduler = new MemoryCuratorScheduler(curator, catalog);
         }
+        // Ingestion is wired only when the backend exposes a catalog port, so a
+        // degraded Hermes silently turns off catalog growth entirely. Record the
+        // state next to the catalog rather than leaving it to be inferred, days
+        // later, from a log that stopped growing.
+        const unwiredReason: IngestionUnwiredReason | undefined = !catalog
+          ? "no-catalog"
+          : !catalogBackend?.catalogPort
+            ? "no-catalog-port"
+            : !curatorScheduler ? "curator-unavailable" : undefined;
+        ingestionReporter = new IngestionStateReporter(catalogRoot);
+        await ingestionReporter.start(!!curatorScheduler, unwiredReason);
+        if (unwiredReason) {
+          // Also on stderr: the host only surfaces this tail when Pi exits
+          // abnormally, which is the one case the state file may not survive.
+          console.error(`[pipiui-memory-broker] catalog ingestion is not wired (${unwiredReason}); candidates will be discarded.`);
+        }
         if (catalog) admin = new MemoryAdminService(catalog, catalogBackend?.catalogPort, `${identity.root}/ui`, async () => {
           const value = await backend!.status((await import("#memory-broker-contract")).createActorContext({ projectRoot, chatSessionID: "memory-main-session", bridgeRoutingKey: "memory-main-route", agentID: "main", runID: "main-session", role: "main" }));
           return value;
@@ -420,7 +442,14 @@ export async function installMemoryBrokerExtension(
           chatSessionID: envText(env, "PIPIUI_MEMORY_CHAT_SESSION_ID"),
           bridgeRoutingKey: envText(env, "PIPIUI_MEMORY_BRIDGE_ROUTING_KEY"),
           ...(backend ? { backend } : {}),
-          onCandidate: async (candidate) => { await curatorScheduler?.submit(candidate, projectRoot); },
+          onCandidate: async (candidate) => {
+            if (!curatorScheduler) {
+              await ingestionReporter?.discard();
+              return;
+            }
+            await curatorScheduler.submit(candidate, projectRoot);
+            ingestionReporter?.forward();
+          },
           ...(admin ? { adminService: admin } : {}),
         };
         const { MemoryBrokerServer: MainMemoryBrokerServer } = await import("./server.ts");
@@ -468,6 +497,8 @@ export async function installMemoryBrokerExtension(
       // catalog durability is already fsync'd per event.
       curatorScheduler?.onSessionEnd();
       curatorScheduler = undefined;
+      await ingestionReporter?.finish();
+      ingestionReporter = undefined;
       catalog = undefined;
       admin?.revokeAdminSession();
       admin = undefined;
@@ -480,6 +511,12 @@ export async function installMemoryBrokerExtension(
       publishedEnvironment = undefined;
       await current?.close().catch(() => {});
       if (globalIssuerHost[RETRIEVAL_DISPATCHER]) delete globalIssuerHost[RETRIEVAL_DISPATCHER];
+      // Hermes consolidates only at 100% and stops as soon as the result fits,
+      // so its failure store settles pinned at the cap and every later add pays
+      // a consolidation subprocess mid-turn. Archive back to the low-water mark
+      // here, off the critical path, so the next session starts with headroom.
+      // Bounded file I/O with no LLM call, and fail-soft by construction.
+      await compactFailureMemoryAtShutdown(env);
       try {
         options.onStopped?.();
       } catch {
