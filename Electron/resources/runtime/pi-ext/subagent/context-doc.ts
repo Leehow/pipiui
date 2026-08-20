@@ -235,6 +235,14 @@ export interface RepeatedBriefMatch {
 	ratio: number;
 }
 
+export interface DispatchedBrief {
+	/** The Boss-chosen id, when it gave one. Undefined dispatches are never "the same worker". */
+	agentId?: string;
+	/** What to call it in the nudge; falls back to a title or a placeholder. */
+	label: string;
+	brief: string;
+}
+
 /**
  * Compare one brief against the briefs already dispatched this turn.
  *
@@ -243,15 +251,21 @@ export interface RepeatedBriefMatch {
  * but not lines. Short lines are ignored so that bullets and headings cannot manufacture a match.
  */
 export function detectRepeatedBrief(
-	brief: string,
-	earlier: readonly { agentId: string; brief: string }[],
+	current_: DispatchedBrief,
+	earlier: readonly DispatchedBrief[],
 ): RepeatedBriefMatch | undefined {
-	const current = significantLines(brief);
+	const current = significantLines(current_.brief);
 	if (current.size === 0) return undefined;
 	const currentChars = [...current.values()].reduce((sum, n) => sum + n, 0);
 
 	let best: RepeatedBriefMatch | undefined;
 	for (const previous of earlier) {
+		// Re-dispatching one agentId is continuation — the orchestration layer asks for it by
+		// name, and the second brief repeating the first is what continuing looks like, not two
+		// workers sharing a preamble. Observed firing on exactly this in real traffic
+		// (`model-label` dispatched twice, 100% match), where the advice was simply wrong.
+		// Both ids must be present: two unnamed dispatches are not "the same worker".
+		if (current_.agentId && previous.agentId && current_.agentId === previous.agentId) continue;
 		const other = significantLines(previous.brief);
 		let sharedChars = 0;
 		for (const [line, length] of current) if (other.has(line)) sharedChars += length;
@@ -260,7 +274,7 @@ export function detectRepeatedBrief(
 		const ratio = sharedChars / Math.max(1, Math.min(currentChars, otherChars));
 		if (ratio < REPEAT_MIN_RATIO) continue;
 		if (!best || sharedChars > best.sharedChars) {
-			best = { againstAgentId: previous.agentId, sharedChars, ratio };
+			best = { againstAgentId: previous.label, sharedChars, ratio };
 		}
 	}
 	return best;

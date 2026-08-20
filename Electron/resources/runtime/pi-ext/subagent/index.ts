@@ -153,6 +153,7 @@ import {
 } from "./boss-ledger.ts";
 import { bossLedgerNoteTool } from "./boss-note.ts";
 import {
+	type DispatchedBrief,
 	contextDocPath,
 	contextDocTool,
 	detectRepeatedBrief,
@@ -160,7 +161,7 @@ import {
 } from "./context-doc.ts";
 
 /** Briefs dispatched in the current Boss turn, for shared-context detection. Reset per turn. */
-const turnDispatchedBriefs: { agentId: string; brief: string }[] = [];
+const turnDispatchedBriefs: DispatchedBrief[] = [];
 /** One shared-context nudge per turn: the point lands once, and a wave is not a lecture. */
 let turnRepeatNudged = false;
 /** Bound the per-turn memory; a very wide wave must not grow this without limit. */
@@ -8324,7 +8325,10 @@ export default function (pi: ExtensionAPI) {
 					// each other, not only against earlier calls in the turn.
 					for (const task of shapeTasks) {
 						if (!turnRepeatNudged) {
-							const match = detectRepeatedBrief(task.task, turnDispatchedBriefs);
+							const match = detectRepeatedBrief(
+								{ agentId: task.agentId, label: task.agentId || task.title || "(unnamed)", brief: task.task },
+								turnDispatchedBriefs,
+							);
 							if (match) {
 								dispatchNudgePrefix += formatRepeatedBriefNudge(
 									match,
@@ -8333,7 +8337,11 @@ export default function (pi: ExtensionAPI) {
 								turnRepeatNudged = true;
 							}
 						}
-						turnDispatchedBriefs.push({ agentId: task.agentId || task.title || "(unnamed)", brief: task.task });
+						turnDispatchedBriefs.push({
+							agentId: task.agentId,
+							label: task.agentId || task.title || "(unnamed)",
+							brief: task.task,
+						});
 					}
 					if (turnDispatchedBriefs.length > TURN_BRIEF_MEMORY) {
 						turnDispatchedBriefs.splice(0, turnDispatchedBriefs.length - TURN_BRIEF_MEMORY);

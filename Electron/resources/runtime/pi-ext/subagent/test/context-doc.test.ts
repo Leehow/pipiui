@@ -105,8 +105,8 @@ const SHARED = [
 ].join("\n");
 
 test("a second brief repeating the shared half is detected, and named against the first", () => {
-	const match = detectRepeatedBrief(`${SHARED}\nGoal: fix the quota pill width regression at render time.`, [
-		{ agentId: "sidebar-icons", brief: `${SHARED}\nGoal: give external rows their own source icon.` },
+	const match = detectRepeatedBrief({ label: "current", brief: `${SHARED}\nGoal: fix the quota pill width regression at render time.` }, [
+		{ agentId: "sidebar-icons", label: "sidebar-icons", brief: `${SHARED}\nGoal: give external rows their own source icon.` },
 	]);
 
 	assert.ok(match, "identical pasted briefing across two briefs is the case context_doc exists for");
@@ -117,37 +117,36 @@ test("a second brief repeating the shared half is detected, and named against th
 
 test("independently written briefs about the same subsystem are not flagged", () => {
 	// Same vocabulary, no pasted lines: this is not repetition worth a document.
-	const match = detectRepeatedBrief(
-		"Goal: the sidebar session row should show a source icon for external sessions. Verify with npm test.",
-		[{ agentId: "other", brief: "Goal: the sidebar drag handler should reorder pinned sessions. Verify with npm test." }],
+	const match = detectRepeatedBrief({ label: "current", brief: "Goal: the sidebar session row should show a source icon for external sessions. Verify with npm test." },
+		[{ agentId: "other", label: "other", brief: "Goal: the sidebar drag handler should reorder pinned sessions. Verify with npm test." }],
 	);
 	assert.equal(match, undefined);
 });
 
 test("short repeated lines cannot manufacture a match", () => {
 	const boilerplate = Array.from({ length: 40 }, (_, i) => `- step ${i}`).join("\n");
-	assert.equal(detectRepeatedBrief(boilerplate, [{ agentId: "a", brief: boilerplate }]), undefined);
+	assert.equal(detectRepeatedBrief({ label: "current", brief: boilerplate }, [{ agentId: "a", label: "a", brief: boilerplate }]), undefined);
 });
 
 test("a small overlap inside two large briefs stays below the ratio bar", () => {
 	const oneSharedLine = "Do not touch Electron/resources/runtime/pi-ext/subagent/index.ts in this wave; it is owned by another slice."
 	const bulk = (seed: string) => Array.from({ length: 30 }, (_, i) => `${seed} line ${i} with enough characters to count as significant`).join("\n");
-	const match = detectRepeatedBrief(`${bulk("alpha")}\n${oneSharedLine}`, [
-		{ agentId: "a", brief: `${bulk("beta")}\n${oneSharedLine}` },
+	const match = detectRepeatedBrief({ label: "current", brief: `${bulk("alpha")}\n${oneSharedLine}` }, [
+		{ agentId: "a", label: "a", brief: `${bulk("beta")}\n${oneSharedLine}` },
 	]);
 	assert.equal(match, undefined, "one shared line in two long briefs is not a shared briefing");
 });
 
 test("the first brief of a turn has nothing to repeat", () => {
-	assert.equal(detectRepeatedBrief(SHARED, []), undefined);
-	assert.equal(detectRepeatedBrief("", [{ agentId: "a", brief: SHARED }]), undefined);
+	assert.equal(detectRepeatedBrief({ label: "current", brief: SHARED }, []), undefined);
+	assert.equal(detectRepeatedBrief({ label: "current", brief: "" }, [{ agentId: "a", label: "a", brief: SHARED }]), undefined);
 });
 
 test("the strongest match wins when several earlier briefs overlap", () => {
 	const extra = "\nShared verification: run `npm run build -w @pipiui/ui` and paste the exit code into the report."
-	const match = detectRepeatedBrief(`${SHARED}${extra}\nGoal: third slice.`, [
-		{ agentId: "weak", brief: `${SHARED}\nGoal: first slice.` },
-		{ agentId: "strong", brief: `${SHARED}${extra}\nGoal: second slice.` },
+	const match = detectRepeatedBrief({ label: "current", brief: `${SHARED}${extra}\nGoal: third slice.` }, [
+		{ agentId: "weak", label: "weak", brief: `${SHARED}\nGoal: first slice.` },
+		{ agentId: "strong", label: "strong", brief: `${SHARED}${extra}\nGoal: second slice.` },
 	]);
 	assert.equal(match?.againstAgentId, "strong");
 });
@@ -163,4 +162,34 @@ test("the nudge names the repeat, the tool, and the file, and keeps briefs respo
 	assert.match(text, /context_doc\(\{section, body\}\)/);
 	assert.match(text, /\/repo\/\.pi\/context\/context-s1\.md/);
 	assert.match(text, /goal, scope and acceptance still belong in the brief itself/);
+});
+
+test("re-dispatching one agentId is continuation, not shared context", () => {
+	// Observed in real traffic: `model-label` dispatched twice in a turn produced a 100% match
+	// and a nudge telling the Boss to extract shared context. Continuing a worker by name is
+	// what the orchestration layer asks for; the second brief repeating the first is what that
+	// looks like, and context_doc is the wrong advice for it.
+	const brief = `${SHARED}\nGoal: land the model label change.`;
+	assert.equal(
+		detectRepeatedBrief({ agentId: "model-label", label: "model-label", brief }, [
+			{ agentId: "model-label", label: "model-label", brief },
+		]),
+		undefined,
+	);
+
+	// A different worker repeating the same briefing is still the real case.
+	assert.ok(detectRepeatedBrief({ agentId: "other-slice", label: "other-slice", brief }, [
+		{ agentId: "model-label", label: "model-label", brief },
+	]));
+});
+
+test("two unnamed dispatches are not treated as the same worker", () => {
+	// The Boss often omits agentId; collapsing those to one placeholder would silently disable
+	// detection for exactly the wave-shaped dispatches this is for.
+	const brief = `${SHARED}\nGoal: one of several parallel slices.`;
+	const match = detectRepeatedBrief({ label: "(unnamed)", brief }, [
+		{ label: "(unnamed)", brief: `${SHARED}\nGoal: a different parallel slice.` },
+	]);
+	assert.ok(match, "no agentId on either side means unknown identity, not same identity");
+	assert.equal(match?.againstAgentId, "(unnamed)");
 });
