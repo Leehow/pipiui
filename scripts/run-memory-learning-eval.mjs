@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const evaluator = join(root, "Sources/PipiUI/PiExt/packages/memory-broker/scripts/eval-memory.ts");
+const evaluator = join(root, "Electron/resources/runtime/pi-ext/packages/memory-broker/scripts/eval-memory.ts");
 
 async function main() {
   try { await access(evaluator); } catch { throw new Error(`Memory eval CLI is missing: ${evaluator}`); }

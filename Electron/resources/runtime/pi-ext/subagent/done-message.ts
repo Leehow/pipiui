@@ -5,11 +5,14 @@
 
 import type { Message } from "@earendil-works/pi-ai";
 
+import { formatFindingsLine } from "./findings-artifact.ts";
+
 // Done-message caps (clean-context orchestration):
 // - Injected [subagent-done] Result body is a TLDR slice (TLDR_DONE_CAP); full text
 //   lives only in the job registry and is pulled via subagent_status full:true.
 // - VERDICT/REPORT/ERROR caps still size chain/foreground aggregates and error paths
 //   that embed more than the TLDR pointer message.
+
 export const TLDR_DONE_CAP = 2500;
 export const TLDR_FALLBACK_NON_EMPTY_LINES = 15;
 export const VERDICT_DONE_CAP = 1500;
@@ -166,7 +169,14 @@ export function formatWaveLine(wave: WaveSnapshot): string {
 
 export function formatSubagentDoneMessage(
 	result: DoneMessageResult,
-	extra?: { aborted?: boolean; error?: string; runId?: string; wave?: WaveSnapshot },
+	extra?: {
+		aborted?: boolean;
+		error?: string;
+		runId?: string;
+		wave?: WaveSnapshot;
+		/** Path written by findings-artifact.ts; absent when the write failed or had nothing to save. */
+		findingsFile?: string;
+	},
 ): string {
 	const aborted = extra?.aborted ?? result.stopReason === "aborted";
 	const ok = isHostEndOk(result, { aborted }) && !extra?.error;
@@ -209,6 +219,10 @@ export function formatSubagentDoneMessage(
 		"Result:",
 		output,
 		`Full report: subagent_status({agentId:"${result.agentId ?? "?"}", full:true})`,
+	);
+	// The handoff path: one line here saves the next worker a full rediscovery pass.
+	if (extra?.findingsFile) lines.push(formatFindingsLine(extra.findingsFile));
+	lines.push(
 		"Handling: The Wave line above is the runtime snapshot of still-running workers taken at this completion; use it to decide whether to speak or stay silent. this is a worker event, not a new user request. One unfiltered subagent_status() without agentId lists running jobs plus the most recent ended jobs; it does not dump the full archive. If this turn already has that snapshot, reuse it and do not call again; if this turn has no unfiltered subagent_status() yet, call it once without agentId and inspect every worker relevant to this user's goal, including this one. If any related worker is running (including stalled) or expected related work is still unfinished, do NOT give the user a status update, progress report, partial conclusion, or summary: only continue orchestration/internal ledger work or dispatch follow-up work, then wait for the next event. ONLY after status confirms every related worker is terminal may you give the user exactly one complete final closeout in their language — verdict, key evidence, and what changed. Do not end silently once that final-closeout condition is met. Never reply \"already completed\" without a status snapshot this turn; if a related worker is still running but its work is done, close it with subagent_abort({agentId}) (or /subagent_abort) so its messages stop, or resolve terminal failed/aborted/interrupted episodes with subagent_resolve({agentId, runId}) (or /subagent_resolve).",
 	);
 	return lines.join("\n");

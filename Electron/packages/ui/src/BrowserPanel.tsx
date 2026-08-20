@@ -6,7 +6,16 @@ import { DismissibleError } from './DismissibleError'
 import './browser-panel.css'
 
 const emptyTabs: BrowserTabsSnapshot = { tabs: [] }
-type SessionChrome = { tabs: BrowserTabsSnapshot; address: string; deviceId: string }
+type SessionChrome = { tabs: BrowserTabsSnapshot; address: string; deviceId: string; zoomFactor: number }
+
+const BROWSER_ZOOM_MIN = 0.25
+const BROWSER_ZOOM_MAX = 5
+const BROWSER_ZOOM_STEP = 0.1
+
+function clampZoom(factor: number): number {
+  const next = Number.isFinite(factor) ? factor : 1
+  return Math.min(BROWSER_ZOOM_MAX, Math.max(BROWSER_ZOOM_MIN, Math.round(next * 100) / 100))
+}
 
 function readRect(node: HTMLElement | null): { x: number; y: number; width: number; height: number } | undefined {
   const rect = node?.getBoundingClientRect()
@@ -37,6 +46,8 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   const [address, setAddress] = useState('')
   const [mobileOpen, setMobileOpen] = useState(false)
   const [deviceId, setDeviceId] = useState('responsive')
+  const [zoomFactor, setZoomFactor] = useState(1)
+  const zoomFactorRef = useRef(1)
   const [error, setError] = useState<string>()
   const [surface, setSurface] = useState<HTMLDivElement | null>(null)
   const sessionKey = sessionId ?? ''
@@ -47,15 +58,19 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   const chromeBySession = useRef(new Map<string, SessionChrome>())
   const [chromeKey, setChromeKey] = useState(sessionKey)
   if (sessionKey !== chromeKey) {
-    if (chromeKey) chromeBySession.current.set(chromeKey, { tabs, address, deviceId })
+    if (chromeKey) chromeBySession.current.set(chromeKey, { tabs, address, deviceId, zoomFactor })
     const cached = sessionKey ? chromeBySession.current.get(sessionKey) : undefined
     if (cached) {
       setTabs(cached.tabs)
       setAddress(cached.address)
       setDeviceId(cached.deviceId)
+      setZoomFactor(cached.zoomFactor)
+      zoomFactorRef.current = cached.zoomFactor
       deviceIdRef.current = cached.deviceId
     } else {
       setDeviceId('responsive')
+      setZoomFactor(1)
+      zoomFactorRef.current = 1
       deviceIdRef.current = 'responsive'
     }
     setMobileOpen(false)
@@ -148,6 +163,17 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
     setDeviceId(next)
     setBounds(!occluded, mobileOpenRef.current, next)
   }
+  const applyZoom = (next: number) => {
+    const factor = clampZoom(next)
+    zoomFactorRef.current = factor
+    setZoomFactor(factor)
+    if (!sessionKey || !browser) return
+    void browser.setZoomFactor(sessionKey, factor, active?.id).then(applied => {
+      zoomFactorRef.current = applied
+      setZoomFactor(applied)
+    }).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
+  }
+  const adjustZoom = (delta: number) => applyZoom(zoomFactorRef.current + delta)
 
   if (!browser) return <section className="browser-panel browser-unavailable" data-testid="browser-unavailable"><b>Browser 不可用</b><p>当前连接未提供桌面浏览器能力。</p></section>
 
@@ -169,11 +195,13 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
       <button type="button" aria-label="前进" title="前进" disabled={!active?.canGoForward} onClick={() => active && run(() => browser.goForward(sessionKey, active.id))}>›</button>
       <button type="button" aria-label="刷新" title="刷新" disabled={!active} onClick={() => active && run(() => browser.reload(sessionKey, active.id))}>↻</button>
       <button type="button" data-testid="browser-mobile-window-toggle" aria-label={mobileOpen ? '关闭手机预览窗口' : '打开手机预览窗口'} aria-pressed={mobileOpen} title={mobileOpen ? '关闭手机预览窗口' : '打开独立手机预览窗口'} className={mobileOpen ? 'selected' : undefined} onClick={toggleMobileWindow}><MobileModeIcon /></button>
-      <select className="browser-device-select" aria-label="手机设备" value={deviceId} onChange={event => selectDevice(event.target.value)}>
+      {mobileOpen && <select className="browser-device-select" data-testid="browser-device-select" aria-label="手机设备" value={deviceId} onChange={event => selectDevice(event.target.value)}>
         {BROWSER_MOBILE_DEVICES.map(device => <option key={device.id} value={device.id}>{device.label}</option>)}
-      </select>
-      {onToggleWorkspaceFullscreen && <button type="button" data-testid="browser-workspace-fullscreen" aria-label={workspaceFullscreen ? '退出浏览器全屏' : '浏览器全屏'} aria-pressed={workspaceFullscreen} title={workspaceFullscreen ? '退出浏览器全屏' : '浏览器全屏'} className={workspaceFullscreen ? 'selected' : undefined} onClick={onToggleWorkspaceFullscreen}><FullscreenIcon exit={workspaceFullscreen} /></button>}
+      </select>}
       <input aria-label="浏览器地址" value={address} placeholder="输入网址或搜索内容" onChange={event => setAddress(event.target.value)} />
+      <button type="button" data-testid="browser-zoom-out" aria-label="缩小" title="缩小" disabled={!active || zoomFactor <= BROWSER_ZOOM_MIN} onClick={() => adjustZoom(-BROWSER_ZOOM_STEP)}>−</button>
+      <button type="button" data-testid="browser-zoom-in" aria-label="放大" title="放大" disabled={!active || zoomFactor >= BROWSER_ZOOM_MAX} onClick={() => adjustZoom(BROWSER_ZOOM_STEP)}>＋</button>
+      {onToggleWorkspaceFullscreen && <button type="button" data-testid="browser-workspace-fullscreen" aria-label={workspaceFullscreen ? '退出浏览器全屏' : '浏览器全屏'} aria-pressed={workspaceFullscreen} title={workspaceFullscreen ? '退出浏览器全屏' : '浏览器全屏'} className={workspaceFullscreen ? 'selected' : undefined} onClick={onToggleWorkspaceFullscreen}><FullscreenIcon exit={workspaceFullscreen} /></button>}
       {active?.isLoading && <span className="browser-loading" role="status" aria-label="正在加载" title="正在加载" />}
     </form>
 

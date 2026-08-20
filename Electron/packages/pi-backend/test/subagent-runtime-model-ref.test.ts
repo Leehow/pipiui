@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { checkedSubagentOverrideModel, isProviderQualifiedModelRef } from '../../../../Sources/PipiUI/PiExt/subagent/model-ref'
+import { checkedSubagentOverrideModel, isProviderQualifiedModelRef } from '../../../resources/runtime/pi-ext/subagent/model-ref'
 
 describe('subagent runtime provider/model dispatch guard', () => {
   it('round-trips the exact provider-qualified model selected by Electron', () => {

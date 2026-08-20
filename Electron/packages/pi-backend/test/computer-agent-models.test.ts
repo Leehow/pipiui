@@ -17,28 +17,28 @@ function authRuntime(models: Array<{ provider: string; id: string; name?: string
 describe('Computer Agent role model settings', () => {
   let root = ''
   afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) })
-  it('advertises terminal as a real role and materializes its independent setting', async () => {
+  it('advertises the unified computer-use agent and materializes its independent setting', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))
     const backend = createPiHostBackend({ agentDir: join(root, 'agent'), env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
     const roles = await backend.handle('listAgentDefinitions', []) as Array<{ name: string }>
-    expect(roles.map(role => role.name)).toContain('computer-terminal')
-    await backend.handle('setSubagentModel', ['computer-terminal', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
-    expect(await backend.handle('getSubagentModels', [])).toMatchObject({ 'computer-terminal': [{ model: 'xai/grok-4.5', thinking: 'high' }] })
+    expect(roles.map(role => role.name)).toEqual(['explore', 'general-purpose', 'reviewer', 'computer-use', 'secretary'])
+    await backend.handle('setSubagentModel', ['computer-use', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
+    expect(await backend.handle('getSubagentModels', [])).toMatchObject({ 'computer-use': [{ model: 'xai/grok-4.5', thinking: 'high' }] })
     const runtime = JSON.parse(await readFile(join(root, 'agent/pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(runtime['computer-terminal']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
+    expect(runtime['computer-use']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
   })
   it('passes the Electron-owned role model file to nested worker resolution', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))
     const agentDir = join(root, 'agent')
     const backend = createPiHostBackend({ agentDir, env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
-    await backend.handle('setSubagentModel', ['computer-verifier', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
+    await backend.handle('setSubagentModel', ['computer-use', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
     const runtime = JSON.parse(await readFile(join(agentDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(runtime['computer-verifier']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
+    expect(runtime['computer-use']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
     await rm(join(agentDir, 'pipiui-subagent-models-runtime.json'))
     const restarted = createPiHostBackend({ agentDir, env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
     await restarted.handle('getSubagentModels', [])
     const rematerialized = JSON.parse(await readFile(join(agentDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(rematerialized['computer-verifier']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
+    expect(rematerialized['computer-use']).toEqual([{ model: 'xai/grok-4.5', thinking: 'high' }])
   })
   it('migrates a uniquely owned legacy bare id but never chooses between duplicate providers', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))

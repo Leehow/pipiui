@@ -100,6 +100,17 @@ const vision = {
   dismissError: () => undefined,
 }
 
+const scan = {
+  enabled: true,
+  available: true,
+  loading: false,
+  saving: false,
+  error: null,
+  refresh: async () => undefined,
+  setEnabled: async () => undefined,
+  dismissError: () => undefined,
+}
+
 const updates = {
   available: false,
   loading: false,
@@ -115,6 +126,7 @@ describe('general settings no longer host Firecrawl OCR', () => {
         host={hostStub()}
         visibility={visibility as never}
         vision={vision as never}
+        scan={scan as never}
         updates={updates as never}
         current={null}
         onRequestUpdate={() => undefined}
@@ -126,5 +138,33 @@ describe('general settings no longer host Firecrawl OCR', () => {
     expect(screen.queryByTestId('firecrawl-pdf-pane')).toBeNull()
     expect(screen.queryByText('Firecrawl OCR Key（选填）')).toBeNull()
     expect(screen.queryByTestId('firecrawl-pdf-key-input')).toBeNull()
+  })
+
+  it('renders the external-session scan switch on by default and persists the toggle', async () => {
+    const setScanExternalSessions = vi.fn(async (enabled: boolean) => enabled)
+    const scanToggle = {
+      ...scan,
+      setEnabled: setScanExternalSessions,
+    }
+    render(
+      <ModelVisibilityModal
+        host={hostStub({ setScanExternalSessions })}
+        visibility={visibility as never}
+        vision={vision as never}
+        scan={scanToggle as never}
+        updates={updates as never}
+        current={null}
+        onRequestUpdate={() => undefined}
+        onClose={() => undefined}
+        projectId="project-1"
+      />,
+    )
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    const toggle = screen.getByTestId('scan-external-sessions-switch')
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText('自动扫描其他 coding agent 聊天记录')).toBeTruthy()
+    expect(screen.getByText('关闭后侧栏不再显示 Codex / Claude / Cursor 等外部会话。')).toBeTruthy()
+    fireEvent.click(toggle)
+    expect(setScanExternalSessions).toHaveBeenCalledWith(false)
   })
 })

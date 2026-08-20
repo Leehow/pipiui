@@ -170,10 +170,10 @@ export type SidebarSessionPreferences = {
   archivedSessionIds: string[];
   /** Unix milliseconds when each session entered the archive. Missing legacy entries receive a fresh grace window in the UI. */
   archivedSessionTimestamps?: Record<string, number>;
-  /** Only sessions that participated in an explicit drag, in their local relative order. */
+  /** @deprecated Legacy manual drag order. Unused since sessionOrderVersion 3; keep for IPC compatibility and always persist as []. */
   orderedSessionIds: string[];
-  /** Absent identifies the legacy full-list order that must be migrated away. */
-  sessionOrderVersion?: 2;
+  /** Absent / 2 are pre-v3 prefs whose orderedSessionIds must be discarded. Current writers persist 3. */
+  sessionOrderVersion?: 2 | 3;
 };
 /** Built-in subagent role metadata used by the settings UI. */
 export type AgentDefinition = { name: string; description: string };
@@ -459,6 +459,8 @@ export interface BrowserHostAPI {
   snapshot(sessionId: string, tabId?: string): Promise<BrowserSnapshot>;
   /** Renderer-to-main placement bridge for the selected session's WebContentsView. */
   setViewBounds(sessionId: string, bounds: BrowserViewBounds): Promise<void>;
+  /** Page zoom for the visible desktop WebContents (not the mobile device-frame scale). */
+  setZoomFactor(sessionId: string, factor: number, tabId?: string): Promise<number>;
   subscribe(listener: (event: BrowserEvent) => void): Unsubscribe;
 }
 
@@ -496,7 +498,13 @@ export type StreamEvent =
    * (`manual` | `threshold` | `overflow`); `aborted`/`error` are end-only and
    * mutually exclusive with a clean finish. Old clients may safely ignore it.
    */
-  | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string };
+  | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string }
+  /**
+   * After the session writer is quiet, the host rewrites JSONL and pushes the
+   * already-redacted texts so live bubbles replace plaintext. Old clients may
+   * safely ignore this new event type.
+   */
+  | { type: "secret_redact"; sessionId: string; messages: Array<{ id: string; role?: "user" | "assistant" | "tool" | "compaction"; content: string; thinking?: string; tools?: HistoryTool[] }> };
 export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Uncapped thinking length; preview `text` may still be sliced. */ charCount?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
 export type DocumentEvent = { type: "documentChanged"; path: string };
 export type HostEvent =
@@ -597,6 +605,12 @@ export interface PipiHostAPI {
    */
   getVisionEnabled?(): Promise<boolean>;
   setVisionEnabled?(enabled: boolean): Promise<boolean>;
+  /**
+   * Scan Codex/Claude/Cursor/Grok/OpenCode/ZCode chats into the sidebar.
+   * Missing key = enabled.
+   */
+  getScanExternalSessions?(): Promise<boolean>;
+  setScanExternalSessions?(enabled: boolean): Promise<boolean>;
   /** Project-scoped PaddleOCR AI Studio token. Renderer only receives hasKey, never the secret. */
   getPaddleOcrStatus?(projectId: string): Promise<{ hasKey: boolean }>;
   /** Pass a new token or null to clear. Never returned back to the renderer. */
@@ -701,7 +715,7 @@ export interface PipiHostAPI {
 
 type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
-export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds";
+export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
 export type HostRequest = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "request"; method: HostMethod; params: unknown[] };
 export type HostResponse = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: true; result: unknown } | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: false; error: string; errorCode?: string };
@@ -790,6 +804,8 @@ function apiFrom(
     setVisionModel: ref => invoke("setVisionModel", ref),
     getVisionEnabled: () => invoke("getVisionEnabled"),
     setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
+    getScanExternalSessions: () => invoke("getScanExternalSessions"),
+    setScanExternalSessions: enabled => invoke("setScanExternalSessions", enabled),
     getPaddleOcrStatus: projectId => invoke("getPaddleOcrStatus", projectId),
     setPaddleOcrAccessToken: (projectId, token) => invoke("setPaddleOcrAccessToken", projectId, token),
     listSecretVault: sessionId => invoke("listSecretVault", sessionId),
@@ -836,6 +852,7 @@ function apiFrom(
       reload: (sessionId, tabId) => invoke("browserReload", sessionId, tabId),
       snapshot: (sessionId, tabId) => invoke("browserSnapshot", sessionId, tabId),
       setViewBounds: (sessionId, bounds) => invoke("browserSetViewBounds", sessionId, bounds),
+      setZoomFactor: (sessionId, factor, tabId) => invoke("browserSetZoomFactor", sessionId, factor, tabId),
       subscribe: listener => subscribe("browser", event => event.channel === "browser", event => listener((event as Extract<HostEvent, { channel: "browser" }>).event))
     },
     terminal: {

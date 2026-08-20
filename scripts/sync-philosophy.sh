@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SRC="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/pipi-philosophy}"
-DEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Sources/PipiUI/PiPhilosophy"
+DEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/Electron/resources/runtime/pi-philosophy"
 
 if [ ! -f "$SRC/package.json" ]; then
   echo "error: no pipi-philosophy package at $SRC" >&2

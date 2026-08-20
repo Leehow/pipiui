@@ -256,12 +256,36 @@
 .sb-session[draggable="true"]{cursor:default}
 .sb-project[data-dragging="true"]{opacity:.42;cursor:grabbing}
 .sb-session[data-dragging="true"]{opacity:.42;cursor:default}
-.sb-pinned-section[data-drop-active="true"]{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--sb-accent) 45%,transparent);border-radius:7px}
+.sb-session[data-drop-target]{
+  outline:2px solid var(--sb-accent);
+  outline-offset:-2px;
+  background:color-mix(in srgb,var(--sb-accent) 22%,var(--sb-surface));
+}
+.sb-project[data-session-drop]{
+  outline:2px solid var(--sb-accent);
+  outline-offset:-2px;
+  background:color-mix(in srgb,var(--sb-accent) 22%,var(--sb-surface));
+  border-radius:7px;
+}
+.sb-pinned-section[data-drop-active],
+.sb-section[aria-label="已归档"][data-drop-active]{
+  outline:2px dashed var(--sb-accent);
+  outline-offset:-2px;
+  background:color-mix(in srgb,var(--sb-accent) 16%,var(--sb-surface));
+  border-radius:7px;
+}
 .sb-project[data-drop-placement="before"],.sb-session[data-drop-placement="before"]{box-shadow:inset 0 2px 0 var(--sb-accent)}
 .sb-project[data-drop-placement="after"],.sb-session[data-drop-placement="after"]{box-shadow:inset 0 -2px 0 var(--sb-accent)}
 .sb-session:focus-visible{outline:1px solid var(--sb-accent);outline-offset:-1px}
 .sb-session .provider-logo,.sb-session-source{flex:none}
 .sb-session-source{display:inline-flex;align-items:center;justify-content:center}
+.sb-session-title-line{
+  flex:1 1 auto;
+  min-width:0;
+  display:flex;
+  align-items:center;
+  gap:4px;
+}
 .sb-session-title{
   flex:1 1 auto;
   min-width:0;
@@ -269,6 +293,17 @@
   text-overflow:ellipsis;
   white-space:nowrap;
   font-size:12px;
+}
+.sb-session-external-badge{
+  flex:none;
+  padding:0 4px;
+  border:1px solid color-mix(in srgb,var(--sb-muted) 28%,transparent);
+  border-radius:999px;
+  background:color-mix(in srgb,var(--sb-muted) 10%,transparent);
+  color:var(--sb-muted);
+  font-size:10.5px;
+  line-height:1.4;
+  white-space:nowrap;
 }
 .sb-session-title-input{
   min-width:0;

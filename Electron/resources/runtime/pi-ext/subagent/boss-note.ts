@@ -1,11 +1,17 @@
 /**
- * The Boss's only write.
+ * The Boss's bookkeeping write.
  *
  * With the main session read-only (`bossReadOnly` in the host's spawn features), `write` and
  * `edit` are gone from the Boss's tool set. One write it genuinely owns survives that: the
  * judgement half of its own ledger — Decisions, Done, Risks & open questions — which no
  * dispatch or completion event can carry and which is exactly what a compaction would
  * otherwise erase.
+ *
+ * It is not the Boss's only narrow write; `context_doc` (context-doc.ts) restores a second one
+ * for a different need. The two do not overlap: this one is a scanned log of judgement the
+ * Boss makes, addressed to the Boss after a compaction. That one is a document addressed to
+ * workers, revisable so a superseded decision can be erased rather than argued with. A note
+ * that a worker must obey belongs there, not here.
  *
  * So the capability is restored as a tool that can reach nothing else. It appends a line to
  * one of three named sections of this session's `.pi/boss/ledger-<key>.md`. There is no path
@@ -130,7 +136,8 @@ export function bossLedgerNoteTool(session: { mainCwd: string | undefined; sessi
 		label: "Ledger Note",
 		description: [
 			`Append one line to a Boss-owned section of this session's ledger (.pi/boss/): ${sections}.`,
-			"This is the Boss's only write. Use it for the judgement no dispatch or completion event carries — why a route was chosen, what a result actually means, what is still unknown — so it survives context compaction.",
+			"Use it for the judgement no dispatch or completion event carries — why a route was chosen, what a result actually means, what is still unknown — so it survives context compaction.",
+			"This ledger is addressed to you after a compaction, not to workers. Shared context workers must read goes in `context_doc` instead, which is revisable; this one is an append-only log.",
 			"The runtime-owned Tasks and Closeout tables are not writable here: they are maintained from real dispatch and completion events, and a hand-written row is the copy that goes stale. Read them with the read tool.",
 			"Never blocks a dispatch: record after dispatching, never before.",
 		].join(" "),

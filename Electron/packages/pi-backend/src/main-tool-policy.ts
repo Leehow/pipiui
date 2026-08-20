@@ -18,9 +18,13 @@
  * attested `verify`, whose exit code is stronger evidence than a command the Boss ran and
  * then summarized for itself.
  *
- * The one write the Boss legitimately owns — the Decisions / Done / Risks half of its own
- * ledger — is served by the subagent extension's `ledger_note` tool, which can only reach
- * `.pi/boss/**`. That is strictly narrower than the `write` it replaces.
+ * The two writes the Boss legitimately owns are served by narrow subagent-extension tools
+ * rather than by restoring `write`, and both are strictly narrower than the tool they
+ * replace: `ledger_note` reaches only `.pi/boss/**` (the Decisions / Done / Risks half of its
+ * own ledger), and `context_doc` reaches only `.pi/context/**` (the shared briefing workers
+ * read so it is not retyped into every brief). Because this policy is a denylist of mutation
+ * verbs, neither needs an entry here — but neither may be added to the mutation set either,
+ * which `main-tool-policy.test.ts` pins.
  *
  * Scope: this governs the main pi process only. Dispatched workers assemble their own tool
  * selection from their agent definition (`resolveSubagentToolSelection`) and never inherit

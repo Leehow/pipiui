@@ -13,6 +13,7 @@ import { ComputerPlanCard } from './ComputerPlanCard'
 import { ComputerTaskResultCard, ComputerWorkerResultCard, computerTaskGoalFromInput } from './ComputerTaskResultCard'
 import { parseComputerPlanSegment, parseComputerTaskResult, parseComputerWorkerResult } from './computer-task-report'
 import type { ChatMessage, TranscriptActivity, TranscriptTool } from './transcript-model'
+import { displaySecretPlaceholders } from './secret-display'
 import { activitiesFromMessage, PENDING_THINKING_ID, planAssistantTranscript } from './transcript-model'
 
 export type { TranscriptActivity, TranscriptTool } from './transcript-model'
@@ -104,7 +105,7 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
         if (plan) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerPlanCard plan={plan} /></div>
         const worker = parseComputerWorkerResult(segment.content)
         if (worker) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerWorkerResultCard result={worker} /></div>
-        return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={segment.content} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={segment.content} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
+        return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={displaySecretPlaceholders(segment.content)} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={displaySecretPlaceholders(segment.content)} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
       }
       const groupTools = segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
       const hasThinking = segment.activities.some(activity => activity.type === 'thinking')
@@ -117,7 +118,7 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
             ? pendingThinking || activityIndex === segment.activities.length - 1
             : !activity.tool.finished
         ))
-        if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(estimateTokens(activity.charCount ?? activity.content.length))} tokens`} running={live} defaultExpanded={live}><p>{activity.content || (live ? '模型正在思考…' : '')}</p></ActivityCard>
+        if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(estimateTokens(activity.charCount ?? activity.content.length))} tokens`} running={live} defaultExpanded={live}><p>{displaySecretPlaceholders(activity.content) || (live ? '模型正在思考…' : '')}</p></ActivityCard>
         const projection = liveByTool.get(activity.tool.id)
         if (activity.tool.name === 'computer_task' && activity.tool.finished && activity.tool.result) {
           const computerResult = parseComputerTaskResult(activity.tool.result)

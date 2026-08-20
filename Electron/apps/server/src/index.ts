@@ -42,7 +42,7 @@ const TERMINAL_METHODS = new Set<HostMethod>([
 const BROWSER_METHODS = new Set<HostMethod>([
   "browserListTabs", "browserGetActiveTab", "browserNewTab", "browserSwitchTab",
   "browserCloseTab", "browserLoadURL", "browserGoBack", "browserGoForward",
-  "browserReload", "browserSnapshot", "browserSetViewBounds",
+  "browserReload", "browserSnapshot", "browserSetViewBounds", "browserSetZoomFactor",
 ]);
 
 type ManagedHostBackend = HostBackend & { close?: () => Promise<void> | void };

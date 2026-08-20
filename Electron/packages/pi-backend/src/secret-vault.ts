@@ -323,8 +323,14 @@ export function applySessionMountsToWorkerEnv(
   return env;
 }
 
+export const SECRET_PLACEHOLDER_PREFIX = "{{secret:";
+
 export function secretPlaceholder(secret: { envName: string }): string {
-  return `{{secret:${secret.envName}}}`;
+  return `${SECRET_PLACEHOLDER_PREFIX}${secret.envName}}}`;
+}
+
+export function hasSecretPlaceholder(text: string | undefined): boolean {
+  return Boolean(text && text.includes(SECRET_PLACEHOLDER_PREFIX));
 }
 
 export function redactText(text: string, secrets: readonly RevealedSecret[]): string {
@@ -369,7 +375,12 @@ function heldSecretPrefixLength(text: string, secrets: readonly RevealedSecret[]
 export class StreamRedactor {
   private buffer = "";
 
-  constructor(private readonly secrets: readonly RevealedSecret[]) {}
+  constructor(private secrets: readonly RevealedSecret[]) {}
+
+  replaceSecrets(secrets: readonly RevealedSecret[]): void {
+    this.secrets = secrets;
+    this.buffer = redactText(this.buffer, secrets);
+  }
 
   push(delta: string): string {
     if (!delta) return "";

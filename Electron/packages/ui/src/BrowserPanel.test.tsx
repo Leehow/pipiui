@@ -311,6 +311,33 @@ describe('BrowserPanel', () => {
     expect(onToggle).toHaveBeenCalledTimes(1)
   })
 
+  it('hides the device preset until the phone preview is open and places zoom then fullscreen after the URL', async () => {
+    const host = createMockHost()
+    const setZoomFactor = vi.spyOn(host.browser!, 'setZoomFactor')
+    render(<BrowserPanel host={host} sessionId="welcome" onToggleWorkspaceFullscreen={() => undefined} />)
+    await screen.findByLabelText('浏览器地址')
+    expect(screen.queryByLabelText('手机设备')).toBeNull()
+    expect(screen.queryByText('响应式 / 自定义')).toBeNull()
+
+    fireEvent.click(await screen.findByTestId('browser-mobile-window-toggle'))
+    const device = await screen.findByLabelText('手机设备')
+    expect((device as HTMLSelectElement).options[0]?.textContent).toBe('响应式 / 自定义')
+
+    const toolbar = screen.getByLabelText('浏览器地址').closest('form')!
+    const controls = [...toolbar.querySelectorAll('input, button, select')].map(node => {
+      if (node instanceof HTMLInputElement) return 'url'
+      return node.getAttribute('data-testid') ?? node.getAttribute('aria-label')
+    })
+    expect(controls.indexOf('url')).toBeLessThan(controls.indexOf('browser-zoom-out'))
+    expect(controls.indexOf('browser-zoom-out')).toBeLessThan(controls.indexOf('browser-zoom-in'))
+    expect(controls.indexOf('browser-zoom-in')).toBeLessThan(controls.indexOf('browser-workspace-fullscreen'))
+
+    fireEvent.click(screen.getByTestId('browser-zoom-out'))
+    fireEvent.click(screen.getByTestId('browser-zoom-in'))
+    await waitFor(() => expect(setZoomFactor).toHaveBeenCalled())
+    expect(setZoomFactor.mock.calls.map(call => call[1])).toEqual([0.9, 1])
+  })
+
   it('sends distinct device presets to the host', async () => {
     const host = createMockHost()
     const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')

@@ -1798,7 +1798,7 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.getAllByText('Electron 三栏界面').length).toBeGreaterThan(0)
     expect(screen.getByText('已归档')).toBeTruthy()
     expect(screen.getByRole('button', { name: /收起项目 PipiUI/ })).toBeTruthy()
-    await waitFor(() => expect(save).toHaveBeenCalledWith({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'], archivedSessionTimestamps: { layout: expect.any(Number) }, orderedSessionIds: [], sessionOrderVersion: 2 }))
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ pinnedSessionIds: ['welcome'], archivedSessionIds: ['layout'], archivedSessionTimestamps: { layout: expect.any(Number) }, orderedSessionIds: [], sessionOrderVersion: 3 }))
   })
 
   it('migrates legacy full session order and keeps a new unranked session in the updatedAt top ten', async () => {
@@ -1829,7 +1829,7 @@ describe('PipiUI Electron main layout', () => {
     expect(within(group).getAllByTestId('session-row')[0].getAttribute('data-session-id')).toBe('newest')
     expect(within(group).getByText('最新未手动会话')).toBeTruthy()
     await waitFor(() => expect(save.mock.calls.some(([value]) =>
-      value.orderedSessionIds.length === 0 && (value as SidebarSessionPreferences & { sessionOrderVersion?: number }).sessionOrderVersion === 2
+      value.orderedSessionIds.length === 0 && Number((value as { sessionOrderVersion?: number }).sessionOrderVersion) === 3
     )).toBe(true))
   })
 
@@ -1857,7 +1857,7 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['older', 'newer']))
   })
 
-  it('persists only sessions involved in an explicit drag and restores that local order', async () => {
+  it('discards version-2 orderedSessionIds and does not write order on same-project drop', async () => {
     const base = createMockHost()
     const project: Project = { id: 'manual', name: 'Manual', path: '/tmp/manual' }
     const sessions: Session[] = [
@@ -1865,8 +1865,8 @@ describe('PipiUI Electron main layout', () => {
       { id: 'b', projectId: project.id, name: 'B', updatedAt: 2_000 },
       { id: 'c', projectId: project.id, name: 'C', updatedAt: 1_000 }
     ]
-    let durable: SidebarSessionPreferences & { sessionOrderVersion?: 2 } = {
-      pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [], sessionOrderVersion: 2
+    let durable: SidebarSessionPreferences = {
+      pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: ['c', 'a'], sessionOrderVersion: 2
     }
     const save = vi.fn(async (preferences: SidebarSessionPreferences) => {
       durable = { ...preferences }
@@ -1880,8 +1880,14 @@ describe('PipiUI Electron main layout', () => {
       getSidebarSessionPreferences: async () => durable,
       setSidebarSessionPreferences: save
     }
-    const first = render(<App host={host} />)
+    render(<App host={host} />)
     const group = await screen.findByRole('group', { name: 'Manual 的会话' })
+    await waitFor(() => expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'b', 'c']))
+    await waitFor(() => expect(save.mock.calls.some(([value]) =>
+      value.orderedSessionIds.length === 0 && Number((value as { sessionOrderVersion?: number }).sessionOrderVersion) === 3
+    )).toBe(true))
+    expect(durable.orderedSessionIds).toEqual([])
+
     const rows = within(group).getAllByTestId('session-row')
     const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
     fireEvent.dragStart(rows.find(row => row.getAttribute('data-session-id') === 'c')!, { dataTransfer: transfer })
@@ -1889,16 +1895,8 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.dragOver(target, { dataTransfer: transfer, clientY: -1 })
     fireEvent.drop(target, { dataTransfer: transfer, clientY: -1 })
 
-    await waitFor(() => expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'c', 'b']))
-    await waitFor(() => expect(save.mock.calls.some(([value]) =>
-      value.orderedSessionIds.join(',') === 'a,c' && (value as SidebarSessionPreferences & { sessionOrderVersion?: number }).sessionOrderVersion === 2
-    )).toBe(true))
-    expect(durable.orderedSessionIds).toEqual(['a', 'c'])
-    first.unmount()
-
-    render(<App host={host} />)
-    const restored = await screen.findByRole('group', { name: 'Manual 的会话' })
-    await waitFor(() => expect(within(restored).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'c', 'b']))
+    expect(within(group).getAllByTestId('session-row').map(row => row.getAttribute('data-session-id'))).toEqual(['a', 'b', 'c'])
+    expect(durable.orderedSessionIds).toEqual([])
   })
 
   it('persists project drag order and routes cross-project session drops through the host', async () => {
@@ -1926,10 +1924,10 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.getByLabelText('置顶会话').textContent).toContain('布局与流式消息'))
 
     sessionRow = (await screen.findAllByTestId('session-row')).find(row => row.getAttribute('data-session-id') === 'layout')!
-    const websiteRow = (await screen.findAllByTestId('project-row')).find(row => row.getAttribute('data-project-id') === 'website')!
+    const siteRow = (await screen.findAllByTestId('session-row')).find(row => row.getAttribute('data-session-id') === 'site')!
     fireEvent.dragStart(sessionRow, { dataTransfer: transfer })
-    fireEvent.dragOver(websiteRow, { dataTransfer: transfer })
-    fireEvent.drop(websiteRow, { dataTransfer: transfer })
+    fireEvent.dragOver(siteRow, { dataTransfer: transfer })
+    fireEvent.drop(siteRow, { dataTransfer: transfer })
     await waitFor(() => expect(moveSession).toHaveBeenCalledWith('layout', 'website'))
   })
 

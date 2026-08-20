@@ -7,11 +7,11 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const canonicalContractRoot = join(
   repositoryRoot,
-  "Sources/PipiUI/PiExt/packages/memory-broker-contract/contract",
+  "Electron/resources/runtime/pi-ext/packages/memory-broker-contract/contract",
 );
 export const vendoredContractRoot = join(
   repositoryRoot,
-  "Sources/PipiUI/PiExt/packages/memory-broker/vendor/pipiui-memory-broker-contract/contract",
+  "Electron/resources/runtime/pi-ext/packages/memory-broker/vendor/pipiui-memory-broker-contract/contract",
 );
 
 async function relativeFiles(root, directory = root) {

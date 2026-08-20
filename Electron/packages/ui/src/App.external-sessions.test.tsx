@@ -102,6 +102,14 @@ describe('external session aggregation', () => {
     expect(within(group).getByTestId('session-source-zcode')).toBeTruthy()
     expect(within(group).getByTestId('session-source-pi')).toBeTruthy()
     expect(within(group).getByLabelText('Anthropic/Claude · Claude 新')).toBeTruthy()
+    for (const row of within(group).getAllByTestId('session-row')) {
+      const id = row.getAttribute('data-session-id') ?? ''
+      if (id.startsWith('ext:')) {
+        expect(within(row).getByTestId('session-external-badge').textContent).toBe('外部')
+      }
+    }
+    const piRow = within(group).getAllByTestId('session-row').find(row => row.getAttribute('data-session-id') === 'pi-mid')!
+    expect(within(piRow).queryByTestId('session-external-badge')).toBeNull()
   })
 
   it('loads read-only external history without touching Pi session APIs', async () => {
@@ -149,5 +157,56 @@ describe('external session aggregation', () => {
     expect(screen.getByText('Demo')).toBeTruthy()
     expect(screen.queryByTestId('sidebar-empty')).toBeNull()
     expect(screen.queryByText('Claude 新')).toBeNull()
+  })
+
+  it('does not call listExternalSessions when the scan toggle is off', async () => {
+    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
+    const host = hostWithExternals({
+      getScanExternalSessions: async () => false,
+      listExternalSessions,
+    })
+    render(<App host={host} />)
+    await screen.findByText('Pi 会话')
+    expect(screen.queryByText('Claude 新')).toBeNull()
+    expect(listExternalSessions).not.toHaveBeenCalled()
+  })
+
+  it('lists external sessions when the scan toggle stays on', async () => {
+    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
+    const host = hostWithExternals({
+      getScanExternalSessions: async () => true,
+      listExternalSessions,
+    })
+    render(<App host={host} />)
+    await screen.findByText('Claude 新')
+    expect(listExternalSessions).toHaveBeenCalled()
+  })
+
+  it('clears existing external rows and drops an ext: selection when the scan toggle turns off', async () => {
+    let scanEnabled = true
+    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
+    const host = hostWithExternals({
+      getScanExternalSessions: async () => scanEnabled,
+      setScanExternalSessions: async enabled => { scanEnabled = enabled; return scanEnabled },
+      listExternalSessions,
+    })
+    render(<App host={host} />)
+    const row = await waitFor(() => {
+      const found = document.querySelector('[data-session-id="ext:claude:new"]')
+      if (!found) throw new Error('external row missing')
+      return found as HTMLElement
+    })
+    fireEvent.click(row)
+    await screen.findByText('外部提问')
+    const callsBeforeOff = listExternalSessions.mock.calls.length
+    fireEvent.click(screen.getByRole('button', { name: '设置' }))
+    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('scan-external-sessions-switch'))
+    await waitFor(() => {
+      expect(screen.queryByText('Claude 新')).toBeNull()
+      expect(document.querySelector('[data-session-id="ext:claude:new"]')).toBeNull()
+    })
+    expect(document.querySelector('[data-session-id="pi-mid"]')).toBeTruthy()
+    expect(listExternalSessions.mock.calls.length).toBe(callsBeforeOff)
   })
 })

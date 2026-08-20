@@ -6,16 +6,14 @@
 
 ### Default product UI: Electron only (binding)
 
-- Default UI, product, and acceptance work is the Electron edition
-  (`Electron/packages/ui` → `build/PipiUI Electron.app`).
-- The Swift/SwiftUI app is frozen. Do not add features, fix UI, keep
-  Electron/Swift UI in parity, or package `build/PipiUI.app` unless the user
-  explicitly asks for the Swift edition in the current turn.
-- `Sources/PipiUI/PiExt` and `Sources/PipiUI/PiPhilosophy` are Swift-app
-  mirrors of `Electron/resources/runtime/`. Do not sync them from Electron
-  unless the user explicitly asks to update Swift.
-- “打包 / 打开 App / 验收” without naming Swift means the Electron App and
-  the `pipiui-electron-build` skill.
+- The only product is the Electron edition (`Electron/packages/ui` →
+  `build/PipiUI Electron.app`). The former Swift/SwiftUI app was retired in
+  2026-08 and removed from the repo; do not reintroduce Swift targets,
+  `Package.swift`, or `build/PipiUI.app`.
+- `Electron/resources/runtime/` (pi-ext + pi-philosophy) is the single source
+  of truth for the bundled pi runtime.
+- “打包 / 打开 App / 验收” means the Electron App and the
+  `pipiui-electron-build` skill.
 
 ### Product priority: usability first (binding)
 
@@ -53,16 +51,15 @@ Pi 必须按打开的项目隔离，自己找自己项目的家。禁止使用�
   agent to gracefully quit the relevant canonical App, pass `--overwrite-running`, install the
   replacement, relaunch it, and continue the requested test. Do not ask for a separate or repeated
   overwrite/restart confirmation.
-- Scope this authority to `/Users/haoli/leehow/code/pipiui/build/PipiUI.app` and
-  `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app` only. Never terminate unrelated Apps
-  or broad process-name matches.
+- Scope this authority to `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`
+  only. Never terminate unrelated Apps or broad process-name matches.
 - Prefer the App's normal quit request and a bounded wait. If that fails and blocks an already
   requested lifecycle/test operation, terminate only the exact verified canonical-App PID; force
   termination is a last resort after another bounded wait. Record what was terminated and why.
 - Analysis-only, source-only, or test-only requests do not imply a lifecycle operation. Do not
   invent restarts when they are unnecessary for the requested result.
 
-Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with `swift build` / `swift test` or Electron workspace builds only and must never create `build/PipiUI.app` or `build/PipiUI Electron.app`.
+Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with Electron workspace builds/tests only and must never create `build/PipiUI Electron.app`.
 
 ### Worktree ownership adapter (binding)
 
@@ -73,13 +70,7 @@ Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may cre
   `.worktrees/*` paths on `codex/*` branches) must be created, audited, and
   closed through `/Users/haoli/.codex/scripts/codex-worktree-lifecycle`.
 - Linked worktrees remain build/test-only. The primary checkout below remains
-  the sole location allowed to package `build/PipiUI.app` or `build/PipiUI Electron.app`.
-
-```bash
-cd /Users/haoli/leehow/code/pipiui
-./make-app.sh              # the sole release .app location
-./scripts/build-app.sh              # test (optional skip) then make-app.sh
-```
+  the sole location allowed to package `build/PipiUI Electron.app`.
 
 ### Electron packaging adapter (binding)
 
@@ -120,16 +111,13 @@ each holds a slimming invariant that an innocuous-looking edit silently undoes.
 
 ### 快速打包（快速迭代）
 
-默认打 Electron，不要走 Swift 的 `make-app.sh`。
-
 ```bash
 ~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app --overwrite-running
 ```
 
 - 只验证 Electron 工作区能否编译、不打包时，在 `Electron/` 跑对应 workspace build / 测试。
-- Swift 的 `make-app.sh` / `./scripts/build-app.sh` 仅在用户明确要求更新 Swift App 时使用。
 
-Do **not** report "done / open the app" if only `Electron/**/dist` or `.build/*` is fresh and `build/PipiUI Electron.app` is older than sources.
+Do **not** report "done / open the app" if only `Electron/**/dist` is fresh and `build/PipiUI Electron.app` is older than sources.
 
 Verify after package:
 
@@ -147,7 +135,6 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Build / run docs | `README.md` → 构建运行 |
 | Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI Electron.app` |
 | Electron release (dual arch + DMG/ZIP) | `pipiui-electron-build` skill → `release`；never `electron-builder` by hand |
-| Swift App（frozen，仅用户点名时） | `./make-app.sh` → `build/PipiUI.app` |
-| Worker/dev verification | Electron workspace build / test；Swift 仅在点名时 `swift build` / `swift test` |
+| Worker/dev verification | Electron workspace build / test |
 
-macOS 14+ · default product is Electron (`build/PipiUI Electron.app`). The Swift App is frozen.
+macOS 14+ · the only product is Electron (`build/PipiUI Electron.app`). The former Swift App was retired and removed.

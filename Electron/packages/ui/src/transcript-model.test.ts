@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -311,6 +311,27 @@ describe('transcript model', () => {
     const next = appendLiveUserMessage(optimistic, { id: 'srv', content: `\nAttached image file: /tmp/a.png\n${note}` })
     expect(next).toHaveLength(1)
     expect(next[0]).toMatchObject({ id: 'srv', role: 'user', content: '', images: [{ data: 'abc', mimeType: 'image/png' }] })
+  })
+
+  it('replaces a live user bubble from secret_redact without appending a new row', () => {
+    const fake = 'vault-test-secret-AAAA'
+    const messages: ChatMessage[] = [
+      { id: 'u-hex', role: 'user', content: `再给你 ${fake}`, timestamp: 1 },
+      { id: 'a-hex', role: 'assistant', content: `echo ${fake}`, thinking: fake, timestamp: 2 },
+    ]
+    const next = applySecretRedact(messages, [
+      { id: 'u-hex', role: 'user', content: '再给你 {{secret:CSTCLOUD_API_KEY}}' },
+      { id: 'a-hex', role: 'assistant', content: 'echo {{secret:CSTCLOUD_API_KEY}}', thinking: '{{secret:CSTCLOUD_API_KEY}}' },
+    ])
+    expect(next).toHaveLength(2)
+    expect(next[0]).toMatchObject({ id: 'u-hex', content: '再给你 [CSTCLOUD_API_KEY]' })
+    expect(next[1]).toMatchObject({ id: 'a-hex', content: 'echo [CSTCLOUD_API_KEY]', thinking: '[CSTCLOUD_API_KEY]' })
+    expect(JSON.stringify(next)).not.toContain(fake)
+    expect(applyStreamEvent(messages, {
+      type: 'secret_redact',
+      sessionId: 's',
+      messages: [{ id: 'u-hex', role: 'user', content: '再给你 {{secret:CSTCLOUD_API_KEY}}' }],
+    })[0].content).toBe('再给你 [CSTCLOUD_API_KEY]')
   })
 
   it('still appends a later user message with different prose', () => {

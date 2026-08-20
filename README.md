@@ -1,6 +1,6 @@
 # PipiUI
 
-pi coding agent 的图形界面。主力产品为 **Electron 版**，支持 macOS 14+ 与 Linux amd64。
+pi coding agent 的图形界面，Electron 实现，支持 macOS 14+ 与 Linux amd64。历史上的 Swift/SwiftUI 原生版已于 2026-08 退役并从仓库移除。
 
 ### 下载
 
@@ -13,13 +13,7 @@ pi coding agent 的图形界面。主力产品为 **Electron 版**，支持 macO
 
 多会话并行、流式工具卡片、内置浏览器、Subagent 面板 + Boss 模式、远程接管、Computer Use（opt-in）、Memory 扩展。
 
-## Swift 原生版（已冻结，存档参考）
-
-Swift 版已冻结，新功能与发布均在 Electron 版；以下内容仅供存档参考（其中构建 / 运行断言未逐句更新）。
-
-纯 Swift/SwiftUI 原生的 pi coding agent 图形界面，通过 `pi --mode rpc`（JSONL over stdin/stdout）驱动。
-
-### 功能
+## 功能概览
 
 - **左侧栏**：项目文件夹管理（持久化）+ 每个项目的历史会话列表（从该项目 `{project}/.pi/agent/sessions/` 发现，显示会话名和时间）
 - **会话**：新建 / 点击恢复历史会话；每个打开的会话独立一个 `pi --mode rpc` 子进程，后台会话继续运行（绿点表示正在生成）
@@ -48,7 +42,7 @@ Swift 版已冻结，新功能与发布均在 Electron 版；以下内容仅供�
 
 设置 → **记忆** 中勾选「启用记忆」即可安装并启用正式的 `pipiui-memory-broker` extension；安装、Catalog/Retrieval/Curator、学习循环、管理页与 eval 都属于该 extension。状态只显示 extension 的版本和 ready/degraded 摘要。点击 **打开 Memory Center** 时，PipiUI 仅通过当前活动 Pi 会话请求一次短期 opaque 描述符并打开 extension 页面；没有活动会话会提示先打开会话，不会自动创建或重启会话。短期 URL 过期后回到设置重试即可。
 
-在裸 Pi 中，安装/启用该 extension 后输入 `/memory` 可请求并打开同一 extension 提供的 Memory Center。业务 API、数据格式及运维说明都在 `Sources/PipiUI/PiExt/packages/memory-broker/README.md`，不属于 Swift 宿主契约。
+在裸 Pi 中，安装/启用该 extension 后输入 `/memory` 可请求并打开同一 extension 提供的 Memory Center。业务 API、数据格式及运维说明都在 `Electron/resources/runtime/pi-ext/packages/memory-broker/README.md`。
 
 ## Computer Use（macOS 桌面控制，opt-in）
 
@@ -111,53 +105,35 @@ Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 
 
 ## 构建运行
 
-**宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建唯一的 `build/PipiUI.app`；其他 worktree 只能编译/测试，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。仅 `swift build` / `swift run` 成功而主工作区 `.app` 仍旧时，不得宣称「可打开 App」。
+**宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建 `build/PipiUI Electron.app`；其他 worktree 只能跑 Electron 工作区 build/test，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。
+
+打包一律走 `pipiui-electron-build` skill：
 
 ```bash
-swift run                 # 任意 worktree 的开发调试（不更新 .app）
-cd /Users/haoli/leehow/code/pipiui
-./make-app.sh             # 唯一 release 包 → build/PipiUI.app
-./scripts/build-app.sh    # 可选：先 swift test 再 make-app.sh（--skip-tests 跳过测试）
-open build/PipiUI.app     # 启动唯一打包后的 App
+~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app   # host arch，签名，无 DMG/ZIP
+~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build release    # 双架构 + DMG/ZIP
 ```
 
-打包后核对 build 二进制新于源码，例如：
+开发调试与验证（不打包）：
 
 ```bash
-stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI.app/Contents/MacOS/PipiUI \
-  Sources/PipiUI/Views/ImagePreview.swift
+cd Electron
+npm run dev       # 开发模式
+npm test          # vitest 工作区测试
 ```
 
 要求：macOS 14+，已安装 pi CLI（在 `~/.npm-global/bin/pi`、`/opt/homebrew/bin` 或 PATH 中可找到）。
 
-单测（本机仅 CLT、无 XCTest 时用自研 runner）：
-
-```bash
-swift test                # 有 XCTest 时
-swift run PipiUITestRunner
-```
-
 ## 代码结构
 
-| 文件 | 职责 |
+| 目录 | 职责 |
 |---|---|
-| `Sources/PipiUI/PiProcess.swift` | pi RPC 子进程：JSONL 分帧（仅 LF）、请求/响应 id 关联、事件回调（主线程投递） |
-| `Sources/PipiUI/ChatSession.swift` | 单会话状态机：事件流 → transcript、流式组装、模型/thinking/统计命令；斜杠 builtin 路由与 `get_commands` |
-| `Sources/PipiUI/AppStore.swift` | 项目持久化、会话发现（目录名转义规则 `--<cwd 中 / 换 - >--`）、多会话进程管理 |
-| `Sources/PipiUI/J.swift` | 轻量动态 JSON 访问器 |
-| `Sources/PipiUI/ImageAttachment.swift` | 图片附件：MIME/缩放/粘贴板/拖入、RPC payload |
-| `Sources/PipiUI/SlashCommand.swift` | 斜杠命令模型、`get_commands` 解析、fuzzy、内置命令路由 |
-| `Sources/PipiUI/Views/SlashPalette.swift` | `/` 补全浮层 |
-| `Sources/PipiUI/Views/` | SidebarView / ChatDetailView / MessageViews / InputBar |
-
-## 已知限制（v1）
-
-- 扩展的交互式对话框（select/confirm/input）暂不弹窗：confirm 自动拒绝、其余自动取消，并在对话流里提示
-- 图片灯箱为等比适应窗口，暂不支持捏合/滚轮缩放与多图左右翻页；无 path 时依赖 `.pi/attachments` 内容匹配或「存储…」
-- 绝对路径自动链接 v1：不识别带空格的路径；围栏代码块内不做路径链接
-- Markdown 为简化渲染（行内语法 + 代码块/表格），无语法高亮
-- 斜杠命令 v1：无 `/model` 模型列表补全（手输 id）；TUI 专有且无 RPC 的命令（`/settings` `/login` `/share` `/import` `/trust` `/hotkeys` `/scoped-models`）不出现在面板；扩展交互对话框仍自动取消；流式中 extension/prompt/skill 命令会排队、无法即时执行（`/reload` 等 builtin 可即时执行）
+| `Electron/apps/electron` | Electron 主进程/preload：窗口、浏览器宿主、Cua driver、远程控制 |
+| `Electron/packages/ui` | React UI：会话、Subagent/文档/终端/浏览器面板 |
+| `Electron/packages/pi-backend` | pi 子进程管理、会话租约、spawn 装配、密钥库 |
+| `Electron/packages/host-api` | PipiHostAPI v2 协议（桌面与浏览器端共用） |
+| `Electron/resources/runtime` | 随包 pi 运行时：pi-ext（subagent/computer-agent/memory-broker）与 pi-philosophy |
+| `Relay/` | 远程配对与隧道中继服务 |
 
 ## 许可证
 

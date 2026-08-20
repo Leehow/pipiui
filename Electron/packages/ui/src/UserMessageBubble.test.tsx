@@ -41,6 +41,14 @@ describe('UserMessageBubble', () => {
     expect(screen.queryByText(/UNIQUE_FULL_TEXT_MARKER/)).toBeNull()
   })
 
+  it('renders vault placeholders as [ENV] and never shows the fake value', () => {
+    const fake = 'vault-test-secret-AAAA'
+    const { container } = render(<UserMessageBubble text={`再给你 {{secret:CSTCLOUD_API_KEY}}`} />)
+    expect(container.querySelector('.user-message-content')?.textContent).toBe('再给你 [CSTCLOUD_API_KEY]')
+    expect(container.textContent).not.toContain(fake)
+    expect(container.textContent).not.toContain('{{secret:CSTCLOUD_API_KEY}}')
+  })
+
   it('renders short messages directly without a disclosure control', () => {
     const { container } = render(<UserMessageBubble text={'短消息\n第二行'} />)
     expect(container.querySelector('.user-message-content')?.textContent).toBe('短消息\n第二行')

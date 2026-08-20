@@ -198,7 +198,12 @@ describe("vendored philosophy: delivery", () => {
     // in-app browser and the visible terminal, so the browser/terminal/dispatch round trip
     // has no other place to live — a worker that cannot see the screen cannot be told the
     // rule, and the evidence-verbatim discipline is what stops a blind worker guessing.
+    // Raised again (~640) for the document-handoff rules: findings artifacts and shared
+    // context are what stop three roles re-running one search, and only the boss can act on
+    // them — it is the one that forwards a findings path into the next brief and the only
+    // writer of shared context. A worker told to read a document nobody points it at reads
+    // nothing, so this rule cannot be pushed down into the agent definitions.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(14800);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(15400);
   });
 });

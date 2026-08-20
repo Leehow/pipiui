@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { stripAttachmentPathsForDisplay } from './attachments'
+import { displaySecretPlaceholders } from './secret-display'
 
 export type UserMessageImage = { data: string; mimeType: string }
 
@@ -19,7 +20,7 @@ export function messagePreview(text: string, maxLines = 5, maxChars = 400): stri
 
 /** Drop `[N张图片]` / `[N 张图片]` once the real images are shown. */
 export function displayUserMessageText(text: string, hasImages: boolean): string {
-  const visible = stripAttachmentPathsForDisplay(text)
+  const visible = displaySecretPlaceholders(stripAttachmentPathsForDisplay(text))
   if (!hasImages) return visible
   return visible.replace(IMAGE_COUNT_PLACEHOLDER, '')
 }

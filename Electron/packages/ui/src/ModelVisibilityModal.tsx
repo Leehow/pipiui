@@ -5,6 +5,7 @@ import { groupByProvider, modelRef, usesBuiltInVisionMcp } from './model-visibil
 import { ProviderLogo } from './ProviderLogo'
 import { ProviderLoginPanel } from './ProviderLoginPanel'
 import type { VisionRoutingController } from './useVisionRouting'
+import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane } from './ExtensionsPane'
@@ -55,6 +56,43 @@ function ProviderTriState({ visibleCount, total, provider, onChange }: {
  * 持久化走 useVisionRouting (getVisionEnabled/setVisionEnabled +
  * getVisionModel/setVisionModel)。
  */
+function ScanExternalSessionsPane({ scan }: { scan: ScanExternalSessionsController }) {
+  if (!scan.available) {
+    return <div className="model-modal-state" data-testid="scan-external-unsupported">当前连接不支持外部会话扫描设置。</div>
+  }
+  if (scan.loading) {
+    return <div className="model-modal-state" data-testid="scan-external-loading">正在加载外部会话扫描设置…</div>
+  }
+  return (
+    <div className="vision-picker" data-testid="scan-external-pane">
+      <div className="computer-use-toggle-row">
+        <div>
+          <strong>自动扫描其他 coding agent 聊天记录</strong>
+          <p>关闭后侧栏不再显示 Codex / Claude / Cursor 等外部会话。</p>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={scan.enabled}
+          aria-label="自动扫描其他 coding agent 聊天记录"
+          className={`computer-use-switch${scan.enabled ? ' enabled' : ''}`}
+          disabled={scan.saving}
+          data-testid="scan-external-sessions-switch"
+          onClick={() => void scan.setEnabled(!scan.enabled)}
+        >
+          <span />
+        </button>
+      </div>
+      {scan.error && (
+        <div className="model-modal-error" role="alert" data-testid="scan-external-error">
+          <span>{scan.error}</span>
+          <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="scan-external-error-close" onClick={() => scan.dismissError()}>×</button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 function VisionRoutingPane({ visibility, vision }: {
   visibility: ModelVisibilityController
   vision: VisionRoutingController
@@ -191,10 +229,11 @@ function VisionRoutingPane({ visibility, vision }: {
  * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
  * setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId, sessionId }: {
+export function ModelVisibilityModal({ host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId, sessionId }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
+  scan: ScanExternalSessionsController
   updates: UpdateCenterController
   current: Model | null
   onModelState?: (state: ModelState) => void
@@ -254,7 +293,7 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
           <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : tab === 'secrets' ? '密钥库' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{tab === 'general' ? '主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : tab === 'secrets' ? '仅当前进程内存，退出 App 后清除。列表只有名称，明文只注入已挂载会话的 Worker 环境。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <p>{tab === 'general' ? '识图路由与其他 Agent 聊天记录扫描。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : tab === 'secrets' ? '仅当前进程内存，退出 App 后清除。列表只有名称，明文只注入已挂载会话的 Worker 环境。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
           <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
             {tab === 'extensions' && <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => setExtensionsAddOpen(true)}>＋ 添加</button>}
@@ -317,7 +356,10 @@ export function ModelVisibilityModal({ host, visibility, vision, updates, curren
         </header>
         <div className="model-modal-body" data-testid="model-modal-body">
           {tab === 'general'
-            ? <VisionRoutingPane visibility={visibility} vision={vision} />
+            ? <>
+                <ScanExternalSessionsPane scan={scan} />
+                <VisionRoutingPane visibility={visibility} vision={vision} />
+              </>
             : tab === 'updates'
               ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
             : tab === 'secrets'

@@ -91,6 +91,7 @@ import {
   putSecret,
   createSessionRedactionGate,
   createSessionWriteBarrier,
+  hasSecretPlaceholder,
   redactSessionJsonl,
   workerEnvFromVault,
   redactText,
@@ -343,15 +344,12 @@ export {
 
 type Rpc = Record<string, any>;
 
-/** Swift `AgentCatalog.builtInAgents` parity for the Electron settings surface. */
+/** Mirrors the bundled runtime agent registry for the Electron settings surface. */
 const BUILT_IN_AGENT_DEFINITIONS: AgentDefinition[] = [
   { name: "explore", description: "Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files." },
   { name: "general-purpose", description: "Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason." },
   { name: "reviewer", description: "Read-only code review specialist for quality and security." },
-  { name: "computer-use-leader", description: "Computer Use supervisor. Plans desktop work, receives every private worker result, owns recovery decisions, and returns the single final report." },
-  { name: "operator", description: "Computer-use desktop worker. Performs macOS desktop operations and returns a compressed text verdict; does not edit code files." },
-  { name: "computer-verifier", description: "Observe-only Computer Use verifier. Takes a fresh desktop observation and independently checks the Leader's requested postconditions." },
-  { name: "computer-terminal", description: "Bounded terminal worker using an attenuated one-run Host tool broker; receives no desktop capability." },
+  { name: "computer-use", description: "Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation." },
   { name: "secretary", description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree." },
 ];
 
@@ -1480,7 +1478,7 @@ export class PiHostBackend implements HostBackend {
   private readonly sessionRedact = createSessionRedactionGate({
     hasWork: (sessionId) => this.sessionSecrets(sessionId).length > 0,
     canRewrite: (sessionId) => this.canRewriteSessionFile(sessionId),
-    confirmWriterIdle: (sessionId) => this.closeQuietSessionWriter(sessionId),
+    confirmWriterIdle: (sessionId) => this.confirmSessionFileIdle(sessionId),
     rewrite: (sessionId) => this.rewriteSessionSecrets(sessionId),
   });
   private readonly sessionEnvRefresh = createSessionEnvRefreshGate({
@@ -1580,6 +1578,9 @@ export class PiHostBackend implements HostBackend {
   /** Master switch for describing attachments through the selected vision model. */
   private visionEnabled = false;
   private visionEnabledLoaded?: Promise<void>;
+  /** Scan other coding-agent chats. Missing key = enabled. */
+  private scanExternalSessions = true;
+  private scanExternalSessionsLoaded?: Promise<void>;
   private projectPaths: string[] = [];
   private projectPathsLoaded?: Promise<void>;
   private projectModelsInitialized?: Promise<void>;
@@ -2209,25 +2210,83 @@ export class PiHostBackend implements HostBackend {
     if (live && this.liveProcessUsable(live)) return this.isSessionQuiet(sessionId);
     return !this.queue.isBusy(sessionId) && this.queue.listQueue(sessionId).length === 0;
   }
+  /**
+   * JSONL rewrite only needs the main turn idle. Background workers write their
+   * own session files, so stopping the parent Pi here used to kill them and
+   * leave the panel stuck on 运行中.
+   */
+  private async confirmSessionFileIdle(sessionId: string): Promise<boolean> {
+    const live = this.live.get(sessionId);
+    if (!live || !this.liveProcessUsable(live)) return true;
+    return this.isSessionQuiet(sessionId);
+  }
+  private sessionHasLiveAgents(sessionId: string): boolean {
+    return [...this.agents.values()].some(
+      (agent) => agent.sessionId === sessionId && this.isLiveAgentState(agent.state),
+    );
+  }
+  private interruptSessionLiveAgents(sessionId: string, reason: string): void {
+    for (const agent of [...this.agents.values()]) {
+      if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
+      this.forceAbortAgent(agent, reason);
+    }
+  }
   private async closeQuietSessionWriter(sessionId: string): Promise<boolean> {
     const live = this.live.get(sessionId);
     if (!live || !this.liveProcessUsable(live)) return true;
     if (!this.isSessionQuiet(sessionId)) return false;
+    if (this.sessionHasLiveAgents(sessionId)) return false;
     live.exiting = true;
     live.compaction.dispose();
     await this.stopLiveProcess(live);
     await (live.exit ?? Promise.resolve());
     if (this.childStillRunning(live.process)) return false;
     if (this.live.get(sessionId) === live) this.live.delete(sessionId);
+    this.interruptSessionLiveAgents(sessionId, "会话 writer 关闭时中断后台工人");
     return true;
+  }
+  private refreshLiveRedactors(sessionId: string): void {
+    const live = this.live.get(sessionId);
+    if (!live?.streamRedactors) return;
+    const secrets = this.sessionSecrets(sessionId);
+    for (const bag of [live.streamRedactors.text, live.streamRedactors.thinking, live.streamRedactors.tool]) {
+      for (const redactor of bag.values()) redactor.replaceSecrets(secrets);
+    }
+    if (live.streamedAssistantText) live.streamedAssistantText = redactText(live.streamedAssistantText, secrets);
+  }
+  private publishSessionSecretRedact(sessionId: string, path: string): void {
+    if (!existsSync(path)) return;
+    const messages: Array<{ id: string; role?: HistoryEntry["role"]; content: string; thinking?: string; tools?: HistoryTool[] }> = [];
+    for (const line of readFileSync(path, "utf8").split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      let row: unknown;
+      try { row = JSON.parse(trimmed); } catch { continue; }
+      const entry = visibleHistoryEntry(row, []);
+      if (!entry) continue;
+      const marked = hasSecretPlaceholder(entry.content)
+        || hasSecretPlaceholder(entry.thinking)
+        || (entry.tools?.some((tool) => hasSecretPlaceholder(tool.input)) ?? false);
+      if (!marked) continue;
+      messages.push({
+        id: entry.id,
+        role: entry.role,
+        content: entry.content,
+        ...(entry.thinking ? { thinking: entry.thinking } : {}),
+        ...(entry.tools ? { tools: entry.tools } : {}),
+      });
+    }
+    if (messages.length === 0) return;
+    this.stream({ type: "secret_redact", sessionId, messages });
   }
   private async rewriteSessionSecrets(sessionId: string): Promise<void> {
     const secrets = this.sessionSecrets(sessionId);
     if (secrets.length === 0) return;
     const path = this.live.get(sessionId)?.path ?? (await this.findSession(sessionId).catch(() => undefined))?.path;
     if (!path) throw new Error("session file unavailable for redaction");
-    await redactSessionJsonl(path, secrets);
+    const result = await redactSessionJsonl(path, secrets);
     this.historyCache.delete(path);
+    if (result.changed) this.publishSessionSecretRedact(sessionId, path);
   }
   private requestSessionRedact(sessionId: string): void {
     this.sessionRedact.request(sessionId);
@@ -2447,6 +2506,7 @@ export class PiHostBackend implements HostBackend {
           .sort((a, b) => b.updatedAt - a.updatedAt);
       }
       case "listExternalSessions": {
+        if (!(await this.loadScanExternalSessions())) return [];
         const project = await this.configuredProject(params[0] as string);
         return listExternalSessionsForProject(
           project.path,
@@ -2643,6 +2703,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadVisionEnabled();
       case "setVisionEnabled":
         return this.saveVisionEnabled(params[0]);
+      case "getScanExternalSessions":
+        return this.loadScanExternalSessions();
+      case "setScanExternalSessions":
+        return this.saveScanExternalSessions(params[0]);
       case "getPaddleOcrStatus":
         return this.loadPaddleOcrStatus(params[0]);
       case "setPaddleOcrAccessToken":
@@ -2662,6 +2726,7 @@ export class PiHostBackend implements HostBackend {
         const secret = await putSecret(this.vaultDir, input);
         const mount = await mountSecret(this.vaultDir, String(input.sessionId), secret.id);
         this.requestSessionEnvRefresh(String(input.sessionId));
+        this.refreshLiveRedactors(String(input.sessionId));
         await this.redactSessionFile(String(input.sessionId)).catch((error) => {
           console.error("[secret-vault] session redaction failed", error);
           throw error;
@@ -3669,8 +3734,7 @@ export class PiHostBackend implements HostBackend {
   private terminalReconciliationHasPendingWork(live: Live, state: any): boolean {
     // Host-queued user prompts are why we must settle: notifyIdle drains them.
     // Counting them as pending work deadlocks "typed after a missed agent_settled".
-    const hasRunningAgent = [...this.agents.values()].some(agent =>
-      agent.sessionId === live.session.id && (agent.state === "running" || agent.state === "stalled"));
+    const hasRunningAgent = this.sessionHasLiveAgents(live.session.id);
     return state?.pendingMessageCount !== 0
       || state?.isCompacting === true
       || live.followUps.length > 0
@@ -3690,7 +3754,7 @@ export class PiHostBackend implements HostBackend {
     const actionableQueueCount = this.queue.listQueue(live.session.id)
       .filter(item => item.state === "queued" || item.state === "sending").length;
     const runningAgentCount = [...this.agents.values()].filter(agent =>
-      agent.sessionId === live.session.id && (agent.state === "running" || agent.state === "stalled")).length;
+      agent.sessionId === live.session.id && this.isLiveAgentState(agent.state)).length;
     this.projectionDebugLine(
       `[terminal-reconcile] reason=${reason}`
       + ` backend=${this.projectionDebugBackendTag}`
@@ -4433,6 +4497,25 @@ export class PiHostBackend implements HostBackend {
     this.visionEnabledLoaded = Promise.resolve();
     return value;
   }
+  private async loadScanExternalSessions(): Promise<boolean> {
+    if (!this.scanExternalSessionsLoaded) {
+      this.scanExternalSessionsLoaded = (async () => {
+        const value = (await this.readSettings()).scanExternalSessions;
+        this.scanExternalSessions = value === false ? false : true;
+      })();
+    }
+    await this.scanExternalSessionsLoaded;
+    return this.scanExternalSessions;
+  }
+  private async saveScanExternalSessions(value: unknown): Promise<boolean> {
+    if (typeof value !== "boolean") throw new Error("scanExternalSessions 必须是 boolean");
+    await this.updateSettings((settings) => {
+      settings.scanExternalSessions = value;
+    });
+    this.scanExternalSessions = value;
+    this.scanExternalSessionsLoaded = Promise.resolve();
+    return value;
+  }
   private async paddleOcrAgentDir(projectId: unknown): Promise<string> {
     if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
     const path = await this.projectPath(projectId);
@@ -4453,7 +4536,7 @@ export class PiHostBackend implements HostBackend {
     const hasKey = await writePaddleocrAccessToken(agentDir, token);
     return { hasKey };
   }
-  private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 } {
+  private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
     const checked = (key: "pinnedSessionIds" | "archivedSessionIds" | "orderedSessionIds", optional = false) => {
       const ids = value[key];
@@ -4475,24 +4558,32 @@ export class PiHostBackend implements HostBackend {
         if (archived.has(id)) archivedSessionTimestamps[id] = timestamp;
       }
     }
-    const orderedSessionIds = checked("orderedSessionIds", true);
     const sessionOrderVersion = value.sessionOrderVersion;
-    if (sessionOrderVersion !== undefined && sessionOrderVersion !== 2)
-      throw new Error("sessionOrderVersion 必须是 2");
+    if (sessionOrderVersion !== undefined && sessionOrderVersion !== 2 && sessionOrderVersion !== 3)
+      throw new Error("sessionOrderVersion 必须是 2 或 3");
+    let orderedSessionIds: string[];
+    if (sessionOrderVersion === 3) {
+      const ids = value.orderedSessionIds;
+      if (ids === undefined) orderedSessionIds = [];
+      else if (!Array.isArray(ids) || !ids.every(id => typeof id === "string")) throw new Error("orderedSessionIds 必须是 string[]");
+      else orderedSessionIds = [...ids];
+    } else {
+      orderedSessionIds = checked("orderedSessionIds", true);
+    }
     // A session cannot occupy both semantic sections; archive wins.
-    return { pinnedSessionIds: pinnedSessionIds.filter(id => !archived.has(id)), archivedSessionIds: [...archived], ...(archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps }), orderedSessionIds, ...(sessionOrderVersion === 2 ? { sessionOrderVersion: 2 as const } : {}) };
+    return { pinnedSessionIds: pinnedSessionIds.filter(id => !archived.has(id)), archivedSessionIds: [...archived], ...(archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps }), orderedSessionIds, ...(sessionOrderVersion === 2 || sessionOrderVersion === 3 ? { sessionOrderVersion } : {}) };
   }
-  private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 }> {
+  private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 }> {
     const value = (await this.readSettings()).sidebarSessionPreferences;
     return value === undefined
       ? { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
       : this.checkedSidebarSessionPreferences(value);
   }
-  private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 }> {
+  private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 }> {
     const checked = this.checkedSidebarSessionPreferences(value);
     return this.updateSettings(settings => {
       settings.sidebarSessionPreferences = checked;
-      return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds], ...(checked.archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps: { ...checked.archivedSessionTimestamps } }), orderedSessionIds: [...checked.orderedSessionIds], ...(checked.sessionOrderVersion === 2 ? { sessionOrderVersion: 2 as const } : {}) };
+      return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds], ...(checked.archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps: { ...checked.archivedSessionTimestamps } }), orderedSessionIds: [...checked.orderedSessionIds], ...(checked.sessionOrderVersion === 2 || checked.sessionOrderVersion === 3 ? { sessionOrderVersion: checked.sessionOrderVersion } : {}) };
     });
   }
   private async modelRuntime(): Promise<AuthRuntimeLike> {

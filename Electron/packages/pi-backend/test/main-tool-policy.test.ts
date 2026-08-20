@@ -16,7 +16,7 @@ describe("boss read-only tool policy", () => {
 
   it("keeps the Boss's read and verification tools", () => {
     const excluded = new Set(resolveMainSessionExcludedTools({ bossReadOnly: true }));
-    for (const kept of ["read", "grep", "find", "ls", "git", "web_search", "browser", "browser_search", "browser_fetch", "subagent", "subagent_status", "ledger_note"]) {
+    for (const kept of ["read", "grep", "find", "ls", "git", "web_search", "browser", "browser_search", "browser_fetch", "subagent", "subagent_status", "ledger_note", "context_doc"]) {
       expect(excluded.has(kept)).toBe(false);
     }
   });

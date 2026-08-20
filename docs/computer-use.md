@@ -92,19 +92,15 @@ Computer Use 是混合桌面能力包，不等于所有任务都从截图中找�
 
 ## 固定 helper 与签名
 
-`scripts/fetch-cua-driver.sh` 固定：
-
-- release tag：`cua-driver-rs-v0.12.5`
-- asset：`cua-driver-rs-0.12.5-darwin-universal-binary.tar.gz`
-- SHA-256：`898a143559694d6083feb89e3991581c87f5c9adf997876588cc262ade529e35`
-
-只有主 checkout 的 `make-app.sh` 会下载/复用经 SHA-256 验证的 archive，并把 universal helper 安装为：
+Electron 打包侧由 `Electron/scripts/fetch-cua-driver.mjs` + `Electron/cua-driver-assets.json`
+固定各架构的 cua-driver slice（版本契约同时写进
+`pi-ext/packages/computer-agent/skills/cua-driver-operation/SKILL.md`，pretest 会校验一致），并把 helper 安装为：
 
 ```text
-PipiUI.app/Contents/Helpers/cua-driver
+PipiUI Electron.app/Contents/MacOS/cua-driver
 ```
 
-MIT notice 安装到 `Contents/Resources/ThirdPartyNotices/`。这足够记录 Cua 项目自身许可，但**不代表公开再分发合规已经完成**：public release 前仍须从精确固定的 v0.12.5 dependency graph 生成完整第三方 notices，并完成 MPL 组件的对应源码提供 gate。本轮只验证本地/内部开发集成，不能声称已完成公开发布合规。
+MIT notice 安装到 `Contents/Resources/ThirdPartyNotices/`。这足够记录 Cua 项目自身许可，但**不代表公开再分发合规已经完成**：public release 前仍须从精确固定的 dependency graph 生成完整第三方 notices，并完成 MPL 组件的对应源码提供 gate。本轮只验证本地/内部开发集成，不能声称已完成公开发布合规。
 
 固定 release helper 的实测签名元数据包含 hardened runtime，以及：
 
@@ -113,29 +109,18 @@ MIT notice 安装到 `Contents/Resources/ThirdPartyNotices/`。这足够记录 C
 <key>com.apple.security.device.screen-capture</key><true/>
 ```
 
-因此重签不能裸用 `codesign --force --sign`。`make-app.sh` 使用
-`--preserve-metadata=identifier,entitlements,flags,runtime`，先签并严格验证 helper，再签资源 bundle，最后签外层 App。对下载的固定 helper 用 `PipiUI Dev` 实测重签后，两项 entitlement、runtime flag 和 identifier 均保留，`codesign --verify --strict` 通过。这里不使用 `com.apple.security.inherit`：Cua 的文档明确说明这是非沙箱 host 的 TCC responsibility chain，不是 App Sandbox entitlement inheritance。
-
-`make-app.sh` 默认查找稳定 identity `PipiUI Dev`；缺失时退回 ad-hoc 并打印 TCC grant 可能失效的警告。其他证书可用：
-
-```bash
-PIPIUI_SIGN_ID="Developer ID Application: Example" ./make-app.sh
-```
+因此重签不能裸用 `codesign --force --sign`，须保留 identifier/entitlements/flags/runtime。
+打包与签名一律经 `pipiui-electron-build` skill（见 `AGENTS.md` → Electron packaging adapter），
+不要手调 electron-builder。
 
 ## 开发与权限
 
-打包 App 从 `Contents/Helpers/cua-driver` 加载 helper。环境变量覆盖只在 DEBUG 构建启用；测试也可通过显式 initializer 注入 helper：
-
-```bash
-PIPIUI_CUA_DRIVER_PATH=/absolute/path/to/cua-driver swift run
-```
-
-需要给 PipiUI App 本身授予：
+打包 App 从 `Contents/MacOS/cua-driver` 加载 helper。需要给 PipiUI Electron App 本身授予：
 
 1. System Settings -> Privacy & Security -> Screen Recording
 2. System Settings -> Privacy & Security -> Accessibility
 
-权限变化后应完全退出并重启 App，以重建 embedded daemon generation。`swift run` 的 TCC 身份不等价于签名后的 `PipiUI.app`，不能作为产品权限验收。
+权限变化后应完全退出并重启 App，以重建 embedded daemon generation。dev 模式（`npm run dev`）的 TCC 身份不等价于签名后的 `PipiUI Electron.app`，不能作为产品权限验收。
 
 ## 验证边界
 

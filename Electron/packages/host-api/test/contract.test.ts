@@ -850,6 +850,7 @@ describe('browser transport extension', () => {
     await browser.loadURL('session-a', 'example.test', tab.id)
     expect(await browser.snapshot('session-a')).toMatchObject({ tabId: tab.id })
     await browser.setViewBounds('session-a', { x: 1, y: 2, width: 3, height: 4, visible: true })
+    await browser.setZoomFactor('session-a', 1.1, tab.id)
     for (const listener of listeners) listener({}, { type: 'event', protocolVersion: 2, channel: 'browser', event: { type: 'tabs', sessionId: 'session-a', snapshot: { tabs: [tab], activeTabId: tab.id } } })
     expect(received).toHaveLength(1)
     expect(calls).toEqual(expect.arrayContaining([
@@ -858,7 +859,8 @@ describe('browser transport extension', () => {
       { method: 'browserGetActiveTab', params: ['session-a'] },
       { method: 'browserLoadURL', params: ['session-a', 'example.test', tab.id] },
       { method: 'browserSnapshot', params: ['session-a', undefined] },
-      { method: 'browserSetViewBounds', params: ['session-a', { x: 1, y: 2, width: 3, height: 4, visible: true }] }
+      { method: 'browserSetViewBounds', params: ['session-a', { x: 1, y: 2, width: 3, height: 4, visible: true }] },
+      { method: 'browserSetZoomFactor', params: ['session-a', 1.1, tab.id] }
     ]))
     unsubscribe()
   })

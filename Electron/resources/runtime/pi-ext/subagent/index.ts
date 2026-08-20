@@ -66,6 +66,8 @@ import {
 	formatAgentDiagnostics,
 } from "./agents.ts";
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
+import { registerMidTurnCompactionGuard } from "./mid-turn-compaction.ts";
+import { writeFindingsArtifact } from "./findings-artifact.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
 import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
@@ -138,6 +140,7 @@ import {
 	seedBossLedger,
 } from "./boss-ledger.ts";
 import { bossLedgerNoteTool } from "./boss-note.ts";
+import { contextDocTool } from "./context-doc.ts";
 import {
 	acquireAgentLease,
 	releaseAgentLease,
@@ -147,9 +150,13 @@ import {
 	type DependencyState,
 	DispatchQueueV1,
 	formatQueuedDispatches,
-	formatQueuedPromptSections,
 	resolveDispatchConcurrency,
 } from "./dispatch-queue.ts";
+import {
+	formatInFlightWorkersBlock,
+	nextInFlightInjection,
+	type InFlightWorkerView,
+} from "./inflight-prompt.ts";
 import {
 	bindWorktreeMergedHook,
 	closeoutDispositionFor,
@@ -2872,46 +2879,28 @@ function currentWaveSnapshot(now: number): WaveSnapshot {
 	};
 }
 
-/** Compact live snapshot of in-flight background workers, for the boss system prompt.
- *  Returns null when nothing is in flight (zero cost in the normal case). */
-function formatInFlightWorkersBlock(now: number): string | null {
-	const queued = dispatchQueue.snapshot();
-	// Queued work is in flight from the boss's point of view: it was handed over and will run.
-	// Returning null while tasks sit in the queue is how handed-over work became invisible and
-	// then forgotten — a held task is exactly the one the boss most needs to see.
-	if (runningAgents.size === 0 && queued.length === 0) return null;
-	const lines: string[] = ["## Background workers in flight (live this turn)"];
-	let anyStalledOrVanished = false;
-	for (const [agentId, handle] of runningAgents) {
-		const idleSec = Math.floor((now - handle.lastActivityAt) / 1000);
-		const elapsed = formatElapsedMs(now - handle.startedAt);
-		const title = (handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60)) || "(untitled)";
-		let state: string;
-		if (handle.finalizing) {
-			state = `finalizing closeout ${elapsed}`;
-		} else if (isHandleVanished(handle, now)) {
-			anyStalledOrVanished = true;
-			state = "VANISHED — process gone with no report";
-		} else if (idleSec * 1000 >= STALL_THRESHOLD_MS) {
-			anyStalledOrVanished = true;
-			state = `STALLED — idle ${idleSec}s`;
-		} else {
-			state = `running ${elapsed}, idle ${idleSec}s`;
-		}
-		lines.push(`- \`${agentId}\` (${title}) — ${state}`);
-	}
-	if (anyStalledOrVanished) {
-		lines.push(
-			"A stalled or vanished worker is NOT fine and NOT \"everything is normal\". Before answering the user or declaring anything done, account for every worker above: call `subagent_status`, then recover each stalled/vanished one (abort + re-dispatch by a materially different route, or continue the same agentId). Do not claim success or normalcy while any worker above is stalled or vanished.",
-		);
-	} else if (runningAgents.size > 0) {
-		lines.push(
-			"All still running. If the user asks about progress, call `subagent_status` rather than answering from memory.",
-		);
-	}
+function inFlightWorkerTitle(handle: RunningAgentHandle): string {
+	return (handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60)) || "(untitled)";
+}
 
-	lines.push(...formatQueuedPromptSections(queued));
-	return lines.join("\n");
+function inFlightWorkerKind(handle: RunningAgentHandle, now: number): InFlightWorkerView["kind"] {
+	if (handle.finalizing) return "finalizing";
+	if (isHandleVanished(handle, now)) return "vanished";
+	if (now - handle.lastActivityAt >= STALL_THRESHOLD_MS) return "stalled";
+	return "running";
+}
+
+/** Quantized live snapshot for a tail custom message. Null when nothing is in flight. */
+function currentInFlightWorkersSnapshot(now: number): string | null {
+	const workers: InFlightWorkerView[] = [];
+	for (const [agentId, handle] of runningAgents) {
+		workers.push({
+			agentId,
+			title: inFlightWorkerTitle(handle),
+			kind: inFlightWorkerKind(handle, now),
+		});
+	}
+	return formatInFlightWorkersBlock(workers, dispatchQueue.snapshot());
 }
 
 /**
@@ -4482,7 +4471,25 @@ function notifySubagentDone(
 	const runId = result.agentId
 		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
 		: undefined;
-	const extraWithWave = { ...extra, wave: currentWaveSnapshot(Date.now()) };
+	// Persist the full report next to the ledger BEFORE formatting, so the done message can
+	// hand the next worker a path instead of making it rediscover this worker's ground.
+	// A failed write only costs the handoff line; it never blocks the completion.
+	const findings = writeFindingsArtifact({
+		mainCwd: PIPIUI_MAIN_CWD,
+		agentId: result.agentId,
+		agentName: result.agent,
+		runId,
+		title: result.title,
+		task: result.task,
+		// An error is not a finding. A worker that died without a report leaves no artifact;
+		// continuing it by agentId is what recovers its work, per the continuity rule.
+		text: extra?.error ? "" : getResultOutput(result),
+	});
+	const extraWithWave = {
+		...extra,
+		wave: currentWaveSnapshot(Date.now()),
+		...(findings.ok && findings.file ? { findingsFile: findings.file } : {}),
+	};
 	const text = formatSubagentDoneMessage(result, runId ? { ...extraWithWave, runId } : extraWithWave);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
 	if (result.agentId && runId) {
@@ -7431,9 +7438,24 @@ function registerLedgerNoteTool(pi: ExtensionAPI): void {
 	pi.registerTool(bossLedgerNoteTool({ mainCwd: PIPIUI_MAIN_CWD, sessionKey: PIPIUI_SESSION }) as never);
 }
 
+/**
+ * The Boss's second write: the shared half of a wave's briefs, stored once.
+ *
+ * Depth 0 only, and for the same reason the ledger is: a worker writing shared context would
+ * be N concurrent writers to one document across isolated worktrees. See context-doc.ts.
+ */
+function registerContextDocTool(pi: ExtensionAPI): void {
+	if (PIPIUI_DEPTH !== 0 || !PIPIUI_MAIN_CWD) return;
+	pi.registerTool(contextDocTool({ mainCwd: PIPIUI_MAIN_CWD, sessionKey: PIPIUI_SESSION }) as never);
+}
+
 export default function (pi: ExtensionAPI) {
 	registerComputerTaskTool(pi);
 	registerLedgerNoteTool(pi);
+	registerContextDocTool(pi);
+	// Last quantized in-flight snapshot injected as a custom message. Null at
+	// startup and after a clear, so empty turns stay silent.
+	let lastInFlightSnapshot: string | null = null;
 	// Bind the queue's boss channel: a held task nobody is told about is the forgetting this
 	// queue exists to end.
 	dispatchQueueNotify = (text) => {
@@ -7452,6 +7474,7 @@ export default function (pi: ExtensionAPI) {
 	// 主会话上下文压缩走有界快路径（thinking off 的 LLM 摘要 → 确定性摘要 → pi 内置兜底）。
 	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
 	registerMainSessionCompactionHook(pi);
+	registerMidTurnCompactionGuard();
 	// Qoder CN / Qwen 3.8-Max-Preview contextWindow 修复：按 API default tier
 	// 归一化 model.contextWindow（真实影响 pi shouldCompact/session stats），
 	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
@@ -7596,16 +7619,37 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	// Boss-only, hot-read routing reference plus the live in-flight reminder. The same dynamic
-	// prompt tells Boss exactly which agent chain / settings / allowed levels it can select before
-	// a dispatch, while workers stay free of parent orchestration context.
+	// Routing is a function of config (stable within a model/session) so it may
+	// stay in the system prompt. Live worker status must not: appending clocks
+	// there busts the prefix cache every user turn during fan-out. Same discipline
+	// as pipiui-git.ts — custom message at the tail, and only when the quantized
+	// snapshot actually changed.
 	pi.on("before_agent_start", (event) => {
 		bossTurnBusy = true;
 		const routing = formatSubagentModelRoutingBlock();
-		const inflight = formatInFlightWorkersBlock(Date.now());
-		const blocks = [routing, inflight].filter((block): block is string => Boolean(block));
-		if (blocks.length === 0) return;
-		return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${blocks.join("\n\n")}` };
+		const snapshot = currentInFlightWorkersSnapshot(Date.now());
+		const injection = nextInFlightInjection(lastInFlightSnapshot, snapshot);
+		lastInFlightSnapshot = injection.stored;
+		const result: {
+			systemPrompt?: string;
+			message?: {
+				customType: string;
+				content: Array<{ type: "text"; text: string }>;
+				display: boolean;
+			};
+		} = {};
+		if (routing) {
+			result.systemPrompt = `${event.systemPrompt.trimEnd()}\n\n${routing}`;
+		}
+		if (injection.text) {
+			result.message = {
+				customType: "pipiui-inflight-workers",
+				content: [{ type: "text", text: injection.text }],
+				display: false,
+			};
+		}
+		if (!result.systemPrompt && !result.message) return;
+		return result;
 	});
 
 	// Prompt text is not a security boundary. The runtime-owned closeout secretary

@@ -14,7 +14,7 @@ import {
   isDriverSessionEndedError,
   selectLaunchWindow,
 } from "./cua-driver-host.js";
-import { ComputerWorkerBroker } from "../../../../../Sources/PipiUI/PiExt/packages/computer-agent/src/worker-broker.ts";
+import { ComputerWorkerBroker } from "../../../../resources/runtime/pi-ext/packages/computer-agent/src/worker-broker.ts";
 
 describe("CuaDriverHost", () => {
   const roots: string[] = [];

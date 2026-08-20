@@ -31,8 +31,8 @@ function usage() {
   node scripts/eval-delegation.mjs --score <transcript.json|jsonl|directory> [--case <id>] [--report <file>]
   node scripts/eval-delegation.mjs --run [--model provider/model] [--case <id>] [--out <directory>] [--report <file>]
 
-Automatic mode uses real pi JSON mode, Sources/PipiUI/PiPhilosophy/philosophy.ts,
-and Sources/PipiUI/PiExt/subagent/index.ts. It defaults to capture-dispatch-only:
+Automatic mode uses real pi JSON mode, Electron/resources/runtime/pi-philosophy/philosophy.ts,
+and Electron/resources/runtime/pi-ext/subagent/index.ts. It defaults to capture-dispatch-only:
 it records the streamed completed subagent tool-call event, then terminates pi before the tool executor starts workers.
 Use --full only in the disposable git-worktree sandbox when worker execution is desired.
 
@@ -902,9 +902,9 @@ function removeDisposableWorktree(repoRoot, workspace) {
 
 function assertRealStack(workspace) {
   const files = {
-    philosophy: path.join(workspace, "Sources", "PipiUI", "PiPhilosophy", "philosophy.ts"),
-    subagent: path.join(workspace, "Sources", "PipiUI", "PiExt", "subagent", "index.ts"),
-    agents: path.join(workspace, "Sources", "PipiUI", "PiExt", "agents"),
+    philosophy: path.join(workspace, "Electron", "resources", "runtime", "pi-philosophy", "philosophy.ts"),
+    subagent: path.join(workspace, "Electron", "resources", "runtime", "pi-ext", "subagent", "index.ts"),
+    agents: path.join(workspace, "Electron", "resources", "runtime", "pi-ext", "agents"),
   };
   for (const [name, filePath] of Object.entries(files)) {
     const result = spawnSync("test", [name === "agents" ? "-d" : "-f", filePath]);
@@ -1100,7 +1100,7 @@ async function runAutomatic(cases, options) {
     generatedAt: new Date().toISOString(),
     runnerForm: options.full ? "automatic headless JSON (full)" : "automatic headless JSON (capture-dispatch-only)",
     runnerReason: "pi JSON mode runs extensions without a TUI; the real project philosophy and patched subagent extension are explicitly mounted. The runner suppresses inherited AGENTS.md context because this evaluator itself runs as a dispatched worker and that ambient context would contaminate the measured boss role. Bridge-only UI plumbing is omitted because no PipiUI GUI bridge exists in a headless process.",
-    stack: `real PiPhilosophy/philosophy.ts and PiExt/subagent/index.ts from ${ownsWorkspace ? `a disposable git worktree of ${repoRoot}` : workspace}; model ${options.model}`,
+    stack: `real pi-philosophy/philosophy.ts and pi-ext/subagent/index.ts from ${ownsWorkspace ? `a disposable git worktree of ${repoRoot}` : workspace}; model ${options.model}`,
     captureMode: options.full
       ? "real delegated workers were allowed to execute inside a disposable git worktree"
       : `the boss process was stopped synchronously at pi's streamed toolcall_end event for subagent, before the real tool executor starts; no mock tool was injected; max parent turns per case: ${options.maxAssistantTurns}`,

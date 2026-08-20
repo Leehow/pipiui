@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bundle": "esbuild src/tunnel-browser.tsx --bundle --minify --format=esm --platform=browser --target=es2022 --jsx=automatic --outfile=dist/assets/tunnel-browser.js && esbuild src/trystero-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/trystero-browser.js && esbuild src/tunnel-host.ts --bundle --format=iife --platform=browser --target=safari16 --outfile=../Sources/PipiUI/Resources/RemoteP2P/tunnel-host.js",
+    "bundle": "esbuild src/tunnel-browser.tsx --bundle --minify --format=esm --platform=browser --target=es2022 --jsx=automatic --outfile=dist/assets/tunnel-browser.js && esbuild src/trystero-browser.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=dist/assets/trystero-browser.js",
     "build": "tsc -p tsconfig.json && npm run bundle",
     "start": "node dist/tunnel-server.js",
     "test": "tsx --test test/*.test.ts"

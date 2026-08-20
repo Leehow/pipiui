@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -307,6 +307,64 @@ describe("external session aggregation", () => {
       await expect(backend.handle("getSessionLease", ["ext:claude:claude-keep"])).rejects.toThrow(/read-only/);
       await expect(backend.handle("forceTakeoverSessionLease", ["ext:claude:claude-keep"])).rejects.toThrow(/read-only/);
       await expect(backend.handle("getSessionHistory", ["ext:claude:claude-keep"])).rejects.toThrow(/read-only/);
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("defaults scanExternalSessions to on and skips scanners when off", async () => {
+    const { home, project } = await fixtureHome();
+    await seedSources(home, project, join(root, "other"));
+    const agent = join(root, "agent-scan");
+    const backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions-scan"),
+      canonicalProjectPaths: async () => undefined,
+      externalSessionRoots: { home },
+      env: { ...process.env, HOME: home },
+    });
+    try {
+      await backend.handle("setProjectPaths", [[project]]);
+      const projects = await backend.handle("listProjects", []) as { id: string }[];
+      const projectId = projects[0].id;
+      expect(await backend.handle("getScanExternalSessions", [])).toBe(true);
+      const listed = await backend.handle("listExternalSessions", [projectId]) as { id: string }[];
+      expect(listed.some((item) => item.id === "ext:claude:claude-keep")).toBe(true);
+      expect(await backend.handle("setScanExternalSessions", [false])).toBe(false);
+      expect(await backend.handle("listExternalSessions", [projectId])).toEqual([]);
+      const settings = JSON.parse(await readFile(join(agent, "pipiui-settings.json"), "utf8"));
+      expect(settings.scanExternalSessions).toBe(false);
+      const fresh = createPiHostBackend({
+        agentDir: agent,
+        sessionsRoot: join(root, "sessions-scan"),
+        canonicalProjectPaths: async () => undefined,
+        externalSessionRoots: { home },
+        env: { ...process.env, HOME: home },
+      });
+      try {
+        await fresh.handle("setProjectPaths", [[project]]);
+        expect(await fresh.handle("getScanExternalSessions", [])).toBe(false);
+        expect(await fresh.handle("listExternalSessions", [projectId])).toEqual([]);
+      } finally {
+        await fresh.close();
+      }
+      await expect(backend.handle("setScanExternalSessions", ["yes"])).rejects.toThrow("scanExternalSessions 必须是");
+      await writeFile(join(agent, "pipiui-settings.json"), JSON.stringify({ scanExternalSessions: "yes" }), "utf8");
+      const coerced = createPiHostBackend({
+        agentDir: agent,
+        sessionsRoot: join(root, "sessions-scan"),
+        canonicalProjectPaths: async () => undefined,
+        externalSessionRoots: { home },
+        env: { ...process.env, HOME: home },
+      });
+      try {
+        await coerced.handle("setProjectPaths", [[project]]);
+        expect(await coerced.handle("getScanExternalSessions", [])).toBe(true);
+        const rescanned = await coerced.handle("listExternalSessions", [projectId]) as { id: string }[];
+        expect(rescanned.some((item) => item.id === "ext:claude:claude-keep")).toBe(true);
+      } finally {
+        await coerced.close();
+      }
     } finally {
       await backend.close();
     }

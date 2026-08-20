@@ -151,3 +151,9 @@ The point of a wave is that its raw output never reaches you. Full reports live 
 registry; pull one with {{delegate_status}} only when a verdict block is not enough to decide.
 Reading every worker's full text defeats the fan-out — the context you spend is the one
 resource the wave cannot regenerate.
+
+That never meant the detail dies at the boundary. Every finished report is also written to
+`.pi/findings/<agentId>.md`, named by the `Findings:` line of that completion. Forward the
+path; do not open the file. One line of your context moves the whole report to the worker that
+needs it, and the reading lands in a context that was disposable anyway — which is what makes
+"do not read this" affordable instead of lossy.

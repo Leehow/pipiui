@@ -317,12 +317,21 @@ function applyViewport(
   kind: BrowserViewportKind,
   visual: { width: number; height: number },
   emulate: boolean,
-  device: BrowserMobileDevice = DEFAULT_MOBILE_DEVICE
+  device: BrowserMobileDevice = DEFAULT_MOBILE_DEVICE,
+  zoomFactor = 1
 ): void {
   if (!nativeViewUsable(view) || view.webContents.isCrashed?.()) return
-  // Desktop always paints 1:1 into the surface. Mobile uses enableDeviceEmulation
-  // scale only — never also zoom, or the page is shrunk twice into the corner.
-  view.webContents.setZoomFactor?.(1)
+  // Mobile uses enableDeviceEmulation scale only — never also zoom, or the page
+  // is shrunk twice into the corner. Desktop page zoom is user-controlled.
+  view.webContents.setZoomFactor?.(kind === 'mobile' ? 1 : clampBrowserZoom(zoomFactor))
+}
+
+const BROWSER_ZOOM_MIN = 0.25
+const BROWSER_ZOOM_MAX = 5
+
+function clampBrowserZoom(factor: number): number {
+  const next = Number.isFinite(factor) ? factor : 1
+  return Math.min(BROWSER_ZOOM_MAX, Math.max(BROWSER_ZOOM_MIN, Math.round(next * 100) / 100))
 }
 
 /** Stable, opaque profile name: raw session ids never become filesystem path components. */
@@ -400,7 +409,8 @@ export class BrowserTabsHost {
   private navigationGeneration = 0
   private viewGeneration = 0
   private readonly consoles = new TabConsoleBuffer()
-  private readonly consoleListeners = new WeakMap<BrowserWebContentsLike, (...args: any[]) => void>()
+  private readonly consoleListeners = new WeakMap<BrowserWebContentsLike, (...args: any[]) => void>
+  private readonly zoomByTab = new Map<string, number>()
 
   constructor(private readonly createView: BrowserViewFactory, private readonly partition = defaultPartition) {
     this.createTab()
@@ -453,6 +463,7 @@ export class BrowserTabsHost {
     }
     if (wasActive) for (const pane of this.createdPanes()) pane.view?.webContents.stop?.()
     this.consoles.clearTab(tabId)
+    this.zoomByTab.delete(tabId)
     this.emit()
     if (this.active) await this.show(this.active, 'restore')
     return this.state()
@@ -516,6 +527,22 @@ export class BrowserTabsHost {
       // remains useful and matches the pre-text snapshot contract.
     }
     return snapshot
+  }
+
+  async setZoomFactor(factor: number, tabId?: string): Promise<number> {
+    const tab = this.activate(tabId)
+    const next = clampBrowserZoom(factor)
+    this.zoomByTab.set(tab.id, next)
+    const desktop = this.panes.desktop
+    if (this.viewUsable(desktop.view) && desktop.shownTabId === tab.id) {
+      desktop.view.webContents.setZoomFactor?.(next)
+    }
+    return next
+  }
+
+  private zoomForActive(): number {
+    const id = this.activeTabId
+    return id ? clampBrowserZoom(this.zoomByTab.get(id) ?? 1) : 1
   }
 
   async toolAction(request: BrowserToolRequest, options: { reveal?: boolean } = {}): Promise<BrowserToolResult> {
@@ -1031,7 +1058,7 @@ export class BrowserTabsHost {
     const pane = this.panes.mobile
     if (!this.mobileOverlayVisible || !this.viewUsable(pane.view)) return
     setNativeBounds(pane.view, this.mobileWindowViewport)
-    applyViewport(pane.view, 'mobile', this.mobileWindowViewport, true, this.mobileDevice)
+    applyViewport(pane.view, 'mobile', this.mobileWindowViewport, true, this.mobileDevice, 1)
     this.applyDeviceEmulationIfSafe(pane)
   }
 
@@ -1222,7 +1249,7 @@ export class BrowserTabsHost {
     const visual = presented ? this.slotFor(pane.kind) : hiddenPresetBounds(pane.kind, this.mobileDevice)
     setNativeBounds(view, visual)
     // Detached WebContentsView has no RenderWidgetHostView; EnableDeviceEmulation SIGSEGVs.
-    applyViewport(view, pane.kind, visual, presented, this.mobileDevice)
+    applyViewport(view, pane.kind, visual, presented, this.mobileDevice, this.zoomForActive())
     view.setVisible?.(presented)
     this.applyMobileUserAgent(pane)
     traceBrowserNative(presented ? 'bounds:visible' : 'bounds:hidden', view, undefined, { requested: this.bounds, viewport: pane.kind })
@@ -1635,6 +1662,7 @@ export class BrowserSessionHost implements BrowserHostAPI {
   goForward(sessionId: string, tabId?: string): Promise<BrowserTab> { return this.run(sessionId, host => host.goForward(tabId)) }
   reload(sessionId: string, tabId?: string): Promise<BrowserTab> { return this.run(sessionId, host => host.reload(tabId)) }
   snapshot(sessionId: string, tabId?: string): Promise<BrowserSnapshot> { return this.run(sessionId, host => host.snapshot(tabId)) }
+  setZoomFactor(sessionId: string, factor: number, tabId?: string): Promise<number> { return this.run(sessionId, host => host.setZoomFactor(factor, tabId)) }
 
   async setViewBounds(sessionId: string, bounds: BrowserViewBounds): Promise<void> {
     const id = sessionId.trim()
@@ -1744,6 +1772,7 @@ export function withBrowserTabsHost(backend: HostBackend, browser: BrowserSessio
         case 'browserReload': return browser.reload(params[0] as string, params[1] as string | undefined)
         case 'browserSnapshot': return browser.snapshot(params[0] as string, params[1] as string | undefined)
         case 'browserSetViewBounds': return browser.setViewBounds(params[0] as string, params[1] as BrowserViewBounds)
+        case 'browserSetZoomFactor': return browser.setZoomFactor(params[0] as string, params[1] as number, params[2] as string | undefined)
         case 'deleteSession': {
           const result = await backend.handle(method, params)
           await browser.disposeSession(params[0] as string)

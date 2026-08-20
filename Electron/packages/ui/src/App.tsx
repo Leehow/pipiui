@@ -37,13 +37,15 @@ import { compactionNotice } from './compaction-notice'
 import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
+import { useScanExternalSessions } from './useScanExternalSessions'
 import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
 import { parseSubagentSignal } from './subagent-signal'
-import { appendLiveUserMessage, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
+import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
 import './app.css'
 import './message-actions.css'
@@ -308,6 +310,7 @@ export function selectedSessionAgentSummaries(agents: readonly AgentSummary[], s
 }
 
 type SidebarDropPlacement = 'before' | 'after'
+const SESSION_ORDER_VERSION = 3 as unknown as NonNullable<SidebarSessionPreferences['sessionOrderVersion']>
 
 function movedIds(ids: string[], sourceId: string, targetId: string, placement: SidebarDropPlacement): string[] {
   if (sourceId === targetId) return ids
@@ -318,18 +321,9 @@ function movedIds(ids: string[], sourceId: string, targetId: string, placement: 
   return without
 }
 
-/** Apply a small explicit-drag constraint without lifting its members above newer untouched sessions. */
-export function sessionsByActivityAndManualOrder<T extends Pick<Session, 'id' | 'updatedAt'>>(items: T[], orderedIds: readonly string[]): T[] {
-  const byActivity = [...items].sort((a, b) => b.updatedAt - a.updatedAt)
-  const itemIds = new Set(byActivity.map(item => item.id))
-  const manual = [...new Set(orderedIds)].filter(id => itemIds.has(id))
-  if (manual.length < 2) return byActivity
-  const participants = new Set(manual)
-  const insertAt = Math.min(...byActivity.flatMap((item, index) => participants.has(item.id) ? [index] : []))
-  const manualItems = manual.flatMap(id => byActivity.find(item => item.id === id) ?? [])
-  const rest = byActivity.filter(item => !participants.has(item.id))
-  rest.splice(insertAt, 0, ...manualItems)
-  return rest
+/** Sessions sort by recency only. Manual drag order was removed in sessionOrderVersion 3. */
+export function sessionsByActivityAndManualOrder<T extends Pick<Session, 'id' | 'updatedAt'>>(items: T[]): T[] {
+  return [...items].sort((a, b) => b.updatedAt - a.updatedAt)
 }
 
 function readWidths(): PaneWidths {
@@ -496,6 +490,10 @@ function createMockBrowserHost(): BrowserHostAPI {
       return snapshot
     },
     setViewBounds: async (_sessionId, bounds) => { lastBounds = { ...bounds }; void lastBounds },
+    setZoomFactor: async (_sessionId, factor) => {
+      const next = Number.isFinite(factor) ? factor : 1
+      return Math.min(5, Math.max(0.25, Math.round(next * 100) / 100))
+    },
     subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener) }
   }
 }
@@ -636,7 +634,7 @@ export function createMockHost(): PipiHostAPI {
     { provider: 'acme', id: 'mystery-1', name: 'Mystery One', reasoning: false, supportsImages: true }
   ]
   let hiddenModelIds: string[] = []
-  let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], archivedSessionTimestamps: {}, orderedSessionIds: [], sessionOrderVersion: 2 }
+  let sidebarSessionPreferences: SidebarSessionPreferences = { pinnedSessionIds: [], archivedSessionIds: [], archivedSessionTimestamps: {}, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION }
   // Demo-only: restore the reload-persisted model when it is still in the catalog;
   // fall back to mockModels[0] otherwise (real host model state is owned by pi sessions).
   const savedDemoModel = readDemoModel()
@@ -666,13 +664,14 @@ export function createMockHost(): PipiHostAPI {
   let computerUseEnabled = false
   let visionEnabled = false
   let visionModel: string | null = null
+  let scanExternalSessions = true
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
   let memoryReviewModel: string | null = null
   const agentDefinitions: AgentDefinition[] = [
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.' },
     { name: 'general-purpose', description: 'Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason.' },
     { name: 'reviewer', description: 'Read-only code review specialist for quality and security.' },
-    { name: 'computer-use', description: 'Single Computer Use Agent. Plans, operates, reconciles, recovers, and verifies without delegation.' },
+    { name: 'computer-use', description: 'Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation.' },
     { name: 'secretary', description: 'Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.' },
   ]
   const emit = (sessionId: string, event: StreamEvent) => {
@@ -820,12 +819,12 @@ export function createMockHost(): PipiHostAPI {
     openExternal: async () => undefined,
     getHiddenModelIds: async () => [...hiddenModelIds],
     setHiddenModelIds: async ids => { hiddenModelIds = [...new Set(ids)].sort(); return [...hiddenModelIds] },
-    getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...(sidebarSessionPreferences.archivedSessionTimestamps ?? {}) }, orderedSessionIds: [...sidebarSessionPreferences.orderedSessionIds], sessionOrderVersion: 2 }),
+    getSidebarSessionPreferences: async () => ({ pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...(sidebarSessionPreferences.archivedSessionTimestamps ?? {}) }, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION }),
     setSidebarSessionPreferences: async preferences => {
       const archived = new Set(preferences.archivedSessionIds)
       const archivedSessionTimestamps = Object.fromEntries(Object.entries(preferences.archivedSessionTimestamps ?? {}).filter(([id]) => archived.has(id)))
-      sidebarSessionPreferences = { pinnedSessionIds: [...new Set(preferences.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived], archivedSessionTimestamps, orderedSessionIds: [...new Set(preferences.orderedSessionIds)], sessionOrderVersion: 2 }
-      return { pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...archivedSessionTimestamps }, orderedSessionIds: [...sidebarSessionPreferences.orderedSessionIds], sessionOrderVersion: 2 }
+      sidebarSessionPreferences = { pinnedSessionIds: [...new Set(preferences.pinnedSessionIds)].filter(id => !archived.has(id)), archivedSessionIds: [...archived], archivedSessionTimestamps, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION }
+      return { pinnedSessionIds: [...sidebarSessionPreferences.pinnedSessionIds], archivedSessionIds: [...sidebarSessionPreferences.archivedSessionIds], archivedSessionTimestamps: { ...archivedSessionTimestamps }, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION }
     },
     getComputerUseState: async () => ({ enabled: computerUseEnabled }),
     setComputerUseEnabled: async enabled => { computerUseEnabled = enabled; return { enabled: computerUseEnabled } },
@@ -837,6 +836,8 @@ export function createMockHost(): PipiHostAPI {
     setVisionModel: async ref => { visionModel = ref; return visionModel },
     getVisionEnabled: async () => visionEnabled,
     setVisionEnabled: async enabled => { visionEnabled = enabled; return visionEnabled },
+    getScanExternalSessions: async () => scanExternalSessions,
+    setScanExternalSessions: async enabled => { scanExternalSessions = enabled; return scanExternalSessions },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
     getMemoryReviewModel: async () => memoryReviewModel,
@@ -1047,7 +1048,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [pinnedSessionIds, setPinnedSessionIds] = useState<string[]>([])
   const [archivedSessionIds, setArchivedSessionIds] = useState<string[]>([])
   const [archivedSessionTimestamps, setArchivedSessionTimestamps] = useState<Record<string, number>>({})
-  const [orderedSessionIds, setOrderedSessionIds] = useState<string[]>([])
+
   const [sidebarVisibleLimit, setSidebarVisibleLimit] = useState(SIDEBAR_PROJECT_PAGE_SIZE)
   const [sidebarSearch, setSidebarSearch] = useState('')
   const [sidebarAgents, setSidebarAgents] = useState<AgentSummary[]>([])
@@ -1122,11 +1123,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [modalInitialView, setModalInitialView] = useState<'manage' | 'add'>('manage')
   const [gitBinary, setGitBinary] = useState<boolean | 'unknown'>('unknown')
   const vision = useVisionRouting(host)
+  const scanExternal = useScanExternalSessions(host)
+  const scanExternalRef = useRef(scanExternal)
+  scanExternalRef.current = scanExternal
   const updates = useUpdateCenter(host)
   // Opening the settings modal refreshes the vision-routing snapshot so the 通用
   // tab always shows the host's current state (reads happen on open, per spec).
-  const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh() }
-  const openAddProvider = () => { setModalInitialView('add'); setModalOpen(true); void vision.refresh() }
+  const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
+  const openAddProvider = () => { setModalInitialView('add'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
   const closeModelManager = () => setModalOpen(false)
   const [computerUseOpen, setComputerUseOpen] = useState(false)
   const [remoteOpen, setRemoteOpen] = useState(false)
@@ -1314,7 +1318,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSelectedProject(first.projectId)
     setSelectedSession(first.sessionId)
     setProjectsLoaded(true)
-    const listedExternal = await loadExternalSessionsForProjects(host.listExternalSessions, items)
+    const scan = scanExternalRef.current
+    const listedExternal = !scan.loading && scan.enabled
+      ? await loadExternalSessionsForProjects(host.listExternalSessions, items)
+      : []
     setExternalSessions(listedExternal)
     const selectedNow = selectedSessionRef.current
     const rememberedExternal = remembered && validProjectIds.has(remembered.projectId)
@@ -1376,7 +1383,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       let pinned = saved?.pinnedSessionIds ?? []
       let archived = saved?.archivedSessionIds ?? []
       let archivedTimestamps = saved?.archivedSessionTimestamps ?? {}
-      let ordered: string[] = []
       if (host.getSidebarSessionPreferences && host.setSidebarSessionPreferences) {
         const remote = await host.getSidebarSessionPreferences()
         const migrated = localStorage.getItem(sidebarSemanticMigrationKey) === '1'
@@ -1384,15 +1390,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           pinned = remote.pinnedSessionIds
           archived = remote.archivedSessionIds
           archivedTimestamps = remote.archivedSessionTimestamps ?? {}
-          ordered = remote.sessionOrderVersion === 2 ? remote.orderedSessionIds ?? [] : []
         } else {
           archived = [...new Set([...remote.archivedSessionIds, ...archived])]
           archivedTimestamps = { ...archivedTimestamps, ...(remote.archivedSessionTimestamps ?? {}) }
           const archivedSet = new Set(archived)
           pinned = [...new Set([...remote.pinnedSessionIds, ...pinned])].filter(id => !archivedSet.has(id))
-          ordered = remote.sessionOrderVersion === 2 ? remote.orderedSessionIds ?? [] : []
           archivedTimestamps = normalizeArchiveTimestamps(archived, archivedTimestamps)
-          await host.setSidebarSessionPreferences({ pinnedSessionIds: pinned, archivedSessionIds: archived, archivedSessionTimestamps: archivedTimestamps, orderedSessionIds: ordered, sessionOrderVersion: 2 })
+          await host.setSidebarSessionPreferences({ pinnedSessionIds: pinned, archivedSessionIds: archived, archivedSessionTimestamps: archivedTimestamps, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION })
           localStorage.setItem(sidebarSemanticMigrationKey, '1')
         }
       }
@@ -1401,7 +1405,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setPinnedSessionIds(pinned)
       setArchivedSessionIds(archived)
       setArchivedSessionTimestamps(archivedTimestamps)
-      setOrderedSessionIds(ordered)
       setLoadedSidebarPreferencesKey(sidebarStorageKey)
     })().catch(error => {
       if (!active) return
@@ -1409,7 +1412,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setPinnedSessionIds(saved?.pinnedSessionIds ?? [])
       setArchivedSessionIds(saved?.archivedSessionIds ?? [])
       setArchivedSessionTimestamps(normalizeArchiveTimestamps(saved?.archivedSessionIds ?? [], saved?.archivedSessionTimestamps))
-      setOrderedSessionIds([])
       setLoadedSidebarPreferencesKey(sidebarStorageKey)
     })
     return () => { active = false }
@@ -1418,9 +1420,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!projects.length || loadedSidebarPreferencesKey !== sidebarStorageKey) return
     writeSidebarPreferences(sidebarStorageKey, { expandedIds: sidebarExpandedIds, pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, visibleLimit: sidebarVisibleLimit })
     if (host.setSidebarSessionPreferences) {
-      void host.setSidebarSessionPreferences({ pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, orderedSessionIds, sessionOrderVersion: 2 }).catch(error => setProjectError(`保存侧栏偏好失败：${error instanceof Error ? error.message : String(error)}`))
+      void host.setSidebarSessionPreferences({ pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, orderedSessionIds: [], sessionOrderVersion: SESSION_ORDER_VERSION }).catch(error => setProjectError(`保存侧栏偏好失败：${error instanceof Error ? error.message : String(error)}`))
     }
-  }, [host, loadedSidebarPreferencesKey, pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, orderedSessionIds, projects.length, sidebarExpandedIds, sidebarStorageKey, sidebarVisibleLimit])
+  }, [host, loadedSidebarPreferencesKey, pinnedSessionIds, archivedSessionIds, archivedSessionTimestamps, projects.length, sidebarExpandedIds, sidebarStorageKey, sidebarVisibleLimit])
   useEffect(() => {
     if (!projects.length || loadedSidebarPreferencesKey !== sidebarStorageKey || archivedSessionIds.length === 0) return
     const cleanup = async () => {
@@ -1446,7 +1448,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           setArchivedSessionIds(current => current.filter(id => id !== sessionId))
           setArchivedSessionTimestamps(current => Object.fromEntries(Object.entries(current).filter(([id]) => id !== sessionId)))
           setPinnedSessionIds(current => current.filter(id => id !== sessionId))
-          setOrderedSessionIds(current => current.filter(id => id !== sessionId))
           if (selectedSession === sessionId) {
             setSelectedSession(fallback?.id ?? '')
             if (fallback) setSelectedProject(fallback.projectId)
@@ -1481,16 +1482,33 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         ]
       })
     }).catch(error => setProjectError(`加载会话列表失败：${error instanceof Error ? error.message : String(error)}`))
-    if (!host.listExternalSessions) {
-      setExternalSessions(current => current.filter(session => session.projectId !== selectedProject))
-      return
-    }
+    if (!host.listExternalSessions || scanExternal.loading || !scanExternal.enabled) return
     void host.listExternalSessions(selectedProject).then(items => {
       setExternalSessions(current => replaceProjectExternalSessions(current, selectedProject, items))
     }).catch(() => {
       setExternalSessions(current => replaceProjectExternalSessions(current, selectedProject, []))
     })
   }, [beginSessionListRequest, host, isCurrentSessionListRequest, projectsLoaded, selectedProject])
+  useEffect(() => {
+    if (scanExternal.loading) return
+    if (!scanExternal.enabled) {
+      setExternalSessions(current => current.length === 0 ? current : [])
+      if (!isExternalSessionId(selectedSessionRef.current)) return
+      const fallback = sessionsRef.current.find(session => session.projectId === selectedProjectRef.current)
+        ?? sessionsRef.current[0]
+      if (fallback) {
+        setSelectedProject(fallback.projectId)
+        setSelectedSession(fallback.id)
+      } else {
+        setSelectedSession('')
+      }
+      return
+    }
+    if (!projectsLoaded || !host.listExternalSessions) return
+    void loadExternalSessionsForProjects(host.listExternalSessions, projects).then(items => {
+      setExternalSessions(items)
+    })
+  }, [host, projects, projectsLoaded, scanExternal.enabled, scanExternal.loading])
   useEffect(() => {
     if (!projectsLoaded || !selectedProject || !selectedSession) return
     const knownPi = sessions.some(session => session.id === selectedSession && session.projectId === selectedProject)
@@ -1897,6 +1915,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         if (event.phase === 'end') setStatsRefreshKey(key => key + 1)
         return
       }
+      if (event.type === 'secret_redact') {
+        const next = applySecretRedact(messagesRef.current, event.messages)
+        if (next !== messagesRef.current) {
+          transcriptLiveRevisionRef.current += 1
+          messagesRef.current = next
+          messagesBySessionRef.current.set(event.sessionId, next)
+          setMessages(next)
+        }
+        return
+      }
       if (event.type === 'user_message') {
         const pendingEcho = pendingLocalUserRef.current
         pendingLocalUserRef.current = null
@@ -2039,6 +2067,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     // keep the previous selected-only behavior.
     const unsubscribeBackground = host.subscribeAllStreams?.(event => {
       if (event.sessionId === selectedSession) return
+      if (event.type === 'secret_redact') {
+        const current = messagesBySessionRef.current.get(event.sessionId)
+        if (current) {
+          const next = applySecretRedact(current, event.messages)
+          if (next !== current) messagesBySessionRef.current.set(event.sessionId, next)
+        }
+        return
+      }
       if (event.type === 'user_message') {
         if (shouldOpenTurnOnUserMessage(event.content, observedSessionStatusesRef.current[event.sessionId] === 'running')) {
           applyObservedStatus(event.sessionId, 'running')
@@ -2244,7 +2280,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
   }
   const handleCopy = async (message: ChatMessage) => {
-    const text = message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content
+    const text = displaySecretPlaceholders(message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content)
     if (!text.trim()) return
     await navigator.clipboard.writeText(text)
     if (copiedTimerRef.current !== null) window.clearTimeout(copiedTimerRef.current)
@@ -2256,7 +2292,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }
   const handleResend = (message: ChatMessage) => {
     // Electron has no fork/resend RPC yet: this deliberately sends a new prompt.
-    const text = message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content
+    const text = displaySecretPlaceholders(message.role === 'user' ? stripAttachmentPathsForDisplay(message.content) : message.content)
     void send(text).catch(() => undefined)
   }
   const resendDisabled = Boolean(!canWriteLease || streaming || sessionQueue.busy)
@@ -2400,10 +2436,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [externalSessions, modelState, observedSessionStatuses, selectedSession, sessionModels, sessions, sidebarAgents, streaming])
   const pinnedSessionIdSet = useMemo(() => new Set(pinnedSessionIds), [pinnedSessionIds])
   const archivedSessionIdSet = useMemo(() => new Set(archivedSessionIds), [archivedSessionIds])
-  const pinnedSidebarSessions = useMemo(() => pinnedSessionIds.flatMap(id => {
-    const session = sidebarSessionById.get(id)
-    return session ? [session] : []
-  }), [pinnedSessionIds, sidebarSessionById])
+  const pinnedSidebarSessions = useMemo(() => sessionsByActivityAndManualOrder(
+    pinnedSessionIds.flatMap(id => {
+      const session = sidebarSessionById.get(id)
+      return session ? [session] : []
+    })
+  ), [pinnedSessionIds, sidebarSessionById])
   // Archived sessions are global (not per-project), Swift archivedSessionsSection parity.
   const archivedSidebarSessions = useMemo(() => archivedSessionIds.flatMap(id => {
     const session = sidebarSessionById.get(id)
@@ -2417,11 +2455,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     sessions: sessionsByActivityAndManualOrder([
       ...sessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)),
       ...externalSessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)),
-    ], orderedSessionIds).flatMap(session => {
+    ]).flatMap(session => {
       const mapped = sidebarSessionById.get(session.id)
       return mapped ? [mapped] : []
     })
-  })), [archivedSessionIdSet, externalSessions, orderedSessionIds, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
+  })), [archivedSessionIdSet, externalSessions, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
   const sidebarProjectMenuUnavailable = useMemo<ProjectMenuUnavailable>(() => ({
     ...(!host.renameProject ? { rename: '待宿主支持' } : {}),
     ...(!host.removeProject ? { remove: '当前连接不支持移除项目' } : {}),
@@ -2580,60 +2618,28 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setProjectError(`调整项目顺序失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  const moveSidebarSession = async (sessionId: string, targetProjectId: string, targetSessionId?: string, placement: SidebarDropPlacement = 'after') => {
-    if (isExternalSessionId(sessionId) || (targetSessionId && isExternalSessionId(targetSessionId))) return
+  const moveSidebarSession = async (sessionId: string, targetProjectId: string) => {
+    if (isExternalSessionId(sessionId)) return
     const source = sessions.find(session => session.id === sessionId)
-    if (!source) return
+    if (!source || source.projectId === targetProjectId) return
     const snapshot = sessions
-    const snapshotOrder = orderedSessionIds
     const snapshotPinned = pinnedSessionIds
-    const projectOrder = projects.flatMap(project => sidebarProjects.find(item => item.id === project.id)?.sessions.map(session => session.id) ?? [])
-    const allIds = [...projectOrder, ...sessions.map(session => session.id).filter(id => !projectOrder.includes(id))]
-    let nextIds = allIds.filter(id => id !== sessionId)
-    if (targetSessionId && nextIds.includes(targetSessionId)) {
-      const target = nextIds.indexOf(targetSessionId)
-      nextIds.splice(target + (placement === 'after' ? 1 : 0), 0, sessionId)
-    } else {
-      const targetProjectIds = nextIds.filter(id => sessions.find(session => session.id === id)?.projectId === targetProjectId)
-      const last = targetProjectIds.at(-1)
-      const insertAt = last ? nextIds.indexOf(last) + 1 : nextIds.length
-      nextIds.splice(insertAt, 0, sessionId)
-    }
-    const participants = new Set(orderedSessionIds)
-    if (targetSessionId) {
-      participants.add(sessionId)
-      participants.add(targetSessionId)
-    }
-    const nextManualOrder = nextIds.filter(id => participants.has(id))
     setSessions(current => current.map(session => session.id === sessionId ? { ...session, projectId: targetProjectId } : session))
-    setOrderedSessionIds(nextManualOrder)
     setPinnedSessionIds(current => current.filter(id => id !== sessionId))
     setSidebarExpandedIds(current => current.includes(targetProjectId) ? current : [...current, targetProjectId])
     try {
-      if (source.projectId !== targetProjectId) {
-        const moved = await host.moveSession(sessionId, targetProjectId)
-        setSessions(current => current.map(session => session.id === sessionId ? moved : session))
-        if (selectedSession === sessionId) setSelectedProject(targetProjectId)
-      }
+      const moved = await host.moveSession(sessionId, targetProjectId)
+      setSessions(current => current.map(session => session.id === sessionId ? moved : session))
+      if (selectedSession === sessionId) setSelectedProject(targetProjectId)
     } catch (error) {
       setSessions(snapshot)
-      setOrderedSessionIds(snapshotOrder)
       setPinnedSessionIds(snapshotPinned)
       setProjectError(`移动会话失败：${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  const moveSidebarSessionToPinned = (sessionId: string, targetSessionId?: string, placement: SidebarDropPlacement = 'after') => {
+  const moveSidebarSessionToPinned = (sessionId: string) => {
     if (isExternalSessionId(sessionId)) return
-    setPinnedSessionIds(current => {
-      const next = current.filter(id => id !== sessionId)
-      if (targetSessionId && next.includes(targetSessionId)) {
-        const target = next.indexOf(targetSessionId)
-        next.splice(target + (placement === 'after' ? 1 : 0), 0, sessionId)
-      } else {
-        next.push(sessionId)
-      }
-      return next
-    })
+    setPinnedSessionIds(current => current.includes(sessionId) ? current : [...current, sessionId])
   }
   const resize = (pane: keyof PaneWidths, start: number) => (event: React.PointerEvent) => { const origin = event.clientX; const onMove = (move: PointerEvent) => setWidths(current => ({ ...current, [pane]: clamp(start + (pane === 'sidebar' ? move.clientX - origin : origin - move.clientX), pane === 'sidebar' ? 190 : 270, pane === 'sidebar' ? 440 : 620) })); const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }; window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', done) }
   const resizeTools = (event: React.PointerEvent) => {
@@ -2801,7 +2807,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} sessionId={selectedSession} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} sessionId={selectedSession} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
       if (!selectedSession || !host.browser) return

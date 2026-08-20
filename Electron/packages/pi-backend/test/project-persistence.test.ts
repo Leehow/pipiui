@@ -147,18 +147,18 @@ describe("explicit sidebar project persistence", () => {
     const first = backend(fixture.agent, fixture.sessions);
     expect(await first.handle("getComputerUseState", [])).toEqual({ enabled: false });
     expect(await first.handle("setComputerUseEnabled", [true])).toEqual({ enabled: true });
-    expect(await first.handle("setSubagentModel", ["operator", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
-      operator: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
+    expect(await first.handle("setSubagentModel", ["computer-use", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
+      "computer-use": [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
     expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
-	  expect.objectContaining({ name: "computer-use-leader" }),
-      expect.objectContaining({ name: "operator" }),
-	  expect.objectContaining({ name: "computer-verifier" }),
+      expect.objectContaining({ name: "computer-use" }),
     ]));
+    const listed = await first.handle("listAgentDefinitions", []) as Array<{ name: string }>;
+    expect(listed.map((a) => a.name)).toEqual(["explore", "general-purpose", "reviewer", "computer-use", "secretary"]);
     const fresh = backend(fixture.agent, fixture.sessions);
     expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });
     expect(await fresh.handle("getSubagentModels", [])).toEqual({
-      operator: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
+      "computer-use": [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
   });
 

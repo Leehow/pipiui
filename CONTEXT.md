@@ -1,30 +1,26 @@
 # PipiUI
 
-Ubiquitous language for the PipiUI project — an Electron-first macOS agent host with an
+Ubiquitous language for the PipiUI project — an Electron macOS/Linux agent host with an
 orchestration runtime. Glossary only: no implementation details, no plans, no status.
 
 ## Product
 
 **Canonical App**:
-One of the two user-authorized packaged apps: `build/PipiUI Electron.app` (default) or
-`build/PipiUI.app` (Swift, frozen). Only the primary checkout may create them.
+The user-authorized packaged app: `build/PipiUI Electron.app`. Only the primary checkout may
+create it. The former Swift/SwiftUI edition was retired in 2026-08 and removed from the repo.
 _Avoid_: the app, the build, the bundle
 
 **Electron edition**:
-The default product (`Electron/packages/ui` → `build/PipiUI Electron.app`). All UI, product,
-and acceptance work targets it unless the user explicitly names Swift.
-
-**Swift edition**:
-The frozen SwiftUI app (`build/PipiUI.app`). No features, fixes, or packaging unless the user
-explicitly asks for it in the current turn.
+The only product (`Electron/packages/ui` → `build/PipiUI Electron.app`). All UI, product,
+and acceptance work targets it.
 
 **fast-app**:
 The `pipiui-electron-build` skill's quick packaging mode: host arch, signed, no DMG/ZIP.
 _Avoid_: quick build, dev package
 
-**Runtime mirror**:
-`Sources/PipiUI/PiExt` and `Sources/PipiUI/PiPhilosophy`, Swift-app copies of
-`Electron/resources/runtime/`. Never synced from Electron without an explicit request.
+**Bundled runtime**:
+`Electron/resources/runtime/` (pi-ext + pi-philosophy): the single source of truth for the
+pi runtime shipped inside the App.
 
 ## Orchestration
 
@@ -60,6 +56,20 @@ Machine testimony; the only acceptance evidence, outranking worker-claimed succe
 The per-session orchestration record under `.pi/boss/`. Runtime writes `## Tasks`; the Boss
 writes judgement (`## Decisions`, `## Done`, `## Risks & open questions`) via `ledger_note`.
 Session-scoped — durable vocabulary goes to `CONTEXT.md`, durable decisions to `docs/adr/`.
+Addressed to the Boss after a compaction; what workers must read is **Shared context**.
+
+**Findings**:
+A finished worker's FULL report, written by the runtime to `.pi/findings/<agentId>.md` and
+named by the `Findings:` line of its `[subagent-done]`. Exists so evidence can cross the
+fan-out boundary without entering the Boss's context: the Boss forwards the path into the
+next brief and does not read the file. Replaced, not accumulated, when an agentId is
+re-dispatched.
+
+**Shared context**:
+The Boss-written document under `.pi/context/`, read by every worker on a goal — shared
+architecture, conventions, decisions all workers must respect — so that half of a brief is
+written once instead of retyped per worker. Boss-only writer via `context_doc` (`set`
+replaces a section, `append` extends it); workers read and never edit it.
 
 ## Runtime
 

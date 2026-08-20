@@ -213,7 +213,7 @@ test("stall watchdog aborts a sync wait and an unanswered background stall", () 
 });
 
 test("runtime timeout aborts the exact run before provider or transient auto-resume", () => {
-	const source = readFileSync(new URL("../../../../../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 	assert.match(source, /currentResult\.stopReason = "runtime_timeout";[\s\S]*?handleForRun\(pipiuiAgentId, runId\)\?\.controller\.abort\(\);/);
 	const retryDecision = source.indexOf("// Decide whether to auto-resume before verify/end");
 	const abortShortCircuit = source.indexOf("if (wasAborted) break;", retryDecision);
@@ -237,7 +237,7 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 });
 
 test("runtime budget expiry is progress-aware, notifies the boss once, and retries terminal reports", () => {
-	const source = readFileSync(new URL("../../../../../../Sources/PipiUI/PiExt/subagent/index.ts", import.meta.url), "utf8");
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 	// The onTimeout body decides before it kills: decide → diagnostic → stopReason → abort,
 	// while extend/notify branches never reach controller.abort().
 	const armIdx = source.indexOf("runtimeTimeout = createRunScopedTimeout({");

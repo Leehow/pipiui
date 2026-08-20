@@ -937,6 +937,8 @@ describe('BrowserTabsHost dual viewport',
       await host.loadURL('example.com')
       expect(created[0].contents.enableDeviceEmulation).not.toHaveBeenCalled()
       expect(created[0].contents.setZoomFactor).toHaveBeenLastCalledWith(1)
+      await host.setZoomFactor(1.2)
+      expect(created[0].contents.setZoomFactor).toHaveBeenLastCalledWith(1.2)
       await expect(host.toolAction({ action: 'observe' })).resolves.toMatchObject({
         ok: true,
         viewport: { width: 368, height: 640 },

@@ -80,6 +80,10 @@ describe('SubagentModelModal', () => {
       hiddenIds: new Set(),
     })} onClose={() => undefined} />)
     await screen.findByTestId('subagent-agent-computer-use')
+    expect(screen.queryByTestId('subagent-agent-computer-use-leader')).toBeNull()
+    expect(screen.queryByTestId('subagent-agent-operator')).toBeNull()
+    expect(screen.queryByTestId('subagent-agent-computer-verifier')).toBeNull()
+    expect(screen.queryByTestId('subagent-agent-computer-terminal')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'computer-use 0 模型' }))
     expect(screen.getByTestId('subagent-model-option-computer-use-0-xai-grok-4.5').textContent).toContain('xai/grok-4.5')
     expect(screen.getByTestId('subagent-model-option-computer-use-0-github-copilot-grok-4.5').textContent).toContain('github-copilot/grok-4.5')

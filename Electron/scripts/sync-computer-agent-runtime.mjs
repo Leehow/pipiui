@@ -1,29 +1,15 @@
 #!/usr/bin/env node
-import { cp, mkdir, readFile, stat } from "node:fs/promises";
+// History: this script mirrored shared Computer Agent files from the Swift app
+// (Sources/PipiUI/PiExt) into the Electron runtime. The Swift app has been
+// retired, so resources/runtime/pi-ext is now the single source of truth and
+// there is nothing left to sync. The script keeps its npm-script wiring
+// (predev/prebuild/pretest) purely to enforce the Cua driver contract.
+import { readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const repoRoot = resolve(electronRoot, "..");
-const sourceRoot = join(repoRoot, "Sources", "PipiUI", "PiExt");
 const runtimeRoot = join(electronRoot, "resources", "runtime", "pi-ext");
-const philosophySourceRoot = join(repoRoot, "Sources", "PipiUI", "PiPhilosophy");
-const philosophyRuntimeRoot = join(electronRoot, "resources", "runtime", "pi-philosophy");
-const mirrors = [
-  ...[
-  // Electron owns resources/runtime/pi-ext/subagent and packages/computer-agent.
-  // Sources/PipiUI/PiExt is the frozen Swift-app mirror and must not overwrite
-  // the default product during normal Electron dev/build/test preparation.
-  "agents/operator/AGENT.md",
-  "agents/computer-use-leader/AGENT.md",
-  "agents/computer-verifier/AGENT.md",
-  "agents/computer-terminal/AGENT.md",
-  ].map((relative) => ({ sourceRoot, runtimeRoot, relative })),
-  ...[
-    "layers/30-orchestration.md",
-    "capabilities.json",
-  ].map((relative) => ({ sourceRoot: philosophySourceRoot, runtimeRoot: philosophyRuntimeRoot, relative })),
-];
 
 async function checkCuaContract() {
   const [assetsText, skillText] = await Promise.all([
@@ -37,45 +23,5 @@ async function checkCuaContract() {
   }
 }
 
-async function filesUnder(root, relative = "") {
-  const target = join(root, relative);
-  const metadata = await stat(target);
-  if (metadata.isFile()) return [relative];
-  const { readdir } = await import("node:fs/promises");
-  const entries = await readdir(target, { withFileTypes: true });
-  const nested = await Promise.all(entries
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((entry) => filesUnder(root, join(relative, entry.name))));
-  return nested.flat();
-}
-
-async function checkPath({ sourceRoot, runtimeRoot, relative }) {
-  const sourceFiles = await filesUnder(sourceRoot, relative);
-  const runtimeFiles = await filesUnder(runtimeRoot, relative).catch(() => []);
-  if (sourceFiles.join("\n") !== runtimeFiles.join("\n")) return false;
-  for (const file of sourceFiles) {
-    const [source, runtime] = await Promise.all([
-      readFile(join(sourceRoot, file)),
-      readFile(join(runtimeRoot, file)).catch(() => undefined),
-    ]);
-    if (!runtime || !source.equals(runtime)) return false;
-  }
-  return true;
-}
-
-if (process.argv.includes("--check")) {
-  await checkCuaContract();
-  const results = await Promise.all(mirrors.map(checkPath));
-  if (results.some((result) => !result)) {
-    throw new Error("Electron Computer Agent runtime is stale; run npm run sync:computer-agent");
-  }
-  console.log("Computer Agent runtime mirror is current.");
-} else {
-  await checkCuaContract();
-  for (const { sourceRoot, runtimeRoot, relative } of mirrors) {
-    const destination = join(runtimeRoot, relative);
-    await mkdir(dirname(destination), { recursive: true });
-    await cp(join(sourceRoot, relative), destination, { recursive: true, force: true });
-  }
-  console.log("Synchronized shared Computer Agent into Electron runtime resources.");
-}
+await checkCuaContract();
+console.log("Computer Agent runtime contract OK.");

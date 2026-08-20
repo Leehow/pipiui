@@ -173,26 +173,42 @@ describe('Sidebar', () => {
     expect(onMoveProject).toHaveBeenCalledWith('p1', 'p2', 'after')
   })
 
-  it('reorders sessions and moves one onto another project', () => {
+  it('moves a session only when dropped on a session in another project', () => {
     const onMoveSession = vi.fn()
-    render(<Sidebar {...defaultProps({ onMoveSession })} />)
-    const rows = screen.getAllByTestId('session-row')
-    const s1 = rows.find(row => row.getAttribute('data-session-id') === 's1')!
-    const s2 = rows.find(row => row.getAttribute('data-session-id') === 's2')!
+    render(<Sidebar {...defaultProps({ onMoveSession, expandedIds: ['p1', 'p2'] })} />)
+    const row = (id: string) => screen.getAllByTestId('session-row').find(item => item.getAttribute('data-session-id') === id)!
     const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
-    fireEvent.dragStart(s1, { dataTransfer: transfer })
-    fireEvent.dragOver(s2, { dataTransfer: transfer, clientY: 10 })
-    fireEvent.drop(s2, { dataTransfer: transfer, clientY: 10 })
-    expect(onMoveSession).toHaveBeenLastCalledWith('s1', 'p1', 's2', 'after')
+    fireEvent.dragStart(row('s1'), { dataTransfer: transfer })
+    fireEvent.dragOver(row('s2'), { dataTransfer: transfer, clientY: 10 })
+    expect(row('s2').getAttribute('data-drop-target')).toBeNull()
+    fireEvent.drop(row('s2'), { dataTransfer: transfer, clientY: 10 })
+    expect(onMoveSession).not.toHaveBeenCalled()
 
-    fireEvent.dragStart(s1, { dataTransfer: transfer })
-    const p2 = screen.getAllByTestId('project-row')[1]
-    fireEvent.dragOver(p2, { dataTransfer: transfer })
-    fireEvent.drop(p2, { dataTransfer: transfer })
-    expect(onMoveSession).toHaveBeenLastCalledWith('s1', 'p2')
+    fireEvent.dragStart(row('s1'), { dataTransfer: transfer })
+    fireEvent.dragOver(row('s3'), { dataTransfer: transfer })
+    expect(row('s3').getAttribute('data-drop-target')).toBe('true')
+    fireEvent.drop(row('s3'), { dataTransfer: transfer })
+    expect(onMoveSession).toHaveBeenCalledTimes(1)
+    expect(onMoveSession).toHaveBeenCalledWith('s1', 'p2')
   })
 
-  it('pins by dropping into the pinned section and unpins by dropping onto a project', () => {
+  it('moves a session onto another project row and highlights it', () => {
+    const onMoveSession = vi.fn()
+    render(<Sidebar {...defaultProps({ onMoveSession })} />)
+    const row = screen.getAllByTestId('session-row').find(item => item.getAttribute('data-session-id') === 's1')!
+    const [p1, p2] = screen.getAllByTestId('project-row')
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(row, { dataTransfer: transfer })
+    fireEvent.dragOver(p1, { dataTransfer: transfer })
+    expect(p1.getAttribute('data-session-drop')).toBeNull()
+    fireEvent.dragOver(p2, { dataTransfer: transfer })
+    expect(p2.getAttribute('data-session-drop')).toBe('true')
+    fireEvent.drop(p2, { dataTransfer: transfer })
+    expect(onMoveSession).toHaveBeenCalledTimes(1)
+    expect(onMoveSession).toHaveBeenCalledWith('s1', 'p2')
+  })
+
+  it('pins by dropping into the pinned section and does not unpin onto a project row', () => {
     const onMoveSession = vi.fn()
     const onMoveSessionToPinned = vi.fn()
     render(<Sidebar {...defaultProps({ onMoveSession, onMoveSessionToPinned })} />)
@@ -202,17 +218,17 @@ describe('Sidebar', () => {
     fireEvent.dragStart(row, { dataTransfer: transfer })
     fireEvent.dragOver(pinned, { dataTransfer: transfer })
     fireEvent.drop(pinned, { dataTransfer: transfer })
-    expect(onMoveSessionToPinned).toHaveBeenCalledWith('s1', undefined, 'after')
+    expect(onMoveSessionToPinned).toHaveBeenCalledWith('s1')
 
     const pinnedRow = (screen.getAllByTestId('session-row')).find(item => item.getAttribute('data-session-id') === 'pin1')!
-    const project = screen.getAllByTestId('project-row')[1]
+    const sameProject = screen.getAllByTestId('project-row')[0]
     fireEvent.dragStart(pinnedRow, { dataTransfer: transfer })
-    fireEvent.dragOver(project, { dataTransfer: transfer })
-    fireEvent.drop(project, { dataTransfer: transfer })
-    expect(onMoveSession).toHaveBeenCalledWith('pin1', 'p2')
+    fireEvent.dragOver(sameProject, { dataTransfer: transfer })
+    fireEvent.drop(sameProject, { dataTransfer: transfer })
+    expect(onMoveSession).not.toHaveBeenCalled()
   })
 
-  it('reorders pinned sessions by dragging one over another', () => {
+  it('does not reorder pinned sessions against each other', () => {
     const onMoveSessionToPinned = vi.fn()
     render(<Sidebar {...defaultProps({ pinnedSessions: [session({ id: 'pin1' }), session({ id: 'pin2' })], onMoveSessionToPinned })} />)
     const rows = screen.getAllByTestId('session-row')
@@ -222,7 +238,26 @@ describe('Sidebar', () => {
     fireEvent.dragStart(pin1, { dataTransfer: transfer })
     fireEvent.dragOver(pin2, { dataTransfer: transfer, clientY: 10 })
     fireEvent.drop(pin2, { dataTransfer: transfer, clientY: 10 })
-    expect(onMoveSessionToPinned).toHaveBeenCalledWith('pin1', 'pin2', 'after')
+    expect(onMoveSessionToPinned).not.toHaveBeenCalled()
+  })
+
+  it('archives a session dropped on the archived section', () => {
+    const onArchiveSession = vi.fn()
+    const onUnarchiveSession = vi.fn()
+    render(<Sidebar {...defaultProps({
+      archivedSessions: [session({ id: 'old' })],
+      onMoveSession: vi.fn(),
+      onArchiveSession,
+      onUnarchiveSession
+    })} />)
+    const row = screen.getAllByTestId('session-row').find(item => item.getAttribute('data-session-id') === 's1')!
+    const archived = screen.getByLabelText('已归档')
+    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
+    fireEvent.dragStart(row, { dataTransfer: transfer })
+    fireEvent.dragOver(archived, { dataTransfer: transfer })
+    expect(archived.getAttribute('data-drop-active')).toBe('true')
+    fireEvent.drop(archived, { dataTransfer: transfer })
+    expect(onArchiveSession).toHaveBeenCalledWith('s1')
   })
 
   it('filters projects and sessions by title', () => {
@@ -581,6 +616,9 @@ describe('Sidebar', () => {
     expect(external.getAttribute('aria-label')).toBe('Anthropic/Claude · Claude 记录')
     expect(external.getAttribute('title')).toBe('Anthropic/Claude · Claude 记录')
     expect(within(external).getByTestId('session-source-claude')).toBeTruthy()
+    expect(within(external).getByTestId('session-external-badge').textContent).toBe('外部')
+    const piRow = document.querySelector('[data-session-id="s1"]') as HTMLElement
+    expect(within(piRow).queryByTestId('session-external-badge')).toBeNull()
     expect(within(external).queryByRole('button', { name: '置顶' })).toBeNull()
     expect(within(external).queryByRole('button', { name: '修改标题' })).toBeNull()
     expect(within(external).queryByRole('button', { name: '归档会话' })).toBeNull()

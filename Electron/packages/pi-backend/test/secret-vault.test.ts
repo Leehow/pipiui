@@ -99,6 +99,15 @@ describe("secret vault", () => {
     expect(text).not.toContain("ghp_historysecret");
   });
 
+  it("replaceSecrets applies newly put values to later chunks", () => {
+    const stream = new StreamRedactor([]);
+    expect(stream.push("再给你 ")).toBe("再给你 ");
+    stream.replaceSecrets([{ id: "1", name: "cst", envName: "CSTCLOUD_API_KEY", value: "vault-test-secret-AAAA" }]);
+    expect(stream.push("vault-test-secret-")).toBe("");
+    expect(stream.push("AAAA!")).toBe("{{secret:CSTCLOUD_API_KEY}}!");
+    expect(stream.flush()).not.toContain("vault-test-secret-AAAA");
+  });
+
   it("holds a split secret until the second chunk completes", () => {
     const secrets = [{ id: "1", name: "demo", envName: "DEMO_TOKEN", value: "abcdefgh" }];
     const stream = new StreamRedactor(secrets);

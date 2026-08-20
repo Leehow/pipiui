@@ -1,5 +1,6 @@
-import type { HistoryEntry, StreamEvent } from '@pipi/host-api'
+import type { HistoryEntry, HistoryTool, StreamEvent } from '@pipi/host-api'
 import { stripAttachmentPathsForDisplay } from './attachments'
+import { displaySecretPlaceholders } from './secret-display'
 
 export type TranscriptTool = {
   id: string
@@ -124,10 +125,25 @@ export function planAssistantTranscript(message: Pick<ChatMessage, 'content' | '
  * liveness is deliberately absent: a tool_result always completes the durable
  * tool record, while live children remain an independent presentation layer.
  */
+function displayHistoryEntry(entry: HistoryEntry): HistoryEntry {
+  return {
+    ...entry,
+    content: displaySecretPlaceholders(entry.content),
+    ...(entry.thinking ? { thinking: displaySecretPlaceholders(entry.thinking) } : {}),
+    ...(entry.errorMessage ? { errorMessage: displaySecretPlaceholders(entry.errorMessage) } : {}),
+    ...(entry.tools ? { tools: entry.tools.map(tool => ({ ...tool, input: displaySecretPlaceholders(tool.input) })) } : {}),
+    ...(entry.activities ? {
+      activities: entry.activities.map(activity => activity.type === 'tool'
+        ? { ...activity, tool: { ...activity.tool, input: displaySecretPlaceholders(activity.tool.input) } }
+        : { ...activity, content: displaySecretPlaceholders(activity.content) }),
+    } : {}),
+  }
+}
+
 export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
   const cards = new Map<string, TranscriptTool>()
   const messages: ChatMessage[] = []
-  for (const entry of entries) {
+  for (const entry of entries.map(displayHistoryEntry)) {
     if (entry.role === 'compaction') {
       messages.push({ id: entry.id, role: 'compaction', content: entry.content ?? '', timestamp: entry.timestamp })
       continue
@@ -216,10 +232,76 @@ export function reconcileHistorySnapshot(
   return { status: 'accepted', messages, fingerprint }
 }
 
+export type SecretRedactPatch = {
+  id: string
+  role?: ChatMessage['role']
+  content: string
+  thinking?: string
+  tools?: HistoryTool[]
+}
+
+function applySecretRedactPatch(message: ChatMessage, patch: SecretRedactPatch): ChatMessage {
+  const content = displaySecretPlaceholders(message.role === 'user' ? stripAttachmentPathsForDisplay(patch.content) : patch.content)
+  const thinking = patch.thinking !== undefined ? displaySecretPlaceholders(patch.thinking) : message.thinking
+  let tools = message.tools
+  if (patch.tools && message.tools) {
+    tools = message.tools.map(tool => {
+      const nextTool = patch.tools!.find(item => item.id === tool.id)
+      return nextTool ? { ...tool, input: displaySecretPlaceholders(nextTool.input) } : tool
+    })
+  }
+  let activities = message.activities
+  if (activities) {
+    const oldJoined = activities.filter(activity => activity.type === 'text').map(activity => activity.content).join('')
+    activities = activities.map((activity, index, items) => {
+      if (activity.type === 'thinking' && patch.thinking !== undefined) {
+        return { ...activity, content: displaySecretPlaceholders(patch.thinking) }
+      }
+      if (activity.type === 'text' && oldJoined && oldJoined !== content) {
+        const first = items.findIndex(item => item.type === 'text') === index
+        return first ? { ...activity, content } : { ...activity, content: '' }
+      }
+      if (activity.type === 'tool' && patch.tools) {
+        const nextTool = patch.tools.find(item => item.id === activity.tool.id)
+        return nextTool ? { ...activity, tool: { ...activity.tool, input: displaySecretPlaceholders(nextTool.input) } } : activity
+      }
+      return activity
+    }).filter(activity => activity.type !== 'text' || activity.content)
+  }
+  if (message.content === content && message.thinking === thinking && tools === message.tools && activities === message.activities) return message
+  return { ...message, content, thinking, tools, activities }
+}
+
+export function applySecretRedact(messages: ChatMessage[], patches: readonly SecretRedactPatch[]): ChatMessage[] {
+  if (patches.length === 0) return messages
+  const remaining = new Map(patches.map(patch => [patch.id, patch]))
+  let changed = false
+  const next = messages.map(message => {
+    const patch = remaining.get(message.id)
+    if (!patch) return message
+    remaining.delete(message.id)
+    const updated = applySecretRedactPatch(message, patch)
+    if (updated !== message) changed = true
+    return updated
+  })
+  if (remaining.size > 0) {
+    const leftover = [...remaining.values()].find(patch => patch.role === 'user')
+    const lastUserIndex = next.findLastIndex(message => message.role === 'user')
+    if (leftover && lastUserIndex >= 0) {
+      const updated = applySecretRedactPatch(next[lastUserIndex], leftover)
+      if (updated !== next[lastUserIndex]) {
+        next[lastUserIndex] = updated
+        changed = true
+      }
+    }
+  }
+  return changed ? next : messages
+}
+
 export function appendLiveUserMessage(messages: ChatMessage[], incoming: { content: string; id?: string; images?: ChatMessage['images'] }, match?: { id: string; content: string }): ChatMessage[] {
   const raw = incoming.content
   if (!raw) return messages
-  const content = stripAttachmentPathsForDisplay(raw)
+  const content = displaySecretPlaceholders(stripAttachmentPathsForDisplay(raw))
   // Server echo of our own just-sent bubble: merge back into the optimistic
   // bubble by id — in place, so an assistant placeholder that already streamed
   // after it cannot wedge a duplicate below it.
@@ -247,7 +329,13 @@ export function appendLiveUserMessage(messages: ChatMessage[], incoming: { conte
 }
 
 export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamEvent, { type: 'status' }>): ChatMessage[] {
-  if (event.type === 'error') return applyTurnError(previous, event.content)
+  if (event.type === 'secret_redact') return applySecretRedact(previous, event.messages)
+  if (event.type === 'error') return applyTurnError(previous, displaySecretPlaceholders(event.content))
+  if (event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call') {
+    if (event.delta) event = { ...event, delta: displaySecretPlaceholders(event.delta) }
+  } else if (event.type === 'tool_result') {
+    event = { ...event, content: displaySecretPlaceholders(event.content) }
+  }
   if (event.type !== 'text' && event.type !== 'thinking' && event.type !== 'tool_call' && event.type !== 'tool_result') return previous
   const index = previous.findLastIndex(item => item.role === 'assistant')
   const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
