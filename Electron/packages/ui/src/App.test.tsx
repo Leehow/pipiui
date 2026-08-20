@@ -2454,6 +2454,34 @@ describe('session switch transcript cache', () => {
     expect(getSessionHistory.mock.calls.length).toBe(loadsBeforeNew)
   })
 
+  it('reloads on-disk history when returning to a locally created session that stayed UI-empty', async () => {
+    const base = createMockHost()
+    const newSession = vi.spyOn(base, 'newSession')
+    const persisted = new Map<string, HistoryEntry[]>()
+    const getSessionHistory = vi.fn(async (sessionId: string) => persisted.get(sessionId) ?? base.getSessionHistory(sessionId))
+    const host: PipiHostAPI = { ...base, getSessionHistory }
+    const { container } = render(<App host={host} />)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+
+    fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
+    await waitFor(() => expect(newSession).toHaveBeenCalled())
+    const created = await newSession.mock.results[0].value as Session
+    await waitFor(() => expect(container.querySelector(`[data-session-id="${created.id}"]`)?.getAttribute('aria-current')).toBe('true'))
+    expect(screen.queryByText('添加记忆的时候经常报超出长度')).toBeNull()
+
+    persisted.set(created.id, [
+      { id: 'u-mem', role: 'user', content: '添加记忆的时候经常报超出长度', timestamp: Date.now() - 1_000 },
+      { id: 'a-mem', role: 'assistant', content: '根因就是工具提示没说明 5000 字符限制', timestamp: Date.now() },
+    ])
+
+    fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    await screen.findByText('请实现 Electron 三栏主界面。')
+    fireEvent.click(container.querySelector(`[data-session-id="${created.id}"]`)!)
+
+    expect(await screen.findByText('添加记忆的时候经常报超出长度')).toBeTruthy()
+    expect(screen.getByText('根因就是工具提示没说明 5000 字符限制')).toBeTruthy()
+  })
+
   it('keeps cached welcome history when a later empty page arrives after switching back', async () => {
     const base = createMockHost()
     let welcomeLoads = 0

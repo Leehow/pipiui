@@ -1064,6 +1064,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
   const historyFingerprintBySessionRef = useRef(new Map<string, string>())
   const locallyCreatedSessionIdsRef = useRef(new Set<string>())
+  const skippedInitialEmptyHistoryRef = useRef(new Set<string>())
   const transcriptLiveRevisionRef = useRef(0)
   const mutateLocalTranscript = useCallback((mutation: (current: ChatMessage[]) => ChatMessage[]) => {
     const current = messagesRef.current
@@ -1445,6 +1446,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             }
           }
           locallyCreatedSessionIdsRef.current.delete(sessionId)
+          skippedInitialEmptyHistoryRef.current.delete(sessionId)
           const archivedSet = new Set(archivedSessionIds)
           const fallback = sessions.find(session => session.id !== sessionId && !archivedSet.has(session.id))
           setSessions(current => current.filter(session => session.id !== sessionId))
@@ -1618,13 +1620,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       return
     }
     const cached = messagesBySessionRef.current.get(selectedSession)
-    // Skip re-reading only for sessions this UI instance created and that are
-    // still empty — for anything else a persisted-empty result may have been a
-    // transient host miss, and caching it forever would hide on-disk history.
+    // Skip the first JSONL read for a session this UI just created. An empty
+    // in-memory cache is not proof the file is still empty: the host may have
+    // written the turn while this renderer missed stream events. Skipping again
+    // on a later select would hide on-disk history forever.
     const knownNewEmptySession = contextChanged
       && locallyCreatedSessionIdsRef.current.has(selectedSession)
       && cached?.length === 0
       && historyCompleteBySessionRef.current.get(selectedSession) === true
+      && !skippedInitialEmptyHistoryRef.current.has(selectedSession)
+    if (knownNewEmptySession) skippedInitialEmptyHistoryRef.current.add(selectedSession)
     if (contextChanged) {
       activeUserTurnRef.current = false
       mainTurnOpenRef.current = false
