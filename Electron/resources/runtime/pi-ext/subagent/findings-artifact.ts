@@ -155,3 +155,119 @@ export function writeFindingsArtifact(
 export function formatFindingsLine(file: string): string {
 	return `Findings: ${file} — this worker's full report, on disk. Do NOT read it yourself; put this exact path in the next worker's brief ("read <path> first; it is the recon for this task, do not re-explore") so the implementer starts from the evidence instead of re-deriving it.`;
 }
+
+/**
+ * The safety net: tell a worker what is already on disk, without waiting to be told.
+ *
+ * Forwarding a findings path is the Boss's job and the precise one — a brief that names the
+ * file says "this is YOUR recon", which no generic list can say. But it is also a rule the
+ * Boss has to remember at dispatch time, several turns after the completion that produced the
+ * file, and possibly across a compaction that erased it. Leaving the whole benefit on that
+ * one thread of discipline reproduces the original problem: information sitting in a place
+ * nobody is required to look.
+ *
+ * So the worker is also told, at startup, which reports exist. Titles only — enough to decide
+ * whether one covers ground the task needs, not enough to be worth skipping the read. The
+ * brief's explicit pointer stays the primary path; this is what catches the dispatch where it
+ * was not passed.
+ *
+ * Deliberately small and deliberately not a summary. A digest would be a second copy of the
+ * evidence that goes stale; a list of titles cannot go stale in a way that misleads, because
+ * acting on it means opening the file.
+ */
+
+/** Enough to choose, few enough that scanning them is cheaper than one redundant grep. */
+export const FINDINGS_INDEX_MAX_ENTRIES = 8;
+export const FINDINGS_INDEX_MAX_CHARS = 1_200;
+/** Past this, a report describes a repository that has moved on; the noise outweighs it. */
+export const FINDINGS_INDEX_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
+
+export interface FindingsIndexEntry {
+	file: string;
+	agentId: string;
+	title: string;
+	ageMs: number;
+}
+
+/** Read the `# Title` line without loading a whole report into memory. */
+function readTitle(file: string, fallback: string): string {
+	try {
+		const head = fs.readFileSync(file, "utf-8").slice(0, 400);
+		const line = head.split("\n").find((l) => l.startsWith("# "));
+		return line ? line.slice(2).trim() || fallback : fallback;
+	} catch {
+		return fallback;
+	}
+}
+
+/**
+ * List the reports on disk, newest first, excluding `selfAgentId` — a worker's own prior
+ * report is either its own continued conversation (which it already has) or the file it is
+ * about to overwrite.
+ */
+export function listFindings(
+	mainCwd: string | undefined,
+	selfAgentId: string | undefined,
+	now: number = Date.now(),
+): FindingsIndexEntry[] {
+	if (!mainCwd) return [];
+	const dir = path.join(mainCwd, ".pi", FINDINGS_DIR);
+	let names: string[];
+	try {
+		names = fs.readdirSync(dir);
+	} catch {
+		return [];
+	}
+	const selfName = selfAgentId ? findingsFileName(selfAgentId) : undefined;
+	const entries: FindingsIndexEntry[] = [];
+	for (const name of names) {
+		if (!name.endsWith(".md") || name === selfName) continue;
+		const file = path.join(dir, name);
+		let ageMs: number;
+		try {
+			ageMs = now - fs.statSync(file).mtimeMs;
+		} catch {
+			continue;
+		}
+		if (ageMs > FINDINGS_INDEX_MAX_AGE_MS) continue;
+		const agentId = name.slice(0, -3);
+		entries.push({ file, agentId, title: readTitle(file, agentId), ageMs });
+	}
+	entries.sort((a, b) => a.ageMs - b.ageMs);
+	return entries.slice(0, FINDINGS_INDEX_MAX_ENTRIES);
+}
+
+function formatAge(ageMs: number): string {
+	const minutes = Math.floor(ageMs / 60_000);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.floor(minutes / 60);
+	return hours < 48 ? `${hours}h ago` : `${Math.floor(hours / 24)}d ago`;
+}
+
+/**
+ * The system-prompt block appended for a dispatched worker. Empty string when there is
+ * nothing to list, so a first worker on a clean project pays nothing.
+ */
+export function formatFindingsIndexBlock(entries: readonly FindingsIndexEntry[]): string {
+	if (entries.length === 0) return "";
+	const lines: string[] = [];
+	let budget = FINDINGS_INDEX_MAX_CHARS;
+	for (const entry of entries) {
+		const line = `- \`${entry.file}\` — ${entry.title} (${formatAge(entry.ageMs)})`;
+		if (line.length > budget) break;
+		budget -= line.length;
+		lines.push(line);
+	}
+	if (lines.length === 0) return "";
+	return [
+		"## Reports already on disk",
+		"",
+		"Earlier workers on this project left full reports here. If your brief names one, read",
+		"that one first — it is the recon for your task. Otherwise open one only when its title",
+		"covers ground your task would otherwise have to find for itself; searching for a file",
+		"is the expensive part, and these already paid it. Do not read them all, and do not",
+		"treat a title as a finding: only the file's contents are evidence.",
+		"",
+		...lines,
+	].join("\n");
+}

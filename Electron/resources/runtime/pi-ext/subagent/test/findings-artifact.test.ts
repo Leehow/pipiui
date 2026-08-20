@@ -5,8 +5,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
+	FINDINGS_INDEX_MAX_AGE_MS,
+	FINDINGS_INDEX_MAX_CHARS,
+	FINDINGS_INDEX_MAX_ENTRIES,
 	FINDINGS_MAX_CHARS,
 	findingsFileName,
+	formatFindingsIndexBlock,
+	listFindings,
 	findingsPath,
 	formatFindingsLine,
 	writeFindingsArtifact,
@@ -137,4 +142,70 @@ test("the handoff line tells the boss to forward the path, not to read it", () =
 	const line = formatFindingsLine("/repo/.pi/findings/x.md");
 	assert.match(line, /next worker's brief/);
 	assert.match(line, /do not re-explore/);
+});
+
+function seedFindings(root: string, entries: Array<{ id: string; title: string; ageMs: number }>): void {
+	const dir = path.join(root, ".pi", "findings");
+	fs.mkdirSync(dir, { recursive: true });
+	for (const entry of entries) {
+		const file = path.join(dir, `${entry.id}.md`);
+		fs.writeFileSync(file, `# ${entry.title}\n\nbody\n`, "utf-8");
+		const when = new Date(Date.now() - entry.ageMs);
+		fs.utimesSync(file, when, when);
+	}
+}
+
+test("the index lists other workers' reports, newest first, never the worker's own", () => {
+	const root = tempRoot();
+	seedFindings(root, [
+		{ id: "old-recon", title: "older recon", ageMs: 3 * 60 * 60 * 1000 },
+		{ id: "quota-pill", title: "quota pill recon", ageMs: 5 * 60 * 1000 },
+		{ id: "me", title: "my own prior run", ageMs: 60 * 1000 },
+	]);
+
+	const entries = listFindings(root, "me");
+	// Own report excluded: it is the file this run is about to overwrite.
+	assert.deepEqual(entries.map((e) => e.agentId), ["quota-pill", "old-recon"]);
+	assert.deepEqual(entries.map((e) => e.title), ["quota pill recon", "older recon"]);
+});
+
+test("a report older than the age window is left out rather than shown as stale", () => {
+	const root = tempRoot();
+	seedFindings(root, [
+		{ id: "fresh", title: "fresh", ageMs: 60 * 1000 },
+		{ id: "ancient", title: "ancient", ageMs: FINDINGS_INDEX_MAX_AGE_MS + 60_000 },
+	]);
+	assert.deepEqual(listFindings(root, undefined).map((e) => e.agentId), ["fresh"]);
+});
+
+test("the index is capped, and a project with no reports costs nothing", () => {
+	const root = tempRoot();
+	seedFindings(
+		root,
+		Array.from({ length: FINDINGS_INDEX_MAX_ENTRIES + 4 }, (_, i) => ({
+			id: `w${i}`,
+			title: `worker ${i}`,
+			ageMs: (i + 1) * 60_000,
+		})),
+	);
+	assert.equal(listFindings(root, undefined).length, FINDINGS_INDEX_MAX_ENTRIES);
+
+	const empty = tempRoot();
+	assert.deepEqual(listFindings(empty, undefined), []);
+	assert.equal(formatFindingsIndexBlock([]), "", "no reports means no system-prompt cost at all");
+	assert.deepEqual(listFindings(undefined, undefined), []);
+});
+
+test("the index block names paths and titles, and warns against reading everything", () => {
+	const root = tempRoot();
+	seedFindings(root, [{ id: "quota-pill", title: "quota pill recon", ageMs: 5 * 60 * 1000 }]);
+	const block = formatFindingsIndexBlock(listFindings(root, undefined));
+
+	assert.match(block, /## Reports already on disk/);
+	assert.match(block, /quota-pill\.md` — quota pill recon \(5m ago\)/);
+	assert.match(block, /If your brief names one, read/);
+	assert.match(block, /Do not read them all/);
+	// A title is a pointer, not evidence: acting on it means opening the file.
+	assert.match(block, /do not\s+treat a title as a finding/);
+	assert.ok(block.length < FINDINGS_INDEX_MAX_CHARS + 600);
 });

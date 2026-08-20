@@ -67,7 +67,11 @@ import {
 } from "./agents.ts";
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
 import { registerMidTurnCompactionGuard } from "./mid-turn-compaction.ts";
-import { writeFindingsArtifact } from "./findings-artifact.ts";
+import {
+	formatFindingsIndexBlock,
+	listFindings,
+	writeFindingsArtifact,
+} from "./findings-artifact.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
 import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
@@ -92,7 +96,12 @@ import {
 	DeliveryObligationStore,
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
-import { formatUnfilteredOmissionNote, selectUnfilteredJobs } from "./job-status-list.ts";
+import {
+	formatResumableSectionLines,
+	formatUnfilteredOmissionNote,
+	selectUnfilteredJobs,
+	UNFILTERED_RESUMABLE_CAP,
+} from "./job-status-list.ts";
 import {
 	admitSignal,
 	classifyRuntimeSignal,
@@ -3000,28 +3009,12 @@ function rememberAgentSliceTerminal(agentId: string, runId: string, state: JobSt
 	]);
 }
 
-function formatResumableSection(exclude: Set<string>): string[] {
+function formatResumableSection(exclude: Set<string>, full = false): string[] {
 	const ids = resumableAgentIds().filter((id) => !exclude.has(id));
 	if (ids.length === 0) return [];
 	const metadata = new Map(readAgentSliceMetadata().map((item) => [item.agentId, item]));
-	const rows = ids.map((id) => {
-		const item = metadata.get(id);
-		if (!item) return `- \`${id}\``;
-		const summary = (item.title?.trim() || item.task.replace(/\s+/g, " ").trim()).slice(0, 120);
-		const result = item.resultSummary?.replace(/\s+/g, " ").trim().slice(0, 120);
-		const state = item.state === "running"
-			? "state=interrupted (not running in this process); last recorded state=running"
-			: `state=${item.state ?? "unknown"}`;
-		return `- \`${id}\` (${item.name}) — ${state}; task=${summary || "(task unavailable)"}${result ? `; result=${result}` : ""}`;
-	});
-	return [
-		"",
-		"Resumable workers (stored context, not running):",
-		...rows,
-		"An interruption is not a failure: inspect the prior task/result before deciding whether to continue or replace the worker.",
-		"Re-dispatch one by its agentId to continue with everything it already knows; pass fresh only to throw that context away.",
-		"Reuse an id only when the explicit title/task is the same vertical slice; do not infer from fuzzy text similarity.",
-	];
+	const entries = ids.map((id) => ({ agentId: id, ...(metadata.get(id) ?? {}) }));
+	return formatResumableSectionLines(entries, full ? entries.length : UNFILTERED_RESUMABLE_CAP);
 }
 
 function historicalWorkerCount(exclude: Set<string>): number {
@@ -3140,9 +3133,9 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		const historical = historicalWorkerCount(new Set());
 		return [
 			head,
-			...formatResumableSection(new Set()),
-			...formatHistoricalSection(new Set(), 8),
-			...formatUnfilteredOmissionNote(0, Math.max(0, historical - 8)),
+			...formatResumableSection(new Set(), opts.full),
+			...formatHistoricalSection(new Set(), opts.full ? historical : 8),
+			...formatUnfilteredOmissionNote(0, opts.full ? 0 : Math.max(0, historical - 8)),
 		].join("\n");
 	}
 
@@ -3191,7 +3184,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		sep,
 		...rows,
 		...formatQueuedSection(now),
-		...formatResumableSection(listedIds),
+		...formatResumableSection(listedIds, opts.full),
 		...formatUnfilteredOmissionNote(selected.omittedEnded, historicalWorkerCount(listedIds)),
 	].join("\n");
 }
@@ -7512,8 +7505,16 @@ export default function (pi: ExtensionAPI) {
 			const isolation = PIPIUI_SKILL_READ_BLOCK
 				? `${SUBAGENT_SKILL_ISOLATION}\n${PLAN_SUBAGENT_ARTIFACT_BAN}`
 				: SUBAGENT_SKILL_ISOLATION;
+			// The Boss naming a findings path in the brief is the precise route and stays the
+			// primary one. This is the net under it: forwarding is a rule the Boss must recall at
+			// dispatch time, turns after the completion and possibly past a compaction, and the
+			// whole benefit should not hang on that. Titles only, and empty on a clean project.
+			// PIPIUI_PARENT reads as the parent's id from the Boss's side, but in a dispatched
+			// child the env carries that child's OWN agentId — which is exactly the report to
+			// leave out, since it is the file this run is about to overwrite.
+			const findingsIndex = formatFindingsIndexBlock(listFindings(PIPIUI_MAIN_CWD, PIPIUI_PARENT));
 			return {
-				systemPrompt: `${systemPrompt}\n\n${isolation}`,
+				systemPrompt: [systemPrompt, isolation, findingsIndex].filter(Boolean).join("\n\n"),
 			};
 		});
 
@@ -7940,7 +7941,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Status",
 		description: [
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
-			"The unfiltered view lists every running job plus the most recent ended jobs (same cap as a Wave line). Older or historical workers are omitted with a count; inspect one with subagent_status({agentId, full:true}).",
+			"The unfiltered view lists every running job plus the most recent ended jobs (same cap as a Wave line), then the most recently touched resumable workers. Older ended, resumable, and historical workers are omitted with a count; inspect one with subagent_status({agentId, full:true}), or list the whole archive with subagent_status({full:true}).",
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Before a user-facing conclusion, one unfiltered status call per turn is enough for the current wave. Do not call again for each [subagent-done]. Keep user-facing progress and summaries silent while related work remains running or stalled, and close out only after the whole related goal is terminal.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
@@ -7952,7 +7953,7 @@ export default function (pi: ExtensionAPI) {
 			full: Type.Optional(
 				Type.Boolean({
 					description:
-						"If true (with agentId), return the job's full stored result text without display truncation. Default false.",
+						"With agentId: return that job's full stored result text without display truncation. Without agentId: list the complete resumable/historical archive instead of the newest few. Default false.",
 				}),
 			),
 		}, { additionalProperties: false }),
