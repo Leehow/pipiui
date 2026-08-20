@@ -222,7 +222,9 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.ok(retryDecision >= 0 && abortShortCircuit > retryDecision);
 	assert.ok(abortShortCircuit < providerDecision, "runtime abort must short-circuit provider recovery");
 	assert.ok(abortShortCircuit < transientDecision, "runtime abort must short-circuit transient recovery");
-	assert.match(source, /if \(wasAborted && !runtimeTimedOut\) throw new Error\("Subagent was aborted"\);/);
+	// Tolerant of the error carrying attached properties (Object.assign(new Error(…), {…})):
+	// the assertion is that an EXTERNAL abort throws while a runtime timeout does not.
+	assert.match(source, /if \(wasAborted && !runtimeTimedOut\) throw [\s\S]{0,40}?new Error\("Subagent was aborted"\)/);
 	assert.match(source, /const externallyAborted = wasAborted && !runtimeTimedOut;/);
 	assert.match(source, /const endState: JobState = externallyAborted \? "aborted" : endOk \? "ok" : "failed";/);
 	assert.match(source, /aborted: externallyAborted,/);

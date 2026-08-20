@@ -183,6 +183,8 @@ test("child JSON handler listens for message_update.usage and keeps message_end 
 	// The per-message estimate accumulator resets on the authoritative close-out.
 	assert.match(
 		source,
-		/streamParts\.clear\(\);\s*streamDirty\.clear\(\);\s*liveEstimateChars = \{ ascii: 0, cjk: 0 \};/,
+		// Tolerant of other per-resume clears landing in this block (fileChangeBuffers, …):
+		// what matters is that a resume resets stream state AND the live estimate together.
+		/streamParts\.clear\(\);\s*streamDirty\.clear\(\);[\s\S]{0,200}?liveEstimateChars = \{ ascii: 0, cjk: 0 \};/,
 	);
 });
