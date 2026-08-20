@@ -21,6 +21,7 @@ import {
   type MemoryBrokerPackageIdentity,
 } from "./runtime-identity.ts";
 import { MemoryAdminService } from "./memory-admin.ts";
+import { compactFailureMemoryAtShutdown } from "./memory-watermark.ts";
 import { MemoryRuntimeMetricsCollector } from "./runtime-metrics.ts";
 import type {
   ChildCapabilityInput,
@@ -476,6 +477,12 @@ export async function installMemoryBrokerExtension(
       publishedEnvironment = undefined;
       await current?.close().catch(() => {});
       if (globalIssuerHost[RETRIEVAL_DISPATCHER]) delete globalIssuerHost[RETRIEVAL_DISPATCHER];
+      // Hermes consolidates only at 100% and stops as soon as the result fits,
+      // so its failure store settles pinned at the cap and every later add pays
+      // a consolidation subprocess mid-turn. Archive back to the low-water mark
+      // here, off the critical path, so the next session starts with headroom.
+      // Bounded file I/O with no LLM call, and fail-soft by construction.
+      await compactFailureMemoryAtShutdown(env);
       try {
         options.onStopped?.();
       } catch {
