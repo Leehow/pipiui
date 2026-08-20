@@ -44,6 +44,7 @@ export function WebSearchKeysPane({ host, projectId }: { host?: PipiHostAPI; pro
 
   const [savedKeys, setSavedKeys] = useState<Record<string, boolean>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [selectedId, setSelectedId] = useState(PROVIDERS[0].id)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -82,6 +83,10 @@ export function WebSearchKeysPane({ host, projectId }: { host?: PipiHostAPI; pro
   const setDraft = (keyField: string, value: string) => {
     setDrafts(prev => ({ ...prev, [keyField]: value }))
   }
+
+  const selected = PROVIDERS.find(p => p.id === selectedId)! as ProviderDef
+  const field = selected.keyField
+  const showDraft = (keyField: string) => Object.prototype.hasOwnProperty.call(drafts, keyField)
 
   const hasChanges = PROVIDERS.some(p => {
     const d = draftValue(p.keyField)
@@ -138,38 +143,40 @@ export function WebSearchKeysPane({ host, projectId }: { host?: PipiHostAPI; pro
           )}
 
           <div className="web-search-keys-list" data-testid="web-search-keys-list">
-            {PROVIDERS.map(p => {
-              const keySet = hasKey(p.keyField)
-              const draft = draftValue(p.keyField)
-              const showDraft = Object.prototype.hasOwnProperty.call(drafts, p.keyField)
-              return (
-                <label key={p.id} className="web-search-key-row" data-testid={`web-search-key-row-${p.id}`}>
-                  <div className="web-search-key-info">
-                    <span className="web-search-key-name">{p.name}</span>
-                    <span className="web-search-key-note" title={p.note}>{p.note}</span>
-                  </div>
-                  <div className="web-search-key-input-wrap">
-                    <input
-                      type="password"
-                      autoComplete="off"
-                      spellCheck={false}
-                      placeholder={keySet && !showDraft ? '已配置（输入新密钥以替换）' : `输入 ${p.name} API Key`}
-                      value={draft}
-                      disabled={!projectId || saving}
-                      data-testid={`web-search-key-input-${p.id}`}
-                      onChange={event => setDraft(p.keyField, event.target.value)}
-                      className="web-search-key-input"
-                    />
-                    <span
-                      className={`web-search-key-status${keySet ? ' set' : ''}`}
-                      data-testid={`web-search-key-status-${p.id}`}
-                    >
-                      {showDraft ? '未保存' : keySet ? '已配置' : '未配置'}
-                    </span>
-                  </div>
-                </label>
-              )
-            })}
+            <select
+              className="web-search-key-select"
+              value={selectedId}
+              onChange={event => setSelectedId(event.target.value)}
+              disabled={saving}
+              data-testid="web-search-key-select"
+            >
+              {PROVIDERS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+            <label className="web-search-key-row" data-testid={`web-search-key-row-${selected.id}`}>
+              <div className="web-search-key-info">
+                <span className="web-search-key-name">{selected.name}</span>
+                <span className="web-search-key-note" title={selected.note}>{selected.note}</span>
+              </div>
+              <div className="web-search-key-input-wrap">
+                <input
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={hasKey(field) && !showDraft(field) ? '已配置（输入新密钥以替换）' : `输入 ${selected.name} API Key`}
+                  value={draftValue(field)}
+                  disabled={!projectId || saving}
+                  data-testid={`web-search-key-input-${selected.id}`}
+                  onChange={event => setDraft(field, event.target.value)}
+                  className="web-search-key-input"
+                />
+                <span
+                  className={`web-search-key-status${hasKey(field) ? ' set' : ''}`}
+                  data-testid={`web-search-key-status-${selected.id}`}
+                >
+                  {showDraft(field) ? '未保存' : hasKey(field) ? '已配置' : '未配置'}
+                </span>
+              </div>
+            </label>
           </div>
 
           <div className="web-search-keys-actions" style={{ display: 'flex', gap: 8, marginTop: 12, flexWrap: 'wrap' }}>
