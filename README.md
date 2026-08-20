@@ -101,7 +101,7 @@ Anthropic `anthropic-messages` 请求会把同名自定义工具替换为官方 
 
 所有 API key 存放在当前项目 `{project}/.pi/agent/.env`（0600），OAuth 凭据在该项目的 `auth.json`。禁止使用全局 `~/.pi/agent`。详见 [`docs/key-management.md`](./docs/key-management.md)。
 
-设置 → **密钥库** 只存在于当前 App 主进程内存，退出后清除。不使用钥匙串 / Secret Service / 磁盘密文。列表只有名称，明文只注入已挂载会话的 Worker 环境。见 [`docs/electron-secret-vault-linux.md`](./docs/electron-secret-vault-linux.md)。
+内存密钥库由 AI 通过 `secret_vault_*` 工具管理，不出现在设置或其它用户入口。只存在于当前 App 主进程内存，退出后清除。不使用钥匙串 / Secret Service / 磁盘密文。明文只注入已挂载会话的 Worker 环境。见 [`docs/electron-secret-vault-linux.md`](./docs/electron-secret-vault-linux.md)。
 
 ## 构建运行
 

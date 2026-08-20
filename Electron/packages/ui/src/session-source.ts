@@ -53,7 +53,31 @@ export function isExternalSidebarSource(source: string | undefined): source is E
   return isSessionSource(source) && source !== 'pi'
 }
 
-export function sessionRowLabel(title: string, source?: string): string {
+const SHORT_SOURCE_LABELS: Record<ExternalSessionSource, string> = {
+  claude: 'Claude',
+  codex: 'Codex',
+  grok: 'Grok',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+  zcode: 'ZCode',
+}
+
+export function adoptedSourceBadge(source: string | undefined): string {
+  const short = source && source in SHORT_SOURCE_LABELS ? SHORT_SOURCE_LABELS[source as ExternalSessionSource] : '外部'
+  return `${short} → Pi`
+}
+
+export function externalSessionLooksAdoptable(session: Pick<ExternalSession, 'historyAvailability'>): boolean {
+  return session.historyAvailability === 'text'
+}
+
+export function canAdoptExternalHistory(history: Pick<ExternalSessionHistory, 'availability' | 'entries'> | undefined): boolean {
+  if (!history || history.availability !== 'text') return false
+  return history.entries.some(entry => (entry.role === 'user' || entry.role === 'assistant') && Boolean(entry.content?.trim()))
+}
+
+export function sessionRowLabel(title: string, source?: string, adoptedFromSource?: string): string {
+  if (adoptedFromSource) return `${adoptedSourceBadge(adoptedFromSource)} · ${title}`
   return `${sessionSourceLabel(source)} · ${title}`
 }
 

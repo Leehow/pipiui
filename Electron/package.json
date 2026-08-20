@@ -16,7 +16,7 @@
     "runtime:check:win": "node scripts/fetch-pi-runtime.mjs --platform win32 --arch x64 --check",
     "runtime:prepare:linux": "node scripts/fetch-pi-runtime.mjs --platform linux --arch x64",
     "runtime:check:linux": "node scripts/fetch-pi-runtime.mjs --platform linux --arch x64 --check",
-    "test:secret-vault": "vitest run --exclude '**/dist/**' --exclude 'resources/runtime/**' packages/pi-backend/test/secret-vault.test.ts packages/pi-backend/test/pipiui-secret-vault.test.ts packages/pi-backend/test/secret-vault-host-contract.test.ts packages/ui/src/SecretVaultPane.test.tsx apps/electron/src/main/linux-secret-service.test.ts apps/electron/src/main/secret-vault-key.test.ts packages/pi-backend/test/spawn-assembly.test.ts apps/electron/packaging-contract.test.ts",
+    "test:secret-vault": "vitest run --exclude '**/dist/**' --exclude 'resources/runtime/**' packages/pi-backend/test/secret-vault.test.ts packages/pi-backend/test/pipiui-secret-vault.test.ts packages/pi-backend/test/secret-vault-host-contract.test.ts packages/ui/src/ModelVisibilityModal.test.tsx packages/ui/src/App.secret-redact.test.tsx packages/ui/src/UserMessageBubble.test.tsx apps/electron/src/main/linux-secret-service.test.ts apps/electron/src/main/secret-vault-key.test.ts packages/pi-backend/test/spawn-assembly.test.ts apps/electron/packaging-contract.test.ts",
     "predev": "npm run sync:computer-agent",
     "predev:watch": "npm run sync:computer-agent",
     "prebuild": "npm run sync:computer-agent",

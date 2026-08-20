@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { externalHistoryToMessages, loadExternalSessionsForProjects, sessionRowLabel, sessionSourceLabel } from './session-source'
+import { adoptedSourceBadge, externalHistoryToMessages, loadExternalSessionsForProjects, sessionRowLabel, sessionSourceLabel } from './session-source'
 
 describe('session source helpers', () => {
   it('labels every dedicated source including the Pi fallback', () => {
@@ -12,6 +12,8 @@ describe('session source helpers', () => {
     expect(sessionSourceLabel('zcode')).toBe('Z.ai/ZCode')
     expect(sessionSourceLabel('unknown')).toBe('Pi')
     expect(sessionRowLabel('设计稿', 'cursor')).toBe('Cursor · 设计稿')
+    expect(adoptedSourceBadge('codex')).toBe('Codex → Pi')
+    expect(sessionRowLabel('设计稿', 'pi', 'codex')).toBe('Codex → Pi · 设计稿')
   })
 
   it('keeps a failed source from rejecting the rest of the list', async () => {

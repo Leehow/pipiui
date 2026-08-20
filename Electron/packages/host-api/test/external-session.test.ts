@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   cwdMatchesProject,
+  adoptedSourceBadge,
+  canAdoptExternalHistory,
   isExternalSessionId,
   makeExternalSessionId,
   normalizeProjectCwd,
@@ -37,5 +39,12 @@ describe('external session contract', () => {
       { id: 'ext:grok:c', source: 'grok', title: 'mid', cwd: '/tmp/p', updatedAt: 2, historyAvailability: 'summary' },
     ]
     expect(sortExternalSessions(rows).map(item => item.id)).toEqual(['ext:codex:b', 'ext:grok:c', 'ext:claude:a'])
+  })
+
+  it('judges adoptability from parsed text entries, not source names', () => {
+    expect(adoptedSourceBadge('claude')).toBe('Claude → Pi')
+    expect(canAdoptExternalHistory({ availability: 'text', entries: [{ id: '1', role: 'user', content: 'hi', timestamp: 1 }] })).toBe(true)
+    expect(canAdoptExternalHistory({ availability: 'metadata', entries: [] })).toBe(false)
+    expect(canAdoptExternalHistory({ availability: 'text', entries: [] })).toBe(false)
   })
 })

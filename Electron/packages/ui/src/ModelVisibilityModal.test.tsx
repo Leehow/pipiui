@@ -168,3 +168,33 @@ describe('general settings no longer host Firecrawl OCR', () => {
     expect(setScanExternalSessions).toHaveBeenCalledWith(false)
   })
 })
+
+describe('settings modal has no secret vault entry', () => {
+  it('does not render a secrets tab, pane, or vault management copy', () => {
+    render(
+      <ModelVisibilityModal
+        host={hostStub()}
+        visibility={visibility as never}
+        vision={vision as never}
+        scan={scan as never}
+        updates={updates as never}
+        current={null}
+        onRequestUpdate={() => undefined}
+        onClose={() => undefined}
+        projectId="project-1"
+      />,
+    )
+    expect(screen.getByTestId('model-tab-general')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-models')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-secrets')).toBeNull()
+    expect(screen.queryByTestId('secret-vault-pane')).toBeNull()
+    expect(screen.queryByTestId('secret-vault-form')).toBeNull()
+    expect(screen.queryByText('密钥库')).toBeNull()
+    expect(screen.queryByText('密钥管理')).toBeNull()
+    expect(screen.queryByText('添加密钥')).toBeNull()
+    expect(screen.queryByText('重试检测')).toBeNull()
+    expect(screen.queryByText('保存并挂载')).toBeNull()
+  })
+})

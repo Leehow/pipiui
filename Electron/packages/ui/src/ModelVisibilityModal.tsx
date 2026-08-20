@@ -9,7 +9,6 @@ import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane } from './ExtensionsPane'
-import { SecretVaultPane } from './SecretVaultPane'
 import './computer-use.css'
 
 function TrashIcon() {
@@ -229,7 +228,7 @@ function VisionRoutingPane({ visibility, vision }: {
  * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
  * setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId, sessionId }: {
+export function ModelVisibilityModal({ host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
@@ -242,9 +241,8 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   /** First-run onboarding opens straight into the provider login pane. */
   initialView?: 'manage' | 'add'
   projectId?: string
-  sessionId?: string
 }) {
-  const [tab, setTab] = useState<'general' | 'models' | 'extensions' | 'updates' | 'secrets'>('models')
+  const [tab, setTab] = useState<'general' | 'models' | 'extensions' | 'updates'>('models')
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
   // Default: every provider collapsed. `expanded` is in-memory only (no cross-session
   // persistence); a refresh keeps it, so already-expanded providers stay open while
@@ -292,8 +290,8 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
-          <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : tab === 'secrets' ? '密钥库' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{tab === 'general' ? '识图路由与其他 Agent 聊天记录扫描。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : tab === 'secrets' ? '仅当前进程内存，退出 App 后清除。列表只有名称，明文只注入已挂载会话的 Worker 环境。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
+          <p>{tab === 'general' ? '识图路由与其他 Agent 聊天记录扫描。' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
           <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
             {tab === 'extensions' && <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => setExtensionsAddOpen(true)}>＋ 添加</button>}
@@ -344,14 +342,6 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
               data-testid="model-tab-updates"
               onClick={() => { setExtensionsAddOpen(false); setTab('updates') }}
             >更新中心</button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'secrets'}
-              className={`model-modal-tab${tab === 'secrets' ? ' active' : ''}`}
-              data-testid="model-tab-secrets"
-              onClick={() => { setExtensionsAddOpen(false); setTab('secrets') }}
-            >密钥库</button>
           </div>
         </header>
         <div className="model-modal-body" data-testid="model-modal-body">
@@ -362,8 +352,6 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
               </>
             : tab === 'updates'
               ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
-            : tab === 'secrets'
-              ? <SecretVaultPane host={host} sessionId={sessionId} />
             : tab === 'extensions'
               ? <ExtensionsPane host={host} projectId={projectId} addOpen={extensionsAddOpen} onCloseAdd={() => setExtensionsAddOpen(false)} />
             : view === 'add'

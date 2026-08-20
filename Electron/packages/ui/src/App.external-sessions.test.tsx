@@ -47,7 +47,7 @@ function hostWithExternals(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
     ext({ id: 'ext:codex:old', source: 'codex', title: 'Codex 旧', updatedAt: 1_000 }),
     ext({ id: 'ext:grok:g', source: 'grok', title: 'Grok', updatedAt: 500 }),
     ext({ id: 'ext:cursor:c', source: 'cursor', title: 'Cursor', updatedAt: 400 }),
-    ext({ id: 'ext:opencode:o', source: 'opencode', title: 'OpenCode', updatedAt: 300 }),
+    ext({ id: 'ext:opencode:o', source: 'opencode', title: 'OpenCode', updatedAt: 300, historyAvailability: 'metadata' }),
     ext({ id: 'ext:zcode:z', source: 'zcode', title: 'ZCode', updatedAt: 200 }),
   ]
   const history: ExternalSessionHistory = {
@@ -65,7 +65,12 @@ function hostWithExternals(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
     listProjects: async () => [project],
     listSessions: async () => [pi],
     listExternalSessions: async () => externals,
-    getExternalSessionHistory: vi.fn(async () => history),
+    getExternalSessionHistory: vi.fn(async (sessionId: string) => {
+      if (sessionId === 'ext:opencode:o') {
+        return { id: sessionId, source: 'opencode' as const, availability: 'metadata' as const, entries: [] }
+      }
+      return history
+    }),
     getSessionHistory: vi.fn(async () => []),
     getSessionLease: vi.fn(async sessionId => ({ sessionId, writable: true })),
     sendPrompt: vi.fn(async () => undefined),
@@ -74,6 +79,7 @@ function hostWithExternals(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
     resumeSession: vi.fn(async sessionId => ({ id: sessionId, projectId: project.id, name: sessionId, updatedAt: Date.now() })),
     setModel: vi.fn(base.setModel),
     forceTakeoverSessionLease: vi.fn(async sessionId => ({ sessionId, writable: true })),
+    adoptExternalSession: vi.fn(async () => ({ id: 'pi-adopted', projectId: project.id, name: 'Claude 新', updatedAt: Date.now(), adoptedFrom: { source: 'claude' as const, externalSessionId: 'ext:claude:new' } })),
     ...overrides,
   }
 }
@@ -102,14 +108,6 @@ describe('external session aggregation', () => {
     expect(within(group).getByTestId('session-source-zcode')).toBeTruthy()
     expect(within(group).getByTestId('session-source-pi')).toBeTruthy()
     expect(within(group).getByLabelText('Anthropic/Claude · Claude 新')).toBeTruthy()
-    for (const row of within(group).getAllByTestId('session-row')) {
-      const id = row.getAttribute('data-session-id') ?? ''
-      if (id.startsWith('ext:')) {
-        expect(within(row).getByTestId('session-external-badge').textContent).toBe('外部')
-      }
-    }
-    const piRow = within(group).getAllByTestId('session-row').find(row => row.getAttribute('data-session-id') === 'pi-mid')!
-    expect(within(piRow).queryByTestId('session-external-badge')).toBeNull()
   })
 
   it('loads read-only external history without touching Pi session APIs', async () => {
@@ -135,6 +133,79 @@ describe('external session aggregation', () => {
     expect(host.sendPrompt).not.toHaveBeenCalled()
     expect(within(row).queryByRole('button', { name: '修改标题' })).toBeNull()
     expect(within(row).queryByRole('button', { name: '归档会话' })).toBeNull()
+    expect(screen.getByTestId('adopt-external-session').textContent).toContain('用 Pi 继续')
+  })
+
+  it('adopts a convertible external session and hides the original row', async () => {
+    const adopted: Session = {
+      id: 'pi-adopted',
+      projectId: project.id,
+      name: 'Claude 新',
+      updatedAt: 4_000,
+      adoptedFrom: { source: 'claude', externalSessionId: 'ext:claude:new' },
+    }
+    let externalsHidden = false
+    const host = hostWithExternals({
+      adoptExternalSession: vi.fn(async () => {
+        externalsHidden = true
+        return adopted
+      }),
+      listExternalSessions: async () => externalsHidden ? [] : [
+        ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新', updatedAt: 3_000 }),
+      ],
+      listSessions: async () => externalsHidden
+        ? [adopted, { id: 'pi-mid', projectId: project.id, name: 'Pi 会话', updatedAt: 2_000 }]
+        : [{ id: 'pi-mid', projectId: project.id, name: 'Pi 会话', updatedAt: 2_000 }],
+      getSessionHistory: vi.fn(async sessionId => sessionId === 'pi-adopted'
+        ? [{ id: 'u1', role: 'user' as const, content: '外部提问', timestamp: 1 }, { id: 'a1', role: 'assistant' as const, content: '外部回答', timestamp: 2 }]
+        : []),
+    })
+    render(<App host={host} />)
+    const row = await waitFor(() => {
+      const found = document.querySelector('[data-session-id="ext:claude:new"]')
+      if (!found) throw new Error('external row missing')
+      return found as HTMLElement
+    })
+    fireEvent.click(row)
+    await screen.findByText('外部提问')
+    fireEvent.click(await screen.findByTestId('adopt-external-session'))
+    await waitFor(() => expect(document.querySelector('[data-session-id="pi-adopted"]')).toBeTruthy())
+    expect(document.querySelector('[data-session-id="ext:claude:new"]')).toBeNull()
+    expect(within(document.querySelector('[data-session-id="pi-adopted"]') as HTMLElement).getByTestId('adopted-source-badge').textContent).toContain('Claude → Pi')
+    expect(host.adoptExternalSession).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByTestId('view-original-record'))
+    await waitFor(() => expect(screen.getByTestId('external-session-readonly')).toBeTruthy())
+  })
+
+  it('does not offer adopt for metadata-only sessions', async () => {
+    const host = hostWithExternals()
+    render(<App host={host} />)
+    const row = await waitFor(() => {
+      const found = document.querySelector('[data-session-id="ext:opencode:o"]')
+      if (!found) throw new Error('opencode row missing')
+      return found as HTMLElement
+    })
+    fireEvent.click(row)
+    await waitFor(() => expect(screen.getByTestId('external-session-readonly')).toBeTruthy())
+    expect(screen.queryByTestId('adopt-external-session')).toBeNull()
+    expect(screen.getByTestId('adopt-external-unavailable').textContent).toContain('元数据')
+  })
+
+  it('keeps the original row when adopt fails', async () => {
+    const host = hostWithExternals({
+      adoptExternalSession: vi.fn(async () => { throw new Error('disk full') }),
+    })
+    render(<App host={host} />)
+    const row = await waitFor(() => {
+      const found = document.querySelector('[data-session-id="ext:claude:new"]')
+      if (!found) throw new Error('external row missing')
+      return found as HTMLElement
+    })
+    fireEvent.click(row)
+    await screen.findByText('外部提问')
+    fireEvent.click(await screen.findByTestId('adopt-external-session'))
+    await screen.findByTestId('adopt-external-error')
+    expect(document.querySelector('[data-session-id="ext:claude:new"]')).toBeTruthy()
   })
 
   it('keeps the Pi list when listing external sessions fails', async () => {
@@ -157,56 +228,5 @@ describe('external session aggregation', () => {
     expect(screen.getByText('Demo')).toBeTruthy()
     expect(screen.queryByTestId('sidebar-empty')).toBeNull()
     expect(screen.queryByText('Claude 新')).toBeNull()
-  })
-
-  it('does not call listExternalSessions when the scan toggle is off', async () => {
-    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
-    const host = hostWithExternals({
-      getScanExternalSessions: async () => false,
-      listExternalSessions,
-    })
-    render(<App host={host} />)
-    await screen.findByText('Pi 会话')
-    expect(screen.queryByText('Claude 新')).toBeNull()
-    expect(listExternalSessions).not.toHaveBeenCalled()
-  })
-
-  it('lists external sessions when the scan toggle stays on', async () => {
-    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
-    const host = hostWithExternals({
-      getScanExternalSessions: async () => true,
-      listExternalSessions,
-    })
-    render(<App host={host} />)
-    await screen.findByText('Claude 新')
-    expect(listExternalSessions).toHaveBeenCalled()
-  })
-
-  it('clears existing external rows and drops an ext: selection when the scan toggle turns off', async () => {
-    let scanEnabled = true
-    const listExternalSessions = vi.fn(async () => [ext({ id: 'ext:claude:new', source: 'claude', title: 'Claude 新' })])
-    const host = hostWithExternals({
-      getScanExternalSessions: async () => scanEnabled,
-      setScanExternalSessions: async enabled => { scanEnabled = enabled; return scanEnabled },
-      listExternalSessions,
-    })
-    render(<App host={host} />)
-    const row = await waitFor(() => {
-      const found = document.querySelector('[data-session-id="ext:claude:new"]')
-      if (!found) throw new Error('external row missing')
-      return found as HTMLElement
-    })
-    fireEvent.click(row)
-    await screen.findByText('外部提问')
-    const callsBeforeOff = listExternalSessions.mock.calls.length
-    fireEvent.click(screen.getByRole('button', { name: '设置' }))
-    fireEvent.click(screen.getByTestId('model-tab-general'))
-    fireEvent.click(screen.getByTestId('scan-external-sessions-switch'))
-    await waitFor(() => {
-      expect(screen.queryByText('Claude 新')).toBeNull()
-      expect(document.querySelector('[data-session-id="ext:claude:new"]')).toBeNull()
-    })
-    expect(document.querySelector('[data-session-id="pi-mid"]')).toBeTruthy()
-    expect(listExternalSessions.mock.calls.length).toBe(callsBeforeOff)
   })
 })

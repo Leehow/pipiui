@@ -2,7 +2,7 @@
 export * from "./plan.js";
 export * from "./external-session.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
-import type { ExternalSession, ExternalSessionHistory } from "./external-session.js";
+import type { ExternalSession, ExternalSessionHistory, SessionAdoptedFrom } from "./external-session.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -20,6 +20,8 @@ export type Session = {
   updatedAt: number;
   /** The session's model (provider/modelId), when known. Absent/null means unknown (sidebar falls back to a neutral logo). */
   model?: { provider: string; modelId: string } | null;
+  /** Present when this Pi session was adopted from a read-only external record. */
+  adoptedFrom?: SessionAdoptedFrom;
 };
 export type SessionLease = { sessionId: string; writable: boolean; holder?: { protocolVersion: number; holder: string; pid: number; hostname: string; acquiredAt: string; heartbeatAt: string; expiresAt: string } };
 export type HistoryTool = { id: string; name: string; input: string };
@@ -552,6 +554,11 @@ export interface PipiHostAPI {
    * credential, account, token, FTS, or message-body stores.
    */
   getExternalSessionHistory?(sessionId: string, before?: number | string, limit?: number): Promise<ExternalSessionHistory>;
+  /**
+   * Derive a writable Pi session from an external record (one-shot, idempotent).
+   * Does not mutate the original external files.
+   */
+  adoptExternalSession?(sessionId: string): Promise<Session>;
   getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
   sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
@@ -764,6 +771,7 @@ function apiFrom(
     getExternalSessionHistory: (sessionId, before, limit) => before === undefined
       ? invoke("getExternalSessionHistory", sessionId)
       : invoke("getExternalSessionHistory", sessionId, before, limit),
+    adoptExternalSession: sessionId => invoke("adoptExternalSession", sessionId),
     getSessionLease: sessionId => invoke("getSessionLease", sessionId),
     forceTakeoverSessionLease: sessionId => invoke("forceTakeoverSessionLease", sessionId),
     sendPrompt: (sessionId, prompt, attachments) => attachments?.length ? invoke("sendPrompt", sessionId, prompt, attachments) : invoke("sendPrompt", sessionId, prompt),

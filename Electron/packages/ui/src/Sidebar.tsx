@@ -1,7 +1,7 @@
 import { useMemo, useState, type DragEvent } from 'react'
 import { ProviderLogo } from './ProviderLogo'
 import { SessionSourceIcon } from './SessionSourceIcon'
-import { isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
+import { adoptedSourceBadge, isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 import './sidebar.css'
 import gearIcon from './sf-icons/gearshape.png'
@@ -91,6 +91,7 @@ export interface SidebarSession {
   modelId?: string
   /** Session origin. Absent/`pi` keeps the live model logo; external sources use dedicated marks. */
   source?: SessionSource
+  adoptedFromSource?: SessionSource
   status: SessionStatus
   /** Running background-subagent count; meaningful only for `subagents-running`. */
   subagentCount?: number
@@ -129,10 +130,8 @@ export interface SidebarProps {
   onProjectMenu: (projectId: string, action: ProjectMenuAction) => void
   onRenameProject?: (projectId: string, name: string) => Promise<void> | void
   onMoveProject?: (sourceProjectId: string, targetProjectId: string, placement: 'before' | 'after') => void
-  /** Move the dragged session into the target session's project. Same-project is a no-op. */
-  onMoveSession?: (sessionId: string, targetProjectId: string) => void
-  /** Pin the dragged session. Already-pinned is a no-op. */
-  onMoveSessionToPinned?: (sessionId: string) => void
+  onMoveSession?: (sessionId: string, targetProjectId: string, targetSessionId?: string, placement?: 'before' | 'after') => void
+  onMoveSessionToPinned?: (sessionId: string, targetSessionId?: string, placement?: 'before' | 'after') => void
   /** Disabled host-backed actions must state why instead of pretending to persist. */
   projectMenuUnavailable?: ProjectMenuUnavailable
   /** Opens the host's native project-folder picker and adds its selection. */
@@ -146,6 +145,7 @@ export interface SidebarProps {
   onPinSession?: (sessionId: string) => void
   onRenameSession?: (sessionId: string, title: string) => Promise<void> | void
   onArchiveSession?: (sessionId: string) => void
+  onViewOriginalSession?: (sessionId: string) => void
   onUnarchiveSession?: (sessionId: string) => void
   /** Opens the app's settings surface (Swift sidebar footer gear parity). */
   onOpenSettings?: () => void
@@ -220,7 +220,7 @@ function StatusGlyph({ status, count }: { status: SessionStatus; count: number }
   return <span className="sb-dot" aria-hidden="true" />
 }
 
-function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, onArchive, draggable, dragging, dropTarget, onDragStart, onDragEnd, onDragOver, onDrop }: {
+function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, onArchive, onViewOriginal, draggable, dragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: {
   session: SidebarSession
   selected: boolean
   onSelect: (id: string) => void
@@ -228,9 +228,10 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   onPin?: (id: string) => void
   onRename?: (id: string, title: string) => Promise<void> | void
   onArchive?: (id: string) => void
+  onViewOriginal?: (id: string) => void
   draggable?: boolean
   dragging?: boolean
-  dropTarget?: boolean
+  dropPlacement?: 'before' | 'after'
   onDragStart?: (event: DragEvent, session: SidebarSession) => void
   onDragEnd?: () => void
   onDragOver?: (event: DragEvent, session: SidebarSession) => void
@@ -239,12 +240,14 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   const [renaming, setRenaming] = useState(false)
   const external = isExternalSidebarSource(session.source)
   const source = session.source ?? 'pi'
-  const rowLabel = sessionRowLabel(session.title, source)
+  const rowLabel = sessionRowLabel(session.title, source, session.adoptedFromSource)
   const canPin = !external && onPin
   const canRename = !external && onRename
   const canArchive = !external && onArchive
-  const actions = (canPin || canRename || canArchive) ? (
+  const canViewOriginal = Boolean(!external && session.adoptedFromSource && onViewOriginal)
+  const actions = (canPin || canRename || canArchive || canViewOriginal) ? (
     <span className="sb-session-actions">
+      {canViewOriginal && onViewOriginal && <button type="button" className="sb-session-action" data-testid="view-original-session" aria-label="查看原始记录" title="查看原始记录" onClick={event => { event.stopPropagation(); onViewOriginal(session.id) }}>原</button>}
       {canPin && <button type="button" className="sb-session-action" aria-label={isPinned ? '取消置顶' : '置顶'} title={isPinned ? '取消置顶' : '置顶'} onClick={event => { event.stopPropagation(); onPin(session.id) }}><SfIconPin filled={isPinned} /></button>}
       {canRename && <button type="button" className="sb-session-action" aria-label="修改标题" title="修改标题" onClick={event => { event.stopPropagation(); setRenaming(true) }}><SfIconPencil /></button>}
       {canArchive && <button type="button" className="sb-session-action" aria-label="归档会话" title="归档会话" onClick={event => { event.stopPropagation(); onArchive(session.id) }}><SfIconArchive /></button>}
@@ -261,7 +264,7 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       data-status={session.status}
       draggable={renaming || external ? false : draggable}
       data-dragging={dragging || undefined}
-      data-drop-target={dropTarget || undefined}
+      data-drop-placement={dropPlacement}
       aria-current={selected ? 'true' : undefined}
       aria-label={rowLabel}
       title={rowLabel}
@@ -277,10 +280,7 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
         : <span className="sb-session-source" data-source="pi" data-testid="session-source-pi" role="img" aria-label={sessionSourceLabel('pi')} title={sessionSourceLabel('pi')}><ProviderLogo provider={session.provider} modelId={session.modelId} size={13} /></span>}
       {renaming && canRename && onRename
         ? <InlineSessionTitleEditor value={session.title} ariaLabel="会话名称" className="sb-session-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} />
-        : <span className="sb-session-title-line">
-            <span className="sb-session-title">{session.title}</span>
-            {external && <span className="sb-session-external-badge" data-testid="session-external-badge">外部</span>}
-          </span>}
+        : <span className="sb-session-title">{session.title}{session.adoptedFromSource ? <span className="sb-adopted-badge" data-testid="adopted-source-badge">{adoptedSourceBadge(session.adoptedFromSource)}</span> : null}</span>}
       <span className="sb-status" data-status={session.status} aria-label={statusCaption(session)} hidden={renaming}>
         <StatusGlyph status={session.status} count={session.subagentCount ?? 0} />
         <span className="sb-status-text">{statusCaption(session)}</span>
@@ -293,7 +293,7 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
 /** Active session rows under a project folder, with Swift-parity pagination.
  *  Browse view truncates to `SESSION_LIMIT` (10) with a 「更多/收起」 toggle that
  *  pages 10 at a time; a search bypasses pagination so every match shows. */
-function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, shown, onToggle, draggedSessionId, sessionDropId, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop }: {
+function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, onViewOriginalSession, shown, onToggle, draggedSessionId, sessionDrop, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop }: {
   project: SidebarProject
   query: string
   selectedSessionId: string | null
@@ -301,10 +301,11 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
   onPinSession?: (id: string) => void
   onRenameSession?: (id: string, title: string) => Promise<void> | void
   onArchiveSession?: (id: string) => void
+  onViewOriginalSession?: (id: string) => void
   shown: number
   onToggle: () => void
   draggedSessionId?: string
-  sessionDropId?: string | null
+  sessionDrop?: { id: string; placement: 'before' | 'after' } | null
   onSessionDragStart?: (event: DragEvent, session: SidebarSession) => void
   onDragEnd?: () => void
   onSessionDragOver?: (event: DragEvent, session: SidebarSession) => void
@@ -318,7 +319,7 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
   return (
     <div className="sb-project-sessions" role="group" aria-label={`${project.name} 的会话`}>
       {visible.map(session => (
-        <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} draggable={Boolean(onSessionDragStart)} dragging={draggedSessionId === session.id} dropTarget={sessionDropId === session.id} onDragStart={onSessionDragStart} onDragEnd={onDragEnd} onDragOver={onSessionDragOver} onDrop={onSessionDrop} />
+        <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} onViewOriginal={onViewOriginalSession} draggable={Boolean(onSessionDragStart)} dragging={draggedSessionId === session.id} dropPlacement={sessionDrop?.id === session.id ? sessionDrop.placement : undefined} onDragStart={onSessionDragStart} onDragEnd={onDragEnd} onDragOver={onSessionDragOver} onDrop={onSessionDrop} />
       ))}
       {showsToggle && (
         <button type="button" className="sb-more sb-more-sessions" data-testid="show-more-sessions" aria-label={collapsed ? `收起${project.name} 会话` : `展开更多${project.name} 会话`} onClick={onToggle}>
@@ -349,7 +350,7 @@ function ProjectAddControl({ onAddProject, unavailable }: { onAddProject?: () =>
   return <button type="button" className="sb-add-project" aria-label="添加项目" title={unavailable ?? '选择项目文件夹'} disabled={Boolean(unavailable) || pending} onClick={() => void pick()}><SfIconFolderBadgePlus /></button>
 }
 
-function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu, onRenameProject, projectMenuUnavailable, draggable, dragging, dropPlacement, sessionDrop, onDragStart, onDragEnd, onDragOver, onDrop }: {
+function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu, onRenameProject, projectMenuUnavailable, draggable, dragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: {
   project: SidebarProject
   isExpanded: boolean
   onToggle: (id: string) => void
@@ -360,7 +361,6 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
   draggable?: boolean
   dragging?: boolean
   dropPlacement?: 'before' | 'after'
-  sessionDrop?: boolean
   onDragStart?: (event: DragEvent, project: SidebarProject) => void
   onDragEnd?: () => void
   onDragOver?: (event: DragEvent, project: SidebarProject) => void
@@ -386,7 +386,6 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
       draggable={renaming ? false : draggable}
       data-dragging={dragging || undefined}
       data-drop-placement={dropPlacement}
-      data-session-drop={sessionDrop || undefined}
       onDragStart={event => onDragStart?.(event, project)}
       onDragEnd={onDragEnd}
       onDragOver={event => onDragOver?.(event, project)}
@@ -462,20 +461,16 @@ function ProjectRow({ project, isExpanded, onToggle, onNewSession, onProjectMenu
   )
 }
 
-function ArchivedSection({ sessions, selectedSessionId, onSelect, onUnarchive, offerDrop, dropActive, onDragOver, onDrop }: {
+function ArchivedSection({ sessions, selectedSessionId, onSelect, onUnarchive }: {
   sessions: SidebarSession[]
   selectedSessionId: string | null
   onSelect: (id: string) => void
   onUnarchive: (id: string) => void
-  offerDrop?: boolean
-  dropActive?: boolean
-  onDragOver?: (event: DragEvent) => void
-  onDrop?: (event: DragEvent) => void
 }) {
   const [expanded, setExpanded] = useState(false)
-  if (sessions.length === 0 && !offerDrop) return null
+  if (sessions.length === 0) return null
   return (
-    <section className="sb-section" aria-label="已归档" data-drop-active={dropActive || undefined} onDragOver={onDragOver} onDrop={onDrop}>
+    <section className="sb-section" aria-label="已归档">
       <button type="button" className="sb-archived-toggle" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
         <span className={`sb-archived-chevron${expanded ? ' open' : ''}`} aria-hidden="true">▸</span>
         <span>已归档</span>
@@ -524,6 +519,7 @@ export function Sidebar(props: SidebarProps) {
     onPinSession,
     onRenameSession,
     onArchiveSession,
+    onViewOriginalSession,
     onUnarchiveSession,
     onOpenSettings,
     onOpenComputerUse,
@@ -539,15 +535,13 @@ export function Sidebar(props: SidebarProps) {
   const [sessionsShownByProject, setSessionsShownByProject] = useState<Record<string, number>>({})
   const [dragged, setDragged] = useState<{ type: 'project' | 'session'; id: string; projectId?: string } | null>(null)
   const [projectDrop, setProjectDrop] = useState<{ id: string; placement: 'before' | 'after' } | null>(null)
-  const [sessionDropId, setSessionDropId] = useState<string | null>(null)
-  const [sessionProjectDropId, setSessionProjectDropId] = useState<string | null>(null)
-  const [archiveDrop, setArchiveDrop] = useState(false)
+  const [sessionDrop, setSessionDrop] = useState<{ id: string; placement: 'before' | 'after' } | null>(null)
 
-  const projectPlacementFor = (event: DragEvent): 'before' | 'after' => {
+  const placementFor = (event: DragEvent): 'before' | 'after' => {
     const rect = event.currentTarget.getBoundingClientRect()
     return event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
   }
-  const finishDrag = () => { setDragged(null); setProjectDrop(null); setSessionDropId(null); setSessionProjectDropId(null); setArchiveDrop(false) }
+  const finishDrag = () => { setDragged(null); setProjectDrop(null); setSessionDrop(null) }
   const startProjectDrag = (event: DragEvent, project: SidebarProject) => {
     event.dataTransfer?.setData('application/x-pipiui-sidebar-project', project.id)
     if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
@@ -560,72 +554,45 @@ export function Sidebar(props: SidebarProps) {
     setDragged({ type: 'session', id: session.id, projectId: session.projectId })
   }
   const dragOverProject = (event: DragEvent, project: SidebarProject) => {
-    if (dragged?.type === 'session') {
-      if (dragged.projectId === project.id) return
-      event.preventDefault()
-      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-      setSessionProjectDropId(project.id)
-      setSessionDropId(null)
-      return
-    }
-    if (dragged?.type !== 'project') return
+    if (!dragged) return
     event.preventDefault()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-    setProjectDrop({ id: project.id, placement: projectPlacementFor(event) })
+    if (dragged.type === 'project') setProjectDrop({ id: project.id, placement: placementFor(event) })
+    else setProjectDrop({ id: project.id, placement: 'after' })
   }
   const dropOnProject = (event: DragEvent, project: SidebarProject) => {
-    if (dragged?.type === 'session') {
-      event.preventDefault()
-      if (dragged.projectId !== project.id) onMoveSession?.(dragged.id, project.id)
-      finishDrag()
-      return
-    }
-    if (dragged?.type !== 'project') return
+    if (!dragged) return
     event.preventDefault()
-    onMoveProject?.(dragged.id, project.id, projectDrop?.placement ?? 'after')
+    if (dragged.type === 'project') onMoveProject?.(dragged.id, project.id, projectDrop?.placement ?? 'after')
+    else onMoveSession?.(dragged.id, project.id)
     finishDrag()
   }
   const dragOverSession = (event: DragEvent, session: SidebarSession) => {
     if (dragged?.type !== 'session') return
-    if (dragged.projectId === session.projectId) return
     event.preventDefault()
     event.stopPropagation()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-    setSessionDropId(session.id)
+    setSessionDrop({ id: session.id, placement: placementFor(event) })
   }
   const dropOnSession = (event: DragEvent, session: SidebarSession) => {
     if (dragged?.type !== 'session') return
     event.preventDefault()
     event.stopPropagation()
-    if (dragged.projectId !== session.projectId) onMoveSession?.(dragged.id, session.projectId)
+    onMoveSession?.(dragged.id, session.projectId, session.id, sessionDrop?.placement ?? 'before')
     finishDrag()
   }
-  const dragOverPinned = (event: DragEvent) => {
-    if (dragged?.type !== 'session') return
-    if (pinnedSessions.some(session => session.id === dragged.id)) return
-    event.preventDefault()
-    event.stopPropagation()
-    if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-  }
-  const dropOnPinned = (event: DragEvent) => {
-    if (dragged?.type !== 'session') return
-    event.preventDefault()
-    event.stopPropagation()
-    if (!pinnedSessions.some(session => session.id === dragged.id)) onMoveSessionToPinned?.(dragged.id)
-    finishDrag()
-  }
-  const dragOverArchived = (event: DragEvent) => {
+  const dragOverPinned = (event: DragEvent, session?: SidebarSession) => {
     if (dragged?.type !== 'session') return
     event.preventDefault()
     event.stopPropagation()
     if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
-    setArchiveDrop(true)
+    setSessionDrop(session ? { id: session.id, placement: placementFor(event) } : null)
   }
-  const dropOnArchived = (event: DragEvent) => {
+  const dropOnPinned = (event: DragEvent, session?: SidebarSession) => {
     if (dragged?.type !== 'session') return
     event.preventDefault()
     event.stopPropagation()
-    onArchiveSession?.(dragged.id)
+    onMoveSessionToPinned?.(dragged.id, session?.id, session ? sessionDrop?.placement ?? 'before' : 'after')
     finishDrag()
   }
 
@@ -691,10 +658,10 @@ export function Sidebar(props: SidebarProps) {
 
       <div className="sb-scroll" role="tree" aria-label="项目与会话">
         {(query ? visiblePinned.length > 0 : true) && (
-          <section className="sb-section sb-pinned-section" aria-label="置顶会话" data-drop-active={(dragged?.type === 'session' && !pinnedSessions.some(session => session.id === dragged.id)) || undefined} onDragOver={dragOverPinned} onDrop={dropOnPinned}>
+          <section className="sb-section sb-pinned-section" aria-label="置顶会话" data-drop-active={dragged?.type === 'session' || undefined} onDragOver={event => dragOverPinned(event)} onDrop={event => dropOnPinned(event)}>
             <h2 className="sb-section-title">置顶</h2>
             {visiblePinned.map(session => (
-              <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} isPinned onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} draggable={!query && Boolean(onMoveSessionToPinned)} dragging={dragged?.type === 'session' && dragged.id === session.id} onDragStart={startSessionDrag} onDragEnd={finishDrag} onDragOver={dragOverPinned} onDrop={dropOnPinned} />
+              <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} isPinned onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} draggable={!query && Boolean(onMoveSessionToPinned)} dragging={dragged?.type === 'session' && dragged.id === session.id} dropPlacement={sessionDrop?.id === session.id ? sessionDrop.placement : undefined} onDragStart={startSessionDrag} onDragEnd={finishDrag} onDragOver={(event, target) => dragOverPinned(event, target)} onDrop={(event, target) => dropOnPinned(event, target)} />
             ))}
           </section>
         )}
@@ -714,7 +681,6 @@ export function Sidebar(props: SidebarProps) {
                 draggable={!query && Boolean(onMoveProject)}
                 dragging={dragged?.type === 'project' && dragged.id === project.id}
                 dropPlacement={projectDrop?.id === project.id ? projectDrop.placement : undefined}
-                sessionDrop={sessionProjectDropId === project.id}
                 onDragStart={startProjectDrag}
                 onDragEnd={finishDrag}
                 onDragOver={dragOverProject}
@@ -729,10 +695,11 @@ export function Sidebar(props: SidebarProps) {
                   onPinSession={onPinSession}
                   onRenameSession={onRenameSession}
                   onArchiveSession={onArchiveSession}
+                  onViewOriginalSession={onViewOriginalSession}
                   shown={sessionsShownByProject[project.id] ?? SESSION_LIMIT}
                   onToggle={() => toggleProjectSessions(project.id, project.sessions.length)}
                   draggedSessionId={dragged?.type === 'session' ? dragged.id : undefined}
-                  sessionDropId={sessionDropId}
+                  sessionDrop={sessionDrop}
                   onSessionDragStart={!query && onMoveSession ? startSessionDrag : undefined}
                   onDragEnd={finishDrag}
                   onSessionDragOver={dragOverSession}
@@ -749,7 +716,7 @@ export function Sidebar(props: SidebarProps) {
         </section>
 
         {!query && onUnarchiveSession && (
-          <ArchivedSection sessions={archivedSessions} selectedSessionId={selectedSessionId} onSelect={onSelectSession} onUnarchive={onUnarchiveSession} offerDrop={dragged?.type === 'session'} dropActive={archiveDrop} onDragOver={dragOverArchived} onDrop={dropOnArchived} />
+          <ArchivedSection sessions={archivedSessions} selectedSessionId={selectedSessionId} onSelect={onSelectSession} onUnarchive={onUnarchiveSession} />
         )}
 
         {(noResults || nothingAtAll) && (

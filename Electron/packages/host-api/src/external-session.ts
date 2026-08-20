@@ -138,3 +138,47 @@ export function isExternalSession(value: unknown): value is ExternalSession {
     && Number.isFinite(value.updatedAt)
     && isExternalHistoryAvailability(value.historyAvailability);
 }
+
+const SHORT_SOURCE_LABELS: Record<ExternalSessionSource, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  grok: "Grok",
+  cursor: "Cursor",
+  opencode: "OpenCode",
+  zcode: "ZCode",
+};
+
+export function shortExternalSourceLabel(source: ExternalSessionSource | string | undefined): string {
+  if (source && source in SHORT_SOURCE_LABELS) return SHORT_SOURCE_LABELS[source as ExternalSessionSource];
+  return "外部";
+}
+
+export function adoptedSourceBadge(source: ExternalSessionSource | string | undefined): string {
+  return `${shortExternalSourceLabel(source)} → Pi`;
+}
+
+/** Scanner advertised text history — still confirm entries before creating a session. */
+export function externalSessionLooksAdoptable(session: Pick<ExternalSession, "historyAvailability">): boolean {
+  return session.historyAvailability === "text";
+}
+
+export function importableExternalHistoryEntries(history: Pick<ExternalSessionHistory, "availability" | "entries"> | undefined): ExternalHistoryEntry[] {
+  if (!history || history.availability !== "text") return [];
+  return history.entries.filter((entry) =>
+    (entry.role === "user" || entry.role === "assistant") && Boolean(entry.content?.trim()),
+  );
+}
+
+export function canAdoptExternalHistory(history: Pick<ExternalSessionHistory, "availability" | "entries"> | undefined): boolean {
+  return importableExternalHistoryEntries(history).length > 0;
+}
+
+export type SessionAdoptedFrom = {
+  source: ExternalSessionSource;
+  externalSessionId: string;
+};
+
+export function isSessionAdoptedFrom(value: unknown): value is SessionAdoptedFrom {
+  if (!isRecord(value)) return false;
+  return isExternalSessionSource(value.source) && isExternalSessionId(value.externalSessionId);
+}

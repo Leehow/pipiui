@@ -41,6 +41,8 @@ import {
   type WorktreeLifecycle,
   type WorktreeStatus,
   isExternalSessionId,
+  isSessionAdoptedFrom,
+  type SessionAdoptedFrom,
 } from "@pipi/host-api";
 import { PlanStore, readPlanStore } from "./plan-store.js";
 import { readUserMcpServers } from "./user-mcp-servers.js";
@@ -131,6 +133,14 @@ import {
   readExternalSessionHistory,
   type ExternalSessionRoots,
 } from "./external-sessions.js";
+import {
+  buildAdoptedPiSessionJsonl,
+  canAdoptExternalHistory,
+  liveAdoptedTargets,
+  readAdoptedExternalMap,
+  rememberAdoption,
+  writeAdoptedSessionFile,
+} from "./adopt-external-session.js";
 export {
   ensureProjectPiHome,
   migrateSharedProjectModels,
@@ -665,6 +675,7 @@ type SessionMeta = {
   model?: { provider: string; modelId: string } | null;
   /** Latest persisted Pi thinking level, when the session recorded one. */
   thinkingLevel?: ThinkingLevel;
+  adoptedFrom?: SessionAdoptedFrom;
 };
 const METADATA_HEAD_BYTES = 64 * 1024,
   METADATA_TAIL_BYTES = 64 * 1024;
@@ -728,6 +739,7 @@ type LatestSessionMetadata = {
   model: { provider: string; modelId: string } | null;
   thinkingLevel?: ThinkingLevel;
   updatedAt?: number;
+  adoptedFrom?: SessionAdoptedFrom;
 };
 
 /**
@@ -746,6 +758,7 @@ async function readLatestSessionMetadata(
   let thinkingLevel: ThinkingLevel | undefined;
   let foundThinkingLevel = false;
   let updatedAt: number | undefined;
+  let adoptedFrom: SessionAdoptedFrom | undefined;
   while (position > 0) {
     const start = Math.max(0, position - METADATA_TAIL_BYTES);
     const chunk = Buffer.alloc(position - start);
@@ -784,11 +797,13 @@ async function readLatestSessionMetadata(
         thinkingLevel = row.thinkingLevel;
         foundThinkingLevel = true;
       }
+      if (adoptedFrom === undefined && isSessionAdoptedFrom(row.adoptedFrom))
+        adoptedFrom = row.adoptedFrom;
     }
-    if (name !== undefined && model !== undefined && foundThinkingLevel && updatedAt !== undefined) break;
+    if (name !== undefined && model !== undefined && foundThinkingLevel && updatedAt !== undefined && adoptedFrom !== undefined) break;
     position = start;
   }
-  return { name, model: model ?? null, thinkingLevel, updatedAt };
+  return { name, model: model ?? null, thinkingLevel, updatedAt, adoptedFrom };
 }
 
 /** Bounded-memory metadata scan: a small header read plus newest-first chunks. */
@@ -803,6 +818,7 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
     if (!header?.id || typeof header.cwd !== "string")
       throw new Error("invalid session header");
     const latest = await readLatestSessionMetadata(handle, stat.size);
+    const headAdopted = headRows.find((row) => row?.type === "session_info" && isSessionAdoptedFrom(row.adoptedFrom))?.adoptedFrom;
     return {
       path,
       header,
@@ -810,6 +826,7 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
       updatedAt: latest.updatedAt ?? stat.mtimeMs,
       model: latest.model,
       thinkingLevel: latest.thinkingLevel,
+      adoptedFrom: latest.adoptedFrom ?? (isSessionAdoptedFrom(headAdopted) ? headAdopted : undefined),
     };
   } finally {
     await handle.close();
@@ -1616,6 +1633,7 @@ export class PiHostBackend implements HostBackend {
   private canonicalProjectPaths: () => Promise<string[] | undefined>;
   private terminalSessionDeleted?: (sessionId: string) => void;
   private externalSessionRoots: ExternalSessionRoots;
+  private adoptInFlight = new Map<string, Promise<Session>>();
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
@@ -2501,6 +2519,7 @@ export class PiHostBackend implements HostBackend {
               name: live?.name ?? s.name ?? "Session",
               updatedAt: Math.max(s.updatedAt, live?.updatedAt ?? 0),
               model: this.sessionModelOf(s),
+              ...(s.adoptedFrom ? { adoptedFrom: s.adoptedFrom } : {}),
             };
           })
           .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -2508,12 +2527,21 @@ export class PiHostBackend implements HostBackend {
       case "listExternalSessions": {
         if (!(await this.loadScanExternalSessions())) return [];
         const project = await this.configuredProject(params[0] as string);
-        return listExternalSessionsForProject(
+        const listed = await listExternalSessionsForProject(
           project.path,
           this.externalSessionRoots,
           this.env.HOME,
         );
+        const map = liveAdoptedTargets(
+          await readAdoptedExternalMap(await this.adoptionAgentDir(project.path)),
+          (id) => this.sessionById.has(id),
+        );
+        if (Object.keys(map).length) await this.index();
+        const live = liveAdoptedTargets(map, (id) => this.sessionById.has(id));
+        return listed.filter((session) => !live[session.id]);
       }
+      case "adoptExternalSession":
+        return this.adoptExternalSession(params[0] as string);
       case "newSession":
         return this.newSession(
           params[0] as string,
@@ -2951,7 +2979,96 @@ export class PiHostBackend implements HostBackend {
       name: s.name ?? "Session",
       updatedAt: s.updatedAt,
       model: this.sessionModelOf(s),
+      ...(s.adoptedFrom ? { adoptedFrom: s.adoptedFrom } : {}),
     };
+  }
+  private async adoptionAgentDir(projectPath: string): Promise<string> {
+    const isolated = await this.ensureIsolatedProjectHome(projectPath, { allowMissing: true, migrate: false });
+    if (isolated) return isolated.agentDir;
+    return join(projectPath, ".pi", "agent");
+  }
+  private async adoptExternalSession(externalSessionId: string): Promise<Session> {
+    const inflight = this.adoptInFlight.get(externalSessionId);
+    if (inflight) return inflight;
+    const work = this.adoptExternalSessionOnce(externalSessionId).finally(() => {
+      if (this.adoptInFlight.get(externalSessionId) === work) this.adoptInFlight.delete(externalSessionId);
+    });
+    this.adoptInFlight.set(externalSessionId, work);
+    return work;
+  }
+  private async adoptExternalSessionOnce(externalSessionId: string): Promise<Session> {
+    if (!isExternalSessionId(externalSessionId)) throw new Error(`unknown external session ${externalSessionId}`);
+    const paths = await this.loadProjectPaths();
+    const history = await readExternalSessionHistory(
+      externalSessionId,
+      paths,
+      this.externalSessionRoots,
+      undefined,
+      500,
+      this.env.HOME,
+    );
+    const listed = (await Promise.all(paths.map((path) => listExternalSessionsForProject(
+      path,
+      this.externalSessionRoots,
+      this.env.HOME,
+    )))).flat();
+    const meta = listed.find((item) => item.id === externalSessionId);
+    const projectPath = meta?.cwd ?? paths.find((path) => path) ?? "";
+    if (!projectPath) throw new Error(`unknown external session ${externalSessionId}`);
+    const agentDir = await this.adoptionAgentDir(projectPath);
+    await this.index();
+    const existingMap = liveAdoptedTargets(
+      await readAdoptedExternalMap(agentDir),
+      (id) => this.sessionById.has(id),
+    );
+    const existingId = existingMap[externalSessionId];
+    if (existingId) {
+      const found = this.sessionById.get(existingId);
+      if (found) return this.toSession(found);
+    }
+    if (!canAdoptExternalHistory(history)) {
+      throw new Error("此外部会话没有可导入的正文，无法用 Pi 继续");
+    }
+    const projectId = dirId(projectPath);
+    const isolated = await this.ensureIsolatedProjectHome(projectPath, { allowMissing: true });
+    const dir = isolated
+      ? isolated.sessionsDir
+      : join(this.root, encodeURIComponent(projectPath));
+    const built = buildAdoptedPiSessionJsonl({
+      cwd: projectPath,
+      title: meta?.title ?? "外部会话",
+      source: history.source,
+      externalSessionId,
+      entries: history.entries,
+    });
+    let createdPath = "";
+    try {
+      createdPath = await writeAdoptedSessionFile(dir, built);
+      const created = await fs.stat(createdPath);
+      const sessionMeta: SessionMeta = {
+        path: createdPath,
+        header: { type: "session", version: 3, id: built.sessionId, cwd: projectPath },
+        name: meta?.title ?? "外部会话",
+        updatedAt: Date.now(),
+        adoptedFrom: { source: history.source, externalSessionId },
+      };
+      this.rememberSessionMeta(sessionMeta, created.size, created.mtimeMs);
+      await rememberAdoption(agentDir, externalSessionId, built.sessionId);
+      return {
+        id: built.sessionId,
+        projectId,
+        name: sessionMeta.name ?? "外部会话",
+        updatedAt: sessionMeta.updatedAt,
+        adoptedFrom: sessionMeta.adoptedFrom,
+      };
+    } catch (error) {
+      if (createdPath) {
+        await fs.rm(createdPath, { force: true }).catch(() => undefined);
+        this.indexCache.delete(createdPath);
+        this.sessionById.delete(built.sessionId);
+      }
+      throw error;
+    }
   }
   private leaseFor(s: { path: string; header: any }): LeaseManager {
     let lease = this.leases.get(s.header.id);

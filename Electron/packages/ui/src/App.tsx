@@ -17,7 +17,7 @@ import { ModelQuickMenu } from './ModelQuickMenu'
 import { GitBranchMenu } from './GitBranchMenu'
 import { ProviderLogo } from './ProviderLogo'
 import { Sidebar, type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarSession, type SessionStatus } from './Sidebar'
-import { externalHistoryToMessages, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
+import { canAdoptExternalHistory, externalHistoryToMessages, externalSessionLooksAdoptable, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
 import { SlashMenu } from './SlashMenu'
 import personGroupIcon from './sf-icons/person-2.png'
 import globeIcon from './sf-icons/globe.png'
@@ -962,6 +962,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [projects, setProjects] = useState<Project[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [externalSessions, setExternalSessions] = useState<ProjectExternalSession[]>([])
+  const [externalAdoptableById, setExternalAdoptableById] = useState<Record<string, boolean>>({})
+  const [adoptError, setAdoptError] = useState<string | null>(null)
+  const [adoptingExternalId, setAdoptingExternalId] = useState<string | null>(null)
   const [selectedProject, setSelectedProject] = useState('')
   const [selectedSession, setSelectedSession] = useState('')
   const sessionsRef = useRef(sessions)
@@ -1607,6 +1610,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         messagesBySessionRef.current.set(selectedSession, next)
         messagesRef.current = next
         setMessages(next)
+        setExternalAdoptableById(current => ({ ...current, [selectedSession]: canAdoptExternalHistory(history) }))
       }).catch(error => {
         if (historyLoadRef.current !== request) return
         setProjectError(`读取外部会话记录失败：${error instanceof Error ? error.message : String(error)}`)
@@ -2318,6 +2322,28 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     messagesRef.current = []
     if (narrowViewport) setNarrowPanes(current => ({ ...current, sidebar: false }))
   }
+  const adoptExternalSession = async (sessionId = selectedSession) => {
+    if (!sessionId || !isExternalSessionId(sessionId) || !host.adoptExternalSession) return
+    setAdoptError(null)
+    setAdoptingExternalId(sessionId)
+    try {
+      const session = await host.adoptExternalSession(sessionId)
+      setExternalSessions(current => current.filter(item => item.id !== sessionId))
+      setSessions(items => [session, ...items.filter(item => item.id !== session.id)])
+      setSelectedProject(session.projectId)
+      setSelectedSession(session.id)
+      setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
+    } catch (error) {
+      setAdoptError(`接管失败：${hostOperationError(error)}`)
+    } finally {
+      setAdoptingExternalId(null)
+    }
+  }
+  const viewOriginalExternalSession = (sessionId: string) => {
+    const adopted = sessions.find(item => item.id === sessionId)?.adoptedFrom
+    if (!adopted) return
+    setSelectedSession(adopted.externalSessionId)
+  }
   const completeAddProject = async (normalizedPath: string): Promise<boolean> => {
     const snapshot = { projects, sessions, selectedProject, selectedSession }
     const name = normalizedPath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || normalizedPath
@@ -2419,7 +2445,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     for (const session of sessions) {
       const model = sidebarModelForSession(session, selectedSession, modelState?.model ?? null, sessionModels)
       const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents)
-      mapped.set(session.id, { id: session.id, projectId: session.projectId, title: session.name, provider: model.provider, modelId: model.modelId, source: 'pi', status: status.status, subagentCount: status.subagentCount, updatedAt: session.updatedAt })
+      mapped.set(session.id, { id: session.id, projectId: session.projectId, title: session.name, provider: model.provider, modelId: model.modelId, source: 'pi', adoptedFromSource: session.adoptedFrom?.source, status: status.status, subagentCount: status.subagentCount, updatedAt: session.updatedAt })
     }
     for (const session of externalSessions) {
       mapped.set(session.id, {
@@ -2751,10 +2777,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const dismissNarrowOverlays = () => setNarrowPanes({ sidebar: false, tools: false })
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${browserWorkspaceActive ? widths.browserTools : widths.tools}px` } as React.CSSProperties}>
     {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
+    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
     <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
-      <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} />
+      <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} canAdoptExternal={Boolean(isExternalSelected && host.adoptExternalSession && selectedExternalSession && externalSessionLooksAdoptable(selectedExternalSession) && externalAdoptableById[selectedSession] !== false)} adoptDisabledReason={isExternalSelected && selectedExternalSession && !externalSessionLooksAdoptable(selectedExternalSession) ? '此外部会话只有元数据，没有可导入的正文' : isExternalSelected && externalAdoptableById[selectedSession] === false ? '此外部会话没有可导入的正文' : undefined} adopting={adoptingExternalId === selectedSession} adoptError={adoptError} onDismissAdoptError={() => setAdoptError(null)} onAdoptExternal={() => void adoptExternalSession()} onViewOriginal={headerSession?.adoptedFrom ? () => viewOriginalExternalSession(headerSession.id) : undefined} />
       <div className="chat-viewport" data-testid="chat-viewport">
         {toolsCollapsed && <ToolQuickRail variant="float" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
         {projectsLoaded && !selectedSession ? (
@@ -2807,7 +2833,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} sessionId={selectedSession} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
       if (!selectedSession || !host.browser) return
@@ -2910,12 +2936,12 @@ function RightPaneToggleIcon({ expanded }: { expanded: boolean }) {
     ? <svg className="right-pane-toggle-icon" data-pane-icon="collapse" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path className="right-pane-toggle-fill" d="M11 3h4.5a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11z" /><path d="M9.5 10h5m-2-2 2 2-2 2" /></svg>
     : <svg className="right-pane-toggle-icon" data-pane-icon="expand" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path d="M11.5 3v14" /><path d="M14.5 7.5v5" /></svg>
 }
-function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onRename, onTakeover, externalReadOnly, externalSource }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onRename: (sessionId: string, title: string) => Promise<void> | void; onTakeover: () => void; externalReadOnly?: boolean; externalSource?: string }) {
+function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onRename, onTakeover, externalReadOnly, externalSource, canAdoptExternal, adoptDisabledReason, adopting, adoptError, onDismissAdoptError, onAdoptExternal, onViewOriginal }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onRename: (sessionId: string, title: string) => Promise<void> | void; onTakeover: () => void; externalReadOnly?: boolean; externalSource?: string; canAdoptExternal?: boolean; adoptDisabledReason?: string; adopting?: boolean; adoptError?: string | null; onDismissAdoptError?: () => void; onAdoptExternal?: () => void; onViewOriginal?: () => void }) {
   const [renaming, setRenaming] = useState(false)
   useEffect(() => setRenaming(false), [session?.id])
   const readOnly = Boolean(externalReadOnly) || (lease !== null && !leaseCanWrite(lease))
   const canRename = Boolean(session) && !externalReadOnly
-  return <header className="chat-header">{sidebarCollapsed && <button className="pane-toggle pane-restore pane-restore-sidebar" data-testid="toggle-sidebar" title="展开左栏" aria-label="展开左栏" aria-expanded="false" onClick={onToggleSidebar}>≡</button>}<div className="chat-header-title">{renaming && canRename && session ? <InlineSessionTitleEditor value={session.name} ariaLabel="会话名称" className="chat-header-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} /> : <strong className="chat-header-title-label" role={canRename ? 'button' : undefined} tabIndex={canRename ? 0 : undefined} title={externalReadOnly ? `${sessionSourceLabel(externalSource)} · 只读` : session ? '双击修改会话名称' : undefined} onDoubleClick={() => { if (canRename) setRenaming(true) }} onKeyDown={event => { if (canRename && (event.key === 'Enter' || event.key === 'F2')) { event.preventDefault(); setRenaming(true) } }}>{session?.name ?? 'PipiUI'}</strong>}{externalReadOnly && <span className="lease-detail" data-testid="external-session-readonly">{sessionSourceLabel(externalSource)} 会话 · 只读</span>}{readOnly && !externalReadOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} />{toolsCollapsed && <button className="pane-toggle" data-testid="toggle-tools" title="展开右栏" aria-label="展开右栏" aria-expanded="false" onClick={onToggleTools}><RightPaneToggleIcon expanded={false} /></button>}</div></header>
+  return <header className="chat-header">{sidebarCollapsed && <button className="pane-toggle pane-restore pane-restore-sidebar" data-testid="toggle-sidebar" title="展开左栏" aria-label="展开左栏" aria-expanded="false" onClick={onToggleSidebar}>≡</button>}<div className="chat-header-title">{renaming && canRename && session ? <InlineSessionTitleEditor value={session.name} ariaLabel="会话名称" className="chat-header-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} /> : <strong className="chat-header-title-label" role={canRename ? 'button' : undefined} tabIndex={canRename ? 0 : undefined} title={externalReadOnly ? `${sessionSourceLabel(externalSource)} · 只读` : session ? '双击修改会话名称' : undefined} onDoubleClick={() => { if (canRename) setRenaming(true) }} onKeyDown={event => { if (canRename && (event.key === 'Enter' || event.key === 'F2')) { event.preventDefault(); setRenaming(true) } }}>{session?.name ?? 'PipiUI'}</strong>}{externalReadOnly && <span className="lease-detail" data-testid="external-session-readonly">{sessionSourceLabel(externalSource)} 会话 · 只读{canAdoptExternal && onAdoptExternal ? <button type="button" data-testid="adopt-external-session" disabled={adopting} onClick={onAdoptExternal}>{adopting ? '正在接管…' : '用 Pi 继续'}</button> : adoptDisabledReason ? <span data-testid="adopt-external-unavailable">{adoptDisabledReason}</span> : null}</span>}{session?.adoptedFrom && onViewOriginal && <button type="button" className="lease-detail" data-testid="view-original-record" onClick={onViewOriginal}>查看原始记录</button>}{adoptError && <span className="lease-detail" data-testid="adopt-external-error" role="alert">{adoptError}{onDismissAdoptError && <button type="button" aria-label="关闭接管错误" onClick={onDismissAdoptError}>×</button>}</span>}{readOnly && !externalReadOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} />{toolsCollapsed && <button className="pane-toggle" data-testid="toggle-tools" title="展开右栏" aria-label="展开右栏" aria-expanded="false" onClick={onToggleTools}><RightPaneToggleIcon expanded={false} /></button>}</div></header>
 }
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150
