@@ -34,7 +34,19 @@ const ENTRY_DELIMITER = "\n§\n";
 const DEFAULT_MEMORY_CHAR_LIMIT = 5000;
 /** Hermes: charLimit("failure") === memoryCharLimit * 2 ("failures get more space"). */
 const FAILURE_LIMIT_MULTIPLIER = 2;
-const DEFAULT_HIGH_WATER = 0.75;
+/**
+ * Deliberately a backstop, not the primary mechanism. Measured behaviour of the
+ * live store is a sawtooth: Hermes consolidation fires at the cap and merges
+ * back down to roughly 70%, so it already maintains the store on its own. This
+ * module exists only to stop a session *ending* near the cap, which would leave
+ * the next session's first few adds paying consolidation mid-turn.
+ *
+ * A high trigger keeps the intelligent merge in charge during normal operation
+ * and reserves archival trimming for the pinned-at-cap state it is meant to
+ * prevent. The gap between the two marks is the deadband: too narrow and the
+ * trim fires again almost immediately.
+ */
+const DEFAULT_HIGH_WATER = 0.85;
 const DEFAULT_LOW_WATER = 0.7;
 const FAILURE_FILE = "failures.md";
 const ARCHIVE_FILE = "failures-archive.md";

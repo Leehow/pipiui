@@ -122,9 +122,28 @@ test("a raised memoryCharLimit raises the cap the watermark is measured against"
 });
 
 test("a low-water mark that would erase the deadband falls back to the defaults", () => {
-  assert.deepEqual(watermarkThresholds({ failureHighWater: 0.7, failureLowWater: 0.9 }), { highWater: 0.75, lowWater: 0.7 });
+  assert.deepEqual(watermarkThresholds({ failureHighWater: 0.7, failureLowWater: 0.9 }), { highWater: 0.85, lowWater: 0.7 });
   assert.deepEqual(watermarkThresholds({ failureHighWater: 0.9, failureLowWater: 0.5 }), { highWater: 0.9, lowWater: 0.5 });
-  assert.deepEqual(watermarkThresholds({ failureLowWater: 0 }), { highWater: 0.75, lowWater: 0.7 });
+  assert.deepEqual(watermarkThresholds({ failureLowWater: 0 }), { highWater: 0.85, lowWater: 0.7 });
+});
+
+test("the trim stays out of the band Hermes consolidation already maintains", async () => {
+  const root = await memoryDir();
+  try {
+    const dir = join(root, "pi-hermes-memory");
+    // Measured post-consolidation resting state: ~71% of the cap. Consolidation
+    // owns this range, so a session ending here must not be trimmed.
+    const content = entries(14).join(DELIMITER);
+    await writeFile(join(dir, "failures.md"), content);
+
+    const result = await compactFailureMemory({ memoryDir: dir });
+
+    assert.ok(result.before! > DEFAULT_FAILURE_LIMIT * 0.7, "precondition: inside the sawtooth band");
+    assert.equal(result.outcome, "below-high-water");
+    assert.equal(await readFile(join(dir, "failures.md"), "utf8"), content);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("the user profile is never compacted, however full it is", async () => {
