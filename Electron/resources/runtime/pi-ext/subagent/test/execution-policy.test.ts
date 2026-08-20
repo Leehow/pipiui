@@ -469,6 +469,8 @@ test("Electron dispatch and stall watchdog use the recovery decisions", () => {
 	assert.match(source, /decideStallWatchdogAction\(/);
 	assert.match(source, /syncWait:\s*!isBackground/);
 	assert.match(source, /if \(action === "abort"\)/);
-	assert.match(source, /\[subagent-blocked\].*auto-aborted after stall/);
+	// The blocked message moved into stall-notification.ts, where its exact text is asserted by
+	// behavior. Here only the wiring matters: the abort branch must still announce itself.
+	assert.match(source, /formatBlockedMessage\(/);
 	assert.doesNotMatch(source, /Use chain if you genuinely need ordered synchronous steps/);
 });

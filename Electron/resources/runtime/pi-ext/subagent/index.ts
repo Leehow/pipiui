@@ -107,8 +107,10 @@ import {
 import {
 	claimStallNotification,
 	confirmStallNotification,
-	isStallWakeSignal,
-	queueStallAfterCutIn,
+	deliverStallWake as deliverStallWakeThrough,
+	formatBlockedMessage,
+	formatStallMessage,
+	planHeldSignalFlush,
 } from "./stall-notification.ts";
 import {
 	formatSecretaryCommitResult,
@@ -4174,40 +4176,37 @@ function admitOrHoldRuntimeSignal(text: string): boolean {
 
 function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 	if (hostStopQuiet || bossTurnBusy) return;
-	const held = heldRuntimeSignals.splice(0);
-	let sent = false;
-	for (const text of held) {
-		const kind = classifyRuntimeSignal(text);
-		if (!kind) continue;
-		const decision = admitSignal({
+	const plan = planHeldSignalFlush({
+		held: heldRuntimeSignals.splice(0),
+		classify: (text) => classifyRuntimeSignal(text),
+		admit: ({ kind, text }) => admitSignal({
 			kind,
 			activity: "idle",
 			workerRunning: workerRunningForSignal(text),
 			episodeOpen: reminderOpenForSignal(text),
 			alreadyDelivered: false,
-		});
-		if (decision === "drop") continue;
-		if (decision === "hold" || sent) {
-			if (!heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
-			continue;
-		}
-		sent = true;
-		if (isStallWakeSignal(kind)) {
-			void deliverStallWake(pi, text).then((ok) => {
-				if (kind === "stall") confirmStallDelivery(text, ok);
-			});
-			continue;
-		}
-		void trySendUserMessage(pi, text);
+		}),
+	});
+	for (const text of plan.rehold) {
+		if (!heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
 	}
+	const deliver = plan.deliver;
+	if (!deliver) return;
+	if (deliver.channel === "stall-wake") {
+		void deliverStallWake(pi, deliver.text).then((ok) => {
+			if (deliver.confirmsStallDelivery) confirmStallDelivery(deliver.text, ok);
+		});
+		return;
+	}
+	void trySendUserMessage(pi, deliver.text);
 }
 
 /** Stall/recovery must wake a settled Boss; sendUserMessage(followUp) only queues. */
 async function deliverStallWake(pi: ExtensionAPI, text: string): Promise<boolean> {
-	if (hostStopQuiet) return false;
-	return queueStallAfterCutIn(pi, text, {
+	return deliverStallWakeThrough(pi, text, {
+		quiet: () => hostStopQuiet,
 		waitForCutIn: awaitCutInHoldRelease,
-		shouldSend: () => !hostStopQuiet && admitOrHoldRuntimeSignal(text),
+		admit: admitOrHoldRuntimeSignal,
 	});
 }
 
@@ -7762,13 +7761,7 @@ export default function (pi: ExtensionAPI) {
 				const aborted = abortRunningAgent(agentId);
 				if (!aborted.ok) continue;
 				if (handle.syncWait !== true) {
-					void deliverStallWake(
-						pi,
-						[
-							`[subagent-blocked] agentId=${agentId} title=${title} idle=${idleSec}s last=${lastLine} auto-aborted after stall`,
-							`This worker was auto-aborted after stall. Query subagent_status({agentId:"${agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Do not treat this message as a new user request.`,
-						].join("\n"),
-					);
+					void deliverStallWake(pi, formatBlockedMessage({ agentId, title, idleSec, lastLine }));
 				}
 				pipiuiReport({
 					kind: "stalled",
@@ -7783,18 +7776,14 @@ export default function (pi: ExtensionAPI) {
 			if (!claimStallNotification(handle, now, STALL_RENOTIFY_MAX, STALL_RENOTIFY_INTERVAL_MS)) continue;
 			void deliverStallWake(
 				pi,
-				// Handling rides with the event rather than sitting in the cached prefix all
-				// session waiting for a stall that may never happen — and it is more likely to
-				// be followed here, next to the thing it is about.
-				[
-					`[subagent-stalled] agentId=${agentId} title=${title} idle=${idleSec}s${stallInfo.inTool ? ` in=${stallInfo.inTool.names.join("+")} for=${stallInfo.inTool.forSec}s` : ""} last=${lastLine}`,
-					// The evidence is attached to the signal so "keep waiting" has to answer to a
-					// measurement instead of a guess. This message now only fires when nothing
-					// explains the silence, or when the CPU says the explained wait stopped moving.
-					`Liveness: ${cpuEvidenceFor(agentId) ?? "no CPU measurement available for this worker"}.`,
-					`Query it first with subagent_status({agentId:"${agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
-					`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
-				].join("\n"),
+				formatStallMessage({
+					agentId,
+					title,
+					idleSec,
+					lastLine,
+					...(stallInfo.inTool ? { inTool: stallInfo.inTool } : {}),
+					...(cpuEvidenceFor(agentId) ? { liveness: cpuEvidenceFor(agentId) as string } : {}),
+				}),
 			).then((ok) => confirmStallNotification(handle, ok));
 			pipiuiReport({
 				kind: "stalled",
