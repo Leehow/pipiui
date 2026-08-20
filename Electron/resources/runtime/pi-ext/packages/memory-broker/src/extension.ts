@@ -21,6 +21,7 @@ import {
   type MemoryBrokerPackageIdentity,
 } from "./runtime-identity.ts";
 import { MemoryAdminService } from "./memory-admin.ts";
+import { IngestionStateReporter, type IngestionUnwiredReason } from "./ingestion-state.ts";
 import { compactFailureMemoryAtShutdown } from "./memory-watermark.ts";
 import { MemoryRuntimeMetricsCollector } from "./runtime-metrics.ts";
 import type {
@@ -306,11 +307,10 @@ export async function installMemoryBrokerExtension(
   let operatorApplicationScope: OperatorComputerApplicationScope | undefined;
   let catalog: MemoryCatalog | undefined;
   let curatorScheduler: MemoryCuratorScheduler | undefined;
-  // Candidates accepted by the server but dropped before reaching the catalog.
-  // Without this the two states "no subagent submitted anything" and "every
-  // submission was discarded" are indistinguishable from outside: the catalog
-  // just stops growing, silently and indefinitely.
-  let discardedCandidates = 0;
+  // Publishes whether candidates are actually reaching the catalog. Without it
+  // "no subagent submitted anything" and "every submission was discarded" are
+  // indistinguishable from outside: the catalog just stops growing, silently.
+  let ingestionReporter: IngestionStateReporter | undefined;
   let retrieval: RetrievalRuntimeAdapter | undefined;
   let admin: MemoryAdminService | undefined;
   const runtimeMetrics = new MemoryRuntimeMetricsCollector();
@@ -414,15 +414,20 @@ export async function installMemoryBrokerExtension(
           if (curator) curatorScheduler = new MemoryCuratorScheduler(curator, catalog);
         }
         // Ingestion is wired only when the backend exposes a catalog port, so a
-        // degraded Hermes silently turns off catalog growth entirely. Name the
-        // gap at the moment it is created rather than leaving it to be inferred
-        // from a log file that stopped growing days ago.
-        if (catalog && !curatorScheduler) {
-          console.error(
-            "[pipiui-memory-broker] catalog ingestion is not wired"
-            + ` (${catalogBackend?.catalogPort ? "curator unavailable" : "backend exposes no catalog port"});`
-            + " submitted experience candidates will be discarded.",
-          );
+        // degraded Hermes silently turns off catalog growth entirely. Record the
+        // state next to the catalog rather than leaving it to be inferred, days
+        // later, from a log that stopped growing.
+        const unwiredReason: IngestionUnwiredReason | undefined = !catalog
+          ? "no-catalog"
+          : !catalogBackend?.catalogPort
+            ? "no-catalog-port"
+            : !curatorScheduler ? "curator-unavailable" : undefined;
+        ingestionReporter = new IngestionStateReporter(catalogRoot);
+        await ingestionReporter.start(!!curatorScheduler, unwiredReason);
+        if (unwiredReason) {
+          // Also on stderr: the host only surfaces this tail when Pi exits
+          // abnormally, which is the one case the state file may not survive.
+          console.error(`[pipiui-memory-broker] catalog ingestion is not wired (${unwiredReason}); candidates will be discarded.`);
         }
         if (catalog) admin = new MemoryAdminService(catalog, catalogBackend?.catalogPort, `${identity.root}/ui`, async () => {
           const value = await backend!.status((await import("#memory-broker-contract")).createActorContext({ projectRoot, chatSessionID: "memory-main-session", bridgeRoutingKey: "memory-main-route", agentID: "main", runID: "main-session", role: "main" }));
@@ -435,15 +440,11 @@ export async function installMemoryBrokerExtension(
           ...(backend ? { backend } : {}),
           onCandidate: async (candidate) => {
             if (!curatorScheduler) {
-              discardedCandidates++;
-              // Once per session: the condition is startup-wide, so repeating it
-              // per candidate would bury the signal it is meant to raise.
-              if (discardedCandidates === 1) {
-                console.error("[pipiui-memory-broker] discarding experience candidates: catalog ingestion is not wired.");
-              }
+              await ingestionReporter?.discard();
               return;
             }
             await curatorScheduler.submit(candidate, projectRoot);
+            ingestionReporter?.forward();
           },
           ...(admin ? { adminService: admin } : {}),
         };
@@ -492,10 +493,8 @@ export async function installMemoryBrokerExtension(
       // catalog durability is already fsync'd per event.
       curatorScheduler?.onSessionEnd();
       curatorScheduler = undefined;
-      if (discardedCandidates > 0) {
-        console.error(`[pipiui-memory-broker] discarded ${discardedCandidates} experience candidate(s) this session: catalog ingestion was not wired.`);
-        discardedCandidates = 0;
-      }
+      await ingestionReporter?.finish();
+      ingestionReporter = undefined;
       catalog = undefined;
       admin?.revokeAdminSession();
       admin = undefined;
