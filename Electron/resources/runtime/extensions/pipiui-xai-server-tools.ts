@@ -4,20 +4,30 @@
 //   "Live search is deprecated. Please switch to the Agent Tools API"
 // Docs: https://docs.x.ai/docs/guides/tools/overview
 //
-// Agent Tools (`web_search` / `x_search`) run on the Responses API. This host
-// still speaks official xAI as openai-completions, so this extension only
-// strips the retired field and leaves client/pi-web-access `web_search` in
-// place. Do not re-inject `search_parameters`.
+// Grok Build / xAI Agent Tools run on the Responses API as hosted
+// `{ type: "web_search" }`. Every channel whose provider field is `xai`
+// (official api.x.ai, relays, custom endpoints, any Grok model id) is
+// remapped onto openai-responses and the hosted tool is injected. Client
+// function tools named `web_search` are dropped so they cannot collide.
+// Incompatible relays must fail visibly — no silent fallback to Pipi
+// pi-web-access web_search.
 //
 // It also captures api.x.ai's `x-ratelimit-*` response headers (the only
 // programmatic quota signal left for SuperGrok/X Premium OAuth accounts) into
 // `<agentDir>/grok-rate-limits.json` for the host's Grok 账号额度 pill.
 import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-type CompletionsPayload = {
+const XAI_WEB_SEARCH_TOOL = {
+  type: "web_search",
+} as const;
+
+const XAI_RESPONSES_API = "openai-responses";
+
+type ProviderPayload = {
   model?: string;
+  input?: unknown;
   messages?: unknown;
   tools?: unknown[];
   [key: string]: unknown;
@@ -27,21 +37,85 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isXaiCompletionsModel(model: { provider?: string; api?: string } | undefined): boolean {
-  if (!model) return false;
-  const provider = (model.provider || "").toLowerCase();
-  if (provider !== "xai") return false;
-  return model.api === "openai-completions";
+function isXaiProvider(model: { provider?: string } | undefined): boolean {
+  return (model?.provider || "").toLowerCase() === "xai";
+}
+
+function isXaiResponsesRequest(
+  model: { provider?: string; api?: string } | undefined,
+  payload: unknown,
+): payload is ProviderPayload {
+  if (!isXaiProvider(model)) return false;
+  if (!isRecord(payload)) return false;
+  return Array.isArray(payload.input);
 }
 
 function isXaiCompletionsRequest(
   model: { provider?: string; api?: string } | undefined,
   payload: unknown,
-): payload is CompletionsPayload {
-  if (!isXaiCompletionsModel(model)) return false;
+): payload is ProviderPayload {
+  if (!isXaiProvider(model)) return false;
   if (!isRecord(payload)) return false;
-  // Chat Completions uses `messages`; Responses uses `input`.
-  return Array.isArray(payload.messages);
+  return Array.isArray(payload.messages) && !Array.isArray(payload.input);
+}
+
+function isClientWebSearchTool(tool: Record<string, unknown>): boolean {
+  const type = typeof tool.type === "string" ? tool.type : "";
+  const name = typeof tool.name === "string" ? tool.name : "";
+  if (name === "web_search") return true;
+  if (type === "function") {
+    const fn = isRecord(tool.function) ? tool.function : undefined;
+    const fnName = typeof fn?.name === "string" ? fn.name : "";
+    return fnName === "web_search";
+  }
+  return false;
+}
+
+function isHostedWebSearchTool(tool: Record<string, unknown>): boolean {
+  return tool.type === "web_search" && (typeof tool.name !== "string" || tool.name === "web_search")
+    && tool.function === undefined;
+}
+
+function dropClientWebSearch(existing: unknown): unknown[] {
+  const current = Array.isArray(existing) ? [...existing] : [];
+  return current.filter((tool) => {
+    if (!isRecord(tool)) return true;
+    if (isHostedWebSearchTool(tool)) return true;
+    return !isClientWebSearchTool(tool);
+  });
+}
+
+function mergeHostedWebSearch(existing: unknown): unknown[] {
+  const filtered = dropClientWebSearch(existing);
+  const hasHosted = filtered.some((tool) => isRecord(tool) && isHostedWebSearchTool(tool));
+  if (!hasHosted) filtered.push({ ...XAI_WEB_SEARCH_TOOL });
+  return filtered;
+}
+
+function withoutSearchParameters(payload: ProviderPayload): ProviderPayload {
+  if (!Object.prototype.hasOwnProperty.call(payload, "search_parameters")) return payload;
+  const next = { ...payload };
+  delete next.search_parameters;
+  return next;
+}
+
+function remapXaiModelsToResponses(models: unknown[]): unknown[] {
+  return models.map((model) => {
+    if (!isRecord(model)) return model;
+    return { ...model, api: XAI_RESPONSES_API };
+  });
+}
+
+async function applyXaiResponsesApi(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+  const registry = ctx.modelRegistry;
+  if (!registry?.getProvider) return;
+  const provider = registry.getProvider("xai");
+  const models = provider?.getModels ? provider.getModels() : [];
+  if (!Array.isArray(models) || models.length === 0) return;
+  pi.registerProvider("xai", {
+    api: XAI_RESPONSES_API,
+    models: remapXaiModelsToResponses(models),
+  });
 }
 
 const RATE_LIMIT_WRITE_INTERVAL_MS = 30_000;
@@ -83,20 +157,43 @@ function captureRateLimitHeaders(headers: Record<string, unknown> | undefined, n
 }
 
 export default function (pi: ExtensionAPI) {
+  pi.on("session_start", (_event, ctx) => {
+    return applyXaiResponsesApi(pi, ctx).catch((error) => {
+      console.error(
+        `[pipiui-xai-server-tools] failed to remap xAI models onto Responses: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  });
+
   pi.on("before_provider_request", (event, ctx) => {
     const model = ctx.model;
-    if (!isXaiCompletionsRequest(model, event.payload)) {
+    if (!isXaiProvider(model) || !isRecord(event.payload)) {
       return;
     }
 
-    const payload = event.payload as CompletionsPayload;
-    if (!Object.prototype.hasOwnProperty.call(payload, "search_parameters")) {
-      return;
+    if (isXaiResponsesRequest(model, event.payload)) {
+      const payload = withoutSearchParameters(event.payload);
+      return {
+        ...payload,
+        tools: mergeHostedWebSearch(payload.tools),
+      };
     }
 
-    const next = { ...payload };
-    delete next.search_parameters;
-    return next;
+    if (isXaiCompletionsRequest(model, event.payload)) {
+      // Legacy completions: never send 410 Live Search, never keep colliding
+      // client web_search. Do not inject hosted tools here — they belong on
+      // Responses. Relays still on completions should fail after remap, not
+      // silently use Pipi web_search.
+      const payload = withoutSearchParameters(event.payload);
+      return {
+        ...payload,
+        tools: dropClientWebSearch(payload.tools),
+      };
+    }
+
+    if (Object.prototype.hasOwnProperty.call(event.payload, "search_parameters")) {
+      return withoutSearchParameters(event.payload as ProviderPayload);
+    }
   });
 
   pi.on("after_provider_response", (event, ctx) => {
@@ -106,18 +203,40 @@ export default function (pi: ExtensionAPI) {
     captureRateLimitHeaders(event.headers, Date.now());
   });
 
+  pi.on("before_agent_start", (event, ctx) => {
+    const model = ctx.model;
+    if (!isXaiProvider(model)) {
+      return;
+    }
+
+    const tip = [
+      "",
+      "## xAI server tools",
+      "When the active model is any `xai` provider channel, xAI Responses hosted Agent Tools are enabled on every request:",
+      "- `web_search` — live web search executed on xAI servers (prefer over bash/curl and over client/pi-web-access web_search)",
+      "Do not send `search_parameters` (retired Live Search, returns 410). Keep using local `read`/`bash`/`edit`/`write` for the workspace.",
+    ].join("\n");
+
+    if (event.systemPrompt.includes("## xAI server tools")) {
+      return;
+    }
+    return {
+      systemPrompt: `${event.systemPrompt}${tip}`,
+    };
+  });
+
   pi.registerCommand("xai-tools", {
-    description: "Show whether xAI server-side search is active",
+    description: "Show whether xAI hosted web_search is active",
     handler: async (_args, ctx) => {
       const model = ctx.model;
-      const active = isXaiCompletionsModel(model);
+      const active = isXaiProvider(model);
       const lines = [
         `model: ${model ? `${model.provider}/${model.id}` : "(none)"}`,
         `api: ${model?.api ?? "(none)"}`,
         "xAI Live Search: retired (search_parameters returns 410)",
         active
-          ? "Use client web_search (pi-web-access). Do not send search_parameters."
-          : "inactive (need xai + openai-completions)",
+          ? "xAI server tools: ENABLED (Responses hosted web_search). Client web_search is removed to avoid collisions."
+          : "inactive (need provider=xai)",
       ];
       ctx.ui.notify(lines.join("\n"), active ? "info" : "warning");
     },

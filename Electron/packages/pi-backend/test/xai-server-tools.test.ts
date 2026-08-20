@@ -18,15 +18,41 @@ async function loadXaiServerTools() {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     }),
     registerCommand: vi.fn(),
+    registerProvider: vi.fn(),
   };
   const extension = (await import(EXTENSION)).default;
   extension(pi as never);
-  return { handlers };
+  return { handlers, pi };
+}
+
+function xaiResponsesContext(overrides: Record<string, unknown> = {}) {
+  return {
+    model: {
+      provider: "xai",
+      api: "openai-responses",
+      id: "grok-4.6",
+      name: "Grok 4.6",
+      ...overrides,
+    },
+  };
 }
 
 function xaiCompletionsContext() {
   return {
     model: { provider: "xai", api: "openai-completions", id: "grok-4.6", name: "Grok 4.6" },
+  };
+}
+
+function responsesPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    model: "grok-4.6",
+    input: [{ role: "user", content: "hello" }],
+    tools: [
+      { type: "function", name: "bash", parameters: { type: "object" } },
+      { type: "function", name: "web_search", parameters: { type: "object" } },
+      { type: "function", name: "read", parameters: { type: "object" } },
+    ],
+    ...overrides,
   };
 }
 
@@ -42,47 +68,138 @@ function completionsPayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function toolNames(tools: unknown): string[] {
+  if (!Array.isArray(tools)) return [];
+  return tools.map((tool) => {
+    if (!tool || typeof tool !== "object") return "";
+    const rec = tool as Record<string, unknown>;
+    if (typeof rec.name === "string") return rec.name;
+    if (rec.function && typeof rec.function === "object" && rec.function !== null && "name" in rec.function) {
+      return String((rec.function as { name: unknown }).name);
+    }
+    return typeof rec.type === "string" ? rec.type : "";
+  });
+}
+
 describe("pipiui-xai-server-tools", () => {
-  it("never injects deprecated search_parameters and keeps client web_search on xAI completions", async () => {
+  it("injects hosted web_search on any xai Responses channel, including custom endpoints", async () => {
     const { handlers } = await loadXaiServerTools();
     const beforeRequest = handlers.get("before_provider_request")?.[0];
-    expect(beforeRequest).toBeTypeOf("function");
-
-    const payload = completionsPayload({
+    const payload = responsesPayload({
       search_parameters: { mode: "auto" },
     });
     const result = beforeRequest?.(
       { type: "before_provider_request", payload },
-      xaiCompletionsContext(),
+      xaiResponsesContext({ id: "custom-grok", baseUrl: "https://relay.example/v1" }),
     ) as Record<string, unknown> | undefined;
 
     expect(result).toBeDefined();
     expect(result).not.toHaveProperty("search_parameters");
     expect(JSON.stringify(result)).not.toMatch(/search_parameters/);
-    expect(result?.tools).toEqual(payload.tools);
+    expect(toolNames(result?.tools)).toEqual(["bash", "read", "web_search"]);
+    expect(result?.tools).toEqual(
+      expect.arrayContaining([{ type: "web_search" }]),
+    );
+    expect(result?.tools).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "web_search" })]),
+    );
   });
 
-  it("does not advertise retired xAI live search in the system prompt", async () => {
+  it("keeps an explicit hosted web_search and does not duplicate it", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      {
+        type: "before_provider_request",
+        payload: responsesPayload({
+          tools: [
+            { type: "function", name: "bash" },
+            { type: "web_search" },
+            { type: "function", name: "web_search" },
+          ],
+        }),
+      },
+      xaiResponsesContext(),
+    ) as Record<string, unknown> | undefined;
+
+    const hosted = (result?.tools as unknown[]).filter(
+      (tool) => tool && typeof tool === "object" && (tool as { type?: string }).type === "web_search",
+    );
+    expect(hosted).toEqual([{ type: "web_search" }]);
+  });
+
+  it("strips retired search_parameters and client web_search on leftover completions without injecting hosted tools", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const payload = completionsPayload({ search_parameters: { mode: "auto" } });
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload },
+      xaiCompletionsContext(),
+    ) as Record<string, unknown> | undefined;
+
+    expect(result).not.toHaveProperty("search_parameters");
+    expect(toolNames(result?.tools)).toEqual(["bash"]);
+    expect(result?.tools).not.toEqual(expect.arrayContaining([{ type: "web_search" }]));
+  });
+
+  it("advertises xAI hosted web_search in the system prompt for provider=xai", async () => {
     const { handlers } = await loadXaiServerTools();
     const beforeStart = handlers.get("before_agent_start")?.[0];
     const result = beforeStart?.(
       { type: "before_agent_start", systemPrompt: "You are a coding agent." },
-      xaiCompletionsContext(),
-    );
+      xaiResponsesContext(),
+    ) as { systemPrompt?: string } | undefined;
 
-    expect(result).toBeUndefined();
+    expect(result?.systemPrompt).toContain("## xAI server tools");
+    expect(result?.systemPrompt).toContain("hosted Agent Tools");
+    expect(result?.systemPrompt).not.toContain("Use client web_search");
   });
 
-  it("leaves non-xAI completions payloads untouched", async () => {
+  it("leaves non-xAI payloads and prompts untouched", async () => {
     const { handlers } = await loadXaiServerTools();
     const beforeRequest = handlers.get("before_provider_request")?.[0];
-    const payload = completionsPayload();
-    const result = beforeRequest?.(
-      { type: "before_provider_request", payload },
-      { model: { provider: "openai", api: "openai-completions", id: "gpt-4.1" } },
+    const beforeStart = handlers.get("before_agent_start")?.[0];
+    const payload = responsesPayload();
+    const openaiCtx = { model: { provider: "openai", api: "openai-responses", id: "gpt-4.1" } };
+
+    expect(beforeRequest?.({ type: "before_provider_request", payload }, openaiCtx)).toBeUndefined();
+    expect(
+      beforeStart?.(
+        { type: "before_agent_start", systemPrompt: "You are a coding agent." },
+        openaiCtx,
+      ),
+    ).toBeUndefined();
+  });
+
+  it("remaps every xai catalog model onto openai-responses at session_start", async () => {
+    const { handlers, pi } = await loadXaiServerTools();
+    const sessionStart = handlers.get("session_start")?.[0];
+    await sessionStart?.(
+      { type: "session_start" },
+      {
+        modelRegistry: {
+          getProvider: (id: string) => {
+            if (id !== "xai") return undefined;
+            return {
+              getModels: () => [
+                { id: "grok-4.3", api: "openai-completions", provider: "xai", baseUrl: "https://relay.example/v1" },
+                { id: "grok-4.5", api: "openai-responses", provider: "xai", baseUrl: "https://api.x.ai/v1" },
+                { id: "custom-id", api: "openai-completions", provider: "xai", baseUrl: "https://relay.example/v1" },
+              ],
+            };
+          },
+        },
+      },
     );
 
-    expect(result).toBeUndefined();
+    expect(pi.registerProvider).toHaveBeenCalledWith("xai", {
+      api: "openai-responses",
+      models: [
+        { id: "grok-4.3", api: "openai-responses", provider: "xai", baseUrl: "https://relay.example/v1" },
+        { id: "grok-4.5", api: "openai-responses", provider: "xai", baseUrl: "https://api.x.ai/v1" },
+        { id: "custom-id", api: "openai-responses", provider: "xai", baseUrl: "https://relay.example/v1" },
+      ],
+    });
   });
 
   it("captures xAI rate-limit headers for the quota pill and throttles repeat writes", async () => {
@@ -109,7 +226,6 @@ describe("pipiui-xai-server-tools", () => {
       });
       expect(captured.capturedAt).toBeGreaterThan(0);
 
-      // The 30s throttle keeps streaming turns from rewriting identical data.
       const firstWrite = captured.capturedAt;
       afterResponse?.(
         { type: "after_provider_response", status: 200, headers: { "x-ratelimit-limit-requests": "1", "x-ratelimit-remaining-requests": "1" } },
@@ -118,7 +234,6 @@ describe("pipiui-xai-server-tools", () => {
       expect(JSON.parse(readFileSync(join(agentDir, "grok-rate-limits.json"), "utf8"))).toEqual(captured);
       expect(firstWrite).toBeGreaterThan(0);
 
-      // Non-xAI providers must not overwrite the captured numbers.
       afterResponse?.(
         { type: "after_provider_response", status: 200, headers: { "x-ratelimit-limit-requests": "9", "x-ratelimit-remaining-requests": "9" } },
         { model: { provider: "openai", api: "openai-completions", id: "gpt-4.1" } },
