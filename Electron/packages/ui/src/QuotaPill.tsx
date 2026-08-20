@@ -9,6 +9,8 @@ export interface QuotaPillProps {
   sessionId?: string
   /** Current model provider; changing it refetches after an in-session model switch. */
   provider?: string
+  /** Model id, used when a provider groups a plan under a distinct model id. */
+  modelId?: string
   /** Extra dependency to force a refetch (e.g. after model/auth changes). */
   refreshKey?: unknown
   /**
@@ -36,20 +38,23 @@ export function visibleQuotaWindows(snapshot: QuotaSnapshot): QuotaWindow[] {
  * Needed because the UI updates the chip immediately while `getQuotaSnapshot`
  * still reads the session's pre-switch model until `setModel` lands.
  */
-export function quotaSnapshotMatchesProvider(snapshot: QuotaSnapshot, modelProvider?: string): boolean {
-  if (!modelProvider) return true
-  const model = modelProvider.toLowerCase()
-  if (model.includes('relay')) return false
+export function quotaSnapshotMatchesProvider(snapshot: QuotaSnapshot, modelProvider?: string, modelId?: string): boolean {
+  if (!modelProvider && !modelId) return true
+  const provider = (modelProvider ?? '').toLowerCase()
+  const id = (modelId ?? '').toLowerCase()
+  // A relay provider must never inherit a plan's similarly named model id.
+  if (provider.includes('relay')) return false
+  const includes = (token: string) => provider.includes(token) || id.includes(token)
   const kind = snapshot.provider.toLowerCase()
-  if (kind === 'qwentokenplan') return model.includes('qwen-token-plan')
-  if (kind === 'opencodengo') return model.includes('opencode-go')
-  if (kind === 'codex') return model.includes('openai') || model.includes('codex')
-  if (kind === 'cursor') return model.includes('cursor')
-  if (kind === 'claude') return model.includes('anthropic') || model.includes('claude')
-  if (kind === 'glm') return ['zai', 'zhipu', 'bigmodel', 'glm'].some(token => model.includes(token))
-  if (kind === 'grok') return model === 'xai' || model.includes('grok')
-  if (kind === 'moonshot') return model.includes('moonshot')
-  return model.includes(kind)
+  if (kind === 'qwentokenplan') return includes('qwen-token-plan')
+  if (kind === 'opencodego') return includes('opencode-go')
+  if (kind === 'codex') return includes('openai') || includes('codex')
+  if (kind === 'cursor') return includes('cursor')
+  if (kind === 'claude') return includes('anthropic') || includes('claude')
+  if (kind === 'glm') return ['zai', 'zhipu', 'bigmodel', 'glm'].some(includes)
+  if (kind === 'grok') return provider === 'xai' || includes('grok')
+  if (kind === 'moonshot') return includes('moonshot')
+  return includes(kind)
 }
 
 /** Per-provider localStorage key, mirroring Swift `LayoutPersistence.quotaWindowKey`. */
@@ -100,7 +105,7 @@ function capsuleWindow(windows: QuotaWindow[], selectedId: string | null): Quota
  * The popover stays open after a pick and closes on outside click or re-click
  * (Swift popover parity).
  */
-export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowserLogin }: QuotaPillProps) {
+export function QuotaPill({ host, sessionId, provider, modelId, refreshKey, onOpenBrowserLogin }: QuotaPillProps) {
   const [snapshot, setSnapshot] = useState<QuotaSnapshot | null>(null)
   const [loaded, setLoaded] = useState(false)
   const [refreshTick, setRefreshTick] = useState(0)
@@ -108,12 +113,12 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
   const [open, setOpen] = useState(false)
   const pillRef = useRef<HTMLButtonElement>(null)
   const [menuStyle, setMenuStyle] = useState<CSSProperties | undefined>()
-  const scopeRef = useRef({ sessionId, provider })
+  const scopeRef = useRef({ sessionId, provider, modelId })
   // Same render-time reset as Composer drafts: a session / model switch must
   // not paint the previous provider's capsule, popover, or in-session pick.
   // refreshKey / poll ticks still reuse the last good snapshot.
-  if (scopeRef.current.sessionId !== sessionId || scopeRef.current.provider !== provider) {
-    scopeRef.current = { sessionId, provider }
+  if (scopeRef.current.sessionId !== sessionId || scopeRef.current.provider !== provider || scopeRef.current.modelId !== modelId) {
+    scopeRef.current = { sessionId, provider, modelId }
     setSnapshot(null)
     setLoaded(false)
     setSelectedId(null)
@@ -130,7 +135,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
         if (cancelled) return
         // A snapshot for the previous model is not "last good" — drop it and
         // wait for the post-setModel refetch instead of painting the wrong pill.
-        if (snap && !quotaSnapshotMatchesProvider(snap, provider)) return
+        if (snap && !quotaSnapshotMatchesProvider(snap, provider, modelId)) return
         setSnapshot(snap)
       } catch {
         // Quota is best-effort: keep the last good snapshot, never error UI.
@@ -139,7 +144,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
     }
     void load()
     return () => { cancelled = true }
-  }, [host, sessionId, provider, refreshKey, refreshTick])
+  }, [host, sessionId, provider, modelId, refreshKey, refreshTick])
 
   useLayoutEffect(() => {
     if (!open) {
@@ -162,7 +167,7 @@ export function QuotaPill({ host, sessionId, provider, refreshKey, onOpenBrowser
     return () => window.removeEventListener('resize', update)
   }, [open])
 
-  const activeSnapshot = snapshot && quotaSnapshotMatchesProvider(snapshot, provider) ? snapshot : null
+  const activeSnapshot = snapshot && quotaSnapshotMatchesProvider(snapshot, provider, modelId) ? snapshot : null
   const showLogin = loaded && !activeSnapshot && Boolean(onOpenBrowserLogin) && Boolean(provider?.includes('qwen-token-plan'))
 
   useEffect(() => {

@@ -46,6 +46,8 @@ describe('quotaSnapshotMatchesProvider', () => {
     expect(quotaSnapshotMatchesProvider({ provider: 'grok', accountLabel: '', windows: [] }, 'grok-relay')).toBe(false)
     expect(quotaSnapshotMatchesProvider({ provider: 'cursor', accountLabel: '', windows: [] }, 'cursor')).toBe(true)
     expect(quotaSnapshotMatchesProvider({ provider: 'cursor', accountLabel: '', windows: [] }, 'cursor-relay')).toBe(false)
+    // OpenCode Go may arrive as the opencode provider plus a plan model id.
+    expect(quotaSnapshotMatchesProvider({ provider: 'opencodeGo', accountLabel: '', windows: [] }, 'opencode', 'opencode-go')).toBe(true)
   })
 })
 
@@ -59,6 +61,16 @@ describe('QuotaPill', () => {
     expect(pill.tagName).toBe('BUTTON')
     expect(pill.getAttribute('aria-haspopup')).toBe('menu')
     expect(pill.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('renders OpenCode Go local usage when its plan is identified by model id', async () => {
+    const { host } = quotaHost({
+      provider: 'opencodeGo',
+      accountLabel: 'OpenCode Go 本机用量',
+      windows: [{ id: 'fiveHour', usedPercent: 50, label: '5h', title: '5小时本机用量' }]
+    })
+    render(<QuotaPill host={host} provider="opencode" modelId="opencode-go" />)
+    expect((await screen.findByTestId('quota-pill')).textContent).toBe('5h 50%')
   })
 
   it('keeps the backend-provided 月 period label', async () => {

@@ -234,6 +234,21 @@ describe("PiHostBackend quota bridge", () => {
     await expect(backend.handle("getQuotaSnapshot", ["codex-session"])).resolves.toEqual(snapshot);
     expect(quotaStore.snapshot).toHaveBeenCalledWith("openai-codex");
   });
+
+  it("uses an OpenCode Go model id when OpenCode groups it under its generic provider", async () => {
+    const snapshot = { provider: "opencodeGo", accountLabel: "OpenCode Go 本机用量", windows: [{ id: "fiveHour", usedPercent: 50, label: "5h", title: "5小时本机用量" }] };
+    const quotaStore = { snapshot: vi.fn(async () => snapshot) };
+    const backend = createPiHostBackend({ quotaStore: quotaStore as any });
+    const privateBackend = backend as unknown as { sessionModelSnapshots: Map<string, unknown> };
+    privateBackend.sessionModelSnapshots.set("opencode-go-session", {
+      model: { provider: "opencode", id: "opencode-go", name: "OpenCode Go", reasoning: true },
+      thinkingLevel: "medium",
+      availableThinkingLevels: ["off", "medium"],
+    });
+
+    await expect(backend.handle("getQuotaSnapshot", ["opencode-go-session"])).resolves.toEqual(snapshot);
+    expect(quotaStore.snapshot).toHaveBeenCalledWith("opencode-go");
+  });
 });
 
 describe("QuotaStore", () => {

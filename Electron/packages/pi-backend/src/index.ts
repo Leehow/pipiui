@@ -80,7 +80,7 @@ import {
   type StopEscalationDelays,
   type StopEscalationHooks,
 } from "./stop-escalation.js";
-import { QuotaStore, parseDotEnv } from "./quota.js";
+import { QuotaStore, parseDotEnv, quotaProviderFor } from "./quota.js";
 import {
   applySessionMountsToMainEnv,
   createSessionEnvRefreshGate,
@@ -5685,7 +5685,16 @@ export class PiHostBackend implements HostBackend {
     const state = sessionId
       ? this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId) ?? await this.getModelState(sessionId)
       : this.modelState;
-    return this.quotaStore.snapshot(state.model.provider);
+    // OpenCode can report Go as a model id below its generic `opencode`
+    // provider. Prefer the provider normally, but let a quota-capable model id
+    // identify that plan without treating ordinary OpenCode pay-as-you-go
+    // models as subscription quota sessions.
+    const provider = quotaProviderFor(state.model.provider)
+      ? state.model.provider
+      : quotaProviderFor(state.model.id)
+        ? state.model.id
+        : state.model.provider;
+    return this.quotaStore.snapshot(provider);
   }
   private async sessionStatsData(id: string): Promise<SessionStats> {
     await this.loadSessionContextLedger();
