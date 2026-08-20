@@ -76,6 +76,18 @@ export function secretPlaceholder(secret: { envName: string }): string {
   return `{{secret:${secret.envName}}}`;
 }
 
+/**
+ * Guard outbound bearer clients that consume a session-mounted vault value.
+ * Do this before constructing request headers: an empty bearer token otherwise
+ * produces a misleading remote 401 after a vault/session reset.
+ */
+export function requireVaultBearerToken(envName: string, value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${envName} is empty (vault cleared, please re-authorize)`);
+  }
+  return value.trim();
+}
+
 export function redactText(text: string, secrets: readonly RevealedSecret[]): string {
   if (!text || secrets.length === 0) return text;
   const ordered = [...secrets].sort((a, b) => b.value.length - a.value.length);

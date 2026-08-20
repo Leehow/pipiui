@@ -78,6 +78,20 @@ describe("pipiui secret vault tools", () => {
     return capability;
   }
 
+  it("marks an empty mount list so callers re-authorize before secret-backed requests", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-vault-tools-empty-"));
+    await started(root);
+    const tools = await loadExtension(root);
+    const ctx = { sessionManager: { getSessionId: () => "sess-a" } };
+    const listed = parse(await tools.secret_vault_list!.execute("1", {}, undefined, undefined, ctx));
+    expect(listed).toMatchObject({
+      ok: true,
+      empty: true,
+      message: "vault is empty; please re-authorize before any secret-backed request",
+      mounts: [],
+    });
+  });
+
   it("stores, lists, mounts across sessions, deletes, and never returns plaintext", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-vault-tools-"));
     const sessionFile = join(root, "sess.jsonl");

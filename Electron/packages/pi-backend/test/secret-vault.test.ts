@@ -3,7 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { requireVaultBearerToken } from "../../../resources/runtime/extensions/secret-vault-core.ts";
 import {
   applySessionMountsToMainEnv,
   applySessionMountsToWorkerEnv,
@@ -29,6 +30,20 @@ import {
 
 describe("secret vault", () => {
   const dirs: string[] = [];
+
+  it("rejects an empty CSTCLOUD token before a bearer request can be made", () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      expect(() => requireVaultBearerToken("CSTCLOUD_API_KEY", "  ")).toThrow(
+        "CSTCLOUD_API_KEY is empty (vault cleared, please re-authorize)",
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(requireVaultBearerToken("CSTCLOUD_API_KEY", " token ")).toBe("token");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 
   afterEach(async () => {
     resetInMemoryVault();

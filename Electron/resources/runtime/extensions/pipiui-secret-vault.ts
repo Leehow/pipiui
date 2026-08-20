@@ -4,6 +4,7 @@ import {
   invokeVaultHostMethod,
   redactJsonValue,
   redactText,
+  requireVaultBearerToken,
   secretsFromProcessEnv,
   sessionIdFromEnv,
   type VaultMount,
@@ -38,6 +39,11 @@ function redactKnown(text: string): string {
   } catch {
     return text;
   }
+}
+
+function mountFailureMessage(error: unknown): string {
+  const detail = redactKnown(error instanceof Error ? error.message : String(error));
+  return `Unable to mount vault secret: ${detail}. Run secret_vault_list and re-authorize the secret if this session was reset.`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -99,11 +105,16 @@ export default function (pi: ExtensionAPI) {
           mounts: Array<VaultMount & { name: string }>;
           sessionId: string;
         };
-        for (const mount of listed.mounts ?? []) rememberEnvName(mount.envName);
+        const mounts = listed.mounts ?? [];
+        for (const mount of mounts) rememberEnvName(mount.envName);
         return result({
           ok: true,
-          secrets: listed.secrets,
-          mounts: listed.mounts,
+          empty: mounts.length === 0,
+          ...(mounts.length === 0
+            ? { message: "vault is empty; please re-authorize before any secret-backed request" }
+            : {}),
+          secrets: listed.secrets ?? [],
+          mounts,
           sessionId: listed.sessionId ?? sessionId,
         });
       } catch (error) {
@@ -130,10 +141,13 @@ export default function (pi: ExtensionAPI) {
           sessionId: string;
           mount: VaultMount;
         };
-        rememberEnvName(hosted.mount?.envName);
+        const envName = hosted.mount?.envName;
+        if (!envName) throw new Error("vault mount returned no environment variable");
+        requireVaultBearerToken(envName, process.env[envName]);
+        rememberEnvName(envName);
         return result({ ok: true, sessionId: hosted.sessionId ?? sessionId, mount: hosted.mount });
       } catch (error) {
-        return result({ ok: false, error: redactKnown(error instanceof Error ? error.message : String(error)) }, true);
+        return result({ ok: false, error: mountFailureMessage(error) }, true);
       }
     },
   });
