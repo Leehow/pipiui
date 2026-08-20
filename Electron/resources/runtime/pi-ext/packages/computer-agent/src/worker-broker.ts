@@ -262,15 +262,21 @@ export class ComputerWorkerBroker {
         if (mutationIndexes.length > 1 || (mutationIndexes.length === 1 && actions.slice(mutationIndexes[0] + 1).some((action) => action.type !== "wait"))) {
           throw new Error("one_state_mutation_per_observation: legacy workers must split the batch and observe between mutations");
         }
+        // Diagnose no-progress BEFORE the generic post-mutation rule. Both fire on the same
+        // second mutation, so whichever is checked first is the only one the worker ever sees —
+        // and they prescribe different remedies. The generic rule asks for a fresh observation;
+        // this one asks the worker to observe AND REPLAN, because repeating a click that changed
+        // nothing will keep changing nothing. Checking the generic rule first made the specific
+        // diagnosis unreachable for legacy workers (regression in b59df17f).
+        if (grant.noProgress?.requiresObserve) {
+          throw new Error("no_progress_requires_fresh_observation: observe and replan before another UI mutation");
+        }
         if (grant.requiresFreshObservation) {
           throw new Error("fresh_observation_required_after_mutation: call desktop_observe with fresh=true before another legacy-worker mutation");
         }
       }
     }
     const signature = request.operation === "mutate" && grant.role !== "computer-use-agent" ? mutationSignature(request.payload.actions) : undefined;
-    if (request.operation === "mutate" && grant.role !== "computer-use-agent" && grant.noProgress?.requiresObserve) {
-      throw new Error("no_progress_requires_fresh_observation: observe and replan before another UI mutation");
-    }
     if (request.operation === "mutate" && grant.role !== "computer-use-agent" && signature && grant.noProgress?.exhausted) {
       if (grant.noProgress.signature === signature) {
         throw new Error("no_progress_budget_exhausted: equivalent UI mutation is blocked until the UI or strategy changes");
