@@ -1,1 +1,28 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Memory Center</title><link rel="stylesheet" href="memory-center.css"></head><body><main><header><h1>Memory Center</h1><p id="state">Connecting…</p></header><nav id="tabs"></nav><section><label>Project <input id="project"></label><label>App <input id="app"></label><label>Kind <select id="kind"><option value="">All</option><option>semantic</option><option>episodic</option><option>procedural</option></select></label><button id="refresh">Refresh</button></section><div id="records"></div><pre id="detail"></pre></main><script src="memory-center.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Memory Center</title>
+<link rel="stylesheet" href="memory-center.css">
+</head>
+<body>
+<header>
+  <h1>Memory Center</h1>
+  <p id="state" role="status">Loading…</p>
+</header>
+<nav id="tabs" aria-label="Record status"></nav>
+<form id="filters" onsubmit="return false">
+  <input id="project" type="search" placeholder="project" autocomplete="off" spellcheck="false">
+  <input id="app" type="search" placeholder="app" autocomplete="off" spellcheck="false">
+  <input id="kind" type="search" placeholder="kind" autocomplete="off" spellcheck="false">
+  <button id="refresh" type="button">Refresh</button>
+</form>
+<main>
+  <section id="records" aria-label="Records"></section>
+  <pre id="detail" aria-label="Record detail">Select a record.</pre>
+</main>
+<script src="memory-center.js"></script>
+</body>
+</html>

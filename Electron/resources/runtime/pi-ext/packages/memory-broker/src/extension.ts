@@ -12,6 +12,7 @@ import { operatorComputerObservationFromToolResult, type OperatorComputerApplica
 import { importControlledMemoryIfRequested } from "./controlled-memory-migration.ts";
 import { openMainMemoryCatalog, type HermesCatalogPort, type MemoryCatalog } from "./memory-catalog.ts";
 import { MemoryCurator, MemoryCuratorScheduler, type CuratorReviewer } from "./memory-curator.ts";
+import type { CuratorReviewerContext } from "./curator-reviewer.ts";
 import { RetrievalOrchestrator, RetrievalRuntimeAdapter, type RetrievalPort, type RetrievalResult } from "./retrieval-orchestrator.ts";
 import { MEMORY_BROKER_HTTP_VERSION, type MemoryBrokerMode } from "./protocol.ts";
 import { publishMemoryBrokerStatus } from "./status-file.ts";
@@ -403,8 +404,11 @@ export async function installMemoryBrokerExtension(
         const catalogBackend = backend as CatalogHermesBackend | undefined;
         if (catalog && catalogBackend?.catalogPort) {
           await catalog.reconcile(catalogBackend.catalogPort);
-          const reviewer = options.curatorReviewer ?? { review: async () => ({ decision: "keep_candidate" }) };
-          const curator = MemoryCurator.create({ mode: "main", catalog, hermes: catalogBackend.catalogPort, reviewer, metrics: runtimeMetrics });
+          // The reviewer reuses the session's own resolved model. Without one it
+          // returns nothing and every candidate simply stays pending.
+          const { createCuratorReviewer, CURATOR_REVIEW_TIMEOUT_MS } = await import("./curator-reviewer.ts");
+          const reviewer = options.curatorReviewer ?? createCuratorReviewer(ctx as CuratorReviewerContext, env);
+          const curator = MemoryCurator.create({ mode: "main", catalog, hermes: catalogBackend.catalogPort, reviewer, metrics: runtimeMetrics, timeoutMs: CURATOR_REVIEW_TIMEOUT_MS + 2_000 });
           if (curator) curatorScheduler = new MemoryCuratorScheduler(curator, catalog);
         }
         if (catalog) admin = new MemoryAdminService(catalog, catalogBackend?.catalogPort, `${identity.root}/ui`, async () => {

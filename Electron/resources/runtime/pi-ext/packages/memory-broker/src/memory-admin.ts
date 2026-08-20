@@ -10,6 +10,7 @@ const TTL_MS = 5 * 60_000;
 const MAX_BODY = 24_000;
 const RECORD_STATUSES: readonly MemoryRecordStatus[] = ["active", "candidate", "stale", "superseded", "rejected", "deleted"];
 const RAW = /(?:https?:\/\/|screenshot|accessibility tree|\bAX[A-Z_]*\b|coordinates?|foregroundapp|window title|typed text|transcript)/iu;
+const ASSET_TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
 
 type Metrics = { query: { triggered: number; skipped: number; abstain: number; resultCount: number; latency: number }; candidate: number; promotion: number; reject: number };
 export type MemoryAdminDescriptor = { version: typeof MEMORY_ADMIN_API_VERSION; origin: string; path: string; bootstrapFragment: string; expiresAt: number };
@@ -109,7 +110,7 @@ export class MemoryAdminService {
   private async asset(path: string): Promise<MemoryAdminResult> {
     const relative = path === "/memory-center/" ? "index.html" : path.slice("/memory-center/".length);
     if (!/^[a-zA-Z0-9._-]+$/u.test(relative)) return { status: 404, body: "not found" };
-    try { const file = await readFile(resolve(this.assetRoot, relative)); return { status: 200, body: file, headers: { "content-type": relative.endsWith(".js") ? "application/javascript; charset=utf-8" : "text/html; charset=utf-8", "content-security-policy": "default-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", "cache-control": "no-store" } }; } catch { return { status: 404, body: "not found" }; }
+    try { const file = await readFile(resolve(this.assetRoot, relative)); return { status: 200, body: file, headers: { "content-type": ASSET_TYPES[/\.[a-z]+$/u.exec(relative)?.[0] ?? ""] ?? "text/html; charset=utf-8", "content-security-policy": "default-src 'self'; connect-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'", "cache-control": "no-store" } }; } catch { return { status: 404, body: "not found" }; }
   }
 }
 export { MAX_BODY as MEMORY_ADMIN_MAX_BODY_BYTES };

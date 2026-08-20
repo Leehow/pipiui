@@ -33,5 +33,8 @@ test("list/filter/page, lifecycle mutations, edit history, tombstones, DTO sanit
   const edited = await f.call("/v1/memory-admin/records/" + f.candidate.id + "/edit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ claim: "Build safely revised" }) }); const revised = (await edited.json() as any).record; assert.notEqual(revised.id, f.candidate.id); assert.equal(f.catalog.get(f.candidate.id)?.status, "superseded");
   await f.call("/v1/memory-admin/records/" + revised.id + "/delete", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: "delete" }) }); assert.equal(f.catalog.get(revised.id)?.status, "deleted"); assert.equal((await f.catalog.upsert({ kind: "procedural", claim: "Build safely revised", scope: { kind: "project", project: "/repo" } })).status, "deleted");
   const command = await f.admin.executeCommand("list status=deleted") as any; assert.equal(command.records.length, 1);
-  const asset = await f.call("/memory-center/"); assert.match(asset.headers.get("content-security-policy") ?? "", /connect-src 'self'/); assert.doesNotMatch(await asset.text(), /https?:\/\//);
+  const asset = await f.call("/memory-center/"); assert.match(asset.headers.get("content-security-policy") ?? "", /connect-src 'self'/); assert.match(asset.headers.get("content-type") ?? "", /^text\/html/); assert.doesNotMatch(await asset.text(), /https?:\/\//);
+  // Under `style-src 'self'` a stylesheet served as text/html is refused on MIME grounds.
+  for (const [file, type] of [["memory-center.css", /^text\/css/], ["memory-center.js", /^application\/javascript/]] as const) { const served = await f.call("/memory-center/" + file); assert.equal(served.status, 200); assert.match(served.headers.get("content-type") ?? "", type); }
+  assert.equal((await f.call("/memory-center/../src/server.ts")).status, 404);
 } finally { await f.server.close(); await rm(f.dir, { recursive: true }); } });
