@@ -915,6 +915,8 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
   const model = agent.model || `${providerLabel(agent)}/${agent.name}`
+  const resolvedModel = modelLabel(agent)
+  const modelFamilyLabel = modelFamily(agent).family
   const activity = localizedTaskSummary(agent.listSubtitle || agent.title || agent.task)
 	const live = isActive(agent) ? liveAgentStatus(agent, now, activeChildCount) : undefined
   const detailTitle = detailTaskTitle(agent, output)
@@ -924,7 +926,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
     <header className="agent-detail-header">
       <div className="detail-agent-title">
         <div><ModelFamilyIcon agent={agent} /><b>{detailTitle}</b></div>
-        <small>{modelFamily(agent).family}</small>
+        <small>{resolvedModel ? `${modelFamilyLabel} · ${resolvedModel}` : modelFamilyLabel}</small>
       </div>
       <AgentDetailUsage agent={agent} />
     </header>

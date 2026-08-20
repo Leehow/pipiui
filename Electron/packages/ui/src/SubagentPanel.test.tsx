@@ -294,10 +294,22 @@ describe('SubagentPanel', () => {
 
     fireEvent.click(row.querySelector('.agent-select')!)
     const detail = document.querySelector('.agent-detail')!
+    expect(detail.querySelector('.detail-agent-title small')?.textContent).toBe('DeepSeek · deepseek-v4-flash')
     expect(detail.textContent).toContain('jellytoken')
     expect(detail.textContent).toContain('volcengine/deepseek-v4-flash')
     expect(detail.textContent).toContain('session-exact-123')
     expect(detail.textContent).toContain('审查')
+  })
+
+  it('retains the provider family label when old agent data has no model reference', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'legacy', runId: 'r-legacy', name: 'general-purpose', task: '旧任务', state: 'ok', createdAt: 1, provider: 'openai'
+    }]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-legacy')
+    expect(document.querySelector('.detail-agent-title small')?.textContent).toBe('GPT')
   })
 
   it('keeps unknown free text unchanged and gives Chinese labels to common tools', async () => {
@@ -497,7 +509,7 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('¥3.60 CNY')).toBeTruthy()
   })
 
-  it('keeps a narrow detail pane readable and reveals exact metadata only after opening technical details', async () => {
+  it('keeps a narrow detail pane readable while showing the resolved model before technical details', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [{
       agentId: 'narrow', runId: 'r1', name: 'reviewer', title: '中文任务简介', task: 'RAW_PROMPT /tmp/exact path',
@@ -513,7 +525,8 @@ describe('SubagentPanel', () => {
     expect(detail.querySelector('[data-testid="subagent-transcript"]')?.textContent).toContain('中文 TLDR：验证完成')
     const technical = detail.querySelector('.agent-technical-details') as HTMLDetailsElement
     expect(technical.open).toBe(false)
-    expect(detail.querySelector('.agent-detail-header')?.textContent).not.toMatch(/jellytoken|deepseek|session-raw|ctx |cache |RAW_PROMPT|FULL_RAW_ERROR/)
+    expect(detail.querySelector('.agent-detail-header')?.textContent).toContain('DeepSeek · deepseek-v4-flash')
+    expect(detail.querySelector('.agent-detail-header')?.textContent).not.toMatch(/jellytoken|session-raw|ctx |cache |RAW_PROMPT|FULL_RAW_ERROR/)
 
     fireEvent.click(screen.getByText('技术详情'))
     expect(technical.open).toBe(true)
