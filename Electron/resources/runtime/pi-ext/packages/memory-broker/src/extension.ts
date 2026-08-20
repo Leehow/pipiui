@@ -306,6 +306,11 @@ export async function installMemoryBrokerExtension(
   let operatorApplicationScope: OperatorComputerApplicationScope | undefined;
   let catalog: MemoryCatalog | undefined;
   let curatorScheduler: MemoryCuratorScheduler | undefined;
+  // Candidates accepted by the server but dropped before reaching the catalog.
+  // Without this the two states "no subagent submitted anything" and "every
+  // submission was discarded" are indistinguishable from outside: the catalog
+  // just stops growing, silently and indefinitely.
+  let discardedCandidates = 0;
   let retrieval: RetrievalRuntimeAdapter | undefined;
   let admin: MemoryAdminService | undefined;
   const runtimeMetrics = new MemoryRuntimeMetricsCollector();
@@ -408,6 +413,17 @@ export async function installMemoryBrokerExtension(
           const curator = MemoryCurator.create({ mode: "main", catalog, hermes: catalogBackend.catalogPort, reviewer, metrics: runtimeMetrics });
           if (curator) curatorScheduler = new MemoryCuratorScheduler(curator, catalog);
         }
+        // Ingestion is wired only when the backend exposes a catalog port, so a
+        // degraded Hermes silently turns off catalog growth entirely. Name the
+        // gap at the moment it is created rather than leaving it to be inferred
+        // from a log file that stopped growing days ago.
+        if (catalog && !curatorScheduler) {
+          console.error(
+            "[pipiui-memory-broker] catalog ingestion is not wired"
+            + ` (${catalogBackend?.catalogPort ? "curator unavailable" : "backend exposes no catalog port"});`
+            + " submitted experience candidates will be discarded.",
+          );
+        }
         if (catalog) admin = new MemoryAdminService(catalog, catalogBackend?.catalogPort, `${identity.root}/ui`, async () => {
           const value = await backend!.status((await import("#memory-broker-contract")).createActorContext({ projectRoot, chatSessionID: "memory-main-session", bridgeRoutingKey: "memory-main-route", agentID: "main", runID: "main-session", role: "main" }));
           return value;
@@ -417,7 +433,18 @@ export async function installMemoryBrokerExtension(
           chatSessionID: envText(env, "PIPIUI_MEMORY_CHAT_SESSION_ID"),
           bridgeRoutingKey: envText(env, "PIPIUI_MEMORY_BRIDGE_ROUTING_KEY"),
           ...(backend ? { backend } : {}),
-          onCandidate: async (candidate) => { await curatorScheduler?.submit(candidate, projectRoot); },
+          onCandidate: async (candidate) => {
+            if (!curatorScheduler) {
+              discardedCandidates++;
+              // Once per session: the condition is startup-wide, so repeating it
+              // per candidate would bury the signal it is meant to raise.
+              if (discardedCandidates === 1) {
+                console.error("[pipiui-memory-broker] discarding experience candidates: catalog ingestion is not wired.");
+              }
+              return;
+            }
+            await curatorScheduler.submit(candidate, projectRoot);
+          },
           ...(admin ? { adminService: admin } : {}),
         };
         const { MemoryBrokerServer: MainMemoryBrokerServer } = await import("./server.ts");
@@ -465,6 +492,10 @@ export async function installMemoryBrokerExtension(
       // catalog durability is already fsync'd per event.
       curatorScheduler?.onSessionEnd();
       curatorScheduler = undefined;
+      if (discardedCandidates > 0) {
+        console.error(`[pipiui-memory-broker] discarded ${discardedCandidates} experience candidate(s) this session: catalog ingestion was not wired.`);
+        discardedCandidates = 0;
+      }
       catalog = undefined;
       admin?.revokeAdminSession();
       admin = undefined;
