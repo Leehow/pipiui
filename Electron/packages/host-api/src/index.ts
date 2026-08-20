@@ -622,6 +622,19 @@ export interface PipiHostAPI {
   getPaddleOcrStatus?(projectId: string): Promise<{ hasKey: boolean }>;
   /** Pass a new token or null to clear. Never returned back to the renderer. */
   setPaddleOcrAccessToken?(projectId: string, token: string | null): Promise<{ hasKey: boolean }>;
+  /**
+   * Project-scoped web search provider API keys.
+   * Returns which non-empty `*ApiKey` fields are configured; values never cross this boundary.
+   */
+  getWebSearchKeys?(projectId: string): Promise<Record<string, boolean>>;
+  /**
+   * Merge API keys into the project's `web-search.json` and reorder
+   * `searchRouting.providers` so providers with keys come first.
+   * Non-empty values set the key; empty strings clear it.
+   * All other web-search.json fields are preserved.
+   * Returns configured `*ApiKey` field names (never the secret values).
+   */
+  setWebSearchKeys?(projectId: string, keys: Record<string, string>): Promise<string[]>;
   /** Global App-profile vault metadata. Values never cross this boundary. Mounts are the current session only. */
   listSecretVault?(sessionId: string): Promise<{ secrets: Array<{ id: string; name: string; envName: string; createdAt: string }>; mounts: Array<{ secretId: string; envName: string; name: string }>; sessionId: string }>;
   putSecretVault?(input: { name: string; envName: string; value: string; sessionId: string }): Promise<{ secret: { id: string; name: string; envName: string; createdAt: string }; mount: { secretId: string; envName: string }; sessionId: string }>;
@@ -816,6 +829,8 @@ function apiFrom(
     setScanExternalSessions: enabled => invoke("setScanExternalSessions", enabled),
     getPaddleOcrStatus: projectId => invoke("getPaddleOcrStatus", projectId),
     setPaddleOcrAccessToken: (projectId, token) => invoke("setPaddleOcrAccessToken", projectId, token),
+    getWebSearchKeys: projectId => invoke("getWebSearchKeys", projectId),
+    setWebSearchKeys: (projectId, keys) => invoke("setWebSearchKeys", projectId, keys),
     listSecretVault: sessionId => invoke("listSecretVault", sessionId),
     putSecretVault: input => invoke("putSecretVault", input),
     mountSecretVault: (sessionId, secret, envName) => invoke("mountSecretVault", sessionId, secret, envName),

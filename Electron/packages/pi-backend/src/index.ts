@@ -122,6 +122,7 @@ import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
 import { paddleocrHasKey, writePaddleocrAccessToken } from "./paddleocr-key.js";
+import { readWebSearchApiKeys, writeWebSearchApiKeys } from "./web-search-keys.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
@@ -2739,6 +2740,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadPaddleOcrStatus(params[0]);
       case "setPaddleOcrAccessToken":
         return this.savePaddleOcrAccessToken(params[0], params[1]);
+      case "getWebSearchKeys":
+        return this.loadWebSearchKeys(params[0]);
+      case "setWebSearchKeys":
+        return this.saveWebSearchKeys(params[0], params[1]);
       case "diagnoseSecretVault":
         return this.diagnoseVault();
       case "listSecretVault": {
@@ -4652,6 +4657,25 @@ export class PiHostBackend implements HostBackend {
     const agentDir = await this.paddleOcrAgentDir(projectId);
     const hasKey = await writePaddleocrAccessToken(agentDir, token);
     return { hasKey };
+  }
+  private async webSearchAgentDir(projectId: unknown): Promise<string> {
+    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
+    const path = await this.projectPath(projectId);
+    if (this.profileMode === "isolated") {
+      const home = await this.ensureIsolatedProjectHome(path);
+      if (!home) throw new Error("isolated project home is unavailable");
+      return home.agentDir;
+    }
+    return this.agentDir;
+  }
+  private async loadWebSearchKeys(projectId: unknown): Promise<Record<string, boolean>> {
+    const agentDir = await this.webSearchAgentDir(projectId);
+    return readWebSearchApiKeys(agentDir);
+  }
+  private async saveWebSearchKeys(projectId: unknown, keys: unknown): Promise<string[]> {
+    if (!keys || typeof keys !== "object" || Array.isArray(keys)) throw new Error("keys 必须是 object");
+    const agentDir = await this.webSearchAgentDir(projectId);
+    return writeWebSearchApiKeys(agentDir, keys as Record<string, string>);
   }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
