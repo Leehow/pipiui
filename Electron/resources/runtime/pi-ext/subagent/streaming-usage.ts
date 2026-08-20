@@ -147,3 +147,108 @@ export function shouldEmitStreamingUsage(input: {
 	}
 	return { emit: true, key, at: input.now };
 }
+
+/**
+ * The wiring, extracted so it can be tested by behavior rather than by grep.
+ *
+ * The pure helpers above were always testable; what was not was the order they run in — read
+ * the provider's mid-stream usage, fall back to the local estimate, add the completed turns,
+ * throttle, report; then let `message_end` overwrite all of it with the authoritative total
+ * and reset the estimate. That sequence lived inline in the dispatch loop, so the only way
+ * tests could reach it was to grep index.ts for the exact call expressions — assertions that
+ * broke whenever the surrounding code moved, while the behavior they guarded was intact.
+ *
+ * The emitter owns the three mutable values that sequence needs (throttle key, throttle
+ * timestamp, estimate accumulator) and takes everything else as dependencies. `session` is a
+ * function rather than a value on purpose: the run's completed usage and model mutate as turns
+ * close, and a snapshot captured at construction would report stale totals.
+ */
+
+export interface UsageReportPayload {
+	usage: StreamingUsageSnapshot & { contextWindow?: number };
+	turn: number;
+	model: string | null;
+	tools: string[];
+}
+
+export interface UsageEmitterSession {
+	usage: Partial<StreamingUsageSnapshot> & { turns?: number; contextWindow?: number };
+	model?: string | null;
+}
+
+export interface UsageEmitterDeps {
+	report: (payload: UsageReportPayload) => void;
+	/** Read fresh on every emit: the run's totals advance underneath this emitter. */
+	session: () => UsageEmitterSession;
+	now?: () => number;
+}
+
+export interface UsageEmitter {
+	/** Accumulate an assistant text/thinking delta toward the local output estimate. */
+	countDelta(delta: string): void;
+	/** Mid-stream: real provider usage if it reported any, else the local estimate. */
+	emitLive(raw: unknown, force?: boolean): void;
+	/** `message_end`: the authoritative total, which always reports and never throttles. */
+	emitAuthoritative(
+		usage: StreamingUsageSnapshot,
+		options: { turn?: number; model?: string | null; tools?: string[] },
+	): void;
+	/** Drop the per-message estimate once an authoritative total has replaced it. */
+	resetEstimate(): void;
+	/** Test/diagnostic view of the accumulator; not used by the wiring. */
+	estimateChars(): EstimateCharCounts;
+}
+
+export function createUsageEmitter(deps: UsageEmitterDeps): UsageEmitter {
+	const now = deps.now ?? (() => Date.now());
+	let lastKey = "";
+	let lastEmitAt = 0;
+	let estimate: EstimateCharCounts = { ascii: 0, cjk: 0 };
+
+	const emit = (
+		usage: StreamingUsageSnapshot,
+		options?: { force?: boolean; turn?: number; model?: string | null; tools?: string[] },
+	): void => {
+		const decision = shouldEmitStreamingUsage({
+			previousKey: lastKey,
+			lastEmitAt,
+			next: usage,
+			now: now(),
+			force: options?.force,
+		});
+		if (!decision.emit) return;
+		lastKey = decision.key;
+		lastEmitAt = decision.at;
+		const session = deps.session();
+		deps.report({
+			turn: options?.turn ?? session.usage.turns ?? 0,
+			model: options?.model ?? session.model ?? null,
+			tools: options?.tools ?? [],
+			usage: {
+				...usage,
+				...(session.usage.contextWindow ? { contextWindow: session.usage.contextWindow } : {}),
+			},
+		});
+	};
+
+	return {
+		countDelta(delta) {
+			if (!delta) return;
+			estimate = addEstimateChars(estimate, delta);
+		},
+		emitLive(raw, force) {
+			const live = liveUsageOrEstimate(raw, estimateOutputTokens(estimate));
+			if (!live) return;
+			emit(combineCompletedAndStreamingUsage(deps.session().usage, live), { force });
+		},
+		emitAuthoritative(usage, options) {
+			emit(usage, { ...options, force: true });
+		},
+		resetEstimate() {
+			estimate = { ascii: 0, cjk: 0 };
+		},
+		estimateChars() {
+			return estimate;
+		},
+	};
+}

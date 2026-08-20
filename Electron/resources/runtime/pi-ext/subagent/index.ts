@@ -208,12 +208,8 @@ import {
 } from "./worker-liveness.ts";
 import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
 import {
-	addEstimateChars,
-	combineCompletedAndStreamingUsage,
-	estimateOutputTokens,
-	type EstimateCharCounts,
-	liveUsageOrEstimate,
-	shouldEmitStreamingUsage,
+	createUsageEmitter,
+	type StreamingUsageSnapshot,
 } from "./streaming-usage.ts";
 
 const MAX_PARALLEL_TASKS = 1000;
@@ -5395,16 +5391,24 @@ async function runSingleAgent(
 				const streamDirty = new Set<number>();
 				const fileChangeBuffers = new Map<number, { name: string; raw: string }>();
 				let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
-					let lastUsageKey = "";
-					let lastUsageEmitAt = 0;
-					// Output-token estimate for providers whose stream reports usage only at
-					// message end (openai-completions). Accumulates delta chars per live
-					// assistant message; message_end resets it with the authoritative total.
-					let liveEstimateChars: EstimateCharCounts = { ascii: 0, cjk: 0 };
-					const countLiveEstimate = (delta: string) => {
-						if (!delta) return;
-						liveEstimateChars = addEstimateChars(liveEstimateChars, delta);
-					};
+				// Throttle state and the openai-completions output estimate live in the emitter
+				// now (streaming-usage.ts), where the read→fallback→combine→throttle sequence is
+				// covered by behavior tests instead of source-text assertions.
+				const usageEmitter = createUsageEmitter({
+					session: () => ({ usage: currentResult.usage, model: currentResult.model }),
+					report: (payload) => {
+						pipiuiReport({
+							kind: "usage",
+							agentId: pipiuiAgentId,
+							runId,
+							turn: payload.turn,
+							model: payload.model,
+							tools: payload.tools,
+							usage: payload.usage,
+						});
+					},
+				});
+				const countLiveEstimate = (delta: string) => usageEmitter.countDelta(delta);
 				const STREAM_FLUSH_MS = 50;
 				const STREAM_TEXT_CAP = 4000;
 				const STREAM_THINKING_CAP = 600;
@@ -5451,44 +5455,12 @@ async function runSingleAgent(
 					flushStreamParts();
 				};
 
-				const emitUsageSnapshot = (usage: {
-					input: number;
-					output: number;
-					cacheRead: number;
-					cacheWrite: number;
-					cost: number;
-					contextTokens: number;
-					contextWindow?: number;
-				}, options?: { force?: boolean; turn?: number; model?: string | null; tools?: string[] }) => {
-					const decision = shouldEmitStreamingUsage({
-						previousKey: lastUsageKey,
-						lastEmitAt: lastUsageEmitAt,
-						next: usage,
-						now: Date.now(),
-						force: options?.force,
-					});
-					if (!decision.emit) return;
-					lastUsageKey = decision.key;
-					lastUsageEmitAt = decision.at;
-					pipiuiReport({
-						kind: "usage",
-						agentId: pipiuiAgentId,
-						runId,
-						turn: options?.turn ?? currentResult.usage.turns,
-						model: options?.model ?? currentResult.model ?? null,
-						tools: options?.tools ?? [],
-						usage: {
-							...usage,
-							...(currentResult.usage.contextWindow ? { contextWindow: currentResult.usage.contextWindow } : {}),
-						},
-					});
-				};
+				const emitUsageSnapshot = (
+					usage: StreamingUsageSnapshot,
+					options: { turn?: number; model?: string | null; tools?: string[] },
+				) => usageEmitter.emitAuthoritative(usage, options);
 
-				const emitStreamingUsage = (raw: unknown, force = false) => {
-					const live = liveUsageOrEstimate(raw, estimateOutputTokens(liveEstimateChars));
-					if (!live) return;
-					emitUsageSnapshot(combineCompletedAndStreamingUsage(currentResult.usage, live), { force });
-				};
+				const emitStreamingUsage = (raw: unknown, force = false) => usageEmitter.emitLive(raw, force);
 
 				const upsertStreamPart = (
 					contentIndex: number,
@@ -5750,7 +5722,7 @@ async function runSingleAgent(
 							streamParts.clear();
 							streamDirty.clear();
 							fileChangeBuffers.clear();
-							liveEstimateChars = { ascii: 0, cjk: 0 };
+							usageEmitter.resetEstimate();
 						}
 						emitUpdate();
 						pipiuiUpdate();
