@@ -76,7 +76,11 @@ describe("installRuntimeTree", () => {
       expect(await readFile(join(root, "extensions", "office-doc-shot-gate.ts"), "utf8")).toContain("mcp_officecli_officecli");
       expect(await readFile(join(root, "extensions", "pipiui-update-center.ts"), "utf8")).toContain('pi.on("input"');
       expect(await readFile(join(root, "extensions", "pipiui-electron-webview.ts"), "utf8")).toContain("sessionCapability: CAPABILITY");
-      expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension"]));
+      expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension", "pipiui-research"]));
+      const researchSkill = await readFile(join(root, "built-in-skills", "pipiui-research", "SKILL.md"), "utf8");
+      expect(researchSkill).toContain("default to multiple `explore` workers, not one");
+      expect(researchSkill).toContain("dispatch **all known independent partitions at once**");
+      expect(researchSkill).toContain("first-wave baseline of **3–6 independent partitions**");
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
