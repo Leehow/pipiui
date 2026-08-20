@@ -1,1 +1,0 @@
-{"version":1,"cases":[{"id":"v1-approved-import","query":"approved project memory","expect":"extension-owned import"},{"id":"catalog-retrieval","query":"retrieve scoped memory","expect":"bounded result"}]}
