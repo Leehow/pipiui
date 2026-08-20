@@ -31,6 +31,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
+	AgentSession,
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	getAgentDir,
@@ -151,7 +152,19 @@ import {
 	seedBossLedger,
 } from "./boss-ledger.ts";
 import { bossLedgerNoteTool } from "./boss-note.ts";
-import { contextDocTool } from "./context-doc.ts";
+import {
+	contextDocPath,
+	contextDocTool,
+	detectRepeatedBrief,
+	formatRepeatedBriefNudge,
+} from "./context-doc.ts";
+
+/** Briefs dispatched in the current Boss turn, for shared-context detection. Reset per turn. */
+const turnDispatchedBriefs: { agentId: string; brief: string }[] = [];
+/** One shared-context nudge per turn: the point lands once, and a wave is not a lecture. */
+let turnRepeatNudged = false;
+/** Bound the per-turn memory; a very wide wave must not grow this without limit. */
+const TURN_BRIEF_MEMORY = 24;
 import {
 	acquireAgentLease,
 	releaseAgentLease,
@@ -7438,7 +7451,7 @@ export default function (pi: ExtensionAPI) {
 	// 主会话上下文压缩走有界快路径（thinking off 的 LLM 摘要 → 确定性摘要 → pi 内置兜底）。
 	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
 	registerMainSessionCompactionHook(pi);
-	registerMidTurnCompactionGuard();
+	registerMidTurnCompactionGuard(AgentSession);
 	// Qoder CN / Qwen 3.8-Max-Preview contextWindow 修复：按 API default tier
 	// 归一化 model.contextWindow（真实影响 pi shouldCompact/session stats），
 	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
@@ -7598,6 +7611,9 @@ export default function (pi: ExtensionAPI) {
 	// snapshot actually changed.
 	pi.on("before_agent_start", (event) => {
 		bossTurnBusy = true;
+		// A new turn is a new wave: last turn's briefs are not the ones this one repeats.
+		turnDispatchedBriefs.length = 0;
+		turnRepeatNudged = false;
 		const routing = formatSubagentModelRoutingBlock();
 		const snapshot = currentInFlightWorkersSnapshot(Date.now());
 		const injection = nextInFlightInjection(lastInFlightSnapshot, snapshot);
@@ -8297,6 +8313,32 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 					dispatchNudgePrefix = assessment.nudgeText;
+
+				// Shared-context detection. context_doc asks the Boss to foresee that a wave's
+				// briefs will repeat; nobody foresees that. The repetition is trivial to measure
+				// once the second brief exists, so say it here — at the dispatch where it becomes
+				// true — rather than as a standing rule to remember. Advisory only: the shared
+				// half cannot be lifted automatically without mangling coincidental overlap.
+				if (PIPIUI_DEPTH === 0 && PIPIUI_MAIN_CWD) {
+					// Accumulate as we go so two briefs in the SAME tasks[] call compare against
+					// each other, not only against earlier calls in the turn.
+					for (const task of shapeTasks) {
+						if (!turnRepeatNudged) {
+							const match = detectRepeatedBrief(task.task, turnDispatchedBriefs);
+							if (match) {
+								dispatchNudgePrefix += formatRepeatedBriefNudge(
+									match,
+									contextDocPath(PIPIUI_MAIN_CWD, PIPIUI_SESSION),
+								);
+								turnRepeatNudged = true;
+							}
+						}
+						turnDispatchedBriefs.push({ agentId: task.agentId || task.title || "(unnamed)", brief: task.task });
+					}
+					if (turnDispatchedBriefs.length > TURN_BRIEF_MEMORY) {
+						turnDispatchedBriefs.splice(0, turnDispatchedBriefs.length - TURN_BRIEF_MEMORY);
+					}
+				}
 				}
 
 			if (hasTasks && (params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {

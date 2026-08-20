@@ -130,18 +130,23 @@ export async function deliverStallWake(
 
 export type SignalAdmission = "send" | "hold" | "drop";
 
-export interface HeldSignalPlan {
+/**
+ * Generic over the caller's signal-kind union so a narrow `RuntimeSignalKind` survives the
+ * round trip. Widening it to `string` here would silently strip the caller's exhaustiveness
+ * checking — the routing would still work, and a mistyped kind would stop being caught.
+ */
+export interface HeldSignalPlan<K extends string = string> {
 	/** At most one signal is delivered per flush; the rest wait for the next one. */
-	deliver?: { text: string; kind: string; channel: RuntimeSignalChannel; confirmsStallDelivery: boolean };
+	deliver?: { text: string; kind: K; channel: RuntimeSignalChannel; confirmsStallDelivery: boolean };
 	/** Signals to put back on the held queue, in their original order. */
 	rehold: string[];
 }
 
-export interface HeldSignalFlushInput {
+export interface HeldSignalFlushInput<K extends string = string> {
 	held: readonly string[];
 	/** Undefined kind means the text is not a runtime signal: dropped, never re-held. */
-	classify: (text: string) => string | undefined;
-	admit: (input: { kind: string; text: string }) => SignalAdmission;
+	classify: (text: string) => K | undefined;
+	admit: (input: { kind: K; text: string }) => SignalAdmission;
 }
 
 /**
@@ -151,8 +156,8 @@ export interface HeldSignalFlushInput {
  * not fire a burst of turns at the Boss. Everything after the first admitted signal goes back
  * on the queue and gets its turn at the next flush.
  */
-export function planHeldSignalFlush(input: HeldSignalFlushInput): HeldSignalPlan {
-	const plan: HeldSignalPlan = { rehold: [] };
+export function planHeldSignalFlush<K extends string>(input: HeldSignalFlushInput<K>): HeldSignalPlan<K> {
+	const plan: HeldSignalPlan<K> = { rehold: [] };
 	for (const text of input.held) {
 		const kind = input.classify(text);
 		if (!kind) continue;

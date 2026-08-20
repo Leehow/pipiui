@@ -11,6 +11,10 @@ import {
 	normalizeSectionName,
 	upsertSection,
 	writeContextSection,
+	detectRepeatedBrief,
+	formatRepeatedBriefNudge,
+	REPEAT_MIN_RATIO,
+	REPEAT_MIN_SHARED_CHARS,
 } from "../context-doc.ts";
 
 function tempRoot(): string {
@@ -91,4 +95,72 @@ test("a missing root or an empty body writes nothing", async () => {
 test("the document sits beside the ledger, keyed by session", () => {
 	assert.equal(contextDocPath("/repo", "abc"), path.join("/repo", ".pi", "context", "context-abc.md"));
 	assert.equal(contextDocPath("/repo", undefined), path.join("/repo", ".pi", "context", "context-terminal.md"));
+});
+
+const SHARED = [
+	"Architecture: the host bridge owns session identity; workers never mint a session id themselves.",
+	"Conventions: name every worker after its vertical slice, and verify with `npm test -w @pipiui/ui`.",
+	"Do not touch Electron/resources/runtime/pi-ext/subagent/index.ts in this wave; it is owned by another slice.",
+	"All edits land in packages/ui and must keep the existing data-testid attributes intact.",
+].join("\n");
+
+test("a second brief repeating the shared half is detected, and named against the first", () => {
+	const match = detectRepeatedBrief(`${SHARED}\nGoal: fix the quota pill width regression at render time.`, [
+		{ agentId: "sidebar-icons", brief: `${SHARED}\nGoal: give external rows their own source icon.` },
+	]);
+
+	assert.ok(match, "identical pasted briefing across two briefs is the case context_doc exists for");
+	assert.equal(match?.againstAgentId, "sidebar-icons");
+	assert.ok((match?.sharedChars ?? 0) >= REPEAT_MIN_SHARED_CHARS);
+	assert.ok((match?.ratio ?? 0) >= REPEAT_MIN_RATIO);
+});
+
+test("independently written briefs about the same subsystem are not flagged", () => {
+	// Same vocabulary, no pasted lines: this is not repetition worth a document.
+	const match = detectRepeatedBrief(
+		"Goal: the sidebar session row should show a source icon for external sessions. Verify with npm test.",
+		[{ agentId: "other", brief: "Goal: the sidebar drag handler should reorder pinned sessions. Verify with npm test." }],
+	);
+	assert.equal(match, undefined);
+});
+
+test("short repeated lines cannot manufacture a match", () => {
+	const boilerplate = Array.from({ length: 40 }, (_, i) => `- step ${i}`).join("\n");
+	assert.equal(detectRepeatedBrief(boilerplate, [{ agentId: "a", brief: boilerplate }]), undefined);
+});
+
+test("a small overlap inside two large briefs stays below the ratio bar", () => {
+	const oneSharedLine = "Do not touch Electron/resources/runtime/pi-ext/subagent/index.ts in this wave; it is owned by another slice."
+	const bulk = (seed: string) => Array.from({ length: 30 }, (_, i) => `${seed} line ${i} with enough characters to count as significant`).join("\n");
+	const match = detectRepeatedBrief(`${bulk("alpha")}\n${oneSharedLine}`, [
+		{ agentId: "a", brief: `${bulk("beta")}\n${oneSharedLine}` },
+	]);
+	assert.equal(match, undefined, "one shared line in two long briefs is not a shared briefing");
+});
+
+test("the first brief of a turn has nothing to repeat", () => {
+	assert.equal(detectRepeatedBrief(SHARED, []), undefined);
+	assert.equal(detectRepeatedBrief("", [{ agentId: "a", brief: SHARED }]), undefined);
+});
+
+test("the strongest match wins when several earlier briefs overlap", () => {
+	const extra = "\nShared verification: run `npm run build -w @pipiui/ui` and paste the exit code into the report."
+	const match = detectRepeatedBrief(`${SHARED}${extra}\nGoal: third slice.`, [
+		{ agentId: "weak", brief: `${SHARED}\nGoal: first slice.` },
+		{ agentId: "strong", brief: `${SHARED}${extra}\nGoal: second slice.` },
+	]);
+	assert.equal(match?.againstAgentId, "strong");
+});
+
+test("the nudge names the repeat, the tool, and the file, and keeps briefs responsible for their own half", () => {
+	const text = formatRepeatedBriefNudge(
+		{ againstAgentId: "sidebar-icons", sharedChars: 620, ratio: 0.42 },
+		"/repo/.pi/context/context-s1.md",
+	);
+	assert.match(text, /^\[shared-context\]/);
+	assert.match(text, /~42% of `sidebar-icons`/);
+	assert.match(text, /620 chars/);
+	assert.match(text, /context_doc\(\{section, body\}\)/);
+	assert.match(text, /\/repo\/\.pi\/context\/context-s1\.md/);
+	assert.match(text, /goal, scope and acceptance still belong in the brief itself/);
 });

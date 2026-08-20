@@ -182,3 +182,97 @@ export function contextDocTool(session: { mainCwd: string | undefined; sessionKe
 		},
 	};
 }
+
+/**
+ * Noticing the moment shared context is worth writing, instead of asking the Boss to foresee it.
+ *
+ * `context_doc` went unused in its first days on real traffic, and the reason is structural
+ * rather than a missing prompt line. The ledger and the findings artifact both hook onto
+ * something that has already happened — a decision made, a worker finished. This tool asks for
+ * foresight: "the six briefs I am about to write will repeat the same architecture, so I should
+ * write it once first." That is a prediction, made before the wave, and a rule that needs
+ * predicting is a rule that gets skipped.
+ *
+ * The condition is trivially detectable after the fact, though: the second brief in a turn that
+ * repeats a chunk of the first IS the case the tool exists for. So the runtime measures it and
+ * says so at the dispatch where it becomes true — the same non-blocking nudge channel the
+ * dispatch-shape validator already uses. The Boss does not have to remember anything; it has to
+ * read a line that appears exactly when the line is worth reading.
+ *
+ * Deliberately advisory. The shared half cannot be extracted automatically without mangling
+ * briefs whose overlap is coincidental, and a wave already in flight is not worth blocking over
+ * a bookkeeping improvement.
+ */
+
+/** Below this, a repeated line is boilerplate coincidence, not shared briefing. */
+const REPEAT_MIN_LINE_CHARS = 25;
+/**
+ * Enough repetition that writing it once is cheaper than repeating it again.
+ *
+ * Set low on purpose. The costs are asymmetric: a false positive is five advisory lines in one
+ * tool result, while a false negative is this detector never firing — which is the failure it
+ * exists to fix. Four pasted lines of shared briefing land near 400 characters, so the bar sits
+ * below that; the ratio gate below is what actually rejects coincidental overlap.
+ */
+export const REPEAT_MIN_SHARED_CHARS = 300;
+export const REPEAT_MIN_RATIO = 0.25;
+
+function significantLines(brief: string): Map<string, number> {
+	const lines = new Map<string, number>();
+	for (const raw of brief.split("\n")) {
+		const line = raw.trim().replace(/\s+/g, " ");
+		if (line.length < REPEAT_MIN_LINE_CHARS) continue;
+		lines.set(line, line.length);
+	}
+	return lines;
+}
+
+export interface RepeatedBriefMatch {
+	/** The earlier dispatch in this turn whose brief this one repeats. */
+	againstAgentId: string;
+	sharedChars: number;
+	/** Share of the smaller brief that is repeated, 0..1. */
+	ratio: number;
+}
+
+/**
+ * Compare one brief against the briefs already dispatched this turn.
+ *
+ * Line-level rather than token-level on purpose: a brief's shared half is pasted, so it repeats
+ * whole lines, while two independently written briefs about the same subsystem share vocabulary
+ * but not lines. Short lines are ignored so that bullets and headings cannot manufacture a match.
+ */
+export function detectRepeatedBrief(
+	brief: string,
+	earlier: readonly { agentId: string; brief: string }[],
+): RepeatedBriefMatch | undefined {
+	const current = significantLines(brief);
+	if (current.size === 0) return undefined;
+	const currentChars = [...current.values()].reduce((sum, n) => sum + n, 0);
+
+	let best: RepeatedBriefMatch | undefined;
+	for (const previous of earlier) {
+		const other = significantLines(previous.brief);
+		let sharedChars = 0;
+		for (const [line, length] of current) if (other.has(line)) sharedChars += length;
+		if (sharedChars < REPEAT_MIN_SHARED_CHARS) continue;
+		const otherChars = [...other.values()].reduce((sum, n) => sum + n, 0);
+		const ratio = sharedChars / Math.max(1, Math.min(currentChars, otherChars));
+		if (ratio < REPEAT_MIN_RATIO) continue;
+		if (!best || sharedChars > best.sharedChars) {
+			best = { againstAgentId: previous.agentId, sharedChars, ratio };
+		}
+	}
+	return best;
+}
+
+/** The nudge body, in the same shape as the dispatch-shape validator's. */
+export function formatRepeatedBriefNudge(match: RepeatedBriefMatch, contextDocFile: string): string {
+	return [
+		`[shared-context] This brief repeats ~${Math.round(match.ratio * 100)}% of \`${match.againstAgentId}\`'s (${match.sharedChars} chars of identical lines).`,
+		"That repeated half is the same briefing typed twice, and the copies drift: write it once with",
+		`context_doc({section, body}), then name ${contextDocFile} in each brief instead of restating it.`,
+		"Workers read that file; per-worker goal, scope and acceptance still belong in the brief itself.",
+		"",
+	].join("\n");
+}
