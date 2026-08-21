@@ -41,10 +41,16 @@ async function loadTools(opts: {
   token?: string | false;
   envToken?: string;
   auth?: unknown;
+  /** Explicit deprecated compat gate (PIPIUI_MEDIA_COMPAT_FALLBACK=1). Default off since M5. */
+  compat?: boolean;
+  /** PIPIUI_MOUNTED_EXTENSIONS marker value. */
+  mounted?: string;
 }) {
   vi.resetModules();
   vi.stubEnv("HOME", opts.home);
   vi.stubEnv("PI_CODING_AGENT_DIR", opts.agentDir);
+  vi.stubEnv("PIPIUI_MEDIA_COMPAT_FALLBACK", opts.compat ? "1" : "");
+  vi.stubEnv("PIPIUI_MOUNTED_EXTENSIONS", opts.mounted ?? "");
   if (opts.envToken) vi.stubEnv("XAI_API_KEY", opts.envToken);
   else vi.stubEnv("XAI_API_KEY", "");
 
@@ -112,7 +118,7 @@ describe("pipiui-media image_gen / image_edit", () => {
       data: [{ b64_json: PNG_1x1, mime_type: "image/png" }],
     }));
     vi.stubGlobal("fetch", fetchMock);
-    const tools = await loadTools({ agentDir, home, token: TOKEN });
+    const tools = await loadTools({ agentDir, home, token: TOKEN, compat: true });
 
     const result = await tools.get("image_gen")!.execute("id", {
       prompt: "a red fox",
@@ -136,7 +142,7 @@ describe("pipiui-media image_gen / image_edit", () => {
     });
     expect(result.details).toEqual({
       path: result.details.path,
-      backend: "Grok Imagine",
+      backend: "Grok Imagine (deprecated compat)",
       model: "grok-imagine-image-2.0",
     });
     expect(dump(result)).not.toContain(TOKEN);
@@ -150,7 +156,7 @@ describe("pipiui-media image_gen / image_edit", () => {
       data: [{ b64_json: JPEG_1x1, mime_type: "image/jpeg" }],
     }));
     vi.stubGlobal("fetch", fetchMock);
-    const tools = await loadTools({ agentDir, home, token: TOKEN });
+    const tools = await loadTools({ agentDir, home, token: TOKEN, compat: true });
 
     const result = await tools.get("image_edit")!.execute("id", {
       prompt: "make it night",
@@ -180,7 +186,7 @@ describe("pipiui-media image_gen / image_edit", () => {
       data: [{ b64_json: PNG_1x1 }],
     }));
     vi.stubGlobal("fetch", fetchMock);
-    const tools = await loadTools({ agentDir, home });
+    const tools = await loadTools({ agentDir, home, compat: true });
 
     const result = await tools.get("image_gen")!.execute("id", {
       prompt: "relay fox",
@@ -193,7 +199,7 @@ describe("pipiui-media image_gen / image_edit", () => {
     expect(String(url)).toBe("http://127.0.0.1:18891/v1/images/generations");
     expect((init.headers as Record<string, string>).authorization).toBe("Bearer local");
     expect(JSON.parse(init.body as string).model).toBe("grok-imagine-image-quality");
-    expect(result.details.backend).toBe("Grok Imagine Relay");
+    expect(result.details.backend).toBe("Grok Imagine Relay (deprecated compat)");
     expect(result.details.model).toBe("grok-imagine-image-quality");
     expect(dump(result)).not.toContain(TOKEN);
   });
@@ -207,7 +213,7 @@ describe("pipiui-media image_gen / image_edit", () => {
       return jsonResponse(200, { data: [{ b64_json: PNG_1x1, mime_type: "image/png" }] });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const tools = await loadTools({ agentDir, home, token: TOKEN });
+    const tools = await loadTools({ agentDir, home, token: TOKEN, compat: true });
 
     const ok = await tools.get("image_gen")!.execute("id", {
       prompt: "retry fox",
@@ -243,6 +249,7 @@ describe("pipiui-media image_gen / image_edit", () => {
       agentDir,
       home,
       auth: { xai: { type: "oauth", access: TOKEN, expires: 1 } },
+      compat: true,
     });
 
     const result = await tools.get("image_gen")!.execute("id", {
@@ -254,5 +261,77 @@ describe("pipiui-media image_gen / image_edit", () => {
     expect((fetchMock.mock.calls[0][1].headers as Record<string, string>).authorization).toBe("Bearer local");
     expect(dump(result)).not.toContain(TOKEN);
     expect(await readFile(join(agentDir, "auth.json"), "utf8")).toContain(TOKEN);
+  });
+});
+
+describe("pipiui-media M5 compat/consumer layer", () => {
+  it("computes the Grok transport role from the spawn env marker and compat gate", async () => {
+    vi.resetModules();
+    const mod = await import(EXTENSION);
+    const role = mod.mediaGrokRole;
+    expect(role({})).toBe("off");
+    expect(role({ PIPIUI_MEDIA_COMPAT_FALLBACK: "1" })).toBe("compat");
+    expect(role({ PIPIUI_MOUNTED_EXTENSIONS: "grok-build-oauth" })).toBe("delegate");
+    expect(role({ PIPIUI_MOUNTED_EXTENSIONS: "other,grok-build-oauth", PIPIUI_MEDIA_COMPAT_FALLBACK: "1" })).toBe("delegate");
+    expect(role({ PIPIUI_MOUNTED_EXTENSIONS: "other-ext" })).toBe("off");
+  });
+
+  it("registers nothing when grok-build-oauth is mounted (canonical tools own the session)", async () => {
+    const { agentDir, home } = await fixture();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = await loadTools({ agentDir, home, token: TOKEN, mounted: "grok-build-oauth", compat: true });
+    expect(tools.size).toBe(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("default off: Grok image_gen/image_edit fail provider-aware without any HTTP", async () => {
+    const { cwd, agentDir, home } = await fixture();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = await loadTools({ agentDir, home, token: TOKEN });
+
+    const gen = await tools.get("image_gen")!.execute("id", { prompt: "a fox", confirmed: true }, undefined, undefined, grokCtx(cwd));
+    expect(gen.isError).toBe(true);
+    expect(gen.content[0].text).toContain("grok-build-oauth");
+    expect(gen.content[0].text).toContain("/login grok-build");
+    expect(gen.content[0].text).toContain("compatFallback");
+    expect(gen.details.code).toBe("grok_build_not_ready");
+
+    const edit = await tools.get("image_edit")!.execute("id", {
+      prompt: "edit",
+      confirmed: true,
+      image: `data:image/png;base64,${PNG_1x1}`,
+    }, undefined, undefined, grokCtx(cwd));
+    expect(edit.isError).toBe(true);
+    expect(edit.content[0].text).toContain("grok-build-oauth");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("default off: the non-Grok coding relay responsibility stays intact", async () => {
+    const { cwd, agentDir, home } = await fixture();
+    const fetchMock = vi.fn(async () => jsonResponse(200, {
+      choices: [{ message: { content: `here you go data:image/png;base64,${PNG_1x1} done` } }],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = await loadTools({ agentDir, home });
+    const result = await tools.get("image_gen")!.execute("id", { prompt: "gpt image", confirmed: true }, undefined, undefined, {
+      cwd,
+      model: { provider: "coding", id: "gpt-5.6", name: "GPT" },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(result.details.backend).toContain("Coding Relay");
+    expect(String(fetchMock.mock.calls[0][0])).toContain("127.0.0.1:18888");
+  });
+
+  it("compat on: the deprecated xAI key transport works but is labelled deprecated", async () => {
+    const { cwd, agentDir, home } = await fixture();
+    const fetchMock = vi.fn(async () => jsonResponse(200, { data: [{ b64_json: PNG_1x1 }] }));
+    vi.stubGlobal("fetch", fetchMock);
+    const tools = await loadTools({ agentDir, home, token: TOKEN, compat: true });
+    const result = await tools.get("image_gen")!.execute("id", { prompt: "compat", confirmed: true }, undefined, undefined, grokCtx(cwd));
+    expect(result.isError).toBeFalsy();
+    expect(result.details.backend).toBe("Grok Imagine (deprecated compat)");
+    expect(String(fetchMock.mock.calls[0][0])).toContain("api.x.ai");
   });
 });

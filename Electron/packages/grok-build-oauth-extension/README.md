@@ -1,8 +1,17 @@
 # @pipiui/grok-build-oauth-extension
 
-Canonical Grok Build OAuth + Image extension — **M4 Images transport** (M3 Credential Broker + M2 Pi-native OAuth included).
+Canonical Grok Build OAuth + Image extension — **M5 PipiUI host integration** (M4 Images transport + M3 Credential Broker + M2 Pi-native OAuth included).
 
 One package, two halves, one `pipiui-extension.json` glue (spec `extension-architecture-v1` D1/D2). Single source for PipiUI + chatrpgv4/pi-coc.
+
+M5 implements (PipiUI host half, on top of M4):
+
+- **Bundled assembly via registry/manifest (no bypass):** the built package is synced into the Bundled runtime tree (`Electron/resources/runtime/extensions/grok-build-oauth/`, script `Electron/scripts/sync-bundled-extension.mjs`, wired as `postbuild`); `installRuntimeTree` re-syncs `BUNDLED_MANIFEST_EXTENSIONS` with `keepDist` so the compiled `agent/dist` + `app/dist` halves survive the `dist`-stripping runtime sync; packaged apps re-include it via a dedicated `extraResources` entry (pdf-inspector precedent). The extension loader discovers it as `origin=builtin`, default-enabled, non-uninstallable; mounting is `-e` at **new-session spawn only** (`SpawnRegisteredExtension`, D9).
+- **`agent/provider.ts` — canonical provider factory (single source):** `createGrokBuildProvider()` carries the device/browser login + broker refresh + `getApiKey`; the extension entry registers it via `pi.registerProvider`, and the PipiUI host registers the same factory into its auth `ModelRuntime` (in-process and `pi-auth-helper.mjs` external runtime), so the provider login panel shows Grok Build **without a live session**: 登录状态 / 重新登录 / 退出 / 凭证来源 / 到期时间 (new optional `AuthProviderInfo.expiresAtMs` / `credentialSource`, metadata only — credential values never cross IPC).
+- **Settings UI:** the manifest settings section renders automatically from the schema (compat fallback switch, base/model/tier overrides); the tool panel (`app/dist/panel.js`) shows 登录状态、到期时间、凭证来源、base/model、tier、compat 开关 with graceful degradation when no session is mounted; `format: secret` keys stay vault-only, OAuth tokens live in pi provider auth (`auth.json`), never in settings JSON.
+- **`pipiui-media` becomes a consumer/compat layer:** spawn assembly exports `PIPIUI_MOUNTED_EXTENSIONS` (mounted manifest ids) and `PIPIUI_MEDIA_COMPAT_FALLBACK` (host internal env from `ext.grok-build-oauth.compatFallback`, default off, parent-env stripped). When `grok-build-oauth` is mounted, media registers **nothing** (canonical tools own the session, US-30); otherwise the coding relay stays, and the deprecated xAI API-key/loopback-relay Grok transport runs only under the explicit compat gate, labelled `(deprecated compat)`, with provider-aware errors pointing at `/login grok-build` when off.
+- Invoke responder: `statusSnapshot()` (non-secret broker status: loggedIn/expired/expiresAt/hasRefresh/source/base/model/tier/compat) answers host `invokeExtension(..., "status")` and `/grok-build:status`.
+- Tests: spawn marker + internal-env contract, `keepDist` runtime install, bundled manifest contract (schema/migrations identity/future-disk refusal), host settings e2e (compat persistence, secret→vault, unknown-key denial, enable toggle keeps settings), loader builtin discovery + disabled overlay, media role matrix (delegate/off/compat + coding relay preserved).
 
 M4 implements (on top of M3):
 
@@ -40,7 +49,8 @@ M2 implements:
 
 ```
 pipiui-extension.json
-agent/index.ts -> agent/dist/index.js  (provider grok-build via broker, import/status, image_gen/image_edit via broker)
+agent/index.ts -> agent/dist/index.js  (provider grok-build via broker, import/status invoke, image_gen/image_edit via broker)
+agent/provider.ts -> agent/dist/provider.js  (canonical grok-build provider factory; shared with the PipiUI host auth runtime)
 agent/oauth/config.ts   issuer/client/scopes resolution
 agent/oauth/device.ts   device_code + poll + refresh wire
 agent/oauth/broker.ts   credential broker: earlyRefresh/rotation/401 dedup/lock/atomic600/redaction
@@ -69,6 +79,7 @@ Scan order: builtin → app → project.
 ```sh
 npm run build -w @pipiui/grok-build-oauth-extension --maxsockets 3
 # tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json
+# postbuild: sync-bundled-extension.mjs -> resources/runtime/extensions/grok-build-oauth/
 ```
 
 ## Tests

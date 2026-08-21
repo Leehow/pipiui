@@ -86,6 +86,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/grok-build-oauth",
+        "to": "pipiui-runtime/extensions/grok-build-oauth",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/anydoc/node_modules",
         "to": "pipiui-runtime/anydoc/node_modules",
         "filter": [

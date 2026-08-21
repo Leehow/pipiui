@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
+import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
@@ -578,6 +578,53 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
     const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter, runtimeInfo } });
     expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBeUndefined();
     expect(env.PIPIUI_SKILL_ROOTS).toBeUndefined();
+  });
+});
+
+describe("grok-build delegation marker and media compat gate (M5)", () => {
+  const updateCenter = "/runtime/update.ts";
+  const runtimeInfo = "/runtime/info.ts";
+  const grokAgent = "/pkg/grok-build-oauth/agent/dist/index.js";
+  const mediaExt = "/runtime/extensions/pipiui-media.ts";
+
+  it("exports the mounted manifest extension ids so legacy media can yield tool ownership", () => {
+    const { args, env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { generateImage: true },
+      paths: { media: mediaExt, updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "grok-build-oauth", enabled: true, extensionPath: grokAgent, settings: {} }],
+    });
+    // Both halves are mounted; the marker is what tells pipiui-media to stay dormant.
+    expect(args).toContain(mediaExt);
+    expect(args).toContain(grokAgent);
+    expect(env[MOUNTED_EXTENSIONS_ENV]).toBe("grok-build-oauth");
+  });
+
+  it("omits the marker when the extension is disabled or has no agent entry", () => {
+    const disabled = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "grok-build-oauth", enabled: false, extensionPath: grokAgent }],
+    });
+    expect(disabled.env[MOUNTED_EXTENSIONS_ENV]).toBeUndefined();
+    const noPath = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "grok-build-oauth", enabled: true }],
+    });
+    expect(noPath.env[MOUNTED_EXTENSIONS_ENV]).toBeUndefined();
+  });
+
+  it("merges host internal env (media compat gate) and strips inherited values", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      internalEnv: { [MEDIA_COMPAT_FALLBACK_ENV]: "1" },
+    });
+    expect(env[MEDIA_COMPAT_FALLBACK_ENV]).toBe("1");
+    // A stale parent value can never turn the deprecated path back on.
+    expect(sanitizeEnvironment({ [MEDIA_COMPAT_FALLBACK_ENV]: "1", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+    expect(sanitizeEnvironment({ [MOUNTED_EXTENSIONS_ENV]: "stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 });
 

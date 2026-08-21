@@ -1,0 +1,92 @@
+{
+  "id": "grok-build-oauth",
+  "name": "Grok Build",
+  "version": "0.1.0",
+  "capabilities": [
+    "settings.read",
+    "settings.write",
+    "bridge.emit",
+    "invoke.agent",
+    "stream.render"
+  ],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.grok-build-oauth.xaiApiBaseUrl": {
+            "type": "string",
+            "format": "uri",
+            "default": "https://api.x.ai/v1",
+            "title": "xAI API Base URL"
+          },
+          "ext.grok-build-oauth.defaultModel": {
+            "type": "string",
+            "default": "grok-imagine-image-quality",
+            "title": "Default image model"
+          },
+          "ext.grok-build-oauth.issuer": {
+            "type": "string",
+            "format": "uri",
+            "title": "OAuth issuer (optional override)"
+          },
+          "ext.grok-build-oauth.clientId": {
+            "type": "string",
+            "title": "OAuth client ID (optional override)"
+          },
+          "ext.grok-build-oauth.scopes": {
+            "type": "string",
+            "title": "OAuth scopes (space-separated)"
+          },
+          "ext.grok-build-oauth.earlyRefreshSec": {
+            "type": "integer",
+            "default": 60,
+            "minimum": 30,
+            "maximum": 120,
+            "title": "Early refresh window (seconds)"
+          },
+          "ext.grok-build-oauth.compatFallback": {
+            "type": "boolean",
+            "default": false,
+            "title": "Compat fallback to legacy xAI relay (deprecated, default off)"
+          },
+          "ext.grok-build-oauth.sessionId": {
+            "type": "string",
+            "title": "Stable x-grok-session-id (auto-generated if empty)"
+          },
+          "ext.grok-build-oauth.tier": {
+            "type": "string",
+            "title": "Subscription tier (advisory gate only; server is authoritative)"
+          },
+          "ext.grok-build-oauth.accessToken": {
+            "type": "string",
+            "format": "secret",
+            "title": "Access token (vault only, never in settings JSON)"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [
+        { "slot": "toolPanel", "id": "grok-build-status", "title": "Grok Build", "entry": "app/dist/panel.js" }
+      ],
+      "toolRenderers": [
+        { "tool": "image_gen", "entry": "app/dist/image-card.js" },
+        { "tool": "image_edit", "entry": "app/dist/image-card.js" }
+      ],
+      "settingsSections": [
+        { "id": "grok-build-oauth", "title": "Grok Build" }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

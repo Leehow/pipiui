@@ -34,6 +34,18 @@ function isLoginEvent(value: unknown): value is AuthLoginEvent {
   return ['auth_url', 'prompt', 'notice', 'completed', 'failed', 'cancelled'].includes((value as { kind: string }).kind)
 }
 
+/** Human-readable remaining validity for a stored OAuth credential (non-secret metadata only). */
+function formatExpiry(expiresAtMs: number): string {
+  const remainingMs = expiresAtMs - Date.now()
+  if (!Number.isFinite(remainingMs)) return '有效期未知'
+  if (remainingMs <= 0) return '已过期'
+  const minutes = Math.floor(remainingMs / 60_000)
+  if (minutes < 60) return `剩余 ${minutes} 分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 48) return `剩余 ${hours} 小时`
+  return `剩余 ${Math.floor(hours / 24)} 天`
+}
+
 type LoginSessionState = {
   providerId: string
   authType: AuthType
@@ -304,7 +316,11 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
         <section key={provider.id} className="provider-row" data-testid={`provider-row-${provider.id}`}>
           <div className="provider-row-main">
             <span className="provider-row-name">{provider.name}</span>
-            <span className="provider-row-status">{provider.authenticated ? `已登录（${provider.authType}）` : '未登录'}</span>
+            <span className="provider-row-status">
+              {provider.authenticated
+                ? `已登录（${provider.authType}${provider.credentialSource === 'environment' ? '·环境变量' : ''}${typeof provider.expiresAtMs === 'number' ? `·${formatExpiry(provider.expiresAtMs)}` : ''}）`
+                : '未登录'}
+            </span>
           </div>
           <div className="provider-row-actions">
             {provider.authTypes.includes('oauth') && (

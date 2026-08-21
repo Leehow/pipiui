@@ -422,6 +422,28 @@ export class GrokCredentialBroker {
     return (await this.readCredential()) !== undefined;
   }
 
+  /**
+   * Non-secret credential status for host/UI surfaces (登录状态/过期时间/凭证来源).
+   * Never returns token values.
+   */
+  async status(): Promise<{
+    loggedIn: boolean;
+    expired: boolean;
+    expiresAtMs?: number;
+    hasRefresh: boolean;
+    issuer?: string;
+  }> {
+    const cred = await this.readCredential();
+    if (!cred) return { loggedIn: false, expired: false, hasRefresh: false };
+    return {
+      loggedIn: true,
+      expired: Number.isFinite(cred.expires) && cred.expires <= Date.now(),
+      expiresAtMs: Number.isFinite(cred.expires) ? cred.expires : undefined,
+      hasRefresh: Boolean(cred.refresh),
+      issuer: cred.issuer,
+    };
+  }
+
   /** For tests: expose read */
   async _readForTest(): Promise<BrokerCredential | undefined> { return this.readCredential(); }
   async _writeForTest(cred: BrokerCredential | undefined): Promise<void> { return this.writeCredential(cred); }

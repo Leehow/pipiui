@@ -49,13 +49,19 @@ describe("grok-build-oauth manifest (M2 oauth)", () => {
 
   it("agent registers grok-build provider and uses Pi OAuth, not plaintext settings token", () => {
     const agentSource = readFileSync(join(pkgRoot, "agent", "index.ts"), "utf8");
-    expect(agentSource).toMatch(/registerProvider\s*\(\s*"grok-build"/);
-    expect(agentSource).toMatch(/oauth/);
+    expect(agentSource).toMatch(/registerProvider\s*\(\s*\n?\s*GROK_BUILD_PROVIDER_ID/);
+    expect(agentSource).toMatch(/createGrokBuildProvider/);
+    // Canonical OAuth transport lives in the shared provider factory (single source).
+    const providerSource = readFileSync(join(pkgRoot, "agent", "provider.ts"), "utf8");
+    expect(providerSource).toMatch(/GROK_BUILD_PROVIDER_ID = "grok-build"/);
+    expect(providerSource).toMatch(/oauth/);
     expect(agentSource).toMatch(/grok-build-oauth/);
     // Must not write token to settings directly — Pi persistence only
     expect(agentSource).not.toMatch(/ext\.grok-build-oauth\.accessToken.*update/);
+    expect(providerSource).not.toMatch(/ext\.grok-build-oauth\.accessToken.*update/);
     // Redaction must be present
     expect(agentSource).toMatch(/redact/);
+    expect(providerSource).toMatch(/redact/);
   });
 });
 

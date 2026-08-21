@@ -16,7 +16,7 @@ export type SpawnRegisteredExtension = {
   skillRoots?: readonly string[];
   settings?: unknown;
 };
-export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string; /** Enabled PipiUI extension agent halves; assembled into `-e` like user-extensions. */ registeredExtensions?: readonly SpawnRegisteredExtension[] };
+export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string; /** Enabled PipiUI extension agent halves; assembled into `-e` like user-extensions. */ registeredExtensions?: readonly SpawnRegisteredExtension[]; /** Extra internal env merged last (never sanitized): host→legacy-extension contracts such as the media compat fallback flag. */ internalEnv?: Record<string,string> };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
 /**
  * An explicit process invocation for Pi.
@@ -38,7 +38,7 @@ const ext=(args:string[], path?:string)=>{if(path)args.push("-e",path)};
  * finalizer: a bridge credential inherited from an outer shell would let another process address
  * this session's agent tree. Only the value this host mints for this spawn survives.
  */
-export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_SKILL_ROOTS","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_ANYDOC_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_","PIPIUI_EXT_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
+export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_MEDIA_COMPAT_FALLBACK","PIPIUI_MOUNTED_EXTENSIONS","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_SKILL_ROOTS","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_ANYDOC_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_","PIPIUI_EXT_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
 /**
  * Layered spawn environment, mirroring Swift `ChatSession.mergedSpawnEnv` + `PiProcess`
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
@@ -89,7 +89,7 @@ if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
 if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}
-if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
+if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
 if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(input.memoryReviewModelId)env.PIPIUI_MEMORY_REVIEW_MODEL=input.memoryReviewModelId;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser")){ext(args,p.webview);if(p.webview)env.PIPIUI_WEBVIEW_EXT=p.webview}
@@ -115,7 +115,7 @@ env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.compu
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
-appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
+appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env}; }
 export const USER_EXTENSIONS_DIR="user-extensions";
 const USER_EXTENSION_FILE=/\.(?:[cm]?js|ts)$/;
 /**
@@ -148,14 +148,29 @@ export function extensionSettingsEnvName(id: string): string {
   const token = id.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
   return `PIPIUI_EXT_SETTINGS_${token || "EXT"}`;
 }
+/**
+ * Comma-joined ids of the registered extensions actually mounted (`-e`) in this spawn.
+ * Legacy bundled extensions (pipiui-media) read it to yield tool ownership to a mounted
+ * manifest package instead of registering duplicate `image_gen`/`image_edit`.
+ */
+export const MOUNTED_EXTENSIONS_ENV = "PIPIUI_MOUNTED_EXTENSIONS";
+/**
+ * Deprecated compat fallback gate for the legacy `pipiui-media` Grok transport
+ * (loopback relay / raw xAI API key). Set to "1" only when the user explicitly
+ * enables `ext.grok-build-oauth.compatFallback`; default off (spec D6 / US-27).
+ */
+export const MEDIA_COMPAT_FALLBACK_ENV = "PIPIUI_MEDIA_COMPAT_FALLBACK";
 function appendRegisteredExtensions(args:string[], env:Record<string,string>, packages?:readonly SpawnRegisteredExtension[]) {
   const skillRoots:string[]=[];
+  const mountedIds:string[]=[];
   for (const pkg of packages ?? []) {
     if (!pkg.enabled || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
+    mountedIds.push(pkg.id);
     if (pkg.skillRoots) for (const root of pkg.skillRoots) if (root) skillRoots.push(root);
     if (pkg.settings !== undefined) env[extensionSettingsEnvName(pkg.id)] = JSON.stringify(pkg.settings);
   }
+  if (mountedIds.length) env[MOUNTED_EXTENSIONS_ENV] = mountedIds.join(",");
   if (skillRoots.length) env.PIPIUI_SKILL_ROOTS = skillRoots.join(delimiter);
 }
 function declaredEntrypoint(root:string):string|undefined {

@@ -96,6 +96,10 @@ describe("invokeExtension and spawn settings snapshot", () => {
       agent: { extension: "agent/index.js" },
       capabilities: ["bridge.emit"],
     });
+    // The loader errors on a declared agent entry that is missing on disk;
+    // quota only exercises the capability_denied path, so give it a real file.
+    await mkdir(join(agent, "extensions", "quota", "agent"), { recursive: true });
+    await writeFile(join(agent, "extensions", "quota", "agent", "index.js"), "export default () => {};\n");
     const backend = backendFor({ agent, sessions: join(root, "sessions"), runtime });
     await backend.handle("listExtensions" as never, []);
 

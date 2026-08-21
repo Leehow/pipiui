@@ -2,10 +2,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { resolveOAuthConfig } from "./oauth/config.js";
-import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
-import { toOAuthCredentials } from "./oauth/credentials.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok } from "./oauth/import.js";
+import { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
 import { createBroker, type GrokCredentialBroker } from "./oauth/broker.js";
 import {
   ImagesClient,
@@ -51,12 +50,6 @@ async function emit(event: string, payload?: unknown): Promise<void> {
   }
 }
 
-function displayUriOf(code: { verification_uri: string; verification_uri_complete?: string; user_code: string }): string {
-  if (code.verification_uri_complete) return code.verification_uri_complete;
-  const sep = code.verification_uri.includes("?") ? "&" : "?";
-  return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
-}
-
 function getAuthPath(): string {
   const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
   if (envDir) return join(envDir, "auth.json");
@@ -73,162 +66,13 @@ function getBroker(signal?: AbortSignal): ReturnType<typeof createBroker> {
 }
 
 export default function (pi: ExtensionAPI): void {
-  // Pi-native OAuth provider `grok-build` — do not override `xai`
-  pi.registerProvider("grok-build", {
-    // Use openai-compatible api placeholder; model list empty until discovery
-    // Provider is auth-only for M2; images wire later.
-    api: "openai-completions" as never,
-    models: [],
-    oauth: {
-      name: "Grok Build",
-      async login(callbacks) {
-        const cfg = resolveOAuthConfig();
-        const signal = callbacks.signal;
-        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-
-        // Choose mode via onSelect if available; default device
-        let mode: "browser" | "device" = "device";
-        if (callbacks.onSelect) {
-          try {
-            const choice = await callbacks.onSelect({
-              message: "Choose Grok Build login method",
-              options: [
-                { id: "browser", label: "Browser (open verification URL)" },
-                { id: "device", label: "Device code (manual)" },
-              ],
-            });
-            if (choice === "browser" || choice === "device") mode = choice;
-          } catch {
-            // selection aborted -> propagate abort
-            if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-          }
-        }
-
-        const surface = mode === "browser" ? "ui" : "cli";
-        let code;
-        try {
-          code = await requestDeviceCode({
-            issuer: cfg.issuer,
-            clientId: cfg.clientId,
-            scopes: cfg.scopes,
-            referrer: cfg.referrer,
-            surface,
-            signal,
-          });
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          await emit("auth_error", { code: (err as OAuthError)?.code ?? "device_code_failed", message: redactMessage(msg, []) });
-          throw err instanceof OAuthError ? new Error(`${err.code}: ${redactMessage(err.message, [])}`) : err;
-        }
-
-        const displayUri = displayUriOf(code);
-
-        // Notify host UI
-        try {
-          if (mode === "browser") {
-            callbacks.onAuth({ url: displayUri, instructions: `Confirm code ${code.user_code} in your browser` });
-          } else {
-            callbacks.onDeviceCode({
-              userCode: code.user_code,
-              verificationUri: code.verification_uri,
-              intervalSeconds: code.interval,
-              expiresInSeconds: code.expires_in,
-            });
-          }
-        } catch {
-          // UI callbacks are best-effort
-        }
-
-        await emit("login_progress", {
-          phase: "device_requested",
-          user_code: code.user_code,
-          verification_uri: code.verification_uri,
-          verification_uri_complete: code.verification_uri_complete,
-          interval: code.interval,
-          expires_in: code.expires_in,
-        });
-
-        let tokens;
-        try {
-          tokens = await pollDeviceToken({
-            issuer: cfg.issuer,
-            clientId: cfg.clientId,
-            deviceCode: code,
-            surface,
-            signal,
-          });
-        } catch (err) {
-          const codeStr = (err as OAuthError)?.code ?? "token_failed";
-          const msg = err instanceof Error ? err.message : String(err);
-          await emit("auth_error", { code: codeStr, message: redactMessage(msg, [code.device_code, code.user_code]) });
-          // Map to user-actionable errors
-          if (err instanceof OAuthError) {
-            if (err.code === "access_denied") throw new Error("Authorization denied. Please try /login grok-build again.");
-            if (err.code === "expired_token") throw new Error("Device code expired. Please run /login grok-build again.");
-            throw new Error(`${err.code}: ${redactMessage(err.message, [code.device_code])}`);
-          }
-          throw err;
-        }
-
-        const creds = toOAuthCredentials(tokens, { issuer: cfg.issuer, clientId: cfg.clientId, scopes: cfg.scopes });
-        await emit("token_refreshed", { expires_at: creds.expires });
-        // Pi expects OAuthCredentials { access, refresh, expires, ...extra }
-        return {
-          access: creds.access,
-          refresh: creds.refresh,
-          expires: creds.expires,
-          issuer: creds.issuer,
-          client_id: creds.client_id,
-          scopes: creds.scopes,
-          token_type: creds.token_type,
-          obtained_at: creds.obtained_at,
-        } as unknown as never;
-      },
-      async refreshToken(credentials, signal) {
-        const cfg = resolveOAuthConfig();
-        const access = (credentials as unknown as Record<string, unknown>).access as string | undefined;
-        const refresh = (credentials as unknown as Record<string, unknown>).refresh as string | undefined;
-        const storedIssuer = (credentials as unknown as Record<string, unknown>).issuer as string | undefined;
-
-        if (storedIssuer && storedIssuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
-          throw new Error("Issuer mismatch — please run /login grok-build again. [redacted]");
-        }
-        if (!refresh) {
-          throw new Error("No refresh token — please run /login grok-build again.");
-        }
-        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-
-        // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
-        const broker = getBroker(signal as AbortSignal | undefined);
-        try {
-          const next = await broker.forceRefresh(signal);
-          await emit("token_refreshed", { expires_at: next.expires });
-          return {
-            access: next.access,
-            refresh: next.refresh,
-            expires: next.expires,
-            issuer: next.issuer,
-            client_id: next.client_id,
-            scopes: next.scopes,
-            token_type: next.token_type,
-            obtained_at: next.obtained_at,
-          } as unknown as never;
-        } catch (err) {
-          const code = (err as OAuthError)?.code;
-          const msg = err instanceof Error ? err.message : String(err);
-          const redacted = redactMessage(msg, [refresh, access ?? ""]);
-          await emit("auth_error", { code: code ?? "refresh_failed", message: redacted });
-          if (code === "auth_expired" || code === "invalid_grant") {
-            throw new Error("Refresh token expired or revoked — please run /login grok-build again. [redacted]");
-          }
-          throw new Error(redacted);
-        }
-      },
-      getApiKey(credentials) {
-        return ((credentials as unknown) as Record<string, unknown>).access as string;
-      },
-    },
-  });
+  // Pi-native OAuth provider `grok-build` — do not override `xai`.
+  // The canonical provider config lives in ./provider.js and is shared with
+  // the PipiUI host auth runtime (single source, no copied OAuth transport).
+  pi.registerProvider(
+    GROK_BUILD_PROVIDER_ID,
+    createGrokBuildProvider({ emit: (event, payload) => emit(event, payload) }) as never,
+  );
 
   // Explicit import command — disabled by default, requires confirm
   pi.registerCommand("grok-build:import", {
@@ -249,19 +93,66 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * Non-secret status snapshot for the app half (Settings > Grok Build panel) and
+   * in-session `/grok-build:status`. Credential values never leave the broker.
+   */
+  async function statusSnapshot(): Promise<Record<string, unknown>> {
+    const broker = getBroker();
+    const auth = await broker.status();
+    const images = resolveImagesConfig();
+    const source = auth.loggedIn
+      ? "oauth"
+      : process.env.XAI_API_KEY?.trim()
+        ? "env"
+        : undefined;
+    return {
+      loggedIn: auth.loggedIn,
+      expired: auth.expired,
+      expiresAtMs: auth.expiresAtMs,
+      hasRefresh: auth.hasRefresh,
+      credentialSource: source,
+      baseUrl: images.baseUrl,
+      model: images.model,
+      tier: images.tier,
+      compatFallback: images.compatFallback,
+    };
+  }
+
   pi.registerCommand("grok-build:status", {
     description: "Show Grok Build OAuth status (no secrets)",
     handler: async (_args, ctx) => {
-      ctx.ui.notify("Use /login grok-build and /logout grok-build. Status is visible in Settings > Grok Build.", "info");
+      const status = await statusSnapshot();
+      const parts = [
+        status.loggedIn
+          ? status.expired
+            ? "已登录但凭证已过期 — 请重新执行 /login grok-build"
+            : `已登录（oauth）${typeof status.expiresAtMs === "number" ? `，到期 ${new Date(status.expiresAtMs).toLocaleString()}` : ""}`
+          : status.credentialSource === "env"
+            ? "未登录 OAuth；当前使用 XAI_API_KEY 环境变量（api_key）"
+            : "未登录 — 执行 /login grok-build，或在 设置 > 添加模型/供应商 中登录 Grok Build",
+        `base=${status.baseUrl} model=${status.model}`,
+        status.compatFallback ? "compatFallback=1（deprecated 兼容回退已开启）" : "compatFallback=0（默认关闭）",
+      ];
+      ctx.ui.notify(parts.join("；"), "info");
     },
   });
 
-  // Keep placeholder invoke for bridge verification
+  // App → agent invoke target (host `invokeExtension`). Method `status` answers with the
+  // non-secret snapshot; anything else echoes for bridge verification (M3 contract).
+  // Pi types command handlers as returning void; the host invoke contract answers with
+  // ExtInvokeResult, so the handler is cast at the registration boundary.
   pi.registerCommand(EXTENSION_ID, {
-    description: "Grok Build OAuth — invoke bridge check",
-    handler: async (args) => {
+    description: "Grok Build OAuth — invoke bridge (status)",
+    handler: (async (args: unknown) => {
+      const record = (args ?? {}) as Record<string, unknown>;
+      const method = typeof record.method === "string" ? record.method : undefined;
+      if (method === "status") {
+        return { ok: true, data: await statusSnapshot() };
+      }
       await emit("invoke", { args: args ?? null, settings: settingsSnapshot() });
-    },
+      return { ok: true, data: { echoed: args ?? null } };
+    }) as unknown as (args: string) => Promise<void>,
   });
 
   // ── M4: image_gen / image_edit — official Grok Build wire contract ─────

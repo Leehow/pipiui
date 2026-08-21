@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { installRuntimeTree, syncTree, treeSignature } from "../src/runtime-install.js";
+import { BUNDLED_MANIFEST_EXTENSIONS, installRuntimeTree, syncTree, treeSignature } from "../src/runtime-install.js";
 
 const runtimeSource = new URL("../../../resources/runtime", import.meta.url).pathname;
 const temp = () => mkdtemp(join(tmpdir(), "runtime-install-"));
@@ -90,6 +90,22 @@ describe("installRuntimeTree", () => {
       };
       expect(helloManifest.agent?.extension).toBeTruthy();
       expect(existsSync(join(helloDir, helloManifest.agent!.extension!))).toBe(true);
+      // M5: bundled manifest extensions keep their compiled `dist` halves even though
+      // the generic extensions sync strips `dist`.
+      expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("grok-build-oauth");
+      const grokDir = join(root, "extensions", "grok-build-oauth");
+      const grokManifest = JSON.parse(await readFile(join(grokDir, "pipiui-extension.json"), "utf8")) as {
+        agent?: { extension?: string };
+        app?: { ui?: { panels?: { entry?: string }[]; toolRenderers?: { entry?: string }[] } };
+      };
+      expect(grokManifest.agent?.extension).toBeTruthy();
+      expect(existsSync(join(grokDir, grokManifest.agent!.extension!))).toBe(true);
+      const grokEntries = [
+        ...(grokManifest.app?.ui?.panels ?? []).map((p) => p.entry),
+        ...(grokManifest.app?.ui?.toolRenderers ?? []).map((r) => r.entry),
+      ].filter(Boolean) as string[];
+      expect(grokEntries.length).toBeGreaterThan(0);
+      for (const entry of grokEntries) expect(existsSync(join(grokDir, entry))).toBe(true);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
@@ -98,6 +114,35 @@ describe("installRuntimeTree", () => {
     try {
       const report = installRuntimeTree({}, root);
       expect(report.failures).toEqual(["runtime source root: no source path resolved"]);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+});
+
+describe("syncTree keepDist (bundled manifest extensions)", () => {
+  it("strips dist by default but preserves it under keepDist, with matching signatures", async () => {
+    const root = await temp();
+    try {
+      const source = join(root, "src");
+      await mkdir(join(source, "agent", "dist"), { recursive: true });
+      await writeFile(join(source, "pipiui-extension.json"), "{}\n");
+      await writeFile(join(source, "agent", "dist", "index.js"), "export default () => {};\n");
+
+      const stripped = join(root, "stripped");
+      syncTree(source, stripped);
+      expect(existsSync(join(stripped, "pipiui-extension.json"))).toBe(true);
+      expect(existsSync(join(stripped, "agent", "dist", "index.js"))).toBe(false);
+
+      const kept = join(root, "kept");
+      const first = syncTree(source, kept, undefined, { keepDist: true });
+      expect(first.installed).toEqual([kept]);
+      expect(existsSync(join(kept, "agent", "dist", "index.js"))).toBe(true);
+      // Idempotent under keepDist; the default-signature tree must not shadow it.
+      expect(syncTree(source, kept, undefined, { keepDist: true }).unchanged).toEqual([kept]);
+      // A dist-only change flips the keepDist signature and reinstalls.
+      await writeFile(join(source, "agent", "dist", "index.js"), "export default () => 1;\n");
+      await utimes(join(source, "agent", "dist", "index.js"), new Date(), new Date(Date.now() + 5000));
+      expect(syncTree(source, kept, undefined, { keepDist: true }).installed).toEqual([kept]);
+      expect(await readFile(join(kept, "agent", "dist", "index.js"), "utf8")).toContain("=> 1");
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });

@@ -339,6 +339,10 @@ export type AuthProviderInfo = {
   /** Provider has a stored credential (auth.json metadata only — never the key). */
   authenticated: boolean;
   authType?: AuthType;
+  /** Stored OAuth credential expiry (epoch ms); undefined for API keys or when unknown. */
+  expiresAtMs?: number;
+  /** Where the presented credential came from (stored auth.json entry vs process environment). */
+  credentialSource?: "stored" | "environment";
 };
 export type AuthPromptOption = { id: string; label: string };
 /** One step of an interactive login flow (pi AuthInteraction prompt/notify events). */

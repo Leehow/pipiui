@@ -10,6 +10,13 @@ import { join, relative } from "node:path";
  */
 /** Dev-only build artifacts. The shipped tree carries none of them (`pi-ext` is ~1.5 MB). */
 const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist", "release", ".cua-driver-cache"]);
+/**
+ * Bundled manifest extensions whose compiled agent/app halves live in `dist/`
+ * (spec D10: builtins live in the Bundled runtime extensions tree). They are
+ * re-synced with `keepDist` after the generic `extensions` pass so their build
+ * artifacts survive both the signature and the copy.
+ */
+export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth"];
 const SIGNATURE_FILE = ".pipiui-install.json";
 let stagingSeq = 0;
 
@@ -22,9 +29,10 @@ const emptyReport = (): InstallReport => ({ installed: [], unchanged: [], failur
  * Cheap enough to run on every launch and precise enough that an untouched tree is never
  * recopied, so a no-op refresh never churns a live session's mounted tree.
  */
-export function treeSignature(root: string, options: { keepNodeModules?: boolean } = {}): string {
+export function treeSignature(root: string, options: { keepNodeModules?: boolean; keepDist?: boolean } = {}): string {
   const skip = new Set(SKIP_ENTRIES);
   if (options.keepNodeModules) skip.delete("node_modules");
+  if (options.keepDist) skip.delete("dist");
   const parts: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -50,7 +58,7 @@ const storedSignature = (dest: string): string | undefined => {
  * sessions resolve `-e` paths against: a half-copied `pi-ext` would take a session down with an
  * unreadable extension. A failed copy leaves the previous tree exactly as it was.
  */
-export function syncTree(source: string, dest: string, report: InstallReport = emptyReport(), options: { keepNodeModules?: boolean } = {}): InstallReport {
+export function syncTree(source: string, dest: string, report: InstallReport = emptyReport(), options: { keepNodeModules?: boolean; keepDist?: boolean } = {}): InstallReport {
   if (!existsSync(source)) { report.failures.push(`${dest}: source missing at ${source}`); return report }
   const signature = treeSignature(source, options);
   if (existsSync(dest) && storedSignature(dest) === signature) { report.unchanged.push(dest); return report }
@@ -61,6 +69,7 @@ export function syncTree(source: string, dest: string, report: InstallReport = e
     rmSync(staging, { recursive: true, force: true });
     const skip = new Set(SKIP_ENTRIES);
     if (options.keepNodeModules) skip.delete("node_modules");
+    if (options.keepDist) skip.delete("dist");
     cpSync(source, staging, { recursive: true, filter: path => {
       const name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
       return !skip.has(name) && !name.endsWith(".tsbuildinfo");
@@ -97,6 +106,11 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
   }
   for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal"] as const)
     syncTree(join(assets.sourceRoot, name), join(runtimeRoot, name), report);
+  // Second pass: bundled manifest extensions ship compiled `dist/` halves that the
+  // generic extensions sync strips. Re-sync each one over its stripped copy; a missing
+  // source directory is a reported failure like any other missing asset.
+  for (const id of BUNDLED_MANIFEST_EXTENSIONS)
+    syncTree(join(assets.sourceRoot, "extensions", id), join(runtimeRoot, "extensions", id), report, { keepDist: true });
   syncTree(join(assets.sourceRoot, "pdf-inspector"), join(runtimeRoot, "pdf-inspector"), report, { keepNodeModules: true });
   syncTree(join(assets.sourceRoot, "anydoc"), join(runtimeRoot, "anydoc"), report, { keepNodeModules: true });
   return report;

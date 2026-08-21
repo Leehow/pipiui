@@ -140,10 +140,30 @@ export class ProviderLoginSession {
 /** Metadata-only read of pi's auth.json ({providerId: {type, ...}}). Never returns key values. */
 export async function readAuthMetadata(authPath: string): Promise<Map<string, AuthType>> {
   const map = new Map<string, AuthType>();
+  for (const [providerId, entry] of await readAuthMetadataEntries(authPath)) {
+    map.set(providerId, entry.type);
+  }
+  return map;
+}
+
+export type AuthMetadataEntry = { type: AuthType; /** OAuth expiry in epoch ms when the stored entry carries one. */ expiresAtMs?: number };
+
+/** Same metadata read, keeping the non-secret expiry so UIs can show remaining validity. */
+export async function readAuthMetadataEntries(authPath: string): Promise<Map<string, AuthMetadataEntry>> {
+  const map = new Map<string, AuthMetadataEntry>();
   try {
     const raw: any = JSON.parse(await readFile(authPath, "utf8"));
     for (const [providerId, entry] of Object.entries<any>(raw ?? {})) {
-      if (entry?.type === "api_key" || entry?.type === "oauth") map.set(providerId, entry.type);
+      if (entry?.type === "api_key") {
+        map.set(providerId, { type: "api_key" });
+      } else if (entry?.type === "oauth") {
+        const expires = entry.expires;
+        const expiresAtMs =
+          typeof expires === "number" && Number.isFinite(expires)
+            ? expires < 1e12 ? expires * 1000 : expires
+            : undefined;
+        map.set(providerId, expiresAtMs === undefined ? { type: "oauth" } : { type: "oauth", expiresAtMs });
+      }
     }
   } catch {
     /* missing/corrupt auth.json = no credentials */
@@ -166,7 +186,7 @@ export class ProviderAuthBackend {
   constructor(private options: ProviderAuthOptions) {}
 
   async listProviders(): Promise<AuthProviderInfo[]> {
-    const stored = await readAuthMetadata(this.options.authPath);
+    const stored = await readAuthMetadataEntries(this.options.authPath);
     let registry: Awaited<ReturnType<AuthRuntimeLike["getProviders"]>>;
     let availableProviders = new Set<string>();
     try {
@@ -194,16 +214,24 @@ export class ProviderAuthBackend {
         // auth.json. Pi ModelRuntime availability is the non-secret canonical
         // proof that such a provider is configured. Never expose the key or
         // infer OAuth when only API-key auth can explain availability.
-        const credentialType = stored.get(provider.id)
+        const storedEntry = stored.get(provider.id);
+        const credentialType = storedEntry?.type
           ?? (authTypes.includes("api_key") && availableProviders.has(provider.id) ? "api_key" : undefined);
-        result.push({
+        const info: AuthProviderInfo = {
           id: provider.id,
           name: provider.name,
           authTypes,
           loginLabel: provider.auth?.oauth?.loginLabel,
           authenticated: Boolean(credentialType),
           authType: credentialType,
-        });
+        };
+        if (storedEntry) {
+          info.credentialSource = "stored";
+          if (storedEntry.expiresAtMs !== undefined) info.expiresAtMs = storedEntry.expiresAtMs;
+        } else if (credentialType) {
+          info.credentialSource = "environment";
+        }
+        result.push(info);
       } catch (err) {
         diagnostics.push(err instanceof Error ? err.message : String(err));
       }

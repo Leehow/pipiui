@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { createInterface } from "node:readline";
 const emit = value => process.stdout.write(`${JSON.stringify(value)}\n`);
 const MODEL_REFRESH_TIMEOUT_MS = 5_000;
@@ -17,10 +17,29 @@ function moduleRoot() {
   for (const candidate of candidates) if (existsSync(join(candidate, "package.json"))) return candidate;
   throw new Error("Cannot find external @earendil-works/pi-coding-agent; install/update the pi CLI");
 }
+/**
+ * Register the canonical grok-build provider from the bundled grok-build-oauth
+ * extension (single source — never a copied OAuth transport) so the host's login
+ * panel can show status / re-login / logout for it. Credential persistence stays
+ * in pi's credential store under the current Pi home (PI_CODING_AGENT_DIR).
+ */
+async function registerBundledAuthProviders(rt) {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const providerModule = join(here, "..", "extensions", "grok-build-oauth", "agent", "dist", "provider.js");
+    if (!existsSync(providerModule)) return;
+    const { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } = await import(pathToFileURL(providerModule).href);
+    if (typeof rt.registerProvider !== "function" || typeof rt.getProvider === "function" && rt.getProvider(GROK_BUILD_PROVIDER_ID)) return;
+    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim();
+    rt.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider(agentDir ? { authPath: join(agentDir, "auth.json") } : {}));
+  } catch { /* auth surface must never break on an optional bundled extension */ }
+}
 async function runtime() {
   const root = moduleRoot(); const require = createRequire(join(root, "package.json")); let mod;
   try { mod = await import(join(root, "dist/index.js")); } catch { mod = require(join(root, "dist/index.js")); }
-  return mod.ModelRuntime.create(modelRuntimeOptions());
+  const rt = await mod.ModelRuntime.create(modelRuntimeOptions());
+  await registerBundledAuthProviders(rt);
+  return rt;
 }
 /** Non-secret model metadata required by Electron's capability reconciliation. */
 export function serializeAvailableModel(model) {

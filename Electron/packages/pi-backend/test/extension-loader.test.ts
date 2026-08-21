@@ -361,3 +361,43 @@ describe("bundled hello-pipiui dogfood package", () => {
     expect(existsSync(spawned!.extensionPath!)).toBe(true);
   });
 });
+
+describe("bundled grok-build-oauth package (M5)", () => {
+  it("scans the runtime extensions dir and loads grok-build-oauth as an enabled builtin", async () => {
+    await tempRoot("pipi-ext-grok-");
+    const manifestText = await readFile(join(bundledRuntimeExtensions, "grok-build-oauth", "pipiui-extension.json"), "utf8");
+    const raw = JSON.parse(manifestText);
+    const validation = validateExtensionManifest(raw);
+    expect(validation.ok).toBe(true);
+    if (!validation.ok) return;
+    expect(validation.manifest.id).toBe("grok-build-oauth");
+    expect(validation.manifest.capabilities).toEqual(
+      expect.arrayContaining(["settings.read", "settings.write", "bridge.emit", "invoke.agent", "stream.render"]),
+    );
+    expect(validation.manifest.agentExtension ?? raw.agent?.extension).toBe("agent/dist/index.js");
+
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: bundledRuntimeExtensions,
+      appRoot: join(root, "agent", "extensions"),
+    });
+    const records = loader.scan();
+    const rec = records.find((item) => item.id === "grok-build-oauth") ?? registry.get("grok-build-oauth");
+    expect(rec).toMatchObject({
+      id: "grok-build-oauth",
+      origin: "builtin",
+      state: "enabled",
+      uninstallable: false,
+    });
+    expect(rec?.error).toBeUndefined();
+    // Registry/manifest mount only — new-session semantics, never hot-mounted.
+    const spawned = loader.spawnPackages().find((pkg) => pkg.id === "grok-build-oauth");
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toBeTruthy();
+    expect(existsSync(spawned!.extensionPath!)).toBe(true);
+    // Disabled overlay keeps the package out of the mounted set (media stays the owner).
+    const disabled = loader.spawnPackages({ "grok-build-oauth": false }).find((pkg) => pkg.id === "grok-build-oauth");
+    expect(disabled?.enabled).toBe(false);
+  });
+});

@@ -209,6 +209,27 @@ export async function putExtensionSecrets(
   return written;
 }
 
+/** Extension id of the canonical Grok Build OAuth package. */
+export const GROK_EXTENSION_ID = "grok-build-oauth";
+/** Settings key gating the deprecated pipiui-media Grok compat transport (default off). */
+export const GROK_COMPAT_FALLBACK_SETTING_KEY = "ext.grok-build-oauth.compatFallback";
+
+/**
+ * Compute the internal media compat env from the App settings slot. Read straight from
+ * the slot (not the manifest scan) so the gate also applies while the extension is
+ * disabled or unmounted. Default off unless the user explicitly enabled it.
+ */
+export function mediaCompatFallbackEnvFromSettings(
+  settings: Record<string, unknown>,
+  envName: string,
+): Record<string, string> {
+  const slot = isRecord(settings.extensions) ? settings.extensions[GROK_EXTENSION_ID] : undefined;
+  const values = isRecord(slot) && isRecord((slot as Record<string, unknown>).settings)
+    ? ((slot as Record<string, unknown>).settings as Record<string, unknown>)
+    : undefined;
+  return values?.[GROK_COMPAT_FALLBACK_SETTING_KEY] === true ? { [envName]: "1" } : {};
+}
+
 export function settingsDenied(code: ExtInvokeErrorCode, message: string): ExtInvokeResult<Record<string, unknown>> {
   return { ok: false, error: { code, message } };
 }

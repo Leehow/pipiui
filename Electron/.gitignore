@@ -14,4 +14,6 @@ node_modules/
 .embedded-runtimes/
 .node-runtime-cache/
 dist/
+!resources/runtime/extensions/grok-build-oauth/
+!resources/runtime/extensions/grok-build-oauth/**
 out/

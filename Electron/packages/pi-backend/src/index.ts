@@ -50,6 +50,7 @@ import { readUserMcpServers } from "./user-mcp-servers.js";
 import {
   assemblePiSpawn,
   defaultRuntimeRoot,
+  MEDIA_COMPAT_FALLBACK_ENV,
   mergedSpawnEnvironment,
   resolvePiExecutable,
   resolveSpawnPaths,
@@ -59,6 +60,10 @@ import {
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
+import {
+  createGrokBuildProvider,
+  GROK_BUILD_PROVIDER_ID,
+} from "@pipiui/grok-build-oauth-extension/agent/provider";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { LeaseManager } from "./lease.js";
 import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
@@ -147,6 +152,7 @@ import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import {
+  mediaCompatFallbackEnvFromSettings,
   putExtensionSecrets,
   readAppExtensionSettingsDocument,
   readAppExtensionSettingsValues,
@@ -3570,6 +3576,7 @@ export class PiHostBackend implements HostBackend {
         : undefined,
       vaultDir: this.vaultDir,
       registeredExtensions,
+      internalEnv: await this.mediaCompatFallbackEnv(),
     });
     this.extensions.mountSession(
       id,
@@ -5482,6 +5489,7 @@ export class PiHostBackend implements HostBackend {
           modelsPath: join(this.agentDir, "models.json"),
           allowModelNetwork: false,
         });
+        this.registerGrokBuildAuthProvider(real);
         return {
           getProviders: () => real.getProviders(),
           getAvailable: () => real.getAvailable(),
@@ -5491,6 +5499,45 @@ export class PiHostBackend implements HostBackend {
       })();
     }
     return this.authRuntimePromise;
+  }
+  /**
+   * Surface the canonical grok-build provider (single source: the bundled
+   * grok-build-oauth package's provider factory) in the host's auth runtime so
+   * the provider login panel shows login state / re-login / logout without a live
+   * session. Secrets stay in pi's credential store (app-profile auth.json); the
+   * extension registry still owns agent-half mounting for new sessions.
+   * Re-registration after an unload is idempotent; failures never break auth.
+   */
+  private registerGrokBuildAuthProvider(real: {
+    registerProvider?(id: string, config: unknown): void;
+    getProvider?(id: string): unknown;
+  }): void {
+    try {
+      if (typeof real.registerProvider !== "function") return;
+      if (real.getProvider?.(GROK_BUILD_PROVIDER_ID)) return;
+      real.registerProvider(
+        GROK_BUILD_PROVIDER_ID,
+        createGrokBuildProvider({ authPath: join(this.agentDir, "auth.json") }),
+      );
+    } catch (error) {
+      console.warn(
+        `[pipiui] grok-build auth provider registration failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+  /**
+   * Deprecated compat gate for the legacy pipiui-media Grok transport: on only when
+   * the user explicitly enabled `ext.grok-build-oauth.compatFallback` (default off).
+   * Read straight from the app settings slot so it also applies when the extension
+   * itself is disabled or unmounted.
+   */
+  private async mediaCompatFallbackEnv(): Promise<Record<string, string>> {
+    try {
+      return mediaCompatFallbackEnvFromSettings(await this.readSettings(), MEDIA_COMPAT_FALLBACK_ENV);
+    } catch {
+      /* settings unreadable -> default off */
+      return {};
+    }
   }
   private toRuntimeModel(m: any): Model {
     return hostModelFromPi(m);
