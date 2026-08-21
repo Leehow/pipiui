@@ -277,7 +277,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     return false
   }
 
-  const handlePayload = (raw: unknown) => {
+  const handlePayload = (raw: unknown, connectedRoomID?: string) => {
     const text = decodeSocketPayload(raw)
     let parsed: unknown
     try { parsed = JSON.parse(text) } catch { return }
@@ -297,12 +297,22 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
         return
       }
       if (value.type === 'end' || value.type === 'expired') {
-        stopping = true
-        stored = stored ? { ...stored, enabled: false } : stored
-        void persist()
-        publishIdentity(value.type === 'expired' ? 'error' : 'stopped', {
-          error: value.type === 'expired' ? 'link expired' : undefined
-        })
+        if (connectedRoomID && stored?.roomID !== connectedRoomID) return
+        if (value.type === 'expired' && stored) {
+          stored = { ...stored, enabled: true, ...newRemoteIdentity() }
+          hostEpoch = 0
+          generation = 0
+          reconnectAttempt = 0
+          publishIdentity('reconnecting', { error: undefined })
+          void persist().catch(error => {
+            emit({ error: error instanceof Error ? error.message : String(error) })
+          })
+        } else {
+          stopping = true
+          stored = stored ? { ...stored, enabled: false } : stored
+          void persist()
+          publishIdentity('stopped')
+        }
         void clearTransport()
         return
       }
@@ -352,7 +362,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
         : event && typeof event === 'object' && 'data' in event
           ? event.data
           : event
-      handlePayload(payload)
+      handlePayload(payload, hello.roomID)
     }
     const onClose = () => {
       if (target.on && target.off) {

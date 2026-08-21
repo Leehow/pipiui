@@ -105,7 +105,7 @@ describe('statusLabel', () => {
     expect(statusLabel('stopped')).toBe('未开启')
     expect(statusLabel('connecting')).toBe('连接中')
     expect(statusLabel('ready')).toBe('已连接 Relay')
-    expect(statusLabel('paired')).toBe('等待浏览器配对')
+    expect(statusLabel('paired')).toBe('浏览器已连接')
     expect(statusLabel('reconnecting')).toBe('断线重连中')
   })
 })
