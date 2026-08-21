@@ -27,12 +27,19 @@ node_modules/
 !Electron/resources/runtime/pdf-inspector/**
 !Electron/resources/runtime/pdf-inspector/node_modules/
 !Electron/resources/runtime/pdf-inspector/node_modules/**
+# Vendored Firecrawl anydoc (local-first any-document runtime)
+!Electron/resources/runtime/anydoc/
+!Electron/resources/runtime/anydoc/**
+!Electron/resources/runtime/anydoc/node_modules/
+!Electron/resources/runtime/anydoc/node_modules/**
 
 # TypeScript incremental build state
 *.tsbuildinfo
 
 # Electron workspace outputs
 Electron/**/dist/
+!Electron/resources/runtime/extensions/hello-pipiui/app/dist/
+!Electron/resources/runtime/extensions/hello-pipiui/app/dist/**
 Electron/**/out/
 
 # file-viewer vite-plugin copies (regenerated on build; manifest has machine paths)

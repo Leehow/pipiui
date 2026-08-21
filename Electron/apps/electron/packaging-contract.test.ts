@@ -59,6 +59,11 @@ describe('macOS packaging contract', () => {
       to: 'pipiui-runtime/pdf-inspector/node_modules',
       filter: ['**/*', '!**/.bin', '!**/.bin/**']
     }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/anydoc/node_modules',
+      to: 'pipiui-runtime/anydoc/node_modules',
+      filter: ['**/*', '!**/.bin', '!**/.bin/**']
+    }))
     expect(embedded?.from).toBe('../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}')
     expect(embedded?.filter).toBeUndefined()
     expect(brokerPackage.dependencies['pi-hermes-memory']).toBe('0.9.6')
@@ -139,7 +144,10 @@ describe('macOS packaging contract', () => {
     }
     const externals = bundledExternals()
     if (!externals) return // out/ is a build artifact; nothing to check before `npm run build`
-    expect([...externals].sort()).toEqual(reincluded.sort())
+    // Vendored document engines are shipped via extraResources/pipiui-runtime, not app node_modules.
+    const vendoredPrefixes = ['@firecrawl/']
+    const filtered = [...externals].filter(spec => !vendoredPrefixes.some(prefix => spec.startsWith(prefix)))
+    expect(filtered.sort()).toEqual(reincluded.sort())
   })
 
   it('ships one Cua driver slice per target and fetches the slice each package script packages', () => {

@@ -13,7 +13,7 @@
     "stream.render"
   ],
   "agent": {
-    "extension": "agent/dist/index.js"
+    "extension": "agent/index.ts"
   },
   "app": {
     "settings": {

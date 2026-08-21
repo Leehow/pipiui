@@ -1,4 +1,6 @@
 node_modules/
 dist/
+!app/dist/
+!app/dist/**
 *.tsbuildinfo
 .DS_Store

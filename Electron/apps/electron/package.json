@@ -86,6 +86,15 @@
         ]
       },
       {
+        "from": "../../resources/runtime/anydoc/node_modules",
+        "to": "pipiui-runtime/anydoc/node_modules",
+        "filter": [
+          "**/*",
+          "!**/.bin",
+          "!**/.bin/**"
+        ]
+      },
+      {
         "from": "../../.embedded-runtimes/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
         "to": "pipiui-embedded"
       },
