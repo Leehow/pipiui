@@ -10,6 +10,13 @@ import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane } from './ExtensionsPane'
 import { WebSearchKeysPane } from './WebSearchKeysPane'
+import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
+import {
+  DEFAULT_SETTINGS_TAB,
+  registerSettingsSection,
+  useSettingsSections,
+  type SettingsSectionContext,
+} from './ui-registries'
 import './computer-use.css'
 
 function TrashIcon() {
@@ -218,6 +225,118 @@ function VisionRoutingPane({ visibility, vision }: {
   )
 }
 
+function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
+  const { host, visibility, current, onModelState, view, setView } = ctx
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const groups = useMemo(() => groupByProvider(visibility.models), [visibility.models])
+  const toggleExpanded = (provider: string) => {
+    setExpanded(currentExpanded => {
+      const next = new Set(currentExpanded)
+      if (next.has(provider)) next.delete(provider)
+      else next.add(provider)
+      return next
+    })
+  }
+  const isCurrent = (model: Model) => current?.provider === model.provider && current.id === model.id
+  const doDelete = async (provider: string) => {
+    setDeleting(true)
+    setDeleteError(null)
+    try {
+      const state = await host.removeProviderCredentials(provider)
+      onModelState?.(state)
+      setConfirmDelete(null)
+      await visibility.refresh()
+    } catch (err) {
+      setDeleteError(`删除失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setDeleting(false)
+    }
+  }
+  if (view === 'add') {
+    return <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
+  }
+  return <>
+    {visibility.error && (
+      <div className="model-modal-error visibility-error" data-testid="visibility-error">
+        <span>{visibility.error}</span>
+        <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="visibility-error-close" onClick={() => visibility.dismissError()}>×</button>
+      </div>
+    )}
+    {visibility.loading && visibility.models.length === 0
+      ? <div className="model-modal-state" data-testid="model-modal-loading">正在加载模型…</div>
+      : visibility.models.length === 0
+        ? <div className="model-modal-state" data-testid="model-modal-empty">暂无可用模型</div>
+        : groups.map(group => {
+          const isExpanded = expanded.has(group.provider)
+          const visibleCount = group.models.filter(model => !visibility.hiddenIds.has(modelRef(model))).length
+          const total = group.models.length
+          return (
+            <section key={group.provider} className="model-provider" data-testid={`model-provider-${group.provider}`}>
+              <div className="model-provider-header">
+                <ProviderTriState
+                  visibleCount={visibleCount}
+                  total={total}
+                  provider={group.provider}
+                  onChange={() => void visibility.setProviderHidden(group.provider, visibleCount > 0)}
+                />
+                <button
+                  className="model-provider-toggle"
+                  aria-label={isExpanded ? `折叠 ${group.provider}` : `展开 ${group.provider}`}
+                  aria-expanded={isExpanded}
+                  onClick={() => toggleExpanded(group.provider)}
+                >
+                  <span aria-hidden="true">{isExpanded ? '▾' : '▸'}</span>
+                  <ProviderLogo provider={group.provider} size={15} />
+                  <span className="model-provider-name">{group.provider}</span>
+                  <span className="model-provider-count" data-testid={`provider-count-${group.provider}`}>{visibleCount}/{total}</span>
+                </button>
+                <button
+                  className="model-provider-delete"
+                  title="删除该 provider 的 Pi 凭据（pi logout）"
+                  aria-label={`删除 ${group.provider} 凭据`}
+                  data-testid={`delete-provider-${group.provider}`}
+                  onClick={() => setConfirmDelete(group.provider)}
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+              {confirmDelete === group.provider && (
+                <div className="model-provider-confirm" data-testid={`delete-confirm-${group.provider}`}>
+                  <span>删除将移除 {group.provider} 的 Pi 凭据，其下模型将不可用。</span>
+                  <div className="model-provider-confirm-actions">
+                    <button className="provider-login-cancel" disabled={deleting} data-testid={`delete-cancel-${group.provider}`} onClick={() => setConfirmDelete(null)}>取消</button>
+                    <button className="confirm-delete" disabled={deleting} data-testid={`delete-confirm-btn-${group.provider}`} onClick={() => void doDelete(group.provider)}>{deleting ? '删除中…' : '确认删除'}</button>
+                  </div>
+                  {deleteError && <div className="model-modal-error" data-testid="delete-error">{deleteError}</div>}
+                </div>
+              )}
+              {isExpanded && group.models.map(model => {
+                const visible = !visibility.hiddenIds.has(modelRef(model))
+                const currentModel = isCurrent(model)
+                return (
+                  <label key={modelRef(model)} className="model-row" data-testid={`model-row-${model.provider}-${model.id}`}>
+                    <input
+                      type="checkbox"
+                      checked={visible}
+                      aria-label={`在快捷菜单显示 ${model.name}`}
+                      onChange={() => void visibility.setHidden(model, visible)}
+                    />
+                    <ProviderLogo provider={model.provider} modelId={model.id} size={14} />
+                    <span className="model-row-name">{model.name}</span>
+                    <span className="model-row-id">{model.provider}/{model.id}</span>
+                    {currentModel && <span className="model-row-current">当前模型</span>}
+                  </label>
+                )
+              })}
+            </section>
+          )
+        })}
+  </>
+}
+
 /**
  * `/model` — settings modal with four tabs: 通用 (vision-routing switch +
  * selector, default off), 模型管理 (provider-collapsible model visibility
@@ -243,17 +362,10 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   initialView?: 'manage' | 'add'
   projectId?: string
 }) {
-  const [tab, setTab] = useState<'general' | 'models' | 'extensions' | 'updates'>('models')
+  const sections = useSettingsSections()
+  const [tab, setTab] = useState(DEFAULT_SETTINGS_TAB)
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
-  // Default: every provider collapsed. `expanded` is in-memory only (no cross-session
-  // persistence); a refresh keeps it, so already-expanded providers stay open while
-  // newly discovered providers (e.g. after refresh) appear collapsed.
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const [view, setView] = useState<'manage' | 'add'>(initialView)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
-  const [deleting, setDeleting] = useState(false)
-  const [deleteError, setDeleteError] = useState<string | null>(null)
-  const groups = useMemo(() => groupByProvider(visibility.models), [visibility.models])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
@@ -261,182 +373,106 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const toggleExpanded = (provider: string) => {
-    setExpanded(current => {
-      const next = new Set(current)
-      if (next.has(provider)) next.delete(provider)
-      else next.add(provider)
-      return next
-    })
+  const ctx: SettingsSectionContext = {
+    host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, projectId,
+    view, setView, extensionsAddOpen, setExtensionsAddOpen,
   }
-
-  const isCurrent = (model: Model) => current?.provider === model.provider && current.id === model.id
-
-  const doDelete = async (provider: string) => {
-    setDeleting(true)
-    setDeleteError(null)
-    try {
-      const state = await host.removeProviderCredentials(provider)
-      onModelState?.(state)
-      setConfirmDelete(null)
-      await visibility.refresh()
-    } catch (err) {
-      setDeleteError(`删除失败：${err instanceof Error ? err.message : String(err)}`)
-    } finally {
-      setDeleting(false)
-    }
-  }
+  const active = sections.find(section => section.id === tab)
+    ?? sections.find(section => section.id === DEFAULT_SETTINGS_TAB)
+    ?? sections[0]
+  const title = active ? (typeof active.title === 'function' ? active.title(ctx) : active.title) : ''
+  const description = active ? (typeof active.description === 'function' ? active.description(ctx) : active.description) : ''
 
   return (
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <header>
-          <h2>{tab === 'general' ? '通用' : tab === 'updates' ? '更新中心' : tab === 'extensions' ? 'MCP / 扩展' : view === 'manage' ? '模型管理' : '添加模型'}</h2>
-          <p>{tab === 'general' ? '识图路由、外部会话扫描与 Web 搜索密钥' : tab === 'updates' ? '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。' : tab === 'extensions' ? '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。' : view === 'manage' ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。' : '登录 pi 支持的 provider 后，其模型目录会自动出现。'}</p>
+          <h2>{title}</h2>
+          <p>{description}</p>
           <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
           <div className="model-modal-header-actions">
-            {tab === 'extensions' && <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => setExtensionsAddOpen(true)}>＋ 添加</button>}
-            {tab === 'models' && (view === 'manage'
-              ? <>
-                  <button
-                    className="model-modal-refresh"
-                    data-testid="model-refresh-button"
-                    disabled={visibility.loading}
-                    onClick={() => void visibility.refresh()}
-                  >
-                    {visibility.loading ? '刷新中…' : '⟳ 刷新'}
-                  </button>
-                  <button className="model-modal-add" data-testid="model-add-button" onClick={() => setView('add')}>＋ 添加模型</button>
-                </>
-              : <button className="model-modal-add" data-testid="model-add-back" onClick={() => setView('manage')}>← 返回</button>)}
+            {active?.headerActions?.(ctx)}
           </div>
           <div className="model-modal-tabs" role="tablist" aria-label="设置分类">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'general'}
-              className={`model-modal-tab${tab === 'general' ? ' active' : ''}`}
-              data-testid="model-tab-general"
-              onClick={() => { setExtensionsAddOpen(false); setTab('general') }}
-            >通用</button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'models'}
-              className={`model-modal-tab${tab === 'models' ? ' active' : ''}`}
-              data-testid="model-tab-models"
-              onClick={() => { setView('manage'); setExtensionsAddOpen(false); setTab('models') }}
-            >模型管理</button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'extensions'}
-              className={`model-modal-tab${tab === 'extensions' ? ' active' : ''}`}
-              data-testid="model-tab-extensions"
-              onClick={() => setTab('extensions')}
-            >扩展</button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={tab === 'updates'}
-              className={`model-modal-tab${tab === 'updates' ? ' active' : ''}`}
-              data-testid="model-tab-updates"
-              onClick={() => { setExtensionsAddOpen(false); setTab('updates') }}
-            >更新中心</button>
+            {sections.map(section => (
+              <button
+                key={section.id}
+                type="button"
+                role="tab"
+                aria-selected={tab === section.id}
+                className={`model-modal-tab${tab === section.id ? ' active' : ''}`}
+                data-testid={`model-tab-${section.id}`}
+                onClick={() => {
+                  section.onActivate?.({ setView, setExtensionsAddOpen })
+                  setTab(section.id)
+                }}
+              >{section.label}</button>
+            ))}
           </div>
         </header>
         <div className="model-modal-body" data-testid="model-modal-body">
-          {tab === 'general'
-            ? <>
-                <ScanExternalSessionsPane scan={scan} />
-                <VisionRoutingPane visibility={visibility} vision={vision} />
-                <WebSearchKeysPane host={host} projectId={projectId} />
-              </>
-            : tab === 'updates'
-              ? <UpdateCenter updates={updates} onRequestUpdate={onRequestUpdate} />
-            : tab === 'extensions'
-              ? <ExtensionsPane host={host} projectId={projectId} addOpen={extensionsAddOpen} onCloseAdd={() => setExtensionsAddOpen(false)} />
-            : view === 'add'
-              ? <ProviderLoginPanel host={host} onAdded={() => { setView('manage'); void visibility.refresh() }} />
-              : <>
-              {visibility.error && (
-                <div className="model-modal-error visibility-error" data-testid="visibility-error">
-                  <span>{visibility.error}</span>
-                  <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="visibility-error-close" onClick={() => visibility.dismissError()}>×</button>
-                </div>
-              )}
-              {visibility.loading && visibility.models.length === 0
-                ? <div className="model-modal-state" data-testid="model-modal-loading">正在加载模型…</div>
-                : visibility.models.length === 0
-                  ? <div className="model-modal-state" data-testid="model-modal-empty">暂无可用模型</div>
-                  : groups.map(group => {
-                    const isExpanded = expanded.has(group.provider)
-                    const visibleCount = group.models.filter(model => !visibility.hiddenIds.has(modelRef(model))).length
-                    const total = group.models.length
-                    return (
-                      <section key={group.provider} className="model-provider" data-testid={`model-provider-${group.provider}`}>
-                        <div className="model-provider-header">
-                          <ProviderTriState
-                            visibleCount={visibleCount}
-                            total={total}
-                            provider={group.provider}
-                            onChange={() => void visibility.setProviderHidden(group.provider, visibleCount > 0)}
-                          />
-                          <button
-                            className="model-provider-toggle"
-                            aria-label={isExpanded ? `折叠 ${group.provider}` : `展开 ${group.provider}`}
-                            aria-expanded={isExpanded}
-                            onClick={() => toggleExpanded(group.provider)}
-                          >
-                            <span aria-hidden="true">{isExpanded ? '▾' : '▸'}</span>
-                            <ProviderLogo provider={group.provider} size={15} />
-                            <span className="model-provider-name">{group.provider}</span>
-                            <span className="model-provider-count" data-testid={`provider-count-${group.provider}`}>{visibleCount}/{total}</span>
-                          </button>
-                          <button
-                            className="model-provider-delete"
-                            title="删除该 provider 的 Pi 凭据（pi logout）"
-                            aria-label={`删除 ${group.provider} 凭据`}
-                            data-testid={`delete-provider-${group.provider}`}
-                            onClick={() => setConfirmDelete(group.provider)}
-                          >
-                            <TrashIcon />
-                          </button>
-                        </div>
-                        {confirmDelete === group.provider && (
-                          <div className="model-provider-confirm" data-testid={`delete-confirm-${group.provider}`}>
-                            <span>删除将移除 {group.provider} 的 Pi 凭据，其下模型将不可用。</span>
-                            <div className="model-provider-confirm-actions">
-                              <button className="provider-login-cancel" disabled={deleting} data-testid={`delete-cancel-${group.provider}`} onClick={() => setConfirmDelete(null)}>取消</button>
-                              <button className="confirm-delete" disabled={deleting} data-testid={`delete-confirm-btn-${group.provider}`} onClick={() => void doDelete(group.provider)}>{deleting ? '删除中…' : '确认删除'}</button>
-                            </div>
-                            {deleteError && <div className="model-modal-error" data-testid="delete-error">{deleteError}</div>}
-                          </div>
-                        )}
-                        {isExpanded && group.models.map(model => {
-                          const visible = !visibility.hiddenIds.has(modelRef(model))
-                          const currentModel = isCurrent(model)
-                          return (
-                            <label key={modelRef(model)} className="model-row" data-testid={`model-row-${model.provider}-${model.id}`}>
-                              <input
-                                type="checkbox"
-                                checked={visible}
-                                aria-label={`在快捷菜单显示 ${model.name}`}
-                                onChange={() => void visibility.setHidden(model, visible)}
-                              />
-                              <ProviderLogo provider={model.provider} modelId={model.id} size={14} />
-                              <span className="model-row-name">{model.name}</span>
-                              <span className="model-row-id">{model.provider}/{model.id}</span>
-                              {currentModel && <span className="model-row-current">当前模型</span>}
-                            </label>
-                          )
-                        })}
-                      </section>
-                    )
-                  })}
-            </>}
+          {sections.map(section => {
+            const isActive = section.id === tab
+            if (!isActive && section.id !== 'models') return null
+            return <div key={section.id} hidden={!isActive}>{section.render(ctx)}</div>
+          })}
         </div>
       </section>
     </div>
   )
 }
+
+registerSettingsSection(BUILTIN_EXTENSION_ID, {
+  id: 'general',
+  label: '通用',
+  title: '通用',
+  description: '识图路由、外部会话扫描与 Web 搜索密钥',
+  onActivate: ({ setExtensionsAddOpen }) => setExtensionsAddOpen(false),
+  render: ctx => <>
+    <ScanExternalSessionsPane scan={ctx.scan} />
+    <VisionRoutingPane visibility={ctx.visibility} vision={ctx.vision} />
+    <WebSearchKeysPane host={ctx.host} projectId={ctx.projectId} />
+  </>,
+})
+
+registerSettingsSection(BUILTIN_EXTENSION_ID, {
+  id: 'models',
+  label: '模型管理',
+  title: ctx => ctx.view === 'manage' ? '模型管理' : '添加模型',
+  description: ctx => ctx.view === 'manage'
+    ? '左侧勾选控制底栏快捷模型菜单是否显示；当前模型在快捷菜单中保底可见。'
+    : '登录 pi 支持的 provider 后，其模型目录会自动出现。',
+  onActivate: ({ setView, setExtensionsAddOpen }) => { setView('manage'); setExtensionsAddOpen(false) },
+  headerActions: ctx => ctx.view === 'manage'
+    ? <>
+        <button
+          className="model-modal-refresh"
+          data-testid="model-refresh-button"
+          disabled={ctx.visibility.loading}
+          onClick={() => void ctx.visibility.refresh()}
+        >
+          {ctx.visibility.loading ? '刷新中…' : '⟳ 刷新'}
+        </button>
+        <button className="model-modal-add" data-testid="model-add-button" onClick={() => ctx.setView('add')}>＋ 添加模型</button>
+      </>
+    : <button className="model-modal-add" data-testid="model-add-back" onClick={() => ctx.setView('manage')}>← 返回</button>,
+  render: ctx => <ModelsSettingsBody ctx={ctx} />,
+})
+
+registerSettingsSection(BUILTIN_EXTENSION_ID, {
+  id: 'extensions',
+  label: '扩展',
+  title: 'MCP / 扩展',
+  description: '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。',
+  headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加</button>,
+  render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} />,
+})
+
+registerSettingsSection(BUILTIN_EXTENSION_ID, {
+  id: 'updates',
+  label: '更新中心',
+  title: '更新中心',
+  description: '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。',
+  onActivate: ({ setExtensionsAddOpen }) => setExtensionsAddOpen(false),
+  render: ctx => <UpdateCenter updates={ctx.updates} onRequestUpdate={ctx.onRequestUpdate} />,
+})

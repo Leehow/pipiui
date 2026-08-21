@@ -3,9 +3,12 @@
  * SlashCommand / SlashPaletteQuery / SlashFuzzy / BuiltinCommands.parseInvocation
  * across both desktop clients.
  *
- * Pure logic only — no React, no host protocol. UI consumes this from the
- * Composer and the slash palette.
+ * Command matching is pure; the live list is a reversible registry consumed by
+ * the Composer and the slash palette.
  */
+
+import { createContributionRegistry, useRegistrySnapshot } from './contribution-registry'
+import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 
 /** Action dispatched when a slash command is executed from the composer. */
 export type SlashAction =
@@ -44,15 +47,43 @@ export function planPromptFromArgs(args: string): string {
   return goal ? `${PLAN_PROMPT_WITH_ARGS}${goal}` : PLAN_PROMPT_BARE
 }
 
-export const slashCommands: readonly SlashCommandDef[] = [
+const slashCommandRegistry = createContributionRegistry<SlashCommandDef>()
+
+export function registerSlashCommand(extId: string, contribution: SlashCommandDef) {
+  return slashCommandRegistry.register(extId, contribution)
+}
+
+export function disposeSlashCommands(extId: string): void {
+  slashCommandRegistry.disposeExtension(extId)
+}
+
+export function listSlashCommands(): readonly SlashCommandDef[] {
+  return slashCommandRegistry.list()
+}
+
+export function useSlashCommands(): readonly SlashCommandDef[] {
+  return useRegistrySnapshot(slashCommandRegistry)
+}
+
+export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandDef[] = [
   { name: 'model', description: '管理模型可见性', action: { kind: 'open-model-manager' } },
   { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } },
   { name: 'plan', description: '为目标制定正式计划', action: { kind: 'send-plan' } },
   { name: 'goal', description: '设定自主完成的目标', action: { kind: 'send-prompt' } }
 ]
 
+for (const command of BUILTIN_SLASH_COMMANDS) {
+  registerSlashCommand(BUILTIN_EXTENSION_ID, command)
+}
+
+/** Live snapshot of registered slash commands (dogfood + extensions). */
+export let slashCommands: readonly SlashCommandDef[] = listSlashCommands()
+slashCommandRegistry.subscribe(() => {
+  slashCommands = slashCommandRegistry.list()
+})
+
 export function slashCommandByName(name: string): SlashCommandDef | undefined {
-  return slashCommands.find(command => command.name === name)
+  return listSlashCommands().find(command => command.name === name)
 }
 
 /**
@@ -104,9 +135,10 @@ export function slashFuzzyScore(query: string, name: string): number | null {
 
 /** Mirrors Swift `SlashFuzzy.filter`: fuzzy-ranked command list for the query. */
 export function filterSlashCommands(query: string): SlashCommandDef[] {
+  const commands = listSlashCommands()
   const q = query.trim()
-  if (!q) return [...slashCommands]
-  return slashCommands
+  if (!q) return [...commands]
+  return commands
     .map(command => ({ command, score: slashFuzzyScore(q, command.name) }))
     .filter((item): item is { command: SlashCommandDef; score: number } => item.score !== null)
     .sort((a, b) => b.score - a.score || a.command.name.localeCompare(b.command.name))

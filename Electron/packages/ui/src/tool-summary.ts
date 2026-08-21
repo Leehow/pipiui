@@ -9,6 +9,9 @@
  * raw JSON braces onto the header.
  */
 
+import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
+import { getToolRenderer, registerToolRenderer } from './ui-registries'
+
 const MAX_LONG = 120
 const MAX_PROMPT = 80
 
@@ -77,45 +80,22 @@ function computerTaskSummary(args: Record<string, unknown>): string {
   return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`
 }
 
+function fetchContentSummary(args: Record<string, unknown>): string {
+  const url = stringField(args, 'url')
+  if (url) return url
+  const urls = args['urls']
+  if (Array.isArray(urls) && typeof urls[0] === 'string') return urls[0]
+  return '…'
+}
+
+function computerSummary(args: Record<string, unknown>): string {
+  const count = Array.isArray(args['actions']) ? args['actions'].length : 0
+  if (count > 0) return `${count} 个桌面操作`
+  return stringField(args, 'action') ?? stringField(args, 'type') ?? '桌面操作'
+}
+
 function summarizeArgs(name: string, args: Record<string, unknown>): string {
-  switch (name) {
-    case 'write':
-    case 'edit':
-      return pathSummary(args)
-    case 'generate_image':
-    case 'image_gen':
-    case 'image_edit':
-      return promptSummary(args)
-    case 'web_search':
-    case 'browser_search':
-      return stringField(args, 'query') ?? '…'
-    case 'fetch_content': {
-      const url = stringField(args, 'url')
-      if (url) return url
-      const urls = args['urls']
-      if (Array.isArray(urls) && typeof urls[0] === 'string') return urls[0]
-      return '…'
-    }
-    case 'browser_fetch':
-      return stringField(args, 'url') ?? '…'
-    case 'browser':
-      return browserSummary(args)
-    case 'computer': {
-      const count = Array.isArray(args['actions']) ? args['actions'].length : 0
-      if (count > 0) return `${count} 个桌面操作`
-      return stringField(args, 'action') ?? stringField(args, 'type') ?? '桌面操作'
-    }
-    case 'find':
-      return findSummary(args)
-    case 'grep':
-      return grepSummary(args)
-    case 'subagent':
-      return subagentSummary(args)
-    case 'computer_task':
-      return computerTaskSummary(args)
-    default:
-      return legacySummary(args)
-  }
+  return getToolRenderer(name)?.summarizeArgs?.(args) ?? legacySummary(args)
 }
 
 function legacySummary(args: Record<string, unknown>): string {
@@ -212,6 +192,8 @@ function grepScrapedSummary(text: string): string {
 
 /** Best-effort field scrape for truncated / invalid tool-arg JSON. */
 function scrapeFields(name: string, text: string): string | undefined {
+  const custom = getToolRenderer(name)?.scrapeSummary?.(text)
+  if (custom !== undefined) return custom
   switch (name) {
     case 'edit':
     case 'write':
@@ -256,8 +238,6 @@ export function toolArgsSummary(name: string, raw: string): string {
   } catch {
     // Fall through to field scraping for truncated / non-JSON input.
   }
-  if (name === 'find') return findScrapedSummary(trimmed)
-  if (name === 'grep') return grepScrapedSummary(trimmed)
   const scraped = scrapeFields(name, trimmed)
   if (scraped) return scraped
   // A JSON-looking payload belongs in expanded details, never in the visible header.
@@ -320,4 +300,36 @@ export function formatToolInput(name: string, raw: string): string {
   } catch {
     return trimmed
   }
+}
+
+function pathScrape(text: string): string | undefined {
+  return scrapeJSONString('path', text) ?? scrapeJSONString('file_path', text)
+}
+
+function promptScrape(text: string): string | undefined {
+  const prompt = scrapeJSONString('prompt', text)
+  return prompt == null ? undefined : truncate(prompt)
+}
+
+const querySummary = (args: Record<string, unknown>) => stringField(args, 'query') ?? '…'
+const urlSummary = (args: Record<string, unknown>) => stringField(args, 'url') ?? '…'
+
+for (const contribution of [
+  { toolName: 'write', summarizeArgs: pathSummary, scrapeSummary: pathScrape },
+  { toolName: 'edit', summarizeArgs: pathSummary, scrapeSummary: pathScrape },
+  { toolName: 'generate_image', summarizeArgs: promptSummary, scrapeSummary: promptScrape },
+  { toolName: 'image_gen', summarizeArgs: promptSummary, scrapeSummary: promptScrape },
+  { toolName: 'image_edit', summarizeArgs: promptSummary, scrapeSummary: promptScrape },
+  { toolName: 'web_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
+  { toolName: 'browser_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
+  { toolName: 'fetch_content', summarizeArgs: fetchContentSummary, scrapeSummary: (text: string) => scrapeJSONString('url', text) },
+  { toolName: 'browser_fetch', summarizeArgs: urlSummary, scrapeSummary: (text: string) => scrapeJSONString('url', text) },
+  { toolName: 'browser', summarizeArgs: browserSummary },
+  { toolName: 'computer', summarizeArgs: computerSummary },
+  { toolName: 'find', summarizeArgs: findSummary, scrapeSummary: findScrapedSummary },
+  { toolName: 'grep', summarizeArgs: grepSummary, scrapeSummary: grepScrapedSummary },
+  { toolName: 'subagent', summarizeArgs: subagentSummary, scrapeSummary: (text: string) => scrapeJSONString('title', text) ?? scrapeJSONString('task', text) },
+  { toolName: 'computer_task', summarizeArgs: computerTaskSummary, scrapeSummary: (text: string) => scrapeJSONString('goal', text) },
+]) {
+  registerToolRenderer(BUILTIN_EXTENSION_ID, contribution)
 }
