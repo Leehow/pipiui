@@ -1,9 +1,11 @@
 .plan-approval-bar{
   display:flex;
+  width:var(--chat-content-width,calc(100% - 32px));
+  max-width:var(--chat-content-max,780px);
   min-width:0;
   align-items:center;
   gap:8px;
-  margin:0 0 8px;
+  margin:0 auto 8px;
   padding:7px 10px;
   border:1px solid var(--border-strong);
   border-radius:10px;
@@ -42,3 +44,16 @@
   background:var(--accent);
 }
 .plan-approval-bar-approve:hover{filter:brightness(1.06)}
+.plan-approval-bar-dismiss{
+  display:grid;
+  width:22px;
+  height:22px;
+  flex:none;
+  place-items:center;
+  padding:0;
+  border-radius:5px;
+  color:var(--muted);
+  font-size:15px;
+  line-height:1;
+}
+.plan-approval-bar-dismiss:hover{color:var(--text-strong);background:var(--surface-hover)}

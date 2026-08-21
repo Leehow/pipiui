@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { PlanStore, planStorePath, readPlanStore } from "../src/plan-store.js";
 import type { PlanSnapshot } from "@pipi/host-api";
+import { planIsLive } from "../../host-api/src/plan.js";
 
 const roots: string[] = [];
 afterEach(() => { roots.length = 0; });
@@ -30,6 +31,10 @@ function snapshot(overrides: Partial<PlanSnapshot> = {}): PlanSnapshot {
 }
 
 describe("PlanStore.accept", () => {
+  it("does not treat a superseded inactive draft as live", () => {
+    expect(planIsLive(snapshot({ active: false }))).toBe(false);
+  });
+
   it("republishes a publish event and keeps it as the session's plan", () => {
     const store = new PlanStore();
     const event = store.accept({ event: "plan_publish", plan: snapshot() }, "s1");
@@ -74,6 +79,7 @@ describe("PlanStore.accept", () => {
     const byId = Object.fromEntries(store.list("s1").map(plan => [plan.id, plan]));
     expect(byId["plan-2"].active).toBe(true);
     expect(byId["plan-1"].active).toBe(false);
+    expect(planIsLive(byId["plan-1"])).toBe(false);
   });
 
   it("sorts unfinished plans above settled ones, newest activity first", () => {

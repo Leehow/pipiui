@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -13,7 +13,8 @@ import {
   REMOTE_CONTROL_STORE_FILE,
   withRemoteSessionCapabilities,
   type RemoteControlCommand,
-  type RemoteControlState
+  type RemoteControlState,
+  type RemoteControlStored
 } from './remote-control.js'
 import { createRemoteDebugService } from './remote-debug.js'
 
@@ -78,10 +79,11 @@ async function waitFor(
   throw new Error(message)
 }
 
-async function startRelay() {
+async function startRelay(options: { browserUIDir?: string; ttlMs?: number } = {}) {
   const relay = createHostAPIRelay({
     publicOrigin: 'http://127.0.0.1',
-    browserUIDir: join(tmpdir(), 'pipiui-missing-browser-ui')
+    browserUIDir: options.browserUIDir ?? join(tmpdir(), 'pipiui-missing-browser-ui'),
+    ttlMs: options.ttlMs
   })
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
@@ -279,6 +281,80 @@ describe('createRemoteControlService', () => {
     second.close()
     browser.close()
   }, 15_000)
+
+  it('serves the authenticated browser UI, upgrades /ws, then rotates an expired room and reconnects', async () => {
+    const dir = await userData()
+    const ui = join(dir, 'browser-ui')
+    await mkdir(join(ui, 'assets'), { recursive: true })
+    await writeFile(
+      join(ui, 'index.html'),
+      '<!doctype html><main data-browser-ui="remote-e2e"></main><script src="/assets/app.js"></script>',
+      'utf8'
+    )
+    await writeFile(join(ui, 'assets/app.js'), 'window.__PIPIUI_REMOTE_UI__=true;', 'utf8')
+    const relay = await startRelay({ browserUIDir: ui, ttlMs: 800 })
+    relays.push(relay)
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: relay.origin,
+      backoffMs: () => 10,
+      pingIntervalMs: 100,
+      connect: url => new WebSocket(url) as unknown as WebSocket
+    })
+    services.push(service)
+
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const expiredRoom = service.getState().roomID
+    const expiredUrl = service.getState().pairUrl
+    expect(expiredRoom).toBeTruthy()
+    expect(expiredUrl).toBeTruthy()
+    const before = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
+
+    const granted = await claim(relay.origin, before.roomID, before.pairSecret)
+    expect(granted.status).toBe(204)
+    const cookie = cookieHeader(granted.headers.get('set-cookie'))
+    const page = await fetch(`${relay.origin}/pair/${before.roomID}`, { headers: { Cookie: cookie } })
+    expect(page.status).toBe(200)
+    expect(await page.text()).toContain('data-browser-ui="remote-e2e"')
+    const asset = await fetch(`${relay.origin}/assets/app.js`, { headers: { Cookie: cookie } })
+    expect(asset.status).toBe(200)
+    expect(await asset.text()).toBe('window.__PIPIUI_REMOTE_UI__=true;')
+
+    const browser = new WebSocket(`ws://127.0.0.1:${new URL(relay.origin).port}/ws`, {
+      headers: { Cookie: cookie }
+    } as never)
+    const browserQ = installQueue(browser)
+    await new Promise((resolve, reject) => {
+      browser.addEventListener('open', resolve, { once: true })
+      browser.addEventListener('error', () => reject(new Error('browser ws')), { once: true })
+    })
+    browser.send(JSON.stringify({
+      protocolVersion: 2,
+      id: 'browser-tail',
+      type: 'request',
+      method: 'listProjects',
+      params: []
+    }))
+    await expect(nextBusinessFrame(browserQ, browser)).resolves.toMatchObject({
+      type: 'response',
+      id: 'browser-tail',
+      ok: true
+    })
+
+    await waitFor(() => service.getState().roomID !== expiredRoom, 'expired room identity was not rotated')
+    await waitFor(() => service.getState().status === 'ready', 'rotated room did not reconnect')
+    const after = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
+    expect(after.enabled).toBe(true)
+    expect(after.roomID).not.toBe(before.roomID)
+    expect(after.pairSecret).not.toBe(before.pairSecret)
+    expect(service.getState().pairUrl).not.toBe(expiredUrl)
+    expect(service.getState().pairUrl).toBe(pairUrlFor(relay.origin, after.roomID, after.pairSecret))
+    expect((await claim(relay.origin, before.roomID, before.pairSecret)).status).toBe(403)
+    expect((await claim(relay.origin, after.roomID, after.pairSecret)).status).toBe(204)
+    browser.close()
+  }, 10_000)
 
   it('does not close the shared backend when the remote socket drops', async () => {
     const relay = await startRelay()

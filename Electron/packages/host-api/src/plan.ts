@@ -115,6 +115,7 @@ export function planProgress(plan: Pick<PlanSnapshot, "tasks">): PlanProgress {
 
 /** A plan the user still has to watch: published, not cancelled, and not finished. */
 export function planIsLive(plan: PlanSnapshot): boolean {
+  if (plan.active === false) return false;
   if (plan.lifecycle === "cancelled") return false;
   return planProgress(plan).settled < plan.tasks.length;
 }

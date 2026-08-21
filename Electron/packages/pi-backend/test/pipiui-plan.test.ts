@@ -14,9 +14,15 @@ type Tool = {
  * specifier is a literal on purpose: a variable one is not statically
  * analyzable and fails to resolve under this vite/vitest.
  */
-async function loadExtension(sessionId = "") {
+async function loadExtension(sessionId = "", options: { allowBridge?: boolean } = {}) {
   vi.resetModules();
   vi.stubEnv("PIPIUI_SESSION_ID", sessionId);
+  if (!options.allowBridge) {
+    vi.stubEnv("PIPIUI_BRIDGE_PORT", "");
+    vi.stubEnv("PIPIUI_HOST_PROTOCOL", "");
+    vi.stubEnv("PIPIUI_SESSION_KEY", "");
+    vi.stubEnv("PIPIUI_SESSION_CAPABILITY", "");
+  }
   const tools: Tool[] = [];
   const extension = (await import("../../../resources/runtime/extensions/pipiui-plan.ts")).default;
   extension({
@@ -50,7 +56,7 @@ describe("pipiui plan tools", () => {
     vi.stubEnv("PIPIUI_HOST_PROTOCOL", "1");
     vi.stubEnv("PIPIUI_SESSION_CAPABILITY", "cap-1");
 
-    const first = await loadExtension();
+    const first = await loadExtension("", { allowBridge: true });
     const ctx = { cwd: root };
     const published = parse(await first.plan_publish.execute("1", {
       plan: {
@@ -86,7 +92,7 @@ describe("pipiui plan tools", () => {
     expect(disk.activePlanId).toBe("plan-a");
     expect(disk.plans["plan-a"].lifecycle).toBe("approved");
 
-    const reloaded = await loadExtension();
+    const reloaded = await loadExtension("", { allowBridge: true });
     const again = parse(await reloaded.plan_task_update.execute("4", {
       planId: "plan-a",
       taskId: "t1",
@@ -139,6 +145,31 @@ describe("pipiui plan tools", () => {
     expect(unknownTask.error).toMatch(/unknown task/);
   });
 
+  it("rejects a second unfinished plan but preserves history after the first finishes", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-lifecycle-"));
+    const tools = await loadExtension();
+    const ctx = { cwd: root };
+    expect(parse(await tools.plan_publish.execute("1", {
+      plan: { id: "plan-a", title: "A", tasks: [{ id: "t1", title: "one" }] },
+    }, undefined, undefined, ctx)).ok).toBe(true);
+
+    const overlapping = parse(await tools.plan_publish.execute("2", {
+      plan: { id: "plan-b", title: "B", tasks: [{ id: "t2", title: "two" }] },
+    }, undefined, undefined, ctx));
+    expect(overlapping).toMatchObject({ ok: false, error: expect.stringMatching(/active plan in progress/i) });
+
+    expect(parse(await tools.plan_task_update.execute("3", {
+      planId: "plan-a", taskId: "t1", state: "completed",
+    }, undefined, undefined, ctx)).ok).toBe(true);
+    expect(parse(await tools.plan_publish.execute("4", {
+      plan: { id: "plan-b", title: "B", tasks: [{ id: "t2", title: "two" }] },
+    }, undefined, undefined, ctx)).ok).toBe(true);
+
+    const disk = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
+    expect(disk.activePlanId).toBe("plan-b");
+    expect(Object.keys(disk.plans)).toEqual(["plan-a", "plan-b"]);
+  });
+
   it("cancels the active plan and records a reason", async () => {
     root = await mkdtemp(join(tmpdir(), "pipiui-plan-"));
     const posts: any[] = [];
@@ -150,7 +181,7 @@ describe("pipiui plan tools", () => {
     vi.stubEnv("PIPIUI_HOST_PROTOCOL", "1");
     vi.stubEnv("PIPIUI_SESSION_CAPABILITY", "cap-1");
 
-    const tools = await loadExtension();
+    const tools = await loadExtension("", { allowBridge: true });
     const ctx = { cwd: root };
     await tools.plan_publish.execute("1", {
       plan: { id: "plan-b", title: "B", tasks: [{ id: "t1", title: "one" }] },
@@ -213,5 +244,22 @@ describe("pipiui plan tools", () => {
     expect(published.ok).toBe(true);
     const disk = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
     expect(disk.activePlanId).toBe("plan-legacy");
+  });
+
+  it("does not post fixture plans through bridge credentials inherited by a no-stub test", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-isolation-"));
+    const fetchSpy = vi.fn(async () => ({ ok: true }) as Response);
+    vi.stubGlobal("fetch", fetchSpy);
+    vi.stubEnv("PIPIUI_BRIDGE_PORT", "18766");
+    vi.stubEnv("PIPIUI_HOST_PROTOCOL", "1");
+    vi.stubEnv("PIPIUI_SESSION_CAPABILITY", "inherited-real-capability");
+
+    const tools = await loadExtension("fixture-session");
+    const published = parse(await tools.plan_publish.execute("1", {
+      plan: { id: "fixture-plan", title: "test-only fixture", tasks: [{ id: "t1", title: "fixture step" }] },
+    }, undefined, undefined, { cwd: root }));
+
+    expect(published.ok).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 });

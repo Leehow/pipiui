@@ -59,7 +59,7 @@ export function statusLabel(status: RemoteControlStatus): string {
     case 'ready':
       return '已连接 Relay'
     case 'paired':
-      return '等待浏览器配对'
+      return '浏览器已连接'
     case 'reconnecting':
       return '断线重连中'
     case 'error':

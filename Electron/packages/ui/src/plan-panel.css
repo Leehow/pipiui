@@ -7,7 +7,7 @@
 .plan-error{padding:10px 12px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent);font-size:12px}
 .plan-section-title{padding:6px 2px 0;color:var(--muted);font-size:11px;font-weight:650;letter-spacing:.06em}
 
-.plan-card{border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);overflow:hidden}
+.plan-card{flex:none;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);overflow:hidden}
 .plan-card-summary{display:grid;gap:6px;padding:10px 12px;cursor:pointer;list-style:none}
 .plan-card-summary::-webkit-details-marker{display:none}
 .plan-card-heading{display:flex;min-width:0;align-items:center;gap:6px}
