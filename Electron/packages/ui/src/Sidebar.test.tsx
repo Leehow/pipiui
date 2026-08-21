@@ -97,17 +97,108 @@ describe('Sidebar', () => {
     expect(props.onToggleProject).toHaveBeenCalledWith('p1')
   })
 
-  it('collapsed project hides its sessions; expanding via expandedIds shows them', () => {
+  it('collapsed project hides idle sessions but keeps working ones; expanding via expandedIds shows them', () => {
     const props = defaultProps({ expandedIds: [] })
     render(<Sidebar {...props} />)
     expect(screen.queryByText('s1')).toBeNull()
-    expect(screen.queryByText('s2')).toBeNull()
+    expect(screen.getByText('s2')).toBeTruthy()
+    expect(screen.getAllByTestId('project-row')[0].getAttribute('aria-expanded')).toBe('false')
 
     // Controlled: parent feeds the id back → folder opens.
+    cleanup()
     props.expandedIds = ['p1']
     render(<Sidebar {...props} />)
     expect(screen.getByText('s1')).toBeTruthy()
     expect(screen.getByText('s2')).toBeTruthy()
+  })
+
+  it('collapsed project still renders a running SessionRow', () => {
+    const props = defaultProps({
+      expandedIds: [],
+      pinnedSessions: [],
+      projects: [{
+        id: 'p1',
+        name: 'demo-project',
+        sessions: [session({ id: 'idle-one' }), session({ id: 'run-one', status: 'running' })]
+      }]
+    })
+    render(<Sidebar {...props} />)
+    const row = screen.getByTestId('session-row')
+    expect(row.getAttribute('data-session-id')).toBe('run-one')
+    expect(row.getAttribute('data-status')).toBe('running')
+    expect(screen.queryByText('idle-one')).toBeNull()
+    expect(screen.getByTestId('project-row').getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('collapsed project with only idle or completed sessions renders no SessionRow', () => {
+    const props = defaultProps({
+      expandedIds: [],
+      pinnedSessions: [],
+      projects: [{
+        id: 'p1',
+        name: 'demo-project',
+        sessions: [session({ id: 'idle-one' }), session({ id: 'done-one', status: 'completed' })]
+      }]
+    })
+    render(<Sidebar {...props} />)
+    expect(screen.queryByTestId('session-row')).toBeNull()
+    expect(screen.queryByText('idle-one')).toBeNull()
+    expect(screen.queryByText('done-one')).toBeNull()
+  })
+
+  it('collapsed project still renders a subagents-running SessionRow', () => {
+    const props = defaultProps({
+      expandedIds: [],
+      pinnedSessions: [],
+      projects: [{
+        id: 'p1',
+        name: 'demo-project',
+        sessions: [session({ id: 'idle-one' }), session({ id: 'subs-one', status: 'subagents-running', subagentCount: 2 })]
+      }]
+    })
+    render(<Sidebar {...props} />)
+    const row = screen.getByTestId('session-row')
+    expect(row.getAttribute('data-session-id')).toBe('subs-one')
+    expect(row.getAttribute('data-status')).toBe('subagents-running')
+    expect(screen.queryByText('idle-one')).toBeNull()
+  })
+
+  it('expanded project still shows idle and working sessions', () => {
+    const props = defaultProps({
+      expandedIds: ['p1'],
+      pinnedSessions: [],
+      projects: [{
+        id: 'p1',
+        name: 'demo-project',
+        sessions: [
+          session({ id: 'idle-one' }),
+          session({ id: 'run-one', status: 'running' }),
+          session({ id: 'done-one', status: 'completed' })
+        ]
+      }]
+    })
+    render(<Sidebar {...props} />)
+    expect(screen.getByText('idle-one')).toBeTruthy()
+    expect(screen.getByText('run-one')).toBeTruthy()
+    expect(screen.getByText('done-one')).toBeTruthy()
+    expect(screen.getAllByTestId('session-row')).toHaveLength(3)
+  })
+
+  it('search-forced-open still shows matching idle sessions under a collapsed project', () => {
+    const props = defaultProps({ expandedIds: [], searchQuery: 's1' })
+    render(<Sidebar {...props} />)
+    expect(screen.getByText('s1')).toBeTruthy()
+    expect(screen.queryByText('s2')).toBeNull()
+    expect(screen.getAllByTestId('project-row')[0].getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it('clicking a peeked working row still selects the session', () => {
+    const props = defaultProps({ expandedIds: [] })
+    render(<Sidebar {...props} />)
+    fireEvent.click(screen.getByText('s2').closest('.sb-session')!)
+    expect(props.onSelectSession).toHaveBeenCalledWith('s2')
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+    expect(props.onToggleProject).not.toHaveBeenCalled()
   })
 
   it('project menu reports reveal/remove and renames inline without touching the folder path', async () => {

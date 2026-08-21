@@ -295,10 +295,15 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   )
 }
 
+function isWorkingSession(session: SidebarSession): boolean {
+  return session.status === 'running' || session.status === 'subagents-running'
+}
+
 /** Active session rows under a project folder, with Swift-parity pagination.
  *  Browse view truncates to `SESSION_LIMIT` (10) with a 「更多/收起」 toggle that
- *  pages 10 at a time; a search bypasses pagination so every match shows. */
-function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, onViewOriginalSession, shown, onToggle, draggedSessionId, sessionDrop, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop }: {
+ *  pages 10 at a time; a search bypasses pagination so every match shows.
+ *  A collapsed folder (`peekWorking`) still lists currently working rows. */
+function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, onViewOriginalSession, shown, onToggle, draggedSessionId, sessionDrop, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop, peekWorking }: {
   project: SidebarProject
   query: string
   selectedSessionId: string | null
@@ -315,11 +320,12 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
   onDragEnd?: () => void
   onSessionDragOver?: (event: DragEvent, session: SidebarSession) => void
   onSessionDrop?: (event: DragEvent, session: SidebarSession) => void
+  peekWorking?: boolean
 }) {
-  const sessions = project.sessions
+  const sessions = peekWorking ? project.sessions.filter(isWorkingSession) : project.sessions
   const isSearch = query !== ''
-  const visible = isSearch ? sessions : visiblePrefix(sessions, SESSION_LIMIT, shown).items
-  const showsToggle = !isSearch && sessions.length > SESSION_LIMIT
+  const visible = peekWorking || isSearch ? sessions : visiblePrefix(sessions, SESSION_LIMIT, shown).items
+  const showsToggle = !peekWorking && !isSearch && sessions.length > SESSION_LIMIT
   const collapsed = showsToggle && shown >= sessions.length
   return (
     <div className="sb-project-sessions" role="group" aria-label={`${project.name} 的会话`}>
@@ -673,11 +679,17 @@ export function Sidebar(props: SidebarProps) {
 
         <section className="sb-section" aria-label="项目">
           <h2 className="sb-section-title sb-project-heading">项目 <ProjectAddControl onAddProject={onAddProject} unavailable={projectAddUnavailable} /></h2>
-          {shownProjects.map(project => (
+          {shownProjects.map(project => {
+            const open = isProjectOpen(project.id)
+            const peekWorking = !open
+            const showSessions = open
+              ? project.sessions.length > 0
+              : project.sessions.some(isWorkingSession)
+            return (
             <div className="sb-project-wrap" key={project.id}>
               <ProjectRow
                 project={project}
-                isExpanded={isProjectOpen(project.id)}
+                isExpanded={open}
                 onToggle={onToggleProject}
                 onNewSession={onNewSession}
                 onProjectMenu={onProjectMenu}
@@ -691,7 +703,7 @@ export function Sidebar(props: SidebarProps) {
                 onDragOver={dragOverProject}
                 onDrop={dropOnProject}
               />
-              {isProjectOpen(project.id) && project.sessions.length > 0 && (
+              {showSessions && (
                 <ProjectSessions
                   project={project}
                   query={query}
@@ -709,10 +721,12 @@ export function Sidebar(props: SidebarProps) {
                   onDragEnd={finishDrag}
                   onSessionDragOver={dragOverSession}
                   onSessionDrop={dropOnSession}
+                  peekWorking={peekWorking}
                 />
               )}
             </div>
-          ))}
+            )
+          })}
           {hasMore && (
             <button type="button" className="sb-more" data-testid="show-more" onClick={onShowMore}>
               更多
