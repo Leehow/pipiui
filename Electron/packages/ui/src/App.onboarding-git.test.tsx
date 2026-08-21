@@ -112,7 +112,9 @@ describe('empty setup guide', () => {
 
   it('keeps a populated workspace on the transcript instead of the setup guide', async () => {
     render(<App host={createMockHost()} />)
-    await screen.findByText('Electron 三栏界面')
+    // The session title now legitimately appears in both the sidebar row and
+    // the chat header, so wait for any of its occurrences as the load sentinel.
+    await screen.findAllByText('Electron 三栏界面')
     expect(screen.queryByTestId('empty-setup')).toBeNull()
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
   })
