@@ -1366,13 +1366,20 @@ describe('PipiUI Electron main layout', () => {
     expect(document.activeElement).not.toBe(composer)
     expect(composer.value).not.toContain('基本情况调查表.txt')
     expect(screen.queryByTestId('composer-thumbs')).toBeNull()
+    expect(screen.queryByTestId('composer-doc-chips')).toBeNull()
     expect(screen.queryByTestId('composer-error')).toBeNull()
     expect(await screen.findByLabelText('文档内容 基本情况调查表.txt')).toBeTruthy()
   })
 
-  it('ignores a file drop that lands on the composer after crossing the chat column', async () => {
+  it('attaches a document drop on the composer as a removable chip without opening the panel', async () => {
     const host = createMockHost()
-    host.notifyDocumentsDropped = vi.fn(async () => undefined)
+    const notifyDocumentsDropped = vi.fn(async () => undefined)
+    const notifyComposerDocumentsDropped = vi.fn(async () => undefined)
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    host.notifyDocumentsDropped = notifyDocumentsDropped
+    host.notifyComposerDocumentsDropped = notifyComposerDocumentsDropped
+    const getPath = vi.fn((file: File) => `/Users/haoli/Downloads/${file.name}`)
+    window.pipiPathForFile = getPath
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
@@ -1380,10 +1387,39 @@ describe('PipiUI Electron main layout', () => {
     const dataTransfer = fileDataTransfer(file)
     fireEvent.dragOver(composer, { dataTransfer })
     fireEvent.drop(composer, { dataTransfer })
+    expect(await screen.findByTestId('composer-doc-chip-0')).toBeTruthy()
+    expect(screen.getByText('form.doc')).toBeTruthy()
     expect(composer.value).not.toContain('form.doc')
+    expect(getPath).toHaveBeenCalled()
+    expect(notifyDocumentsDropped).not.toHaveBeenCalled()
+    expect(notifyComposerDocumentsDropped).not.toHaveBeenCalled()
+    expect(screen.queryByLabelText(/文档内容/)).toBeNull()
+    expect(document.querySelector('input[type="file"]')).toBeNull()
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(notifyComposerDocumentsDropped).toHaveBeenCalledWith('welcome', ['/Users/haoli/Downloads/form.doc']))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请分析这些文件的内容'))
+    expect(notifyDocumentsDropped).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.queryByTestId('composer-doc-chips')).toBeNull())
+  })
+
+  it('ignores an unsupported file drop that lands on the composer', async () => {
+    const host = createMockHost()
+    host.notifyDocumentsDropped = vi.fn(async () => undefined)
+    host.notifyComposerDocumentsDropped = vi.fn(async () => undefined)
+    window.pipiPathForFile = (file: File) => `/tmp/${file.name}`
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    const footer = document.querySelector('footer.composer') as HTMLElement
+    const file = new File(['skip'], 'skip.js', { type: 'text/javascript' })
+    const dataTransfer = fileDataTransfer(file)
+    fireEvent.dragOver(footer, { dataTransfer })
+    fireEvent.drop(footer, { dataTransfer })
+    expect(composer.value).not.toContain('skip.js')
+    expect(screen.queryByTestId('composer-doc-chips')).toBeNull()
     expect(screen.queryByTestId('composer-thumbs')).toBeNull()
-    expect(screen.queryByTestId('composer-error')).toBeNull()
     expect(host.notifyDocumentsDropped).not.toHaveBeenCalled()
+    expect(host.notifyComposerDocumentsDropped).not.toHaveBeenCalled()
   })
 
   it('does not remount an open document preview when the selected session streams tokens', async () => {
@@ -1781,6 +1817,43 @@ describe('PipiUI Electron main layout', () => {
     expect(listSessions).toHaveBeenCalledTimes(initialListCalls)
     expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true')
     expect(container.querySelector('.chat-header-title-label')?.textContent).toBe('Electron 三栏界面')
+  })
+
+  it('does not auto-expand a collapsed project when selecting a peeked working session', async () => {
+    const host = createMockHost()
+    const workspace = await host.listProjects()
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('data-status')).toBe('subagents-running'))
+    fireEvent.click(screen.getByRole('button', { name: '收起项目 PipiUI' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy())
+    const welcome = container.querySelector('[data-session-id="welcome"]')!
+    expect(welcome).toBeTruthy()
+    fireEvent.click(welcome)
+    await waitFor(() => expect(welcome.getAttribute('aria-current')).toBe('true'))
+    expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy()
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).not.toContain('pipiui'))
+  })
+
+  it('auto-expands a collapsed project when selecting a non-working session', async () => {
+    const host = createMockHost()
+    const workspace = await host.listProjects()
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(screen.getByRole('button', { name: '收起项目 Website' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 Website' })).toBeTruthy())
+    expect(container.querySelector('[data-session-id="site"]')).toBeNull()
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: 'Landing' } })
+    const site = await waitFor(() => {
+      const row = container.querySelector('[data-session-id="site"]')
+      expect(row).toBeTruthy()
+      return row!
+    })
+    fireEvent.click(site)
+    await waitFor(() => expect(site.getAttribute('aria-current')).toBe('true'))
+    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: '' } })
+    await waitFor(() => expect(screen.getByRole('button', { name: '收起项目 Website' })).toBeTruthy())
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).toContain('website'))
   })
 
   it('uses host semantic sidebar preferences after one-time local migration while keeping disclosure local', async () => {

@@ -62,6 +62,36 @@ describe("PiHostBackend terminal projection", () => {
     await backend.close();
   });
 
+  it("settles a durable stop even when a stale host follow-up is still listed", async () => {
+    const backend = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") statuses.push(event.event.status);
+    });
+
+    await backend.handle("sendPrompt", ["s1", "final-with-stale-followup"]);
+    await eventually(() => statuses.includes("settled"));
+
+    off();
+    expect(statuses).toEqual(["started", "settled"]);
+    await backend.close();
+  });
+
+  it("settles a persisted final assistant when Pi pendingMessageCount never clears", async () => {
+    const backend = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(event => {
+      if (event.channel === "stream" && event.event.type === "status") statuses.push(event.event.status);
+    });
+
+    await backend.handle("sendPrompt", ["s1", "final-durable-stuck-pending"]);
+    await eventually(() => statuses.includes("settled"), 3_000);
+
+    off();
+    expect(statuses).toEqual(["started", "settled"]);
+    await backend.close();
+  });
+
   it("does not project settled while Pi reports queued post-run re-entry", async () => {
     const backend = await fixture();
     const statuses: string[] = [];

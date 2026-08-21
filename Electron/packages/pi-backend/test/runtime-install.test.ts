@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -83,6 +84,12 @@ describe("installRuntimeTree", () => {
       expect(researchSkill).toContain("default to multiple `explore` workers, not one");
       expect(researchSkill).toContain("dispatch **all known independent partitions at once**");
       expect(researchSkill).toContain("first-wave baseline of **3–6 independent partitions**");
+      const helloDir = join(root, "extensions", "hello-pipiui");
+      const helloManifest = JSON.parse(await readFile(join(helloDir, "pipiui-extension.json"), "utf8")) as {
+        agent?: { extension?: string };
+      };
+      expect(helloManifest.agent?.extension).toBeTruthy();
+      expect(existsSync(join(helloDir, helloManifest.agent!.extension!))).toBe(true);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 

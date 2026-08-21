@@ -130,6 +130,13 @@ export class SessionMessageQueue {
     return session ? session.turnActive || session.dispatching : false;
   }
 
+  /** Sessions whose FIFO is blocked on a turn or in-flight delivery. */
+  busySessionIds(): string[] {
+    return [...this.sessions.entries()]
+      .filter(([, session]) => session.turnActive || session.dispatching)
+      .map(([sessionId]) => sessionId);
+  }
+
   /** Wait only for acceptance/failure of the currently-starting pi RPC, never for turn settle. */
   async waitForDispatch(sessionId: string): Promise<void> {
     await this.state(sessionId).dispatchPromise;

@@ -65,6 +65,15 @@ import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } 
 import { HostBridge } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { DocumentFileWatcher } from "./document-watch.js";
+import {
+  FREEZE_PROBE_FILE,
+  freezeProbe,
+  freezeProbeHistoryIpcEnd,
+  freezeProbeHistoryIpcStart,
+  freezeProbeHistoryScanEnd,
+  freezeProbeHistoryScanStart,
+  installFreezeProbe,
+} from "./freeze-probe.js";
 import { buildDocumentsOpenedInjection, DocumentInjectionStore, prependDocumentInjection } from "./document-inject.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
 import { ExternalAuthRuntime } from "./external-auth-runtime.js";
@@ -1708,6 +1717,7 @@ export class PiHostBackend implements HostBackend {
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.vaultDir = options.vaultDir ?? this.agentDir;
+    installFreezeProbe(join(this.agentDir, FREEZE_PROBE_FILE));
     this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
       () => undefined,
@@ -2303,11 +2313,27 @@ export class PiHostBackend implements HostBackend {
       hit.size === stat.size &&
       hit.before === before &&
       hit.limit === limit
-    )
+    ) {
+      freezeProbe("history_cache_hit", { session: sessionId, size: stat.size, before: String(before), limit });
       return hit.entries;
-    const entries = await readHistory(path, before, limit, this.vaultDir, sessionId);
-    this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, before, limit, entries });
-    return entries;
+    }
+    freezeProbeHistoryScanStart({
+      session: sessionId,
+      file: basename(path),
+      size: stat.size,
+      before: String(before).slice(0, 40),
+      limit,
+    });
+    const started = Date.now();
+    try {
+      const entries = await readHistory(path, before, limit, this.vaultDir, sessionId);
+      this.historyCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, before, limit, entries });
+      freezeProbeHistoryScanEnd({ session: sessionId, size: stat.size, ms: Date.now() - started, rows: entries.length });
+      return entries;
+    } catch (error) {
+      freezeProbeHistoryScanEnd({ session: sessionId, size: stat.size, ms: Date.now() - started, failed: 1 });
+      throw error;
+    }
   }
   private sessionSecrets(sessionId: string): RevealedSecret[] {
     try { return revealRedactionSecrets(this.vaultDir, sessionId); }
@@ -2704,12 +2730,21 @@ export class PiHostBackend implements HostBackend {
           ? requestedBefore
           : Number.isFinite(numericBefore) ? Math.max(0, Math.floor(numericBefore)) : 0;
         const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(500, Math.floor(requestedLimit))) : 500;
-        return this.readHistoryCached(
-          session.path,
-          before,
-          limit,
-          session.header.id,
-        );
+        freezeProbeHistoryIpcStart({ session: session.header.id, before: String(before).slice(0, 40), limit });
+        const started = Date.now();
+        try {
+          const entries = await this.readHistoryCached(
+            session.path,
+            before,
+            limit,
+            session.header.id,
+          );
+          freezeProbeHistoryIpcEnd({ session: session.header.id, ms: Date.now() - started, rows: entries.length });
+          return entries;
+        } catch (error) {
+          freezeProbeHistoryIpcEnd({ session: session.header.id, ms: Date.now() - started, failed: 1 });
+          throw error;
+        }
       }
       case "getExternalSessionHistory": {
         const sessionId = params[0] as string;
@@ -2926,6 +2961,7 @@ export class PiHostBackend implements HostBackend {
         return this.getQuotaSnapshot(params[0] as string | undefined);
       case "listAgents": {
         const sessionId = params[0] as string | undefined;
+        const started = Date.now();
         // Reconnect reconciliation: ensure a panel subscribeAgents / session
         // reload sees the corrected terminal state even before the periodic
         // orphan timer fires. This is the stale-threshold sweep (10min) run
@@ -2936,6 +2972,13 @@ export class PiHostBackend implements HostBackend {
           (agent) => !sessionId || agent.sessionId === sessionId,
         );
         const result = params[1] === "history" ? rows : this.currentAgentSummaries(rows);
+        freezeProbe("list_agents", {
+          session: sessionId ?? "all",
+          history: params[1] === "history" ? 1 : 0,
+          stored: this.agents.size,
+          rows: result.length,
+          ms: Date.now() - started,
+        });
         const active = this.projectionDebugActive(sessionId);
         this.projectionDebug("list_agents", {
           session: this.projectionDebugSessionTag(sessionId),
@@ -6529,7 +6572,17 @@ export class PiHostBackend implements HostBackend {
   }
   private loadPersistedAgents(): void {
     try {
-      const value = JSON.parse(readFileSync(this.agentsFile(), "utf8"));
+      const readStarted = Date.now();
+      const text = readFileSync(this.agentsFile(), "utf8");
+      const readMs = Date.now() - readStarted;
+      const parseStarted = Date.now();
+      const value = JSON.parse(text);
+      freezeProbe("load_agents", {
+        readMs,
+        parseMs: Date.now() - parseStarted,
+        bytes: text.length,
+        agents: isRecord(value) && Array.isArray(value.agents) ? value.agents.length : 0,
+      });
       if (!isRecord(value) || value.version !== 1 || !Array.isArray(value.agents)) return;
       const restartedAt = Date.now();
       let normalized = false;
@@ -6557,7 +6610,17 @@ export class PiHostBackend implements HostBackend {
   }
   private loadPersistedAgentLogs(): void {
     try {
-      const value = JSON.parse(readFileSync(this.agentLogsFile(), "utf8"));
+      const readStarted = Date.now();
+      const text = readFileSync(this.agentLogsFile(), "utf8");
+      const readMs = Date.now() - readStarted;
+      const parseStarted = Date.now();
+      const value = JSON.parse(text);
+      freezeProbe("load_logs", {
+        readMs,
+        parseMs: Date.now() - parseStarted,
+        bytes: text.length,
+        keys: isRecord(value) && isRecord(value.logs) ? Object.keys(value.logs).length : 0,
+      });
       if (!isRecord(value) || value.version !== 1 || !isRecord(value.logs)) return;
       for (const [key, entries] of Object.entries(value.logs)) {
         if (typeof key !== "string" || !Array.isArray(entries)) continue;
@@ -6591,7 +6654,13 @@ export class PiHostBackend implements HostBackend {
       logs[key] = entries;
     }
     const target = this.agentLogsFile();
+    const stringifyStarted = Date.now();
     const snapshot = JSON.stringify({ version: 1, logs }) + "\n";
+    freezeProbe("persist_logs", {
+      stringifyMs: Date.now() - stringifyStarted,
+      bytes: snapshot.length,
+      keys: Object.keys(logs).length,
+    });
     this.agentsWrite = this.agentsWrite.then(async () => {
       await fs.mkdir(dirname(target), { recursive: true });
       const tmp = `${target}.tmp-${process.pid}`;
@@ -6612,7 +6681,14 @@ export class PiHostBackend implements HostBackend {
         while (this.agentsPersistDirty) {
           this.agentsPersistDirty = false;
           const target = this.agentsFile();
+          const stringifyStarted = Date.now();
           const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
+          freezeProbe("persist_agents", {
+            stringifyMs: Date.now() - stringifyStarted,
+            bytes: snapshot.length,
+            agents: this.agents.size,
+            worktrees: this.worktrees.size,
+          });
           await fs.mkdir(dirname(target), { recursive: true });
           const tmp = `${target}.tmp-${process.pid}`;
           await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
@@ -7209,3 +7285,4 @@ export {
   type VaultDiagnosis,
   type VaultDiagKind,
 } from "./secret-vault.js";
+export { FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from "./freeze-probe.js";

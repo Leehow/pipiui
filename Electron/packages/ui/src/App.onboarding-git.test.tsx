@@ -43,51 +43,31 @@ function emptyHost(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
 }
 
 describe('add-project silent git setup', () => {
-  it('silently inits a non-git folder and adds it without asking the user anything', async () => {
+  it('adds a plain folder without calling gitInitDirectory or showing a modal', async () => {
     const gitInitDirectory = vi.fn(async () => A_REPO)
-    const probeDirectoryGit = vi.fn(async () => NOT_A_REPO)
-    const host: PipiHostAPI = { ...projectHost({ probeDirectoryGit, gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
+    const host: PipiHostAPI = { ...projectHost({ gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
     render(<App host={host} />)
     await screen.findByText('existing')
 
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    await waitFor(() => expect(gitInitDirectory).toHaveBeenCalledWith('/Users/demo/plain'))
     await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
+    expect(gitInitDirectory).not.toHaveBeenCalled()
     expect(await screen.findByText('plain')).toBeTruthy()
-    // No decision dialog ever appears — the user picked a folder, PipiUI did the rest.
     expect(document.querySelector('[data-testid="git-init-modal"]')).toBeNull()
   })
 
-  it('still adds the folder when git init itself fails', async () => {
-    const gitInitDirectory = vi.fn(async () => { throw new Error('git not installed') })
-    const probeDirectoryGit = vi.fn(async () => NOT_A_REPO)
-    const host: PipiHostAPI = { ...projectHost({ probeDirectoryGit, gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
-    render(<App host={host} />)
-    await screen.findByText('existing')
-
-    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    await waitFor(() => expect(host.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
-    expect(await screen.findByText('plain')).toBeTruthy()
-  })
-
-  it('never touches an already-managed folder and ignores a failing probe', async () => {
-    const gitHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => A_REPO), gitInitDirectory: vi.fn(async () => A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/repo') }
-    const { unmount } = render(<App host={gitHost} />)
+  it('adds an already-managed folder without calling gitInitDirectory or showing a modal', async () => {
+    const gitInitDirectory = vi.fn(async () => A_REPO)
+    const gitHost: PipiHostAPI = { ...projectHost({ gitInitDirectory }), pickProjectDirectory: vi.fn(async () => '/Users/demo/repo') }
+    render(<App host={gitHost} />)
     await screen.findByText('existing')
     fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
     await waitFor(() => expect(gitHost.addProject).toHaveBeenCalledWith('/Users/demo/repo'))
-    expect(gitHost.gitInitDirectory).not.toHaveBeenCalled()
-    unmount()
-
-    const brokenHost: PipiHostAPI = { ...projectHost({ probeDirectoryGit: vi.fn(async () => { throw new Error('git missing') }), gitInitDirectory: vi.fn(async () => A_REPO) }), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
-    render(<App host={brokenHost} />)
-    await screen.findByText('existing')
-    fireEvent.click(screen.getByRole('button', { name: '添加项目' }))
-    await waitFor(() => expect(brokenHost.addProject).toHaveBeenCalledWith('/Users/demo/plain'))
-    expect(brokenHost.gitInitDirectory).not.toHaveBeenCalled()
+    expect(gitInitDirectory).not.toHaveBeenCalled()
+    expect(document.querySelector('[data-testid="git-init-modal"]')).toBeNull()
   })
 
-  it('keeps the plain legacy flow for hosts without the probe', async () => {
+  it('keeps the plain add flow for hosts without gitInitDirectory', async () => {
     const host: PipiHostAPI = { ...projectHost({}), pickProjectDirectory: vi.fn(async () => '/Users/demo/plain') }
     render(<App host={host} />)
     await screen.findByText('existing')

@@ -128,6 +128,14 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       } }), 25);
     } else if (command.message === "final-without-settled" || command.message === "iso-timestamp-without-settled") {
       isStreaming = false;
+    } else if (command.message === "final-with-stale-followup") {
+      // Delayed subagent receipts sit on the host follow-up list. They are the
+      // next turn, not proof this one is still open.
+      isStreaming = false;
+      send({ type: "queue_update", followUp: ["[subagent-done] agentId=already-finished ok=true"] });
+    } else if (command.message === "final-durable-stuck-pending") {
+      pendingMessageCount = 1;
+      persistFinal();
     } else if (command.message === "final-with-reentry") {
       pendingMessageCount = 1;
       setTimeout(() => {

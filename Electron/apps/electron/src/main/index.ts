@@ -1,7 +1,7 @@
 import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore } from '@pipi/pi-backend'
+import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from '@pipi/pi-backend'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -71,7 +71,7 @@ export function registerPipiHostIpc(
   })
 }
 
-function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
+function createWindow(browser: BrowserSessionHost, onClosed: () => void, freezeProbeFile?: string): void {
   const window = new BaseWindow({
     width: 1280,
     height: 800,
@@ -90,6 +90,20 @@ function createWindow(browser: BrowserSessionHost, onClosed: () => void): void {
     }
   })
   const unmountShellView = mountBrowserShellView(window as any, shellView as any)
+  if (freezeProbeFile) {
+    shellView.webContents.on('console-message', (...args: unknown[]) => {
+      const details = args[1]
+      const message = typeof details === 'object' && details && details !== null && 'message' in details
+        ? String((details as { message: unknown }).message)
+        : typeof args[2] === 'string' ? args[2] : ''
+      if (!message.includes(FREEZE_PROBE_PREFIX)) return
+      try {
+        appendFileSync(freezeProbeFile, message.endsWith('\n') ? message : `${message}\n`)
+      } catch {
+        /* probe must not affect the window */
+      }
+    })
+  }
   const mobileWindows = new BrowserMobileWindowController(
     window,
     options => new BaseWindow(options as any) as any,
@@ -278,13 +292,13 @@ if (app) {
     )
     void remoteControl.restore()
     app.on('before-quit', () => { void remoteDebug.close() })
-    createWindow(browser, () => terminalHost.closeAll())
+    createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE))
     // Capability is the first models-write job. Isolated backend init then migrates
     // project catalogs and refreshes the model catalog; do not refresh here or the
     // UI can observe pre-migration canonical state.
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
-      if (BaseWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll())
+      if (BaseWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE))
     })
   })
 

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -105,6 +106,9 @@ describe("extension loader via listExtensions", () => {
     await tempRoot("pipi-ext-valid-");
     const runtime = join(root, "runtime");
     await copyFixture("valid", join(runtime, "extensions"), "quota");
+    const agentEntry = join(runtime, "extensions", "quota", "agent", "dist", "index.js");
+    await mkdir(dirname(agentEntry), { recursive: true });
+    await writeFile(agentEntry, "export default function () {}\n");
     const backend = await backendFor({ runtime });
     const listed = (await backend.handle("listExtensions" as never, [])) as Listed[];
     const quota = listed.find((item) => item.id === "quota");
@@ -245,6 +249,9 @@ describe("extension loader agent spawn mounts", () => {
     await tempRoot("pipi-ext-spawn-");
     const appRoot = join(root, "agent", "extensions");
     await copyFixture("valid", appRoot, "quota");
+    const agentEntry = join(appRoot, "quota", "agent", "dist", "index.js");
+    await mkdir(dirname(agentEntry), { recursive: true });
+    await writeFile(agentEntry, "export default function () {}\n");
     const registry = createExtensionRegistry([]);
     const loader = createExtensionLoader({
       registry,
@@ -258,6 +265,24 @@ describe("extension loader agent spawn mounts", () => {
     const enabled = loader.spawnPackages({ quota: true }).find((pkg) => pkg.id === "quota");
     expect(enabled?.enabled).toBe(true);
     expect(enabled?.extensionPath).toBe(disabled?.extensionPath);
+  });
+
+  it("does not mount a declared agent.extension whose file is missing", async () => {
+    await tempRoot("pipi-ext-missing-agent-");
+    const appRoot = join(root, "agent", "extensions");
+    await copyFixture("valid", appRoot, "quota");
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    const rec = loader.scan().find((item) => item.id === "quota");
+    expect(rec?.state).toBe("error");
+    expect(rec?.error).toMatch(/agent\.extension/i);
+    const spawned = loader.spawnPackages({ quota: true }).find((pkg) => pkg.id === "quota");
+    expect(spawned?.enabled).toBe(false);
+    expect(spawned?.extensionPath).toBeUndefined();
   });
 });
 
@@ -330,5 +355,9 @@ describe("bundled hello-pipiui dogfood package", () => {
       expect.arrayContaining(["bridge.emit", "invoke.agent", "stream.render"]),
     );
     expect(listed?.ui?.panels?.[0]?.slot).toBe("toolPanel");
+    const spawned = loader.spawnPackages().find((pkg) => pkg.id === "hello-pipiui");
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toBeTruthy();
+    expect(existsSync(spawned!.extensionPath!)).toBe(true);
   });
 });

@@ -19,6 +19,7 @@ import { SlashMenu } from './SlashMenu'
 import { ThinkingChip } from './thinking-chip'
 import type { WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
+import { freezeProbe, freezeProbeHistoryIpcEnd, freezeProbeHistoryIpcStart } from './freeze-probe'
 import { QuotaPill, QWEN_TOKEN_PLAN_LOGIN_URL } from './QuotaPill'
 import { BalancePill } from './BalancePill'
 import { SessionStatsPill } from './SessionStatsPill'
@@ -1197,6 +1198,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       // selected main-stream `settled` event is lost. Re-read the authoritative
       // JSONL; the existing history/live-revision gates decide whether this
       // exact turn is terminal and refuse to close a newer one.
+      freezeProbe('history_refresh', { reason: 'subagents_idle', session: selectedSession, turnEpoch: mainTurnEpochRef.current })
       setHistoryRefreshKey(key => key + 1)
     }
   }, [selectedSession, subagentsRunningCount])
@@ -1711,6 +1713,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             if (historyLoadRef.current === request
               && historyContextRef.current?.host === host
               && historyContextRef.current.sessionId === selectedSession) {
+              freezeProbe('history_refresh', { reason: 'stale_request_retry', session: selectedSession })
               setHistoryRefreshKey(key => key + 1)
             }
           }, 0)
@@ -1756,9 +1759,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           while (historyLoadRef.current === request) {
             let page: HistoryEntry[]
             try {
-              page = before === undefined
-                ? await host.getSessionHistory(selectedSession)
-                : await host.getSessionHistory(selectedSession, before, HISTORY_PAGE_SIZE)
+              freezeProbeHistoryIpcStart({ session: selectedSession, page: before ?? 'latest' })
+              try {
+                page = before === undefined
+                  ? await host.getSessionHistory(selectedSession)
+                  : await host.getSessionHistory(selectedSession, before, HISTORY_PAGE_SIZE)
+              } finally {
+                freezeProbeHistoryIpcEnd({ session: selectedSession })
+              }
             } catch (error) {
               // A compaction landing mid-pagination rewrites the visible branch
               // and retires the cursor id. Restart from the newest page instead
@@ -1782,6 +1790,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
                   if (historyLoadRef.current === request
                     && historyContextRef.current?.host === host
                     && historyContextRef.current.sessionId === selectedSession) {
+                    freezeProbe('history_refresh', { reason: 'empty_page_retry', session: selectedSession })
                     setHistoryRefreshKey(key => key + 1)
                   }
                 }, 250)
@@ -1876,12 +1885,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const scheduleTerminalReconciliation = () => {
       if (terminalReconcilePending) return
       terminalReconcilePending = true
+      freezeProbe('history_refresh', { reason: 'terminal_immediate', session: selectedSession })
       setHistoryRefreshKey(key => key + 1)
       terminalReconcileTimer = window.setTimeout(() => {
         terminalReconcilePending = false
         if (active
           && selectedSessionRef.current === selectedSession
           && historyContextRef.current?.host === host) {
+          freezeProbe('history_refresh', { reason: 'terminal_trailing', session: selectedSession })
           setHistoryRefreshKey(key => key + 1)
         }
       }, 250)
@@ -2041,7 +2052,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
           else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
           else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
-          if (historyContextRef.current?.host === host && historyContextRef.current.sessionId === event.sessionId) setHistoryRefreshKey(key => key + 1)
+          if (historyContextRef.current?.host === host && historyContextRef.current.sessionId === event.sessionId) {
+            freezeProbe('history_refresh', { reason: 'late_live', session: event.sessionId, type: event.type })
+            setHistoryRefreshKey(key => key + 1)
+          }
           return
         }
         return

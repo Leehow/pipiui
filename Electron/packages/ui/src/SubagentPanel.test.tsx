@@ -126,7 +126,7 @@ describe('SubagentPanel', () => {
 
   it('explains a pre-spawn worktree failure in Chinese above the raw stderr', async () => {
     const harness = hostHarness()
-    const reason = 'writable isolation requires a git work tree; refusing shared-cwd fallback'
+    const reason = 'git worktree add failed; refusing shared-cwd fallback'
     render(<SubagentPanel host={harness.host} projectPath="/projects/main" />)
     await screen.findByText('还没有 subagent')
 
@@ -140,7 +140,7 @@ describe('SubagentPanel', () => {
     const row = await screen.findByTestId('agent-row-iso')
     fireEvent.click(row.querySelector('.agent-select')!)
 
-    expect(await screen.findByText('工人没有启动，这次任务也没有自动交回主管。若文件夹缺少版本管理，重新添加文件夹可能有帮助；否则请查看技术详情后重试。')).toBeTruthy()
+    expect(await screen.findByText('工人没有启动，这次任务也没有自动交回主管。当前 Git 仓库无法建立隔离工作区。未使用 Git 的文件夹不会建隔离工作区，工人会直接在项目目录运行。请查看技术详情后重试。')).toBeTruthy()
     expect(screen.getByText(`Writable subagent isolation failed before spawn: ${reason}`)).toBeTruthy()
   })
 

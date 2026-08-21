@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkoutBranch, createPiHostBackend, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, probeGitBinary, validateBranchName } from "../src/index.js";
+import { checkoutBranch, createPiHostBackend, ensureLocalGitForWorktrees, githubBrowserURL, initGit, parsePorcelain, parseUpstreamCounts, probeGit, probeGitBinary, validateBranchName } from "../src/index.js";
 
 let root = "";
 afterEach(async () => { if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }); root = ""; });
@@ -64,10 +65,80 @@ describe("probeGit", () => {
     const cwd = await repository();
     await expect(checkoutBranch(cwd, "missing-branch")).rejects.toThrow(/missing-branch/);
   });
-  it("inits a plain folder into a probe-able repository", async () => {
+  it("leaves a plain folder as a non-repository", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-initgit-"));
     expect(await probeGit(root)).toMatchObject({ isRepo: false });
-    expect(await initGit(root)).toMatchObject({ isRepo: true, isDetached: false });
+    expect(await initGit(root)).toMatchObject({ isRepo: false });
+    expect(existsSync(join(root, ".git"))).toBe(false);
+  });
+});
+
+function localConfig(cwd: string, key: string): string | undefined {
+  try {
+    return execFileSync("git", ["-C", cwd, "config", "--local", "--get", key], { encoding: "utf8" }).trim();
+  } catch {
+    return undefined;
+  }
+}
+
+describe("ensureLocalGitForWorktrees", () => {
+  it("is a no-op on a plain folder: still not a repo, no .git", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ensure-plain-"));
+    await writeFile(join(root, "app.ts"), "export const n = 1;\n");
+    const status = await ensureLocalGitForWorktrees(root);
+    expect(status).toMatchObject({ isRepo: false });
+    expect(existsSync(join(root, ".git"))).toBe(false);
+    expect(existsSync(join(root, ".gitignore"))).toBe(false);
+  });
+
+  it("is a no-op when HEAD already resolves", async () => {
+    const cwd = await repository();
+    const before = execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const countBefore = execFileSync("git", ["-C", cwd, "rev-list", "--count", "HEAD"], { encoding: "utf8" }).trim();
+    const status = await ensureLocalGitForWorktrees(cwd);
+    expect(status.isRepo).toBe(true);
+    expect(execFileSync("git", ["-C", cwd, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(before);
+    expect(execFileSync("git", ["-C", cwd, "rev-list", "--count", "HEAD"], { encoding: "utf8" }).trim()).toBe(countBefore);
+  });
+
+  it("creates HEAD for an unborn git init without origin or persistent identity", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ensure-unborn-"));
+    execFileSync("git", ["-C", root, "init"], { stdio: "pipe" });
+    await writeFile(join(root, "app.ts"), "export const n = 1;\n");
+    await mkdir(join(root, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(root, "node_modules", "pkg", "index.js"), "module.exports = 1;\n");
+    expect((await probeGit(root)).shortSHA).toBeUndefined();
+    const status = await ensureLocalGitForWorktrees(root);
+    expect(status.isRepo).toBe(true);
+    expect(status.shortSHA).toMatch(/^[0-9a-f]{7,}$/);
+    expect(status.githubURL).toBeUndefined();
+    const tracked = execFileSync("git", ["-C", root, "ls-files"], { encoding: "utf8" });
+    expect(tracked).toContain("app.ts");
+    expect(tracked).toContain(".gitignore");
+    expect(tracked).not.toContain("node_modules");
+    expect(execFileSync("git", ["-C", root, "remote"], { encoding: "utf8" }).trim()).toBe("");
+    expect(localConfig(root, "user.name")).toBeUndefined();
+    expect(localConfig(root, "user.email")).toBeUndefined();
+  });
+
+  it("does not commit .env when an existing gitignore omits that exclude", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ensure-gitignore-"));
+    execFileSync("git", ["-C", root, "init"], { stdio: "pipe" });
+    await writeFile(join(root, ".gitignore"), "node_modules/\n");
+    await writeFile(join(root, "app.ts"), "export const n = 1;\n");
+    await writeFile(join(root, ".env"), "SECRET=1\n");
+    await writeFile(join(root, ".env.local"), "SECRET=2\n");
+    await mkdir(join(root, ".pi"), { recursive: true });
+    await writeFile(join(root, ".pi", "secret.txt"), "nope\n");
+    const status = await ensureLocalGitForWorktrees(root);
+    expect(status.isRepo).toBe(true);
+    expect(status.shortSHA).toMatch(/^[0-9a-f]{7,}$/);
+    const tracked = execFileSync("git", ["-C", root, "ls-files"], { encoding: "utf8" });
+    expect(tracked).toContain("app.ts");
+    expect(tracked).toContain(".gitignore");
+    expect(tracked.split("\n")).not.toContain(".env");
+    expect(tracked.split("\n")).not.toContain(".env.local");
+    expect(tracked).not.toContain(".pi/");
   });
 });
 
@@ -97,12 +168,13 @@ describe("PiHostBackend git methods", () => {
     expect(await backend.handle("gitCheckout", [project.id, "feature"])).toMatchObject({ currentBranch: "feature" });
     await expect(backend.handle("gitStatus", ["not-a-project"])).rejects.toThrow(/unknown project/);
   });
-  it("probes a freshly picked non-repo directory and inits it in place", async () => {
+  it("probes a freshly picked non-repo directory and does not turn it into a git repo", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-pick-"));
     const backend = createPiHostBackend({ agentDir: join(root, ".agent"), sessionsRoot: join(root, ".sessions"), canonicalProjectPaths: async () => undefined });
     expect(await backend.handle("probeDirectoryGit", [root])).toMatchObject({ isRepo: false });
-    expect(await backend.handle("gitInitDirectory", [root])).toMatchObject({ isRepo: true });
-    expect(await backend.handle("probeDirectoryGit", [root])).toMatchObject({ isRepo: true });
+    expect(await backend.handle("gitInitDirectory", [root])).toMatchObject({ isRepo: false });
+    expect(await backend.handle("probeDirectoryGit", [root])).toMatchObject({ isRepo: false });
+    expect(existsSync(join(root, ".git"))).toBe(false);
   });
   it("refuses probe/init outside an existing absolute directory", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-pick-"));

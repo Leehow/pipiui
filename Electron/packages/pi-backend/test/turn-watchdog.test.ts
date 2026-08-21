@@ -104,6 +104,53 @@ describe("turn watchdog (fix 3)", () => {
     await backend.close();
   });
 
+  it("releases a parked FIFO when Pi exits after the settle epoch has been overtaken", async () => {
+    const { backend } = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
+
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    await eventually(() => statuses.includes("started"));
+    const queued = await backend.handle("enqueueMessage", ["s1", "after-writer-exit"]) as any;
+    expect(queued.outcome).toBe("queued");
+
+    const live = (backend as any).live.get("s1");
+    expect(live?.process?.pid).toEqual(expect.any(Number));
+    // Mint a newer queue epoch without a real new turn. The close handler used
+    // to pass the dead writer's epoch into notifyIdle, which then ignored the
+    // idle and left turnActive set forever.
+    (backend as any).queue.markBusy("s1");
+    expect((backend as any).queue.isBusy("s1")).toBe(true);
+    live.process.kill();
+
+    await eventually(async () => ((await backend.handle("listQueue", ["s1"]) as any[]).every((item: any) => item.id !== queued.message.id)), 4_000);
+
+    off();
+    await backend.close();
+  });
+
+  it("drains a busy queue with no live writer when the JSONL tail is already terminal", async () => {
+    const { backend, sessionPath } = await fixture();
+    await backend.handle("getSessionHistory", ["s1"]);
+    await backend.handle("listQueue", ["s1"]);
+    (backend as any).queue.markBusy("s1");
+    const queued = await backend.handle("enqueueMessage", ["s1", "orphan-busy"]) as any;
+    expect(queued.outcome).toBe("queued");
+    expect((backend as any).queue.isBusy("s1")).toBe(true);
+    expect((backend as any).live.has("s1")).toBe(false);
+
+    await appendFile(sessionPath, JSON.stringify({
+      type: "message", id: "tail-stop", parentId: null,
+      message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    }) + "\n");
+
+    await (backend as any).checkTurnWatchdogs();
+    await eventually(async () => ((await backend.handle("listQueue", ["s1"]) as any[]).length === 0));
+
+    await backend.close();
+  });
+
   it("isSessionTailTerminal distinguishes stop vs tool_use", async () => {
     const { backend, sessionPath } = await fixture();
     // Write stop tail

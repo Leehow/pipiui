@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +15,7 @@ import {
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
 import { createProviderWaitController, decideProviderStallRecovery, providerWaitDeadlineMs } from "../index.ts";
-import { resolveSubagentWorktree } from "../worktree.ts";
+import { classifyInsideWorkTree, resolveSubagentWorktree } from "../worktree.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
 
@@ -461,6 +461,104 @@ test("bundled isolation treats cwd as repo base and ignores PIPIUI_WORKTREE=0", 
 	assert.equal(placement.worktreeError, undefined);
 	assert.equal(placement.worktreePath, join(realpathSync(root), ".pi", "worktrees", "policy-test"));
 	assert.equal(placement.cwd, placement.worktreePath);
+});
+
+test("unborn git init bootstraps HEAD so isolated worktrees succeed", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pipiui-unborn-worktree-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	execFileSync("git", ["init", "-q", root]);
+	const placement = resolveSubagentWorktree({
+		agentId: "unborn-test",
+		defaultCwd: root,
+		readOnly: false,
+		policy: { worktree: "isolated" },
+		allowEnvironmentOptOut: false,
+	});
+	assert.equal(placement.worktreeError, undefined);
+	assert.equal(placement.worktreePath, join(realpathSync(root), ".pi", "worktrees", "unborn-test"));
+	assert.equal(existsSync(placement.worktreePath ?? ""), true);
+	assert.doesNotMatch(execFileSync("git", ["-C", root, "remote"], { encoding: "utf8" }), /\S/);
+});
+
+test("classifyInsideWorkTree splits not-a-repo from probe errors", () => {
+	assert.equal(classifyInsideWorkTree({ ok: true, stdout: "true", stderr: "" }), "inside");
+	assert.equal(classifyInsideWorkTree({ ok: true, stdout: "false", stderr: "" }), "outside");
+	assert.equal(
+		classifyInsideWorkTree({
+			ok: false,
+			stdout: "",
+			stderr: "fatal: not a git repository (or any of the parent directories): .git",
+		}),
+		"outside",
+	);
+	assert.equal(
+		classifyInsideWorkTree({ ok: false, stdout: "", stderr: "spawnSync git ENOENT" }),
+		"error",
+	);
+	assert.equal(
+		classifyInsideWorkTree({ ok: false, stdout: "", stderr: "fatal: Permission denied" }),
+		"error",
+	);
+});
+
+test("plain folder skips isolation: shared cwd, no worktreeError, no .git, no worktree", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pipiui-plain-worktree-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	writeFileSync(join(root, "src.ts"), "export const n = 1;\n");
+	const placement = resolveSubagentWorktree({
+		agentId: "plain-test",
+		defaultCwd: root,
+		readOnly: false,
+		policy: { worktree: "isolated" },
+		allowEnvironmentOptOut: false,
+	});
+	assert.equal(placement.worktreeError, undefined);
+	assert.equal(placement.worktreePath, undefined);
+	assert.equal(placement.cwd, root);
+	assert.equal(existsSync(join(root, ".git")), false);
+	assert.equal(existsSync(join(root, ".pi", "worktrees")), false);
+});
+
+test("git probe failure fails closed instead of shared-cwd", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pipiui-probe-fail-"));
+	const previousPath = process.env.PATH;
+	process.env.PATH = "/nonexistent-pipiui-git-probe";
+	t.after(() => {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
+		rmSync(root, { recursive: true, force: true });
+	});
+	writeFileSync(join(root, "src.ts"), "export const n = 1;\n");
+	const placement = resolveSubagentWorktree({
+		agentId: "probe-fail",
+		defaultCwd: root,
+		readOnly: false,
+		policy: { worktree: "isolated" },
+		allowEnvironmentOptOut: false,
+	});
+	assert.equal(placement.worktreePath, undefined);
+	assert.match(placement.worktreeError ?? "", /./);
+	assert.equal(existsSync(join(root, ".git")), false);
+});
+
+test("unborn repo with an existing gitignore still excludes .env from the first commit", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pipiui-unborn-env-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	execFileSync("git", ["init", "-q", root]);
+	writeFileSync(join(root, ".gitignore"), "node_modules/\n");
+	writeFileSync(join(root, "app.ts"), "export const n = 1;\n");
+	writeFileSync(join(root, ".env"), "SECRET=1\n");
+	const placement = resolveSubagentWorktree({
+		agentId: "unborn-env",
+		defaultCwd: root,
+		readOnly: false,
+		policy: { worktree: "isolated" },
+		allowEnvironmentOptOut: false,
+	});
+	assert.equal(placement.worktreeError, undefined);
+	const tracked = execFileSync("git", ["-C", root, "ls-files"], { encoding: "utf8" });
+	assert.match(tracked, /app\.ts/);
+	assert.equal(tracked.split("\n").includes(".env"), false);
 });
 
 test("Electron dispatch and stall watchdog use the recovery decisions", () => {

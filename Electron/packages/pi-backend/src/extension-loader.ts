@@ -271,16 +271,22 @@ export class ExtensionLoader {
     this.agent.delete(id);
   }
 
-  private rememberAgent(id: string, directory: string, manifest?: ValidatedExtensionManifest): void {
+  private rememberAgent(id: string, directory: string, manifest?: ValidatedExtensionManifest): string | undefined {
     if (!manifest) {
       this.agent.delete(id);
-      return;
+      return undefined;
     }
-    const extensionPath = manifest.agentExtension ? confinedJoin(directory, manifest.agentExtension) : undefined;
+    const declared = manifest.agentExtension;
+    const extensionPath = declared ? confinedJoin(directory, declared) : undefined;
     const skillRoots = (manifest.agentSkills ?? [])
       .map((rel) => confinedJoin(directory, rel))
       .filter((path): path is string => Boolean(path));
+    if (declared && (!extensionPath || !existsSync(extensionPath))) {
+      this.agent.set(id, { skillRoots });
+      return `agent.extension does not exist: ${declared}`;
+    }
     this.agent.set(id, extensionPath ? { extensionPath, skillRoots } : { skillRoots });
+    return undefined;
   }
 
   /** Overlay-aware agent-half mounts for a new session spawn (D3 / D9: not hot-mounted). */
@@ -311,7 +317,10 @@ export class ExtensionLoader {
         return this.registry.enterError(descriptor.id, validation.errors.join("; "));
       }
       if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
-      this.rememberAgent(descriptor.id, pkg.directory, manifest);
+      const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
+      if (missingAgent && existing.state !== "error") {
+        return this.registry.enterError(descriptor.id, missingAgent);
+      }
       return existing;
     }
     if (existing) this.drop(descriptor.id);
@@ -323,7 +332,8 @@ export class ExtensionLoader {
       this.rememberAgent(descriptor.id, pkg.directory, undefined);
       return this.registry.enterError(descriptor.id, validation.errors.join("; "));
     }
-    this.rememberAgent(descriptor.id, pkg.directory, manifest);
+    const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
+    if (missingAgent) return this.registry.enterError(descriptor.id, missingAgent);
     return record;
   }
 

@@ -29,15 +29,25 @@ export function safeId(agentId: string): string {
 	return agentId.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || "agent";
 }
 
+const GIT_ENSURE_TIMEOUT_MS = 30_000;
+const LOCAL_GIT_NAME = "PipiUI";
+const LOCAL_GIT_EMAIL = "pipiui@local";
+const LOCAL_INITIAL_COMMIT_MESSAGE = "PipiUI: local initial commit";
+const MINIMAL_GITIGNORE = ["node_modules/", "dist/", ".DS_Store", ".env", ".env.*", ".pi/", ""].join("\n");
+/** Extra pathspec so an existing `.gitignore` cannot smuggle `.env` / `.pi` into the first commit. */
+const UNBORN_ADD_PATHSPEC = [".", ":(exclude).env", ":(exclude).env.*", ":(exclude).pi/"];
+
 export function gitSpawnSync(
 	args: string[],
 	cwd?: string,
+	timeoutMs?: number,
 ): { ok: boolean; stdout: string; stderr: string; status: number | null } {
 	const result = spawnSync("git", args, {
 		cwd,
 		encoding: "utf8",
 		shell: false,
 		env: gitChildEnv(),
+		...(timeoutMs ? { timeout: timeoutMs } : {}),
 	});
 	const stdout = typeof result.stdout === "string" ? result.stdout : "";
 	const stderr = typeof result.stderr === "string" ? result.stderr : "";
@@ -89,6 +99,86 @@ export function parseWorktreeListPorcelain(output: string): Array<{ path: string
 	return results;
 }
 
+function headResolves(cwd: string): boolean {
+	const head = gitSpawnSync(["-C", cwd, "rev-parse", "--verify", "HEAD"]);
+	return head.ok && Boolean(head.stdout);
+}
+
+/**
+ * Split “plain folder” from “git probe failed”.
+ * `true` → isolate; explicit not-a-repo → shared cwd; anything else → fail closed.
+ */
+export function classifyInsideWorkTree(probe: {
+	ok: boolean;
+	stdout: string;
+	stderr: string;
+}): "inside" | "outside" | "error" {
+	if (probe.ok && probe.stdout === "true") return "inside";
+	if (probe.ok && probe.stdout === "false") return "outside";
+	const text = `${probe.stderr}\n${probe.stdout}`;
+	if (/not a git repository/i.test(text)) return "outside";
+	return "error";
+}
+
+function writeMinimalGitignore(root: string): { ok: boolean; error?: string } {
+	const gitignore = path.join(root, ".gitignore");
+	if (fs.existsSync(gitignore)) return { ok: true };
+	try {
+		fs.writeFileSync(gitignore, MINIMAL_GITIGNORE);
+		return { ok: true };
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { ok: false, error: `write .gitignore: ${msg}` };
+	}
+}
+
+/**
+ * Fill an unborn HEAD so `git worktree add … HEAD` works.
+ * GitHub is not required: never add origin, never push, never clone, never touch remotes.
+ * Plain (non-git) folders are a no-op — do not `git init`. Repos with HEAD are unchanged.
+ * Duplicate of host `ensureLocalGitForWorktrees` — packages cannot share this helper.
+ */
+export function ensureResolvableHead(cwd: string): { ok: boolean; error?: string } {
+	const inside = gitSpawnSync(["-C", cwd, "rev-parse", "--is-inside-work-tree"]);
+	if (!inside.ok || inside.stdout !== "true") return { ok: true };
+	if (headResolves(cwd)) return { ok: true };
+
+	const top = gitSpawnSync(["-C", cwd, "rev-parse", "--show-toplevel"]);
+	const root = top.ok && top.stdout ? path.resolve(top.stdout) : cwd;
+	if (headResolves(root)) return { ok: true };
+
+	const gitignore = writeMinimalGitignore(root);
+	if (!gitignore.ok) return gitignore;
+
+	const add = gitSpawnSync(
+		["-C", root, "add", "-A", "--", ...UNBORN_ADD_PATHSPEC],
+		undefined,
+		GIT_ENSURE_TIMEOUT_MS,
+	);
+	if (!add.ok) return { ok: false, error: add.stderr || "git add failed" };
+
+	const porcelain = gitSpawnSync(["-C", root, "status", "--porcelain"], undefined, GIT_ENSURE_TIMEOUT_MS);
+	const empty = !porcelain.stdout;
+	const commit = gitSpawnSync(
+		[
+			"-C",
+			root,
+			"-c",
+			`user.name=${LOCAL_GIT_NAME}`,
+			"-c",
+			`user.email=${LOCAL_GIT_EMAIL}`,
+			"commit",
+			...(empty ? ["--allow-empty"] : []),
+			"-m",
+			LOCAL_INITIAL_COMMIT_MESSAGE,
+		],
+		undefined,
+		GIT_ENSURE_TIMEOUT_MS,
+	);
+	if (!commit.ok) return { ok: false, error: commit.stderr || "git commit failed" };
+	return { ok: true };
+}
+
 /**
  * Default: create an isolated git worktree under <toplevel>/.pi/worktrees/<safeId>
  * on branch pipiui/<safeId> so non-read-only subagents write without polluting the main dirty tree.
@@ -105,7 +195,9 @@ export function parseWorktreeListPorcelain(output: string): Array<{ path: string
  * - agent is read-only
  * - PIPIUI_WORKTREE=0
  * - caller passed explicit cwd (respect; do not wrap)
- * - effective cwd is not inside a git work tree
+ * - effective cwd is not a git work tree (user decision: do not silently `git init`;
+ *   writable workers run in the project directory, same as PIPIUI_WORKTREE=0).
+ *   A git probe that is not a clear not-a-repo answer fails closed.
  *
  * TS never auto remove / commit / merge (Swift SubagentStore owns lifecycle).
  * On failure creating required isolation, return worktreeError; runSingleAgent fails closed
@@ -147,11 +239,26 @@ export function resolveSubagentWorktree(opts: {
 
 	const effectiveCwd = opts.defaultCwd;
 	const inside = gitSpawnSync(["-C", effectiveCwd, "rev-parse", "--is-inside-work-tree"]);
-	if (!inside.ok || inside.stdout !== "true") {
+	const kind = classifyInsideWorkTree(inside);
+	if (kind === "outside") {
+		// User decision: a non-git project skips isolation. Do not silently
+		// create a git repo, `.gitignore`, or worktree — run in the folder.
+		return { cwd: effectiveCwd };
+	}
+	if (kind === "error") {
 		return {
 			cwd: effectiveCwd,
 			worktreeError:
-				inside.stderr || "writable isolation requires a git work tree; refusing shared-cwd fallback",
+				inside.stderr || "git rev-parse --is-inside-work-tree failed; refusing shared-cwd fallback",
+		};
+	}
+	// Unborn HEAD (`git init` with no commit) cannot `worktree add … HEAD`.
+	// Fill HEAD locally; GitHub is not required. Failure stays fail-closed.
+	const head = ensureResolvableHead(effectiveCwd);
+	if (!head.ok) {
+		return {
+			cwd: effectiveCwd,
+			worktreeError: head.error || "unborn HEAD could not be committed; refusing shared-cwd fallback",
 		};
 	}
 
