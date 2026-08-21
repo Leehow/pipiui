@@ -1,0 +1,9 @@
+{
+  "name": "pipiui-firecrawl-anydoc",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@firecrawl/anydoc": "0.2.3",
+    "@firecrawl/anydoc-wasm": "0.2.3"
+  }
+}

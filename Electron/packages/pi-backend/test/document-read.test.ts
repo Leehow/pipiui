@@ -41,6 +41,9 @@ describe("explicit local document reads", () => {
     const text = join(root, "notes.txt");
     await writeFile(text, "plain text");
     expect(await backend.handle("readDocument", [text])).toMatchObject({ kind: "plain", content: "plain text" });
+    const csv = join(root, "table.csv");
+    await writeFile(csv, "name,age\n");
+    expect(await backend.handle("readDocument", [csv])).toMatchObject({ kind: "plain", content: "name,age\n" });
 
     const fixtures = [
       ["report.pdf", "pdf"],
@@ -50,6 +53,9 @@ describe("explicit local document reads", () => {
       ["budget.xlsx", "spreadsheet"],
       ["deck.ppt", "presentation"],
       ["deck.pptx", "presentation"],
+      ["notes.odt", "word"],
+      ["book.epub", "word"],
+      ["table.ods", "spreadsheet"],
     ] as const;
     for (const [name, kind] of fixtures) {
       const path = join(root, name);
@@ -89,6 +95,15 @@ describe("explicit local document reads", () => {
   it("notifyDocumentsDropped without a session degrades without throwing", async () => {
     const backend = await fixture();
     await expect(backend.handle("notifyDocumentsDropped", ["", [join(root, "notes.md")]])).resolves.toBeUndefined();
+    await backend.close();
+  });
+
+  it("notifyComposerDocumentsDropped injects without remembering opened documents", async () => {
+    const backend = await fixture();
+    const path = join(root, "form.docx");
+    await writeFile(path, Buffer.alloc(64));
+    await expect(backend.handle("notifyComposerDocumentsDropped", ["s1", [path]])).resolves.toBeUndefined();
+    expect(await backend.handle("listDocuments", [])).toEqual([]);
     await backend.close();
   });
 

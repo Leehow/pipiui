@@ -54,8 +54,11 @@ describe("runtime tree refresh across spawns", () => {
     const extensions = sessionArgs.flatMap((arg, index) => (arg === "-e" ? [sessionArgs[index + 1]] : []));
     expect(extensions).toContain(join(runtimeRoot, "pi-philosophy", "philosophy.ts"));
     expect(extensions).toContain(join(runtimeRoot, "extensions", "pipiui-firecrawl-pdf.ts"));
+    expect(extensions).toContain(join(runtimeRoot, "extensions", "pipiui-firecrawl-anydoc.ts"));
     expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBe(join(runtimeRoot, "pdf-inspector"));
+    expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));
     expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
+    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "anydoc", "node_modules"));
     const layer = join(runtimeRoot, "pi-philosophy", "layers", "30-orchestration.md");
     expect(await readFile(layer, "utf8")).not.toContain("REFRESH-PROBE");
 
@@ -70,6 +73,8 @@ describe("runtime tree refresh across spawns", () => {
     expect(await readFile(layer, "utf8")).toContain("REFRESH-PROBE");
     expect(await readFile(join(runtimeRoot, "extensions", "pipiui-git.ts"), "utf8")).toContain("REFRESH-PROBE");
     expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBe(join(runtimeRoot, "pdf-inspector"));
+    expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));
     expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
+    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "anydoc", "node_modules"));
   }, 30_000);
 });

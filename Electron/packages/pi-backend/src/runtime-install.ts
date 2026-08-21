@@ -98,5 +98,6 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
   for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal"] as const)
     syncTree(join(assets.sourceRoot, name), join(runtimeRoot, name), report);
   syncTree(join(assets.sourceRoot, "pdf-inspector"), join(runtimeRoot, "pdf-inspector"), report, { keepNodeModules: true });
+  syncTree(join(assets.sourceRoot, "anydoc"), join(runtimeRoot, "anydoc"), report, { keepNodeModules: true });
   return report;
 }

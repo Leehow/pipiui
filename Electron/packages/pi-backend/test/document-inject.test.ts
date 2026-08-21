@@ -20,18 +20,35 @@ describe("document injection", () => {
     expect(store.takePending("s1")).toBeUndefined();
   });
 
-  it("reads markdown text and only summarizes binary office files", async () => {
+  it("reads markdown text and hints anydoc instead of read when office convert fails", async () => {
     root = await mkdtemp(join(tmpdir(), "doc-inject-"));
     const md = join(root, "notes.md");
     const doc = join(root, "form.doc");
     await writeFile(md, "# 幼儿\n可见正文");
     await writeFile(doc, Buffer.alloc(2048));
-    const text = await buildDocumentsOpenedInjection([md, doc]);
+    const text = await buildDocumentsOpenedInjection([md, doc], { convertBinary: async () => undefined });
     expect(text).toContain("可见正文");
     expect(text).toContain(md);
     expect(text).toContain(doc);
-    expect(text).toContain("请用 read 工具");
+    expect(text).toContain("pipiui_firecrawl_anydoc");
+    expect(text).not.toContain("请用 read 工具");
     expect(text).not.toMatch(/\0/);
+  });
+
+  it("injects converted office markdown and uses composer copy for input-box chips", async () => {
+    root = await mkdtemp(join(tmpdir(), "doc-inject-convert-"));
+    const doc = join(root, "form.docx");
+    await writeFile(doc, Buffer.alloc(128));
+    const panel = await buildDocumentsOpenedInjection([doc], { convertBinary: async () => "# 转换正文" });
+    expect(panel).toContain("[文档面板]");
+    expect(panel).toContain("转换正文");
+    const composer = await buildDocumentsOpenedInjection([doc], {
+      source: "composer",
+      convertBinary: async () => "# 输入框正文",
+    });
+    expect(composer).toContain("[输入框] 用户附上了文档：");
+    expect(composer).toContain("输入框正文");
+    expect(composer).not.toContain("[文档面板]");
   });
 
   it("tells the model to parse opened PDFs with pipiui_firecrawl_pdf instead of read", async () => {

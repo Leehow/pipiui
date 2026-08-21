@@ -3,6 +3,10 @@ node_modules/
 !resources/runtime/pdf-inspector/**
 !resources/runtime/pdf-inspector/node_modules/
 !resources/runtime/pdf-inspector/node_modules/**
+!resources/runtime/anydoc/
+!resources/runtime/anydoc/**
+!resources/runtime/anydoc/node_modules/
+!resources/runtime/anydoc/node_modules/**
 .cua-driver/
 .cua-driver-cache/
 .embedded-runtime/

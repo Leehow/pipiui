@@ -2,10 +2,12 @@ import { documentKindForName, documentsDroppedAnnouncement, documentsOpenedInjec
 
 export { documentsDroppedAnnouncement, documentsOpenedInjection }
 
+export const DEFAULT_COMPOSER_DOCUMENT_PROMPT = '请分析这些文件的内容'
+
 type FileDragEventLike = {
   preventDefault(): void
   stopPropagation(): void
-  dataTransfer?: { dropEffect?: string } | null
+  dataTransfer?: { dropEffect?: string; types?: readonly string[] } | null
 }
 
 export function consumeFileDropEvent(event: FileDragEventLike): void {
@@ -18,6 +20,10 @@ export function ignoreComposerFileDrag(event: FileDragEventLike): void {
   event.preventDefault()
   event.stopPropagation()
   if (event.dataTransfer) event.dataTransfer.dropEffect = 'none'
+}
+
+export function fileDragHasFiles(event: FileDragEventLike): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
 }
 
 export function filterSupportedDocumentPaths(paths: readonly string[]): string[] {
@@ -48,4 +54,10 @@ export function supportedDocumentPathsFromFiles(
     }
   }
   return filterSupportedDocumentPaths(paths)
+}
+
+export function composerDocumentName(path: string): string {
+  const trimmed = path.trim()
+  const slash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed
 }

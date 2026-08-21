@@ -5,7 +5,9 @@ import {
   documentKindForName,
   documentsOpenedInjection,
   type DocumentInjectionEntry,
+  type DocumentInjectionSource,
 } from "@pipi/host-api";
+import { convertDocumentFileToMarkdown } from "./anydoc-convert.js";
 
 export function truncateDocumentExcerpt(text: string, max = DOCUMENT_INJECTION_EXCERPT_LIMIT): string {
   if (text.length <= max) return text;
@@ -46,7 +48,19 @@ export class DocumentInjectionStore {
   }
 }
 
-export async function buildDocumentsOpenedInjection(paths: readonly string[]): Promise<string> {
+export type BinaryMarkdownConverter = (path: string) => Promise<string | undefined>;
+
+export async function buildDocumentsOpenedInjection(
+  paths: readonly string[],
+  options: {
+    source?: DocumentInjectionSource;
+    convertBinary?: BinaryMarkdownConverter;
+    anydocRoot?: string;
+  } = {},
+): Promise<string> {
+  const source = options.source === "composer" ? "composer" : "panel";
+  const convertBinary = options.convertBinary
+    ?? ((path: string) => convertDocumentFileToMarkdown(path, { anydocRoot: options.anydocRoot }));
   const entries: DocumentInjectionEntry[] = [];
   for (const raw of paths) {
     const path = raw.trim();
@@ -55,8 +69,8 @@ export async function buildDocumentsOpenedInjection(paths: readonly string[]): P
     if (!kind) continue;
     if (kind === "markdown" || kind === "plain") {
       try {
-        const stat = await fs.stat(path);
-        if (!stat.isFile()) {
+        const fileStat = await fs.stat(path);
+        if (!fileStat.isFile()) {
           entries.push({ path, kind });
           continue;
         }
@@ -67,12 +81,19 @@ export async function buildDocumentsOpenedInjection(paths: readonly string[]): P
       }
       continue;
     }
+    if (kind !== "pdf") {
+      const markdown = await convertBinary(path).catch(() => undefined);
+      if (markdown?.trim()) {
+        entries.push({ path, kind, excerpt: truncateDocumentExcerpt(markdown) });
+        continue;
+      }
+    }
     try {
-      const stat = await fs.stat(path);
-      entries.push({ path, kind, binary: true, size: stat.size });
+      const fileStat = await fs.stat(path);
+      entries.push({ path, kind, binary: true, size: fileStat.size });
     } catch {
       entries.push({ path, kind, binary: true });
     }
   }
-  return documentsOpenedInjection(entries);
+  return documentsOpenedInjection(entries, { source });
 }
