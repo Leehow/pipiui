@@ -1033,6 +1033,8 @@ describe('extension architecture M1 host-api contract', () => {
       enabledBy: 'app',
       name: 'Quota Monitor',
       version: '1.0.0',
+      capabilities: ['settings.read', 'bridge.emit'],
+      grantedCapabilities: ['settings.read', 'bridge.emit'],
       contributions,
     }
     const event: ExtEvent = { type: 'warning', payload: { used: 92 } }
@@ -1134,6 +1136,12 @@ describe('extension architecture M1 host-api contract', () => {
         if (request.method === 'setExtensionEnabled') {
           return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { ...descriptor, state: 'enabled' } }
         }
+        if (request.method === 'uninstallExtension') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+        }
+        if (request.method === 'getCapabilityGrant' || request.method === 'confirmCapabilityGrant') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { capabilities: ['settings.read'] } }
+        }
         if (request.method === 'getExtensionContributions') {
           return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { slashCommands: [{ name: 'quota', description: '查看当前用量' }] } }
         }
@@ -1149,6 +1157,9 @@ describe('extension architecture M1 host-api contract', () => {
     await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.listExtensions?.()).resolves.toEqual([descriptor])
     await expect(host.setExtensionEnabled?.('quota', true, 'project')).resolves.toEqual({ ...descriptor, state: 'enabled' })
+    await expect(host.uninstallExtension?.('quota')).resolves.toBeUndefined()
+    await expect(host.getCapabilityGrant?.('quota')).resolves.toEqual({ capabilities: ['settings.read'] })
+    await expect(host.confirmCapabilityGrant?.('quota', ['settings.read'])).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.getExtensionContributions?.('quota')).resolves.toEqual({ slashCommands: [{ name: 'quota', description: '查看当前用量' }] })
     expect(host.listProjects).toBeTypeOf('function')
     expect(calls).toEqual([
@@ -1158,6 +1169,9 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' }] },
       { method: 'listExtensions', params: [] },
       { method: 'setExtensionEnabled', params: ['quota', true, 'project'] },
+      { method: 'uninstallExtension', params: ['quota'] },
+      { method: 'getCapabilityGrant', params: ['quota'] },
+      { method: 'confirmCapabilityGrant', params: ['quota', ['settings.read']] },
       { method: 'getExtensionContributions', params: ['quota'] },
     ])
   })

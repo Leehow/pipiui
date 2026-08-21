@@ -33,6 +33,7 @@ export type ExtensionListItem = ExtensionRecord & {
   ui?: ExtensionUiSummary;
   /** Package install directory; app-half `entry` paths resolve against this. */
   directory?: string;
+  grantedCapabilities?: readonly string[];
 };
 
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git", ".DS_Store"]);
@@ -328,6 +329,14 @@ export class ExtensionLoader {
 
   loadedProject(): string | undefined {
     return this.loadedProjectRoot;
+  }
+
+  directoryOf(id: string): string | undefined {
+    return this.directories.get(id);
+  }
+
+  forget(id: string): void {
+    this.drop(id);
   }
 
   list(overlay?: Record<string, boolean>): ExtensionListItem[] {

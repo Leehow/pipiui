@@ -222,7 +222,7 @@ describe("extension settings schema seam", () => {
     expect(settings.extensions.quota.settings).toEqual({ "ext.quota.threshold": 90 });
     expect(listSecretMeta(agent)).toEqual([expect.objectContaining({ name: "ext.quota.token" })]);
     const got = (await backend.handle("getExtensionSettings" as never, ["quota"])) as Record<string, unknown>;
-    expect(got).toEqual({ "ext.quota.threshold": 90 });
+    expect(got).toEqual({ "ext.quota.threshold": 90, "ext.quota.token": true });
     expect(JSON.stringify(got)).not.toContain(secret);
     await backend.close();
   });

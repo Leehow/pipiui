@@ -1,6 +1,14 @@
-import { useEffect, useState } from 'react'
-import type { PipiHostAPI, UserMcpServer } from '@pipi/host-api'
+import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import type { ExtensionDescriptor, PipiHostAPI, UserMcpServer } from '@pipi/host-api'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
+import {
+  blocksEnableForL2,
+  capabilityLabel,
+  EXTENSION_SOURCE_LABEL,
+  EXTENSION_STATE_LABEL,
+  grantNeedsConfirmation,
+  L2_CAPABILITY_HINT,
+} from './extension-capabilities'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
 
@@ -198,21 +206,304 @@ function PaddleOcrBuiltinRow({ host, projectId }: { host?: PipiHostAPI; projectI
   )
 }
 
+function requestedCapabilities(ext: ExtensionDescriptor): readonly string[] {
+  return ext.capabilities ?? []
+}
+
+function readableError(ext: ExtensionDescriptor): string | undefined {
+  if (ext.state !== 'error') return undefined
+  const reason = ext.errorReason ?? ext.error
+  return reason && reason.trim() ? reason : '加载失败'
+}
+
+function ConfirmDialog({
+  testId,
+  title,
+  children,
+  confirmLabel,
+  confirmTestId,
+  cancelTestId,
+  onConfirm,
+  onCancel,
+}: {
+  testId: string
+  title: string
+  children: ReactNode
+  confirmLabel: string
+  confirmTestId: string
+  cancelTestId: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopPropagation()
+      onCancel()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [onCancel])
+
+  return (
+    <div
+      className="extensions-add-backdrop"
+      data-testid={`${testId}-backdrop`}
+      onMouseDown={event => { if (event.target === event.currentTarget) onCancel() }}
+    >
+      <section className="extensions-add-dialog" role="dialog" aria-modal="true" aria-labelledby={`${testId}-title`} data-testid={testId}>
+        <header>
+          <h3 id={`${testId}-title`}>{title}</h3>
+          <button type="button" className="model-modal-close" aria-label="关闭" onClick={onCancel}>×</button>
+        </header>
+        <div className="extensions-add-body">
+          {children}
+          <div className="extensions-dialog-actions">
+            <button type="button" className="model-modal-refresh" data-testid={cancelTestId} onClick={onCancel}>取消</button>
+            <button type="button" className="model-modal-add" data-testid={confirmTestId} onClick={onConfirm}>{confirmLabel}</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function ExtensionPackageRow({
+  ext,
+  busy,
+  onToggle,
+  onUninstall,
+}: {
+  ext: ExtensionDescriptor
+  busy: boolean
+  onToggle: (ext: ExtensionDescriptor) => void
+  onUninstall: (ext: ExtensionDescriptor) => void
+}) {
+  const enabled = ext.state === 'enabled'
+  const caps = requestedCapabilities(ext)
+  const l2Blocked = blocksEnableForL2(ext.source, caps)
+  const errorText = readableError(ext)
+  const canToggle = !busy && ext.state !== 'error' && !(l2Blocked && !enabled)
+  const sourceLabel = EXTENSION_SOURCE_LABEL[ext.source] ?? ext.source
+  const stateLabel = EXTENSION_STATE_LABEL[ext.state] ?? ext.state
+
+  return (
+    <div className="extensions-pkg-row" data-testid={`extensions-pkg-${ext.id}`}>
+      <div className="extensions-pkg-top">
+        <div className="update-center-name">
+          <strong>{ext.name ?? ext.id}</strong>
+          <span data-testid={`extensions-pkg-meta-${ext.id}`}>{ext.version ?? '—'} · {sourceLabel} · {stateLabel}</span>
+        </div>
+        <div className="extensions-pkg-actions">
+          <button
+            type="button"
+            role="switch"
+            className={`computer-use-switch${enabled ? ' enabled' : ''}`}
+            aria-checked={enabled}
+            aria-label={enabled ? `禁用 ${ext.name ?? ext.id}` : `启用 ${ext.name ?? ext.id}`}
+            disabled={!canToggle}
+            data-testid={`extensions-pkg-toggle-${ext.id}`}
+            onClick={() => onToggle(ext)}
+          >
+            <span />
+          </button>
+          {ext.source !== 'builtin' && (
+            <button
+              type="button"
+              className="model-modal-refresh"
+              disabled={busy}
+              data-testid={`extensions-pkg-uninstall-${ext.id}`}
+              onClick={() => onUninstall(ext)}
+            >
+              卸载
+            </button>
+          )}
+        </div>
+      </div>
+      {caps.length > 0 && (
+        <div className="extensions-badges" data-testid={`extensions-pkg-caps-${ext.id}`}>
+          {caps.map(capability => (
+            <span
+              key={capability}
+              className={`extensions-badge${blocksEnableForL2(ext.source, [capability]) ? ' l2' : ''}`}
+              title={capabilityLabel(capability)}
+            >
+              {capability}
+            </span>
+          ))}
+        </div>
+      )}
+      {l2Blocked && (
+        <p className="vision-picker-hint" data-testid={`extensions-pkg-l2-${ext.id}`}>{L2_CAPABILITY_HINT}</p>
+      )}
+      {errorText && (
+        <p className="model-modal-error" role="alert" data-testid={`extensions-pkg-error-${ext.id}`}>{errorText}</p>
+      )}
+    </div>
+  )
+}
+
+function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
+  const [items, setItems] = useState<ExtensionDescriptor[]>([])
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [grantTarget, setGrantTarget] = useState<ExtensionDescriptor | null>(null)
+  const [uninstallTarget, setUninstallTarget] = useState<ExtensionDescriptor | null>(null)
+
+  const refresh = useCallback(async () => {
+    if (!host.listExtensions) {
+      setItems([])
+      return
+    }
+    try {
+      setItems(await host.listExtensions())
+    } catch {
+      setItems([])
+    }
+  }, [host])
+
+  useEffect(() => { void refresh() }, [refresh])
+
+  const applyEnable = async (ext: ExtensionDescriptor, enabled: boolean) => {
+    if (!host.setExtensionEnabled) return
+    setBusyId(ext.id)
+    try {
+      await host.setExtensionEnabled(ext.id, enabled, 'project')
+      await refresh()
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const onToggle = async (ext: ExtensionDescriptor) => {
+    if (ext.state === 'enabled') {
+      await applyEnable(ext, false)
+      return
+    }
+    const requested = requestedCapabilities(ext)
+    if (blocksEnableForL2(ext.source, requested)) return
+    let granted = ext.grantedCapabilities
+    if (granted === undefined && host.getCapabilityGrant) {
+      try {
+        granted = (await host.getCapabilityGrant(ext.id)).capabilities
+      } catch {
+        granted = []
+      }
+    }
+    if (grantNeedsConfirmation(requested, granted ?? [])) {
+      setGrantTarget(ext)
+      return
+    }
+    await applyEnable(ext, true)
+  }
+
+  const confirmGrant = async () => {
+    const ext = grantTarget
+    if (!ext) return
+    const requested = requestedCapabilities(ext)
+    setGrantTarget(null)
+    setBusyId(ext.id)
+    try {
+      await host.confirmCapabilityGrant?.(ext.id, requested)
+      await host.setExtensionEnabled?.(ext.id, true, 'project')
+      await refresh()
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const confirmUninstall = async () => {
+    const ext = uninstallTarget
+    if (!ext) return
+    setUninstallTarget(null)
+    setBusyId(ext.id)
+    try {
+      await host.uninstallExtension?.(ext.id)
+      await refresh()
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  return (
+    <section className="update-center-group" data-testid="extensions-packages">
+      <header className="update-center-group-header">
+        <div>
+          <h3>扩展包</h3>
+          <p>启用、禁用或卸载已扫描到的扩展。启用作用于当前项目。</p>
+        </div>
+        {items.length > 0 && <span>{items.length} 项</span>}
+      </header>
+      {items.length === 0
+        ? <div className="model-modal-state" data-testid="extensions-packages-empty">还没有扫描到扩展包。</div>
+        : (
+          <div className="update-center-group-items" data-testid="extensions-packages-list">
+            {items.map(ext => (
+              <ExtensionPackageRow
+                key={ext.id}
+                ext={ext}
+                busy={busyId === ext.id}
+                onToggle={ext => { void onToggle(ext) }}
+                onUninstall={setUninstallTarget}
+              />
+            ))}
+          </div>
+        )}
+      {grantTarget && (
+        <ConfirmDialog
+          testId="extensions-grant-dialog"
+          title={`授权 ${grantTarget.name ?? grantTarget.id}`}
+          confirmLabel="确认并启用"
+          confirmTestId="extensions-grant-confirm"
+          cancelTestId="extensions-grant-cancel"
+          onConfirm={() => { void confirmGrant() }}
+          onCancel={() => setGrantTarget(null)}
+        >
+          <p>此扩展请求以下能力。确认后才会启用。</p>
+          <ul className="extensions-grant-list" data-testid="extensions-grant-list">
+            {requestedCapabilities(grantTarget).map(capability => (
+              <li key={capability}>
+                <code>{capability}</code>
+                <span>{capabilityLabel(capability)}</span>
+              </li>
+            ))}
+          </ul>
+        </ConfirmDialog>
+      )}
+      {uninstallTarget && (
+        <ConfirmDialog
+          testId="extensions-uninstall-dialog"
+          title={`卸载 ${uninstallTarget.name ?? uninstallTarget.id}`}
+          confirmLabel="确认卸载"
+          confirmTestId="extensions-uninstall-confirm"
+          cancelTestId="extensions-uninstall-cancel"
+          onConfirm={() => { void confirmUninstall() }}
+          onCancel={() => setUninstallTarget(null)}
+        >
+          <p>卸载后将删除该扩展包，其界面贡献会立即消失。内置扩展不能卸载。</p>
+        </ConfirmDialog>
+      )}
+    </section>
+  )
+}
+
 export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOpen: boolean; onCloseAdd: () => void; host?: PipiHostAPI; projectId?: string }) {
   const [servers, setServers] = useState<UserMcpServer[]>([])
+  const resolvedHost = host ?? hostFromWindow()
 
   useEffect(() => {
     let cancelled = false
-    void loadUserMcpServers(host ?? hostFromWindow()).then(rows => {
+    void loadUserMcpServers(resolvedHost).then(rows => {
       if (!cancelled) setServers(rows)
     }).catch(() => {
       if (!cancelled) setServers([])
     })
     return () => { cancelled = true }
-  }, [host])
+  }, [resolvedHost])
 
   return (
     <div className="extensions-pane" data-testid="extensions-pane">
+      {resolvedHost?.listExtensions && <ExtensionPackagesSection host={resolvedHost} />}
       <section className="update-center-group" data-testid="extensions-builtin">
         <header className="update-center-group-header">
           <div>

@@ -29,10 +29,17 @@ export type ExtensionSettingsSchema = {
   additionalProperties?: boolean;
 };
 
+export type ExtensionSettingsMigration = {
+  from: number;
+  to: number;
+  map: Record<string, string>;
+};
+
 export type ExtensionSettingsManifest = {
   scope: ExtensionEnableScope;
   schema: ExtensionSettingsSchema;
   settingsVersion?: number;
+  migrations?: ExtensionSettingsMigration[];
 };
 
 export type ExtensionDescriptor = {

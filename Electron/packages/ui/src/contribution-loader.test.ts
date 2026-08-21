@@ -58,6 +58,21 @@ describe('syncDeclarativeContributions', () => {
     expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)
   })
 
+  it('uninstall (missing from list) disposes contributions with zero residue', () => {
+    const slashBefore = listSlashCommands().map(command => command.name)
+    const settingsBefore = listSettingsSections().map(section => section.id)
+    const statusBefore = listStatusBarItems().map(item => item.id)
+
+    syncDeclarativeContributions([quotaDescriptor('enabled')])
+    expect(slashCommandByName('quota')).toBeTruthy()
+
+    syncDeclarativeContributions([])
+    expect(listSlashCommands().map(command => command.name)).toEqual(slashBefore)
+    expect(listSettingsSections().map(section => section.id)).toEqual(settingsBefore)
+    expect(listStatusBarItems().map(item => item.id)).toEqual(statusBefore)
+    expect(slashCommandByName('quota')).toBeUndefined()
+  })
+
   it('disable disposes the whole group with zero residue', () => {
     const slashBefore = listSlashCommands().map(command => command.name)
     const settingsBefore = listSettingsSections().map(section => section.id)

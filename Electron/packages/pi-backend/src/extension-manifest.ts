@@ -1,10 +1,16 @@
-import type { ExtensionOrigin, ExtensionSettingsManifest, ExtensionSettingsSchema } from "./extension-registry.js";
+import type {
+  ExtensionOrigin,
+  ExtensionSettingsManifest,
+  ExtensionSettingsMigration,
+  ExtensionSettingsSchema,
+} from "./extension-registry.js";
+import { parseExtensionMigrations } from "./extension-migrations.js";
 
 /** Spec D2. */
 export const EXTENSION_MANIFEST_FILENAME = "pipiui-extension.json";
 export const EXTENSION_ID_RE = /^[a-z][a-z0-9-]*$/;
 
-/** Spec D8 first-version capability enum. */
+/** Spec D8 first-version capability enum (L0/L1). */
 export const EXTENSION_CAPABILITIES = [
   "settings.read",
   "settings.write",
@@ -14,9 +20,13 @@ export const EXTENSION_CAPABILITIES = [
   "terminal.read",
   "notifications",
 ] as const;
-export type ExtensionCapability = (typeof EXTENSION_CAPABILITIES)[number];
+/** Spec D11 L2 host privileges — recognized so they can be refused, never granted. */
+export const EXTENSION_L2_CAPABILITIES = ["host.main", "host.decorator", "host.api", "native.driver"] as const;
+export type ExtensionCapability =
+  | (typeof EXTENSION_CAPABILITIES)[number]
+  | (typeof EXTENSION_L2_CAPABILITIES)[number];
 
-const CAPABILITY_SET = new Set<string>(EXTENSION_CAPABILITIES);
+const CAPABILITY_SET = new Set<string>([...EXTENSION_CAPABILITIES, ...EXTENSION_L2_CAPABILITIES]);
 
 /** Spec D2 / D7: first version only `toolPanel`. Unknown slots are errors, never silent skips. */
 export const EXTENSION_PANEL_SLOTS = ["toolPanel"] as const;
@@ -153,12 +163,21 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
       if (typeof settingsVersion !== "number" || !Number.isFinite(settingsVersion) || settingsVersion < 1) {
         errors.push("settingsVersion is required (number ≥ 1) when settings are declared");
       }
+      const rawMigrations = value.migrations ?? appSettings.migrations;
+      const parsedMigrations = parseExtensionMigrations(rawMigrations);
+      let migrations: ExtensionSettingsMigration[] | undefined;
+      if (!parsedMigrations.ok) {
+        errors.push(parsedMigrations.error);
+      } else if (parsedMigrations.migrations.length) {
+        migrations = parsedMigrations.migrations;
+      }
       if (scope === "app" || scope === "project") {
         settings = {
           scope,
           schema: schema ?? {},
           settingsVersion: typeof settingsVersion === "number" ? settingsVersion : undefined,
         };
+        if (migrations) settings.migrations = migrations;
       }
     }
   }

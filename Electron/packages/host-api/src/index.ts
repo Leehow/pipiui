@@ -620,8 +620,18 @@ export type ExtensionDescriptor = {
   name?: string;
   version?: string;
   error?: string;
+  /** User-visible reason when `state === "error"` (spec D9). */
+  errorReason?: string;
+  /** Manifest-declared capabilities (spec D8). */
+  capabilities?: readonly string[];
+  /** Capabilities the user has confirmed for this package (spec D11 / M4). */
+  grantedCapabilities?: readonly string[];
   /** Declarative app-half contributions (schema / slash / settings tabs / statusBar). */
   contributions?: ExtensionContributions;
+};
+/** Current capability grant snapshot (spec D11 / M4). */
+export type ExtensionCapabilityGrant = {
+  capabilities: readonly string[];
 };
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
@@ -860,6 +870,12 @@ export interface PipiHostAPI {
   invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
   listExtensions?(): Promise<ExtensionDescriptor[]>;
   setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope): Promise<ExtensionDescriptor>;
+  /** Remove a non-builtin package (spec D9). Builtins are not uninstallable. */
+  uninstallExtension?(id: string): Promise<void>;
+  /** Currently confirmed capabilities for this package (empty = none granted). */
+  getCapabilityGrant?(id: string): Promise<ExtensionCapabilityGrant>;
+  /** Persist a user-confirmed capability set before enable (spec D11). */
+  confirmCapabilityGrant?(id: string, capabilities: readonly string[]): Promise<ExtensionCapabilityGrant>;
   /** Optional: declarative contributions when they are not inlined on the descriptor. */
   getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
@@ -1019,6 +1035,9 @@ function apiFrom(
       : invoke("invokeExtension", id, method, params, opts),
     listExtensions: () => invoke("listExtensions"),
     setExtensionEnabled: (id, enabled, scope) => invoke("setExtensionEnabled", id, enabled, scope),
+    uninstallExtension: id => invoke("uninstallExtension", id),
+    getCapabilityGrant: id => invoke("getCapabilityGrant", id),
+    confirmCapabilityGrant: (id, capabilities) => invoke("confirmCapabilityGrant", id, capabilities),
     getExtensionContributions: id => invoke("getExtensionContributions", id),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),

@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { putSecret, type VaultSecretMeta } from "./secret-vault.js";
+import { listSecretMeta, putSecret, type VaultSecretMeta } from "./secret-vault.js";
 import type { ExtInvokeErrorCode, ExtensionSettingsManifest } from "./extension-registry.js";
 
 export type ExtInvokeResult<T = unknown> =
@@ -82,18 +82,44 @@ export function validateExtensionSettingsPatch(
   return { ok: true, values, secrets };
 }
 
+export type ExtensionSettingsDocument = {
+  values: Record<string, unknown>;
+  settingsVersion?: number;
+};
+
+export function readAppExtensionSettingsDocument(
+  settings: Record<string, unknown>,
+  id: string,
+  secretKeys: Set<string>,
+): ExtensionSettingsDocument {
+  const slot = isRecord(settings.extensions) ? settings.extensions[id] : undefined;
+  if (!isRecord(slot)) return { values: {} };
+  const stored = isRecord(slot.settings) ? slot.settings : {};
+  const values: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(stored)) {
+    if (secretKeys.has(key)) continue;
+    values[key] = value;
+  }
+  const settingsVersion =
+    typeof slot.settingsVersion === "number" && Number.isFinite(slot.settingsVersion)
+      ? slot.settingsVersion
+      : undefined;
+  return settingsVersion === undefined ? { values } : { values, settingsVersion };
+}
+
 export function readAppExtensionSettingsValues(
   settings: Record<string, unknown>,
   id: string,
   secretKeys: Set<string>,
 ): Record<string, unknown> {
-  const slot = isRecord(settings.extensions) ? settings.extensions[id] : undefined;
-  if (!isRecord(slot)) return {};
-  const stored = isRecord(slot.settings) ? slot.settings : {};
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(stored)) {
-    if (secretKeys.has(key)) continue;
-    out[key] = value;
+  return readAppExtensionSettingsDocument(settings, id, secretKeys).values;
+}
+
+export function secretPresence(vaultDir: string, secretKeys: Set<string>): Record<string, true> {
+  const names = new Set(listSecretMeta(vaultDir).map((item) => item.name));
+  const out: Record<string, true> = {};
+  for (const key of secretKeys) {
+    if (names.has(key)) out[key] = true;
   }
   return out;
 }
@@ -112,24 +138,35 @@ export function writeAppExtensionSettingsValues(
   settings.extensions = slot;
 }
 
+export async function readProjectExtensionSettingsDocument(
+  projectAgentDir: string,
+  id: string,
+  secretKeys: Set<string>,
+): Promise<ExtensionSettingsDocument> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(projectExtensionSettingsPath(projectAgentDir, id), "utf8"));
+    const stored = isRecord(parsed) && isRecord(parsed.settings) ? parsed.settings : isRecord(parsed) ? parsed : {};
+    const values: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(stored)) {
+      if (key === "settingsVersion" || secretKeys.has(key)) continue;
+      values[key] = value;
+    }
+    const versionRaw = isRecord(parsed) ? parsed.settingsVersion : undefined;
+    const settingsVersion =
+      typeof versionRaw === "number" && Number.isFinite(versionRaw) ? versionRaw : undefined;
+    return settingsVersion === undefined ? { values } : { values, settingsVersion };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { values: {} };
+    throw error;
+  }
+}
+
 export async function readProjectExtensionSettingsValues(
   projectAgentDir: string,
   id: string,
   secretKeys: Set<string>,
 ): Promise<Record<string, unknown>> {
-  try {
-    const parsed: unknown = JSON.parse(await readFile(projectExtensionSettingsPath(projectAgentDir, id), "utf8"));
-    const stored = isRecord(parsed) && isRecord(parsed.settings) ? parsed.settings : isRecord(parsed) ? parsed : {};
-    const out: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(stored)) {
-      if (key === "settingsVersion" || secretKeys.has(key)) continue;
-      out[key] = value;
-    }
-    return out;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw error;
-  }
+  return (await readProjectExtensionSettingsDocument(projectAgentDir, id, secretKeys)).values;
 }
 
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {

@@ -139,14 +139,30 @@ import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js"
 import type { ExtInvokeResult } from "./extension-settings.js";
 import {
   putExtensionSecrets,
+  readAppExtensionSettingsDocument,
   readAppExtensionSettingsValues,
+  readProjectExtensionSettingsDocument,
   readProjectExtensionSettingsValues,
+  secretPresence,
   secretPropertyKeys,
   settingsDenied,
   validateExtensionSettingsPatch,
   writeAppExtensionSettingsValues,
   writeProjectExtensionSettingsValues,
 } from "./extension-settings.js";
+import { migrateExtensionSettings } from "./extension-migrations.js";
+import {
+  evaluateCapabilityGrant,
+  grantFromConfirmation,
+  l2CapabilitiesOf,
+  readAppExtensionGrant,
+  readProjectExtensionGrants,
+  writeAppExtensionGrant,
+  writeProjectExtensionGrant,
+  type ExtensionCapabilityGrant,
+  type ExtensionGrantRecord,
+} from "./extension-grants.js";
+import { removeExtensionPackageDirectory } from "./extension-uninstall.js";
 import { readWebSearchApiKeys, writeWebSearchApiKeys } from "./web-search-keys.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
@@ -2550,7 +2566,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse") {      case "listProjects":
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant") {      case "listProjects":
         return this.listConfiguredProjects();
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
@@ -2574,6 +2590,12 @@ export class PiHostBackend implements HostBackend {
         return this.getExtensionSettings(params[0], params[1]);
       case "updateExtensionSettings":
         return this.updateExtensionSettings(params[0], params[1], params[2]);
+      case "uninstallExtension":
+        return this.uninstallExtension(params[0], params[1]);
+      case "getCapabilityGrant":
+        return this.getCapabilityGrant(params[0], params[1]);
+      case "confirmCapabilityGrant":
+        return this.confirmCapabilityGrant(params[0], params[1], params[2]);
       case "invokeExtension":
         return this.invokeExtension(params[0], params[1], params[2], params[3]);
       case "extensionUiResponse":
@@ -4763,7 +4785,15 @@ export class PiHostBackend implements HostBackend {
     const projectRoot =
       typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;
     this.extensionLoader.scan(projectRoot);
-    return this.extensionLoader.list(await this.extensionEnableOverlay(projectId));  }
+    await this.migrateLoadedExtensions(projectRoot);
+    const listed = this.extensionLoader.list(await this.extensionEnableOverlay(projectId));
+    const grants = await this.capabilityGrantsOverlay(projectId);
+    return listed.map((item) => {
+      const grant = grants[item.id];
+      if (!grant) return item;
+      return { ...item, grantedCapabilities: grant.grantedCapabilities };
+    });
+  }
   private async extensionEnableOverlay(projectId: unknown): Promise<Record<string, boolean>> {
     if (typeof projectId === "string" && projectId.trim()) {
       const root = await this.projectPath(projectId);
@@ -4816,13 +4846,16 @@ export class PiHostBackend implements HostBackend {
     if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
     const manifest = this.extensions.settingsManifest(id);
     const secretKeys = secretPropertyKeys(manifest?.schema);
+    const presence = secretPresence(this.vaultDir, secretKeys);
     const scope = manifest?.scope ?? "app";
     if (scope === "project") {
       const root = await this.resolveExtensionSettingsProject(projectId);
-      if (!root) return {};
-      return readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
+      if (!root) return { ...presence };
+      const values = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
+      return { ...values, ...presence };
     }
-    return readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
+    const values = readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
+    return { ...values, ...presence };
   }
   private async updateExtensionSettings(
     idValue: unknown,
@@ -4865,6 +4898,154 @@ export class PiHostBackend implements HostBackend {
     });
     this.notifyExtensionSettingsChanged(id, next);
     return { ok: true, data: next };
+  }
+  private async migrateLoadedExtensions(projectRoot?: string): Promise<void> {
+    for (const record of this.extensions.list()) {
+      if (record.state === "error") continue;
+      const manifest = this.extensions.settingsManifest(record.id);
+      const target = manifest?.settingsVersion;
+      if (!manifest || typeof target !== "number") continue;
+      const secretKeys = secretPropertyKeys(manifest.schema);
+      try {
+        if (manifest.scope === "project") {
+          if (!projectRoot) continue;
+          const agentDir = projectPiAgentDir(projectRoot);
+          const document = await readProjectExtensionSettingsDocument(agentDir, record.id, secretKeys);
+          const diskVersion = document.settingsVersion ?? (Object.keys(document.values).length ? 1 : undefined);
+          if (diskVersion === undefined || diskVersion >= target) continue;
+          const migrated = migrateExtensionSettings({
+            diskVersion,
+            targetVersion: target,
+            migrations: manifest.migrations ?? [],
+            settings: document.values,
+          });
+          if (!migrated.ok) {
+            this.extensions.enterError(record.id, migrated.error);
+            continue;
+          }
+          if (migrated.changed) {
+            await writeProjectExtensionSettingsValues(agentDir, record.id, migrated.settings, migrated.settingsVersion);
+          }
+          continue;
+        }
+        const settings = await this.readSettings();
+        const document = readAppExtensionSettingsDocument(settings, record.id, secretKeys);
+        const diskVersion = document.settingsVersion ?? (Object.keys(document.values).length ? 1 : undefined);
+        if (diskVersion === undefined || diskVersion >= target) continue;
+        const migrated = migrateExtensionSettings({
+          diskVersion,
+          targetVersion: target,
+          migrations: manifest.migrations ?? [],
+          settings: document.values,
+        });
+        if (!migrated.ok) {
+          this.extensions.enterError(record.id, migrated.error);
+          continue;
+        }
+        if (migrated.changed) {
+          await this.updateSettings((current) => {
+            writeAppExtensionSettingsValues(current, record.id, migrated.settings, migrated.settingsVersion);
+          });
+        }
+      } catch (error) {
+        this.extensions.enterError(record.id, error instanceof Error ? error.message : String(error));
+      }
+    }
+  }
+  private async capabilityGrantsOverlay(projectId: unknown): Promise<Record<string, ExtensionGrantRecord>> {
+    const appSettings = await this.readSettings();
+    const app: Record<string, ExtensionGrantRecord> = {};
+    for (const item of this.extensions.list()) {
+      const grant = readAppExtensionGrant(appSettings, item.id);
+      if (grant) app[item.id] = grant;
+    }
+    if (typeof projectId !== "string" || !projectId.trim()) return app;
+    const root = await this.projectPath(projectId);
+    const project = await readProjectExtensionGrants(projectPiAgentDir(root));
+    return { ...app, ...project };
+  }
+  private async resolveGrantProjectRoot(projectId: unknown): Promise<string | undefined> {
+    if (typeof projectId === "string" && projectId.trim()) return this.projectPath(projectId);
+    return this.extensionLoader.loadedProject();
+  }
+  private async getCapabilityGrant(idValue: unknown, projectId?: unknown): Promise<ExtensionCapabilityGrant> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) throw new Error(`unknown extension ${id}`);
+    const declared = this.extensions.capabilities(id);
+    const overlay = await this.capabilityGrantsOverlay(projectId);
+    return evaluateCapabilityGrant({
+      id,
+      origin: current.origin,
+      declared,
+      stored: overlay[id],
+    });
+  }
+  private async confirmCapabilityGrant(
+    idValue: unknown,
+    capabilitiesValue: unknown,
+    projectId?: unknown,
+  ): Promise<ExtensionCapabilityGrant> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    if (!Array.isArray(capabilitiesValue) || !capabilitiesValue.every((item) => typeof item === "string")) {
+      throw new Error("capabilities 必须是 string[]");
+    }
+    const id = idValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) throw new Error(`unknown extension ${id}`);
+    const refused = [...new Set([...l2CapabilitiesOf(this.extensions.capabilities(id)), ...l2CapabilitiesOf(capabilitiesValue)])];
+    if (refused.length) {
+      return {
+        id,
+        grantedCapabilities: [],
+        needsConfirmation: false,
+        refused: true,
+        refusedCapabilities: refused,
+      };
+    }
+    const grant = grantFromConfirmation(capabilitiesValue);
+    if (typeof projectId === "string" && projectId.trim()) {
+      const root = await this.projectPath(projectId);
+      await writeProjectExtensionGrant(projectPiAgentDir(root), id, grant);
+    } else {
+      await this.updateSettings((settings) => {
+        writeAppExtensionGrant(settings, id, grant);
+      });
+    }
+    return evaluateCapabilityGrant({
+      id,
+      origin: current.origin,
+      declared: this.extensions.capabilities(id),
+      stored: grant,
+    });
+  }
+  private async uninstallExtension(idValue: unknown, projectId?: unknown): Promise<{ id: string; state: "unloaded" }> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) throw new Error(`unknown extension ${id}`);
+    if (current.origin === "builtin" || !current.uninstallable) {
+      throw new Error(`builtin extensions cannot be uninstalled: ${id}`);
+    }
+    if (current.state === "enabled" || current.state === "loaded") {
+      this.extensions.disable(id);
+    } else if (current.state === "discovered") {
+      this.extensions.enterError(id, "uninstalled");
+    }
+    const directory = this.extensionLoader.directoryOf(id);
+    if (!directory) throw new Error(`unknown extension package directory ${id}`);
+    const projectRoot = await this.resolveGrantProjectRoot(projectId);
+    await removeExtensionPackageDirectory({
+      id,
+      origin: current.origin,
+      directory,
+      appRoot: join(this.agentDir, "extensions"),
+      projectRoot,
+    });
+    if (this.extensions.get(id)) this.extensions.unload(id);
+    this.extensionLoader.forget(id);
+    return { id, state: "unloaded" };
   }
   private async mergedExtensionOverlay(projectRoot?: string): Promise<Record<string, boolean>> {
     const app = readAppExtensionEnabled(await this.readSettings());
