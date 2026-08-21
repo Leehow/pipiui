@@ -1,4 +1,7 @@
 import { memo, type ReactNode } from 'react'
+import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
+import { getToolRenderer, isLiveProjectedTool, registerToolRenderer, useToolRenderers } from './ui-registries'
+import { toToolRenderPayload } from './piui-envelope'
 import { ActivityCard } from './ActivityCard'
 import { parseSubagentNotice } from './subagent-notice'
 import { toolArgsSummary, toolDisplaySummary, formatToolInput } from './tool-summary'
@@ -65,9 +68,9 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   // Lost tool_result/settled: if the model generated text after the last
   // unfinished tool, the tool must have completed — suppress the live indicator.
   const lastUnfinishedToolIndex = activities.reduce((last, a, i) =>
-    a.type === 'tool' && !a.tool.finished && a.tool.name !== 'subagent' && a.tool.name !== 'computer_task' ? i : last, -1)
+    a.type === 'tool' && !a.tool.finished && !isLiveProjectedTool(a.tool.name) ? i : last, -1)
   const textAfterUnfinishedTool = lastUnfinishedToolIndex >= 0 && activities.slice(lastUnfinishedToolIndex + 1).some(a => a.type === 'text' && a.content.trim())
-  const activeTool = message.streaming && !textAfterUnfinishedTool ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && activity.tool.name !== 'subagent' && activity.tool.name !== 'computer_task') : undefined
+  const activeTool = message.streaming && !textAfterUnfinishedTool ? [...stepActivities].reverse().find((activity): activity is Extract<TranscriptActivity, { type: 'tool' }> => activity.type === 'tool' && !activity.tool.finished && !isLiveProjectedTool(activity.tool.name)) : undefined
   const segments: ReturnType<typeof planAssistantTranscript> = []
   for (const segment of planAssistantTranscript(message)) {
     if (segment.type === 'text') {
@@ -78,10 +81,11 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
     if (grouped.length) segments.push({ type: 'steps', activities: grouped })
   }
   const tools = segments.flatMap(segment => segment.type === 'steps' ? segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : []) : [])
+  useToolRenderers()
   const liveByTool = useLiveSubagentBindings(tools)
   // `computer_task` children carry the same toolCallId linkage as `subagent`
   // children, so both project into live row cards while running.
-  const liveProjectable = (tool: TranscriptTool) => tool.name === 'subagent' || tool.name === 'computer_task'
+  const liveProjectable = (tool: TranscriptTool) => isLiveProjectedTool(tool.name)
   const subagentProjections = tools.filter(liveProjectable).map(tool => liveByTool.get(tool.id)).filter((projection): projection is NonNullable<typeof projection> => Boolean(projection))
   const linkedRunning = subagentProjections.some(projection => projection.runningCount > 0)
   const pendingDispatch = tools.some(tool => liveProjectable(tool) && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
@@ -120,23 +124,56 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
         ))
         if (activity.type === 'thinking') return <ActivityCard key={`thinking:${activity.id}`} kind="thinking" label="Thinking" summary="Thinking" meta={`${formatCompactTokens(estimateTokens(activity.charCount ?? activity.content.length))} tokens`} running={live} defaultExpanded={live}><p>{displaySecretPlaceholders(activity.content) || (live ? '模型正在思考…' : '')}</p></ActivityCard>
         const projection = liveByTool.get(activity.tool.id)
-        if (activity.tool.name === 'computer_task' && activity.tool.finished && activity.tool.result) {
-          const computerResult = parseComputerTaskResult(activity.tool.result)
-          if (computerResult) return <ComputerTaskResultCard
-            key={`tool:${activity.tool.id}`}
-            result={computerResult}
-            goal={computerTaskGoalFromInput(activity.tool.input)}
-            raw={activity.tool.result}
-            elapsed={elapsed(activity.tool.startedAt, activity.tool.finishedAt ?? activity.tool.startedAt)}
-            onOpenSubagents={onOpenSubagents}
-          />
+        const payload = toToolRenderPayload(activity.tool.result)
+        if (!payload.fallback) {
+          const custom = getToolRenderer(activity.tool.name)?.render?.({
+            tool: activity.tool,
+            streaming: live,
+            projection,
+            onOpenSubagents,
+            elapsed,
+            content: payload.content,
+            details: payload.details,
+          })
+          if (custom != null) return custom
         }
-        return liveProjectable(activity.tool) && projection && projection.totalCount > 0
-          ? <LiveSubagentCard key={`tool:${activity.tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} title={activity.tool.name === 'computer_task' ? '桌面任务' : undefined} />
-          : <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live} />
+        return <TranscriptToolCard key={`tool:${activity.tool.id}`} tool={activity.tool} streaming={live} />
       })}</ActivityCard>
     })}
     {activeTool && <ActiveToolCard key={`active-tool:${activeTool.tool.id}`} tool={activeTool.tool} />}
     {message.error && <div className="assistant-turn-error" data-testid="assistant-turn-error" role="alert">{message.error}</div>}
   </div>
+})
+
+registerToolRenderer(BUILTIN_EXTENSION_ID, {
+  toolName: 'computer_task',
+  liveProjected: true,
+  render: ({ tool, projection, onOpenSubagents, elapsed }) => {
+    if (tool.finished && tool.result) {
+      const computerResult = parseComputerTaskResult(tool.result)
+      if (computerResult) return <ComputerTaskResultCard
+        key={`tool:${tool.id}`}
+        result={computerResult}
+        goal={computerTaskGoalFromInput(tool.input)}
+        raw={tool.result}
+        elapsed={elapsed(tool.startedAt, tool.finishedAt ?? tool.startedAt)}
+        onOpenSubagents={onOpenSubagents}
+      />
+    }
+    if (projection && projection.totalCount > 0) {
+      return <LiveSubagentCard key={`tool:${tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} title="桌面任务" />
+    }
+    return null
+  },
+})
+
+registerToolRenderer(BUILTIN_EXTENSION_ID, {
+  toolName: 'subagent',
+  liveProjected: true,
+  render: ({ tool, projection, onOpenSubagents }) => {
+    if (projection && projection.totalCount > 0) {
+      return <LiveSubagentCard key={`tool:${tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} />
+    }
+    return null
+  },
 })

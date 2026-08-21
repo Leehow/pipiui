@@ -23,6 +23,11 @@ export type BridgeHandlers = {
   onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
   onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
+  /** Spec D4 `ext.emit`. Fail closed when omitted. */
+  onExtEmit?(
+    input: { extensionId: string; event: string; payload?: unknown },
+    sessionId: string,
+  ): { ok: true } | { ok: false; error: string; errorCode?: string } | Promise<{ ok: true } | { ok: false; error: string; errorCode?: string }>;
 };
 
 /** Agent logs are the largest payload; anything past this is refused, not buffered. */
@@ -157,6 +162,28 @@ export class HostBridge {
     // Fail closed and identically for a missing, stale or forged capability: an unauthorized
     // caller learns nothing about which sessions exist.
     if (!sessionId || body.schemaVersion !== 1) return this.reply(response, 403, { ok: false, error: "unauthorized bridge capability" });
+    if (body.action === "ext.emit") {
+      const extensionId = body.extensionId;
+      const eventName = body.event;
+      if (typeof extensionId !== "string" || !extensionId) {
+        return this.reply(response, 400, { ok: false, error: "missing extensionId" });
+      }
+      if (typeof eventName !== "string" || !eventName) {
+        return this.reply(response, 400, { ok: false, error: "missing event" });
+      }
+      try {
+        const result = await (this.handlers.onExtEmit?.({
+          extensionId,
+          event: eventName,
+          payload: body.payload,
+        }, sessionId) ?? { ok: false as const, error: "capability_denied", errorCode: "capability_denied" });
+        if (!result.ok) return this.reply(response, 403, result);
+        return this.reply(response, 200, { ok: true });
+      } catch (error) {
+        console.warn(`[pipi-bridge] ext.emit handler error: ${error instanceof Error ? error.message : String(error)}`);
+        return this.reply(response, 200, { ok: true });
+      }
+    }
     const event = body.event;
     if (!event || typeof event !== "object") return this.reply(response, 400, { ok: false, error: "missing event" });
     try {

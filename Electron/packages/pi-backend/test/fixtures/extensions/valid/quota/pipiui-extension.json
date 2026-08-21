@@ -1,0 +1,29 @@
+{
+  "id": "quota",
+  "name": "Quota Monitor",
+  "version": "1.0.0",
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.quota.threshold": { "type": "number", "default": 80, "title": "告警阈值（%）" }
+        }
+      }
+    },
+    "ui": {
+      "panels": [{ "slot": "toolPanel", "id": "quota", "title": "用量" }],
+      "toolRenderers": [{ "tool": "get_quota" }],
+      "settingsSections": [{ "id": "quota", "title": "用量监控" }],
+      "slashCommands": [{ "name": "quota", "description": "查看当前用量" }],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "capabilities": ["settings.read", "settings.write", "bridge.emit"],
+  "settingsVersion": 1
+}

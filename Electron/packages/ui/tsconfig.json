@@ -5,7 +5,11 @@
     "declaration": true,
     "declarationMap": true,
     "emitDeclarationOnly": true,
-    "outDir": "dist"
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@pipi/host-api": ["../host-api/dist/index.d.ts"]
+    }
   },
   "include": ["src"]
 }

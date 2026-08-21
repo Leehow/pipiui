@@ -1,0 +1,11 @@
+{
+  "id": "quota-unknown-slot",
+  "name": "Unknown Slot",
+  "version": "1.0.0",
+  "app": {
+    "ui": {
+      "panels": [{ "slot": "sidebar", "id": "quota", "title": "用量" }]
+    }
+  },
+  "capabilities": []
+}

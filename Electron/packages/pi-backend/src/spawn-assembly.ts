@@ -6,9 +6,17 @@ import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
 export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
-export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string };
+/** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
+export type SpawnRegisteredExtension = {
+  id: string;
+  enabled: boolean;
+  extensionPath?: string;
+  skillRoots?: readonly string[];
+  settings?: unknown;
+};
+export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string; /** Enabled PipiUI extension agent halves; assembled into `-e` like user-extensions. */ registeredExtensions?: readonly SpawnRegisteredExtension[] };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
 /**
  * An explicit process invocation for Pi.
@@ -30,7 +38,7 @@ const ext=(args:string[], path?:string)=>{if(path)args.push("-e",path)};
  * finalizer: a bridge credential inherited from an outer shell would let another process address
  * this session's agent tree. Only the value this host mints for this spawn survives.
  */
-export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
+export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL","PIPIUI_SKILL_READ_BLOCK","PIPIUI_SKILL_ROOTS","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_ANYDOC_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_","PIPIUI_EXT_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
 /**
  * Layered spawn environment, mirroring Swift `ChatSession.mergedSpawnEnv` + `PiProcess`
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
@@ -63,7 +71,7 @@ export function mergedSpawnEnvironment(
   });
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlPdf)ext(args,p.firecrawlPdf);if(p.pdfInspector){env.PIPIUI_PDF_INSPECTOR_ROOT=p.pdfInspector;const inspectorModules=join(p.pdfInspector,"node_modules");env.NODE_PATH=env.NODE_PATH?inspectorModules+delimiter+env.NODE_PATH:inspectorModules}if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlPdf)ext(args,p.firecrawlPdf);if(p.pdfInspector){env.PIPIUI_PDF_INSPECTOR_ROOT=p.pdfInspector;const inspectorModules=join(p.pdfInspector,"node_modules");env.NODE_PATH=env.NODE_PATH?inspectorModules+delimiter+env.NODE_PATH:inspectorModules}if(p.firecrawlAnydoc)ext(args,p.firecrawlAnydoc);if(p.anydoc){env.PIPIUI_ANYDOC_ROOT=p.anydoc;const anydocModules=join(p.anydoc,"node_modules");env.NODE_PATH=env.NODE_PATH?anydocModules+delimiter+env.NODE_PATH:anydocModules}if(enabled(f,"philosophy"))ext(args,p.philosophy);if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames}));
 /*
  * Subagent orchestration, deliberately mounted before the bridge gate.
  *
@@ -81,7 +89,7 @@ if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
 if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}
-if(!input.bridgePort){appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
+if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
 if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(input.memoryReviewModelId)env.PIPIUI_MEMORY_REVIEW_MODEL=input.memoryReviewModelId;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser")){ext(args,p.webview);if(p.webview)env.PIPIUI_WEBVIEW_EXT=p.webview}
@@ -107,7 +115,7 @@ env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.compu
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
-appendUserExtensions(args,input.agentDir);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
+appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);return{args,env}; }
 export const USER_EXTENSIONS_DIR="user-extensions";
 const USER_EXTENSION_FILE=/\.(?:[cm]?js|ts)$/;
 /**
@@ -135,6 +143,21 @@ export function userExtensionMounts(agentDir?:string):string[] {
   return mounts.sort();
 }
 function appendUserExtensions(args:string[],agentDir?:string){for(const path of userExtensionMounts(agentDir))ext(args,path)}
+/** Spec §5.5: `PIPIUI_EXT_SETTINGS_<ID>` with the extension id uppercased. */
+export function extensionSettingsEnvName(id: string): string {
+  const token = id.replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase();
+  return `PIPIUI_EXT_SETTINGS_${token || "EXT"}`;
+}
+function appendRegisteredExtensions(args:string[], env:Record<string,string>, packages?:readonly SpawnRegisteredExtension[]) {
+  const skillRoots:string[]=[];
+  for (const pkg of packages ?? []) {
+    if (!pkg.enabled || !pkg.extensionPath) continue;
+    ext(args, pkg.extensionPath);
+    if (pkg.skillRoots) for (const root of pkg.skillRoots) if (root) skillRoots.push(root);
+    if (pkg.settings !== undefined) env[extensionSettingsEnvName(pkg.id)] = JSON.stringify(pkg.settings);
+  }
+  if (skillRoots.length) env.PIPIUI_SKILL_ROOTS = skillRoots.join(delimiter);
+}
 function declaredEntrypoint(root:string):string|undefined {
   try {
     const manifest=JSON.parse(readFileSync(join(root,"package.json"),"utf8"));
@@ -318,6 +341,8 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     officeDocShotGate:fileIfPresent(extensions,"pipiui-office-doc-shot-gate.ts"),
     firecrawlPdf:fileIfPresent(extensions,"pipiui-firecrawl-pdf.ts"),
     pdfInspector:packageIfPresent(runtimeRoot,"pdf-inspector"),
+    firecrawlAnydoc:fileIfPresent(extensions,"pipiui-firecrawl-anydoc.ts"),
+    anydoc:packageIfPresent(runtimeRoot,"anydoc"),
     subagentDir:fileIfPresent(ext,"subagent"),
     agentsDir:fileIfPresent(ext,"agents"),
     memoryBroker:packageIfPresent(ext,"packages","memory-broker"),

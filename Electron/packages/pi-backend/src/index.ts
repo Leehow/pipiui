@@ -57,10 +57,11 @@ import {
   type ComputerDescriptor,
   type PiCommand,
   type SpawnFeatures,
+  type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { LeaseManager } from "./lease.js";
-import { checkoutBranch, initGit, probeGit, probeGitBinary } from "./git.js";
+import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { DocumentFileWatcher } from "./document-watch.js";
@@ -123,11 +124,34 @@ import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
 import { paddleocrHasKey, writePaddleocrAccessToken } from "./paddleocr-key.js";
+import {
+  createExtensionRegistry,
+  readAppExtensionEnabled,
+  readProjectExtensionEnabled,
+  writeAppExtensionEnabled,
+  writeProjectExtensionEnabled,
+  type ExtensionEnableScope,
+  type ExtensionRecord,
+  type ExtensionRegistry,
+} from "./extension-registry.js";
+import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
+import type { ExtInvokeResult } from "./extension-settings.js";
+import {
+  putExtensionSecrets,
+  readAppExtensionSettingsValues,
+  readProjectExtensionSettingsValues,
+  secretPropertyKeys,
+  settingsDenied,
+  validateExtensionSettingsPatch,
+  writeAppExtensionSettingsValues,
+  writeProjectExtensionSettingsValues,
+} from "./extension-settings.js";
 import { readWebSearchApiKeys, writeWebSearchApiKeys } from "./web-search-keys.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
   migrateSharedProjectModels,
+  projectPiAgentDir,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
 import {
@@ -231,7 +255,7 @@ export async function readLocalDocument(input: unknown): Promise<DocumentContent
   if (!isAbsolute(path)) throw documentError("document_invalid_path", "document path must be absolute");
   const kind = documentKindForName(extname(path));
   if (!kind)
-    throw documentError("document_unsupported_type", "unsupported document type; allowed: .md, .markdown, .txt, .pdf, .doc, .docx, .xls, .xlsx, .ppt, .pptx");
+    throw documentError("document_unsupported_type", "unsupported document type");
   const limit = kind === "markdown" || kind === "plain" ? MAX_TEXT_DOCUMENT_BYTES : MAX_BINARY_DOCUMENT_BYTES;
 
   let handle: Awaited<ReturnType<typeof fs.open>>;
@@ -287,6 +311,7 @@ export {
 } from "./runtime-install.js";
 export {
   checkoutBranch,
+  ensureLocalGitForWorktrees,
   githubBrowserURL,
   initGit,
   parsePorcelain,
@@ -355,6 +380,9 @@ export {
 } from "./quota.js";
 
 type Rpc = Record<string, any>;
+
+/** Spec D5 invokeExtension timeout (host → agent RPC). Tests may override via options. */
+export const EXT_INVOKE_TIMEOUT_MS = 15_000;
 
 /** Mirrors the bundled runtime agent registry for the Electron settings surface. */
 const BUILT_IN_AGENT_DEFINITIONS: AgentDefinition[] = [
@@ -494,10 +522,14 @@ export type PiBackendOptions = {
   stopEscalationDelays?: StopEscalationDelays;
   /** Max wait for abort RPC ack before emitting stopped (default 1500ms). */
   abortAckTimeoutMs?: number;
+  /** Max wait for invokeExtension RPC (default 15000ms). */
+  extensionInvokeTimeoutMs?: number;
   /** Open a project folder in the OS file manager. Defaults to open/explorer/xdg-open. */
   revealPath?: (path: string) => Promise<void>;
   /** Read-only roots for other local agents. Tests inject a temp home; production uses $HOME. */
   externalSessionRoots?: ExternalSessionRoots;
+  /** Injectable registry for tests; defaults to bundled builtins. */
+  extensionRegistry?: ExtensionRegistry;
 };
 
 async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
@@ -1512,7 +1544,8 @@ export class PiHostBackend implements HostBackend {
     stopWriter: (sessionId) => this.closeQuietSessionWriter(sessionId),
   });
   private readonly planStore = new PlanStore();
-  private planRuntimeMounted: boolean | undefined;
+  private readonly extensions: ExtensionRegistry;
+  private readonly extensionLoader: ExtensionLoader;  private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
   /**
    * Per-session in-flight spawn (ensure) promises. Concurrent ensure() calls for
@@ -1627,6 +1660,7 @@ export class PiHostBackend implements HostBackend {
   private queue: SessionMessageQueue;
   private stopEscalation: StopEscalationScheduler;
   private abortAckTimeoutMs: number;
+  private extensionInvokeTimeoutMs: number;
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
   private toolBatchTelemetry: ToolBatchTelemetry;
@@ -1705,7 +1739,14 @@ export class PiHostBackend implements HostBackend {
         },
       }, options.stopEscalationDelays);
     this.abortAckTimeoutMs = options.abortAckTimeoutMs ?? 1_500;
-    this.bridge = new HostBridge({
+    this.extensionInvokeTimeoutMs = options.extensionInvokeTimeoutMs ?? EXT_INVOKE_TIMEOUT_MS;
+    this.extensions = options.extensionRegistry ?? createExtensionRegistry();
+    this.extensionLoader = new ExtensionLoader({
+      registry: this.extensions,
+      builtinRoot: join(this.runtimeRoot, "extensions"),
+      appRoot: join(this.agentDir, "extensions"),
+    });
+    this.extensionLoader.scan();    this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
       onPlanEvent: (event, sessionId) => this.planEvent(event, sessionId),
       onBrowserAction: async (event, sessionId) =>
@@ -1728,6 +1769,12 @@ export class PiHostBackend implements HostBackend {
         return result
       },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
+      onExtEmit: (input, sessionId) => {
+        const result = handleExtEmit(this.extensions, input, sessionId);
+        if (!result.ok) return result;
+        emitFrame(this.listeners, result.event as unknown as HostEvent);
+        return { ok: true as const };
+      },
     });
     if (options.authRuntime) {
       this.authRuntimePromise = Promise.resolve(options.authRuntime);
@@ -1926,6 +1973,7 @@ export class PiHostBackend implements HostBackend {
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
     const live = [...this.live.values()];
+    for (const sessionId of this.live.keys()) this.extensions.unmountSession(sessionId);
     this.live.clear();
     this.planStore.clear();
     for (const item of live) {
@@ -2487,8 +2535,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method) {
-      case "listProjects":
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension") {      case "listProjects":
         return this.listConfiguredProjects();
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
@@ -2504,7 +2551,16 @@ export class PiHostBackend implements HostBackend {
         return this.revealProject(params[0] as string);
       case "listUserMcpServers":
         return this.listUserMcpServers(params[0]);
-      case "listDocuments":
+      case "listExtensions":
+        return this.listExtensions(params[0]);
+      case "setExtensionEnabled":
+        return this.setExtensionEnabled(params[0], params[1], params[2], params[3]);
+      case "getExtensionSettings":
+        return this.getExtensionSettings(params[0], params[1]);
+      case "updateExtensionSettings":
+        return this.updateExtensionSettings(params[0], params[1], params[2]);
+      case "invokeExtension":
+        return this.invokeExtension(params[0], params[1], params[2], params[3]);      case "listDocuments":
         return this.listOpenedDocuments();
       case "readDocument":
         return readLocalDocument(params[0]);
@@ -2517,6 +2573,8 @@ export class PiHostBackend implements HostBackend {
         return undefined;
       case "notifyDocumentsDropped":
         return this.notifyDocumentsDropped(params[0], params[1]);
+      case "notifyComposerDocumentsDropped":
+        return this.notifyComposerDocumentsDropped(params[0], params[1]);
       case "listSessions": {
         const pid = params[0] as string;
         const paths = await this.loadProjectPaths();
@@ -2888,7 +2946,7 @@ export class PiHostBackend implements HostBackend {
       case "probeDirectoryGit":
         return probeGit(await this.pickedDirectory(params[0]));
       case "gitInitDirectory":
-        return initGit(await this.pickedDirectory(params[0]));
+        return ensureLocalGitForWorktrees(await this.pickedDirectory(params[0]));
       case "probeGitBinary":
         return probeGitBinary();
       case "getPlans":
@@ -2933,12 +2991,15 @@ export class PiHostBackend implements HostBackend {
     }
     return out;
   }
+  private documentInjectionOptions(source: "panel" | "composer") {
+    return { source, anydocRoot: join(this.runtimeRoot, "anydoc") };
+  }
   private async notifyDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
     const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
     this.rememberOpenedDocuments(list);
     const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
     if (!supported.length) return;
-    const injection = await buildDocumentsOpenedInjection(supported);
+    const injection = await buildDocumentsOpenedInjection(supported, this.documentInjectionOptions("panel"));
     if (!injection) return;
     if (typeof sessionId !== "string" || !sessionId.trim()) {
       console.warn("[document-drop] no active session; skip announce");
@@ -2954,6 +3015,18 @@ export class PiHostBackend implements HostBackend {
       }
     }
     this.documentInjections.setPending(id, injection, supported);
+  }
+  private async notifyComposerDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
+    const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
+    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
+    if (!supported.length) return;
+    const injection = await buildDocumentsOpenedInjection(supported, this.documentInjectionOptions("composer"));
+    if (!injection) return;
+    if (typeof sessionId !== "string" || !sessionId.trim()) {
+      console.warn("[composer-docs] no active session; skip announce");
+      return;
+    }
+    this.documentInjections.setPending(sessionId.trim(), injection, supported);
   }
   /** Configured display path: project identity, settings keys, and returned `path`. */
   private async configuredProject(projectId: string): Promise<Project> {
@@ -3391,6 +3464,7 @@ export class PiHostBackend implements HostBackend {
       ? await this.ensureIsolatedProjectHome(found.header.cwd)
       : undefined;
     const spawnCwd = isolated?.realProjectRoot ?? found.header.cwd;
+    const registeredExtensions = await this.registeredExtensionsForSpawn(spawnCwd);
     const output = assemblePiSpawn({
       sessionPath: found.path,
       sessionId: id,
@@ -3413,7 +3487,12 @@ export class PiHostBackend implements HostBackend {
         ? this.computerDescriptor
         : undefined,
       vaultDir: this.vaultDir,
+      registeredExtensions,
     });
+    this.extensions.mountSession(
+      id,
+      registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
+    );
     // close() may race a cache-first background resume before the child is
     // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
     // process or leave its session lease behind.
@@ -3490,10 +3569,18 @@ export class PiHostBackend implements HostBackend {
         this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled");
       live.compaction.dispose();
       const finish = () => {
-        if (this.live.get(id) === live) this.live.delete(id);
+        const stillCurrent = this.live.get(id) === live;
+        if (stillCurrent) this.live.delete(id);
         resolveExit();
         this.reconcileOrphanedNow(id);
-        if (!this.closed) void this.queueIdle(id, live.turnEpoch);
+        if (this.closed) return;
+        // A dead writer cannot still own the turn. Passing its (possibly
+        // stale) epoch into notifyIdle used to be ignored when the queue had
+        // minted a newer epoch, leaving FIFO parked with no process to settle.
+        // A replacement live may already own a newer turn — keep the epoch
+        // fence only in that case.
+        if (stillCurrent) void this.queueIdle(id);
+        else void this.queueIdle(id, live.turnEpoch);
       };
       // Keep the writer lease after Pi exits. Releasing here let another
       // pipiui-electron (dev:browser, a second App) steal the file while this
@@ -3830,6 +3917,7 @@ export class PiHostBackend implements HostBackend {
         content: resultText,
         images: images.length > 0 ? images : undefined,
         isError: e.isError,
+        ...toolResultDetailsField(e.result),
       });
     }
   }
@@ -3887,12 +3975,12 @@ export class PiHostBackend implements HostBackend {
     return true;
   }
   private terminalReconciliationHasPendingWork(live: Live, state: any): boolean {
-    // Host-queued user prompts are why we must settle: notifyIdle drains them.
-    // Counting them as pending work deadlocks "typed after a missed agent_settled".
+    // Host-queued user prompts and delayed subagent follow-ups are the *next*
+    // turn. Counting them as pending work deadlocks a durable assistant stop
+    // (typed-after-missed-settle, and last night's "延迟重复投递" wedge).
     const hasRunningAgent = this.sessionHasLiveAgents(live.session.id);
     return state?.pendingMessageCount !== 0
       || state?.isCompacting === true
-      || live.followUps.length > 0
       || live.pendingDrainPrompt !== undefined
       || live.compactionHoldsQueue === true
       || live.compaction.isCompacting
@@ -3978,7 +4066,8 @@ export class PiHostBackend implements HostBackend {
       }
       if (!retried) {
         console.warn(`[pipi-backend] reconcile pending still after ${TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES} retries session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
-        return;
+        // Fall through: a durable JSONL stop already closed this turn. Pi's
+        // leftover pendingMessageCount is not proof a new turn started.
       }
     }
     if (state?.isStreaming === false) {
@@ -3988,9 +4077,8 @@ export class PiHostBackend implements HostBackend {
     }
     // Pi can persist the final assistant message but omit agent_settled while
     // its in-memory isStreaming flag remains stale. Require exact durable
-    // evidence, then a short stable interval and a second authoritative state
-    // check before projecting terminal. A real queued re-entry, worker, tool
-    // continuation, compaction, or late agent_settled wins every fence.
+    // evidence, then a short stable interval. Leftover pendingMessageCount
+    // after the wait above is not a new turn — a later agent_start mints one.
     const durableFinal = await waitForLatestDurableFinalAssistant(live.path, identity);
     if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
       this.debugTerminalReconciliation(live, epoch, "durable_wait_fence", state, durableFinal);
@@ -4004,39 +4092,6 @@ export class PiHostBackend implements HostBackend {
     if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
       this.debugTerminalReconciliation(live, epoch, "stable_wait_fence", state, true);
       return;
-    }
-    try {
-      state = await this.command(live.session.id, { type: "get_state" });
-    } catch {
-      this.debugTerminalReconciliation(live, epoch, "second_state_error", undefined, true);
-      return;
-    }
-    if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
-      this.debugTerminalReconciliation(live, epoch, "second_state_fence", state, true);
-      return;
-    }
-    if (this.terminalReconciliationHasPendingWork(live, state)) {
-      this.debugTerminalReconciliation(live, epoch, "second_state_pending", state, true);
-      let retried = false;
-      for (let attempt = 0; attempt < TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES; attempt += 1) {
-        await new Promise<void>(resolve => setTimeout(resolve, TERMINAL_RECONCILIATION_PENDING_RETRY_MS));
-        if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
-          this.debugTerminalReconciliation(live, epoch, "second_state_pending_fence", state, true);
-          return;
-        }
-        try {
-          state = await this.command(live.session.id, { type: "get_state" });
-        } catch {
-          this.debugTerminalReconciliation(live, epoch, "second_state_pending_retry_error", undefined, true);
-          return;
-        }
-        if (!this.terminalReconciliationHasPendingWork(live, state)) { retried = true; break; }
-        this.debugTerminalReconciliation(live, epoch, `second_state_pending_retry_${attempt + 1}`, state, true);
-      }
-      if (!retried) {
-        console.warn(`[pipi-backend] reconcile second pending still after ${TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES} retries session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
-        return;
-      }
     }
     this.debugTerminalReconciliation(live, epoch, "durable_settle", state, true);
     this.projectTurnTerminal(live, "settled", true);
@@ -4089,7 +4144,9 @@ export class PiHostBackend implements HostBackend {
   private async checkTurnWatchdogs(): Promise<void> {
     if (this.closed) return;
     const now = Date.now();
+    const seen = new Set<string>();
     for (const live of this.live.values()) {
+      seen.add(live.session.id);
       const epoch = live.turnEpoch;
       if (epoch === undefined || live.terminalEpoch === epoch) continue;
       const active = live.lastTurnActivityAt ?? 0;
@@ -4104,6 +4161,23 @@ export class PiHostBackend implements HostBackend {
       console.warn(`[pipi-backend] turn watchdog firing session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch} idleMs=${now - active}`);
       this.projectTurnTerminal(live, "settled", true);
     }
+    // Writer already gone: the loop above never sees these. JSONL may already
+    // be a durable stop while FIFO stays turnActive (missed agent_settled, then
+    // the child exited and the epoch fence dropped the close-path idle).
+    for (const sessionId of this.queue.busySessionIds()) {
+      if (seen.has(sessionId) || this.ensureInFlight.has(sessionId)) continue;
+      const live = this.live.get(sessionId);
+      if (live && this.liveProcessUsable(live)) continue;
+      const session = this.sessionById.get(sessionId);
+      if (!session) continue;
+      const tailTerminal = await this.isSessionTailTerminal(session.path);
+      if (!tailTerminal) {
+        console.warn(`[pipi-backend] turn watchdog no tail terminal orphan-busy session=${this.projectionDebugSessionTag(sessionId)}`);
+        continue;
+      }
+      console.warn(`[pipi-backend] turn watchdog firing orphan-busy session=${this.projectionDebugSessionTag(sessionId)}`);
+      await this.queueIdle(sessionId);
+    }
   }
   private rejectPendingCommands(sessionId: string, error: Error): void {
     const live = this.live.get(sessionId);
@@ -4117,6 +4191,29 @@ export class PiHostBackend implements HostBackend {
     return new Promise<any>((resolve, reject) => {
       const req = crypto.randomUUID();
       live.pending.set(req, { resolve, reject });
+      live.process!.stdin.write(
+        JSON.stringify({ id: req, ...body }) + "\n",
+      );
+    });
+  }
+  private writeCommandWithTimeout(live: Live, body: Rpc, timeoutMs: number) {
+    return new Promise<any>((resolve, reject) => {
+      const req = crypto.randomUUID();
+      const timer = setTimeout(() => {
+        if (!live.pending.has(req)) return;
+        live.pending.delete(req);
+        reject(new Error("timeout"));
+      }, timeoutMs);
+      live.pending.set(req, {
+        resolve: (data) => {
+          clearTimeout(timer);
+          resolve(data);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
       live.process!.stdin.write(
         JSON.stringify({ id: req, ...body }) + "\n",
       );
@@ -4597,6 +4694,7 @@ export class PiHostBackend implements HostBackend {
     const paths = await this.loadProjectPaths();
     if (!paths.includes(value)) await this.saveProjectPaths([value, ...paths]);
     await this.ensureIsolatedProjectHome(value);
+    this.extensionLoader.scan(value);
     await this.loadProjectNames();
     return this.project(value);
   }
@@ -4620,7 +4718,222 @@ export class PiHostBackend implements HostBackend {
     await this.saveProjectNames(next);
     return this.project(displayPath, next);
   }
-  private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
+  private async listExtensions(projectId: unknown): Promise<ExtensionListItem[]> {
+    const projectRoot =
+      typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;
+    this.extensionLoader.scan(projectRoot);
+    return this.extensionLoader.list(await this.extensionEnableOverlay(projectId));  }
+  private async extensionEnableOverlay(projectId: unknown): Promise<Record<string, boolean>> {
+    if (typeof projectId === "string" && projectId.trim()) {
+      const root = await this.projectPath(projectId);
+      return readProjectExtensionEnabled(projectPiAgentDir(root));
+    }
+    return readAppExtensionEnabled(await this.readSettings());
+  }
+  private async setExtensionEnabled(
+    idValue: unknown,
+    enabledValue: unknown,
+    scopeValue: unknown,
+    projectIdValue: unknown,
+  ): Promise<ExtensionRecord> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    if (typeof enabledValue !== "boolean") throw new Error("enabled 必须是 boolean");
+    const scope = scopeValue as ExtensionEnableScope;
+    if (scope !== "app" && scope !== "project") throw new Error("scope 必须是 app 或 project");
+    const id = idValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) throw new Error(`unknown extension ${id}`);
+    if (current.state === "error") throw new Error(`extension ${id} is in error; not retrying`);
+    if (scope === "app") {
+      const overlay = await this.updateSettings((settings) => {
+        writeAppExtensionEnabled(settings, id, enabledValue);
+        return readAppExtensionEnabled(settings);
+      });
+      if (enabledValue) this.extensions.enable(id);
+      else this.extensions.disable(id);
+      const record = this.extensions.list(overlay).find((item) => item.id === id);
+      if (!record) throw new Error(`unknown extension ${id}`);
+      return record;
+    }
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是 string");
+    }
+    const root = await this.projectPath(projectIdValue);
+    const overlay = await writeProjectExtensionEnabled(projectPiAgentDir(root), id, enabledValue);
+    const record = this.extensions.list(overlay).find((item) => item.id === id);
+    if (!record) throw new Error(`unknown extension ${id}`);
+    return record;
+  }
+  private async resolveExtensionSettingsProject(projectId: unknown): Promise<string | undefined> {
+    if (typeof projectId === "string" && projectId.trim()) return this.projectPath(projectId);
+    const paths = await this.loadProjectPaths();
+    return paths[0];
+  }
+  private async getExtensionSettings(idValue: unknown, projectId?: unknown): Promise<Record<string, unknown>> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
+    const manifest = this.extensions.settingsManifest(id);
+    const secretKeys = secretPropertyKeys(manifest?.schema);
+    const scope = manifest?.scope ?? "app";
+    if (scope === "project") {
+      const root = await this.resolveExtensionSettingsProject(projectId);
+      if (!root) return {};
+      return readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
+    }
+    return readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
+  }
+  private async updateExtensionSettings(
+    idValue: unknown,
+    patchValue: unknown,
+    projectId?: unknown,
+  ): Promise<ExtInvokeResult<Record<string, unknown>>> {
+    if (typeof idValue !== "string" || !idValue.trim()) {
+      return settingsDenied("not_found", "extension id 必须是 string");
+    }
+    if (!isRecord(patchValue)) return settingsDenied("capability_denied", "patch 必须是 object");
+    const id = idValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) return settingsDenied("not_found", `unknown extension ${id}`);
+    if (current.state === "error") return settingsDenied("disabled", `extension ${id} is in error`);
+    const manifest = this.extensions.settingsManifest(id);
+    const validated = validateExtensionSettingsPatch(id, manifest?.schema, patchValue);
+    if (!validated.ok) return settingsDenied(validated.code, validated.message);
+    if (Object.keys(validated.secrets).length > 0) {
+      try {
+        await putExtensionSecrets(this.vaultDir, validated.secrets);
+      } catch (error) {
+        return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+      }
+    }
+    const secretKeys = secretPropertyKeys(manifest?.schema);
+    const scope = manifest?.scope ?? "app";
+    if (scope === "project") {
+      const root = await this.resolveExtensionSettingsProject(projectId);
+      if (!root) return settingsDenied("no_session", "project-scoped settings require a project");
+      const existing = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
+      const next = { ...existing, ...validated.values };
+      await writeProjectExtensionSettingsValues(projectPiAgentDir(root), id, next, manifest?.settingsVersion);
+      this.notifyExtensionSettingsChanged(id, next);      return { ok: true, data: next };
+    }
+    const next = await this.updateSettings((settings) => {
+      const existing = readAppExtensionSettingsValues(settings, id, secretKeys);
+      const merged = { ...existing, ...validated.values };
+      writeAppExtensionSettingsValues(settings, id, merged, manifest?.settingsVersion);
+      return merged;
+    });
+    this.notifyExtensionSettingsChanged(id, next);
+    return { ok: true, data: next };
+  }
+  private async mergedExtensionOverlay(projectRoot?: string): Promise<Record<string, boolean>> {
+    const app = readAppExtensionEnabled(await this.readSettings());
+    if (!projectRoot) return app;
+    const project = await readProjectExtensionEnabled(projectPiAgentDir(projectRoot));
+    return { ...app, ...project };
+  }
+  private async readExtensionSettingsSnapshot(id: string, projectRoot?: string): Promise<Record<string, unknown>> {
+    const manifest = this.extensions.settingsManifest(id);
+    const secretKeys = secretPropertyKeys(manifest?.schema);
+    const scope = manifest?.scope ?? "app";
+    if (scope === "project") {
+      if (!projectRoot) return {};
+      return readProjectExtensionSettingsValues(projectPiAgentDir(projectRoot), id, secretKeys);
+    }
+    return readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
+  }
+  private async registeredExtensionsForSpawn(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
+    this.extensionLoader.scan(projectRoot);
+    const overlay = await this.mergedExtensionOverlay(projectRoot);
+    const packages = this.extensionLoader.spawnPackages(overlay);
+    const out: SpawnRegisteredExtension[] = [];
+    for (const pkg of packages) {
+      if (!pkg.enabled || !pkg.extensionPath) {
+        out.push(pkg);
+        continue;
+      }
+      let settings: Record<string, unknown> = {};
+      try {
+        settings = await this.readExtensionSettingsSnapshot(pkg.id, projectRoot);
+      } catch {
+        settings = {};
+      }
+      out.push({ ...pkg, settings });
+    }
+    return out;
+  }
+  private notifyExtensionSettingsChanged(id: string, settings: Record<string, unknown>): void {
+    for (const [sessionId, live] of this.live) {
+      if (!this.liveProcessUsable(live) || !live.process?.stdin) continue;
+      if (!this.extensions.isMounted(sessionId, id)) continue;
+      try {
+        live.process.stdin.write(
+          JSON.stringify({
+            id: crypto.randomUUID(),
+            type: "ext.settings_changed",
+            extensionId: id,
+            settings,
+          }) + "\n",
+        );
+      } catch {
+        /* session may have exited */
+      }
+    }
+  }
+  private async invokeExtension(
+    idValue: unknown,
+    methodValue: unknown,
+    params: unknown,
+    optsValue?: unknown,
+  ): Promise<ExtInvokeResult> {
+    if (typeof idValue !== "string" || !idValue.trim()) {
+      return settingsDenied("not_found", "extension id 必须是 string");
+    }
+    if (typeof methodValue !== "string" || !methodValue.trim()) {
+      return settingsDenied("capability_denied", "method 必须是 string");
+    }
+    const id = idValue.trim();
+    const method = methodValue.trim();
+    const current = this.extensions.get(id);
+    if (!current) return settingsDenied("not_found", `unknown extension ${id}`);
+    if (current.state === "error" || current.state === "disabled") {
+      return settingsDenied("disabled", `extension ${id} is ${current.state}`);
+    }
+    let overlayEnabled = current.state === "enabled";
+    try {
+      const projectRoot = this.extensionLoader.loadedProject();
+      const overlay = await this.mergedExtensionOverlay(projectRoot);
+      overlayEnabled = this.extensions.list(overlay).find((item) => item.id === id)?.state === "enabled";
+    } catch {
+      overlayEnabled = current.state === "enabled";
+    }
+    if (!overlayEnabled) return settingsDenied("disabled", `extension ${id} is disabled`);
+    if (!this.extensions.hasCapability(id, "invoke.agent")) {
+      return settingsDenied("capability_denied", "capability_denied");
+    }
+    const sessionId =
+      isRecord(optsValue) && typeof optsValue.sessionId === "string" && optsValue.sessionId.trim()
+        ? optsValue.sessionId.trim()
+        : [...this.live.keys()].at(-1);
+    if (!sessionId) return settingsDenied("no_session", "no active session");
+    const live = this.live.get(sessionId);
+    if (!live || !this.liveProcessUsable(live)) return settingsDenied("no_session", "no active session");
+    if (!this.extensions.isMounted(sessionId, id)) {
+      return settingsDenied("capability_denied", "extension not mounted on session");
+    }
+    try {
+      const data = await this.writeCommandWithTimeout(
+        live,
+        { type: "invokeExtension", extensionId: id, method, params },
+        this.extensionInvokeTimeoutMs,
+      );
+      return { ok: true, data };
+    } catch (error) {
+      if (error instanceof Error && error.message === "timeout") {
+        return settingsDenied("timeout", "extension invoke timed out");
+      }
+      return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+    }
+  }  private async listUserMcpServers(projectId: unknown): Promise<UserMcpServer[]> {
     if (typeof projectId !== "string" || !projectId.trim()) return [];
     let root: string;
     try {

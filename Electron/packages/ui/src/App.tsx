@@ -1,12 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
-import { SubagentPanel } from './SubagentPanel'
-import { PlanPanel } from './PlanPanel'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { PlanApprovalBar } from './PlanApprovalBar'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
-import { DocumentPanel } from './DocumentPanel'
-import { consumeFileDropEvent, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
-import { TerminalPanel } from './TerminalPanel'
-import { BrowserPanel } from './BrowserPanel'
+import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
+import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
@@ -19,10 +15,6 @@ import { ProviderLogo } from './ProviderLogo'
 import { Sidebar, type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarSession, type SessionStatus } from './Sidebar'
 import { canAdoptExternalHistory, externalHistoryToMessages, externalSessionLooksAdoptable, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
 import { SlashMenu } from './SlashMenu'
-import personGroupIcon from './sf-icons/person-2.png'
-import globeIcon from './sf-icons/globe.png'
-import docTextIcon from './sf-icons/doc-text.png'
-import terminalIcon from './sf-icons/terminal.png'
 import { ThinkingChip } from './thinking-chip'
 import type { WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
@@ -34,7 +26,9 @@ import { useSessionQueue } from './useSessionQueue'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice } from './compaction-notice'
-import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
+import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, useSlashCommands, type SlashCommandDef } from './slash-commands'
+import { useDeclarativeContributionLoader } from './contribution-loader'
+import { DEFAULT_PANEL_TAB, usePanels, type PanelRailContext, type PanelTab } from './ui-registries'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
@@ -51,7 +45,6 @@ import './app.css'
 import './message-actions.css'
 import './subagent.css'
 
-type PanelTab = 'Subagents' | 'Plan' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; browserTools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
 type SessionWithSidebarMetadata = Session & { provider?: unknown; modelId?: unknown; modelRef?: unknown; model?: unknown }
@@ -75,20 +68,6 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
   return lease.holder?.holder || '另一客户端'
 }
 
-const tabs: PanelTab[] = ['Subagents', 'Plan', 'Browser', 'Document', 'Terminal']
-/** SF Symbols `checklist` traced inline: the rail masks a shape, and a two-row
- *  checklist stays legible at 13px without shipping another bitmap. */
-const checklistIcon = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 13"><g fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M.9 3.1 2.5 4.7 5.5 1.3"/><path d="M.9 9.5 2.5 11.1 5.5 7.7"/><path d="M8.2 3.3h7.9"/><path d="M8.2 9.7h7.9"/></g></svg>')}`
-/** SF Symbols parity tool-rail glyphs (Swift panelQuickRail: person.2/globe/doc.text/terminal).
- *  Rendered from system-exported SF Symbols bitmaps via CSS mask, so the icon shape matches
- *  Swift's `systemName` glyphs exactly and the color follows `currentColor` (accent when active). */
-const toolRailIcons: Record<PanelTab, { src: string; ratio: number }> = {
-  Subagents: { src: personGroupIcon, ratio: 70 / 49 },
-  Plan: { src: checklistIcon, ratio: 17 / 13 },
-  Browser: { src: globeIcon, ratio: 46 / 46 },
-  Document: { src: docTextIcon, ratio: 44 / 49 },
-  Terminal: { src: terminalIcon, ratio: 57 / 43 },
-}
 function initialBrowserToolsWidth(sidebar = 258): number {
   const viewportWidth = typeof window === 'undefined' ? 1280 : window.innerWidth
   return Math.min(920, Math.max(520, Math.round((viewportWidth - sidebar - 12) * 0.58)))
@@ -959,6 +938,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // re-ran all host effects on each composer keystroke.
   const mockHost = useRef<PipiHostAPI>()
   const host = injectedHost ?? (mockHost.current ??= createMockHost())
+  useDeclarativeContributionLoader(host)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [externalSessions, setExternalSessions] = useState<ProjectExternalSession[]>([])
@@ -1005,6 +985,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const draftsBySessionRef = useRef(new Map<string, string>())
   /** Unsent composer image attachments per session; cleared on send or when the list empties. */
   const attachmentsBySessionRef = useRef(new Map<string, ComposerAttachment[]>())
+  /** Unsent composer document chips per session; cleared on send or when the list empties. */
+  const documentsBySessionRef = useRef(new Map<string, ComposerDocument[]>())
   const [streaming, setStreaming] = useState(false)
   const [compacting, setCompacting] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
@@ -1017,7 +999,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null)
   const [stopError, setStopError] = useState<{ sessionId: string; message: string } | null>(null)
   const [lease, setLease] = useState<SessionLease | null>(null)
-  const [activeTab, setActiveTab] = useState<PanelTab>('Subagents')
+  const [activeTab, setActiveTab] = useState<PanelTab>(DEFAULT_PANEL_TAB)
   const [toolReturnTab, setToolReturnTab] = useState<PanelTab | null>(null)
   const activeTabRef = useRef(activeTab)
   activeTabRef.current = activeTab
@@ -1097,12 +1079,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const selectedHasPlans = selectedSession ? hasPlansBySession[selectedSession] === true : false
   useEffect(() => {
     if (!selectedSession) return
-    const remembered = activeTabBySessionRef.current[selectedSession] ?? 'Subagents'
+    const remembered = activeTabBySessionRef.current[selectedSession] ?? DEFAULT_PANEL_TAB
     // When the last live plan settles, drop the Plan tab and leave the page so
     // the user is not stranded on a hidden/blank Plan surface.
     if ((remembered === 'Plan' || activeTabRef.current === 'Plan') && !selectedHasPlans) {
       setToolReturnTab(current => current === 'Plan' ? null : current)
-      applyActiveTab('Subagents')
+      applyActiveTab(DEFAULT_PANEL_TAB)
       return
     }
     setActiveTab(remembered)
@@ -1175,7 +1157,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   /** Send from the empty "新会话" state creates the session first; the pending
    *  prompt is dispatched by the auto-send effect once the new session's history
    *  load and stream subscription are live (a direct sendPrompt would race them). */
-  const pendingAutoSendRef = useRef<{ sessionId: string; prompt: string; attachments?: ComposerAttachment[] } | null>(null)
+  const pendingAutoSendRef = useRef<{ sessionId: string; prompt: string; attachments?: ComposerAttachment[]; documents?: ComposerDocument[] } | null>(null)
   // Mirror of observedSessionStatuses for the history-load effect. Adding the map
   // itself to that effect's deps would re-load history on every status event.
   const observedSessionStatusesRef = useRef(observedSessionStatuses)
@@ -1867,6 +1849,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             const converted = chatImagesFromAttachments(payload)
             mutateLocalTranscript(items => items.map(message => message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
           }
+          const documentPaths = pending.documents?.map(document => document.path).filter(Boolean) ?? []
+          if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(pending.sessionId, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
           if (payload?.length) await host.sendPrompt(pending.sessionId, pending.prompt, payload)
           else await host.sendPrompt(pending.sessionId, pending.prompt)
         } catch (error) {
@@ -2215,8 +2199,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return session.id
   }
 
-  const send = async (draft: string, attachments?: ComposerAttachment[]) => {
-    const prompt = draft.trim()
+  const send = async (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => {
+    const documentPaths = documents?.map(document => document.path).filter(Boolean) ?? []
+    const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : '')
     if (!prompt && !attachments?.length) return false
     if (selectedSession && isExternalSessionId(selectedSession)) return false
     let targetSession: string | null = selectedSession
@@ -2225,7 +2210,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       // in the selected project and dispatch the prompt as soon as it is selected.
       // No lease exists yet in this state, so the write gate below must not apply.
       targetSession = await ensureSession(sessionId => {
-        pendingAutoSendRef.current = { sessionId, prompt, attachments }
+        pendingAutoSendRef.current = { sessionId, prompt, attachments, documents }
       })
       if (!targetSession) return false
       return true
@@ -2279,6 +2264,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         const converted = chatImagesFromAttachments(payload)
         mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
       }
+      if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
       const result = await sessionQueue.enqueue(prompt, payload)
       if (result.outcome === 'queued' || selectedSession !== targetSession) return true
       // Race: host dispatched directly despite busy check. Clear queued visual and open turn (bubble already exists).
@@ -2298,6 +2284,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
     beginDirectTurn()
     try {
+      if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
       const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
       if (payload?.length) patchOptimisticImages(payload)
       if (payload?.length) await host.sendPrompt(targetSession, prompt, payload)
@@ -2389,6 +2376,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSelectedSession(adopted.externalSessionId)
   }
   const completeAddProject = async (normalizedPath: string): Promise<boolean> => {
+    // Adding a folder must not silently `git init` it. Non-git projects stay
+    // plain folders; writable workers then run in the project directory.
     const snapshot = { projects, sessions, selectedProject, selectedSession }
     const name = normalizedPath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || normalizedPath
     const optimistic: Project = { id: `pending-project:${normalizedPath}`, name, path: normalizedPath }
@@ -2434,21 +2423,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!path) return false
     const normalizedPath = path.trim()
     if (!normalizedPath) return false
-    // Writable workers are isolated in git worktrees, but "init or not" is not a
-    // question a non-technical user can answer — PipiUI answers it for them:
-    // a plain folder silently gains version management before joining the
-    // sidebar. Every failure falls through to a normal add: the main session
-    // still works, only parallel writable workers would be unavailable.
-    if (host.probeDirectoryGit && host.gitInitDirectory) {
-      try {
-        const status = await host.probeDirectoryGit(normalizedPath)
-        if (!status.isRepo) {
-          try { await host.gitInitDirectory(normalizedPath) } catch { /* git missing/permission: add anyway */ }
-        }
-      } catch {
-        // A failed probe must not block adding — behave exactly like a host without one.
-      }
-    }
     return completeAddProject(normalizedPath)
   }
   const removeProject = async (projectId: string) => {
@@ -2552,9 +2526,18 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const session = sessions.find(item => item.id === sessionId)
     const external = externalSessions.find(item => item.id === sessionId)
+    const expandProjectIfSessionHidden = (projectId: string, status: SessionStatus) => {
+      setSidebarExpandedIds(current => {
+        if (current.includes(projectId)) return current
+        // Peeked working rows stay visible under a collapsed folder; don't auto-expand.
+        if (status === 'running' || status === 'subagents-running') return current
+        return [...current, projectId]
+      })
+    }
     if (session) {
       setSelectedProject(session.projectId)
-      setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
+      const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents).status
+      expandProjectIfSessionHidden(session.projectId, status)
     } else if (external) {
       setSelectedProject(external.projectId)
       setSidebarExpandedIds(current => current.includes(external.projectId) ? current : [...current, external.projectId])
@@ -2605,6 +2588,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!selectedSession) return
     if (attachments.length === 0) attachmentsBySessionRef.current.delete(selectedSession)
     else attachmentsBySessionRef.current.set(selectedSession, attachments)
+  }
+  const persistComposerDocuments = (documents: ComposerDocument[]) => {
+    if (!selectedSession) return
+    if (documents.length === 0) documentsBySessionRef.current.delete(selectedSession)
+    else documentsBySessionRef.current.set(selectedSession, documents)
   }
   // App unmount: revoke object URLs parked for every session (the Composer only
   // ever sees the selected session's attachments, so it cannot clean them all).
@@ -2739,7 +2727,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     expandTools()
   }, [expandTools, rememberToolReturn])
   const goBackTool = useCallback(() => {
-    const target = toolReturnTab ?? 'Subagents'
+    const target = toolReturnTab ?? DEFAULT_PANEL_TAB
     setToolReturnTab(null)
     applyActiveTab(target)
   }, [applyActiveTab, toolReturnTab])
@@ -2872,11 +2860,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} onSend={send} />
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
-        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
+        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
@@ -3006,21 +2994,30 @@ type ComposerAttachment = {
   file: File
 }
 
+type ComposerDocument = {
+  id: string
+  name: string
+  path: string
+}
+
 /** Shared empty list so no render allocates a fresh array for the default. */
 const EMPTY_COMPOSER_ATTACHMENTS: ComposerAttachment[] = []
+const EMPTY_COMPOSER_DOCUMENTS: ComposerDocument[] = []
 
 function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
   return fileToPromptAttachment(a.file).catch(() => { throw new Error('无法读取图片') })
 }
 
-function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, onDraftChange, onAttachmentsChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
+function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
   const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(initialAttachments)
+  const [documents, setDocuments] = useState<ComposerDocument[]>(initialDocuments)
   const [draftSessionId, setDraftSessionId] = useState(sessionId)
   if (sessionId !== draftSessionId) {
     setDraftSessionId(sessionId)
     setDraft(initialDraft)
     setAttachments(initialAttachments)
+    setDocuments(initialDocuments)
   }
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [attachError, setAttachError] = useState<string | null>(null)
@@ -3049,7 +3046,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   }, [lightboxIndex, quickOpen])
 
   const slashQuery = slashPaletteQuery(draft)
-  const slashMatches = useMemo(() => (slashQuery === null ? [] : filterSlashCommands(slashQuery)), [slashQuery])
+  const registeredSlashCommands = useSlashCommands()
+  const slashMatches = useMemo(() => (slashQuery === null ? [] : filterSlashCommands(slashQuery)), [slashQuery, registeredSlashCommands])
   const slashVisible = slashQuery !== null && !slashHidden
 
   useEffect(() => { setSlashIndex(0) }, [slashQuery])
@@ -3114,15 +3112,54 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     const files = imageFilesFromClipboard(event.clipboardData)
     if (files.length) { event.preventDefault(); setAttachError(null); addFiles(files) }
   }
-  const ignoreFileDrag = (event: DragEvent) => {
-    if (!Array.from(event.dataTransfer?.types ?? []).includes('Files')) return
-    ignoreComposerFileDrag(event)
+  const addDocuments = (paths: string[]) => {
+    if (readOnly || !paths.length) return
+    const existing = new Set(documents.map(document => document.path))
+    const accepted: ComposerDocument[] = []
+    for (const path of paths) {
+      if (existing.has(path)) continue
+      existing.add(path)
+      accepted.push({ id: crypto.randomUUID(), name: composerDocumentName(path) || path, path })
+    }
+    if (!accepted.length) return
+    const next = [...documents, ...accepted]
+    setDocuments(next)
+    onDocumentsChange?.(next)
+  }
+  const removeDocument = (id: string) => {
+    if (readOnly) return
+    const next = documents.filter(document => document.id !== id)
+    setDocuments(next)
+    onDocumentsChange?.(next)
+  }
+  const onComposerFileDrag = (event: DragEvent) => {
+    if (!fileDragHasFiles(event)) return
+    consumeFileDropEvent(event)
+  }
+  const onComposerFileDrop = (event: DragEvent) => {
+    if (!fileDragHasFiles(event)) return
+    if (readOnly) {
+      ignoreComposerFileDrag(event)
+      return
+    }
+    const getPath = typeof window !== 'undefined' ? window.pipiPathForFile : undefined
+    if (!getPath) {
+      ignoreComposerFileDrag(event)
+      return
+    }
+    const paths = supportedDocumentPathsFromFiles(event.dataTransfer?.files ?? [], getPath)
+    if (!paths.length) {
+      ignoreComposerFileDrag(event)
+      return
+    }
+    consumeFileDropEvent(event)
+    addDocuments(paths)
   }
 
   const dispatchSend = async (outgoing: string) => {
     if (readOnly) return
     const hasText = outgoing.trim() !== ''
-    if (!hasText && attachments.length === 0) return
+    if (!hasText && attachments.length === 0 && documents.length === 0) return
     if (attachments.length > 0 && modelState?.model && modelState.model.supportsImages === false) {
       // 识图路由开启且已选识图模型时放行：图片交给识图模型识别后路由给主线文字模型
       // （后端负责 describe+route，UI 只负责不拦截）。否则保持原拦截提示。
@@ -3133,19 +3170,24 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     }
     setSendError(null)
     const outgoingAttachments = attachments.slice()
+    const outgoingDocuments = documents.slice()
     // Clear immediately. sendPrompt/enqueue can sit on ensure+RPC for seconds
     // while the optimistic bubble is already visible; waiting to clear after
     // that promise leaves the same text in the composer.
     persistDraft('')
     setAttachments([])
     onAttachmentsChange?.([])
+    setDocuments([])
+    onDocumentsChange?.([])
     setAttachError(null)
     try {
-      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined)
+      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined, outgoingDocuments.length ? outgoingDocuments : undefined)
       if (!ok) {
         persistDraft(outgoing)
         setAttachments(outgoingAttachments)
         onAttachmentsChange?.(outgoingAttachments)
+        setDocuments(outgoingDocuments)
+        onDocumentsChange?.(outgoingDocuments)
         return
       }
       for (const attachment of outgoingAttachments) URL.revokeObjectURL(attachment.url)
@@ -3153,6 +3195,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       persistDraft(outgoing)
       setAttachments(outgoingAttachments)
       onAttachmentsChange?.(outgoingAttachments)
+      setDocuments(outgoingDocuments)
+      onDocumentsChange?.(outgoingDocuments)
       setSendError(`发送失败：${err instanceof Error ? err.message : String(err)}`)
     }
   }
@@ -3209,9 +3253,9 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       setSendError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`)
     }
   }
-  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0)
+  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0)
   const showQueueSubmit = queueBusy && canSend
-  return <footer className="composer" onDragEnter={ignoreFileDrag} onDragOver={ignoreFileDrag} onDrop={ignoreFileDrag}>
+  return <footer className="composer" onDragEnter={onComposerFileDrag} onDragOver={onComposerFileDrag} onDrop={onComposerFileDrop}>
     {readOnly && <div className="composer-read-only" data-testid="composer-read-only" role="status"><span>{readOnlyMessage ?? `当前由 ${leaseOwner ?? '另一客户端'} 持有，会话只读。`}</span>{onTakeover && <button type="button" data-testid="composer-lease-takeover" onClick={onTakeover}>强制接管</button>}</div>}
     {slashVisible && <SlashMenu commands={slashMatches} selectedIndex={Math.min(slashIndex, Math.max(0, slashMatches.length - 1))} onHighlight={setSlashIndex} onSelect={executeSlash} onDismiss={dismissSlash} />}
     {attachments.length > 0 && <div className="composer-thumbs" data-testid="composer-thumbs">
@@ -3222,6 +3266,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
         </div>
       ))}
     </div>}
+    {documents.length > 0 && <div className="composer-doc-chips" data-testid="composer-doc-chips">
+      {documents.map((document, index) => (
+        <div key={document.id} className="composer-doc-chip" data-testid={`composer-doc-chip-${index}`} title={document.path}>
+          <span className="composer-doc-chip-name">{document.name}</span>
+          <button className="composer-doc-chip-remove" aria-label={`移除文件 ${document.name}`} disabled={readOnly} onClick={() => removeDocument(document.id)}>×</button>
+        </div>
+      ))}
+    </div>}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
     <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) setQuickOpen(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void handleQuickSelect(model)} onClose={() => setQuickOpen(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void setThinking(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
@@ -3229,33 +3281,35 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   </footer>
 }
 function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; planTabVisible: boolean; planProgress: { completed: number; total: number } | null; subagentsRunningCount: number }) {
+  const panels = usePanels()
+  const railCtx: PanelRailContext = { host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }
   return <nav className={`tool-quick-rail tool-quick-rail-${variant}`} aria-label="工具面板" data-testid="tool-quick-rail">
-    {tabs.map(tab => {
-      if (tab === 'Plan' && !planTabVisible) return null
-      const browserUnavailable = tab === 'Browser' && (browserAvailable === false || !host.browser)
-      const terminalUnavailable = tab === 'Terminal' && (terminalAvailable === false || !host.terminal)
-      const unavailable = browserUnavailable || terminalUnavailable
-      const unavailableTitle = browserUnavailable ? '当前连接不支持内置浏览器' : '当前连接不支持终端'
-      const active = activeTab === tab && !toolsCollapsed
-      return <button key={tab} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={tab} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : tab} onClick={() => onSelect(tab)}>
-        <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * toolRailIcons[tab].ratio, WebkitMaskImage: `url(${toolRailIcons[tab].src})`, maskImage: `url(${toolRailIcons[tab].src})` }} />
-        {tab === 'Subagents' && subagentsRunningCount > 0 && <span className="tool-rail-running" aria-label={`${subagentsRunningCount} 个运行中的 subagent`}>{subagentsRunningCount}</span>}
-        {tab === 'Plan' && planProgress && <span className="tool-rail-running tool-rail-progress" data-testid="tool-rail-plan-progress" aria-label={`计划进度 ${planProgress.completed}/${planProgress.total}`}>{planProgress.completed}/{planProgress.total}</span>}
+    {panels.map(panel => {
+      if (panel.visibleInRail && !panel.visibleInRail(railCtx)) return null
+      const unavailableTitle = panel.railUnavailable?.(railCtx)
+      const unavailable = Boolean(unavailableTitle)
+      const active = activeTab === panel.id && !toolsCollapsed
+      return <button key={panel.id} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={panel.id} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : panel.id} onClick={() => onSelect(panel.id)}>
+        <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * panel.icon.ratio, WebkitMaskImage: `url(${panel.icon.src})`, maskImage: `url(${panel.icon.src})` }} />
+        {panel.railBadge?.(railCtx)}
       </button>
     })}
   </nav>
 }
 function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void; workspaceFullscreen?: boolean; onToggleWorkspaceFullscreen?: () => void }) {
+  const panels = usePanels()
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
-  const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
-  const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
-  const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
+  const [mountedIds, setMountedIds] = useState<Set<string>>(() => {
+    const initial = new Set<string>()
+    for (const panel of panels) {
+      if (!panel.lazy || panel.id === activeTab) initial.add(panel.id)
+    }
+    return initial
+  })
   const [dropActive, setDropActive] = useState(false)
   const dropDepthRef = useRef(0)
   useEffect(() => {
-    if (activeTab === 'Terminal') setTerminalMounted(true)
-    if (activeTab === 'Document') setDocumentMounted(true)
-    if (activeTab === 'Browser') setBrowserMounted(true)
+    setMountedIds(current => current.has(activeTab) ? current : new Set(current).add(activeTab))
   }, [activeTab])
   const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes('Files')
   const onDragEnter = (event: DragEvent) => {
@@ -3286,11 +3340,16 @@ function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, o
     <div className="tool-panel-drop-overlay" aria-hidden="true" />
     {!collapsed && <header className="tool-panel-header">{rail}{canGoBack && <button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button>}<div className="tool-panel-header-slot" ref={el => setHeaderSlot(el)} /><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
     <div className="tool-content">
-      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} headerSlot={headerSlot} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} onManualStatusCheck={onManualSubagentStatusCheck} /></div>
-      {planAvailable === false ? (activeTab === 'Plan' ? <div className="tool-page"><div className="empty-panel" data-testid="plan-unavailable"><b>Plan 不可用</b><p>当前连接未提供计划能力。</p></div></div> : null) : <div className="tool-page plan-content" hidden={activeTab !== 'Plan'}><PlanPanel host={host} sessionId={sessionId} visible={activeTab === 'Plan' && !collapsed} headerSlot={headerSlot} onProgressChange={onPlanProgressChange} onHasPlansChange={onHasPlansChange} /></div>}
-      {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} headerSlot={headerSlot} /></div> : null}
-      {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
-      {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} headerSlot={headerSlot} workspaceFullscreen={workspaceFullscreen} onToggleWorkspaceFullscreen={onToggleWorkspaceFullscreen} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
+      {panels.map(panel => {
+        if (panel.lazy && !mountedIds.has(panel.id) && panel.id !== activeTab) return null
+        return <Fragment key={panel.id}>{panel.render({
+          host, theme, sessionId, collapsed, active: activeTab === panel.id, headerSlot,
+          announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted,
+          onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable,
+          onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath,
+          openedDocumentPath, onOpenDocument, workspaceFullscreen, onToggleWorkspaceFullscreen,
+        })}</Fragment>
+      })}
     </div>
   </aside>
 }

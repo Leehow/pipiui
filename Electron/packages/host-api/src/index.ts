@@ -61,25 +61,44 @@ export const DOCUMENT_KIND_BY_EXTENSION = {
   ".md": "markdown",
   ".markdown": "markdown",
   ".txt": "plain",
+  ".csv": "plain",
   ".pdf": "pdf",
   ".doc": "word",
   ".docx": "word",
+  ".docm": "word",
+  ".rtf": "word",
+  ".odt": "word",
+  ".epub": "word",
   ".xls": "spreadsheet",
   ".xlsx": "spreadsheet",
+  ".xlsm": "spreadsheet",
+  ".xlsb": "spreadsheet",
+  ".ods": "spreadsheet",
   ".ppt": "presentation",
   ".pptx": "presentation",
+  ".pptm": "presentation",
+  ".pps": "presentation",
+  ".ppsx": "presentation",
+  ".ppsm": "presentation",
+  ".pot": "presentation",
+  ".odp": "presentation",
 } as const satisfies Record<string, DocumentKind>;
 export type SupportedDocumentExtension = keyof typeof DOCUMENT_KIND_BY_EXTENSION;
 export function documentKindForName(name: string): DocumentKind | null {
   const normalized = name.toLowerCase();
-  const extension = Object.keys(DOCUMENT_KIND_BY_EXTENSION).find(candidate => normalized.endsWith(candidate));
-  return extension ? DOCUMENT_KIND_BY_EXTENSION[extension as SupportedDocumentExtension] : null;
+  let matched: SupportedDocumentExtension | undefined;
+  for (const extension of Object.keys(DOCUMENT_KIND_BY_EXTENSION) as SupportedDocumentExtension[]) {
+    if (!normalized.endsWith(extension)) continue;
+    if (!matched || extension.length > matched.length) matched = extension;
+  }
+  return matched ? DOCUMENT_KIND_BY_EXTENSION[matched] : null;
 }
 export function documentsDroppedAnnouncement(paths: readonly string[]): string {
   const listed = paths.filter(path => path.trim() && documentKindForName(path)).join("、");
   return `[文档面板] 用户拖拽打开了文档：${listed}。文件在磁盘上，可读取与编辑；面板会自动刷新。`;
 }
 export const DOCUMENT_INJECTION_EXCERPT_LIMIT = 24_000;
+export type DocumentInjectionSource = "panel" | "composer";
 export type DocumentInjectionEntry = {
   path: string;
   kind?: DocumentKind | null;
@@ -92,8 +111,25 @@ function formatDocumentSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
-/** Path + readable excerpt (or a binary read hint) so the model can see an opened document. */
-export function documentsOpenedInjection(entries: readonly DocumentInjectionEntry[]): string {
+function binaryParseHint(kind: DocumentKind | null | undefined, size: string, source: DocumentInjectionSource): string {
+  if (kind === "pdf") {
+    const tool = "请用 pipiui_firecrawl_pdf 工具本地解析该绝对路径（不要用 read）。默认本地提取文字，不会上传；仅当页面需要 OCR 且已配置可选 OCR Key 时才会上传。";
+    return source === "composer"
+      ? `。${tool}`
+      : `。文件已在右侧面板打开（${kind}${size}）；${tool}打开预览本身不会解析。`;
+  }
+  const tool = "请用 pipiui_firecrawl_anydoc 工具本地解析该绝对路径（不要用 read）。转换在本地完成，不会上传。";
+  return source === "composer"
+    ? `。${tool}`
+    : `。文件已在右侧面板打开（${kind ?? "binary"}${size}）；${tool}打开预览本身不会解析。`;
+}
+/** Path + readable excerpt (or a local parse hint) so the model can see an opened document. */
+export function documentsOpenedInjection(
+  entries: readonly DocumentInjectionEntry[],
+  options?: { source?: DocumentInjectionSource },
+): string {
+  const source = options?.source === "composer" ? "composer" : "panel";
+  const opened = source === "composer" ? "[输入框] 用户附上了文档：" : "[文档面板] 用户打开了文档：";
   const blocks: string[] = [];
   for (const entry of entries) {
     const path = entry.path.trim();
@@ -101,16 +137,16 @@ export function documentsOpenedInjection(entries: readonly DocumentInjectionEntr
     const kind = entry.kind ?? documentKindForName(path);
     const excerpt = entry.excerpt?.trim();
     if (excerpt) {
-      blocks.push(`[文档面板] 用户打开了文档：${path}\n--- 文档内容 ---\n${excerpt}`);
+      blocks.push(`${opened}${path}\n--- 文档内容 ---\n${excerpt}`);
       continue;
     }
     const size = typeof entry.size === "number" ? `，约 ${formatDocumentSize(entry.size)}` : "";
     const hint = entry.binary
-      ? kind === "pdf"
-        ? `。文件已在右侧面板打开（${kind}${size}）；请用 pipiui_firecrawl_pdf 工具本地解析该绝对路径（不要用 read）。默认本地提取文字，不会上传；仅当页面需要 OCR 且已配置可选 OCR Key 时才会上传。打开预览本身不会解析。`
-        : `。文件已在右侧面板打开（${kind}${size}）；请用 read 工具读取该路径以查看正文。`
-      : `。文件在磁盘上，可读取与编辑；面板会自动刷新。`;
-    blocks.push(`[文档面板] 用户打开了文档：${path}${hint}`);
+      ? binaryParseHint(kind, size, source)
+      : source === "composer"
+        ? "。文件在磁盘上，可读取。"
+        : "。文件在磁盘上，可读取与编辑；面板会自动刷新。";
+    blocks.push(`${opened}${path}${hint}`);
   }
   return blocks.join("\n\n");
 }
@@ -185,9 +221,9 @@ export type CostUnit = "USD" | "CNY";
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
 export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;
   /**
-   * Writable isolation could not be created for this worker (e.g. the project
-   * is not a git work tree). Verbatim technical reason; the UI maps it to an
-   * actionable Chinese hint, so this stays detail, not prose.
+   * Writable isolation failed on an existing git repo (worktree add / unborn HEAD).
+   * Non-git folders do not isolate and do not set this field — workers run in
+   * the project directory. Verbatim technical reason; the UI maps it to a Chinese hint.
    */
   worktreeError?: string };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
@@ -481,7 +517,7 @@ export type StreamEvent =
   | { type: "text"; sessionId: string; contentIndex: number; delta: string; segment?: number }
   | { type: "thinking"; sessionId: string; contentIndex: number; delta: string; segment?: number }
   | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string; segment?: number }
-  | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[] }
+  | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[]; details?: unknown }
   | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[]; turnEpoch?: number }
   /**
@@ -509,6 +545,79 @@ export type StreamEvent =
   | { type: "secret_redact"; sessionId: string; messages: Array<{ id: string; role?: "user" | "assistant" | "tool" | "compaction"; content: string; thinking?: string; tools?: HistoryTool[] }> };
 export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent_log"; /** Optional only so an older host event can be ignored safely; current hosts always emit both identity fields. */ sessionId?: string; agentId: string; runId?: string; itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; /** Runtime log_delta key: cumulative full text per streamed entry, so the panel can upsert one row per contentIndex instead of one per chunk. */ contentIndex?: number; /** Uncapped thinking length; preview `text` may still be sliced. */ charCount?: number; /** Turn boundary from runtime `kind:"log"`: forget contentIndex slots so the next message's index 0 opens a new row instead of rewriting the previous thinking/text. */ resetStreamSlots?: boolean } | { type: "worktree"; status: WorktreeStatus };
 export type DocumentEvent = { type: "documentChanged"; path: string };
+/** Renderer envelope for HostEvent `channel: "ext.<id>"` (spec D4). */
+export type ExtEvent = { type: string; payload?: unknown };
+export type ExtInvokeErrorCode =
+  | "not_found"
+  | "disabled"
+  | "no_session"
+  | "capability_denied"
+  | "agent_error"
+  | "timeout";
+export type ExtInvokeResult<T = unknown> =
+  | { ok: true; data: T }
+  | { ok: false; error: { code: ExtInvokeErrorCode; message: string } };
+/** Spec D9 lifecycle. */
+export type ExtensionLifecycleState =
+  | "discovered"
+  | "loaded"
+  | "enabled"
+  | "disabled"
+  | "unloaded"
+  | "error";
+/** Spec D10 scan locations. */
+export type ExtensionSource = "builtin" | "app" | "project";
+export type ExtensionEnabledScope = "app" | "project";
+/** JSON Schema subset for D6/D8 settings forms (string/number/boolean/enum + format:secret). */
+export type ExtensionJsonSchema = {
+  type?: string;
+  title?: string;
+  description?: string;
+  default?: unknown;
+  enum?: readonly unknown[];
+  format?: string;
+  properties?: Record<string, ExtensionJsonSchema>;
+  required?: readonly string[];
+};
+/** Spec D2 `app.ui.settingsSections` — declarative; no `entry` code. */
+export type ExtensionSettingsSectionDecl = {
+  id: string;
+  title?: string;
+  description?: string;
+};
+/** Spec D2 `app.ui.slashCommands` — declarative; no custom action entry. */
+export type ExtensionSlashCommandDecl = {
+  name: string;
+  description?: string;
+};
+/** Spec D2 `app.ui.statusBar` — declarative; first-shell render may be empty. */
+export type ExtensionStatusBarDecl = {
+  id: string;
+  text?: string;
+  tooltip?: string;
+  alignment?: "left" | "right";
+};
+/** Declarative contribution metadata on an extension (spec D2/D7). No entry modules. */
+export type ExtensionContributions = {
+  settings?: {
+    scope?: ExtensionEnabledScope;
+    schema?: ExtensionJsonSchema;
+  };
+  settingsSections?: readonly ExtensionSettingsSectionDecl[];
+  slashCommands?: readonly ExtensionSlashCommandDecl[];
+  statusBar?: readonly ExtensionStatusBarDecl[];
+};
+export type ExtensionDescriptor = {
+  id: string;
+  state: ExtensionLifecycleState;
+  source: ExtensionSource;
+  enabledBy?: ExtensionEnabledScope;
+  name?: string;
+  version?: string;
+  error?: string;
+  /** Declarative app-half contributions (schema / slash / settings tabs / statusBar). */
+  contributions?: ExtensionContributions;
+};
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
@@ -516,7 +625,8 @@ export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "browser"; event: BrowserEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "session_stats"; event: SessionStatsEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "document"; event: DocumentEvent }
-  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "plan"; event: PlanEvent };
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "plan"; event: PlanEvent }
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: `ext.${string}`; event: ExtEvent };
 
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
@@ -545,6 +655,8 @@ export interface PipiHostAPI {
   subscribeDocuments?(listener: (event: DocumentEvent) => void): Unsubscribe;
   /** Open or drop: remember the documents and inject path+excerpt into the session. */
   notifyDocumentsDropped?(sessionId: string, paths: string[]): Promise<void>;
+  /** Composer chips: inject path+excerpt into the next prompt without opening the document panel. */
+  notifyComposerDocumentsDropped?(sessionId: string, paths: string[]): Promise<void>;
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
   /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
   getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
@@ -713,9 +825,10 @@ export interface PipiHostAPI {
   gitCheckout?(projectId: string, branch: string): Promise<GitStatus>;
   /**
    * Optional add-project-time probe of an arbitrary directory the user just
-   * picked in the native chooser. Hosts that advertise it let the UI warn
-   * about non-git folders before the first writable-worker dispatch fails
-   * mid-task; `gitInitDirectory` is the matching one-click remedy.
+   * picked in the native chooser. `probeDirectoryGit` only reports status.
+   * `gitInitDirectory` fills an unborn HEAD (`git init` with no commit) so
+   * local worktrees work; it does not create a repo from a plain folder and
+   * never talks to GitHub. Existing repos with HEAD are left unchanged.
    */
   probeDirectoryGit?(path: string): Promise<GitStatus>;
   gitInitDirectory?(path: string): Promise<GitStatus>;
@@ -727,13 +840,26 @@ export interface PipiHostAPI {
   listUserMcpServers?(projectId: string): Promise<UserMcpServer[]>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
   checkForUpdates?(): Promise<UpdateCenterSnapshot>;
+  /**
+   * Extension architecture M1 (optional). Backends may omit these until wired.
+   * Event channel is `ext.<id>` (spec D4); settings keys `ext.<id>.*` (spec D6).
+   */
+  subscribeExt?(extensionId: string, listener: (event: ExtEvent) => void): Unsubscribe;
+  getExtensionSettings?(id: string): Promise<Record<string, unknown>>;
+  updateExtensionSettings?(id: string, patch: Record<string, unknown>): Promise<ExtInvokeResult<Record<string, unknown>>>;
+  /** Reserved: M2 wires this to the session's pi RPC. */
+  invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
+  listExtensions?(): Promise<ExtensionDescriptor[]>;
+  setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope): Promise<ExtensionDescriptor>;
+  /** Optional: declarative contributions when they are not inlined on the descriptor. */
+  getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
   browser?: BrowserHostAPI;
   /** Optional extension; clients show an unavailable state when an old host omits it. */
   terminal?: TerminalHostAPI;
 }
 
-type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "browser" | "terminal">, "browser" | "terminal">;
+type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
@@ -772,6 +898,7 @@ function apiFrom(
     watchDocument: path => invoke("watchDocument", path),
     unwatchDocument: () => invoke("unwatchDocument"),
     notifyDocumentsDropped: (sessionId, paths) => invoke("notifyDocumentsDropped", sessionId, paths),
+    notifyComposerDocumentsDropped: (sessionId, paths) => invoke("notifyComposerDocumentsDropped", sessionId, paths),
     subscribeDocuments: listener => subscribe("document", event => event.channel === "document", event => listener((event as Extract<HostEvent, { channel: "document" }>).event)),
     newSession: (projectId, name) => invoke("newSession", projectId, name),
     resumeSession: sessionId => invoke("resumeSession", sessionId),
@@ -862,6 +989,22 @@ function apiFrom(
     revealProject: projectId => invoke("revealProject", projectId),
     listUserMcpServers: projectId => invoke("listUserMcpServers", projectId),
     checkForUpdates: () => invoke("checkForUpdates"),
+    subscribeExt: (extensionId, listener) => {
+      const channel = `ext.${extensionId}` as const;
+      return subscribe(
+        channel,
+        event => event.channel === channel,
+        event => listener((event as Extract<HostEvent, { channel: `ext.${string}` }>).event)
+      );
+    },
+    getExtensionSettings: id => invoke("getExtensionSettings", id),
+    updateExtensionSettings: (id, patch) => invoke("updateExtensionSettings", id, patch),
+    invokeExtension: (id, method, params, opts) => opts === undefined
+      ? invoke("invokeExtension", id, method, params)
+      : invoke("invokeExtension", id, method, params, opts),
+    listExtensions: () => invoke("listExtensions"),
+    setExtensionEnabled: (id, enabled, scope) => invoke("setExtensionEnabled", id, enabled, scope),
+    getExtensionContributions: id => invoke("getExtensionContributions", id),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),
       listTabs: sessionId => invoke("browserListTabs", sessionId),

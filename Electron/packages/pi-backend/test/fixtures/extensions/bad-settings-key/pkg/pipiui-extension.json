@@ -1,0 +1,18 @@
+{
+  "id": "quota-bad-key",
+  "name": "Bad Settings Key",
+  "version": "1.0.0",
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "threshold": { "type": "number" }
+        }
+      }
+    }
+  },
+  "capabilities": ["settings.read"],
+  "settingsVersion": 1
+}

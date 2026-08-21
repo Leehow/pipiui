@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assemblePiSpawn, isElectronNodeShim, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
+import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, mergedSpawnEnvironment, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
@@ -48,17 +48,25 @@ describe("firecrawl pdf extension mount", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
     expect(resolveSpawnPaths(root).firecrawlPdf).toBe(join(root, "extensions", "pipiui-firecrawl-pdf.ts"));
     expect(resolveSpawnPaths(root).pdfInspector).toBe(join(root, "pdf-inspector"));
+    expect(resolveSpawnPaths(root).firecrawlAnydoc).toBe(join(root, "extensions", "pipiui-firecrawl-anydoc.ts"));
+    expect(resolveSpawnPaths(root).anydoc).toBe(join(root, "anydoc"));
     expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector", "package.json"))).toBe(true);
     expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector-wasm", "pdf_inspector_wasm_bg.wasm"))).toBe(true);
+    expect(existsSync(join(root, "anydoc", "node_modules", "@firecrawl", "anydoc-wasm", "anydoc_wasm_bg.wasm"))).toBe(true);
   });
 
   it("exports the inspector root and NODE_PATH so the Pi child can resolve official packages", () => {
     const firecrawlPdf = "/runtime/extensions/pipiui-firecrawl-pdf.ts";
     const pdfInspector = "/runtime/pdf-inspector";
-    const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { firecrawlPdf, pdfInspector } });
+    const firecrawlAnydoc = "/runtime/extensions/pipiui-firecrawl-anydoc.ts";
+    const anydoc = "/runtime/anydoc";
+    const { env, args } = assemblePiSpawn({ cwd: "/tmp/project", paths: { firecrawlPdf, pdfInspector, firecrawlAnydoc, anydoc } });
+    expect(args).toEqual(["-e", firecrawlPdf, "-e", firecrawlAnydoc]);
     expect(env.PIPIUI_PDF_INSPECTOR_ROOT).toBe(pdfInspector);
+    expect(env.PIPIUI_ANYDOC_ROOT).toBe(anydoc);
     expect(env.NODE_PATH?.split(delimiter)).toContain(join(pdfInspector, "node_modules"));
-    expect(sanitizeEnvironment({ PIPIUI_PDF_INSPECTOR_ROOT: "/stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+    expect(env.NODE_PATH?.split(delimiter)).toContain(join(anydoc, "node_modules"));
+    expect(sanitizeEnvironment({ PIPIUI_PDF_INSPECTOR_ROOT: "/stale", PIPIUI_ANYDOC_ROOT: "/stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 });
 
@@ -521,6 +529,55 @@ describe("user-added Pi extensions", () => {
     } finally {
       await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
     }
+  });
+});
+
+describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
+  const updateCenter = "/runtime/update.ts";
+  const runtimeInfo = "/runtime/info.ts";
+  const quotaAgent = "/pkg/quota/agent/dist/index.js";
+  const offAgent = "/pkg/off/agent.js";
+  const skillRoot = "/pkg/quota/agent/skills";
+
+  it("mounts enabled agent.extension on -e and skips disabled/error", () => {
+    const { args, env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        {
+          id: "quota",
+          enabled: true,
+          extensionPath: quotaAgent,
+          skillRoots: [skillRoot],
+          settings: { "ext.quota.threshold": 80 },
+        },
+        { id: "off", enabled: false, extensionPath: offAgent },
+        { id: "broken", enabled: false },
+        { id: "my-ext", enabled: true, extensionPath: "/pkg/my-ext/agent.js", settings: { "ext.my-ext.on": true } },
+      ],
+    });
+    expect(args).toEqual([
+      "-e", quotaAgent,
+      "-e", "/pkg/my-ext/agent.js",
+      "-e", updateCenter,
+      "-e", runtimeInfo,
+    ]);
+    expect(args).not.toContain(offAgent);
+    expect(env[extensionSettingsEnvName("quota")]).toBe(JSON.stringify({ "ext.quota.threshold": 80 }));
+    expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBe(JSON.stringify({ "ext.quota.threshold": 80 }));
+    expect(env.PIPIUI_EXT_SETTINGS_MY_EXT).toBe(JSON.stringify({ "ext.my-ext.on": true }));
+    expect(env.PIPIUI_SKILL_ROOTS?.split(delimiter)).toContain(skillRoot);
+  });
+
+  it("does not leak inherited extension settings env into a spawn without mounts", () => {
+    expect(sanitizeEnvironment({
+      PIPIUI_EXT_SETTINGS_QUOTA: "{\"stale\":true}",
+      PIPIUI_SKILL_ROOTS: "/stale",
+      PATH: "/usr/bin",
+    })).toEqual({ PATH: "/usr/bin" });
+    const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter, runtimeInfo } });
+    expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBeUndefined();
+    expect(env.PIPIUI_SKILL_ROOTS).toBeUndefined();
   });
 });
 

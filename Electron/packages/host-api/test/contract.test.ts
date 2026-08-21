@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type WebSocketLike } from '../src/index.js'
+import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
@@ -810,6 +810,7 @@ describe('document drop host methods', () => {
     const unsubscribe = host.subscribeDocuments?.(event => received.push(event))
     await host.watchDocument?.('/abs/notes.md')
     await host.notifyDocumentsDropped?.('sess-1', ['/abs/notes.md'])
+    await host.notifyComposerDocumentsDropped?.('sess-1', ['/abs/form.docx'])
     await host.unwatchDocument?.()
     for (const listener of listeners) {
       listener(undefined, { type: 'event', protocolVersion: 2, channel: 'document', event: { type: 'documentChanged', path: '/abs/notes.md' } })
@@ -817,6 +818,7 @@ describe('document drop host methods', () => {
     expect(calls).toEqual([
       { method: 'watchDocument', params: ['/abs/notes.md'] },
       { method: 'notifyDocumentsDropped', params: ['sess-1', ['/abs/notes.md']] },
+      { method: 'notifyComposerDocumentsDropped', params: ['sess-1', ['/abs/form.docx']] },
       { method: 'unwatchDocument', params: [] },
     ])
     expect(received).toEqual([{ type: 'documentChanged', path: '/abs/notes.md' }])
@@ -1000,5 +1002,129 @@ describe('secret vault host contract', () => {
     expect(JSON.stringify(listed)).not.toContain('sk-live')
     await host.deleteSecretVault?.('1')
     expect(calls.map(call => call.method)).toEqual(['diagnoseSecretVault', 'listSecretVault', 'deleteSecretVault'])
+  })
+})
+
+describe('extension architecture M1 host-api contract', () => {
+  const extErrorCodes: ExtInvokeErrorCode[] = ['not_found', 'disabled', 'no_session', 'capability_denied', 'agent_error', 'timeout']
+
+  it('exports invoke envelopes, error codes, and extension descriptors', () => {
+    const ok: ExtInvokeResult<{ used: number }> = { ok: true, data: { used: 92 } }
+    const fail: ExtInvokeResult = { ok: false, error: { code: 'not_found', message: 'missing' } }
+    const contributions: ExtensionContributions = {
+      settings: {
+        scope: 'app',
+        schema: {
+          type: 'object',
+          properties: {
+            'ext.quota.threshold': { type: 'number', default: 80, title: '告警阈值（%）' },
+            'ext.quota.apiKey': { type: 'string', format: 'secret', title: '可选 API Key' },
+          },
+        },
+      },
+      settingsSections: [{ id: 'quota', title: '用量监控' }],
+      slashCommands: [{ name: 'quota', description: '查看当前用量' }],
+      statusBar: [{ id: 'quota-bar', text: '92%' }],
+    }
+    const descriptor: ExtensionDescriptor = {
+      id: 'quota',
+      state: 'enabled',
+      source: 'builtin',
+      enabledBy: 'app',
+      name: 'Quota Monitor',
+      version: '1.0.0',
+      contributions,
+    }
+    const event: ExtEvent = { type: 'warning', payload: { used: 92 } }
+    expect(ok.ok).toBe(true)
+    expect(fail.ok).toBe(false)
+    expect(extErrorCodes).toContain(fail.error.code)
+    expect(descriptor.id).toBe('quota')
+    expect(descriptor.contributions?.slashCommands?.[0]?.name).toBe('quota')
+    expect(descriptor.contributions?.settings?.schema?.properties?.['ext.quota.apiKey']?.format).toBe('secret')
+    expect(event.type).toBe('warning')
+  })
+
+  it('keeps tool_result without details valid and accepts optional details', () => {
+    const legacy: StreamEvent = { type: 'tool_result', sessionId: 's', toolCallId: 't', content: 'ok' }
+    const rich: StreamEvent = { type: 'tool_result', sessionId: 's', toolCallId: 't', content: 'ok', details: { kind: 'quota', used: 1200 } }
+    expect(legacy).not.toHaveProperty('details')
+    expect(rich.type === 'tool_result' && rich.details).toEqual({ kind: 'quota', used: 1200 })
+  })
+
+  it('parses HostEvent channels named ext.<id>', () => {
+    const parsed = parseHostWireFrame({
+      protocolVersion: 2,
+      type: 'event',
+      channel: 'ext.quota',
+      event: { type: 'warning', payload: { used: 92 } },
+    })
+    expect(parsed).toMatchObject({ ok: true, frame: { type: 'event', channel: 'ext.quota' } })
+  })
+
+  it('forwards subscribeExt on ext.<id> without mixing other channels', async () => {
+    const listeners = new Set<(event: unknown, frame: HostWireFrame) => void>()
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => ({ protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }),
+      on: (_channel, listener) => listeners.add(listener),
+      removeListener: (_channel, listener) => listeners.delete(listener),
+    }
+    const host = createIpcHost(ipc)
+    const received: ExtEvent[] = []
+    const off = host.subscribeExt?.('quota', event => received.push(event))
+    for (const listener of listeners) {
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'ext.quota', event: { type: 'warning', payload: { used: 92 } } })
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'ext.other', event: { type: 'warning', payload: { used: 1 } } })
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'stream', event: { type: 'status', sessionId: 's', status: 'started' } })
+    }
+    expect(received).toEqual([{ type: 'warning', payload: { used: 92 } }])
+    off?.()
+  })
+
+  it('passthrough-invokes optional extension methods over pipi-host:v1', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const settings = { 'ext.quota.threshold': 80 }
+    const descriptor: ExtensionDescriptor = { id: 'quota', state: 'disabled', source: 'app', enabledBy: 'project' }
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        if (request.method === 'getExtensionSettings') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: settings }
+        }
+        if (request.method === 'updateExtensionSettings' || request.method === 'invokeExtension') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { ok: true, data: settings } }
+        }
+        if (request.method === 'listExtensions') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: [descriptor] }
+        }
+        if (request.method === 'setExtensionEnabled') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { ...descriptor, state: 'enabled' } }
+        }
+        if (request.method === 'getExtensionContributions') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { slashCommands: [{ name: 'quota', description: '查看当前用量' }] } }
+        }
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+      },
+      on: () => undefined,
+      removeListener: () => undefined,
+    }
+    const host = createIpcHost(ipc)
+    await expect(host.getExtensionSettings?.('quota')).resolves.toEqual(settings)
+    await expect(host.updateExtensionSettings?.('quota', { 'ext.quota.threshold': 90 })).resolves.toEqual({ ok: true, data: settings })
+    await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 })).resolves.toEqual({ ok: true, data: settings })
+    await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' })).resolves.toEqual({ ok: true, data: settings })
+    await expect(host.listExtensions?.()).resolves.toEqual([descriptor])
+    await expect(host.setExtensionEnabled?.('quota', true, 'project')).resolves.toEqual({ ...descriptor, state: 'enabled' })
+    await expect(host.getExtensionContributions?.('quota')).resolves.toEqual({ slashCommands: [{ name: 'quota', description: '查看当前用量' }] })
+    expect(host.listProjects).toBeTypeOf('function')
+    expect(calls).toEqual([
+      { method: 'getExtensionSettings', params: ['quota'] },
+      { method: 'updateExtensionSettings', params: ['quota', { 'ext.quota.threshold': 90 }] },
+      { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }] },
+      { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' }] },
+      { method: 'listExtensions', params: [] },
+      { method: 'setExtensionEnabled', params: ['quota', true, 'project'] },
+      { method: 'getExtensionContributions', params: ['quota'] },
+    ])
   })
 })
