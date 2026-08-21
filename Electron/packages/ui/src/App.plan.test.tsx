@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { HostCapabilities, PipiHostAPI, PlanEvent, PlanSnapshot } from '@pipi/host-api'
@@ -323,6 +325,11 @@ function draftPlan(overrides: Partial<PlanSnapshot> = {}): PlanSnapshot {
 }
 
 describe('Plan approval bar in main chat', () => {
+  it('shares the Composer content width and centering contract', () => {
+    const css = readFileSync(join(import.meta.dirname, 'plan-approval-bar.css'), 'utf8')
+    expect(css).toMatch(/\.plan-approval-bar\{[^}]*width:var\(--chat-content-width,calc\(100% - 32px\)\)[^}]*max-width:var\(--chat-content-max,780px\)[^}]*margin:0 auto 8px/)
+  })
+
   it('shows 批准 when getPlans returns a live draft', async () => {
     const host: PipiHostAPI = {
       ...createMockHost(),
@@ -380,6 +387,46 @@ describe('Plan approval bar in main chat', () => {
     fireEvent.click(screen.getByTestId('plan-approval-approve'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划'))
     expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
+  })
+
+  it('dismisses only the current draft without sending and shows a new draft', async () => {
+    const plans = multicastPlans()
+    const sendPrompt = vi.fn(async () => undefined)
+    const host: PipiHostAPI = {
+      ...createMockHost(),
+      capabilities: async () => CAPABILITIES,
+      getPlans: async () => [draftPlan()],
+      subscribePlans: plans.subscribePlans,
+      sendPrompt,
+    }
+    render(<App host={host} />)
+    await screen.findByTestId('plan-approval-bar')
+    await waitFor(() => expect(plans.attached).toBe(true))
+
+    const dismiss = screen.getByRole('button', { name: '关闭计划批准提示' })
+    expect(dismiss.getAttribute('title')).toBe('关闭计划批准提示')
+    expect(dismiss).toBe(screen.getByTestId('plan-approval-dismiss'))
+    fireEvent.click(dismiss)
+
+    expect(sendPrompt).not.toHaveBeenCalled()
+    expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
+
+    act(() => plans.emit({
+      type: 'plan',
+      sessionId: 'welcome',
+      kind: 'plan_publish',
+      plan: draftPlan({
+        id: 'plan-draft-next',
+        title: '新的待确认计划',
+        createdAt: '2026-08-18T02:00:00.000Z',
+        updatedAt: '2026-08-18T02:04:00.000Z',
+      }),
+    }))
+
+    const next = await screen.findByTestId('plan-approval-bar')
+    expect(next.getAttribute('data-plan-id')).toBe('plan-draft-next')
+    expect(next.textContent).toContain('新的待确认计划')
+    expect(sendPrompt).not.toHaveBeenCalled()
   })
 
   it('hides the bar when subscribePlans flips draft to approved', async () => {

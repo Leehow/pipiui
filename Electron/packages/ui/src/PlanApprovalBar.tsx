@@ -69,6 +69,16 @@ export function PlanApprovalBar({
         >
           批准
         </button>
+        <button
+          type="button"
+          className="plan-approval-bar-dismiss"
+          aria-label="关闭计划批准提示"
+          title="关闭计划批准提示"
+          data-testid="plan-approval-dismiss"
+          onClick={() => setDismissedPlanId(draft.id)}
+        >
+          ×
+        </button>
       </div>
     </div>
   )
