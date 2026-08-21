@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Canonical Grok Build OAuth + Image extension (M2 Pi-native OAuth, no Images transport)",
+  "description": "Canonical Grok Build OAuth + Image extension (M4 Images transport over M3 Credential Broker / M2 Pi-native OAuth)",
   "exports": {
     "./package.json": "./package.json"
   },

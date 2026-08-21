@@ -6,7 +6,15 @@ import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.j
 import { toOAuthCredentials } from "./oauth/credentials.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok } from "./oauth/import.js";
-import { createBroker } from "./oauth/broker.js";
+import { createBroker, type GrokCredentialBroker } from "./oauth/broker.js";
+import {
+  ImagesClient,
+  resolveImageReference,
+} from "./images/client.js";
+import { ImagesError, TIER_RESTRICTED_UPSELL } from "./images/errors.js";
+import { resolveImagesConfig, legacyRelayBase } from "./images/config.js";
+import { isRestrictedTier } from "./images/tier.js";
+import { SessionImageWriter } from "./images/storage.js";
 
 const EXTENSION_ID = "grok-build-oauth";
 const BRIDGE_PORT = process.env.PIPIUI_BRIDGE_PORT;
@@ -256,44 +264,229 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  // M3: image_gen shares the same broker API as provider requests (early refresh, 401 single retry, redaction)
+  // ── M4: image_gen / image_edit — official Grok Build wire contract ─────
+  // POST {base}/images/generations | /images/edits; model grok-imagine-image-quality,
+  // n=1, resolution 1k, b64_json strict decode, x-grok-session-id header.
+  // OAuth (via M3 broker: early refresh + 401 single retry) and explicit
+  // XAI_API_KEY share this exact client; only Authorization differs.
+
+  type ImageAuth =
+    | { kind: "oauth"; broker: GrokCredentialBroker }
+    | { kind: "api_key"; key: string };
+
+  async function resolveImageAuth(signal?: AbortSignal): Promise<ImageAuth> {
+    const broker = getBroker(signal);
+    if (await broker.hasCredential()) return { kind: "oauth", broker };
+    const key = process.env.XAI_API_KEY?.trim();
+    if (key) return { kind: "api_key", key };
+    throw new ImagesError(
+      "auth_expired",
+      "未登录 — 请先执行 /login grok-build 或设置 XAI_API_KEY",
+    );
+  }
+
+  type ImageOp =
+    | { kind: "gen"; prompt: string; aspectRatio?: string }
+    | { kind: "edit"; prompt: string; aspectRatio?: string; refs: string[] };
+
+  type ImageToolDetails = {
+    path?: string;
+    mime?: string;
+    backend: string;
+    model?: string;
+    code?: string;
+    deprecated?: boolean;
+  };
+  type ImageToolResult = {
+    content: { type: "text"; text: string }[];
+    details: ImageToolDetails;
+  };
+
+  async function runImageOp(op: ImageOp, signal?: AbortSignal): Promise<ImageToolResult> {
+    const cfg = resolveImagesConfig();
+    let auth: ImageAuth;
+    try {
+      auth = await resolveImageAuth(signal);
+    } catch (err) {
+      // Deprecated PipiUI loopback relay — only when compatFallback=true
+      // and no OAuth/API-key credential is present (spec §D6 / US-27).
+      if (err instanceof ImagesError && err.code === "auth_expired" && cfg.compatFallback) {
+        return runLegacyRelay(op, signal);
+      }
+      throw err;
+    }
+
+    // Client-side advisory tier gate — OAuth callers only; API-key callers
+    // are never gated. Server remains the final authority (US-22/US-23).
+    if (auth.kind === "oauth" && isRestrictedTier(cfg.tier)) {
+      await emit("image_gen.gated", { code: "tier_restricted", backend: "grok-build" });
+      return {
+        content: [{ type: "text" as const, text: TIER_RESTRICTED_UPSELL }],
+        details: { code: "tier_restricted", backend: "grok-build" },
+      };
+    }
+
+    // Resolve edit references (data URLs / safe file paths) before any HTTP.
+    const dataUrls: string[] = [];
+    if (op.kind === "edit") {
+      for (const ref of op.refs) dataUrls.push(await resolveImageReference(ref));
+    }
+
+    const client = new ImagesClient({
+      baseUrl: cfg.baseUrl,
+      model: cfg.model,
+      editModel: cfg.editModel,
+      sessionId: cfg.sessionId,
+      fetchImpl: fetch as unknown as typeof fetch,
+    });
+    const writer = new SessionImageWriter();
+    const model = op.kind === "gen" ? client.model : client.editModel;
+
+    const requestOnce = async (bearer: string) => {
+      const result =
+        op.kind === "gen"
+          ? await client.generate({ prompt: op.prompt, aspectRatio: op.aspectRatio, bearer, signal })
+          : await client.edit({ prompt: op.prompt, images: dataUrls, aspectRatio: op.aspectRatio, bearer, signal });
+      const saved = await writer.save(result.bytes, { signal });
+      return saved;
+    };
+
+    // OAuth path: broker handles early refresh + single forced refresh on 401.
+    // API-key path: same client/payload, no refresh, never tier-gated.
+    const saved =
+      auth.kind === "oauth"
+        ? await auth.broker.with401Retry(requestOnce, signal)
+        : await requestOnce(auth.key);
+
+    await emit("image_gen.saved", {
+      path: saved.path,
+      mime: saved.mime,
+      backend: "grok-build",
+      model,
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${op.kind === "gen" ? "图像已生成" : "图像已编辑"}: ${saved.path}`,
+        },
+      ],
+      details: { path: saved.path, mime: saved.mime, backend: "grok-build", model },
+    };
+  }
+
+  /** Deprecated compat fallback: legacy PipiUI loopback relay (default off). */
+  async function runLegacyRelay(op: ImageOp, signal?: AbortSignal): Promise<ImageToolResult> {
+    const relay = legacyRelayBase();
+    await emit("compat_fallback", { deprecated: true, relay: true });
+    const cfg = resolveImagesConfig();
+    const suffix = op.kind === "edit" ? "/images/edits" : "/images/generations";
+    const body: Record<string, unknown> = {
+      model: cfg.model,
+      prompt: op.prompt,
+      n: 1,
+      response_format: "b64_json",
+    };
+    if (op.aspectRatio) body.aspect_ratio = op.aspectRatio;
+    if (op.kind === "edit") {
+      const urls: string[] = [];
+      for (const ref of op.refs) urls.push(await resolveImageReference(ref));
+      if (urls.length === 1) body.image = { url: urls[0] };
+      else {
+        body.images = urls.map((url) => ({ url }));
+        body.aspect_ratio = op.aspectRatio ?? "auto";
+      }
+    }
+    const res = await fetch(`${relay.replace(/\/+$/, "")}${suffix}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local" },
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) {
+      const text = [...(await res.text().catch(() => ""))].slice(0, 200).join("");
+      throw new ImagesError("upstream_error", `兼容 relay 请求失败 HTTP ${res.status}: ${text}`, res.status);
+    }
+    const json = (await res.json().catch(() => null)) as { data?: Array<{ b64_json?: string }> } | null;
+    const b64 = json?.data?.[0]?.b64_json;
+    if (typeof b64 !== "string" || !b64.trim()) {
+      throw new ImagesError("invalid_response", "兼容 relay 响应缺少 b64_json 图像数据");
+    }
+    const { decodeBase64Strict } = await import("./images/client.js");
+    const saved = await new SessionImageWriter().save(decodeBase64Strict(b64), { signal });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `图像已生成（deprecated 兼容 relay）: ${saved.path}`,
+        },
+      ],
+      details: {
+        path: saved.path,
+        mime: saved.mime,
+        backend: "grok-build-relay",
+        model: cfg.model,
+        deprecated: true,
+      },
+    };
+  }
+
   pi.registerTool({
     name: "image_gen",
-    label: "Grok Build image_gen (OAuth via broker, image transport pending)",
-    description: "Placeholder — image generation ships after OAuth phases; broker validates auth.",
+    label: "Grok Build image_gen",
+    description:
+      "Generate a new image from a text description using xAI Grok Imagine; returns the saved image's absolute path under the session attachments directory. When telling the user where it was saved, refer to the short path. To produce multiple images, emit multiple tool calls with distinct prompts.",
     parameters: {
       type: "object",
       properties: {
-        prompt: { type: "string", description: "Image prompt" },
-        aspect_ratio: { type: "string", description: "Aspect ratio (e.g. 16:9, auto)" },
+        prompt: { type: "string", description: "Text description of the image to generate." },
+        aspect_ratio: {
+          type: "string",
+          description:
+            "Aspect ratio. Defaults to 'auto'. Supported: 1:1, 16:9, 9:16, 4:3, 3:4, 3:2, 2:3, 2:1, 1:2, 19.5:9, 9:19.5, 20:9, 9:20, auto.",
+        },
       },
       required: ["prompt"],
       additionalProperties: false,
     },
     async execute(_toolCallId, params, signal) {
-      // Broker ensures early refresh before any image request; never logs token
-      const broker = getBroker(signal);
-      let tokenPreview = "none";
-      try {
-        const token = await broker.getAccessToken(signal);
-        tokenPreview = "[redacted]";
-        void token;
-      } catch (err) {
-        const msg = err instanceof Error ? redactMessage(err.message, []) : String(err);
-        // still proceed to placeholder but mark auth state
-        tokenPreview = msg.includes("Not logged") ? "not_logged_in" : "refresh_failed";
-      }
-      const payload = {
-        message: "grok-build-oauth M3 — broker ready; image_gen transport ships next phase",
-        params,
-        settings: settingsSnapshot(),
-        broker: { tokenPreview, earlyRefreshSec: resolveOAuthConfig().earlyRefreshSec },
-      };
-      await emit("skeleton.image_gen", payload);
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(payload) }],
-        details: payload,
-      };
+      const p = params as { prompt: string; aspect_ratio?: string };
+      return runImageOp({ kind: "gen", prompt: p.prompt, aspectRatio: p.aspect_ratio }, signal);
+    },
+  });
+
+  pi.registerTool({
+    name: "image_edit",
+    label: "Grok Build image_edit",
+    description:
+      "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Each `image` entry is a `data:image/...;base64,...` URL or a filesystem path to a JPEG/PNG ≤400KB. Returns the saved image's absolute path.",
+    parameters: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description: "A text description of the desired edit or transformation.",
+        },
+        image: {
+          type: "array",
+          items: { type: "string" },
+          description: "Reference image(s): data:image/...;base64,... URLs or filesystem paths.",
+        },
+        aspect_ratio: {
+          type: "string",
+          description:
+            "Output aspect ratio. Ignored for single-image edits (output matches input). Defaults to 'auto'.",
+        },
+      },
+      required: ["prompt", "image"],
+      additionalProperties: false,
+    },
+    async execute(_toolCallId, params, signal) {
+      const p = params as { prompt: string; image: string[]; aspect_ratio?: string };
+      return runImageOp(
+        { kind: "edit", prompt: p.prompt, aspectRatio: p.aspect_ratio, refs: p.image ?? [] },
+        signal,
+      );
     },
   });
 }

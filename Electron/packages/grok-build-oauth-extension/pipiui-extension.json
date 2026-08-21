@@ -58,6 +58,10 @@
             "type": "string",
             "title": "Stable x-grok-session-id (auto-generated if empty)"
           },
+          "ext.grok-build-oauth.tier": {
+            "type": "string",
+            "title": "Subscription tier (advisory gate only; server is authoritative)"
+          },
           "ext.grok-build-oauth.accessToken": {
             "type": "string",
             "format": "secret",

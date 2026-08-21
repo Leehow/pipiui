@@ -417,6 +417,11 @@ export class GrokCredentialBroker {
     }
   }
 
+  /** Whether a grok-build OAuth credential is currently persisted (no network). */
+  async hasCredential(): Promise<boolean> {
+    return (await this.readCredential()) !== undefined;
+  }
+
   /** For tests: expose read */
   async _readForTest(): Promise<BrokerCredential | undefined> { return this.readCredential(); }
   async _writeForTest(cred: BrokerCredential | undefined): Promise<void> { return this.writeCredential(cred); }
