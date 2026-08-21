@@ -252,7 +252,16 @@ describe("vendored philosophy: delivery", () => {
     // them — it is the one that forwards a findings path into the next brief and the only
     // writer of shared context. A worker told to read a document nobody points it at reads
     // nothing, so this rule cannot be pushed down into the agent definitions.
+    // Raised again (~200) for the recon-tier rule in 9bd33dd3: recon runs on the cheaper
+    // `explore` model, so a repo-wide sweep performed inside `general-purpose` is the most
+    // expensive time in the system. Only the boss picks the agent, so only the boss can be
+    // told; one avoided implementer-priced sweep returns this raise many times over.
+    //
+    // This ledger has run 11500 → 15600 in seven raises, every one of them justified in
+    // isolation. A cap that only ratchets up measures growth instead of bounding it, so the
+    // next raise should be preceded by a compression pass over the whole prefix rather than
+    // another entry here.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(15400);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(15600);
   });
 });
