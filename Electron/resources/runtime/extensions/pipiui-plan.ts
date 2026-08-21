@@ -156,6 +156,12 @@ function requireActivePlan(store: Store, planId: string): { ok: true; plan: Plan
   return { ok: true, plan };
 }
 
+/** Match the stronger reducer lifecycle: only cancelled or fully completed/skipped plans are terminal. */
+function isPlanTerminal(plan: PlanSnapshot): boolean {
+  return plan.lifecycle === "cancelled"
+    || (plan.tasks.length > 0 && plan.tasks.every((task) => task.state === "completed" || task.state === "skipped"));
+}
+
 export async function publishPlan(
   cwd: string,
   input: { id: string; title: string; tasks: Array<{ id: string; title: string; state?: string }> },
@@ -165,6 +171,10 @@ export async function publishPlan(
   if (!Array.isArray(input.tasks) || input.tasks.length === 0) return { ok: false, error: "plan.tasks must be a non-empty array" };
   const store = loadStore(cwd);
   if (store.plans[input.id]) return { ok: false, error: `duplicate plan id "${input.id}"` };
+  const activePlan = store.activePlanId ? store.plans[store.activePlanId] : undefined;
+  if (activePlan && !isPlanTerminal(activePlan)) {
+    return { ok: false, error: "active plan in progress; finish it before publishing a new plan" };
+  }
   const tasks: PlanTask[] = [];
   for (const task of input.tasks) {
     if (!task?.id?.trim() || !task.title?.trim()) return { ok: false, error: "each task needs id and title" };
