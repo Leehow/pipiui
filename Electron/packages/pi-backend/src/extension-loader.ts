@@ -31,6 +31,8 @@ export type ExtensionListItem = ExtensionRecord & {
   source: ExtensionOrigin;
   capabilities: readonly string[];
   ui?: ExtensionUiSummary;
+  /** Package install directory; app-half `entry` paths resolve against this. */
+  directory?: string;
 };
 
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git", ".DS_Store"]);
@@ -346,6 +348,8 @@ export class ExtensionLoader {
       capabilities,
     };
     if (ui) item.ui = ui;
+    const directory = this.directories.get(record.id);
+    if (directory) item.directory = directory;
     return item;
   }
 }

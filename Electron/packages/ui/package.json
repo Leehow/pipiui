@@ -40,6 +40,7 @@
     "@file-viewer/react": "^2.2.8",
     "@lobehub/icons-static-svg": "^1.94.0",
     "@pipi/host-api": "file:../host-api",
+    "@pipiui/extension-api": "file:../extension-api",
     "@streamdown/code": "^1.1.1",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",

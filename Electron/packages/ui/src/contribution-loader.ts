@@ -1,6 +1,12 @@
 import { createElement, useEffect } from 'react'
 import type { ExtensionContributions, ExtensionDescriptor, PipiHostAPI } from '@pipi/host-api'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
+import {
+  hasControlledEntry,
+  loadControlledContributions,
+  settingsSectionHasEntry,
+  type LoadableExtensionDescriptor,
+} from './controlled-component-loader'
 import type { Disposer } from './contribution-registry'
 import { SchemaSettingsForm } from './schema-settings-form'
 import { registerSlashCommand } from './slash-commands'
@@ -8,9 +14,11 @@ import { subscribeExt } from './subscribe-ext'
 import { registerSettingsSection, registerStatusBarItem } from './ui-registries'
 
 const loaded = new Map<string, Disposer[]>()
+const controlledLoaded = new Set<string>()
 
 function unloadDeclarative(extId: string): void {
   const disposers = loaded.get(extId)
+  controlledLoaded.delete(extId)
   if (!disposers) return
   loaded.delete(extId)
   for (const dispose of disposers) dispose()
@@ -21,15 +29,32 @@ export function resetDeclarativeContributions(): void {
   for (const extId of [...loaded.keys()]) unloadDeclarative(extId)
 }
 
+function uniqueBy<T>(items: readonly T[], key: (item: T) => string | undefined): T[] {
+  const seen = new Set<string>()
+  const out: T[] = []
+  for (const item of items) {
+    const id = key(item)
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(item)
+  }
+  return out
+}
+
 function loadDeclarative(descriptor: ExtensionDescriptor): void {
   if (descriptor.id === BUILTIN_EXTENSION_ID) return
   if (loaded.has(descriptor.id)) return
   const contrib = descriptor.contributions
+  const ui = (descriptor as LoadableExtensionDescriptor).ui
   const disposers: Disposer[] = []
   const schema = contrib?.settings?.schema
 
-  for (const section of contrib?.settingsSections ?? []) {
-    if (!section.id) continue
+  const settingsSections = uniqueBy(
+    [...(ui?.settingsSections ?? []), ...(contrib?.settingsSections ?? [])],
+    section => section.id,
+  )
+  for (const section of settingsSections) {
+    if (!section.id || settingsSectionHasEntry(section)) continue
     const title = section.title ?? section.id
     disposers.push(registerSettingsSection(descriptor.id, {
       id: section.id,
@@ -44,7 +69,7 @@ function loadDeclarative(descriptor: ExtensionDescriptor): void {
     }))
   }
 
-  for (const command of contrib?.slashCommands ?? []) {
+  for (const command of contrib?.slashCommands ?? ui?.slashCommands ?? []) {
     if (!command.name) continue
     disposers.push(registerSlashCommand(descriptor.id, {
       name: command.name,
@@ -53,7 +78,7 @@ function loadDeclarative(descriptor: ExtensionDescriptor): void {
     }))
   }
 
-  for (const item of contrib?.statusBar ?? []) {
+  for (const item of contrib?.statusBar ?? ui?.statusBar ?? []) {
     if (!item.id) continue
     disposers.push(registerStatusBarItem(descriptor.id, {
       id: item.id,
@@ -63,8 +88,26 @@ function loadDeclarative(descriptor: ExtensionDescriptor): void {
     }))
   }
 
-  // Panels with or without entry are M3 — do not register a rail tab here.
   loaded.set(descriptor.id, disposers)
+}
+
+async function loadControlled(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI): Promise<void> {
+  if (descriptor.id === BUILTIN_EXTENSION_ID) return
+  if (controlledLoaded.has(descriptor.id)) return
+  if (!hasControlledEntry(descriptor)) return
+  const bucket = loaded.get(descriptor.id)
+  if (!bucket) return
+  controlledLoaded.add(descriptor.id)
+  try {
+    const extra = await loadControlledContributions(descriptor, host)
+    if (!loaded.has(descriptor.id) || !controlledLoaded.has(descriptor.id)) {
+      for (const dispose of extra) dispose()
+      return
+    }
+    bucket.push(...extra)
+  } catch {
+    controlledLoaded.delete(descriptor.id)
+  }
 }
 
 function isEnabled(descriptor: ExtensionDescriptor): boolean {
@@ -82,6 +125,16 @@ export function syncDeclarativeContributions(descriptors: readonly ExtensionDesc
     if (!wanted.has(extId)) unloadDeclarative(extId)
   }
   for (const descriptor of enabled) loadDeclarative(descriptor)
+}
+
+/** L0 declarative + M3 controlled entries. Disable/unload disposes the whole group. */
+export async function syncExtensionContributions(
+  descriptors: readonly ExtensionDescriptor[],
+  host: PipiHostAPI,
+): Promise<void> {
+  syncDeclarativeContributions(descriptors)
+  const enabled = descriptors.filter(descriptor => isEnabled(descriptor) && descriptor.id !== BUILTIN_EXTENSION_ID)
+  await Promise.all(enabled.map(descriptor => loadControlled(descriptor as LoadableExtensionDescriptor, host)))
 }
 
 async function resolveContributions(
@@ -115,7 +168,7 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined):
       if (cancelled) return
       const resolved = await Promise.all(list.map(descriptor => resolveContributions(host, descriptor)))
       if (cancelled) return
-      syncDeclarativeContributions(resolved)
+      await syncExtensionContributions(resolved, host)
       for (const descriptor of list) {
         if (subscribed.has(descriptor.id)) continue
         subscribed.add(descriptor.id)

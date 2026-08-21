@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
+import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtUiEvent, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
@@ -1078,6 +1078,40 @@ describe('extension architecture M1 host-api contract', () => {
       listener(undefined, { type: 'event', protocolVersion: 2, channel: 'stream', event: { type: 'status', sessionId: 's', status: 'started' } })
     }
     expect(received).toEqual([{ type: 'warning', payload: { used: 92 } }])
+    off?.()
+  })
+
+  it('parses HostEvent channel extui', () => {
+    const parsed = parseHostWireFrame({
+      protocolVersion: 2,
+      type: 'event',
+      channel: 'extui',
+      event: { type: 'request', sessionId: 's1', requestId: 'r1', kind: 'notify', payload: { message: 'hi' } },
+    })
+    expect(parsed).toMatchObject({ ok: true, frame: { type: 'event', channel: 'extui' } })
+  })
+
+  it('forwards subscribeExtUi on extui and invokes extensionUiResponse', async () => {
+    const listeners = new Set<(event: unknown, frame: HostWireFrame) => void>()
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: undefined }
+      },
+      on: (_channel, listener) => listeners.add(listener),
+      removeListener: (_channel, listener) => listeners.delete(listener),
+    }
+    const host = createIpcHost(ipc)
+    const received: ExtUiEvent[] = []
+    const off = host.subscribeExtUi?.(event => received.push(event))
+    for (const listener of listeners) {
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'extui', event: { type: 'request', sessionId: 's1', requestId: 'r1', kind: 'confirm' } })
+      listener(undefined, { type: 'event', protocolVersion: 2, channel: 'ext.quota', event: { type: 'warning' } })
+    }
+    expect(received).toEqual([{ type: 'request', sessionId: 's1', requestId: 'r1', kind: 'confirm' }])
+    await host.extensionUiResponse?.('s1', 'r1', { confirmed: true })
+    expect(calls).toEqual([{ method: 'extensionUiResponse', params: ['s1', 'r1', { confirmed: true }] }])
     off?.()
   })
 

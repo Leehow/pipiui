@@ -1,4 +1,8 @@
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
+
+const here = dirname(fileURLToPath(import.meta.url))
 
 // The pi-backend integration tests spawn a real fake-pi child (a node process)
 // per sendPrompt; on a busy machine a single test legitimately runs 3-5s. The
@@ -6,6 +10,11 @@ import { defineConfig } from 'vitest/config'
 // run, so every suite gets headroom here. `packages/pi-backend/vitest.config.ts`
 // mirrors this for runs started inside that package.
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@pipiui/extension-api': resolve(here, 'packages/extension-api/src/index.ts'),
+    },
+  },
   test: {
     // `.pi/worktrees` / `.worktrees` hold live in-app agent worktrees: their
     // copied test files must never run from this workspace (positional file

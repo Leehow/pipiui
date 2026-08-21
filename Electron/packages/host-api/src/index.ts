@@ -547,6 +547,11 @@ export type AgentEvent = { type: "agent"; agent: AgentSummary } | { type: "agent
 export type DocumentEvent = { type: "documentChanged"; path: string };
 /** Renderer envelope for HostEvent `channel: "ext.<id>"` (spec D4). */
 export type ExtEvent = { type: string; payload?: unknown };
+/** Official pi UI hooks on HostEvent `channel: "extui"` (spec D12). Parallel to `ext.emit`. */
+export type ExtUiEvent =
+  | { type: "request"; sessionId: string; requestId: string; kind: string; payload?: unknown }
+  | { type: "cancel"; sessionId: string; requestId: string; reason?: "timeout" | "aborted" };
+export type ExtUiResponse = { value?: unknown; confirmed?: boolean; cancelled?: boolean };
 export type ExtInvokeErrorCode =
   | "not_found"
   | "disabled"
@@ -626,7 +631,8 @@ export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "session_stats"; event: SessionStatsEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "document"; event: DocumentEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "plan"; event: PlanEvent }
-  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: `ext.${string}`; event: ExtEvent };
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: `ext.${string}`; event: ExtEvent }
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "extui"; event: ExtUiEvent };
 
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
@@ -845,6 +851,9 @@ export interface PipiHostAPI {
    * Event channel is `ext.<id>` (spec D4); settings keys `ext.<id>.*` (spec D6).
    */
   subscribeExt?(extensionId: string, listener: (event: ExtEvent) => void): Unsubscribe;
+  /** Official pi `extension_ui_*` channel (spec D12). Older hosts may omit it. */
+  subscribeExtUi?(listener: (event: ExtUiEvent) => void): Unsubscribe;
+  extensionUiResponse?(sessionId: string, requestId: string, response: ExtUiResponse): Promise<void>;
   getExtensionSettings?(id: string): Promise<Record<string, unknown>>;
   updateExtensionSettings?(id: string, patch: Record<string, unknown>): Promise<ExtInvokeResult<Record<string, unknown>>>;
   /** Reserved: M2 wires this to the session's pi RPC. */
@@ -859,7 +868,7 @@ export interface PipiHostAPI {
   terminal?: TerminalHostAPI;
 }
 
-type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "browser" | "terminal">, "browser" | "terminal">;
+type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "subscribeExtUi" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
@@ -997,6 +1006,12 @@ function apiFrom(
         event => listener((event as Extract<HostEvent, { channel: `ext.${string}` }>).event)
       );
     },
+    subscribeExtUi: listener => subscribe(
+      "extui",
+      event => event.channel === "extui",
+      event => listener((event as Extract<HostEvent, { channel: "extui" }>).event),
+    ),
+    extensionUiResponse: (sessionId, requestId, response) => invoke("extensionUiResponse", sessionId, requestId, response),
     getExtensionSettings: id => invoke("getExtensionSettings", id),
     updateExtensionSettings: (id, patch) => invoke("updateExtensionSettings", id, patch),
     invokeExtension: (id, method, params, opts) => opts === undefined

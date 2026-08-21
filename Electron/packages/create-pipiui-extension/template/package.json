@@ -1,0 +1,14 @@
+{
+  "name": "__ID__",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@pipiui/extension-api": "*",
+    "typescript": "^5.6.3"
+  }
+}

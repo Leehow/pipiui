@@ -8,7 +8,8 @@
     "outDir": "dist",
     "baseUrl": ".",
     "paths": {
-      "@pipi/host-api": ["../host-api/dist/index.d.ts"]
+      "@pipi/host-api": ["../host-api/dist/index.d.ts"],
+      "@pipiui/extension-api": ["../extension-api/src/index.ts"]
     }
   },
   "include": ["src"]

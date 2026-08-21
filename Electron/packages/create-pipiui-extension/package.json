@@ -1,0 +1,19 @@
+{
+  "name": "create-pipiui-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "create-pipiui-extension": "./src/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/cli.mjs"
+  },
+  "files": [
+    "src",
+    "template"
+  ],
+  "scripts": {
+    "test": "vitest run"
+  }
+}

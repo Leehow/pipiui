@@ -6,6 +6,7 @@ import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
+import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
@@ -2872,6 +2873,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       void host.browser.newTab(selectedSession, { url }).then(() => navigateTool('Browser')).catch(() => undefined)
     }} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
+    <ExtensionUiHost host={host} sessionId={selectedSession || undefined} />
   </main>
 }
 

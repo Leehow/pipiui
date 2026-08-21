@@ -1,0 +1,54 @@
+{
+  // Spec D2: stable id, [a-z][a-z0-9-]*. Host refuses settings keys without ext.<id>.*
+  "id": "__ID__",
+  "name": "__NAME__",
+  "version": "0.1.0",
+  // D8 enum: settings.read | settings.write | bridge.emit | invoke.agent | stream.render | terminal.read | notifications
+  // Empty array = L0 only (no agent.extension / no controlled entry).
+  "capabilities": [
+    "settings.read",
+    "settings.write",
+    "bridge.emit",
+    "invoke.agent",
+    "stream.render"
+  ],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          // Host rejects keys that are not ext.<id>.*
+          "ext.__ID__.greeting": {
+            "type": "string",
+            "default": "hello",
+            "title": "Greeting"
+          }
+        }
+      }
+    },
+    "ui": {
+      // v1 slot must be "toolPanel"; unknown slot = load error, not a silent skip
+      "panels": [
+        { "slot": "toolPanel", "id": "__ID__", "title": "__NAME__", "entry": "app/dist/panel.js" }
+      ],
+      "toolRenderers": [
+        { "tool": "__ID__", "entry": "app/dist/hello-card.js" }
+      ],
+      // No entry = schema form (preferred). Controlled components only when schema cannot express the UI.
+      "settingsSections": [
+        { "id": "__ID__", "title": "__NAME__" }
+      ],
+      "slashCommands": [
+        { "name": "__ID__", "description": "Sample command from __NAME__" }
+      ],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": []
+}

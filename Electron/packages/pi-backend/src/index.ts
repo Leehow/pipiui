@@ -135,6 +135,7 @@ import {
   type ExtensionRegistry,
 } from "./extension-registry.js";
 import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
+import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import {
   putExtensionSecrets,
@@ -524,6 +525,8 @@ export type PiBackendOptions = {
   abortAckTimeoutMs?: number;
   /** Max wait for invokeExtension RPC (default 15000ms). */
   extensionInvokeTimeoutMs?: number;
+  /** Host-side extension_ui dialog timeout (default 30000ms). */
+  extensionUiTimeoutMs?: number;
   /** Open a project folder in the OS file manager. Defaults to open/explorer/xdg-open. */
   revealPath?: (path: string) => Promise<void>;
   /** Read-only roots for other local agents. Tests inject a temp home; production uses $HOME. */
@@ -1661,6 +1664,7 @@ export class PiHostBackend implements HostBackend {
   private stopEscalation: StopEscalationScheduler;
   private abortAckTimeoutMs: number;
   private extensionInvokeTimeoutMs: number;
+  private extensionUi: ExtensionUiChannel;
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
   private toolBatchTelemetry: ToolBatchTelemetry;
@@ -1740,6 +1744,15 @@ export class PiHostBackend implements HostBackend {
       }, options.stopEscalationDelays);
     this.abortAckTimeoutMs = options.abortAckTimeoutMs ?? 1_500;
     this.extensionInvokeTimeoutMs = options.extensionInvokeTimeoutMs ?? EXT_INVOKE_TIMEOUT_MS;
+    this.extensionUi = new ExtensionUiChannel({
+      emit: (event) => emitFrame(this.listeners, event as unknown as HostEvent),
+      timeoutMs: options.extensionUiTimeoutMs ?? EXTUI_TIMEOUT_MS,
+      writeResponse: (sessionId, body) => {
+        const live = this.live.get(sessionId);
+        if (!live || !this.liveProcessUsable(live) || !live.process?.stdin) return;
+        void this.writeCommand(live, body);
+      },
+    });
     this.extensions = options.extensionRegistry ?? createExtensionRegistry();
     this.extensionLoader = new ExtensionLoader({
       registry: this.extensions,
@@ -1972,6 +1985,7 @@ export class PiHostBackend implements HostBackend {
     await this.thinkingControlWrite.catch(() => undefined);
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
+    this.extensionUi.dispose();
     const live = [...this.live.values()];
     for (const sessionId of this.live.keys()) this.extensions.unmountSession(sessionId);
     this.live.clear();
@@ -2104,6 +2118,7 @@ export class PiHostBackend implements HostBackend {
   ): Promise<void> {
     const live = this.live.get(sessionId);
     if (live) live.hostAbortedTurn = true;
+    this.extensionUi.abortSession(sessionId);
     if (options.drain === false) {
       // User stop owns the queue: a hung prompt or parked cut-in must not keep
       // the composer locked on `sending`. Cut-in abort leaves pendingCutIn so
@@ -2535,7 +2550,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension") {      case "listProjects":
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse") {      case "listProjects":
         return this.listConfiguredProjects();
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
@@ -2560,7 +2575,9 @@ export class PiHostBackend implements HostBackend {
       case "updateExtensionSettings":
         return this.updateExtensionSettings(params[0], params[1], params[2]);
       case "invokeExtension":
-        return this.invokeExtension(params[0], params[1], params[2], params[3]);      case "listDocuments":
+        return this.invokeExtension(params[0], params[1], params[2], params[3]);
+      case "extensionUiResponse":
+        return this.extensionUiResponse(params[0], params[1], params[2]);      case "listDocuments":
         return this.listOpenedDocuments();
       case "readDocument":
         return readLocalDocument(params[0]);
@@ -3637,6 +3654,7 @@ export class PiHostBackend implements HostBackend {
     } catch {
       /* best-effort telemetry must not affect the live stream */
     }
+    if (this.extensionUi.handleRpc(live.session.id, e)) return;
     if (e.type === "agent_event" || e.type === "pipiui_agent_event") {
       this.mapAgentEvent(e.event ?? e, live.session.id);
       return;
@@ -4188,6 +4206,11 @@ export class PiHostBackend implements HostBackend {
     }
   }
   private writeCommand(live: Live, body: Rpc) {
+    // extension_ui_response is a stdin notification keyed by the request id, not an RPC command.
+    if (body?.type === "extension_ui_response") {
+      live.process!.stdin.write(JSON.stringify(body) + "\n");
+      return Promise.resolve(undefined);
+    }
     return new Promise<any>((resolve, reject) => {
       const req = crypto.randomUUID();
       live.pending.set(req, { resolve, reject });
@@ -4195,6 +4218,24 @@ export class PiHostBackend implements HostBackend {
         JSON.stringify({ id: req, ...body }) + "\n",
       );
     });
+  }
+  private async extensionUiResponse(
+    sessionIdValue: unknown,
+    requestIdValue: unknown,
+    response: unknown,
+  ): Promise<void> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim() || typeof requestIdValue !== "string" || !requestIdValue.trim()) {
+      throw new Error("extension ui response rejected: invalid");
+    }
+    const sessionId = sessionIdValue.trim();
+    const requestId = requestIdValue.trim();
+    const result = this.extensionUi.respond(sessionId, requestId, response);
+    if (!result.ok) throw new Error(`extension ui response rejected: ${result.error}`);
+    const live = this.live.get(sessionId);
+    if (!live || !this.liveProcessUsable(live) || !live.process?.stdin) {
+      throw new Error("extension ui response rejected: no_session");
+    }
+    await this.writeCommand(live, result.command);
   }
   private writeCommandWithTimeout(live: Live, body: Rpc, timeoutMs: number) {
     return new Promise<any>((resolve, reject) => {

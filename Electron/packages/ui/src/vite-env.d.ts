@@ -3,6 +3,7 @@
 declare global {
   interface Window {
     pipiPathForFile?: (file: File) => string
+    pipiHost?: unknown
   }
 }
 
