@@ -99,7 +99,7 @@ Superpowers 不能简单降到 L2：弱模型不走 SOP 几乎不可用，而强
 
 档位来源只有一个：Settings → 模型里逐个勾选，未勾 = 强。**代码里不存在任何内置强弱模型清单**，`ModelTierSettingsTests` 会断言这一点——硬编码清单必然过时，而分错档会静默改变整个会话的工作方式。
 
-弱模型另有一道闸门：本会话没读过任何 skill 时，第一次调 `subagent` 会被 `tool_call` 钩子拦一次并要求先读 SOP，**每会话只拦一次**，误伤上限一次往返。行为用 `./scripts/check-skilltier-gate.sh` 验证（直接驱动扩展 handler，不发 API 请求）。
+（历史：弱模型曾另有一道首调 `subagent` 的 SOP 闸门，随 SkillTier/ModelTier 机制一起整体移除，对应的 `./scripts/check-skilltier-gate.sh` 已删除。）
 
 ## 反模式
 

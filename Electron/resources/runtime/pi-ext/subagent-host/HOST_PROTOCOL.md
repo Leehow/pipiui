@@ -103,8 +103,6 @@ must inject `onPlatform` for computer, search, or memory operations; this slice
 does not implement TCC checks, screen geometry, permission prompts, or process
 supervision.
 
-PipiUI Swift is not switched to this Node runtime in this slice. `Package.swift`
-already copies the whole `PiExt` tree, so bundled files and JSON v1 fixtures are
-kept as resource-compatible contracts. The Swift test only verifies their
-presence and `JSONSerialization` readability; it does not reimplement either
-reducer.
+The Electron host is the only consumer of this Node runtime. Bundled files and
+JSON v1 fixtures are kept as resource-compatible contracts; tests verify their
+presence and readability without reimplementing either reducer.

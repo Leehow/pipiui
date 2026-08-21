@@ -1,7 +1,7 @@
 # API key 统一管理（`~/.pi/agent/.env`）
 
 Pipi UI 把模型 provider 的 API key 集中存放在 `~/.pi/agent/.env` 一个文件里，由
-`EnvFileStore`（`Sources/PipiUI/EnvFileStore.swift`）统一读写。添加模型、设置页与
+Electron 宿主（`Electron/packages/pi-backend` 的 dotenv/spawn 装配）统一读写。添加模型、设置页与
 启动迁移都走这一个文件。
 
 ## 位置与权限模型

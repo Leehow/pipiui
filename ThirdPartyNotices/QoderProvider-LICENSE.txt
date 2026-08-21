@@ -11,7 +11,7 @@ License: MIT, as declared in the package's package.json `license` field and by
 
 This notice covers the vendored, minimally-patched port of the package's
 `streamQoder` and its helpers in
-Sources/PipiUI/PiExt/subagent/qoder-stream.ts (see that file's header for the
+Electron/resources/runtime/pi-ext/subagent/qoder-stream.ts (see that file's header for the
 exact sync baseline and behavioral divergence).
 
 MIT License

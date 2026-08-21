@@ -1,7 +1,7 @@
 /**
  * Opportunistic main-session compaction for the Electron host.
  *
- * Port of Swift `ProactiveCompactionPolicy` (Sources/PipiUI/ProactiveCompactionPolicy.swift)
+ * Port of the retired Swift app's `ProactiveCompactionPolicy`
  * plus the scheduling half that lives in `ChatSession`. Same reason to exist:
  * pi only checks its own threshold (`contextWindow - 16384`) at `agent_end` and
  * immediately before a prompt is submitted, so a session can idle far above the

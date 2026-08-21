@@ -2,12 +2,11 @@ import { promises as fs } from "node:fs";
 import { dirname } from "node:path";
 
 /**
- * Swift TokenLedger parity (`Sources/PipiUI/Logging/TokenLedger.swift`):
- * one JSON record per line in `pipiui-token-ledger.jsonl`, using Swift's exact
+ * Ledger line shape carried over from the retired Swift app's TokenLedger:
+ * one JSON record per line in `pipiui-token-ledger.jsonl`, using the exact
  * line shape — `ts`/`session`/`channel`/`depth`/`model`/`turn`/`input`/
  * `output`/`cacheRead`/`cacheWrite`/`cost`/`contextTokens`, sorted keys, nulls
- * stripped. Records written here are readable by Swift's `TokenUsageStats`
- * reader (and vice versa), so main-chat context occupancy survives host
+ * stripped — so historical ledger files stay readable across host
  * restarts and even a Swift ↔ Electron host switch on the same machine.
  *
  * `contextWindow` is an Electron-only extra field: Swift's parser reads only

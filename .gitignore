@@ -17,9 +17,9 @@ Sources.bak-20260723-104538/
 # Local git worktrees
 .worktrees/
 
-# Dependency trees at any depth. The earlier Electron-only rules left the repo
-# root and Sources/**/node_modules tracked-able, and `git add Sources/PipiUI/PiExt`
-# once swept 31766 files into a commit.
+# Dependency trees at any depth. A historical Electron-only rule set once left
+# deep node_modules tracked-able, and a bulk `git add` of a runtime tree
+# swept 31766 files into a commit.
 node_modules/
 
 # Vendored Firecrawl pdf-inspector (local-first PDF runtime)
