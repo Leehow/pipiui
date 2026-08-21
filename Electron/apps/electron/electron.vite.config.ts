@@ -22,6 +22,7 @@ const serverSourceEntry = resolve(workspaceRoot, 'apps/server/src/index.ts')
 // build` alike, so the production bundle is built from the same source.
 const uiSourceEntry = resolve(uiPackageRoot, 'src/index.ts')
 const uiSourceAppCss = resolve(uiPackageRoot, 'src/app.css')
+const extensionApiSourceEntry = resolve(workspaceRoot, 'packages/extension-api/src/index.ts')
 // Extensionless static files (file-viewer LICENSE/NOTICE) become
 // `NAME-<hash>.` under Vite's default `[extname]`. electron-builder on
 // macOS cannot open a trailing-dot path (ENOENT).
@@ -90,7 +91,8 @@ export default defineConfig({
       // dedupes the identical resolved app.css module).
       alias: [
         { find: '@pipiui/ui/style.css', replacement: uiSourceAppCss },
-        { find: '@pipiui/ui', replacement: uiSourceEntry }
+        { find: '@pipiui/ui', replacement: uiSourceEntry },
+        { find: '@pipiui/extension-api', replacement: extensionApiSourceEntry }
       ],
       // The UI source and the renderer share the hoisted workspace React;
       // dedupe guarantees a single React instance even if a nested

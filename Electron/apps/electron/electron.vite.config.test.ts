@@ -23,6 +23,7 @@ const aliases: AliasEntry[] = config.renderer?.resolve?.alias ?? []
 
 const bare = aliases.find((a) => a.find === '@pipiui/ui')
 const style = aliases.find((a) => a.find === '@pipiui/ui/style.css')
+const extensionApi = aliases.find((a) => a.find === '@pipiui/extension-api')
 const toPosix = (p: string): string => p.replace(/\\/g, '/')
 
 describe('renderer resolves @pipiui/ui from packages/ui source', () => {
@@ -44,6 +45,14 @@ describe('renderer resolves @pipiui/ui from packages/ui source', () => {
   it('never references packages/ui/dist in renderer resolution', () => {
     expect(toPosix(JSON.stringify(aliases))).not.toContain('/dist/')
   })
+
+  it('aliases @pipiui/extension-api to packages/extension-api source, never dist',
+    () => {
+      expect(extensionApi, 'expected an @pipiui/extension-api renderer alias').toBeDefined()
+      expect(toPosix(extensionApi!.replacement)).toMatch(/packages\/extension-api\/src\/index\.ts$/)
+      expect(toPosix(extensionApi!.replacement)).not.toContain('/dist/')
+      expect(existsSync(extensionApi!.replacement)).toBe(true)
+    })
 
   it('selects only the office preset and publishes its offline assets below the renderer output', () => {
     expect(fileViewerAssetOptions).toEqual({ preset: 'office', copyAssets: { baseDir: 'file-viewer' }, chunkStrategy: 'none' })
