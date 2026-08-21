@@ -1,9 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { resolveOAuthConfig } from "./oauth/config.js";
-import { requestDeviceCode, pollDeviceToken, refreshAccessToken, OAuthError } from "./oauth/device.js";
+import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok } from "./oauth/import.js";
+import { createBroker } from "./oauth/broker.js";
 
 const EXTENSION_ID = "grok-build-oauth";
 const BRIDGE_PORT = process.env.PIPIUI_BRIDGE_PORT;
@@ -44,6 +47,21 @@ function displayUriOf(code: { verification_uri: string; verification_uri_complet
   if (code.verification_uri_complete) return code.verification_uri_complete;
   const sep = code.verification_uri.includes("?") ? "&" : "?";
   return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
+}
+
+function getAuthPath(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (envDir) return join(envDir, "auth.json");
+  return join(homedir(), ".pi", "agent", "auth.json");
+}
+
+function getBroker(signal?: AbortSignal): ReturnType<typeof createBroker> {
+  const cfg = resolveOAuthConfig();
+  return createBroker({
+    authPath: getAuthPath(),
+    earlyRefreshSec: cfg.earlyRefreshSec,
+    fetchImpl: fetch as unknown as typeof fetch,
+  });
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -163,56 +181,40 @@ export default function (pi: ExtensionAPI): void {
         const access = (credentials as unknown as Record<string, unknown>).access as string | undefined;
         const refresh = (credentials as unknown as Record<string, unknown>).refresh as string | undefined;
         const storedIssuer = (credentials as unknown as Record<string, unknown>).issuer as string | undefined;
-        const storedClient = (credentials as unknown as Record<string, unknown>).client_id as string | undefined;
-        const storedScopes = (credentials as unknown as Record<string, unknown>).scopes as string[] | undefined;
 
-        const issuer = typeof storedIssuer === "string" && storedIssuer ? storedIssuer : cfg.issuer;
-        const clientId = typeof storedClient === "string" && storedClient ? storedClient : cfg.clientId;
-        const scopes = Array.isArray(storedScopes) && storedScopes.length ? storedScopes : cfg.scopes;
-
-        // Issuer mismatch -> require re-login
         if (storedIssuer && storedIssuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
           throw new Error("Issuer mismatch — please run /login grok-build again. [redacted]");
         }
-
         if (!refresh) {
           throw new Error("No refresh token — please run /login grok-build again.");
         }
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
-        if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-
-        let tokens;
+        // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
+        const broker = getBroker(signal as AbortSignal | undefined);
         try {
-          tokens = await refreshAccessToken({ issuer, clientId, refreshToken: refresh, signal });
+          const next = await broker.forceRefresh(signal);
+          await emit("token_refreshed", { expires_at: next.expires });
+          return {
+            access: next.access,
+            refresh: next.refresh,
+            expires: next.expires,
+            issuer: next.issuer,
+            client_id: next.client_id,
+            scopes: next.scopes,
+            token_type: next.token_type,
+            obtained_at: next.obtained_at,
+          } as unknown as never;
         } catch (err) {
           const code = (err as OAuthError)?.code;
           const msg = err instanceof Error ? err.message : String(err);
           const redacted = redactMessage(msg, [refresh, access ?? ""]);
           await emit("auth_error", { code: code ?? "refresh_failed", message: redacted });
-          if (code === "invalid_grant") {
+          if (code === "auth_expired" || code === "invalid_grant") {
             throw new Error("Refresh token expired or revoked — please run /login grok-build again. [redacted]");
           }
           throw new Error(redacted);
         }
-
-        const next = toOAuthCredentials(tokens, {
-          issuer,
-          clientId,
-          scopes,
-          refreshFallback: refresh,
-        });
-
-        await emit("token_refreshed", { expires_at: next.expires });
-        return {
-          access: next.access,
-          refresh: next.refresh,
-          expires: next.expires,
-          issuer: next.issuer,
-          client_id: next.client_id,
-          scopes: next.scopes,
-          token_type: next.token_type,
-          obtained_at: next.obtained_at,
-        } as unknown as never;
       },
       getApiKey(credentials) {
         return ((credentials as unknown) as Record<string, unknown>).access as string;
@@ -254,11 +256,11 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
-  // Placeholder image_gen retains wiring; real transport lands in Phase 4
+  // M3: image_gen shares the same broker API as provider requests (early refresh, 401 single retry, redaction)
   pi.registerTool({
     name: "image_gen",
-    label: "Grok Build image_gen (OAuth ready, image transport pending)",
-    description: "Placeholder — image generation ships after OAuth phases.",
+    label: "Grok Build image_gen (OAuth via broker, image transport pending)",
+    description: "Placeholder — image generation ships after OAuth phases; broker validates auth.",
     parameters: {
       type: "object",
       properties: {
@@ -268,11 +270,24 @@ export default function (pi: ExtensionAPI): void {
       required: ["prompt"],
       additionalProperties: false,
     },
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
+      // Broker ensures early refresh before any image request; never logs token
+      const broker = getBroker(signal);
+      let tokenPreview = "none";
+      try {
+        const token = await broker.getAccessToken(signal);
+        tokenPreview = "[redacted]";
+        void token;
+      } catch (err) {
+        const msg = err instanceof Error ? redactMessage(err.message, []) : String(err);
+        // still proceed to placeholder but mark auth state
+        tokenPreview = msg.includes("Not logged") ? "not_logged_in" : "refresh_failed";
+      }
       const payload = {
-        message: "grok-build-oauth M2 — OAuth is ready; image_gen transport ships next phase",
+        message: "grok-build-oauth M3 — broker ready; image_gen transport ships next phase",
         params,
         settings: settingsSnapshot(),
+        broker: { tokenPreview, earlyRefreshSec: resolveOAuthConfig().earlyRefreshSec },
       };
       await emit("skeleton.image_gen", payload);
       return {
