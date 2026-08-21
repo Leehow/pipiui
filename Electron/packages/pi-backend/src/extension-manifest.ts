@@ -53,6 +53,9 @@ export type ValidatedExtensionManifest = {
   ui?: ExtensionUiSummary;
   agentExtension?: string;
   agentSkills?: string[];
+  /** Optional stable host library entry for cross-host consumers (e.g. pi-coc);
+   *  content hash is pinned by the bundled sync receipt. */
+  hostEntry?: string;
 };
 
 export type ManifestValidationOk = { ok: true; manifest: ValidatedExtensionManifest };
@@ -300,6 +303,22 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   }
 
   const fallbackId = typeof rawId === "string" && rawId.trim() ? rawId.trim() : undefined;
+
+  // Optional stable host library entry (cross-host consumers, e.g. pi-coc).
+  // Declared in the manifest; its content hash is pinned by the bundled sync
+  // receipt (`pipiui-host-receipt.json`) so resolvers can verify both hosts
+  // consume the same build artifact.
+  let hostEntry: string | undefined;
+  if (value.host !== undefined && value.host !== null) {
+    if (!isRecord(value.host)) {
+      errors.push("host must be an object");
+    } else {
+      const entry = asNonEmptyString(value.host.entry);
+      if (!entry) errors.push("host.entry must be a path string");
+      else hostEntry = entry;
+    }
+  }
+
   if (errors.length) return { ok: false, errors, fallbackId };
 
   const manifest: ValidatedExtensionManifest = {
@@ -312,6 +331,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (ui) manifest.ui = ui;
   if (agentExtension) manifest.agentExtension = agentExtension;
   if (agentSkills) manifest.agentSkills = agentSkills;
+  if (hostEntry) manifest.hostEntry = hostEntry;
   return { ok: true, manifest };
 }
 

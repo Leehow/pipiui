@@ -16,8 +16,10 @@
  */
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
 import { ImagesError } from "./errors.js";
 import { redactMessage } from "../oauth/redact.js";
+import { tryResolveAgentHome } from "../oauth/home.js";
 export const ASPECT_RATIOS = [
     "1:1",
     "16:9",
@@ -42,7 +44,16 @@ export const SESSION_ID_HEADER = "x-grok-session-id";
 export const DEFAULT_TIMEOUT_MS = 300_000;
 /** Official Imagine reference-image raw size limit (backend 400s above). */
 export const MAX_REFERENCE_BYTES = 400 * 1024;
-export function normalizeBaseUrl(raw) {
+function isLoopbackHost(url) {
+    return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+}
+/**
+ * Normalize a base URL. Bearer credentials are only ever sent over HTTPS;
+ * plain HTTP is refused, except for explicit loopback compat relay endpoints
+ * (and only when the caller passes `allowHttpLoopback` — i.e. the deprecated
+ * compat path is explicitly enabled). (Reviewer MUST-FIX #8.)
+ */
+export function normalizeBaseUrl(raw, opts = {}) {
     const trimmed = raw.trim();
     if (!trimmed) {
         throw new ImagesError("invalid_params", "xai_api_base_url 不能为空");
@@ -54,8 +65,17 @@ export function normalizeBaseUrl(raw) {
     catch {
         throw new ImagesError("invalid_params", `非法的 xai_api_base_url: ${trimmed}`);
     }
-    if (url.protocol !== "https:" && url.protocol !== "http:") {
-        throw new ImagesError("invalid_params", `xai_api_base_url 必须是 http(s) URL: ${trimmed}`);
+    if (url.protocol === "https:") {
+        // ok
+    }
+    else if (url.protocol === "http:" && opts.allowHttpLoopback && isLoopbackHost(url)) {
+        // loopback compat relay only, explicitly enabled
+    }
+    else if (url.protocol === "http:" && isLoopbackHost(url)) {
+        throw new ImagesError("invalid_params", `拒绝 HTTP base URL（${trimmed}）：Bearer 凭证仅发性 HTTPS；loopback HTTP 仅在 compatFallback 开启时用于 deprecated relay`);
+    }
+    else {
+        throw new ImagesError("invalid_params", `拒绝非 HTTPS 的 xai_api_base_url: ${trimmed}（Bearer 凭证仅发 HTTPS）`);
     }
     return trimmed.replace(/\/+$/, "");
 }
@@ -98,7 +118,7 @@ export class ImagesClient {
     timeoutMs;
     fetchImpl;
     constructor(opts = {}) {
-        this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL);
+        this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL, { allowHttpLoopback: opts.allowHttpLoopback === true });
         this.model = assertModel(opts.model ?? DEFAULT_MODEL);
         this.editModel = assertModel(opts.editModel ?? DEFAULT_EDIT_MODEL);
         this.sessionId = opts.sessionId?.trim() || undefined;
@@ -208,7 +228,7 @@ export class ImagesClient {
             json = JSON.parse(body);
         }
         catch {
-            const preview = [...body].slice(0, 200).join("");
+            const preview = redactMessage([...body].slice(0, 200).join(""), [bearer]);
             throw new ImagesError("invalid_response", `图像响应无法解析: ${preview}`);
         }
         const data = json?.data;
@@ -221,12 +241,40 @@ export class ImagesClient {
     }
 }
 /**
+ * Default allowed roots for filesystem reference images: the current working
+ * directory (project) and the agent-home attachments root. Absolute paths
+ * outside these roots are refused (reviewer MUST-FIX #7).
+ */
+export function defaultReferenceRoots() {
+    const roots = [];
+    try {
+        roots.push(resolve(process.cwd()));
+    }
+    catch {
+        /* cwd unavailable */
+    }
+    const home = tryResolveAgentHome();
+    if (home)
+        roots.push(resolve(home, "attachments"));
+    return roots;
+}
+/** True when `candidate` (already realpath'd) is inside one of `roots` (realpath'd). */
+function isInsideRoots(candidate, resolvedRoots) {
+    for (const root of resolvedRoots) {
+        if (candidate === root || candidate.startsWith(root.endsWith("/") ? root : `${root}/`))
+            return true;
+    }
+    return false;
+}
+/**
  * Resolve an image_edit reference into a compressed-enough data URL.
- * Accepts `data:image/...;base64,...` URLs and filesystem paths (absolute
- * or cwd-relative). Raw paths containing `..` segments are rejected
- * (path traversal guard). JPEG/PNG ≤ MAX_REFERENCE_BYTES pass through
- * (official client re-encodes other formats; without an image codec we
- * reject them with an actionable error instead of sending a doomed request).
+ * Accepts `data:image/...;base64,...` URLs and filesystem paths — filesystem
+ * paths must stay inside the allowed roots (cwd / agent-home attachments):
+ * arbitrary absolute paths are refused, symlink escapes are resolved via
+ * realpath and refused when they land outside, and `..` segments are always
+ * rejected. JPEG/PNG ≤ MAX_REFERENCE_BYTES pass through (official client
+ * re-encodes other formats; without an image codec we reject them with an
+ * actionable error instead of sending a doomed request).
  */
 export async function resolveImageReference(raw, opts = {}) {
     const value = raw.trim();
@@ -252,9 +300,32 @@ export async function resolveImageReference(raw, opts = {}) {
     }
     const path = value.startsWith("file://") ? value.slice("file://".length) : value;
     const abs = isAbsolute(path) ? resolve(path) : resolve(opts.cwd ?? process.cwd(), path);
+    // Containment: resolve symlinks on both sides; refuse anything that lands
+    // outside the allowed roots (cwd / attachments). Arbitrary absolute paths
+    // (e.g. ~/.ssh/id_rsa renamed to .jpg) never reach the upload path.
+    const rootCandidates = (opts.allowedRoots ?? defaultReferenceRoots()).map((r) => resolve(r));
+    const resolvedRoots = [];
+    for (const root of rootCandidates) {
+        try {
+            resolvedRoots.push(await realpath(root));
+        }
+        catch {
+            resolvedRoots.push(root); // root may not exist yet — compare lexically
+        }
+    }
+    let realAbs;
+    try {
+        realAbs = await realpath(abs);
+    }
+    catch {
+        throw new ImagesError("invalid_params", "参考图无法读取（文件不存在或不可读）");
+    }
+    if (!isInsideRoots(realAbs, resolvedRoots)) {
+        throw new ImagesError("invalid_params", "参考图路径越界：仅允许当前工作目录或 attachments 目录内的图片（或直接使用 data URL）");
+    }
     let bytes;
     try {
-        bytes = await readFile(abs);
+        bytes = await readFile(realAbs);
     }
     catch {
         throw new ImagesError("invalid_params", "参考图无法读取（文件不存在或不可读）");

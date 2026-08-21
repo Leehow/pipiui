@@ -82,6 +82,8 @@ export type ExtensionManifest = {
 export type ToolRenderProps = {
   content: string;
   details?: unknown;
+  /** Typed image blocks delivered with the tool result (b64 + mime), if any. */
+  images?: { data: string; mimeType: string }[];
 };
 
 /** Injected into a controlled panel `entry`. */

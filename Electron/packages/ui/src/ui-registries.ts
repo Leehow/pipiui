@@ -25,6 +25,8 @@ export type ToolRenderProps = {
   content: string
   /** Structured payload from a `piui:v1` envelope (spec D5). */
   details?: unknown
+  /** Typed image blocks delivered with the tool result (b64 + mime), if any. */
+  images?: { data: string; mimeType: string }[]
 }
 
 export type ToolRendererContribution = {

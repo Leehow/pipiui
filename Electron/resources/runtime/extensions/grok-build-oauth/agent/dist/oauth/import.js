@@ -1,40 +1,122 @@
+/**
+ * Explicit one-shot import from the official grok CLI's `~/.grok/auth.json`
+ * (spec US-09 / D5 "永不静默读全局").
+ *
+ * Contract:
+ * - Requires an explicit confirmation from the user (`confirm: true`).
+ * - Reads the source file exactly ONCE, never writes/deletes/moves it.
+ * - Validates issuer / client_id / expiry against the resolved OAuth config.
+ * - Persists only through the broker's controlled `importCredential` (shared
+ *   lock on the real credential target, 0600 atomic merge).
+ */
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-export async function importFromGlobalGrok(opts) {
-    if (!opts.confirm) {
-        return { imported: false, reason: "confirm required" };
-    }
-    const home = opts.homedirOverride ?? homedir();
-    const authPath = join(home, ".grok", "auth.json");
+import { resolveOAuthConfig } from "./config.js";
+import { OAuthError } from "./device.js";
+export function globalGrokAuthPath(homedirOverride) {
+    const home = homedirOverride ?? homedir();
+    return join(home, ".grok", "auth.json");
+}
+/** Accept seconds or milliseconds epochs (official file has used both). */
+function normalizeExpiry(raw) {
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0)
+        return undefined;
+    return raw > 1e12 ? raw : raw * 1000;
+}
+/**
+ * Read and validate `~/.grok/auth.json` once. Returns the mapped credential
+ * fields or a refusal reason. Never touches the source file.
+ */
+export async function readGlobalGrokAuth(opts) {
+    const path = opts.sourcePath ?? globalGrokAuthPath(opts.homedirOverride);
     let text;
     try {
-        text = await readFile(authPath, "utf8");
+        text = await readFile(path, "utf8");
     }
     catch {
-        return { imported: false, reason: "no global auth file" };
+        return { ok: false, reason: `未找到 ${path} — 请先在官方 grok CLI 登录，或改用 /login grok-build` };
     }
     let parsed;
     try {
         parsed = JSON.parse(text);
     }
     catch {
-        return { imported: false, reason: "invalid auth.json" };
+        return { ok: false, reason: "auth.json 不是合法 JSON" };
     }
-    // Expect shape { key, refresh_token, expires_at, oidc_issuer... } or similar
-    // We only copy if we can map to OAuth fields; caller will persist via Provider auth.
-    if (!parsed || typeof parsed !== "object")
-        return { imported: false, reason: "invalid auth shape" };
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, reason: "auth.json 结构不识别" };
+    }
     const rec = parsed;
-    // Support both legacy flat auth and nested by scope. Try to find a record
-    // with access token. For simplicity, look for .key or .access or first string containing token.
-    const key = typeof rec.key === "string" ? rec.key : typeof rec.access === "string" ? rec.access : undefined;
-    if (!key)
-        return { imported: false, reason: "no token in global auth" };
-    // Signal that caller may proceed to persist; we don't write here.
-    return { imported: true };
+    // Official grok CLI shape: top-level `key` (access), `refresh_token`,
+    // `expires_at` (epoch, s or ms), `oidc_issuer`, `client_id`. Also accept the
+    // pi-shaped { access, refresh, expires } for symmetry.
+    const access = typeof rec.key === "string" && rec.key ? rec.key :
+        typeof rec.access === "string" && rec.access ? rec.access :
+            typeof rec.access_token === "string" && rec.access_token ? rec.access_token :
+                undefined;
+    if (!access)
+        return { ok: false, reason: "auth.json 中没有可用的 access token（缺少 key/access 字段）" };
+    const refresh = typeof rec.refresh_token === "string" && rec.refresh_token ? rec.refresh_token :
+        typeof rec.refresh === "string" && rec.refresh ? rec.refresh :
+            undefined;
+    const expiresAtMs = normalizeExpiry(rec.expires_at) ?? normalizeExpiry(rec.expires) ?? normalizeExpiry(rec.expires_at_ms);
+    if (expiresAtMs === undefined) {
+        return { ok: false, reason: "auth.json 缺少 expires_at — 无法判断有效期，请重新登录" };
+    }
+    const nowMs = opts.nowMs ?? Date.now;
+    if (expiresAtMs <= nowMs()) {
+        return { ok: false, reason: "导入的凭证已过期 — 请重新登录 grok-build" };
+    }
+    const issuer = typeof rec.oidc_issuer === "string" && rec.oidc_issuer ? rec.oidc_issuer :
+        typeof rec.issuer === "string" && rec.issuer ? rec.issuer :
+            undefined;
+    const clientId = typeof rec.client_id === "string" && rec.client_id ? rec.client_id : undefined;
+    return { ok: true, credential: { access, refresh, expiresAtMs, issuer, clientId } };
 }
-export function globalGrokAuthPath(homedirOverride) {
-    const home = homedirOverride ?? homedir();
-    return join(home, ".grok", "auth.json");
+/**
+ * Full import flow: confirm -> read once -> validate -> broker-controlled
+ * persist. The source file is never modified.
+ */
+export async function importFromGlobalGrok(opts) {
+    if (!opts.confirm) {
+        return { imported: false, reason: "需要显式确认：/grok-build:import --confirm（仅读取一次 ~/.grok/auth.json，不修改源文件）" };
+    }
+    const read = await readGlobalGrokAuth({ homedirOverride: opts.homedirOverride, sourcePath: opts.sourcePath, nowMs: opts.nowMs });
+    if (!read.ok)
+        return { imported: false, reason: read.reason };
+    const cfg = resolveOAuthConfig();
+    const credential = read.credential;
+    try {
+        await opts.broker.importCredential({
+            access: credential.access,
+            refresh: credential.refresh,
+            expiresAtMs: credential.expiresAtMs,
+            issuer: credential.issuer ?? cfg.issuer,
+            clientId: credential.clientId,
+            scopes: cfg.scopes,
+        });
+    }
+    catch (err) {
+        const reason = err instanceof OAuthError ? err.message : err instanceof Error ? err.message : String(err);
+        return { imported: false, reason };
+    }
+    return { imported: true, expiresAtMs: credential.expiresAtMs, issuer: credential.issuer ?? cfg.issuer };
+}
+/**
+ * Parse slash-command args into an explicit confirmation. Pi delivers command
+ * args as a raw string; `--confirm` / `confirm=true` / `confirm` all confirm.
+ */
+export function parseImportConfirm(args) {
+    if (args == null)
+        return { confirm: false };
+    if (typeof args === "string") {
+        const tokens = args.trim().split(/\s+/).filter(Boolean);
+        return { confirm: tokens.some((t) => t === "--confirm" || t === "confirm" || /^confirm=(true|1|yes)$/i.test(t)) };
+    }
+    if (typeof args === "object") {
+        const rec = args;
+        return { confirm: rec.confirm === true || rec.confirm === "true" || rec.confirm === 1 };
+    }
+    return { confirm: false };
 }

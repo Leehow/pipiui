@@ -10,10 +10,10 @@
  * - compatFallback: ext.grok-build-oauth.compatFallback (default false).
  */
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_BASE_URL, DEFAULT_EDIT_MODEL, DEFAULT_MODEL } from "./client.js";
+import { tryResolveAgentHome } from "../oauth/home.js";
 
 export function settingsSnapshot(): Record<string, unknown> | undefined {
   const raw = process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH;
@@ -34,10 +34,13 @@ function settingString(key: string): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-export function agentHome(): string {
-  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (envDir) return envDir;
-  return join(homedir(), ".pi", "agent");
+/**
+ * Agent home — `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR`; never the global
+ * `~/.pi/agent` (fail closed per spec §D9). Returns undefined when unset so
+ * non-critical helpers (session id persistence) can degrade gracefully.
+ */
+export function agentHome(): string | undefined {
+  return tryResolveAgentHome();
 }
 
 /** Stable x-grok-session-id: settings > env > persisted generated UUID. */
@@ -46,7 +49,10 @@ export function resolveSessionId(): string {
   if (fromSettings) return fromSettings;
   const fromEnv = process.env.GROK_SESSION_ID?.trim();
   if (fromEnv) return fromEnv;
-  const file = join(agentHome(), "grok-build-session-id");
+  const home = agentHome();
+  // No resolved home -> transient id (never falls back to a global ~/.pi dir).
+  if (!home) return randomUUID();
+  const file = join(home, "grok-build-session-id");
   try {
     const existing = readFileSync(file, "utf8").trim();
     if (existing) return existing;
@@ -55,7 +61,7 @@ export function resolveSessionId(): string {
   }
   const id = randomUUID();
   try {
-    mkdirSync(agentHome(), { recursive: true, mode: 0o700 });
+    mkdirSync(home, { recursive: true, mode: 0o700 });
     writeFileSync(file, `${id}\n`, { mode: 0o600 });
     try { chmodSync(file, 0o600); } catch {}
   } catch {
@@ -83,7 +89,15 @@ export function resolveImagesConfig(): ImagesConfig {
     process.env.GROK_IMAGINE_MODEL?.trim() ||
     settingString("ext.grok-build-oauth.defaultModel") ||
     DEFAULT_MODEL;
-  const tier = process.env.GROK_TIER?.trim() || settingString("ext.grok-build-oauth.tier");
+  // Tier: an explicitly configured value is preserved as-is — including the
+  // EMPTY string, which US-22 gates as the free tier. Only an unset value
+  // stays undefined (fail-open, server is authoritative).
+  const tierRaw = process.env.GROK_TIER !== undefined
+    ? process.env.GROK_TIER
+    : typeof settings?.["ext.grok-build-oauth.tier"] === "string"
+      ? (settings["ext.grok-build-oauth.tier"] as string)
+      : undefined;
+  const tier = typeof tierRaw === "string" ? tierRaw : undefined;
   const compatFallback = settings?.["ext.grok-build-oauth.compatFallback"] === true;
   return {
     baseUrl,

@@ -1,9 +1,9 @@
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { resolveOAuthConfig } from "./oauth/config.js";
-import { importFromGlobalGrok } from "./oauth/import.js";
+import { redactMessage } from "./oauth/redact.js";
+import { importFromGlobalGrok, parseImportConfirm } from "./oauth/import.js";
 import { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
 import { createBroker } from "./oauth/broker.js";
+import { authJsonPath } from "./oauth/home.js";
 import { ImagesClient, resolveImageReference, } from "./images/client.js";
 import { ImagesError, TIER_RESTRICTED_UPSELL } from "./images/errors.js";
 import { resolveImagesConfig, legacyRelayBase } from "./images/config.js";
@@ -45,11 +45,9 @@ async function emit(event, payload) {
         // best-effort
     }
 }
+/** `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR`; throws when both unset (fail closed). */
 function getAuthPath() {
-    const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-    if (envDir)
-        return join(envDir, "auth.json");
-    return join(homedir(), ".pi", "agent", "auth.json");
+    return authJsonPath();
 }
 function getBroker(signal) {
     const cfg = resolveOAuthConfig();
@@ -64,23 +62,35 @@ export default function (pi) {
     // The canonical provider config lives in ./provider.js and is shared with
     // the PipiUI host auth runtime (single source, no copied OAuth transport).
     pi.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider({ emit: (event, payload) => emit(event, payload) }));
-    // Explicit import command — disabled by default, requires confirm
+    // Explicit one-shot import from the official grok CLI's ~/.grok/auth.json
+    // (US-09): requires --confirm, reads the source exactly once, validates
+    // issuer/client/expiry, persists via the broker (never deletes the source).
     pi.registerCommand("grok-build:import", {
-        description: "Import credentials from ~/.grok/auth.json (requires confirm)",
+        description: "Import credentials from ~/.grok/auth.json (requires --confirm)",
         handler: async (args, ctx) => {
-            const confirm = args?.confirm === true;
+            const { confirm } = parseImportConfirm(args);
             if (!confirm) {
-                ctx.ui.notify("Import requires confirm: /grok-build:import --confirm or invoke with {confirm:true}", "warning");
+                ctx.ui.notify("导入需要显式确认：/grok-build:import --confirm（仅读取一次 ~/.grok/auth.json，不会修改源文件）", "warning");
                 return;
             }
-            const result = await importFromGlobalGrok({ confirm: true });
+            let result;
+            try {
+                const broker = getBroker();
+                result = await importFromGlobalGrok({ confirm: true, broker });
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                ctx.ui.notify(`导入失败：${redactMessage(msg, [])}`, "error");
+                return;
+            }
             if (result.imported) {
-                ctx.ui.notify("Found ~/.grok/auth.json — copy its token via /login grok-build instead of silent read. No file was modified.", "info");
+                const until = result.expiresAtMs ? new Date(result.expiresAtMs).toLocaleString() : "未知";
+                ctx.ui.notify(`已从 ~/.grok/auth.json 导入 grok-build 凭证（有效期至 ${until}）；源文件未修改。`, "info");
             }
             else {
-                ctx.ui.notify(`Import not performed: ${result.reason ?? "unknown"}`, "warning");
+                ctx.ui.notify(`导入未完成：${result.reason ?? "未知原因"}`, "warning");
             }
-            await emit("import_checked", result);
+            await emit("import_result", { imported: result.imported, reason: result.reason });
         },
     });
     /**
@@ -88,18 +98,30 @@ export default function (pi) {
      * in-session `/grok-build:status`. Credential values never leave the broker.
      */
     async function statusSnapshot() {
-        const broker = getBroker();
-        const auth = await broker.status();
         const images = resolveImagesConfig();
-        const source = auth.loggedIn
+        let auth = {
+            loggedIn: false,
+            expired: false,
+            hasRefresh: false,
+            usable: false,
+        };
+        try {
+            auth = await getBroker().status();
+        }
+        catch {
+            /* no resolved home — report unauthenticated, guidance below */
+        }
+        // Credential source reflects the ACTUAL resolution rules: the legacy
+        // XAI_API_KEY path only exists when compatFallback is enabled (US-27).
+        const envKey = process.env.XAI_API_KEY?.trim();
+        const source = auth.usable
             ? "oauth"
-            : process.env.XAI_API_KEY?.trim()
+            : images.compatFallback && envKey
                 ? "env"
                 : undefined;
         return {
             loggedIn: auth.loggedIn,
             expired: auth.expired,
-            expiresAtMs: auth.expiresAtMs,
             hasRefresh: auth.hasRefresh,
             credentialSource: source,
             baseUrl: images.baseUrl,
@@ -115,21 +137,22 @@ export default function (pi) {
             const parts = [
                 status.loggedIn
                     ? status.expired
-                        ? "已登录但凭证已过期 — 请重新执行 /login grok-build"
+                        ? status.hasRefresh
+                            ? "已登录（凭证已过期，将自动刷新）"
+                            : "已登录但凭证已过期且无 refresh token — 请重新执行 /login grok-build"
                         : `已登录（oauth）${typeof status.expiresAtMs === "number" ? `，到期 ${new Date(status.expiresAtMs).toLocaleString()}` : ""}`
                     : status.credentialSource === "env"
-                        ? "未登录 OAuth；当前使用 XAI_API_KEY 环境变量（api_key）"
+                        ? "未登录 OAuth；compatFallback 开启，当前使用 XAI_API_KEY 环境变量（deprecated 兼容）"
                         : "未登录 — 执行 /login grok-build，或在 设置 > 添加模型/供应商 中登录 Grok Build",
                 `base=${status.baseUrl} model=${status.model}`,
-                status.compatFallback ? "compatFallback=1（deprecated 兼容回退已开启）" : "compatFallback=0（默认关闭）",
+                status.compatFallback ? "compatFallback=1（deprecated 兼容回退已开启）" : "compatFallback=0（默认关闭，XAI_API_KEY/relay 不会被使用）",
             ];
             ctx.ui.notify(parts.join("；"), "info");
         },
     });
-    // App → agent invoke target (host `invokeExtension`). Method `status` answers with the
-    // non-secret snapshot; anything else echoes for bridge verification (M3 contract).
-    // Pi types command handlers as returning void; the host invoke contract answers with
-    // ExtInvokeResult, so the handler is cast at the registration boundary.
+    // App → agent invoke target (host `invokeExtension`). Only the fixed methods
+    // from the extension contract (spec §D10) are answered; unknown methods are
+    // refused without echoing raw args back to the bridge (secret hygiene).
     pi.registerCommand(EXTENSION_ID, {
         description: "Grok Build OAuth — invoke bridge (status)",
         handler: (async (args) => {
@@ -138,32 +161,53 @@ export default function (pi) {
             if (method === "status") {
                 return { ok: true, data: await statusSnapshot() };
             }
-            await emit("invoke", { args: args ?? null, settings: settingsSnapshot() });
-            return { ok: true, data: { echoed: args ?? null } };
+            return {
+                ok: false,
+                error: { code: "invalid_params", message: `未知 invoke method：${String(method)}（仅支持 status）` },
+            };
         }),
     });
+    /**
+     * Credential resolution (reviewer MUST-FIX #4):
+     * - OAuth usable (present, and fresh or refreshable) -> OAuth.
+     * - compatFallback=false -> NEVER XAI_API_KEY, never relay: actionable error.
+     * - compatFallback=true + OAuth absent/expired-without-refresh -> explicit
+     *   deprecated fallback (API key first, then relay).
+     */
     async function resolveImageAuth(signal) {
+        const cfg = resolveImagesConfig();
         const broker = getBroker(signal);
-        if (await broker.hasCredential())
+        const status = await broker.status();
+        if (status.usable)
             return { kind: "oauth", broker };
-        const key = process.env.XAI_API_KEY?.trim();
-        if (key)
-            return { kind: "api_key", key };
-        throw new ImagesError("auth_expired", "未登录 — 请先执行 /login grok-build 或设置 XAI_API_KEY");
+        if (cfg.compatFallback) {
+            const key = process.env.XAI_API_KEY?.trim();
+            if (key)
+                return { kind: "api_key", key };
+            return { kind: "relay" };
+        }
+        throw new ImagesError("auth_expired", status.loggedIn
+            ? "OAuth 凭证已过期且无 refresh token — 请重新执行 /login grok-build（或在设置中开启 deprecated compat fallback）"
+            : "未登录 — 请先执行 /login grok-build（compatFallback 默认关闭，不使用 XAI_API_KEY）");
+    }
+    function imageResult(saved, b64, op, details, note) {
+        const prefix = op.kind === "gen" ? "图像已生成" : "图像已编辑";
+        return {
+            content: [
+                { type: "text", text: `${prefix}${note ?? ""}: ${saved.path}` },
+                // Typed image content (US-18): strict-decoded b64 reaches the model and
+                // the host UI as a first-class image block, not just a path string.
+                { type: "image", data: b64, mimeType: saved.mime },
+            ],
+            details: { ...details, path: saved.path, mime: saved.mime },
+        };
     }
     async function runImageOp(op, signal) {
         const cfg = resolveImagesConfig();
-        let auth;
-        try {
-            auth = await resolveImageAuth(signal);
-        }
-        catch (err) {
-            // Deprecated PipiUI loopback relay — only when compatFallback=true
-            // and no OAuth/API-key credential is present (spec §D6 / US-27).
-            if (err instanceof ImagesError && err.code === "auth_expired" && cfg.compatFallback) {
-                return runLegacyRelay(op, signal);
-            }
-            throw err;
+        const auth = await resolveImageAuth(signal);
+        if (auth.kind === "relay") {
+            // Deprecated loopback relay — only reachable with compatFallback=true.
+            return runLegacyRelay(op, signal);
         }
         // Client-side advisory tier gate — OAuth callers only; API-key callers
         // are never gated. Server remains the final authority (US-22/US-23).
@@ -174,7 +218,7 @@ export default function (pi) {
                 details: { code: "tier_restricted", backend: "grok-build" },
             };
         }
-        // Resolve edit references (data URLs / safe file paths) before any HTTP.
+        // Resolve edit references (data URLs / in-root file paths) before any HTTP.
         const dataUrls = [];
         if (op.kind === "edit") {
             for (const ref of op.refs)
@@ -186,6 +230,9 @@ export default function (pi) {
             editModel: cfg.editModel,
             sessionId: cfg.sessionId,
             fetchImpl: fetch,
+            // Loopback http base URLs only exist for the deprecated compat relay,
+            // which requires compatFallback=true (reviewer MUST-FIX #8).
+            allowHttpLoopback: cfg.compatFallback,
         });
         const writer = new SessionImageWriter();
         const model = op.kind === "gen" ? client.model : client.editModel;
@@ -194,11 +241,11 @@ export default function (pi) {
                 ? await client.generate({ prompt: op.prompt, aspectRatio: op.aspectRatio, bearer, signal })
                 : await client.edit({ prompt: op.prompt, images: dataUrls, aspectRatio: op.aspectRatio, bearer, signal });
             const saved = await writer.save(result.bytes, { signal });
-            return saved;
+            return { saved, b64: result.b64 };
         };
         // OAuth path: broker handles early refresh + single forced refresh on 401.
         // API-key path: same client/payload, no refresh, never tier-gated.
-        const saved = auth.kind === "oauth"
+        const { saved, b64 } = auth.kind === "oauth"
             ? await auth.broker.with401Retry(requestOnce, signal)
             : await requestOnce(auth.key);
         await emit("image_gen.saved", {
@@ -207,15 +254,8 @@ export default function (pi) {
             backend: "grok-build",
             model,
         });
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `${op.kind === "gen" ? "图像已生成" : "图像已编辑"}: ${saved.path}`,
-                },
-            ],
-            details: { path: saved.path, mime: saved.mime, backend: "grok-build", model },
-        };
+        const deprecated = auth.kind === "api_key";
+        return imageResult(saved, b64, op, { backend: "grok-build", model, ...(deprecated ? { deprecated: true } : {}) }, deprecated ? "（deprecated 兼容 API key 路径）" : undefined);
     }
     /** Deprecated compat fallback: legacy PipiUI loopback relay (default off). */
     async function runLegacyRelay(op, signal) {
@@ -258,27 +298,14 @@ export default function (pi) {
             throw new ImagesError("invalid_response", "兼容 relay 响应缺少 b64_json 图像数据");
         }
         const { decodeBase64Strict } = await import("./images/client.js");
-        const saved = await new SessionImageWriter().save(decodeBase64Strict(b64), { signal });
-        return {
-            content: [
-                {
-                    type: "text",
-                    text: `图像已生成（deprecated 兼容 relay）: ${saved.path}`,
-                },
-            ],
-            details: {
-                path: saved.path,
-                mime: saved.mime,
-                backend: "grok-build-relay",
-                model: cfg.model,
-                deprecated: true,
-            },
-        };
+        const writer = new SessionImageWriter();
+        const saved = await writer.save(decodeBase64Strict(b64), { signal });
+        return imageResult(saved, b64.replace(/\s+/g, ""), op, { backend: "grok-build-relay", model: cfg.model, deprecated: true }, "（deprecated 兼容 relay）");
     }
     pi.registerTool({
         name: "image_gen",
         label: "Grok Build image_gen",
-        description: "Generate a new image from a text description using xAI Grok Imagine; returns the saved image's absolute path under the session attachments directory. When telling the user where it was saved, refer to the short path. To produce multiple images, emit multiple tool calls with distinct prompts.",
+        description: "Generate a new image from a text description using xAI Grok Imagine; returns a typed image plus the saved file's absolute path under the session attachments directory. When telling the user where it was saved, refer to the short path. To produce multiple images, emit multiple tool calls with distinct prompts.",
         parameters: {
             type: "object",
             properties: {
@@ -299,7 +326,7 @@ export default function (pi) {
     pi.registerTool({
         name: "image_edit",
         label: "Grok Build image_edit",
-        description: "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Each `image` entry is a `data:image/...;base64,...` URL or a filesystem path to a JPEG/PNG ≤400KB. Returns the saved image's absolute path.",
+        description: "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Each `image` entry is a `data:image/...;base64,...` URL or a path to a JPEG/PNG ≤400KB inside the current workspace or the session attachments directory (arbitrary absolute paths are rejected). Returns a typed image plus the saved file's absolute path.",
         parameters: {
             type: "object",
             properties: {
@@ -310,7 +337,7 @@ export default function (pi) {
                 image: {
                     type: "array",
                     items: { type: "string" },
-                    description: "Reference image(s): data:image/...;base64,... URLs or filesystem paths.",
+                    description: "Reference image(s): data:image/...;base64,... URLs or in-workspace/attachment filesystem paths.",
                 },
                 aspect_ratio: {
                     type: "string",

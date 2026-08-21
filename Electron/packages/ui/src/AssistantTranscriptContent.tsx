@@ -140,6 +140,7 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
             elapsed,
             content: payload.content,
             details: payload.details,
+            images: activity.tool.images,
           })
           if (custom != null) return custom
         }

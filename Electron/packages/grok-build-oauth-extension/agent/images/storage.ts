@@ -22,10 +22,18 @@ import { open, readdir, rename, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { sniffImageMime } from "./client.js";
+import { tryResolveAgentHome } from "../oauth/home.js";
 
 export function resolveImagesRoot(): string {
-  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-  const agentDir = envDir || join(process.cwd(), ".pi", "agent");
+  // PI_COC_AGENT_DIR > PI_CODING_AGENT_DIR; never a global ~/.pi fallback.
+  // Without a resolved home the caller fails closed with an actionable error
+  // (project isolation hard rule) — no writes to an undisclosed location.
+  const agentDir = tryResolveAgentHome();
+  if (!agentDir) {
+    throw new Error(
+      "未检测到 PI_COC_AGENT_DIR / PI_CODING_AGENT_DIR — 无法确定图片隔离目录（拒绝回退到全局 ~/.pi/agent）",
+    );
+  }
   return join(agentDir, "attachments", "images");
 }
 

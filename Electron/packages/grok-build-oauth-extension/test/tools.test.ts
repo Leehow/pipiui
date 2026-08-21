@@ -3,6 +3,7 @@ import { mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TIER_RESTRICTED_UPSELL } from "../agent/images/errors.js";
+import { GrokCredentialBroker } from "../agent/oauth/broker.js";
 
 // 1x1 transparent PNG
 const TINY_PNG_B64 =
@@ -138,15 +139,26 @@ describe("M4 tool wiring — image_gen / image_edit via extension entry", () => 
     expect(fetchCalls[0].headers["x-grok-session-id"]).toBe(sessionId);
   });
 
-  it("XAI_API_KEY path shares the same client/payload; never tier-gated", async () => {
+  it("XAI_API_KEY is NOT used with compatFallback off; with compat on it shares the same client/payload and is never tier-gated", async () => {
     process.env.XAI_API_KEY = "xai-key-123";
     process.env.GROK_TIER = "Free"; // gate applies to OAuth callers only
     setFetch(() => okImageResponse());
     const pi = await loadExtension();
-    const res = await pi.tools.get("image_gen")!.execute("c", { prompt: "p" });
+    // compatFallback=false (default) — the API key must never be used (MUST-FIX #4).
+    await expect(pi.tools.get("image_gen")!.execute("c", { prompt: "p" }))
+      .rejects.toMatchObject({ code: "auth_expired" });
+    expect(fetchCalls).toHaveLength(0);
+
+    // compatFallback=true — deprecated API-key fallback shares the client/payload.
+    process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH = JSON.stringify({
+      "ext.grok-build-oauth.compatFallback": true,
+    });
+    const pi2 = await loadExtension();
+    const res = await pi2.tools.get("image_gen")!.execute("c", { prompt: "p" });
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0].headers.authorization).toBe("Bearer xai-key-123");
     expect((res.details.path as string).endsWith("1.jpg")).toBe(true);
+    expect(res.details.deprecated).toBe(true);
   });
 
   it("OAuth + restricted tier short-circuits with advisory upsell, no HTTP", async () => {
@@ -241,9 +253,10 @@ describe("M4 tool wiring — image_gen / image_edit via extension entry", () => 
     setFetch(() => okImageResponse());
     const pi = await loadExtension();
 
-    // reference file inside the sandbox
-    const ref = join(dir, "ref.png");
-    const { writeFile } = await import("node:fs/promises");
+    // reference file inside the allowed roots (agent-home attachments)
+    const ref = join(dir, "attachments", "ref.png");
+    const { writeFile, mkdir } = await import("node:fs/promises");
+    await mkdir(join(dir, "attachments"), { recursive: true });
     await writeFile(ref, Buffer.from(TINY_PNG_B64, "base64"));
 
     const res = await pi.tools.get("image_edit")!.execute("c", {

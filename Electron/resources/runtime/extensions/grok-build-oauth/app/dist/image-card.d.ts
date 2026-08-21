@@ -1,7 +1,8 @@
 import type { ToolRenderProps } from "@pipiui/extension-api";
 /**
- * M1 tool renderer placeholder for `image_gen` / `image_edit`.
- * Real renderer will decode `b64_json` and show the落盘 file.
- * This placeholder only proves the `toolRenderers` + `stream.render` + `details` wiring.
+ * Typed image renderer for `image_gen` / `image_edit` (US-18): renders the
+ * actual generated image — the typed `{type:"image"}` blocks delivered with the
+ * tool result — plus the saved file path and backend/model metadata. Falls back
+ * to path/metadata text when no image payload is present (e.g. tier gate).
  */
 export default function ImageCard(props: ToolRenderProps): import("react").JSX.Element;

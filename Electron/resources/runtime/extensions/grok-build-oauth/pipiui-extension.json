@@ -12,6 +12,10 @@
   "agent": {
     "extension": "agent/dist/index.js"
   },
+  "host": {
+    "entry": "agent/dist/host.js",
+    "description": "Stable host library entry for cross-host consumers (pi-coc); same broker/tier/images client as the tools, returns bytes+metadata. Content hash pinned by the bundled sync receipt (pipiui-host-receipt.json)."
+  },
   "app": {
     "settings": {
       "scope": "app",

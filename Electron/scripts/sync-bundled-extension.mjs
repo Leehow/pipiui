@@ -10,7 +10,8 @@
  * Usage: node scripts/sync-bundled-extension.mjs [packageDirName]
  *   packageDirName defaults to grok-build-oauth-extension (id from its manifest).
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -33,6 +34,7 @@ if (typeof id !== "string" || !/^[a-z][a-z0-9-]*$/.test(id)) {
 
 const dest = join(electronRoot, "resources", "runtime", "extensions", id);
 const agentEntry = manifest.agent?.extension;
+const hostEntry = typeof manifest.host?.entry === "string" ? manifest.host.entry : undefined;
 const appEntries = [
   ...(manifest.app?.ui?.panels ?? []).map((p) => p.entry),
   ...(manifest.app?.ui?.toolRenderers ?? []).map((r) => r.entry),
@@ -40,7 +42,7 @@ const appEntries = [
 ].filter((entry) => typeof entry === "string" && entry.length > 0);
 
 // Every declared entry must be built before the runtime copy is refreshed.
-for (const entry of [agentEntry, ...appEntries]) {
+for (const entry of [agentEntry, hostEntry, ...appEntries]) {
   if (!entry) continue;
   if (!existsSync(join(packageDir, entry))) {
     console.error(`sync-bundled-extension: missing build artifact ${entry}; run the package build first`);
@@ -58,7 +60,29 @@ for (const half of ["agent", "app"]) {
   if (existsSync(distDir)) cpSync(distDir, join(dest, half, "dist"), { recursive: true });
 }
 
-for (const entry of [agentEntry, ...appEntries]) {
+// Host receipt: pin the declared host library entry's content hash so a
+// cross-host resolver (pi-coc) can verify both hosts consume the same build
+// artifact byte-for-byte (spec §D1). Written next to the manifest.
+if (hostEntry) {
+  const hostFile = join(dest, hostEntry);
+  if (!existsSync(hostFile)) {
+    console.error(`sync-bundled-extension: runtime copy is missing host entry ${hostEntry}`);
+    process.exit(1);
+  }
+  const sha256 = createHash("sha256").update(readFileSync(hostFile)).digest("hex");
+  const receipt = {
+    version: 1,
+    extensionId: id,
+    manifestVersion: manifest.version,
+    hostEntry,
+    sha256,
+    bytes: readFileSync(hostFile).byteLength,
+    generatedAt: new Date().toISOString(),
+  };
+  writeFileSync(join(dest, "pipiui-host-receipt.json"), `${JSON.stringify(receipt, null, 2)}\n`);
+}
+
+for (const entry of [agentEntry, hostEntry, ...appEntries]) {
   if (!entry) continue;
   if (!existsSync(join(dest, entry))) {
     console.error(`sync-bundled-extension: runtime copy is missing ${entry}`);

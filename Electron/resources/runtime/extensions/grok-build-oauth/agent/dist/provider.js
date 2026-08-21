@@ -9,13 +9,12 @@
  * Secrets never leave the pi credential store (`auth.json` under the host's Pi home);
  * this module only carries code and non-secret config.
  */
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { resolveOAuthConfig } from "./oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
 import { redactMessage } from "./oauth/redact.js";
 import { createBroker } from "./oauth/broker.js";
+import { authJsonPath } from "./oauth/home.js";
 export const GROK_BUILD_PROVIDER_ID = "grok-build";
 function displayUriOf(code) {
     if (code.verification_uri_complete)
@@ -24,15 +23,14 @@ function displayUriOf(code) {
     return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
 }
 export function defaultAuthPath() {
-    const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-    if (envDir)
-        return join(envDir, "auth.json");
-    return join(homedir(), ".pi", "agent", "auth.json");
+    // PI_COC_AGENT_DIR > PI_CODING_AGENT_DIR; throws NoAgentHomeError when both
+    // are unset (no global ~/.pi/agent fallback — project isolation hard rule).
+    return authJsonPath();
 }
 function brokerFor(authPath, signal) {
     const cfg = resolveOAuthConfig();
     return createBroker({
-        authPath,
+        authPath: authPath ?? defaultAuthPath(),
         earlyRefreshSec: cfg.earlyRefreshSec,
         fetchImpl: fetch,
     });
@@ -44,7 +42,9 @@ function brokerFor(authPath, signal) {
  */
 export function createGrokBuildProvider(options = {}) {
     const emit = options.emit ?? (() => undefined);
-    const authPath = options.authPath ?? defaultAuthPath();
+    // Resolved lazily so a missing home surfaces as an actionable error at the
+    // first credential operation instead of breaking extension registration.
+    const authPath = options.authPath;
     return {
         // Auth-only provider: no chat models are exposed (images transport is tool-based).
         name: "Grok Build",

@@ -89,9 +89,14 @@ describe("M4 images — request contract (official Grok Build alignment)", () =>
     expect(headers["x-grok-session-id"]).toBe("sess-123");
   });
 
-  it("normalizes trailing slashes and honors base override", () => {
+  it("normalizes trailing slashes, honors base override, HTTPS-only bearer policy", () => {
     expect(normalizeBaseUrl("https://api.x.ai/v1/")).toBe("https://api.x.ai/v1");
-    expect(normalizeBaseUrl("http://127.0.0.1:9/v1///")).toBe("http://127.0.0.1:9/v1");
+    // Bearer credentials never go to plain HTTP (reviewer MUST-FIX #8)...
+    expect(() => normalizeBaseUrl("http://127.0.0.1:9/v1///")).toThrowError(ImagesError);
+    expect(() => normalizeBaseUrl("http://evil.example/v1")).toThrowError(ImagesError);
+    // ...except explicit loopback compat relay opt-in.
+    expect(normalizeBaseUrl("http://127.0.0.1:9/v1///", { allowHttpLoopback: true })).toBe("http://127.0.0.1:9/v1");
+    expect(() => normalizeBaseUrl("http://evil.example/v1", { allowHttpLoopback: true })).toThrowError(ImagesError);
     expect(() => normalizeBaseUrl("not a url")).toThrowError(ImagesError);
     expect(() => normalizeBaseUrl("ftp://x.ai")).toThrowError(ImagesError);
   });
@@ -295,32 +300,54 @@ describe("M4 images — image_edit contract (official compatible path/params)", 
       .rejects.toMatchObject({ code: "invalid_params" });
   });
 
-  it("resolveImageReference: data URLs pass, traversal/large/missing rejected", async () => {
+  it("resolveImageReference: data URLs pass; filesystem refs confined to allowed roots", async () => {
     const dir = await mkdtemp(join(tmpdir(), "grok-refs-"));
+    const outsideDir = await mkdtemp(join(tmpdir(), "grok-refs-out-"));
     try {
       const good = await resolveImageReference(`data:image/png;base64,${TINY_PNG_B64}`);
       expect(good.startsWith("data:image/png;base64,")).toBe(true);
       await expect(resolveImageReference("data:image/jpeg")).rejects.toMatchObject({ code: "invalid_params" });
 
+      // In-root file (inside the allowed root = the temp dir passed as cwd root).
       const p = join(dir, "ref.png");
       await writeFile(p, TINY_PNG);
-      const fromFile = await resolveImageReference(p);
+      const fromFile = await resolveImageReference(p, { allowedRoots: [dir] });
       expect(fromFile).toBe(`data:image/png;base64,${TINY_PNG_B64}`);
 
-      await expect(resolveImageReference(join(dir, "..", "secret.png")))
+      await expect(resolveImageReference(join(dir, "..", "secret.png"), { allowedRoots: [dir] }))
         .rejects.toMatchObject({ code: "invalid_params" });
-      await expect(resolveImageReference(join(dir, "missing.png")))
+      await expect(resolveImageReference(join(dir, "missing.png"), { allowedRoots: [dir] }))
         .rejects.toMatchObject({ code: "invalid_params" });
 
       const big = join(dir, "big.png");
       await writeFile(big, Buffer.concat([TINY_PNG, Buffer.alloc(MAX_REFERENCE_BYTES)]));
-      await expect(resolveImageReference(big)).rejects.toMatchObject({ code: "invalid_params" });
+      await expect(resolveImageReference(big, { allowedRoots: [dir] })).rejects.toMatchObject({ code: "invalid_params" });
 
       const notImage = join(dir, "x.gif");
       await writeFile(notImage, Buffer.from("GIF89a...."));
-      await expect(resolveImageReference(notImage)).rejects.toMatchObject({ code: "invalid_params" });
+      await expect(resolveImageReference(notImage, { allowedRoots: [dir] })).rejects.toMatchObject({ code: "invalid_params" });
+
+      // Arbitrary absolute path outside the allowed roots is refused (MUST-FIX #7).
+      await expect(resolveImageReference(join(outsideDir, "escape.png"), { allowedRoots: [dir] }))
+        .rejects.toMatchObject({ code: "invalid_params" });
+      const outsideFile = join(outsideDir, "escape.png");
+      await writeFile(outsideFile, TINY_PNG);
+      await expect(resolveImageReference(outsideFile, { allowedRoots: [dir] }))
+        .rejects.toMatchObject({ code: "invalid_params" });
+
+      // Symlink escape: a link inside the root pointing outside is refused.
+      const { symlinkSync } = await import("node:fs");
+      const link = join(dir, "link.png");
+      symlinkSync(outsideFile, link);
+      await expect(resolveImageReference(link, { allowedRoots: [dir] }))
+        .rejects.toMatchObject({ code: "invalid_params" });
+
+      // cwd-relative paths still work when inside the default root (cwd).
+      const rel = await resolveImageReference("ref.png", { cwd: dir, allowedRoots: [dir] });
+      expect(rel).toBe(`data:image/png;base64,${TINY_PNG_B64}`);
     } finally {
       await rm(dir, { recursive: true, force: true });
+      await rm(outsideDir, { recursive: true, force: true });
     }
   });
 });

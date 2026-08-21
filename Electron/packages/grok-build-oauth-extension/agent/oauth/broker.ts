@@ -1,38 +1,65 @@
 /**
- * OAuth Credential Broker — M3
- * Single API for provider requests and image tools.
+ * OAuth Credential Broker — single API for provider requests and image tools.
+ *
  * Invariants: earlyRefresh, rotation, 401 single retry, no-refresh -> re-login,
  * invalid_grant cleanup, network/5xx preserve old, in-process dedup,
- * cross-process flock + re-read + freshness guard, 0600 tmp/fsync/rename, no token logs.
+ * cross-process lock + re-read + freshness guard, 0600 tmp/fsync/rename, no token logs.
+ *
+ * Symlink/shared-profile safety (reviewer MUST-FIX #1):
+ * - The credential target is resolved to its REAL path first. PipiUI links each
+ *   project's `.pi/agent/auth.json` at the App-profile canonical file; the lock
+ *   and the atomic tmp+rename therefore act on the canonical file, never on the
+ *   project symlink (a rename through the symlink path would replace the link
+ *   and split the shared login), and every project pointing at the same
+ *   canonical file shares the SAME lock.
+ * - Persistence mirrors pi's `FileAuthStorageBackend` semantics (whole-file
+ *   auth.json, 0600, only this provider's entry mutated per merge) and is only
+ *   reachable through this broker's controlled methods — no second persistence
+ *   path exists in the package.
+ *
+ * Lock safety (reviewer MUST-FIX #2): the dependency-free heartbeat lock in
+ * `./lock.js` keeps a live refresh from ever being treated as stale; takeover
+ * only happens after the holder stopped heartbeating (crash), and release is
+ * owner-checked so a late release can never delete a new holder's lock.
  */
 import { chmodSync, mkdirSync } from "node:fs";
 import { open, readFile, rename, stat } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { refreshAccessToken, OAuthError } from "./device.js";
 import { toOAuthCredentials, type StoredOAuthCredential } from "./credentials.js";
 import { redactMessage } from "./redact.js";
 import { resolveOAuthConfig } from "./config.js";
+import { acquireFileLock, resolveCredentialTarget, type LockOptions } from "./lock.js";
 
 export type BrokerCredential = StoredOAuthCredential & { type: "oauth" };
 
 type Clock = { nowMs: () => number };
 
-function defaultAuthPath(): string {
-  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
-  if (envDir) return join(envDir, "auth.json");
-  // fallback to homedir for tests / pi-coc repo-local may override via opts
-  return join(homedir(), ".pi", "agent", "auth.json");
-}
+export type BrokerOptions = {
+  authPath?: string;
+  providerId?: string;
+  earlyRefreshSec?: number;
+  fetchImpl?: typeof fetch;
+  clock?: Clock;
+  lock?: LockOptions;
+  /** Network timeout for refresh calls. Default 30s. */
+  refreshTimeoutMs?: number;
+};
 
 function ensureDirSecure(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   try { chmodSync(dir, 0o700); } catch {}
 }
 
-async function atomicWriteJson(filePath: string, data: Record<string, unknown>): Promise<void> {
-  const dir = dirname(filePath);
+/**
+ * Atomic JSON write against the REAL target file (tmp + fsync + chmod 0600 +
+ * rename inside the real file's directory). `rename` may replace a regular
+ * file — it must never be pointed at a symlink path, which is why callers
+ * resolve the real target first.
+ */
+async function atomicWriteJson(realPath: string, data: Record<string, unknown>): Promise<void> {
+  const dir = dirname(realPath);
   ensureDirSecure(dir);
   const tmp = join(dir, `.${randomUUID()}.tmp`);
   const content = `${JSON.stringify(data, null, 2)}\n`;
@@ -44,8 +71,8 @@ async function atomicWriteJson(filePath: string, data: Record<string, unknown>):
     await fd.chmod(0o600);
     await fd.close();
     fd = undefined;
-    await rename(tmp, filePath);
-    try { chmodSync(filePath, 0o600); } catch {}
+    await rename(tmp, realPath);
+    try { chmodSync(realPath, 0o600); } catch {}
     // fsync dir for durability (best-effort)
     try {
       const dirFd = await open(dir, "r");
@@ -53,7 +80,6 @@ async function atomicWriteJson(filePath: string, data: Record<string, unknown>):
     } catch {}
   } finally {
     if (fd) try { await fd.close(); } catch {}
-    try { await stat(tmp).then(() => {}).catch(() => {}); } catch {}
     // cleanup tmp if rename failed
     try {
       const { unlink } = await import("node:fs/promises");
@@ -62,17 +88,14 @@ async function atomicWriteJson(filePath: string, data: Record<string, unknown>):
   }
 }
 
-async function readAuthJson(authPath: string): Promise<Record<string, unknown>> {
+async function readAuthJson(path: string): Promise<Record<string, unknown>> {
   try {
-    const text = await readFile(authPath, "utf8");
+    const text = await readFile(path, "utf8");
     const parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
-  } catch (e: unknown) {
-    const code = (e as NodeJS.ErrnoException)?.code;
-    if (code === "ENOENT") return {};
-    // corrupt file -> treat as empty but don't overwrite silently
-    if (e instanceof SyntaxError) return {};
+  } catch {
+    // Missing or corrupt file -> treat as empty; merges only touch our key.
     return {};
   }
 }
@@ -92,175 +115,84 @@ function isFreshEnough(newer: BrokerCredential, older: BrokerCredential | undefi
   return newer.expires > older.expires;
 }
 
-// Minimal cross-process lock using proper-lockfile when available,
-// fallback to simple fs lock file with stale handling.
-async function acquireLock(authPath: string, signal?: AbortSignal): Promise<() => Promise<void>> {
-  const staleMs = 30_000;
-  const maxDelayMs = 2_000;
-  const deadline = Date.now() + staleMs;
-  let retry = 0;
-  // Try proper-lockfile first
-  let useProper = false;
-  let properLock: unknown;
-  try {
-    // @ts-ignore — optional dep, fallback if missing
-    const mod = await import("proper-lockfile");
-    properLock = (mod as Record<string, unknown>).default ?? mod;
-    useProper = true;
-  } catch {
-    useProper = false;
-  }
-
-  if (useProper && properLock) {
-    const pl = properLock as { lock: (p: string, o: unknown) => Promise<() => Promise<void>> };
-    // retry loop matching Pi's FileAuthStorageBackend.acquireLockAsync
-    while (true) {
-      signal?.throwIfAborted();
-      let release: (() => Promise<void>) | undefined;
-      let compromised = false;
-      let compromisedError: unknown;
-      try {
-        release = await pl.lock(authPath, {
-          realpath: false,
-          retries: 0,
-          stale: staleMs,
-          onCompromised: (err: unknown) => { compromised = true; compromisedError = err; },
-        } as never);
-      } catch (err) {
-        signal?.throwIfAborted();
-        const code = (err as { code?: string })?.code;
-        const remaining = deadline - Date.now();
-        if (code !== "ELOCKED" || remaining <= 0) throw err;
-        const base = Math.min(10 * 2 ** retry, maxDelayMs / 2);
-        retry++;
-        const delay = Math.min(Math.round(base * (1 + Math.random())), remaining);
-        if (signal) {
-          await new Promise<void>((res, rej) => {
-            const t = setTimeout(res, delay);
-            signal.addEventListener("abort", () => { clearTimeout(t); rej(signal.reason ?? new DOMException("Aborted", "AbortError")); }, { once: true });
-          });
-        } else {
-          await new Promise<void>((res) => setTimeout(res, delay));
-        }
-        continue;
-      }
-      if (signal?.aborted) {
-        if (release) await release().catch(() => {});
-        signal.throwIfAborted();
-      }
-      if (compromised) {
-        if (release) await release().catch(() => {});
-        throw compromisedError ?? new Error("Auth storage lock was compromised");
-      }
-      // wrap release to always be async
-      return async () => {
-        if (release) await (release as () => Promise<void>)().catch(() => {});
-      };
-    }
-  }
-
-  // Fallback: simple lock file auth.json.lock with PID:TS and flock via fs
-  // Uses open + exclusive create + stale check.
-  const lockPath = `${authPath}.lock`;
-  const pid = process.pid;
-  const writeHolder = async () => {
-    const ts = Math.floor(Date.now() / 1000);
-    await atomicWriteJson(lockPath, { holder: `${pid}:${ts}` } as unknown as Record<string, unknown>);
-  };
-  // simple busy-wait with stale break
-  while (true) {
-    signal?.throwIfAborted();
-    try {
-      // try exclusive create
-      const fd = await open(lockPath, "wx", 0o600);
-      try { await fd.writeFile(`${pid}:${Math.floor(Date.now()/1000)}`); await fd.sync(); } finally { await fd.close(); }
-      return async () => {
-        try {
-          const { unlink } = await import("node:fs/promises");
-          await unlink(lockPath).catch(() => {});
-        } catch {}
-      };
-    } catch (e: unknown) {
-      const code = (e as NodeJS.ErrnoException)?.code;
-      if (code !== "EEXIST") throw e;
-      // check stale
-      try {
-        const st = await stat(lockPath);
-        const ageMs = Date.now() - st.mtimeMs;
-        if (ageMs > staleMs) {
-          // try to break stale lock
-          try {
-            const { unlink } = await import("node:fs/promises");
-            await unlink(lockPath);
-            continue;
-          } catch {}
-        }
-      } catch {}
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error(`Failed to acquire lock on ${authPath}: timeout`);
-      const base = Math.min(10 * 2 ** retry, maxDelayMs / 2);
-      retry++;
-      const delay = Math.min(Math.round(base * (1 + Math.random())), Math.min(100, remaining));
-      if (signal) {
-        await new Promise<void>((res, rej) => {
-          const t = setTimeout(res, delay);
-          signal.addEventListener("abort", () => { clearTimeout(t); rej(signal.reason ?? new DOMException("Aborted","AbortError")); }, { once:true });
-        });
-      } else {
-        await new Promise<void>((res) => setTimeout(res, delay));
-      }
-    }
-  }
+/** Read the credential entry from a specific file path (real or as-given). */
+async function readCredentialFrom(path: string, providerId: string, nowMs: () => number): Promise<BrokerCredential | undefined> {
+  const data = await readAuthJson(path);
+  const entry = data[providerId] as Record<string, unknown> | undefined;
+  if (!entry || entry.type !== "oauth") return undefined;
+  const access = entry.access as string | undefined;
+  const refresh = entry.refresh as string | undefined;
+  const expires = entry.expires as number | undefined;
+  if (typeof access !== "string" || !access || typeof expires !== "number" || !Number.isFinite(expires)) return undefined;
+  const cfg = resolveOAuthConfig();
+  return {
+    type: "oauth",
+    access,
+    refresh: typeof refresh === "string" ? refresh : "",
+    expires,
+    issuer: typeof entry.issuer === "string" ? entry.issuer : cfg.issuer,
+    client_id: typeof entry.client_id === "string" ? entry.client_id : cfg.clientId,
+    scopes: Array.isArray(entry.scopes) ? entry.scopes as string[] : cfg.scopes,
+    token_type: typeof entry.token_type === "string" ? entry.token_type : "Bearer",
+    obtained_at: typeof entry.obtained_at === "number" ? entry.obtained_at : nowMs(),
+  } as BrokerCredential;
 }
-
-export type BrokerOptions = {
-  authPath?: string;
-  providerId?: string;
-  earlyRefreshSec?: number;
-  fetchImpl?: typeof fetch;
-  clock?: Clock;
-};
 
 export class GrokCredentialBroker {
   private inflight = new Map<string, Promise<BrokerCredential>>();
-  private opts: { authPath: string; providerId: string; earlyRefreshSec: number; fetchImpl: typeof fetch; clock: Clock };
+  private opts: {
+    authPath: string;
+    providerId: string;
+    earlyRefreshSec: number;
+    fetchImpl: typeof fetch;
+    clock: Clock;
+    lock: LockOptions;
+    refreshTimeoutMs: number;
+  };
+  /** Resolved real credential target (symlinks followed). */
+  private target: { asGiven: string; real: string } | undefined;
 
   constructor(opts: BrokerOptions = {}) {
     const cfg = resolveOAuthConfig();
     this.opts = {
-      authPath: opts.authPath ?? defaultAuthPath(),
+      authPath: opts.authPath ?? join(process.cwd(), "auth.json"),
       providerId: opts.providerId ?? "grok-build",
       earlyRefreshSec: opts.earlyRefreshSec ?? cfg.earlyRefreshSec,
       fetchImpl: (opts.fetchImpl ?? fetch) as typeof fetch,
       clock: opts.clock ?? { nowMs: () => Date.now() },
+      lock: opts.lock ?? {},
+      refreshTimeoutMs: opts.refreshTimeoutMs ?? 30_000,
     };
   }
 
   private nowMs(): number { return this.opts.clock.nowMs(); }
 
-  private async readCredential(): Promise<BrokerCredential | undefined> {
-    const data = await readAuthJson(this.opts.authPath);
-    const entry = data[this.opts.providerId] as Record<string, unknown> | undefined;
-    if (!entry || entry.type !== "oauth") return undefined;
-    const access = entry.access as string | undefined;
-    const refresh = entry.refresh as string | undefined;
-    const expires = entry.expires as number | undefined;
-    if (typeof access !== "string" || !access || typeof expires !== "number" || !Number.isFinite(expires)) return undefined;
-    return {
-      type: "oauth",
-      access,
-      refresh: typeof refresh === "string" ? refresh : "",
-      expires,
-      issuer: typeof entry.issuer === "string" ? entry.issuer : resolveOAuthConfig().issuer,
-      client_id: typeof entry.client_id === "string" ? entry.client_id : resolveOAuthConfig().clientId,
-      scopes: Array.isArray(entry.scopes) ? entry.scopes as string[] : resolveOAuthConfig().scopes,
-      token_type: typeof entry.token_type === "string" ? entry.token_type : "Bearer",
-      obtained_at: typeof entry.obtained_at === "number" ? entry.obtained_at : this.nowMs(),
-    } as BrokerCredential;
+  /** Resolve (and cache) the real credential target; locks and writes act on it. */
+  private async resolveTarget(): Promise<{ asGiven: string; real: string }> {
+    if (!this.target) this.target = await resolveCredentialTarget(this.opts.authPath);
+    return this.target;
   }
 
+  /** The path reads/writes/locks act on (real target, symlink-followed). */
+  async realAuthPath(): Promise<string> {
+    return (await this.resolveTarget()).real;
+  }
+
+  private async readCredential(): Promise<BrokerCredential | undefined> {
+    const { real } = await this.resolveTarget();
+    // Read through the as-given path first (matches what the holder sees via
+    // their project link); fall back to the real file. Both resolve to the same
+    // bytes when the link is healthy.
+    return (
+      (await readCredentialFrom(this.opts.authPath, this.opts.providerId, () => this.nowMs())) ??
+      (await readCredentialFrom(real, this.opts.providerId, () => this.nowMs()))
+    );
+  }
+
+  /** Controlled write: merge only this provider's entry into the real file. */
   private async writeCredential(cred: BrokerCredential | undefined): Promise<void> {
-    const data = await readAuthJson(this.opts.authPath);
+    const { real } = await this.resolveTarget();
+    const data = await readAuthJson(real);
     if (!cred) {
       delete data[this.opts.providerId];
     } else {
@@ -276,7 +208,7 @@ export class GrokCredentialBroker {
         obtained_at: cred.obtained_at,
       };
     }
-    await atomicWriteJson(this.opts.authPath, data);
+    await atomicWriteJson(real, data);
   }
 
   /** Shared API for provider and image tools: returns a fresh access token, refreshing early if needed */
@@ -312,23 +244,27 @@ export class GrokCredentialBroker {
       throw new OAuthError("auth_expired", "No refresh token — please run /login grok-build again.");
     }
 
-    let release: (() => Promise<void>) | undefined;
-    try {
-      release = await acquireLock(this.opts.authPath, signal);
-      signal?.throwIfAborted();
+    const { real } = await this.resolveTarget();
+    ensureDirSecure(dirname(real));
 
-      // Re-read inside lock
-      const inside = await this.readCredential();
+    // Cross-process lock on the REAL target — projects sharing the App-profile
+    // canonical file share this one lock (in-flight refresh is never stale-broken:
+    // heartbeat lock).
+    const lock = await acquireFileLock(real, { ...this.opts.lock, signal });
+    signal?.throwIfAborted();
+
+    try {
+      // Re-read inside lock (from the real file — the authoritative bytes).
+      const inside = await readCredentialFrom(real, this.opts.providerId, () => this.nowMs());
       if (!inside) throw new OAuthError("auth_expired", "Not logged in — please run /login grok-build");
-      // Freshness guard: if inside was already refreshed by another process, reuse it
-      if (inside && before && !isExpiring(inside, this.opts.earlyRefreshSec, this.nowMs()) && isFreshEnough(inside, before)) {
-        // If inside is fresh enough (newer), no need to refresh
-        if (inside.obtained_at !== before.obtained_at || inside.access !== before.access) {
-          // Another process refreshed, use that
-          return inside;
-        }
+      // Freshness guard: another process already refreshed while we waited.
+      if (
+        !isExpiring(inside, this.opts.earlyRefreshSec, this.nowMs()) &&
+        isFreshEnough(inside, before) &&
+        (inside.obtained_at !== before.obtained_at || inside.access !== before.access)
+      ) {
+        return inside;
       }
-      // If inside is same as before but still expiring, proceed to refresh
 
       const cfg = resolveOAuthConfig();
       const issuer = inside.issuer || cfg.issuer;
@@ -336,26 +272,25 @@ export class GrokCredentialBroker {
 
       // Issuer mismatch -> require re-login
       if (inside.issuer && inside.issuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
-        // Clear credential? Spec says invalid issuer requires re-login, don't keep stale?
-        // We'll throw auth_expired and let caller clear if needed.
         throw new OAuthError("auth_expired", "Issuer mismatch — please run /login grok-build again. [redacted]");
       }
 
       let tokens;
       try {
-        tokens = await refreshAccessToken({ issuer, clientId, refreshToken: inside.refresh, fetchImpl: this.opts.fetchImpl, signal });
+        const timeoutSignal = AbortSignal.timeout(this.opts.refreshTimeoutMs);
+        const effective = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+        tokens = await refreshAccessToken({ issuer, clientId, refreshToken: inside.refresh, fetchImpl: this.opts.fetchImpl, signal: effective });
       } catch (err) {
+        if (signal?.aborted) throw err;
         const code = (err as OAuthError)?.code;
         const msg = err instanceof Error ? err.message : String(err);
         const redacted = redactMessage(msg, [inside.refresh, inside.access]);
-        // Never log token
         if (code === "invalid_grant") {
-          // Clear credential on invalid_grant
+          // Clear credential on invalid_grant (invalidated refresh token)
           await this.writeCredential(undefined);
           throw new OAuthError("auth_expired", "Refresh token expired or revoked — please run /login grok-build again. [redacted]");
         }
-        // Network/5xx -> preserve old credential, throw retryable error
-        // Do not overwrite file
+        // Network/5xx/timeout -> preserve old credential, throw retryable error
         throw new OAuthError(code ?? "refresh_failed", redacted);
       }
 
@@ -367,19 +302,16 @@ export class GrokCredentialBroker {
       }) as BrokerCredential & { type: "oauth" };
       const nextCred: BrokerCredential = { ...next, type: "oauth" as const };
 
-      // Freshness guard before write: re-read again? But we already hold lock, so no race except we already checked.
-      // Ensure we don't overwrite with older obtained_at
-      const current = await this.readCredential();
+      // Freshness guard before write (we hold the lock, but belt-and-braces).
+      const current = await readCredentialFrom(real, this.opts.providerId, () => this.nowMs());
       if (current && !isFreshEnough(nextCred, current)) {
-        // Current on disk is fresher (another holder wrote after we read but before we acquired lock? Already handled)
-        // But we hold lock, so this shouldn't happen. Still guard.
         return current;
       }
 
       await this.writeCredential(nextCred);
       return nextCred;
     } finally {
-      if (release) await release().catch(() => {});
+      await lock.release().catch(() => {});
     }
   }
 
@@ -423,23 +355,76 @@ export class GrokCredentialBroker {
   }
 
   /**
+   * Controlled one-shot import of an externally obtained credential (US-09).
+   * Validates issuer/client/expiry, then merges into the real auth.json under
+   * the shared lock. The source file is never modified or deleted.
+   */
+  async importCredential(input: {
+    access: string;
+    refresh?: string;
+    expiresAtMs: number;
+    issuer?: string;
+    clientId?: string;
+    scopes?: string[];
+  }): Promise<BrokerCredential> {
+    if (!input.access || typeof input.access !== "string") {
+      throw new OAuthError("invalid_params", "导入的凭证缺少 access token");
+    }
+    const cfg = resolveOAuthConfig();
+    if (input.issuer && input.issuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
+      throw new OAuthError("invalid_params", `导入凭证的 issuer 不匹配（期望 ${cfg.issuer}）— 请重新登录 grok-build`);
+    }
+    if (input.clientId && input.clientId !== cfg.clientId) {
+      throw new OAuthError("invalid_params", `导入凭证的 client_id 不匹配（期望 ${cfg.clientId}）— 请重新登录 grok-build`);
+    }
+    if (!Number.isFinite(input.expiresAtMs) || input.expiresAtMs <= this.nowMs()) {
+      throw new OAuthError("invalid_params", "导入的凭证已过期 — 请重新登录 grok-build");
+    }
+    const { real } = await this.resolveTarget();
+    ensureDirSecure(dirname(real));
+    const lock = await acquireFileLock(real, { ...this.opts.lock });
+    try {
+      const cred: BrokerCredential = {
+        type: "oauth",
+        access: input.access,
+        refresh: input.refresh ?? "",
+        expires: input.expiresAtMs,
+        issuer: input.issuer ?? cfg.issuer,
+        client_id: input.clientId ?? cfg.clientId,
+        scopes: input.scopes ?? cfg.scopes,
+        token_type: "Bearer",
+        obtained_at: this.nowMs(),
+      };
+      await this.writeCredential(cred);
+      return cred;
+    } finally {
+      await lock.release().catch(() => {});
+    }
+  }
+
+  /**
    * Non-secret credential status for host/UI surfaces (登录状态/过期时间/凭证来源).
-   * Never returns token values.
+   * Never returns token values. `usable` folds expiry + refresh presence so
+   * compat consumers can decide without duplicating broker logic.
    */
   async status(): Promise<{
     loggedIn: boolean;
     expired: boolean;
-    expiresAtMs?: number;
     hasRefresh: boolean;
+    usable: boolean;
+    expiresAtMs?: number;
     issuer?: string;
   }> {
     const cred = await this.readCredential();
-    if (!cred) return { loggedIn: false, expired: false, hasRefresh: false };
+    if (!cred) return { loggedIn: false, expired: false, hasRefresh: false, usable: false };
+    const expired = Number.isFinite(cred.expires) && cred.expires <= Date.now();
+    const hasRefresh = Boolean(cred.refresh);
     return {
       loggedIn: true,
-      expired: Number.isFinite(cred.expires) && cred.expires <= Date.now(),
+      expired,
+      hasRefresh,
+      usable: !expired || hasRefresh,
       expiresAtMs: Number.isFinite(cred.expires) ? cred.expires : undefined,
-      hasRefresh: Boolean(cred.refresh),
       issuer: cred.issuer,
     };
   }
@@ -453,5 +438,5 @@ export function createBroker(opts?: BrokerOptions): GrokCredentialBroker {
   return new GrokCredentialBroker(opts);
 }
 
-// Re-export atomic helpers for tests
-export const _internal = { atomicWriteJson, readAuthJson, acquireLock, isExpiring, isFreshEnough };
+// Re-export helpers for tests
+export const _internal = { atomicWriteJson, readAuthJson, isExpiring, isFreshEnough };

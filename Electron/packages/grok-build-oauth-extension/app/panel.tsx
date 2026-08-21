@@ -37,6 +37,7 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
   const [settings, setSettings] = useState<Record<string, unknown>>({});
   const [status, setStatus] = useState<StatusData | undefined>(undefined);
   const [statusError, setStatusError] = useState<string | undefined>(undefined);
+  const [statusErrorDismissed, setStatusErrorDismissed] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
@@ -51,6 +52,7 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
     if (result?.ok && result.data && typeof result.data === "object") {
       setStatus(result.data as StatusData);
       setStatusError(undefined);
+      setStatusErrorDismissed(false);
     } else {
       setStatus(undefined);
       const code = result && !result.ok ? result.error.code : "no_session";
@@ -94,7 +96,7 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
   const source = status?.credentialSource
     ? status.credentialSource === "oauth"
       ? "OAuth（grok-build provider）"
-      : "环境变量 XAI_API_KEY（api_key）"
+      : "环境变量 XAI_API_KEY（deprecated 兼容，仅 compatFallback 开启时使用）"
     : undefined;
 
   return (
@@ -139,9 +141,21 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
         </tbody>
       </table>
 
-      {statusError && (
-        <p style={{ margin: "0 0 8px", fontSize: 12, opacity: 0.7 }} data-testid="grok-build-status-note">
-          {statusError}
+      {statusError && !statusErrorDismissed && (
+        <p
+          style={{ margin: "0 0 8px", fontSize: 12, opacity: 0.7, display: "flex", gap: 8, alignItems: "center" }}
+          data-testid="grok-build-status-note"
+        >
+          <span style={{ flex: 1 }}>{statusError}</span>
+          <button
+            type="button"
+            aria-label="关闭状态提示"
+            title="关闭状态提示"
+            data-testid="grok-build-status-note-close"
+            onClick={() => setStatusErrorDismissed(true)}
+          >
+            ×
+          </button>
         </p>
       )}
 
@@ -157,7 +171,7 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
           compat fallback（deprecated，默认关闭）
           <br />
           <span style={{ fontSize: 12, opacity: 0.7 }}>
-            仅当 grok-build 未登录时回退旧 xAI API key / loopback relay 兼容路径；对新会话生效。
+            仅当 grok-build 未登录或凭证过期且无 refresh 时，才回退旧 xAI API key / loopback relay 兼容路径；对新会话生效。
           </span>
         </span>
       </label>

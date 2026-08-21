@@ -3,7 +3,7 @@ export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> 
 export type GrokBuildProviderOptions = {
     /** Best-effort bridge emitter; omitted in the host auth runtime (no bridge there). */
     emit?: GrokBuildEmit;
-    /** Explicit `auth.json` path. Defaults to `PI_CODING_AGENT_DIR` / `~/.pi/agent`. */
+    /** Explicit `auth.json` path. Defaults to `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR` (fail closed). */
     authPath?: string;
 };
 export type GrokBuildOAuthCredentials = {

@@ -1,5 +1,10 @@
 export declare function settingsSnapshot(): Record<string, unknown> | undefined;
-export declare function agentHome(): string;
+/**
+ * Agent home — `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR`; never the global
+ * `~/.pi/agent` (fail closed per spec §D9). Returns undefined when unset so
+ * non-critical helpers (session id persistence) can degrade gracefully.
+ */
+export declare function agentHome(): string | undefined;
 /** Stable x-grok-session-id: settings > env > persisted generated UUID. */
 export declare function resolveSessionId(): string;
 export type ImagesConfig = {

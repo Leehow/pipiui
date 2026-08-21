@@ -30,8 +30,12 @@ async function registerBundledAuthProviders(rt) {
     if (!existsSync(providerModule)) return;
     const { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } = await import(pathToFileURL(providerModule).href);
     if (typeof rt.registerProvider !== "function" || typeof rt.getProvider === "function" && rt.getProvider(GROK_BUILD_PROVIDER_ID)) return;
-    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim();
-    rt.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider(agentDir ? { authPath: join(agentDir, "auth.json") } : {}));
+    // Same home precedence as the extension agent half: PI_COC_AGENT_DIR >
+    // PI_CODING_AGENT_DIR; never a global ~/.pi/agent fallback (fail closed —
+    // registration is skipped when no home is resolved).
+    const agentDir = process.env.PI_COC_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
+    if (!agentDir) return;
+    rt.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider({ authPath: join(agentDir, "auth.json") }));
   } catch { /* auth surface must never break on an optional bundled extension */ }
 }
 async function runtime() {

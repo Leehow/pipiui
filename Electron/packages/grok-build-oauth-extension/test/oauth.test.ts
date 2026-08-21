@@ -4,6 +4,7 @@ import { resolveOAuthConfig, PROD_ISSUER, PROD_CLIENT_ID, defaultScopes } from "
 import { requestDeviceCode, pollDeviceToken, refreshAccessToken, OAuthError } from "../agent/oauth/device.js";
 import { redactMessage, redactObject } from "../agent/oauth/redact.js";
 import { importFromGlobalGrok } from "../agent/oauth/import.js";
+import { GrokCredentialBroker } from "../agent/oauth/broker.js";
 import { mkdtemp, writeFile, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -155,7 +156,7 @@ describe("requestDeviceCode", () => {
 });
 
 describe("pollDeviceToken", () => {
-  it("handles pending then success with fake clock, slow_down increments interval", async () => {
+  it("handles pending then success with fake clock, slow_down grows interval ×1.5 (capped)", async () => {
     const deviceCode = { device_code: "dc-123", user_code: "ABCD-1234", verification_uri: "https://accounts.x.ai/device", expires_in: 600, interval: 2 };
     let call = 0;
     const fakeFetch: typeof fetch = async () => {
@@ -170,11 +171,19 @@ describe("pollDeviceToken", () => {
     });
     expect(tokens.access_token).toBe("at-1");
     expect(tokens.refresh_token).toBe("rt-1");
-    // sleeps: first interval 2000, then 2000, then after slow_down should be 7000
+    // sleeps: first interval 2000, again 2000, after slow_down 2000*1.5=3000 (spec §D4)
     expect(clock.sleeps.length).toBe(3);
     expect(clock.sleeps[0]).toBe(2000);
     expect(clock.sleeps[1]).toBe(2000);
-    expect(clock.sleeps[2]).toBe(7000);
+    expect(clock.sleeps[2]).toBe(3000);
+  });
+
+  it("honors a short server expires_in as the total deadline (no forced 10-minute floor)", async () => {
+    const deviceCode = { device_code: "dc-short", user_code: "ABCD-1234", verification_uri: "https://accounts.x.ai/device", expires_in: 2, interval: 1 };
+    const pendingFetch: typeof fetch = async () => new Response(JSON.stringify({ error: "authorization_pending" }), { status: 400 });
+    await expect(pollDeviceToken({
+      issuer: "https://auth.x.ai", clientId: "c", deviceCode, fetchImpl: pendingFetch as never, clock: fakeClock(),
+    })).rejects.toMatchObject({ code: "expired_token" });
   });
 
   it("maps access_denied and expired_token to terminal errors", async () => {
@@ -278,24 +287,27 @@ describe("explicit import (no silent read)", () => {
     tmp = await mkdtemp(join(tmpdir(), "grok-import-"));
     const homeGrok = join(tmp, ".grok");
     await mkdir(homeGrok, { recursive: true });
-    await writeFile(join(homeGrok, "auth.json"), JSON.stringify({ key: "tok" }), "utf8");
-    const res = await importFromGlobalGrok({ confirm: false, homedirOverride: tmp });
+    await writeFile(join(homeGrok, "auth.json"), JSON.stringify({ key: "tok", expires_at: Date.now() + 3_600_000 }), "utf8");
+    const broker = new GrokCredentialBroker({ authPath: join(tmp, "auth.json") });
+    const res = await importFromGlobalGrok({ confirm: false, broker, homedirOverride: tmp });
     expect(res.imported).toBe(false);
-    expect(res.reason).toMatch(/confirm/);
+    expect(res.reason).toMatch(/确认|confirm/);
   });
 
   it("reads only when confirm true and finds token", async () => {
     tmp = await mkdtemp(join(tmpdir(), "grok-import2-"));
     const homeGrok = join(tmp, ".grok");
     await mkdir(homeGrok, { recursive: true });
-    await writeFile(join(homeGrok, "auth.json"), JSON.stringify({ key: "tok123" }), "utf8");
-    const res = await importFromGlobalGrok({ confirm: true, homedirOverride: tmp });
+    await writeFile(join(homeGrok, "auth.json"), JSON.stringify({ key: "tok123", expires_at: Date.now() + 3_600_000, oidc_issuer: "https://auth.x.ai", client_id: "b1a00492-073a-47ea-816f-4c329264a828" }), "utf8");
+    const broker = new GrokCredentialBroker({ authPath: join(tmp, "auth.json") });
+    const res = await importFromGlobalGrok({ confirm: true, broker, homedirOverride: tmp });
     expect(res.imported).toBe(true);
   });
 
   it("returns not imported when file missing", async () => {
     tmp = await mkdtemp(join(tmpdir(), "grok-import3-"));
-    const res = await importFromGlobalGrok({ confirm: true, homedirOverride: tmp });
+    const broker = new GrokCredentialBroker({ authPath: join(tmp, "auth.json") });
+    const res = await importFromGlobalGrok({ confirm: true, broker, homedirOverride: tmp });
     expect(res.imported).toBe(false);
   });
 });

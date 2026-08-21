@@ -6,7 +6,8 @@
   "description": "Canonical Grok Build OAuth + Image extension (M4 Images transport over M3 Credential Broker / M2 Pi-native OAuth)",
   "exports": {
     "./package.json": "./package.json",
-    "./agent/provider": "./agent/dist/provider.js"
+    "./agent/provider": "./agent/dist/provider.js",
+    "./agent/host": "./agent/dist/host.js"
   },
   "scripts": {
     "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
