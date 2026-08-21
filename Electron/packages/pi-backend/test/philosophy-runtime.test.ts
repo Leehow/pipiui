@@ -161,7 +161,24 @@ describe("vendored philosophy: delivery", () => {
     expect(planning).toMatch(/one worker per independent task/);
     expect(planning).toMatch(/fan-out violation/);
     expect(orchestration).toMatch(/Two unrelated changes are two workers in one dispatch/);
-    expect(orchestration).toMatch(/plan_approve` with the stable `plan\.id`/);
+    // The approve call moved to `planning` with the rest of the lifecycle. Orchestration is
+    // skipped without a dispatch tool while planning still ships, so the layer that always
+    // reaches a planning session is the one that has to carry it.
+    expect(planning).toMatch(/plan_approve` with the stable `plan\.id`/);
+  });
+
+  it("states the plan lifecycle in exactly one layer", () => {
+    // Two copies drifted before this guard existed: orchestration required `plan_cancel` plus
+    // a fresh `plan.id` on Adjust, while planning said only "revises and republishes". A
+    // session with no dispatch tool drops orchestration and kept the incomplete half.
+    const owners = (pattern: RegExp) => layers.filter((l) => pattern.test(l.body)).map((l) => l.id);
+    expect(owners(/plan_approve/)).toEqual(["planning"]);
+    expect(owners(/plan_cancel/)).toEqual(["planning"]);
+    expect(owners(/plan_publish/)).toEqual(["planning"]);
+    // Every branch of the lifecycle is spelled out where it now lives.
+    const planning = layers.find((l) => l.id === "planning")!.body;
+    for (const rule of [/plan_cancel` for the current plan/, /new\*\* `plan.id`/, /same `planId` and task id/])
+      expect(planning, String(rule)).toMatch(rule);
   });
 
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
@@ -252,16 +269,14 @@ describe("vendored philosophy: delivery", () => {
     // them — it is the one that forwards a findings path into the next brief and the only
     // writer of shared context. A worker told to read a document nobody points it at reads
     // nothing, so this rule cannot be pushed down into the agent definitions.
-    // Raised again (~200) for the recon-tier rule in 9bd33dd3: recon runs on the cheaper
-    // `explore` model, so a repo-wide sweep performed inside `general-purpose` is the most
-    // expensive time in the system. Only the boss picks the agent, so only the boss can be
-    // told; one avoided implementer-priced sweep returns this raise many times over.
-    //
-    // This ledger has run 11500 → 15600 in seven raises, every one of them justified in
+    // Briefly raised to 15600 for the recon-tier rule in 9bd33dd3, then put back: that raise
+    // would have been the seventh in a ledger running 11500 → 15600, every one justified in
     // isolation. A cap that only ratchets up measures growth instead of bounding it, so the
-    // next raise should be preceded by a compression pass over the whole prefix rather than
-    // another entry here.
+    // raise was paid for by compression instead — the plan lifecycle had been written out in
+    // full in both `planning` and `orchestration`, and consolidating it into `planning`
+    // returned more room than the recon-tier rule spent. The recon rule keeps its place; the
+    // budget keeps its meaning. Prefer that trade to another entry in this list.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(15600);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(15400);
   });
 });
