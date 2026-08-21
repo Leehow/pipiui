@@ -5,13 +5,13 @@ summary: 思考是手段不是表演：想够即动手，不复述、不反复�
 order: 52
 requires: []
 requires-capabilities: []
-requires-models: deepseek/deepseek-v4-*
+excludes-models: openai-codex/*, xai/*
 scope: [main, lead, worker]
 ---
 # Thinking discipline
 
-Left alone, this model's thinking sprawls: thousands of tokens restating the task and
-second-guessing decisions it already made. Thinking is a tool — enough to be correct, never
+Left alone, most routed models' thinking sprawls: thousands of tokens restating the task and
+second-guessing decisions they already made. Thinking is a tool — enough to be correct, never
 a stage for performing diligence.
 
 - Think in the language of the work — code, identifiers, commands — not prose that re-narrates

@@ -44,6 +44,17 @@ export interface Layer {
    * family's behavior, which is advice that would be wrong to give any other model.
    */
   requiresModels: string[];
+  /**
+   * `provider/id` patterns this layer is written *against*. Empty means no exclusion.
+   *
+   * The mirror of `requires-models`, for the opposite shape of correction. An allowlist
+   * suits a drift only one family has; it fails open, so a route the author never named
+   * silently gets nothing — which is how the thinking layer sat inactive for every model
+   * this host actually ran. A denylist suits a drift that is the norm and the exception
+   * is what is enumerable: it fails closed, so a newly added provider inherits the
+   * discipline until someone measures that it does not need it.
+   */
+  excludesModels: string[];
   /** Roles (`main`/`lead`/`worker`) and/or agent names (`explore`, `plan`, …). */
   scope: string[];
   body: string;
@@ -156,6 +167,7 @@ export function parseLayer(
       requires: parseInlineList(fields.requires ?? ""),
       requiresCapabilities: parseInlineList(fields["requires-capabilities"] ?? ""),
       requiresModels: parseInlineList(fields["requires-models"] ?? ""),
+      excludesModels: parseInlineList(fields["excludes-models"] ?? ""),
       scope,
       body,
       file,
@@ -178,6 +190,17 @@ export function parseLayer(
  * told about. A pattern that stops matching after a provider renames a model shows up
  * as the layer going inactive in `/philosophy`, which is the honest failure.
  */
+/**
+ * Is this layer a per-model correction rather than general judgement?
+ *
+ * Either direction counts. Such a layer bypasses the worker bulk switch: the switch is
+ * about not paying 1.6k of judgement prefix per worker, and a correction that keeps a
+ * worker's model from misbehaving is not what that switch is declining to buy.
+ */
+export function isModelScoped(layer: Layer): boolean {
+  return layer.requiresModels.length > 0 || layer.excludesModels.length > 0;
+}
+
 export function modelMatches(model: string, pattern: string): boolean {
   const m = model.trim().toLowerCase();
   const p = pattern.trim().toLowerCase();
@@ -301,7 +324,7 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
       continue;
     }
     const targetsAnAgent = layer.scope.some((s) => rosterNames.has(s.toLowerCase()));
-    if (workerBulkOff && !targetsAnAgent && layer.requiresModels.length === 0) {
+    if (workerBulkOff && !targetsAnAgent && !isModelScoped(layer)) {
       skip(layer, "worker distribution is off");
       continue;
     }
@@ -318,6 +341,12 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
         skip(layer, `not in scope for model "${model}"`);
         continue;
       }
+    }
+    // Exclusion needs positive knowledge of the route. An unknown model keeps the layer:
+    // the default is that the correction applies, and only a named model opts out.
+    if (model && layer.excludesModels.some((pattern) => modelMatches(model, pattern))) {
+      skip(layer, `excluded for model "${model}"`);
+      continue;
     }
     const missing = layer.requiresCapabilities.filter((key) => {
       const capability = capabilities.capabilities[key];

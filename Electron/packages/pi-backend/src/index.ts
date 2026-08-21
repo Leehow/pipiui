@@ -44,6 +44,7 @@ import {
   isSessionAdoptedFrom,
   type SessionAdoptedFrom,
 } from "@pipi/host-api";
+import { ThinkingControlReporter } from "./thinking-control.js";
 import { PlanStore, readPlanStore } from "./plan-store.js";
 import { readUserMcpServers } from "./user-mcp-servers.js";
 import {
@@ -1551,6 +1552,9 @@ export class PiHostBackend implements HostBackend {
     availableThinkingLevels: [],
   };
   private sessionModelStates = new Map<string, ModelState>();
+  /** Records routes whose thinking level is not reaching the wire. See thinking-control.ts. */
+  private thinkingControl?: ThinkingControlReporter;
+  private thinkingControlWrite: Promise<void> = Promise.resolve();
   private sessionModelSnapshots = new Map<string, ModelState>();
   /** Per-session last-known context occupancy, rehydrated from the token ledger on cold start. */
   private sessionContextLastKnown = new Map<
@@ -1659,6 +1663,7 @@ export class PiHostBackend implements HostBackend {
       void this.modelsWrite.enqueue(() => this.profileInitialization);
     }
     this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
+    this.thinkingControl = new ThinkingControlReporter(this.agentDir);
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
     this.piCommand = options.piCommand
       ? {
@@ -1917,6 +1922,7 @@ export class PiHostBackend implements HostBackend {
     for (const wake of [...this.agentTerminalWaiters]) wake();
     this.titleGenerationAbort.abort();
     this.toolBatchTelemetry.dispose();
+    await this.thinkingControlWrite.catch(() => undefined);
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
     const live = [...this.live.values()];
@@ -3661,6 +3667,11 @@ export class PiHostBackend implements HostBackend {
       }
       if (d.type === "thinking_delta") {
         const delta = redactor("thinking", d.contentIndex ?? 0).push(d.delta ?? "");
+        // Thinking arriving is the only evidence that the dial was ever consulted. A route
+        // whose selected level maps to no provider value reasons at the upstream default
+        // and reports nothing, so this is where that gets noticed rather than inferred.
+        // In-memory only: the write happens once per message, at message_end.
+        this.noteThinkingObserved(id, (d.delta ?? "").length);
         this.stream({
           type: "thinking",
           sessionId: id,
@@ -3749,6 +3760,7 @@ export class PiHostBackend implements HostBackend {
           this.stream({ type: "text", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: flushed });
         }
         live.streamedAssistantText = "";
+        this.flushThinkingControl();
       }
       // A new message restarts content indexing; drop unclaimed tool buffers and
       // bump the epoch so later thinking segments key apart from earlier ones.
@@ -4143,6 +4155,37 @@ export class PiHostBackend implements HostBackend {
       `Pi 模型选择未生效：期望 ${provider}/${modelId}，实际 ${state.model?.provider ?? "unknown"}/${state.model?.id ?? "unknown"}`,
     );
   }
+  /**
+   * Fold one thinking observation into the host's thinking-control record.
+   *
+   * Fire-and-forget and failure-swallowing on purpose: a diagnostic that can break a
+   * turn is worse than the blind spot it closes. The reporter only asks for a write when
+   * a route/level pair is new or its verdict moved, so a long think costs no extra I/O.
+   */
+  private noteThinkingObserved(sessionId: string, chars: number) {
+    const reporter = this.thinkingControl;
+    const state = this.sessionModelStates.get(sessionId);
+    if (!reporter || !state || chars <= 0) return;
+    reporter.observe(state.model, state.thinkingLevel, state.availableThinkingLevels, chars);
+  }
+
+  /**
+   * Flush the thinking-control record, at most one write per assistant message.
+   *
+   * Chained rather than fired and forgotten. An unanchored promise doing filesystem work
+   * inside a delta handler is not free: it reorders the writes and spawns around it, and
+   * it made an unrelated spawn-env test fail two runs in eight. `close()` awaits this
+   * chain, so a diagnostic can neither outlive the backend nor perturb its shutdown.
+   */
+  private flushThinkingControl() {
+    const reporter = this.thinkingControl;
+    if (!reporter) return;
+    this.thinkingControlWrite = this.thinkingControlWrite
+      .catch(() => undefined)
+      .then(() => reporter.publish())
+      .catch(() => undefined);
+  }
+
   private async refreshState(live: Live) {
     try {
       const models = await this.command(live.session.id, {

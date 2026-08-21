@@ -96,6 +96,32 @@ scope: [main, lead, worker]
 Your text.
 ```
 
+### Scoping a layer to models
+
+Most layers are judgement and apply everywhere. A layer that exists to *correct* one
+model's behaviour should not be given to a model that does not have that drift — the
+prose would simply be false. Two fields express that, and the choice between them is
+about which side is enumerable:
+
+| Field | Meaning | Use when |
+|---|---|---|
+| `requires-models` | Only these routes get the layer | The drift belongs to one family and every other model is fine |
+| `excludes-models` | Every route except these gets it | The drift is the norm and the exceptions are what you can name |
+
+Both take `provider/id` patterns, matched case-insensitively as an exact string or with
+one trailing `*` (`kimi-coding/*`). Nothing infers a family from a name it was not told.
+
+Prefer `excludes-models` when you are unsure. `requires-models` fails open: a route the
+author never named silently receives nothing, and `/philosophy` is the only place that
+says so. That is how `thinking` — the layer written to stop thinking sprawl — sat
+inactive on this host's own default route while every measured session went on sprawling.
+`excludes-models` fails closed, so a provider added tomorrow inherits the correction
+until someone measures that it does not need it.
+
+A layer scoped either way bypasses the `scopes.worker` bulk switch. That switch declines
+to buy ~1.6k of judgement prefix per worker; it was never about withholding a correction
+that keeps the worker's own model from misbehaving.
+
 ## When pi changes
 
 Layer bodies never name a pi tool. They reference capabilities — `{{delegate}}`, `{{search}}`,

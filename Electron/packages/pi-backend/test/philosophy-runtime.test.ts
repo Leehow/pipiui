@@ -85,13 +85,19 @@ describe("vendored philosophy: structure", () => {
 
 describe("vendored philosophy: delivery", () => {
   it("addresses each dispatched agent only the layers written for it", () => {
-    expect(workerIds("explore")).toEqual(["research"]);
-    expect(workerIds("plan")).toEqual(["planning"]);
-    expect(workerIds("general-purpose")).toEqual(["craft"]);
+    // `thinking` rides along on every route it is not excluded from, this one included:
+    // a fan-out multiplies thinking sprawl by the width of the wave, so the worker is
+    // exactly where the correction pays for itself.
+    expect(workerIds("explore")).toEqual(["research", "thinking"]);
+    expect(workerIds("plan")).toEqual(["planning", "thinking"]);
+    expect(workerIds("general-purpose")).toEqual(["craft", "thinking"]);
   });
 
-  it("gives an unaddressed worker nothing while bulk distribution is off", () => {
-    expect(workerIds()).toEqual([]);
+  it("gives an unaddressed worker only model-scoped corrections while bulk distribution is off", () => {
+    // The switch declines the ~1.6k judgement prefix per worker. It has never governed
+    // model-scoped corrections, and `thinking` is one — now by exclusion rather than by
+    // an allowlist, which is why it reaches an unnamed model here.
+    expect(workerIds()).toEqual(["thinking"]);
   });
 
   it("delivers a model-scoped layer to a worker regardless of the bulk switch", () => {
@@ -125,6 +131,7 @@ describe("vendored philosophy: delivery", () => {
       "orchestration",
       "same-turn",
       "fanout",
+      "thinking",
     ]);
     expect(result.text).not.toContain("{{");
     expect(result.text).not.toMatch(/\bsubagent_status\b/);
@@ -188,10 +195,52 @@ describe("vendored philosophy: delivery", () => {
     ).not.toContain("same-turn");
   });
 
+  it("delivers thinking discipline to the routes that actually drift", () => {
+    // The regression this pins: `requires-models: deepseek/deepseek-v4-*` meant the layer
+    // written to stop thinking sprawl was inactive on the host's own default route, and on
+    // every other relay serving the same drifting families. Measured p90 thinking on this
+    // host: kimi-coding/k3 6.4k chars, jellytoken/kimi-k3 8.5k, opencode-go/hy3 8.1k,
+    // zai-coding-cn/glm-5.3 5.9k — none of which the allowlist named.
+    for (const model of [
+      "kimi-coding/k3-256k",
+      "kimi-coding/k3",
+      "jellytoken/kimi-k3",
+      "opencode-go/hy3",
+      "zai-coding-cn/glm-5.3",
+      SCOPED_MODEL,
+    ]) {
+      expect(compose({ model }).included.map((l) => l.id), model).toContain("thinking");
+    }
+  });
+
+  it("withholds thinking discipline from the models measured not to sprawl", () => {
+    // p90 259 chars and 843 chars respectively: telling these two that their thinking
+    // sprawls is false, and a correction aimed at nobody's drift is prompt weight at best.
+    for (const model of ["openai-codex/gpt-5.6-sol", "xai/grok-4.6"]) {
+      const result = compose({ model });
+      expect(result.included.map((l) => l.id), model).not.toContain("thinking");
+      expect(result.skipped.find((s) => s.id === "thinking")?.reason).toMatch(/excluded for model/);
+    }
+  });
+
+  it("keeps the discipline when the route is unknown", () => {
+    // Exclusion fails closed: an unnamed model is assumed to need the correction, so a
+    // provider added tomorrow inherits it instead of silently opting out.
+    expect(compose({ model: undefined }).included.map((l) => l.id)).toContain("thinking");
+    expect(compose({ model: "some-relay/whatever-v9" }).included.map((l) => l.id)).toContain("thinking");
+  });
+
+  it("delivers an excludes-scoped layer to a worker regardless of the bulk switch", () => {
+    // Same bypass `requires-models` layers get: the bulk switch declines to buy judgement
+    // prefix, not a correction that keeps the worker's own model from misbehaving.
+    const result = compose({ role: "worker", agent: "general-purpose", model: "kimi-coding/k3-256k" });
+    expect(result.included.map((l) => l.id)).toEqual(["craft", "thinking"]);
+  });
+
   it("keeps the boss's whole prefix inside budget", () => {
     // The standalone package capped this at 11500; the vendored tree also carries the
     // host-policy sections (tool withholding, computer_task routing, status persistence,
-    // session recall) and the deepseek-scoped thinking-discipline layer, which are
+    // session recall) and the thinking-discipline layer, which are
     // load-bearing here and cost the difference. Raised again for the domain-memory layer
     // (CONTEXT.md vocabulary + ADR gate), which pays for itself in re-derived terminology.
     // Raised again (~1k) for the debug-loop layer: the boss is the only holder of the
