@@ -369,4 +369,37 @@ describe('transcript model', () => {
     ])
     expect(messages[1]).toMatchObject({ role: 'assistant', content: '', error: "Codex error: Invalid schema for function 'subagent': ..." })
   })
+
+  it('opens a new assistant turn for events after a provider error instead of appending to the failed turn', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 0, delta: 'partial work' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'call-1', name: 'subagent_chain', delta: '{"goal":"' })
+    messages = applyStreamEvent(messages, { type: 'error', sessionId: 's', content: 'WebSocket error' })
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatchObject({ content: 'partial work', error: 'WebSocket error', streaming: false })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'call-1', finished: true, error: true })
+    expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+    expect(assistantEndedAwaitingModel(messages[0])).toBe(false)
+    expect(reopenAssistantForNextCompletion(messages)).toBe(messages)
+    expect(reopenAssistantForNextCompletion(messages, { includeHistoryMergedToolHop: true })).toBe(messages)
+
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'call-2', name: 'subagent_chain', delta: '{"goal":"retry"}' })
+    expect(messages).toHaveLength(2)
+    expect(messages[0]).toMatchObject({ error: 'WebSocket error', streaming: false })
+    expect(messages[0].tools?.map(tool => tool.id)).toEqual(['call-1'])
+    expect(messages[1]).toMatchObject({ role: 'assistant', streaming: true, content: '' })
+    expect(messages[1].error).toBeUndefined()
+    expect(messages[1].tools?.[0]).toMatchObject({ id: 'call-2', name: 'subagent_chain', input: '{"goal":"retry"}' })
+  })
+
+  it('strips pending thinking when a live turn ends in error', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'read-1', name: 'read', delta: '{}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'read-1', content: 'ok' })
+    expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(true)
+    messages = applyStreamEvent(messages, { type: 'error', sessionId: 's', content: 'WebSocket error' })
+    expect(messages[0].streaming).toBe(false)
+    expect(messages[0].error).toBe('WebSocket error')
+    expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+  })
 })

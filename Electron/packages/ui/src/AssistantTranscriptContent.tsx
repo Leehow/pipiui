@@ -1,4 +1,4 @@
-import { memo, type ReactNode } from 'react'
+import { memo, useState, type ReactNode } from 'react'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import { getToolRenderer, isLiveProjectedTool, registerToolRenderer, useToolRenderers } from './ui-registries'
 import { toToolRenderPayload } from './piui-envelope'
@@ -63,6 +63,12 @@ const ActiveToolCard = memo(function ActiveToolCard({ tool }: { tool: Transcript
 })
 
 export const AssistantTranscriptContent = memo(function AssistantTranscriptContent({ message, expandSteps, documentBasePath, onOpenDocument, onOpenSubagents }: { message: AssistantTranscriptMessage; expandSteps?: boolean; documentBasePath?: string; onOpenDocument?: (path: string) => void; onOpenSubagents?: (agentId?: string) => void }) {
+  const [errorDismissed, setErrorDismissed] = useState(false)
+  const [errorSeen, setErrorSeen] = useState(message.error)
+  if (message.error !== errorSeen) {
+    setErrorSeen(message.error)
+    setErrorDismissed(false)
+  }
   const activities = activitiesFromMessage(message)
   const stepActivities = activities.filter((activity): activity is Extract<TranscriptActivity, { type: 'thinking' | 'tool' }> => activity.type !== 'text')
   // Lost tool_result/settled: if the model generated text after the last
@@ -141,7 +147,7 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
       })}</ActivityCard>
     })}
     {activeTool && <ActiveToolCard key={`active-tool:${activeTool.tool.id}`} tool={activeTool.tool} />}
-    {message.error && <div className="assistant-turn-error" data-testid="assistant-turn-error" role="alert">{message.error}</div>}
+    {message.error && !errorDismissed && <div className="assistant-turn-error" data-testid="assistant-turn-error" role="alert"><span className="assistant-turn-error-message">{message.error}</span><button type="button" className="assistant-turn-error-close" aria-label="关闭错误提示" title="关闭错误提示" data-testid="assistant-turn-error-close" onClick={() => setErrorDismissed(true)}>×</button></div>}
   </div>
 })
 

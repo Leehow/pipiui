@@ -448,15 +448,33 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
   return next
 }
 
+function finalizeFailedAssistantTurn(message: ChatMessage, error: string): ChatMessage {
+  const tools = message.tools?.map(tool => tool.finished
+    ? { ...tool }
+    : { ...tool, error: true, finished: true, finishedAt: tool.finishedAt ?? tool.startedAt })
+  const toolsById = tools ? new Map(tools.map(tool => [tool.id, tool])) : undefined
+  const activities = message.activities
+    ? stripPendingThinking(message.activities).map(activity => toolsById ? cloneActivity(activity, toolsById) : { ...activity })
+    : message.activities
+  return {
+    ...message,
+    error,
+    streaming: false,
+    ...(tools ? { tools } : {}),
+    ...(activities ? { activities } : {}),
+  }
+}
+
 /** A turn that ended in `stopReason: "error"` streams no text — surface the
  *  provider errorMessage on the assistant turn so the failure is visible
- *  instead of an empty bubble. */
+ *  instead of an empty bubble. The failed visual turn is terminal (`streaming`
+ *  false) so later live events open a new turn; this is not a session settle. */
 function applyTurnError(messages: ChatMessage[], content: string): ChatMessage[] {
   if (!content) return messages
   const index = messages.findLastIndex(message => message.role === 'assistant' && message.streaming)
   const next = [...messages]
   if (index >= 0) {
-    next[index] = { ...next[index], error: content, streaming: false }
+    next[index] = finalizeFailedAssistantTurn(next[index], content)
   } else {
     next.push({ id: `error-${Date.now()}`, role: 'assistant', content: '', error: content, streaming: false, timestamp: Date.now() })
   }
@@ -476,8 +494,9 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
 /** Last durable activity is a finished tool (or the live pending-thinking
  *  placeholder). A later `started` after that is the next model hop, not a
  *  ghost turn after a text-only conclusion. */
-export function assistantEndedAwaitingModel(message: Pick<ChatMessage, 'role' | 'content' | 'activities' | 'thinking' | 'tools'>): boolean {
+export function assistantEndedAwaitingModel(message: Pick<ChatMessage, 'role' | 'content' | 'activities' | 'thinking' | 'tools' | 'error'>): boolean {
   if (message.role !== 'assistant') return false
+  if (message.error) return false
   const activities = activitiesFromMessage(message)
   let last: TranscriptActivity | undefined
   for (const activity of activities) {
@@ -528,6 +547,7 @@ export function reopenAssistantForNextCompletion(
   const index = messages.findLastIndex(message => message.role === 'assistant')
   if (index < 0) return messages
   const message = messages[index]
+  if (message.error) return messages
   if (!assistantEndedAwaitingModel(message) && !(options?.includeHistoryMergedToolHop && historyMergedToolHop(message))) {
     return messages
   }
