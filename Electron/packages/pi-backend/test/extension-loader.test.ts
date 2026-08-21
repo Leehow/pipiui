@@ -10,6 +10,10 @@ import { createExtensionRegistry } from "../src/extension-registry.js";
 import { projectPiAgentDir } from "../src/project-pi-home.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "extensions");
+const bundledRuntimeExtensions = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../../resources/runtime/extensions",
+);
 
 let root = "";
 afterEach(async () => {
@@ -281,5 +285,50 @@ describe("extension loader scan confinement", () => {
     });
     loader.scan(projectA);
     expect(registry.get("escaped")).toBeUndefined();
+  });
+});
+
+describe("bundled hello-pipiui dogfood package", () => {
+  it("scans the runtime extensions dir and loads hello-pipiui as builtin", async () => {
+    await tempRoot("pipi-ext-hello-");
+    const manifestText = await readFile(join(bundledRuntimeExtensions, "hello-pipiui", "pipiui-extension.json"), "utf8");
+    const raw = JSON.parse(manifestText);
+    const validation = validateExtensionManifest(raw);
+    expect(validation.ok).toBe(true);
+    if (!validation.ok) return;
+    expect(validation.manifest.id).toBe("hello-pipiui");
+    expect(validation.manifest.capabilities).toEqual([
+      "settings.read",
+      "settings.write",
+      "bridge.emit",
+      "invoke.agent",
+      "stream.render",
+    ]);
+    expect(validation.manifest.ui?.panels?.[0]).toMatchObject({
+      slot: "toolPanel",
+      id: "hello-pipiui",
+      entry: "app/dist/panel.js",
+    });
+
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: bundledRuntimeExtensions,
+      appRoot: join(root, "agent", "extensions"),
+    });
+    const records = loader.scan();
+    const rec = records.find((item) => item.id === "hello-pipiui") ?? registry.get("hello-pipiui");
+    expect(rec).toMatchObject({
+      id: "hello-pipiui",
+      origin: "builtin",
+      state: "enabled",
+    });
+    expect(rec?.error).toBeUndefined();
+    const listed = loader.list().find((item) => item.id === "hello-pipiui");
+    expect(listed?.source).toBe("builtin");
+    expect(listed?.capabilities).toEqual(
+      expect.arrayContaining(["bridge.emit", "invoke.agent", "stream.render"]),
+    );
+    expect(listed?.ui?.panels?.[0]?.slot).toBe("toolPanel");
   });
 });

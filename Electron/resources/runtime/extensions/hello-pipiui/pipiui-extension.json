@@ -1,0 +1,54 @@
+{
+  
+  "id": "hello-pipiui",
+  "name": "hello-pipiui",
+  "version": "0.1.0",
+  
+  
+  "capabilities": [
+    "settings.read",
+    "settings.write",
+    "bridge.emit",
+    "invoke.agent",
+    "stream.render"
+  ],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          
+          "ext.hello-pipiui.greeting": {
+            "type": "string",
+            "default": "hello",
+            "title": "Greeting"
+          }
+        }
+      }
+    },
+    "ui": {
+      
+      "panels": [
+        { "slot": "toolPanel", "id": "hello-pipiui", "title": "hello-pipiui", "entry": "app/dist/panel.js" }
+      ],
+      "toolRenderers": [
+        { "tool": "hello-pipiui", "entry": "app/dist/hello-card.js" }
+      ],
+      
+      "settingsSections": [
+        { "id": "hello-pipiui", "title": "hello-pipiui" }
+      ],
+      "slashCommands": [
+        { "name": "hello-pipiui", "description": "Sample command from hello-pipiui" }
+      ],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": []
+}
