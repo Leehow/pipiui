@@ -78,13 +78,13 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_event", event: {
         kind: "start", agentId: "active", runId: "active-run", parentId: null,
         name: "operator", role: "operator", title: "Finishing operation",
-        task: "Finishing operation", depth: 1, at: "2026-08-17T00:00:01.000Z",
+        task: "Finishing operation", depth: 1, at: new Date().toISOString(),
       } });
     } else if (command.message === "final-with-real-running-agent") {
       send({ type: "agent_event", event: {
         kind: "start", agentId: "active", runId: "active-run", parentId: null,
         name: "operator", role: "operator", title: "Still operating",
-        task: "Still operating", depth: 1, at: "2026-08-17T00:00:01.000Z",
+        task: "Still operating", depth: 1, at: new Date().toISOString(),
       } });
     }
     const finalMessage = {
@@ -124,7 +124,7 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       setTimeout(() => send({ type: "agent_event", event: {
         kind: "end", agentId: "active", runId: "active-run", ok: true,
         output: JSON.stringify({ outcome: "completed", summary: "done" }),
-        at: "2026-08-17T00:00:02.000Z",
+        at: new Date().toISOString(),
       } }), 25);
     } else if (command.message === "final-without-settled" || command.message === "iso-timestamp-without-settled") {
       isStreaming = false;

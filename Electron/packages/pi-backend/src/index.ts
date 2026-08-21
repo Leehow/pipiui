@@ -561,8 +561,15 @@ type Live = {
   pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
   /** SIGKILL/close in flight: do not write another RPC to this child. */
   exiting?: boolean;
+  /** Monotonic timestamp of the last turn-related event (agent_start, deltas, tool, message_end). */
+  lastTurnActivityAt?: number;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
+/** Main-turn watchdog: turnActive with no event for this long is wedged. */
+export const TURN_WATCHDOG_TIMEOUT_MS = 120_000;
+export const TURN_WATCHDOG_CHECK_INTERVAL_MS = 30_000;
+const TERMINAL_RECONCILIATION_PENDING_RETRY_MS = 250;
+const TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES = 6;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
 const ORPHAN_STALE_MS = 10 * 60 * 1000;
 const ORPHAN_RECONCILE_INTERVAL_MS = 60 * 1000;
@@ -1621,6 +1628,7 @@ export class PiHostBackend implements HostBackend {
   private toolBatchTelemetry: ToolBatchTelemetry;
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
+  private turnWatchdogTimer?: NodeJS.Timeout;
   private closed = false;
   private agentTerminalWaiters = new Set<() => void>();
   /** Computer-use screenshot cache: screenshotId → base64+mimeType. Populated by
@@ -1755,6 +1763,8 @@ export class PiHostBackend implements HostBackend {
     // pre-migration snapshot.
     void this.loadModelCatalog().catch(() => undefined);
     void this.index().catch(() => undefined);
+    this.turnWatchdogTimer = setInterval(() => void this.checkTurnWatchdogs(), TURN_WATCHDOG_CHECK_INTERVAL_MS);
+    if (this.turnWatchdogTimer.unref) this.turnWatchdogTimer.unref();
   }
   subscribe(listener: (event: HostEvent) => void) {
     this.listeners.add(listener);
@@ -1901,6 +1911,7 @@ export class PiHostBackend implements HostBackend {
     this.closed = true;
     this.stopEscalation.cancelAll();
     this.stopOrphanReconcileTimer();
+    if (this.turnWatchdogTimer) { clearInterval(this.turnWatchdogTimer); this.turnWatchdogTimer = undefined; }
     // Stop the resident external-pi worker if one was spawned during this run.
     this.externalAuthRuntime?.stop();
     for (const wake of [...this.agentTerminalWaiters]) wake();
@@ -2812,6 +2823,12 @@ export class PiHostBackend implements HostBackend {
         return this.getQuotaSnapshot(params[0] as string | undefined);
       case "listAgents": {
         const sessionId = params[0] as string | undefined;
+        // Reconnect reconciliation: ensure a panel subscribeAgents / session
+        // reload sees the corrected terminal state even before the periodic
+        // orphan timer fires. This is the stale-threshold sweep (10min) run
+        // synchronously on read, using only stored lastObservedAt freshness.
+        if (sessionId) this.reconcileOrphanedNow(sessionId);
+        else this.reconcileAllOrphaned();
         const rows = [...this.agents.values()].filter(
           (agent) => !sessionId || agent.sessionId === sessionId,
         );
@@ -3549,11 +3566,12 @@ export class PiHostBackend implements HostBackend {
       // in the same stdout chunk. An async markBusy lets the settle run with a
       // stale epoch and drop the drain that should release the next queued item.
       live.turnEpoch = this.queue.markBusy(id);
+      live.lastTurnActivityAt = Date.now();
       live.pendingFinalReconciliation = undefined;
       if (!this.queueLoads.has(id)) {
-        void this.loadQueue(id).then(() => {
-          if (this.live.get(id) !== live) return;
-          live.turnEpoch = this.queue.markBusy(id);
+        // Load only for queue restoration; do not re-mark busy (second epoch would strand the turn).
+        void this.loadQueue(id).catch((error) => {
+          console.warn(`[pipi-backend] agent_start queue load failed for ${id}: ${error instanceof Error ? error.message : String(error)}`);
         });
       }
       const pendingFollowUps = live.followUps.length > 0
@@ -3618,6 +3636,7 @@ export class PiHostBackend implements HostBackend {
       // composer as 生成中 with no turn — the UI treats streaming as "busy now".
       live.followUps = e.followUp ?? [];
     } else if (e.type === "message_update") {
+      this.touchTurnActivity(live);
       const d = e.assistantMessageEvent ?? {};
       const secrets = this.sessionSecrets(id);
       live.streamRedactors ??= { text: new Map(), thinking: new Map(), tool: new Map() };
@@ -3704,6 +3723,7 @@ export class PiHostBackend implements HostBackend {
         });
       }
     } else if (e.type === "message_end") {
+      this.touchTurnActivity(live);
       const endingEpoch = live.messageEpoch;
       const endedMessage = e.message ?? {};
       const secrets = this.sessionSecrets(id);
@@ -3789,6 +3809,7 @@ export class PiHostBackend implements HostBackend {
         }
       }
     } else if (e.type === "tool_execution_end") {
+      this.touchTurnActivity(live);
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
       this.stream({
         type: "tool_result",
@@ -3925,7 +3946,28 @@ export class PiHostBackend implements HostBackend {
     }
     if (this.terminalReconciliationHasPendingWork(live, state)) {
       this.debugTerminalReconciliation(live, epoch, "first_state_pending", state);
-      return;
+      // Bounded retry: pending may be a transient followUp/reentry that clears quickly.
+      // Do not abandon permanently — retry a few times so a delayed drain can still settle.
+      let retried = false;
+      for (let attempt = 0; attempt < TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES; attempt += 1) {
+        await new Promise<void>(resolve => setTimeout(resolve, TERMINAL_RECONCILIATION_PENDING_RETRY_MS));
+        if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+          this.debugTerminalReconciliation(live, epoch, "first_state_pending_fence", state);
+          return;
+        }
+        try {
+          state = await this.command(live.session.id, { type: "get_state" });
+        } catch {
+          this.debugTerminalReconciliation(live, epoch, "first_state_pending_retry_error", state);
+          return;
+        }
+        if (!this.terminalReconciliationHasPendingWork(live, state)) { retried = true; break; }
+        this.debugTerminalReconciliation(live, epoch, `first_state_pending_retry_${attempt + 1}`, state);
+      }
+      if (!retried) {
+        console.warn(`[pipi-backend] reconcile pending still after ${TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES} retries session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
+        return;
+      }
     }
     if (state?.isStreaming === false) {
       this.debugTerminalReconciliation(live, epoch, "idle_settle", state);
@@ -3963,10 +4005,93 @@ export class PiHostBackend implements HostBackend {
     }
     if (this.terminalReconciliationHasPendingWork(live, state)) {
       this.debugTerminalReconciliation(live, epoch, "second_state_pending", state, true);
-      return;
+      let retried = false;
+      for (let attempt = 0; attempt < TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES; attempt += 1) {
+        await new Promise<void>(resolve => setTimeout(resolve, TERMINAL_RECONCILIATION_PENDING_RETRY_MS));
+        if (this.closed || this.live.get(live.session.id) !== live || live.turnEpoch !== epoch || live.terminalEpoch === epoch) {
+          this.debugTerminalReconciliation(live, epoch, "second_state_pending_fence", state, true);
+          return;
+        }
+        try {
+          state = await this.command(live.session.id, { type: "get_state" });
+        } catch {
+          this.debugTerminalReconciliation(live, epoch, "second_state_pending_retry_error", undefined, true);
+          return;
+        }
+        if (!this.terminalReconciliationHasPendingWork(live, state)) { retried = true; break; }
+        this.debugTerminalReconciliation(live, epoch, `second_state_pending_retry_${attempt + 1}`, state, true);
+      }
+      if (!retried) {
+        console.warn(`[pipi-backend] reconcile second pending still after ${TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES} retries session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
+        return;
+      }
     }
     this.debugTerminalReconciliation(live, epoch, "durable_settle", state, true);
     this.projectTurnTerminal(live, "settled", true);
+  }
+  private touchTurnActivity(live: Live): void {
+    live.lastTurnActivityAt = Date.now();
+  }
+  private async isSessionTailTerminal(path: string): Promise<boolean> {
+    try {
+      const stat = await fs.stat(path);
+      const length = Math.min(stat.size, TERMINAL_DURABILITY_TAIL_BYTES);
+      if (length <= 0) return false;
+      const start = stat.size - length;
+      const handle = await fs.open(path, "r");
+      let text = "";
+      try {
+        const buffer = Buffer.alloc(length);
+        const { bytesRead } = await handle.read(buffer, 0, length, start);
+        text = buffer.subarray(0, bytesRead).toString("utf8");
+      } finally {
+        await handle.close();
+      }
+      const lines = text.split("\n");
+      if (start > 0) lines.shift();
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index].trim();
+        if (!line) continue;
+        let entry: any;
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (entry?.type === "message") {
+          const message = entry.message;
+          if (!message) return false;
+          // Tool-use in progress is not terminal — long tool calls must not be interrupted.
+          const content = Array.isArray(message.content) ? message.content : [];
+          const hasToolCall = content.some((part: any) => part?.type === "toolCall" || part?.type === "tool_call" || part?.type === "tool_use");
+          if (hasToolCall) return false;
+          if (message.role === "assistant" && (message.stopReason === "stop" || message.stopReason === "error" || message.stopReason === "aborted")) {
+            return true;
+          }
+          return false;
+        }
+        // Abort or custom abort markers also considered terminal
+        if (entry?.type === "abort" || entry?.type === "aborted") return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+  private async checkTurnWatchdogs(): Promise<void> {
+    if (this.closed) return;
+    const now = Date.now();
+    for (const live of this.live.values()) {
+      const epoch = live.turnEpoch;
+      if (epoch === undefined || live.terminalEpoch === epoch) continue;
+      const active = live.lastTurnActivityAt ?? 0;
+      if (now - active < TURN_WATCHDOG_TIMEOUT_MS) continue;
+      // Must not trigger while queue thinks idle but live still shows busy phantom — check turnActive via queue
+      if (!this.queue.isBusy(live.session.id)) continue;
+      const tailTerminal = await this.isSessionTailTerminal(live.path);
+      if (!tailTerminal) {
+        console.warn(`[pipi-backend] turn watchdog no tail terminal session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
+        continue;
+      }
+      console.warn(`[pipi-backend] turn watchdog firing session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch} idleMs=${now - active}`);
+      this.projectTurnTerminal(live, "settled", true);
+    }
   }
   private rejectPendingCommands(sessionId: string, error: Error): void {
     const live = this.live.get(sessionId);
@@ -5975,9 +6100,7 @@ export class PiHostBackend implements HostBackend {
   private syncOrphanReconcileTimer(): void {
     const needsTick = [...this.agents.values()].some(
       (agent) =>
-        this.isLiveAgentState(agent.state) &&
-        Boolean(agent.sessionId) &&
-        !this.liveSessionProcess(agent.sessionId!),
+        this.isLiveAgentState(agent.state) && Boolean(agent.sessionId),
     );
     if (!needsTick || this.closed) {
       this.stopOrphanReconcileTimer();
@@ -6003,15 +6126,16 @@ export class PiHostBackend implements HostBackend {
     this.agent({ type: "worktree", status });
   }
   /**
-   * App-runtime orphan sweep (Swift `SubagentStore.reconcileOrphanedNow`):
-   * only when the session process is dead, and only for running/stalled rows
-   * whose last observation is older than the 10-minute watchdog window.
+   * Orphan sweep: running/stalled rows whose last observation is older than
+   * the 10-minute watchdog window are marked interrupted. Previously this
+   * only swept dead sessions (liveSessionProcess guard); that treated a
+   * long-lived main Pi process as proof the worker was still alive and let
+   * a lost terminal event leave the panel stuck on running forever.
+   * Now staleness is judged purely on worker liveness evidence (updatedAt/
+   * createdAt age / stream freshness via lastObservedAt); main process
+   * liveness no longer exempts the row.
    */
   private reconcileOrphanedNow(sessionId: string, now = Date.now()): boolean {
-    if (this.liveSessionProcess(sessionId)) {
-      this.syncOrphanReconcileTimer();
-      return false;
-    }
     let changed = false;
     for (const agent of [...this.agents.values()]) {
       if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
@@ -6479,6 +6603,7 @@ export class PiHostBackend implements HostBackend {
     // 50ms flush queued one JSON snapshot per event and froze the Electron main
     // process (100% CPU, multi-GB heap) once a few workers were live.
     if (raw.kind !== "log_delta") this.persistAgents();
+    this.syncOrphanReconcileTimer();
     if (terminal && sessionId) {
       const live = this.live.get(sessionId);
       const pending = live?.pendingFinalReconciliation;

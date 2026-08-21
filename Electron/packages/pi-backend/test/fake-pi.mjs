@@ -105,14 +105,14 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "__agent_running__") {
       // A background subagent starts and the turn settles, but the agent never
       // ends: the panel holds one running worker for the stop-sweep test.
-      send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Sweep fixture", task: "long task", depth: 1, at: "2026-08-15T00:00:02.000Z" } });
+      send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Sweep fixture", task: "long task", depth: 1, at: new Date().toISOString() } });
       send({ type: "agent_start" });
       send({ type: "agent_settled" });
       return;
     }
     if (command.message === "/subagent_abort_all") {
       // The runtime extension aborts every worker; simulate its terminal events.
-      send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: false, aborted: true, at: "2026-08-15T00:00:09.000Z" } });
+      send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: false, aborted: true, at: new Date().toISOString() } });
       return;
     }
     if (command.message === "__user_followup__") {

@@ -388,8 +388,18 @@ export class SessionMessageQueue {
    */
   async notifyIdle(sessionId: string, epoch?: number): Promise<void> {
     const session = this.state(sessionId);
-    if (epoch !== undefined && epoch !== session.turnEpoch) return;
-    session.turnActive = false;
+    if (epoch !== undefined && epoch !== session.turnEpoch) {
+      // Epoch mismatch: distinguish "new epoch has taken over" (safe to ignore) from
+      // "stale epoch with no active turn" (must force-clear orphaned busy and drain).
+      if (session.turnActive && session.turnEpoch > epoch) {
+        console.warn(`[message-queue] notifyIdle stale ignored session=${sessionId} epoch=${epoch} current=${session.turnEpoch}`);
+        return;
+      }
+      console.warn(`[message-queue] notifyIdle stale forced session=${sessionId} epoch=${epoch} current=${session.turnEpoch} turnActive=${session.turnActive}`);
+      session.turnActive = false;
+    } else {
+      session.turnActive = false;
+    }
     if (session.pendingCutIn) {
       await this.dispatchPendingCutIn(sessionId);
       return;

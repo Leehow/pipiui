@@ -652,21 +652,65 @@ describe("dead-session orphan reconcile", () => {
   const staleAt = new Date(base).toISOString();
   const staleNow = base + 10 * 60 * 1000;
 
-  it("leaves a stale running worker alone while the session process is alive", async () => {
-    const { backend, deliver } = await harness();
-    deliver({ ...START, at: staleAt });
-    (backend as any).live.set("session-1", fakeLive());
-    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
-    await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
-      { agentId: "a1", state: "running" },
-    ]);
+  it("sweeps a stale running worker to interrupted even while the session process is still alive", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver, events } = await harness();
+      deliver({ ...START, at: staleAt });
+      (backend as any).live.set("session-1", fakeLive());
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "interrupted" },
+      ]);
+      expect(events.some(e => e.type === "agent" && (e as any).agent.state === "interrupted")).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not misjudge a worker with a fresh heartbeat while the session is alive", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: new Date(staleNow - 60_000).toISOString() });
+      // Fresh log_delta within watchdog window is worker liveness evidence.
+      deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "text", text: "still working", at: new Date(staleNow - 30_000).toISOString() });
+      (backend as any).live.set("session-1", fakeLive());
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconciles on listAgents so a reconnect immediately corrects a stale running row", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: staleAt });
+      (backend as any).live.set("session-1", fakeLive());
+      (backend as any).reconcileOrphanedNow("session-1", staleNow);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "interrupted", endedAt: staleNow },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("sweeps a stale running worker to interrupted after the session process dies", async () => {
-    const { backend, deliver, events } = await harness();
-    deliver({ ...START, at: staleAt, activity: "bash sleep 999" });
-    expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
-    await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver, events } = await harness();
+      deliver({ ...START, at: staleAt, activity: "bash sleep 999" });
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
       {
         agentId: "a1",
         state: "interrupted",
@@ -676,14 +720,20 @@ describe("dead-session orphan reconcile", () => {
       },
     ]);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
-    expect(worktree?.status).toMatchObject({ agentId: "a1", lifecycle: "pendingReview", merge: "ready", discard: "ready" });
-    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
-      lifecycle: "pendingReview",
-    });
+      expect(worktree?.status).toMatchObject({ agentId: "a1", lifecycle: "pendingReview", merge: "ready", discard: "ready" });
+      await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
+        lifecycle: "pendingReview",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("does not sweep a fresh observation or a terminal row", async () => {
-    const { backend, deliver } = await harness();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver } = await harness();
     deliver({ ...START, at: staleAt });
     deliver({ ...START, agentId: "fresh", runId: "r-fresh", at: new Date(staleNow).toISOString(), worktreePath: undefined });
     deliver({ ...START, agentId: "done", runId: "r-done", at: staleAt, worktreePath: undefined });
@@ -695,11 +745,15 @@ describe("dead-session orphan reconcile", () => {
       expect.objectContaining({ agentId: "fresh", state: "running" }),
       expect.objectContaining({ agentId: "done", state: "ok" }),
     ]));
-    expect((backend as any).reconcileOrphanedNow("session-1", staleNow + 10 * 60 * 1000)).toBe(true);
-    await expect(backend.handle("listAgents", ["session-1"])).resolves.toEqual(expect.arrayContaining([
-      expect.objectContaining({ agentId: "fresh", state: "interrupted" }),
-      expect.objectContaining({ agentId: "done", state: "ok" }),
-    ]));
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow + 10 * 60 * 1000)).toBe(true);
+      vi.setSystemTime(new Date(staleNow + 10 * 60 * 1000));
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ agentId: "fresh", state: "interrupted" }),
+        expect.objectContaining({ agentId: "done", state: "ok" }),
+      ]));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("is idempotent and persists so a restart does not see a running ghost", async () => {
