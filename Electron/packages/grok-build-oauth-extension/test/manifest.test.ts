@@ -7,7 +7,7 @@ import { validateExtensionManifest } from "../../pi-backend/src/extension-manife
 const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const manifestPath = join(pkgRoot, "pipiui-extension.json");
 
-describe("grok-build-oauth manifest (M1 skeleton)", () => {
+describe("grok-build-oauth manifest (M2 oauth)", () => {
   it("is valid JSON and passes D2 validation", () => {
     const raw = JSON.parse(readFileSync(manifestPath, "utf8"));
     const result = validateExtensionManifest(raw);
@@ -47,13 +47,15 @@ describe("grok-build-oauth manifest (M1 skeleton)", () => {
     expect(rendererEntries).toEqual(["app/dist/image-card.js", "app/dist/image-card.js"]);
   });
 
-  it("does not hardcode OAuth or images business — agent skeleton only", () => {
+  it("agent registers grok-build provider and uses Pi OAuth, not plaintext settings token", () => {
     const agentSource = readFileSync(join(pkgRoot, "agent", "index.ts"), "utf8");
-    // Skeleton must not call real OAuth/image endpoints
-    expect(agentSource).not.toMatch(/api\.x\.ai\/v1\/images\/generations/);
-    expect(agentSource).not.toMatch(/oauth2\/token/);
-    expect(agentSource).not.toMatch(/oauth2\/device\/code/);
+    expect(agentSource).toMatch(/registerProvider\s*\(\s*"grok-build"/);
+    expect(agentSource).toMatch(/oauth/);
     expect(agentSource).toMatch(/grok-build-oauth/);
+    // Must not write token to settings directly — Pi persistence only
+    expect(agentSource).not.toMatch(/ext\.grok-build-oauth\.accessToken.*update/);
+    // Redaction must be present
+    expect(agentSource).toMatch(/redact/);
   });
 });
 
