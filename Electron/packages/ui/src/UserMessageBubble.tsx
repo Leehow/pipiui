@@ -29,7 +29,7 @@ export function userImageSrc(image: UserMessageImage): string {
   return `data:${image.mimeType};base64,${image.data}`
 }
 
-export function UserMessageBubble({ text, images }: { text: string; images?: UserMessageImage[] }) {
+export function UserMessageBubble({ text, images, queued }: { text: string; images?: UserMessageImage[]; queued?: boolean }) {
   const shownImages = images?.filter(image => image.data) ?? []
   const hasImages = shownImages.length > 0
   const visibleText = displayUserMessageText(text, hasImages)
@@ -38,6 +38,7 @@ export function UserMessageBubble({ text, images }: { text: string; images?: Use
   const displayText = collapsible && collapsed ? messagePreview(visibleText) : visibleText
 
   return <div className="user-bubble">
+    {queued && <span className="user-bubble-queued" data-testid="user-bubble-queued" style={{ fontSize: '11px', opacity: 0.6, marginBottom: '4px', display: 'inline-block' }}>排队中</span>}
     {hasImages && <div className="user-bubble-images">{shownImages.map((image, index) => <img key={index} className="user-bubble-image" src={userImageSrc(image)} alt="用户图片" />)}</div>}
     {collapsible && <button className="user-message-collapse-toggle" aria-expanded={!collapsed} onClick={() => setCollapsed(value => !value)}>{collapsed ? '展开' : '收起'}</button>}
     {visibleText ? <div className="user-message-content">{displayText}</div> : null}

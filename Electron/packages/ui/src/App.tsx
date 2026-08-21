@@ -2038,7 +2038,29 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         observedSessionStatusesRef.current[event.sessionId] === 'completed'
         || observedSessionStatusesRef.current[event.sessionId] === 'interrupted'
       )
-      if (turnClosed) return
+      if (turnClosed) {
+        // Do not unconditionally drop late live events after settle — they would
+        // otherwise wait for the 250ms history reconcile and appear as "stuck then flood".
+        // Tradeoff: immediate apply may briefly diverge from history, but the
+        // fingerprint-based reconcile dedups and preserves source of truth;
+        // immediate refresh avoids batch涌出 while keeping content不丢不双显.
+        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'
+        if (isLiveContent) {
+          const lateNext = applyStreamEvent(messagesRef.current, event)
+          if (lateNext !== messagesRef.current) {
+            transcriptLiveRevisionRef.current += 1
+            messagesRef.current = lateNext
+            setMessages(lateNext)
+          }
+          if (event.type === 'text' && event.delta.trim()) setWaitingVisible(false)
+          else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
+          else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
+          else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
+          if (historyContextRef.current?.host === host && historyContextRef.current.sessionId === event.sessionId) setHistoryRefreshKey(key => key + 1)
+          return
+        }
+        return
+      }
       const next = applyStreamEvent(messagesRef.current, event)
       if (next !== messagesRef.current) {
         transcriptLiveRevisionRef.current += 1
@@ -2247,13 +2269,30 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
 
     if (sessionQueue.busy) {
+      // Optimistic local echo even while busy — mirrors direct send's mutateLocalTranscript + pendingLocalUserRef.
+      // Host user_message will dedup via pendingLocalUserRef / queued content match; queued flag gives light "排队中" visual.
+      const localUserId = crypto.randomUUID()
+      pendingLocalUserRef.current = { id: localUserId, content: prompt }
+      mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now(), queued: true } as ChatMessage])
       const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
+      if (payload?.length) {
+        const converted = chatImagesFromAttachments(payload)
+        mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
+      }
       const result = await sessionQueue.enqueue(prompt, payload)
-      // The host owns queue state. A queued outcome arrives through
-      // queue_update; a just-idle race can legitimately dispatch directly.
       if (result.outcome === 'queued' || selectedSession !== targetSession) return true
-      beginDirectTurn()
-      if (payload?.length) patchOptimisticImages(payload)
+      // Race: host dispatched directly despite busy check. Clear queued visual and open turn (bubble already exists).
+      mutateLocalTranscript(items => items.map(m => m.id === localUserId && (m as ChatMessage).queued ? { ...m, queued: undefined } as ChatMessage : m))
+      activeUserTurnRef.current = true
+      mainTurnOpenRef.current = true
+      mainTurnEpochRef.current += 1
+      applyObservedStatus(targetSession, 'running')
+      setStreaming(true)
+      setWaitingStartedAt(Date.now())
+      setWaitingVisible(true)
+      setWaitingPhase('awaiting')
+      setWaitingDetail(undefined)
+      setSessions(current => current.map(session => session.id === targetSession ? { ...session, updatedAt: Date.now() } : session))
       return true
     }
 

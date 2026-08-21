@@ -9,8 +9,12 @@ export const TRANSCRIPT_PIN_MAX_ATTEMPTS = 4
  * can contain duplicate ids. Include stable history fields so two different
  * imported rows sharing an id do not collapse into one prepend identity.
  */
-export function transcriptMessageIdentity(message: { id: string; role: string; timestamp?: number; content: string }): string {
-  return JSON.stringify([message.id, message.role, message.timestamp ?? null, message.content])
+export function transcriptMessageIdentity(message: { id: string; role: string; timestamp?: number; content?: string }): string {
+  // Identity must be stable across streaming content updates; content changes
+  // should trigger normal React re-render, not a Virtuoso key reset.
+  // Tradeoff: two distinct user messages with same id+role+timestamp but
+  // different content would collide — host ids are unique per message, so safe.
+  return JSON.stringify([message.id, message.role, message.timestamp ?? null])
 }
 
 function sameAt(haystack: readonly string[], offset: number, needle: readonly string[]): boolean {

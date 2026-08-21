@@ -41,6 +41,8 @@ export type ChatMessage = {
   images?: { data: string; mimeType: string }[]
   /** assistant only: terminal provider error (stopReason "error") rendered as an error bubble. */
   error?: string
+  /** Local optimistic state for messages sent while queue is busy; cleared on host echo. */
+  queued?: boolean
 }
 
 function isBackgroundSubagentAck(content: string): boolean {
@@ -309,20 +311,35 @@ export function appendLiveUserMessage(messages: ChatMessage[], incoming: { conte
     const index = messages.findIndex(item => item.id === match.id)
     if (index >= 0) {
       const next = [...messages]
-      next[index] = { ...next[index], id: incoming.id ?? next[index].id, content, images: next[index].images?.length ? next[index].images : incoming.images }
+      const merged = { ...next[index], id: incoming.id ?? next[index].id, content, images: next[index].images?.length ? next[index].images : incoming.images }
+      if (merged.queued) delete (merged as { queued?: boolean }).queued
+      next[index] = merged
       return next
     }
+  }
+  // Also handle queued optimistic bubbles: find earliest queued user message
+  // with matching content (FIFO queue drain order) and merge in place.
+  const queuedIndex = messages.findIndex(item => item.role === 'user' && item.queued && stripAttachmentPathsForDisplay(item.content).trim() === content.trim())
+  if (queuedIndex >= 0) {
+    const next = [...messages]
+    const queued = next[queuedIndex]
+    const merged = { ...queued, id: incoming.id ?? queued.id, content, images: queued.images?.length ? queued.images : incoming.images }
+    delete (merged as { queued?: boolean }).queued
+    next[queuedIndex] = merged
+    return next
   }
   const last = messages[messages.length - 1]
   if (last?.role === 'user' && last.content === raw) return messages
   if (last?.role === 'user' && stripAttachmentPathsForDisplay(last.content).trim() === content.trim()) {
     const next = [...messages]
-    next[next.length - 1] = {
+    const merged = {
       ...last,
       id: incoming.id ?? last.id,
       content,
       images: last.images?.length ? last.images : incoming.images,
     }
+    if ((merged as { queued?: boolean }).queued) delete (merged as { queued?: boolean }).queued
+    next[next.length - 1] = merged
     return next
   }
   return [...messages, { id: incoming.id ?? `user-${Date.now()}`, role: 'user', content, timestamp: Date.now(), ...(incoming.images?.length ? { images: incoming.images } : {}) }]
