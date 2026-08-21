@@ -669,6 +669,8 @@ export interface PipiHostAPI {
   renameProject?(projectId: string, name: string): Promise<Project>;
   /** Optional: absent or unsupported v2 hosts let the UI use its local preview fallback. */
   listDocuments?(projectId?: string): Promise<DocumentSummary[]>; readDocument?(documentId: string): Promise<DocumentContent>;
+  /** Local anydoc conversion to markdown; used when the office viewer cannot render a document. `null` = no conversion available. */
+  convertDocumentToMarkdown?(path: string): Promise<string | null>;
   /** Watch the displayed document; switch unwatches the previous path. Watch errors stay silent. */
   watchDocument?(path: string): Promise<void>;
   unwatchDocument?(): Promise<void>;
@@ -924,6 +926,7 @@ function apiFrom(
     renameProject: (projectId, name) => invoke("renameProject", projectId, name),
     listDocuments: projectId => invoke("listDocuments", projectId),
     readDocument: documentId => invoke("readDocument", documentId),
+    convertDocumentToMarkdown: path => invoke("convertDocumentToMarkdown", path),
     watchDocument: path => invoke("watchDocument", path),
     unwatchDocument: () => invoke("unwatchDocument"),
     notifyDocumentsDropped: (sessionId, paths) => invoke("notifyDocumentsDropped", sessionId, paths),

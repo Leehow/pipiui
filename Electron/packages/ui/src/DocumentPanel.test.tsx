@@ -8,12 +8,22 @@ import { DocumentPanel } from './DocumentPanel'
 
 vi.mock('@file-viewer/react', async () => {
   const React = await import('react')
+  type ViewerStateSink = (state: { error?: unknown }) => void
+  const sinks = new Set<ViewerStateSink>()
+  const MockViewer = ({ buffer, name, type, className, onStateChange }: { buffer: ArrayBuffer; name: string; type: string; className?: string; onStateChange?: ViewerStateSink }) => {
+    const [generations, setGenerations] = React.useState(0)
+    React.useEffect(() => { setGenerations(count => count + 1) }, [buffer])
+    React.useEffect(() => {
+      if (!onStateChange) return
+      sinks.add(onStateChange)
+      return () => { sinks.delete(onStateChange) }
+    }, [onStateChange])
+    return <div className={className} data-testid="office-viewer" data-name={name} data-type={type} data-size={buffer.byteLength} data-generations={String(generations)} />
+  }
   return {
-    default: ({ buffer, name, type, className }: { buffer: ArrayBuffer; name: string; type: string; className?: string }) => {
-      const [generations, setGenerations] = React.useState(0)
-      React.useEffect(() => { setGenerations(count => count + 1) }, [buffer])
-      return <div className={className} data-testid="office-viewer" data-name={name} data-type={type} data-size={buffer.byteLength} data-generations={String(generations)} />
-    }
+    default: MockViewer,
+    // Tests simulate FileViewer failures by broadcasting a ViewerState.
+    __emitViewerState: (state: { error?: unknown }) => { for (const sink of [...sinks]) sink(state) }
   }
 })
 vi.mock('@file-viewer/preset-office', () => ({ default: { id: 'office' } }))
@@ -49,6 +59,46 @@ describe('DocumentPanel', () => {
     expect(viewer.getAttribute('data-name')).toBe('report.pdf')
     expect(viewer.getAttribute('data-type')).toBe('pdf')
     expect(viewer.getAttribute('data-size')).toBe('4')
+  })
+
+  it('renders a .docx word document in the FileViewer without throwing', async () => {
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x05, 0x06])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: '托班幼儿基本情况调查表.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/托班幼儿基本情况调查表.docx" />)
+    const viewer = await screen.findByTestId('office-viewer')
+    expect(viewer.getAttribute('data-name')).toBe('托班幼儿基本情况调查表.docx')
+    expect(viewer.getAttribute('data-type')).toBe('docx')
+    expect(viewer.getAttribute('data-size')).toBe(String(bytes.byteLength))
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('falls back to locally converted markdown when the office viewer fails', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# 转换后的标题\n\n本地转换的正文内容。')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    expect(await screen.findByRole('heading', { name: '转换后的标题' })).toBeTruthy()
+    expect(screen.getByTestId('document-fallback')).toBeTruthy()
+    expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/form.docx')
+    expect(screen.getByText('本地转换的正文内容。')).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('keeps a closable viewer error when no markdown conversion is available', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'slides.pptx', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/slides.pptx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('wasm load failed') })
+    expect((await screen.findByRole('alert')).textContent).toContain('wasm load failed')
+    fireEvent.click(screen.getByRole('button', { name: '关闭文档错误' }))
+    await screen.findByTestId('office-viewer')
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('keeps the office search toolbar inside the tools pane instead of the window width', () => {

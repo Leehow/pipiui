@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import FileViewer, { type ViewerState } from '@file-viewer/react'
 import officePreset from '@file-viewer/preset-office'
 import { documentKindForName, type BinaryDocumentContent, type DocumentContent, type DocumentKind, type PipiHostAPI } from '@pipi/host-api'
@@ -31,6 +31,11 @@ function isBinaryDocument(document: DocumentContent): document is BinaryDocument
   return document.kind !== 'markdown' && document.kind !== 'plain'
 }
 
+/** Office kinds the bundled anydoc engine can convert to readable markdown (PDF is out of scope). */
+function isOfficeKind(document: DocumentContent): boolean {
+  return document.kind === 'word' || document.kind === 'spreadsheet' || document.kind === 'presentation'
+}
+
 function binaryBuffer(document: BinaryDocumentContent): ArrayBuffer {
   const bytes = document.bytes
   const copy = new Uint8Array(bytes.byteLength)
@@ -43,6 +48,10 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [reloadGeneration, setReloadGeneration] = useState(0)
+  const [viewerError, setViewerError] = useState<string | null>(null)
+  const [fallbackMarkdown, setFallbackMarkdown] = useState<string | null>(null)
+  const [fallbackPending, setFallbackPending] = useState(false)
+  const fallbackAttemptedRef = useRef(false)
 
   const load = useCallback(() => setReloadGeneration(value => value + 1), [])
   const openExternally = useCallback(() => {
@@ -51,12 +60,16 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
     void host.openDocumentExternally(documentPath).catch(nextError => setError(errorMessage(nextError)))
   }, [host, documentPath])
   const onViewerStateChange = useCallback((state: ViewerState) => {
-    if (state.error) setError(errorMessage(state.error))
+    if (state.error) setViewerError(errorMessage(state.error))
   }, [])
 
   useEffect(() => {
     setDocument(null)
     setError(null)
+    setViewerError(null)
+    setFallbackMarkdown(null)
+    setFallbackPending(false)
+    fallbackAttemptedRef.current = false
     if (!documentPath) {
       setLoading(false)
       return
@@ -93,6 +106,22 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
     })
   }, [host, documentPath, load])
 
+  // When the Office viewer fails (missing runtime asset, engine error, …), keep the
+  // user reading the document: convert it locally with the bundled anydoc engine
+  // and show markdown instead of a bare error. PDF/markdown/plain stay unchanged.
+  useEffect(() => {
+    if (!viewerError || !document || !isOfficeKind(document) || !documentPath) return
+    if (!host.convertDocumentToMarkdown || fallbackAttemptedRef.current) return
+    fallbackAttemptedRef.current = true
+    let cancelled = false
+    setFallbackPending(true)
+    void host.convertDocumentToMarkdown(documentPath)
+      .then(markdown => { if (!cancelled) setFallbackMarkdown(typeof markdown === 'string' && markdown.trim() ? markdown : '') })
+      .catch(() => { if (!cancelled) setFallbackMarkdown('') })
+      .finally(() => { if (!cancelled) setFallbackPending(false) })
+    return () => { cancelled = true }
+  }, [viewerError, document, host, documentPath])
+
   const previewBuffer = useMemo(
     () => (document && isBinaryDocument(document) ? binaryBuffer(document) : null),
     [document],
@@ -116,7 +145,15 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
             : document?.kind === 'markdown' ? <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={document.content} /></article>
               : document?.kind === 'plain' ? <pre className="document-plain-text" aria-label={`文档内容 ${document.name}`}>{document.content}</pre>
                 : document && isBinaryDocument(document) && previewBuffer ? <div className="document-office-preview" aria-label={`文档内容 ${document.name}`}>
-                  <FileViewer
+                  {viewerError
+                    ? fallbackMarkdown
+                      ? <div className="document-fallback" data-testid="document-fallback">
+                        <div className="document-fallback-bar" role="status">原始版式预览失败，已显示本地转换的文本。<span className="document-error-actions"><button onClick={load}>重试</button><button aria-label="关闭文档错误" onClick={() => setViewerError(null)}>×</button></span></div>
+                        <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={fallbackMarkdown} /></article>
+                      </div>
+                      : fallbackPending ? <div className="document-loading" role="status">正在转换文档为可读文本…</div>
+                        : <div className="document-error" role="alert"><span>{viewerError}</span><span className="document-error-actions"><button onClick={load}>重试</button><button aria-label="关闭文档错误" onClick={() => setViewerError(null)}>×</button></span></div>
+                    : <FileViewer
                     className="document-file-viewer"
                     key={`${document.path}:${document.updatedAt ?? document.size ?? 0}`}
                     buffer={previewBuffer}
@@ -125,7 +162,7 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
                     size={document.size}
                     options={OFFICE_VIEWER_OPTIONS}
                     onStateChange={onViewerStateChange}
-                  />
+                  />}
                 </div> : null}
       </div>
     </>}

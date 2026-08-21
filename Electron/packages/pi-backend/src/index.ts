@@ -80,6 +80,7 @@ import {
   installFreezeProbe,
 } from "./freeze-probe.js";
 import { buildDocumentsOpenedInjection, DocumentInjectionStore, prependDocumentInjection } from "./document-inject.js";
+import { convertDocumentFileToMarkdown } from "./anydoc-convert.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
 import { ExternalAuthRuntime } from "./external-auth-runtime.js";
 import {
@@ -2635,6 +2636,13 @@ export class PiHostBackend implements HostBackend {
         return this.listOpenedDocuments();
       case "readDocument":
         return readLocalDocument(params[0]);
+      case "convertDocumentToMarkdown":
+        // Panel-side fallback when the Office viewer cannot render a document:
+        // convert locally with the bundled anydoc engine (no upload).
+        return convertDocumentFileToMarkdown(
+          typeof params[0] === "string" ? params[0] : "",
+          { anydocRoot: join(this.runtimeRoot, "anydoc") },
+        ) ?? null;
       case "watchDocument":
         this.rememberOpenedDocuments([params[0]]);
         this.documentWatcher.setPath(typeof params[0] === "string" ? params[0].trim() : null);
