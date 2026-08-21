@@ -63,7 +63,7 @@
   "agents": [
     {
       "name": "explore",
-      "use": "read-only investigation; sweeps the repo and returns compressed findings with file:line evidence. Reach for it when you do not yet know which files matter."
+      "use": "read-only investigation; sweeps the repo and returns compressed findings with file:line evidence. The default first dispatch whenever you cannot yet name the files a change touches \u2014 it runs the cheap retrieval tier precisely so the implementer does not."
     },
     {
       "name": "plan",

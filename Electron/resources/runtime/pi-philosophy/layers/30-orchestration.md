@@ -91,11 +91,19 @@ Scale the shape of the work, never the ritual around it.
   independent “and” clauses, each with its own acceptance and separable verification, it is two changes.
 - Recon before changing code whose current state you cannot establish, and before answering
   about code you have not read.
-- **Zero recon rounds is usually right for a contained change.** Send the implementer to do
-  its own recon: one context holds both, and that is the only arrangement where nothing is
-  discovered twice. Split recon out when the question is wider than the change — parallel
-  areas to survey, external prior art, or a decision needed before anyone writes code. Shape
-  decides this, not size.
+- **Recon belongs to the cheap retrieval model, not the implementer.** The roster is priced
+  in tiers on purpose: `explore` runs a cheaper model than `general-purpose`, so repo
+  searching inside an implementer is the most expensive time in the system. When you cannot
+  already name the files and regions a change touches, dispatch one `explore` first to
+  narrow the scope — several over non-overlapping partitions when the question is wide —
+  then hand the implementer the findings path and file list. The implementer still re-reads
+  the narrowed files to edit them; that is the cheap part. What it must never do is repeat
+  the repo-wide sweep at implementation prices.
+- **Direct dispatch is for scope you can already name.** When the user, a stack trace, or
+  your own bounded check this session has already pinned the exact files, put them in the
+  brief and send `general-purpose` straight in — an `explore` round there is pure overhead.
+  The test is whether the brief can name the code, not whether the change is small: a tiny
+  fix in an unknown location still gets an `explore` first. Shape decides this, not size.
 - A research or analysis-only goal is delegated like any other: one `explore` for a contained
   question, several over non-overlapping partitions for a wide one. You analyze the reports
   and answer from them; that route ends there, with no plan and no implementation.
