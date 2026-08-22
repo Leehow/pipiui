@@ -13,11 +13,10 @@ import { dirname } from "node:path";
  * the known keys and ignores it, so writing it keeps the shared format intact
  * while letting this host restore the ring's denominator on cold start.
  *
- * Snapshot semantics: each line records one observed `get_session_stats`
- * context sample. `input`/`output`/`cacheRead`/`cacheWrite`/`cost` are kept at
- * zero on purpose — Swift's reader sums those per record as *per-turn* values,
- * and a session-total here would double count. Only the context sample is
- * meaningful to persist.
+ * Billing semantics: assistant `message_end` rows carry that response's exact
+ * provider usage. `get_session_stats` is cumulative across the whole session,
+ * so context-only observations keep the billing fields at zero rather than
+ * append a session total that Swift's per-turn reader would double count.
  */
 
 export type LedgerContextRecord = {
@@ -39,6 +38,43 @@ export type LedgerContextRecord = {
 
 function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+export type ExactAssistantUsage = Pick<
+  LedgerContextRecord,
+  "input" | "output" | "cacheRead" | "cacheWrite" | "cost" | "contextTokens"
+>;
+
+const nonNegativeFinite = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+/**
+ * Extract one provider response's exact usage. Missing/invalid fields fail
+ * closed: this ledger never estimates tokens from text length or substitutes a
+ * cumulative session total for a per-response value.
+ */
+export function exactAssistantUsage(value: unknown): ExactAssistantUsage | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const usage = value as Record<string, unknown>;
+  const cost = usage.cost;
+  if (!cost || typeof cost !== "object" || Array.isArray(cost)) return undefined;
+  const costTotal = (cost as Record<string, unknown>).total;
+  if (
+    !nonNegativeFinite(usage.input) ||
+    !nonNegativeFinite(usage.output) ||
+    !nonNegativeFinite(usage.cacheRead) ||
+    !nonNegativeFinite(usage.cacheWrite) ||
+    !nonNegativeFinite(usage.totalTokens) ||
+    !nonNegativeFinite(costTotal)
+  ) return undefined;
+  return {
+    input: usage.input,
+    output: usage.output,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cost: costTotal,
+    contextTokens: usage.totalTokens,
+  };
 }
 
 /** Parse one ledger line. Returns null for malformed/unrelated lines. */

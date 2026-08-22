@@ -123,6 +123,7 @@ import {
 } from "./secret-vault.js";
 import {
   appendLedgerRecord,
+  exactAssistantUsage,
   latestContextBySession,
   readLedgerFile,
 } from "./token-ledger.js";
@@ -385,6 +386,7 @@ export {
   parseLedgerLine,
   readLedgerFile,
   appendLedgerRecord,
+  exactAssistantUsage,
   latestContextBySession,
   type LedgerContextRecord,
   type SessionLastContext,
@@ -1633,6 +1635,8 @@ export class PiHostBackend implements HostBackend {
     string,
     { tokens: number; contextWindow: number; percent: number | null }
   >();
+  /** Next exact main-assistant ledger turn, rehydrated from old/new rows. */
+  private sessionLedgerTurns = new Map<string, number>();
   private sessionContextLedgerLoaded?: Promise<void>;
   private computerDescriptor?: ComputerDescriptor;
   private computerUsable: () => boolean = () => false;
@@ -3928,6 +3932,7 @@ export class PiHostBackend implements HostBackend {
       const endedMessage = e.message ?? {};
       const secrets = this.sessionSecrets(id);
       if (endedMessage.role === "assistant") {
+        void this.persistAssistantUsage(id, endedMessage);
         const flushed = [...(live.streamRedactors?.text.values() ?? [])].map((item) => item.flush()).join("");
         live.streamRedactors?.text.clear();
         live.streamRedactors?.thinking.forEach((item) => {
@@ -6389,9 +6394,9 @@ export class PiHostBackend implements HostBackend {
   /**
    * Per-session last-known context persistence. Same file name and line format
    * as Swift's TokenLedger (`pipiui-token-ledger.jsonl`), written beside the
-   * host's other state in `~/.pi/agent`; existing files are parsed with the
-   * same reader, so records from earlier runs (or a Swift host sharing the
-   * sessions) are reused instead of recreated with a new format.
+   * host's other state in the active project's Pi home; existing files are
+   * parsed with the same reader, so records from earlier runs (or a Swift host
+   * sharing the sessions) are reused instead of recreated with a new format.
    */
   private contextLedgerFile(): string {
     return join(this.agentDir, "pipiui-token-ledger.jsonl");
@@ -6405,6 +6410,13 @@ export class PiHostBackend implements HostBackend {
   private async readSessionContextLedger(): Promise<void> {
     try {
       const records = await readLedgerFile(this.contextLedgerFile());
+      for (const record of records) {
+        if (record.channel !== "main") continue;
+        this.sessionLedgerTurns.set(
+          record.session,
+          Math.max(this.sessionLedgerTurns.get(record.session) ?? 0, record.turn),
+        );
+      }
       for (const [session, context] of latestContextBySession(records)) {
         if (this.sessionContextLastKnown.has(session)) continue;
         if (typeof context.contextWindow === "number" && context.contextWindow > 0)
@@ -6417,6 +6429,34 @@ export class PiHostBackend implements HostBackend {
     } catch {
       /* a missing/unreadable ledger is fine; live stats still work */
     }
+  }
+  /** Persist one exact provider response; cumulative stats never enter here. */
+  private async persistAssistantUsage(id: string, message: any): Promise<void> {
+    const usage = exactAssistantUsage(message?.usage);
+    const provider = nonEmpty(message?.provider);
+    const modelId = nonEmpty(message?.responseModel) ?? nonEmpty(message?.model);
+    const timestamp = num2(message?.timestamp);
+    if (!usage || !provider || !modelId || timestamp === undefined || timestamp < 0) return;
+    let ts: string;
+    try {
+      ts = new Date(timestamp).toISOString();
+    } catch {
+      return;
+    }
+    await this.loadSessionContextLedger();
+    const turn = (this.sessionLedgerTurns.get(id) ?? 0) + 1;
+    this.sessionLedgerTurns.set(id, turn);
+    const contextWindow = this.sessionContextLastKnown.get(id)?.contextWindow;
+    void appendLedgerRecord(this.contextLedgerFile(), {
+      ts,
+      session: id,
+      channel: "main",
+      depth: 0,
+      model: `${provider}/${modelId}`,
+      turn,
+      ...usage,
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+    });
   }
   /** Best-effort ledger append of one observed context sample. */
   private persistSessionContext(
