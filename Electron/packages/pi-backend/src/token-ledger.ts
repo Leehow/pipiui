@@ -12,6 +12,10 @@ import { dirname } from "node:path";
  * `contextWindow` is an Electron-only extra field: Swift's parser reads only
  * the known keys and ignores it, so writing it keeps the shared format intact
  * while letting this host restore the ring's denominator on cold start.
+ * `contextSample` is another optional Electron discriminator. Missing means
+ * the historical behavior (the row may restore context); `false` marks a pure
+ * billing row. Keeping `channel: "main"` preserves retired Swift usage sums,
+ * while its unknown-field-tolerant parser simply ignores this discriminator.
  *
  * Billing semantics: assistant `message_end` rows carry that response's exact
  * provider usage. `get_session_stats` is cumulative across the whole session,
@@ -34,6 +38,7 @@ export type LedgerContextRecord = {
   cost: number;
   contextTokens: number;
   contextWindow?: number;
+  contextSample?: boolean;
 };
 
 function numberOrZero(value: unknown): number {
@@ -42,7 +47,7 @@ function numberOrZero(value: unknown): number {
 
 export type ExactAssistantUsage = Pick<
   LedgerContextRecord,
-  "input" | "output" | "cacheRead" | "cacheWrite" | "cost" | "contextTokens"
+  "input" | "output" | "cacheRead" | "cacheWrite" | "cost"
 >;
 
 const nonNegativeFinite = (value: unknown): value is number =>
@@ -64,7 +69,6 @@ export function exactAssistantUsage(value: unknown): ExactAssistantUsage | undef
     !nonNegativeFinite(usage.output) ||
     !nonNegativeFinite(usage.cacheRead) ||
     !nonNegativeFinite(usage.cacheWrite) ||
-    !nonNegativeFinite(usage.totalTokens) ||
     !nonNegativeFinite(costTotal)
   ) return undefined;
   return {
@@ -73,7 +77,6 @@ export function exactAssistantUsage(value: unknown): ExactAssistantUsage | undef
     cacheRead: usage.cacheRead,
     cacheWrite: usage.cacheWrite,
     cost: costTotal,
-    contextTokens: usage.totalTokens,
   };
 }
 
@@ -109,6 +112,9 @@ export function parseLedgerLine(line: string): LedgerContextRecord | null {
     Number.isFinite(obj.contextWindow)
       ? { contextWindow: obj.contextWindow }
       : {}),
+    ...(typeof obj.contextSample === "boolean"
+      ? { contextSample: obj.contextSample }
+      : {}),
   };
 }
 
@@ -130,6 +136,8 @@ export function ledgerLine(record: LedgerContextRecord): string {
   };
   if (typeof record.contextWindow === "number" && record.contextWindow > 0)
     obj.contextWindow = record.contextWindow;
+  if (typeof record.contextSample === "boolean")
+    obj.contextSample = record.contextSample;
   // Swift sorts keys and strips nulls for human-readable diffs; a replacer
   // array also pins the field order regardless of insertion sequence.
   return JSON.stringify(obj, Object.keys(obj).sort()) + "\n";
@@ -187,6 +195,9 @@ export function latestContextBySession(
   >();
   for (const record of records) {
     if (record.channel !== channel) continue;
+    // New pure billing rows deliberately carry no occupancy sample. Historical
+    // rows predate this flag and retain their original context semantics.
+    if (record.contextSample === false) continue;
     const previous = newest.get(record.session);
     if (previous && (!record.ts || (previous.ts && record.ts <= previous.ts)))
       continue;
