@@ -220,6 +220,24 @@ export async function resolveCredentialTarget(authPath) {
     }
 }
 /**
+ * Canonical comparison key for one guarded path: resolve ONLY the parent
+ * directory through symlinked ancestors (macOS `/var` → `/private/var`,
+ * aliased home dirs). The final segment is never resolved: the as-given path
+ * of a symlinked credential must keep its OWN lock dir even though it
+ * resolves to the real file. Two paths whose keys are equal guard the exact
+ * same lock directory and must collapse into a single lock — otherwise the
+ * second acquire deadlocks against the first (self-deadlock until timeout).
+ */
+async function physicalLockKey(p) {
+    try {
+        const { realpath } = await import("node:fs/promises");
+        return join(await realpath(dirname(p)), basename(p));
+    }
+    catch {
+        return p; // parent missing — cannot canonicalize; treat as distinct
+    }
+}
+/**
  * Acquire the full auth-store guard for a credential target:
  * 1. `<real>.lock`   — the lock Pipi's host ModelRuntime (authPath = canonical
  *                      file) and every other broker instance take.
@@ -229,9 +247,15 @@ export async function resolveCredentialTarget(authPath) {
  *                      canonical file).
  * Fixed order (real, then as-given) prevents broker/broker deadlock; pi
  * parties hold exactly one of the two, so they never wait on each other here.
+ *
+ * When the two paths differ as STRINGS but denote the same physical lock dir
+ * (symlinked ancestor like macOS `/var` vs `/private/var`), only ONE lock is
+ * taken: locking both would block on the directory we just created ourself.
  */
 export async function acquireAuthStoreLocks(target, opts = {}) {
-    const paths = target.real === target.asGiven ? [target.real] : [target.real, target.asGiven];
+    const samePhysicalLock = target.real === target.asGiven ||
+        (await physicalLockKey(target.real)) === (await physicalLockKey(target.asGiven));
+    const paths = samePhysicalLock ? [target.real] : [target.real, target.asGiven];
     const handles = [];
     try {
         for (const p of paths) {

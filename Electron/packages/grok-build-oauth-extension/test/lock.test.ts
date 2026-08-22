@@ -104,30 +104,73 @@ describe("proper-lockfile wire-format lock (round-2 Critical #1)", () => {
   });
 
   it("true multi-process contention: a child process holding the lock blocks the parent until release", async () => {
+    // Deterministic handshake: the child speaks "HELD" on stdout after
+    // acquiring and "RELEASED" after releasing on a stdin command — no fixed
+    // sleeps anywhere. The script itself must be plain JS: a `.mjs` file is
+    // never type-stripped, so TypeScript syntax crashes the child before it
+    // can report anything.
     const script = join(dir, "holder.mjs");
-    await writeFile(script, `import { acquireCredentialLock } from ${JSON.stringify(new URL("../agent/oauth/lock.ts", import.meta.url).href)};
-const handle = await acquireCredentialLock(process.argv[2]!, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 10_000 });
+    await writeFile(
+      script,
+      `import { acquireCredentialLock } from ${JSON.stringify(new URL("../agent/oauth/lock.ts", import.meta.url).href)};
+const guard = process.argv[2];
+const handle = await acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 10_000 });
 process.stdout.write("HELD\\n");
-process.stdin.resume();
-process.on("disconnect", () => { try { process.exit(0); } catch {} });
-`, "utf8");
-    const child = spawn(process.execPath, ["--experimental-strip-types", script, guard], { stdio: ["pipe", "pipe", "inherit"] });
-    try {
-      const held = await new Promise<string>((resolve, reject) => {
-        const t = setTimeout(() => reject(new Error("child never held the lock")), 8_000);
-        child.stdout!.on("data", (d) => { clearTimeout(t); resolve(String(d)); });
-        child.on("exit", (c) => { clearTimeout(t); reject(new Error(`child exited ${c}`)); });
+process.stdin.setEncoding("utf8");
+for await (const chunk of process.stdin) {
+  if (chunk.trim() === "release") {
+    await handle.release();
+    process.stdout.write("RELEASED\\n");
+  }
+}
+`,
+      "utf8",
+    );
+    const child = spawn(process.execPath, ["--experimental-strip-types", script, guard], {
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    // Attached at spawn so an early crash (exit before any stdout) can never
+    // leave a listener waiting for an event that already fired.
+    const exited = new Promise<void>((resolve) => {
+      child.once("exit", () => resolve());
+      if (child.exitCode !== null || child.signalCode !== null) resolve();
+    });
+    const say = (want: string, ms: number) =>
+      new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`child never said ${want}`)), ms);
+        let buf = "";
+        const onData = (d: string) => {
+          buf += d;
+          if (buf.split("\n").includes(want)) {
+            clearTimeout(timer);
+            child.stdout!.off("data", onData);
+            resolve();
+          }
+        };
+        child.stdout!.setEncoding("utf8");
+        child.stdout!.on("data", onData);
+        child.once("exit", (c) => {
+          clearTimeout(timer);
+          reject(new Error(`child exited ${c} before saying ${want}`));
+        });
       });
-      expect(held).toContain("HELD");
+    try {
+      await say("HELD", 8_000);
+      // Real cross-process exclusion: the child holds the lock dir, the parent
+      // must time out while the holder keeps heartbeating.
       await expect(
         acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 800 }),
       ).rejects.toThrow(/timeout/);
+      // Deterministic release handshake — the child removes the lock itself.
+      child.stdin!.write("release\n");
+      await say("RELEASED", 5_000);
     } finally {
       child.kill();
-      await new Promise((r) => child.on("exit", r));
+      await exited;
     }
     const parentHandle = await acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
     await parentHandle.release();
+    await expect(stat(lockPathFor(guard))).rejects.toMatchObject({ code: "ENOENT" });
   }, 20_000);
 
   describe("interop with the REAL proper-lockfile (pi FileAuthStorageBackend's lock)", () => {
@@ -253,6 +296,7 @@ describe("resolveCredentialTarget (reviewer MUST-FIX #1)", () => {
 
   it("no .groklock exists anywhere — the only lock is the shared proper-lockfile one", async () => {
     const { GrokCredentialBroker } = await import("../agent/oauth/broker.js");
+    const { createFileCredentialStoreAdapter } = await import("../agent/oauth/store-adapter.js");
     const authPath = join(dir, "auth.json");
     const broker = new GrokCredentialBroker({ authPath, fetchImpl: (async () => { throw new Error("no network"); }) as unknown as typeof fetch });
     const now = Date.now();
@@ -260,8 +304,21 @@ describe("resolveCredentialTarget (reviewer MUST-FIX #1)", () => {
       type: "oauth", access: "at", refresh: "rt", expires: now + 3600_000,
       issuer: "https://auth.x.ai", client_id: "c", scopes: ["openid"], token_type: "Bearer", obtained_at: now,
     } as never);
+    // The broker writes through the same file adapter as every other store
+    // mutation — assert from INSIDE a held section (immediate, no waiting):
+    // while the shared proper-lockfile lock is held, it is the ONLY lock
+    // artifact next to auth.json.
+    const adapter = createFileCredentialStoreAdapter({ authPath });
+    await adapter.withExclusive(async () => {
+      const held = await import("node:fs/promises").then((fs) => fs.readdir(dir));
+      expect(held.some((e) => e.includes("groklock"))).toBe(false);
+      expect(held).toContain("auth.json.lock");
+    });
+    // After release nothing is left behind: no .groklock ever, and the shared
+    // lock dir was cleaned up.
     const entries = await import("node:fs/promises").then((fs) => fs.readdir(dir));
     expect(entries.some((e) => e.includes("groklock"))).toBe(false);
-    expect(entries).toContain("auth.json.lock");
+    expect(entries).toContain("auth.json");
+    expect(entries.some((e) => e.endsWith(".lock"))).toBe(false);
   });
 });

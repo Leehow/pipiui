@@ -81,6 +81,10 @@ export declare function resolveCredentialTarget(authPath: string): Promise<{
  *                      canonical file).
  * Fixed order (real, then as-given) prevents broker/broker deadlock; pi
  * parties hold exactly one of the two, so they never wait on each other here.
+ *
+ * When the two paths differ as STRINGS but denote the same physical lock dir
+ * (symlinked ancestor like macOS `/var` vs `/private/var`), only ONE lock is
+ * taken: locking both would block on the directory we just created ourself.
  */
 export declare function acquireAuthStoreLocks(target: {
     asGiven: string;

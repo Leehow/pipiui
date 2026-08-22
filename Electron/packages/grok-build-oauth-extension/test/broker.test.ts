@@ -480,28 +480,34 @@ describe("Broker × Pi credential store — one lock, no lost fields (round-2 Cr
   });
 
   it("file adapter: invalid_grant for a rotated-away refresh token keeps the rotated credential (rotation race)", async () => {
-    // The stored credential is rt-new (rotated); the broker believes rt-old.
+    // Deterministic interleave (no timer races): the rotation lands while the
+    // refresh HTTP call is in flight — i.e. between the broker's unlocked read
+    // (sees rt-old) and its locked re-read inside withExclusive (must see
+    // rt-new). Driving the write from inside fetchImpl pins that order on
+    // every machine, however loaded.
+    const rotated = makeCred({ access: "at-new", refresh: "rt-new", expires: Date.now() + 3600_000, obtained_at: Date.now() }) as never;
+    let rotations = 0;
     const broker = new GrokCredentialBroker({
       authPath,
-      fetchImpl: (async () =>
-        new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 })) as unknown as typeof fetch,
+      fetchImpl: (async () => {
+        if (rotations++ === 0) {
+          // "Another process" rotates the credential under the refresh call.
+          await writeFile(authPath, JSON.stringify({ "grok-build": rotated }, null, 2));
+        }
+        return new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 });
+      }) as unknown as typeof fetch,
     });
-    const rotated = makeCred({ access: "at-new", refresh: "rt-new", expires: Date.now() + 3600_000, obtained_at: Date.now() }) as never;
-    await broker._writeForTest(rotated);
-    // Force the broker to "see" an older credential so it refreshes with it:
-    // simulate by pointing it at rt-old via a direct file rewrite under it.
+    // The broker believes the older credential (rt-old) when it starts.
     const stale = makeCred({ access: "at-old", refresh: "rt-old", expires: Date.now() + 10_000, obtained_at: Date.now() - 5_000 }) as never;
-    await writeFile(authPath, JSON.stringify({ "grok-build": stale }, null, 2));
-    // Another process rotates back to the new credential right after the broker read:
-    const race = new Promise<void>((resolve) => {
-      setTimeout(() => {
-        void writeFile(authPath, JSON.stringify({ "grok-build": rotated }, null, 2)).then(resolve);
-      }, 10);
-    });
-    await expect(broker.forceRefresh()).rejects.toMatchObject({ code: "auth_expired" });
-    await race;
+    await broker._writeForTest(stale);
+    // The broker must surface the rotated credential (not throw, not loop):
+    // a refresh failure for a token that is no longer stored means another
+    // process already fixed the store.
+    const res = await broker.forceRefresh();
+    expect(res.refresh).toBe("rt-new");
     const after = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
     // The rotated credential was NOT cleared by the stale invalid_grant.
     expect((after["grok-build"] as { refresh: string }).refresh).toBe("rt-new");
+    expect((after["grok-build"] as { access: string }).access).toBe("at-new");
   });
 });
