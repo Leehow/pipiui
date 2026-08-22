@@ -71,6 +71,8 @@ describe("installRuntimeTree", () => {
       expect(await readdir(join(root, "pdf-inspector", "node_modules", "@firecrawl"))).toEqual(expect.arrayContaining(["pdf-inspector", "pdf-inspector-wasm"]));
       expect(await readdir(join(root, "anydoc", "node_modules", "@firecrawl"))).toEqual(expect.arrayContaining(["anydoc", "anydoc-wasm"]));
       expect(await readdir(join(root, "pi-ext"))).toEqual(expect.arrayContaining(["agents", "packages", "subagent"]));
+      expect(existsSync(join(root, "pi-ext", "packages", "context-fold", "index.ts"))).toBe(true);
+      expect(await readFile(join(root, "pi-ext", "packages", "context-fold", "VENDORED.md"), "utf8")).toContain("4881382bc6a5acaaf8e346a5f36a4c62cf0d3ae3");
       expect(await readdir(join(root, "pi-philosophy"))).toContain("philosophy.ts");
       expect(await readFile(join(root, "extensions", "pipiui-git.ts"), "utf8")).toContain("git_status");
       expect(await readFile(join(root, "extensions", "pipiui-runtime-info.ts"), "utf8")).toContain("pipiui_runtime_info");

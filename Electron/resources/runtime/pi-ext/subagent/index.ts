@@ -98,6 +98,7 @@ import {
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
 import {
+	decideAdjacentStatusSnapshot,
 	formatResumableSectionLines,
 	formatUnfilteredOmissionNote,
 	selectUnfilteredJobs,
@@ -109,7 +110,7 @@ import {
 	sessionActivity,
 } from "./signal-admission.ts";
 import {
-	completionObservation,
+	completionObservations,
 	completionObservationMatches,
 	completionPersistenceState,
 	queueCompletionAfterCutIn,
@@ -4381,33 +4382,34 @@ function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, 
 function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[]): void {
 	if (!doneDeliveryStore || doneDeliveryPiSessionId !== piSessionId) return;
 	for (const value of branch) {
-		const observed = completionObservation(value);
-		if (!observed || observed.sessionId !== piSessionId) continue;
-		const record = doneDeliveryStore.read(observed.obligationId) ?? pendingDone.get(observed.obligationId)?.obligation;
-		if (!record) continue;
-		const expected = { sessionId: piSessionId, agentId: record.agentId, runId: record.runId, obligationId: record.id };
-		if (!completionObservationMatches(observed, expected)) continue;
-		try {
-			const persistenceState = completionPersistenceState(branch, expected);
-			const settled = persistenceState === "fulfilled"
-				? doneDeliveryStore.markFulfilled(record.id)
-				: persistenceState === "retryable"
-					? doneDeliveryStore.markRetryable(record.id)
-					: doneDeliveryStore.markObserved(record.id);
-			if (!settled) continue;
-			if (settled.state === "failed" && settled.attempts < DONE_MAX_ATTEMPTS) {
-				pendingDone.set(record.id, {
-					obligation: settled,
-					sessionId: piSessionId,
-					firstFailedAt: settled.updatedAt,
-					inFlight: false,
-					recoveredAmbiguous: false,
-				});
-			} else {
-				pendingDone.delete(record.id);
+		for (const observed of completionObservations(value)) {
+			if (observed.sessionId !== piSessionId) continue;
+			const record = doneDeliveryStore.read(observed.obligationId) ?? pendingDone.get(observed.obligationId)?.obligation;
+			if (!record) continue;
+			const expected = { sessionId: piSessionId, agentId: record.agentId, runId: record.runId, obligationId: record.id };
+			if (!completionObservationMatches(observed, expected)) continue;
+			try {
+				const persistenceState = completionPersistenceState(branch, expected);
+				const settled = persistenceState === "fulfilled"
+					? doneDeliveryStore.markFulfilled(record.id)
+					: persistenceState === "retryable"
+						? doneDeliveryStore.markRetryable(record.id)
+						: doneDeliveryStore.markObserved(record.id);
+				if (!settled) continue;
+				if (settled.state === "failed" && settled.attempts < DONE_MAX_ATTEMPTS) {
+					pendingDone.set(record.id, {
+						obligation: settled,
+						sessionId: piSessionId,
+						firstFailedAt: settled.updatedAt,
+						inFlight: false,
+						recoveredAmbiguous: false,
+					});
+				} else {
+					pendingDone.delete(record.id);
+				}
+			} catch (err) {
+				logDonePersistenceFailure("reconcile", record.id, err);
 			}
-		} catch (err) {
-			logDonePersistenceFailure("reconcile", record.id, err);
 		}
 	}
 }
@@ -7465,9 +7467,9 @@ export default function (pi: ExtensionAPI) {
 	// branch one tick later; sibling branches cannot acknowledge this wake.
 	pi.on("message_end", (event, ctx) => {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
-		const observed = completionObservation(event.message);
+		const observations = completionObservations(event.message);
 		const assistantEnded = event.message.role === "assistant";
-		if ((!observed && !assistantEnded) || (observed && observed.sessionId !== piSessionId)) return;
+		if ((observations.length === 0 && !assistantEnded) || observations.some(({ sessionId }) => sessionId !== piSessionId)) return;
 		const timer = setTimeout(() => {
 			if (doneDeliveryPiSessionId !== piSessionId) return;
 			reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
@@ -7953,6 +7955,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Per extension/session: explicit detail/archive queries bypass this cache and cannot
+	// replace the last default snapshot used for adjacent duplicate suppression.
+	let previousUnfilteredStatusSemanticKey: string | undefined;
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
@@ -7976,12 +7981,19 @@ export default function (pi: ExtensionAPI) {
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params) {
 			params = omitNulls(params);
-			const text = formatJobsStatus({
+			const query = {
 				agentId: params.agentId,
 				onlyRunning: params.onlyRunning === true,
 				full: params.full === true,
-			});
-			return { content: [{ type: "text", text }], details: null };
+			};
+			const formatted = formatJobsStatus(query);
+			const snapshot = decideAdjacentStatusSnapshot(
+				previousUnfilteredStatusSemanticKey,
+				formatted,
+				query,
+			);
+			previousUnfilteredStatusSemanticKey = snapshot.semanticKey;
+			return { content: [{ type: "text", text: snapshot.text }], details: null };
 		},
 	});
 

@@ -12,12 +12,15 @@ import { dirname } from "node:path";
  * `contextWindow` is an Electron-only extra field: Swift's parser reads only
  * the known keys and ignores it, so writing it keeps the shared format intact
  * while letting this host restore the ring's denominator on cold start.
+ * `contextSample` is another optional Electron discriminator. Missing means
+ * the historical behavior (the row may restore context); `false` marks a pure
+ * billing row. Keeping `channel: "main"` preserves retired Swift usage sums,
+ * while its unknown-field-tolerant parser simply ignores this discriminator.
  *
- * Snapshot semantics: each line records one observed `get_session_stats`
- * context sample. `input`/`output`/`cacheRead`/`cacheWrite`/`cost` are kept at
- * zero on purpose — Swift's reader sums those per record as *per-turn* values,
- * and a session-total here would double count. Only the context sample is
- * meaningful to persist.
+ * Billing semantics: assistant `message_end` rows carry that response's exact
+ * provider usage. `get_session_stats` is cumulative across the whole session,
+ * so context-only observations keep the billing fields at zero rather than
+ * append a session total that Swift's per-turn reader would double count.
  */
 
 export type LedgerContextRecord = {
@@ -35,10 +38,46 @@ export type LedgerContextRecord = {
   cost: number;
   contextTokens: number;
   contextWindow?: number;
+  contextSample?: boolean;
 };
 
 function numberOrZero(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+export type ExactAssistantUsage = Pick<
+  LedgerContextRecord,
+  "input" | "output" | "cacheRead" | "cacheWrite" | "cost"
+>;
+
+const nonNegativeFinite = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value) && value >= 0;
+
+/**
+ * Extract one provider response's exact usage. Missing/invalid fields fail
+ * closed: this ledger never estimates tokens from text length or substitutes a
+ * cumulative session total for a per-response value.
+ */
+export function exactAssistantUsage(value: unknown): ExactAssistantUsage | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const usage = value as Record<string, unknown>;
+  const cost = usage.cost;
+  if (!cost || typeof cost !== "object" || Array.isArray(cost)) return undefined;
+  const costTotal = (cost as Record<string, unknown>).total;
+  if (
+    !nonNegativeFinite(usage.input) ||
+    !nonNegativeFinite(usage.output) ||
+    !nonNegativeFinite(usage.cacheRead) ||
+    !nonNegativeFinite(usage.cacheWrite) ||
+    !nonNegativeFinite(costTotal)
+  ) return undefined;
+  return {
+    input: usage.input,
+    output: usage.output,
+    cacheRead: usage.cacheRead,
+    cacheWrite: usage.cacheWrite,
+    cost: costTotal,
+  };
 }
 
 /** Parse one ledger line. Returns null for malformed/unrelated lines. */
@@ -73,6 +112,9 @@ export function parseLedgerLine(line: string): LedgerContextRecord | null {
     Number.isFinite(obj.contextWindow)
       ? { contextWindow: obj.contextWindow }
       : {}),
+    ...(typeof obj.contextSample === "boolean"
+      ? { contextSample: obj.contextSample }
+      : {}),
   };
 }
 
@@ -94,6 +136,8 @@ export function ledgerLine(record: LedgerContextRecord): string {
   };
   if (typeof record.contextWindow === "number" && record.contextWindow > 0)
     obj.contextWindow = record.contextWindow;
+  if (typeof record.contextSample === "boolean")
+    obj.contextSample = record.contextSample;
   // Swift sorts keys and strips nulls for human-readable diffs; a replacer
   // array also pins the field order regardless of insertion sequence.
   return JSON.stringify(obj, Object.keys(obj).sort()) + "\n";
@@ -151,6 +195,9 @@ export function latestContextBySession(
   >();
   for (const record of records) {
     if (record.channel !== channel) continue;
+    // New pure billing rows deliberately carry no occupancy sample. Historical
+    // rows predate this flag and retain their original context semantics.
+    if (record.contextSample === false) continue;
     const previous = newest.get(record.session);
     if (previous && (!record.ts || (previous.ts && record.ts <= previous.ts)))
       continue;

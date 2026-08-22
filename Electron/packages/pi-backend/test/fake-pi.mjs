@@ -39,6 +39,28 @@ function emitTurn(message, images) {
   send({ type: "message_update", assistantMessageEvent: { type: "toolcall_delta", contentIndex: 1, delta: "{\"command\":\"ls -la\"}" } });
   send({ type: "message_update", assistantMessageEvent: { type: "toolcall_end", contentIndex: 1, toolCall: { id: "tool-1", name: "fake_tool" } } });
   send({ type: "tool_execution_end", toolCallId: "tool-1", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+  if (message === "ledger-usage") {
+    send({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "ledger response" }],
+        api: "fake",
+        provider: "fake",
+        model: "fake-1",
+        usage: {
+          input: 1200,
+          output: 340,
+          cacheRead: 800,
+          cacheWrite: 100,
+          totalTokens: 2440,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.00123 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    });
+  }
   if (message === "__segments__") {
     // A second assistant message restarts contentIndex at 0 — the host must tag
     // its thinking with a fresh segment so the UI keeps the blocks apart.

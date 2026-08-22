@@ -4,9 +4,9 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:pa
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
-export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
+export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 /** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
 export type SpawnRegisteredExtension = {
@@ -44,9 +44,9 @@ export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,strin
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
  * env-key providers (DeepSeek, Kimi, …) resolve in the RPC session exactly as they do
  * for `listModels`. Precedence, highest first: internal assembly env (the host's own
- * PIPIUI_* contract) → `.env` → host process env. Managed PIPIUI_* keys are stripped
- * from both base layers, so a stale `.env`/parent value can never resurrect a disabled
- * feature or clobber the host's bridge/computer contract.
+ * PIPIUI_* contract) → `.env` → host process env → host defaults. Managed PIPIUI_*
+ * keys are stripped from both base layers, so a stale `.env`/parent value can never resurrect
+ * a disabled feature or clobber the host's bridge/computer contract.
  */
 /**
  * Packaged Pi/auth children run as Electron Helper. A reconstructed spawn env
@@ -65,6 +65,11 @@ export function mergedSpawnEnvironment(
   internal: Record<string, string>,
 ): Record<string, string> {
   return withElectronRunAsNode({
+    PI_CACHE_RETENTION: "long",
+    CONTEXTFOLD_BUDGET_CAP: "150000",
+    CONTEXTFOLD_TAIL: "30000",
+    CONTEXTFOLD_COMPACT: "native",
+    CONTEXTFOLD_SPOOL_RETAIN_DAYS: "30",
     ...sanitizeEnvironment(parent),
     ...sanitizeEnvironment(dotEnv),
     ...internal,
@@ -88,7 +93,7 @@ env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile}
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
-if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}
+if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}if(enabled(f,"contextFold")){ext(args,p.contextFold)}
 if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
@@ -361,6 +366,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     subagentDir:fileIfPresent(ext,"subagent"),
     agentsDir:fileIfPresent(ext,"agents"),
     memoryBroker:packageIfPresent(ext,"packages","memory-broker"),
+    contextFold:fileIfPresent(ext,"packages","context-fold","index.ts"),
     hermesMemory:managedRoot(HERMES_MEMORY_PACKAGE),
     arxivFetchPackage:packageIfPresent(ext,"packages","arxiv-fetch"),
     webSearch:managed(MANAGED_PACKAGES[0]),
