@@ -17,7 +17,11 @@ afterEach(async () => {
   root = "";
 });
 
-async function fixture(compaction?: { quietDelayMs?: number }) {
+async function fixture(compaction?: {
+  quietDelayMs?: number;
+  waitWatermark?: number;
+  waitQuietDelayMs?: number;
+}) {
   root = await mkdtemp(join(tmpdir(), "pipi-compact-"));
   const cwd = join(root, "project");
   const dir = join(root, "sessions", "project");
@@ -38,6 +42,8 @@ async function fixture(compaction?: { quietDelayMs?: number }) {
       // Keep the quiet period short; the watermark logic is unit-tested separately.
       quietDelayMs: compaction?.quietDelayMs ?? 20,
       failureBackoffMs: 60_000,
+      waitWatermark: compaction?.waitWatermark,
+      waitQuietDelayMs: compaction?.waitQuietDelayMs,
     },
     spawn: (_bin, _args, options) =>
       spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], {
@@ -121,6 +127,38 @@ describe("context compaction", () => {
 
     await backend.handle("sendPrompt", ["session-1", "go"]);
     await settle(200);
+    off();
+
+    expect(compactionEvents(events)).toEqual([]);
+    await backend.close();
+  });
+
+  it("uses exact live-agent host state to compact a quiet waiting Boss below the ordinary watermark", async () => {
+    // The fake's ordinary settled context is ~5.7%. Lower only the injected
+    // wait watermark so this integration test exercises the host wiring without
+    // adding a second fake-pi control surface; unit tests own the real 50%/30s values.
+    const backend = await fixture({ waitWatermark: 0.05, waitQuietDelayMs: 20 });
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__agent_running__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    off();
+
+    expect(compactionEvents(events).map((e) => e.phase)).toEqual(["start", "end"]);
+    await backend.close();
+  });
+
+  it("cancels a pending wait compact when the last live agent becomes terminal", async () => {
+    const backend = await fixture({ waitWatermark: 0.05, waitQuietDelayMs: 150 });
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__agent_running__"]);
+    // Force a fresh eligible sample while the exact durable projection is live.
+    await backend.handle("getSessionStats", ["session-1"]);
+    await backend.handle("sendPrompt", ["session-1", "/subagent_abort_all"]);
+    await settle(250);
     off();
 
     expect(compactionEvents(events)).toEqual([]);
