@@ -59,6 +59,132 @@ test("completion notification rejection is reported for persisted retry", (t) =>
 	assert.equal(queued, false);
 });
 
+test("a short completion wave is combined and wakes the Boss only once", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	const hooks = {
+		waitForCutIn: async () => {},
+		currentSessionId: () => "session-a",
+	};
+	const wave = { batchWindowMs: 10 };
+	const first = queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a", text: "done-a",
+	}, hooks, wave);
+	const second = queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: "agent-b", runId: "run-b", obligationId: "row-b", text: "done-b",
+	}, hooks, wave);
+
+	assert.deepEqual(await Promise.all([first, second]), [true, true]);
+	assert.equal(calls.length, 1);
+	assert.deepEqual(calls[0]?.[0], {
+		customType: "pipiui-subagent-complete-v1",
+		content: "done-a\n\n---\n\ndone-b",
+		display: false,
+		details: {
+			version: 1,
+			completions: [
+				{ sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a" },
+				{ sessionId: "session-a", agentId: "agent-b", runId: "run-b", obligationId: "row-b" },
+			],
+		},
+	});
+	assert.deepEqual(calls[0]?.[1], { triggerTurn: true, deliverAs: "followUp" });
+});
+
+test("one later assistant fulfills every exact obligation in a batch envelope", () => {
+	const batch = {
+		type: "custom_message",
+		customType: "pipiui-subagent-complete-v1",
+		details: {
+			version: 1,
+			completions: [
+				{ sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a" },
+				{ sessionId: "session-a", agentId: "agent-b", runId: "run-b", obligationId: "row-b" },
+			],
+		},
+	};
+	const branch = [batch, { type: "message", message: { role: "assistant", stopReason: "stop" } }];
+	assert.equal(completionPersistenceState(branch, batch.details.completions[0]!), "fulfilled");
+	assert.equal(completionPersistenceState(branch, batch.details.completions[1]!), "fulfilled");
+});
+
+test("a large wave is split into bounded envelopes but still has one wake", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	const hooks = { waitForCutIn: async () => {}, currentSessionId: () => "session-a" };
+	const wave = { batchWindowMs: 10, maxItems: 2 };
+	const queued = ["a", "b", "c"].map((id) => queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: `agent-${id}`, runId: `run-${id}`, obligationId: `row-${id}`, text: `done-${id}`,
+	}, hooks, wave));
+
+	assert.deepEqual(await Promise.all(queued), [true, true, true]);
+	assert.equal(calls.length, 2);
+	assert.deepEqual(calls.map((call) => (call[0] as { details: { completions?: unknown[] } }).details.completions?.length ?? 1), [2, 1]);
+	assert.deepEqual(calls.map((call) => (call[1] as { triggerTurn: boolean }).triggerTurn), [false, true]);
+});
+
+test("wave envelopes also split at the content-byte budget", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	const hooks = { waitForCutIn: async () => {}, currentSessionId: () => "session-a" };
+	const wave = { batchWindowMs: 5, maxContentBytes: 12 };
+	const queued = ["a", "b", "c"].map((id) => queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: `agent-${id}`, runId: `run-${id}`, obligationId: `row-${id}`, text: `done-${id}!`,
+	}, hooks, wave));
+
+	assert.deepEqual(await Promise.all(queued), [true, true, true]);
+	assert.equal(calls.length, 3);
+	assert.deepEqual(calls.map((call) => (call[1] as { triggerTurn: boolean }).triggerTurn), [false, false, true]);
+});
+
+test("one oversized completion is capped instead of defeating the envelope budget", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	const hooks = { waitForCutIn: async () => {}, currentSessionId: () => "session-a" };
+	assert.equal(await queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a", text: "界".repeat(100),
+	}, hooks, { batchWindowMs: 5, maxContentBytes: 64 }), true);
+
+	const content = (calls[0]?.[0] as { content: string }).content;
+	assert.ok(Buffer.byteLength(content, "utf8") <= 64);
+	assert.match(content, /truncated/);
+});
+
+test("a completion outside the batch window starts a later wave", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	const hooks = { waitForCutIn: async () => {}, currentSessionId: () => "session-a" };
+	const wave = { batchWindowMs: 5 };
+	assert.equal(await queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a", text: "done-a",
+	}, hooks, wave), true);
+	assert.equal(await queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: "agent-b", runId: "run-b", obligationId: "row-b", text: "done-b",
+	}, hooks, wave), true);
+
+	assert.equal(calls.length, 2);
+	assert.deepEqual(calls.map((call) => (call[1] as { triggerTurn: boolean }).triggerTurn), [true, true]);
+});
+
+test("failure of the one waking envelope leaves the whole wave retryable", async (t) => {
+	t.mock.method(console, "error", () => {});
+	const calls: unknown[][] = [];
+	const pi = {
+		sendMessage: (...args: unknown[]) => {
+			calls.push(args);
+			if ((args[1] as { triggerTurn: boolean }).triggerTurn) throw new Error("busy");
+		},
+	};
+	const hooks = { waitForCutIn: async () => {}, currentSessionId: () => "session-a" };
+	const wave = { batchWindowMs: 5, maxItems: 1 };
+	const queued = ["a", "b"].map((id) => queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: `agent-${id}`, runId: `run-${id}`, obligationId: `row-${id}`, text: `done-${id}`,
+	}, hooks, wave));
+
+	assert.deepEqual(await Promise.all(queued), [false, false]);
+	assert.equal(calls.length, 2);
+});
+
 test("fire-and-forget harness does not acknowledge before post-message_end persistence", async (t) => {
 	const directory = mkdtempSync(join(tmpdir(), "pipiui-completion-fire-forget-"));
 	t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -421,6 +547,7 @@ test("runtime finalizes status before using the custom completion channel", () =
 	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?deliveryRetryDue\(/);
 	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?flushAfterSettle:\s*true/);
 	assert.match(source, /const existing = pendingDone\.get\(obligation\.id\);[\s\S]*?deliveryRetryDue\(\s*existing\.obligation/);
+	assert.match(source, /for \(const observed of completionObservations\(value\)\)/);
 });
 
 test("settle flush sends held confirmed dones even after the first receipt flips busy", () => {
