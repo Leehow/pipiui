@@ -90,6 +90,7 @@ export function emitFoldIndex(
 	const spooled: WireBlock[] = [];
 	const droppedIds: string[] = [];
 	for (const b of masked) {
+		const spoolText = b.spoolText ?? b.text;
 		const existing = deps.registry.get(b.id);
 		if (existing) {
 			// Already spooled — point at the existing envelope, don't duplicate.
@@ -98,7 +99,7 @@ export function emitFoldIndex(
 				code: existing.code,
 				tool: existing.tool,
 				turn: b.turn,
-				log: { path: existing.spoolPath, byteStart: 0, byteEnd: existing.bytes, lines: countLines(b.text) },
+				log: { path: existing.spoolPath, byteStart: 0, byteEnd: existing.bytes, lines: countLines(spoolText) },
 				fullOutputPath: existing.fullOutputPath,
 			});
 			spooled.push(b);
@@ -113,7 +114,7 @@ export function emitFoldIndex(
 				tool: b.toolName ?? b.kind,
 				input: undefined,
 				isError: b.isError ?? false,
-				content: b.text,
+				content: spoolText,
 				now: deps.now,
 			});
 		} catch (err) {
@@ -137,7 +138,7 @@ export function emitFoldIndex(
 				path: deps.spool.pathFor(code),
 				byteStart: 0,
 				byteEnd: res.envelope.bytes,
-				lines: countLines(b.text),
+				lines: countLines(spoolText),
 			},
 		});
 		// Stage the registry entry; publish it only after the complete index record is durable.
@@ -204,6 +205,7 @@ export function spoolCompactedBlocks(
 	const added: SpoolEntry[] = [];
 	for (const b of blocks) {
 		if (!wireFoldable(b) || !isDurableId(b.id) || !b.text || deps.registry.has(b.id)) continue;
+		const spoolText = b.spoolText ?? b.text;
 		const code = foldCode(b.id);
 		let res: SpoolWriteResult;
 		try {
@@ -213,7 +215,7 @@ export function spoolCompactedBlocks(
 				tool: b.toolName ?? b.kind,
 				input: undefined,
 				isError: b.isError ?? false,
-				content: b.text,
+				content: spoolText,
 				now: deps.now,
 			});
 		} catch {

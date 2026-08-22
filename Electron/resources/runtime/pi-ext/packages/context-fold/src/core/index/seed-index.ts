@@ -44,7 +44,7 @@ export interface SeedIndexRecord {
 	session: string;
 	seq: number;
 	at: string;
-	trigger: "threshold" | "cap" | "compact";
+	trigger: "threshold" | "cap" | "tool-use-count" | "superseded" | "compact";
 	usage: { tokens: number; contextWindow: number; fraction: number };
 	files: string[];
 	commands: string[];

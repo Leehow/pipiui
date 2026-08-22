@@ -11,10 +11,18 @@ provides the extension API and `typebox` virtual modules at runtime.
 
 ## PipiUI deviations
 
-- Only text-only `toolResult` observations may fold. Assistant text, thinking/reasoning, tool
-  calls, user messages, images, and all other non-text parts remain byte-for-byte raw. The apply
-  path independently rejects assistant-message fold operations so signed reasoning cannot be
-  rewritten while retaining a provider signature.
+- Text-only `toolResult` observations may fold. In addition, a discrete completed-tool-use event
+  (40 eligible uses by default, preserving the newest 12 pairs and requiring at least 10,000
+  estimated saved tokens) may replace only the arguments object of an old, successful, matched
+  `subagent` call. Exact original arguments are committed through the same session-local
+  spool/index path first; the replacement is a deterministic receipt with recall code, SHA-256,
+  original size, and preview. The wire path independently rechecks the fixed `subagent` allowlist,
+  durable pair, success, working tail, held, and frozen guards. Assistant text, signed
+  thinking/reasoning blocks and signature fields, user messages, images, errors, unmatched calls,
+  and every other tool's arguments remain byte-for-byte raw.
+- Older successful `subagent_status` results are superseded only when a later successful result has
+  the exact same structured `agentId` and `runId`; the newest, errors, other runs, and the protected
+  tail stay raw. This is a discrete frozen layer, not persisted-history rewriting.
 - Defaults are an absolute 150,000-token cap, a 30,000-token protected recent tail, native Pi
   hard compaction, and 30-day spool retention. Explicit process/project environment values keep
   their normal higher precedence. Native mode registers no `session_before_compact` handler, so
@@ -26,6 +34,9 @@ provides the extension API and `typebox` virtual modules at runtime.
 - Spool and seed-index paths remain the upstream session-local layout rooted exclusively at
   `ctx.sessionManager.getSessionDir()`. Spool/index persistence remains a precondition for a fold
   to reach the provider; failures send the raw context.
+- Anthropic provider-native `clear_tool_uses` / `clear_tool_inputs` remains deferred: the scoped
+  extension has no typed provider-payload capability seam, and the active Kimi-compatible route
+  has no verified support. This deviation is deliberately provider-generic and local.
 - The outbound `context` view makes every completed prior user turn's thinking eligible by default
   (`CONTEXTFOLD_THINKING=0` disables it and `CONTEXTFOLD_THINKING_KEEP_TURNS` overrides the
   protected recent-turn window). The newest/current turn remains protected. This is a

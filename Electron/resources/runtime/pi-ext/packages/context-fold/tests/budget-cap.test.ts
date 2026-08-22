@@ -85,3 +85,62 @@ describe("PipiUI compaction ownership", () => {
 		}
 	});
 });
+
+describe("tool-use trigger env parsing", () => {
+	const names = ["CONTEXTFOLD_TOOL_USE_TRIGGER", "CONTEXTFOLD_TOOL_USE_KEEP", "CONTEXTFOLD_TOOL_USE_MIN_SAVINGS"] as const;
+	function withEnv(values: Partial<Record<(typeof names)[number], string>>, fn: () => void) {
+		const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+		for (const name of names) {
+			if (values[name] === undefined) delete process.env[name];
+			else process.env[name] = values[name];
+		}
+		try {
+			fn();
+		} finally {
+			for (const name of names) {
+				if (previous[name] === undefined) delete process.env[name];
+				else process.env[name] = previous[name];
+			}
+		}
+	}
+
+	it("uses stable defaults and accepts canonical base-10 integers", () => {
+		withEnv({}, () => {
+			const config = adapterConfigFromEnv().ladder;
+			expect(config.toolUseTrigger).toBe(40);
+			expect(config.toolUseKeep).toBe(12);
+			expect(config.toolUseMinSavings).toBe(10_000);
+		});
+		withEnv(
+			{
+				CONTEXTFOLD_TOOL_USE_TRIGGER: "48",
+				CONTEXTFOLD_TOOL_USE_KEEP: "0",
+				CONTEXTFOLD_TOOL_USE_MIN_SAVINGS: "12000",
+			},
+			() => {
+				const config = adapterConfigFromEnv().ladder;
+				expect(config.toolUseTrigger).toBe(48);
+				expect(config.toolUseKeep).toBe(0);
+				expect(config.toolUseMinSavings).toBe(12_000);
+			},
+		);
+	});
+
+	it("rejects whitespace, signs, decimals, exponents, leading zeroes, and zero where positive is required", () => {
+		for (const invalid of [" 40", "+40", "40.0", "4e1", "040", "-1", "0", ""] as const) {
+			withEnv(
+				{
+					CONTEXTFOLD_TOOL_USE_TRIGGER: invalid,
+					CONTEXTFOLD_TOOL_USE_KEEP: "01",
+					CONTEXTFOLD_TOOL_USE_MIN_SAVINGS: invalid,
+				},
+				() => {
+					const config = adapterConfigFromEnv().ladder;
+					expect(config.toolUseTrigger).toBe(40);
+					expect(config.toolUseKeep).toBe(12);
+					expect(config.toolUseMinSavings).toBe(10_000);
+				},
+			);
+		}
+	});
+});
