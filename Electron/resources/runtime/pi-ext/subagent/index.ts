@@ -210,12 +210,15 @@ import {
 } from "../subagent-host/worktree/preflight.ts";
 import {
 	bindCanonicalComputerAgents,
+	childReceivesDelegationTools,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
 	decideDispatchBackground,
 	decideRuntimeBudgetExpiry,
 	decideStallWatchdogAction,
 	normalizeGeneralPurposeExecutionPolicy,
+	rejectDispatchAtDepth,
+	rejectNestedDelegationTypes,
 	runtimeRolePolicyForAgent,
 } from "./runtime-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
@@ -4757,6 +4760,12 @@ async function runSingleAgent(
 	}
 	const executionPolicy = executionPolicyResult.policy;
 	const runtimePolicy = runtimeRolePolicyForAgent(agent);
+	const childDepth = options?.depth ?? PIPIUI_DEPTH + 1;
+	const allowRecursiveDelegation = childReceivesDelegationTools({
+		allowRecursiveDelegation: runtimePolicy.allowRecursiveDelegation,
+		childDepth,
+		maxDepth: PIPIUI_MAX_DEPTH,
+	});
 	const createsWorktree = executionPolicy
 		? executionPolicy.worktree === "isolated"
 		: runtimePolicy.worktree === "isolated";
@@ -5009,8 +5018,9 @@ async function runSingleAgent(
 	const normalToolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
+		// Depth-gated: a child at/above PIPIUI_MAX_DEPTH must not even see the tools.
 		declaredTools: options?.computerAgent ? undefined : agent.tools?.filter(
-			(t) => runtimePolicy.allowRecursiveDelegation || !isDelegationTool(t),
+			(t) => allowRecursiveDelegation || !isDelegationTool(t),
 		),
 		disabledTools: loadDisabledTools(),
 		hasDesktopCapability: desktopGrant.granted,
@@ -5019,7 +5029,7 @@ async function runSingleAgent(
 		// (`-e PIPIUI_SUBAGENT_EXT`); without recall a compacted worker cannot
 		// find its own task back from the raw JSONL.
 		hasSessionRecall: Boolean(PIPIUI_SUBAGENT_EXT),
-		allowRecursiveDelegation: runtimePolicy.allowRecursiveDelegation,
+		allowRecursiveDelegation,
 		availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,
 	});
 	const toolSelection = options?.computerWorker
@@ -5240,7 +5250,7 @@ async function runSingleAgent(
 				const childEnvironmentInput = {
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_RUN_ID: runId,
-					PIPIUI_AGENT_DEPTH: String(options?.depth ?? PIPIUI_DEPTH + 1),
+					PIPIUI_AGENT_DEPTH: String(childDepth),
 					PIPIUI_AGENT_ROLE: runtimePolicy.role,
 					...(terminalMemoryBrokerEnvironment ?? {}),
 					...(computerMemoryEnabled
@@ -5255,7 +5265,7 @@ async function runSingleAgent(
 					// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
 					// consistent with `tools` already deciding whether it can dispatch at all.
 					PIPI_PHILOSOPHY_ROLE:
-						agent.traits.delegates && runtimePolicy.allowRecursiveDelegation ? "lead" : "worker",
+						agent.traits.delegates && allowRecursiveDelegation ? "lead" : "worker",
 					// The agent's own name, so a philosophy layer can address one kind of worker:
 					// craft rules to whoever writes code, research rules to whoever investigates.
 					// Without it every dispatched agent looks alike and only role-wide layers land.
@@ -8023,12 +8033,13 @@ export default function (pi: ExtensionAPI) {
 			const sessionModel = formatCtxModel(ctxModel);
 			const contextWindow = ctxContextWindow(ctxModel);
 			// 多层深度护栏：达到上限的进程不允许继续派 subagent
-			if (PIPIUI_DEPTH >= PIPIUI_MAX_DEPTH) {
+			const depthLimitMessage = rejectDispatchAtDepth({ depth: PIPIUI_DEPTH, maxDepth: PIPIUI_MAX_DEPTH });
+			if (depthLimitMessage) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Subagent depth limit reached (depth ${PIPIUI_DEPTH}, max ${PIPIUI_MAX_DEPTH}). Do the work yourself with your available tools instead of delegating.`,
+							text: depthLimitMessage,
 						},
 					],
 					details: { mode: "single", agentScope: params.agentScope ?? "user", projectAgentsDir: null, results: [] },
@@ -8229,6 +8240,23 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			const requestedAgentNames = hasChain
+				? (params.chain ?? []).map((step) => step.agent)
+				: hasTasks
+					? (params.tasks ?? []).map((item) => item.agent)
+					: [params.agent!];
+			const nestedTypeProblem = rejectNestedDelegationTypes({
+				callerDepth: PIPIUI_DEPTH,
+				agentNames: requestedAgentNames,
+			});
+			if (nestedTypeProblem) {
+				return {
+					content: [{ type: "text", text: nestedTypeProblem }],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
 				};
 			}
 

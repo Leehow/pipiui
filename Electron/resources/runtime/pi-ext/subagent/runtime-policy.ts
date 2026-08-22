@@ -21,6 +21,41 @@ export interface AgentRuntimeRolePolicy {
 	allowRecursiveDelegation: boolean;
 }
 
+/** Depth-1 workers may dispatch only these types. Depth 0 (Boss) is unrestricted. */
+export const NESTED_DELEGATION_ALLOWED_TYPES = ["explore", "general-purpose"] as const;
+
+/** Capability may declare delegation; children at/above the max depth still lose the tools. */
+export function childReceivesDelegationTools(input: {
+	allowRecursiveDelegation: boolean;
+	childDepth: number;
+	maxDepth: number;
+}): boolean {
+	return input.allowRecursiveDelegation && input.childDepth < input.maxDepth;
+}
+
+/** Execution-time hard cap. Same wording the `subagent` tool returns to the model. */
+export function rejectDispatchAtDepth(input: { depth: number; maxDepth: number }): string | null {
+	if (input.depth < input.maxDepth) return null;
+	return `Subagent depth limit reached (depth ${input.depth}, max ${input.maxDepth}). Do the work yourself with your available tools instead of delegating.`;
+}
+
+export function isNestedDelegationAllowedType(name: string): boolean {
+	return (NESTED_DELEGATION_ALLOWED_TYPES as readonly string[]).includes(name);
+}
+
+/** Reject disallowed `subagent_type` values when the caller is already nested. Not remapped. */
+export function rejectNestedDelegationTypes(input: {
+	callerDepth: number;
+	agentNames: readonly string[];
+}): string | null {
+	if (input.callerDepth < 1) return null;
+	for (const name of input.agentNames) {
+		if (isNestedDelegationAllowedType(name)) continue;
+		return `Nested dispatch at depth ${input.callerDepth} may only use subagent_type "explore" or "general-purpose"; "${name}" is not allowed.`;
+	}
+	return null;
+}
+
 export interface GeneralPurposeExecutionOverrides {
 	worktree?: "isolated" | "none";
 	noWorktreeReason?: string;
