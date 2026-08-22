@@ -189,6 +189,78 @@ describe("provider.refreshToken — no self-lock under the outer Pi credential-s
     expect(bytesDuring).toBe(`${before}\n`);
   });
 
+  it("a NEVER-RESOLVING bridge emit does not extend the in-lock refresh nor hold the store lock (REAL pi AuthStorage)", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const pi = createPiStore?.(authPath);
+    if (!pi) return; // pi runtime not installed in this environment
+
+    const provider = createGrokBuildProvider({
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: "at-stall", refresh_token: "rt-stall", expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+      // A stalled bridge: every emit hangs forever (success AND error paths).
+      emit: () => new Promise<void>(() => {}),
+    });
+    const refresh = adaptRefresh(provider);
+
+    await pi.modify("grok-build", async () => makeCred() as unknown);
+
+    // Mirror of pi's resolveStoredOAuth: the refresh runs INSIDE
+    // credentials.modify(). OLD behavior awaited the emit here — with a
+    // stalled bridge the modify (and thus the auth-store lock) never
+    // completed. Now the emit is fire-and-forget and must not gate the lock.
+    const post = (await Promise.race([
+      pi.modify("grok-build", async (current) => refresh(current, undefined)),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("stalled bridge emit held the credentials.modify lock")), 5_000),
+      ),
+    ])) as Record<string, unknown>;
+    expect(post.access).toBe("at-stall");
+    expect(post.tier).toBe("supergrok"); // tier preserved, response had no id_token
+
+    // Lock released: the very next modify on the same store completes promptly.
+    await Promise.race([
+      pi.modify("anthropic", async () => ({ type: "api_key", key: "sk-after" }) as unknown),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("auth-store lock was not released after the in-lock refresh")), 5_000),
+      ),
+    ]);
+    const data = JSON.parse(await readFile(authPath, "utf8")) as Record<string, Record<string, unknown>>;
+    expect(data["grok-build"]?.access).toBe("at-stall");
+    expect(data.anthropic?.key).toBe("sk-after");
+  });
+
+  it("refreshToken returns without awaiting a never-resolving emit (success path, no pi store needed)", async () => {
+    const provider = createGrokBuildProvider({
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: "at-quick", refresh_token: "rt-quick", expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+      emit: () => new Promise<void>(() => {}),
+    });
+    const next = await Promise.race([
+      provider.oauth.refreshToken(makeCred(), undefined),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("refresh awaited the stalled bridge emit")), 3_000),
+      ),
+    ]);
+    expect(next.access).toBe("at-quick");
+    expect((next as Record<string, unknown>).tier).toBe("supergrok");
+  });
+
+  it("refreshToken rejects without awaiting a never-resolving emit (auth_error path)", async () => {
+    const provider = createGrokBuildProvider({
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ error: "invalid_grant", error_description: "refresh token revoked" }), { status: 400 })) as unknown as typeof fetch,
+      emit: () => new Promise<void>(() => {}),
+    });
+    await expect(
+      Promise.race([
+        provider.oauth.refreshToken(makeCred(), undefined),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("refresh awaited the stalled bridge emit")), 3_000),
+        ),
+      ]),
+    ).rejects.toThrow(/login grok-build/);
+  });
+
   it("provider.refreshToken is pure: never reads or writes auth.json on its own", async () => {
     const provider = createGrokBuildProvider({
       fetchImpl: (async () => new Response(JSON.stringify({ access_token: "at-pure", refresh_token: "rt-pure", expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,

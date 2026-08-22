@@ -35,6 +35,10 @@ async function emit(event: string, payload?: unknown): Promise<void> {
     await fetch(`http://127.0.0.1:${BRIDGE_PORT}/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      // Bounded: a best-effort UI hint must never hang on a stalled bridge.
+      // (The provider refresh path additionally treats this as strictly
+      // fire-and-forget — see `notifyUnlocked` in provider.ts.)
+      signal: AbortSignal.timeout(10_000),
       body: JSON.stringify({
         schemaVersion: 1,
         sessionCapability: SESSION_CAPABILITY,

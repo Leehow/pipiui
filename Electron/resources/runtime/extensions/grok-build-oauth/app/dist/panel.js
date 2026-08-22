@@ -63,8 +63,21 @@ export default function Panel(props) {
     // string is gated as the free tier (restricted), undefined means "unknown"
     // and the server stays the final authority (fail-open).
     const settingsTier = settings["ext.grok-build-oauth.tier"];
-    const tierValue = status?.tier !== undefined
-        ? status.tier
+    // Live tier evidence: the session's own resolution actually found tier data —
+    // a mapped name (tier), an unmapped raw claim (tierRaw), or an explicit
+    // override/credential source. A live tier=undefined with ONLY a raw claim is
+    // still credential evidence (unmapped JWT claim → unknown name, fail-open):
+    // the value shows unknown/raw while the source stays “登录凭证” — it is never
+    // relabeled 未知/设置 just because the claim had no official mapping. A
+    // session reporting NO tier evidence at all (tierSource "unknown") is not
+    // evidence and still falls back to the settings slot below.
+    const liveTier = status !== undefined &&
+        (status.tier !== undefined ||
+            status.tierRaw !== undefined ||
+            status.tierSource === "override" ||
+            status.tierSource === "credential");
+    const tierValue = liveTier
+        ? status?.tier
         : typeof settingsTier === "string"
             ? settingsTier
             : undefined;
@@ -75,16 +88,16 @@ export default function Panel(props) {
         : tierValue.trim() === ""
             ? "空（受限 — 按官方 free tier 处理）"
             : tierValue;
-    const tierSourceLabel = status?.tier !== undefined
-        ? status.tierSource === "override"
+    const tierSourceLabel = liveTier
+        ? status?.tierSource === "override"
             ? "手动配置"
-            : status.tierSource === "credential"
+            : status?.tierSource === "credential"
                 ? "登录凭证"
                 : "未知"
-        : // No live status (or a session that itself reports no tier): the value
-            // shown above came from the settings slot — label it as such instead
-            // of "未知". Unknown (no value anywhere) and an explicitly EMPTY
-            // (restricted) tier stay visible as before.
+        : // No live tier evidence (no session, or a session that itself reports
+            // none): the value shown above came from the settings slot — label it
+            // as such instead of "未知". Unknown (no value anywhere) and an
+            // explicitly EMPTY (restricted) tier stay visible as before.
             typeof settingsTier === "string"
                 ? "设置"
                 : "未知";

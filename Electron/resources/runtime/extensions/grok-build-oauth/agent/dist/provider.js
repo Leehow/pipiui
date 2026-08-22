@@ -32,6 +32,22 @@ function displayUriOf(code) {
 export function createGrokBuildProvider(options = {}) {
     const emit = options.emit ?? (() => undefined);
     const fetchImpl = options.fetchImpl;
+    // Fire-and-forget notification used ONLY from `refreshToken`: pi invokes
+    // that callback INSIDE `credentials.modify()` while already holding the
+    // auth-store lock, and the bridge emitter is an unbounded network hop (no
+    // timeout/signal of its own). Awaiting it there would let a stalled bridge
+    // hold the store lock indefinitely — so never await side effects in the
+    // refresh callback; the returned credential is the whole contract.
+    const notifyUnlocked = (event, payload) => {
+        try {
+            void Promise.resolve(emit(event, payload)).catch(() => {
+                /* best-effort */
+            });
+        }
+        catch {
+            /* best-effort */
+        }
+    };
     return {
         // Auth-only provider: no chat models are exposed (images transport is tool-based).
         name: "Grok Build",
@@ -156,13 +172,16 @@ export function createGrokBuildProvider(options = {}) {
                 // auth-store lock. This callback must therefore be pure: refresh over
                 // the network using the handed-in (authoritative, in-lock) credential
                 // and RETURN the next value; pi persists it. No broker, no store
-                // adapter, no second lock acquisition — those self-deadlock.
+                // adapter, no second lock acquisition — those self-deadlock. And no
+                // AWAITED side effects either: bridge emits go through
+                // `notifyUnlocked` (fire-and-forget) so a stalled bridge can never
+                // extend the time this lock is held.
                 const current = (credentials ?? {});
                 const access = current.access;
                 const refresh = current.refresh;
                 try {
                     const next = await refreshCredentialUnlocked(current, signal, { fetchImpl });
-                    await emit("token_refreshed", { expires_at: next.expires });
+                    notifyUnlocked("token_refreshed", { expires_at: next.expires });
                     return {
                         access: next.access,
                         refresh: next.refresh,
@@ -181,7 +200,7 @@ export function createGrokBuildProvider(options = {}) {
                     const code = err?.code;
                     const msg = err instanceof Error ? err.message : String(err);
                     const redacted = redactMessage(msg, [refresh ?? "", access ?? ""]);
-                    await emit("auth_error", { code: code ?? "refresh_failed", message: redacted });
+                    notifyUnlocked("auth_error", { code: code ?? "refresh_failed", message: redacted });
                     if (code === "invalid_grant") {
                         throw new Error("Refresh token expired or revoked — please run /login grok-build again. [redacted]");
                     }
