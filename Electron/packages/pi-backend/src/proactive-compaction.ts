@@ -23,15 +23,29 @@ export interface ProactiveCompactionConfiguration {
   quietDelayMs: number;
   /** Avoid repeatedly retrying an unsuccessful compaction while context stays high. */
   failureBackoffMs: number;
+  /** Lower watermark used only while the quiet Boss still has live subagents. */
+  waitWatermark?: number;
+  /** Longer quiet interval for the live-subagent waiting path. */
+  waitQuietDelayMs?: number;
 }
 
-export const STANDARD_PROACTIVE_COMPACTION: ProactiveCompactionConfiguration =
-  Object.freeze({
-    highWatermark: 0.8,
-    lowWatermark: 0.6,
-    quietDelayMs: 2_000,
-    failureBackoffMs: 60_000,
-  });
+export const STANDARD_PROACTIVE_COMPACTION = Object.freeze({
+  highWatermark: 0.8,
+  lowWatermark: 0.6,
+  quietDelayMs: 2_000,
+  failureBackoffMs: 60_000,
+  waitWatermark: 0.5,
+  waitQuietDelayMs: 30_000,
+});
+
+type ResolvedProactiveCompactionConfiguration = Required<ProactiveCompactionConfiguration>;
+
+type ProactiveCompactionMode = "ordinary" | "wait-for-subagents";
+
+interface ProactiveCompactionSchedulingPlan {
+  mode: ProactiveCompactionMode;
+  delayMs: number;
+}
 
 /** A single fresh context report. `percent` keeps pi/UI's 0…100 convention. */
 export interface ContextUsageLike {
@@ -72,7 +86,7 @@ export function contextUsageFraction(
 }
 
 export class ProactiveCompactionPolicy {
-  readonly configuration: ProactiveCompactionConfiguration;
+  readonly configuration: Readonly<ResolvedProactiveCompactionConfiguration>;
   private usage?: ContextUsageLike;
   /** A success cannot re-arm from a pre-compaction/stale stats response. */
   private requiredGeneration?: number;
@@ -81,7 +95,16 @@ export class ProactiveCompactionPolicy {
   constructor(
     configuration: ProactiveCompactionConfiguration = STANDARD_PROACTIVE_COMPACTION,
   ) {
-    this.configuration = configuration;
+    this.configuration = Object.freeze({
+      highWatermark: configuration.highWatermark,
+      lowWatermark: configuration.lowWatermark,
+      quietDelayMs: configuration.quietDelayMs,
+      failureBackoffMs: configuration.failureBackoffMs,
+      waitWatermark:
+        configuration.waitWatermark ?? STANDARD_PROACTIVE_COMPACTION.waitWatermark,
+      waitQuietDelayMs:
+        configuration.waitQuietDelayMs ?? STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs,
+    });
   }
 
   get latestUsage(): ContextUsageLike | undefined {
@@ -115,13 +138,30 @@ export class ProactiveCompactionPolicy {
    * means the policy is disarmed or context sits below the high watermark.
    */
   nextSchedulingDelay(now: number): number | undefined {
+    return this.nextSchedulingPlan(now, false)?.delayMs;
+  }
+
+  /** Select the ordinary fast path first, then the structured live-subagent wait path. */
+  nextSchedulingPlan(
+    now: number,
+    allowWaitForSubagents: boolean,
+  ): ProactiveCompactionSchedulingPlan | undefined {
     if (!this.isArmed) return undefined;
     const fraction = contextUsageFraction(this.usage);
     if (fraction === undefined) return undefined;
-    if (fraction < this.configuration.highWatermark) return undefined;
+    const mode: ProactiveCompactionMode | undefined =
+      fraction >= this.configuration.highWatermark
+        ? "ordinary"
+        : allowWaitForSubagents && fraction >= this.configuration.waitWatermark
+          ? "wait-for-subagents"
+          : undefined;
+    if (!mode) return undefined;
     const backoff =
       this.backoffUntil === undefined ? 0 : Math.max(0, this.backoffUntil - now);
-    return Math.max(this.configuration.quietDelayMs, backoff);
+    const quietDelay = mode === "ordinary"
+      ? this.configuration.quietDelayMs
+      : this.configuration.waitQuietDelayMs;
+    return { mode, delayMs: Math.max(quietDelay, backoff) };
   }
 
   /** Suppress further proactive compactions until a post-success low report. */
@@ -142,6 +182,8 @@ export interface ProactiveCompactionSchedulerOptions {
    * only a hint.
    */
   isIdle: () => boolean;
+  /** Exact host projection; never inferred from assistant text or cache state. */
+  hasLiveAgents?: () => boolean;
   /** Issues the `compact` RPC. Must reject when pi refuses the request. */
   compact: () => Promise<unknown>;
   configuration?: ProactiveCompactionConfiguration;
@@ -163,12 +205,21 @@ export class ProactiveCompactionScheduler {
   private readonly now: () => number;
   private policy: ProactiveCompactionPolicy;
   private timer?: unknown;
+  private timerMode?: ProactiveCompactionMode;
+  private timerWave?: number;
   private token = 0;
   private generation = 0;
   /** True from the proactive `compact` dispatch until its lifecycle settles. */
   private rpcInFlight = false;
   /** True between `compaction_start` and `compaction_end`, whoever started it. */
   private compacting = false;
+  /** Mode/wave of the proactive RPC, retained across pi compaction lifecycle events. */
+  private requestMode?: ProactiveCompactionMode;
+  private requestWave?: number;
+  private liveAgentWaveActive = false;
+  private liveAgentWave = 0;
+  /** A successful wait compact is allowed once per continuous live-agent wave. */
+  private waitCompactedInWave = false;
   private disposed = false;
 
   constructor(options: ProactiveCompactionSchedulerOptions) {
@@ -205,32 +256,49 @@ export class ProactiveCompactionScheduler {
     this.reconsider();
   }
 
+  /** Host agent projection changed; terminal/new-wave transitions must not wait for new stats. */
+  liveAgentStateChanged(): void {
+    this.reconsider();
+  }
+
   /** Recheck all live state; arms, re-arms, or cancels the quiet-period timer. */
   reconsider(): void {
     if (this.disposed) return;
+    const hasLiveAgents = this.syncLiveAgentWave();
     if (this.isCompacting || !this.options.isIdle()) {
       this.cancel();
       return;
     }
-    const delay = this.policy.nextSchedulingDelay(this.now());
-    if (delay === undefined) {
+    const plan = this.policy.nextSchedulingPlan(
+      this.now(),
+      hasLiveAgents && !this.waitCompactedInWave,
+    );
+    if (!plan) {
       this.cancel();
       return;
     }
-    if (this.timer !== undefined) return;
+    const wave = plan.mode === "wait-for-subagents" ? this.liveAgentWave : undefined;
+    if (this.timer !== undefined && this.timerMode === plan.mode && this.timerWave === wave) return;
+    this.cancel();
     this.token += 1;
     const token = this.token;
+    this.timerMode = plan.mode;
+    this.timerWave = wave;
     this.timer = this.setTimer(() => {
       if (this.disposed || token !== this.token) return;
       this.timer = undefined;
-      this.fire();
-    }, delay);
+      this.timerMode = undefined;
+      this.timerWave = undefined;
+      this.fire(plan.mode, wave);
+    }, plan.delayMs);
   }
 
   cancel(): void {
     this.token += 1;
     if (this.timer !== undefined) this.clearTimer(this.timer);
     this.timer = undefined;
+    this.timerMode = undefined;
+    this.timerWave = undefined;
   }
 
   /** `compaction_start` from pi — manual, overflow, threshold, or ours. */
@@ -244,8 +312,21 @@ export class ProactiveCompactionScheduler {
    * explicitly low report can re-arm.
    */
   compactionFinished(success: boolean): void {
+    const requestMode = this.requestMode;
+    const requestWave = this.requestWave;
     this.compacting = false;
     this.rpcInFlight = false;
+    this.requestMode = undefined;
+    this.requestWave = undefined;
+    const hasLiveAgents = this.syncLiveAgentWave();
+    if (
+      success &&
+      requestMode === "wait-for-subagents" &&
+      hasLiveAgents &&
+      requestWave === this.liveAgentWave
+    ) {
+      this.waitCompactedInWave = true;
+    }
     if (success) this.policy.recordCompactionSuccess(this.generation);
     else this.policy.recordCompactionFailure(this.now());
     this.reconsider();
@@ -265,10 +346,24 @@ export class ProactiveCompactionScheduler {
     this.cancel();
   }
 
-  private fire(): void {
+  private fire(mode: ProactiveCompactionMode, wave?: number): void {
     if (this.isCompacting || !this.options.isIdle()) return;
-    if (this.policy.nextSchedulingDelay(this.now()) === undefined) return;
+    const hasLiveAgents = this.syncLiveAgentWave();
+    const plan = this.policy.nextSchedulingPlan(
+      this.now(),
+      hasLiveAgents && !this.waitCompactedInWave,
+    );
+    if (!plan || plan.mode !== mode) {
+      this.reconsider();
+      return;
+    }
+    if (mode === "wait-for-subagents" && wave !== this.liveAgentWave) {
+      this.reconsider();
+      return;
+    }
     this.rpcInFlight = true;
+    this.requestMode = mode;
+    this.requestWave = wave;
     void Promise.resolve()
       .then(() => this.options.compact())
       .then(
@@ -286,5 +381,16 @@ export class ProactiveCompactionScheduler {
   private requestFailed(): void {
     if (!this.rpcInFlight) return;
     this.compactionFinished(false);
+  }
+
+  /** Sample the exact host projection and advance/reset the continuous-wave latch. */
+  private syncLiveAgentWave(): boolean {
+    const hasLiveAgents = this.options.hasLiveAgents?.() === true;
+    if (hasLiveAgents !== this.liveAgentWaveActive) {
+      this.liveAgentWaveActive = hasLiveAgents;
+      if (hasLiveAgents) this.liveAgentWave += 1;
+      else this.waitCompactedInWave = false;
+    }
+    return hasLiveAgents;
   }
 }

@@ -2137,7 +2137,13 @@ export class PiHostBackend implements HostBackend {
     await this.loadQueue(id);
     await new Promise<void>((resolve) => setImmediate(resolve));
     await this.awaitUnusableLiveExit(id);
-    if (!this.closed) await this.queue.notifyIdle(id, epoch);
+    if (!this.closed) {
+      await this.queue.notifyIdle(id, epoch);
+      // Stats and queue-idle completion can race after agent_settled. Recheck
+      // after the authoritative idle transition so an eligible wait wave is
+      // never lost merely because its fresh stats response arrived first.
+      this.live.get(id)?.compaction.reconsider();
+    }
     if (!this.closed) {
       try {
         await this.flushSessionRedact(id);
@@ -2380,6 +2386,13 @@ export class PiHostBackend implements HostBackend {
     return [...this.agents.values()].some(
       (agent) => agent.sessionId === sessionId && this.isLiveAgentState(agent.state),
     );
+  }
+  /** Reconsider immediately when the exact durable agent projection starts/ends a live wave. */
+  private agentProjectionChanged(sessionId: string | undefined): void {
+    if (!sessionId) return;
+    // Some narrow host-test fakes intentionally implement only dispose(); the
+    // production scheduler owns this method, while legacy fakes may omit it.
+    this.live.get(sessionId)?.compaction.liveAgentStateChanged?.();
   }
   private interruptSessionLiveAgents(sessionId: string, reason: string): void {
     for (const agent of [...this.agents.values()]) {
@@ -3649,6 +3662,7 @@ export class PiHostBackend implements HostBackend {
       compaction: new ProactiveCompactionScheduler({
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
+        hasLiveAgents: () => this.sessionHasLiveAgents(id),
         compact: () => this.command(id, { type: "compact" }),
       }),
     };
@@ -3844,6 +3858,7 @@ export class PiHostBackend implements HostBackend {
       // Follow-up list only. Emitting status:streaming here reopened a settled
       // composer as 生成中 with no turn — the UI treats streaming as "busy now".
       live.followUps = e.followUp ?? [];
+      live.compaction.reconsider();
     } else if (e.type === "message_update") {
       this.touchTurnActivity(live);
       const d = e.assistantMessageEvent ?? {};
@@ -6919,6 +6934,7 @@ export class PiHostBackend implements HostBackend {
         closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
       };
       this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), next);
+      this.agentProjectionChanged(next.sessionId);
       this.agent({ type: "agent", agent: next });
       this.retainOrphanWorktree(agent.agentId);
       changed = true;
@@ -6947,6 +6963,7 @@ export class PiHostBackend implements HostBackend {
       closeout: current.closeout ?? reason,
     };
     this.agents.set(key, next);
+    this.agentProjectionChanged(next.sessionId);
     this.agent({ type: "agent", agent: next });
     this.persistAgents();
   }
@@ -7331,6 +7348,7 @@ export class PiHostBackend implements HostBackend {
       contextWindowTokens: positiveWindow(usage?.contextWindow) ?? positiveWindow(raw.contextWindow) ?? (sameRun ? current?.contextWindowTokens : undefined) ?? (sessionId ? this.sessionContextLastKnown.get(sessionId)?.contextWindow : undefined),
     };
     this.agents.set(key, agent);
+    this.agentProjectionChanged(agent.sessionId);
     this.projectionDebugProvenance.set(key, eventKind);
     this.projectionDebug("agent_event", {
       session: this.projectionDebugSessionTag(sessionId),

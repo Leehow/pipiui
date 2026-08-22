@@ -65,16 +65,28 @@ describe("ProactiveCompactionPolicy", () => {
     expect(policy.nextSchedulingDelay(1_000 + STANDARD_PROACTIVE_COMPACTION.failureBackoffMs))
       .toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
   });
+
+  it("fills wait defaults for a legacy four-field configuration", () => {
+    const policy = new ProactiveCompactionPolicy({
+      highWatermark: 0.8,
+      lowWatermark: 0.6,
+      quietDelayMs: 10,
+      failureBackoffMs: 20,
+    });
+    expect(policy.configuration.waitWatermark).toBe(0.5);
+    expect(policy.configuration.waitQuietDelayMs).toBe(30_000);
+  });
 });
 
 /** Manual timer/clock so the scheduler's quiet period never costs wall-clock time. */
-function harness(options: { idle?: boolean; compact?: () => Promise<unknown> } = {}) {
+function harness(options: { idle?: boolean; liveAgents?: boolean; compact?: () => Promise<unknown> } = {}) {
   const timers = new Map<number, { fn: () => void; at: number }>();
   let nextHandle = 1;
   let clock = 0;
-  const state = { idle: options.idle ?? true, compactCalls: 0 };
+  const state = { idle: options.idle ?? true, liveAgents: options.liveAgents ?? false, compactCalls: 0 };
   const scheduler = new ProactiveCompactionScheduler({
     isIdle: () => state.idle,
+    hasLiveAgents: () => state.liveAgents,
     compact: () => {
       state.compactCalls += 1;
       return options.compact ? options.compact() : Promise.resolve();
@@ -90,6 +102,10 @@ function harness(options: { idle?: boolean; compact?: () => Promise<unknown> } =
   return {
     scheduler,
     state,
+    setLiveAgents(value: boolean) {
+      state.liveAgents = value;
+      scheduler.liveAgentStateChanged();
+    },
     get pending() {
       return timers.size;
     },
@@ -106,6 +122,9 @@ function harness(options: { idle?: boolean; compact?: () => Promise<unknown> } =
 }
 
 const HIGH = { tokens: 90, contextWindow: 100 };
+const WAIT_BOUNDARY = { tokens: 50, contextWindow: 100 };
+const WAIT_HIGH = { tokens: 55, contextWindow: 100 };
+const WAIT_LOW = { tokens: 49, contextWindow: 100 };
 const LOW = { tokens: 10, contextWindow: 100 };
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -199,5 +218,140 @@ describe("ProactiveCompactionScheduler", () => {
     h.advance(10_000);
     await flush();
     expect(h.state.compactCalls).toBe(0);
+  });
+
+  describe("quiet Boss wait with live subagents", () => {
+    it("does not schedule between 50% and 79% without live agents", () => {
+      const h = harness();
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(0);
+    });
+
+    it("does not schedule below 50% with live agents", () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_LOW, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(0);
+    });
+
+    it("waits 30 seconds at 50-79%, then compacts only once in the same live wave", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_BOUNDARY, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(1);
+
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs - 1);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+      h.advance(1);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+
+      // 55% is below the ordinary 60% re-arm watermark. The per-wave latch,
+      // not the ordinary policy, must prevent a second wait compact.
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(0);
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+    });
+
+    it("keeps the existing two-second path at or above 80%", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs - 1);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+      h.advance(1);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+    });
+
+    it("replaces a pending 30-second wait with the fast path when usage rises to 80%", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      h.advance(10_000);
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs - 1);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+      h.advance(1);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+    });
+
+    it("cancels the wait timer when the live wave ends", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(1);
+      h.setLiveAgents(false);
+      expect(h.pending).toBe(0);
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+    });
+
+    it("cancels through the ordinary idle gate when queue/follow-up/turn work arrives", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(1);
+      h.state.idle = false;
+      h.scheduler.reconsider();
+      expect(h.pending).toBe(0);
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+    });
+
+    it("resets the success latch only after all agents terminate, allowing a new wave", async () => {
+      const h = harness({ liveAgents: true });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(0);
+
+      h.setLiveAgents(false);
+      h.setLiveAgents(true);
+      expect(h.pending).toBe(1);
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(2);
+    });
+
+    it("does not let an old-wave in-flight success consume a newer live wave", async () => {
+      let finish!: () => void;
+      const inFlight = new Promise<void>((resolve) => { finish = resolve; });
+      const h = harness({ liveAgents: true, compact: () => inFlight });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+
+      h.setLiveAgents(false);
+      h.setLiveAgents(true);
+      finish();
+      await flush();
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(1);
+    });
+
+    it("does not consume the wave allowance on failure and retries after existing backoff", async () => {
+      let attempt = 0;
+      const h = harness({
+        liveAgents: true,
+        compact: () => (++attempt === 1 ? Promise.reject(new Error("retry")) : Promise.resolve()),
+      });
+      h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.waitQuietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+
+      h.advance(STANDARD_PROACTIVE_COMPACTION.failureBackoffMs - 1);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+      h.advance(1);
+      await flush();
+      expect(h.state.compactCalls).toBe(2);
+    });
   });
 });
