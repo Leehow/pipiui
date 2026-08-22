@@ -68,6 +68,7 @@ import {
 } from "./agents.ts";
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
 import { registerMidTurnCompactionGuard } from "./mid-turn-compaction.ts";
+import { registerFollowUpCompactionGuard } from "./follow-up-compaction.ts";
 import {
 	formatFindingsIndexBlock,
 	listFindings,
@@ -7573,6 +7574,7 @@ export default function (pi: ExtensionAPI) {
 	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
 	registerMainSessionCompactionHook(pi);
 	registerMidTurnCompactionGuard(AgentSession);
+	registerFollowUpCompactionGuard(AgentSession);
 	// Qoder CN / Qwen 3.8-Max-Preview contextWindow 修复：按 API default tier
 	// 归一化 model.contextWindow（真实影响 pi shouldCompact/session stats），
 	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
