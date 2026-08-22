@@ -348,12 +348,13 @@ export default function contextFold(pi: ExtensionAPI): void {
 	// CONTEXTFOLD_COMPACT=det (explicit opt-in) hands Pi a deterministic summary rendered verbatim from
 	// the seed index — no hallucination surface, every listed token a lexical hook for recall —
 	// after emitting one final "compact" index record for the span leaving live history.
-	// CONTEXTFOLD_COMPACT=native leaves Pi's own compaction untouched. Fail-open: any error here
-	// falls through to Pi's default behavior.
-	pi.on("session_before_compact", (event, ctx) => {
-		compactions++;
-		if (acfg.compact !== "det") return;
-		try {
+	// CONTEXTFOLD_COMPACT=native leaves Pi's own compaction hook ownership untouched. Pi uses the
+	// last registered handler for this event, so even a no-op handler would displace PipiUI's native
+	// compaction owner. Explicit `det` opt-in is therefore the only mode that registers this hook.
+	if (acfg.compact === "det")
+		pi.on("session_before_compact", (event, ctx) => {
+			compactions++;
+			try {
 			const prep = (event as { preparation: { messagesToSummarize: unknown[]; turnPrefixMessages: unknown[]; tokensBefore: number; firstKeptEntryId: string; previousSummary?: string } }).preparation;
 			const index = indexFor(ctx);
 			// Pi hands a mid-turn cut over in TWO arrays and drops BOTH from live history:
@@ -395,13 +396,13 @@ export default function contextFold(pi: ExtensionAPI): void {
 			if (debug)
 				process.stderr.write(`[context-fold] det compaction: ${prep.tokensBefore} tok summarized deterministically (no model)\n`);
 			return { compaction: { summary, firstKeptEntryId: prep.firstKeptEntryId, tokensBefore: prep.tokensBefore } };
-		} catch (err) {
-			process.stderr.write(
-				`[context-fold] det compaction failed (falling back to Pi default): ${err instanceof Error ? err.message : String(err)}\n`,
-			);
-			return;
-		}
-	});
+			} catch (err) {
+				process.stderr.write(
+					`[context-fold] det compaction failed (falling back to Pi default): ${err instanceof Error ? err.message : String(err)}\n`,
+				);
+				return;
+			}
+		});
 
 	registerFoldTools(pi, engine, (ids) => recordUnfold(pi, ids));
 	registerHandoffCommand(pi, {

@@ -47,18 +47,41 @@ describe("package manifest", () => {
 });
 
 describe.skipIf(!PI_PRESENT)("extension entry point", () => {
-	it("registers every hook, tool and command", async () => {
+	it("registers its native-mode hooks, tools and commands without claiming hard compaction", async () => {
 		const { default: contextFold } = await import("../index");
+		const prev = process.env.CONTEXTFOLD_COMPACT;
+		process.env.CONTEXTFOLD_COMPACT = "native";
 		const s = stubPi();
-		contextFold(s.api);
+		try {
+			contextFold(s.api);
+		} finally {
+			if (prev === undefined) delete process.env.CONTEXTFOLD_COMPACT;
+			else process.env.CONTEXTFOLD_COMPACT = prev;
+		}
 
 		expect(s.hooks).toEqual(
-			expect.arrayContaining(["session_start", "message_end", "agent_settled", "context", "session_before_compact"]),
+			expect.arrayContaining(["session_start", "message_end", "agent_settled", "context"]),
 		);
+		expect(s.hooks).not.toContain("session_before_compact");
 		expect(s.hooks).not.toContain("tool_result");
 		expect(s.hooks).not.toContain("before_agent_start");
 		expect(s.tools).toEqual(expect.arrayContaining(["recall_folded", "unfold"]));
 		expect(s.commands).toEqual(expect.arrayContaining(["context-fold", "fold-handoff"]));
+	});
+
+	it("claims hard compaction only for explicit CONTEXTFOLD_COMPACT=det", async () => {
+		const { default: contextFold } = await import("../index");
+		const prev = process.env.CONTEXTFOLD_COMPACT;
+		process.env.CONTEXTFOLD_COMPACT = "det";
+		const s = stubPi();
+		try {
+			contextFold(s.api);
+		} finally {
+			if (prev === undefined) delete process.env.CONTEXTFOLD_COMPACT;
+			else process.env.CONTEXTFOLD_COMPACT = prev;
+		}
+
+		expect(s.hooks).toContain("session_before_compact");
 	});
 
 	it("registers nothing at all when CONTEXTFOLD=0 (the master kill switch)", async () => {
