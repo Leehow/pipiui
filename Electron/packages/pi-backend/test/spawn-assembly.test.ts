@@ -305,6 +305,32 @@ describe("Computer Agent host contract", () => {
  * both base layers.
  */
 describe(".env injection into the pi spawn env (T17 parity)", () => {
+  it("defaults new Pi processes to native long cache retention", () => {
+    const merged = mergedSpawnEnvironment({}, {}, {});
+    expect(merged.PI_CACHE_RETENTION).toBe("long");
+  });
+
+  it.each(["short", "none", "provider-specific"])(
+    "preserves an explicit PI_CACHE_RETENTION=%s value",
+    (retention) => {
+      const merged = mergedSpawnEnvironment(
+        { PI_CACHE_RETENTION: retention },
+        {},
+        {},
+      );
+      expect(merged.PI_CACHE_RETENTION).toBe(retention);
+    },
+  );
+
+  it("lets the configured project .env override the cache-retention default", () => {
+    const merged = mergedSpawnEnvironment(
+      {},
+      { PI_CACHE_RETENTION: "none" },
+      {},
+    );
+    expect(merged.PI_CACHE_RETENTION).toBe("none");
+  });
+
   it("injects .env keys under the internal contract", () => {
     const merged = mergedSpawnEnvironment(
       {},
