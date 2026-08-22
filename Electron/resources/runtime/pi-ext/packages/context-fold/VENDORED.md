@@ -17,7 +17,9 @@ provides the extension API and `typebox` virtual modules at runtime.
   rewritten while retaining a provider signature.
 - Defaults are an absolute 150,000-token cap, a 30,000-token protected recent tail, native Pi
   hard compaction, and 30-day spool retention. Explicit process/project environment values keep
-  their normal higher precedence.
+  their normal higher precedence. Native mode registers no `session_before_compact` handler, so
+  it cannot displace PipiUI's last-wins compaction owner; only explicit `CONTEXTFOLD_COMPACT=det`
+  opts into the vendored deterministic handler.
 - The PipiUI host owns a dedicated default-on `contextFold` spawn feature and resolves this exact
   `index.ts` from the installed project runtime. A missing asset or disabled feature omits the
   mount; `CONTEXTFOLD=0` remains the extension-level kill switch.

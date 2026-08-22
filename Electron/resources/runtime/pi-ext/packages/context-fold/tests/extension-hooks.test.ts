@@ -306,16 +306,11 @@ describe.skipIf(!PI_PRESENT)("session_before_compact hook", () => {
 		expect(out.compaction.summary).toContain("trace the overflow path");
 	});
 
-	it("stands aside for Pi's own compaction under CONTEXTFOLD_COMPACT=native", async () => {
+	it("does not register a competing hook under CONTEXTFOLD_COMPACT=native", async () => {
 		process.env.CONTEXTFOLD_COMPACT = "native";
 		const s = await load();
-		const { ctx } = ctxFor();
 
-		const out = await s.hooks.get("session_before_compact")!(
-			{ preparation: { messagesToSummarize: [], turnPrefixMessages: [], tokensBefore: 1, firstKeptEntryId: "e1" } },
-			ctx,
-		);
-		expect(out).toBeUndefined();
+		expect(s.hooks.has("session_before_compact")).toBe(false);
 	});
 });
 
