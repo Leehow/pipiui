@@ -44,12 +44,14 @@ type Listed = {
   id: string;
   name?: string;
   version?: string;
+  description?: string;
   state: string;
   source?: string;
   origin?: string;
   error?: string;
   capabilities?: string[];
   ui?: { panels?: Array<{ slot: string }> };
+  contributions?: { settings?: { scope?: string; schema?: { properties?: Record<string, unknown> } } };
 };
 
 async function backendFor(dirs: { runtime?: string; agent?: string }) {
@@ -71,7 +73,21 @@ describe("extension manifest D2 validation", () => {
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.manifest.id).toBe("quota");
+    expect(result.manifest.description).toBe("用量监控示例包");
     expect(result.manifest.ui?.panels?.[0]?.slot).toBe("toolPanel");
+  });
+
+  it("rejects a description longer than 200 characters", () => {
+    const result = validateExtensionManifest({
+      id: "quota",
+      name: "Quota Monitor",
+      version: "1.0.0",
+      description: "长".repeat(201),
+      capabilities: [],
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.join("; ")).toMatch(/description must be at most 200 characters/);
   });
 
   it("rejects missing id, illegal id, non-namespaced settings, and unknown slot", async () => {
@@ -116,11 +132,17 @@ describe("extension loader via listExtensions", () => {
       id: "quota",
       name: "Quota Monitor",
       version: "1.0.0",
+      description: "用量监控示例包",
       state: "enabled",
       source: "builtin",
     });
     expect(quota?.capabilities).toEqual(expect.arrayContaining(["settings.read", "bridge.emit"]));
     expect(quota?.ui?.panels?.[0]?.slot).toBe("toolPanel");
+    // Settings schema rides the descriptor so renderer schema forms get fields.
+    expect(Object.keys(quota?.contributions?.settings?.schema?.properties ?? {})).toEqual([
+      "ext.quota.threshold",
+    ]);
+    expect(quota?.contributions?.settings?.scope).toBe("app");
     await backend.close();
   });
 
@@ -322,6 +344,7 @@ describe("bundled hello-pipiui dogfood package", () => {
     expect(validation.ok).toBe(true);
     if (!validation.ok) return;
     expect(validation.manifest.id).toBe("hello-pipiui");
+    expect(validation.manifest.description).toBe("示例扩展：演示双半包的最小功能");
     expect(validation.manifest.capabilities).toEqual([
       "settings.read",
       "settings.write",
@@ -329,11 +352,7 @@ describe("bundled hello-pipiui dogfood package", () => {
       "invoke.agent",
       "stream.render",
     ]);
-    expect(validation.manifest.ui?.panels?.[0]).toMatchObject({
-      slot: "toolPanel",
-      id: "hello-pipiui",
-      entry: "app/dist/panel.js",
-    });
+    expect(validation.manifest.ui?.panels ?? []).toEqual([]);
 
     const registry = createExtensionRegistry([]);
     const loader = createExtensionLoader({
@@ -351,10 +370,11 @@ describe("bundled hello-pipiui dogfood package", () => {
     expect(rec?.error).toBeUndefined();
     const listed = loader.list().find((item) => item.id === "hello-pipiui");
     expect(listed?.source).toBe("builtin");
+    expect(listed?.description).toBe("示例扩展：演示双半包的最小功能");
     expect(listed?.capabilities).toEqual(
       expect.arrayContaining(["bridge.emit", "invoke.agent", "stream.render"]),
     );
-    expect(listed?.ui?.panels?.[0]?.slot).toBe("toolPanel");
+    expect(listed?.ui?.panels ?? []).toEqual([]);
     const spawned = loader.spawnPackages().find((pkg) => pkg.id === "hello-pipiui");
     expect(spawned?.enabled).toBe(true);
     expect(spawned?.extensionPath).toBeTruthy();

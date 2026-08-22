@@ -10,10 +10,12 @@ import {
 } from "./extension-manifest.js";
 import {
   type ExtensionDescriptor,
+  type ExtensionEnableScope,
   type ExtensionLifecycleState,
   type ExtensionOrigin,
   type ExtensionRecord,
   type ExtensionRegistry,
+  type ExtensionSettingsManifest,
 } from "./extension-registry.js";
 import { projectPiAgentDir } from "./project-pi-home.js";
 import type { SpawnRegisteredExtension } from "./spawn-assembly.js";
@@ -31,6 +33,11 @@ export type ExtensionListItem = ExtensionRecord & {
   source: ExtensionOrigin;
   capabilities: readonly string[];
   ui?: ExtensionUiSummary;
+  /** Declarative contributions surfaced to the renderer (Extensions-tab schema forms). */
+  contributions?: {
+    settings?: { scope?: ExtensionEnableScope; schema?: ExtensionSettingsManifest["schema"] };
+    settingsSections?: ExtensionUiSummary["settingsSections"];
+  };
   /** Package install directory; app-half `entry` paths resolve against this. */
   directory?: string;
   grantedCapabilities?: readonly string[];
@@ -188,6 +195,7 @@ function descriptorFrom(
     id,
     name: manifest?.name ?? pkg.directoryName,
     version: manifest?.version ?? "0.0.0",
+    description: manifest?.description,
     origin: pkg.origin,
     uninstallable: pkg.origin !== "builtin",
     defaultEnabled: pkg.origin === "builtin",
@@ -226,6 +234,7 @@ export class ExtensionLoader {
   private readonly builtinRoot: string;
   private readonly appRoot: string;
   private readonly ui = new Map<string, ExtensionUiSummary>();
+  private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly directories = new Map<string, string>();
   private readonly agent = new Map<string, { extensionPath?: string; skillRoots: string[] }>();
   private readonly reservedBuiltinIds: Set<string>;
@@ -267,6 +276,7 @@ export class ExtensionLoader {
   private drop(id: string): void {
     unloadSafe(this.registry, id);
     this.ui.delete(id);
+    this.settings.delete(id);
     this.directories.delete(id);
     this.agent.delete(id);
   }
@@ -317,6 +327,7 @@ export class ExtensionLoader {
         return this.registry.enterError(descriptor.id, validation.errors.join("; "));
       }
       if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
+      if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
       const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
       if (missingAgent && existing.state !== "error") {
         return this.registry.enterError(descriptor.id, missingAgent);
@@ -328,6 +339,8 @@ export class ExtensionLoader {
     this.directories.set(descriptor.id, pkg.directory);
     if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
     else this.ui.delete(descriptor.id);
+    if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
+    else this.settings.delete(descriptor.id);
     if (!validation.ok) {
       this.rememberAgent(descriptor.id, pkg.directory, undefined);
       return this.registry.enterError(descriptor.id, validation.errors.join("; "));
@@ -367,6 +380,14 @@ export class ExtensionLoader {
       capabilities,
     };
     if (ui) item.ui = ui;
+    const settings = this.settings.get(record.id);
+    const settingsSections = ui?.settingsSections;
+    if (settings || settingsSections) {
+      item.contributions = {
+        ...(settings ? { settings: { scope: settings.scope, schema: settings.schema } } : {}),
+        ...(settingsSections ? { settingsSections } : {}),
+      };
+    }
     const directory = this.directories.get(record.id);
     if (directory) item.directory = directory;
     return item;

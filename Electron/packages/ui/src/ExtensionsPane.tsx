@@ -9,6 +9,7 @@ import {
   grantNeedsConfirmation,
   L2_CAPABILITY_HINT,
 } from './extension-capabilities'
+import { SchemaSettingsForm } from './schema-settings-form'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
 
@@ -27,9 +28,9 @@ function lastProjectId(): string | undefined {
   }
 }
 
-async function loadUserMcpServers(host: PipiHostAPI | undefined): Promise<UserMcpServer[]> {
+async function loadUserMcpServers(host: PipiHostAPI | undefined, preferredProjectId?: string): Promise<UserMcpServer[]> {
   if (!host?.listUserMcpServers) return []
-  let projectId = lastProjectId()
+  let projectId = preferredProjectId || lastProjectId()
   if (!projectId) {
     const projects = await host.listProjects()
     projectId = projects[0]?.id
@@ -271,17 +272,23 @@ function ConfirmDialog({
 
 function ExtensionPackageRow({
   ext,
+  host,
   busy,
   onToggle,
   onUninstall,
 }: {
   ext: ExtensionDescriptor
+  host: PipiHostAPI
   busy: boolean
   onToggle: (ext: ExtensionDescriptor) => void
   onUninstall: (ext: ExtensionDescriptor) => void
 }) {
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const enabled = ext.state === 'enabled'
   const caps = requestedCapabilities(ext)
+  const settingsSchema = ext.contributions?.settings?.schema
+  const declaresSettings = Boolean(ext.contributions?.settingsSections?.length || settingsSchema)
+  const canEditSettings = enabled && declaresSettings && Boolean(host.getExtensionSettings && host.updateExtensionSettings)
   const l2Blocked = blocksEnableForL2(ext.source, caps)
   const errorText = readableError(ext)
   const canToggle = !busy && ext.state !== 'error' && !(l2Blocked && !enabled)
@@ -321,6 +328,25 @@ function ExtensionPackageRow({
           )}
         </div>
       </div>
+      {ext.description && (
+        <p className="extensions-pkg-desc" data-testid={`extensions-pkg-desc-${ext.id}`}>{ext.description}</p>
+      )}
+      {canEditSettings && (
+        <div className="extensions-pkg-settings" data-testid={`extensions-pkg-settings-${ext.id}`}>
+          <button
+            type="button"
+            className="model-modal-refresh"
+            data-testid={`extensions-pkg-settings-toggle-${ext.id}`}
+            aria-expanded={settingsOpen}
+            onClick={() => setSettingsOpen(open => !open)}
+          >
+            {settingsOpen ? '收起设置' : '设置'}
+          </button>
+          {settingsOpen && (
+            <SchemaSettingsForm host={host} extensionId={ext.id} schema={settingsSchema} />
+          )}
+        </div>
+      )}
       {caps.length > 0 && (
         <div className="extensions-badges" data-testid={`extensions-pkg-caps-${ext.id}`}>
           {caps.map(capability => (
@@ -442,6 +468,7 @@ function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
               <ExtensionPackageRow
                 key={ext.id}
                 ext={ext}
+                host={host}
                 busy={busyId === ext.id}
                 onToggle={ext => { void onToggle(ext) }}
                 onUninstall={setUninstallTarget}
@@ -493,13 +520,13 @@ export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOp
 
   useEffect(() => {
     let cancelled = false
-    void loadUserMcpServers(resolvedHost).then(rows => {
+    void loadUserMcpServers(resolvedHost, projectId).then(rows => {
       if (!cancelled) setServers(rows)
     }).catch(() => {
       if (!cancelled) setServers([])
     })
     return () => { cancelled = true }
-  }, [resolvedHost])
+  }, [resolvedHost, projectId])
 
   return (
     <div className="extensions-pane" data-testid="extensions-pane">

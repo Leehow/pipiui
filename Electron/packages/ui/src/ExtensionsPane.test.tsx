@@ -122,6 +122,11 @@ function managementHost(initial: ExtensionDescriptor[]) {
     uninstallExtension: vi.fn(async (id: string) => {
       items = items.filter(item => item.id !== id)
     }),
+    getExtensionSettings: vi.fn(async () => ({} as Record<string, unknown>)),
+    updateExtensionSettings: vi.fn(async (id: string, patch: Record<string, unknown>) => ({
+      ok: true as const,
+      value: { ...patch },
+    })),
   }
   return host as unknown as PipiHostAPI & typeof host
 }
@@ -245,5 +250,53 @@ describe('ExtensionsPane package management', () => {
     render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
     expect((await screen.findByTestId('extensions-pkg-error-broken')).textContent).toContain('migration v1 → v2 failed')
     expect(screen.getByTestId('extensions-pkg-toggle-broken')).toHaveProperty('disabled', true)
+  })
+})
+
+describe('ExtensionsPane descriptions and inline settings', () => {
+  it('renders the manifest description under the name and no placeholder when absent', async () => {
+    const host = managementHost([
+      pkg({ id: 'quota', state: 'enabled', description: '用量监控示例包' }),
+      pkg({ id: 'office', state: 'disabled' }),
+    ])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    expect((await screen.findByTestId('extensions-pkg-desc-quota')).textContent).toBe('用量监控示例包')
+    expect(screen.queryByTestId('extensions-pkg-desc-office')).toBeNull()
+  })
+
+  it('expands an inline schema settings form for an enabled package that declares settings', async () => {
+    const host = managementHost([pkg({
+      id: 'quota',
+      state: 'enabled',
+      contributions: {
+        settings: {
+          scope: 'app',
+          schema: {
+            type: 'object',
+            properties: { 'ext.quota.threshold': { type: 'number', default: 80, title: '告警阈值（%）' } },
+          },
+        },
+        settingsSections: [{ id: 'quota', title: '用量监控' }],
+      },
+    })])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('extensions-pkg-settings-toggle-quota'))
+    expect(await screen.findByTestId('ext-schema-field-ext.quota.threshold')).toBeTruthy()
+    expect(host.getExtensionSettings).toHaveBeenCalledWith('quota')
+  })
+
+  it('hides the inline settings entry for disabled or settings-less packages', async () => {
+    const host = managementHost([
+      pkg({
+        id: 'off',
+        state: 'disabled',
+        contributions: { settings: { scope: 'app', schema: { type: 'object' } } },
+      }),
+      pkg({ id: 'bare', state: 'enabled' }),
+    ])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-pkg-off')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-off')).toBeNull()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-bare')).toBeNull()
   })
 })

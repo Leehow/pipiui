@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { PlanApprovalBar } from './PlanApprovalBar'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
@@ -2035,11 +2035,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         || observedSessionStatusesRef.current[event.sessionId] === 'interrupted'
       )
       if (turnClosed) {
-        // Do not unconditionally drop late live events after settle — they would
-        // otherwise wait for the 250ms history reconcile and appear as "stuck then flood".
-        // Tradeoff: immediate apply may briefly diverge from history, but the
-        // fingerprint-based reconcile dedups and preserves source of truth;
-        // immediate refresh avoids batch涌出 while keeping content不丢不双显.
+        // Do not drop late live events after settle — they would otherwise wait
+        // for the 250ms history reconcile and appear as "stuck then flood".
+        // Apply them to the live transcript only. Reloading JSONL on every
+        // thinking/text delta stacked overlapping full-file scans on large
+        // sessions and froze the main process.
         const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'
         if (isLiveContent) {
           const lateNext = applyStreamEvent(messagesRef.current, event)
@@ -2052,10 +2052,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
           else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
           else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
-          if (historyContextRef.current?.host === host && historyContextRef.current.sessionId === event.sessionId) {
-            freezeProbe('history_refresh', { reason: 'late_live', session: event.sessionId, type: event.type })
-            setHistoryRefreshKey(key => key + 1)
-          }
+          freezeProbe('late_live_applied', { session: event.sessionId, type: event.type })
           return
         }
         return
@@ -3024,6 +3021,13 @@ function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
   return fileToPromptAttachment(a.file).catch(() => { throw new Error('无法读取图片') })
 }
 
+/** Stable composer chrome (model chip, quick menu, thinking control, stats/quota/balance
+ * pills). Memoized with useCallback-backed handlers so per-keystroke draft updates,
+ * which re-render only the Composer, never re-render this row. */
+const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readOnly, streaming, compacting, statsRefreshKey, host, sessionId, modelState, visibility, quickOpen, onOpenBrowserLogin, onSelectModel, onThinkingChange, onQuickOpenChange }: { hideSessionChrome?: boolean; readOnly: boolean; streaming: boolean; compacting: boolean; statsRefreshKey: number; host: PipiHostAPI; sessionId: string; modelState: ModelState | null; visibility: ModelVisibilityController; quickOpen: boolean; onOpenBrowserLogin?: () => void; onSelectModel: (model: Model) => void; onThinkingChange: (level: ThinkingLevel) => void; onQuickOpenChange: (value: boolean | ((previous: boolean) => boolean)) => void }) {
+  return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
+})
+
 function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
   const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(initialAttachments)
@@ -3061,20 +3065,30 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     return () => window.removeEventListener('keydown', onKey)
   }, [lightboxIndex, quickOpen])
 
-  const slashQuery = slashPaletteQuery(draft)
   const registeredSlashCommands = useSlashCommands()
+  // Memoized on the draft so re-renders that don't change the text (palette
+  // navigation, streaming flags, error states) skip re-parsing the draft.
+  const slashQuery = useMemo(() => slashPaletteQuery(draft), [draft])
   const slashMatches = useMemo(() => (slashQuery === null ? [] : filterSlashCommands(slashQuery)), [slashQuery, registeredSlashCommands])
   const slashVisible = slashQuery !== null && !slashHidden
 
   useEffect(() => { setSlashIndex(0) }, [slashQuery])
   useEffect(() => { setSlashIndex(i => Math.min(i, Math.max(0, slashMatches.length - 1))) }, [slashMatches.length])
   // Auto-grow: typing, paste, deletion and programmatic clears all flow through `draft`.
+  // The cheap line estimate is applied during render (textarea style below) so the
+  // height tracks the draft without layout; the exact scrollHeight measurement is
+  // coalesced into one animation frame per input burst, and the effect cleanup cancels
+  // the pending frame whenever a newer draft arrives. The frame after the final change
+  // (last keystroke, IME composition end, post-send reset) settles the height.
   useEffect(() => {
-    const el = textareaRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    const measured = el.scrollHeight > 0 ? el.scrollHeight : estimatedTextareaHeight(draft)
-    el.style.height = `${Math.min(measured, MAX_COMPOSER_HEIGHT)}px`
+    const frame = requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.style.height = 'auto'
+      const measured = el.scrollHeight > 0 ? el.scrollHeight : estimatedTextareaHeight(draft)
+      el.style.height = `${Math.min(measured, MAX_COMPOSER_HEIGHT)}px`
+    })
+    return () => cancelAnimationFrame(frame)
   }, [draft])
 
   const persistDraft = (value: string) => { setDraft(value); onDraftChange?.(value) }
@@ -3237,7 +3251,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       void submit()
     }
   }
-  const setThinking = async (level: ThinkingLevel) => {
+  const setThinking = useCallback(async (level: ThinkingLevel) => {
     const previous = modelState
     if (previous) onModel({ ...previous, thinkingLevel: level })
     try {
@@ -3249,8 +3263,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       if (previous) onModel(previous)
       setSendError(`切换思考级别失败：${err instanceof Error ? err.message : String(err)}`)
     }
-  }
-  const handleQuickSelect = async (model: Model) => {
+  }, [modelState, host, sessionId, onEnsureSession, onModel])
+  const handleQuickSelect = useCallback(async (model: Model) => {
     setQuickOpen(false)
     const previous = modelState
     const availableThinkingLevels = thinkingLevelsForModel(model)
@@ -3268,7 +3282,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       if (previous) onModel(previous)
       setSendError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`)
     }
-  }
+  }, [modelState, host, sessionId, onEnsureSession, onModel])
   const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0)
   const showQueueSubmit = queueBusy && canSend
   return <footer className="composer" onDragEnter={onComposerFileDrag} onDragOver={onComposerFileDrag} onDrop={onComposerFileDrop}>
@@ -3291,8 +3305,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       ))}
     </div>}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
-    <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) setQuickOpen(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void handleQuickSelect(model)} onClose={() => setQuickOpen(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void setThinking(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }

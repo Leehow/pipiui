@@ -10,6 +10,9 @@ import { parseExtensionMigrations } from "./extension-migrations.js";
 export const EXTENSION_MANIFEST_FILENAME = "pipiui-extension.json";
 export const EXTENSION_ID_RE = /^[a-z][a-z0-9-]*$/;
 
+/** Optional top-level manifest `description` length cap (user-facing list summary). */
+export const EXTENSION_DESCRIPTION_MAX_LENGTH = 200;
+
 /** Spec D8 first-version capability enum (L0/L1). */
 export const EXTENSION_CAPABILITIES = [
   "settings.read",
@@ -48,6 +51,8 @@ export type ValidatedExtensionManifest = {
   id: string;
   name: string;
   version: string;
+  /** One-line package summary shown in the extension list. */
+  description?: string;
   capabilities: ExtensionCapability[];
   settings?: ExtensionSettingsManifest;
   ui?: ExtensionUiSummary;
@@ -114,6 +119,20 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
 
   const version = asNonEmptyString(value.version);
   if (!version) errors.push("missing required field version");
+
+  let description: string | undefined;
+  if (value.description !== undefined && value.description !== null) {
+    if (typeof value.description !== "string") {
+      errors.push("description must be a string");
+    } else {
+      const trimmedDescription = value.description.trim();
+      if (trimmedDescription.length > EXTENSION_DESCRIPTION_MAX_LENGTH) {
+        errors.push(`description must be at most ${EXTENSION_DESCRIPTION_MAX_LENGTH} characters`);
+      } else if (trimmedDescription) {
+        description = trimmedDescription;
+      }
+    }
+  }
 
   let capabilities: ExtensionCapability[] = [];
   if (!Object.prototype.hasOwnProperty.call(value, "capabilities")) {
@@ -327,6 +346,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     version: version!,
     capabilities,
   };
+  if (description) manifest.description = description;
   if (settings) manifest.settings = settings;
   if (ui) manifest.ui = ui;
   if (agentExtension) manifest.agentExtension = agentExtension;

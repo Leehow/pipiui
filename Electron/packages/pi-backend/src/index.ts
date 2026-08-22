@@ -3673,6 +3673,9 @@ export class PiHostBackend implements HostBackend {
       if (!this.closed && this.queue.isBusy(id))
         this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled");
       live.compaction.dispose();
+      // A dead writer cannot still be compacting; drop the drain gate so FIFO
+      // is not wedged waiting for a compaction_end that will never arrive.
+      this.queue.clearCompacting(id);
       const finish = () => {
         const stillCurrent = this.live.get(id) === live;
         if (stillCurrent) this.live.delete(id);
@@ -3795,12 +3798,18 @@ export class PiHostBackend implements HostBackend {
       this.projectTurnTerminal(live, "stopped");
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
-      // A compaction that started outside a turn (idle-time or `/compact`) must
-      // hold the queue itself: a prompt sent meanwhile would otherwise reach pi
-      // mid-compaction. Inside a turn the turn already owns the flag.
-      if (!this.queue.isBusy(id)) {
+      // Must be synchronous: `loadQueue().then(markBusy)` raced enqueue/drain
+      // and let a prompt reach pi mid-compaction. The queue's compact gate is
+      // independent of turn epochs so restoreQueue cannot clear it.
+      const turnAlreadyHeld = this.queue.isBusy(id);
+      this.queue.markCompacting(id);
+      if (!turnAlreadyHeld) {
         live.compactionHoldsQueue = true;
-        void this.loadQueue(id).then(() => this.queue.markBusy(id));
+        if (!this.queueLoads.has(id)) {
+          void this.loadQueue(id).catch((error) => {
+            console.warn(`[pipi-backend] compaction_start queue load failed for ${id}: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
       }
       this.stream({
         type: "compaction",
@@ -3815,6 +3824,7 @@ export class PiHostBackend implements HostBackend {
           ? e.errorMessage
           : undefined;
       live.compaction.compactionFinished(!aborted && !error);
+      this.queue.clearCompacting(id);
       if (live.compactionHoldsQueue) {
         live.compactionHoldsQueue = false;
         void this.queueIdle(id);

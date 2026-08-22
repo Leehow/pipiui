@@ -626,6 +626,8 @@ export type ExtensionDescriptor = {
   enabledBy?: ExtensionEnabledScope;
   name?: string;
   version?: string;
+  /** One-line package summary from the manifest `description` field. */
+  description?: string;
   error?: string;
   /** User-visible reason when `state === "error"` (spec D9). */
   errorReason?: string;

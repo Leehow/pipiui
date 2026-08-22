@@ -139,10 +139,21 @@ describe("context compaction", () => {
 
     const result = (await backend.handle("enqueueMessage", ["session-1", "during"])) as any;
     expect(result.outcome).toBe("queued");
+    expect(result.message.state).toBe("queued");
+    expect(result.message.error).toBeUndefined();
+
+    // A mid-compact drain must not surface Pi's compaction rejection as 发送失败.
+    await settle(30);
+    const mid = (await backend.handle("listQueue", ["session-1"])) as any[];
+    expect(mid.every((item) => item.state !== "failed")).toBe(true);
+    expect(mid.some((item) => item.text === "during" && item.state === "queued")).toBe(true);
+    expect(compactionEvents(events).some((e) => e.phase === "end")).toBe(false);
 
     // Releasing the hold drains the queue: the held prompt reaches pi afterwards.
     await waitFor(() => compactionEvents(events).some((e) => e.phase === "end"));
     await waitFor(async () => ((await backend.handle("listQueue", ["session-1"])) as any[]).length === 0);
+    const after = (await backend.handle("listQueue", ["session-1"])) as any[];
+    expect(after).toEqual([]);
     off();
     await backend.close();
   });

@@ -46,6 +46,8 @@ export type ExtensionDescriptor = {
   id: string;
   name: string;
   version: string;
+  /** One-line package summary shown in the extension list. */
+  description?: string;
   origin: ExtensionOrigin;
   /** Bundled runtime layer name (D13). */
   layer?: string;
@@ -60,6 +62,8 @@ export type ExtensionRecord = {
   id: string;
   name: string;
   version: string;
+  /** One-line package summary shown in the extension list. */
+  description?: string;
   origin: ExtensionOrigin;
   state: ExtensionLifecycleState;
   uninstallable: boolean;
@@ -90,10 +94,10 @@ const ID_RE = /^[a-z][a-z0-9-]*$/;
 
 /** Spec § D13 / brief: bundled runtime layers as first-class builtin packages. */
 export const BUILTIN_EXTENSION_PACKAGES: readonly ExtensionDescriptor[] = [
-  { id: "pi-ext", name: "Pi Ext", version: "1.0.0", origin: "builtin", layer: "pi-ext", defaultEnabled: true, uninstallable: false },
-  { id: "pi-philosophy", name: "Pi Philosophy", version: "1.0.0", origin: "builtin", layer: "pi-philosophy", defaultEnabled: true, uninstallable: false },
-  { id: "pi-goal", name: "Pi Goal", version: "1.0.0", origin: "builtin", layer: "pi-goal", defaultEnabled: true, uninstallable: false },
-  { id: "built-in-skills", name: "Built-in Skills", version: "1.0.0", origin: "builtin", layer: "built-in-skills", defaultEnabled: true, uninstallable: false },
+  { id: "pi-ext", name: "Pi Ext", version: "1.0.0", description: "PipiUI 宿主编排扩展", origin: "builtin", layer: "pi-ext", defaultEnabled: true, uninstallable: false },
+  { id: "pi-philosophy", name: "Pi Philosophy", version: "1.0.0", description: "哲学层系统提示", origin: "builtin", layer: "pi-philosophy", defaultEnabled: true, uninstallable: false },
+  { id: "pi-goal", name: "Pi Goal", version: "1.0.0", description: "目标层系统提示", origin: "builtin", layer: "pi-goal", defaultEnabled: true, uninstallable: false },
+  { id: "built-in-skills", name: "Built-in Skills", version: "1.0.0", description: "内置技能集", origin: "builtin", layer: "built-in-skills", defaultEnabled: true, uninstallable: false },
 ];
 
 /** Project-home enable overlay. Not a pi `settings.json` key (those are stripped). */
@@ -215,6 +219,7 @@ function snapshot(entry: Entry): ExtensionRecord {
     uninstallable: entry.uninstallable,
     defaultEnabled: entry.defaultEnabled,
   };
+  if (entry.description) record.description = entry.description;
   if (entry.error) record.error = entry.error;
   return record;
 }
@@ -256,6 +261,7 @@ export class ExtensionRegistry {
       id: descriptor.id,
       name: descriptor.name,
       version: descriptor.version,
+      description: descriptor.description,
       origin: descriptor.origin,
       state: "discovered",
       uninstallable,

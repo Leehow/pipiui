@@ -150,6 +150,9 @@ body{overscroll-behavior:none}
 .extensions-pkg-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
 .extensions-pkg-actions{display:flex;align-items:center;gap:8px;flex:none}
 .extensions-badges{display:flex;flex-wrap:wrap;gap:4px}
+.extensions-pkg-desc{margin:0;color:var(--muted);font-size:12px;line-height:1.4}
+.extensions-pkg-settings{display:flex;flex-direction:column;gap:8px;border-top:1px dashed var(--border);padding-top:8px}
+.extensions-pkg-settings>.model-modal-refresh{align-self:flex-start}
 .extensions-badge{padding:1px 6px;border-radius:999px;color:var(--muted);background:var(--surface-hover);font:9px ui-monospace,SFMono-Regular,Menlo,monospace}
 .extensions-badge.l2{color:var(--danger)}
 .extensions-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}

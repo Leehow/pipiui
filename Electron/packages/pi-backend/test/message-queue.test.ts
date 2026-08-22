@@ -559,4 +559,82 @@ describe("SessionMessageQueue", () => {
     void queue.notifyIdle("s1");
     expect(host.calls[0]).toMatchObject({ behavior: "follow_up" });
   });
+
+  it("holds enqueue and idle drain while compacting, then dispatches on clear", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markCompacting("s1");
+    const result = queue.enqueue("s1", { text: "during compact" });
+    expect(result.outcome).toBe("queued");
+    expect(queue.isBusy("s1")).toBe(true);
+    expect(queue.isCompacting("s1")).toBe(true);
+    expect(host.calls).toHaveLength(0);
+
+    await queue.notifyIdle("s1");
+    expect(host.calls).toHaveLength(0);
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ text: "during compact", state: "queued" }),
+    ]);
+
+    queue.clearCompacting("s1");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["during compact"]);
+    host.pending[0].resolve(undefined);
+    await flush();
+    expect(queue.listQueue("s1")).toEqual([]);
+    expect(queue.isCompacting("s1")).toBe(false);
+  });
+
+  it("does not mark a compaction-in-progress rejection as a send failure", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const result = queue.enqueue("s1", { text: "retry after compact" });
+    expect(result.outcome).toBe("dispatched");
+    // Compaction starts after drain already called dispatch — the historic race.
+    queue.markCompacting("s1");
+    host.pending[0].reject(new Error("Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."));
+    await flush();
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ text: "retry after compact", state: "queued", error: undefined }),
+    ]);
+    expect(host.calls).toHaveLength(1);
+
+    queue.clearCompacting("s1");
+    expect(host.calls).toHaveLength(2);
+    host.pending[1].resolve(undefined);
+    await flush();
+    expect(queue.listQueue("s1")).toEqual([]);
+  });
+
+  it("clearCompacting does not drain after user stop", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    queue.markCompacting("s1");
+    queue.enqueue("s1", { text: "stay queued" });
+    queue.noteAbort("s1");
+    await queue.notifyIdle("s1");
+    // Writer-exit / compaction_end after Stop: turn is already idle, but this epoch must stay parked.
+    queue.clearCompacting("s1");
+    expect(host.calls).toHaveLength(0);
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ text: "stay queued", state: "queued" }),
+    ]);
+  });
+
+  it("restoreQueue does not drop an active compaction gate", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markCompacting("s1");
+    queue.restoreQueue("s1", [
+      { id: "q1", sessionId: "s1", text: "kept", attachments: [], createdAt: 1, state: "queued" },
+    ]);
+    expect(queue.isCompacting("s1")).toBe(true);
+    expect(host.calls).toHaveLength(0);
+    await queue.notifyIdle("s1");
+    expect(host.calls).toHaveLength(0);
+    queue.clearCompacting("s1");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["kept"]);
+    host.pending[0].resolve(undefined);
+    await flush();
+  });
 });

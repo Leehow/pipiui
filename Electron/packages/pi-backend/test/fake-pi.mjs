@@ -20,6 +20,8 @@ let slowAbort = false;
 let contextTokens = null;
 let failCompact = false;
 let slowCompact = false;
+/** Real Pi rejects `prompt` while `_compactionAbortController` is set. */
+let compacting = false;
 let activeModel = { provider: "fake", id: "fake-1", name: "Fake", reasoning: true };
 let activeThinkingLevel = "medium";
 
@@ -97,9 +99,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   }
   if (command.type === "compact") {
     if (failCompact) return response(command.type, command.id, false, undefined, "Nothing to compact (session too small)");
+    compacting = true;
     send({ type: "compaction_start", reason: "manual" });
     contextTokens = 12000;
     const finish = () => {
+      compacting = false;
       send({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false, result: { summary: "…", firstKeptEntryId: "entry-1", tokensBefore: 240000, estimatedTokensAfter: 12000 } });
       ok({ summary: "…" });
     };
@@ -108,6 +112,9 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     return;
   }
   if (command.type === "prompt") {
+    if (compacting) {
+      return response(command.type, command.id, false, undefined, "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.");
+    }
     if (command.message === "__no_ack__") return;
     if (command.message === "__queue_fail__") return response(command.type, command.id, false, undefined, "queue dispatch failed");
     if (heldTurn && !command.streamingBehavior) {

@@ -13,8 +13,11 @@
  *
  * Lifecycle per session:
  * - A session is *busy* while a turn is running (`markBusy`/`notifyIdle` from
- *   the host, or right after the queue itself delivered a message) and while a
- *   queue-owned dispatch is still in flight (single-flight per session).
+ *   the host, or right after the queue itself delivered a message), while a
+ *   queue-owned dispatch is still in flight (single-flight per session), and
+ *   while compaction is active (`markCompacting`/`clearCompacting`). Compaction
+ *   is a synchronous drain gate: it must not wait on `loadQueue` or any other
+ *   async work, or a settle/enqueue can reach pi mid-compact.
  * - `enqueue` while busy appends FIFO and returns a `queued` item (with its id)
  *   instead of throwing. `enqueue` while idle dispatches immediately.
  * - `notifyIdle` drains the queue: the head item is delivered with the drain
@@ -23,6 +26,8 @@
  *   `notifyIdle`, so the next item is never sent while a turn is streaming.
  *   A failed delivery keeps the item with its error and continues the FIFO —
  *   the failed item never reached pi, so retrying cannot double-send.
+ *   A compaction-in-progress rejection is not a user-facing failure: the item
+ *   stays `queued` and drains again after `clearCompacting`.
  *   Duplicate idle/completion events are harmless: the single-flight guard
  *   swallows them.
  * - `steerMessage` injects an item into a running turn (`steer` behavior) and
@@ -90,12 +95,16 @@ type SessionState = {
   suppressDrainEpoch?: number;
   /** Bumped by `noteAbort` so a late dispatch ack cannot remove or fail the restored item. */
   deliveryEpoch: number;
+  /** Host-observed compaction; blocks drain/enqueue independently of turn epochs. */
+  compactionActive: boolean;
 };
 
 /** Deep copy used both for input snapshots and for values returned to callers. */
 const snapshot = <T>(value: T): T => structuredClone(value);
 const freeze = <T extends object>(value: T): T => Object.freeze(value);
 const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+const isCompactionInProgressError = (error: unknown): boolean =>
+  /compaction is in progress/i.test(errorMessage(error));
 
 export class SessionMessageQueue {
   private readonly dispatch: DispatchHandler;
@@ -114,7 +123,7 @@ export class SessionMessageQueue {
   private state(sessionId: string): SessionState {
     let session = this.sessions.get(sessionId);
     if (!session) {
-      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false, deliveryEpoch: 0 };
+      session = { items: [], turnActive: false, turnEpoch: 0, dispatching: false, deliveryEpoch: 0, compactionActive: false };
       this.sessions.set(sessionId, session);
     }
     return session;
@@ -124,16 +133,20 @@ export class SessionMessageQueue {
     this.onChange?.(sessionId, this.listQueue(sessionId));
   }
 
-  /** True while a turn is running or a queue-owned delivery is in flight. */
-  isBusy(sessionId: string): boolean {
-    const session = this.sessions.get(sessionId);
-    return session ? session.turnActive || session.dispatching : false;
+  private blocked(session: SessionState): boolean {
+    return session.turnActive || session.dispatching || session.compactionActive;
   }
 
-  /** Sessions whose FIFO is blocked on a turn or in-flight delivery. */
+  /** True while a turn is running, a queue-owned delivery is in flight, or compaction is holding drain. */
+  isBusy(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return session ? this.blocked(session) : false;
+  }
+
+  /** Sessions whose FIFO is blocked on a turn, in-flight delivery, or compaction. */
   busySessionIds(): string[] {
     return [...this.sessions.entries()]
-      .filter(([, session]) => session.turnActive || session.dispatching)
+      .filter(([, session]) => this.blocked(session))
       .map(([sessionId]) => sessionId);
   }
 
@@ -155,7 +168,7 @@ export class SessionMessageQueue {
     const session = this.state(sessionId);
     const message = freeze({ id: crypto.randomUUID(), sessionId, text, attachments, createdAt: this.now(), state: "queued" as const });
     session.items.push(message);
-    if (session.turnActive || session.dispatching) {
+    if (this.blocked(session)) {
       this.changed(sessionId);
       return { outcome: "queued", message: snapshot(message) };
     }
@@ -234,6 +247,8 @@ export class SessionMessageQueue {
     session.pendingCutIn = undefined;
     session.suppressDrainEpoch = undefined;
     session.deliveryEpoch += 1;
+    // Compaction is host-observed and can outlive a process restart restore.
+    // Never clear `compactionActive` here — `loadQueue` would reopen the drain race.
     this.changed(sessionId);
   }
 
@@ -300,7 +315,7 @@ export class SessionMessageQueue {
       const promoted = freeze({ ...current, state: "queued" as const, error: undefined });
       session.items.splice(index, 1);
       session.items.unshift(promoted);
-      void this.drain(sessionId);
+      if (!session.compactionActive) void this.drain(sessionId);
       return snapshot(session.items[0]);
     }
     session.dispatching = true;
@@ -316,14 +331,16 @@ export class SessionMessageQueue {
       return snapshot(sending);
     } catch (error) {
       if (session.deliveryEpoch !== deliveryEpoch) return snapshot(sending);
-      const failed = freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
-      if (session.items[index]?.id === id) session.items[index] = failed;
+      const kept = isCompactionInProgressError(error)
+        ? freeze({ ...sending, state: "queued" as const, error: undefined })
+        : freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
+      if (session.items[index]?.id === id) session.items[index] = kept;
       this.changed(sessionId);
-      return snapshot(failed);
+      return snapshot(kept);
     } finally {
       if (session.deliveryEpoch === deliveryEpoch) {
         session.dispatching = false;
-        if (!session.turnActive) void this.drain(sessionId);
+        if (!session.turnActive && !session.compactionActive) void this.drain(sessionId);
       }
     }
   }
@@ -348,6 +365,10 @@ export class SessionMessageQueue {
       const promoted = freeze({ ...current, state: "queued" as const, error: undefined });
       session.items.splice(index, 1);
       session.items.unshift(promoted);
+      if (session.compactionActive) {
+        this.changed(sessionId);
+        return snapshot(session.items[0]);
+      }
       const delivery = this.send(sessionId, promoted, this.drainBehavior);
       session.dispatchPromise = delivery.then(() => undefined);
       await delivery;
@@ -373,7 +394,7 @@ export class SessionMessageQueue {
     session.items.splice(index, 1);
     session.items.unshift(retried);
     this.changed(sessionId);
-    if (!session.turnActive && !session.dispatching) void this.drain(sessionId);
+    if (!this.blocked(session)) void this.drain(sessionId);
     return snapshot(retried);
   }
 
@@ -384,6 +405,32 @@ export class SessionMessageQueue {
     session.turnEpoch += 1;
     session.suppressDrainEpoch = undefined;
     return session.turnEpoch;
+  }
+
+  /**
+   * Compaction started. Synchronous on purpose: an async hold (e.g. after
+   * `loadQueue`) lets `enqueue`/`notifyIdle` dispatch into pi's compact window.
+   */
+  markCompacting(sessionId: string): void {
+    this.state(sessionId).compactionActive = true;
+  }
+
+  /** Compaction finished. Releases the drain gate and delivers the next queued item. */
+  clearCompacting(sessionId: string): void {
+    const session = this.state(sessionId);
+    session.compactionActive = false;
+    if (session.turnActive || session.dispatching) return;
+    // User Stop owns this epoch: a late compaction_end / writer-exit must not FIFO-drain.
+    if (session.suppressDrainEpoch !== undefined && session.suppressDrainEpoch === session.turnEpoch) return;
+    if (session.pendingCutIn) {
+      void this.dispatchPendingCutIn(sessionId);
+      return;
+    }
+    void this.drain(sessionId);
+  }
+
+  isCompacting(sessionId: string): boolean {
+    return this.sessions.get(sessionId)?.compactionActive === true;
   }
 
   /**
@@ -407,6 +454,7 @@ export class SessionMessageQueue {
     } else {
       session.turnActive = false;
     }
+    if (session.compactionActive) return;
     if (session.pendingCutIn) {
       await this.dispatchPendingCutIn(sessionId);
       return;
@@ -420,7 +468,7 @@ export class SessionMessageQueue {
   private async dispatchPendingCutIn(sessionId: string): Promise<void> {
     const session = this.state(sessionId);
     const item = session.pendingCutIn;
-    if (!item || session.dispatching || session.turnActive) return;
+    if (!item || session.dispatching || session.turnActive || session.compactionActive) return;
     session.pendingCutIn = undefined;
     session.items.unshift(freeze({ ...item, state: "queued" as const, error: undefined }));
     const delivery = this.send(sessionId, session.items[0], this.drainBehavior);
@@ -438,7 +486,7 @@ export class SessionMessageQueue {
    */
   async drain(sessionId: string): Promise<void> {
     const session = this.state(sessionId);
-    if (session.dispatching || session.turnActive) return;
+    if (session.dispatching || session.turnActive || session.compactionActive) return;
     const index = session.items.findIndex((item) => item.state === "queued");
     if (index < 0) return;
     const deliveryEpoch = session.deliveryEpoch;
@@ -482,7 +530,13 @@ export class SessionMessageQueue {
       return true;
     } catch (error) {
       if (session.deliveryEpoch !== deliveryEpoch) return false;
-      if (index >= 0 && session.items[index]?.id === item.id) session.items[index] = freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
+      if (index >= 0 && session.items[index]?.id === item.id) {
+        // Pi rejects prompts mid-compaction. Keep the item queued and let
+        // `clearCompacting` / a later idle drain retry — never a send failure.
+        session.items[index] = isCompactionInProgressError(error)
+          ? freeze({ ...sending, state: "queued" as const, error: undefined })
+          : freeze({ ...sending, state: "failed" as const, error: errorMessage(error) });
+      }
       this.changed(sessionId);
       return false;
     } finally {

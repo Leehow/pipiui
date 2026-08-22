@@ -16,6 +16,10 @@ import { registerSettingsSection, registerStatusBarItem } from './ui-registries'
 const loaded = new Map<string, Disposer[]>()
 const controlledLoaded = new Set<string>()
 
+/** Extension ids whose declarative settings sections stay as top-level settings tabs.
+ *  Everything else nests inside the「扩展」tab (ExtensionsPane inline schema forms). */
+const TOP_LEVEL_SETTINGS_SECTION_EXTENSION_IDS = new Set(['grok-build-oauth'])
+
 function unloadDeclarative(extId: string): void {
   const disposers = loaded.get(extId)
   controlledLoaded.delete(extId)
@@ -55,6 +59,9 @@ function loadDeclarative(descriptor: ExtensionDescriptor): void {
   )
   for (const section of settingsSections) {
     if (!section.id || settingsSectionHasEntry(section)) continue
+    // Extension-declared schema sections nest under the「扩展」tab instead of the
+    // top-level settings dialog; only allowlisted core tabs keep top-level registration.
+    if (!TOP_LEVEL_SETTINGS_SECTION_EXTENSION_IDS.has(descriptor.id)) continue
     const title = section.title ?? section.id
     disposers.push(registerSettingsSection(descriptor.id, {
       id: section.id,

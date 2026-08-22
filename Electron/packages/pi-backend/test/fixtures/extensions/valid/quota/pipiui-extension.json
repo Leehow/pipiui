@@ -2,6 +2,7 @@
   "id": "quota",
   "name": "Quota Monitor",
   "version": "1.0.0",
+  "description": "用量监控示例包",
   "agent": {
     "extension": "agent/dist/index.js"
   },

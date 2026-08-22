@@ -38,7 +38,7 @@ afterEach(() => {
 })
 
 describe('syncDeclarativeContributions', () => {
-  it('registers slash, settings, and statusBar from an enabled descriptor', () => {
+  it('registers slash and statusBar from an enabled descriptor; schema settings stay nested under the Extensions tab', () => {
     const slashBefore = listSlashCommands().map(command => command.name)
     const settingsBefore = listSettingsSections().map(section => section.id)
     const statusBefore = listStatusBarItems().map(item => item.id)
@@ -47,9 +47,25 @@ describe('syncDeclarativeContributions', () => {
     syncDeclarativeContributions([quotaDescriptor('enabled')])
 
     expect(listSlashCommands().map(command => command.name)).toEqual([...slashBefore, 'quota'])
-    expect(listSettingsSections().map(section => section.id)).toEqual([...settingsBefore, 'quota'])
+    expect(listSettingsSections().map(section => section.id)).toEqual(settingsBefore)
     expect(listStatusBarItems().map(item => item.id)).toEqual([...statusBefore, 'quota-bar'])
     expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)
+  })
+
+  it('keeps allowlisted grok-build-oauth settings sections as a top-level tab', () => {
+    const settingsBefore = listSettingsSections().map(section => section.id)
+
+    syncDeclarativeContributions([{
+      ...quotaDescriptor('enabled'),
+      id: 'grok-build-oauth',
+      name: 'Grok Build',
+      contributions: {
+        ...quotaDescriptor('enabled').contributions,
+        settingsSections: [{ id: 'grok-build-oauth', title: 'Grok Build' }],
+      },
+    }])
+
+    expect(listSettingsSections().map(section => section.id)).toEqual([...settingsBefore, 'grok-build-oauth'])
   })
 
   it('does not register panels that lack an entry (M3)', () => {

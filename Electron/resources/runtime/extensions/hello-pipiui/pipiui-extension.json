@@ -3,6 +3,7 @@
   "id": "hello-pipiui",
   "name": "hello-pipiui",
   "version": "0.1.0",
+  "description": "示例扩展：演示双半包的最小功能",
   
   
   "capabilities": [
@@ -32,9 +33,7 @@
     },
     "ui": {
       
-      "panels": [
-        { "slot": "toolPanel", "id": "hello-pipiui", "title": "hello-pipiui", "entry": "app/dist/panel.js" }
-      ],
+      "panels": [],
       "toolRenderers": [
         { "tool": "hello-pipiui", "entry": "app/dist/hello-card.js" }
       ],

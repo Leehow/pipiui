@@ -49,6 +49,7 @@ describe('fix1: queue busy local echo + dedup', () => {
     }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -72,7 +73,7 @@ describe('fix1: queue busy local echo + dedup', () => {
 })
 
 describe('fix2: turnClosed late events not dropped', () => {
-  it('late text/tool after settled still appears and triggers immediate history refresh', async () => {
+  it('late text/tool after settled still appears without rereading history per delta', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     let historyCalls = 0
     const base = createMockHost()
@@ -86,6 +87,7 @@ describe('fix2: turnClosed late events not dropped', () => {
     }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -94,18 +96,51 @@ describe('fix2: turnClosed late events not dropped', () => {
     expect(screen.getByText('early')).toBeTruthy()
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
     await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    // Terminal reconcile fires immediately and again at 250ms. Drain that
+    // before measuring, so leftover trailing loads are not blamed on late live.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 300)) })
     historyCalls = 0
 
-    // Late delta after turnClosed should still apply immediately, not wait for 250ms
+    // Late delta after turnClosed should still apply immediately, not wait for history.
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: ' late-needs-show' }) })
-    // Should be visible immediately
     expect(screen.getByText(/late-needs-show/)).toBeTruthy()
-    // And history refresh should have been triggered immediately (count increased)
-    await waitFor(() => expect(historyCalls).toBeGreaterThan(0))
 
-    // Late tool_call also not dropped
-    act(() => { listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'late-tool', name: 'read', delta: '{"path":"a"}' }) })
+    // A thinking burst after a false settle must not stack full JSONL reloads.
+    act(() => {
+      for (let i = 0; i < 20; i++) {
+        listener?.({ type: 'thinking', sessionId: 'layout', contentIndex: 0, delta: `think-${i}` })
+      }
+      listener?.({ type: 'tool_call', sessionId: 'layout', toolCallId: 'late-tool', name: 'read', delta: '{"path":"a"}' })
+    })
     expect(document.body.textContent).toContain('read')
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    expect(historyCalls).toBe(0)
+  })
+
+  it('settled turn rereads history once, not immediate plus trailing', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    let historyCalls = 0
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async (sid, before, limit) => {
+        historyCalls++
+        return base.getSessionHistory(sid, before, limit)
+      },
+      subscribeStream: (_sid, cb) => { listener = cb; return () => { listener = undefined } },
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    historyCalls = 0
+
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'done' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)) })
+    expect(historyCalls).toBe(1)
   })
 })
 
