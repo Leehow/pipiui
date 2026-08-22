@@ -48,7 +48,7 @@ export interface ThinkingPruneResult<T> {
 	prunedThinkingBlocks: number;
 }
 
-const DEFAULT_KEEP_USER_TURNS = 20;
+const DEFAULT_KEEP_USER_TURNS = 0;
 const COMPLETE_STOP_REASONS = new Set(["stop", "toolUse"]);
 const RESPONSES_APIS = new Set(["openai-responses", "azure-openai-responses", "openai-codex-responses"]);
 
@@ -115,9 +115,9 @@ function fingerprint(islands: Array<{ index: number; message: ThinkingPruneMessa
 /**
  * Remove only source-backed historical reasoning from the model-visible copy.
  *
- * `keepUserTurns` counts user messages, not provider responses: with 21 user turns and the
- * default of 20, only turn 1 is eligible. The newest user turn is always protected even when the
- * configured keep window is zero, so the current tool island cannot be split.
+ * `keepUserTurns` counts user messages, not provider responses. The default zero makes every
+ * completed prior turn eligible, while the newest user turn is always protected because it has
+ * no later user message. That keeps the current tool island intact.
  */
 export function pruneHistoricalThinking<T extends ThinkingPruneMessage>(
 	messages: T[],

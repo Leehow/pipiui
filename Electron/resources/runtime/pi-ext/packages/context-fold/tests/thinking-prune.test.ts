@@ -61,8 +61,8 @@ afterEach(() => {
 });
 
 describe("thinking prune configuration", () => {
-	it("is enabled by default with an exact 20-user-turn keep window", () => {
-		expect(thinkingPruneConfigFromEnv()).toEqual({ enabled: true, keepUserTurns: 20 });
+	it("is enabled by default with no completed-prior-turn keep window", () => {
+		expect(thinkingPruneConfigFromEnv()).toEqual({ enabled: true, keepUserTurns: 0 });
 	});
 
 	it.each(["0", "off", "false"])("accepts %s as the local kill switch", (value) => {
@@ -74,12 +74,12 @@ describe("thinking prune configuration", () => {
 		process.env.CONTEXTFOLD_THINKING_KEEP_TURNS = "7";
 		expect(thinkingPruneConfigFromEnv().keepUserTurns).toBe(7);
 		process.env.CONTEXTFOLD_THINKING_KEEP_TURNS = "7turns";
-		expect(thinkingPruneConfigFromEnv().keepUserTurns).toBe(20);
+		expect(thinkingPruneConfigFromEnv().keepUserTurns).toBe(0);
 	});
 });
 
 describe("pure historical-thinking transform", () => {
-	it("prunes exactly the first of 21 user turns at the default boundary", () => {
+	it("prunes exactly the first of 21 user turns with an explicit 20-turn keep window", () => {
 		const messages = conversation(21, (turn) => assistant(turn, [thinking(`thought-${turn}`), text(`answer-${turn}`)]));
 		const result = pruneHistoricalThinking(messages, target("generic", "custom-chat", "m1"), {
 			enabled: true,
@@ -91,6 +91,19 @@ describe("pure historical-thinking transform", () => {
 		expect(JSON.stringify(result.messages.at(-1))).toContain("thought-21");
 		expect(result.messages[3]).toBe(messages[3]);
 		expect(result.messages.at(-1)).toBe(messages.at(-1));
+	});
+
+	it("makes every completed prior turn eligible by default while protecting the newest turn", () => {
+		const messages = conversation(4, (turn) => assistant(turn, [thinking(`thought-${turn}`), text(`answer-${turn}`)]));
+		const result = pruneHistoricalThinking(
+			messages,
+			target("generic", "custom-chat", "m1"),
+			thinkingPruneConfigFromEnv(),
+		);
+
+		for (const index of [1, 3, 5]) expect(JSON.stringify(result.messages[index])).not.toContain("thought-");
+		expect(JSON.stringify(result.messages[7])).toContain("thought-4");
+		expect(result.messages[7]).toBe(messages[7]);
 	});
 
 	it("uses the override boundary while always protecting the current user turn", () => {
