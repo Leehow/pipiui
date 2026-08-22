@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "strict": true,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["node"],
+    "baseUrl": ".",
+    // Pi injects these as bundled virtual modules at runtime, so they are peer dependencies and
+    // are never shipped in this package. Point the type resolver at the copies inside the locally
+    // installed Pi CLI; `npm install` puts one there.
+    "paths": {
+      "@earendil-works/pi-coding-agent": ["./node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/index.d.ts"],
+      "typebox": ["./node_modules/@earendil-works/pi-coding-agent/node_modules/typebox/build/index.d.mts"]
+    }
+  },
+  "include": ["index.ts", "src", "tests", "vitest.config.ts"]
+}
