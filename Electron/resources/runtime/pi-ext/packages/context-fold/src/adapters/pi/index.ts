@@ -28,6 +28,7 @@ import { recordSpoolEntry, recordLayer, recordUnfold, restoreFoldState, revalida
 import { spoolRetainMsFromEnv, sweepSpools, sweepWorkspaceSpools, touchHeartbeat } from "./retention";
 import { CacheTelemetry, k } from "./cache-telemetry";
 import { advise } from "./advisor";
+import { pruneHistoricalThinking, thinkingPruneConfigFromEnv } from "./thinking-prune";
 
 import { adapterConfigFromEnv, configFromEnv } from "./config";
 export { adapterConfigFromEnv, configFromEnv };
@@ -42,6 +43,7 @@ export default function contextFold(pi: ExtensionAPI): void {
 	}
 	const acfg = adapterConfigFromEnv();
 	const foldCfg = configFromEnv();
+	const thinkingCfg = thinkingPruneConfigFromEnv();
 	const ladderPolicy = new FoldLadderPolicy(acfg.ladder);
 
 	// Exact originals for ladder folds, shared by fold-index emission and recall.
@@ -68,6 +70,21 @@ export default function contextFold(pi: ExtensionAPI): void {
 	let lastContextWindow: number | null = null;
 	let wasCold = false;
 	let warnedWireDeferral = false;
+	// A strict signed/tool-coupled reasoning island cannot be surgically edited. Remember its
+	// stable outbound fingerprint and ask Pi to compact the whole old region exactly once after
+	// the run settles. The completed fingerprint is retained until that island disappears, which
+	// prevents a post-compaction context refresh from immediately starting a loop.
+	let thinkingSessionId = "";
+	let pendingThinkingCompaction: string | null = null;
+	let completedThinkingCompaction: string | null = null;
+	let thinkingCompactionInFlight = false;
+	const resetThinkingCompactionForSession = (sessionId: string) => {
+		if (thinkingSessionId === sessionId) return;
+		thinkingSessionId = sessionId;
+		pendingThinkingCompaction = null;
+		completedThinkingCompaction = null;
+		thinkingCompactionInFlight = false;
+	};
 	// True when Pi couldn't report a token count this turn (post-compaction window) and the ladder
 	// fell back to its chars÷4 liveTokens estimate — /context-fold marks its usage % with `~` there.
 	let ctxUsageIsEstimate = false;
@@ -157,6 +174,7 @@ export default function contextFold(pi: ExtensionAPI): void {
 	let restoredFor = "";
 	pi.on("session_start", (_event, ctx) => {
 		const sid = ctx.sessionManager.getSessionId();
+		resetThinkingCompactionForSession(sid);
 		if (restoredFor === sid) return;
 		const isSwitch = restoredFor !== "";
 		restoredFor = sid;
@@ -227,6 +245,14 @@ export default function contextFold(pi: ExtensionAPI): void {
 		}
 	});
 
+	// Observe completion only; never register a native-mode `session_before_compact` handler.
+	// Keeping the completed fingerprint suppresses a repeat if the same strict island remains in
+	// the first post-compaction view, while a later view without it clears the cooldown below.
+	pi.on("session_compact", () => {
+		pendingThinkingCompaction = null;
+		thinkingCompactionInFlight = false;
+	});
+
 	// OBSERVE-ONLY cache telemetry: every finalized assistant message carries real provider
 	// usage (cacheRead/cacheWrite). The per-turn hit ratio is the measured signal for whether
 	// folding kept the prefix warm — it collapses on the turn after a head-rewriting fold.
@@ -265,7 +291,7 @@ export default function contextFold(pi: ExtensionAPI): void {
 	// tool-call response while the agent is visibly still working. Coldness is a session-level
 	// recommendation: evaluate it only once Pi says retries, compaction and queued continuations
 	// have all settled. This also lets a transient cache miss recover later in the same agent run.
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (_event, ctx) => {
 		const t = telemetry.snapshot();
 		const adv = buildAdvisory();
 		if (adv.coldNow && !wasCold) {
@@ -279,6 +305,38 @@ export default function contextFold(pi: ExtensionAPI): void {
 		// extension itself rewrote the prefix. Treat it as an ignored sample, not a warm recovery:
 		// otherwise a genuinely cold streak would reset here and warn again on its next response.
 		if (!t.lastTurnAfterFold) wasCold = adv.coldNow;
+
+		const strictIsland = pendingThinkingCompaction;
+		if (
+			!thinkingCfg.enabled ||
+			!strictIsland ||
+			strictIsland === completedThinkingCompaction ||
+			thinkingCompactionInFlight ||
+			!ctx.isIdle() ||
+			ctx.hasPendingMessages()
+		) return;
+
+		// Mark before invoking the fire-and-forget API: synchronous callbacks and another settled
+		// notification must both observe the request as consumed.
+		pendingThinkingCompaction = null;
+		completedThinkingCompaction = strictIsland;
+		thinkingCompactionInFlight = true;
+		try {
+			ctx.compact({
+				onComplete: () => {
+					thinkingCompactionInFlight = false;
+				},
+				onError: (error) => {
+					thinkingCompactionInFlight = false;
+					process.stderr.write(`[context-fold] historical-thinking native compaction failed: ${error.message}\n`);
+				},
+			});
+		} catch (error) {
+			thinkingCompactionInFlight = false;
+			process.stderr.write(
+				`[context-fold] historical-thinking native compaction failed: ${error instanceof Error ? error.message : String(error)}\n`,
+			);
+		}
 	});
 
 	// The make-or-break hook: rewrite the outgoing context before each model call.
@@ -287,7 +345,9 @@ export default function contextFold(pi: ExtensionAPI): void {
 			// Liveness for the GC sweep: mark this session's spool as belonging to a running session,
 			// so a quiet-but-live session is not reaped by a sibling's session_start sweep. Throttled
 			// internally to once an hour and inert until this session has actually spooled something.
-			touchHeartbeat(join(ctx.sessionManager.getSessionDir(), "spool", ctx.sessionManager.getSessionId()));
+			const sessionId = ctx.sessionManager.getSessionId();
+			resetThinkingCompactionForSession(sessionId);
+			touchHeartbeat(join(ctx.sessionManager.getSessionDir(), "spool", sessionId));
 			lastContextWindow = ctx.getContextUsage()?.contextWindow ?? lastContextWindow;
 			// Ladder cold branch: no live cache read observed after a few turns ⇒ there is no warm
 			// prefix to protect, so the ladder folds earlier and more freely (measured, not assumed).
@@ -318,9 +378,22 @@ export default function contextFold(pi: ExtensionAPI): void {
 					return false;
 				}
 			};
+			const pruned = pruneHistoricalThinking(
+				event.messages as unknown as CoreAgentMessage[],
+				ctx.model ? { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id } : undefined,
+				thinkingCfg,
+			);
+			if (!pruned.compactionFingerprint) {
+				pendingThinkingCompaction = null;
+				completedThinkingCompaction = null;
+			} else if (pruned.compactionFingerprint === completedThinkingCompaction) {
+				pendingThinkingCompaction = null;
+			} else {
+				pendingThinkingCompaction = pruned.compactionFingerprint;
+			}
 			const usage = ctx.getContextUsage();
 			ctxUsageIsEstimate = usage?.tokens == null;
-			const messages = engine.process(event.messages as unknown as CoreAgentMessage[], {
+			const messages = engine.process(pruned.messages, {
 				contextWindow: usage?.contextWindow ?? null,
 				tokens: usage?.tokens ?? null,
 			});
