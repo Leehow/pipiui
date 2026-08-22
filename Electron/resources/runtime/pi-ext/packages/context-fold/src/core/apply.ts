@@ -11,19 +11,37 @@
  * caller's array is never mutated. Ported from Accordion `live/mapping.ts:applyPlan`/`foldOne`
  * (pinned commit 0c22434).
  */
+import { createHash } from "node:crypto";
 import type { AgentMessage, FoldOp } from "./block";
 import { blockId, isDurableId } from "./block";
+import { foldCode } from "./digest";
 
 /**
  * Apply one message's in-place FoldOps. Returns the same message by reference when nothing
  * folds; clones lazily otherwise. Kind-guarded so a mis-mapped id can never fold the wrong part:
- * tool_call and any other kind are never folded.
+ * only text-only tool results and allowlisted subagent arguments can change.
  */
 function foldOne(m: AgentMessage, i: number, byId: Map<string, FoldOp>, mark: () => void): AgentMessage {
-	// PipiUI folds tool observations only. Assistant text and provider-signed thinking/reasoning
-	// are immutable here: rewriting their bytes while retaining provider signatures is invalid,
-	// and stripping signatures would destroy replay semantics.
-	if (m.role === "assistant") return m;
+	// Assistant text and provider-signed thinking/reasoning are immutable. The sole assistant-side
+	// exception is an allowlisted subagent toolCall's arguments object; every sibling part and every
+	// signature-bearing field is retained byte-for-byte/by reference.
+	if (m.role === "assistant" && Array.isArray(m.content)) {
+		let changed = false;
+		const content = (m.content as any[]).map((part, partIndex) => {
+			if (part?.type !== "toolCall" || part.name !== "subagent") return part;
+			const id = blockId(m, i, partIndex);
+			const op = byId.get(id);
+			const receipt = op ? parseToolCallReceipt(op.digestText, id, part.arguments) : null;
+			if (!receipt) return part;
+			changed = true;
+			return { ...part, arguments: receipt };
+		});
+		if (changed) {
+			mark();
+			return { ...m, content: content as any };
+		}
+		return m;
+	}
 	if (m.role === "toolResult") {
 		const op = byId.get(blockId(m, i));
 		if (op && op.digestText) {
@@ -37,8 +55,31 @@ function foldOne(m: AgentMessage, i: number, byId: Map<string, FoldOp>, mark: ()
 
 /** The foldable positions' ids for one message — the exact set foldOne would look up. */
 function foldableIdsOf(m: AgentMessage, i: number): string[] {
+	if (m.role === "assistant" && Array.isArray(m.content)) {
+		return (m.content as any[])
+			.map((part, partIndex) => (part?.type === "toolCall" && part.name === "subagent" ? blockId(m, i, partIndex) : null))
+			.filter((id): id is string => id !== null);
+	}
 	if (m.role === "toolResult") return [blockId(m, i)];
 	return [];
+}
+
+function parseToolCallReceipt(text: string, id: string, originalArgs: unknown): Record<string, unknown> | null {
+	try {
+		const value = JSON.parse(text) as Record<string, unknown>;
+		const original = JSON.stringify(originalArgs ?? {});
+		if (
+			value?._contextFold !== "historical subagent arguments folded" ||
+			value.code !== foldCode(id) ||
+			typeof value.hash !== "string" ||
+			value.hash !== createHash("sha256").update(original, "utf8").digest("hex") ||
+			value.originalChars !== original.length ||
+			typeof value.preview !== "string"
+		) return null;
+		return value;
+	} catch {
+		return null;
+	}
 }
 
 /**

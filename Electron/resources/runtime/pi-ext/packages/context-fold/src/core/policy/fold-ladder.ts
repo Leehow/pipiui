@@ -16,11 +16,12 @@
  *     fold must buy at least one ladder step, so a fresh fold can't re-fire on the next turn.
  * Crossing the budget cap (PipiUI defaults to min(150k, fraction × window)) is an emergency event with no minimum.
  *
- * What masks in the PipiUI build: stale tool_result blocks outside the protected tail — never
- * user intent, assistant conclusions, provider-signed thinking, or tool_call records.
- * Each masked block folds to its deterministic per-kind digest — a `{#code FOLDED}` pointer that
- * keeps risk/error lines verbatim and stays reversible via recall/unfold. Stateless across turns
- * (a pure function of the view), so resume needs no ladder state.
+ * What masks in the PipiUI build: stale tool_result blocks outside the protected tail, plus only
+ * the arguments object of an old matched successful `subagent` call at the count boundary — never
+ * user intent, assistant conclusions, provider-signed thinking, or any other tool-call field.
+ * Each masked block folds to its deterministic per-kind receipt and stays reversible via
+ * recall/unfold. Stateless across turns (a pure function of the view), so resume needs no ladder
+ * state.
  */
 import type { FoldCommand, FoldPolicy, PolicyHost, PolicyView, ViewBlock } from "../contract";
 import { isDurableId } from "../block";
@@ -32,11 +33,24 @@ export interface LadderConfig {
 	foldStep: number;
 	/** First-fold threshold when the session has never observed a live cache read. */
 	coldFoldAt: number;
+	/** Fire a discrete fold event once this many completed eligible tool uses are live. */
+	toolUseTrigger: number;
+	/** Preserve the newest completed tool-use/result pairs at a count-triggered event. */
+	toolUseKeep: number;
+	/** Minimum estimated token savings for a count-triggered event. */
+	toolUseMinSavings: number;
 }
 
-export const LADDER_DEFAULTS: LadderConfig = { foldAt: 0.45, foldStep: 0.12, coldFoldAt: 0.25 };
+export const LADDER_DEFAULTS: LadderConfig = {
+	foldAt: 0.45,
+	foldStep: 0.12,
+	coldFoldAt: 0.25,
+	toolUseTrigger: 40,
+	toolUseKeep: 12,
+	toolUseMinSavings: 10_000,
+};
 
-/** PipiUI masks tool observations only; signed assistant reasoning is immutable. */
+/** Ordinary ladder sweeps mask tool observations only; signed assistant reasoning is immutable. */
 const MASKABLE_KINDS = new Set<ViewBlock["kind"]>(["tool_result"]);
 
 export class FoldLadderPolicy implements FoldPolicy {
@@ -63,6 +77,54 @@ export class FoldLadderPolicy implements FoldPolicy {
 		const used = view.reportedTokens ?? view.liveTokens;
 		const fraction = cw > 0 ? used / cw : 0;
 		const foldAt = this.cold ? Math.min(this.cfg.coldFoldAt, this.cfg.foldAt) : this.cfg.foldAt;
+
+		const superseded = this.supersededStatusCandidates(view);
+		const countTriggered = this.countTriggeredCandidates(view);
+		if (countTriggered.length > 0) {
+			const candidates = uniqueBlocks([...countTriggered, ...superseded]);
+			const savings = savedTokens(candidates);
+			this.host?.setStatus(
+				`fold event (tool-use-count): masking ${candidates.length} block${candidates.length === 1 ? "" : "s"}, ~${k(savings)} tok`,
+				{
+					fold_event: true,
+					trigger: "tool-use-count",
+					folds: candidates.length,
+					tokens_saved: savings,
+					live_tokens: view.liveTokens - savings,
+					budget: view.budget,
+					cap: view.budget,
+					usage_fraction: round3(fraction),
+					fold_at: round3(foldAt),
+					maskable_tokens: 0,
+					step_tokens: 0,
+					irreducible_floor: irreducibleFloor(view.blocks),
+					over_budget: false,
+				},
+			);
+			return [{ kind: "fold", ids: candidates.map((b) => b.id) }];
+		}
+		if (superseded.length > 0) {
+			const savings = savedTokens(superseded);
+			this.host?.setStatus(
+				`fold event (superseded): masking ${superseded.length} stale status block${superseded.length === 1 ? "" : "s"}, ~${k(savings)} tok`,
+				{
+					fold_event: true,
+					trigger: "superseded",
+					folds: superseded.length,
+					tokens_saved: savings,
+					live_tokens: view.liveTokens - savings,
+					budget: view.budget,
+					cap: view.budget,
+					usage_fraction: round3(fraction),
+					fold_at: round3(foldAt),
+					maskable_tokens: 0,
+					step_tokens: 0,
+					irreducible_floor: irreducibleFloor(view.blocks),
+					over_budget: false,
+				},
+			);
+			return [{ kind: "fold", ids: superseded.map((b) => b.id) }];
+		}
 
 		const eligible = view.blocks.filter(maskable);
 		let savings = 0;
@@ -110,6 +172,63 @@ export class FoldLadderPolicy implements FoldPolicy {
 		return [{ kind: "fold", ids: eligible.map((b) => b.id) }];
 	}
 
+	/** Oldest completed successful result blocks, excluding the newest configured pair count. */
+	private countTriggeredCandidates(view: PolicyView): ViewBlock[] {
+		const calls = new Map<string, ViewBlock>();
+		for (const block of view.blocks) {
+			if (block.kind === "tool_call" && block.callId && isDurableId(block.id) && !block.held && !block.frozen) {
+				calls.set(block.callId, block);
+			}
+		}
+		const completed = view.blocks
+			.filter(
+				(block) =>
+				block.kind === "tool_result" &&
+				!!block.callId &&
+				calls.has(block.callId) &&
+				isDurableId(block.id) &&
+				!block.isError &&
+				!block.held &&
+				!block.frozen &&
+				block.foldedTokens < block.tokens,
+			)
+			.map((result) => ({ result, call: calls.get(result.callId!)! }));
+		if (completed.length < this.cfg.toolUseTrigger) return [];
+		const keepFrom = Math.max(0, completed.length - this.cfg.toolUseKeep);
+		const candidates: ViewBlock[] = [];
+		for (const { call, result } of completed.slice(0, keepFrom)) {
+			if (maskable(result)) candidates.push(result);
+			if (argumentMaskable(call, result)) candidates.push(call);
+		}
+		return savedTokens(candidates) >= this.cfg.toolUseMinSavings ? candidates : [];
+	}
+
+	/** Older successful status snapshots for the exact same structured agentId + runId. */
+	private supersededStatusCandidates(view: PolicyView): ViewBlock[] {
+		const calls = new Map<string, ViewBlock>();
+		for (const block of view.blocks) {
+			if (block.kind === "tool_call" && block.callId && block.toolName === "subagent_status") calls.set(block.callId, block);
+		}
+		const seen = new Set<string>();
+		const candidates: ViewBlock[] = [];
+		for (let i = view.blocks.length - 1; i >= 0; i--) {
+			const result = view.blocks[i];
+			if (result.kind !== "tool_result" || !result.callId || result.isError || result.held || result.frozen) continue;
+			const call = calls.get(result.callId);
+			if (!call || call.held || call.frozen) continue;
+			const agentId = call.toolArgs?.agentId;
+			const runId = call.toolArgs?.runId;
+			if (typeof agentId !== "string" || !agentId || typeof runId !== "string" || !runId) continue;
+			const key = `${agentId}\u0000${runId}`;
+			if (!seen.has(key)) {
+				seen.add(key);
+				continue;
+			}
+			if (maskable(result)) candidates.push(result);
+		}
+		return candidates.reverse();
+	}
+
 	private publishIdle(view: PolicyView, fraction: number, foldAt: number, savings: number, stepTokens: number): void {
 		// Between events the ladder is quiet; publish the position so the status command can show
 		// "next fold at N %" without the engine re-deriving policy internals.
@@ -146,6 +265,17 @@ export class FoldLadderPolicy implements FoldPolicy {
 	}
 }
 
+function savedTokens(blocks: ViewBlock[]): number {
+	let savings = 0;
+	for (const block of blocks) savings += block.tokens - block.foldedTokens;
+	return savings;
+}
+
+function uniqueBlocks(blocks: ViewBlock[]): ViewBlock[] {
+	const seen = new Set<string>();
+	return blocks.filter((block) => (seen.has(block.id) ? false : (seen.add(block.id), true)));
+}
+
 function maskable(b: ViewBlock): boolean {
 	return (
 		MASKABLE_KINDS.has(b.kind) &&
@@ -154,6 +284,22 @@ function maskable(b: ViewBlock): boolean {
 		!b.held &&
 		!b.frozen &&
 		b.foldedTokens < b.tokens
+	);
+}
+
+function argumentMaskable(call: ViewBlock, result: ViewBlock): boolean {
+	return (
+		call.kind === "tool_call" &&
+		call.toolName === "subagent" &&
+		isDurableId(call.id) &&
+		!call.protected &&
+		!call.held &&
+		!call.frozen &&
+		!result.protected &&
+		!result.held &&
+		!result.frozen &&
+		!result.isError &&
+		call.foldedTokens < call.tokens
 	);
 }
 

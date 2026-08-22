@@ -42,6 +42,8 @@ export interface DigestBlock {
 	id: string;
 	kind: BlockKind;
 	text: string;
+	/** Exact payload persisted for recall when it differs from the display/index text. */
+	spoolText?: string;
 	tokens: number;
 	toolName?: string;
 	isError?: boolean;
@@ -56,8 +58,11 @@ export interface WireBlock {
 	turn: number;
 	order: number;
 	text: string;
+	/** Exact payload persisted for recall when it differs from the display/index text. */
+	spoolText?: string;
 	tokens: number;
 	toolName?: string;
+	toolArgs?: Record<string, unknown>;
 	callId?: string;
 	model?: string;
 	isError?: boolean;
@@ -169,7 +174,7 @@ export function linearize(messages: AgentMessage[]): WireBlock[] {
 		id: string,
 		kind: WireBlock["kind"],
 		text: string,
-		extra: Partial<Pick<WireBlock, "toolName" | "callId" | "model" | "isError" | "opaque">> = {},
+		extra: Partial<Pick<WireBlock, "spoolText" | "toolName" | "toolArgs" | "callId" | "model" | "isError" | "opaque">> = {},
 	) => {
 		if (!text && kind !== "tool_result") return; // drop empty non-results
 		out.push({ id, kind, turn, order: order++, text, tokens: tokensFor(text), ...extra });
@@ -190,7 +195,9 @@ export function linearize(messages: AgentMessage[]): WireBlock[] {
 					else if (b?.type === "toolCall") {
 						const c = b as ToolCallPart;
 						push(blockId(m, i, j), "tool_call", `${c.name} ${JSON.stringify(c.arguments ?? {})}`, {
+							spoolText: JSON.stringify(c.arguments ?? {}),
 							toolName: c.name,
+							toolArgs: c.arguments ?? {},
 							callId: c.id,
 							model: m.model,
 						});

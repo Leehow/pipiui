@@ -337,6 +337,9 @@ describe(".env injection into the pi spawn env (T17 parity)", () => {
       CONTEXTFOLD_TAIL: "30000",
       CONTEXTFOLD_COMPACT: "native",
       CONTEXTFOLD_SPOOL_RETAIN_DAYS: "30",
+      CONTEXTFOLD_TOOL_USE_TRIGGER: "40",
+      CONTEXTFOLD_TOOL_USE_KEEP: "12",
+      CONTEXTFOLD_TOOL_USE_MIN_SAVINGS: "10000",
     });
   });
 
@@ -351,6 +354,15 @@ describe(".env injection into the pi spawn env (T17 parity)", () => {
     );
     expect(project.CONTEXTFOLD_TAIL).toBe("22000");
     expect(project.CONTEXTFOLD_COMPACT).toBe("det");
+
+    const triggerOverride = mergedSpawnEnvironment(
+      { CONTEXTFOLD_TOOL_USE_TRIGGER: "44" },
+      { CONTEXTFOLD_TOOL_USE_TRIGGER: "48", CONTEXTFOLD_TOOL_USE_KEEP: "10" },
+      { CONTEXTFOLD_TOOL_USE_MIN_SAVINGS: "12000" },
+    );
+    expect(triggerOverride.CONTEXTFOLD_TOOL_USE_TRIGGER).toBe("48");
+    expect(triggerOverride.CONTEXTFOLD_TOOL_USE_KEEP).toBe("10");
+    expect(triggerOverride.CONTEXTFOLD_TOOL_USE_MIN_SAVINGS).toBe("12000");
 
     const internal = mergedSpawnEnvironment(
       {},

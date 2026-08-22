@@ -57,7 +57,7 @@ export interface FoldEventReport {
 	/** The committed layer's seq. */
 	seq: number;
 	/** Why the policy folded. */
-	trigger: "threshold" | "cap";
+	trigger: "threshold" | "cap" | "tool-use-count" | "superseded";
 	/** Ids masked by THIS event. */
 	maskedIds: string[];
 	/** Every block in this turn's view, full content — the extractor's span input. */
@@ -313,7 +313,9 @@ export class ContextFoldEngine {
 		if (entries.length === 0) return [];
 
 		const seq = this.lastLayerSeq + 1;
-		const trigger = this.lastStatus?.metrics?.trigger === "cap" ? "cap" : "threshold";
+		const rawTrigger = this.lastStatus?.metrics?.trigger;
+		const trigger: FoldEventReport["trigger"] =
+			rawTrigger === "cap" || rawTrigger === "tool-use-count" || rawTrigger === "superseded" ? rawTrigger : "threshold";
 		const event = { seq, trigger, maskedIds: entries.map((e) => e.id), blocks, usage } satisfies FoldEventReport;
 		const res = this.onFoldEvent?.(event);
 		if (res === false) return [];
@@ -618,6 +620,7 @@ export class ContextFoldEngine {
 				tokens: b.tokens,
 				foldedTokens,
 				toolName: b.toolName,
+				toolArgs: b.toolArgs,
 				callId: b.callId,
 				isError: b.isError,
 				held: this.unfolded.has(b.id) || firstDelivery.has(b.id) || this.spoolRejected.has(b.id),
@@ -663,13 +666,15 @@ export class ContextFoldEngine {
 	 */
 	private lower(commands: FoldCommand[], blocks: WireBlock[], protectFrom: number, firstDelivery: ReadonlySet<string>): FoldOp[] {
 		const byId = new Map(blocks.map((b) => [b.id, b] as const));
+		const resultsByCallId = new Map<string, WireBlock>();
+		for (const block of blocks) if (block.kind === "tool_result" && block.callId) resultsByCallId.set(block.callId, block);
 		const protectedAt = (id: string): boolean => {
 			const b = byId.get(id);
 			return b !== undefined && b.order >= protectFrom;
 		};
 		const canFold = (id: string): boolean => {
 			const b = byId.get(id);
-			return (
+			const baseSafe =
 				!!b &&
 				isDurableId(id) &&
 				wireFoldable(b) &&
@@ -677,7 +682,21 @@ export class ContextFoldEngine {
 				!protectedAt(id) &&
 				!this.unfolded.has(id) &&
 				!this.spoolRejected.has(id) &&
-				!this.frozenById.has(id)
+				!this.frozenById.has(id);
+			if (!baseSafe || !b) return false;
+			if (b.kind !== "tool_call") return true;
+			if (b.toolName !== "subagent" || !b.callId) return false;
+			const result = resultsByCallId.get(b.callId);
+			return (
+				!!result &&
+				isDurableId(result.id) &&
+				wireFoldable(result) &&
+				!result.isError &&
+				!firstDelivery.has(result.id) &&
+				!protectedAt(result.id) &&
+				!this.unfolded.has(result.id) &&
+				!this.spoolRejected.has(result.id) &&
+				!this.frozenById.has(result.id)
 			);
 		};
 

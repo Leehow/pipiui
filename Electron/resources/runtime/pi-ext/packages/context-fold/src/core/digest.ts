@@ -5,25 +5,26 @@
  * WHAT it did, a tool_result keeps only its shape and a taste of WHAT it saw. No LLM here —
  * these are structured digests so behaviour is reproducible and debuggable.
  *
- * Every digest carries a leading `{#<code> FOLDED}` tag. This is the engine's source-of-truth
- * string: it is the exact text the agent receives in place of the folded content. The agent
- * reads the short `code` from the tag and calls `unfold`/`recall_folded` with it to pull the block
- * back to full content. The code is a 6-char base36 FNV-1a hash of the block's durable id —
- * stateless and globally stable (same block → same code, every session).
+ * Text-result digests carry a leading `{#<code> FOLDED}` tag. A folded tool-call arguments object
+ * is instead a JSON receipt carrying the same short recall code. Both forms are the exact wire
+ * substitution. The code is a 6-char base36 FNV-1a hash of the block's durable id — stateless and
+ * globally stable (same block → same code, every session).
  *
  * Ported ~verbatim from Accordion `engine/digest.ts` (pinned commit 0c22434); only the type
  * imports were retargeted to this port's block model.
  */
+import { createHash } from "node:crypto";
 import type { BlockKind, DigestBlock } from "./block";
 import { estTokens, clip, firstLine, safeSlice, BLOCK_OVERHEAD } from "./tokens";
 import { categorize } from "./policy/ledger";
 
 /**
- * Kinds the wire can actually fold and send. A `tool_call` is never folded (it would orphan its
- * result) and a `user` block (intent) is never folded. ONLY these kinds get a `{#code FOLDED}`
- * tag — so the agent is never shown a handle for a block it can't actually unfold.
+ * Kinds the wire can actually fold and send. A user block (intent) is never folded. Tool calls
+ * remain structurally paired with their results; only the arguments of the fixed `subagent`
+ * allowlist are eligible. Tool results get a text tag, while tool-call receipts carry the code in
+ * their JSON object.
  */
-export const FOLDABLE_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["tool_result"]);
+export const FOLDABLE_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["tool_call", "tool_result"]);
 
 /**
  * The ONE foldability predicate, shared by the view and the wire: a block may be folded iff its
@@ -33,7 +34,8 @@ export const FOLDABLE_KINDS: ReadonlySet<BlockKind> = new Set<BlockKind>(["tool_
  * substitution would replace the whole content array and silently drop them from the view.
  */
 export function wireFoldable(b: DigestBlock): boolean {
-	return FOLDABLE_KINDS.has(b.kind) && !(b as { opaque?: boolean }).opaque;
+	if (b.kind === "tool_result") return !(b as { opaque?: boolean }).opaque;
+	return b.kind === "tool_call" && b.toolName === "subagent";
 }
 
 /** Short, stable handle for a block, derived purely from its durable id (FNV-1a → base36, 6 chars). */
@@ -61,15 +63,17 @@ export function foldTag(id: string): string {
 const digestCache = new WeakMap<DigestBlock, string>();
 
 /**
- * The full folded representation. Foldable kinds get the `{#<code> FOLDED}` tag followed by the
- * per-kind body; non-foldable kinds (user / tool_call) get the body alone — they are never sent
- * folded, so tagging them would show a handle the agent can never use.
+ * The full folded representation. Foldable text results get the `{#<code> FOLDED}` tag followed
+ * by the per-kind body. Tool-call receipts are parsed as JSON arguments and therefore carry the
+ * recall code inside the object rather than as a text prefix.
  */
 export function digest(b: DigestBlock): string {
 	const cached = digestCache.get(b);
 	if (cached !== undefined) return cached;
 	const body = digestBody(b);
-	const out = FOLDABLE_KINDS.has(b.kind) ? `${foldTag(b.id)} ${body}` : body;
+	// A folded tool call is not text: applyPlan parses this JSON back into the replacement
+	// arguments object. The receipt carries its own recall code instead of a leading text tag.
+	const out = b.kind === "tool_call" ? body : FOLDABLE_KINDS.has(b.kind) ? `${foldTag(b.id)} ${body}` : body;
 	digestCache.set(b, out);
 	return out;
 }
@@ -86,7 +90,7 @@ function digestBody(b: DigestBlock): string {
 			return `thought · ~${tok} tok${gist ? " · " + gist : ""}`;
 		}
 		case "tool_call":
-			return `${b.toolName ?? "tool"}(${clip(b.text.replace(/^\S+\s*/, ""), 70)})`;
+			return toolCallReceipt(b);
 		case "tool_result": {
 			const name = b.toolName ?? "result";
 			if (!b.text.trim()) return `${name} → ${b.isError ? "error" : "empty"}`;
@@ -103,6 +107,18 @@ function digestBody(b: DigestBlock): string {
 		default:
 			return clip(b.text, 80);
 	}
+}
+
+function toolCallReceipt(b: DigestBlock): string {
+	const args = (b as DigestBlock & { toolArgs?: Record<string, unknown>; spoolText?: string }).spoolText ??
+		JSON.stringify((b as DigestBlock & { toolArgs?: Record<string, unknown> }).toolArgs ?? {});
+	return JSON.stringify({
+		_contextFold: "historical subagent arguments folded",
+		code: foldCode(b.id),
+		hash: createHash("sha256").update(args, "utf8").digest("hex"),
+		originalChars: args.length,
+		preview: clip(args, 120),
+	});
 }
 
 /**

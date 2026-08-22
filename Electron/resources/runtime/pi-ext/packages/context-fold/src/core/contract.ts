@@ -33,6 +33,8 @@ export interface ViewBlock {
 	/** Token cost if folded — digest size for a foldable kind, full tokens for a non-foldable kind. */
 	foldedTokens: number;
 	toolName?: string;
+	/** Structured call arguments when this is a tool_call block. */
+	toolArgs?: Record<string, unknown>;
 	callId?: string;
 	isError?: boolean;
 	/** The agent unfolded this block; it is protected from re-folding for the rest of the session. */

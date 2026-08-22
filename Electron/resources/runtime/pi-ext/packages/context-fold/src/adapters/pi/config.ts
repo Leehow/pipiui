@@ -41,11 +41,22 @@ function fracEnv(name: string, fallback: number): number {
 	return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback;
 }
 
+function positiveIntEnv(name: string, fallback: number, allowZero = false): number {
+	const raw = process.env[name];
+	if (raw === undefined || !/^(?:0|[1-9]\d*)$/.test(raw)) return fallback;
+	const value = Number(raw);
+	if (!Number.isSafeInteger(value) || (allowZero ? value < 0 : value <= 0)) return fallback;
+	return value;
+}
+
 export function adapterConfigFromEnv(): AdapterConfig {
 	const ladder: LadderConfig = {
 		foldAt: fracEnv("CONTEXTFOLD_FOLD_AT", LADDER_DEFAULTS.foldAt),
 		foldStep: fracEnv("CONTEXTFOLD_FOLD_STEP", LADDER_DEFAULTS.foldStep),
 		coldFoldAt: fracEnv("CONTEXTFOLD_COLD_FOLD_AT", LADDER_DEFAULTS.coldFoldAt),
+		toolUseTrigger: positiveIntEnv("CONTEXTFOLD_TOOL_USE_TRIGGER", LADDER_DEFAULTS.toolUseTrigger),
+		toolUseKeep: positiveIntEnv("CONTEXTFOLD_TOOL_USE_KEEP", LADDER_DEFAULTS.toolUseKeep, true),
+		toolUseMinSavings: positiveIntEnv("CONTEXTFOLD_TOOL_USE_MIN_SAVINGS", LADDER_DEFAULTS.toolUseMinSavings),
 	};
 	const recon = Number(process.env.CONTEXTFOLD_RECON_TOKENS);
 	const reconTokens = Number.isFinite(recon) && recon > 0 ? Math.floor(recon) : ADAPTER_DEFAULTS.reconTokens;
