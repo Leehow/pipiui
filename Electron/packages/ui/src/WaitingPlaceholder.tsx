@@ -33,6 +33,10 @@ export const WAITING_COPY = {
 export const WAITING_CONNECTED_SECONDS = 1.5
 /** Elapsed seconds at which the awaiting copy switches to the neutral "模型仍在处理". */
 export const WAITING_LONG_SECONDS = 8
+/** Elapsed seconds before a silent continuing turn acknowledges no visible output. */
+export const WAITING_NO_VISIBLE_OUTPUT_SECONDS = 30
+/** Elapsed seconds before a silent continuing turn acknowledges a slow response. */
+export const WAITING_SLOW_RESPONSE_SECONDS = 120
 /** Duration of each alternating awaiting copy slot between 1.5s and 8s. */
 const WAITING_ROTATE_SLOT_SECONDS = 3
 
@@ -44,8 +48,18 @@ const WAITING_ROTATE_SLOT_SECONDS = 3
  * implies the model is stuck.
  */
 export function waitingCopy(phase: WaitingPhase, elapsedSeconds: number): string {
-  if (phase !== 'awaiting') return WAITING_COPY[phase]
   const t = Math.max(0, elapsedSeconds)
+  if (phase === 'continuing') {
+    if (t >= WAITING_SLOW_RESPONSE_SECONDS) return '模型响应较慢，仍在等待'
+    if (t >= WAITING_NO_VISIBLE_OUTPUT_SECONDS) return '模型仍在处理 · 暂无可见输出'
+    return WAITING_COPY.continuing
+  }
+  if (phase === 'followup') {
+    if (t >= WAITING_SLOW_RESPONSE_SECONDS) return '子任务结果处理较慢，仍在继续'
+    if (t >= WAITING_NO_VISIBLE_OUTPUT_SECONDS) return '仍在处理子任务结果 · 暂无可见输出'
+    return WAITING_COPY.followup
+  }
+  if (phase !== 'awaiting') return WAITING_COPY[phase]
   if (t < WAITING_CONNECTED_SECONDS) return WAITING_COPY.connecting
   if (t < WAITING_LONG_SECONDS) {
     const slot = Math.floor((t - WAITING_CONNECTED_SECONDS) / WAITING_ROTATE_SLOT_SECONDS) % 2

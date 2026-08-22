@@ -247,6 +247,18 @@ function latestWriteEditTokenLabel(agent: Agent): string | undefined {
   return undefined
 }
 
+function toolResultWasObserved(agent: Agent, toolName: string | undefined): boolean {
+  if (!toolName) return false
+  const toolIndex = agent.logs.findLastIndex(log => log.itemType === 'tool' && (log.name ?? '').trim() === toolName)
+  if (toolIndex < 0) return false
+  return agent.logs.slice(toolIndex + 1).some(log =>
+    log.itemType === 'toolResult' && (!(log.name ?? '').trim() || (log.name ?? '').trim() === toolName)
+  )
+}
+
+const QUIET_STATUS_SECONDS = 30
+const POSSIBLY_STUCK_SECONDS = 120
+
 function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveAgentStatus {
 	if (activeChildCount > 0) {
 		return { severity: 'active', text: `正在协调 · ${activeChildCount} 个子 agent 运行中` }
@@ -260,7 +272,9 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
   const phase = replanning
     ? '正在调查失败并重新规划'
     : toolLabel
-      ? `等待工具返回 · ${toolLabel}`
+      ? toolResultWasObserved(agent, liveName)
+        ? '工具结果已返回 · 等待模型响应'
+        : `最近活动 · ${toolLabel}`
       : '等待模型响应'
   const deadlineSeconds = agent.deadlineAt ? Math.max(0, Math.ceil((agent.deadlineAt - now) / 1000)) : undefined
   if (quietSeconds === undefined) {
@@ -269,9 +283,15 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
   if (deadlineSeconds === 0) {
     return { text: `正在自动中止 · ${phase} · ${quietSeconds} 秒无新进展`, severity: 'deadline' }
   }
-  if (quietSeconds >= 30) {
+  if (quietSeconds >= POSSIBLY_STUCK_SECONDS) {
     return {
       text: `可能卡住 · ${phase} · ${quietSeconds} 秒无新进展${deadlineSeconds === undefined ? '' : ` · ${deadlineSeconds} 秒后自动中止`}`,
+      severity: 'quiet'
+    }
+  }
+  if (quietSeconds >= QUIET_STATUS_SECONDS) {
+    return {
+      text: `暂无新状态 · ${phase} · ${quietSeconds} 秒无新进展${deadlineSeconds === undefined ? '' : ` · ${deadlineSeconds} 秒后自动中止`}`,
       severity: 'quiet'
     }
   }

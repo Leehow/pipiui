@@ -31,7 +31,7 @@ describe('waitingCopy', () => {
     expect(waitingCopy('awaiting', -5)).toBe('正在连接模型')
   })
 
-  it('returns static copy for non-awaiting phases regardless of elapsed', () => {
+  it('keeps activity phases static while making continuing and followup waits honest over time', () => {
     expect(waitingCopy('thinking', 0)).toBe('模型正在思考…')
     expect(waitingCopy('thinking', 600)).toBe('模型正在思考…')
     expect(waitingCopy('tool', 8)).toBe('正在执行工具操作…')
@@ -39,9 +39,11 @@ describe('waitingCopy', () => {
     expect(waitingCopy('retrying', 20)).toBe('连接中断，正在重试…')
     expect(waitingCopy('stopping', 45)).toBe('正在停止…')
     expect(waitingCopy('continuing', 0)).toBe('等待模型响应')
-    expect(waitingCopy('continuing', 600)).toBe('等待模型响应')
+    expect(waitingCopy('continuing', 36)).toBe('模型仍在处理 · 暂无可见输出')
+    expect(waitingCopy('continuing', 300)).toBe('模型响应较慢，仍在等待')
     expect(waitingCopy('followup', 0)).toBe('正在处理子任务结果')
-    expect(waitingCopy('followup', 94)).toBe('正在处理子任务结果')
+    expect(waitingCopy('followup', 36)).toBe('仍在处理子任务结果 · 暂无可见输出')
+    expect(waitingCopy('followup', 300)).toBe('子任务结果处理较慢，仍在继续')
   })
 })
 

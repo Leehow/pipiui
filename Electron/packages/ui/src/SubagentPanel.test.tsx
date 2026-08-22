@@ -352,7 +352,7 @@ describe('SubagentPanel', () => {
       const row = await screen.findByTestId('agent-row-run')
       expect(row.querySelector('.agent-name-line .agent-row-time')?.textContent).toBe('12s')
       expect(row.querySelectorAll('.agent-copy > small').length).toBe(2)
-      expect(row.textContent).toContain('等待工具返回 · tool')
+      expect(row.textContent).toContain('最近活动 · tool')
 
       act(() => {
         harness.emitAgent({
@@ -426,7 +426,7 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('已中止')).toBeTruthy()
   })
 
-  it('distinguishes a quiet Computer Worker from healthy indeterminate progress', async () => {
+  it('keeps a 45-second quiet Computer Worker neutral instead of calling it stuck or claiming its tool is pending', async () => {
     const harness = hostHarness()
     const now = Date.now()
     harness.host.listAgents = async () => [{
@@ -437,10 +437,46 @@ describe('SubagentPanel', () => {
     render(<SubagentPanel host={harness.host} />)
 
     await screen.findByTestId('agent-row-quiet-operator')
-    expect(screen.getAllByText(/等待工具返回 · desktop_act/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/暂无新状态 · 最近活动 · desktop_act/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/45 秒无新进展/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/105 秒后自动中止/).length).toBeGreaterThan(0)
-    expect(screen.getAllByText(/可能卡住/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/等待工具返回/)).toBeNull()
+    expect(screen.queryByText(/可能卡住/)).toBeNull()
+  })
+
+  it('only calls a quiet running agent possibly stuck after 120 seconds', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'stale-operator', runId: 'r-stale', name: 'operator', task: '在 TextEdit 中打开文件',
+      state: 'running', createdAt: now - 150_000, updatedAt: now - 120_000,
+      deadlineAt: now + 30_000, listSubtitle: 'desktop_act {"actions":[{"type":"key","keys":["CMD","O"]}]}'
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-stale-operator')
+    expect(screen.getAllByText(/可能卡住 · 最近活动 · desktop_act/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/120 秒无新进展/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/30 秒后自动中止/).length).toBeGreaterThan(0)
+  })
+
+  it('uses tool-result logs to distinguish provider waiting from sticky tool activity', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'returned-tool', runId: 'r-returned', name: 'explore', task: '检查事件日志',
+      state: 'running', createdAt: now - 60_000, updatedAt: now - 45_000,
+      listSubtitle: 'grep ./heartbeat/agent_events.jsonl'
+    } as AgentSummary]
+    harness.host.getAgentLogs = vi.fn(async () => [
+      { itemType: 'tool' as const, name: 'grep', text: './heartbeat/agent_events.jsonl' },
+      { itemType: 'toolResult' as const, name: 'grep', text: 'matching event' }
+    ])
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-returned-tool')
+    await waitFor(() => expect(screen.getAllByText(/工具结果已返回 · 等待模型响应/).length).toBeGreaterThan(0))
+    expect(screen.queryByText(/等待工具返回/)).toBeNull()
   })
 
   it('shows a quiet Leader as coordinating while one of its children is still active', async () => {
@@ -898,7 +934,7 @@ describe('SubagentPanel', () => {
     const active = await screen.findByTestId('active-tool')
     expect(active.querySelector('b')?.textContent).toBe('bash · npm test --workspaces')
     expect(active.textContent).toContain('运行中')
-    expect(screen.getAllByText(/等待工具返回 · bash · npm test --workspaces/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/最近活动 · bash · npm test --workspaces/).length).toBeGreaterThan(0)
     expect(screen.queryByText('输入')).toBeNull()
   })
 
@@ -1227,7 +1263,7 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'write', text: JSON.stringify({ path: 'src/a.ts', payloadChars: 8 }), contentIndex: 0 })
     expect((await screen.findByTestId('active-tool')).textContent).toMatch(/~2 tokens/)
-    expect(screen.getAllByText(/等待工具返回 · write · src\/a.ts/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/最近活动 · write · src\/a.ts/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/~2 tokens/).length).toBeGreaterThan(0)
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'tool', name: 'write', text: JSON.stringify({ path: 'src/a.ts', payloadChars: 40 }), contentIndex: 0 })
     await waitFor(() => expect(screen.getByTestId('active-tool').textContent).toMatch(/~10 tokens/))
