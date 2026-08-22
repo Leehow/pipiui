@@ -1,6 +1,46 @@
 /** Same cap as the done-message Wave line: one glance, not the whole archive. */
 export const UNFILTERED_ENDED_CAP = 8;
 
+export const UNCHANGED_STATUS_NOTICE = "[unchanged since previous subagent_status]";
+
+/**
+ * Ignore display-only clocks while retaining every identity, state category, progress field,
+ * preview, and omission count. The caller owns the previous key so the comparison remains
+ * scoped to one extension/session rather than leaking through module-global state.
+ */
+function statusSemanticKey(text: string): string {
+	return text.split("\n").map((line) => {
+		if (!line.startsWith("|")) return line;
+		const cells = line.split("|");
+		if (cells.length < 9) return line;
+		const agentId = cells[1]?.trim();
+		if (!agentId || agentId === "agentId" || agentId === "---") return line;
+
+		// State timing is useful on the first snapshot, but a clock tick alone is not a new
+		// status. Prefixes such as running/finalizing/stalled and the tool name stay exact.
+		cells[4] = cells[4]
+			.replace(/\bfor \d+s\b/g, "for <duration>")
+			.replace(/\bidle \d+s\b/g, "idle <duration>");
+		// The seventh data field is wall-clock elapsed time and changes on every read.
+		cells[7] = " <elapsed> ";
+		return cells.join("|");
+	}).join("\n");
+}
+
+export function decideAdjacentStatusSnapshot(
+	previousSemanticKey: string | undefined,
+	text: string,
+	query: { agentId?: string; onlyRunning?: boolean; full?: boolean },
+): { text: string; semanticKey: string | undefined } {
+	const allowSuppression = query.agentId === undefined && query.onlyRunning !== true && query.full !== true;
+	if (!allowSuppression) return { text, semanticKey: previousSemanticKey };
+	const semanticKey = statusSemanticKey(text);
+	return {
+		text: semanticKey === previousSemanticKey ? UNCHANGED_STATUS_NOTICE : text,
+		semanticKey,
+	};
+}
+
 export function selectUnfilteredJobs<T extends { state: string }>(
 	sorted: T[],
 	endedCap = UNFILTERED_ENDED_CAP,

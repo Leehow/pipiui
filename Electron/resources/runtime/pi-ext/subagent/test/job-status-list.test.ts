@@ -2,13 +2,70 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+	decideAdjacentStatusSnapshot,
 	formatResumableSectionLines,
 	formatUnfilteredOmissionNote,
 	selectResumableEntries,
 	selectUnfilteredJobs,
+	UNCHANGED_STATUS_NOTICE,
 	UNFILTERED_ENDED_CAP,
 	UNFILTERED_RESUMABLE_CAP,
 } from "../job-status-list.ts";
+
+const runningSnapshot = (elapsed: string, state = "running") => [
+	"| agentId | runId | name | state | turns | cost | elapsed | preview |",
+	"| --- | --- | --- | --- | --- | --- | --- | --- |",
+	`| worker-a | run-1 | general-purpose | ${state} | 2 | $0.0100 | ${elapsed} | editing tests |`,
+	"",
+	"3 older resumable worker(s) omitted, newest kept.",
+].join("\n");
+
+test("adjacent semantically unchanged status snapshots emit once", () => {
+	const first = decideAdjacentStatusSnapshot(undefined, runningSnapshot("4s", "running (in bash for 2s)"), {});
+	assert.equal(first.text, runningSnapshot("4s", "running (in bash for 2s)"));
+
+	const adjacent = decideAdjacentStatusSnapshot(
+		first.semanticKey,
+		runningSnapshot("11s", "running (in bash for 9s)"),
+		{},
+	);
+	assert.equal(adjacent.text, UNCHANGED_STATUS_NOTICE);
+});
+
+test("a real transition is emitted and a later repeat is not merged across it", () => {
+	const running = decideAdjacentStatusSnapshot(undefined, runningSnapshot("1s"), {});
+	const failedText = runningSnapshot("2s", "failed");
+	const failed = decideAdjacentStatusSnapshot(running.semanticKey, failedText, {});
+	assert.equal(failed.text, failedText, "terminal state changes must remain visible");
+
+	const runningAgainText = runningSnapshot("3s");
+	const runningAgain = decideAdjacentStatusSnapshot(failed.semanticKey, runningAgainText, {});
+	assert.equal(runningAgain.text, runningAgainText, "only adjacent equal snapshots collapse");
+});
+
+test("identity and omission changes always emit a fresh snapshot", () => {
+	const first = decideAdjacentStatusSnapshot(undefined, runningSnapshot("1s"), {});
+	for (const changed of [
+		runningSnapshot("2s").replace("run-1", "run-2"),
+		runningSnapshot("2s").replace("worker-a", "worker-b"),
+		runningSnapshot("2s").replace("3 older resumable", "4 older resumable"),
+	]) {
+		assert.equal(decideAdjacentStatusSnapshot(first.semanticKey, changed, {}).text, changed);
+	}
+});
+
+test("explicit status queries bypass suppression and preserve the default snapshot", () => {
+	const first = decideAdjacentStatusSnapshot(undefined, runningSnapshot("1s"), {});
+	for (const query of [{ full: true }, { agentId: "worker-a" }, { agentId: "" }, { onlyRunning: true }]) {
+		const explicitText = runningSnapshot("2s");
+		const explicit = decideAdjacentStatusSnapshot(first.semanticKey, explicitText, query);
+		assert.equal(explicit.text, explicitText);
+		assert.equal(explicit.semanticKey, first.semanticKey);
+	}
+
+	const nextDefault = decideAdjacentStatusSnapshot(first.semanticKey, runningSnapshot("3s"), {});
+	assert.equal(nextDefault.text, UNCHANGED_STATUS_NOTICE);
+});
 
 test("unfiltered status keeps every running job and only the newest ended cap", () => {
 	const jobs = [
