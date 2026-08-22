@@ -44,9 +44,9 @@ export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,strin
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
  * env-key providers (DeepSeek, Kimi, …) resolve in the RPC session exactly as they do
  * for `listModels`. Precedence, highest first: internal assembly env (the host's own
- * PIPIUI_* contract) → `.env` → host process env. Managed PIPIUI_* keys are stripped
- * from both base layers, so a stale `.env`/parent value can never resurrect a disabled
- * feature or clobber the host's bridge/computer contract.
+ * PIPIUI_* contract) → `.env` → host process env → host defaults. Managed PIPIUI_*
+ * keys are stripped from both base layers, so a stale `.env`/parent value can never resurrect
+ * a disabled feature or clobber the host's bridge/computer contract.
  */
 /**
  * Packaged Pi/auth children run as Electron Helper. A reconstructed spawn env
@@ -65,6 +65,7 @@ export function mergedSpawnEnvironment(
   internal: Record<string, string>,
 ): Record<string, string> {
   return withElectronRunAsNode({
+    PI_CACHE_RETENTION: "long",
     ...sanitizeEnvironment(parent),
     ...sanitizeEnvironment(dotEnv),
     ...internal,
