@@ -31,6 +31,7 @@ import { advise } from "./advisor";
 import { pruneHistoricalThinking, thinkingPruneConfigFromEnv } from "./thinking-prune";
 
 import { adapterConfigFromEnv, configFromEnv } from "./config";
+import { registerLiveContextFoldEngine } from "./live-engine";
 export { adapterConfigFromEnv, configFromEnv };
 
 export default function contextFold(pi: ExtensionAPI): void {
@@ -64,6 +65,8 @@ export default function contextFold(pi: ExtensionAPI): void {
 			return false;
 		}
 	};
+	// Share this session engine with idle-fold (P2) and context_manage (P3).
+	registerLiveContextFoldEngine(engine);
 
 	// ── advisory state (display-only; nothing here gates a turn) ─────────────────────────────────
 	let compactions = 0;

@@ -124,6 +124,20 @@ import {
 	planHeldSignalFlush,
 } from "./stall-notification.ts";
 import {
+	contextAboveIdleFoldWatermark,
+	createIdleFoldRegistry,
+	idleFoldConfigFromEnv,
+	runDeterministicIdleFold,
+	type IdleFoldRegistry,
+	type IdleFoldUsage,
+} from "./idle-fold-timer.ts";
+import {
+	contextManageTool,
+	handleIdleFoldNudge,
+	restoreNudgeThinking,
+	shouldRegisterContextManageTool,
+} from "./context-manage.ts";
+import {
 	formatSecretaryCommitResult,
 	runSecretaryCommit,
 } from "./secretary-commit.ts";
@@ -2173,6 +2187,72 @@ interface RunningAgentHandle {
 /** Every live child is externally abortable; parent cancellation is composed separately. */
 const runningAgents = new Map<string, RunningAgentHandle>();
 
+/**
+ * Dispatch-idle fold timer. Independent one-shot setTimeout (default 5 min), not the
+ * 30s stall watchdog. Shared per Boss session so a wave folds once; completion cancels.
+ */
+const IDLE_FOLD_REGISTRY_KEY = "__pipiuiIdleFoldRegistry";
+const idleFoldConfig = idleFoldConfigFromEnv();
+let idleFoldRegistry: IdleFoldRegistry | undefined;
+let lastIdleFoldUsage: IdleFoldUsage | undefined;
+let lastIdleFoldMessages: unknown[] | undefined;
+
+function idleFoldSessionKey(): string {
+	return PIPIUI_SESSION || "default";
+}
+
+function noteIdleFoldContext(event: { messages?: unknown }, ctx: {
+	getContextUsage?: () => { tokens?: number | null; contextWindow?: number | null } | undefined;
+	model?: { contextWindow?: number } | null;
+} | undefined): void {
+	const usage = typeof ctx?.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+	lastIdleFoldMessages = Array.isArray(event.messages) ? event.messages : undefined;
+	lastIdleFoldUsage = {
+		tokens: typeof usage?.tokens === "number" ? usage.tokens : null,
+		contextWindow: typeof usage?.contextWindow === "number"
+			? usage.contextWindow
+			: (typeof ctx?.model?.contextWindow === "number" ? ctx.model.contextWindow : null),
+	};
+}
+
+function runProductionIdleFold(): void {
+	const usage = lastIdleFoldUsage;
+	if (!contextAboveIdleFoldWatermark(usage, idleFoldConfig.lowWatermark)) return;
+	const messages = lastIdleFoldMessages;
+	if (!messages || messages.length === 0) return;
+	void runDeterministicIdleFold({
+		messages,
+		tokens: usage?.tokens,
+		contextWindow: usage?.contextWindow,
+	}).catch((err) => {
+		console.error("[pipiui-subagent] idle fold failed:", err);
+	});
+}
+
+function bindIdleFoldRegistry(registry: IdleFoldRegistry): void {
+	const g = globalThis as Record<string, unknown>;
+	const prev = g[IDLE_FOLD_REGISTRY_KEY] as IdleFoldRegistry | undefined;
+	if (prev && prev !== registry) prev.disposeAll();
+	g[IDLE_FOLD_REGISTRY_KEY] = registry;
+	idleFoldRegistry = registry;
+}
+
+function armIdleFoldForDispatch(agentId: string): void {
+	if (PIPIUI_DEPTH !== 0 || !agentId) return;
+	idleFoldRegistry?.arm(idleFoldSessionKey(), agentId);
+}
+
+function noteIdleFoldCompleted(agentId: string | undefined): void {
+	if (!agentId) return;
+	idleFoldRegistry?.noteCompleted(agentId);
+}
+
+function disposeAllIdleFoldTimers(): void {
+	idleFoldRegistry?.disposeAll();
+	lastIdleFoldUsage = undefined;
+	lastIdleFoldMessages = undefined;
+}
+
 function handleForRun(agentId: string, runId: string): RunningAgentHandle | undefined {
 	const handle = runningAgents.get(agentId);
 	return handle?.runId === runId ? handle : undefined;
@@ -2223,7 +2303,10 @@ function deleteRunningAgentHandle(agentId: string, runId: string): void {
 	const handle = runningAgents.get(agentId);
 	// `runId` was added after early test hooks/legacy handles existed; normal runtime handles
 	// always carry it, while an old untagged handle is still safe to remove only here.
-	if (handle && (handle.runId === runId || handle.runId === undefined)) runningAgents.delete(agentId);
+	if (handle && (handle.runId === runId || handle.runId === undefined)) {
+		runningAgents.delete(agentId);
+		noteIdleFoldCompleted(agentId);
+	}
 }
 
 /**
@@ -2825,6 +2908,7 @@ function markWorkerInterrupted(agentId: string, reason: string): boolean {
 		turns: job?.turns,
 	});
 	deleteRunningAgentHandle(agentId, runId);
+	noteIdleFoldCompleted(agentId);
 	if (!changed) return false;
 	void postTerminalPipiuiReport({
 		kind: "end",
@@ -4466,6 +4550,8 @@ function notifySubagentDone(
 	result: SingleResult,
 	extra?: { aborted?: boolean; error?: string },
 ): void {
+	// A completion (ok/failed/aborted) is the cancel hook for the dispatch-idle fold timer.
+	noteIdleFoldCompleted(result.agentId);
 	// Finalize job BEFORE notification: status must work even if Pi rejects the wake-up.
 	const terminalRunId = ensureJobTerminalFromResult(result, extra);
 	const aborted = extra?.aborted === true || result.stopReason === "aborted";
@@ -5135,6 +5221,7 @@ async function runSingleAgent(
 			readOnly: Boolean(agent.traits.readOnly),
 			syncWait: !isBackground,
 		});
+		armIdleFoldForDispatch(pipiuiAgentId);
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
@@ -7439,10 +7526,31 @@ function registerContextDocTool(pi: ExtensionAPI): void {
 	pi.registerTool(contextDocTool({ mainCwd: PIPIUI_MAIN_CWD, sessionKey: PIPIUI_SESSION }) as never);
 }
 
+/**
+ * Boss-only self-compression: inspect a bounded candidate manifest, then fold by id.
+ * Workers must not see this tool — same PIPIUI_DEPTH !== 0 guard as ledger_note.
+ */
+function registerContextManageTool(pi: ExtensionAPI): void {
+	if (!shouldRegisterContextManageTool(PIPIUI_DEPTH, PIPIUI_MAIN_CWD)) return;
+	pi.registerTool(contextManageTool({
+		sessionKey: PIPIUI_SESSION,
+		getMessages: () => lastIdleFoldMessages,
+		getUsage: () => lastIdleFoldUsage,
+		onSuccessfulFold: () => idleFoldRegistry?.noteFolded(idleFoldSessionKey()),
+	}) as never);
+}
+
 export default function (pi: ExtensionAPI) {
+	bindIdleFoldRegistry(createIdleFoldRegistry({
+		...idleFoldConfig,
+		isContextAboveWatermark: () => contextAboveIdleFoldWatermark(lastIdleFoldUsage, idleFoldConfig.lowWatermark),
+		onNudge: () => handleIdleFoldNudge(pi, { watermark: idleFoldConfig.lowWatermark }),
+		onFold: () => runProductionIdleFold(),
+	}));
 	registerComputerTaskTool(pi);
 	registerLedgerNoteTool(pi);
 	registerContextDocTool(pi);
+	registerContextManageTool(pi);
 	// Last quantized in-flight snapshot injected as a custom message. Null at
 	// startup and after a clear, so empty turns stay silent.
 	let lastInFlightSnapshot: string | null = null;
@@ -7470,12 +7578,22 @@ export default function (pi: ExtensionAPI) {
 	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
 	registerQoderContextWindowCompat(pi);
 	pi.on("session_start", (_event, ctx) => {
+		restoreNudgeThinking(pi);
+		disposeAllIdleFoldTimers();
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
+	});
+	pi.on("session_shutdown", () => {
+		restoreNudgeThinking(pi);
+		disposeAllIdleFoldTimers();
+	});
+	pi.on("context", (event, ctx) => {
+		noteIdleFoldContext(event, ctx);
 	});
 	// Extension handlers run before SessionManager persistence. Re-scan the active
 	// branch one tick later; sibling branches cannot acknowledge this wake.
 	pi.on("message_end", (event, ctx) => {
+		if (event.message.role === "assistant") restoreNudgeThinking(pi);
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		const observations = completionObservations(event.message);
 		const assistantEnded = event.message.role === "assistant";
@@ -7704,6 +7822,9 @@ export default function (pi: ExtensionAPI) {
 	if (prevWatchdog) clearInterval(prevWatchdog); // 防扩展 reload 后旧定时器泄漏
 	const stallWatchdog = setInterval(() => {
 		const now = Date.now();
+		// Idle-fold TTL is an independent one-shot timer. Watchdog only sweeps orphans
+		// (vanished/aborted workers whose completion hook was missed) so handles cannot leak.
+		idleFoldRegistry?.sweepOrphans(new Set(runningAgents.keys()));
 
 		// (1) done 重投
 		for (const [obligationId, entry] of [...pendingDone]) {
@@ -7895,6 +8016,8 @@ export default function (pi: ExtensionAPI) {
 	process.on("exit", () => {
 		clearInterval(stallWatchdog);
 		if (g[STALL_WATCHDOG_KEY] === stallWatchdog) delete g[STALL_WATCHDOG_KEY];
+		disposeAllIdleFoldTimers();
+		if (g[IDLE_FOLD_REGISTRY_KEY] === idleFoldRegistry) delete g[IDLE_FOLD_REGISTRY_KEY];
 	});
 
 	// ---- RPC commands: GUI uses these same Node control paths instead of mutating Swift-only state. ----

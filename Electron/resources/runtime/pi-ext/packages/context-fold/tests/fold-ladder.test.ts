@@ -3,12 +3,17 @@
  * threshold crossing, step spacing, cold branch, cap emergency, byte-stable layers,
  * and fold-event reporting.
  */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { adapterConfigFromEnv } from "../src/adapters/pi/config";
 import { ContextFoldEngine, type FoldEventReport, type FrozenLayer } from "../src/adapters/pi/store";
 import { FoldLadderPolicy, LADDER_DEFAULTS } from "../src/core/policy/fold-ladder";
+import { annotateExternalized, parseSubagentDone } from "../src/core/policy/externalized";
 import { MapSpoolRegistry } from "../src/core/spool-registry";
 import type { AgentMessage } from "../src/core/block";
-import type { FoldPolicy } from "../src/core/contract";
+import type { FoldPolicy, PolicyView, ViewBlock } from "../src/core/contract";
 import { user, assistantText, assistantWithCalls, bigResult, toolResult, isBalanced } from "./helpers";
 
 function ladderEngine(cfg: Record<string, unknown> = {}, ladderCfg = LADDER_DEFAULTS) {
@@ -251,6 +256,236 @@ describe("reversibility", () => {
 		e.markUnfold([codeOf(frozenId)]);
 		const after = e.process(messages, { contextWindow: 80_000, tokens: null });
 		expect(resultText(after, code)).toContain("line 0:");
+	});
+});
+
+describe("externalized fold priority", () => {
+	function doneWithFindings(agentId: string, findingsPath: string): string {
+		return [
+			`[subagent-done] agentId=${agentId} runId=run-1 name=explore ok=true verified=none cost=0.0000 turns=1`,
+			"Title: recon",
+			"Result:",
+			"TLDR: the worker finished.",
+			`Findings: ${findingsPath} — this worker's full report, on disk. Do NOT read it yourself; put this exact path in the next worker's brief.`,
+		].join("\n");
+	}
+
+	function mixedSession(findingsPath: string): AgentMessage[] {
+		const messages: AgentMessage[] = [user("orchestrate")];
+		messages.push(
+			assistantWithCalls([{ id: "ext", name: "subagent_status", args: { agentId: "worker-a", runId: "run-1" } }]),
+		);
+		messages.push(bigResult("ext", 900, "subagent_status"));
+		for (let i = 0; i < 8; i++) {
+			messages.push(assistantWithCalls([{ id: `c${i}`, name: "read" }]));
+			messages.push(bigResult(`c${i}`, 400));
+		}
+		messages.push(user(doneWithFindings("worker-a", findingsPath)));
+		messages.push(user("now the newest question"));
+		return messages;
+	}
+
+	function withFindingsFile(agentId: string): { dir: string; path: string } {
+		const dir = mkdtempSync(join(tmpdir(), "cf-findings-"));
+		const path = join(dir, ".pi", "findings", `${agentId}.md`);
+		mkdirSync(join(dir, ".pi", "findings"), { recursive: true });
+		writeFileSync(path, `# ${agentId}\nfull worker report\n`);
+		return { dir, path };
+	}
+
+	function vb(partial: Partial<ViewBlock> & Pick<ViewBlock, "id" | "kind" | "tokens">): ViewBlock {
+		return {
+			turn: 1,
+			order: 0,
+			foldedTokens: 20,
+			held: false,
+			folded: false,
+			protected: false,
+			...partial,
+		};
+	}
+
+	it("parses agentId and Findings path from a [subagent-done] body", () => {
+		const path = "/repo/.pi/findings/worker-a.md";
+		const parsed = parseSubagentDone(doneWithFindings("worker-a", path));
+		expect(parsed.agentId).toBe("worker-a");
+		expect(parsed.findingsPath).toBe(path);
+		expect(parseSubagentDone("ordinary tool output")).toEqual({});
+	});
+
+	it("marks the matching tool_result externalized when the named findings file exists", () => {
+		const path = "/repo/.pi/findings/worker-a.md";
+		const blocks = annotateExternalized(
+			[
+				vb({ id: "u:done", kind: "user", tokens: 40, text: doneWithFindings("worker-a", path), order: 0 }),
+				vb({
+					id: "a:1:p0",
+					kind: "tool_call",
+					tokens: 10,
+					callId: "ext",
+					toolName: "subagent_status",
+					toolArgs: { agentId: "worker-a" },
+					order: 1,
+				}),
+				vb({ id: "r:ext", kind: "tool_result", tokens: 8_000, callId: "ext", order: 2 }),
+				vb({ id: "r:norm", kind: "tool_result", tokens: 8_000, callId: "norm", order: 3 }),
+			],
+			(candidate) => candidate === path,
+		);
+		expect(blocks.find((b) => b.id === "r:ext")?.externalized).toBe(true);
+		expect(blocks.find((b) => b.id === "r:ext")?.agentId).toBe("worker-a");
+		expect(blocks.find((b) => b.id === "r:norm")?.externalized).toBeFalsy();
+		expect(blocks.find((b) => b.id === "u:done")?.kind).toBe("user");
+	});
+
+	it("leaves blocks unmarked when the findings file is missing", () => {
+		const path = "/missing/.pi/findings/worker-a.md";
+		const blocks = annotateExternalized(
+			[
+				vb({ id: "u:done", kind: "user", tokens: 40, text: doneWithFindings("worker-a", path) }),
+				vb({
+					id: "r:ext",
+					kind: "tool_result",
+					tokens: 8_000,
+					callId: "ext",
+					agentId: "worker-a",
+				}),
+			],
+			() => false,
+		);
+		expect(blocks.find((b) => b.id === "r:ext")?.externalized).toBeFalsy();
+	});
+
+	it("folds only the externalized worker result when it already buys a ladder step", () => {
+		const policy = new FoldLadderPolicy({
+			...LADDER_DEFAULTS,
+			findingsExists: (path) => path.endsWith("worker-a.md"),
+		});
+		const view: PolicyView = {
+			blocks: [
+				vb({
+					id: "u:done",
+					kind: "user",
+					tokens: 40,
+					text: doneWithFindings("worker-a", "/repo/.pi/findings/worker-a.md"),
+					order: 0,
+				}),
+				vb({
+					id: "a:1:p0",
+					kind: "tool_call",
+					tokens: 10,
+					callId: "ext",
+					toolName: "subagent_status",
+					toolArgs: { agentId: "worker-a" },
+					order: 1,
+				}),
+				vb({ id: "r:ext", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "ext", order: 2 }),
+				vb({ id: "r:norm", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "norm", order: 3 }),
+			],
+			budget: 80_000,
+			contextWindow: 80_000,
+			liveTokens: 40_050,
+			protectedFromIndex: 4,
+			protectTokens: 100,
+		};
+		const cmds = policy.conduct(view);
+		expect(cmds).toEqual([{ kind: "fold", ids: ["r:ext"] }]);
+	});
+
+	it("keeps fold-all-eligible behaviour when no findings file exists", () => {
+		const policy = new FoldLadderPolicy({
+			...LADDER_DEFAULTS,
+			findingsExists: () => false,
+		});
+		const view: PolicyView = {
+			blocks: [
+				vb({ id: "u:1", kind: "user", tokens: 10, text: "go", order: 0 }),
+				vb({ id: "r:a", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "a", order: 1 }),
+				vb({ id: "r:b", kind: "tool_result", tokens: 20_000, foldedTokens: 30, callId: "b", order: 2 }),
+			],
+			budget: 80_000,
+			contextWindow: 80_000,
+			liveTokens: 40_010,
+			protectedFromIndex: 3,
+			protectTokens: 100,
+		};
+		const cmds = policy.conduct(view);
+		expect(cmds).toEqual([{ kind: "fold", ids: ["r:a", "r:b"] }]);
+	});
+
+	it("never folds the [subagent-done] user message itself", () => {
+		const { dir, path } = withFindingsFile("worker-a");
+		try {
+			const { e } = ladderEngine();
+			const messages = mixedSession(path);
+			const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+			const done = out.filter((m) => (m as { role?: string }).role === "user").find((m) => String((m as { content?: string }).content).includes("[subagent-done]"));
+			expect(String((done as { content?: string })?.content ?? "")).toContain("Findings:");
+			expect(String((done as { content?: string })?.content ?? "")).not.toContain("FOLDED");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("folds the externalized worker block to a pointer and recall_folded restores the original", () => {
+		const { dir, path } = withFindingsFile("worker-a");
+		try {
+			const { e, committed, events } = ladderEngine();
+			const messages = mixedSession(path);
+			const view = e.viewFor(messages, { contextWindow: 80_000, tokens: null });
+			const extView = view.blocks.find((b) => b.callId === "ext");
+			expect(extView?.externalized).toBe(true);
+			expect(extView?.agentId).toBe("worker-a");
+
+			const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+			expect(events[0]?.trigger).toBe("threshold");
+			expect(resultText(out, "ext")).toContain("FOLDED");
+			expect(resultText(out, "c0")).not.toContain("FOLDED");
+			expect(committed[0].entries.some((entry) => entry.id === "r:ext")).toBe(true);
+			expect(committed[0].entries.some((entry) => entry.id === "r:c0")).toBe(false);
+
+			const { matches, missing } = e.resolveRecall([codeOf("r:ext")]);
+			expect(missing).toEqual([]);
+			expect(matches[0].text).toContain("line 0:");
+			expect(matches[0].text).not.toContain("FOLDED");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not change a session whose [subagent-done] names a missing findings file", () => {
+		const { e, committed } = ladderEngine();
+		const messages = mixedSession("/no/such/.pi/findings/worker-a.md");
+		const out = e.process(messages, { contextWindow: 80_000, tokens: null });
+		expect(committed.length).toBe(1);
+		expect(resultText(out, "ext")).toContain("FOLDED");
+		expect(resultText(out, "c0")).toContain("FOLDED");
+	});
+
+	it("parses CONTEXTFOLD_PREFER_EXTERNALIZED and CONTEXTFOLD_EXTERNALIZED_WEIGHT", () => {
+		const names = ["CONTEXTFOLD_PREFER_EXTERNALIZED", "CONTEXTFOLD_EXTERNALIZED_WEIGHT"] as const;
+		const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+		try {
+			delete process.env.CONTEXTFOLD_PREFER_EXTERNALIZED;
+			delete process.env.CONTEXTFOLD_EXTERNALIZED_WEIGHT;
+			expect(adapterConfigFromEnv().ladder.preferExternalized).toBe(true);
+			expect(adapterConfigFromEnv().ladder.externalizedWeight).toBe(1);
+
+			process.env.CONTEXTFOLD_PREFER_EXTERNALIZED = "0";
+			process.env.CONTEXTFOLD_EXTERNALIZED_WEIGHT = "0";
+			expect(adapterConfigFromEnv().ladder.preferExternalized).toBe(false);
+			expect(adapterConfigFromEnv().ladder.externalizedWeight).toBe(0);
+
+			process.env.CONTEXTFOLD_PREFER_EXTERNALIZED = "high";
+			process.env.CONTEXTFOLD_EXTERNALIZED_WEIGHT = "2";
+			expect(adapterConfigFromEnv().ladder.preferExternalized).toBe(true);
+			expect(adapterConfigFromEnv().ladder.externalizedWeight).toBe(2);
+		} finally {
+			for (const name of names) {
+				if (previous[name] === undefined) delete process.env[name];
+				else process.env[name] = previous[name];
+			}
+		}
 	});
 });
 

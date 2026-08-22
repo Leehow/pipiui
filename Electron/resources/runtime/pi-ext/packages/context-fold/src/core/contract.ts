@@ -51,6 +51,14 @@ export interface ViewBlock {
 	protected: boolean;
 	/** Full content. */
 	text?: string;
+	/** Worker agentId associated with this block, when known from tool args or [subagent-done]. */
+	agentId?: string;
+	/**
+	 * True when this block's worker report already lives on disk at `.pi/findings/<agentId>.md`
+	 * (the path is named by a [subagent-done] message in the same view). Pure metadata — it does
+	 * not change how a fold is applied, only which eligible tool_result the ladder prefers.
+	 */
+	externalized?: boolean;
 }
 
 /**

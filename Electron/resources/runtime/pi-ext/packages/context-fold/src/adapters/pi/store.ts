@@ -18,6 +18,7 @@ import { blockId, linearize, isDurableId } from "../../core/block";
 import { applyPlan } from "../../core/apply";
 import { digest, wireFoldable, foldCode, substTokens } from "../../core/digest";
 import { estTokens, safeSlice, BLOCK_OVERHEAD } from "../../core/tokens";
+import { agentIdFromToolArgs, annotateExternalized, parseSubagentDone } from "../../core/policy/externalized";
 import { MapSpoolRegistry, type SpoolRegistry, type SpoolEntry } from "../../core/spool-registry";
 import { readEnvelopeAt, SpoolError } from "./spool";
 import { readFileSync } from "node:fs";
@@ -116,6 +117,19 @@ export interface CodeMatch {
 export interface CodeError {
 	code: string;
 	message: string;
+}
+
+/** Why a requested id was not folded by `foldByIds`. */
+export interface FoldSkip {
+	id: string;
+	reason: string;
+}
+
+/** Result of a machine fold-by-id pass. No LLM, reversible via recall_folded. */
+export interface FoldByIdsResult {
+	messages: AgentMessage[];
+	foldedIds: string[];
+	skipped: FoldSkip[];
 }
 
 /** Partial-retrieval options for spool-backed recall (ignored for in-memory-only folds). */
@@ -347,6 +361,61 @@ export class ContextFoldEngine {
 		const frame = normalizeContextFrame(context);
 		const { cw, budget, tailTarget, protectFrom } = this.frame(blocks, frame.contextWindow, frozenOps);
 		return this.buildView(blocks, protectFrom, budget, cw, tailTarget, frozenOps, frame.tokens);
+	}
+
+	/**
+	 * Fold specific durable ids through the same lower/commit/spool path as a policy event.
+	 * No LLM, no history rewrite beyond the reversible digest substitution. Unsafe ids
+	 * (user / protected / held / frozen / non-foldable) are skipped, never forced.
+	 */
+	foldByIds(messages: AgentMessage[], ids: readonly string[], context: ContextFrameInput = null): FoldByIdsResult {
+		const requested = uniqueIds(ids);
+		if (requested.length === 0) return { messages, foldedIds: [], skipped: [] };
+
+		const blocks = linearize(messages);
+		this.snapshot = new Map(blocks.map((b) => [b.id, b] as const));
+		this.pruneCaches(blocks);
+		const firstDelivery = firstDeliveryResultIds(messages);
+		const frame = normalizeContextFrame(context);
+		const frozenOps = this.computeFrozenOps(blocks);
+		const { cw, budget, tailTarget, protectFrom } = this.frame(blocks, frame.contextWindow, frozenOps);
+		const view = this.buildView(blocks, protectFrom, budget, cw, tailTarget, frozenOps, frame.tokens, firstDelivery);
+		const byView = new Map(view.blocks.map((b) => [b.id, b]));
+
+		const skipped: FoldSkip[] = [];
+		const accepted: string[] = [];
+		for (const id of requested) {
+			const reason = skipReasonForManualFold(byView.get(id));
+			if (reason) skipped.push({ id, reason });
+			else accepted.push(id);
+		}
+		if (accepted.length === 0) return { messages, foldedIds: [], skipped };
+
+		const ops = this.lower([{ kind: "fold", ids: accepted }], blocks, protectFrom, firstDelivery);
+		const lowered = new Set(ops.map((op) => op.id));
+		for (const id of accepted) {
+			if (!lowered.has(id)) skipped.push({ id, reason: "rejected_by_engine" });
+		}
+
+		let committedOps: FoldOp[] = [];
+		if (ops.length > 0) {
+			const used = frame.tokens ?? view.liveTokens;
+			committedOps = this.commitLayer(ops, blocks, {
+				tokens: used,
+				contextWindow: cw,
+				fraction: cw > 0 ? used / cw : 0,
+			});
+		}
+		const foldedIds = committedOps.map((op) => op.id);
+		const committed = new Set(foldedIds);
+		for (const id of lowered) {
+			if (!committed.has(id) && !skipped.some((row) => row.id === id)) {
+				skipped.push({ id, reason: "commit_rejected" });
+			}
+		}
+		if (committedOps.length === 0) return { messages, foldedIds: [], skipped };
+
+		return { messages: applyPlan(messages, mergeOpsById(frozenOps, committedOps)), foldedIds, skipped };
 	}
 
 	/**
@@ -605,6 +674,11 @@ export class ContextFoldEngine {
 		reportedTokens: number | null,
 		firstDelivery: ReadonlySet<string> = new Set(),
 	): PolicyView {
+		const agentIdByCallId = new Map<string, string>();
+		for (const b of blocks) {
+			const id = agentIdFromToolArgs(b.toolArgs);
+			if (b.kind === "tool_call" && b.callId && id) agentIdByCallId.set(b.callId, id);
+		}
 		let liveTokens = 0;
 		const viewBlocks: ViewBlock[] = blocks.map((b, i) => {
 			const frozenText = frozenOps.get(b.id);
@@ -628,10 +702,11 @@ export class ContextFoldEngine {
 				frozen,
 				protected: i >= protectFrom,
 				text: b.text,
+				agentId: agentIdFromToolArgs(b.toolArgs) ?? (b.callId ? agentIdByCallId.get(b.callId) : undefined) ?? parseSubagentDone(b.text).agentId,
 			};
 		});
 		return {
-			blocks: viewBlocks,
+			blocks: annotateExternalized(viewBlocks),
 			budget,
 			contextWindow,
 			liveTokens,
@@ -860,6 +935,32 @@ function sliceLiveText(text: string, opts: RecallOptions): { text: string; note?
 	if (opts.lines) return sliceByLines(text, opts.lines, "live block");
 	if (opts.grep) return grepContent(text, opts.grep, "live block");
 	return capWholeRecall(text);
+}
+
+function uniqueIds(ids: readonly string[]): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const id of ids) {
+		if (typeof id !== "string") continue;
+		const trimmed = id.trim();
+		if (!trimmed || seen.has(trimmed)) continue;
+		seen.add(trimmed);
+		out.push(trimmed);
+	}
+	return out;
+}
+
+function skipReasonForManualFold(block: ViewBlock | undefined): string | undefined {
+	if (!block) return "unknown_id";
+	if (block.kind === "user") return "user_message";
+	if (block.kind === "thinking" || block.kind === "text") return "not_foldable_kind";
+	if (!isDurableId(block.id)) return "ephemeral_id";
+	if (block.protected) return "protected_tail";
+	if (block.held) return "held";
+	if (block.frozen || block.folded) return "already_folded";
+	if (block.kind === "tool_call" && block.toolName !== "subagent") return "not_foldable_kind";
+	if (block.foldedTokens >= block.tokens) return "no_savings";
+	return undefined;
 }
 
 /** Existing frozen ops first, then new policy ops whose id was not already claimed. */

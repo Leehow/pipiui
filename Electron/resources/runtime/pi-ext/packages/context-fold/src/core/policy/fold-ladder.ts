@@ -22,9 +22,16 @@
  * Each masked block folds to its deterministic per-kind receipt and stays reversible via
  * recall/unfold. Stateless across turns (a pure function of the view), so resume needs no ladder
  * state.
+ *
+ * Externalized awareness: a [subagent-done] that names an existing `.pi/findings/<agentId>.md`
+ * marks the matching tool_result `externalized:true`. On a threshold event those blocks are
+ * folded first (and alone, when they already buy one ladder step). No-findings sessions keep
+ * the historical "fold every eligible observation" behaviour. The fold itself is unchanged —
+ * still a digest pointer + spool, still recall_folded-reversible.
  */
 import type { FoldCommand, FoldPolicy, PolicyHost, PolicyView, ViewBlock } from "../contract";
 import { isDurableId } from "../block";
+import { annotateExternalized, defaultFindingsExists } from "./externalized";
 
 export interface LadderConfig {
 	/** First fold when usage ≥ this fraction of the context window. */
@@ -39,6 +46,19 @@ export interface LadderConfig {
 	toolUseKeep: number;
 	/** Minimum estimated token savings for a count-triggered event. */
 	toolUseMinSavings: number;
+	/**
+	 * Prefer folding tool_results whose worker findings file exists. Default true: only
+	 * changes selection when a [subagent-done] names an existing file. Sessions without
+	 * that evidence keep the historical fold-all-eligible behaviour.
+	 */
+	preferExternalized: boolean;
+	/**
+	 * Sort bonus for externalized candidates. 0 disables preference (fold every eligible
+	 * block, original order). Default 1 = externalized first.
+	 */
+	externalizedWeight: number;
+	/** Test/host seam: does this findings path exist? Defaults to fs.existsSync. */
+	findingsExists?: (path: string) => boolean;
 }
 
 export const LADDER_DEFAULTS: LadderConfig = {
@@ -48,6 +68,8 @@ export const LADDER_DEFAULTS: LadderConfig = {
 	toolUseTrigger: 40,
 	toolUseKeep: 12,
 	toolUseMinSavings: 10_000,
+	preferExternalized: true,
+	externalizedWeight: 1,
 };
 
 /** Ordinary ladder sweeps mask tool observations only; signed assistant reasoning is immutable. */
@@ -78,8 +100,11 @@ export class FoldLadderPolicy implements FoldPolicy {
 		const fraction = cw > 0 ? used / cw : 0;
 		const foldAt = this.cold ? Math.min(this.cfg.coldFoldAt, this.cfg.foldAt) : this.cfg.foldAt;
 
-		const superseded = this.supersededStatusCandidates(view);
-		const countTriggered = this.countTriggeredCandidates(view);
+		const blocks = annotateExternalized(view.blocks, this.cfg.findingsExists ?? defaultFindingsExists);
+		const annotated: PolicyView = blocks === view.blocks ? view : { ...view, blocks };
+
+		const superseded = this.supersededStatusCandidates(annotated);
+		const countTriggered = this.countTriggeredCandidates(annotated);
 		if (countTriggered.length > 0) {
 			const candidates = uniqueBlocks([...countTriggered, ...superseded]);
 			const savings = savedTokens(candidates);
@@ -126,7 +151,7 @@ export class FoldLadderPolicy implements FoldPolicy {
 			return [{ kind: "fold", ids: superseded.map((b) => b.id) }];
 		}
 
-		const eligible = view.blocks.filter(maskable);
+		const eligible = annotated.blocks.filter(maskable);
 		let savings = 0;
 		for (const b of eligible) savings += b.tokens - b.foldedTokens;
 
@@ -146,30 +171,49 @@ export class FoldLadderPolicy implements FoldPolicy {
 			return [];
 		}
 
+		const chosen = this.preferExternalized(eligible, { overCap, stepTokens });
+		const chosenSavings = savedTokens(chosen);
 		const trigger = overCap && !thresholdHit ? "cap" : "threshold";
-		const projected = view.liveTokens - savings;
+		const projected = view.liveTokens - chosenSavings;
 		this.host?.setStatus(
-			`fold event (${trigger}): masking ${eligible.length} block${eligible.length === 1 ? "" : "s"}, ~${k(savings)} tok`,
+			`fold event (${trigger}): masking ${chosen.length} block${chosen.length === 1 ? "" : "s"}, ~${k(chosenSavings)} tok`,
 			{
 				fold_event: true,
 				trigger,
-				folds: eligible.length,
-				tokens_saved: savings,
+				folds: chosen.length,
+				tokens_saved: chosenSavings,
 				live_tokens: projected,
 				budget: view.budget,
 				cap: view.budget,
 				usage_fraction: round3(fraction),
 				fold_at: round3(foldAt),
-				// Post-fold position: every eligible block is in this command, so nothing maskable
-				// remains until new observations land. Published so the trigger gauge stays renderable
-				// on the turn a fold fires without special-casing this branch.
-				maskable_tokens: 0,
+				// Remaining maskable mass after this command. 0 when every eligible block is in it
+				// (the historical fold-all path); leftover when only externalized blocks were taken.
+				maskable_tokens: Math.max(0, savings - chosenSavings),
 				step_tokens: stepTokens,
-				irreducible_floor: irreducibleFloor(view.blocks),
+				irreducible_floor: irreducibleFloor(annotated.blocks),
 				over_budget: projected > view.budget,
 			},
 		);
-		return [{ kind: "fold", ids: eligible.map((b) => b.id) }];
+		return [{ kind: "fold", ids: chosen.map((b) => b.id) }];
+	}
+
+	/**
+	 * On a threshold event, fold already-on-disk worker results first — and only those, when they
+	 * already buy one ladder step. Cap emergencies and no-findings sessions still fold every
+	 * eligible block. Preference never bypasses maskable()/tail/held guards.
+	 */
+	private preferExternalized(eligible: ViewBlock[], opts: { overCap: boolean; stepTokens: number }): ViewBlock[] {
+		const prefer = this.cfg.preferExternalized !== false;
+		const weight = this.cfg.externalizedWeight ?? LADDER_DEFAULTS.externalizedWeight;
+		if (!prefer || weight <= 0) return eligible;
+
+		const externalized = eligible.filter((block) => block.externalized);
+		if (externalized.length === 0) return eligible;
+
+		const extSorted = sortByOrder(externalized);
+		if (!opts.overCap && savedTokens(extSorted) >= opts.stepTokens) return extSorted;
+		return [...extSorted, ...sortByOrder(eligible.filter((block) => !block.externalized))];
 	}
 
 	/** Oldest completed successful result blocks, excluding the newest configured pair count. */
@@ -274,6 +318,10 @@ function savedTokens(blocks: ViewBlock[]): number {
 function uniqueBlocks(blocks: ViewBlock[]): ViewBlock[] {
 	const seen = new Set<string>();
 	return blocks.filter((block) => (seen.has(block.id) ? false : (seen.add(block.id), true)));
+}
+
+function sortByOrder(blocks: ViewBlock[]): ViewBlock[] {
+	return [...blocks].sort((a, b) => a.order - b.order);
 }
 
 function maskable(b: ViewBlock): boolean {

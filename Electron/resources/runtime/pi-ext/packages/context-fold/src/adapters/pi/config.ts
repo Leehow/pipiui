@@ -49,6 +49,14 @@ function positiveIntEnv(name: string, fallback: number, allowZero = false): numb
 	return value;
 }
 
+function boolEnv(name: string, fallback: boolean): boolean {
+	const raw = process.env[name]?.trim().toLowerCase();
+	if (raw === undefined || raw === "") return fallback;
+	if (raw === "0" || raw === "off" || raw === "false" || raw === "no") return false;
+	if (raw === "1" || raw === "on" || raw === "true" || raw === "yes" || raw === "high") return true;
+	return fallback;
+}
+
 export function adapterConfigFromEnv(): AdapterConfig {
 	const ladder: LadderConfig = {
 		foldAt: fracEnv("CONTEXTFOLD_FOLD_AT", LADDER_DEFAULTS.foldAt),
@@ -57,6 +65,8 @@ export function adapterConfigFromEnv(): AdapterConfig {
 		toolUseTrigger: positiveIntEnv("CONTEXTFOLD_TOOL_USE_TRIGGER", LADDER_DEFAULTS.toolUseTrigger),
 		toolUseKeep: positiveIntEnv("CONTEXTFOLD_TOOL_USE_KEEP", LADDER_DEFAULTS.toolUseKeep, true),
 		toolUseMinSavings: positiveIntEnv("CONTEXTFOLD_TOOL_USE_MIN_SAVINGS", LADDER_DEFAULTS.toolUseMinSavings),
+		preferExternalized: boolEnv("CONTEXTFOLD_PREFER_EXTERNALIZED", LADDER_DEFAULTS.preferExternalized),
+		externalizedWeight: positiveIntEnv("CONTEXTFOLD_EXTERNALIZED_WEIGHT", LADDER_DEFAULTS.externalizedWeight, true),
 	};
 	const recon = Number(process.env.CONTEXTFOLD_RECON_TOKENS);
 	const reconTokens = Number.isFinite(recon) && recon > 0 ? Math.floor(recon) : ADAPTER_DEFAULTS.reconTokens;
