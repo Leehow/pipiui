@@ -26,3 +26,11 @@ provides the extension API and `typebox` virtual modules at runtime.
 - Spool and seed-index paths remain the upstream session-local layout rooted exclusively at
   `ctx.sessionManager.getSessionDir()`. Spool/index persistence remains a precondition for a fold
   to reach the provider; failures send the raw context.
+- The outbound `context` view also omits thinking older than 20 user turns by default
+  (`CONTEXTFOLD_THINKING=0` disables it and `CONTEXTFOLD_THINKING_KEEP_TURNS` overrides the
+  window). This is a provider-deny-by-default PipiUI transform: cross-model thinking is dropped;
+  completed old Anthropic blocks and no-tool official DeepSeek/generic unsigned reasoning use
+  narrow source-backed rules; current/incomplete turns and strict signed/tool-coupled islands stay
+  byte-exact. A strict over-age island triggers Pi's existing `ctx.compact()` once after
+  `agent_settled`, replacing the old region as a whole rather than separating reasoning from its
+  tool protocol. Native mode still registers no `session_before_compact` hook.
