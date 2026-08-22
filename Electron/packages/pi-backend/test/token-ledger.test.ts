@@ -45,7 +45,6 @@ describe("token-ledger format (Swift TokenLedger parity)", () => {
       cacheRead: 800,
       cacheWrite: 100,
       cost: 0.00123,
-      contextTokens: 2_440,
     });
   });
 
@@ -114,6 +113,28 @@ describe("token-ledger format (Swift TokenLedger parity)", () => {
     expect(latest.get("session-1")).toEqual({ tokens: 2000, contextWindow: 262144, percent: 2000 / 262144 * 100 });
     expect(latest.get("other")).toEqual({ tokens: 42, contextWindow: 128000, percent: 42 / 128000 * 100 });
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it("does not restore context occupancy from a newer assistant billing row", () => {
+    const latest = latestContextBySession([
+      { ...record, ts: "2026-08-10T00:00:04.000Z", contextTokens: 15_000, contextSample: true },
+      {
+        ...record,
+        ts: "2026-08-10T00:00:05.000Z",
+        input: 1_200,
+        output: 340,
+        cacheRead: 800,
+        cacheWrite: 100,
+        cost: 0.00123,
+        contextTokens: 0,
+        contextSample: false,
+      },
+    ]);
+    expect(latest.get("session-1")).toEqual({
+      tokens: 15_000,
+      contextWindow: 262_144,
+      percent: 15_000 / 262_144 * 100,
+    });
   });
 
   it("reports null percent when the latest record has no window (Swift-written)", () => {
@@ -215,7 +236,8 @@ describe("per-session last-known context persistence", () => {
         cacheRead: 800,
         cacheWrite: 100,
         cost: 0.00123,
-        contextTokens: 2_440,
+        contextTokens: 0,
+        contextSample: false,
       }),
     ]);
 

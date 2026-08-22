@@ -6446,7 +6446,6 @@ export class PiHostBackend implements HostBackend {
     await this.loadSessionContextLedger();
     const turn = (this.sessionLedgerTurns.get(id) ?? 0) + 1;
     this.sessionLedgerTurns.set(id, turn);
-    const contextWindow = this.sessionContextLastKnown.get(id)?.contextWindow;
     void appendLedgerRecord(this.contextLedgerFile(), {
       ts,
       session: id,
@@ -6455,7 +6454,8 @@ export class PiHostBackend implements HostBackend {
       model: `${provider}/${modelId}`,
       turn,
       ...usage,
-      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      contextTokens: 0,
+      contextSample: false,
     });
   }
   /** Best-effort ledger append of one observed context sample. */
@@ -6482,6 +6482,7 @@ export class PiHostBackend implements HostBackend {
       cost: 0,
       contextTokens: known.tokens,
       contextWindow: known.contextWindow,
+      contextSample: true,
     });
   }
   /**
