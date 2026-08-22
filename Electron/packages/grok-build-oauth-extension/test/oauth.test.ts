@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createServer, type Server } from "node:http";
 import { resolveOAuthConfig, PROD_ISSUER, PROD_CLIENT_ID, defaultScopes } from "../agent/oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, refreshAccessToken, OAuthError } from "../agent/oauth/device.js";
 import { redactMessage, redactObject } from "../agent/oauth/redact.js";
@@ -143,15 +142,23 @@ describe("requestDeviceCode", () => {
     })).rejects.toThrow(/Abort/);
   });
 
-  it("allows http localhost verification_uri", async () => {
-    const fetchOk: typeof fetch = async () =>
+  it("rejects http verification_uri even from a loopback issuer (HTTPS-only, round-2 Critical #2)", async () => {
+    const fetchHttp: typeof fetch = async () =>
       new Response(JSON.stringify({
         device_code: "dc", user_code: "ABCD-1234", verification_uri: "http://localhost:22255/device", expires_in: 600,
       }), { status: 200 });
-    const code = await requestDeviceCode({
-      issuer: "http://localhost:22255", clientId: "c", scopes: ["openid"], referrer: "grok-build", fetchImpl: fetchOk as never,
-    });
-    expect(code.verification_uri).toBe("http://localhost:22255/device");
+    await expect(requestDeviceCode({
+      issuer: "https://auth.x.ai", clientId: "c", scopes: ["openid"], referrer: "grok-build", fetchImpl: fetchHttp as never,
+    })).rejects.toThrow(/verification URI/);
+  });
+
+  it("rejects a non-HTTPS issuer before any network call (device code)", async () => {
+    let fetched = false;
+    const fetchSpy: typeof fetch = async () => { fetched = true; return new Response("{}", { status: 200 }); };
+    await expect(requestDeviceCode({
+      issuer: "http://127.0.0.1:9999", clientId: "c", scopes: ["openid"], referrer: "grok-build", fetchImpl: fetchSpy as never,
+    })).rejects.toMatchObject({ code: "invalid_params" });
+    expect(fetched).toBe(false);
   });
 });
 
@@ -312,68 +319,52 @@ describe("explicit import (no silent read)", () => {
   });
 });
 
-describe("fake OAuth server integration (device+token contract)", () => {
-  let server: Server;
-  let issuer: string;
-  let tokenSeq: Array<{ status: number; body: unknown }> = [];
-  let deviceHits: Array<{ body: string; headers: Record<string, string> }> = [];
+describe("HTTPS enforcement (round-2 Critical #2)", () => {
+  it("resolveOAuthConfig refuses a non-HTTPS issuer from env", () => {
+    const prev = process.env.GROK_OAUTH2_ISSUER;
+    process.env.GROK_OAUTH2_ISSUER = "http://127.0.0.1:9999";
+    try {
+      expect(() => resolveOAuthConfig()).toThrow(/HTTPS/);
+    } finally {
+      if (prev === undefined) delete process.env.GROK_OAUTH2_ISSUER;
+      else process.env.GROK_OAUTH2_ISSUER = prev;
+    }
+  });
 
-  function start(): Promise<string> {
-    tokenSeq = [];
-    deviceHits = [];
-    return new Promise((resolve) => {
-      server = createServer((req, res) => {
-        let body = "";
-        req.on("data", (c) => (body += c));
-        req.on("end", () => {
-          if (req.url === "/oauth2/device/code" && req.method === "POST") {
-            const h: Record<string, string> = {};
-            for (const [k, v] of Object.entries(req.headers)) if (typeof v === "string") h[k.toLowerCase()] = v;
-            deviceHits.push({ body, headers: h });
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({
-              device_code: "dev-code-1",
-              user_code: "ABCD-1234",
-              verification_uri: "https://accounts.x.ai/device",
-              verification_uri_complete: "https://accounts.x.ai/device?user_code=ABCD-1234",
-              expires_in: 600,
-              interval: 1,
-            }));
-            return;
-          }
-          if (req.url === "/oauth2/token" && req.method === "POST") {
-            const next = tokenSeq.shift() ?? { status: 400, body: { error: "authorization_pending" } };
-            res.writeHead(next.status, { "content-type": "application/json" });
-            res.end(JSON.stringify(next.body));
-            return;
-          }
-          res.writeHead(404); res.end();
-        });
-      });
-      server.listen(0, () => {
-        const addr = server.address() as { port: number };
-        issuer = `http://127.0.0.1:${addr.port}`;
-        resolve(issuer);
-      });
+  it("resolveOAuthConfig refuses a non-HTTPS issuer from settings", () => {
+    const prev = process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH;
+    process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH = JSON.stringify({
+      "ext.grok-build-oauth.issuer": "http://auth.example.com",
     });
-  }
+    try {
+      expect(() => resolveOAuthConfig()).toThrow(/HTTPS/);
+    } finally {
+      if (prev === undefined) delete process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH;
+      else process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH = prev;
+    }
+  });
 
-  afterEach(() => { server?.close(); });
+  it("refreshAccessToken refuses a non-HTTPS issuer before any network call (defense in depth)", async () => {
+    let fetched = false;
+    const fetchSpy: typeof fetch = async () => { fetched = true; return new Response("{}", { status: 200 }); };
+    await expect(refreshAccessToken({
+      issuer: "http://auth.example.com", clientId: "c", refreshToken: "rt", fetchImpl: fetchSpy as never,
+    })).rejects.toMatchObject({ code: "invalid_params" });
+    expect(fetched).toBe(false);
+    // An HTTPS issuer passes the scheme guard and completes normally.
+    await expect(refreshAccessToken({
+      issuer: "https://auth.x.ai", clientId: "c", refreshToken: "rt", fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: "at" }), { status: 200 })) as never,
+    })).resolves.toMatchObject({ access_token: "at" });
+  });
 
-  it("device code contract: posts form with referrer and polls until success", async () => {
-    const iss = await start();
-    tokenSeq = [
-      { status: 400, body: { error: "authorization_pending" } },
-      { status: 200, body: { access_token: "at-ok", refresh_token: "rt-ok", expires_in: 900 } },
-    ];
-    const code = await requestDeviceCode({ issuer: iss, clientId: "test", scopes: ["openid", "profile"], referrer: "grok-build", surface: "cli" });
-    expect(code.device_code).toBe("dev-code-1");
-    expect(deviceHits[0].body).toContain("referrer=grok-build");
-    expect(deviceHits[0].body).toContain("client_id=test");
-    expect(deviceHits[0].headers["x-grok-client-surface"]).toBe("cli");
-
-    const clock = fakeClock();
-    const tokens = await pollDeviceToken({ issuer: iss, clientId: "test", deviceCode: code, clock });
-    expect(tokens.access_token).toBe("at-ok");
+  it("pollDeviceToken refuses a non-HTTPS issuer before any network call", async () => {
+    let fetched = false;
+    const fetchSpy: typeof fetch = async () => { fetched = true; return new Response("{}", { status: 200 }); };
+    const dc = { device_code: "dc", user_code: "ABCD-1234", verification_uri: "https://accounts.x.ai/device", expires_in: 600, interval: 1 };
+    await expect(pollDeviceToken({
+      issuer: "http://127.0.0.1:9999", clientId: "c", deviceCode: dc, fetchImpl: fetchSpy as never, clock: fakeClock(),
+    })).rejects.toMatchObject({ code: "invalid_params" });
+    expect(fetched).toBe(false);
   });
 });

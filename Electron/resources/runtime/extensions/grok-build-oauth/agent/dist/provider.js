@@ -27,12 +27,13 @@ export function defaultAuthPath() {
     // are unset (no global ~/.pi/agent fallback — project isolation hard rule).
     return authJsonPath();
 }
-function brokerFor(authPath, signal) {
+function brokerFor(authPath, credentialStore, signal) {
     const cfg = resolveOAuthConfig();
     return createBroker({
         authPath: authPath ?? defaultAuthPath(),
         earlyRefreshSec: cfg.earlyRefreshSec,
         fetchImpl: fetch,
+        ...(credentialStore ? { credentialStore } : {}),
     });
 }
 /**
@@ -45,6 +46,7 @@ export function createGrokBuildProvider(options = {}) {
     // Resolved lazily so a missing home surfaces as an actionable error at the
     // first credential operation instead of breaking extension registration.
     const authPath = options.authPath;
+    const credentialStore = options.credentialStore;
     return {
         // Auth-only provider: no chat models are exposed (images transport is tool-based).
         name: "Grok Build",
@@ -146,7 +148,9 @@ export function createGrokBuildProvider(options = {}) {
                 }
                 const creds = toOAuthCredentials(tokens, { issuer: cfg.issuer, clientId: cfg.clientId, scopes: cfg.scopes });
                 await emit("token_refreshed", { expires_at: creds.expires });
-                // Pi expects OAuthCredentials { access, refresh, expires, ...extra }
+                // Pi expects OAuthCredentials { access, refresh, expires, ...extra }.
+                // The official id_token `tier` claim is captured with the credential
+                // (tier/tier_raw/tier_source) so the tier gate/status use real data.
                 return {
                     access: creds.access,
                     refresh: creds.refresh,
@@ -156,6 +160,9 @@ export function createGrokBuildProvider(options = {}) {
                     scopes: creds.scopes,
                     token_type: creds.token_type,
                     obtained_at: creds.obtained_at,
+                    ...(creds.tier !== undefined ? { tier: creds.tier } : {}),
+                    ...(creds.tier_raw !== undefined ? { tier_raw: creds.tier_raw } : {}),
+                    ...(creds.tier_source !== undefined ? { tier_source: creds.tier_source } : {}),
                 };
             },
             async refreshToken(credentials, signal) {
@@ -172,7 +179,7 @@ export function createGrokBuildProvider(options = {}) {
                 if (signal?.aborted)
                     throw new DOMException("Aborted", "AbortError");
                 // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
-                const broker = brokerFor(authPath, signal);
+                const broker = brokerFor(authPath, credentialStore, signal);
                 try {
                     const next = await broker.forceRefresh(signal);
                     await emit("token_refreshed", { expires_at: next.expires });
@@ -185,6 +192,9 @@ export function createGrokBuildProvider(options = {}) {
                         scopes: next.scopes,
                         token_type: next.token_type,
                         obtained_at: next.obtained_at,
+                        ...(next.tier !== undefined ? { tier: next.tier } : {}),
+                        ...(next.tier_raw !== undefined ? { tier_raw: next.tier_raw } : {}),
+                        ...(next.tier_source !== undefined ? { tier_source: next.tier_source } : {}),
                     };
                 }
                 catch (err) {

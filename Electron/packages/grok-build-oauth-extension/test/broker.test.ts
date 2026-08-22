@@ -147,7 +147,7 @@ describe("Broker — in-process dedup, cross-process lock, crash recovery, atomi
     const { mkdir } = await import("node:fs/promises");
     await mkdir(lockPath).catch(() => {});
     const { utimes } = await import("node:fs/promises");
-    const old = new Date(Date.now() - 40_000);
+    const old = new Date(Date.now() - 120_000);
     await utimes(lockPath, old, old).catch(() => {});
     const fakeFetch = async () => new Response(JSON.stringify({ access_token: "at-recovered", expires_in: 3600 }), { status: 200 });
     const broker = new GrokCredentialBroker({ authPath, fetchImpl: fakeFetch as unknown as typeof fetch });
@@ -269,5 +269,239 @@ describe("Broker — in-process dedup, cross-process lock, crash recovery, atomi
     const [t1, t2] = await Promise.all([broker2.getAccessToken(), broker2.getAccessToken()]);
     expect(t1).toBe(t2);
     expect(calls).toBe(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-2 reviewer Critical #1 — the broker must share Pi ModelRuntime's lock.
+// These tests race the broker against the REAL pi credential store
+// (AuthStorage + FileAuthStorageBackend — exactly what ModelRuntime.create
+// constructs internally), imported by file URL from the installed runtime.
+// ─────────────────────────────────────────────────────────────────────────────
+import { createRequire } from "node:module";
+import { realpathSync, symlinkSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { createCredentialStoreAdapterFromStore } from "../agent/oauth/store-adapter.js";
+
+const nodeRequire = createRequire(import.meta.url);
+
+type PiStore = {
+  read(provider: string): Promise<unknown>;
+  modify(provider: string, fn: (current: unknown) => Promise<unknown>): Promise<unknown>;
+  delete(provider: string): Promise<void>;
+};
+
+async function loadPiAuthStorage(): Promise<((authPath: string) => PiStore) | undefined> {
+  try {
+    const indexJs = nodeRequire.resolve("@earendil-works/pi-coding-agent");
+    const { pathToFileURL } = await import("node:url");
+    const mod = (await import(pathToFileURL(join(dirname(indexJs), "core", "auth-storage.js")).href)) as {
+      AuthStorage: { create(authPath?: string): PiStore };
+    };
+    return (authPath: string) => mod.AuthStorage.create(authPath);
+  } catch {
+    return undefined;
+  }
+}
+
+describe("Broker × Pi credential store — one lock, no lost fields (round-2 Critical #1)", () => {
+  let dir = "";
+  let authPath = "";
+  afterEach(async () => { if (dir) await rm(dir, { recursive: true, force: true }); dir = ""; });
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "grok-broker-pi-"));
+    authPath = join(dir, "auth.json");
+  });
+
+  it("concurrent Pi login/logout/other-provider writes + broker refresh never lose fields", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const pi = createPiStore?.(authPath);
+    if (!pi) return; // pi runtime not installed in this environment
+
+    const broker = new GrokCredentialBroker({
+      authPath,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: `at-${Date.now()}`, refresh_token: `rt-${Date.now()}`, expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+    });
+    await broker._writeForTest(makeCred({ refresh: "rt-0", expires: Date.now() + 10_000 }) as never);
+
+    // 15 rounds of interleaved ModelRuntime-style activity:
+    // - login another provider (modify)
+    // - logout another provider (delete)
+    // - rotate a third provider's key
+    // - broker refresh of grok-build
+    for (let round = 1; round <= 15; round++) {
+      await Promise.all([
+        pi.modify("anthropic", async () => ({ type: "api_key", key: `sk-ant-${round}` })),
+        round % 3 === 0
+          ? pi.delete("deepseek").then(() => pi.modify("deepseek", async () => ({ type: "api_key", key: `sk-ds-${round}` })))
+          : Promise.resolve(),
+        pi.modify("openai", async (cur) => ({ ...(cur as object), type: "api_key", key: `sk-oai-${round}` })),
+        broker.forceRefresh().catch(() => {}),
+      ]);
+    }
+
+    const data = JSON.parse(await readFile(authPath, "utf8")) as Record<string, { key?: string; access?: string }>;
+    expect(data.anthropic?.key).toBe("sk-ant-15");
+    expect(data.deepseek?.key).toBe("sk-ds-15");
+    expect(data.openai?.key).toBe("sk-oai-15");
+    expect(typeof data["grok-build"]?.access).toBe("string");
+    expect(data["grok-build"]?.access).toMatch(/^at-/);
+  });
+
+  it("Pi logout of grok-build racing a broker refresh leaves a consistent file (either logged out or refreshed)", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const pi = createPiStore?.(authPath);
+    if (!pi) return;
+
+    for (let round = 1; round <= 8; round++) {
+      const broker = new GrokCredentialBroker({
+        authPath,
+        fetchImpl: (async () =>
+          new Response(JSON.stringify({ access_token: `at-r${round}`, refresh_token: `rt-r${round}`, expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+      });
+      await broker._writeForTest(makeCred({ refresh: `rt-${round}`, expires: Date.now() + 10_000 }) as never);
+      await pi.modify("anthropic", async () => ({ type: "api_key", key: `sk-${round}` }));
+      // Race: ModelRuntime logout (delete grok-build) vs broker refresh.
+      await Promise.allSettled([pi.delete("grok-build"), broker.forceRefresh()]);
+      const data = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
+      // Whatever won, the OTHER provider must have survived every single round.
+      expect((data.anthropic as { key: string }).key).toBe(`sk-${round}`);
+      // And the grok-build entry is either absent (logout won) or a full oauth entry.
+      const grok = data["grok-build"] as { type?: string; access?: string } | undefined;
+      if (grok) expect(grok.type).toBe("oauth");
+    }
+  });
+
+  it("broker refresh (network inside the lock) excludes a concurrent Pi write — no torn interleave", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const pi = createPiStore?.(authPath);
+    if (!pi) return;
+
+    const broker = new GrokCredentialBroker({
+      authPath,
+      fetchImpl: (async () => {
+        // Slow "network" while the shared lock is held.
+        await new Promise((r) => setTimeout(r, 120));
+        return new Response(JSON.stringify({ access_token: "at-slow", refresh_token: "rt-slow", expires_in: 3600 }), { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    await broker._writeForTest(makeCred({ refresh: "rt-old", expires: Date.now() + 10_000 }) as never);
+    await pi.modify("anthropic", async () => ({ type: "api_key", key: "sk-before" }));
+
+    const refreshP = broker.forceRefresh();
+    // Pi write started while the broker holds the lock across the "network" call.
+    const piWriteP = new Promise<number>((resolve) => {
+      setTimeout(() => resolve(Date.now()), 60);
+    }).then(async (start) => {
+      await pi.modify("anthropic", async () => ({ type: "api_key", key: "sk-during" }));
+      return Date.now() - start;
+    });
+    const [refreshed] = await Promise.all([refreshP, piWriteP]);
+    expect(refreshed.access).toBe("at-slow");
+    const data = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
+    expect((data.anthropic as { key: string }).key).toBe("sk-during");
+    expect((data["grok-build"] as { access: string }).access).toBe("at-slow");
+  });
+
+  it("project symlink shape: session pi store (locks the symlink path) + broker share one real lock", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const piSession = createPiStore?.(authPath);
+    if (!piSession) return;
+
+    const canonicalDir = join(dir, "app-profile");
+    mkdirSync(canonicalDir, { recursive: true });
+    const canonical = join(canonicalDir, "auth.json");
+    writeFileSync(canonical, "{}\n", { mode: 0o600 });
+    const projectAgentDir = join(dir, "projectA", ".pi", "agent");
+    mkdirSync(projectAgentDir, { recursive: true });
+    const projectAuth = join(projectAgentDir, "auth.json");
+    symlinkSync(canonical, projectAuth);
+
+    // A session's ModelRuntime is constructed with the PROJECT authPath (pi
+    // resolves PI_CODING_AGENT_DIR/auth.json and locks realpath:false — i.e.
+    // the symlink path's own .lock). The broker is given the same path.
+    const pi = createPiStore!(projectAuth);
+    const broker = new GrokCredentialBroker({
+      authPath: projectAuth,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: `at-${Date.now()}`, refresh_token: `rt-${Date.now()}`, expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+    });
+    await broker._writeForTest(makeCred({ refresh: "rt-0", expires: Date.now() + 10_000 }) as never);
+
+    for (let round = 1; round <= 8; round++) {
+      await Promise.all([
+        pi.modify("anthropic", async () => ({ type: "api_key", key: `sk-${round}` })),
+        broker.forceRefresh().catch(() => {}),
+      ]);
+    }
+    const data = JSON.parse(await readFile(realpathSync(canonical), "utf8")) as Record<string, unknown>;
+    expect((data.anthropic as { key: string }).key).toBe("sk-8");
+    expect(typeof (data["grok-build"] as { access: string }).access).toBe("string");
+    // The project symlink was never replaced by the broker's atomic writes.
+    const { lstatSync } = await import("node:fs");
+    expect(lstatSync(projectAuth).isSymbolicLink()).toBe(true);
+  });
+
+  it("host-injected pi CredentialStore adapter: broker mutates only through it; invalid_grant never clears a rotated credential", async () => {
+    const createPiStore = await loadPiAuthStorage();
+    const pi = createPiStore?.(authPath);
+    if (!pi) return;
+
+    const adapter = createCredentialStoreAdapterFromStore(pi);
+    const broker = new GrokCredentialBroker({
+      authPath,
+      credentialStore: adapter,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ access_token: `at-${Date.now()}`, refresh_token: `rt-${Date.now()}`, expires_in: 3600 }), { status: 200 })) as unknown as typeof fetch,
+    });
+    await broker._writeForTest(makeCred({ refresh: "rt-0", expires: Date.now() + 10_000 }) as never);
+    await pi.modify("anthropic", async () => ({ type: "api_key", key: "sk-keep" }));
+
+    const refreshed = await broker.forceRefresh();
+    expect(refreshed.access).toMatch(/^at-/);
+    const afterRefresh = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
+    expect((afterRefresh.anthropic as { key: string }).key).toBe("sk-keep");
+    expect((afterRefresh["grok-build"] as { refresh: string }).refresh).toBe(refreshed.refresh);
+
+    // Rotation race: the stored refresh token was already rotated by someone
+    // else; an invalid_grant for the OLD token must NOT clear the new one.
+    const staleBroker = new GrokCredentialBroker({
+      authPath,
+      credentialStore: createCredentialStoreAdapterFromStore(pi),
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 })) as unknown as typeof fetch,
+    });
+    await expect(staleBroker.forceRefresh()).rejects.toMatchObject({ code: "auth_expired" });
+    const afterRace = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
+    // The currently-valid credential survived the stale invalid_grant.
+    expect(afterRace["grok-build"]).toBeTruthy();
+    expect(typeof (afterRace["grok-build"] as { access: string }).access).toBe("string");
+  });
+
+  it("file adapter: invalid_grant for a rotated-away refresh token keeps the rotated credential (rotation race)", async () => {
+    // The stored credential is rt-new (rotated); the broker believes rt-old.
+    const broker = new GrokCredentialBroker({
+      authPath,
+      fetchImpl: (async () =>
+        new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 })) as unknown as typeof fetch,
+    });
+    const rotated = makeCred({ access: "at-new", refresh: "rt-new", expires: Date.now() + 3600_000, obtained_at: Date.now() }) as never;
+    await broker._writeForTest(rotated);
+    // Force the broker to "see" an older credential so it refreshes with it:
+    // simulate by pointing it at rt-old via a direct file rewrite under it.
+    const stale = makeCred({ access: "at-old", refresh: "rt-old", expires: Date.now() + 10_000, obtained_at: Date.now() - 5_000 }) as never;
+    await writeFile(authPath, JSON.stringify({ "grok-build": stale }, null, 2));
+    // Another process rotates back to the new credential right after the broker read:
+    const race = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        void writeFile(authPath, JSON.stringify({ "grok-build": rotated }, null, 2)).then(resolve);
+      }, 10);
+    });
+    await expect(broker.forceRefresh()).rejects.toMatchObject({ code: "auth_expired" });
+    await race;
+    const after = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
+    // The rotated credential was NOT cleared by the stale invalid_grant.
+    expect((after["grok-build"] as { refresh: string }).refresh).toBe("rt-new");
   });
 });

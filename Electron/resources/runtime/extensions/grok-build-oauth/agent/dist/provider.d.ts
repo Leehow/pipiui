@@ -1,3 +1,4 @@
+import type { CredentialStoreAdapter } from "./oauth/store-adapter.js";
 export declare const GROK_BUILD_PROVIDER_ID = "grok-build";
 export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> | void;
 export type GrokBuildProviderOptions = {
@@ -5,6 +6,8 @@ export type GrokBuildProviderOptions = {
     emit?: GrokBuildEmit;
     /** Explicit `auth.json` path. Defaults to `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR` (fail closed). */
     authPath?: string;
+    /** Host-injected credential store — every broker mutation goes through it. */
+    credentialStore?: CredentialStoreAdapter;
 };
 export type GrokBuildOAuthCredentials = {
     access: string;

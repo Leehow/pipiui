@@ -1,4 +1,5 @@
 import { xGrokClientVersion } from "./config.js";
+import { assertHttpsIssuer } from "./config.js";
 import { redactMessage } from "./redact.js";
 const DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
 const REFRESH_GRANT = "refresh_token";
@@ -26,7 +27,14 @@ function validateUserCode(code) {
         throw new OAuthError("invalid_response", "Server returned invalid user_code format");
     }
 }
-function validateVerificationUri(uri, opts = {}) {
+/**
+ * Validate a verification URI. HTTPS only — the device verification page is
+ * entered by the user with the user_code; a plain-HTTP page would let a
+ * network attacker swap the code (round-2 reviewer: no loopback-HTTP
+ * tolerance for issuers; local fakes use an https stub or the relay-free
+ * test transport instead).
+ */
+function validateVerificationUri(uri) {
     if ([...uri].some((c) => c.charCodeAt(0) < 0x20)) {
         throw new OAuthError("invalid_response", "Server returned invalid verification URI");
     }
@@ -37,13 +45,9 @@ function validateVerificationUri(uri, opts = {}) {
     catch {
         throw new OAuthError("invalid_response", "Server returned invalid verification URI");
     }
-    if (parsed.protocol === "https:")
-        return;
-    // Loopback http is only tolerated for explicit test deployments (fake issuer
-    // on localhost); production issuers are https (spec §D4).
-    if (opts.allowLoopbackHttp && parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]"))
-        return;
-    throw new OAuthError("invalid_response", "Server returned unsupported verification URI scheme");
+    if (parsed.protocol !== "https:") {
+        throw new OAuthError("invalid_response", "Server returned unsupported verification URI scheme (HTTPS only)");
+    }
 }
 function sleepMs(ms, signal) {
     if (signal?.aborted)
@@ -61,6 +65,7 @@ function sleepMs(ms, signal) {
 export async function requestDeviceCode(opts) {
     if (opts.signal?.aborted)
         throw new DOMException("Aborted", "AbortError");
+    assertHttpsIssuer(opts.issuer);
     const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/device/code`;
     const scopeStr = opts.scopes.join(" ");
     const fetchFn = opts.fetchImpl ?? fetch;
@@ -92,19 +97,10 @@ export async function requestDeviceCode(opts) {
     if (!data || typeof data.device_code !== "string" || typeof data.user_code !== "string" || typeof data.verification_uri !== "string") {
         throw new OAuthError("invalid_response", "Device code response missing required fields");
     }
-    const loopbackIssuer = (() => {
-        try {
-            const u = new URL(opts.issuer);
-            return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
-        }
-        catch {
-            return false;
-        }
-    })();
     validateUserCode(data.user_code);
-    validateVerificationUri(data.verification_uri, { allowLoopbackHttp: loopbackIssuer });
+    validateVerificationUri(data.verification_uri);
     if (typeof data.verification_uri_complete === "string" && data.verification_uri_complete) {
-        validateVerificationUri(data.verification_uri_complete, { allowLoopbackHttp: loopbackIssuer });
+        validateVerificationUri(data.verification_uri_complete);
     }
     const interval = typeof data.interval === "number" && Number.isFinite(data.interval) ? Math.max(MIN_INTERVAL_SECS, Math.floor(data.interval)) : DEFAULT_INTERVAL_SECS;
     // Honor the server's expiry as-is (spec §D4/§D6-06); only default when absent.
@@ -119,6 +115,7 @@ export async function requestDeviceCode(opts) {
     };
 }
 export async function pollDeviceToken(opts) {
+    assertHttpsIssuer(opts.issuer);
     const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/token`;
     const fetchFn = opts.fetchImpl ?? fetch;
     const sleep = opts.clock
@@ -154,7 +151,9 @@ export async function pollDeviceToken(opts) {
             method: "POST",
             headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
             body: body.toString(),
-            signal: mergedSignal(opts.signal),
+            // Per-request timeout is clamped to the remaining device-code deadline so
+            // a hung request cannot blow past `expires_in` (round-2 reviewer warning).
+            signal: mergedSignal(opts.signal, Math.min(DEFAULT_REQUEST_TIMEOUT_MS, Math.max(1_000, deadlineMs - nowMs()))),
         });
         if (resp.ok) {
             const tokens = (await resp.json().catch(() => null));
@@ -195,6 +194,9 @@ export async function pollDeviceToken(opts) {
 export async function refreshAccessToken(opts) {
     if (opts.signal?.aborted)
         throw new DOMException("Aborted", "AbortError");
+    // Defense in depth: the refresh token is a long-lived credential; it is
+    // only ever posted to an HTTPS issuer (config already enforces this).
+    assertHttpsIssuer(opts.issuer);
     const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/token`;
     const fetchFn = opts.fetchImpl ?? fetch;
     const body = new URLSearchParams({

@@ -13,7 +13,8 @@ import {
   MAX_REFERENCE_BYTES,
 } from "../agent/images/client.js";
 import { ImagesError, TIER_RESTRICTED_UPSELL } from "../agent/images/errors.js";
-import { isRestrictedTier } from "../agent/images/tier.js";
+import { isRestrictedTier, resolveSubscriptionTier, tierNameFromJwtClaim, decodeIdTokenTierClaim } from "../agent/images/tier.js";
+import { resolveRelayBase } from "../agent/images/config.js";
 import { SessionImageWriter } from "../agent/images/storage.js";
 import { GrokCredentialBroker } from "../agent/oauth/broker.js";
 
@@ -89,14 +90,14 @@ describe("M4 images — request contract (official Grok Build alignment)", () =>
     expect(headers["x-grok-session-id"]).toBe("sess-123");
   });
 
-  it("normalizes trailing slashes, honors base override, HTTPS-only bearer policy", () => {
+  it("normalizes trailing slashes, honors base override, HTTPS-only bearer policy (no loopback exception)", () => {
     expect(normalizeBaseUrl("https://api.x.ai/v1/")).toBe("https://api.x.ai/v1");
-    // Bearer credentials never go to plain HTTP (reviewer MUST-FIX #8)...
+    // Bearer credentials never go to plain HTTP — including loopback (round-2
+    // Critical #2: compatFallback must not re-open an HTTP bearer path; the
+    // deprecated relay is a separate loopback transport with `Bearer local`).
     expect(() => normalizeBaseUrl("http://127.0.0.1:9/v1///")).toThrowError(ImagesError);
+    expect(() => normalizeBaseUrl("http://localhost:9/v1")).toThrowError(ImagesError);
     expect(() => normalizeBaseUrl("http://evil.example/v1")).toThrowError(ImagesError);
-    // ...except explicit loopback compat relay opt-in.
-    expect(normalizeBaseUrl("http://127.0.0.1:9/v1///", { allowHttpLoopback: true })).toBe("http://127.0.0.1:9/v1");
-    expect(() => normalizeBaseUrl("http://evil.example/v1", { allowHttpLoopback: true })).toThrowError(ImagesError);
     expect(() => normalizeBaseUrl("not a url")).toThrowError(ImagesError);
     expect(() => normalizeBaseUrl("ftp://x.ai")).toThrowError(ImagesError);
   });
@@ -429,5 +430,95 @@ describe("M4 images — broker integration: 401 single forced-refresh retry", ()
     ).rejects.toMatchObject({ code: "rate_limited", status: 429 });
     expect(calls).toBe(1);
     expect(refreshes).toBe(0);
+  });
+});
+
+describe("M4 images — relay base (deprecated compat transport, loopback-only, local credential)", () => {
+  const ENV = "PIPIUI_GROK_RELAY";
+  let saved: string | undefined;
+  beforeEach(() => { saved = process.env[ENV]; });
+  afterEach(() => {
+    if (saved === undefined) delete process.env[ENV];
+    else process.env[ENV] = saved;
+  });
+
+  it("default relay base is the loopback relay", () => {
+    delete process.env[ENV];
+    expect(resolveRelayBase()).toBe("http://127.0.0.1:18891/v1");
+  });
+
+  it("accepts a loopback http relay base only", () => {
+    process.env[ENV] = "http://127.0.0.1:19999/v1/";
+    expect(resolveRelayBase()).toBe("http://127.0.0.1:19999/v1");
+    process.env[ENV] = "http://localhost:19999/v1";
+    expect(resolveRelayBase()).toBe("http://localhost:19999/v1");
+  });
+
+  it("refuses non-loopback and non-http relay bases (no exfil, no fake https relay)", () => {
+    process.env[ENV] = "http://evil.example/v1";
+    expect(() => resolveRelayBase()).toThrowError(ImagesError);
+    process.env[ENV] = "https://evil.example/v1";
+    expect(() => resolveRelayBase()).toThrowError(ImagesError);
+    process.env[ENV] = "https://127.0.0.1:1/v1";
+    expect(() => resolveRelayBase()).toThrowError(ImagesError);
+    process.env[ENV] = "not a url";
+    expect(() => resolveRelayBase()).toThrowError(ImagesError);
+  });
+});
+
+describe("M4 images — tier resolver (real sources: override / official JWT claim; unknown fail-open)", () => {
+  const claim = (n: number) => {
+    const b64 = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    return `x.${b64({ iss: "https://auth.x.ai", tier: n })}.y`;
+  };
+
+  it("decodes ONLY the official numeric `tier` claim from the id_token payload", () => {
+    expect(decodeIdTokenTierClaim(claim(0))).toBe(0);
+    expect(decodeIdTokenTierClaim(claim(2))).toBe(2);
+    expect(decodeIdTokenTierClaim(undefined)).toBeUndefined();
+    expect(decodeIdTokenTierClaim("not.a.jwt")).toBeUndefined();
+    expect(decodeIdTokenTierClaim("x.###.y")).toBeUndefined();
+    // a token without a numeric tier claim
+    const b64 = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString("base64url");
+    expect(decodeIdTokenTierClaim(`x.${b64({ plan: "free" })}.y`)).toBeUndefined();
+  });
+
+  it("maps only officially mapped claim values; unknown numbers stay unknown (never guessed)", () => {
+    expect(tierNameFromJwtClaim(0)).toEqual({ name: "free", raw: "0" });
+    expect(tierNameFromJwtClaim(1)).toEqual({ name: "supergrok", raw: "1" });
+    expect(tierNameFromJwtClaim(2)).toEqual({ name: "x_basic", raw: "2" });
+    expect(tierNameFromJwtClaim(7)).toEqual({ raw: "7" }); // future tier — unknown, fail-open
+    expect(tierNameFromJwtClaim("free")).toEqual({});
+  });
+
+  it("resolveSubscriptionTier: override wins (incl. restricted empty string); credential tier; unknown fail-open", () => {
+    expect(resolveSubscriptionTier({ override: "" })).toEqual({ tier: "", source: "override", restricted: true });
+    expect(resolveSubscriptionTier({ override: "X Basic" })).toEqual({ tier: "X Basic", source: "override", restricted: true });
+    expect(resolveSubscriptionTier({ override: "supergrok" })).toEqual({ tier: "supergrok", source: "override", restricted: false });
+    expect(resolveSubscriptionTier({ credential: { tier: "free", tier_source: "jwt" } })).toEqual({ tier: "free", source: "credential", restricted: true });
+    expect(resolveSubscriptionTier({ credential: { tier: "supergrok", tier_source: "jwt" } })).toEqual({ tier: "supergrok", source: "credential", restricted: false });
+    // unmapped numeric claim: unknown name, fail-open, raw surfaced
+    expect(resolveSubscriptionTier({ credential: { tier_raw: "7", tier_source: "jwt" } })).toEqual({ tier: undefined, source: "credential", restricted: false, raw: "7" });
+    expect(resolveSubscriptionTier({})).toEqual({ tier: undefined, source: "unknown", restricted: false });
+    // override beats credential
+    expect(resolveSubscriptionTier({ override: "supergrok", credential: { tier: "free" } }).restricted).toBe(false);
+  });
+
+  it("toOAuthCredentials carries the mapped tier from the token response id_token", async () => {
+    const { toOAuthCredentials } = await import("../agent/oauth/credentials.js");
+    const cred = toOAuthCredentials(
+      { access_token: "at", refresh_token: "rt", expires_in: 3600, id_token: claim(2) },
+      { issuer: "https://auth.x.ai", clientId: "c", scopes: ["openid"] },
+    );
+    expect(cred.tier).toBe("x_basic");
+    expect(cred.tier_source).toBe("jwt");
+    expect(isRestrictedTier(cred.tier)).toBe(true);
+    const unknown = toOAuthCredentials(
+      { access_token: "at", expires_in: 3600, id_token: claim(9) },
+      { issuer: "https://auth.x.ai", clientId: "c", scopes: ["openid"] },
+    );
+    expect(unknown.tier).toBeUndefined();
+    expect(unknown.tier_raw).toBe("9");
+    expect(isRestrictedTier(unknown.tier)).toBe(false); // fail-open
   });
 });

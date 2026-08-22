@@ -92,6 +92,47 @@ describe("PiHostBackend history structure",()=>{let root="";afterEach(async()=>{
   ]);
 });
 
+it("projects typed toolResult images and structured details without leaking base64 into content", async () => {
+  root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-img-"));
+  const cwd = join(root, "project");
+  const dir = join(root, "sessions", "project");
+  await mkdir(dir, { recursive: true });
+  await mkdir(cwd, { recursive: true });
+  const path = join(dir, "session.jsonl");
+  const msg = (id, parentId, message) => JSON.stringify({ type: "message", id, parentId, timestamp: "2026-08-10T00:00:01.000Z", message });
+  await writeFile(path, [
+    JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-10T00:00:00.000Z", cwd }),
+    msg("a1", null, { role: "assistant", content: [
+      { type: "toolCall", id: "call-img", name: "image_gen", arguments: { prompt: "a red panda" } },
+    ] }),
+    msg("t1", "a1", {
+      role: "toolResult",
+      toolCallId: "call-img",
+      toolName: "image_gen",
+      isError: false,
+      content: [
+        { type: "text", text: "图像已生成: /tmp/attachments/images/1.jpg" },
+        { type: "image", data: "aGk=", mimeType: "image/png" },
+      ],
+      details: { path: "/tmp/attachments/images/1.jpg", mime: "image/png", backend: "grok-build", model: "grok-imagine-image-quality" },
+    }),
+  ].join("\n") + "\n");
+  const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions"), runtimeRoot: join(root, "runtime"), piPath: "node" });
+  const history = await backend.handle("getSessionHistory", ["session-1"]) as any[];
+  expect(history).toEqual([
+    expect.objectContaining({ role: "assistant", tools: [{ id: "call-img", name: "image_gen", input: '{"prompt":"a red panda"}' }] }),
+    expect.objectContaining({
+      role: "tool",
+      toolCallId: "call-img",
+      images: [{ data: "aGk=", mimeType: "image/png" }],
+      details: { path: "/tmp/attachments/images/1.jpg", mime: "image/png", backend: "grok-build", model: "grok-imagine-image-quality" },
+    }),
+  ]);
+  // The base64 payload stays in the structured images channel, never in text.
+  expect(history[1].content).toBe("图像已生成: /tmp/attachments/images/1.jpg");
+  expect(history[1].content).not.toContain("aGk=");
+});
+
 it("preserves tool structure via the streaming fallback for oversized sessions", async () => {
   root = await mkdtemp(join(tmpdir(), "pipi-pi-hist-big-"));
   const cwd = join(root, "project");

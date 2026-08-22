@@ -139,7 +139,9 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
             onOpenSubagents,
             elapsed,
             content: payload.content,
-            details: payload.details,
+            // Typed `details` projected from the pi ToolResultMessage win; the
+            // `piui:v1` text envelope stays the fallback convention (spec D5).
+            details: activity.tool.details ?? payload.details,
             images: activity.tool.images,
           })
           if (custom != null) return custom

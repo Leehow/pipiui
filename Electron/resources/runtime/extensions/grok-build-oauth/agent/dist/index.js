@@ -6,8 +6,8 @@ import { createBroker } from "./oauth/broker.js";
 import { authJsonPath } from "./oauth/home.js";
 import { ImagesClient, resolveImageReference, } from "./images/client.js";
 import { ImagesError, TIER_RESTRICTED_UPSELL } from "./images/errors.js";
-import { resolveImagesConfig, legacyRelayBase } from "./images/config.js";
-import { isRestrictedTier } from "./images/tier.js";
+import { resolveImagesConfig, resolveRelayBase, isHttpsBaseUrl } from "./images/config.js";
+import { resolveSubscriptionTier } from "./images/tier.js";
 import { SessionImageWriter } from "./images/storage.js";
 const EXTENSION_ID = "grok-build-oauth";
 const BRIDGE_PORT = process.env.PIPIUI_BRIDGE_PORT;
@@ -114,6 +114,12 @@ export default function (pi) {
         // Credential source reflects the ACTUAL resolution rules: the legacy
         // XAI_API_KEY path only exists when compatFallback is enabled (US-27).
         const envKey = process.env.XAI_API_KEY?.trim();
+        // Tier: explicit override (incl. restricted EMPTY string) or the
+        // credential's official id_token `tier` claim; unknown stays visible.
+        const tierResolution = resolveSubscriptionTier({
+            override: images.tier,
+            credential: { tier: auth.tier, tier_raw: auth.tierRaw, tier_source: auth.tierSource },
+        });
         const source = auth.usable
             ? "oauth"
             : images.compatFallback && envKey
@@ -123,10 +129,13 @@ export default function (pi) {
             loggedIn: auth.loggedIn,
             expired: auth.expired,
             hasRefresh: auth.hasRefresh,
+            expiresAtMs: auth.expiresAtMs,
             credentialSource: source,
             baseUrl: images.baseUrl,
             model: images.model,
-            tier: images.tier,
+            tier: tierResolution.tier,
+            tierSource: tierResolution.source,
+            ...(tierResolution.raw !== undefined ? { tierRaw: tierResolution.raw } : {}),
             compatFallback: images.compatFallback,
         };
     }
@@ -145,6 +154,7 @@ export default function (pi) {
                         ? "未登录 OAuth；compatFallback 开启，当前使用 XAI_API_KEY 环境变量（deprecated 兼容）"
                         : "未登录 — 执行 /login grok-build，或在 设置 > 添加模型/供应商 中登录 Grok Build",
                 `base=${status.baseUrl} model=${status.model}`,
+                `tier=${status.tier === undefined ? (status.tierRaw !== undefined ? `未知（claim=${status.tierRaw}，fail-open）` : "未知（fail-open）") : status.tier === "" ? "（空 = Free，受限）" : status.tier}（来源：${status.tierSource === "override" ? "手动配置" : status.tierSource === "credential" ? "登录凭证" : "未知"}）`,
                 status.compatFallback ? "compatFallback=1（deprecated 兼容回退已开启）" : "compatFallback=0（默认关闭，XAI_API_KEY/relay 不会被使用）",
             ];
             ctx.ui.notify(parts.join("；"), "info");
@@ -168,11 +178,14 @@ export default function (pi) {
         }),
     });
     /**
-     * Credential resolution (reviewer MUST-FIX #4):
-     * - OAuth usable (present, and fresh or refreshable) -> OAuth.
+     * Credential resolution (round-2 reviewer Critical #2):
+     * - OAuth usable (present, and fresh or refreshable) -> OAuth over HTTPS only.
      * - compatFallback=false -> NEVER XAI_API_KEY, never relay: actionable error.
-     * - compatFallback=true + OAuth absent/expired-without-refresh -> explicit
-     *   deprecated fallback (API key first, then relay).
+     * - compatFallback=true + OAuth absent/expired-without-refresh -> deprecated
+     *   fallback: the real XAI_API_KEY only over an HTTPS base; a loopback HTTP
+     *   base means the deprecated RELAY transport, which is an independent
+     *   loopback endpoint speaking `Bearer local` — the real OAuth token or API
+     *   key is never sent to HTTP under any configuration.
      */
     async function resolveImageAuth(signal) {
         const cfg = resolveImagesConfig();
@@ -182,7 +195,7 @@ export default function (pi) {
             return { kind: "oauth", broker };
         if (cfg.compatFallback) {
             const key = process.env.XAI_API_KEY?.trim();
-            if (key)
+            if (key && isHttpsBaseUrl(cfg.baseUrl))
                 return { kind: "api_key", key };
             return { kind: "relay" };
         }
@@ -207,16 +220,25 @@ export default function (pi) {
         const auth = await resolveImageAuth(signal);
         if (auth.kind === "relay") {
             // Deprecated loopback relay — only reachable with compatFallback=true.
+            // Independent loopback transport with the local relay credential; real
+            // OAuth/API-key Bearers never go to it.
             return runLegacyRelay(op, signal);
         }
         // Client-side advisory tier gate — OAuth callers only; API-key callers
-        // are never gated. Server remains the final authority (US-22/US-23).
-        if (auth.kind === "oauth" && isRestrictedTier(cfg.tier)) {
-            await emit("image_gen.gated", { code: "tier_restricted", backend: "grok-build" });
-            return {
-                content: [{ type: "text", text: TIER_RESTRICTED_UPSELL }],
-                details: { code: "tier_restricted", backend: "grok-build" },
-            };
+        // are never gated. Tier resolution is real-data driven: explicit override
+        // (GROK_TIER / settings, incl. the restricted EMPTY string) or the
+        // credential's official id_token `tier` claim; unknown stays fail-open.
+        // Server remains the final authority (US-22/US-23).
+        if (auth.kind === "oauth") {
+            const credStatus = await auth.broker.status();
+            const tierResolution = resolveSubscriptionTier({ override: cfg.tier, credential: credStatus });
+            if (tierResolution.restricted) {
+                await emit("image_gen.gated", { code: "tier_restricted", backend: "grok-build" });
+                return {
+                    content: [{ type: "text", text: TIER_RESTRICTED_UPSELL }],
+                    details: { code: "tier_restricted", backend: "grok-build" },
+                };
+            }
         }
         // Resolve edit references (data URLs / in-root file paths) before any HTTP.
         const dataUrls = [];
@@ -230,9 +252,9 @@ export default function (pi) {
             editModel: cfg.editModel,
             sessionId: cfg.sessionId,
             fetchImpl: fetch,
-            // Loopback http base URLs only exist for the deprecated compat relay,
-            // which requires compatFallback=true (reviewer MUST-FIX #8).
-            allowHttpLoopback: cfg.compatFallback,
+            // HTTPS-only base: the client refuses plain HTTP outright — the
+            // deprecated relay never flows through here (it is a separate loopback
+            // transport with the local relay credential).
         });
         const writer = new SessionImageWriter();
         const model = op.kind === "gen" ? client.model : client.editModel;
@@ -259,7 +281,7 @@ export default function (pi) {
     }
     /** Deprecated compat fallback: legacy PipiUI loopback relay (default off). */
     async function runLegacyRelay(op, signal) {
-        const relay = legacyRelayBase();
+        const relay = resolveRelayBase(); // loopback-only, validated
         await emit("compat_fallback", { deprecated: true, relay: true });
         const cfg = resolveImagesConfig();
         const suffix = op.kind === "edit" ? "/images/edits" : "/images/generations";

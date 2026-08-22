@@ -18,6 +18,8 @@ type StatusData = {
   baseUrl?: string;
   model?: string;
   tier?: string;
+  tierSource?: "override" | "credential" | "unknown";
+  tierRaw?: string;
   compatFallback?: boolean;
 };
 
@@ -75,6 +77,27 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
 
   const compatFromSettings = settings["ext.grok-build-oauth.compatFallback"] === true;
   const compat = status?.compatFallback ?? compatFromSettings;
+  // Presentation only — tier resolution stays env > settings > undefined
+  // (agent images/config.ts). Unknown/empty is never hidden: an explicit empty
+  // string is gated as the free tier (restricted), undefined means "unknown"
+  // and the server stays the final authority (fail-open).
+  const settingsTier = settings["ext.grok-build-oauth.tier"];
+  const tierValue: string | undefined =
+    status?.tier !== undefined
+      ? status.tier
+      : typeof settingsTier === "string"
+        ? settingsTier
+        : undefined;
+  const tierLabel =
+    tierValue === undefined
+      ? status?.tierRaw !== undefined
+        ? `unknown（claim=${status.tierRaw}，fail-open）`
+        : "unknown（未配置；受限与否由服务端最终裁决）"
+      : tierValue.trim() === ""
+        ? "空（受限 — 按官方 free tier 处理）"
+        : tierValue;
+  const tierSourceLabel =
+    status?.tierSource === "override" ? "手动配置" : status?.tierSource === "credential" ? "登录凭证" : "未知";
 
   const toggleCompat = async (next: boolean) => {
     setBusy(true);
@@ -132,12 +155,12 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
             <td style={{ padding: "2px 12px 2px 0", opacity: 0.7 }}>图像模型</td>
             <td>{status?.model ?? (settings["ext.grok-build-oauth.defaultModel"] as string | undefined) ?? "grok-imagine-image-quality"}</td>
           </tr>
-          {(status?.tier ?? (settings["ext.grok-build-oauth.tier"] as string | undefined)) && (
-            <tr>
-              <td style={{ padding: "2px 12px 2px 0", opacity: 0.7 }}>订阅 tier（仅提示）</td>
-              <td>{String(status?.tier ?? settings["ext.grok-build-oauth.tier"])}</td>
-            </tr>
-          )}
+          <tr>
+            <td style={{ padding: "2px 12px 2px 0", opacity: 0.7 }}>订阅 tier（仅提示）</td>
+            <td data-testid="grok-build-tier">
+              {tierLabel}（来源：{tierSourceLabel}）
+            </td>
+          </tr>
         </tbody>
       </table>
 

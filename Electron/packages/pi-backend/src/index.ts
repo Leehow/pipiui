@@ -1016,6 +1016,10 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
     result.toolCallId = message.toolCallId;
     result.toolName = message.toolName;
     result.isError = Boolean(message.isError);
+    // Structured tool-result details ride on the persisted toolResult message
+    // (pi ToolResultMessage `details`). Kept separate from `content` so typed
+    // image base64 never lands in the plain-text channel.
+    if (message.details !== undefined) result.details = message.details;
   }
   if (role === "assistant" && message.stopReason === "error") {
     const errorMessage =

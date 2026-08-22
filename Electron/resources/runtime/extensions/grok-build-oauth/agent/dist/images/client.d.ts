@@ -8,15 +8,18 @@ export declare const SESSION_ID_HEADER = "x-grok-session-id";
 export declare const DEFAULT_TIMEOUT_MS = 300000;
 /** Official Imagine reference-image raw size limit (backend 400s above). */
 export declare const MAX_REFERENCE_BYTES: number;
+/** True when the URL is a plain-HTTP loopback endpoint (relay transport only). */
+export declare function isLoopbackHttpUrl(raw: string): boolean;
 /**
- * Normalize a base URL. Bearer credentials are only ever sent over HTTPS;
- * plain HTTP is refused, except for explicit loopback compat relay endpoints
- * (and only when the caller passes `allowHttpLoopback` — i.e. the deprecated
- * compat path is explicitly enabled). (Reviewer MUST-FIX #8.)
+ * Normalize a base URL. Bearer credentials (OAuth access tokens and API keys)
+ * are ONLY ever sent over HTTPS — plain HTTP is always refused, with NO
+ * loopback exception (round-2 reviewer Critical #2: `compatFallback` must not
+ * turn into an allow-list that leaks the real Bearer to an HTTP base). The
+ * deprecated compat relay is a SEPARATE loopback transport that speaks its own
+ * `Bearer local` credential and never receives real tokens (see
+ * `resolveRelayBase` in images/config.js).
  */
-export declare function normalizeBaseUrl(raw: string, opts?: {
-    allowHttpLoopback?: boolean;
-}): string;
+export declare function normalizeBaseUrl(raw: string): string;
 export declare function assertAspectRatio(aspectRatio: string): asserts aspectRatio is AspectRatio;
 export declare function assertModel(model: string): string;
 /** Strict base64 decode — rejects empty/malformed input (no partial writes). */
@@ -33,8 +36,6 @@ export type ImagesClientOptions = {
     extraHeaders?: Record<string, string>;
     timeoutMs?: number;
     fetchImpl?: typeof fetch;
-    /** Allow http:// loopback base URLs (deprecated compat relay only, explicit opt-in). */
-    allowHttpLoopback?: boolean;
 };
 export declare class ImagesClient {
     readonly baseUrl: string;

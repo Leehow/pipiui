@@ -42,7 +42,22 @@ export function handleExtEmit(
   };
 }
 
-/** D5: project pi `tool_execution_end.result` onto StreamEvent.tool_result.details. */
+/**
+ * D5: project pi `tool_execution_end.result` onto StreamEvent.tool_result.details.
+ * A pi ToolResultMessage is `{ content, details }` — surface only the structured
+ * `details` subfield. The content array already travels via the dedicated
+ * text/images channels; duplicating it here would copy typed image base64
+ * into the unstructured details channel (and any logs that print it).
+ */
 export function toolResultDetailsField(result: unknown): { details?: unknown } {
-  return result === undefined ? {} : { details: result };
+  if (result === undefined) return {};
+  if (
+    result !== null &&
+    typeof result === "object" &&
+    Array.isArray((result as { content?: unknown }).content)
+  ) {
+    const details = (result as { details?: unknown }).details;
+    return details === undefined ? {} : { details };
+  }
+  return { details: result };
 }

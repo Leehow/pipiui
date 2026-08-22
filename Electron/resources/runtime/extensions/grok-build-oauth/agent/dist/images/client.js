@@ -47,13 +47,26 @@ export const MAX_REFERENCE_BYTES = 400 * 1024;
 function isLoopbackHost(url) {
     return url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
 }
+/** True when the URL is a plain-HTTP loopback endpoint (relay transport only). */
+export function isLoopbackHttpUrl(raw) {
+    try {
+        const url = new URL(raw.trim());
+        return url.protocol === "http:" && isLoopbackHost(url);
+    }
+    catch {
+        return false;
+    }
+}
 /**
- * Normalize a base URL. Bearer credentials are only ever sent over HTTPS;
- * plain HTTP is refused, except for explicit loopback compat relay endpoints
- * (and only when the caller passes `allowHttpLoopback` — i.e. the deprecated
- * compat path is explicitly enabled). (Reviewer MUST-FIX #8.)
+ * Normalize a base URL. Bearer credentials (OAuth access tokens and API keys)
+ * are ONLY ever sent over HTTPS — plain HTTP is always refused, with NO
+ * loopback exception (round-2 reviewer Critical #2: `compatFallback` must not
+ * turn into an allow-list that leaks the real Bearer to an HTTP base). The
+ * deprecated compat relay is a SEPARATE loopback transport that speaks its own
+ * `Bearer local` credential and never receives real tokens (see
+ * `resolveRelayBase` in images/config.js).
  */
-export function normalizeBaseUrl(raw, opts = {}) {
+export function normalizeBaseUrl(raw) {
     const trimmed = raw.trim();
     if (!trimmed) {
         throw new ImagesError("invalid_params", "xai_api_base_url 不能为空");
@@ -65,17 +78,8 @@ export function normalizeBaseUrl(raw, opts = {}) {
     catch {
         throw new ImagesError("invalid_params", `非法的 xai_api_base_url: ${trimmed}`);
     }
-    if (url.protocol === "https:") {
-        // ok
-    }
-    else if (url.protocol === "http:" && opts.allowHttpLoopback && isLoopbackHost(url)) {
-        // loopback compat relay only, explicitly enabled
-    }
-    else if (url.protocol === "http:" && isLoopbackHost(url)) {
-        throw new ImagesError("invalid_params", `拒绝 HTTP base URL（${trimmed}）：Bearer 凭证仅发性 HTTPS；loopback HTTP 仅在 compatFallback 开启时用于 deprecated relay`);
-    }
-    else {
-        throw new ImagesError("invalid_params", `拒绝非 HTTPS 的 xai_api_base_url: ${trimmed}（Bearer 凭证仅发 HTTPS）`);
+    if (url.protocol !== "https:") {
+        throw new ImagesError("invalid_params", `拒绝非 HTTPS 的 xai_api_base_url: ${trimmed}（Bearer 凭证仅发 HTTPS；loopback HTTP 仅限 deprecated relay 且使用 Bearer local，不携带真实凭证）`);
     }
     return trimmed.replace(/\/+$/, "");
 }
@@ -118,7 +122,7 @@ export class ImagesClient {
     timeoutMs;
     fetchImpl;
     constructor(opts = {}) {
-        this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL, { allowHttpLoopback: opts.allowHttpLoopback === true });
+        this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_BASE_URL);
         this.model = assertModel(opts.model ?? DEFAULT_MODEL);
         this.editModel = assertModel(opts.editModel ?? DEFAULT_EDIT_MODEL);
         this.sessionId = opts.sessionId?.trim() || undefined;

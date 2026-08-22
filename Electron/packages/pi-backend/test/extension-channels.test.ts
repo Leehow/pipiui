@@ -246,7 +246,7 @@ describe("extension settings schema seam", () => {
 });
 
 describe("tool_result details projection", () => {
-  it("projects tool_execution_end.result onto details when present", () => {
+  it("unwraps the structured `details` subfield of a pi ToolResultMessage and never copies its content (no image base64 duplication)", () => {
     expect(toolResultDetailsField(undefined)).toEqual({});
     expect(toolResultDetailsField({ kind: "quota", used: 1200, limit: 1500 })).toEqual({
       details: { kind: "quota", used: 1200, limit: 1500 },
@@ -256,8 +256,20 @@ describe("tool_result details projection", () => {
       sessionId: "s",
       toolCallId: "t",
       content: "ok",
-      ...toolResultDetailsField({ content: "ok", kind: "quota" }),
+      ...toolResultDetailsField({ content: [{ type: "text", text: "ok" }], details: { path: "/tmp/1.jpg", backend: "grok-build" } }),
     };
-    expect(mapped).toMatchObject({ type: "tool_result", details: { content: "ok", kind: "quota" } });
+    expect(mapped).toMatchObject({ type: "tool_result", details: { path: "/tmp/1.jpg", backend: "grok-build" } });
+    // Legacy flat shape (no content array) still surfaces as-is.
+    expect(toolResultDetailsField({ content: "ok", kind: "quota" })).toEqual({
+      details: { content: "ok", kind: "quota" },
+    });
+    // A ToolResultMessage WITHOUT details carries no details field at all.
+    expect(toolResultDetailsField({ content: [{ type: "text", text: "ok" }] })).toEqual({});
+    // Typed image base64 inside content must never be duplicated into details.
+    const leaky = toolResultDetailsField({
+      content: [{ type: "image", data: "aGk=", mimeType: "image/png" }],
+      details: { path: "/tmp/1.jpg" },
+    });
+    expect(JSON.stringify(leaky)).not.toContain("aGk=");
   });
 });

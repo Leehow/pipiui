@@ -54,6 +54,9 @@ export type HistoryEntry = {
   isError?: boolean;
   /** tool only: images extracted from the result (screenshots, generated images). */
   images?: TranscriptImage[];
+  /** tool only: structured `details` from the pi ToolResultMessage, when present.
+   *  Metadata only (path/backend/model/…) — never typed image base64. */
+  details?: unknown;
 };
 /** Local files that a host makes available to the right-side document reader. */
 export type DocumentKind = "markdown" | "plain" | "pdf" | "word" | "spreadsheet" | "presentation";

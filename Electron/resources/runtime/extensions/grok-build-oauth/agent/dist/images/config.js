@@ -13,6 +13,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_BASE_URL, DEFAULT_EDIT_MODEL, DEFAULT_MODEL } from "./client.js";
+import { ImagesError } from "./errors.js";
 import { tryResolveAgentHome } from "../oauth/home.js";
 export function settingsSnapshot() {
     const raw = process.env.PIPIUI_EXT_SETTINGS_GROK_BUILD_OAUTH;
@@ -103,11 +104,41 @@ export function resolveImagesConfig() {
         compatFallback,
     };
 }
+/** True when `raw` is an HTTPS URL (the only transport real Bearers may use). */
+export function isHttpsBaseUrl(raw) {
+    try {
+        return new URL(raw.trim()).protocol === "https:";
+    }
+    catch {
+        return false;
+    }
+}
 /**
- * Deprecated legacy PipiUI loopback relay. Used ONLY when
- * `ext.grok-build-oauth.compatFallback === true` and neither OAuth nor
- * XAI_API_KEY credentials are present (spec §D6 / US-27).
+ * Deprecated legacy PipiUI loopback relay base (spec §D6 / US-27).
+ *
+ * The relay is an INDEPENDENT transport: it is only ever a loopback HTTP
+ * endpoint and it is authenticated with the local relay credential
+ * (`Bearer local`) — the real OAuth access token and XAI_API_KEY never go to
+ * it, and it is never reached unless `ext.grok-build-oauth.compatFallback`
+ * is explicitly enabled (default off). A non-loopback relay base is refused
+ * (prompts/images must not be exfiltrated to a remote "relay").
  */
+export function resolveRelayBase() {
+    const raw = process.env.PIPIUI_GROK_RELAY?.trim() || "http://127.0.0.1:18891/v1";
+    let url;
+    try {
+        url = new URL(raw);
+    }
+    catch {
+        throw new ImagesError("invalid_params", `非法的 PIPIUI_GROK_RELAY: ${raw}`);
+    }
+    const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]" || url.hostname === "::1";
+    if (url.protocol !== "http:" || !loopback) {
+        throw new ImagesError("invalid_params", `拒绝非 loopback HTTP 的 relay base：${raw}（deprecated relay 仅允许 127.0.0.1/localhost/[::1]，且使用 Bearer local，不携带真实凭证）`);
+    }
+    return raw.replace(/\/+$/, "");
+}
+/** @deprecated Use resolveRelayBase() — kept for one release for external callers. */
 export function legacyRelayBase() {
-    return process.env.PIPIUI_GROK_RELAY?.trim() || "http://127.0.0.1:18891/v1";
+    return resolveRelayBase();
 }

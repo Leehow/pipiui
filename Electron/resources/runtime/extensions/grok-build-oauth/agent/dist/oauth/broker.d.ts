@@ -1,5 +1,6 @@
 import { type StoredOAuthCredential } from "./credentials.js";
-import { type LockOptions } from "./lock.js";
+import { type CredentialEntry, type CredentialStoreAdapter } from "./store-adapter.js";
+import type { LockOptions } from "./lock.js";
 export type BrokerCredential = StoredOAuthCredential & {
     type: "oauth";
 };
@@ -15,34 +16,31 @@ export type BrokerOptions = {
     lock?: LockOptions;
     /** Network timeout for refresh calls. Default 30s. */
     refreshTimeoutMs?: number;
+    /**
+     * Host-injected credential store (pi `AuthStorage` shape: read/modify/delete
+     * — or a ready-made adapter). ALL broker mutations then go through it.
+     */
+    credentialStore?: CredentialStoreAdapter | {
+        read: unknown;
+        modify: unknown;
+        delete: unknown;
+    };
 };
-/**
- * Atomic JSON write against the REAL target file (tmp + fsync + chmod 0600 +
- * rename inside the real file's directory). `rename` may replace a regular
- * file — it must never be pointed at a symlink path, which is why callers
- * resolve the real target first.
- */
-declare function atomicWriteJson(realPath: string, data: Record<string, unknown>): Promise<void>;
-declare function readAuthJson(path: string): Promise<Record<string, unknown>>;
 declare function isExpiring(cred: BrokerCredential, earlyRefreshSec: number, nowMs: number): boolean;
 declare function isFreshEnough(newer: BrokerCredential, older: BrokerCredential | undefined): boolean;
+/** Map a stored auth.json entry onto a broker credential. */
+export declare function brokerCredentialFromEntry(entry: CredentialEntry | undefined, nowMs: () => number): BrokerCredential | undefined;
 export declare class GrokCredentialBroker {
     private inflight;
     private opts;
-    /** Resolved real credential target (symlinks followed). */
-    private target;
     constructor(opts?: BrokerOptions);
     private nowMs;
-    /** Resolve (and cache) the real credential target; locks and writes act on it. */
-    private resolveTarget;
-    /** The path reads/writes/locks act on (real target, symlink-followed). */
-    realAuthPath(): Promise<string>;
     private readCredential;
     /** Controlled write: merge only this provider's entry into the real file. */
     private writeCredential;
     /** Shared API for provider and image tools: returns a fresh access token, refreshing early if needed */
     getAccessToken(signal?: AbortSignal): Promise<string>;
-    /** Force refresh, deduped in-process, cross-process locked, with re-read + freshness guard */
+    /** Force refresh, deduped in-process, cross-process locked (when the adapter has a lock), with re-read + freshness guard */
     forceRefresh(signal?: AbortSignal): Promise<BrokerCredential>;
     private doRefresh;
     /**
@@ -64,9 +62,12 @@ export declare class GrokCredentialBroker {
         issuer?: string;
         clientId?: string;
         scopes?: string[];
+        tier?: string;
+        tierRaw?: string;
+        tierSource?: "jwt";
     }): Promise<BrokerCredential>;
     /**
-     * Non-secret credential status for host/UI surfaces (登录状态/过期时间/凭证来源).
+     * Non-secret credential status for host/UI surfaces (登录状态/过期时间/凭证来源/tier).
      * Never returns token values. `usable` folds expiry + refresh presence so
      * compat consumers can decide without duplicating broker logic.
      */
@@ -77,6 +78,10 @@ export declare class GrokCredentialBroker {
         usable: boolean;
         expiresAtMs?: number;
         issuer?: string;
+        /** Subscription tier carried by the credential (official id_token `tier` claim); undefined = unknown. */
+        tier?: string;
+        tierRaw?: string;
+        tierSource?: "jwt";
     }>;
     /** For tests: expose read */
     _readForTest(): Promise<BrokerCredential | undefined>;
@@ -84,9 +89,7 @@ export declare class GrokCredentialBroker {
 }
 export declare function createBroker(opts?: BrokerOptions): GrokCredentialBroker;
 export declare const _internal: {
-    atomicWriteJson: typeof atomicWriteJson;
-    readAuthJson: typeof readAuthJson;
     isExpiring: typeof isExpiring;
     isFreshEnough: typeof isFreshEnough;
 };
-export {};
+export { atomicWriteJson, readAuthJson } from "./store-adapter.js";

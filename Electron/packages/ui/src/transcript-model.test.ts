@@ -102,6 +102,23 @@ describe('transcript model', () => {
     expect(messages[0].tools?.[0]).toMatchObject({ id: 'sub-call', finished: true, dispatched: true, finishedAt: 2 })
   })
 
+  it('keeps typed images and structured details on the tool record (stream + history)', () => {
+    const images = [{ data: 'aGk=', mimeType: 'image/png' }]
+    const details = { path: '/tmp/attachments/images/1.jpg', backend: 'grok-build', model: 'grok-imagine-image-quality' }
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'image_gen', name: 'image_gen', delta: '{}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'image_gen', content: '图像已生成: /tmp/attachments/images/1.jpg', images, details })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'image_gen', finished: true, images, details })
+    // base64 never leaks into the plain result text
+    expect(messages[0].tools?.[0].result).not.toContain('aGk=')
+
+    const fromHistory = historyMessages([
+      { id: 'assistant', role: 'assistant', content: '', timestamp: 1, tools: [{ id: 'image_gen', name: 'image_gen', input: '{}' }] },
+      { id: 'result', role: 'tool', content: '图像已生成: /tmp/attachments/images/1.jpg', timestamp: 2, toolCallId: 'image_gen', toolName: 'image_gen', images, details },
+    ])
+    expect(fromHistory[0].tools?.[0]).toMatchObject({ finished: true, images, details })
+  })
+
   it('preserves a completed duration and settles only the streaming assistant', () => {
     vi.useFakeTimers()
     try {

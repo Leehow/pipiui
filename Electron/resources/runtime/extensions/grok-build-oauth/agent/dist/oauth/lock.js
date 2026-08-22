@@ -1,25 +1,39 @@
 /**
- * Cross-process file lock with holder identity, heartbeat, and stale takeover —
- * dependency-free (no `proper-lockfile`), so the lock behaves identically in the
- * workspace build and in the packaged bundle.
+ * Credential-store file lock — proper-lockfile wire compatible (dependency-free).
  *
- * Invariants (reviewer MUST-FIX #2):
- * - A live holder heartbeats the lock mtime, so an in-flight refresh that takes
- *   longer than any fixed threshold is NEVER considered stale and never deleted
- *   by a second process.
- * - Stale takeover only happens after `staleMs` without any heartbeat (crash /
- *   killed holder) and is atomic (rename race: exactly one contender wins).
- * - Release deletes the lock only when the on-disk owner nonce still matches,
- *   so a late release from a compromised/stale holder can never delete a lock
- *   that a new holder legitimately acquired.
+ * Pipi's `FileAuthStorageBackend` (the store behind ModelRuntime login/logout)
+ * locks `auth.json` with `proper-lockfile`:
+ *   lock  = mkdir `<path>.lock`            (atomic EEXIST check)
+ *   stale = lock-dir mtime older than `stale` ms → rmdir + retry
+ *   fresh = holder `utimes()`s the lock dir while holding
+ *   free  = rmdir `<path>.lock`
+ * This module speaks EXACTLY that wire format, so a grok-build broker and a
+ * Pipi ModelRuntime writing the same `auth.json` exclude each other across
+ * processes — one lock, one file, no second `.groklock` (reviewer round-2
+ * Critical #1: independent lock files let whole-file read-modify-write races
+ * drop concurrent logins/logouts/other-provider updates).
  *
- * Lock file: `<path>.groklock` (regular file). The `.groklock` suffix keeps us
- * clear of pi's own `proper-lockfile` lock *directories* (`<path>.lock`).
+ * Safety properties beyond the wire format:
+ * - A live holder heartbeats the lock dir mtime, so an in-flight refresh that
+ *   outlasts any fixed threshold is never considered stale and never removed.
+ * - Takeover only happens `staleMs` after the last heartbeat (crashed holder).
+ *   Default 45s > pi's async-lock stale (30s), so we never steal a lock pi
+ *   itself still considers live; our heartbeat (2s) is far below pi's sync
+ *   stale (10s), so pi never steals ours while we are working.
+ * - Release and heartbeat verify the observed mtime is still ours; a holder
+ *   whose lock was taken over after a crash never deletes the new holder's
+ *   lock, and the broker can detect compromise and fail safely.
+ *
+ * All paths are the *resolved real* credential file (see `resolveCredentialTarget`)
+ * — projects sharing one App-profile file through a symlink share ONE real lock.
+ * Sessions constructed by pi lock the *symlink path* (`realpath: false`), so
+ * callers additionally lock the as-given path (see `acquireAuthStoreLocks`).
  */
-import { open, readFile, rename, stat, unlink, utimes } from "node:fs/promises";
+import { mkdir, readFile, rename, rmdir, stat, unlink, utimes } from "node:fs/promises";
+import { rmdirSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
-const LOCK_SUFFIX = ".groklock";
+const LOCK_SUFFIX = ".lock";
 function sleepAbortable(ms, signal) {
     if (signal?.aborted)
         return Promise.reject(abortError());
@@ -38,92 +52,66 @@ function abortError() {
     e.name = "AbortError";
     return e;
 }
-function readLockContent(path) {
-    return readFile(path, "utf8")
-        .then((text) => {
-        try {
-            const parsed = JSON.parse(text);
-            if (parsed && typeof parsed === "object" && typeof parsed.owner === "string" && parsed.owner) {
-                return parsed;
+/** Best-effort cleanup when the process exits while holding (mirrors proper-lockfile's onExit). */
+const heldLockDirs = new Set();
+let exitHookInstalled = false;
+function installExitHook() {
+    if (exitHookInstalled)
+        return;
+    exitHookInstalled = true;
+    process.on("exit", () => {
+        for (const dir of heldLockDirs) {
+            try {
+                rmdirSync(dir);
             }
+            catch { /* already gone / not empty */ }
         }
-        catch {
-            /* malformed content — treated by mtime staleness */
-        }
+    });
+}
+async function observeMtimeMs(lockPath) {
+    try {
+        return (await stat(lockPath)).mtimeMs;
+    }
+    catch {
         return undefined;
-    })
-        .catch(() => undefined);
+    }
 }
 /**
- * Acquire an exclusive lock guarding `guardedPath` (the *resolved real*
- * credential file — callers resolve symlinks first so projects sharing one
- * App-profile file also share one lock).
+ * Acquire an exclusive lock guarding `guardedPath` using proper-lockfile's
+ * on-disk format: a lock DIRECTORY at `<guardedPath>.lock`.
  */
-export async function acquireFileLock(guardedPath, opts = {}) {
+export async function acquireCredentialLock(guardedPath, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 60_000;
-    const staleMs = Math.max(1_000, opts.staleMs ?? 45_000);
-    const heartbeatMs = Math.min(Math.max(250, opts.heartbeatMs ?? 5_000), Math.floor(staleMs / 3));
+    const staleMs = Math.max(2_000, opts.staleMs ?? 45_000);
+    const heartbeatMs = Math.min(Math.max(250, opts.heartbeatMs ?? 2_000), Math.floor(staleMs / 2));
     const nowMs = opts.nowMs ?? Date.now;
     const lockPath = `${guardedPath}${LOCK_SUFFIX}`;
     const owner = randomUUID();
     const deadline = nowMs() + timeoutMs;
+    let observedMtimeMs;
     let heartbeatTimer;
+    let compromised = false;
     let released = false;
-    const startHeartbeat = () => {
-        heartbeatTimer = setInterval(() => {
-            // Best-effort liveness touch: a live holder never looks stale.
-            utimes(lockPath, new Date(), new Date()).catch(() => { });
-        }, heartbeatMs);
-        heartbeatTimer.unref?.();
-    };
-    const stopHeartbeat = () => {
-        if (heartbeatTimer)
-            clearInterval(heartbeatTimer);
-        heartbeatTimer = undefined;
-    };
-    const release = async () => {
-        if (released)
-            return;
-        released = true;
-        stopHeartbeat();
-        // Owner-checked release: never delete a lock a new holder took over.
-        const current = await readLockContent(lockPath);
-        if (current?.owner === owner) {
-            await unlink(lockPath).catch(() => { });
-        }
-    };
     let retry = 0;
+    installExitHook();
+    // ── contend ──────────────────────────────────────────────────────────────
     for (;;) {
         opts.signal?.throwIfAborted();
-        // Fast path: exclusive create.
-        let fd;
+        // Fast path: atomic mkdir (this is the acquisition).
         try {
-            fd = await open(lockPath, "wx", 0o600);
+            await mkdir(lockPath, { mode: 0o700 });
         }
         catch (e) {
             const code = e?.code;
             if (code !== "EEXIST")
                 throw e;
-            // Locked. Stale? (no heartbeat for staleMs)
-            let mtimeMs;
-            try {
-                mtimeMs = (await stat(lockPath)).mtimeMs;
-            }
-            catch {
-                continue; // lock vanished between open and stat — retry immediately
-            }
-            const age = nowMs() - mtimeMs;
-            if (age > staleMs) {
-                // Atomic takeover: rename wins for exactly one contender.
-                const tombstone = `${lockPath}.stale.${randomUUID()}`;
-                try {
-                    await rename(lockPath, tombstone);
-                    await unlink(tombstone).catch(() => { });
-                }
-                catch {
-                    /* someone else took it over — fall through to wait */
-                }
-                continue;
+            // Locked. Stale? (no heartbeat for staleMs — same rule proper-lockfile applies)
+            const mtimeMs = await observeMtimeMs(lockPath);
+            if (mtimeMs === undefined)
+                continue; // lock vanished between mkdir and stat — retry
+            if (nowMs() - mtimeMs > staleMs) {
+                await rmdir(lockPath).catch(() => { });
+                continue; // someone else may win the re-mkdir race; loop decides
             }
             const remaining = deadline - nowMs();
             if (remaining <= 0) {
@@ -134,23 +122,74 @@ export async function acquireFileLock(guardedPath, opts = {}) {
             await sleepAbortable(backoff, opts.signal);
             continue;
         }
-        // Created — write holder identity and heartbeat for the hold duration.
-        try {
-            const content = { v: 1, owner, pid: process.pid, acquiredAtMs: nowMs() };
-            await fd.writeFile(JSON.stringify(content), "utf8");
-            await fd.sync();
-            await fd.chmod(0o600);
-        }
-        finally {
-            await fd.close();
-        }
-        startHeartbeat();
-        // Paranoia: if we were starved past the deadline while creating, still hold —
-        // we own the lock now; release is owner-checked.
-        return { owner, release };
+        // Created — record the mtime we now own. If it vanished instantly
+        // (stale-takeover race), loop again instead of operating unlocked.
+        observedMtimeMs = await observeMtimeMs(lockPath);
+        if (observedMtimeMs === undefined)
+            continue;
+        break;
     }
+    heldLockDirs.add(lockPath);
+    const stopHeartbeat = () => {
+        if (heartbeatTimer)
+            clearInterval(heartbeatTimer);
+        heartbeatTimer = undefined;
+    };
+    // ── hold: keep the mtime fresh and verify ownership ─────────────────────
+    const beat = async () => {
+        if (released || compromised)
+            return;
+        try {
+            const current = await observeMtimeMs(lockPath);
+            if (current === undefined || current !== observedMtimeMs) {
+                // Lock dir removed and recreated by another contender (takeover).
+                compromised = true;
+                stopHeartbeat();
+                heldLockDirs.delete(lockPath);
+                return;
+            }
+            const next = new Date();
+            await utimes(lockPath, next, next);
+            observedMtimeMs = (await observeMtimeMs(lockPath)) ?? observedMtimeMs;
+        }
+        catch {
+            compromised = true;
+            stopHeartbeat();
+            heldLockDirs.delete(lockPath);
+        }
+    };
+    heartbeatTimer = setInterval(() => {
+        void beat();
+    }, heartbeatMs);
+    heartbeatTimer.unref?.();
+    return {
+        owner,
+        get compromised() {
+            return compromised;
+        },
+        assertValid() {
+            if (compromised) {
+                const e = new Error(`Credential lock on ${guardedPath} was compromised (taken over) — aborting store operation`);
+                e.code = "ECOMPROMISED";
+                throw e;
+            }
+        },
+        async release() {
+            if (released)
+                return;
+            released = true;
+            stopHeartbeat();
+            heldLockDirs.delete(lockPath);
+            if (compromised)
+                return; // not ours anymore — never delete the new holder's lock
+            const current = await observeMtimeMs(lockPath);
+            if (current === undefined || current !== observedMtimeMs)
+                return; // taken over
+            await rmdir(lockPath).catch(() => { });
+        },
+    };
 }
-/** Test/introspection helper: the lock path guarding `guardedPath`. */
+/** Test/introspection helper: the proper-lockfile lock dir guarding `guardedPath`. */
 export function lockPathFor(guardedPath) {
     return `${guardedPath}${LOCK_SUFFIX}`;
 }
@@ -180,3 +219,37 @@ export async function resolveCredentialTarget(authPath) {
         return { asGiven: authPath, real: authPath };
     }
 }
+/**
+ * Acquire the full auth-store guard for a credential target:
+ * 1. `<real>.lock`   — the lock Pipi's host ModelRuntime (authPath = canonical
+ *                      file) and every other broker instance take.
+ * 2. `<asGiven>.lock`— the lock a session-embedded pi ModelRuntime takes
+ *                      (pi locks its authPath with `realpath: false`, and a
+ *                      project's `.pi/agent/auth.json` is a symlink to the
+ *                      canonical file).
+ * Fixed order (real, then as-given) prevents broker/broker deadlock; pi
+ * parties hold exactly one of the two, so they never wait on each other here.
+ */
+export async function acquireAuthStoreLocks(target, opts = {}) {
+    const paths = target.real === target.asGiven ? [target.real] : [target.real, target.asGiven];
+    const handles = [];
+    try {
+        for (const p of paths) {
+            handles.push(await acquireCredentialLock(p, opts));
+        }
+    }
+    catch (err) {
+        for (const h of handles.reverse())
+            await h.release().catch(() => { });
+        throw err;
+    }
+    return {
+        handles,
+        async release() {
+            for (const h of [...handles].reverse())
+                await h.release().catch(() => { });
+        },
+    };
+}
+// Re-exported for the atomic writer in store-adapter.js (same module keeps fs imports in one place).
+export const _fs = { readFile, rename, stat, unlink, utimes };

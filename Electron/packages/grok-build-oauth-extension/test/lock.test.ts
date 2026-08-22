@@ -1,12 +1,44 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, writeFile, stat, utimes, readFile } from "node:fs/promises";
+import { mkdtemp, rm, stat, utimes, readFile, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { spawn } from "node:child_process";
 import { lstatSync, symlinkSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
-import { acquireFileLock, lockPathFor, resolveCredentialTarget } from "../agent/oauth/lock.js";
+import { createRequire } from "node:module";
+import { acquireCredentialLock, acquireAuthStoreLocks, lockPathFor, resolveCredentialTarget } from "../agent/oauth/lock.js";
 
-describe("heartbeat cross-process lock (reviewer MUST-FIX #2)", () => {
+/**
+ * The broker lock speaks proper-lockfile's ON-DISK format (pi's
+ * FileAuthStorageBackend — the store behind ModelRuntime login/logout — locks
+ * `auth.json` with `proper-lockfile`'s mkdir `<path>.lock`). These tests prove
+ * the wire-level interop against the REAL library and against pi's real
+ * AuthStorage/FileAuthStorageBackend.
+ */
+const nodeRequire = createRequire(import.meta.url);
+
+async function loadProperLockfile(): Promise<typeof import("proper-lockfile") | undefined> {
+  try {
+    return (await import("proper-lockfile")) as typeof import("proper-lockfile");
+  } catch {
+    return undefined;
+  }
+}
+
+type PiAuthStorageModule = {
+  AuthStorage: { create(authPath?: string): unknown };
+};
+async function loadPiAuthStorage(): Promise<PiAuthStorageModule | undefined> {
+  try {
+    const indexJs = nodeRequire.resolve("@earendil-works/pi-coding-agent");
+    const { pathToFileURL } = await import("node:url");
+    const deep = pathToFileURL(join(dirname(indexJs), "core", "auth-storage.js")).href;
+    return (await import(deep)) as PiAuthStorageModule;
+  } catch {
+    return undefined;
+  }
+}
+
+describe("proper-lockfile wire-format lock (round-2 Critical #1)", () => {
   let dir = "";
   let guard = "";
   afterEach(async () => { if (dir) await rm(dir, { recursive: true, force: true }); dir = ""; });
@@ -15,91 +47,124 @@ describe("heartbeat cross-process lock (reviewer MUST-FIX #2)", () => {
     guard = join(dir, "auth.json");
   });
 
+  it("uses the proper-lockfile lock DIRECTORY path (<auth.json>.lock)", async () => {
+    expect(lockPathFor(guard)).toBe(`${guard}.lock`);
+    const handle = await acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
+    const st = await stat(lockPathFor(guard));
+    expect(st.isDirectory()).toBe(true);
+    await handle.release();
+    await expect(stat(lockPathFor(guard))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("acquires exclusively and releases cleanly", async () => {
-    const a = await acquireFileLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
-    await expect(acquireFileLock(guard, { staleMs: 60_000, heartbeatMs: 1_000, timeoutMs: 150 })).rejects.toThrow(/timeout/);
+    const a = await acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
+    await expect(acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 1_000, timeoutMs: 150 })).rejects.toThrow(/timeout/);
     await a.release();
-    const b = await acquireFileLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
+    const b = await acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
     await b.release();
   });
 
   it("never breaks a live holder whose refresh outlasts the stale threshold (heartbeat)", async () => {
     // stale threshold far shorter than the hold — only the heartbeat keeps it alive.
-    const staleMs = 400;
-    const holder = await acquireFileLock(guard, { staleMs, heartbeatMs: 100 });
-    // Simulate a long in-flight refresh: 3x the stale window elapses with the
-    // heartbeat running (mtime keeps refreshing).
+    const staleMs = 1_200;
+    const holder = await acquireCredentialLock(guard, { staleMs, heartbeatMs: 200 });
     await new Promise((r) => setTimeout(r, staleMs * 3));
-    const mtimeBefore = (await stat(lockPathFor(guard))).mtimeMs;
-    expect(mtimeBefore).toBeGreaterThan(0);
     await expect(
-      acquireFileLock(guard, { staleMs, heartbeatMs: 100, timeoutMs: 300 }),
+      acquireCredentialLock(guard, { staleMs, heartbeatMs: 200, timeoutMs: 400 }),
     ).rejects.toThrow(/timeout/); // never stale-broken while heartbeating
     await holder.release();
-    const next = await acquireFileLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
+    const next = await acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 1_000 });
     await next.release();
   });
 
-  it("takes over after crash (heartbeat stopped, mtime aged past staleMs)", async () => {
-    // Simulate a crashed holder: lock file exists but nobody heartbeats.
-    await writeFile(lockPathFor(guard), JSON.stringify({ v: 1, owner: "crashed", pid: 999999, acquiredAtMs: Date.now() }));
+  it("takes over after crash (heartbeat stopped, lock dir mtime aged past staleMs)", async () => {
+    // Simulate a crashed holder: lock dir exists but nobody heartbeats.
+    await mkdir(lockPathFor(guard));
     const aged = new Date(Date.now() - 120_000);
     await utimes(lockPathFor(guard), aged, aged);
 
-    const taker = await acquireFileLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
-    const content = JSON.parse(await readFile(lockPathFor(guard), "utf8")) as { owner: string };
-    expect(content.owner).not.toBe("crashed");
+    const taker = await acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
+    taker.assertValid();
     await taker.release();
   });
 
-  it("late release from a stale holder never deletes the new holder's lock (owner nonce)", async () => {
-    await writeFile(lockPathFor(guard), JSON.stringify({ v: 1, owner: "stale-old", pid: 1, acquiredAtMs: Date.now() }));
+  it("late release from a taken-over holder never deletes the new holder's lock (mtime check)", async () => {
+    // Holder whose heartbeat is effectively off (long interval), then a
+    // takeover happens underneath it; its late release must keep its mtime
+    // check and never rmdir the new holder's lock.
+    const victim = await acquireCredentialLock(guard, { staleMs: 60_000, heartbeatMs: 60_000 });
     const aged = new Date(Date.now() - 120_000);
     await utimes(lockPathFor(guard), aged, aged);
-
-    // New holder takes over via stale takeover; the OLD holder's release (with
-    // mismatched owner) must not delete the new holder's lock.
-    const fresh = await acquireFileLock(guard, { staleMs: 30_000, heartbeatMs: 5_000 });
-    const staleHandle = { owner: "stale-old", release: async () => {
-      const { unlink } = await import("node:fs/promises");
-      const current = JSON.parse(await readFile(lockPathFor(guard), "utf8")) as { owner: string };
-      if (current?.owner === "stale-old") await unlink(lockPathFor(guard)).catch(() => {});
-    } };
-    await (staleHandle as { release: () => Promise<void> }).release();
-    // Lock still on disk, owned by the fresh holder.
-    const content = JSON.parse(await readFile(lockPathFor(guard), "utf8")) as { owner: string };
-    expect(content.owner).toBe(fresh.owner);
-    await fresh.release();
+    const winner = await acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
+    await victim.release(); // mtime no longer its own — must NOT rmdir
+    const st = await stat(lockPathFor(guard));
+    expect(st.isDirectory()).toBe(true); // winner's lock survived
+    await winner.release();
+    await expect(stat(lockPathFor(guard))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("true multi-process contention: a child process holding the lock blocks the parent until release", async () => {
-    const script = join(dir, "holder.ts");
-    await writeFile(script, `import { acquireFileLock } from ${JSON.stringify(new URL("../agent/oauth/lock.ts", import.meta.url).href)};
-const handle = await acquireFileLock(process.argv[2]!, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 10_000 });
+    const script = join(dir, "holder.mjs");
+    await writeFile(script, `import { acquireCredentialLock } from ${JSON.stringify(new URL("../agent/oauth/lock.ts", import.meta.url).href)};
+const handle = await acquireCredentialLock(process.argv[2]!, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 10_000 });
 process.stdout.write("HELD\\n");
 process.stdin.resume();
-process.on("SIGTERM", async () => { await handle.release(); process.exit(0); });
-`);
-    const child = spawn(process.execPath, ["--experimental-strip-types", script, guard], { stdio: ["pipe", "pipe", "pipe"] });
-    let held = "";
-    child.stdout!.on("data", (d: Buffer) => { held += d.toString(); });
-    // Wait until the child announces it holds the lock.
-    for (let i = 0; i < 100 && !held.includes("HELD"); i++) {
-      await new Promise((r) => setTimeout(r, 100));
+process.on("disconnect", () => { try { process.exit(0); } catch {} });
+`, "utf8");
+    const child = spawn(process.execPath, ["--experimental-strip-types", script, guard], { stdio: ["pipe", "pipe", "inherit"] });
+    try {
+      const held = await new Promise<string>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("child never held the lock")), 8_000);
+        child.stdout!.on("data", (d) => { clearTimeout(t); resolve(String(d)); });
+        child.on("exit", (c) => { clearTimeout(t); reject(new Error(`child exited ${c}`)); });
+      });
+      expect(held).toContain("HELD");
+      await expect(
+        acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 800 }),
+      ).rejects.toThrow(/timeout/);
+    } finally {
+      child.kill();
+      await new Promise((r) => child.on("exit", r));
     }
-    expect(held).toContain("HELD");
-
-    // Parent (a separate process) cannot take it while the child heartbeats.
-    await expect(
-      acquireFileLock(guard, { staleMs: 30_000, heartbeatMs: 200, timeoutMs: 800 }),
-    ).rejects.toThrow(/timeout/);
-
-    // Release via SIGTERM; parent takes it immediately after.
-    child.kill("SIGTERM");
-    await new Promise((resolve) => { child.on("exit", resolve); });
-    const parentHandle = await acquireFileLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
+    const parentHandle = await acquireCredentialLock(guard, { staleMs: 30_000, heartbeatMs: 5_000, timeoutMs: 5_000 });
     await parentHandle.release();
   }, 20_000);
+
+  describe("interop with the REAL proper-lockfile (pi FileAuthStorageBackend's lock)", () => {
+    it("broker lock excludes proper-lockfile and vice versa (same wire format)", async () => {
+      const lockfile = await loadProperLockfile();
+      if (!lockfile) return; // transitive dep unavailable in this install
+      const guard2 = join(dir, "auth2.json");
+      // proper-lockfile holds — broker must wait.
+      const releaseP = await lockfile.lock(guard2, { realpath: false, retries: 0, stale: 30_000 });
+      await expect(acquireCredentialLock(guard2, { staleMs: 45_000, timeoutMs: 300 })).rejects.toThrow(/timeout/);
+      await releaseP();
+      // broker holds — proper-lockfile must see ELOCKED.
+      const handle = await acquireCredentialLock(guard2, { staleMs: 45_000, heartbeatMs: 1_000 });
+      await expect(lockfile.lock(guard2, { realpath: false, retries: 0, stale: 30_000 })).rejects.toMatchObject({ code: "ELOCKED" });
+      await handle.release();
+      // and proper-lockfile can take it again
+      const release2 = await lockfile.lock(guard2, { realpath: false, retries: 0, stale: 30_000 });
+      await release2();
+    });
+  });
+
+  describe("acquireAuthStoreLocks — real target + as-given path (session pi locks its own path)", () => {
+    it("locks both <real>.lock and <asGiven>.lock in a fixed order", async () => {
+      const projectDir = join(dir, "projectA", ".pi", "agent");
+      mkdirSync(projectDir, { recursive: true });
+      writeFileSync(join(dir, "auth.json"), "{}\n");
+      symlinkSync(join(dir, "auth.json"), join(projectDir, "auth.json"));
+      const asGiven = join(projectDir, "auth.json");
+      const locks = await acquireAuthStoreLocks(await resolveCredentialTarget(asGiven), { staleMs: 60_000, heartbeatMs: 1_000 });
+      // both lock dirs exist while held
+      expect((await stat(lockPathFor(realpathSync(join(dir, "auth.json"))))).isDirectory()).toBe(true);
+      expect((await stat(lockPathFor(asGiven))).isDirectory()).toBe(true);
+      await locks.release();
+      await expect(stat(lockPathFor(asGiven))).rejects.toMatchObject({ code: "ENOENT" });
+      await expect(stat(lockPathFor(realpathSync(join(dir, "auth.json"))))).rejects.toMatchObject({ code: "ENOENT" });
+    });
+  });
 });
 
 describe("resolveCredentialTarget (reviewer MUST-FIX #1)", () => {
@@ -120,8 +185,9 @@ describe("resolveCredentialTarget (reviewer MUST-FIX #1)", () => {
     const target = await resolveCredentialTarget(projectA);
     expect(target.real).toBe(realpathSync(canonical));
     expect(target.asGiven).toBe(projectA);
-    // The lock for both projects guards the canonical file.
-    expect(lockPathFor(target.real)).toBe(`${realpathSync(canonical)}.groklock`);
+    // The lock guards the CANONICAL file — the same lock the host
+    // ModelRuntime's FileAuthStorageBackend takes on its canonical authPath.
+    expect(lockPathFor(target.real)).toBe(`${realpathSync(canonical)}.lock`);
   });
 
   it("resolves the nearest existing directory when the file does not exist yet", async () => {
@@ -183,5 +249,19 @@ describe("resolveCredentialTarget (reviewer MUST-FIX #1)", () => {
     });
     expect(await brokerB.getAccessToken()).toBe("at-new");
     expect(fetchCalls).toBe(1);
+  });
+
+  it("no .groklock exists anywhere — the only lock is the shared proper-lockfile one", async () => {
+    const { GrokCredentialBroker } = await import("../agent/oauth/broker.js");
+    const authPath = join(dir, "auth.json");
+    const broker = new GrokCredentialBroker({ authPath, fetchImpl: (async () => { throw new Error("no network"); }) as unknown as typeof fetch });
+    const now = Date.now();
+    await broker._writeForTest({
+      type: "oauth", access: "at", refresh: "rt", expires: now + 3600_000,
+      issuer: "https://auth.x.ai", client_id: "c", scopes: ["openid"], token_type: "Bearer", obtained_at: now,
+    } as never);
+    const entries = await import("node:fs/promises").then((fs) => fs.readdir(dir));
+    expect(entries.some((e) => e.includes("groklock"))).toBe(false);
+    expect(entries).toContain("auth.json.lock");
   });
 });

@@ -13,6 +13,7 @@
  * SessionImageWriter. Results carry bytes + metadata (never just a path).
  */
 import { type GrokCredentialBroker, type BrokerCredential } from "./oauth/broker.js";
+import type { CredentialStoreAdapter } from "./oauth/store-adapter.js";
 export { NoAgentHomeError } from "./oauth/home.js";
 export { ImagesError } from "./images/errors.js";
 export { OAuthError } from "./oauth/device.js";
@@ -23,6 +24,10 @@ export type HostStatus = {
     usable: boolean;
     expiresAtMs?: number;
     issuer?: string;
+    /** Subscription tier carried by the credential (official id_token `tier` claim); undefined = unknown. */
+    tier?: string;
+    tierRaw?: string;
+    tierSource?: "jwt";
 };
 export type HostImageResult = {
     /** Decoded image bytes. */
@@ -42,6 +47,8 @@ export type HostLibraryOptions = {
     fetchImpl?: typeof fetch;
     /** Images isolation root override (tests). */
     imagesRoot?: string;
+    /** Host-injected credential store — every broker mutation goes through it. */
+    credentialStore?: CredentialStoreAdapter;
 };
 export type HostLibrary = {
     status(): Promise<HostStatus>;

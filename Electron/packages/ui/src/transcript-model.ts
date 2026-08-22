@@ -13,6 +13,8 @@ export type TranscriptTool = {
   finished?: boolean
   dispatched?: boolean
   images?: { data: string; mimeType: string }[]
+  /** Structured `details` projected from the pi tool result (metadata only, never image base64). */
+  details?: unknown
 }
 
 export type TranscriptActivity =
@@ -179,6 +181,7 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
       tool.finished = true
       tool.dispatched = tool.name === 'subagent' && !tool.error && isBackgroundSubagentAck(entry.content)
       if (entry.images) tool.images = entry.images
+      if (entry.details !== undefined) tool.details = entry.details
       continue
     }
     const previous = messages[messages.length - 1]
@@ -203,7 +206,7 @@ export function transcriptFingerprint(messages: readonly ChatMessage[]): string 
     content: message.content,
     error: message.error,
     thinking: message.thinking,
-    tools: message.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, result: tool.result, error: tool.error })),
+    tools: message.tools?.map(tool => ({ id: tool.id, name: tool.name, input: tool.input, result: tool.result, error: tool.error, details: tool.details })),
     activities: message.activities?.map(activity => activity.type === 'tool'
       ? { type: activity.type, contentIndex: activity.contentIndex, toolId: activity.tool.id, result: activity.tool.result, error: activity.tool.error }
       : { type: activity.type, contentIndex: activity.contentIndex, content: activity.content }),
@@ -435,7 +438,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
     if (toolIndex >= 0) {
       const tool = updated.tools![toolIndex]
-      const completed = { ...tool, result: event.content, error: event.isError, finishedAt: Date.now(), finished: true, dispatched: tool.name === 'subagent' && !event.isError && isBackgroundSubagentAck(event.content), images: event.images }
+      const completed = { ...tool, result: event.content, error: event.isError, finishedAt: Date.now(), finished: true, dispatched: tool.name === 'subagent' && !event.isError && isBackgroundSubagentAck(event.content), images: event.images, details: event.details }
       updated.tools![toolIndex] = completed
       const activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
       if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity

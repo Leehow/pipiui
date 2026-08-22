@@ -50,6 +50,40 @@ describe('toolRenderer dispatch', () => {
     expect(screen.queryByTestId('quota-renderer')).toBeTruthy()
   })
 
+  it('delivers typed images and structured details to the renderer (typed details win over envelope)', () => {
+    registerToolRenderer(TEST_EXT, {
+      toolName: 'quota_probe',
+      render: ({ content, details, images }) => (
+        <div data-testid="quota-renderer">
+          {JSON.stringify(details)}|{content}|{images?.map(image => `${image.mimeType}:${image.data}`).join(',') ?? 'none'}
+        </div>
+      ),
+    })
+    const tool: TranscriptTool = {
+      ...quotaTool('图像已生成: /tmp/1.jpg'),
+      images: [{ data: 'aGk=', mimeType: 'image/png' }],
+      details: { path: '/tmp/1.jpg', backend: 'grok-build', model: 'grok-imagine-image-quality' },
+    }
+    render(
+      <AssistantTranscriptContent
+        expandSteps
+        message={{ content: '', activities: [{ type: 'tool', contentIndex: 0, tool }], tools: [tool] }}
+      />,
+    )
+    expect(screen.getByTestId('quota-renderer').textContent).toBe(
+      '{"path":"/tmp/1.jpg","backend":"grok-build","model":"grok-imagine-image-quality"}|图像已生成: /tmp/1.jpg|image/png:aGk=',
+    )
+  })
+
+  it('falls back to the envelope details when the tool record has no typed details', () => {
+    registerToolRenderer(TEST_EXT, {
+      toolName: 'quota_probe',
+      render: ({ details }) => <div data-testid="quota-renderer">{JSON.stringify(details)}</div>,
+    })
+    renderQuota('{ "piui:v1": { "kind": "quota" } }\nok')
+    expect(screen.getByTestId('quota-renderer').textContent).toBe('{"kind":"quota"}')
+  })
+
   it('falls back to TranscriptToolCard when the envelope is invalid', () => {
     registerToolRenderer(TEST_EXT, {
       toolName: 'quota_probe',

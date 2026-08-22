@@ -1,7 +1,13 @@
+import { OAuthError } from "./device.js";
 /**
  * Resolved OAuth config — production issuer/client/scopes are taken from
  * official Grok Build HEAD 19d42e35 (not guessed). They are overridable via
  * env or extension settings. Priority: env > settings > hardcoded prod defaults.
+ *
+ * The issuer is the base for the device-code, token and refresh endpoints;
+ * refresh tokens and access tokens are bearer credentials, so a NON-HTTPS
+ * issuer is always refused (round-2 reviewer Critical #2: a plain-HTTP
+ * issuer would receive the refresh token in cleartext).
  *
  * Spec §7.3: these values were locked by reading
  * crates/codegen/xai-grok-shell/src/auth/config.rs at HEAD 19d42e35.
@@ -44,6 +50,20 @@ function settingsSnapshot() {
         return undefined;
     }
 }
+/** Refuse non-HTTPS issuers — token/refresh endpoints must never be plain HTTP. */
+export function assertHttpsIssuer(issuer) {
+    let protocol;
+    try {
+        protocol = new URL(issuer).protocol;
+    }
+    catch {
+        /* fall through */
+    }
+    if (protocol !== "https:") {
+        throw new OAuthError("invalid_params", `拒绝非 HTTPS OAuth issuer：${issuer}（device-code/token/refresh 端点仅允许 HTTPS，凭证绝不走明文 HTTP）`);
+    }
+    return issuer;
+}
 export function resolveOAuthConfig(overrides) {
     const envIssuer = process.env.GROK_OAUTH2_ISSUER?.trim();
     const envClient = process.env.GROK_OAUTH2_CLIENT_ID?.trim();
@@ -59,6 +79,9 @@ export function resolveOAuthConfig(overrides) {
     issuer = issuer.trim().replace(/\/+$/, "");
     let clientId = overrides?.clientId ?? envClient ?? (settingsClient || undefined) ?? PROD_CLIENT_ID;
     clientId = clientId.trim();
+    // HTTPS-only issuer, no exceptions: the refresh token posted to
+    // `${issuer}/oauth2/token` is a long-lived bearer credential.
+    assertHttpsIssuer(issuer);
     const referrer = overrides?.referrer ?? PROD_REFERRER;
     const early = overrides?.earlyRefreshSec ?? settingsEarly ?? 60;
     const earlyClamped = Math.min(120, Math.max(30, early));

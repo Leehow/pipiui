@@ -13,7 +13,8 @@ import { resolveOAuthConfig } from "./oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
 import { redactMessage } from "./oauth/redact.js";
-import { createBroker } from "./oauth/broker.js";
+import { createBroker, type GrokCredentialBroker } from "./oauth/broker.js";
+import type { CredentialStoreAdapter } from "./oauth/store-adapter.js";
 import { authJsonPath } from "./oauth/home.js";
 
 export const GROK_BUILD_PROVIDER_ID = "grok-build";
@@ -25,6 +26,8 @@ export type GrokBuildProviderOptions = {
   emit?: GrokBuildEmit;
   /** Explicit `auth.json` path. Defaults to `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR` (fail closed). */
   authPath?: string;
+  /** Host-injected credential store — every broker mutation goes through it. */
+  credentialStore?: CredentialStoreAdapter;
 };
 
 export type GrokBuildOAuthCredentials = {
@@ -38,11 +41,14 @@ export type GrokBuildOAuthCredentials = {
   obtained_at?: number;
 };
 
+type CredentialStoreStore = CredentialStoreAdapter;
+
 function displayUriOf(code: { verification_uri: string; verification_uri_complete?: string; user_code: string }): string {
   if (code.verification_uri_complete) return code.verification_uri_complete;
   const sep = code.verification_uri.includes("?") ? "&" : "?";
   return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
 }
+
 
 export function defaultAuthPath(): string {
   // PI_COC_AGENT_DIR > PI_CODING_AGENT_DIR; throws NoAgentHomeError when both
@@ -50,13 +56,14 @@ export function defaultAuthPath(): string {
   return authJsonPath();
 }
 
-function brokerFor(authPath: string | undefined, signal?: AbortSignal) {
+function brokerFor(authPath: string | undefined, credentialStore?: CredentialStoreStore, signal?: AbortSignal) {
   const cfg = resolveOAuthConfig();
   return createBroker({
     authPath: authPath ?? defaultAuthPath(),
     earlyRefreshSec: cfg.earlyRefreshSec,
     fetchImpl: fetch as unknown as typeof fetch,
-  });
+    ...(credentialStore ? { credentialStore } : {}),
+  } as never);
 }
 
 /**
@@ -89,6 +96,7 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
   // Resolved lazily so a missing home surfaces as an actionable error at the
   // first credential operation instead of breaking extension registration.
   const authPath = options.authPath;
+  const credentialStore = options.credentialStore;
 
   return {
     // Auth-only provider: no chat models are exposed (images transport is tool-based).
@@ -188,7 +196,9 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
 
         const creds = toOAuthCredentials(tokens, { issuer: cfg.issuer, clientId: cfg.clientId, scopes: cfg.scopes });
         await emit("token_refreshed", { expires_at: creds.expires });
-        // Pi expects OAuthCredentials { access, refresh, expires, ...extra }
+        // Pi expects OAuthCredentials { access, refresh, expires, ...extra }.
+        // The official id_token `tier` claim is captured with the credential
+        // (tier/tier_raw/tier_source) so the tier gate/status use real data.
         return {
           access: creds.access,
           refresh: creds.refresh,
@@ -198,6 +208,9 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
           scopes: creds.scopes,
           token_type: creds.token_type,
           obtained_at: creds.obtained_at,
+          ...(creds.tier !== undefined ? { tier: creds.tier } : {}),
+          ...(creds.tier_raw !== undefined ? { tier_raw: creds.tier_raw } : {}),
+          ...(creds.tier_source !== undefined ? { tier_source: creds.tier_source } : {}),
         };
       },
       async refreshToken(credentials, signal) {
@@ -215,7 +228,7 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
         // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
-        const broker = brokerFor(authPath, signal as AbortSignal | undefined);
+        const broker = brokerFor(authPath, credentialStore, signal as AbortSignal | undefined);
         try {
           const next = await broker.forceRefresh(signal);
           await emit("token_refreshed", { expires_at: next.expires });
@@ -228,6 +241,9 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
             scopes: next.scopes,
             token_type: next.token_type,
             obtained_at: next.obtained_at,
+            ...(next.tier !== undefined ? { tier: next.tier } : {}),
+            ...(next.tier_raw !== undefined ? { tier_raw: next.tier_raw } : {}),
+            ...(next.tier_source !== undefined ? { tier_source: next.tier_source } : {}),
           };
         } catch (err) {
           const code = (err as OAuthError)?.code;

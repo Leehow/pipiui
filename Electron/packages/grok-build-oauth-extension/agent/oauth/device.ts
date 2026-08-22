@@ -1,4 +1,5 @@
 import { xGrokClientVersion } from "./config.js";
+import { assertHttpsIssuer } from "./config.js";
 import { redactMessage } from "./redact.js";
 
 export type DeviceCode = {
@@ -49,7 +50,14 @@ function validateUserCode(code: string): void {
   }
 }
 
-function validateVerificationUri(uri: string, opts: { allowLoopbackHttp?: boolean } = {}): void {
+/**
+ * Validate a verification URI. HTTPS only — the device verification page is
+ * entered by the user with the user_code; a plain-HTTP page would let a
+ * network attacker swap the code (round-2 reviewer: no loopback-HTTP
+ * tolerance for issuers; local fakes use an https stub or the relay-free
+ * test transport instead).
+ */
+function validateVerificationUri(uri: string): void {
   if ([...uri].some((c) => c.charCodeAt(0) < 0x20)) {
     throw new OAuthError("invalid_response", "Server returned invalid verification URI");
   }
@@ -59,11 +67,9 @@ function validateVerificationUri(uri: string, opts: { allowLoopbackHttp?: boolea
   } catch {
     throw new OAuthError("invalid_response", "Server returned invalid verification URI");
   }
-  if (parsed.protocol === "https:") return;
-  // Loopback http is only tolerated for explicit test deployments (fake issuer
-  // on localhost); production issuers are https (spec §D4).
-  if (opts.allowLoopbackHttp && parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]")) return;
-  throw new OAuthError("invalid_response", "Server returned unsupported verification URI scheme");
+  if (parsed.protocol !== "https:") {
+    throw new OAuthError("invalid_response", "Server returned unsupported verification URI scheme (HTTPS only)");
+  }
 }
 
 function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
@@ -88,6 +94,7 @@ export async function requestDeviceCode(opts: {
   signal?: AbortSignal;
 }): Promise<DeviceCode> {
   if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  assertHttpsIssuer(opts.issuer);
   const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/device/code`;
   const scopeStr = opts.scopes.join(" ");
   const fetchFn = opts.fetchImpl ?? fetch;
@@ -124,19 +131,10 @@ export async function requestDeviceCode(opts: {
     throw new OAuthError("invalid_response", "Device code response missing required fields");
   }
 
-  const loopbackIssuer = (() => {
-    try {
-      const u = new URL(opts.issuer);
-      return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
-    } catch {
-      return false;
-    }
-  })();
-
   validateUserCode(data.user_code);
-  validateVerificationUri(data.verification_uri, { allowLoopbackHttp: loopbackIssuer });
+  validateVerificationUri(data.verification_uri);
   if (typeof data.verification_uri_complete === "string" && data.verification_uri_complete) {
-    validateVerificationUri(data.verification_uri_complete, { allowLoopbackHttp: loopbackIssuer });
+    validateVerificationUri(data.verification_uri_complete);
   }
 
   const interval = typeof data.interval === "number" && Number.isFinite(data.interval) ? Math.max(MIN_INTERVAL_SECS, Math.floor(data.interval)) : DEFAULT_INTERVAL_SECS;
@@ -162,6 +160,7 @@ export async function pollDeviceToken(opts: {
   signal?: AbortSignal;
   clock?: { nowMs: () => number; sleep: (ms: number, signal?: AbortSignal) => Promise<void> };
 }): Promise<TokenSuccess> {
+  assertHttpsIssuer(opts.issuer);
   const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/token`;
   const fetchFn = opts.fetchImpl ?? fetch;
   const sleep = opts.clock
@@ -202,7 +201,9 @@ export async function pollDeviceToken(opts: {
       method: "POST",
       headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
       body: body.toString(),
-      signal: mergedSignal(opts.signal),
+      // Per-request timeout is clamped to the remaining device-code deadline so
+      // a hung request cannot blow past `expires_in` (round-2 reviewer warning).
+      signal: mergedSignal(opts.signal, Math.min(DEFAULT_REQUEST_TIMEOUT_MS, Math.max(1_000, deadlineMs - nowMs()))),
     });
 
     if (resp.ok) {
@@ -252,6 +253,9 @@ export async function refreshAccessToken(opts: {
   signal?: AbortSignal;
 }): Promise<TokenSuccess> {
   if (opts.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  // Defense in depth: the refresh token is a long-lived credential; it is
+  // only ever posted to an HTTPS issuer (config already enforces this).
+  assertHttpsIssuer(opts.issuer);
   const url = `${opts.issuer.replace(/\/+$/, "")}/oauth2/token`;
   const fetchFn = opts.fetchImpl ?? fetch;
   const body = new URLSearchParams({

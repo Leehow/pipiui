@@ -171,7 +171,7 @@ export async function loadControlledContributions(
       const Component = await loadComponent(directory, entry, importModule)
       disposers.push(registerToolRenderer(descriptor.id, {
         toolName: renderer.tool,
-        render: ({ content, details }) => createElement(Component, { content, details }),
+        render: ({ content, details, images }) => createElement(Component, { content, details, images }),
       }))
     } catch {
       // No panel slot: leave the default tool card. Do not crash the host.

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI } from '@pipi/host-api'
 import {
@@ -108,7 +108,17 @@ describe('loadControlledContributions', () => {
       content: 'ok',
       details: { used: 1 },
     } as unknown as ToolRenderProps))
-    expect(card.getByTestId('ext-controlled-tool').textContent).toBe('ok:{"used":1}')
+    expect(card.getByTestId('ext-controlled-tool').textContent).toBe('ok:{"used":1}:')
+
+    // Typed images forwarded to the controlled component (typed image chain).
+    const cardWithImages = render(renderer!.render!({
+      tool: { id: 't2', name: 'get_quota', input: '{}' },
+      elapsed: () => '',
+      content: 'ok',
+      details: { used: 2 },
+      images: [{ data: 'aGk=', mimeType: 'image/png' }],
+    } as unknown as ToolRenderProps))
+    expect(within(cardWithImages.container).getByTestId('ext-controlled-tool').textContent).toBe('ok:{"used":2}:image/png:aGk=')
 
     for (const dispose of disposers) dispose()
     expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)

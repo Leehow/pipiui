@@ -1,3 +1,5 @@
+import { tierNameFromJwtClaim, decodeIdTokenTierClaim, type CredentialTierInfo } from "../images/tier.js";
+
 export type GrokBuildOAuthExtra = {
   issuer: string;
   client_id: string;
@@ -16,18 +18,24 @@ export type StoredOAuthCredential = {
   scopes: string[];
   token_type?: string;
   obtained_at: number;
-};
+} & CredentialTierInfo;
 
 export function toOAuthCredentials(tokens: {
   access_token: string;
   refresh_token?: string;
   expires_in?: number;
   token_type?: string;
+  /** OIDC id_token; only its numeric `tier` claim is read (see images/tier.js). */
+  id_token?: string;
 }, meta: { issuer: string; clientId: string; scopes: string[]; refreshFallback?: string }): StoredOAuthCredential {
   const now = Date.now();
   const expiresIn = typeof tokens.expires_in === "number" && Number.isFinite(tokens.expires_in) ? tokens.expires_in : 3600;
   const expires = now + Math.max(60, expiresIn) * 1000;
   const refresh = tokens.refresh_token ?? meta.refreshFallback ?? "";
+  // Official `tier` claim (numeric). Only officially mapped values become a
+  // tier name; an unmapped number is kept raw (unknown, fail-open) and any
+  // other claim is ignored — nothing is guessed.
+  const tierInfo = tierNameFromJwtClaim(decodeIdTokenTierClaim(tokens.id_token));
   return {
     access: tokens.access_token,
     refresh,
@@ -37,5 +45,8 @@ export function toOAuthCredentials(tokens: {
     scopes: meta.scopes,
     token_type: tokens.token_type ?? "Bearer",
     obtained_at: now,
+    ...(tierInfo.name !== undefined ? { tier: tierInfo.name } : {}),
+    ...(tierInfo.raw !== undefined ? { tier_raw: tierInfo.raw } : {}),
+    ...(tierInfo.name !== undefined || tierInfo.raw !== undefined ? { tier_source: "jwt" as const } : {}),
   };
 }
