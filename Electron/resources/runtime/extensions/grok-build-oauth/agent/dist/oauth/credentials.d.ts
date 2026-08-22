@@ -29,4 +29,11 @@ export declare function toOAuthCredentials(tokens: {
     clientId: string;
     scopes: string[];
     refreshFallback?: string;
+    /**
+     * Tier metadata carried by the credential being replaced. When the token
+     * response carries NO new `tier` claim (refresh responses legitimately omit
+     * `id_token`), the previous tier/tier_raw/tier_source are preserved instead
+     * of being silently dropped; a fresh claim always wins.
+     */
+    previousTier?: CredentialTierInfo;
 }): StoredOAuthCredential;

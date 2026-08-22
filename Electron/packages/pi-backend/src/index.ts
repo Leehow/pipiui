@@ -5529,7 +5529,11 @@ export class PiHostBackend implements HostBackend {
       if (real.getProvider?.(GROK_BUILD_PROVIDER_ID)) return;
       real.registerProvider(
         GROK_BUILD_PROVIDER_ID,
-        createGrokBuildProvider({ authPath: join(this.agentDir, "auth.json") }),
+        // The provider is pure code: login returns the credential for pi's own
+        // store to persist, and refreshToken runs inside pi's locked
+        // credentials.modify() — it never touches the store itself (round-3
+        // reviewer Critical: no second lock acquisition).
+        createGrokBuildProvider(),
       );
     } catch (error) {
       console.warn(

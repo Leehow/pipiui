@@ -1,13 +1,10 @@
-import type { CredentialStoreAdapter } from "./oauth/store-adapter.js";
 export declare const GROK_BUILD_PROVIDER_ID = "grok-build";
 export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> | void;
 export type GrokBuildProviderOptions = {
     /** Best-effort bridge emitter; omitted in the host auth runtime (no bridge there). */
     emit?: GrokBuildEmit;
-    /** Explicit `auth.json` path. Defaults to `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR` (fail closed). */
-    authPath?: string;
-    /** Host-injected credential store — every broker mutation goes through it. */
-    credentialStore?: CredentialStoreAdapter;
+    /** Test hook: inject the token-endpoint transport (defaults to global fetch). */
+    fetchImpl?: typeof fetch;
 };
 export type GrokBuildOAuthCredentials = {
     access: string;
@@ -19,7 +16,6 @@ export type GrokBuildOAuthCredentials = {
     token_type?: string;
     obtained_at?: number;
 };
-export declare function defaultAuthPath(): string;
 /**
  * Build the provider registration payload. The shape matches pi's extension
  * `registerProvider` contract; the host ModelRuntime's `registerProvider`

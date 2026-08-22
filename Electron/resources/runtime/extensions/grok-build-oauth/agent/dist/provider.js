@@ -7,34 +7,22 @@
  *   provider login panel can show login state / re-login / logout without a session.
  *
  * Secrets never leave the pi credential store (`auth.json` under the host's Pi home);
- * this module only carries code and non-secret config.
+ * this module only carries code and non-secret config. The provider NEVER
+ * touches the store itself — `login` returns the credential for pi to persist,
+ * and `refreshToken` is a pure network refresh whose result pi persists inside
+ * its own `credentials.modify()` (which already holds the store lock).
  */
 import { resolveOAuthConfig } from "./oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
+import { refreshCredentialUnlocked } from "./oauth/refresh.js";
 import { redactMessage } from "./oauth/redact.js";
-import { createBroker } from "./oauth/broker.js";
-import { authJsonPath } from "./oauth/home.js";
 export const GROK_BUILD_PROVIDER_ID = "grok-build";
 function displayUriOf(code) {
     if (code.verification_uri_complete)
         return code.verification_uri_complete;
     const sep = code.verification_uri.includes("?") ? "&" : "?";
     return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
-}
-export function defaultAuthPath() {
-    // PI_COC_AGENT_DIR > PI_CODING_AGENT_DIR; throws NoAgentHomeError when both
-    // are unset (no global ~/.pi/agent fallback — project isolation hard rule).
-    return authJsonPath();
-}
-function brokerFor(authPath, credentialStore, signal) {
-    const cfg = resolveOAuthConfig();
-    return createBroker({
-        authPath: authPath ?? defaultAuthPath(),
-        earlyRefreshSec: cfg.earlyRefreshSec,
-        fetchImpl: fetch,
-        ...(credentialStore ? { credentialStore } : {}),
-    });
 }
 /**
  * Build the provider registration payload. The shape matches pi's extension
@@ -43,10 +31,7 @@ function brokerFor(authPath, credentialStore, signal) {
  */
 export function createGrokBuildProvider(options = {}) {
     const emit = options.emit ?? (() => undefined);
-    // Resolved lazily so a missing home surfaces as an actionable error at the
-    // first credential operation instead of breaking extension registration.
-    const authPath = options.authPath;
-    const credentialStore = options.credentialStore;
+    const fetchImpl = options.fetchImpl;
     return {
         // Auth-only provider: no chat models are exposed (images transport is tool-based).
         name: "Grok Build",
@@ -166,22 +151,17 @@ export function createGrokBuildProvider(options = {}) {
                 };
             },
             async refreshToken(credentials, signal) {
-                const cfg = resolveOAuthConfig();
-                const access = credentials.access;
-                const refresh = credentials.refresh;
-                const storedIssuer = credentials.issuer;
-                if (storedIssuer && storedIssuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
-                    throw new Error("Issuer mismatch — please run /login grok-build again. [redacted]");
-                }
-                if (!refresh) {
-                    throw new Error("No refresh token — please run /login grok-build again.");
-                }
-                if (signal?.aborted)
-                    throw new DOMException("Aborted", "AbortError");
-                // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
-                const broker = brokerFor(authPath, credentialStore, signal);
+                // Round-3 reviewer Critical: pi-ai's resolveStoredOAuth calls this
+                // INSIDE `credentials.modify()` — while pi already holds the
+                // auth-store lock. This callback must therefore be pure: refresh over
+                // the network using the handed-in (authoritative, in-lock) credential
+                // and RETURN the next value; pi persists it. No broker, no store
+                // adapter, no second lock acquisition — those self-deadlock.
+                const current = (credentials ?? {});
+                const access = current.access;
+                const refresh = current.refresh;
                 try {
-                    const next = await broker.forceRefresh(signal);
+                    const next = await refreshCredentialUnlocked(current, signal, { fetchImpl });
                     await emit("token_refreshed", { expires_at: next.expires });
                     return {
                         access: next.access,
@@ -200,10 +180,15 @@ export function createGrokBuildProvider(options = {}) {
                 catch (err) {
                     const code = err?.code;
                     const msg = err instanceof Error ? err.message : String(err);
-                    const redacted = redactMessage(msg, [refresh, access ?? ""]);
+                    const redacted = redactMessage(msg, [refresh ?? "", access ?? ""]);
                     await emit("auth_error", { code: code ?? "refresh_failed", message: redacted });
-                    if (code === "auth_expired" || code === "invalid_grant") {
+                    if (code === "invalid_grant") {
                         throw new Error("Refresh token expired or revoked — please run /login grok-build again. [redacted]");
+                    }
+                    if (code === "auth_expired") {
+                        // Already a user-actionable re-login message (issuer mismatch /
+                        // missing refresh token / revoked refresh).
+                        throw new Error(redacted);
                     }
                     throw new Error(redacted);
                 }

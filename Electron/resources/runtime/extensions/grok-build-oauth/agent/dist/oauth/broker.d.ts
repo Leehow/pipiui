@@ -1,4 +1,4 @@
-import { type StoredOAuthCredential } from "./credentials.js";
+import type { StoredOAuthCredential } from "./credentials.js";
 import { type CredentialEntry, type CredentialStoreAdapter } from "./store-adapter.js";
 import type { LockOptions } from "./lock.js";
 export type BrokerCredential = StoredOAuthCredential & {

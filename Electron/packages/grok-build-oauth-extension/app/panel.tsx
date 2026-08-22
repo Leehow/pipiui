@@ -97,7 +97,19 @@ export default function Panel(props: { api?: ExtensionHostAPI }) {
         ? "空（受限 — 按官方 free tier 处理）"
         : tierValue;
   const tierSourceLabel =
-    status?.tierSource === "override" ? "手动配置" : status?.tierSource === "credential" ? "登录凭证" : "未知";
+    status?.tier !== undefined
+      ? status.tierSource === "override"
+        ? "手动配置"
+        : status.tierSource === "credential"
+          ? "登录凭证"
+          : "未知"
+      : // No live status (or a session that itself reports no tier): the value
+        // shown above came from the settings slot — label it as such instead
+        // of "未知". Unknown (no value anywhere) and an explicitly EMPTY
+        // (restricted) tier stay visible as before.
+        typeof settingsTier === "string"
+        ? "设置"
+        : "未知";
 
   const toggleCompat = async (next: boolean) => {
     setBusy(true);

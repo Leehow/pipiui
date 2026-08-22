@@ -26,9 +26,9 @@
  * and release is mtime-checked so a late release can never delete a new
  * holder's lock.
  */
-import { refreshAccessToken, OAuthError } from "./device.js";
-import { toOAuthCredentials, type StoredOAuthCredential } from "./credentials.js";
-import { redactMessage } from "./redact.js";
+import { OAuthError } from "./device.js";
+import { refreshCredentialUnlocked } from "./refresh.js";
+import type { StoredOAuthCredential } from "./credentials.js";
 import { resolveOAuthConfig } from "./config.js";
 import { authJsonPath } from "./home.js";
 import {
@@ -204,7 +204,6 @@ export class GrokCredentialBroker {
     }
 
     const cfg = resolveOAuthConfig();
-    const issuer = before.issuer || cfg.issuer;
 
     // Issuer mismatch -> require re-login
     if (before.issuer && before.issuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
@@ -235,19 +234,18 @@ export class GrokCredentialBroker {
         return inside;
       }
 
-      const clientId = inside.client_id || cfg.clientId;
-
-      let tokens;
+      // Pure network refresh (shared with the provider's in-lock callback —
+      // see oauth/refresh.js): no store access, no lock, no persistence.
+      // We already hold the unified store lock here and do the RMW below.
+      let next: StoredOAuthCredential;
       try {
-        const timeoutSignal = AbortSignal.timeout(this.opts.refreshTimeoutMs);
-        const effective = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-        tokens = await refreshAccessToken({ issuer, clientId, refreshToken: inside.refresh, fetchImpl: this.opts.fetchImpl, signal: effective });
+        next = await refreshCredentialUnlocked(inside, signal, {
+          fetchImpl: this.opts.fetchImpl,
+          refreshTimeoutMs: this.opts.refreshTimeoutMs,
+        });
       } catch (err) {
         if (signal?.aborted) throw err;
-        const code = (err as OAuthError)?.code;
-        const msg = err instanceof Error ? err.message : String(err);
-        const redacted = redactMessage(msg, [inside.refresh, inside.access]);
-        if (code === "invalid_grant") {
+        if ((err as OAuthError)?.code === "invalid_grant") {
           // Clear credential on invalid_grant (invalidated refresh token) —
           // but ONLY when the stored credential is still the one we tried:
           // if another process rotated it meanwhile, that token is valid and
@@ -266,16 +264,10 @@ export class GrokCredentialBroker {
           }
           throw new OAuthError("auth_expired", "Refresh token expired or revoked — please run /login grok-build again. [redacted]");
         }
-        // Network/5xx/timeout -> preserve old credential, throw retryable error
-        throw new OAuthError(code ?? "refresh_failed", redacted);
+        // Network/5xx/timeout (already redacted by the pure refresh) —
+        // preserve old credential, throw retryable error.
+        throw err;
       }
-
-      const next = toOAuthCredentials(tokens, {
-        issuer,
-        clientId,
-        scopes: inside.scopes,
-        refreshFallback: inside.refresh,
-      }) as BrokerCredential;
       const nextCred: BrokerCredential = { ...next, type: "oauth" as const };
 
       // Freshness guard before write (we hold the lock, but belt-and-braces).

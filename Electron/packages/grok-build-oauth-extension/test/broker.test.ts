@@ -278,12 +278,10 @@ describe("Broker — in-process dedup, cross-process lock, crash recovery, atomi
 // (AuthStorage + FileAuthStorageBackend — exactly what ModelRuntime.create
 // constructs internally), imported by file URL from the installed runtime.
 // ─────────────────────────────────────────────────────────────────────────────
-import { createRequire } from "node:module";
 import { realpathSync, symlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCredentialStoreAdapterFromStore } from "../agent/oauth/store-adapter.js";
-
-const nodeRequire = createRequire(import.meta.url);
 
 type PiStore = {
   read(provider: string): Promise<unknown>;
@@ -293,12 +291,24 @@ type PiStore = {
 
 async function loadPiAuthStorage(): Promise<((authPath: string) => PiStore) | undefined> {
   try {
-    const indexJs = nodeRequire.resolve("@earendil-works/pi-coding-agent");
+    // The pi package's exports map has no CJS/"require" condition, so
+    // require.resolve on the bare specifier fails and these suites silently
+    // skipped; walk up to the installed package directly instead.
+    const { existsSync } = await import("node:fs");
     const { pathToFileURL } = await import("node:url");
-    const mod = (await import(pathToFileURL(join(dirname(indexJs), "core", "auth-storage.js")).href)) as {
-      AuthStorage: { create(authPath?: string): PiStore };
-    };
-    return (authPath: string) => mod.AuthStorage.create(authPath);
+    let here = dirname(fileURLToPath(import.meta.url));
+    while (true) {
+      const candidate = join(here, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "core", "auth-storage.js");
+      if (existsSync(candidate)) {
+        const mod = (await import(pathToFileURL(candidate).href)) as {
+          AuthStorage: { create(authPath?: string): PiStore };
+        };
+        return (authPath: string) => mod.AuthStorage.create(authPath);
+      }
+      const parent = dirname(here);
+      if (parent === here) return undefined;
+      here = parent;
+    }
   } catch {
     return undefined;
   }
@@ -464,19 +474,26 @@ describe("Broker × Pi credential store — one lock, no lost fields (round-2 Cr
     expect((afterRefresh.anthropic as { key: string }).key).toBe("sk-keep");
     expect((afterRefresh["grok-build"] as { refresh: string }).refresh).toBe(refreshed.refresh);
 
-    // Rotation race: the stored refresh token was already rotated by someone
-    // else; an invalid_grant for the OLD token must NOT clear the new one.
+    // Rotation race: the stored refresh token was rotated by someone else
+    // WHILE our refresh (for the older token we already read) was in flight;
+    // an invalid_grant for the OLD token must NOT clear the NEW one.
+    // (Deterministic: the rotation is driven from inside fetchImpl, between
+    // the broker's unlocked read and its conditional cleanup — this test
+    // previously never ran because the pi-package loader silently skipped.)
     const staleBroker = new GrokCredentialBroker({
       authPath,
       credentialStore: createCredentialStoreAdapterFromStore(pi),
-      fetchImpl: (async () =>
-        new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 })) as unknown as typeof fetch,
+      fetchImpl: (async () => {
+        await pi.modify("grok-build", async () =>
+          makeCred({ access: "at-rot-race", refresh: "rt-rot-race", expires: Date.now() + 3600_000, obtained_at: Date.now() }) as never);
+        return new Response(JSON.stringify({ error: "invalid_grant", error_description: "bad token" }), { status: 400 });
+      }) as unknown as typeof fetch,
     });
     await expect(staleBroker.forceRefresh()).rejects.toMatchObject({ code: "auth_expired" });
     const afterRace = JSON.parse(await readFile(authPath, "utf8")) as Record<string, unknown>;
     // The currently-valid credential survived the stale invalid_grant.
     expect(afterRace["grok-build"]).toBeTruthy();
-    expect(typeof (afterRace["grok-build"] as { access: string }).access).toBe("string");
+    expect((afterRace["grok-build"] as { refresh: string }).refresh).toBe("rt-rot-race");
   });
 
   it("file adapter: invalid_grant for a rotated-away refresh token keeps the rotated credential (rotation race)", async () => {

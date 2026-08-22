@@ -8,6 +8,9 @@ export function toOAuthCredentials(tokens, meta) {
     // tier name; an unmapped number is kept raw (unknown, fail-open) and any
     // other claim is ignored — nothing is guessed.
     const tierInfo = tierNameFromJwtClaim(decodeIdTokenTierClaim(tokens.id_token));
+    const hasNewTierClaim = tierInfo.name !== undefined || tierInfo.raw !== undefined;
+    const tierName = hasNewTierClaim ? tierInfo.name : meta.previousTier?.tier;
+    const tierRaw = hasNewTierClaim ? tierInfo.raw : meta.previousTier?.tier_raw;
     return {
         access: tokens.access_token,
         refresh,
@@ -17,8 +20,8 @@ export function toOAuthCredentials(tokens, meta) {
         scopes: meta.scopes,
         token_type: tokens.token_type ?? "Bearer",
         obtained_at: now,
-        ...(tierInfo.name !== undefined ? { tier: tierInfo.name } : {}),
-        ...(tierInfo.raw !== undefined ? { tier_raw: tierInfo.raw } : {}),
-        ...(tierInfo.name !== undefined || tierInfo.raw !== undefined ? { tier_source: "jwt" } : {}),
+        ...(tierName !== undefined ? { tier: tierName } : {}),
+        ...(tierRaw !== undefined ? { tier_raw: tierRaw } : {}),
+        ...(tierName !== undefined || tierRaw !== undefined ? { tier_source: "jwt" } : {}),
     };
 }

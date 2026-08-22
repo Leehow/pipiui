@@ -38,6 +38,35 @@ describe("Grok Build panel tier presentation", () => {
     expect(screen.getByTestId("grok-build-tier").textContent).toContain("SuperGrok Heavy");
   });
 
+  it("without a session, a settings-derived tier is labeled 来源：设置 (not 未知)", async () => {
+    await renderPanel(apiStub({
+      settings: { "ext.grok-build-oauth.tier": "SuperGrok Heavy" },
+      invoke: noSession,
+    }));
+    const tier = screen.getByTestId("grok-build-tier");
+    expect(tier.textContent).toContain("来源：设置");
+    expect(tier.textContent).not.toContain("未知");
+  });
+
+  it("without a session, an explicitly EMPTY settings tier stays visible as restricted with 来源：设置", async () => {
+    await renderPanel(apiStub({
+      settings: { "ext.grok-build-oauth.tier": "" },
+      invoke: noSession,
+    }));
+    const tier = screen.getByTestId("grok-build-tier");
+    expect(tier.textContent).toContain("受限");
+    expect(tier.textContent).toContain("来源：设置");
+    expect(tier.textContent).not.toContain("unknown");
+    expect(tier.textContent).not.toContain("未知");
+  });
+
+  it("without a session and without any tier, unknown stays visible with 来源：未知", async () => {
+    await renderPanel(apiStub({ settings: {}, invoke: noSession }));
+    const tier = screen.getByTestId("grok-build-tier");
+    expect(tier.textContent).toContain("unknown");
+    expect(tier.textContent).toContain("来源：未知");
+  });
+
   it("never hides an explicitly EMPTY tier — shows it as restricted", async () => {
     await renderPanel(apiStub({
       settings: { "ext.grok-build-oauth.tier": "" },

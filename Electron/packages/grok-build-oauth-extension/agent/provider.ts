@@ -7,15 +7,16 @@
  *   provider login panel can show login state / re-login / logout without a session.
  *
  * Secrets never leave the pi credential store (`auth.json` under the host's Pi home);
- * this module only carries code and non-secret config.
+ * this module only carries code and non-secret config. The provider NEVER
+ * touches the store itself — `login` returns the credential for pi to persist,
+ * and `refreshToken` is a pure network refresh whose result pi persists inside
+ * its own `credentials.modify()` (which already holds the store lock).
  */
 import { resolveOAuthConfig } from "./oauth/config.js";
 import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.js";
 import { toOAuthCredentials } from "./oauth/credentials.js";
+import { refreshCredentialUnlocked } from "./oauth/refresh.js";
 import { redactMessage } from "./oauth/redact.js";
-import { createBroker, type GrokCredentialBroker } from "./oauth/broker.js";
-import type { CredentialStoreAdapter } from "./oauth/store-adapter.js";
-import { authJsonPath } from "./oauth/home.js";
 
 export const GROK_BUILD_PROVIDER_ID = "grok-build";
 
@@ -24,10 +25,8 @@ export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> 
 export type GrokBuildProviderOptions = {
   /** Best-effort bridge emitter; omitted in the host auth runtime (no bridge there). */
   emit?: GrokBuildEmit;
-  /** Explicit `auth.json` path. Defaults to `PI_COC_AGENT_DIR` > `PI_CODING_AGENT_DIR` (fail closed). */
-  authPath?: string;
-  /** Host-injected credential store — every broker mutation goes through it. */
-  credentialStore?: CredentialStoreAdapter;
+  /** Test hook: inject the token-endpoint transport (defaults to global fetch). */
+  fetchImpl?: typeof fetch;
 };
 
 export type GrokBuildOAuthCredentials = {
@@ -41,30 +40,12 @@ export type GrokBuildOAuthCredentials = {
   obtained_at?: number;
 };
 
-type CredentialStoreStore = CredentialStoreAdapter;
-
 function displayUriOf(code: { verification_uri: string; verification_uri_complete?: string; user_code: string }): string {
   if (code.verification_uri_complete) return code.verification_uri_complete;
   const sep = code.verification_uri.includes("?") ? "&" : "?";
   return `${code.verification_uri}${sep}user_code=${encodeURIComponent(code.user_code)}`;
 }
 
-
-export function defaultAuthPath(): string {
-  // PI_COC_AGENT_DIR > PI_CODING_AGENT_DIR; throws NoAgentHomeError when both
-  // are unset (no global ~/.pi/agent fallback — project isolation hard rule).
-  return authJsonPath();
-}
-
-function brokerFor(authPath: string | undefined, credentialStore?: CredentialStoreStore, signal?: AbortSignal) {
-  const cfg = resolveOAuthConfig();
-  return createBroker({
-    authPath: authPath ?? defaultAuthPath(),
-    earlyRefreshSec: cfg.earlyRefreshSec,
-    fetchImpl: fetch as unknown as typeof fetch,
-    ...(credentialStore ? { credentialStore } : {}),
-  } as never);
-}
 
 /**
  * Build the provider registration payload. The shape matches pi's extension
@@ -93,10 +74,7 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
   };
 } {
   const emit: GrokBuildEmit = options.emit ?? (() => undefined);
-  // Resolved lazily so a missing home surfaces as an actionable error at the
-  // first credential operation instead of breaking extension registration.
-  const authPath = options.authPath;
-  const credentialStore = options.credentialStore;
+  const fetchImpl = options.fetchImpl;
 
   return {
     // Auth-only provider: no chat models are exposed (images transport is tool-based).
@@ -214,23 +192,17 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
         };
       },
       async refreshToken(credentials, signal) {
-        const cfg = resolveOAuthConfig();
-        const access = (credentials as unknown as Record<string, unknown>).access as string | undefined;
-        const refresh = (credentials as unknown as Record<string, unknown>).refresh as string | undefined;
-        const storedIssuer = (credentials as unknown as Record<string, unknown>).issuer as string | undefined;
-
-        if (storedIssuer && storedIssuer.replace(/\/+$/, "") !== cfg.issuer.replace(/\/+$/, "")) {
-          throw new Error("Issuer mismatch — please run /login grok-build again. [redacted]");
-        }
-        if (!refresh) {
-          throw new Error("No refresh token — please run /login grok-build again.");
-        }
-        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-
-        // Broker handles earlyRefresh, rotation, 401 dedup, cross-process lock + re-read + freshness guard, 0600 atomic write, redaction
-        const broker = brokerFor(authPath, credentialStore, signal as AbortSignal | undefined);
+        // Round-3 reviewer Critical: pi-ai's resolveStoredOAuth calls this
+        // INSIDE `credentials.modify()` — while pi already holds the
+        // auth-store lock. This callback must therefore be pure: refresh over
+        // the network using the handed-in (authoritative, in-lock) credential
+        // and RETURN the next value; pi persists it. No broker, no store
+        // adapter, no second lock acquisition — those self-deadlock.
+        const current = (credentials ?? {}) as Record<string, unknown>;
+        const access = current.access as string | undefined;
+        const refresh = current.refresh as string | undefined;
         try {
-          const next = await broker.forceRefresh(signal);
+          const next = await refreshCredentialUnlocked(current, signal, { fetchImpl });
           await emit("token_refreshed", { expires_at: next.expires });
           return {
             access: next.access,
@@ -248,10 +220,15 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
         } catch (err) {
           const code = (err as OAuthError)?.code;
           const msg = err instanceof Error ? err.message : String(err);
-          const redacted = redactMessage(msg, [refresh, access ?? ""]);
+          const redacted = redactMessage(msg, [refresh ?? "", access ?? ""]);
           await emit("auth_error", { code: code ?? "refresh_failed", message: redacted });
-          if (code === "auth_expired" || code === "invalid_grant") {
+          if (code === "invalid_grant") {
             throw new Error("Refresh token expired or revoked — please run /login grok-build again. [redacted]");
+          }
+          if (code === "auth_expired") {
+            // Already a user-actionable re-login message (issuer mismatch /
+            // missing refresh token / revoked refresh).
+            throw new Error(redacted);
           }
           throw new Error(redacted);
         }
