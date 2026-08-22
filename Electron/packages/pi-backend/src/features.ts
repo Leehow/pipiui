@@ -26,4 +26,4 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *
  * Everything else is verified to load: pi boots with all 13 mounts and a clean stderr.
  */
-export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:true,goal:true,subagent:true,memoryBroker:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});
+export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:true,goal:true,subagent:true,memoryBroker:true,contextFold:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});

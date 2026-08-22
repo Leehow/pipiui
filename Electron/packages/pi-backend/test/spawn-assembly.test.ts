@@ -8,6 +8,31 @@ import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, MEDIA_CO
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
+describe("context-fold main-session mount", () => {
+  const contextFold = "/runtime/pi-ext/packages/context-fold/index.ts";
+
+  it("mounts the resolved context-fold entrypoint once behind its dedicated feature", () => {
+    const input = { cwd: "/tmp/project", features: { contextFold: true }, paths: { contextFold } };
+    expect(assemblePiSpawn(input).args).toEqual(["-e", contextFold]);
+    expect(assemblePiSpawn({ ...input, bridgePort: 1234 }).args).toEqual(["-e", contextFold]);
+  });
+
+  it("honors the explicit feature-off kill switch", () => {
+    const output = assemblePiSpawn({ cwd: "/tmp/project", features: { contextFold: false }, paths: { contextFold } });
+    expect(output.args).not.toContain(contextFold);
+  });
+
+  it("fails open by omitting an unresolved runtime asset", () => {
+    const output = assemblePiSpawn({ cwd: "/tmp/project", features: { contextFold: true }, paths: {} });
+    expect(output.args).toEqual([]);
+  });
+
+  it("resolves only the shipped runtime entrypoint", () => {
+    const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
+    expect(resolveSpawnPaths(root).contextFold).toBe(join(root, "pi-ext", "packages", "context-fold", "index.ts"));
+  });
+});
+
 describe("runtime info extension mount", () => {
   const runtimeInfo = "/runtime/extensions/pipiui-runtime-info.ts";
   const updateCenter = "/runtime/extensions/pipiui-update-center.ts";
@@ -305,6 +330,39 @@ describe("Computer Agent host contract", () => {
  * both base layers.
  */
 describe(".env injection into the pi spawn env (T17 parity)", () => {
+  it("applies PipiUI context-fold product defaults at the lowest precedence", () => {
+    const merged = mergedSpawnEnvironment({}, {}, {});
+    expect(merged).toMatchObject({
+      CONTEXTFOLD_BUDGET_CAP: "150000",
+      CONTEXTFOLD_TAIL: "30000",
+      CONTEXTFOLD_COMPACT: "native",
+      CONTEXTFOLD_SPOOL_RETAIN_DAYS: "30",
+    });
+  });
+
+  it("lets caller, project .env, and internal values override context-fold defaults in order", () => {
+    const parent = mergedSpawnEnvironment({ CONTEXTFOLD_BUDGET_CAP: "140000" }, {}, {});
+    expect(parent.CONTEXTFOLD_BUDGET_CAP).toBe("140000");
+
+    const project = mergedSpawnEnvironment(
+      { CONTEXTFOLD_TAIL: "25000" },
+      { CONTEXTFOLD_TAIL: "22000", CONTEXTFOLD_COMPACT: "det" },
+      {},
+    );
+    expect(project.CONTEXTFOLD_TAIL).toBe("22000");
+    expect(project.CONTEXTFOLD_COMPACT).toBe("det");
+
+    const internal = mergedSpawnEnvironment(
+      {},
+      { CONTEXTFOLD_SPOOL_RETAIN_DAYS: "10" },
+      { CONTEXTFOLD_SPOOL_RETAIN_DAYS: "45" },
+    );
+    expect(internal.CONTEXTFOLD_SPOOL_RETAIN_DAYS).toBe("45");
+
+    const disabled = mergedSpawnEnvironment({}, { CONTEXTFOLD: "0" }, {});
+    expect(disabled.CONTEXTFOLD).toBe("0");
+  });
+
   it("defaults new Pi processes to native long cache retention", () => {
     const merged = mergedSpawnEnvironment({}, {}, {});
     expect(merged.PI_CACHE_RETENTION).toBe("long");
@@ -500,7 +558,7 @@ describe("installed runtime tree", () => {
 
 describe("default feature set", () => {
   it("mounts the orchestration stack and the built-in browser while withholding unavailable desktop surfaces", () => {
-    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: true, subagent: true, git: true, skillLoader: true, searchScope: false, webSearch: true, browserSearch: true, mcp: true, browser: true });
+    expect(DEFAULT_FEATURES).toMatchObject({ philosophy: true, plan: true, subagent: true, contextFold: true, git: true, skillLoader: true, searchScope: false, webSearch: true, browserSearch: true, mcp: true, browser: true });
     expect(DEFAULT_FEATURES.computerUse).toBe(true);
   });
 
