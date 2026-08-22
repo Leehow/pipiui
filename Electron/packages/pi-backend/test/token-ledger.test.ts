@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { createPiHostBackend } from "../src/index.js";
 import {
   appendLedgerRecord,
+  exactAssistantUsage,
   latestContextBySession,
   ledgerLine,
   parseLedgerLine,
@@ -30,6 +31,43 @@ const record: LedgerContextRecord = {
 };
 
 describe("token-ledger format (Swift TokenLedger parity)", () => {
+  it("attributes an exact assistant response, including cache hits and billed cost", () => {
+    expect(exactAssistantUsage({
+      input: 1_200,
+      output: 340,
+      cacheRead: 800,
+      cacheWrite: 100,
+      totalTokens: 2_440,
+      cost: { total: 0.00123 },
+    })).toEqual({
+      input: 1_200,
+      output: 340,
+      cacheRead: 800,
+      cacheWrite: 100,
+      cost: 0.00123,
+      contextTokens: 2_440,
+    });
+  });
+
+  it("fails closed when an assistant usage field is missing or invalid", () => {
+    expect(exactAssistantUsage({
+      input: 1,
+      output: 2,
+      cacheRead: 3,
+      cacheWrite: 4,
+      totalTokens: 10,
+      cost: {},
+    })).toBeUndefined();
+    expect(exactAssistantUsage({
+      input: 1,
+      output: -2,
+      cacheRead: 3,
+      cacheWrite: 4,
+      totalTokens: 10,
+      cost: { total: 0.5 },
+    })).toBeUndefined();
+  });
+
   it("serializes one Swift-shaped JSON line with sorted keys and the Electron-only contextWindow", () => {
     const line = ledgerLine(record);
     expect(line.endsWith("\n")).toBe(true);
@@ -145,6 +183,48 @@ describe("per-session last-known context persistence", () => {
     expect(text).toContain('"channel":"main"');
     expect(text).toContain('"contextWindow":262144');
     expect(text).toContain('"model":"fake/fake-1"');
+  });
+
+  it("writes exact per-response usage once while cumulative stats refreshes stay non-billing", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ledger-usage-"));
+    const agent = join(root, "agent");
+    const sessions = join(root, "sessions");
+    await mkdir(agent, { recursive: true });
+    const cwd = join(root, "project");
+    await mkdir(cwd, { recursive: true });
+    await writeSession("session-1", cwd, sessions);
+    const backend = await sessionBackend(agent, sessions);
+
+    await backend.handle("sendPrompt", ["session-1", "ledger-usage"]);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await backend.handle("getSessionStats", ["session-1"]);
+    await backend.handle("getSessionStats", ["session-1"]);
+
+    const ledger = join(agent, "pipiui-token-ledger.jsonl");
+    await waitForFileContaining(ledger, '"input":1200');
+    const rows = await readLedgerFile(ledger);
+    const billed = rows.filter((row) => row.input || row.output || row.cacheRead || row.cacheWrite || row.cost);
+    expect(billed).toEqual([
+      expect.objectContaining({
+        session: "session-1",
+        channel: "main",
+        model: "fake/fake-1",
+        turn: 1,
+        input: 1_200,
+        output: 340,
+        cacheRead: 800,
+        cacheWrite: 100,
+        cost: 0.00123,
+        contextTokens: 2_440,
+      }),
+    ]);
+
+    await backend.close();
+    const restarted = await sessionBackend(agent, sessions);
+    await restarted.handle("getSessionStats", ["session-1"]);
+    const afterRestart = await readLedgerFile(ledger);
+    expect(afterRestart.filter((row) => row.input || row.output || row.cacheRead || row.cacheWrite || row.cost)).toHaveLength(1);
+    await restarted.close();
   });
 
   it("restores per-session last-known context on a cold host when live stats omit usage", async () => {
