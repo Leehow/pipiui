@@ -33,7 +33,9 @@ describe("grok-build-oauth loader / spawn assembly (M1)", () => {
     const listed = loader.list().find((i) => i.id === "grok-build-oauth");
     expect(listed?.source).toBe("app");
     expect(listed?.capabilities).toEqual(expect.arrayContaining(["bridge.emit", "invoke.agent"]));
-    expect(listed?.ui?.panels?.[0]?.slot).toBe("toolPanel");
+    expect(listed?.contributions?.auth?.provider.id).toBe("grok-build");
+    expect(listed?.ui?.panels ?? []).toEqual([]);
+    expect(listed?.ui?.settingsSections).toBeUndefined();
   });
 
   it("spawnPackages exposes agent entry only when enabled (D3/D9)", async () => {

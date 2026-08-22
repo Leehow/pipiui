@@ -5,6 +5,10 @@ import type {
   ExtensionSettingsSchema,
 } from "./extension-registry.js";
 import { parseExtensionMigrations } from "./extension-migrations.js";
+import {
+  parseExtensionAuthContribution,
+  type ExtensionAuthContribution,
+} from "./extension-provider-contract.js";
 
 /** Spec D2. */
 export const EXTENSION_MANIFEST_FILENAME = "pipiui-extension.json";
@@ -61,6 +65,8 @@ export type ValidatedExtensionManifest = {
   /** Optional stable host library entry for cross-host consumers (e.g. pi-coc);
    *  content hash is pinned by the bundled sync receipt. */
   hostEntry?: string;
+  /** Declarative auth/provider contribution. Models use the Pi provider shape. */
+  auth?: ExtensionAuthContribution;
 };
 
 export type ManifestValidationOk = { ok: true; manifest: ValidatedExtensionManifest };
@@ -338,6 +344,13 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     }
   }
 
+  let auth: ExtensionAuthContribution | undefined;
+  const parsedAuth = parseExtensionAuthContribution(value.auth);
+  if (parsedAuth) {
+    if (!parsedAuth.ok) errors.push(...parsedAuth.errors);
+    else auth = parsedAuth.contribution;
+  }
+
   if (errors.length) return { ok: false, errors, fallbackId };
 
   const manifest: ValidatedExtensionManifest = {
@@ -352,6 +365,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (agentExtension) manifest.agentExtension = agentExtension;
   if (agentSkills) manifest.agentSkills = agentSkills;
   if (hostEntry) manifest.hostEntry = hostEntry;
+  if (auth) manifest.auth = auth;
   return { ok: true, manifest };
 }
 

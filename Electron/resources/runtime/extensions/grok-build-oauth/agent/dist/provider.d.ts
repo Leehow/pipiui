@@ -1,4 +1,7 @@
-export declare const GROK_BUILD_PROVIDER_ID = "grok-build";
+import { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID, type GrokBuildConversationModel } from "./models.js";
+export { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID };
+export { GROK_BUILD_BASE_URL, GROK_BUILD_CHAT_API, GROK_BUILD_CONVERSATION_MODEL_IDS, GROK_BUILD_CONVERSATION_MODELS, grokBuildManifestModels, } from "./models.js";
+export { accessTokenFromCredentials, buildConversationRequest, conversationProviderTransport } from "./conversation.js";
 export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> | void;
 export type GrokBuildProviderOptions = {
     /** Best-effort bridge emitter; omitted in the host auth runtime (no bridge there). */
@@ -24,7 +27,9 @@ export type GrokBuildOAuthCredentials = {
 export declare function createGrokBuildProvider(options?: GrokBuildProviderOptions): {
     name: string;
     api: string;
-    models: never[];
+    baseUrl: string;
+    authHeader: true;
+    models: GrokBuildConversationModel[];
     oauth: {
         name: string;
         login(callbacks: {
@@ -51,3 +56,5 @@ export declare function createGrokBuildProvider(options?: GrokBuildProviderOptio
         getApiKey(credentials: unknown): string;
     };
 };
+/** Generic host/loader export — same factory, no Grok-named import required. */
+export declare const createAuthProvider: typeof createGrokBuildProvider;

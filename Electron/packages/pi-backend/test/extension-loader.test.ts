@@ -392,8 +392,10 @@ describe("bundled grok-build-oauth package (M5)", () => {
     if (!validation.ok) return;
     expect(validation.manifest.id).toBe("grok-build-oauth");
     expect(validation.manifest.capabilities).toEqual(
-      expect.arrayContaining(["settings.read", "settings.write", "bridge.emit", "invoke.agent", "stream.render"]),
+      expect.arrayContaining(["bridge.emit", "invoke.agent", "stream.render"]),
     );
+    expect(validation.manifest.auth?.provider.id).toBe("grok-build");
+    expect(validation.manifest.ui?.panels ?? []).toEqual([]);
     expect(validation.manifest.agentExtension ?? raw.agent?.extension).toBe("agent/dist/index.js");
 
     const registry = createExtensionRegistry([]);

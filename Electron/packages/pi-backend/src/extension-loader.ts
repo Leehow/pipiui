@@ -9,6 +9,10 @@ import {
   type ValidatedExtensionManifest,
 } from "./extension-manifest.js";
 import {
+  type ContributionClaim,
+  type ExtensionAuthContribution,
+} from "./extension-provider-contract.js";
+import {
   type ExtensionDescriptor,
   type ExtensionEnableScope,
   type ExtensionLifecycleState,
@@ -37,6 +41,7 @@ export type ExtensionListItem = ExtensionRecord & {
   contributions?: {
     settings?: { scope?: ExtensionEnableScope; schema?: ExtensionSettingsManifest["schema"] };
     settingsSections?: ExtensionUiSummary["settingsSections"];
+    auth?: ExtensionAuthContribution;
   };
   /** Package install directory; app-half `entry` paths resolve against this. */
   directory?: string;
@@ -235,6 +240,7 @@ export class ExtensionLoader {
   private readonly appRoot: string;
   private readonly ui = new Map<string, ExtensionUiSummary>();
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
+  private readonly auth = new Map<string, ExtensionAuthContribution>();
   private readonly directories = new Map<string, string>();
   private readonly agent = new Map<string, { extensionPath?: string; skillRoots: string[] }>();
   private readonly reservedBuiltinIds: Set<string>;
@@ -277,6 +283,7 @@ export class ExtensionLoader {
     unloadSafe(this.registry, id);
     this.ui.delete(id);
     this.settings.delete(id);
+    this.auth.delete(id);
     this.directories.delete(id);
     this.agent.delete(id);
   }
@@ -328,6 +335,8 @@ export class ExtensionLoader {
       }
       if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
       if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
+      if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
+      else this.auth.delete(descriptor.id);
       const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
       if (missingAgent && existing.state !== "error") {
         return this.registry.enterError(descriptor.id, missingAgent);
@@ -341,6 +350,8 @@ export class ExtensionLoader {
     else this.ui.delete(descriptor.id);
     if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
     else this.settings.delete(descriptor.id);
+    if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
+    else this.auth.delete(descriptor.id);
     if (!validation.ok) {
       this.rememberAgent(descriptor.id, pkg.directory, undefined);
       return this.registry.enterError(descriptor.id, validation.errors.join("; "));
@@ -356,6 +367,24 @@ export class ExtensionLoader {
 
   directoryOf(id: string): string | undefined {
     return this.directories.get(id);
+  }
+
+  authContribution(id: string): ExtensionAuthContribution | undefined {
+    return this.auth.get(id);
+  }
+
+  contributionClaims(overlay?: Record<string, boolean>): ContributionClaim[] {
+    const claims: ContributionClaim[] = [];
+    for (const record of this.registry.list(overlay)) {
+      const contribution = this.auth.get(record.id);
+      if (!contribution) continue;
+      claims.push({
+        extensionId: record.id,
+        enabled: record.state === "enabled",
+        contribution,
+      });
+    }
+    return claims;
   }
 
   forget(id: string): void {
@@ -382,10 +411,12 @@ export class ExtensionLoader {
     if (ui) item.ui = ui;
     const settings = this.settings.get(record.id);
     const settingsSections = ui?.settingsSections;
-    if (settings || settingsSections) {
+    const auth = this.auth.get(record.id);
+    if (settings || settingsSections || auth) {
       item.contributions = {
         ...(settings ? { settings: { scope: settings.scope, schema: settings.schema } } : {}),
         ...(settingsSections ? { settingsSections } : {}),
+        ...(auth ? { auth } : {}),
       };
     }
     const directory = this.directories.get(record.id);

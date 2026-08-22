@@ -26,6 +26,7 @@ import {
   type HistoryEntry,
   type HistoryTool,
   type Model,
+  type ModelCatalogEvent,
   type ModelState,
   type PromptAttachment,
   type Project,
@@ -60,11 +61,8 @@ import {
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
-import {
-  createGrokBuildProvider,
-  GROK_BUILD_PROVIDER_ID,
-} from "@pipiui/grok-build-oauth-extension/agent/provider";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
+import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
 import { LeaseManager } from "./lease.js";
 import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge } from "./bridge.js";
@@ -150,7 +148,16 @@ import {
   type ExtensionRecord,
   type ExtensionRegistry,
 } from "./extension-registry.js";
-import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
+import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";
+import {
+  detectContributionCollisions,
+  extensionAuthStatus,
+  filterCatalogByContributions,
+  redactAuthStatus,
+  reservedProviderClaimError,
+  resolveContributedCatalog,
+} from "./extension-provider-contract.js";
+import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import {
@@ -2620,7 +2627,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant") {      case "listProjects":
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension") {      case "listProjects":
         return this.listConfiguredProjects();
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
@@ -2650,6 +2657,14 @@ export class PiHostBackend implements HostBackend {
         return this.getCapabilityGrant(params[0], params[1]);
       case "confirmCapabilityGrant":
         return this.confirmCapabilityGrant(params[0], params[1], params[2]);
+      case "getExtensionContributions":
+        return this.getExtensionContributions(params[0], params[1]);
+      case "getExtensionAuthStatus":
+        return this.getExtensionAuthStatus(params[0], params[1]);
+      case "beginExtensionLogin":
+        return this.beginExtensionLogin(params[0], params[1]);
+      case "logoutExtension":
+        return this.logoutExtension(params[0]);
       case "invokeExtension":
         return this.invokeExtension(params[0], params[1], params[2], params[3]);
       case "extensionUiResponse":
@@ -4886,6 +4901,79 @@ export class PiHostBackend implements HostBackend {
       return { ...item, grantedCapabilities: grant.grantedCapabilities };
     });
   }
+  private async getExtensionContributions(
+    idValue: unknown,
+    projectId?: unknown,
+  ): Promise<ExtensionListItem["contributions"]> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    const listed = await this.listExtensions(projectId);
+    const item = listed.find((entry) => entry.id === id);
+    if (!item) throw new Error(`unknown extension ${id}`);
+    return item.contributions;
+  }
+  private async getExtensionAuthStatus(
+    idValue: unknown,
+    projectId?: unknown,
+  ): Promise<ReturnType<typeof extensionAuthStatus>> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
+    const contribution = this.extensionLoader.authContribution(id);
+    if (!contribution) throw new Error(`extension ${id} has no auth contribution`);
+    const overlay = await this.extensionEnableOverlay(projectId);
+    const enabled = this.extensionLoader.list(overlay).find((item) => item.id === id)?.state === "enabled";
+    let loggedIn = false;
+    let expiresAtMs: number | undefined;
+    try {
+      const info = (await this.auth.listProviders()).find((provider) => provider.id === contribution.provider.id);
+      loggedIn = Boolean(info?.authenticated);
+      expiresAtMs = info?.expiresAtMs;
+    } catch {
+      loggedIn = false;
+    }
+    return redactAuthStatus(extensionAuthStatus({
+      extensionId: id,
+      providerId: contribution.provider.id,
+      enabled: Boolean(enabled),
+      loggedIn,
+      expiresAtMs,
+    }));
+  }
+  private async beginExtensionLogin(
+    idValue: unknown,
+    authTypeValue?: unknown,
+  ): Promise<{ loginId: string }> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
+    const contribution = this.extensionLoader.authContribution(id);
+    if (!contribution) throw new Error(`extension ${id} has no auth contribution`);
+    const overlay = await this.currentExtensionOverlay();
+    if (this.extensionLoader.list(overlay).find((item) => item.id === id)?.state !== "enabled") {
+      throw new Error(`extension ${id} is not enabled`);
+    }
+    let authType: AuthType;
+    if (authTypeValue === "oauth" || authTypeValue === "api_key") {
+      authType = authTypeValue;
+    } else {
+      try {
+        const info = (await this.auth.listProviders()).find((provider) => provider.id === contribution.provider.id);
+        authType = info?.authTypes.includes("oauth") ? "oauth" : info?.authTypes[0] ?? (contribution.provider.oauth === false ? "api_key" : "oauth");
+      } catch {
+        authType = contribution.provider.oauth === false ? "api_key" : "oauth";
+      }
+    }
+    return { loginId: this.auth.beginLogin(contribution.provider.id, authType) };
+  }
+  private async logoutExtension(idValue: unknown): Promise<ModelState> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
+    const contribution = this.extensionLoader.authContribution(id);
+    if (!contribution) throw new Error(`extension ${id} has no auth contribution`);
+    return this.removeProviderCredentials(contribution.provider.id);
+  }
   private async extensionEnableOverlay(projectId: unknown): Promise<Record<string, boolean>> {
     if (typeof projectId === "string" && projectId.trim()) {
       const root = await this.projectPath(projectId);
@@ -4907,6 +4995,7 @@ export class PiHostBackend implements HostBackend {
     const current = this.extensions.get(id);
     if (!current) throw new Error(`unknown extension ${id}`);
     if (current.state === "error") throw new Error(`extension ${id} is in error; not retrying`);
+    if (enabledValue) await this.assertContributionCanEnable(id, projectIdValue);
     if (scope === "app") {
       const overlay = await this.updateSettings((settings) => {
         writeAppExtensionEnabled(settings, id, enabledValue);
@@ -4916,6 +5005,7 @@ export class PiHostBackend implements HostBackend {
       else this.extensions.disable(id);
       const record = this.extensions.list(overlay).find((item) => item.id === id);
       if (!record) throw new Error(`unknown extension ${id}`);
+      await this.refreshCatalogAfterExtensionChange(id);
       return record;
     }
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
@@ -4925,7 +5015,23 @@ export class PiHostBackend implements HostBackend {
     const overlay = await writeProjectExtensionEnabled(projectPiAgentDir(root), id, enabledValue);
     const record = this.extensions.list(overlay).find((item) => item.id === id);
     if (!record) throw new Error(`unknown extension ${id}`);
+    await this.refreshCatalogAfterExtensionChange(id);
     return record;
+  }
+  private async refreshCatalogAfterExtensionChange(id: string): Promise<void> {
+    if (!this.extensionLoader.authContribution(id)) return;
+    await this.refreshModelsAfterAuthChange(true, "extension");
+    this.fallbackModelIfMissing();
+  }
+  private async assertContributionCanEnable(id: string, projectIdValue: unknown): Promise<void> {
+    const contribution = this.extensionLoader.authContribution(id);
+    if (!contribution) return;
+    const reserved = reservedProviderClaimError(contribution.provider.id, this.reservedOfficialProviderIds());
+    if (reserved) throw new Error(reserved);
+    const overlay = { ...(await this.extensionEnableOverlay(projectIdValue)), [id]: true };
+    const collisions = detectContributionCollisions(this.extensionLoader.contributionClaims(overlay));
+    const self = collisions.find((item) => item.extensionId === id);
+    if (self) throw new Error(self.errors[0]);
   }
   private async resolveExtensionSettingsProject(projectId: unknown): Promise<string | undefined> {
     if (typeof projectId === "string" && projectId.trim()) return this.projectPath(projectId);
@@ -5135,8 +5241,13 @@ export class PiHostBackend implements HostBackend {
       appRoot: join(this.agentDir, "extensions"),
       projectRoot,
     });
+    const hadAuth = Boolean(this.extensionLoader.authContribution(id));
     if (this.extensions.get(id)) this.extensions.unload(id);
     this.extensionLoader.forget(id);
+    if (hadAuth) {
+      await this.refreshModelsAfterAuthChange(true, "extension");
+      this.fallbackModelIfMissing();
+    }
     return { id, state: "unloaded" };
   }
   private async mergedExtensionOverlay(projectRoot?: string): Promise<Record<string, boolean>> {
@@ -5531,7 +5642,7 @@ export class PiHostBackend implements HostBackend {
           modelsPath: join(this.agentDir, "models.json"),
           allowModelNetwork: false,
         });
-        this.registerGrokBuildAuthProvider(real);
+        await this.registerExtensionAuthProviders(real);
         return {
           getProviders: () => real.getProviders(),
           getAvailable: () => real.getAvailable(),
@@ -5543,33 +5654,20 @@ export class PiHostBackend implements HostBackend {
     return this.authRuntimePromise;
   }
   /**
-   * Surface the canonical grok-build provider (single source: the bundled
-   * grok-build-oauth package's provider factory) in the host's auth runtime so
-   * the provider login panel shows login state / re-login / logout without a live
-   * session. Secrets stay in pi's credential store (app-profile auth.json); the
-   * extension registry still owns agent-half mounting for new sessions.
-   * Re-registration after an unload is idempotent; failures never break auth.
+   * Register every scanned extension that declares `auth.provider` and exports
+   * `createAuthProvider`. No per-extension host special case. Secrets stay in
+   * pi's credential store (app-profile auth.json). Re-registration is
+   * idempotent; failures never break auth.
    */
-  private registerGrokBuildAuthProvider(real: {
+  private async registerExtensionAuthProviders(real: {
     registerProvider?(id: string, config: unknown): void;
     getProvider?(id: string): unknown;
-  }): void {
-    try {
-      if (typeof real.registerProvider !== "function") return;
-      if (real.getProvider?.(GROK_BUILD_PROVIDER_ID)) return;
-      real.registerProvider(
-        GROK_BUILD_PROVIDER_ID,
-        // The provider is pure code: login returns the credential for pi's own
-        // store to persist, and refreshToken runs inside pi's locked
-        // credentials.modify() — it never touches the store itself (round-3
-        // reviewer Critical: no second lock acquisition).
-        createGrokBuildProvider(),
-      );
-    } catch (error) {
-      console.warn(
-        `[pipiui] grok-build auth provider registration failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
+  }): Promise<void> {
+    await registerExtensionAuthProviders({
+      runtime: real,
+      claims: this.extensionLoader.contributionClaims(),
+      directoryOf: (id) => this.extensionLoader.directoryOf(id),
+    });
   }
   /**
    * Deprecated compat gate for the legacy pipiui-media Grok transport: on only when
@@ -5642,7 +5740,74 @@ export class PiHostBackend implements HostBackend {
       !merged.has(currentKey)
     )
       merged.set(currentKey, current);
-    this.models = [...merged.values()];
+    this.models = await this.applyExtensionProviderContributions([...merged.values()]);
+  }
+  private async currentExtensionOverlay(): Promise<Record<string, boolean>> {
+    return this.mergedExtensionOverlay(this.extensionLoader.loadedProject());
+  }
+  private async authenticatedProviderIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    try {
+      for (const model of await this.runtimeModels()) ids.add(model.provider);
+    } catch {
+      /* runtime catalog unavailable — fall through to stored metadata */
+    }
+    try {
+      for (const provider of await this.auth.listProviders()) {
+        if (provider.authenticated) ids.add(provider.id);
+      }
+    } catch {
+      /* metadata-only listing failed */
+    }
+    return ids;
+  }
+  private emitModelCatalogChanged(reason: ModelCatalogEvent["reason"]): void {
+    emitFrame(this.listeners, {
+      protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+      channel: "models",
+      event: { type: "catalog_changed", reason },
+    });
+  }
+  /** Gate contributed providers by enablement + auth. Never writes models.json. */
+  private async applyExtensionProviderContributions(models: Model[]): Promise<Model[]> {
+    const overlay = await this.currentExtensionOverlay();
+    const claims = this.extensionLoader.contributionClaims(overlay);
+    if (!claims.length) return models;
+    const authenticatedProviders = await this.authenticatedProviderIds();
+    const reserved = this.reservedOfficialProviderIds();
+    const usable = claims.filter((claim) => !reservedProviderClaimError(claim.contribution.provider.id, reserved));
+    const filtered = filterCatalogByContributions(models, {
+      claims: usable,
+      authenticatedProviders,
+    });
+    const extra = resolveContributedCatalog({
+      claims: usable,
+      authenticatedProviders,
+      existing: filtered,
+    });
+    const next = [...filtered];
+    for (const model of extra.models) {
+      next.push(hostModelFromPi(model, model.provider));
+    }
+    return next;
+  }
+  private fallbackModelIfMissing(): void {
+    const current = this.modelState.model;
+    if (current.provider === "unknown") return;
+    if (this.models.some((model) => model.provider === current.provider && model.id === current.id)) return;
+    const next = this.models[0] ?? {
+      provider: "unknown",
+      id: "unknown",
+      name: "无可用模型",
+      reasoning: false,
+    };
+    const availableThinkingLevels = thinkingLevelsForModel(next);
+    this.modelState = {
+      ...this.modelState,
+      model: next,
+      thinkingLevel: resolveThinkingLevel(this.modelState.thinkingLevel, availableThinkingLevels) ?? "off",
+      availableThinkingLevels,
+    };
   }
   private awaitCanonicalModelsIdle(): Promise<void> {
     return this.modelsWrite.enqueue(async () => undefined);
@@ -5706,9 +5871,11 @@ export class PiHostBackend implements HostBackend {
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
     includeCurrent = true,
+    reason: ModelCatalogEvent["reason"] = "auth",
   ): Promise<Model[]> {
     this.invalidateModelCatalog();
     await this.loadModelCatalog(includeCurrent);
+    this.emitModelCatalogChanged(reason);
     return this.models;
   }
   private async refreshModelsAfterAuthChangeUnsafe(

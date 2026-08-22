@@ -110,8 +110,8 @@ export default function (pi: ExtensionAPI): void {
   });
 
   /**
-   * Non-secret status snapshot for the app half (Settings > Grok Build panel) and
-   * in-session `/grok-build:status`. Credential values never leave the broker.
+   * Non-secret status snapshot for the app half and `/grok-build:status`.
+   * Credential values never leave the broker.
    */
   async function statusSnapshot(): Promise<Record<string, unknown>> {
     const images = resolveImagesConfig();
@@ -129,12 +129,6 @@ export default function (pi: ExtensionAPI): void {
     // Credential source reflects the ACTUAL resolution rules: the legacy
     // XAI_API_KEY path only exists when compatFallback is enabled (US-27).
     const envKey = process.env.XAI_API_KEY?.trim();
-    // Tier: explicit override (incl. restricted EMPTY string) or the
-    // credential's official id_token `tier` claim; unknown stays visible.
-    const tierResolution = resolveSubscriptionTier({
-      override: images.tier,
-      credential: { tier: auth.tier, tier_raw: auth.tierRaw, tier_source: auth.tierSource },
-    });
     const source = auth.usable
       ? "oauth"
       : images.compatFallback && envKey
@@ -144,14 +138,9 @@ export default function (pi: ExtensionAPI): void {
       loggedIn: auth.loggedIn,
       expired: auth.expired,
       hasRefresh: auth.hasRefresh,
+      usable: auth.usable,
       expiresAtMs: auth.expiresAtMs,
       credentialSource: source,
-      baseUrl: images.baseUrl,
-      model: images.model,
-      tier: tierResolution.tier,
-      tierSource: tierResolution.source,
-      ...(tierResolution.raw !== undefined ? { tierRaw: tierResolution.raw } : {}),
-      compatFallback: images.compatFallback,
     };
   }
 
@@ -164,14 +153,11 @@ export default function (pi: ExtensionAPI): void {
           ? status.expired
             ? status.hasRefresh
               ? "已登录（凭证已过期，将自动刷新）"
-              : "已登录但凭证已过期且无 refresh token — 请重新执行 /login grok-build"
+              : "已登录但凭证已过期且无 refresh token — 请在扩展页重新登录 Grok Build"
             : `已登录（oauth）${typeof status.expiresAtMs === "number" ? `，到期 ${new Date(status.expiresAtMs).toLocaleString()}` : ""}`
           : status.credentialSource === "env"
-            ? "未登录 OAuth；compatFallback 开启，当前使用 XAI_API_KEY 环境变量（deprecated 兼容）"
-            : "未登录 — 执行 /login grok-build，或在 设置 > 添加模型/供应商 中登录 Grok Build",
-        `base=${status.baseUrl} model=${status.model}`,
-        `tier=${status.tier === undefined ? (status.tierRaw !== undefined ? `未知（claim=${status.tierRaw}，fail-open）` : "未知（fail-open）") : status.tier === "" ? "（空 = Free，受限）" : status.tier}（来源：${status.tierSource === "override" ? "手动配置" : status.tierSource === "credential" ? "登录凭证" : "未知"}）`,
-        status.compatFallback ? "compatFallback=1（deprecated 兼容回退已开启）" : "compatFallback=0（默认关闭，XAI_API_KEY/relay 不会被使用）",
+            ? "未登录 OAuth；当前使用环境变量兼容路径"
+            : "未登录 — 请在扩展页登录 Grok Build",
       ];
       ctx.ui.notify(parts.join("；"), "info");
     },

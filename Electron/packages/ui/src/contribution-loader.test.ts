@@ -2,7 +2,7 @@
 import { cleanup, renderHook } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ExtensionDescriptor, ExtEvent, PipiHostAPI } from '@pipi/host-api'
-import { resetDeclarativeContributions, syncDeclarativeContributions, useDeclarativeContributionLoader } from './contribution-loader'
+import { resetDeclarativeContributions, syncDeclarativeContributions, syncExtensionContributions, useDeclarativeContributionLoader } from './contribution-loader'
 import { parseSlashInvocation, slashCommandByName, listSlashCommands } from './slash-commands'
 import { listPanels, listSettingsSections, listStatusBarItems } from './ui-registries'
 
@@ -52,7 +52,7 @@ describe('syncDeclarativeContributions', () => {
     expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)
   })
 
-  it('keeps allowlisted grok-build-oauth settings sections as a top-level tab', () => {
+  it('does not promote grok-build-oauth or any extension settings section to a top-level tab', () => {
     const settingsBefore = listSettingsSections().map(section => section.id)
 
     syncDeclarativeContributions([{
@@ -62,10 +62,34 @@ describe('syncDeclarativeContributions', () => {
       contributions: {
         ...quotaDescriptor('enabled').contributions,
         settingsSections: [{ id: 'grok-build-oauth', title: 'Grok Build' }],
+        auth: { provider: { id: 'grok-build', name: 'Grok Build' } },
       },
     }])
 
-    expect(listSettingsSections().map(section => section.id)).toEqual([...settingsBefore, 'grok-build-oauth'])
+    expect(listSettingsSections().map(section => section.id)).toEqual(settingsBefore)
+    expect(listSettingsSections().some(section => /grok/i.test(section.id) || /grok/i.test(section.label))).toBe(false)
+  })
+
+  it('does not register a right-sidebar panel or icon for grok-build-oauth', async () => {
+    const panelsBefore = listPanels().map(panel => panel.id)
+    await syncExtensionContributions([{
+      id: 'grok-build-oauth',
+      name: 'Grok Build',
+      version: '0.2.0',
+      state: 'enabled',
+      source: 'app',
+      contributions: {
+        auth: { provider: { id: 'grok-build', name: 'Grok Build', oauth: true } },
+      },
+      ui: {
+        toolRenderers: [
+          { tool: 'image_gen', entry: 'app/dist/image-card.js' },
+          { tool: 'image_edit', entry: 'app/dist/image-card.js' },
+        ],
+      },
+    } as ExtensionDescriptor], {} as PipiHostAPI)
+    expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)
+    expect(listPanels().some(panel => /grok/i.test(panel.id))).toBe(false)
   })
 
   it('does not register panels that lack an entry (M3)', () => {

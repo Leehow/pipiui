@@ -28,6 +28,31 @@ async function loaded(result: { current: ReturnType<typeof useModelVisibility> }
   await waitFor(() => expect(result.current.loading).toBe(false))
 }
 
+describe('useModelVisibility catalog refresh', () => {
+  it('refreshes listModels when the host catalog changes', async () => {
+    const listeners = new Set<(event: { type: 'catalog_changed'; reason: 'auth' | 'extension' | 'refresh' }) => void>()
+    let models: Model[] = [first, second]
+    const listModels = vi.fn(async () => models)
+    const host = visibilityHost({
+      listModels,
+      subscribeModelCatalog: listener => {
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+    })
+    const { result } = renderHook(() => useModelVisibility(host))
+    await loaded(result)
+    expect(result.current.models).toEqual([first, second])
+    const extra: Model = { provider: 'acme-chat', id: 'acme-fast', name: 'Acme Fast' }
+    models = [first, second, extra]
+    await act(async () => {
+      for (const listener of listeners) listener({ type: 'catalog_changed', reason: 'auth' })
+    })
+    await waitFor(() => expect(result.current.models.some(model => model.id === 'acme-fast')).toBe(true))
+    expect(listModels.mock.calls.length).toBeGreaterThan(1)
+  })
+})
+
 describe('useModelVisibility host contract and ordering', () => {
   it('does not turn an invalid get response into an empty hidden set', async () => {
     const getHiddenModelIds = vi.fn()

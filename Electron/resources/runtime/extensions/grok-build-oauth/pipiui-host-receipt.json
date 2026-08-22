@@ -1,10 +1,10 @@
 {
   "version": 1,
   "extensionId": "grok-build-oauth",
-  "manifestVersion": "0.1.0",
+  "manifestVersion": "0.2.0",
   "hostEntry": "agent/dist/host.js",
-  "sha256": "941df8747f84f174edf08af76c424a228a01a0c4c27408e64d50d59417850b2d",
-  "bytes": 6445,
-  "contentHash": "438627e1c0028a93848f6a39b63a9f16e698d9cf729a00547f46b5d42e721f2b",
-  "generatedAt": "2026-08-22T03:29:59.575Z"
+  "sha256": "640d771aeecbd697acbfc853d27e9b9710db343710b1930fbf7ee5c939ca5f39",
+  "bytes": 6597,
+  "contentHash": "4bb2becb13cc4b3e07520eee836adc0f349cfe81e978e256bfcaf51779cb208c",
+  "generatedAt": "2026-08-22T13:55:18.711Z"
 }

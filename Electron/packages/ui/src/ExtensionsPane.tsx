@@ -9,6 +9,7 @@ import {
   grantNeedsConfirmation,
   L2_CAPABILITY_HINT,
 } from './extension-capabilities'
+import { ExtensionAuthCard } from './ExtensionAuthCard'
 import { SchemaSettingsForm } from './schema-settings-form'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
@@ -287,8 +288,10 @@ function ExtensionPackageRow({
   const enabled = ext.state === 'enabled'
   const caps = requestedCapabilities(ext)
   const settingsSchema = ext.contributions?.settings?.schema
+  const declaresAuth = Boolean(ext.contributions?.auth?.provider?.id)
   const declaresSettings = Boolean(ext.contributions?.settingsSections?.length || settingsSchema)
-  const canEditSettings = enabled && declaresSettings && Boolean(host.getExtensionSettings && host.updateExtensionSettings)
+  const canEditSettings = enabled && declaresSettings && !declaresAuth && Boolean(host.getExtensionSettings && host.updateExtensionSettings)
+  const canShowAuth = enabled && declaresAuth
   const l2Blocked = blocksEnableForL2(ext.source, caps)
   const errorText = readableError(ext)
   const canToggle = !busy && ext.state !== 'error' && !(l2Blocked && !enabled)
@@ -331,6 +334,7 @@ function ExtensionPackageRow({
       {ext.description && (
         <p className="extensions-pkg-desc" data-testid={`extensions-pkg-desc-${ext.id}`}>{ext.description}</p>
       )}
+      {canShowAuth && <ExtensionAuthCard host={host} extensionId={ext.id} />}
       {canEditSettings && (
         <div className="extensions-pkg-settings" data-testid={`extensions-pkg-settings-${ext.id}`}>
           <button

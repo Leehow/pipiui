@@ -41,6 +41,7 @@ import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
 import { parseSubagentSignal } from './subagent-signal'
 import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
+import { DismissibleError } from './DismissibleError'
 import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
 import './app.css'
@@ -212,6 +213,30 @@ function reconcileModelStateWithCatalog(state: ModelState, catalog: readonly Mod
     ...state,
     model: known,
     availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels)
+  }
+}
+
+function fallbackModelIfMissing(state: ModelState, catalog: readonly Model[]): { state: ModelState; fellBack: boolean } {
+  if (catalog.length === 0) return { state, fellBack: false }
+  const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
+  if (known) {
+    return {
+      state: {
+        ...state,
+        model: known,
+        availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels),
+      },
+      fellBack: false,
+    }
+  }
+  const next = catalog[0]
+  return {
+    state: {
+      model: next,
+      thinkingLevel: resolveThinkingLevel(state.thinkingLevel, thinkingLevelsForModel(next)) ?? 'off',
+      availableThinkingLevels: thinkingLevelsForModel(next),
+    },
+    fellBack: true,
   }
 }
 
@@ -590,6 +615,7 @@ export function createMockHost(): PipiHostAPI {
   }
   const listeners = new Map<string, Set<(event: StreamEvent) => void>>()
   const allStreamListeners = new Set<(event: StreamEvent) => void>()
+  const catalogListeners = new Set<(event: { type: 'catalog_changed'; reason: 'auth' | 'extension' | 'refresh' }) => void>()
   // Subagent fixtures are per-session, mirroring the real backend's
   // `filter(agent => !sessionId || agent.sessionId === sessionId)`:
   // switching sessions in the right panel shows that session's own tree.
@@ -731,6 +757,10 @@ export function createMockHost(): PipiHostAPI {
     subscribeStream: (sessionId, listener) => { const bucket = listeners.get(sessionId) ?? new Set(); bucket.add(listener); listeners.set(sessionId, bucket); return () => bucket.delete(listener) },
     subscribeAllStreams: listener => { allStreamListeners.add(listener); return () => allStreamListeners.delete(listener) },
     listModels: async () => mockModels,
+    subscribeModelCatalog: listener => {
+      catalogListeners.add(listener)
+      return () => { catalogListeners.delete(listener) }
+    },
     getModelState: async sessionId => {
       // Per-session binding, mirroring the real host: each session answers with
       // its own model (JSONL-backed there, fixture/localStorage here).
@@ -1125,6 +1155,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
   const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
+  const [catalogNotice, setCatalogNotice] = useState<string | null>(null)
+  const lastCatalogFallbackKeyRef = useRef('')
+  const announceCatalogFallback = useCallback((sessionId: string, previous: Model, next: ModelState) => {
+    const key = `${sessionId}:${previous.provider}/${previous.id}->${next.model.provider}/${next.model.id}`
+    if (lastCatalogFallbackKeyRef.current === key) return
+    lastCatalogFallbackKeyRef.current = key
+    setCatalogNotice(`当前模型已不可用，已切换到 ${next.model.name}`)
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    // Persist the fallback for future turns. Never stop an in-flight response.
+    void host.setModel(sessionId, next.model.provider, next.model.id).catch(() => {
+      // Local chip already shows the fallback; a host persist miss must not abort the turn.
+    })
+  }, [host])
   const copiedTimerRef = useRef<number | null>(null)
   const archiveCleanupInFlightRef = useRef(new Set<string>())
   const sidebarStorageKey = useMemo(() => sidebarPreferencesKey(projects), [projects])
@@ -1552,6 +1595,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       })
     return () => { current = false }
   }, [host, modalVisibility.models, selectedSession])
+  useEffect(() => {
+    if (modalVisibility.catalogEpoch === 0 || modalVisibility.loading) return
+    const sessionId = selectedSessionRef.current
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    const current = modelStatesBySessionRef.current.get(sessionId) ?? modelState
+    if (!current) return
+    const { state, fellBack } = fallbackModelIfMissing(current, modalVisibility.models)
+    if (!fellBack) return
+    modelStatesBySessionRef.current.set(sessionId, state)
+    rememberSessionModel(sessionId, state.model)
+    setModelState(state)
+    announceCatalogFallback(sessionId, current.model, state)
+  }, [announceCatalogFallback, modalVisibility.catalogEpoch, modalVisibility.loading, modalVisibility.models, modelState])
   useEffect(() => {
     const request = ++historyLoadRef.current
     const requestLiveRevision = transcriptLiveRevisionRef.current
@@ -2872,7 +2928,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} onSend={send} />
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
-        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
+        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
@@ -3028,7 +3084,7 @@ const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readO
   return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
 })
 
-function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
+function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, catalogNotice, onDismissCatalogNotice, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; catalogNotice?: string | null; onDismissCatalogNotice?: () => void; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
   const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(initialAttachments)
   const [documents, setDocuments] = useState<ComposerDocument[]>(initialDocuments)
@@ -3304,6 +3360,11 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
         </div>
       ))}
     </div>}
+    {catalogNotice && onDismissCatalogNotice && (
+      <div data-testid="catalog-fallback-notice">
+        <DismissibleError className="composer-catalog-notice" message={catalogNotice} onDismiss={onDismissCatalogNotice} />
+      </div>
+    )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
     <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />

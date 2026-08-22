@@ -23,6 +23,7 @@ import { authJsonPath, attachmentsRoot, tryResolveAgentHome } from "./oauth/home
 export { NoAgentHomeError } from "./oauth/home.js";
 export { ImagesError } from "./images/errors.js";
 export { OAuthError } from "./oauth/device.js";
+export { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID, GROK_BUILD_CONVERSATION_MODELS, createAuthProvider, createGrokBuildProvider, } from "./provider.js";
 async function runWithBroker(broker, op, signal) {
     // OAuth is the canonical path; compat fallback (deprecated) mirrors the
     // extension tools' rules so both hosts behave identically.

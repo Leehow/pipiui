@@ -1,24 +1,18 @@
-import { createElement, useEffect } from 'react'
+import { useEffect } from 'react'
 import type { ExtensionContributions, ExtensionDescriptor, PipiHostAPI } from '@pipi/host-api'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import {
   hasControlledEntry,
   loadControlledContributions,
-  settingsSectionHasEntry,
   type LoadableExtensionDescriptor,
 } from './controlled-component-loader'
 import type { Disposer } from './contribution-registry'
-import { SchemaSettingsForm } from './schema-settings-form'
 import { registerSlashCommand } from './slash-commands'
 import { subscribeExt } from './subscribe-ext'
-import { registerSettingsSection, registerStatusBarItem } from './ui-registries'
+import { registerStatusBarItem } from './ui-registries'
 
 const loaded = new Map<string, Disposer[]>()
 const controlledLoaded = new Set<string>()
-
-/** Extension ids whose declarative settings sections stay as top-level settings tabs.
- *  Everything else nests inside the「扩展」tab (ExtensionsPane inline schema forms). */
-const TOP_LEVEL_SETTINGS_SECTION_EXTENSION_IDS = new Set(['grok-build-oauth'])
 
 function unloadDeclarative(extId: string): void {
   const disposers = loaded.get(extId)
@@ -33,48 +27,15 @@ export function resetDeclarativeContributions(): void {
   for (const extId of [...loaded.keys()]) unloadDeclarative(extId)
 }
 
-function uniqueBy<T>(items: readonly T[], key: (item: T) => string | undefined): T[] {
-  const seen = new Set<string>()
-  const out: T[] = []
-  for (const item of items) {
-    const id = key(item)
-    if (!id || seen.has(id)) continue
-    seen.add(id)
-    out.push(item)
-  }
-  return out
-}
-
 function loadDeclarative(descriptor: ExtensionDescriptor): void {
   if (descriptor.id === BUILTIN_EXTENSION_ID) return
   if (loaded.has(descriptor.id)) return
   const contrib = descriptor.contributions
   const ui = (descriptor as LoadableExtensionDescriptor).ui
   const disposers: Disposer[] = []
-  const schema = contrib?.settings?.schema
 
-  const settingsSections = uniqueBy(
-    [...(ui?.settingsSections ?? []), ...(contrib?.settingsSections ?? [])],
-    section => section.id,
-  )
-  for (const section of settingsSections) {
-    if (!section.id || settingsSectionHasEntry(section)) continue
-    // Extension-declared schema sections nest under the「扩展」tab instead of the
-    // top-level settings dialog; only allowlisted core tabs keep top-level registration.
-    if (!TOP_LEVEL_SETTINGS_SECTION_EXTENSION_IDS.has(descriptor.id)) continue
-    const title = section.title ?? section.id
-    disposers.push(registerSettingsSection(descriptor.id, {
-      id: section.id,
-      label: title,
-      title,
-      description: section.description ?? schema?.description ?? '',
-      render: ctx => createElement(SchemaSettingsForm, {
-        host: ctx.host,
-        extensionId: descriptor.id,
-        schema,
-      }),
-    }))
-  }
+  // Declarative settings sections stay nested under the「扩展」tab. Never promote
+  // an extension (including former Grok Build allowlist entries) to a top-level tab.
 
   for (const command of contrib?.slashCommands ?? ui?.slashCommands ?? []) {
     if (!command.name) continue

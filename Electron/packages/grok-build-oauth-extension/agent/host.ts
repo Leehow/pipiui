@@ -25,6 +25,13 @@ import { authJsonPath, attachmentsRoot, tryResolveAgentHome } from "./oauth/home
 export { NoAgentHomeError } from "./oauth/home.js";
 export { ImagesError } from "./images/errors.js";
 export { OAuthError } from "./oauth/device.js";
+export {
+  AUTH_PROVIDER_ID,
+  GROK_BUILD_PROVIDER_ID,
+  GROK_BUILD_CONVERSATION_MODELS,
+  createAuthProvider,
+  createGrokBuildProvider,
+} from "./provider.js";
 
 export type HostStatus = {
   loggedIn: boolean;

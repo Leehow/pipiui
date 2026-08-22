@@ -54,11 +54,45 @@ export type ExtensionUiStatusBar = {
   alignment?: "left" | "right";
 };
 
+/** Pi provider `models[]` shape. Host-visible conversation models use this contract. */
+export type ExtensionProviderModelContribution = {
+  id: string;
+  name: string;
+  api?: string;
+  input?: string[];
+  reasoning?: boolean;
+  capabilities?: Record<string, unknown>;
+};
+
+export type ExtensionProviderContribution = {
+  id: string;
+  name: string;
+  api?: string;
+  oauth?: boolean;
+  models?: ExtensionProviderModelContribution[];
+};
+
+export type ExtensionAuthContribution = {
+  provider: ExtensionProviderContribution;
+};
+
+/** Host-owned, secret-free login state. Never includes tokens or keys. */
+export type ExtensionAuthStatus = {
+  extensionId: string;
+  providerId: string;
+  loggedIn: boolean;
+  usable: boolean;
+  expiresAtMs?: number;
+  error?: string;
+};
+
 export type ExtensionManifest = {
   id: string;
   name: string;
   version: string;
   capabilities: ExtensionCapability[];
+  /** Declarative auth/provider contribution. The host owns login and credentials. */
+  auth?: ExtensionAuthContribution;
   agent?: { extension?: string; skills?: string[] };
   app?: {
     settings?: {
@@ -109,11 +143,17 @@ export type ExtensionSettingsAPI = {
  * Narrow host surface injected into controlled components.
  * Undeclared capability services are omitted from the object (spec D8).
  */
+export type ExtensionAuthAPI = {
+  /** Secret-free status. Login/logout stay on the host, not this object. */
+  status: () => Promise<ExtensionAuthStatus>;
+};
+
 export type ExtensionHostAPI = {
   subscribeExt: (listener: (event: ExtEvent) => void) => () => void;
   settings?: ExtensionSettingsAPI;
   invoke?: (method: string, params: unknown) => Promise<ExtInvokeResult>;
   notify?: (title: string, body: string) => void | Promise<void>;
+  auth?: ExtensionAuthAPI;
 };
 
 /** Structural backing host. Intentionally not `PipiHostAPI`. */
@@ -126,6 +166,7 @@ export type ExtensionHostBacking = {
   subscribeExt?(id: string, listener: (event: ExtEvent) => void): (() => void) | void;
   invokeExtension?(id: string, method: string, params: unknown): Promise<ExtInvokeResult>;
   notify?(title: string, body: string): void | Promise<void>;
+  getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
 };
 
 export type CreateExtensionHostAPIOptions = {
@@ -196,6 +237,12 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
     api.notify = (title, body) => {
       if (host.notify) return host.notify(title, body);
       fallbackNotify(title, body);
+    };
+  }
+
+  if (host.getExtensionAuthStatus) {
+    api.auth = {
+      status: () => host.getExtensionAuthStatus!(id),
     };
   }
 

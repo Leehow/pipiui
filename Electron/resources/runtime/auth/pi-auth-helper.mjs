@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
@@ -18,25 +18,38 @@ function moduleRoot() {
   throw new Error("Cannot find external @earendil-works/pi-coding-agent; install/update the pi CLI");
 }
 /**
- * Register the canonical grok-build provider from the bundled grok-build-oauth
- * extension (single source — never a copied OAuth transport) so the host's login
- * panel can show status / re-login / logout for it. Credential persistence stays
- * in pi's credential store under the current Pi home (PI_CODING_AGENT_DIR).
+ * Register every bundled extension that exports `createAuthProvider` from its
+ * agent provider module. No per-extension host special case. Credential
+ * persistence stays in pi's credential store under the current Pi home.
  */
 async function registerBundledAuthProviders(rt) {
   try {
-    const here = dirname(fileURLToPath(import.meta.url));
-    const providerModule = join(here, "..", "extensions", "grok-build-oauth", "agent", "dist", "provider.js");
-    if (!existsSync(providerModule)) return;
-    const { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } = await import(pathToFileURL(providerModule).href);
-    if (typeof rt.registerProvider !== "function" || typeof rt.getProvider === "function" && rt.getProvider(GROK_BUILD_PROVIDER_ID)) return;
-    // Same home precedence as the extension agent half: PI_COC_AGENT_DIR >
+    if (typeof rt.registerProvider !== "function") return;
+    // Same home precedence as extension agent halves: PI_COC_AGENT_DIR >
     // PI_CODING_AGENT_DIR; never a global ~/.pi/agent fallback (fail closed —
     // registration is skipped when no home is resolved).
     const agentDir = process.env.PI_COC_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
     if (!agentDir) return;
-    rt.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider({ authPath: join(agentDir, "auth.json") }));
-  } catch { /* auth surface must never break on an optional bundled extension */ }
+    const here = dirname(fileURLToPath(import.meta.url));
+    const extensionsRoot = join(here, "..", "extensions");
+    if (!existsSync(extensionsRoot)) return;
+    let names = [];
+    try { names = readdirSync(extensionsRoot); } catch { return; }
+    for (const name of names) {
+      const providerModule = join(extensionsRoot, name, "agent", "dist", "provider.js");
+      if (!existsSync(providerModule)) continue;
+      try {
+        const mod = await import(pathToFileURL(providerModule).href);
+        const factory = mod.createAuthProvider ?? mod.createGrokBuildProvider;
+        const id = typeof mod.AUTH_PROVIDER_ID === "string" && mod.AUTH_PROVIDER_ID.trim()
+          ? mod.AUTH_PROVIDER_ID.trim()
+          : typeof mod.GROK_BUILD_PROVIDER_ID === "string" ? mod.GROK_BUILD_PROVIDER_ID.trim() : "";
+        if (typeof factory !== "function" || !id) continue;
+        if (typeof rt.getProvider === "function" && rt.getProvider(id)) continue;
+        rt.registerProvider(id, factory());
+      } catch { /* optional package — never break the auth surface */ }
+    }
+  } catch { /* auth surface must never break on optional bundled extensions */ }
 }
 async function runtime() {
   const root = moduleRoot(); const require = createRequire(join(root, "package.json")); let mod;

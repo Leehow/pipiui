@@ -81,4 +81,25 @@ describe('createExtensionHostAPI capability trimming', () => {
     stop()
     expect(listeners.size).toBe(0)
   })
+
+  it('exposes host-owned secret-free auth status and never login/logout', async () => {
+    const status = {
+      extensionId: 'acme',
+      providerId: 'acme-chat',
+      loggedIn: true,
+      usable: true,
+    }
+    const getExtensionAuthStatus = vi.fn(async (id: string) => ({ ...status, extensionId: id }))
+    const api = createExtensionHostAPI({
+      extensionId: 'acme',
+      capabilities: [],
+      host: { getExtensionAuthStatus },
+    })
+    expect(Object.hasOwn(api, 'auth')).toBe(true)
+    expect('login' in (api.auth ?? {})).toBe(false)
+    expect('logout' in (api.auth ?? {})).toBe(false)
+    await expect(api.auth?.status()).resolves.toEqual(status)
+    expect(getExtensionAuthStatus).toHaveBeenCalledWith('acme')
+    expect(JSON.stringify(await api.auth?.status())).not.toMatch(/token|apiKey|refresh|secret/i)
+  })
 })

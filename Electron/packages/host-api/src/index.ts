@@ -609,6 +609,38 @@ export type ExtensionStatusBarDecl = {
   tooltip?: string;
   alignment?: "left" | "right";
 };
+/** Pi provider `models[]` shape used as the single host-visible model source. */
+export type ExtensionProviderModelContribution = {
+  id: string;
+  name: string;
+  api?: string;
+  input?: readonly string[];
+  reasoning?: boolean;
+  capabilities?: Record<string, unknown>;
+};
+export type ExtensionProviderContribution = {
+  id: string;
+  name: string;
+  api?: string;
+  oauth?: boolean;
+  models?: readonly ExtensionProviderModelContribution[];
+};
+export type ExtensionAuthContribution = {
+  provider: ExtensionProviderContribution;
+};
+/** Host-owned, secret-free extension login state. Never includes tokens or keys. */
+export type ExtensionAuthStatus = {
+  extensionId: string;
+  providerId: string;
+  loggedIn: boolean;
+  usable: boolean;
+  expiresAtMs?: number;
+  error?: string;
+};
+export type ModelCatalogEvent = {
+  type: "catalog_changed";
+  reason: "auth" | "extension" | "refresh";
+};
 /** Declarative contribution metadata on an extension (spec D2/D7). No entry modules. */
 export type ExtensionContributions = {
   settings?: {
@@ -618,6 +650,7 @@ export type ExtensionContributions = {
   settingsSections?: readonly ExtensionSettingsSectionDecl[];
   slashCommands?: readonly ExtensionSlashCommandDecl[];
   statusBar?: readonly ExtensionStatusBarDecl[];
+  auth?: ExtensionAuthContribution;
 };
 export type ExtensionDescriptor = {
   id: string;
@@ -650,6 +683,7 @@ export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "session_stats"; event: SessionStatsEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "document"; event: DocumentEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "plan"; event: PlanEvent }
+  | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "models"; event: ModelCatalogEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: `ext.${string}`; event: ExtEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "extui"; event: ExtUiEvent };
 
@@ -889,13 +923,21 @@ export interface PipiHostAPI {
   confirmCapabilityGrant?(id: string, capabilities: readonly string[]): Promise<ExtensionCapabilityGrant>;
   /** Optional: declarative contributions when they are not inlined on the descriptor. */
   getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
+  /** Host-owned secret-free status for an extension auth contribution. */
+  getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
+  /** Start login for the extension's contributed provider. Credentials stay in the host. */
+  beginExtensionLogin?(id: string, authType?: AuthType): Promise<{ loginId: string }>;
+  /** Remove credentials for the extension's contributed provider and refresh the catalog. */
+  logoutExtension?(id: string): Promise<ModelState>;
+  /** Catalog rebuilds after auth or extension enable/disable. */
+  subscribeModelCatalog?(listener: (event: ModelCatalogEvent) => void): Unsubscribe;
   /** Optional extension; remote/non-Electron hosts advertise `capabilities().browser === false`. */
   browser?: BrowserHostAPI;
   /** Optional extension; clients show an unavailable state when an old host omits it. */
   terminal?: TerminalHostAPI;
 }
 
-type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "subscribeExtUi" | "browser" | "terminal">, "browser" | "terminal">;
+type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "subscribeExtUi" | "subscribeModelCatalog" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
 export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
@@ -1051,6 +1093,16 @@ function apiFrom(
     getCapabilityGrant: id => invoke("getCapabilityGrant", id),
     confirmCapabilityGrant: (id, capabilities) => invoke("confirmCapabilityGrant", id, capabilities),
     getExtensionContributions: id => invoke("getExtensionContributions", id),
+    getExtensionAuthStatus: id => invoke("getExtensionAuthStatus", id),
+    beginExtensionLogin: (id, authType) => authType === undefined
+      ? invoke("beginExtensionLogin", id)
+      : invoke("beginExtensionLogin", id, authType),
+    logoutExtension: id => invoke("logoutExtension", id),
+    subscribeModelCatalog: listener => subscribe(
+      "models",
+      event => event.channel === "models",
+      event => listener((event as Extract<HostEvent, { channel: "models" }>).event),
+    ),
     browser: {
       selectSession: sessionId => invoke("browserSelectSession", sessionId),
       listTabs: sessionId => invoke("browserListTabs", sessionId),

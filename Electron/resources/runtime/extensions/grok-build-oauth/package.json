@@ -1,13 +1,14 @@
 {
   "name": "@pipiui/grok-build-oauth-extension",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Canonical Grok Build OAuth + Image extension (M4 Images transport over M3 Credential Broker / M2 Pi-native OAuth)",
+  "description": "Canonical Grok Build OAuth + conversation models + Image tools (generic extension auth/provider contribution)",
   "exports": {
     "./package.json": "./package.json",
     "./agent/provider": "./agent/dist/provider.js",
-    "./agent/host": "./agent/dist/host.js"
+    "./agent/host": "./agent/dist/host.js",
+    "./agent/models": "./agent/dist/models.js"
   },
   "scripts": {
     "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",

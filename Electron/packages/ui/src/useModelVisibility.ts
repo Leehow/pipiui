@@ -16,6 +16,8 @@ export interface ModelVisibilityController {
   quickProviders: string[]
   quickGroups: ReturnType<typeof groupByProvider>
   refresh(): Promise<void>
+  /** Increments when the host emits a model-catalog change (auth / extension / refresh). */
+  catalogEpoch: number
   setHidden(model: Model, hidden: boolean): Promise<void>
   /** Hide/show every model of one provider in a single atomic save. */
   setProviderHidden(provider: string, hidden: boolean): Promise<void>
@@ -53,6 +55,7 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
   const [hiddenIds, setHiddenIds] = useState<ReadonlySet<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [catalogEpoch, setCatalogEpoch] = useState(0)
   const hiddenRef = useRef<ReadonlySet<string>>(hiddenIds)
   const persistedRef = useRef<ReadonlySet<string> | null>(null)
   const generationRef = useRef(0)
@@ -89,6 +92,14 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
   }, [applyHidden, host])
 
   useEffect(() => { void refresh() }, [refresh])
+
+  useEffect(() => {
+    if (!host.subscribeModelCatalog) return
+    return host.subscribeModelCatalog(() => {
+      setCatalogEpoch(value => value + 1)
+      void refresh()
+    })
+  }, [host, refresh])
 
   const persist = useCallback(async (next: Set<string>) => {
     const generation = ++generationRef.current
@@ -150,5 +161,5 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
   const quickProviders = useMemo(() => pickerProviders(models, hiddenIds, current), [models, hiddenIds, current])
   const quickGroups = useMemo(() => groupByProvider(quickModels), [quickModels])
 
-  return { models, hiddenIds, loading, error, visibleModels, quickModels, quickProviders, quickGroups, refresh, setHidden, setProviderHidden, dismissError }
+  return { models, hiddenIds, loading, error, visibleModels, quickModels, quickProviders, quickGroups, refresh, catalogEpoch, setHidden, setProviderHidden, dismissError }
 }

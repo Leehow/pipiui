@@ -114,6 +114,21 @@ describe("M4 tool wiring — image_gen / image_edit via extension entry", () => 
     );
   }
 
+  it("registers image_gen and image_edit as tools, not conversation models", async () => {
+    const pi = await loadExtension();
+    expect([...pi.tools.keys()]).toEqual(expect.arrayContaining(["image_gen", "image_edit"]));
+    expect(pi.providers.has("grok-build")).toBe(true);
+    const provider = pi.providers.get("grok-build") as { models: Array<{ id: string }> };
+    expect(provider.models.map((model) => model.id)).not.toContain("grok-imagine-image-quality");
+    expect(provider.models.map((model) => model.id)).toEqual(["grok-4.6", "grok-4-fast", "grok-code-fast-1"]);
+    const statusCmd = pi.commands.get("grok-build-oauth") as { handler: (args: unknown) => Promise<{ ok: boolean; data?: Record<string, unknown> }> };
+    const status = await statusCmd.handler({ method: "status" });
+    expect(status.ok).toBe(true);
+    expect(JSON.stringify(status.data)).not.toMatch(/at-oauth|rt-oauth|accessToken|refreshToken/);
+    expect(status.data).not.toHaveProperty("baseUrl");
+    expect(status.data).not.toHaveProperty("compatFallback");
+  });
+
   it("OAuth path: image_gen writes file under isolation dir and returns typed path", async () => {
     await writeOAuthCred();
     setFetch(() => okImageResponse());

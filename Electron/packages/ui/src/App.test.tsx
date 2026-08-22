@@ -3413,6 +3413,116 @@ describe('extensions settings tab', () => {
     await waitFor(() => expect(screen.queryByTestId('extensions-add-dialog')).toBeNull())
     expect(screen.getByTestId('model-modal')).toBeTruthy()
   })
+
+  it('does not add a top-level Grok Build settings tab when the extension is enabled', async () => {
+    const host = createMockHost()
+    host.listExtensions = vi.fn(async () => [{
+      id: 'grok-build-oauth',
+      name: 'Grok Build',
+      version: '0.1.0',
+      state: 'enabled' as const,
+      source: 'app' as const,
+      contributions: {
+        settingsSections: [{ id: 'grok-build-oauth', title: 'Grok Build' }],
+        auth: { provider: { id: 'grok-build', name: 'Grok Build', oauth: true } },
+      },
+    }])
+    await openModelModal(host)
+    expect(screen.getByTestId('model-tab-general')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-models')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-grok-build-oauth')).toBeNull()
+    expect(screen.queryByRole('tab', { name: 'Grok Build' })).toBeNull()
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
+    expect(await screen.findByTestId('extensions-pkg-grok-build-oauth')).toBeTruthy()
+  })
+
+  it('does not register a Grok Build right-sidebar panel or rail icon', async () => {
+    const host = createMockHost()
+    host.listExtensions = vi.fn(async () => [{
+      id: 'grok-build-oauth',
+      name: 'Grok Build',
+      version: '0.2.0',
+      state: 'enabled' as const,
+      source: 'app' as const,
+      contributions: {
+        auth: { provider: { id: 'grok-build', name: 'Grok Build', oauth: true } },
+      },
+      ui: {
+        toolRenderers: [
+          { tool: 'image_gen', entry: 'app/dist/image-card.js' },
+          { tool: 'image_edit', entry: 'app/dist/image-card.js' },
+        ],
+      },
+    } as Awaited<ReturnType<NonNullable<PipiHostAPI['listExtensions']>>>[number]])
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(host.listExtensions).toHaveBeenCalled())
+    const rail = container.querySelector('.tool-quick-rail')!
+    expect(rail.querySelectorAll('button')).toHaveLength(5)
+    expect(screen.queryByRole('button', { name: 'Grok Build' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'grok-build-status' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /grok-build/i })).toBeNull()
+    expect(screen.queryByText('扩展面板「Grok Build」加载失败')).toBeNull()
+  })
+})
+
+describe('model catalog fallback', () => {
+  it('falls back when the selected model disappears and does not abort an in-flight response', async () => {
+    const host = createMockHost()
+    const full = await host.listModels()
+    let models = full
+    const grok = full.find(model => model.provider === 'xai' && model.id === 'grok-4')!
+    const fallback = full[0]
+    const listeners = new Set<(event: { type: 'catalog_changed'; reason: 'auth' | 'extension' | 'refresh' }) => void>()
+    host.listModels = vi.fn(async () => models)
+    host.subscribeModelCatalog = listener => {
+      listeners.add(listener)
+      return () => { listeners.delete(listener) }
+    }
+    const setModel = vi.spyOn(host, 'setModel')
+    const stop = vi.spyOn(host, 'stop')
+    const streamListeners = new Set<(event: StreamEvent) => void>()
+    const originalSubscribe = host.subscribeStream.bind(host)
+    host.subscribeStream = (sessionId, listener) => {
+      streamListeners.add(listener)
+      const unsubscribe = originalSubscribe(sessionId, listener)
+      return () => { streamListeners.delete(listener); unsubscribe() }
+    }
+    host.sendPrompt = vi.fn(async sessionId => {
+      for (const listener of streamListeners) listener({ type: 'status', sessionId, status: 'started' })
+    })
+
+    await renderChat(host)
+    fireEvent.click(await screen.findByTestId('model-chip'))
+    fireEvent.click(await screen.findByTestId(`quick-row-${grok.provider}-${grok.id}`))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain(grok.name))
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '继续生成' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalled())
+    expect(screen.getByTestId('waiting-stop')).toBeTruthy()
+
+    models = full.filter(model => model.id !== grok.id)
+    host.getModelState = vi.fn(async (): Promise<ModelState> => ({
+      model: grok,
+      thinkingLevel: 'off',
+      availableThinkingLevels: ['off'],
+    }))
+    await act(async () => {
+      for (const listener of listeners) listener({ type: 'catalog_changed', reason: 'auth' })
+    })
+
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain(fallback.name))
+    const notice = await screen.findByTestId('catalog-fallback-notice')
+    expect(notice.textContent).toContain(`已切换到 ${fallback.name}`)
+    expect(stop).not.toHaveBeenCalled()
+    expect(screen.getByTestId('waiting-stop')).toBeTruthy()
+    expect(setModel).toHaveBeenCalledWith('welcome', fallback.provider, fallback.id)
+    fireEvent.click(screen.getByRole('button', { name: '关闭错误提示' }))
+    expect(screen.queryByTestId('catalog-fallback-notice')).toBeNull()
+  })
 })
 
 describe('update center settings flow', () => {

@@ -3,8 +3,8 @@
  *
  * Consumed twice, never copied:
  * - the extension entry (`agent/index.ts`) registers it via `pi.registerProvider`;
- * - the PipiUI host registers the same factory into its auth ModelRuntime so the
- *   provider login panel can show login state / re-login / logout without a session.
+ * - the host generically loads `createAuthProvider` from this module for any
+ *   extension that declares `auth.provider` (no Grok-named special case).
  *
  * Secrets never leave the pi credential store (`auth.json` under the host's Pi home);
  * this module only carries code and non-secret config. The provider NEVER
@@ -17,8 +17,23 @@ import { requestDeviceCode, pollDeviceToken, OAuthError } from "./oauth/device.j
 import { toOAuthCredentials } from "./oauth/credentials.js";
 import { refreshCredentialUnlocked } from "./oauth/refresh.js";
 import { redactMessage } from "./oauth/redact.js";
+import {
+  AUTH_PROVIDER_ID,
+  GROK_BUILD_CONVERSATION_MODELS,
+  GROK_BUILD_PROVIDER_ID,
+  type GrokBuildConversationModel,
+} from "./models.js";
+import { accessTokenFromCredentials, conversationProviderTransport } from "./conversation.js";
 
-export const GROK_BUILD_PROVIDER_ID = "grok-build";
+export { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID };
+export {
+  GROK_BUILD_BASE_URL,
+  GROK_BUILD_CHAT_API,
+  GROK_BUILD_CONVERSATION_MODEL_IDS,
+  GROK_BUILD_CONVERSATION_MODELS,
+  grokBuildManifestModels,
+} from "./models.js";
+export { accessTokenFromCredentials, buildConversationRequest, conversationProviderTransport } from "./conversation.js";
 
 export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> | void;
 
@@ -55,7 +70,9 @@ function displayUriOf(code: { verification_uri: string; verification_uri_complet
 export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}): {
   name: string;
   api: string;
-  models: never[];
+  baseUrl: string;
+  authHeader: true;
+  models: GrokBuildConversationModel[];
   oauth: {
     name: string;
     login(callbacks: {
@@ -92,11 +109,16 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
     }
   };
 
+  const transport = conversationProviderTransport();
   return {
-    // Auth-only provider: no chat models are exposed (images transport is tool-based).
+    // Conversation models are contributed only while the host reports this
+    // provider authenticated + the extension enabled. Image generation stays
+    // on image_gen / image_edit tools, not in this catalog.
     name: "Grok Build",
-    api: "openai-completions",
-    models: [],
+    api: transport.api,
+    baseUrl: transport.baseUrl,
+    authHeader: transport.authHeader,
+    models: GROK_BUILD_CONVERSATION_MODELS.map((model) => ({ ...model, input: [...model.input] })),
     oauth: {
       name: "Grok Build",
       async login(callbacks) {
@@ -253,8 +275,11 @@ export function createGrokBuildProvider(options: GrokBuildProviderOptions = {}):
         }
       },
       getApiKey(credentials) {
-        return ((credentials as unknown) as Record<string, unknown>).access as string;
+        return accessTokenFromCredentials(credentials);
       },
     },
   };
 }
+
+/** Generic host/loader export — same factory, no Grok-named import required. */
+export const createAuthProvider = createGrokBuildProvider;

@@ -26,6 +26,7 @@ function visibility(overrides: Partial<ModelVisibilityController> = {}): ModelVi
     quickProviders: ['openai', 'anthropic'],
     quickGroups: [],
     refresh: async () => undefined,
+    catalogEpoch: 0,
     setHidden: async () => undefined,
     setProviderHidden: async () => undefined,
     dismissError: () => undefined,

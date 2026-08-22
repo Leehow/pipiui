@@ -153,6 +153,11 @@ body{overscroll-behavior:none}
 .extensions-pkg-desc{margin:0;color:var(--muted);font-size:12px;line-height:1.4}
 .extensions-pkg-settings{display:flex;flex-direction:column;gap:8px;border-top:1px dashed var(--border);padding-top:8px}
 .extensions-pkg-settings>.model-modal-refresh{align-self:flex-start}
+.extensions-pkg-auth{display:flex;flex-direction:column;gap:8px;border-top:1px dashed var(--border);padding-top:8px}
+.extensions-pkg-auth-row{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.extensions-pkg-auth-status{color:var(--muted);font-size:12px}
+.extensions-pkg-auth-actions{display:flex;gap:6px;flex-wrap:wrap}
+.extensions-pkg-auth-pending{margin:0;color:var(--muted);font-size:12px}
 .extensions-badge{padding:1px 6px;border-radius:999px;color:var(--muted);background:var(--surface-hover);font:9px ui-monospace,SFMono-Regular,Menlo,monospace}
 .extensions-badge.l2{color:var(--danger)}
 .extensions-dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:8px}

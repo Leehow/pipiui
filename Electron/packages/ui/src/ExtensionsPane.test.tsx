@@ -285,6 +285,69 @@ describe('ExtensionsPane descriptions and inline settings', () => {
     expect(host.getExtensionSettings).toHaveBeenCalledWith('quota')
   })
 
+  it('renders host-owned auth on an enabled package and hides schema Token/Key fields', async () => {
+    const status = {
+      extensionId: 'acme',
+      providerId: 'acme-chat',
+      loggedIn: false,
+      usable: false,
+      accessToken: 'tok-secret',
+      refreshToken: 'ref-secret',
+    }
+    const host = managementHost([pkg({
+      id: 'acme',
+      name: 'Acme Chat',
+      state: 'enabled',
+      contributions: {
+        auth: { provider: { id: 'acme-chat', name: 'Acme Chat', oauth: true } },
+        settings: {
+          scope: 'app',
+          schema: {
+            type: 'object',
+            properties: {
+              accessToken: { type: 'string', format: 'secret', title: 'Access token' },
+              xaiApiBaseUrl: { type: 'string', title: 'Base URL' },
+              issuer: { type: 'string', title: 'OAuth issuer' },
+              clientId: { type: 'string', title: 'OAuth client ID' },
+              scopes: { type: 'string', title: 'OAuth scopes' },
+              tier: { type: 'string', title: 'Subscription tier' },
+              compatFallback: { type: 'boolean', title: 'Compat fallback' },
+              sessionId: { type: 'string', title: 'Stable session ID' },
+            },
+          },
+        },
+        settingsSections: [{ id: 'acme', title: 'Acme' }],
+      },
+    })])
+    Object.assign(host, {
+      getExtensionAuthStatus: vi.fn(async () => status),
+      beginExtensionLogin: vi.fn(async () => ({ loginId: 'login-1' })),
+      logoutExtension: vi.fn(async () => ({ model: { provider: 'anthropic', id: 'a1', name: 'A1' }, thinkingLevel: 'off', availableThinkingLevels: [] })),
+    })
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-pkg-auth-acme')).toBeTruthy()
+    expect(screen.getByTestId('extensions-pkg-auth-login-acme')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-acme')).toBeNull()
+    const card = screen.getByTestId('extensions-pkg-acme')
+    expect(card.textContent).not.toContain('tok-secret')
+    expect(card.textContent).not.toContain('ref-secret')
+    expect(card.textContent).not.toMatch(/Access token|Base URL|OAuth issuer|OAuth client|OAuth scopes|Subscription tier|Compat fallback|session ID/i)
+  })
+
+  it('does not show auth controls on a disabled package that declares auth', async () => {
+    const host = managementHost([pkg({
+      id: 'acme',
+      state: 'disabled',
+      contributions: { auth: { provider: { id: 'acme-chat', name: 'Acme' } } },
+    })])
+    const getExtensionAuthStatus = vi.fn(async () => ({ extensionId: 'acme', providerId: 'acme-chat', loggedIn: false, usable: false }))
+    Object.assign(host, { getExtensionAuthStatus })
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-pkg-acme')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-auth-acme')).toBeNull()
+    expect(getExtensionAuthStatus).not.toHaveBeenCalled()
+  })
+
   it('hides the inline settings entry for disabled or settings-less packages', async () => {
     const host = managementHost([
       pkg({
