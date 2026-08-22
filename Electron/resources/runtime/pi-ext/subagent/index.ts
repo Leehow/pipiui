@@ -98,6 +98,7 @@ import {
 	type DeliveryObligation,
 } from "./delivery-obligation.ts";
 import {
+	decideAdjacentStatusSnapshot,
 	formatResumableSectionLines,
 	formatUnfilteredOmissionNote,
 	selectUnfilteredJobs,
@@ -7953,6 +7954,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Per extension/session: explicit detail/archive queries bypass this cache and cannot
+	// replace the last default snapshot used for adjacent duplicate suppression.
+	let previousUnfilteredStatusSemanticKey: string | undefined;
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
@@ -7976,12 +7980,19 @@ export default function (pi: ExtensionAPI) {
 		}, { additionalProperties: false }),
 		async execute(_toolCallId, params) {
 			params = omitNulls(params);
-			const text = formatJobsStatus({
+			const query = {
 				agentId: params.agentId,
 				onlyRunning: params.onlyRunning === true,
 				full: params.full === true,
-			});
-			return { content: [{ type: "text", text }], details: null };
+			};
+			const formatted = formatJobsStatus(query);
+			const snapshot = decideAdjacentStatusSnapshot(
+				previousUnfilteredStatusSemanticKey,
+				formatted,
+				query,
+			);
+			previousUnfilteredStatusSemanticKey = snapshot.semanticKey;
+			return { content: [{ type: "text", text: snapshot.text }], details: null };
 		},
 	});
 
