@@ -382,7 +382,7 @@ describe("subagent lifecycle → AgentSummary", () => {
   it("does not persist the durable agent index on every streamed log_delta", async () => {
     const { backend, deliver } = await harness();
     deliver(START);
-    await (backend as any).agentsWrite;
+    await (backend as any).flushAgentProjection();
     const persist = vi.spyOn(backend as any, "persistAgents");
     for (let i = 1; i <= 80; i++) {
       deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "text", text: "x".repeat(i) });
@@ -394,11 +394,30 @@ describe("subagent lifecycle → AgentSummary", () => {
   it("coalesces persistAgents bursts to one snapshot write", async () => {
     const { backend, deliver } = await harness();
     deliver(START);
-    await (backend as any).agentsWrite;
+    await (backend as any).flushAgentProjection();
     const { promises: fs } = await import("node:fs");
     const writeFile = vi.spyOn(fs, "writeFile");
     for (let i = 0; i < 40; i++) (backend as any).persistAgents();
-    await (backend as any).agentsWrite;
+    await (backend as any).flushAgentProjection();
+    const indexWrites = writeFile.mock.calls.filter(([path]) => String(path).includes("pipiui-agent-index.json"));
+    expect(indexWrites.length).toBe(1);
+    writeFile.mockRestore();
+  });
+
+  it("collapses a continuous event burst into one snapshot write despite the throttle window", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    await (backend as any).flushAgentProjection();
+    const { promises: fs } = await import("node:fs");
+    const writeFile = vi.spyOn(fs, "writeFile");
+    // Simulates a live worker reporting activity/status every few hundred ms:
+    // every event dirties the projection while the minimum write interval is
+    // still pending. Pre-throttle this queued one full serialize per event.
+    for (let i = 0; i < 40; i++) {
+      deliver({ ...UPDATE, activity: `step ${i}` });
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    await (backend as any).flushAgentProjection();
     const indexWrites = writeFile.mock.calls.filter(([path]) => String(path).includes("pipiui-agent-index.json"));
     expect(indexWrites.length).toBe(1);
     writeFile.mockRestore();
@@ -761,11 +780,85 @@ describe("dead-session orphan reconcile", () => {
     deliver({ ...START, at: staleAt });
     expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
     expect((backend as any).reconcileOrphanedNow("session-1", staleNow + 120_000)).toBe(false);
-    await (backend as any).agentsWrite;
+    await (backend as any).flushAgentProjection();
     const persisted = JSON.parse(await readFile(join(root, "agent", "pipiui-agent-index.json"), "utf8"));
     expect(persisted.agents).toEqual(expect.arrayContaining([
       expect.objectContaining({ agentId: "a1", state: "interrupted", endedAt: staleNow }),
     ]));
     expect(persisted.agents.some((agent: { state: string }) => agent.state === "running")).toBe(false);
+  });
+});
+
+describe("durable projection retention", () => {
+  it("flushes a pending throttled snapshot on close even inside the interval window", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    deliver({ ...END });
+    // No manual flush: close() must bypass the throttle and leave the terminal
+    // state on disk, otherwise a quit right after an event loses the snapshot.
+    await closeTracked(backend);
+    const persisted = JSON.parse(await readFile(join(root, "agent", "pipiui-agent-index.json"), "utf8"));
+    expect(persisted.agents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "a1", state: "ok" }),
+    ]));
+  });
+
+  it("prunes terminal rows beyond the retention cap and drops their logs and settled worktrees", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-agent-retention-"));
+    const agentDir = join(root, "agent");
+    await mkdir(agentDir, { recursive: true });
+    const now = Date.now();
+    const rows = ["old2", "old1", "older", "fresh"].map((agentId, index) => ({
+      agentId,
+      runId: `run-${agentId}`,
+      name: "general-purpose",
+      task: `task ${agentId}`,
+      state: "ok",
+      sessionId: "session-r",
+      createdAt: now - (10 - index) * 60_000,
+      endedAt: now - (10 - index) * 60_000 + 1_000,
+      updatedAt: now - (10 - index) * 60_000 + 1_000,
+    }));
+    await writeFile(join(agentDir, "pipiui-agent-index.json"), JSON.stringify({
+      version: 1,
+      agents: rows,
+      worktrees: [
+        { agentId: "old2", path: "/tmp/wt-old2", lifecycle: "merged", merge: "done", discard: "done" },
+        { agentId: "fresh", path: "/tmp/wt-fresh", lifecycle: "pendingReview", merge: "ready", discard: "ready" },
+      ],
+    }, null, 2) + "\n");
+    await writeFile(join(agentDir, "pipiui-agent-logs.json"), JSON.stringify({
+      version: 1,
+      logs: Object.fromEntries(rows.map(row => [
+        `session-r\u0000${row.agentId}\u0000run-${row.agentId}`,
+        [{ itemType: "text", text: `transcript ${row.agentId}` }],
+      ])),
+    }) + "\n");
+
+    const retentionBackend = createPiHostBackend({
+      agentDir,
+      sessionsRoot: join(root, "sessions"),
+      agentRetentionMaxTerminal: 2,
+    });
+    backends.push(retentionBackend);
+    const history = await retentionBackend.handle("listAgents", ["session-r", "history"]) as AgentSummary[];
+    expect(history.map(agent => agent.agentId).sort()).toEqual(["fresh", "older"]);
+    await expect(retentionBackend.handle("getAgentLogs", ["old1", "session-r", "run-old1"])).resolves.toEqual([]);
+    await expect(retentionBackend.handle("getAgentLogs", ["fresh", "session-r", "run-fresh"])).resolves.toMatchObject([{ text: "transcript fresh" }]);
+    await closeTracked(retentionBackend);
+
+    const persisted = JSON.parse(await readFile(join(agentDir, "pipiui-agent-index.json"), "utf8"));
+    expect(persisted.agents.map((agent: { agentId: string }) => agent.agentId).sort()).toEqual(["fresh", "older"]);
+    // The merged worktree of a pruned agent goes with it; an actionable
+    // pendingReview worktree must survive retention.
+    expect(persisted.worktrees).toEqual([
+      expect.objectContaining({ agentId: "fresh", lifecycle: "pendingReview" }),
+    ]);
+
+    const restarted = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions"), agentRetentionMaxTerminal: 2 });
+    backends.push(restarted);
+    const reloaded = await restarted.handle("listAgents", ["session-r", "history"]) as AgentSummary[];
+    expect(reloaded.map(agent => agent.agentId).sort()).toEqual(["fresh", "older"]);
+    await closeTracked(restarted);
   });
 });

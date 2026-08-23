@@ -574,6 +574,12 @@ export type PiBackendOptions = {
   externalSessionRoots?: ExternalSessionRoots;
   /** Injectable registry for tests; defaults to bundled builtins. */
   extensionRegistry?: ExtensionRegistry;
+  /** Minimum gap between durable agent-index snapshots (default 2000ms; tests shorten it). */
+  agentPersistMinIntervalMs?: number;
+  /** Debounce + minimum gap between durable agent-log snapshots (default 2000ms). */
+  agentLogPersistDebounceMs?: number;
+  /** How many newest terminal agent rows the durable projection retains (default 400). */
+  agentRetentionMaxTerminal?: number;
 };
 
 async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
@@ -650,6 +656,15 @@ const TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES = 6;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
 const ORPHAN_STALE_MS = 10 * 60 * 1000;
 const ORPHAN_RECONCILE_INTERVAL_MS = 60 * 1000;
+/**
+ * Durable-projection write pacing. The 2026-08-23 freeze ran one full 15MB index /
+ * 40MB log JSON.stringify per event (97% CPU, 3.9GB heap); writes are now
+ * time-throttled and every event burst merges into a single snapshot.
+ */
+const AGENT_PERSIST_MIN_INTERVAL_MS = 2_000;
+const AGENT_LOG_PERSIST_DEBOUNCE_MS = 2_000;
+/** Retention for terminal agent rows: keep live rows plus the newest N terminal rows. */
+const AGENT_RETENTION_MAX_TERMINAL = 400;
 const ORPHAN_CLOSEOUT =
   "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留";
 class PiExitedError extends Error {
@@ -1619,6 +1634,15 @@ export class PiHostBackend implements HostBackend {
   /** Coalesce durable index writes: a log_delta burst must not retain one snapshot string per event. */
   private agentsPersistDirty = false;
   private agentsPersistInflight = false;
+  /** Throttle state for durable projection writes (see AGENT_PERSIST_MIN_INTERVAL_MS). */
+  private agentsPersistTimer?: ReturnType<typeof setTimeout>;
+  private agentsPersistLastEnd = 0;
+  /** Throttle state for durable agent-log snapshots. */
+  private agentLogsThrottleTimer?: ReturnType<typeof setTimeout>;
+  private agentLogsPersistLastEnd = 0;
+  private readonly agentPersistMinIntervalMs: number;
+  private readonly agentLogPersistDebounceMs: number;
+  private readonly agentRetentionMaxTerminal: number;
   /** Cache-first stats refreshes that must settle during graceful close. */
   private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
@@ -1743,6 +1767,9 @@ export class PiHostBackend implements HostBackend {
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
     this.vaultDir = options.vaultDir ?? this.agentDir;
+    this.agentPersistMinIntervalMs = options.agentPersistMinIntervalMs ?? AGENT_PERSIST_MIN_INTERVAL_MS;
+    this.agentLogPersistDebounceMs = options.agentLogPersistDebounceMs ?? AGENT_LOG_PERSIST_DEBOUNCE_MS;
+    this.agentRetentionMaxTerminal = options.agentRetentionMaxTerminal ?? AGENT_RETENTION_MAX_TERMINAL;
     installFreezeProbe(join(this.agentDir, FREEZE_PROBE_FILE));
     this.modelsWrite = options.canonicalModelsWrite ?? createCanonicalModelsWriteQueue();
     this.profileInitialization = Promise.resolve(options.profileInitialization).then(
@@ -2023,8 +2050,6 @@ export class PiHostBackend implements HostBackend {
 
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
-    this.persistAgentLogs();
-    this.persistAgents();
     // Sweep before closed=true: abortSessionTurn no longer stops workers, so host
     // exit is the remaining path that must reap leftover subagent processes.
     const sessionIds = new Set<string>(this.live.keys());
@@ -2032,6 +2057,10 @@ export class PiHostBackend implements HostBackend {
       if (agent.sessionId && agent.state === "running") sessionIds.add(agent.sessionId);
     }
     await Promise.allSettled([...sessionIds].map((sessionId) => this.sweepSessionAgents(sessionId)));
+    // Final durable flush after the sweep so its state changes ride the same
+    // snapshot; both bypass the write throttle.
+    this.persistAgentLogs();
+    this.persistAgentsNow();
     this.closed = true;
     this.stopEscalation.cancelAll();
     this.stopOrphanReconcileTimer();
@@ -2097,7 +2126,7 @@ export class PiHostBackend implements HostBackend {
     const logs = this.agentLogCache.get(key)
     if (!logs?.length) return
     this.agentLogCache.set(key, logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined }))
-    this.persistAgentLogs()
+    this.schedulePersistAgentLogs()
   }
   private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: CachedAgentLog) {
     const key = this.agentLogKey(sessionId, agentId, runId)
@@ -5799,6 +5828,24 @@ export class PiHostBackend implements HostBackend {
     for (const model of extra.models) {
       next.push(hostModelFromPi(model, model.provider));
     }
+    // Reserved official providers stay host-owned: extensions cannot replace or
+    // filter their built-in models. Enabled, authenticated reserved claims may
+    // only append models whose `${provider}/${id}` key is not already in the catalog.
+    const reservedClaims = claims.filter(
+      (claim) =>
+        claim.enabled &&
+        Boolean(reservedProviderClaimError(claim.contribution.provider.id, reserved)),
+    );
+    if (reservedClaims.length) {
+      const additive = resolveContributedCatalog({
+        claims: reservedClaims,
+        authenticatedProviders,
+        existing: next,
+      });
+      for (const model of additive.models) {
+        next.push(hostModelFromPi(model, model.provider));
+      }
+    }
     return next;
   }
   private fallbackModelIfMissing(): void {
@@ -6942,7 +6989,10 @@ export class PiHostBackend implements HostBackend {
       if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
         if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
       }
-      if (normalized) this.persistAgents();
+      // Shrink a bloated projection once at load so the first snapshot is already
+      // bounded; a 15MB index costs a full parse + stringify cycle otherwise.
+      const pruned = this.pruneAgentProjection(Date.now());
+      if (normalized || pruned) this.persistAgents();
     } catch (error: any) {
       if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable index: ${error?.message ?? error}`);
     }
@@ -6965,6 +7015,16 @@ export class PiHostBackend implements HostBackend {
         if (typeof key !== "string" || !Array.isArray(entries)) continue;
         this.agentLogCache.set(key, entries.filter(isCachedAgentLog));
       }
+      // Drop logs whose agent row did not survive load-time retention; otherwise
+      // they stay resident in memory and get rewritten into every snapshot.
+      const retainedKeys = new Set(
+        [...this.agents.values()].map(agent => this.agentLogKey(agent.sessionId ?? "", agent.agentId, agent.runId)),
+      );
+      if (retainedKeys.size) {
+        for (const key of [...this.agentLogCache.keys()]) {
+          if (!retainedKeys.has(key)) this.agentLogCache.delete(key);
+        }
+      }
     } catch (error: any) {
       if (error?.code !== "ENOENT") console.warn(`[pipi-agents] unable to load durable logs: ${error?.message ?? error}`);
     }
@@ -6973,14 +7033,33 @@ export class PiHostBackend implements HostBackend {
     if (this.closed || this.agentLogsPersistTimer) return;
     this.agentLogsPersistTimer = setTimeout(() => {
       this.agentLogsPersistTimer = undefined;
-      this.persistAgentLogs();
-    }, 250);
+      this.tryPersistAgentLogs();
+    }, this.agentLogPersistDebounceMs);
     this.agentLogsPersistTimer.unref?.();
+  }
+  /** Enforce the minimum gap between log snapshots; continuous log_delta streams
+   * used to re-arm a 250ms debounce into a permanent full-serialize loop. */
+  private tryPersistAgentLogs(): void {
+    if (this.closed) return;
+    const waitMs = this.agentLogsPersistLastEnd + this.agentLogPersistDebounceMs - Date.now();
+    if (waitMs > 0 && !this.agentLogsThrottleTimer) {
+      this.agentLogsThrottleTimer = setTimeout(() => {
+        this.agentLogsThrottleTimer = undefined;
+        this.tryPersistAgentLogs();
+      }, waitMs);
+      this.agentLogsThrottleTimer.unref?.();
+      return;
+    }
+    this.persistAgentLogs();
   }
   private persistAgentLogs(): void {
     if (this.agentLogsPersistTimer) {
       clearTimeout(this.agentLogsPersistTimer);
       this.agentLogsPersistTimer = undefined;
+    }
+    if (this.agentLogsThrottleTimer) {
+      clearTimeout(this.agentLogsThrottleTimer);
+      this.agentLogsThrottleTimer = undefined;
     }
     if (this.closed) return;
     const known = new Set(
@@ -6995,6 +7074,7 @@ export class PiHostBackend implements HostBackend {
     const target = this.agentLogsFile();
     const stringifyStarted = Date.now();
     const snapshot = JSON.stringify({ version: 1, logs }) + "\n";
+    this.agentLogsPersistLastEnd = Date.now();
     freezeProbe("persist_logs", {
       stringifyMs: Date.now() - stringifyStarted,
       bytes: snapshot.length,
@@ -7010,15 +7090,35 @@ export class PiHostBackend implements HostBackend {
   private persistAgents(): void {
     if (this.closed) return;
     this.agentsPersistDirty = true;
-    this.enqueuePersistAgents();
+    this.schedulePersistAgents();
   }
-  private enqueuePersistAgents(): void {
-    if (this.agentsPersistInflight || !this.agentsPersistDirty) return;
+  /** Final flush for close(): bypasses the throttle but keeps the write queue ordered. */
+  private persistAgentsNow(): void {
+    if (this.closed) return;
+    this.agentsPersistDirty = true;
+    if (this.agentsPersistTimer) {
+      clearTimeout(this.agentsPersistTimer);
+      this.agentsPersistTimer = undefined;
+    }
+    this.startPersistAgents();
+  }
+  private schedulePersistAgents(): void {
+    if (this.closed || this.agentsPersistTimer || this.agentsPersistInflight) return;
+    const waitMs = Math.max(0, this.agentsPersistLastEnd + this.agentPersistMinIntervalMs - Date.now());
+    this.agentsPersistTimer = setTimeout(() => {
+      this.agentsPersistTimer = undefined;
+      this.startPersistAgents();
+    }, waitMs);
+    this.agentsPersistTimer.unref?.();
+  }
+  private startPersistAgents(): void {
+    if (this.closed || this.agentsPersistInflight || !this.agentsPersistDirty) return;
     this.agentsPersistInflight = true;
     this.agentsWrite = this.agentsWrite.then(async () => {
       try {
         while (this.agentsPersistDirty) {
           this.agentsPersistDirty = false;
+          this.pruneAgentProjection(Date.now());
           const target = this.agentsFile();
           const stringifyStarted = Date.now();
           const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
@@ -7034,13 +7134,69 @@ export class PiHostBackend implements HostBackend {
           await fs.rename(tmp, target);
         }
       } finally {
+        this.agentsPersistLastEnd = Date.now();
         this.agentsPersistInflight = false;
-        if (this.agentsPersistDirty) this.enqueuePersistAgents();
+        if (this.agentsPersistDirty && !this.closed) this.schedulePersistAgents();
       }
     }).catch(error => {
+      this.agentsPersistLastEnd = Date.now();
       this.agentsPersistInflight = false;
       console.warn(`[pipi-agents] unable to persist durable index: ${error?.message ?? error}`);
     });
+  }
+  /**
+   * Force a throttled flush to start immediately and wait for the write queue
+   * to drain. close() relies on persistAgentsNow instead; this is the path
+   * tests use to observe a durable snapshot without waiting out the interval.
+   */
+  private async flushAgentProjection(): Promise<void> {
+    if (!this.closed && this.agentsPersistTimer) {
+      clearTimeout(this.agentsPersistTimer);
+      this.agentsPersistTimer = undefined;
+      this.startPersistAgents();
+    }
+    await this.agentsWrite;
+    if (this.agentsPersistInflight || this.agentsPersistTimer) await this.flushAgentProjection();
+  }
+  /**
+   * Durable-projection retention. The index grew without bound (3591 agents /
+   * 3128 log keys → 15MB index + 40MB log file) until every event-driven
+   * snapshot stringify pinned the Electron main thread at ~100% CPU
+   * (2026-08-23 freeze). Keep live rows plus the newest N terminal rows and
+   * drop the cached logs and settled worktrees of everything else. Pi still
+   * owns the worker transcripts; this projection only rebuilds the UI tree.
+   */
+  private pruneAgentProjection(now: number): boolean {
+    const terminal: Array<[string, AgentSummary]> = [];
+    for (const [key, agent] of this.agents) {
+      if (!this.isLiveAgentState(agent.state)) terminal.push([key, agent]);
+    }
+    if (terminal.length <= this.agentRetentionMaxTerminal) return false;
+    terminal.sort((a, b) => (this.lastObservedAt(b[1]) ?? 0) - (this.lastObservedAt(a[1]) ?? 0));
+    const drop = new Set<string>(
+      terminal.slice(this.agentRetentionMaxTerminal).map(([key]) => key),
+    );
+    const droppedAgentIds = new Set<string>();
+    for (const key of drop) {
+      const agent = this.agents.get(key);
+      if (!agent) continue;
+      this.agents.delete(key);
+      this.agentLogCache.delete(this.agentLogKey(agent.sessionId ?? "", agent.agentId, agent.runId));
+      this.projectionDebugProvenance.delete(key);
+      droppedAgentIds.add(agent.agentId);
+    }
+    for (const agentId of droppedAgentIds) {
+      // An agentId may be reused across sessions; only touch the worktree when
+      // no retained row still references it.
+      const stillReferenced = [...this.agents.values()].some(agent => agent.agentId === agentId);
+      if (stillReferenced) continue;
+      const worktree = this.worktrees.get(agentId);
+      // Actionable worktrees survive retention: pendingReview still offers
+      // manual merge/discard and active belongs to a live worker.
+      if (!worktree || worktree.lifecycle === "active" || worktree.lifecycle === "pendingReview") continue;
+      this.worktrees.delete(agentId);
+    }
+    return drop.size > 0;
   }
   private async getAgent(id: string) {
     // Commands predate session-qualified ids. Prefer an active matching row, then the newest;
