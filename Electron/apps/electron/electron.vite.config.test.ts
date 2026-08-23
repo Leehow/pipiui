@@ -7,17 +7,24 @@
 // just this file: `npx vitest run apps/electron/electron.vite.config.test.ts`.
 // The single dev command is `npm run dev` from Electron/ (forwards to the
 // @pipiui/electron workspace).
-import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { resolveFileViewerCopyAssetsTarget } from '@file-viewer/vite-plugin'
-import electronViteConfig, { fileViewerAssetOptions, generatedWatchExcludes, rendererAssetFileNames } from './electron.vite.config'
+import electronViteConfig, {
+  fileViewerAssetOptions,
+  fileViewerPptVendorAssetPlugin,
+  generatedWatchExcludes,
+  rendererAssetFileNames,
+  rewriteFileViewerPptDefaultAssetUrls
+} from './electron.vite.config'
 
 type AliasEntry = { find: string | RegExp; replacement: string }
 
 const config = electronViteConfig as {
-  renderer?: { resolve?: { alias?: AliasEntry[] } }
+  renderer?: { plugins?: Array<{ name?: string }>; resolve?: { alias?: AliasEntry[] } }
 }
 const aliases: AliasEntry[] = config.renderer?.resolve?.alias ?? []
 
@@ -61,6 +68,38 @@ describe('renderer resolves @pipiui/ui from packages/ui source', () => {
       outDir: 'out/renderer'
     })
     expect(toPosix(target.targetRoot)).toMatch(/apps\/electron\/out\/renderer\/file-viewer$/)
+  })
+})
+
+describe('PPT vendor assets are published once', () => {
+  const pptSource = readFileSync(
+    createRequire(import.meta.url).resolve('@file-viewer/ppt'),
+    'utf8'
+  )
+
+  it('rewrites the installed @file-viewer/ppt default URLs onto the copyAssets vendor root', () => {
+    const rewritten = rewriteFileViewerPptDefaultAssetUrls(pptSource)
+    expect(rewritten).toContain('file-viewer/vendor/ppt/ppt-native.wasm')
+    expect(rewritten).toContain('file-viewer/vendor/ppt/ppt-font-cjk.otf')
+    expect(rewritten).toContain('file-viewer/vendor/ppt/worker.mjs')
+    expect(rewritten).not.toContain("new URL('./ppt-native.wasm', import.meta.url)")
+    expect(rewritten).not.toContain('new URL(`./${MANIFEST.fontPack.file}`, import.meta.url)')
+    expect(rewritten).not.toContain('new URL(`./${MANIFEST.workerFile}`, import.meta.url)')
+  })
+
+  it('does not rewrite unrelated modules and refuses a partial match', () => {
+    expect(rewriteFileViewerPptDefaultAssetUrls('export const x = 1')).toBeNull()
+    expect(() => rewriteFileViewerPptDefaultAssetUrls(
+      "const DEFAULT_WASM_URL = new URL('./ppt-native.wasm', import.meta.url);"
+    )).toThrow(/partial DEFAULT_\*_URL match/)
+  })
+
+  it('registers the vendor-only rewrite plugin before file-viewer renderers', () => {
+    const plugin = fileViewerPptVendorAssetPlugin()
+    expect(plugin.name).toBe('file-viewer-ppt-vendor-assets')
+    expect(plugin.enforce).toBe('pre')
+    const names = (config.renderer?.plugins ?? []).map((plugin) => plugin.name)
+    expect(names[0]).toBe('file-viewer-ppt-vendor-assets')
   })
 })
 
