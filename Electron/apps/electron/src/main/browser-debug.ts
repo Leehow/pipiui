@@ -153,12 +153,8 @@ export const PAGE_SAFE_SERIALIZE_SOURCE = `function __pipiSafeSerialize(value, b
     const cloned = walk(value, 0);
     let text = JSON.stringify(cloned);
     if (typeof text !== "string") return { ok: false, code: "result_not_serializable", error: "script result could not be JSON.stringified" };
-    let truncated = false;
-    if (text.length > max) {
-      text = text.slice(0, max);
-      truncated = true;
-    }
-    return { ok: true, json: text, truncated: truncated };
+    void max;
+    return { ok: true, json: text, truncated: false };
   } catch (error) {
     return { ok: false, code: "result_not_serializable", error: error && error.message ? String(error.message) : "script result is not serializable" };
   }
@@ -181,7 +177,7 @@ export function buildScriptWrapper(js: string, requestId: string, deadlineMs = B
   var __steps = [];
   function step(label) {
     if (__steps.length >= ${BROWSER_SCRIPT_STEP_CAP}) return;
-    __steps.push({ label: String(label == null ? "" : label).slice(0, 200), t: Date.now() });
+    __steps.push({ label: String(label == null ? "" : label), t: Date.now() });
   }
   function el(token) {
     var api = globalThis.__pipiBrowserDOM;

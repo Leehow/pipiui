@@ -615,7 +615,7 @@ export class BrowserTabsHost {
     return undefined
   }
 
-  private debugEnvelope(request: BrowserToolRequest, extra: Record<string, unknown> = {}): BrowserDebugEnvelope {
+  private debugEnvelope(request: BrowserToolRequest, extra: Record<string, unknown> = {}, options?: { truncate?: boolean }): BrowserDebugEnvelope {
     const requestId = requestIdOf(request as { requestID?: unknown; requestId?: unknown })
     const startedAt = typeof extra.startedAt === 'number' ? extra.startedAt : Date.now()
     const { startedAt: _s, ...rest } = extra
@@ -634,9 +634,21 @@ export class BrowserTabsHost {
       ...(tail && tail.length ? { consoleTail: tail } : {}),
       ...rest,
     }
+    if (options?.truncate === false) return payload
     const packed = truncateEnvelope(payload)
     if (packed.truncated) packed.value.truncated = true
     return packed.value as BrowserDebugEnvelope
+  }
+
+  private redactionClosed(kind: BrowserViewportKind): BrowserToolResult {
+    return {
+      ok: false,
+      error: 'browser redaction capacity exceeded; reload the document before continuing',
+      code: 'browser_redaction_capacity_exceeded',
+      requiresObservation: true,
+      redacted: true,
+      viewportTarget: kind,
+    }
   }
 
   private traceAction(stage: string, request: BrowserToolRequest, extra: Record<string, unknown> = {}): void {
@@ -822,7 +834,29 @@ export class BrowserTabsHost {
     const requestId = requestIdOf(request as { requestID?: unknown; requestId?: unknown })
     const wrapped = buildScriptWrapper(request.js, requestId, BROWSER_SCRIPT_DEADLINE_MS)
     const source = `${this.controllerPrelude()};${wrapped.source}`
-    const finish = (extra: Record<string, unknown>) => this.sanitizeBypassResult(pane, kind, this.debugEnvelope(request, extra))
+    const finish = async (extra: Record<string, unknown>) => {
+      const envelope = this.debugEnvelope(request, extra, { truncate: false })
+      const sanitized = await this.sanitizeBypassResult(pane, kind, envelope)
+      if (
+        sanitized.code === 'browser_redaction_capacity_exceeded'
+        && extra.ok === false
+        && typeof extra.code === 'string'
+        && extra.code !== 'browser_redaction_capacity_exceeded'
+        && extra.result == null
+      ) {
+        return {
+          ok: false,
+          code: extra.code,
+          error: typeof extra.error === 'string' ? extra.error : 'browser action failed',
+          redacted: true,
+          viewportTarget: kind,
+          ...(extra.partialSideEffects === true ? { partialSideEffects: true } : {}),
+        }
+      }
+      const packed = truncateEnvelope(sanitized)
+      if (packed.truncated) packed.value.truncated = true
+      return packed.value as BrowserToolResult
+    }
     try {
       const raw = await execute.call(pane.view!.webContents, source) as Record<string, unknown> | undefined
       const drift = this.contextDrift(ctx)
@@ -892,44 +926,21 @@ export class BrowserTabsHost {
 
   private async sanitizeBypassResult(pane: ViewPane, kind: BrowserViewportKind, payload: BrowserToolResult): Promise<BrowserToolResult> {
     const execute = pane.view?.webContents.executeJavaScript
-    if (!execute) return payload
+    if (!execute) return this.redactionClosed(kind)
     let serialized: string
     try {
       serialized = JSON.stringify({ action: 'sanitize', value: payload })
     } catch {
-      return {
-        ok: false,
-        error: 'browser redaction capacity exceeded; reload the document before continuing',
-        code: 'browser_redaction_capacity_exceeded',
-        requiresObservation: true,
-        redacted: true,
-        viewportTarget: kind,
-      }
+      return this.redactionClosed(kind)
     }
     const source = `${this.controllerPrelude()}globalThis.__pipiBrowserDOM.dispatch(${serialized})`
     try {
       const sanitized = await execute.call(pane.view!.webContents, source)
-      if (!sanitized || typeof sanitized !== 'object') {
-        return {
-          ok: false,
-          error: 'browser redaction capacity exceeded; reload the document before continuing',
-          code: 'browser_redaction_capacity_exceeded',
-          requiresObservation: true,
-          redacted: true,
-          viewportTarget: kind,
-        }
-      }
+      if (!sanitized || typeof sanitized !== 'object') return this.redactionClosed(kind)
       const result = sanitized as BrowserToolResult
       return result.viewportTarget == null ? { ...result, viewportTarget: kind } : result
     } catch {
-      return {
-        ok: false,
-        error: 'browser redaction capacity exceeded; reload the document before continuing',
-        code: 'browser_redaction_capacity_exceeded',
-        requiresObservation: true,
-        redacted: true,
-        viewportTarget: kind,
-      }
+      return this.redactionClosed(kind)
     }
   }
 
@@ -1027,13 +1038,16 @@ export class BrowserTabsHost {
     try {
       const raw = await execute.call(pane.view!.webContents, source) as { content?: unknown } | undefined
       const full = typeof raw?.content === 'string' ? raw.content : ''
-      const truncated = full.length > 100_000
-      return this.sanitizeBypassResult(pane, kind, {
+      const sanitized = await this.sanitizeBypassResult(pane, kind, {
         ok: true,
-        content: truncated ? full.slice(0, 100_000) : full,
-        truncated,
+        content: full,
+        truncated: full.length > 100_000,
         viewportTarget: kind,
       })
+      if (sanitized.ok && typeof sanitized.content === 'string' && sanitized.content.length > 100_000) {
+        return { ...sanitized, content: sanitized.content.slice(0, 100_000), truncated: true }
+      }
+      return sanitized
     } catch (error) {
       return this.sanitizeBypassResult(pane, kind, {
         ok: false,
@@ -1087,13 +1101,22 @@ export class BrowserTabsHost {
     const selector = JSON.stringify(request.selector)
     const text = JSON.stringify(request.text ?? '')
     const append = request.action === 'input' && request.mode === 'append'
-    const code = `(()=>{const e=document.querySelector(${selector});if(!e)return {ok:false,error:'selector not found'};if(${JSON.stringify(request.action)}==='click'){e.click();return {ok:true}};const p=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;p?p.call(e,${append ? `String(e.value??'')+${text}` : text}):e.value=${text};e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:true}})()`
-    const result = await execute.call(pane.view!.webContents, code)
-    if (!result || typeof result !== 'object' || !(result as any).ok) {
-      return this.sanitizeBypassResult(pane, kind, (result && typeof result === 'object' ? result : { ok: false, error: 'selector not found' }) as BrowserToolResult)
+    const action = JSON.stringify(request.action)
+    const code = `${this.controllerPrelude()}(()=>{const api=globalThis.__pipiBrowserDOM;const e=document.querySelector(${selector});if(!e)return {ok:false,error:'selector not found'};if(api&&typeof api.isSensitive==='function'&&api.isSensitive(e))return {ok:false,error:'This sensitive field requires user input.',code:'user_handoff_required',requiresUserInput:true};if(${action}==='click'){e.click();return {ok:true}};const p=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;p?p.call(e,${append ? `String(e.value??'')+${text}` : text}):e.value=${text};e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:true}})()`
+    try {
+      const result = await execute.call(pane.view!.webContents, code)
+      if (!result || typeof result !== 'object' || !(result as any).ok) {
+        return this.sanitizeBypassResult(pane, kind, (result && typeof result === 'object' ? result : { ok: false, error: 'selector not found' }) as BrowserToolResult)
+      }
+      const observed = await this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
+      return this.sanitizeBypassResult(pane, kind, observed)
+    } catch (error) {
+      return this.sanitizeBypassResult(pane, kind, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        viewportTarget: kind,
+      })
     }
-    const observed = await this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
-    return this.sanitizeBypassResult(pane, kind, observed)
   }
 
   async setViewBounds(bounds: BrowserViewBounds, restoreActivePage = true): Promise<boolean> {

@@ -2517,6 +2517,24 @@ describe('browser semantic locators', () => {
     const obscured = await host.toolAction(asRequest({ action: 'click', locator: { role: 'button', name: 'Pay' } }))
     expect(obscured).toMatchObject({ ok: false, code: 'browser_target_obscured' })
   })
+
+  it('rejects off-screen locator targets before acting', async () => {
+    const { host, runtime } = await liveBrowser([
+      { tag: 'button', text: 'Offscreen' },
+      { tag: 'input', attrs: { 'aria-label': 'Note' } },
+    ])
+    const button = walkElements(runtime.document.body).find(el => el.localName === 'button')
+    const note = walkElements(runtime.document.body).find(el => el.getAttribute('aria-label') === 'Note')
+    expect(button && note).toBeTruthy()
+    const offscreen = { x: 8, y: 2400, left: 8, top: 2400, width: 200, height: 20, right: 208, bottom: 2420 }
+    button!._rect = offscreen
+    const failed = await host.toolAction(asRequest({ action: 'click', locator: { role: 'button', name: 'Offscreen' } }))
+    expect(failed).toMatchObject({ ok: false, code: 'browser_target_not_actionable' })
+    expect(String(failed.error)).toMatch(/off-screen|hidden|not interactive/i)
+    note!._rect = offscreen
+    const typed = await host.toolAction(asRequest({ action: 'input', locator: { label: 'Note' }, text: 'nope' }))
+    expect(typed).toMatchObject({ ok: false, code: 'browser_target_not_actionable' })
+  })
 })
 
 function checkoutFormTree(): PageSpec[] {
@@ -2691,6 +2709,57 @@ describe('browser fill_form batch API', () => {
     expect(result.action).toEqual(expect.objectContaining({ kind: 'fill_form', filled: 1, failed: 0 }))
     expect(webviewSource).toContain('fill_form {fields, snapshot_id?}')
   })
+
+  it('keeps locator candidates and disambiguation text on a failed field', async () => {
+    const { host, runtime } = await liveBrowser(checkoutFormTree())
+    const result = await host.toolAction(asRequest({
+      action: 'fill_form',
+      fields: [
+        { locator: { role: 'textbox', name: 'NoSuch' }, value: 'skip' },
+        { locator: { label: 'Email' }, value: 'ok@example.com' },
+      ],
+    }))
+    expect(result).toMatchObject({
+      ok: true,
+      filled: 1,
+      failed: 1,
+      results: [
+        { index: 0, ok: false, error: 'browser_locator_not_found' },
+        { index: 1, ok: true },
+      ],
+    })
+    const failed = (result.results as Array<{ candidates?: unknown; message?: string }>)[0]
+    expect(Array.isArray(failed.candidates)).toBe(true)
+    expect(String(failed.message || '')).toMatch(/matched 0 elements/i)
+    expect(formControls(runtime).email.value).toBe('ok@example.com')
+  })
+
+  it('invalidates the snapshot when every field fails after dispatching events', async () => {
+    const { host, runtime } = await liveBrowser(checkoutFormTree())
+    const observed = await host.toolAction(asRequest({ action: 'observe', role: 'textbox' }))
+    const name = (observed.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Full name')
+    const email = (observed.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Email')
+    expect(name?.token && email?.token).toBeTruthy()
+    const cancel = (event: { preventDefault(): void }) => event.preventDefault()
+    formControls(runtime).name.addEventListener('beforeinput', cancel)
+    formControls(runtime).email.addEventListener('beforeinput', cancel)
+    const result = await host.toolAction(asRequest({
+      action: 'fill_form',
+      snapshot_id: String(observed.snapshotID),
+      fields: [
+        { element_token: name!.token, value: 'Ada' },
+        { element_token: email!.token, value: 'ada@example.com' },
+      ],
+    }))
+    expect(result).toMatchObject({ ok: true, filled: 0, failed: 2 })
+    const retry = await host.toolAction(asRequest({
+      action: 'input',
+      snapshot_id: String(observed.snapshotID),
+      element_token: name!.token,
+      text: 'Ada',
+    }))
+    expect(retry).toMatchObject({ ok: false, code: 'stale_browser_snapshot' })
+  })
 })
 
 describe('browser bypass redaction', () => {
@@ -2787,5 +2856,45 @@ describe('browser bypass redaction', () => {
     await expect(host.toolAction({ action: 'click', selector: '#go' })).resolves.toMatchObject(expected)
     const evaluated = await host.toolAction({ action: 'eval', js: 'document.querySelector("#pw").value' })
     expect(JSON.stringify(evaluated)).not.toContain(oversized.slice(0, 80))
+  })
+
+  it('refuses selector writes into sensitive fields', async () => {
+    const { host, runtime } = await liveBrowser(checkoutFormTree())
+    const result = await host.toolAction({ action: 'input', selector: '#pw', text: 's3cret-should-not-write' })
+    expect(result).toMatchObject({ ok: false, code: 'user_handoff_required' })
+    expect(formControls(runtime).password.value).toBe('')
+    expect(JSON.stringify(result)).not.toContain('s3cret-should-not-write')
+  })
+
+  it('sanitizes selector execution errors', async () => {
+    const { host, contents } = await liveBrowser()
+    const inner = contents.executeJavaScript.getMockImplementation()!
+    contents.executeJavaScript.mockImplementation(async (code: string) => {
+      if (String(code).includes('api.isSensitive') && String(code).includes('document.querySelector(')) {
+        throw new Error('selector boom')
+      }
+      return inner(code)
+    })
+    const failed = await host.toolAction({ action: 'click', selector: '#go' })
+    expect(failed.ok).toBe(false)
+    expect(String(failed.error)).toMatch(/selector boom/)
+    expect(contents.executeJavaScript.mock.calls.some(([code]) => String(code).includes('"action":"sanitize"'))).toBe(true)
+  })
+
+  it('redacts secrets that would straddle the content truncation boundary', async () => {
+    const secret = 'BOUNDARY-SECRET-TOKEN-ZZ'
+    const beforeValue = '<html><body><main><p></p><input id="pw" type="password" aria-label="Password" value="'
+    const pad = 'p'.repeat(Math.max(0, 100_000 - 8 - beforeValue.length))
+    const { host } = await liveBrowser([{
+      tag: 'main',
+      children: [
+        { tag: 'p', text: pad },
+        { tag: 'input', attrs: { id: 'pw', type: 'password', 'aria-label': 'Password', value: secret }, value: secret },
+      ],
+    }])
+    const dumped = await host.toolAction({ action: 'content', mode: 'html' })
+    expect(dumped.ok).toBe(true)
+    expect(JSON.stringify(dumped)).not.toContain(secret)
+    expect(JSON.stringify(dumped)).not.toContain(secret.slice(0, 12))
   })
 })

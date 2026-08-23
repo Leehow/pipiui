@@ -1248,6 +1248,23 @@
     return isInteractive(element, role(element));
   }
 
+  function locatorHitError(element) {
+    if (!isActionable(element)) {
+      return failure("The requested element is hidden, disabled, or not interactive.", "browser_target_not_actionable");
+    }
+    const hit = clickCenter(element);
+    if (hit.kind === "clear") return null;
+    if (hit.kind === "obscured") {
+      return failure(
+        "The target is obscured at its center; observe again before retrying.",
+        "browser_target_obscured",
+        true,
+        { retryable: true },
+      );
+    }
+    return failure("The requested element is hidden, disabled, off-screen, or not interactive.", "browser_target_not_actionable");
+  }
+
   function entryFromElement(element) {
     const currentRole = role(element);
     const currentName = accessibleName(element);
@@ -1402,14 +1419,8 @@
       };
     }
     const element = chosen[0];
-    if (!isActionable(element)) {
-      return {
-        error: failure(
-          "The requested element is hidden, disabled, or not interactive.",
-          "browser_target_not_actionable",
-        ),
-      };
-    }
+    const hitError = locatorHitError(element);
+    if (hitError) return { error: hitError };
     return { entry: entryFromElement(element) };
   }
 
@@ -1488,6 +1499,20 @@
     return "browser_action_failed";
   }
 
+  function fieldFailure(index, result) {
+    if (!result || typeof result !== "object") {
+      return { index, ok: false, error: "browser_action_failed" };
+    }
+    const code = fieldErrorCode(result);
+    const next = { index, ok: false, error: code };
+    if (typeof result.error === "string") next.message = result.error;
+    if (Array.isArray(result.candidates)) next.candidates = result.candidates;
+    if (result.requiresObservation === true) next.requiresObservation = true;
+    if (result.retryable === true) next.retryable = true;
+    if (result.requiresUserInput === true) next.requiresUserInput = true;
+    return next;
+  }
+
   function resolveFormField(field, snapshotId) {
     if (!field || typeof field !== "object") {
       return { error: failure("Each fill_form field must be an object.", "invalid_browser_input") };
@@ -1509,8 +1534,12 @@
     return { error: failure("Each field needs element_token or a locator (role+name / label / text / css).", "invalid_browser_target") };
   }
 
-  function fillControl(element, value, fieldType) {
+  function fillControl(element, value, fieldType, validate) {
     const kind = String(fieldType || "input").toLowerCase();
+    const afterEvent = () => {
+      if (typeof validate !== "function") return null;
+      return validate();
+    };
     if (element.localName === "input" && (element.getAttribute("type") || "").toLowerCase() === "file") {
       return { ok: false, error: "file_input_not_supported" };
     }
@@ -1524,12 +1553,19 @@
       option.selected = true;
       element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
       element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      const stale = afterEvent();
+      if (stale) return stale;
+      if (String(element.value ?? "") !== String(option.value ?? "")) {
+        return { ok: false, error: "stale_browser_snapshot" };
+      }
       return { ok: true };
     }
     if (!dispatchBeforeInput(element, value)) {
       return { ok: false, error: "browser_input_cancelled" };
     }
     if (isSensitive(element)) return { ok: false, error: "user_handoff_required" };
+    const afterBeforeInput = afterEvent();
+    if (afterBeforeInput) return afterBeforeInput;
     if (element.localName === "input" || element.localName === "textarea") {
       nativeValueSetter(element, value);
     } else if (element.isContentEditable) {
@@ -1538,10 +1574,17 @@
       return { ok: false, error: "unsupported_browser_action" };
     }
     dispatchInputEvents(element, value);
+    const afterWrite = afterEvent();
+    if (afterWrite) return afterWrite;
+    if (element.localName === "input" || element.localName === "textarea") {
+      if (String(element.value ?? "") !== value) return { ok: false, error: "stale_browser_snapshot" };
+    } else if (element.isContentEditable && normalizedText(element.textContent) !== normalizedText(value)) {
+      return { ok: false, error: "stale_browser_snapshot" };
+    }
     return { ok: true };
   }
 
-  function fillOneField(field, index, snapshotId) {
+  function fillOneField(field, index, snapshotId, flags) {
     if (!field || typeof field !== "object") {
       return { index, ok: false, error: "invalid_browser_input" };
     }
@@ -1553,7 +1596,7 @@
     }
     const resolved = resolveFormField(field, snapshotId);
     if (resolved?.error) {
-      return { index, ok: false, error: fieldErrorCode(resolved.error) };
+      return fieldFailure(index, resolved.error);
     }
     const entry = resolved.entry;
     const element = entry?.element;
@@ -1563,19 +1606,32 @@
     }
     const hit = clickCenter(element);
     if (hit.kind !== "clear") {
-      return { index, ok: false, error: "browser_target_obscured" };
+      return {
+        index,
+        ok: false,
+        error: hit.kind === "obscured" ? "browser_target_obscured" : "browser_target_not_actionable",
+      };
     }
     highlight(element);
     element.focus?.({ preventScroll: true });
+    if (flags) flags.interacted = true;
     if (isSensitive(element)) {
       return { index, ok: false, error: "user_handoff_required" };
     }
-    if (entry.fingerprint && state.activeSnapshot) {
-      const postFocusError = validateEntry(entry, false);
-      if (postFocusError) return { index, ok: false, error: fieldErrorCode(postFocusError) };
+    const postFocusError = validateEntry(entry, false);
+    if (postFocusError) return fieldFailure(index, postFocusError);
+    const written = fillControl(element, field.value, field.type, () => {
+      const err = validateEntry(entry, false);
+      return err ? { ok: false, error: fieldErrorCode(err), message: typeof err.error === "string" ? err.error : undefined } : null;
+    });
+    if (!written.ok) {
+      return {
+        index,
+        ok: false,
+        error: written.error || "browser_action_failed",
+        ...(typeof written.message === "string" ? { message: written.message } : {}),
+      };
     }
-    const written = fillControl(element, field.value, field.type);
-    if (!written.ok) return { index, ok: false, error: written.error || "browser_action_failed" };
     const extra = resolved.relocated === true || entry.relocated === true ? { relocated: true } : {};
     return { index, ok: true, ...extra };
   }
@@ -1593,10 +1649,11 @@
     const results = [];
     let filled = 0;
     let failed = 0;
+    const flags = { interacted: false };
     for (let index = 0; index < fields.length; index += 1) {
       let outcome;
       try {
-        outcome = fillOneField(fields[index], index, snapshotId);
+        outcome = fillOneField(fields[index], index, snapshotId, flags);
       } catch (_) {
         outcome = { index, ok: false, error: "browser_action_failed" };
       }
@@ -1604,7 +1661,7 @@
       if (outcome.ok) filled += 1;
       else failed += 1;
     }
-    if (filled > 0) invalidateSnapshot();
+    if (filled > 0 || flags.interacted) invalidateSnapshot();
     return attachMutation({
       ok: true,
       filled,
@@ -2102,6 +2159,10 @@
     try {
       if (["click", "input", "select", "scroll"].includes(action)) beginMutationWindow();
       if (action === "click") {
+        if (entry?.locatorResolved) {
+          const blocked = locatorHitError(element);
+          if (blocked) return blocked;
+        }
         const hit = clickCenter(element);
         if (relocated && hit.kind !== "clear") {
           return stale("The requested element could not be relocated; observe again.");
@@ -2203,6 +2264,10 @@
       }
 
       if (action === "input") {
+        if (entry?.locatorResolved) {
+          const blocked = locatorHitError(element);
+          if (blocked) return blocked;
+        }
         if (typeof params.text !== "string") return failure("input requires text.", "invalid_browser_input");
         if (!retainRedactions([params.text])) return redactionCapacityFailure();
         const preFocusSensitive = isSensitive(element);
@@ -2243,6 +2308,10 @@
       }
 
       if (action === "select") {
+        if (entry?.locatorResolved) {
+          const blocked = locatorHitError(element);
+          if (blocked) return blocked;
+        }
         if (element.localName !== "select") return failure("The target is not a select control.", "unsupported_browser_action");
         if (typeof params.option !== "string") return failure("select requires option.", "invalid_browser_input");
         const preFocusSensitive = isSensitive(element);
@@ -2296,7 +2365,7 @@
   }
 
   Object.defineProperty(globalThis, API_NAME, {
-    value: Object.freeze({ dispatch, resolveElement }),
+    value: Object.freeze({ dispatch, resolveElement, isSensitive }),
     configurable: false,
     enumerable: false,
     writable: false,
