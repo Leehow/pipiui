@@ -1,0 +1,92 @@
+{
+  "id": "deepseek",
+  "name": "DeepSeek",
+  "version": "0.1.0",
+  "capabilities": [
+    "settings.read",
+    "settings.write",
+    "bridge.emit",
+    "invoke.agent",
+    "stream.render"
+  ],
+  "auth": {
+    "provider": {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "api": "openai-responses",
+      "oauth": false,
+      "models": [
+        {
+          "id": "deepseek-v4-flash-vision-exp",
+          "name": "DeepSeek V4 Flash Vision",
+          "api": "openai-responses",
+          "input": ["text", "image"],
+          "reasoning": true,
+          "capabilities": {
+            "hostedTools": { "tools": ["web_search"] },
+            "structuredOutputs": true,
+            "nativeSearch": { "tools": ["web_search"] }
+          }
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "name": "DeepSeek V4 Flash",
+          "api": "openai-responses",
+          "input": ["text"],
+          "reasoning": true,
+          "capabilities": {
+            "hostedTools": { "tools": ["web_search"] },
+            "structuredOutputs": true,
+            "nativeSearch": { "tools": ["web_search"] }
+          }
+        }
+      ]
+    }
+  },
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "host": {
+    "entry": "agent/dist/host.js",
+    "description": "Stable host library entry; same createAuthProvider as the agent half."
+  },
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.deepseek.apiKey": {
+            "type": "string",
+            "format": "secret",
+            "title": "API Key"
+          },
+          "ext.deepseek.baseUrl": {
+            "type": "string",
+            "default": "https://api.deepseek.com",
+            "title": "Base URL"
+          },
+          "ext.deepseek.forceWebSearch": {
+            "type": "boolean",
+            "default": false,
+            "title": "Force hosted web_search"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [
+        { "slot": "toolPanel", "id": "usage", "title": "用量", "entry": "app/dist/usage-panel.js" }
+      ],
+      "settingsSections": [
+        { "id": "deepseek", "title": "DeepSeek" }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}
