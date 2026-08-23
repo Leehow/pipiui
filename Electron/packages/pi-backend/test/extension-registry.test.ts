@@ -231,14 +231,51 @@ describe("extension enable persistence", () => {
       id: string;
       state: string;
     }>;
-    expect(projectView.find((item) => item.id === "pi-ext")?.state).toBe("enabled");
-    expect(projectView.find((item) => item.id === "pi-goal")?.state).toBe("enabled");
+    // Effective/merged state (same as spawn): inherit App disable. Do not copy it into project home.
+    expect(projectView.find((item) => item.id === "pi-ext")?.state).toBe("disabled");
+    expect(projectView.find((item) => item.id === "pi-goal")?.state).toBe("disabled");
     await expect(readFile(join(projectPiAgentDir(project), PROJECT_EXTENSION_ENABLED_FILE), "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });
     await expect(readFile(join(projectPiAgentDir(project), "trust.json"), "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });
+    await backend.close();
+  });
+
+  it("lets a project overlay re-enable after a pure App-level disable", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-merge-"));
+    const agent = join(root, "agent");
+    const project = join(root, "repo");
+    await mkdir(agent, { recursive: true });
+    await mkdir(project, { recursive: true });
+    const backend = createPiHostBackend({
+      agentDir: agent,
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+    });
+    const added = (await backend.handle("addProject", [project])) as { id: string };
+    await backend.handle("setExtensionEnabled" as never, ["pi-ext", false, "app"]);
+    const before = (await backend.handle("listExtensions" as never, [added.id])) as Array<{ id: string; state: string }>;
+    expect(before.find((item) => item.id === "pi-ext")?.state).toBe("disabled");
+    await expect(readFile(join(projectPiAgentDir(project), PROJECT_EXTENSION_ENABLED_FILE), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const projectEnabled = (await backend.handle("setExtensionEnabled" as never, [
+      "pi-ext",
+      true,
+      "project",
+      added.id,
+    ])) as { state: string };
+    expect(projectEnabled.state).toBe("enabled");
+    const appView = (await backend.handle("listExtensions" as never, [])) as Array<{ id: string; state: string }>;
+    const projectView = (await backend.handle("listExtensions" as never, [added.id])) as Array<{ id: string; state: string }>;
+    expect(appView.find((item) => item.id === "pi-ext")?.state).toBe("disabled");
+    expect(projectView.find((item) => item.id === "pi-ext")?.state).toBe("enabled");
+    const overlay = JSON.parse(await readFile(join(projectPiAgentDir(project), PROJECT_EXTENSION_ENABLED_FILE), "utf8"));
+    expect(parseProjectExtensionEnabled(overlay)).toEqual({ "pi-ext": true });
+    const settings = JSON.parse(await readFile(join(agent, "pipiui-settings.json"), "utf8"));
+    expect(readAppExtensionEnabled(settings)["pi-ext"]).toBe(false);
     await backend.close();
   });
 });

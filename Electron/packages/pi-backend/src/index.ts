@@ -4979,7 +4979,8 @@ export class PiHostBackend implements HostBackend {
   private async extensionEnableOverlay(projectId: unknown): Promise<Record<string, boolean>> {
     if (typeof projectId === "string" && projectId.trim()) {
       const root = await this.projectPath(projectId);
-      return readProjectExtensionEnabled(projectPiAgentDir(root));
+      // Same merge spawn uses ({...app, ...project}): project keys win, else inherit App.
+      return this.mergedExtensionOverlay(root);
     }
     return readAppExtensionEnabled(await this.readSettings());
   }
