@@ -52,6 +52,7 @@ describe("vendored philosophy: structure", () => {
     expect(layers.map((l) => l.id)).toEqual([
       "foundation",
       "method",
+      "retrieval",
       "research",
       "planning",
       "craft",
@@ -88,9 +89,11 @@ describe("vendored philosophy: delivery", () => {
     // `thinking` rides along on every route it is not excluded from, this one included:
     // a fan-out multiplies thinking sprawl by the width of the wave, so the worker is
     // exactly where the correction pays for itself.
-    expect(workerIds("explore")).toEqual(["research", "thinking"]);
-    expect(workerIds("plan")).toEqual(["planning", "thinking"]);
-    expect(workerIds("general-purpose")).toEqual(["craft", "thinking"]);
+    // `retrieval` rides along on every code-reading role for the same reason: choosing the
+    // exact matcher for a semantic question is a drift the recon tier pays for most.
+    expect(workerIds("explore")).toEqual(["retrieval", "research", "thinking"]);
+    expect(workerIds("plan")).toEqual(["retrieval", "planning", "thinking"]);
+    expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "thinking"]);
   });
 
   it("gives an unaddressed worker only model-scoped corrections while bulk distribution is off", () => {
@@ -102,7 +105,7 @@ describe("vendored philosophy: delivery", () => {
 
   it("delivers a model-scoped layer to a worker regardless of the bulk switch", () => {
     const result = compose({ role: "worker", agent: "general-purpose", model: SCOPED_MODEL });
-    expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall", "thinking"]);
+    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
   });
 
   it("keeps deepseek worker toolcall when the dispatch tool is absent", () => {
@@ -193,6 +196,46 @@ describe("vendored philosophy: delivery", () => {
       expect(planning, String(rule)).toMatch(rule);
   });
 
+  it("skips retrieval discipline in a project that mounts no retrieval", () => {
+    // The layer is advice about choosing between two kinds of search. Where the second kind
+    // does not exist it is not merely unnecessary, it is false — so it is gated on the tool
+    // rather than shipped with an `absent` fallback.
+    const withoutIndex = ALL_TOOLS.filter((t) => t !== capabilities.capabilities.code_search.tool);
+    const result = compose({ activeTools: withoutIndex });
+    expect(result.included.map((l) => l.id)).not.toContain("retrieval");
+    expect(result.skipped.find((s) => s.id === "retrieval")?.reason).toMatch(
+      /needs a tool this session does not have/,
+    );
+    expect(result.text).not.toContain("{{");
+  });
+
+  it("names the tell that an exact search was the wrong question", () => {
+    // The drift is one-directional and the correction has to be actionable mid-search, not a
+    // taxonomy: the trigger is the boss's own second keyword guess.
+    const retrieval = layers.find((l) => l.id === "retrieval")!.body;
+    expect(retrieval).toMatch(/second keyword is the tell/);
+    expect(retrieval).toMatch(/Refs before bodies/);
+    // Nothing else may re-define searching as the exact matcher alone; that framing in
+    // `toolcall` is what kept the index unused after it shipped.
+    expect(layers.find((l) => l.id === "toolcall")!.body).toMatch(
+      /Searching for a string you can name/,
+    );
+  });
+
+  it("makes review and empirical acceptance concurrent rather than sequential", () => {
+    // A reviewer at high effort is one of the longest wall-clock workers in the system, and
+    // the boss holds the only observation surfaces. Serializing them idles the one role that
+    // cannot be delegated for the duration of the one worker that takes longest.
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(orchestration).toMatch(/two evidence streams, not two stages/);
+    expect(orchestration).toMatch(/belongs there, never on the test/);
+    const debugloop = layers.find((l) => l.id === "debugloop")!.body;
+    expect(debugloop).toMatch(/A running reviewer is a window, not a queue/);
+    expect(layers.find((l) => l.id === "fanout")!.body).toMatch(
+      /sitting out a long review or other read-only worker/,
+    );
+  });
+
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
     expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
     expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
@@ -263,7 +306,7 @@ describe("vendored philosophy: delivery", () => {
     // Same bypass `requires-models` layers get: the bulk switch declines to buy judgement
     // prefix, not a correction that keeps the worker's own model from misbehaving.
     const result = compose({ role: "worker", agent: "general-purpose", model: "kimi-coding/k3-256k" });
-    expect(result.included.map((l) => l.id)).toEqual(["craft", "thinking"]);
+    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "thinking"]);
   });
 
   it("keeps the boss's whole prefix inside budget", () => {
@@ -288,7 +331,10 @@ describe("vendored philosophy: delivery", () => {
     // full in both `planning` and `orchestration`, and consolidating it into `planning`
     // returned more room than the recon-tier rule spent. The recon rule keeps its place; the
     // budget keeps its meaning. Prefer that trade to another entry in this list.
+    // Raised to 16700 for the retrieval layer plus the review/acceptance concurrency rule:
+    // both correct a drift that was costing more than their prose does — an unused index and
+    // a boss idling through the longest worker in the system.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(15400);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(16700);
   });
 });

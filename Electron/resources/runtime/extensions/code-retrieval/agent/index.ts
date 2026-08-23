@@ -32,6 +32,9 @@ type ExtensionAPI = {
     name: string;
     label?: string;
     description: string;
+    /** One line under Pi's `Available tools:`. Absent means the model meets the tool only as
+     *  a schema in an array, with no steering about when it is the right call. */
+    promptSnippet?: string;
     parameters: Record<string, unknown>;
     execute: (
       toolCallId: string,
@@ -176,8 +179,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_search",
     label: "Code search",
+    promptSnippet: "Search code by meaning when grep would need a keyword guess",
     description:
-      "Search the project (exact / symbol / semantic). Returns compressed R# refs (top 12 inline). Use read_spans to fetch bodies. Falls back to grep when the index sidecar is down.",
+      "Find code by meaning when you cannot name the string you are looking for — \"where does the session token get refreshed\", \"what handles retry on a 429\". Also does exact and symbol matching, so it is the right call the moment grep would need a second keyword guess. Returns ranked compressed R# refs (top 12 inline), never file bodies; pull the ones worth reading with read_spans. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
     parameters: {
       type: "object",
       properties: {
@@ -223,8 +227,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_nav",
     label: "Code nav",
+    promptSnippet: "Symbol graph: definition, callers, implementations",
     description:
-      "Navigate symbols (definition / references / …). Uses the symbol-layer hook when present; otherwise degrades to a stub.",
+      "Answer the symbol-graph questions text search flattens: where a symbol is defined, who calls it, what implements it. Prefer it over grepping a symbol name, which returns the definition, every call site and every passing mention as one undifferentiated list. Degrades to a stub when the symbol layer is unavailable.",
     parameters: {
       type: "object",
       properties: {
@@ -311,8 +316,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "repo_map",
     label: "Repo map",
+    promptSnippet: "Map an unfamiliar tree before opening files",
     description:
-      "Token-budgeted signature / import / call-edge map. Uses the symbol-layer hook when present.",
+      "First move in a tree whose layout you cannot yet name: a token-budgeted map of signatures, imports and call edges across the project. Cheaper than walking directories and opening files to find out what is in them. Uses the symbol-layer hook when present.",
     parameters: {
       type: "object",
       properties: {
@@ -354,8 +360,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "read_spans",
     label: "Read spans",
+    promptSnippet: "Fetch the span bodies a prior code_search ranked",
     description:
-      "Fetch code spans by stable R# ref from a prior search/map. Session seen-range ledger: a range already returned is cited, not re-inlined. Honors ext.code-retrieval.tokenBudget (default 4000).",
+      "Second half of a search: fetch the bodies of spans a prior code_search / repo_map ranked, by stable R# ref. Read the ranked list first, decide which spans deserve context, then pull only those — that ordering is what keeps a search cheap. A range already returned this session is cited, not re-inlined. Honors ext.code-retrieval.tokenBudget (default 4000).",
     parameters: {
       type: "object",
       properties: {

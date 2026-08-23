@@ -35,6 +35,17 @@ own work, and delegating a piece of it delegates it to someone who cannot perfor
 6. A failed re-check goes back to the same named worker with the new evidence. Never a fresh
    worker, never a quick patch of your own.
 
+## A running reviewer is a window, not a queue
+
+Step 5 and a code review are the same turn's work. They answer different questions — *does it
+work* against *is this the right change* — and neither answer tells the other where to look,
+so there is nothing here to serialize. Send the review out and walk the screen while it reads.
+
+A reviewer is among the longest wall-clock workers you have, and its whole duration is time in
+which nothing is asked of you. Sitting through it with the one check nobody else can perform
+still undone spends precisely what delegation was supposed to buy. The same holds for any long
+read-only worker: while one is out, the observation surfaces are still yours and still idle.
+
 ## Carry the evidence, do not summarize it
 
 You are the only one who saw it, so your summary is the only copy — and a summary is where

@@ -58,6 +58,26 @@
       "tool": "browser",
       "required": false,
       "absent": "an in-app browser"
+    },
+    "code_search": {
+      "tool": "code_search",
+      "required": false,
+      "absent": "a `grep` sweep with several keyword guesses"
+    },
+    "code_nav": {
+      "tool": "code_nav",
+      "required": false,
+      "absent": "`grep` for the symbol name and read the hits apart yourself"
+    },
+    "repo_map": {
+      "tool": "repo_map",
+      "required": false,
+      "absent": "`ls` plus a few reads to work out what lives where"
+    },
+    "read_spans": {
+      "tool": "read_spans",
+      "required": false,
+      "absent": "`read` on the files a search named"
     }
   },
   "agents": [

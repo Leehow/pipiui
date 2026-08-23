@@ -5,8 +5,8 @@ A layered working philosophy for the [pi coding agent](https://github.com/earend
 Philosophy is the part of an agent setup that has nothing to do with which frontend you happen
 to be using — it is how the agent *thinks*: when to delegate, when to search, what counts as
 evidence, when it is allowed to stop. So it lives in pi, not in any one UI. Install it once and
-a bare terminal session, a GUI frontend, and every dispatched worker load the same four layers
-from the same config.
+a bare terminal session, a GUI frontend, and every dispatched worker load the same layers from
+the same config — each one addressed to whoever can act on it.
 
 ## Install
 
@@ -30,21 +30,36 @@ To try it without touching your settings:
 pi -e /path/to/pipi-philosophy/philosophy.ts
 ```
 
-## The four layers
+## The layers
 
-The split runs along one line: **delete `foundation` and the agent becomes untrustworthy;
-delete `method` and it stays trustworthy but works badly.** Foundation is what you are owed as
-the person it works for. Method is craft.
+The split that matters most runs along one line: **delete `foundation` and the agent becomes
+untrustworthy; delete the rest and it stays trustworthy but works badly.** Foundation is what
+you are owed as the person it works for. Everything after it is craft.
 
-| id | 中文名 | What it governs | Scope |
+The rest of the split is by audience. A layer is written for whoever can act on it, which is
+why `craft` reaches the worker that writes code and `orchestration` does not: a rule delivered
+to someone who cannot perform it is prompt weight and nothing else.
+
+| id | 中文名 | What it governs | Delivered to |
 |---|---|---|---|
 | `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + lead + worker |
-| `method` | 工作方式哲学 | Form your own read *first*, then cross-validate outside; process weight matches the work; plans are lists; define the success criterion before starting; write the minimum that solves it; change only what the task requires | main + lead + worker |
+| `method` | 工作方式哲学 | Process weight matches the work; research-only requests are terminal | main + lead |
+| `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + lead + every code-reading agent |
+| `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + lead + `explore` |
+| `planning` | 规划哲学 | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + lead + `plan` |
+| `craft` | 编码手艺哲学 | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + lead + `general-purpose` |
+| `debugloop` | 调试回路哲学 | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main + lead |
+| `domain` | 领域记忆哲学 | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main + lead |
 | `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main + lead |
-| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly (clear briefs and partitions manage wide waves); worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
+| `same-turn` | 同轮调用纪律 | Every call whose arguments you already know goes out in the same message | main + lead |
+| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly; worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
+| `toolcall` | 工具调用纪律 | Calling the tool *is* the work; act on the first turn; "I can't" has to name something | one model family (see below) |
+| `thinking` | 思考纪律 | Decide, act, verify — once each; resolve an unknown with the cheapest sufficient probe | every family measured to sprawl |
 
-`fanout` requires `orchestration`. `orchestration` and `fanout` require a dispatch tool and are
-skipped entirely in a session that has none — the judgement layers keep working.
+`fanout` requires `orchestration`. `orchestration`, `same-turn` and `fanout` require a dispatch
+tool and are skipped entirely in a session that has none; `retrieval` requires a code-search
+tool and is skipped in a project that mounts none — the judgement layers keep working either
+way.
 
 Turning off orchestration does **not** cost you the foundation. That separation is the main
 reason this package exists: "don't ask ritual confirmations" and "a failed attempt is not the
@@ -63,6 +78,10 @@ no session restart:
   "scopes": { "worker": false }
 }
 ```
+
+`layers` is a set of overrides, not a roster: a layer absent from the map is on. The four
+named above are the ones the defaults spell out, and listing any other id with `false` turns
+that one off just the same.
 
 `scopes.worker` is off by default. Dispatched workers already carry their own agent prompt and
 a brief; adding the judgement layers costs roughly 1.6k tokens of prefix per worker, so turn it
@@ -125,11 +144,11 @@ that keeps the worker's own model from misbehaving.
 ## When pi changes
 
 Layer bodies never name a pi tool. They reference capabilities — `{{delegate}}`, `{{search}}`,
-`{{fetch}}`, `{{browser}}`, `{{delegate_status}}` — and `capabilities.json` is the single place
-that maps a capability to the tool name of the day. A test fails the build if a body names a
-tool directly.
+`{{fetch}}`, `{{browser}}`, `{{code_search}}`, `{{delegate_status}}` — and `capabilities.json`
+is the single place that maps a capability to the tool name of the day. A test fails the build
+if a body names a tool directly.
 
-So when pi renames or drops a tool, you edit two lines of JSON and the four bodies stay
+So when pi renames or drops a tool, you edit two lines of JSON and every body stays
 untouched. When a tool disappears entirely:
 
 - a layer that lists it in `requires-capabilities` is skipped, with the reason shown in
@@ -155,14 +174,22 @@ after a pi upgrade and you will see immediately whether anything came unstuck.
 
 ## Development
 
+This copy is vendored into PipiUI rather than installed from npm, so its `test/` directory does
+not travel with it. The suite that guards this tree lives with the host:
+
 ```bash
-node --test test/*.test.ts
+npx vitest run packages/pi-backend/test/philosophy-runtime.test.ts
 ```
+
+Run it from `Electron/`. It reads these layer files off disk and pins what the standalone
+package's own tests cannot see: which layers each dispatched agent is addressed, that no body
+names a pi tool directly, that the plan lifecycle is stated in exactly one layer, and the
+boss's total prefix size.
 
 The composition core (`compose.ts`) imports nothing from pi, so every rule that matters —
 placeholder resolution, dependency and scope filtering, capability degradation, user overrides
-— is tested with plain node and no API calls. `philosophy.ts` is the only file that touches the
-runtime.
+— is testable with plain node and no API calls. `philosophy.ts` is the only file that touches
+the runtime.
 
 ## Credits
 

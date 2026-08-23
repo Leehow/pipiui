@@ -100,8 +100,9 @@ spent.
 
 Named anti-patterns: dispatching A and then "B after A is done" when they have no real
 dependency or shared code-region conflict; one worker told to cover several independent sub-items; idling on a single worker
-while dispatchable work is queued; waiting for the user to say "in parallel" before doing what
-this layer already requires.
+while dispatchable work is queued; sitting out a long review or other read-only worker while
+the acceptance check only you can run goes unperformed; waiting for the user to say "in
+parallel" before doing what this layer already requires.
 
 ## Wide waves stay under the boss
 
