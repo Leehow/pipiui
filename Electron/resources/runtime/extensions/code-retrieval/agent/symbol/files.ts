@@ -11,7 +11,8 @@ export interface SourceEntry {
   size: number;
 }
 
-const DEFAULT_SKIP = new Set([
+/** Directory names skipped by default. Matched as a single path segment only. */
+export const DEFAULT_SKIP_DIRS = [
   ".git",
   ".hg",
   ".svn",
@@ -22,15 +23,27 @@ const DEFAULT_SKIP = new Set([
   "__pycache__",
   ".mypy_cache",
   ".pytest_cache",
+  "out",
   "dist",
   "build",
+  "release",
+  "coverage",
+  ".next",
+  ".turbo",
+  ".cache",
   "target",
   "vendor",
   ".tox",
   ".eggs",
-]);
+] as const;
+
+const DEFAULT_SKIP = new Set<string>(DEFAULT_SKIP_DIRS);
 
 const MAX_FILE_BYTES = 512 * 1024;
+
+function pathSegments(relPath: string): string[] {
+  return relPath.split(sep).join("/").split("/").filter(Boolean);
+}
 
 function skippedDir(name: string): boolean {
   return DEFAULT_SKIP.has(name) || name.startsWith(".");
@@ -38,13 +51,16 @@ function skippedDir(name: string): boolean {
 
 function matchesExclude(relPath: string, globs: string[]): boolean {
   const norm = relPath.split(sep).join("/");
+  const segs = pathSegments(relPath);
   for (const raw of globs) {
     const g = raw.replace(/\\/g, "/").replace(/^\.\//, "");
     if (!g) continue;
     if (g.includes("*")) {
       const escaped = g.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "§§").replace(/\*/g, "[^/]*").replace(/§§/g, ".*");
       if (new RegExp(`^${escaped}$`).test(norm) || new RegExp(escaped).test(norm)) return true;
-    } else if (norm === g || norm.startsWith(`${g}/`) || norm.includes(`/${g}/`)) {
+    } else if (g.includes("/")) {
+      if (norm === g || norm.startsWith(`${g}/`)) return true;
+    } else if (segs.includes(g)) {
       return true;
     }
   }
