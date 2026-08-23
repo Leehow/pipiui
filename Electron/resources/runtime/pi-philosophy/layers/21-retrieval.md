@@ -1,7 +1,7 @@
 ---
 id: retrieval
 name: 代码检索哲学
-summary: 点得出名字就精确搜，只有意图就语义检索；先读 ref 再取正文；陌生仓库先要地图。
+summary: 点得出 token 就精确搜，只描述得出就交给加权检索；先读 ref 再取正文；陌生仓库先要地图。
 order: 21
 requires: []
 requires-capabilities: [code_search]
@@ -17,15 +17,22 @@ something that appears literally in the file you want. Match it literally: `grep
 are exact, complete and instant, and reaching past them for something cleverer is the same
 mistake as running a heavy workflow on a one-line fix.
 
-**You only have the intent.** *Where does the login state get invalidated. What handles retry
-on a 429. Which layer owns the merge.* You cannot spell the answer, so a literal matcher
-cannot find it — it returns every file containing the word `login` and none of the reasoning.
-{{code_search}} is what that question has always needed.
+**You can describe it in several words but cannot name the one token.** *Where the login
+state gets invalidated. What handles retry on a 429. Which layer owns the merge.* A literal
+matcher needs you to guess the exact word the author chose, and one wrong guess returns
+nothing while one broad guess returns the whole repository. {{code_search}} weighs your terms
+against each other inside symbol boundaries and hands back ranked spans, so the sentence you
+can already say does the work the guess was doing.
 
-The drift runs one way only: taking an open question to the exact matcher, then compensating
-with a dozen greps. Your own second keyword is the tell — if the first pattern missed and you
-are reaching for a synonym, the question was semantic before you typed either one. Switch,
-rather than guess again.
+Be exact about what that is and is not. It ranks the words you gave it; it does not read your
+mind, and this build carries no semantic index. If the answer is written in vocabulary you did
+not use, it comes back empty — and that emptiness is worth more than a miss, because it tells
+you your words are wrong rather than that the code is absent. Change vocabulary, not tool.
+
+The drift runs one way only: taking a describable question to the exact matcher, then
+compensating with a dozen greps. Your own second keyword is the tell — if the first pattern
+missed and you are reaching for a synonym, you are hand-rolling the weighing that one
+{{code_search}} call does properly. Hand it the sentence instead of guessing again.
 
 **Relationships are their own question**: where a symbol is defined, who calls it, what
 implements it. Text search flattens the definition, every call, and every mention in a comment
@@ -50,10 +57,16 @@ Walking directories and opening files to discover what they are is that same map
 hand, at full price — and it is what makes recon expensive enough that it has to be delegated
 in the first place.
 
-## It degrades by itself, so the attempt is never the expensive bet
+## A note about the route is not a verdict on the answer
 
-These tools fall back on their own — to text search when the index is not up, to a plain
-report when the symbol layer is vacant — and each one says so in what it returns. A degraded
-answer is the answer you would have gotten anyway, so trying costs nothing over the search you
-were about to run regardless. "The index might not be ready" is never a reason to skip the
-call; the call is how you find out.
+These tools narrate what they did, and the two kinds of narration mean different things.
+*"Ranked by term match, not by meaning"* describes how an answer was produced — it is not a
+warning that the answer is wrong. A real degradation is stated separately and in its own
+words: the index is down, the symbol layer is vacant, nothing matched at all. Reading the
+first as the second is how a correct set of spans gets thrown away and re-derived by hand.
+
+They also fall back on their own — to text search when the index is not up, to a plain report
+when the symbol layer is vacant. So a degraded answer is still the answer you would have
+gotten anyway, and trying costs nothing over the search you were about to run regardless.
+"The index might not be ready" is never a reason to skip the call; the call is how you find
+out.

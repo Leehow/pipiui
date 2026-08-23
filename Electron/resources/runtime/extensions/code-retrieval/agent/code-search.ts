@@ -43,9 +43,8 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
 
     if (open) {
       notes.push(
-        "Semantic retrieval is phase 4 and is not enabled; using lexical+symbol fallback.",
+        "Ranked by weighted term match inside symbol spans, not by meaning (semantic retrieval is not enabled in this build): these hits are as good as the words you chose.",
       );
-      degraded = true;
     }
 
     if (useLexicalFallback) {
@@ -93,7 +92,9 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       const message = [
         `No hits for ${JSON.stringify(query)} (mode ${routed}).`,
         ...notes,
-        degraded ? "Not pretending this was a successful empty index result." : "",
+        degraded
+          ? "This is a real miss, not an empty index: none of those terms occur in indexed code. That is information about your vocabulary — re-running the same words through grep will miss too."
+          : "",
       ]
         .filter(Boolean)
         .join("\n");

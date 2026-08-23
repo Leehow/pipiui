@@ -209,6 +209,22 @@ describe("vendored philosophy: delivery", () => {
     expect(result.text).not.toContain("{{");
   });
 
+  it("promises only the retrieval this build actually has", () => {
+    // The first version of this layer told workers `code_search` was for questions they
+    // "cannot spell" — semantic retrieval, which is not enabled here. They obeyed, sent it the
+    // one shape it cannot answer, got "No hits", and went back to grep 22:1. Prose that
+    // oversells a tool trains the model out of using it, so the layer has to state the ranking
+    // it really does and what an empty result means.
+    const retrieval = layers.find((l) => l.id === "retrieval")!.body;
+    expect(retrieval).toMatch(/does not read your\s*\n?mind/);
+    expect(retrieval).toMatch(/no semantic index/);
+    expect(retrieval).toMatch(/Change vocabulary, not tool/);
+    expect(retrieval).not.toMatch(/what that question has always needed/);
+    // A route note and a failure are different claims; conflating them is what discarded
+    // correct spans.
+    expect(retrieval).toMatch(/not a verdict on the answer/);
+  });
+
   it("names the tell that an exact search was the wrong question", () => {
     // The drift is one-directional and the correction has to be actionable mid-search, not a
     // taxonomy: the trigger is the boss's own second keyword guess.
@@ -334,7 +350,11 @@ describe("vendored philosophy: delivery", () => {
     // Raised to 16700 for the retrieval layer plus the review/acceptance concurrency rule:
     // both correct a drift that was costing more than their prose does — an unused index and
     // a boss idling through the longest worker in the system.
+    // Raised again to 16900: the retrieval layer's first version promised semantic search the
+    // build does not have, so workers sent it the one question shape it cannot answer, got
+    // nothing, and learned to distrust it. Saying what the tool actually ranks on — and what
+    // an empty result means — costs the difference.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(16700);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(16900);
   });
 });

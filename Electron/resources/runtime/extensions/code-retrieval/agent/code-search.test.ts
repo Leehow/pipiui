@@ -115,6 +115,44 @@ test("multi-term hybrid finds registeredExtensionsForSpawn / mergedExtensionOver
   });
 });
 
+test("taking the lexical+symbol route does not itself degrade a hit", async () => {
+  // The route taken is not the same claim as the quality of the answer. Marking every open
+  // query degraded put a "this failed" banner on correct spans: measured across one session,
+  // workers who got twelve right hits under that banner went back to grep 22:1.
+  //
+  // Differential rather than absolute: a fixture with no sidecar degrades its exact layer for
+  // real, and that is not what this pins. What must hold is that an open query and a short
+  // identifier — same fixture, same missing sidecar, both finding code — carry the same flag.
+  await withFixture(async (root) => {
+    const prev = symbolLayer.searchSymbols;
+    symbolLayer.searchSymbols = async () => [
+      { path: "src/spawn.ts", startLine: 4, endLine: 7, symbol: "mergedExtensionOverlay", score: 3 },
+    ];
+    const run = (query: string) =>
+      executeCodeSearch({
+        query,
+        mode: "auto",
+        projectRoot: root,
+        registry: new RefRegistry(),
+        excludeGlobs: [],
+        sidecar: undefined,
+      });
+    try {
+      const open = await run("where is a disabled extension skipped when mounting tools?");
+      const exact = await run("mergedExtensionOverlay");
+      assert.ok(open.details.hits.length > 0, "fixture should be reachable by its own words");
+      assert.ok(exact.details.hits.length > 0);
+      assert.equal(open.details.degraded, exact.details.degraded);
+      // It still says what the ranking is and is not, so the caller can judge an off-target hit.
+      assert.match(open.content[0]!.text, /not by meaning/);
+      assert.doesNotMatch(open.content[0]!.text, /Not pretending/);
+    } finally {
+      if (prev) symbolLayer.searchSymbols = prev;
+      else delete symbolLayer.searchSymbols;
+    }
+  });
+});
+
 test("empty open query is honest degraded, not a silent miss", async () => {
   await withFixture(async (root) => {
     const result = await executeCodeSearch({

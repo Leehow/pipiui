@@ -179,9 +179,9 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_search",
     label: "Code search",
-    promptSnippet: "Search code by meaning when grep would need a keyword guess",
+    promptSnippet: "Search code from a description when grep would need a keyword guess",
     description:
-      "Find code by meaning when you cannot name the string you are looking for — \"where does the session token get refreshed\", \"what handles retry on a 429\". Also does exact and symbol matching, so it is the right call the moment grep would need a second keyword guess. Returns ranked compressed R# refs (top 12 inline), never file bodies; pull the ones worth reading with read_spans. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
+      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Weighs your terms against each other inside symbol boundaries and returns ranked compressed R# refs (top 12 inline), never file bodies; pull the ones worth reading with read_spans. It is the right call the moment grep would need a second keyword guess. It ranks the words you give it and has no semantic index in this build, so a query whose answer uses none of your words comes back empty — that means change vocabulary, not tool. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
     parameters: {
       type: "object",
       properties: {
