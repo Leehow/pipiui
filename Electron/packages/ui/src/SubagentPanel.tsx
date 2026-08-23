@@ -12,6 +12,7 @@ import { AssistantTranscriptContent, type AssistantTranscriptMessage, type Trans
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
 import { diagnoseAgentProgress } from './agent-stall-diagnostics'
+import { formatFinalizationLine, liveRunningProgressLine } from './agent-finalization'
 import { staleRunningAgentIDs, statusChannelWarningText } from './subagent-status-check'
 
 type Log = {
@@ -49,6 +50,8 @@ function isActive(agent: Pick<Agent, 'state'>) {
 }
 
 function stateText(agent: Agent) {
+  const closing = formatFinalizationLine(agent.diagnostics)
+  if (closing && (agent.state === 'running' || agent.state === 'stalled')) return closing
   return agent.stalled || agent.state === 'stalled'
     ? '卡住'
     : ({ running: '运行中', ok: '已完成', failed: '失败', aborted: '已中止', interrupted: '已中断', stalled: '卡住' }[agent.state])
@@ -255,6 +258,14 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
 	if (activeChildCount > 0) {
 		return { severity: 'active', text: `正在协调 · ${activeChildCount} 个子 agent 运行中` }
 	}
+  const closing = liveRunningProgressLine({
+    state: agent.state,
+    diagnostics: agent.diagnostics,
+    activityActive: agent.activityActive,
+    listSubtitle: agent.listSubtitle,
+    now,
+  })
+  if (closing) return { severity: 'active', text: closing }
   const quietSeconds = agent.updatedAt === undefined ? undefined : Math.max(0, Math.floor((now - agent.updatedAt) / 1000))
   const activityActive = agent.activityActive === true
   const rawActivity = activityActive ? visibleAgentText(agent.listSubtitle ?? '').trim() : ''
@@ -872,7 +883,18 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
   const subtitle = agentListSubtitle(agent)
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
   const stalled = agent.stalled || agent.state === 'stalled'
-	const live = active ? liveAgentStatus(agent, now, activeChildCount) : undefined
+  const closing = liveRunningProgressLine({
+    state: agent.state,
+    diagnostics: agent.diagnostics,
+    activityActive: agent.activityActive,
+    listSubtitle: agent.listSubtitle,
+    now,
+  })
+	const live = closing
+    ? { severity: 'active' as const, text: closing }
+    : active
+      ? liveAgentStatus(agent, now, activeChildCount)
+      : undefined
   const liveTokens = active ? formatTokens(agentTokenTotal(agent)) : ''
 
   return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${agent.agentId}`}>
@@ -887,7 +909,7 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
           <ModelFamilyIcon agent={agent} />
           <strong>{agentDisplayName(agent)}</strong>
 		  {childCount > 0 && <em className="agent-leader-badge">主管 · {childCount} 个子 agent</em>}
-          {stalled && <em className="stalled-badge">{agent.stalledIdleSec ? `卡住 ${agent.stalledIdleSec}s` : '卡住'}</em>}
+          {stalled && !closing && <em className="stalled-badge">{agent.stalledIdleSec ? `卡住 ${agent.stalledIdleSec}s` : '卡住'}</em>}
           {worktree && <em className={`worktree-badge ${worktree.lifecycle}`}>{worktree.text}</em>}
           {liveTokens && <small className="agent-row-tokens" data-testid={`agent-row-tokens-${agent.agentId}`}>{liveTokens}</small>}
           {active && <RunningElapsed startedAt={agent.startedAt} />}
@@ -946,7 +968,18 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   const resolvedModel = modelLabel(agent)
   const modelFamilyLabel = modelFamily(agent).family
   const activity = localizedTaskSummary(agent.listSubtitle || agent.title || agent.task)
-	const live = isActive(agent) ? liveAgentStatus(agent, now, activeChildCount) : undefined
+  const closing = liveRunningProgressLine({
+    state: agent.state,
+    diagnostics: agent.diagnostics,
+    activityActive: agent.activityActive,
+    listSubtitle: agent.listSubtitle,
+    now,
+  })
+	const live = closing
+    ? { severity: 'active' as const, text: closing }
+    : isActive(agent)
+      ? liveAgentStatus(agent, now, activeChildCount)
+      : undefined
   const detailTitle = detailTaskTitle(agent, output)
   const transcript = agentTranscript(agent, output)
 

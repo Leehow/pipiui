@@ -457,6 +457,302 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest().activityEndedAt).toBeGreaterThan(0);
   });
 
+  it("does not refresh business updatedAt on phase-only diagnostics", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({ ...UPDATE, activity: "bash git diff HEAD -- a.ts", activityActive: true });
+    const updatedAt = latest().updatedAt;
+    expect(updatedAt).toEqual(expect.any(Number));
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 6,
+        finalizationPhase: "final-received",
+        phaseSince: Date.now(),
+      },
+    });
+    expect(latest().updatedAt).toBe(updatedAt);
+    expect(latest().diagnostics?.finalizationPhase).toBe("final-received");
+    expect(latest().activityActive).toBe(true);
+    expect(latest().listSubtitle).toBe("bash git diff HEAD -- a.ts");
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: { eventSeq: 7, finalizationPhase: "verifying", phaseSince: Date.now() },
+    });
+    expect(latest().updatedAt).toBe(updatedAt);
+    expect(latest().diagnostics?.finalizationPhase).toBe("verifying");
+  });
+
+  it("keeps the newer finalization phase when diagnostics arrive out of order", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    const updatedAt = latest().updatedAt;
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 8,
+        processGeneration: "11:100",
+        finalizationPhase: "cleaning",
+        phaseSince: 40,
+      },
+    });
+    expect(latest().diagnostics?.finalizationPhase).toBe("cleaning");
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 6,
+        processGeneration: "11:100",
+        finalizationPhase: "merging",
+        phaseSince: 20,
+      },
+    });
+    expect(latest().diagnostics?.finalizationPhase).toBe("cleaning");
+    expect(latest().diagnostics?.phaseSince).toBe(40);
+    expect(latest().updatedAt).toBe(updatedAt);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 9,
+        processGeneration: "11:100",
+        finalizationPhase: "post-verify",
+        phaseSince: 60,
+      },
+    });
+    expect(latest().diagnostics?.finalizationPhase).toBe("post-verify");
+    expect(latest().updatedAt).toBe(updatedAt);
+    expect(latest().activityActive).toBeUndefined();
+    const receipt = latest().diagnostics?.hostReceivedAt;
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 11,
+        processGeneration: "11:100",
+        finalizationPhase: "merging",
+        phaseSince: 20,
+        cpuVerdict: "gone",
+        lastOutputAt: 99,
+        exitReason: "child-close:1",
+      },
+    });
+    expect(latest().diagnostics).toMatchObject({
+      eventSeq: 9,
+      finalizationPhase: "post-verify",
+      phaseSince: 60,
+    });
+    expect(latest().diagnostics?.cpuVerdict).toBeUndefined();
+    expect(latest().diagnostics?.lastOutputAt).toBeUndefined();
+    expect(latest().diagnostics?.exitReason).toBeUndefined();
+    expect(latest().diagnostics?.hostReceivedAt).toBe(receipt);
+    expect(latest().updatedAt).toBe(updatedAt);
+  });
+
+  it("rejects an older generation high-seq replay and lets a new generation restart from generating",
+    async () => {
+      const { deliver, latest } = await harness();
+      deliver(START);
+      const updatedAt = latest().updatedAt;
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 8,
+          processGeneration: "11:200",
+          finalizationPhase: "cleaning",
+          phaseSince: 40,
+          mergeElapsedMs: 12,
+        },
+      });
+      expect(latest().diagnostics?.finalizationPhase).toBe("cleaning");
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 99,
+          processGeneration: "11:100",
+          finalizationPhase: "generating",
+          phaseSince: 90,
+          cpuVerdict: "gone",
+          lastOutputAt: 88,
+        },
+      });
+      expect(latest().diagnostics).toMatchObject({
+        eventSeq: 8,
+        processGeneration: "11:200",
+        finalizationPhase: "cleaning",
+        mergeElapsedMs: 12,
+      });
+      expect(latest().diagnostics?.cpuVerdict).toBeUndefined();
+      expect(latest().updatedAt).toBe(updatedAt);
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 1,
+          processGeneration: "11:500",
+          finalizationPhase: "generating",
+          phaseSince: 5,
+          cpuVerdict: "working",
+        },
+      });
+      expect(latest().diagnostics).toMatchObject({
+        eventSeq: 1,
+        processGeneration: "11:500",
+        finalizationPhase: "generating",
+        phaseSince: 5,
+        cpuVerdict: "working",
+      });
+      expect(latest().diagnostics?.mergeElapsedMs).toBeUndefined();
+      expect(latest().updatedAt).toBe(updatedAt);
+    });
+
+  it("does not let a stale same-generation packet clear vanished marks or refresh receipt",
+    async () => {
+      const { backend, deliver, latest } = await harness();
+      deliver(START);
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 8,
+          processGeneration: "11:100",
+          finalizationPhase: "verifying",
+          phaseSince: 40,
+          cpuVerdict: "working",
+          lastOutputAt: 30,
+        },
+      });
+      const agents = (backend as unknown as { agents: Map<string, AgentSummary> }).agents;
+      const key = "session-1\u0000a1\u0000r1";
+      const current = agents.get(key);
+      expect(current).toBeDefined();
+      agents.set(key, {
+        ...current!,
+        diagnostics: {
+          ...current!.diagnostics,
+          persistedRunning: true,
+          reconciliation: "interrupted",
+          lastPhaseError: "process-missing",
+        },
+      });
+      const receipt = agents.get(key)?.diagnostics?.hostReceivedAt;
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 3,
+          processGeneration: "11:100",
+          finalizationPhase: "merging",
+          phaseSince: 10,
+          cpuVerdict: "gone",
+          lastOutputAt: 99,
+          persistedRunning: false,
+          reconciliation: "none",
+          lastPhaseError: null,
+        },
+      });
+      expect(latest().diagnostics).toMatchObject({
+        eventSeq: 8,
+        finalizationPhase: "verifying",
+        phaseSince: 40,
+        cpuVerdict: "working",
+        lastOutputAt: 30,
+        persistedRunning: true,
+        reconciliation: "interrupted",
+        lastPhaseError: "process-missing",
+      });
+      expect(latest().diagnostics?.hostReceivedAt).toBe(receipt);
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 9,
+          processGeneration: "11:100",
+          finalizationPhase: "verifying",
+          phaseSince: 40,
+          cpuVerdict: "working",
+        },
+      });
+      expect(latest().diagnostics?.eventSeq).toBe(9);
+      expect(latest().diagnostics?.persistedRunning).toBeUndefined();
+      expect(latest().diagnostics?.reconciliation).toBeUndefined();
+      expect(latest().diagnostics?.lastPhaseError).toBeUndefined();
+      expect(latest().diagnostics?.hostReceivedAt).toBeGreaterThan(receipt ?? 0);
+    });
+
+  it("records host receipt after done-await-host and clears activity on terminal", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 8,
+        finalizationPhase: "done-await-host",
+        phaseSince: 10,
+        verifyElapsedMs: 1500,
+        doneEventSeq: 8,
+      },
+    });
+    const before = latest().diagnostics?.hostReceivedAt;
+    expect(latest().state).toBe("running");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    deliver({
+      ...END,
+      activity: null,
+      activityActive: false,
+      diagnostics: {
+        eventSeq: 9,
+        finalizationPhase: "done-await-host",
+        verifyElapsedMs: 1500,
+        doneEventSeq: 8,
+      },
+    });
+    expect(latest().state).toBe("ok");
+    expect(latest().activityActive).toBe(false);
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().diagnostics?.hostReceivedAt).toBeGreaterThan(before ?? 0);
+    expect(latest().diagnostics?.verifyElapsedMs).toBe(1500);
+    expect(latest().diagnostics?.finalizationPhase).toBe("done-await-host");
+    expect(latest().diagnostics?.doneEventSeq).toBe(8);
+  });
+
+  it("clears running activity on interrupted and aborted terminals", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: { finalizationPhase: "reconciling", phaseSince: 1, lastPhaseError: "process-missing" },
+    });
+    deliver({ kind: "end", agentId: "a1", runId: "r1", ok: false, interrupted: true, output: "gone" });
+    expect(latest().state).toBe("interrupted");
+    expect(latest().activityActive).toBe(false);
+    expect(latest().diagnostics?.lastPhaseError).toBe("process-missing");
+    expect(latest().diagnostics?.hostReceivedAt).toEqual(expect.any(Number));
+  });
+
   it("replaces streaming usage totals instead of adding them", async () => {
     const { deliver, latest } = await harness();
     deliver(START);

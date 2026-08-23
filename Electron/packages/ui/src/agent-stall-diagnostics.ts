@@ -1,4 +1,5 @@
 import type { AgentDiagnostics, AgentState } from '@pipi/host-api'
+import { formatFinalizationLine, isTerminalFinalizingPhase } from './agent-finalization'
 
 export type StallDiagnosticKind =
   | 'output-recent'
@@ -9,6 +10,7 @@ export type StallDiagnosticKind =
   | 'seq-stale'
   | 'ui-quiet-only'
   | 'watchdog-stalled'
+  | 'finalizing'
   | 'healthy'
 
 export type StallDiagnosticView = {
@@ -31,6 +33,9 @@ export function diagnoseAgentProgress(input: {
     ? undefined
     : Math.max(0, Math.floor((input.now - input.updatedAt) / 1000))
 
+  if (isTerminalFinalizingPhase(d?.finalizationPhase)) {
+    return view('finalizing', formatFinalizationLine(d, input.now) ?? '子任务已进入收尾，不是模型静默卡住。', input, quietSeconds)
+  }
   if (d?.persistedRunning || d?.reconciliation === 'interrupted' || d?.generationMatch === false) {
     return view('generation-mismatch', '宿主或运行时进程世代已变化，这是重启后的遗留运行态，不是当前实时卡住。', input, quietSeconds)
   }
@@ -73,6 +78,13 @@ function view(
   const d = input.diagnostics
   const fields: Array<{ label: string; value: string }> = []
   push(fields, '诊断结论', conclusion)
+  if (d?.finalizationPhase) push(fields, '收尾阶段', d.finalizationPhase)
+  if (d?.phaseSince !== undefined) push(fields, '阶段已持续', ageLabel(input.now, d.phaseSince))
+  if (d?.verifyElapsedMs !== undefined) push(fields, '验证耗时', `${d.verifyElapsedMs}ms`)
+  if (d?.reconcileElapsedMs !== undefined) push(fields, '对账耗时', `${d.reconcileElapsedMs}ms`)
+  if (d?.mergeElapsedMs !== undefined) push(fields, '合并耗时', `${d.mergeElapsedMs}ms`)
+  if (d?.cleanupElapsedMs !== undefined) push(fields, '清理耗时', `${d.cleanupElapsedMs}ms`)
+  if (d?.lastPhaseError) push(fields, '阶段代码', d.lastPhaseError)
   if (d?.eventSeq !== undefined) push(fields, '事件序号', String(d.eventSeq))
   if (d?.seqGap !== undefined) push(fields, '序号间隔', String(d.seqGap))
   if (d?.processGeneration) push(fields, '运行时世代', d.processGeneration)

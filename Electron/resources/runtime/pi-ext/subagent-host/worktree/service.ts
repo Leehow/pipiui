@@ -97,6 +97,8 @@ export type WorktreeFinalizationServiceOptionsV1 = {
 	onMerged?: (event: WorktreeMergedEventV1) => void | Promise<void>;
 	/** Live/persisted leases must block post-merge worktree removal. */
 	lease?: LeftoverWorktreeLeaseHooksV1;
+	/** Observational closeout stages. Must never fail finalization. */
+	onProgress?: (phase: "reconciling" | "merging" | "cleaning" | "post-verify") => void;
 };
 
 export type WorktreeMergedEventV1 = {
@@ -215,6 +217,7 @@ export class WorktreeFinalizationServiceV1 {
 	private readonly logger: WorktreeFinalizationLoggerV1;
 	private readonly postMergeVerify?: PostMergeVerifyRunnerV1;
 	private readonly onMerged?: WorktreeFinalizationServiceOptionsV1["onMerged"];
+	private readonly onProgress?: WorktreeFinalizationServiceOptionsV1["onProgress"];
 	private readonly lease?: LeftoverWorktreeLeaseHooksV1;
 	private readonly verifyTimeoutMs: number;
 	private readonly abortSignal?: AbortSignal;
@@ -234,7 +237,16 @@ export class WorktreeFinalizationServiceV1 {
 		this.logger = options.logger ?? {};
 		this.postMergeVerify = options.postMergeVerify;
 		this.onMerged = options.onMerged;
+		this.onProgress = options.onProgress;
 		this.lease = options.lease;
+	}
+
+	private emitProgress(phase: "reconciling" | "merging" | "cleaning" | "post-verify"): void {
+		try {
+			this.onProgress?.(phase);
+		} catch {
+			/* progress is observational */
+		}
 	}
 
 	/** Reap settled leftover `.pi/worktrees` entries without racing a live finalization. */
@@ -308,6 +320,7 @@ export class WorktreeFinalizationServiceV1 {
 		const now = iso(this.clock);
 		const result = makeResult(input, now);
 		const attempt = (previous?.attempt ?? 0) + 1;
+		this.emitProgress("reconciling");
 		this.logger.debug?.("worktree-finalization-preflight", { agentId: input.agentId, runId: input.runId, attempt });
 		let inspection;
 		try {
@@ -348,6 +361,7 @@ export class WorktreeFinalizationServiceV1 {
 			return this.completeIntegrated(input, previous, result);
 		}
 
+		this.emitProgress("merging");
 		this.logger.info?.("worktree-finalization-merge", { agentId: input.agentId, runId: input.runId, branch: input.worktree.branch });
 		let preMergeHead: string | undefined;
 		try {
@@ -505,6 +519,7 @@ export class WorktreeFinalizationServiceV1 {
 		previous: WorktreeFinalizationStateV1 | undefined,
 		result: WorktreeFinalizationResultV1,
 	): Promise<WorktreeFinalizationStateV1> {
+		this.emitProgress("cleaning");
 		const cleanup = await this.cleanupAfterIntegration(input);
 		result.cleanup = cleanup.disposition;
 		appendMessages(result, cleanup.messages);
@@ -669,6 +684,7 @@ export class WorktreeFinalizationServiceV1 {
 
 	private async runPostMergeVerify(input: WorktreeFinalizationInputV1): Promise<VerifyOutcome> {
 		if (!verifyRequested(input)) return { kind: "none", postMerge: "not-requested" };
+		this.emitProgress("post-verify");
 		const request: PostMergeVerifyRequestV1 = {
 			mainCwd: input.mainCwd,
 			agentId: input.agentId,

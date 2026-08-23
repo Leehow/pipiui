@@ -3,6 +3,13 @@
  * tool arguments, or stdout/stderr text. Does not change stall/abort policy.
  */
 
+import {
+	type AgentFinalizationPhase,
+	type FinalizationFields,
+	isTerminalFinalizingPhase,
+	snapshotFinalizationFields,
+} from "./finalization-phase.ts";
+
 export type StallWatchdogDecision =
 	| "ignore"
 	| "output-recent"
@@ -15,7 +22,7 @@ export type StallWatchdogDecision =
 
 export type StallCpuVerdict = "working" | "no-progress" | "gone" | "unknown";
 
-export interface StallDiagnosticsState {
+export interface StallDiagnosticsState extends FinalizationFields {
 	processGeneration: string;
 	supervisorPid: number;
 	eventSeq: number;
@@ -34,7 +41,7 @@ export interface StallDiagnosticsState {
 	exitReason?: string;
 }
 
-export interface AgentDiagnosticsSnapshot {
+export interface AgentDiagnosticsSnapshot extends FinalizationFields {
 	agentId: string;
 	runId: string;
 	eventSeq: number;
@@ -178,6 +185,7 @@ export function classifyWatchdogProbe(input: {
 	stallNotifyCount: number;
 	childPid?: number;
 	finalizing: boolean;
+	finalizationPhase?: AgentFinalizationPhase;
 	cpuVerdict?: StallCpuVerdict;
 	lastOutputAt?: number;
 	lastActivityAt: number;
@@ -187,8 +195,13 @@ export function classifyWatchdogProbe(input: {
 	if (input.stallAction === "abort") {
 		return { decision: "final-abort", reason: "watchdog-abort" };
 	}
-	if (input.finalizing || input.cpuVerdict === "gone") {
-		return { decision: "process-exited", reason: input.finalizing ? "child-finalizing" : "cpu-tree-gone" };
+	if (input.finalizing || isTerminalFinalizingPhase(input.finalizationPhase) || input.cpuVerdict === "gone") {
+		return {
+			decision: "process-exited",
+			reason: input.finalizing || isTerminalFinalizingPhase(input.finalizationPhase)
+				? (input.finalizationPhase ? `child-finalizing:${input.finalizationPhase}` : "child-finalizing")
+				: "cpu-tree-gone",
+		};
 	}
 	if (input.childPid === undefined) {
 		return { decision: "no-process", reason: "no-child-pid" };
@@ -241,6 +254,7 @@ export function snapshotStallDiagnostics(input: {
 		...(input.state.lastWatchdogReason ? { watchdogReason: input.state.lastWatchdogReason } : {}),
 		...(input.state.abortReason ? { abortReason: input.state.abortReason } : {}),
 		...(input.state.exitReason ? { exitReason: input.state.exitReason } : {}),
+		...snapshotFinalizationFields(input.state),
 	};
 }
 

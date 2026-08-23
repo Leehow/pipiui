@@ -1,10 +1,19 @@
 import { memo } from 'react'
 import type { AgentSummary } from '@pipi/host-api'
+import { liveRunningProgressLine } from './agent-finalization'
 import type { LiveSubagentProjection } from './live-subagent-projection'
 import './live-subagent-card.css'
 
-function rowLine(agent: AgentSummary): string {
-  if (agent.state === 'running' || agent.state === 'stalled') return agent.activityActive === true && agent.listSubtitle?.trim() ? agent.listSubtitle.trim() : '思考中…'
+function rowLine(agent: AgentSummary, now = Date.now()): string {
+  if (agent.state === 'running' || agent.state === 'stalled') {
+    return liveRunningProgressLine({
+      state: agent.state,
+      diagnostics: agent.diagnostics,
+      activityActive: agent.activityActive,
+      listSubtitle: agent.listSubtitle,
+      now,
+    }) ?? (agent.activityActive === true && agent.listSubtitle?.trim() ? agent.listSubtitle.trim() : '思考中…')
+  }
   if (agent.state === 'ok') return `完成${agent.turns ? ` · ${agent.turns} turns` : ''}`
   if (agent.state === 'failed') return '失败'
   if (agent.state === 'aborted') return '已中止'

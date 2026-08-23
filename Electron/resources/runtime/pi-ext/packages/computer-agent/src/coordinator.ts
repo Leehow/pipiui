@@ -105,12 +105,26 @@ export type ComputerWorkerFailureCode = typeof COMPUTER_WORKER_FAILURE_CODES[num
 export const COMPUTER_WORKER_STALL_TIMEOUT_MS = 150_000;
 export const COMPUTER_LEADER_STALL_TIMEOUT_MS = 120_000;
 export const COMPUTER_LEADER_PROGRESS_GRACE_MS = 30_000;
+export const COMPUTER_TASK_OPTIONAL_SUMMARY_TIMEOUT_MS = 8_000;
+export const COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS = 2_000;
 
 type StallProgressOptions = {
   lastProgressAt: () => number | undefined;
   progressGraceMs: number;
   onExtended?: (deadlineAt: number) => void;
+  signal?: AbortSignal;
 };
+
+function clearStallTimer(timer: ReturnType<typeof setTimeout> | undefined): undefined {
+  if (!timer) return undefined;
+  clearTimeout(timer);
+  timer.unref?.();
+  return undefined;
+}
+
+function stallAbortSignal(signal?: AbortSignal | { signal?: AbortSignal }): AbortSignal | undefined {
+  return signal instanceof AbortSignal ? signal : signal?.signal;
+}
 
 async function runWithStallDeadline<T>(
   run: () => Promise<T>,
@@ -118,6 +132,7 @@ async function runWithStallDeadline<T>(
   timeoutMs: number,
   failureCode: "gui_child_stalled" | "computer_leader_stalled",
   progress?: StallProgressOptions,
+  signal?: AbortSignal,
 ): Promise<T> {
   const operation = Promise.resolve().then(run);
   // Attach settlement handlers immediately so a late resolve/reject cannot
@@ -128,8 +143,15 @@ async function runWithStallDeadline<T>(
   );
   let timer: ReturnType<typeof setTimeout> | undefined;
   let stalled = false;
+  let aborted = false;
   let extensionUsed = false;
-  const deadline = new Promise<"stalled">((resolve) => {
+  const deadline = new Promise<"stalled" | "aborted">((resolve) => {
+    const settleAbort = () => {
+      if (aborted || stalled) return;
+      aborted = true;
+      timer = clearStallTimer(timer);
+      resolve("aborted");
+    };
     const arm = () => {
       timer = setTimeout(() => {
         const now = Date.now();
@@ -141,6 +163,7 @@ async function runWithStallDeadline<T>(
         }
         if (
           progress
+          && typeof progress.lastProgressAt === "function"
           && !extensionUsed
           && lastProgressAt !== undefined
           && lastProgressAt <= now
@@ -152,24 +175,35 @@ async function runWithStallDeadline<T>(
           return;
         }
         stalled = true;
+        timer = clearStallTimer(timer);
         try { onStalled(); } catch { /* The closed failure still wins if best-effort abort reporting fails. */ }
         resolve("stalled");
       }, Math.max(10, timeoutMs));
     };
     arm();
+    if (!signal) return;
+    if (signal.aborted) {
+      settleAbort();
+      return;
+    }
+    signal.addEventListener("abort", settleAbort, { once: true });
   });
   try {
     const outcome = await Promise.race([
       settled,
-      deadline.then(() => ({ kind: "stalled" as const })),
+      deadline.then((kind) => ({ kind })),
     ]);
-    if (outcome.kind === "stalled" || stalled) {
+    if (stalled || outcome.kind === "stalled") {
       throw Object.assign(new Error(failureCode), { failureCode });
     }
+    if (aborted || outcome.kind === "aborted") {
+      throw Object.assign(new Error("computer_worker_request_cancelled"), { failureCode: "computer_worker_request_cancelled" });
+    }
     if (outcome.kind === "fulfilled") return outcome.value;
-    throw outcome.error;
+    if (outcome.kind === "rejected") throw outcome.error;
+    throw Object.assign(new Error(failureCode), { failureCode });
   } finally {
-    if (timer) clearTimeout(timer);
+    timer = clearStallTimer(timer);
   }
 }
 
@@ -177,8 +211,9 @@ export async function runComputerWorkerWithStallDeadline<T>(
   run: () => Promise<T>,
   onStalled: () => void,
   timeoutMs = COMPUTER_WORKER_STALL_TIMEOUT_MS,
+  signal?: AbortSignal | { signal?: AbortSignal },
 ): Promise<T> {
-  return runWithStallDeadline(run, onStalled, timeoutMs, "gui_child_stalled");
+  return runWithStallDeadline(run, onStalled, timeoutMs, "gui_child_stalled", undefined, stallAbortSignal(signal));
 }
 
 export async function runComputerLeaderWithStallDeadline<T>(
@@ -187,7 +222,7 @@ export async function runComputerLeaderWithStallDeadline<T>(
   timeoutMs = COMPUTER_LEADER_STALL_TIMEOUT_MS,
   progress?: StallProgressOptions,
 ): Promise<T> {
-  return runWithStallDeadline(run, onStalled, timeoutMs, "computer_leader_stalled", progress);
+  return runWithStallDeadline(run, onStalled, timeoutMs, "computer_leader_stalled", progress, progress?.signal);
 }
 export type HostExecutionRecord =
   | { role: "gui-operator"; kind: "open_application" | "click" | "type_parameter"; bundleId?: string; appName?: string; locator?: { role: string; nameLiteral: string }; observationId: string; observedAt: string }
@@ -234,6 +269,7 @@ export type ComputerTaskResult = {
 export async function finalizeComputerTaskWithOptionalSummary(
   result: ComputerTaskResult,
   summarize: () => Promise<string>,
+  timeoutMs = COMPUTER_TASK_OPTIONAL_SUMMARY_TIMEOUT_MS,
 ): Promise<{ result: ComputerTaskResult; leaderSummary?: string }> {
   if (
     result.outcome === "blocked"
@@ -242,10 +278,433 @@ export async function finalizeComputerTaskWithOptionalSummary(
     && result.investigation.nextAction === "restore_target_state_manually"
   ) return { result };
   try {
-    return { result, leaderSummary: await summarize() };
+    const leaderSummary = await runWithStallDeadline(
+      summarize,
+      () => {},
+      timeoutMs,
+      "computer_leader_stalled",
+    );
+    return { result, leaderSummary };
   } catch {
     if (result.outcome === "succeeded") return { result };
     return { result, leaderSummary: result.summary };
+  }
+}
+
+export type ClosedComputerUseOutcome = {
+  outcome: "succeeded" | "blocked" | "failed" | "cancelled";
+  summary: string;
+  verification: {
+    status: "verified" | "unverified" | "partial";
+    claims: Array<{ claim: string; evidenceRef: string }>;
+  };
+  handoff?: string;
+};
+
+const CLOSED_COMPUTER_USE_OUTCOMES = ["succeeded", "blocked", "failed", "cancelled"] as const;
+
+function stripClosedOutcomeFence(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("```")) return trimmed;
+  const firstLineBreak = trimmed.indexOf("\n");
+  if (firstLineBreak < 0) return "";
+  const body = trimmed.slice(firstLineBreak + 1);
+  const closingFence = body.lastIndexOf("```");
+  return (closingFence >= 0 ? body.slice(0, closingFence) : body).trim();
+}
+
+function asClosedComputerUseOutcome(value: unknown): ClosedComputerUseOutcome | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (Array.isArray(record.steps) || Array.isArray(record.episodeLedger)) return undefined;
+  if (!CLOSED_COMPUTER_USE_OUTCOMES.includes(record.outcome as ClosedComputerUseOutcome["outcome"])) return undefined;
+  if (typeof record.summary !== "string" || !record.summary.trim()) return undefined;
+  const verificationRecord = record.verification && typeof record.verification === "object" && !Array.isArray(record.verification)
+    ? record.verification as Record<string, unknown>
+    : undefined;
+  const status = verificationRecord && ["verified", "unverified", "partial"].includes(String(verificationRecord.status))
+    ? verificationRecord.status as ClosedComputerUseOutcome["verification"]["status"]
+    : "unverified";
+  const claims = Array.isArray(verificationRecord?.claims)
+    ? verificationRecord.claims.flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const claim = item as Record<string, unknown>;
+      if (typeof claim.claim !== "string" || typeof claim.evidenceRef !== "string") return [];
+      return [{ claim: claim.claim.slice(0, 500), evidenceRef: claim.evidenceRef.slice(0, 500) }];
+    }).slice(0, 32)
+    : [];
+  return {
+    outcome: record.outcome as ClosedComputerUseOutcome["outcome"],
+    summary: record.summary.trim().slice(0, 2_000),
+    verification: { status, claims },
+    ...(typeof record.handoff === "string" && record.handoff.trim() ? { handoff: record.handoff.trim().slice(0, 1_000) } : {}),
+  };
+}
+
+/** A Computer Use agent's streamed or final JSON verdict. Plans and ledgers stay ignored. */
+export function parseClosedComputerUseOutcome(text: string): ClosedComputerUseOutcome | undefined {
+  if (!text || text === "(running...)") return undefined;
+  const body = stripClosedOutcomeFence(text);
+  try {
+    const parsed = asClosedComputerUseOutcome(JSON.parse(body));
+    if (parsed) return parsed;
+  } catch { /* try a surrounding-prose slice next */ }
+  const start = body.indexOf("{");
+  const end = body.lastIndexOf("}");
+  if (start < 0 || end <= start) return undefined;
+  try {
+    return asClosedComputerUseOutcome(JSON.parse(body.slice(start, end + 1)));
+  } catch {
+    return undefined;
+  }
+}
+
+export const EARLY_CLOSED_COMPUTER_USE_OUTCOMES = ["blocked", "failed", "cancelled"] as const;
+
+export function isEarlyClosedComputerUseOutcome(
+  outcome: ClosedComputerUseOutcome | undefined,
+): outcome is ClosedComputerUseOutcome & { outcome: typeof EARLY_CLOSED_COMPUTER_USE_OUTCOMES[number] } {
+  return !!outcome && (EARLY_CLOSED_COMPUTER_USE_OUTCOMES as readonly string[]).includes(outcome.outcome);
+}
+
+export function createClosedOutcomeGate<T>() {
+  let value: T | undefined;
+  let resolve!: (next: T) => void;
+  const seen = new Promise<T>((next) => { resolve = next; });
+  return {
+    note(next: T | undefined) {
+      if (!next || value) return;
+      value = next;
+      resolve(next);
+    },
+    get value() { return value; },
+    seen,
+  };
+}
+
+type ComputerTaskUpdateLike = {
+  content?: Array<{ type?: string; text?: unknown } | null | undefined>;
+} | null | undefined;
+
+export function closedOutcomeTextFromUpdate(update: ComputerTaskUpdateLike): string {
+  return (update?.content ?? []).flatMap((part) =>
+    part?.type === "text" && typeof part.text === "string" ? [part.text] : [],
+  ).join("\n");
+}
+
+export function noteEarlyClosedComputerUseOutcome(
+  gate: { note: (next: ClosedComputerUseOutcome | undefined) => void },
+  text: string,
+): ClosedComputerUseOutcome | undefined {
+  const parsed = parseClosedComputerUseOutcome(text);
+  if (!isEarlyClosedComputerUseOutcome(parsed)) return undefined;
+  gate.note(parsed);
+  return parsed;
+}
+
+export function bindComputerTaskClosedOutcomeFromUpdates() {
+  const gate = createClosedOutcomeGate<ClosedComputerUseOutcome>();
+  return {
+    gate,
+    noteFromUpdate(update: ComputerTaskUpdateLike) {
+      return noteEarlyClosedComputerUseOutcome(gate, closedOutcomeTextFromUpdate(update));
+    },
+  };
+}
+
+export function projectComputerTaskActiveToolsAborted(
+  outcome: ClosedComputerUseOutcome,
+  now = Date.now(),
+): {
+  content: Array<{ type: "text"; text: string }>;
+  details: {
+    activity: null;
+    activityActive: false;
+    activityEndedAt: number;
+    toolStatus: "aborted";
+    outcome: ClosedComputerUseOutcome["outcome"];
+  };
+} {
+  return {
+    content: [{ type: "text", text: JSON.stringify(outcome) }],
+    details: {
+      activity: null,
+      activityActive: false,
+      activityEndedAt: now,
+      toolStatus: "aborted",
+      outcome: outcome.outcome,
+    },
+  };
+}
+
+function detachComputerTaskChildCleanup(input: {
+  child: Promise<unknown>;
+  timeoutMs: number;
+  onError?: (error: unknown) => void;
+}): void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), input.timeoutMs);
+    timer.unref?.();
+  });
+  void Promise.race([
+    Promise.resolve(input.child).then(() => "child" as const, () => "child" as const),
+    timeout,
+  ]).then(() => {
+    timer = clearStallTimer(timer);
+  }, (error) => {
+    timer = clearStallTimer(timer);
+    try { input.onError?.(error); } catch { /* diagnostics only; never rewrite the closed result */ }
+  });
+}
+
+export async function finishComputerTaskOnClosedOutcome<TChild>(input: {
+  child: Promise<TChild>;
+  closed: Promise<ClosedComputerUseOutcome>;
+  abortOnce: () => void;
+  cleanupTimeoutMs?: number;
+  onAbandoned?: (outcome: ClosedComputerUseOutcome) => void;
+  onCleanupError?: (error: unknown) => void;
+}): Promise<{
+  outcome?: ClosedComputerUseOutcome;
+  child?: TChild;
+  childError?: unknown;
+  finishedVia: "closed_outcome" | "child";
+  abortCount: number;
+}> {
+  let abortCount = 0;
+  const abortOnce = () => {
+    if (abortCount > 0) return;
+    abortCount += 1;
+    try { input.abortOnce(); } catch { /* cleanup abort is best-effort */ }
+  };
+  const settledChild = Promise.resolve(input.child).then(
+    (value) => ({ kind: "fulfilled" as const, value }),
+    (error) => ({ kind: "rejected" as const, error }),
+  );
+  const settledClosed = Promise.resolve(input.closed).then(
+    (value) => ({ kind: "closed" as const, value }),
+    () => ({ kind: "closed_failed" as const }),
+  );
+  const first = await Promise.race([
+    settledChild.then((child) => ({ via: "child" as const, child })),
+    settledClosed.then((closed) => closed.kind === "closed"
+      ? { via: "closed" as const, outcome: closed.value }
+      : { via: "closed_failed" as const }),
+  ]);
+  if (first.via === "child") {
+    return {
+      ...(first.child.kind === "fulfilled" ? { child: first.child.value } : { childError: first.child.error }),
+      finishedVia: "child",
+      abortCount,
+    };
+  }
+  if (first.via === "closed_failed") {
+    const child = await settledChild;
+    return {
+      ...(child.kind === "fulfilled" ? { child: child.value } : { childError: child.error }),
+      finishedVia: "child",
+      abortCount,
+    };
+  }
+  if (!isEarlyClosedComputerUseOutcome(first.outcome)) {
+    const child = await settledChild;
+    return {
+      ...(child.kind === "fulfilled" ? { child: child.value } : { childError: child.error }),
+      finishedVia: "child",
+      abortCount,
+    };
+  }
+  abortOnce();
+  try { input.onAbandoned?.(first.outcome); } catch { /* activity projection is best-effort */ }
+  detachComputerTaskChildCleanup({
+    child: settledChild,
+    timeoutMs: Math.max(10, input.cleanupTimeoutMs ?? COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS),
+    onError: input.onCleanupError,
+  });
+  return {
+    outcome: first.outcome,
+    finishedVia: "closed_outcome",
+    abortCount,
+  };
+}
+
+export type ComputerTaskGenerationToken = {
+  readonly generation: number;
+  readonly taskId: string;
+  readonly runId: string;
+};
+
+export type ComputerTaskGenerationRegistry = {
+  begin(taskId: string, runId: string): ComputerTaskGenerationToken;
+  end(token: ComputerTaskGenerationToken): void;
+  shouldCancel(token: ComputerTaskGenerationToken): boolean;
+  readonly currentGeneration: number;
+  readonly active: ComputerTaskGenerationToken | undefined;
+};
+
+export function createComputerTaskGenerationRegistry(): ComputerTaskGenerationRegistry {
+  let currentGeneration = 0;
+  let active: ComputerTaskGenerationToken | undefined;
+  return {
+    begin(taskId, runId) {
+      currentGeneration += 1;
+      active = { generation: currentGeneration, taskId, runId };
+      return active;
+    },
+    end(token) {
+      if (
+        active
+        && active.generation === token.generation
+        && active.taskId === token.taskId
+        && active.runId === token.runId
+      ) {
+        active = undefined;
+      }
+    },
+    shouldCancel(token) {
+      if (currentGeneration !== token.generation) return false;
+      if (
+        active
+        && (
+          active.generation !== token.generation
+          || active.taskId !== token.taskId
+          || active.runId !== token.runId
+        )
+      ) return false;
+      return true;
+    },
+    get currentGeneration() { return currentGeneration; },
+    get active() { return active; },
+  };
+}
+
+export function detachGenerationScopedComputerCancel(input: {
+  cancel: (signal: AbortSignal) => Promise<unknown>;
+  shouldCancel: () => boolean;
+  timeoutMs?: number;
+  onError?: (error: unknown) => void;
+}): void {
+  const timeoutMs = Math.max(10, input.timeoutMs ?? COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let startTimer: ReturnType<typeof setTimeout> | undefined;
+  const controller = new AbortController();
+  const operation = new Promise<"skipped" | "cancelled">((resolve, reject) => {
+    startTimer = setTimeout(() => {
+      startTimer = undefined;
+      Promise.resolve().then(() => {
+        if (!input.shouldCancel()) return "skipped" as const;
+        return Promise.resolve(input.cancel(controller.signal)).then(() => "cancelled" as const);
+      }).then(resolve, reject);
+    }, 0);
+    startTimer.unref?.();
+  });
+  const settled = operation.then(
+    (value) => ({ kind: "done" as const, value }),
+    (error) => ({ kind: "error" as const, error }),
+  );
+  const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
+    timer = setTimeout(() => {
+      try { controller.abort(); } catch { /* abort is best-effort */ }
+      resolve({ kind: "timeout" });
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  void Promise.race([settled, timeout]).then((first) => {
+    startTimer = clearStallTimer(startTimer);
+    timer = clearStallTimer(timer);
+    if (first.kind === "error") {
+      try { input.onError?.(first.error); } catch { /* diagnostics only; never rewrite the closed result */ }
+    }
+  }, (error) => {
+    startTimer = clearStallTimer(startTimer);
+    timer = clearStallTimer(timer);
+    try { input.onError?.(error); } catch { /* diagnostics only; never rewrite the closed result */ }
+  });
+}
+
+export async function raceComputerTaskToolToClosedOutcome<TChild>(input: {
+  runChild: (onUpdate: (update: ComputerTaskUpdateLike) => void) => Promise<TChild>;
+  abortOnce: () => void;
+  signal?: AbortSignal;
+  onUpdate?: (update: ComputerTaskUpdateLike) => void;
+  onClosedLatch?: (outcome: ClosedComputerUseOutcome) => void;
+  stallTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
+  onAbandoned?: (outcome: ClosedComputerUseOutcome) => void;
+  onCleanupError?: (error: unknown) => void;
+}): Promise<{
+  outcome?: ClosedComputerUseOutcome;
+  child?: TChild;
+  childError?: unknown;
+  finishedVia: "closed_outcome" | "child";
+  abortCount: number;
+}> {
+  const binding = bindComputerTaskClosedOutcomeFromUpdates();
+  const childUpdate = (update: ComputerTaskUpdateLike) => {
+    if (binding.gate.value) return;
+    input.onUpdate?.(update);
+    const closed = binding.noteFromUpdate(update);
+    if (closed) input.onClosedLatch?.(closed);
+  };
+  return finishComputerTaskOnClosedOutcome({
+    child: runComputerWorkerWithStallDeadline(
+      () => input.runChild(childUpdate),
+      input.abortOnce,
+      input.stallTimeoutMs ?? COMPUTER_WORKER_STALL_TIMEOUT_MS,
+      input.signal,
+    ),
+    closed: binding.gate.seen,
+    abortOnce: input.abortOnce,
+    cleanupTimeoutMs: input.cleanupTimeoutMs,
+    onAbandoned: input.onAbandoned,
+    onCleanupError: input.onCleanupError,
+  });
+}
+
+export async function runRegisteredComputerTaskLifecycle<TChild>(input: {
+  runChild: (onUpdate: (update: ComputerTaskUpdateLike) => void) => Promise<TChild>;
+  abortOnce: () => void;
+  signal?: AbortSignal;
+  onUpdate?: (update: ComputerTaskUpdateLike) => void;
+  onClosedLatch?: (outcome: ClosedComputerUseOutcome) => void;
+  stallTimeoutMs?: number;
+  cleanupTimeoutMs?: number;
+  onAbandoned?: (outcome: ClosedComputerUseOutcome) => void;
+  onCleanupError?: (error: unknown) => void;
+  generation: ComputerTaskGenerationToken;
+  generationRegistry: ComputerTaskGenerationRegistry;
+  cancelRuntime?: (signal: AbortSignal) => Promise<unknown>;
+  onCancelError?: (error: unknown) => void;
+}): Promise<{
+  outcome?: ClosedComputerUseOutcome;
+  child?: TChild;
+  childError?: unknown;
+  finishedVia: "closed_outcome" | "child";
+  abortCount: number;
+}> {
+  try {
+    return await raceComputerTaskToolToClosedOutcome({
+      runChild: input.runChild,
+      abortOnce: input.abortOnce,
+      signal: input.signal,
+      onUpdate: input.onUpdate,
+      onClosedLatch: input.onClosedLatch,
+      stallTimeoutMs: input.stallTimeoutMs,
+      cleanupTimeoutMs: input.cleanupTimeoutMs,
+      onAbandoned: input.onAbandoned,
+      onCleanupError: input.onCleanupError,
+    });
+  } finally {
+    input.generationRegistry.end(input.generation);
+    if (input.signal?.aborted && input.cancelRuntime) {
+      detachGenerationScopedComputerCancel({
+        cancel: input.cancelRuntime,
+        shouldCancel: () => input.generationRegistry.shouldCancel(input.generation),
+        timeoutMs: input.cleanupTimeoutMs ?? COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS,
+        onError: input.onCancelError,
+      });
+    }
   }
 }
 

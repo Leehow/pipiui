@@ -46,7 +46,7 @@ import {
   type SessionAdoptedFrom,
 } from "@pipi/host-api";
 import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.js";
-import { enrichHostDiagnostics, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
+import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
 import { ThinkingControlReporter } from "./thinking-control.js";
 import { PlanStore, readPlanStore } from "./plan-store.js";
 import { readUserMcpServers } from "./user-mcp-servers.js";
@@ -7603,6 +7603,7 @@ export class PiHostBackend implements HostBackend {
       sanitizeAgentDiagnostics(raw?.diagnostics),
       current?.diagnostics,
       { receivedAt, generation: this.hostProcessGeneration },
+      explicitNullDiagnosticKeys(raw?.diagnostics),
     );
   }
   private mapAgentEvent(raw: any, sessionId?: string) {
@@ -7783,7 +7784,12 @@ export class PiHostBackend implements HostBackend {
       cacheTokens: num2(usage?.cacheRead) ?? (sameRun ? current?.cacheTokens : undefined),
       contextTokens: num2(usage?.contextTokens) ?? (sameRun ? current?.contextTokens : undefined),
       contextWindowTokens: positiveWindow(usage?.contextWindow) ?? positiveWindow(raw.contextWindow) ?? (sameRun ? current?.contextWindowTokens : undefined) ?? (sessionId ? this.sessionContextLastKnown.get(sessionId)?.contextWindow : undefined),
-      diagnostics: this.mergeAgentDiagnostics(raw, sameRun ? current : undefined),
+      diagnostics: terminal
+        ? applyTerminalHostReceipt(
+          this.mergeAgentDiagnostics(raw, sameRun ? current : undefined, eventAt),
+          { receivedAt: Date.now(), generation: this.hostProcessGeneration },
+        )
+        : this.mergeAgentDiagnostics(raw, sameRun ? current : undefined, eventAt),
     };
     this.agents.set(key, agent);
     this.agentProjectionChanged(agent.sessionId);

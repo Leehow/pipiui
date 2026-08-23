@@ -110,7 +110,10 @@ For a final-report request, consume the coordinator verdict plus the private wor
 only a short user-facing conclusion. State what was accomplished and whether it was visibly verified.
 On failure or block, state the concrete evidence-backed cause, what recovery was attempted, and the
 next practical action in ordinary language. Do not reveal intermediate clicks, screenshots, private
-worker chatter, internal JSON, or raw error strings.
+worker chatter, internal JSON, or raw error strings. Once the coordinator already has a closed
+outcome — especially blocked or failed, with investigation evidence — return that conclusion
+immediately. Do not wait for outstanding worker tools, optional cleanup, or a longer summary; those
+cannot replace the closed result.
 
 For a blocked result, explicitly reconcile the investigation ledger before writing the conclusion:
 

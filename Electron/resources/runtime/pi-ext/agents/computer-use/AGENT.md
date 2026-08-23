@@ -47,6 +47,8 @@ Never state or assume that a pending action succeeded before its tool result arr
 tool timeout means the Host cancelled the old operation: observe fresh state, reconcile the checkpoint,
 and continue inside this same episode instead of giving up or asking the parent to start another agent.
 Do not claim success from action completion alone: verify the declared success conditions against fresh
-evidence. Finish with exactly one JSON object and no surrounding prose:
+evidence. A closed `outcome` is terminal: emit that JSON as your last message and stop immediately.
+Do not keep browser, desktop, or shell tools running after a blocked, failed, cancelled, or succeeded
+verdict; outstanding tools cannot change it. Finish with exactly one JSON object and no surrounding prose:
 
 `{"outcome":"succeeded|blocked|failed|cancelled","summary":"short user-facing result","verification":{"status":"verified|unverified|partial","claims":[{"claim":"observable fact","evidenceRef":"observation or receipt reference"}]},"handoff":"optional next human action"}`

@@ -90,6 +90,8 @@ export interface FinalizeWorktreeRequest {
 	verify?: { command?: string; argv?: string[]; exitCode?: number };
 	/** Boss/runtime re-entry after accept/resolve. Reuses the same ownership/readiness checks. */
 	acceptance?: { source: "boss" };
+	/** Observational closeout stages. Must never fail finalization. */
+	onProgress?: (phase: "reconciling" | "merging" | "cleaning" | "post-verify") => void;
 }
 
 const rememberedFinalizations = new Map<string, FinalizeWorktreeRequest>();
@@ -141,6 +143,7 @@ export async function finalizeWorktreeIfOwned(
 	const options = {
 		postMergeVerify: piPostMergeVerifyRunner,
 		...(onMergedHook ? { onMerged: onMergedHook } : {}),
+		...(request.onProgress ? { onProgress: request.onProgress } : {}),
 		lease: {
 			inspect(agentId: string) {
 				return inspectAgentLease(mainCwd, agentId).status;

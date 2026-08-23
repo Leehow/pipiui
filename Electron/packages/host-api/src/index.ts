@@ -238,6 +238,17 @@ export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "
 export type CostUnit = "USD" | "CNY";
 /** Metadata-only stall probe. Never carries prompt, tool args, or output text. */
 export type AgentCpuVerdict = "working" | "no-progress" | "gone" | "unknown";
+/** Closeout stage after the child summary. Missing means a legacy producer omitted it. */
+export type AgentFinalizationPhase =
+  | "generating"
+  | "tool-active"
+  | "final-received"
+  | "verifying"
+  | "reconciling"
+  | "merging"
+  | "cleaning"
+  | "post-verify"
+  | "done-await-host";
 export type AgentDiagnostics = {
   agentId?: string;
   runId?: string;
@@ -268,6 +279,16 @@ export type AgentDiagnostics = {
   persistedRunning?: boolean;
   reconciliation?: "interrupted" | "none";
   hostGeneration?: string;
+  finalizationPhase?: AgentFinalizationPhase;
+  phaseSince?: number;
+  lastPhaseError?: string;
+  childExitedAt?: number;
+  verifyPid?: number;
+  verifyElapsedMs?: number;
+  reconcileElapsedMs?: number;
+  mergeElapsedMs?: number;
+  cleanupElapsedMs?: number;
+  doneEventSeq?: number;
 };
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
 export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; /** True only while a tool is in-flight. Missing means the field was not provided. */ activityActive?: boolean; /** In-flight tool id when the runtime supplied one. */ activityToolCallId?: string; /** Set when the last in-flight tool ended/failed/aborted. */ activityEndedAt?: number; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;

@@ -1388,4 +1388,66 @@ describe('SubagentPanel', () => {
     expect(screen.getByRole('button', { name: /edit · b.ts/ }).textContent).toMatch(/\+1/)
     expect(screen.getByRole('button', { name: /edit · b.ts/ }).textContent).toMatch(/\u22121/)
   })
+
+  it('shows real closeout phases instead of thinking or stale git diff', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'closing', runId: 'r-close', name: 'general-purpose', task: 'pack',
+      state: 'running', createdAt: now - 180_000, updatedAt: now - 130_000,
+      listSubtitle: 'bash git diff HEAD -- a.ts', activityActive: true,
+      diagnostics: {
+        finalizationPhase: 'verifying',
+        phaseSince: now - 12_000,
+        watchdogDecision: 'tool-quiet-alive',
+        cpuVerdict: 'working',
+      },
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-closing')
+    expect(row.textContent).toContain('收尾中：验证')
+    expect(row.textContent).toContain('12s')
+    expect(row.textContent).not.toContain('思考中')
+    expect(row.textContent).not.toContain('无新进展')
+    expect(row.textContent).not.toContain('git diff')
+    expect(screen.getAllByText(/收尾中：验证/).length).toBeGreaterThan(0)
+  })
+
+  it('stalled list still shows closeout after final-received instead of ordinary stall copy', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'closing-stalled', runId: 'r-close-stalled', name: 'general-purpose', task: 'pack',
+      state: 'stalled', stalled: true, stalledIdleSec: 90,
+      createdAt: now - 180_000, updatedAt: now - 130_000,
+      listSubtitle: 'bash git diff HEAD -- a.ts', activityActive: true,
+      diagnostics: {
+        finalizationPhase: 'post-verify',
+        phaseSince: now - 8_000,
+        watchdogDecision: 'first-stall-notify',
+      },
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-closing-stalled')
+    expect(row.textContent).toContain('收尾中：合并后验证')
+    expect(row.textContent).toContain('8s')
+    expect(row.textContent).not.toContain('卡住')
+    expect(row.textContent).not.toContain('无新进展')
+    expect(row.textContent).not.toContain('思考中')
+    expect(screen.queryByLabelText('中止 general-purpose')).toBeNull()
+  })
+
+  it('stops closeout copy once the terminal state arrives', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'done', runId: 'r-done', name: 'general-purpose', task: 'pack',
+      state: 'ok', createdAt: now - 20_000, updatedAt: now - 1_000, endedAt: now - 500,
+      diagnostics: { finalizationPhase: 'done-await-host', phaseSince: now - 1_000, verifyElapsedMs: 800 },
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-done')
+    expect(row.textContent).not.toContain('收尾中')
+    expect(row.textContent).not.toContain('思考中')
+  })
 })

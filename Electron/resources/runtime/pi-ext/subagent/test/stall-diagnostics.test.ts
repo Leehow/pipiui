@@ -152,3 +152,22 @@ test("a coded child-close is not overwritten by a generic child-close", () => {
 	assert.equal(state.exitReason, "child-close:0");
 	assert.equal(state.eventSeq, seq);
 });
+
+test("finalizing phases do not classify as tool-quiet or cpu-progress", () => {
+	const probe = classifyWatchdogProbe({
+		inTool: true,
+		stalled: false,
+		stallAction: "notify",
+		stallNotifyCount: 0,
+		childPid: 4242,
+		finalizing: false,
+		finalizationPhase: "verifying",
+		cpuVerdict: "working",
+		lastActivityAt: 1_000,
+		now: 180_000,
+	});
+	assert.equal(probe.decision, "process-exited");
+	assert.match(probe.reason, /child-finalizing/);
+	assert.notEqual(probe.decision, "cpu-progress");
+	assert.notEqual(probe.decision, "tool-quiet-alive");
+});

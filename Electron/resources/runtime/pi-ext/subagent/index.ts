@@ -295,6 +295,12 @@ import {
 	snapshotStallDiagnostics,
 } from "./stall-diagnostics.ts";
 import {
+	type AgentFinalizationPhase,
+	applyFinalizationTransition,
+	noteFinalizationDetails,
+	resetFinalizationFields,
+} from "./finalization-phase.ts";
+import {
 	type ActiveTool,
 	activeToolForContentIndex,
 	boundActivitySummary,
@@ -1728,7 +1734,11 @@ function tailText(text: string, maxChars: number, maxLines: number): string {
 }
 
 /** Run `bash -lc <command>` in cwd with a hard timeout; capture combined stdout+stderr tail. */
-function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestation> {
+function runVerifyCommand(
+	command: string,
+	cwd: string,
+	hooks?: { onSpawn?: (pid: number | undefined) => void },
+): Promise<VerifyAttestation> {
 	return new Promise((resolve) => {
 		let proc: ReturnType<typeof spawn>;
 		try {
@@ -1742,6 +1752,7 @@ function runVerifyCommand(command: string, cwd: string): Promise<VerifyAttestati
 				stdio: ["ignore", "pipe", "pipe"],
 				env: pipiuiChildProcessEnv(),
 			});
+			hooks?.onSpawn?.(proc.pid);
 		} catch (err) {
 			resolve({
 				command,
@@ -2314,6 +2325,7 @@ function noteAgentToolWait(agentId: string, runId: string, names: string[]): voi
 	handle.toolWaitSince = Date.now();
 	handle.toolWaitNames = names.length > 0 ? names : undefined;
 	noteDiagnosticsToolStart(handle.diagnostics, handle.toolWaitSince);
+	projectFinalizationPhase(agentId, runId, "tool-active");
 }
 
 function noteAgentToolEnd(agentId: string, runId: string): void {
@@ -2338,6 +2350,28 @@ function diagnosticsSnapshotFor(agentId: string, handle: RunningAgentHandle, now
 function attachDiagnostics<T extends { agentId: string; runId: string }>(payload: T, handle?: RunningAgentHandle): T & { diagnostics?: ReturnType<typeof snapshotStallDiagnostics> } {
 	if (!handle || handle.runId !== payload.runId) return payload;
 	return { ...payload, diagnostics: diagnosticsSnapshotFor(payload.agentId, handle) };
+}
+
+function projectFinalizationPhase(
+	agentId: string,
+	runId: string,
+	phase: AgentFinalizationPhase,
+	extras?: { error?: string; childExitedAt?: number; verifyPid?: number; doneEventSeq?: number },
+): void {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return;
+	const now = Date.now();
+	const changed = applyFinalizationTransition(handle.diagnostics, phase, now, extras);
+	if (changed || extras) handle.diagnostics.eventSeq += 1;
+	if (phase === "done-await-host" && handle.diagnostics.doneEventSeq === undefined) {
+		handle.diagnostics.doneEventSeq = handle.diagnostics.eventSeq;
+	}
+	pipiuiReport({
+		kind: "diagnostics",
+		agentId,
+		runId,
+		diagnostics: diagnosticsSnapshotFor(agentId, handle, now),
+	});
 }
 
 function projectChildExitDiagnostics(agentId: string, handle: RunningAgentHandle, exitReason: string): ReturnType<typeof snapshotStallDiagnostics> {
@@ -2369,6 +2403,7 @@ function markAgentFinalizing(agentId: string, runId: string, exitReason = "child
 	const already = handle.finalizing;
 	handle.pid = undefined;
 	handle.finalizing = true;
+	if (handle.diagnostics.childExitedAt === undefined) handle.diagnostics.childExitedAt = Date.now();
 	if (already && handle.diagnostics.exitReason === keptReason) return;
 	projectChildExitDiagnostics(agentId, handle, keptReason);
 	if (!already) noteAgentActivity(agentId, runId);
@@ -2379,7 +2414,9 @@ function resumeAgentHandle(agentId: string, runId: string): void {
 	if (!handle) return;
 	handle.pid = undefined;
 	handle.finalizing = false;
+	resetFinalizationFields(handle.diagnostics);
 	noteAgentActivity(agentId, runId);
+	projectFinalizationPhase(agentId, runId, "generating");
 }
 
 function deleteRunningAgentHandle(agentId: string, runId: string): void {
@@ -3006,6 +3043,7 @@ function markWorkerInterrupted(agentId: string, reason: string): boolean {
 		return false;
 	}
 
+	if (handle) noteFinalizationDetails(handle.diagnostics, { error: "process-missing" });
 	const exitSnapshot = handle ? projectChildExitDiagnostics(agentId, handle, "vanished") : undefined;
 	const changed = jobFinalize(agentId, runId, {
 		name: handle?.name ?? job?.name,
@@ -5779,8 +5817,11 @@ async function runSingleAgent(
 			syncWait: !isBackground,
 			diagnostics: stallDiagnostics,
 		});
+		projectFinalizationPhase(pipiuiAgentId, runId, "generating");
 		armIdleFoldForDispatch(pipiuiAgentId);
 	const pipiuiUpdate = (force = false) => {
+		const closedComputerTask = runningComputerTasks.get(pipiuiAgentId);
+		if (closedComputerTask?.closed && closedComputerTask.runId === runId) return;
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
 		pipiuiLastUpdate = now;
@@ -6415,6 +6456,7 @@ async function runSingleAgent(
 						// tools running, not a wedge. Claimed here rather than on stopReason so a
 						// provider that omits `toolUse` still gets the same explained window.
 						if (toolNames.length > 0) noteAgentToolWait(pipiuiAgentId, runId, toolNames);
+						else projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -6707,7 +6749,27 @@ async function runSingleAgent(
 			currentResult.verifyDropped = true;
 		}
 		if (attestableVerify && attestableVerify.trim() && !wasAborted) {
-			currentResult.verify = await runVerifyCommand(attestableVerify.trim(), spawnCwd);
+			projectFinalizationPhase(pipiuiAgentId, runId, "verifying");
+			currentResult.verify = await runVerifyCommand(attestableVerify.trim(), spawnCwd, {
+				onSpawn(pid) {
+					if (pid === undefined) return;
+					const live = handleForRun(pipiuiAgentId, runId);
+					if (!live) return;
+					noteFinalizationDetails(live.diagnostics, { verifyPid: pid });
+					live.diagnostics.eventSeq += 1;
+					pipiuiReport({
+						kind: "diagnostics",
+						agentId: pipiuiAgentId,
+						runId,
+						diagnostics: diagnosticsSnapshotFor(pipiuiAgentId, live),
+					});
+				},
+			});
+			if (currentResult.verify.timedOut) {
+				projectFinalizationPhase(pipiuiAgentId, runId, "verifying", { error: "verify-timeout" });
+			} else if (currentResult.verify.exitCode !== 0 && currentResult.verify.exitCode !== null) {
+				projectFinalizationPhase(pipiuiAgentId, runId, "verifying", { error: "verify-failed" });
+			}
 		} else if (attestableVerify && attestableVerify.trim()) {
 			// Aborted: verify was in the brief but intentionally not run — record that
 			// so the done message can say "skipped" instead of "no verify in brief".
@@ -6789,6 +6851,9 @@ async function runSingleAgent(
 				worktreeBranch: placement.worktreeBranch,
 				role: agentName === "secretary" ? "secretary" : "worker",
 				terminalState: terminalStateForFinalization({ ok: endOk, aborted: wasAborted }),
+				onProgress(phase) {
+					projectFinalizationPhase(pipiuiAgentId, runId, phase);
+				},
 				...(currentResult.verify
 					? {
 							verify: {
@@ -6826,9 +6891,13 @@ async function runSingleAgent(
 			// The service retains unsafe work rather than forcing it; a thrown error here means
 			// finalization did not run at all, which must be visible but must not lose the run.
 			finalization = `finalization error: ${error instanceof Error ? error.message : String(error)}`;
+			projectFinalizationPhase(pipiuiAgentId, runId, handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "reconciling", {
+				error: "finalization-error",
+			});
 		}
 		const endHandle = handleForRun(pipiuiAgentId, runId);
 		clearActiveTools();
+		if (endHandle) projectFinalizationPhase(pipiuiAgentId, runId, "done-await-host");
 		await postTerminalPipiuiReport(attachDiagnostics({
 			kind: "end",
 			agentId: pipiuiAgentId,
@@ -7203,7 +7272,8 @@ let computerAgentModule: Promise<ComputerAgentModule> | undefined;
 let computerWorkerBrokerServer: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
 const computerWorkerFatalControllers = new Map<string, AbortController>();
 const computerWorkerFatalCodes = new Map<string, "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled">();
-const runningComputerTasks = new Map<string, { runId: string; controller: AbortController }>();
+const runningComputerTasks = new Map<string, { runId: string; controller: AbortController; generation?: number; closed?: boolean }>();
+let computerTaskGenerations: ReturnType<ComputerAgentModule["createComputerTaskGenerationRegistry"]> | undefined;
 const computerWorkerKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
 
 function loadComputerAgentModule(): Promise<ComputerAgentModule> {
@@ -8059,7 +8129,17 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task ${taskId} is already running`);
 			runningComputerTasks.set(taskId, { runId, controller });
 			let broker: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
+			let generations: NonNullable<typeof computerTaskGenerations> | undefined;
+			let generation: ReturnType<NonNullable<typeof computerTaskGenerations>["begin"]> | undefined;
 			try {
+				const {
+					COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS,
+					COMPUTER_WORKER_STALL_TIMEOUT_MS,
+					createComputerTaskGenerationRegistry,
+					projectComputerTaskActiveToolsAborted,
+					runRegisteredComputerTaskLifecycle,
+				} = await loadComputerAgentModule();
+				generations = computerTaskGenerations ??= createComputerTaskGenerationRegistry();
 				const discovery = discoverAgents(ctx.cwd, "user");
 				const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
 				if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Use Agent failed validation");
@@ -8068,36 +8148,71 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				const computerAgents = [canonicalAgent];
 				broker = await ensureComputerWorkerBroker();
 				const issued = broker.issue({ taskId, stepId, runId, role: "computer-use-agent", goal });
-				const child = await runSingleAgent(ctx.cwd, computerAgents, "computer-use", goal, undefined, undefined, taskSignal, onUpdate,
-					(results) => ({ mode: "single", agentScope: "bundled", projectAgentsDir: discovery.projectAgentsDir, results }),
-					{
-						toolCallId: _toolCallId,
-						agentId: taskId,
-						parentAgentId: PIPIUI_PARENT,
-						depth: PIPIUI_DEPTH + 1,
-						fresh: true,
-						retainContext: false,
-						runId,
-						sessionModel: formatCtxModel(ctx.model),
-						contextWindow: ctxContextWindow(ctx.model as { contextWindow?: number } | undefined),
-						background: false,
-						computerAgent: { environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerUseAgent() },
-					});
-				const fallback: SingleComputerTaskResult = taskSignal.aborted
+				const abortOnce = () => {
+					if (!controller.signal.aborted) controller.abort();
+				};
+				generation = generations.begin(taskId, runId);
+				const liveTask = runningComputerTasks.get(taskId);
+				if (liveTask?.runId === runId) liveTask.generation = generation.generation;
+				const finished = await runRegisteredComputerTaskLifecycle({
+					runChild: (childUpdate) => runSingleAgent(ctx.cwd, computerAgents, "computer-use", goal, undefined, undefined, taskSignal, childUpdate,
+						(results) => ({ mode: "single", agentScope: "bundled", projectAgentsDir: discovery.projectAgentsDir, results }),
+						{
+							toolCallId: _toolCallId,
+							agentId: taskId,
+							parentAgentId: PIPIUI_PARENT,
+							depth: PIPIUI_DEPTH + 1,
+							fresh: true,
+							retainContext: false,
+							runId,
+							sessionModel: formatCtxModel(ctx.model),
+							contextWindow: ctxContextWindow(ctx.model as { contextWindow?: number } | undefined),
+							background: false,
+							computerAgent: { environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerUseAgent() },
+						}),
+					abortOnce,
+					signal: controller.signal,
+					onUpdate,
+					onClosedLatch: () => {
+						const record = runningComputerTasks.get(taskId);
+						if (record?.runId === runId) record.closed = true;
+					},
+					stallTimeoutMs: COMPUTER_WORKER_STALL_TIMEOUT_MS,
+					cleanupTimeoutMs: COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS,
+					onAbandoned: (outcome) => {
+						const projected = projectComputerTaskActiveToolsAborted(outcome);
+						pipiuiReport({
+							kind: "activity",
+							agentId: taskId,
+							runId,
+							activity: projected.details.activity,
+							activityActive: projected.details.activityActive,
+							activityEndedAt: projected.details.activityEndedAt,
+						});
+						onUpdate?.(projected);
+					},
+					generation,
+					generationRegistry: generations,
+					cancelRuntime: (cancelSignal) => computerRuntimeRequest({ action: "computer_cancel" }, cancelSignal),
+				});
+				const child = finished.child;
+				if (finished.childError && !finished.outcome && !child) throw finished.childError;
+				const fallback: SingleComputerTaskResult = finished.outcome ?? (taskSignal.aborted
 					? { outcome: "cancelled", summary: "Computer Task was cancelled.", verification: { status: "unverified", claims: [] } }
-					: { outcome: "failed", summary: child.errorMessage || child.stderr || "Computer Use Agent did not return a valid result.", verification: { status: "unverified", claims: [] } };
-				const projected = child.exitCode === 0 && !child.errorMessage
-					? parseSingleComputerTaskResult(getFinalOutput(child.messages) || child.stderr, fallback)
-					: fallback;
+					: { outcome: "failed", summary: (child && (child.errorMessage || child.stderr)) || "Computer Use Agent did not return a valid result.", verification: { status: "unverified", claims: [] } });
+				const projected = finished.outcome
+					?? (child && child.exitCode === 0 && !child.errorMessage
+						? parseSingleComputerTaskResult(getFinalOutput(child.messages) || child.stderr, fallback)
+						: fallback);
 				if (projected.outcome === "succeeded" && projected.verification.status === "verified") await broker.recordTaskSuccess(taskId, stepId);
 				const checkpoint = broker.checkpoint(taskId, stepId);
 				const episode = {
-					agentId: child.agentId,
-					runId: child.runId,
+					agentId: child?.agentId ?? taskId,
+					runId: child?.runId ?? runId,
 					parentId: PIPIUI_PARENT,
 					name: "computer-use",
 					role: "computer-use-agent",
-					terminalState: child.stopReason ?? (child.exitCode === 0 ? "ok" : "failed"),
+					terminalState: projected.outcome === "succeeded" ? "ok" : projected.outcome === "cancelled" ? "aborted" : "failed",
 					result: { outcome: projected.outcome, summary: projected.summary },
 				};
 				const details = {
@@ -8111,8 +8226,8 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 				const envelope = { episodeLedger: [episode], verification: projected.verification, checkpoint };
 				return { content: [{ type: "text", text: `${projected.summary}\n\nEpisode ledger:\n${JSON.stringify(envelope)}` }], details };
 			} finally {
-				broker?.revokeTask(taskId);
-				if (taskSignal.aborted) await computerRuntimeRequest({ action: "computer_cancel" }).catch(() => {});
+				if (generation) generations?.end(generation);
+				try { broker?.revokeTask(taskId); } catch { /* revoke is best-effort and must not delay the Boss return */ }
 				if (runningComputerTasks.get(taskId)?.runId === runId) runningComputerTasks.delete(taskId);
 			}
 		},
@@ -8525,6 +8640,7 @@ export default function (pi: ExtensionAPI) {
 				stallNotifyCount: handle.stallNotifyCount,
 				childPid: handle.pid,
 				finalizing: handle.finalizing,
+				finalizationPhase: handle.diagnostics.finalizationPhase,
 				cpuVerdict: stallInfo.verdict,
 				lastOutputAt: handle.diagnostics.lastOutputAt,
 				lastActivityAt: handle.lastActivityAt,
