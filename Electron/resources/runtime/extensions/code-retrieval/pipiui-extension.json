@@ -1,0 +1,51 @@
+{
+  "id": "code-retrieval",
+  "name": "Code Retrieval",
+  "version": "1.0.0",
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.code-retrieval.exactProvider": {
+            "type": "string",
+            "enum": ["auto", "rg", "zoekt", "tantivy"],
+            "default": "auto",
+            "title": "精确索引"
+          },
+          "ext.code-retrieval.tokenBudget": {
+            "type": "number",
+            "default": 4000,
+            "title": "默认 token 预算"
+          },
+          "ext.code-retrieval.excludeGlobs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "title": "排除 glob"
+          },
+          "ext.code-retrieval.semanticApiKey": {
+            "type": "string",
+            "format": "secret",
+            "title": "语义检索 API Key"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [{ "slot": "toolPanel", "id": "retrieval", "title": "索引", "entry": "app/dist/panel.js" }],
+      "toolRenderers": [
+        { "tool": "code_search", "entry": "app/dist/search-card.js" },
+        { "tool": "repo_map", "entry": "app/dist/map-card.js" }
+      ],
+      "slashCommands": [{ "name": "reindex", "description": "重建本项目代码索引" }]
+    }
+  },
+  "capabilities": ["settings.read", "bridge.emit", "invoke.agent", "stream.render"],
+  "settingsVersion": 1,
+  "migrations": []
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@pipiui/code-retrieval-extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bundled code-retrieval dual-half extension (protocol skeleton)",
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
+    "clean": "rm -rf agent/dist app/dist"
+  }
+}

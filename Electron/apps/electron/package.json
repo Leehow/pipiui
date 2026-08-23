@@ -96,6 +96,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/code-retrieval",
+        "to": "pipiui-runtime/extensions/code-retrieval",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/anydoc/node_modules",
         "to": "pipiui-runtime/anydoc/node_modules",
         "filter": [

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, withToolPath } from "../src/spawn-assembly.js";
+import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
@@ -663,17 +663,56 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
     expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBe(JSON.stringify({ "ext.quota.threshold": 80 }));
     expect(env.PIPIUI_EXT_SETTINGS_MY_EXT).toBe(JSON.stringify({ "ext.my-ext.on": true }));
     expect(env.PIPIUI_SKILL_ROOTS?.split(delimiter)).toContain(skillRoot);
+    expect(env[REGISTERED_EXTENSION_PATHS_ENV]?.split(delimiter)).toEqual([
+      quotaAgent,
+      "/pkg/my-ext/agent.js",
+    ]);
+    expect(workerRegisteredExtensionArgs(env)).toEqual([
+      "-e", quotaAgent,
+      "-e", "/pkg/my-ext/agent.js",
+    ]);
+    expect(workerRegisteredExtensionArgs(env, { computerWorker: true })).toEqual([]);
   });
 
   it("does not leak inherited extension settings env into a spawn without mounts", () => {
     expect(sanitizeEnvironment({
       PIPIUI_EXT_SETTINGS_QUOTA: "{\"stale\":true}",
       PIPIUI_SKILL_ROOTS: "/stale",
+      [REGISTERED_EXTENSION_PATHS_ENV]: "/stale/agent.js",
       PATH: "/usr/bin",
     })).toEqual({ PATH: "/usr/bin" });
     const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter, runtimeInfo } });
     expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBeUndefined();
     expect(env.PIPIUI_SKILL_ROOTS).toBeUndefined();
+    expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBeUndefined();
+    expect(workerRegisteredExtensionArgs(env)).toEqual([]);
+  });
+
+  it("snapshots enabled mounts so a later enable cannot rewrite a live spawn", () => {
+    const first = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "off", enabled: false, extensionPath: offAgent }],
+    });
+    expect(first.args).not.toContain(offAgent);
+    expect(first.env[REGISTERED_EXTENSION_PATHS_ENV]).toBeUndefined();
+    expect(workerRegisteredExtensionArgs(first.env)).toEqual([]);
+
+    const laterEnabled = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "off", enabled: true, extensionPath: offAgent }],
+    });
+    expect(laterEnabled.env[REGISTERED_EXTENSION_PATHS_ENV]).toBe(offAgent);
+    // The already-assembled first spawn keeps its original args/env.
+    expect(first.args).not.toContain(offAgent);
+    expect(workerRegisteredExtensionArgs(first.env)).toEqual([]);
+  });
+
+  it("is the same worker -e remount the subagent spawn uses", async () => {
+    const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
+    expect(source).toContain("PIPIUI_EXT_REGISTERED_PATHS");
+    expect(source).toContain("args.push(\"-e\", mount)");
   });
 });
 

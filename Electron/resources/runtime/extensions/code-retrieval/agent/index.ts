@@ -1,0 +1,379 @@
+/**
+ * pipiui-code-retrieval agent half (spec D2 / D4 / D5 / D8).
+ *
+ * Registers four read-only tools. code_search + read_spans implement the
+ * result protocol, seen-range ledger, rg exact layer, and sidecar lifecycle.
+ *
+ * repo_map / code_nav stay on the hook table in hooks.ts so the symbol-layer
+ * worker can `setSymbolLayer({ repoMap, codeNav, searchSymbols })` without
+ * editing protocol / code_search / read_spans. Do not import agent/sidecar
+ * symbol extractors from this file.
+ */
+
+import { executeCodeSearch } from "./code-search.js";
+import { getSymbolLayer, setSymbolLayer } from "./hooks.js";
+import { SeenRangeLedger } from "./ledger.js";
+import { EXTENSION_ID } from "./paths.js";
+import { buildToolResult, emptyDegraded, formatCompressedContent, RefRegistry } from "./protocol.js";
+import { executeReadSpans } from "./read-spans.js";
+import { loadRetrievalSettings } from "./settings.js";
+import { attachSidecar, detachSidecar, pingSidecar, readSidecarSnapshot } from "./sidecar-lifecycle.js";
+import { installSymbolLayer } from "./symbol/hooks-adapter.js";
+import { initTreeSitter, isTreeSitterReady, treeSitterInitError } from "./symbol/treesitter.js";
+import type { SidecarConnection, ToolResult } from "./types.js";
+
+export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
+export { RefRegistry, formatRefLine, buildToolResult } from "./protocol.js";
+export { SeenRangeLedger } from "./ledger.js";
+
+type ExtensionAPI = {
+  registerTool(tool: {
+    name: string;
+    label?: string;
+    description: string;
+    parameters: Record<string, unknown>;
+    execute: (
+      toolCallId: string,
+      params: Record<string, unknown>,
+      signal?: AbortSignal,
+      onUpdate?: unknown,
+      ctx?: { cwd?: string },
+    ) => Promise<ToolResult>;
+  }): void;
+  registerCommand(
+    name: string,
+    spec: {
+      description: string;
+      handler: (args: unknown) => Promise<unknown> | unknown;
+    },
+  ): void;
+  on?(
+    event: string,
+    handler: (event: unknown, ctx: { cwd: string }) => void | Promise<void>,
+  ): void;
+};
+
+class SessionRuntime {
+  projectRoot = "";
+  sessionId = `sess-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  readonly registry = new RefRegistry();
+  readonly ledger = new SeenRangeLedger();
+  sidecar: SidecarConnection | undefined;
+  started = false;
+
+  async ensure(cwd?: string): Promise<void> {
+    const root = cwd || this.projectRoot || process.cwd();
+    if (this.started && this.projectRoot === root) return;
+    this.projectRoot = root;
+    this.started = true;
+    try {
+      this.sidecar = await attachSidecar({
+        projectRoot: root,
+        sessionId: this.sessionId,
+      });
+    } catch {
+      this.sidecar = undefined;
+    }
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.started) return;
+    try {
+      if (this.projectRoot) await detachSidecar(this.projectRoot, this.sessionId);
+    } catch {
+      // D2: shutdown only drops our ref; never throw into the session.
+    }
+    this.sidecar = undefined;
+    this.started = false;
+    this.registry.clear();
+    this.ledger.clear();
+  }
+
+  async sidecarStatus(): Promise<Record<string, unknown>> {
+    const snap = this.projectRoot ? await readSidecarSnapshot(this.projectRoot) : undefined;
+    const live = snap ? await pingSidecar(snap) : undefined;
+    return {
+      state: live ? "ready" : "degraded",
+      ready: Boolean(live),
+      degraded: !live,
+      pid: live?.pid ?? snap?.pid,
+      port: live?.port ?? snap?.port,
+      refcount: live?.refcount,
+      reason: live ? "sidecar reachable" : "sidecar not reachable; tools fall back to grep",
+    };
+  }
+}
+
+let tsInitStarted = false;
+async function ensureTreeSitter(): Promise<void> {
+  if (tsInitStarted) return;
+  tsInitStarted = true;
+  try {
+    await initTreeSitter();
+  } catch {
+    // symbol layer stays degraded; callers fall back per spec D8
+  }
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+export default function (pi: ExtensionAPI): void {
+  // Wire the tree-sitter symbol layer into the hook table (spec D4/D6). Lazy: the
+  // WASM grammars are only loaded on the first symbol call via ensureTreeSitter(),
+  // so installing the hooks here never blocks extension load.
+  installSymbolLayer(setSymbolLayer);
+
+  const runtime = new SessionRuntime();
+
+  pi.on?.("session_start", async (_event, ctx) => {
+    await runtime.ensure(ctx.cwd);
+  });
+
+  pi.on?.("session_shutdown", async () => {
+    await runtime.shutdown();
+  });
+
+  pi.registerTool({
+    name: "code_search",
+    label: "Code search",
+    description:
+      "Search the project (exact / symbol / semantic). Returns compressed R# refs (top 12 inline). Use read_spans to fetch bodies. Falls back to grep when the index sidecar is down.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Search query" },
+        mode: {
+          type: "string",
+          enum: ["auto", "exact", "symbol", "semantic"],
+          description: "Retrieval mode; default auto",
+        },
+        path: { type: "string", description: "Optional path prefix" },
+        glob: { type: "string", description: "Optional glob filter" },
+        topK: { type: "number", description: "Optional hit cap" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      try {
+        await runtime.ensure(ctx?.cwd);
+        const settings = await loadRetrievalSettings(runtime.projectRoot);
+        return await executeCodeSearch({
+          query: asString(params.query) ?? "",
+          mode: asString(params.mode) as "auto" | "exact" | "symbol" | "semantic" | undefined,
+          path: asString(params.path),
+          glob: asString(params.glob),
+          topK: asNumber(params.topK),
+          projectRoot: runtime.projectRoot,
+          registry: runtime.registry,
+          excludeGlobs: settings.excludeGlobs,
+          sidecar: runtime.sidecar,
+          signal,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return emptyDegraded(
+          "code-retrieval.search",
+          `code_search failed: ${message}. Use the existing grep / read tools.`,
+        );
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "code_nav",
+    label: "Code nav",
+    description:
+      "Navigate symbols (definition / references / …). Uses the symbol-layer hook when present; otherwise degrades to a stub.",
+    parameters: {
+      type: "object",
+      properties: {
+        operation: {
+          type: "string",
+          enum: [
+            "definition",
+            "references",
+            "implementations",
+            "workspace_symbols",
+            "callers",
+            "callees",
+          ],
+        },
+        symbol: { type: "string" },
+        path: { type: "string" },
+        line: { type: "number" },
+        column: { type: "number" },
+      },
+      required: ["operation"],
+      additionalProperties: false,
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        await runtime.ensure(ctx?.cwd);
+        await ensureTreeSitter();
+        const impl = getSymbolLayer().codeNav;
+        if (!impl) {
+          return emptyDegraded(
+            "code-retrieval.nav",
+            "code_nav symbol graph is not wired yet (hook vacant). Use grep / code_search.",
+          );
+        }
+        const operation = asString(params.operation) as
+          | "definition"
+          | "references"
+          | "implementations"
+          | "workspace_symbols"
+          | "callers"
+          | "callees"
+          | undefined;
+        if (!operation) {
+          return emptyDegraded("code-retrieval.nav", "code_nav requires operation.");
+        }
+        const hits = await impl({
+          operation,
+          symbol: asString(params.symbol),
+          path: asString(params.path),
+          line: asNumber(params.line),
+          column: asNumber(params.column),
+          projectRoot: runtime.projectRoot,
+        });
+        const assigned = runtime.registry.assignAll(hits);
+        return buildToolResult({
+          projectRoot: runtime.projectRoot,
+          kind: "code-retrieval.nav",
+          hits: assigned,
+          degraded: false,
+          content: formatCompressedContent(assigned),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return emptyDegraded("code-retrieval.nav", `code_nav failed: ${message}. Use grep.`);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "repo_map",
+    label: "Repo map",
+    description:
+      "Token-budgeted signature / import / call-edge map. Uses the symbol-layer hook when present.",
+    parameters: {
+      type: "object",
+      properties: {
+        tokenBudget: { type: "number", description: "Override default token budget" },
+      },
+      additionalProperties: false,
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        await runtime.ensure(ctx?.cwd);
+        await ensureTreeSitter();
+        const impl = getSymbolLayer().repoMap;
+        if (!impl) {
+          return emptyDegraded(
+            "code-retrieval.map",
+            "repo_map symbol extractor is not wired yet (hook vacant). Use grep / ls.",
+          );
+        }
+        const settings = await loadRetrievalSettings(runtime.projectRoot);
+        const hits = await impl({
+          tokenBudget: asNumber(params.tokenBudget) ?? settings.tokenBudget,
+          projectRoot: runtime.projectRoot,
+        });
+        const assigned = runtime.registry.assignAll(hits);
+        return buildToolResult({
+          projectRoot: runtime.projectRoot,
+          kind: "code-retrieval.map",
+          hits: assigned,
+          degraded: false,
+          content: formatCompressedContent(assigned),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return emptyDegraded("code-retrieval.map", `repo_map failed: ${message}. Use grep / ls.`);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "read_spans",
+    label: "Read spans",
+    description:
+      "Fetch code spans by stable R# ref from a prior search/map. Session seen-range ledger: a range already returned is cited, not re-inlined. Honors ext.code-retrieval.tokenBudget (default 4000).",
+    parameters: {
+      type: "object",
+      properties: {
+        refs: {
+          type: "array",
+          items: { type: "string" },
+          description: "Stable span ids from a prior search / map result",
+        },
+      },
+      required: ["refs"],
+      additionalProperties: false,
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      try {
+        await runtime.ensure(ctx?.cwd);
+        const settings = await loadRetrievalSettings(runtime.projectRoot);
+        return await executeReadSpans({
+          refs: asStringArray(params.refs),
+          projectRoot: runtime.projectRoot,
+          registry: runtime.registry,
+          ledger: runtime.ledger,
+          tokenBudget: settings.tokenBudget,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return emptyDegraded("code-retrieval.spans", `read_spans failed: ${message}. Use read.`);
+      }
+    },
+  });
+
+  pi.registerCommand(EXTENSION_ID, {
+    description: "Code retrieval invoke bridge (status / reindex)",
+    handler: async (args) => {
+      const record = (args ?? {}) as Record<string, unknown>;
+      const method =
+        typeof record.method === "string"
+          ? record.method
+          : typeof record.name === "string"
+            ? record.name
+            : "status";
+      if (method === "reindex") {
+        return {
+          ok: true,
+          data: {
+            ...(await runtime.sidecarStatus()),
+            accepted: Boolean(runtime.sidecar),
+            message: runtime.sidecar
+              ? "reindex accepted (v1 sidecar is a query shell; no persistent index to rebuild)"
+              : "no sidecar to rebuild; tools will keep using grep fallback",
+          },
+        };
+      }
+      if (method === "status") {
+        return { ok: true, data: await runtime.sidecarStatus() };
+      }
+      return {
+        ok: false,
+        error: {
+          code: "invalid_params",
+          message: `未知 invoke method：${method}（仅支持 status / reindex）`,
+        },
+      };
+    },
+  });
+
+}

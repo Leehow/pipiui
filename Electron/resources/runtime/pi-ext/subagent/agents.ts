@@ -151,6 +151,20 @@ const CAPABILITY_FIELDS = new Set([
 const RESERVED_DESKTOP_TOOLS = new Set(["computer", "open_application"]);
 const WORKER_BROWSER_TOOL = "browser";
 const SECRETARY_COMMIT_TOOL = "secretary_commit";
+/**
+ * Readonly retrieval tools from project-enabled extensions. Role-gated by filesystem
+ * capability (explore / reviewer = read-only; general-purpose = workspace-write).
+ * Not bound to a single extension id: a mount that is not present simply does not register.
+ * Writable extension tools must not be listed here — they stay off explore/reviewer.
+ */
+export const READONLY_RETRIEVAL_TOOL_NAMES = [
+	"code_search",
+	"code_nav",
+	"repo_map",
+	"read_spans",
+	"memory_query",
+] as const;
+const READONLY_RETRIEVAL_TOOL_SET = new Set<string>(READONLY_RETRIEVAL_TOOL_NAMES);
 const MCP_TOOL_NAME = /^mcp_[A-Za-z0-9_-]+_[A-Za-z0-9_.-]+$/;
 
 function str(raw: unknown): string | undefined {
@@ -454,6 +468,8 @@ function capabilityToolNames(capabilities: AgentCapabilities, trustedSecretary: 
 	const names: string[] = [];
 	if (capabilities.filesystem === "read-only" || capabilities.filesystem === "workspace-write") {
 		names.push("read", "grep", "find", "ls");
+		// Project-enabled extension readonly tools: injected by filesystem role, not extension id.
+		names.push(...READONLY_RETRIEVAL_TOOL_NAMES);
 	}
 	if (capabilities.filesystem === "workspace-write") names.push("edit", "write");
 	if (capabilities.shell) names.push("bash");
@@ -530,6 +546,12 @@ function validateExplicitTools(
 				filePath,
 			);
 		}
+	}
+	// Frontmatter `tools` may only narrow. Readonly retrieval tools are role-injected
+	// from the capability set so bundled explore/reviewer/general-purpose lists cannot drop them.
+	if (capabilityTools) {
+		const injected = capabilityTools.filter((name) => READONLY_RETRIEVAL_TOOL_SET.has(name));
+		return [...new Set([...explicitTools, ...injected])];
 	}
 	return explicitTools;
 }

@@ -163,6 +163,12 @@ export function extensionSettingsEnvName(id: string): string {
  */
 export const MOUNTED_EXTENSIONS_ENV = "PIPIUI_MOUNTED_EXTENSIONS";
 /**
+ * PATH-delimited agent-half paths of registry-enabled extensions mounted in this spawn.
+ * Workers remount the same snapshot (`-e`); mid-session enable cannot rewrite a live session.
+ * Name uses the `PIPIUI_EXT_` prefix so sanitizeEnvironment strips inherited/stale values.
+ */
+export const REGISTERED_EXTENSION_PATHS_ENV = "PIPIUI_EXT_REGISTERED_PATHS";
+/**
  * Deprecated compat fallback gate for the legacy `pipiui-media` Grok transport
  * (loopback relay / raw xAI API key). Set to "1" only when the user explicitly
  * enables `ext.grok-build-oauth.compatFallback`; default off (spec D6 / US-27).
@@ -171,15 +177,30 @@ export const MEDIA_COMPAT_FALLBACK_ENV = "PIPIUI_MEDIA_COMPAT_FALLBACK";
 function appendRegisteredExtensions(args:string[], env:Record<string,string>, packages?:readonly SpawnRegisteredExtension[]) {
   const skillRoots:string[]=[];
   const mountedIds:string[]=[];
+  const mountedPaths:string[]=[];
   for (const pkg of packages ?? []) {
     if (!pkg.enabled || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
     mountedIds.push(pkg.id);
+    mountedPaths.push(pkg.extensionPath);
     if (pkg.skillRoots) for (const root of pkg.skillRoots) if (root) skillRoots.push(root);
     if (pkg.settings !== undefined) env[extensionSettingsEnvName(pkg.id)] = JSON.stringify(pkg.settings);
   }
   if (mountedIds.length) env[MOUNTED_EXTENSIONS_ENV] = mountedIds.join(",");
+  if (mountedPaths.length) env[REGISTERED_EXTENSION_PATHS_ENV] = mountedPaths.join(delimiter);
   if (skillRoots.length) env.PIPIUI_SKILL_ROOTS = skillRoots.join(delimiter);
+}
+/**
+ * Worker `-e` remount of the main-session registered-extension snapshot.
+ * Same registry channel as assemblePiSpawn; does not scan bare files.
+ */
+export function workerRegisteredExtensionArgs(env:NodeJS.ProcessEnv=process.env, options:{computerWorker?:boolean}={}):string[] {
+  if(options.computerWorker)return[];
+  const raw=env[REGISTERED_EXTENSION_PATHS_ENV];
+  if(!raw)return[];
+  const args:string[]=[];
+  for(const mount of raw.split(delimiter)) if(mount){args.push("-e",mount)}
+  return args;
 }
 function declaredEntrypoint(root:string):string|undefined {
   try {

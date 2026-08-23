@@ -5543,6 +5543,16 @@ async function runSingleAgent(
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
 	if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT && !options?.computerWorker) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT);
+	// Registry-enabled project extensions: remount the main-session snapshot (D3 / D9).
+	// Same `-e` paths assemblePiSpawn already mounted; do not scan bare files here.
+	if (!options?.computerWorker) {
+		const registered = process.env.PIPIUI_EXT_REGISTERED_PATHS;
+		if (registered) {
+			for (const mount of registered.split(path.delimiter)) {
+				if (mount) args.push("-e", mount);
+			}
+		}
+	}
 	// The official package owns the child-side read-only query registration.
 	// Mount it only alongside a complete main-issued capability tuple.
 	if (terminalMemoryBrokerEnvironment) {
