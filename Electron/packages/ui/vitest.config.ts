@@ -9,6 +9,7 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
+      '@pipi/host-api': resolve(here, '../host-api/src/index.ts'),
       '@pipiui/extension-api': resolve(here, '../extension-api/src/index.ts'),
     },
   },

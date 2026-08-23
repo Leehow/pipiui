@@ -4021,6 +4021,58 @@ describe('composer thinking selector', () => {
     await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('cold-grok', 'medium'))
   })
 
+  it('uses a hydrated GPT-5.6 Sol catalog map over provisional xhigh and falls back safely', async () => {
+    const base = createMockHost()
+    const restoredSession: Session = {
+      id: 'sol-session',
+      projectId: 'pipiui',
+      name: 'GPT Sol thinking',
+      updatedAt: Date.now(),
+      model: { provider: 'openai-codex', modelId: 'gpt-5.6-sol' }
+    }
+    const coldSnapshot: ModelState = {
+      model: { provider: 'openai-codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true },
+      thinkingLevel: 'xhigh',
+      availableThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+    }
+    const catalogModel: Model = {
+      provider: 'openai-codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true,
+      thinkingConfigurable: true,
+      thinkingLevelMap: { minimal: 'low', max: 'max' }
+    }
+    const setThinkingLevel = vi.fn(async (_sessionId: string, level: ModelState['thinkingLevel']): Promise<ModelState> => {
+      if (level === 'xhigh') throw new Error('thinking level xhigh is unavailable')
+      return { model: catalogModel, thinkingLevel: level, availableThinkingLevels: ['off', 'minimal', 'max'] as ModelState['availableThinkingLevels'] }
+    })
+    let resolveCatalog!: (models: Model[]) => void
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: async () => [{ id: 'pipiui', name: 'PipiUI', path: '/Users/demo/code/pipiui' }],
+      listSessions: async () => [restoredSession],
+      getSessionHistory: async () => [],
+      getModelState: vi.fn(async () => coldSnapshot),
+      listModels: vi.fn(() => new Promise<Model[]>(resolve => { resolveCatalog = resolve })),
+      setThinkingLevel
+    }
+
+    render(<App host={host} />)
+    expect(await screen.findByLabelText('思考级别（当前：xhigh）')).toBeTruthy()
+
+    await act(async () => { resolveCatalog([catalogModel]) })
+
+    const chip = await screen.findByLabelText('思考级别（当前：off）') as HTMLButtonElement
+    expect(chip.disabled).toBe(false)
+    fireEvent.click(chip)
+    expect(screen.getByTestId('thinking-row-off')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-minimal')).toBeTruthy()
+    expect(screen.getByTestId('thinking-row-max')).toBeTruthy()
+    expect(screen.queryByTestId('thinking-row-xhigh')).toBeNull()
+    expect(screen.queryByTestId('thinking-row-high')).toBeNull()
+    fireEvent.click(screen.getByTestId('thinking-row-max'))
+    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('sol-session', 'max'))
+    expect(screen.queryByText(/thinking level xhigh is unavailable/)).toBeNull()
+  })
+
   it('updates the thinking chip immediately and rolls back when the host fails', async () => {
     const base = createMockHost()
     let release!: (state: ModelState) => void

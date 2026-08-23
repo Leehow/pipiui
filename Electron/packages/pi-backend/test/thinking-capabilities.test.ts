@@ -624,4 +624,76 @@ describe("model thinking capability contract", () => {
     expect(availableModelsRpc).toBeGreaterThan(modelsRpcAfterEnsure);
     await backend.close();
   });
+
+  it("hydrated GPT-5.6 Sol catalog map wins over stale reported xhigh", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-thinking-sol-catalog-"));
+    const agentDir = join(root, "agent");
+    const cwd = join(root, "project");
+    const sessionDir = join(root, "sessions", "project");
+    await mkdir(agentDir, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({
+      defaultProvider: "openai-codex",
+      defaultModel: "gpt-5.6-sol",
+      defaultThinkingLevel: "max",
+    }));
+    await writeFile(
+      join(sessionDir, "session.jsonl"),
+      [
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "sol-session",
+          timestamp: "2026-08-23T00:00:00.000Z",
+          cwd,
+        }),
+        JSON.stringify({
+          type: "model_change",
+          id: "model-sol",
+          parentId: null,
+          timestamp: "2026-08-23T00:00:01.000Z",
+          provider: "openai-codex",
+          modelId: "gpt-5.6-sol",
+        }),
+        JSON.stringify({
+          type: "thinking_level_change",
+          id: "thinking-xhigh",
+          parentId: "model-sol",
+          timestamp: "2026-08-23T00:00:01.001Z",
+          thinkingLevel: "xhigh",
+        }),
+      ].join("\n") + "\n",
+    );
+    const backend = createPiHostBackend({
+      agentDir,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      canonicalProjectPaths: async () => undefined,
+      authRuntime: {
+        getProviders: async () => [],
+        getAvailable: async () => [{
+          provider: "openai-codex",
+          id: "gpt-5.6-sol",
+          name: "GPT-5.6 Sol",
+          reasoning: true,
+          thinkingLevelMap: { minimal: "low", max: "max" },
+        }],
+        login: async () => undefined,
+        logout: async () => undefined,
+      },
+    });
+
+    expect(await backend.handle("getModelState", ["sol-session"])).toMatchObject({
+      model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+      thinkingLevel: "off",
+      availableThinkingLevels: ["off", "minimal", "max"],
+    });
+    await expect(backend.handle("setThinkingLevel", ["sol-session", "xhigh"])).rejects.toThrow(/unavailable/);
+    expect(await backend.handle("setThinkingLevel", ["sol-session", "max"])).toMatchObject({
+      thinkingLevel: "max",
+      availableThinkingLevels: ["off", "minimal", "max"],
+    });
+    await backend.close();
+  });
 });

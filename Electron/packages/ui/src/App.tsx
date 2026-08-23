@@ -3,7 +3,7 @@ import { PlanApprovalBar } from './PlanApprovalBar'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
 import './builtin-panels'
-import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
+import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
@@ -209,10 +209,12 @@ function modelStateFromSession(session: Session | undefined, catalog: readonly M
 function reconcileModelStateWithCatalog(state: ModelState, catalog: readonly Model[]): ModelState {
   const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
   if (!known) return state
+  const availableThinkingLevels = thinkingLevelsForHydratedModel(known, state.availableThinkingLevels)
   return {
     ...state,
     model: known,
-    availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels)
+    thinkingLevel: resolveThinkingLevel(state.thinkingLevel, availableThinkingLevels) ?? state.thinkingLevel,
+    availableThinkingLevels,
   }
 }
 
@@ -220,11 +222,13 @@ function fallbackModelIfMissing(state: ModelState, catalog: readonly Model[]): {
   if (catalog.length === 0) return { state, fellBack: false }
   const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
   if (known) {
+    const availableThinkingLevels = thinkingLevelsForHydratedModel(known, state.availableThinkingLevels)
     return {
       state: {
         ...state,
         model: known,
-        availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels),
+        thinkingLevel: resolveThinkingLevel(state.thinkingLevel, availableThinkingLevels) ?? state.thinkingLevel,
+        availableThinkingLevels,
       },
       fellBack: false,
     }

@@ -173,6 +173,13 @@ export type Model = {
 };
 export type ModelState = { model: Model; thinkingLevel: ThinkingLevel; availableThinkingLevels: ThinkingLevel[] };
 
+/** Catalog metadata that must not be overridden by provisional/session-reported lists. */
+export function modelHasExplicitThinkingCapability(model: Model): boolean {
+  return model.reasoning === false
+    || model.thinkingConfigurable === false
+    || model.thinkingLevelMap !== undefined;
+}
+
 /** One capability source for backend fallbacks, the composer, and subagent overrides. */
 export function thinkingLevelsForModel(model: Model, reported?: readonly ThinkingLevel[]): ThinkingLevel[] {
   if (model.reasoning === false || model.thinkingConfigurable === false) return [];
@@ -191,6 +198,14 @@ export function thinkingLevelsForModel(model: Model, reported?: readonly Thinkin
     return THINKING_LEVELS.filter(level => supported.has(level));
   }
   return [...STANDARD_THINKING_LEVELS];
+}
+
+/**
+ * After listModels hydration, explicit catalog capability wins. Reported/provisional
+ * lists are only a fallback when the catalog model itself is silent.
+ */
+export function thinkingLevelsForHydratedModel(model: Model, reported?: readonly ThinkingLevel[]): ThinkingLevel[] {
+  return thinkingLevelsForModel(model, modelHasExplicitThinkingCapability(model) ? undefined : reported);
 }
 
 /** Prefer current if allowed, else fallback if allowed, else the first allowed level. */

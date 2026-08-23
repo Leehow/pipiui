@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtUiEvent, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
+import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtUiEvent, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
@@ -99,6 +99,28 @@ describe('thinking capability tri-state helper', () => {
     expect(resolveThinkingLevel('high', available, 'xhigh')).toBe('xhigh')
     expect(resolveThinkingLevel('minimal', available, 'off')).toBe('minimal')
     expect(resolveThinkingLevel('high', [])).toBeUndefined()
+  })
+
+  it('lets a hydrated catalog map override a stale provisional list', () => {
+    const sol = {
+      ...unknown,
+      provider: 'openai-codex',
+      id: 'gpt-5.6-sol',
+      name: 'GPT-5.6 Sol',
+      reasoning: true,
+      thinkingLevelMap: { minimal: 'low', max: 'max' } as const,
+    }
+    const stale = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+    expect(thinkingLevelsForHydratedModel(sol, stale)).toEqual(['off', 'minimal', 'max'])
+    expect(thinkingLevelsForHydratedModel(sol, stale)).not.toContain('xhigh')
+    expect(resolveThinkingLevel('xhigh', thinkingLevelsForHydratedModel(sol, stale))).toBe('off')
+  })
+
+  it('keeps reported levels when the hydrated catalog is silent', () => {
+    const grok = { ...unknown, provider: 'xai', id: 'grok-4.6', name: 'Grok 4.6', reasoning: true, thinkingConfigurable: true }
+    expect(thinkingLevelsForHydratedModel(grok, ['minimal', 'low', 'medium', 'high', 'xhigh'])).toEqual([
+      'minimal', 'low', 'medium', 'high', 'xhigh',
+    ])
   })
 })
 

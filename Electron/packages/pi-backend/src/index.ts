@@ -1669,6 +1669,10 @@ export class PiHostBackend implements HostBackend {
   private modelsLoaded?: Promise<void>;
   /** True only after configured and auth-aware runtime catalogs have been merged successfully. */
   private modelCatalogReady = false;
+  /** In-flight or completed full catalog load for the current generation. Cleared on invalidate/failure. */
+  private modelCatalogLoad?: Promise<void>;
+  private modelCatalogIncludeCurrent = false;
+  private modelCatalogGeneration = 0;
   /** One /models probe per backend lifetime per normalized baseUrl. */
   private probedCompatBaseUrls = new Set<string>();
   private modelsJsonUnwritableWarned = false;
@@ -4851,9 +4855,7 @@ export class PiHostBackend implements HostBackend {
         if (this.projectModelsInitialized === initialization) this.projectModelsInitialized = undefined;
         throw error;
       }
-      this.modelsLoaded = undefined;
-      this.runtimeModelsPromise = undefined;
-      this.modelCatalogReady = false;
+      this.invalidateModelCatalog();
       await this.loadModelCatalog(true);
     }
     return [...saved];
@@ -5814,18 +5816,42 @@ export class PiHostBackend implements HostBackend {
   }
   /** Renderer/API catalog reads wait for isolated init and the current write-queue tail. */
   private async loadModelCatalog(includeCurrent = true): Promise<void> {
-    if (this.profileMode === "isolated") {
-      await this.loadProjectPaths();
-      await this.awaitCanonicalModelsIdle();
+    if (this.modelCatalogReady && (!includeCurrent || this.modelCatalogIncludeCurrent)) return;
+    if (this.modelCatalogLoad && (!includeCurrent || this.modelCatalogIncludeCurrent)) {
+      return this.modelCatalogLoad;
     }
-    await this.loadModelCatalogUnsafe(includeCurrent);
+    const generation = this.modelCatalogGeneration;
+    const requestedIncludeCurrent = includeCurrent || this.modelCatalogIncludeCurrent;
+    let load!: Promise<void>;
+    load = (async () => {
+      try {
+        if (this.profileMode === "isolated") {
+          await this.loadProjectPaths();
+          await this.awaitCanonicalModelsIdle();
+        }
+        if (generation !== this.modelCatalogGeneration) return;
+        await this.loadModelCatalogUnsafe(requestedIncludeCurrent);
+        if (generation !== this.modelCatalogGeneration) return;
+        this.modelCatalogIncludeCurrent = requestedIncludeCurrent || this.modelCatalogIncludeCurrent;
+      } catch (error) {
+        if (this.modelCatalogLoad === load) this.modelCatalogLoad = undefined;
+        throw error;
+      }
+    })();
+    this.modelCatalogLoad = load;
+    return load;
   }
   /** Queue-job catalog reread. Must not await the write queue it is already running on. */
   private async loadModelCatalogUnsafe(includeCurrent = true): Promise<void> {
+    const generation = this.modelCatalogGeneration;
     await this.loadConfiguredModels();
+    if (generation !== this.modelCatalogGeneration) return;
     await this.mergeRuntimeModels(includeCurrent);
+    if (generation !== this.modelCatalogGeneration) return;
     this.applyManualModelSelection(await this.loadManualModelSelection());
+    if (generation !== this.modelCatalogGeneration) return;
     this.applyManualThinkingLevel(await this.loadManualThinkingLevel());
+    if (generation !== this.modelCatalogGeneration) return;
     for (const [sessionId, state] of this.sessionModelStates) {
       const catalog = this.models.find(model =>
         model.provider === state.model.provider && model.id === state.model.id,
@@ -5860,13 +5886,18 @@ export class PiHostBackend implements HostBackend {
         }
       }
     }
+    if (generation !== this.modelCatalogGeneration) return;
     this.modelCatalogReady = true;
+    this.modelCatalogIncludeCurrent = includeCurrent || this.modelCatalogIncludeCurrent;
     this.scheduleCompatContextBackfill();
   }
   private invalidateModelCatalog(): void {
     this.modelsLoaded = undefined;
     this.runtimeModelsPromise = undefined;
     this.modelCatalogReady = false;
+    this.modelCatalogLoad = undefined;
+    this.modelCatalogIncludeCurrent = false;
+    this.modelCatalogGeneration += 1;
   }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
@@ -6557,7 +6588,11 @@ export class PiHostBackend implements HostBackend {
     };
     const availableThinkingLevels = thinkingLevelsForModel(
       model,
-      reported.availableThinkingLevels.length > 0 ? reported.availableThinkingLevels : undefined,
+      model.thinkingLevelMap !== undefined
+        || model.reasoning === false
+        || model.thinkingConfigurable === false
+        ? undefined
+        : (reported.availableThinkingLevels.length > 0 ? reported.availableThinkingLevels : undefined),
     );
     if (!availableThinkingLevels.includes(level))
       throw new Error(`thinking level ${level} is unavailable`);

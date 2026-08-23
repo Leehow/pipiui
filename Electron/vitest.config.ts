@@ -12,6 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 export default defineConfig({
   resolve: {
     alias: {
+      '@pipi/host-api': resolve(here, 'packages/host-api/src/index.ts'),
       '@pipiui/extension-api': resolve(here, 'packages/extension-api/src/index.ts'),
     },
   },
