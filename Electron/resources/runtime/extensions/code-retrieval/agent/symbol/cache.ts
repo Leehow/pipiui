@@ -6,7 +6,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { extractSymbols } from "./extract.js";
 import { collectSourceEntries, type SourceEntry } from "./files.js";
@@ -40,10 +40,26 @@ interface CachePayload {
 }
 
 const memory = new Map<string, SymbolInfo[]>();
+const inflightExtracts = new Map<string, Promise<CachedExtractResult>>();
 let lastStats: CachedExtractStats | null = null;
+let extractRunStarts = 0;
+let parseDirtyCount = 0;
 
 export function lastCachedExtractStats(): CachedExtractStats | null {
   return lastStats;
+}
+
+export function symbolExtractRunStarts(): number {
+  return extractRunStarts;
+}
+
+export function symbolParseDirtyCount(): number {
+  return parseDirtyCount;
+}
+
+export function resetSymbolExtractCounters(): void {
+  extractRunStarts = 0;
+  parseDirtyCount = 0;
 }
 
 export function clearSymbolMemoryCache(): void {
@@ -141,6 +157,7 @@ function parseDirty(
   file: SourceFile,
   contentSha: string,
 ): SymbolInfo[] {
+  parseDirtyCount += 1;
   const symbols = extractSymbols(file.path, file.source, file.lang);
   store(projectRoot, cacheDir, file.path, contentSha, symbols);
   return symbols;
@@ -149,10 +166,26 @@ function parseDirty(
 /**
  * Incremental extract: hash each source file, reuse cache, parse only dirty files.
  * Yields the event loop between parse batches so a first full scan cannot pin Node.
+ * Concurrent callers for the same projectRoot wait on one in-flight run (no double parse).
  */
 export async function extractProjectCached(
   root: string,
   opts: { excludeGlobs?: string[]; maxFiles?: number } = {},
+): Promise<CachedExtractResult> {
+  const key = resolve(root);
+  const existing = inflightExtracts.get(key);
+  if (existing) return existing;
+  extractRunStarts += 1;
+  const run = runExtractProjectCached(root, opts).finally(() => {
+    if (inflightExtracts.get(key) === run) inflightExtracts.delete(key);
+  });
+  inflightExtracts.set(key, run);
+  return run;
+}
+
+async function runExtractProjectCached(
+  root: string,
+  opts: { excludeGlobs?: string[]; maxFiles?: number },
 ): Promise<CachedExtractResult> {
   const started = Date.now();
   const cacheDir = symbolCacheDir(root);

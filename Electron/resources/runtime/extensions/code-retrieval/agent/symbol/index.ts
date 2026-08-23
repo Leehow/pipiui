@@ -28,6 +28,9 @@ export {
   lastCachedExtractStats,
   clearSymbolMemoryCache,
   symbolCacheDir,
+  symbolExtractRunStarts,
+  symbolParseDirtyCount,
+  resetSymbolExtractCounters,
   CACHE_SCHEMA,
 } from "./cache.js";
 export {

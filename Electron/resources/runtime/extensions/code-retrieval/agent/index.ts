@@ -18,8 +18,9 @@ import { buildToolResult, emptyDegraded, formatCompressedContent, RefRegistry } 
 import { executeReadSpans } from "./read-spans.js";
 import { loadRetrievalSettings } from "./settings.js";
 import { attachSidecar, detachSidecar, pingSidecar, readSidecarSnapshot } from "./sidecar-lifecycle.js";
+import { extractProjectCached } from "./symbol/cache.js";
 import { installSymbolLayer } from "./symbol/hooks-adapter.js";
-import { initTreeSitter, isTreeSitterReady, treeSitterInitError } from "./symbol/treesitter.js";
+import { initTreeSitter, isTreeSitterReady } from "./symbol/treesitter.js";
 import type { SidecarConnection, ToolResult } from "./types.js";
 
 export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
@@ -104,14 +105,40 @@ class SessionRuntime {
   }
 }
 
-let tsInitStarted = false;
-async function ensureTreeSitter(): Promise<void> {
-  if (tsInitStarted) return;
-  tsInitStarted = true;
+let tsInitPromise: Promise<void> | null = null;
+let warmupRoot = "";
+let warmupPromise: Promise<void> | null = null;
+
+/** Shared in-flight tree-sitter init. Concurrent callers wait on the same promise. */
+export function ensureTreeSitter(): Promise<void> {
+  if (!tsInitPromise) {
+    tsInitPromise = initTreeSitter().catch(() => {
+      // symbol layer stays degraded; callers fall back per spec D8
+    });
+  }
+  return tsInitPromise;
+}
+
+/**
+ * Background symbol-cache warmup. Never throws. Same projectRoot reuses the
+ * in-flight (or already-settled) promise so session_start cannot double-parse.
+ */
+export function startSymbolWarmup(projectRoot: string): Promise<void> {
+  const root = projectRoot;
+  if (warmupPromise && warmupRoot === root) return warmupPromise;
+  warmupRoot = root;
+  warmupPromise = runSymbolWarmup(root);
+  return warmupPromise;
+}
+
+async function runSymbolWarmup(projectRoot: string): Promise<void> {
   try {
-    await initTreeSitter();
+    await ensureTreeSitter();
+    if (!isTreeSitterReady()) return;
+    const settings = await loadRetrievalSettings(projectRoot);
+    await extractProjectCached(projectRoot, { excludeGlobs: settings.excludeGlobs });
   } catch {
-    // symbol layer stays degraded; callers fall back per spec D8
+    // D8: wasm missing / init / extract failure must not affect session load.
   }
 }
 
@@ -129,15 +156,17 @@ function asStringArray(value: unknown): string[] {
 }
 
 export default function (pi: ExtensionAPI): void {
-  // Wire the tree-sitter symbol layer into the hook table (spec D4/D6). Lazy: the
-  // WASM grammars are only loaded on the first symbol call via ensureTreeSitter(),
-  // so installing the hooks here never blocks extension load.
+  // Wire the tree-sitter symbol layer into the hook table (spec D4/D6).
+  // Hooks install is cheap; WASM + full extract run in the background after
+  // session_start so the first repo_map / code_nav can join the in-flight cache.
   installSymbolLayer(setSymbolLayer);
 
   const runtime = new SessionRuntime();
 
   pi.on?.("session_start", async (_event, ctx) => {
     await runtime.ensure(ctx.cwd);
+    // Fire-and-forget: never block session_start on tree-sitter / extract.
+    void startSymbolWarmup(runtime.projectRoot);
   });
 
   pi.on?.("session_shutdown", async () => {
