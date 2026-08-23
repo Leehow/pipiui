@@ -60,6 +60,41 @@ describe('SubagentModelModal', () => {
     expect(await host.getMemoryReviewModel?.()).toBeNull()
   })
 
+  it('persists a dedicated Luna Supervisor override and clears it without thinking or fallback controls', async () => {
+    const luna: Model = { provider: 'openai-codex', id: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', reasoning: true }
+    const host = createMockHost()
+    const save = vi.spyOn(host, 'setSubagentModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility({
+      models: [luna, hidden], visibleModels: [luna, hidden], quickModels: [luna, hidden],
+      quickProviders: ['openai-codex', 'deepseek'], hiddenIds: new Set(['deepseek/deepseek-v3']),
+    })} onClose={() => undefined} />)
+
+    const row = await screen.findByTestId('supervisor-model-row')
+    expect(within(row).getByText('Supervisor 管理 Agent')).toBeTruthy()
+    expect(within(row).getByText(/general-purpose.*当前主 Agent.*下一个 Supervisor epoch/)).toBeTruthy()
+    expect(within(row).queryByText(/思考强度/)).toBeNull()
+    expect(within(row).queryByText(/添加备用模型/)).toBeNull()
+    const picker = within(row).getByRole('button', { name: 'supervisor 0 模型' })
+    expect(picker.textContent).toContain('使用 general-purpose / 主 Agent 回退')
+
+    fireEvent.click(picker)
+    expect(screen.queryByTestId('subagent-model-option-supervisor-0-deepseek-deepseek-v3')).toBeNull()
+    fireEvent.click(screen.getByTestId('subagent-model-option-supervisor-0-openai-codex-gpt-5.6-luna'))
+    await waitFor(() => expect(picker.textContent).toContain('openai-codex/gpt-5.6-luna'))
+    expect(save).toHaveBeenLastCalledWith('supervisor', [{ model: 'openai-codex/gpt-5.6-luna' }])
+    expect(await host.getSubagentModels?.()).toMatchObject({
+      supervisor: [{ model: 'openai-codex/gpt-5.6-luna' }],
+    })
+
+    fireEvent.click(picker)
+    fireEvent.click(screen.getByRole('option', { name: /使用 general-purpose \/ 主 Agent 回退/ }))
+    await waitFor(() => expect(picker.textContent).toContain('使用 general-purpose / 主 Agent 回退'))
+    expect(save).toHaveBeenLastCalledWith('supervisor', [])
+    const clearedOverrides = await host.getSubagentModels?.()
+    expect(clearedOverrides).toBeDefined()
+    expect(clearedOverrides?.supervisor).toBeUndefined()
+  })
+
   it('keeps existing subagent settings available when an older host lacks Hermes review methods', async () => {
     const host = createMockHost()
     host.getMemoryReviewModel = undefined

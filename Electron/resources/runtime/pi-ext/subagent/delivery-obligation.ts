@@ -160,11 +160,14 @@ export class DeliveryObligationStore {
 		return sha256(routingKey).slice(0, 24);
 	}
 
-	create(agentId: string, runId: string, text: string): DeliveryObligation {
+	create(agentId: string, runId: string, text: string, identityNamespace?: string): DeliveryObligation {
 		const payloadHash = sha256(text);
-		// One Pi session + agent generation is one logical completion. The payload hash
-		// protects the stored text, but must not turn retry formatting into a second event.
-		const id = sha256(`${this.routingKeyHash}\0${agentId}\0${runId}`);
+		// The default keeps existing worker-completion identities byte-for-byte stable.
+		// Named host channels (for example Supervisor escalation) must not consume that
+		// worker receipt merely because they share an agent/run coordinate.
+		const id = sha256(identityNamespace
+			? `${this.routingKeyHash}\0${identityNamespace}\0${agentId}\0${runId}`
+			: `${this.routingKeyHash}\0${agentId}\0${runId}`);
 		const existing = this.read(id);
 		if (existing) return existing;
 		const now = this.now();

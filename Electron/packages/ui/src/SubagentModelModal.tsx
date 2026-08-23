@@ -27,6 +27,7 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
   const computerUseAgent = agents.find(agent => agent.name === 'computer-use')
   const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
+  const supervisorModel = settings.supervisor?.[0]?.model ?? ''
 
   useEffect(() => {
     if (!host.getSubagentModels || !host.listAgentDefinitions) return
@@ -104,15 +105,32 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
             <div className="subagent-main-model">
               {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.provider}/{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
             </div>
-            {memoryAvailable && <section className="subagent-agent-group" aria-labelledby="system-memory-models-heading">
+            <section className="subagent-agent-group" aria-labelledby="system-memory-models-heading">
               <div className="subagent-agent-group-heading"><h3 id="system-memory-models-heading">系统 / 记忆</h3><span>独立后台角色，不参与 Subagent fallback</span></div>
-              <article className="subagent-agent-row" data-testid="memory-review-model-row">
+              <article className="subagent-agent-row" data-testid="supervisor-model-row">
+                <div className="subagent-agent-heading"><strong>Supervisor 管理 Agent</strong></div>
+                <p>显式选择只覆盖 Supervisor。默认依次使用 general-purpose 主模型，再使用当前主 Agent（Boss）；新选择从下一个 Supervisor epoch 生效。</p>
+                <ModelPicker
+                  models={candidateModels}
+                  selected={candidateModels.find(model => modelRef(model) === supervisorModel)}
+                  configuredRef={supervisorModel}
+                  follow={!supervisorModel}
+                  allowFollow
+                  followLabel="使用 general-purpose / 主 Agent 回退"
+                  disabled={saving === 'supervisor'}
+                  onSelect={model => { void save('supervisor', model ? [{ model }] : []) }}
+                  agentName="supervisor"
+                  index={0}
+                />
+                {supervisorModel && !candidateModels.some(model => modelRef(model) === supervisorModel) && <div className="subagent-model-warning" role="alert">历史设置「{supervisorModel}」当前不可见，请重新选择已启用的 provider/model。</div>}
+              </article>
+              {memoryAvailable && <article className="subagent-agent-row" data-testid="memory-review-model-row">
                 <div className="subagent-agent-heading"><strong>Hermes 记忆复核</strong></div>
                 <p>整理会话记忆时使用。默认在复核发生时跟随当时的主 Agent；显式选择只覆盖复核模型。</p>
                 <ModelPicker models={candidateModels} selected={candidateModels.find(model => modelRef(model) === memoryReviewModel)} configuredRef={memoryReviewModel ?? ''} follow={!memoryReviewModel} allowFollow disabled={saving === 'memory-review'} onSelect={saveMemoryReview} agentName="memory-review" index={0} />
                 {memoryReviewModel && !candidateModels.some(model => modelRef(model) === memoryReviewModel) && <div className="subagent-model-warning" role="alert">历史设置「{memoryReviewModel}」当前不可见，请重新选择已启用的 provider/model。</div>}
-              </article>
-            </section>}
+              </article>}
+            </section>
             <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
               <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
               {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
@@ -206,12 +224,13 @@ function AgentRow({ agent, chain, models, saving, onSave, hierarchy }: {
   )
 }
 
-function ModelPicker({ models, selected, configuredRef, follow, allowFollow, disabled, onSelect, agentName, index }: {
+function ModelPicker({ models, selected, configuredRef, follow, allowFollow, followLabel = '跟随主 Agent', disabled, onSelect, agentName, index }: {
   models: Model[]
   selected?: Model
   configuredRef: string
   follow: boolean
   allowFollow: boolean
+  followLabel?: string
   disabled: boolean
   onSelect: (modelId: string) => void
   agentName: string
@@ -219,7 +238,7 @@ function ModelPicker({ models, selected, configuredRef, follow, allowFollow, dis
 }) {
   const [open, setOpen] = useState(false)
   const pick = (modelId: string) => { setOpen(false); onSelect(modelId) }
-  const label = follow ? '跟随主 Agent' : selected ? `${selected.name}（${selected.provider}/${selected.id}）` : configuredRef ? `需重新选择 provider（${configuredRef}）` : '选择模型'
+  const label = follow ? followLabel : selected ? `${selected.name}（${selected.provider}/${selected.id}）` : configuredRef ? `需重新选择 provider（${configuredRef}）` : '选择模型'
   return (
     <div className="subagent-model-picker">
       <button type="button" className="subagent-model-picker-trigger" aria-label={`${agentName} ${index} 模型`} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} onClick={() => setOpen(value => !value)}>
@@ -227,7 +246,7 @@ function ModelPicker({ models, selected, configuredRef, follow, allowFollow, dis
         <span>{label}</span><b>⌄</b>
       </button>
       {open && <div className="subagent-model-picker-menu" role="listbox" aria-label={`${agentName} 模型候选`}>
-        {allowFollow && <button type="button" role="option" aria-selected={follow} className={follow ? 'selected' : ''} onClick={() => pick('')}><span>跟随主 Agent</span>{follow && <b aria-label="已选中">✓</b>}</button>}
+        {allowFollow && <button type="button" role="option" aria-selected={follow} className={follow ? 'selected' : ''} onClick={() => pick('')}><span>{followLabel}</span>{follow && <b aria-label="已选中">✓</b>}</button>}
         {models.map(model => {
           const ref = modelRef(model)
           const active = selected ? modelRef(selected) === ref && !follow : false

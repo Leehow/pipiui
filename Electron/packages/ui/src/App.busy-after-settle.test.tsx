@@ -347,12 +347,28 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
   })
 
-  it('reconciles durable history when a terminal event belongs to an unopened newer epoch', async () => {
+  it('closes a genuinely busy turn when a terminal event belongs to an unopened newer epoch', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     let durableSummaryAvailable = false
+    let terminalQueueEmpty = false
+    let resolvedTerminalQueueReads = 0
+    const stuck = {
+      id: 'abort-command',
+      sessionId: 'layout',
+      text: '/subagent_abort agent-exact',
+      attachments: [],
+      createdAt: 1,
+      state: 'sending' as const,
+    }
     const base = createMockHost()
     const host: PipiHostAPI = {
       ...base,
+      listQueue: async () => {
+        if (!terminalQueueEmpty) return [stuck]
+        await new Promise(resolve => window.setTimeout(resolve, 40))
+        resolvedTerminalQueueReads += 1
+        return []
+      },
       getSessionHistory: async (sessionId, before, limit) => {
         const page = await base.getSessionHistory(sessionId, before, limit)
         return sessionId === 'layout' && durableSummaryAvailable
@@ -367,17 +383,176 @@ describe('settled turn stays idle after a late streaming status', () => {
     await waitFor(() => expect(listener).toBeDefined())
 
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
-    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '前一轮答复' }) })
-    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
-    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '批次仍在处理' }) })
+    act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
+    expect(screen.getByLabelText('停止生成')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
     await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 300)) })
 
     durableSummaryAvailable = true
+    terminalQueueEmpty = true
+    // Production exact-abort closeout: the renderer missed epoch 2's started,
+    // but receives its terminal after the durable Boss report is already in JSONL.
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 2 }) })
 
     expect(await screen.findByText('持久化的最终总结')).toBeTruthy()
+    await waitFor(() => expect(resolvedTerminalQueueReads).toBeGreaterThan(0))
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '下一条消息' } })
+    expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false)
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it('closes scalar busy on the trailing history pull after the first pull replaces the live tail', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    let durableSummaryAvailable = false
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async (sessionId, before, limit) => {
+        const page = await base.getSessionHistory(sessionId, before, limit)
+        return sessionId === 'layout' && durableSummaryAvailable
+          ? [...page, { id: 'durable-race-summary', role: 'assistant' as const, content: '完整持久化结论', timestamp: Date.now() }]
+          : page
+      },
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '不完整实时尾部' }) })
+    expect(screen.getByLabelText('停止生成')).toBeTruthy()
+    durableSummaryAvailable = true
+    // An older terminal may trigger reconciliation but must not directly close
+    // epoch 2. The first pull replaces the live tail; the bounded trailing pull
+    // sees that exact settled snapshot and must clear the split scalar busy flag.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+
+    expect(await screen.findByText('完整持久化结论')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull(), { timeout: 1_000 })
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it('closes the exact durable abort summary and delayed-empty queue after a stale terminal', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    let durableSummaryAvailable = false
+    let terminalQueueEmpty = false
+    let resolvedTerminalQueueReads = 0
+    const staleSending = {
+      id: 'abort-d-hang',
+      sessionId: 'layout',
+      text: '/subagent_abort agent-41772b9589e92166',
+      attachments: [],
+      createdAt: 1,
+      state: 'sending' as const,
+    }
+    const initialSummary = '批次 D 仍在等待 C-HANG'
+    const finalSummary = '批次D回归汇报：D-OK 已完成，D-HANG 已精确中止。'
+    const base = createMockHost()
+    const listQueue = vi.fn(async () => {
+      if (!terminalQueueEmpty) return [staleSending]
+      await new Promise(resolve => window.setTimeout(resolve, 40))
+      resolvedTerminalQueueReads += 1
+      return []
+    })
+    const host: PipiHostAPI = {
+      ...base,
+      listQueue,
+      getSessionHistory: async (sessionId, before, limit) => {
+        const page = await base.getSessionHistory(sessionId, before, limit)
+        return sessionId === 'layout'
+          ? [...page, {
+              id: 'batch-d-final',
+              role: 'assistant' as const,
+              content: durableSummaryAvailable ? finalSummary : initialSummary,
+              timestamp: 2,
+            }]
+          : page
+      },
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await screen.findByText(initialSummary)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['Supervisor notification'] }) })
+    act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [staleSending] }) })
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+
+    // The canonical D trace had already rendered the durable final branch by
+    // the time the terminal-triggered history pull completed. Secret redaction
+    // is a deterministic same-id stream mutation that recreates that exact
+    // live/durable fingerprint without inventing another assistant message.
+    act(() => {
+      listener?.({
+        type: 'secret_redact',
+        sessionId: 'layout',
+        messages: [{ id: 'batch-d-final', role: 'assistant', content: finalSummary }],
+      })
+    })
+    durableSummaryAvailable = true
+    terminalQueueEmpty = true
+    const queueReadsBeforeTerminal = listQueue.mock.calls.length
+
+    // Epoch 1 is older than the genuinely open epoch 2, so it may reconcile
+    // durable history but must not directly close the live turn.
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+
+    expect(await screen.findByText(finalSummary)).toBeTruthy()
+    await waitFor(() => expect(resolvedTerminalQueueReads).toBeGreaterThan(0), { timeout: 1_000 })
+    expect(listQueue.mock.calls.length).toBeGreaterThan(queueReadsBeforeTerminal)
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
     expect(screen.queryByLabelText('停止生成')).toBeNull()
     expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '下一条消息' } })
+    expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false)
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it('does not let an older terminal close a genuinely newer first-token wait', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    let durableFinalAvailable = false
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async (sessionId, before, limit) => {
+        const page = await base.getSessionHistory(sessionId, before, limit)
+        return sessionId === 'layout' && durableFinalAvailable
+          ? [...page, { id: 'epoch-1-final', role: 'assistant' as const, content: '第一轮已经完成', timestamp: Date.now() }]
+          : page
+      },
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).not.toBeNull())
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '第一轮已经完成' }) })
+    durableFinalAvailable = true
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['真正的新请求'] }) })
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 350)) })
+
+    expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
   it('reopens a live wait when a queued 继续 user_message arrives after a ghost started', async () => {
@@ -386,6 +561,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).not.toBeNull())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -486,6 +662,8 @@ describe('settled turn stays idle after a late streaming status', () => {
 
   it('does not keep the composer busy on a leftover sending item after stop', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
+    let terminalQueueEmpty = false
+    let resolvedTerminalQueueReads = 0
     const stuck = {
       id: 'stuck-send',
       sessionId: 'layout',
@@ -495,9 +673,15 @@ describe('settled turn stays idle after a late streaming status', () => {
       state: 'sending' as const,
     }
     const base = createMockHost()
+    const listQueue = vi.fn(async () => {
+      if (!terminalQueueEmpty) return [stuck]
+      await new Promise(resolve => window.setTimeout(resolve, 40))
+      resolvedTerminalQueueReads += 1
+      return []
+    })
     const host: PipiHostAPI = {
       ...base,
-      listQueue: async () => [stuck],
+      listQueue,
       subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
     }
     const { container } = render(<App host={host} />)
@@ -511,10 +695,76 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
     expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
 
+    terminalQueueEmpty = true
+    const queueReadsBeforeTerminal = listQueue.mock.calls.length
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'stopped' }) })
-    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+    await waitFor(() => expect(resolvedTerminalQueueReads).toBeGreaterThan(0))
+    expect(listQueue.mock.calls.length).toBeGreaterThan(queueReadsBeforeTerminal)
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
     expect(screen.getByLabelText('发送消息')).toBeTruthy()
     expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
   })
+
+  it.each(['settled', 'stopped'] as const)(
+    'dirties the accessibility node on busy-to-idle without replacing the focused IME draft on %s',
+    async terminalStatus => {
+      let listener: ((event: StreamEvent) => void) | undefined
+      let terminalQueueEmpty = false
+      let resolvedTerminalQueueReads = 0
+      const sending = {
+        id: `accessibility-${terminalStatus}`,
+        sessionId: 'layout',
+        text: '保留输入法草稿',
+        attachments: [],
+        createdAt: 1,
+        state: 'sending' as const,
+      }
+      const base = createMockHost()
+      const host: PipiHostAPI = {
+        ...base,
+        listQueue: async () => {
+          if (!terminalQueueEmpty) return [sending]
+          await new Promise(resolve => window.setTimeout(resolve, 40))
+          resolvedTerminalQueueReads += 1
+          return []
+        },
+        subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+      }
+      const { container } = render(<App host={host} />)
+      await screen.findAllByText('Electron 三栏界面')
+      fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+      await waitFor(() => expect(listener).toBeDefined())
+
+      const input = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+      input.focus()
+      fireEvent.compositionStart(input)
+      fireEvent.change(input, { target: { value: '批次 E 输入法草稿' } })
+      act(() => {
+        listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 })
+        listener?.({ type: 'queue_update', sessionId: 'layout', queue: [sending] })
+      })
+
+      expect(screen.getByLabelText('消息输入框')).toBe(input)
+      expect(document.activeElement).toBe(input)
+      expect(input.value).toBe('批次 E 输入法草稿')
+      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+      expect(input.classList.contains('queue-busy')).toBe(true)
+      expect(input.getAttribute('aria-busy')).toBeNull()
+
+      terminalQueueEmpty = true
+      act(() => { listener?.({ type: 'status', sessionId: 'layout', status: terminalStatus, turnEpoch: 1 }) })
+      await waitFor(() => expect(resolvedTerminalQueueReads).toBeGreaterThan(0))
+
+      expect(screen.getByLabelText('消息输入框')).toBe(input)
+      expect(document.activeElement).toBe(input)
+      expect(input.value).toBe('批次 E 输入法草稿')
+      expect(input.getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+      expect(input.classList.contains('idle')).toBe(true)
+      expect(input.classList.contains('queue-busy')).toBe(false)
+      expect(input.getAttribute('aria-busy')).toBeNull()
+      expect(screen.getByLabelText('发送消息')).toBeTruthy()
+      fireEvent.compositionEnd(input)
+    },
+  )
 })

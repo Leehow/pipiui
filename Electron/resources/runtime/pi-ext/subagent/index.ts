@@ -33,9 +33,13 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	AgentSession,
 	CONFIG_DIR_NAME,
+	createAgentSession,
+	DefaultResourceLoader,
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
+	ModelRuntime,
+	SessionManager,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
@@ -116,6 +120,28 @@ import {
 	completionPersistenceState,
 	queueCompletionAfterCutIn,
 } from "./completion-notification.ts";
+import {
+	SUPERVISOR_WAVE_AGENT_ID,
+	createFileSupervisorStateStore,
+	createHostSupervisorDelivery,
+	createPiSupervisorSessionFactory,
+	serializeBossEscalation,
+	supervisorResourceLoaderFlags,
+	supervisorSessionStatePath,
+	waveReceiptIdentity,
+	type HostSupervisorDelivery,
+	type SupervisorDeliveryRequest,
+	type SupervisorJobSnapshot,
+	type SupervisorTaskManifest,
+	type SupervisorTerminalReport,
+} from "./supervisor/index.ts";
+import {
+	classifySupervisorHostAdmission,
+	createSupervisorOwnedTerminalCloseout,
+	supervisorBossObligationNamespace,
+	type SupervisorHostAdmission,
+} from "./supervisor/host-seam.ts";
+import { SupervisorWaveIdentityTracker, summarizeSupervisorRuntimeWave } from "./supervisor/wave-identity.ts";
 import {
 	claimStallNotification,
 	confirmStallNotification,
@@ -2389,9 +2415,13 @@ function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle,
 
 /**
  * 中止运行中的后台 job：触发其 AbortController → killProc（SIGTERM，5s 后未退出则 SIGKILL）。
- * job 以 aborted 结束并正常推 [subagent-done]。agentId 不存在/已结束返回明确错误。
+ * job 以 aborted 结束；精确单任务中止由 Supervisor 接收终态，stop sweep 保持静默。
+ * agentId 不存在/已结束返回明确错误。
  */
-function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
+function abortRunningAgent(
+	agentId: string,
+	options?: { reportTerminalToSupervisor?: boolean },
+): { ok: boolean; message: string } {
 	// A queued task has no process to signal, so abort means "drop it before it starts". This is
 	// also the escape hatch offered by the [subagent-blocked] signal for a task no longer wanted.
 	if (dispatchQueue.cancel(agentId)) {
@@ -2434,7 +2464,15 @@ function abortRunningAgent(agentId: string): { ok: boolean; message: string } {
 			message: `Cannot abort agentId=${agentId}: child process already exited and is already finalizing closeout.`,
 		};
 	}
-	handle.controller.abort();
+	const abortExactRun = () => handle.controller.abort();
+	if (options?.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
+		supervisorAbortTerminalCloseout.requestExternal(
+			{ agentId, runId: handle.runId },
+			abortExactRun,
+		);
+	} else {
+		abortExactRun();
+	}
 	return {
 		ok: true,
 		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
@@ -3955,6 +3993,11 @@ async function sendUserMessageAfterCutIn(
 async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
 	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
 	await awaitCutInHoldRelease();
+	const routed = await routeRuntimeSignalThroughSupervisor(text);
+	if (routed === "accepted") return true;
+	// The Supervisor has retained a pending durable receipt. Do not fall through
+	// to a second Boss admission attempt, and let heartbeat/stall callers retry.
+	if (routed === "pending") return false;
 	return sendUserMessageAfterCutIn(pi, text);
 }
 
@@ -4192,6 +4235,10 @@ interface PendingDoneEntry {
 const pendingDone = new Map<string, PendingDoneEntry>();
 let pendingDoneSettledRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let doneDeliveryStore: DeliveryObligationStore | undefined;
+let hostSupervisor: HostSupervisorDelivery | undefined;
+let supervisorAbortTerminalCloseout: ReturnType<typeof createSupervisorOwnedTerminalCloseout> | undefined;
+let supervisorWaveIdentity: SupervisorWaveIdentityTracker | undefined;
+let supervisorWaveIdentitySessionId: string | undefined;
 
 /**
  * A compaction can make follow-up delivery reject as busy even though the done
@@ -4299,6 +4346,13 @@ function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 
 /** Stall/recovery must wake a settled Boss; sendUserMessage(followUp) only queues. */
 async function deliverStallWake(pi: ExtensionAPI, text: string): Promise<boolean> {
+	const routed = await routeRuntimeSignalThroughSupervisor(text);
+	if (routed === "accepted") return true;
+	if (routed === "pending") return false;
+	return deliverStallWakeToBoss(pi, text);
+}
+
+async function deliverStallWakeToBoss(pi: ExtensionAPI, text: string): Promise<boolean> {
 	return deliverStallWakeThrough(pi, text, {
 		quiet: () => hostStopQuiet,
 		waitForCutIn: awaitCutInHoldRelease,
@@ -4322,11 +4376,11 @@ function logDonePersistenceFailure(action: string, obligationId: string, err: un
 	);
 }
 
-function volatileObligation(agentId: string, runId: string, text: string): DeliveryObligation {
+function volatileObligation(agentId: string, runId: string, text: string, identityNamespace?: string): DeliveryObligation {
 	const now = Date.now();
 	return {
 		version: 1,
-		id: `volatile-${runId}-${randomBytes(6).toString("hex")}`,
+		id: `volatile-${identityNamespace ?? "completion"}-${runId}-${randomBytes(6).toString("hex")}`,
 		routingKeyHash: "unavailable",
 		agentId,
 		runId,
@@ -4341,13 +4395,18 @@ function volatileObligation(agentId: string, runId: string, text: string): Deliv
 }
 
 /** Persist pending BEFORE attempting send; persistence failure degrades to the old in-memory path. */
-function createDoneObligation(agentId: string, runId: string, text: string): DeliveryObligation {
-	if (!doneDeliveryStore) return volatileObligation(agentId, runId, text);
+function createDoneObligation(
+	agentId: string,
+	runId: string,
+	text: string,
+	identityNamespace?: string,
+): DeliveryObligation {
+	if (!doneDeliveryStore) return volatileObligation(agentId, runId, text, identityNamespace);
 	try {
-		return doneDeliveryStore.create(agentId, runId, text);
+		return doneDeliveryStore.create(agentId, runId, text, identityNamespace);
 	} catch (err) {
 		logDonePersistenceFailure("create", "", err);
-		return volatileObligation(agentId, runId, text);
+		return volatileObligation(agentId, runId, text, identityNamespace);
 	}
 }
 
@@ -4356,14 +4415,16 @@ function sendDoneWithConfirmation(
 	entry: PendingDoneEntry,
 	isRetry: boolean,
 	options?: { flushAfterSettle?: boolean },
-): void {
+): Promise<boolean> {
 	let obligation = entry.obligation;
-	if (obligation.state === "fulfilled" || obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) return;
+	if (obligation.state === "fulfilled" || obligation.state === "delivered" || entry.inFlight || obligation.attempts >= DONE_MAX_ATTEMPTS) {
+		return Promise.resolve(obligation.state === "fulfilled" || obligation.state === "delivered");
+	}
 	// Host-stop quiet always holds. A live Boss turn also holds, except the
 	// just-idle settle flush which must send every sibling before the first
 	// receipt flips bossTurnBusy and would otherwise stall the rest.
-	if (holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options)) return;
-	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return;
+	if (holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options)) return Promise.resolve(false);
+	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return Promise.resolve(false);
 	const now = Date.now();
 	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
 		try {
@@ -4372,7 +4433,7 @@ function sendDoneWithConfirmation(
 				obligation = persisted;
 			} else if (doneDeliveryStore.read(obligation.id)) {
 				// Another live process/extension instance owns this exact obligation.
-				return;
+				return Promise.resolve(true);
 			} else {
 				// The row vanished/corrupted after create: do not suppress the actual completion.
 				logDonePersistenceFailure("missing-before-send", obligation.id, undefined);
@@ -4403,7 +4464,7 @@ function sendDoneWithConfirmation(
 			? `(re-delivery #${obligation.attempts}: Pi did not confirm the prior completion; obligationId=${obligation.id}; treat it as the same event.)`
 			: "";
 	const outText = prefix ? `${prefix}\n${obligation.text}` : obligation.text;
-	void queueCompletionAfterCutIn(pi, {
+	return queueCompletionAfterCutIn(pi, {
 		sessionId: entry.sessionId,
 		agentId: obligation.agentId,
 		runId: obligation.runId,
@@ -4413,7 +4474,7 @@ function sendDoneWithConfirmation(
 		waitForCutIn: awaitCutInHoldRelease,
 		currentSessionId: () => doneDeliveryPiSessionId,
 	}).then((queued) => {
-		if (pendingDone.get(obligation.id) !== entry) return;
+		if (pendingDone.get(obligation.id) !== entry) return queued;
 		entry.inFlight = false;
 		let settled: DeliveryObligation = { ...entry.obligation, state: queued ? "queued" : "failed" };
 		if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
@@ -4433,27 +4494,57 @@ function sendDoneWithConfirmation(
 				`[pipiui-subagent] giving up done delivery after ${settled.attempts} attempts: ${settled.agentId}`,
 			);
 		}
+		return queued;
 	});
 }
 
 /** [subagent-done] 专用：带送达确认 + 失败重投。job 此时已 terminal，重投只依赖保存的 text。 */
 function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
+	if (hostSupervisor) {
+		const request = supervisorRequestFromCompletion(agentId, runId, text);
+		if (request) {
+			void routeSupervisorDelivery(request).then((admission) => {
+				// Pending has already written/retained the same durable obligation. A
+				// second direct send would consume an attempt without Boss admission.
+				if (admission === "unhandled") deliverConfirmedDoneToBoss(pi, agentId, runId, text);
+			}).catch((err) => {
+				console.error("[pipiui-subagent] supervisor completion routing failed:", err);
+				deliverConfirmedDoneToBoss(pi, agentId, runId, text);
+			});
+			return;
+		}
+	}
+	deliverConfirmedDoneToBoss(pi, agentId, runId, text);
+}
+
+function deliverConfirmedDoneToBoss(pi: ExtensionAPI, agentId: string, runId: string, text: string): void {
+	void deliverConfirmedDoneToBossAsync(pi, agentId, runId, text);
+}
+
+async function deliverConfirmedDoneToBossAsync(
+	pi: ExtensionAPI,
+	agentId: string,
+	runId: string,
+	text: string,
+	identityNamespace?: string,
+): Promise<boolean> {
 	// The durable channel can only address a bound Pi session. A nested leader (depth > 0)
 	// and a terminal-only pi never bind one, and sendDoneWithConfirmation refuses an entry
 	// with an empty sessionId — silently swallowing the receipt. Degrade to the one-shot.
 	if (!doneDeliveryPiSessionId) {
-		deliverSubagentDone(pi, text);
-		return;
+		return trySendUserMessage(pi, text);
 	}
-	const obligation = createDoneObligation(agentId, runId, text);
-	if (obligation.state === "observed" || obligation.state === "fulfilled" || obligation.state === "delivered") return;
+	const obligation = createDoneObligation(agentId, runId, text, identityNamespace);
+	if (obligation.state === "observed" || obligation.state === "fulfilled" || obligation.state === "delivered") {
+		return true;
+	}
 	// Duplicate close/finalize callbacks for the same completion share one in-flight promise.
 	const existing = pendingDone.get(obligation.id);
 	if (existing) {
 		if (!existing.inFlight && deliveryRetryDue(
 			existing.obligation, Date.now(), DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS,
-		)) sendDoneWithConfirmation(pi, existing, true);
-		return;
+		)) return sendDoneWithConfirmation(pi, existing, true);
+		return existing.inFlight || existing.obligation.state === "queued" || existing.obligation.state === "observed";
 	}
 	const entry: PendingDoneEntry = {
 		obligation,
@@ -4463,7 +4554,7 @@ function deliverConfirmedDone(pi: ExtensionAPI, agentId: string, runId: string, 
 		recoveredAmbiguous: false,
 	};
 	pendingDone.set(obligation.id, entry);
-	sendDoneWithConfirmation(pi, entry, false);
+	return sendDoneWithConfirmation(pi, entry, false);
 }
 
 /** Reconcile only the active branch and inspect the first assistant after each exact wake. */
@@ -4514,6 +4605,8 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 		// Their durable rows remain for that Pi session's next startup.
 		pendingDone.clear();
 		doneDeliveryStore = undefined;
+		supervisorWaveIdentity = undefined;
+		supervisorWaveIdentitySessionId = undefined;
 	}
 	doneDeliveryPiSessionId = piSessionId;
 	try {
@@ -4546,6 +4639,315 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 	}
 }
 
+function supervisorAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR
+		|| (PIPIUI_MAIN_CWD ? path.join(PIPIUI_MAIN_CWD, ".pi", "agent") : getAgentDir());
+}
+
+function supervisorJobSnapshot(agentId: string, runId: string, fallbackStatus: SupervisorJobSnapshot["status"]): SupervisorJobSnapshot {
+	const record = jobRegistry.get(agentId);
+	const handle = runningAgents.get(agentId);
+	const now = Date.now();
+	let status: SupervisorJobSnapshot["status"] = fallbackStatus;
+	if (record && record.runId === runId) {
+		if (record.state === "ok") status = "completed";
+		else if (record.state === "failed") status = "failed";
+		else if (record.state === "interrupted" || record.state === "aborted") status = "interrupted";
+		else if (stalledInfoFor(agentId, now).stalled) status = "stalled";
+		else status = "running";
+	} else if (handle && handle.runId === runId && stalledInfoFor(agentId, now).stalled) {
+		status = "stalled";
+	}
+	const verify = record?.verify
+		? (record.verify.timedOut || record.verify.exitCode !== 0 ? "failed" : "passed")
+		: undefined;
+	return {
+		agentId,
+		runId,
+		status,
+		...(record?.title || record?.name || handle?.title ? { title: record?.title ?? record?.name ?? handle?.title } : {}),
+		...(record ? { elapsedMs: Math.max(0, now - record.startedAt) } : {}),
+		...(handle ? { lastActivityAt: handle.lastActivityAt } : {}),
+		...(verify ? { verify } : {}),
+	};
+}
+
+function supervisorWaveFromRuntime(): SupervisorDeliveryRequest["wave"] {
+	const jobs = [...jobRegistry.values()];
+	const sessionId = doneDeliveryPiSessionId || "unbound";
+	if (!supervisorWaveIdentity || supervisorWaveIdentitySessionId !== sessionId) {
+		const directory = doneDeliveryStore?.directory ?? path.join(
+			PIPIUI_MAIN_CWD || process.cwd(),
+			".pi",
+			"subagent-delivery-obligations",
+			DeliveryObligationStore.routingDirectory(sessionId),
+		);
+		supervisorWaveIdentity = new SupervisorWaveIdentityTracker(directory, sessionId);
+		supervisorWaveIdentitySessionId = sessionId;
+	}
+	return summarizeSupervisorRuntimeWave(supervisorWaveIdentity, jobs);
+}
+
+function supervisorTerminalReports(wave: NonNullable<SupervisorDeliveryRequest["wave"]>): SupervisorTerminalReport[] {
+	return wave.agentIds.flatMap((agentId) => {
+		const job = jobRegistry.get(agentId);
+		if (!job) return [];
+		const statusRef = `artifact://status/${agentId}/${job.runId}`;
+		return [{
+			agentId,
+			runId: job.runId,
+			status: supervisorJobSnapshot(agentId, job.runId, "completed").status,
+			findings: (job.resultText || (job.state === "ok" ? "completed without a textual result" : job.state)).replace(/\0/g, " "),
+			statusRef,
+		}];
+	});
+}
+
+function supervisorRequestFromHeartbeat(text: string): SupervisorDeliveryRequest | undefined {
+	if (!text.startsWith("[subagent-heartbeat]")) return undefined;
+	const ids = [...text.matchAll(/^\s{2}([A-Za-z0-9_-]+) \(/gm)].map((match) => match[1]!);
+	const agentId = ids[0];
+	if (!agentId) return undefined;
+	const handle = runningAgents.get(agentId);
+	const job = jobRegistry.get(agentId);
+	const runId = handle?.runId ?? job?.runId;
+	if (!runId) return undefined;
+	return {
+		kind: "heartbeat",
+		agentId,
+		runId,
+		sequence: (handle?.checkinCount ?? 0) + 1,
+		publicText: text,
+		job: supervisorJobSnapshot(agentId, runId, "running"),
+		summary: text.split("\n").slice(0, 4).join(" | ").slice(0, 400),
+		activeJobs: [...runningAgents.entries()].map(([id, live]) =>
+			supervisorJobSnapshot(id, live.runId ?? jobRegistry.get(id)?.runId ?? live.runId ?? id, "running")),
+	};
+}
+
+function supervisorRequestFromStall(text: string): SupervisorDeliveryRequest | undefined {
+	const kind = text.startsWith("[subagent-blocked]") ? "upgrade_failure" as const
+		: text.startsWith("[subagent-stalled]") ? "stall" as const
+		: undefined;
+	if (!kind) return undefined;
+	const agentId = /(?:^|\s)agentId=([A-Za-z0-9_-]+)/.exec(text)?.[1];
+	if (!agentId) return undefined;
+	const handle = runningAgents.get(agentId);
+	const job = jobRegistry.get(agentId);
+	const runId = handle?.runId ?? job?.runId;
+	if (!runId) return undefined;
+	return {
+		kind,
+		agentId,
+		runId,
+		sequence: (handle?.stallNotifyCount ?? 0) + 1,
+		publicText: text,
+		job: supervisorJobSnapshot(agentId, runId, kind === "stall" ? "stalled" : "failed"),
+		summary: text.split("\n")[0]?.slice(0, 400) || kind,
+	};
+}
+
+function supervisorRequestFromCompletion(agentId: string, runId: string, text: string): SupervisorDeliveryRequest {
+	const wave = supervisorWaveFromRuntime();
+	if (wave.running === 0) {
+		const terminalReports = supervisorTerminalReports(wave);
+		const identity = waveReceiptIdentity(wave.waveId);
+		const coords = identity.ok
+			? identity.value
+			: { kind: "wave" as const, agentId: SUPERVISOR_WAVE_AGENT_ID, runId: wave.waveId, sequence: 1, waveId: wave.waveId };
+		return {
+			kind: "wave",
+			agentId: coords.agentId,
+			runId: coords.runId,
+			sequence: coords.sequence,
+			waveId: wave.waveId,
+			publicText: terminalReports.length > 0
+				? `[subagent-wave] ${wave.waveId} completed=${wave.completed} failed=${wave.failed}`
+				: text,
+			job: { agentId: coords.agentId, runId: coords.runId, status: "completed" },
+			summary: `wave closed completed=${wave.completed} failed=${wave.failed}`,
+			wave,
+			evidenceRefs: [
+				...terminalReports.map((report) => report.statusRef),
+				`artifact://wave/${wave.waveId}`,
+			],
+			terminalReports,
+			activeJobs: [],
+		};
+	}
+	return {
+		kind: "completion",
+		agentId,
+		runId,
+		sequence: 1,
+		waveId: wave.waveId,
+		publicText: text,
+		job: supervisorJobSnapshot(agentId, runId, "completed"),
+		summary: text.split("\n")[0]?.slice(0, 400) || "completion",
+		wave,
+		evidenceRefs: [`artifact://status/${agentId}/${runId}`],
+	};
+}
+
+function currentSupervisorManifest(): SupervisorTaskManifest {
+	const tasks: SupervisorTaskManifest["tasks"] = [];
+	for (const item of dispatchQueue.snapshot()) {
+		tasks.push({
+			taskId: item.agentId,
+			title: item.title ?? item.role,
+			status: item.heldReason ? "blocked" : "declared",
+			...(item.blockedBy.length > 0 ? { blockedBy: [...item.blockedBy] } : {}),
+			dispatch: { taskId: item.agentId, agentId: item.agentId, role: item.role, ...(item.title ? { title: item.title } : {}) },
+		});
+	}
+	for (const job of jobRegistry.values()) {
+		if (tasks.some((task) => task.taskId === job.agentId)) continue;
+		tasks.push({
+			taskId: job.agentId,
+			title: job.title ?? job.name,
+			status: job.state === "running" ? "running" : job.state === "ok" ? "completed" : "failed",
+			...(job.blockedBy && job.blockedBy.length > 0 ? { blockedBy: [...job.blockedBy] } : {}),
+			dispatch: { taskId: job.agentId, agentId: job.agentId, role: job.name, ...(job.title ? { title: job.title } : {}) },
+		});
+	}
+	return { tasks };
+}
+
+async function routeSupervisorDelivery(request: SupervisorDeliveryRequest): Promise<SupervisorHostAdmission> {
+	if (!hostSupervisor) return "unhandled";
+	await hostSupervisor.runtime.setActiveWorkerCount(runningAgents.size);
+	const result = await hostSupervisor.delivery.handle(request);
+	if (runningAgents.size === 0) {
+		void hostSupervisor.runtime.setActiveWorkerCount(0);
+	}
+	return classifySupervisorHostAdmission(result);
+}
+
+async function routeRuntimeSignalThroughSupervisor(text: string): Promise<SupervisorHostAdmission> {
+	if (!hostSupervisor) return "unhandled";
+	const request = supervisorRequestFromHeartbeat(text) ?? supervisorRequestFromStall(text);
+	if (!request) return "unhandled";
+	try {
+		return await routeSupervisorDelivery(request);
+	} catch (err) {
+		console.error("[pipiui-subagent] supervisor signal routing failed:", err);
+		return "unhandled";
+	}
+}
+
+function bindHostSupervisor(pi: ExtensionAPI): void {
+	if (hostSupervisor || PIPIUI_DEPTH !== 0 || !PIPIUI_MAIN_CWD || !PIPIUI_SESSION) return;
+	try {
+		const projectRoot = PIPIUI_MAIN_CWD;
+		const agentDir = supervisorAgentDir();
+		const factory = createPiSupervisorSessionFactory({
+			createAgentSession: createAgentSession as unknown as Parameters<typeof createPiSupervisorSessionFactory>[0]["createAgentSession"],
+			SessionManager,
+			agentDir,
+			async resolveModel(ref) {
+				const runtime = await ModelRuntime.create({
+					authPath: path.join(agentDir, "auth.json"),
+					modelsPath: path.join(agentDir, "models.json"),
+				});
+				const slash = ref.indexOf("/");
+				if (slash <= 0) return undefined;
+				return runtime.getModel(ref.slice(0, slash), ref.slice(slash + 1)) ?? undefined;
+			},
+			createResourceLoader(systemPrompt) {
+				return new DefaultResourceLoader({
+					cwd: projectRoot,
+					agentDir,
+					...supervisorResourceLoaderFlags(systemPrompt),
+				});
+			},
+		});
+		const ownedTerminalCloseout = createSupervisorOwnedTerminalCloseout({
+			mutate(id) {
+				const job = jobRegistry.get(id.agentId);
+				if (!job || job.runId !== id.runId) throw new Error("abort run identity mismatch");
+				const result = abortRunningAgent(id.agentId);
+				if (!result.ok) throw new Error(result.message);
+			},
+		});
+		hostSupervisor = createHostSupervisorDelivery({
+			projectRoot,
+			factory,
+			models: () => {
+				const overrides = loadSubagentModelOverrides();
+				return {
+					supervisor: overrides.supervisor?.models[0]?.model,
+					generalPurpose: overrides["general-purpose"]?.models[0]?.model,
+					boss: inheritMainModel(undefined),
+				};
+			},
+			store: createFileSupervisorStateStore(supervisorSessionStatePath(projectRoot, PIPIUI_SESSION)),
+			promptTimeoutMs: envPositiveSecs("PIPIUI_SUPERVISOR_PROMPT_TIMEOUT_SECS", 60) * 1000,
+			activeWorkerCount: () => runningAgents.size,
+			manifest: currentSupervisorManifest,
+			lifecycle: {
+				status(id) {
+					return supervisorJobSnapshot(id.agentId, id.runId, "running");
+				},
+				resume() {
+					throw new Error("resume is unsupported; Boss must explicitly redispatch the stable agentId");
+				},
+				retry() {
+					throw new Error("retry is unsupported; Boss must explicitly redispatch from the immutable brief");
+				},
+				abort(id) {
+					if (!ownedTerminalCloseout.request(id)) {
+						throw new Error("Supervisor already requested abort for this exact run");
+					}
+				},
+				resolve(id) {
+					const result = resolveSubagentEpisode(id.agentId, id.runId);
+					if (!result.ok) throw new Error(result.message);
+				},
+				startDeclared(spec) {
+					if (!dispatchQueue.startDeclared(spec.agentId)) {
+						throw new Error("declared task cannot start from the immutable queue");
+					}
+				},
+			},
+			boss: {
+				get requestCount() { return 0; },
+				get envelopes() { return []; },
+				send(envelope) {
+					const serialized = serializeBossEscalation(envelope);
+					if (!serialized.ok) throw new Error(serialized.error);
+				},
+			},
+			deliverCurrent: async ({ kind, publicText, agentId, runId, envelope }) => {
+				if (envelope || kind === "completion" || kind === "wave" || kind === "upgrade_failure") {
+					return deliverConfirmedDoneToBossAsync(
+						pi,
+						agentId,
+						runId,
+						publicText,
+						supervisorBossObligationNamespace({ kind, envelope }),
+					);
+				}
+				if (kind === "stall") {
+					return deliverStallWakeToBoss(pi, publicText);
+				}
+				return sendUserMessageAfterCutIn(pi, publicText);
+			},
+		});
+		supervisorAbortTerminalCloseout = ownedTerminalCloseout;
+	} catch (err) {
+		console.error("[pipiui-subagent] supervisor host bind failed; using current Boss delivery:", err);
+		hostSupervisor = undefined;
+		supervisorAbortTerminalCloseout = undefined;
+	}
+}
+
+async function disposeHostSupervisor(): Promise<void> {
+	const current = hostSupervisor;
+	hostSupervisor = undefined;
+	supervisorAbortTerminalCloseout = undefined;
+	if (current) await current.dispose();
+}
+
 function notifySubagentDone(
 	pi: ExtensionAPI,
 	result: SingleResult,
@@ -4556,15 +4958,30 @@ function notifySubagentDone(
 	// Finalize job BEFORE notification: status must work even if Pi rejects the wake-up.
 	const terminalRunId = ensureJobTerminalFromResult(result, extra);
 	const aborted = extra?.aborted === true || result.stopReason === "aborted";
+	const terminalAgentId = result.agentId;
+	const runId = terminalAgentId
+		? (result.runId ?? terminalRunId ?? jobRegistry.get(terminalAgentId)?.runId ?? DeliveryObligationStore.runId())
+		: undefined;
 	if (aborted) {
+		if (terminalAgentId && runId && supervisorAbortTerminalCloseout) {
+			const text = `[subagent-aborted] agentId=${terminalAgentId} runId=${runId}; this exact run reached aborted terminal state.`;
+			void supervisorAbortTerminalCloseout.terminalize(
+				{ agentId: terminalAgentId, runId },
+				async () => {
+					const admission = await routeSupervisorDelivery(
+						supervisorRequestFromCompletion(terminalAgentId, runId, text),
+					);
+					if (admission === "unhandled") throw new Error("Supervisor terminal wave was not handled");
+				},
+			).catch((err) => {
+				console.error("[pipiui-subagent] supervisor abort closeout failed:", err);
+			});
+		}
 		// An aborted job never pushes a [subagent-done] follow-up. The registry is already
 		// terminal and the Subagents panel shows the aborted state; pushing one receipt
 		// turn per aborted worker is what kept a stopped session churning (2026-08-15).
 		return;
 	}
-	const runId = result.agentId
-		? (result.runId ?? terminalRunId ?? jobRegistry.get(result.agentId)?.runId ?? DeliveryObligationStore.runId())
-		: undefined;
 	// Persist the full report next to the ledger BEFORE formatting, so the done message can
 	// hand the next worker a path instead of making it rediscover this worker's ground.
 	// A failed write only costs the handoff line; it never blocks the completion.
@@ -7570,6 +7987,7 @@ export default function (pi: ExtensionAPI) {
 	bindWorktreeRecoveryEscalation(pi);
 	bindWorktreeMergedHook((event) => notifyInflightWorkersOfBaseAdvance(event));
 	resumePersistedWorktreeRecovery();
+	bindHostSupervisor(pi);
 	// 主会话上下文压缩走有界快路径（thinking off 的 LLM 摘要 → 确定性摘要 → pi 内置兜底）。
 	// 见 main-compaction.ts：不覆盖 worker（PIPIUI_AGENT_DEPTH 守卫）。
 	registerMainSessionCompactionHook(pi);
@@ -7588,6 +8006,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
+		void disposeHostSupervisor();
 	});
 	pi.on("context", (event, ctx) => {
 		noteIdleFoldContext(event, ctx);
@@ -7911,7 +8330,7 @@ export default function (pi: ExtensionAPI) {
 			const activityRaw = job?.activity?.trim() || "";
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			if (action === "abort") {
-				const aborted = abortRunningAgent(agentId);
+				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true });
 				if (!aborted.ok) continue;
 				if (handle.syncWait !== true) {
 					void deliverStallWake(pi, formatBlockedMessage({ agentId, title, idleSec, lastLine }));
@@ -8031,7 +8450,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /subagent_abort <agentId>", "error");
 				return;
 			}
-			const result = abortRunningAgent(agentId);
+			const result = abortRunningAgent(agentId, { reportTerminalToSupervisor: true });
 			ctx.ui.notify(result.message, result.ok ? "info" : "error");
 		},
 	});
@@ -8244,7 +8663,7 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				const abortResult = abortRunningAgent(target);
+				const abortResult = abortRunningAgent(target, { reportTerminalToSupervisor: true });
 				return {
 					content: [{ type: "text", text: abortResult.message }],
 					details: makeDetails("single")([]),

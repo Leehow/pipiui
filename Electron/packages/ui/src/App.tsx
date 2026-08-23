@@ -1077,6 +1077,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const messagesBySessionRef = useRef(new Map<string, ChatMessage[]>())
   const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
   const historyFingerprintBySessionRef = useRef(new Map<string, string>())
+  const historySettledReplacementRef = useRef(new Map<string, { fingerprint: string; liveRevision: number }>())
   const locallyCreatedSessionIdsRef = useRef(new Set<string>())
   const skippedInitialEmptyHistoryRef = useRef(new Set<string>())
   const transcriptLiveRevisionRef = useRef(0)
@@ -1615,6 +1616,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     let staleRetryTimer: number | undefined
     let emptyPageRetryScheduled = false
     let emptyPageRetryTimer: number | undefined
+    let settleConfirmRetryTimer: number | undefined
     const previousContext = historyContextRef.current
     const contextChanged = previousContext?.host !== host || previousContext.sessionId !== selectedSession
     historyContextRef.current = { host, sessionId: selectedSession }
@@ -1699,6 +1701,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setLease(null)
     }
     const closeLostSettle = () => {
+      historySettledReplacementRef.current.delete(selectedSession)
       mainTurnOpenRef.current = false
       activeUserTurnRef.current = false
       turnJustSettledRef.current = true
@@ -1707,6 +1710,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingStartedAt(null)
       setWaitingDetail(undefined)
       applyObservedStatus(selectedSession, 'completed')
+      void sessionQueue.resync()
       const settled = finishStreamingMessage(messagesRef.current)
       if (settled !== messagesRef.current) {
         transcriptLiveRevisionRef.current += 1
@@ -1725,11 +1729,37 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const resumeOrCloseLostSettle = (historyMessages: ChatMessage[], liveMessages = messagesRef.current) => {
       if (!resumedRunning) return
-      if (historyConfirmsLostSettle(historyMessages, liveMessages)) {
+      const candidate = historySettledReplacementRef.current.get(selectedSession)
+      const replacementConfirmed = Boolean(candidate
+        && candidate.liveRevision === transcriptLiveRevisionRef.current
+        && candidate.fingerprint === transcriptFingerprint(liveMessages)
+        && candidate.fingerprint === transcriptFingerprint(historyMessages))
+      if (candidate && !replacementConfirmed) historySettledReplacementRef.current.delete(selectedSession)
+      if (historyConfirmsLostSettle(historyMessages, liveMessages, replacementConfirmed)) {
         closeLostSettle()
         return
       }
       openResumeWait(liveMessages, historyMessages)
+    }
+    const scheduleSettledReplacementConfirmation = (snapshot: ChatMessage[]) => {
+      if (!resumedRunning || !mainTurnOpenRef.current) return
+      const last = snapshot[snapshot.length - 1]
+      if (!last || last.role !== 'assistant' || !assistantLooksSettled(last) || assistantEndedAwaitingModel(last)) return
+      const fingerprint = transcriptFingerprint(snapshot)
+      const existing = historySettledReplacementRef.current.get(selectedSession)
+      if (existing?.fingerprint === fingerprint && existing.liveRevision === transcriptLiveRevisionRef.current) return
+      historySettledReplacementRef.current.set(selectedSession, {
+        fingerprint,
+        liveRevision: transcriptLiveRevisionRef.current,
+      })
+      if (settleConfirmRetryTimer !== undefined) window.clearTimeout(settleConfirmRetryTimer)
+      settleConfirmRetryTimer = window.setTimeout(() => {
+        if (historyLoadRef.current === request
+          && historyContextRef.current?.host === host
+          && historyContextRef.current.sessionId === selectedSession) {
+          setHistoryRefreshKey(key => key + 1)
+        }
+      }, 250)
     }
     const restoreOpenHop = (snapshot: ChatMessage[], live: ChatMessage[]): ChatMessage[] => {
       if (!mainTurnOpenRef.current) return snapshot
@@ -1747,11 +1777,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const applyHistory = (entries: HistoryEntry[]) => {
       if (historyLoadRef.current !== request) return
+      const previousFingerprint = historyFingerprintBySessionRef.current.get(selectedSession)
       const reconciliation = reconcileHistorySnapshot(
         entries,
         requestLiveRevision,
         transcriptLiveRevisionRef.current,
-        historyFingerprintBySessionRef.current.get(selectedSession),
+        previousFingerprint,
         messagesRef.current,
       )
       if (reconciliation.status === 'retained-longer-live') {
@@ -1785,6 +1816,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       historyFingerprintBySessionRef.current.set(selectedSession, reconciliation.fingerprint)
       if (transcriptFingerprint(messagesRef.current) === reconciliation.fingerprint) {
         resumeOrCloseLostSettle(next)
+        // The first accepted durable final may already be byte-for-byte equal
+        // to the live transcript (the D exact-abort trace did this). It is still
+        // a newly advanced disk snapshot, so require one bounded unchanged pull
+        // before closing the scalar turn instead of waiting forever for a
+        // replacement which will never occur.
+        if (previousFingerprint !== reconciliation.fingerprint) scheduleSettledReplacementConfirmation(next)
         applyRestoredOpenHop(messagesRef.current)
         return
       }
@@ -1795,7 +1832,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       messagesRef.current = restored
       if (resumedRunning) {
         if (historyConfirmsLostSettle(next, liveBefore)) closeLostSettle()
-        else openResumeWait(liveBefore, restored)
+        else {
+          openResumeWait(liveBefore, restored)
+          scheduleSettledReplacementConfirmation(restored)
+        }
       } else {
         const last = restored[restored.length - 1]
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
@@ -1879,8 +1919,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return () => {
       if (staleRetryTimer !== undefined) window.clearTimeout(staleRetryTimer)
       if (emptyPageRetryTimer !== undefined) window.clearTimeout(emptyPageRetryTimer)
+      if (settleConfirmRetryTimer !== undefined) window.clearTimeout(settleConfirmRetryTimer)
     }
-  }, [historyRefreshKey, host, selectedSession])
+  }, [historyRefreshKey, host, selectedSession, sessionQueue.resync])
   useEffect(() => {
     if (!selectedSession || isExternalSessionId(selectedSession) || !leaseConflictError) return
     let cancelled = false
@@ -2968,7 +3009,7 @@ function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
  *  That is a lost `settled` only when this assistant was still marked
  *  streaming. A finished historical conclusion plus a new `started` is a
  *  first-token wait — closing it is the idle-composer side of the seesaw. */
-function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages: ChatMessage[]): boolean {
+function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages: ChatMessage[], settledReplacementConfirmed = false): boolean {
   const historyLast = historyMessages[historyMessages.length - 1]
   if (!historyLast || !assistantLooksSettled(historyLast)) return false
   const liveLast = liveMessages[liveMessages.length - 1]
@@ -2977,7 +3018,11 @@ function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages:
   // content+finished tools, which looks settled and must not close the wait.
   if (assistantEndedAwaitingModel(liveLast)) return false
   if ((liveLast.content ?? '').trim() !== (historyLast.content ?? '').trim()) return false
-  return Boolean(liveLast.streaming)
+  // An immediate history pull may already have replaced the streaming live
+  // row with this exact settled snapshot while the independent scalar status
+  // remains running. Only the bounded, revision-stable replacement candidate
+  // may close that split state; an unchanged old final cannot close a new wait.
+  return Boolean(liveLast.streaming || settledReplacementConfirmed)
 }
 
 function streamingAssistantToolsAllFinished(messages: ChatMessage[]): boolean {
@@ -2996,12 +3041,13 @@ function waitingPhaseForTurn(messages: ChatMessage[], pendingFollowUps?: string[
   return hasVisibleAssistantOutput(messages) ? 'continuing' : 'awaiting'
 }
 
-/** A terminal from another host epoch must not close the turn now on screen. */
+/** An older terminal must not close the turn now on screen. A newer terminal
+ *  is authoritative when the renderer missed its matching `started`. */
 function staleTurnTerminal(event: Extract<StreamEvent, { type: 'status' }>, openedEpoch?: number): boolean {
   return (event.status === 'settled' || event.status === 'stopped')
     && event.turnEpoch !== undefined
     && openedEpoch !== undefined
-    && event.turnEpoch !== openedEpoch
+    && event.turnEpoch < openedEpoch
 }
 
 /** A `started` after a finished assistant is real when it advances the backend
@@ -3341,6 +3387,10 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   }, [modelState, host, sessionId, onEnsureSession, onModel])
   const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0)
   const showQueueSubmit = queueBusy && canSend
+  // Chromium's AXObjectCache invalidates an existing text field on `class`
+  // changes but not on `placeholder` changes. Keep the same textarea (and thus
+  // draft/focus/IME ownership) while making busy → idle dirty the AX node.
+  const inputStateClass = queueBusy ? 'composer-input queue-busy' : working ? 'composer-input working' : 'composer-input idle'
   return <footer className="composer" onDragEnter={onComposerFileDrag} onDragOver={onComposerFileDrag} onDrop={onComposerFileDrop}>
     {readOnly && <div className="composer-read-only" data-testid="composer-read-only" role="status"><span>{readOnlyMessage ?? `当前由 ${leaseOwner ?? '另一客户端'} 持有，会话只读。`}</span>{onTakeover && <button type="button" data-testid="composer-lease-takeover" onClick={onTakeover}>强制接管</button>}</div>}
     {slashVisible && <SlashMenu commands={slashMatches} selectedIndex={Math.min(slashIndex, Math.max(0, slashMatches.length - 1))} onHighlight={setSlashIndex} onSelect={executeSlash} onDismiss={dismissSlash} />}
@@ -3366,7 +3416,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       </div>
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>

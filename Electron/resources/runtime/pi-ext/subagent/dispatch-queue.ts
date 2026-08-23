@@ -83,6 +83,19 @@ export class DispatchQueueV1 {
 		this.pump();
 	}
 
+	/**
+	 * Start one already-declared queued item if it is ready right now.
+	 * Returns false when the item is missing, held, waiting on a dependency, or over capacity.
+	 */
+	startDeclared(agentId: string): boolean {
+		const item = this.queued.find((entry) => entry.agentId === agentId);
+		if (!item) return false;
+		if (this.running.size >= this.options.limit) return false;
+		if (this.admit(item).kind !== "ready") return false;
+		this.start(item);
+		return true;
+	}
+
 	/** Drop a queued item that has not started. Returns false when it is unknown or already running. */
 	cancel(agentId: string): boolean {
 		const index = this.queued.findIndex((item) => item.agentId === agentId);
