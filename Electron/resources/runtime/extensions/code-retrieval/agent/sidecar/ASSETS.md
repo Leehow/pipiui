@@ -3,6 +3,8 @@
 规范 D6 / D7：符号层用 web-tree-sitter（纯 WASM），grammars 随包分发。
 本目录只放运行时资产；符号提取逻辑在 `../symbol/`。
 
+阶段 2 Tantivy 精确索引二进制（darwin arm64）放 `bin/darwin-arm64/tantivy-sidecar`，源码在扩展包 `sidecar-rust/`。x64 留到打包阶段。
+
 ## 已内置（本提交已解包进仓）
 
 | 文件 | 来源 npm | 版本 | sha256 |

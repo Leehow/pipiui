@@ -1,0 +1,26 @@
+[package]
+name = "tantivy-sidecar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "Tantivy exact-index sidecar for pipiui code-retrieval (phase 2)"
+
+[[bin]]
+name = "tantivy-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+tantivy = "=0.26.1"
+notify = "=8.2.0"
+regex = "=1.11.1"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"

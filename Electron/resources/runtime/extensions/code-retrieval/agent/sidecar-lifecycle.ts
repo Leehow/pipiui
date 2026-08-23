@@ -175,6 +175,22 @@ async function waitForSnapshot(projectRoot: string, budgetMs: number): Promise<S
   return undefined;
 }
 
+function resolveTantivyBinary(): string | undefined {
+  const override = process.env.PIPIUI_CODE_RETRIEVAL_SIDECAR?.trim();
+  if (override) return existsSync(override) ? override : undefined;
+  if (process.env.PIPIUI_CODE_RETRIEVAL_FORCE_RG === "1") return undefined;
+  if (process.platform !== "darwin" || process.arch !== "arm64") return undefined;
+  const dir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    join(dir, "sidecar", "bin", "darwin-arm64", "tantivy-sidecar"),
+    join(dir, "..", "sidecar", "bin", "darwin-arm64", "tantivy-sidecar"),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 function resolveSidecarScript(): string | undefined {
   const dir = dirname(fileURLToPath(import.meta.url));
   for (const name of ["query-sidecar.js", "query-sidecar.ts"]) {
@@ -185,10 +201,25 @@ function resolveSidecarScript(): string | undefined {
 }
 
 async function spawnSidecar(projectRoot: string, idleMs: number): Promise<SidecarConnection | undefined> {
+  const rustBin = resolveTantivyBinary();
+  if (rustBin) {
+    const spawned = await spawnProcess(rustBin, [], projectRoot, idleMs);
+    if (spawned) return spawned;
+  }
+  // D8: missing / failed Rust binary falls back to the Node rg sidecar.
   const script = resolveSidecarScript();
   if (!script) return undefined;
+  return spawnProcess(process.execPath, [script], projectRoot, idleMs);
+}
+
+async function spawnProcess(
+  command: string,
+  args: string[],
+  projectRoot: string,
+  idleMs: number,
+): Promise<SidecarConnection | undefined> {
   await mkdir(retrievalHome(projectRoot), { recursive: true });
-  const child: ChildProcess = spawn(process.execPath, [script], {
+  const child: ChildProcess = spawn(command, args, {
     env: {
       ...process.env,
       PIPIUI_CODE_RETRIEVAL_PROJECT: projectRoot,
@@ -209,6 +240,8 @@ async function spawnSidecar(projectRoot: string, idleMs: number): Promise<Sideca
     if (child.exitCode !== null) return undefined;
     await sleep(40);
   }
+  // Process still alive but snapshot never appeared — do not start a second writer.
+  if (child.exitCode === null && child.pid && pidAlive(child.pid)) return undefined;
   return undefined;
 }
 
