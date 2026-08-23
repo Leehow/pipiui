@@ -148,6 +148,32 @@ export async function readAuthMetadata(authPath: string): Promise<Map<string, Au
 
 export type AuthMetadataEntry = { type: AuthType; /** OAuth expiry in epoch ms when the stored entry carries one. */ expiresAtMs?: number };
 
+export type StoredAuthStatus = {
+  authenticated: boolean;
+  authType?: AuthType;
+  expiresAtMs?: number;
+};
+
+function oauthExpiresAtMs(expires: unknown): number | undefined {
+  return typeof expires === "number" && Number.isFinite(expires)
+    ? expires < 1e12 ? expires * 1000 : expires
+    : undefined;
+}
+
+/** Typeless but oauth-shaped: object with a non-empty access token and finite expires. */
+function isTypelessOauthEntry(entry: unknown): entry is { access: string; expires: number } {
+  if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return false;
+  const record = entry as Record<string, unknown>;
+  if ("type" in record && record.type !== undefined && record.type !== null) return false;
+  return typeof record.access === "string" && record.access.length > 0
+    && typeof record.expires === "number" && Number.isFinite(record.expires);
+}
+
+function oauthMetadataFromEntry(entry: { expires?: unknown }): AuthMetadataEntry {
+  const expiresAtMs = oauthExpiresAtMs(entry.expires);
+  return expiresAtMs === undefined ? { type: "oauth" } : { type: "oauth", expiresAtMs };
+}
+
 /** Same metadata read, keeping the non-secret expiry so UIs can show remaining validity. */
 export async function readAuthMetadataEntries(authPath: string): Promise<Map<string, AuthMetadataEntry>> {
   const map = new Map<string, AuthMetadataEntry>();
@@ -157,12 +183,9 @@ export async function readAuthMetadataEntries(authPath: string): Promise<Map<str
       if (entry?.type === "api_key") {
         map.set(providerId, { type: "api_key" });
       } else if (entry?.type === "oauth") {
-        const expires = entry.expires;
-        const expiresAtMs =
-          typeof expires === "number" && Number.isFinite(expires)
-            ? expires < 1e12 ? expires * 1000 : expires
-            : undefined;
-        map.set(providerId, expiresAtMs === undefined ? { type: "oauth" } : { type: "oauth", expiresAtMs });
+        map.set(providerId, oauthMetadataFromEntry(entry));
+      } else if (isTypelessOauthEntry(entry)) {
+        map.set(providerId, oauthMetadataFromEntry(entry));
       }
     }
   } catch {
@@ -184,6 +207,17 @@ export class ProviderAuthBackend {
   private seq = 0;
 
   constructor(private options: ProviderAuthOptions) {}
+
+  /** Metadata-only lookup of one stored provider. Never returns token/key values. */
+  async getStoredAuthStatus(providerId: string): Promise<StoredAuthStatus> {
+    const entry = (await readAuthMetadataEntries(this.options.authPath)).get(providerId);
+    if (!entry) return { authenticated: false };
+    return {
+      authenticated: true,
+      authType: entry.type,
+      ...(entry.expiresAtMs !== undefined ? { expiresAtMs: entry.expiresAtMs } : {}),
+    };
+  }
 
   async listProviders(): Promise<AuthProviderInfo[]> {
     const stored = await readAuthMetadataEntries(this.options.authPath);

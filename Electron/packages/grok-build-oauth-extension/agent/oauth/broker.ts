@@ -97,9 +97,19 @@ function isFreshEnough(newer: BrokerCredential, older: BrokerCredential | undefi
   return newer.expires > older.expires;
 }
 
+function isOauthShapedEntry(entry: CredentialEntry): boolean {
+  const access = entry.access;
+  const expires = entry.expires;
+  return typeof access === "string" && access.length > 0
+    && typeof expires === "number" && Number.isFinite(expires);
+}
+
 /** Map a stored auth.json entry onto a broker credential. */
 export function brokerCredentialFromEntry(entry: CredentialEntry | undefined, nowMs: () => number): BrokerCredential | undefined {
-  if (!entry || entry.type !== "oauth") return undefined;
+  if (!entry) return undefined;
+  const typedOauth = entry.type === "oauth";
+  const typelessOauth = (entry.type === undefined || entry.type === null) && isOauthShapedEntry(entry);
+  if (!typedOauth && !typelessOauth) return undefined;
   const access = entry.access as string | undefined;
   const refresh = entry.refresh as string | undefined;
   const expires = entry.expires as number | undefined;

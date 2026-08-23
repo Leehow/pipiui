@@ -4935,9 +4935,9 @@ export class PiHostBackend implements HostBackend {
     let loggedIn = false;
     let expiresAtMs: number | undefined;
     try {
-      const info = (await this.auth.listProviders()).find((provider) => provider.id === contribution.provider.id);
-      loggedIn = Boolean(info?.authenticated);
-      expiresAtMs = info?.expiresAtMs;
+      const stored = await this.auth.getStoredAuthStatus(contribution.provider.id);
+      loggedIn = stored.authenticated;
+      expiresAtMs = stored.expiresAtMs;
     } catch {
       loggedIn = false;
     }

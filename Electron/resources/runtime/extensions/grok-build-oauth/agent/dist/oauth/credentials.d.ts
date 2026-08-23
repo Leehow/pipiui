@@ -8,6 +8,7 @@ export type GrokBuildOAuthExtra = {
     principal?: string;
 };
 export type StoredOAuthCredential = {
+    type: "oauth";
     access: string;
     refresh: string;
     expires: number;

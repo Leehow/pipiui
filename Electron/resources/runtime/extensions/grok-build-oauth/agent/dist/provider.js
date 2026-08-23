@@ -162,6 +162,7 @@ export function createGrokBuildProvider(options = {}) {
                 // The official id_token `tier` claim is captured with the credential
                 // (tier/tier_raw/tier_source) so the tier gate/status use real data.
                 return {
+                    type: "oauth",
                     access: creds.access,
                     refresh: creds.refresh,
                     expires: creds.expires,
@@ -192,6 +193,7 @@ export function createGrokBuildProvider(options = {}) {
                     const next = await refreshCredentialUnlocked(current, signal, { fetchImpl });
                     notifyUnlocked("token_refreshed", { expires_at: next.expires });
                     return {
+                        type: "oauth",
                         access: next.access,
                         refresh: next.refresh,
                         expires: next.expires,

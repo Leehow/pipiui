@@ -3,7 +3,7 @@ import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { statSync } from "node:fs";
-import { GrokCredentialBroker } from "../agent/oauth/broker.js";
+import { brokerCredentialFromEntry, GrokCredentialBroker } from "../agent/oauth/broker.js";
 import { redactMessage } from "../agent/oauth/redact.js";
 
 function makeCred(overrides: Partial<Record<string, unknown>> = {}) {
@@ -21,6 +21,29 @@ function makeCred(overrides: Partial<Record<string, unknown>> = {}) {
     ...overrides,
   };
 }
+
+describe("brokerCredentialFromEntry", () => {
+  it("accepts a typeless oauth-shaped auth.json entry", () => {
+    const now = Date.now();
+    const cred = brokerCredentialFromEntry({
+      access: "at-typeless",
+      refresh: "rt-typeless",
+      expires: now + 3600_000,
+      issuer: "https://auth.x.ai",
+      client_id: "c",
+      scopes: ["openid"],
+      token_type: "Bearer",
+      obtained_at: now,
+    }, () => now);
+    expect(cred).toMatchObject({
+      type: "oauth",
+      issuer: "https://auth.x.ai",
+      expires: now + 3600_000,
+    });
+    expect(cred?.access).toBeTruthy();
+    expect(JSON.stringify(cred)).not.toContain("type\":undefined");
+  });
+});
 
 describe("GrokCredentialBroker — early refresh, rotation, no-refresh, invalid_grant, network preserve", () => {
   let dir = "";

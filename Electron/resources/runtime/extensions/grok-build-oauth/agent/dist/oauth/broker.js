@@ -71,9 +71,19 @@ function isFreshEnough(newer, older) {
     }
     return newer.expires > older.expires;
 }
+function isOauthShapedEntry(entry) {
+    const access = entry.access;
+    const expires = entry.expires;
+    return typeof access === "string" && access.length > 0
+        && typeof expires === "number" && Number.isFinite(expires);
+}
 /** Map a stored auth.json entry onto a broker credential. */
 export function brokerCredentialFromEntry(entry, nowMs) {
-    if (!entry || entry.type !== "oauth")
+    if (!entry)
+        return undefined;
+    const typedOauth = entry.type === "oauth";
+    const typelessOauth = (entry.type === undefined || entry.type === null) && isOauthShapedEntry(entry);
+    if (!typedOauth && !typelessOauth)
         return undefined;
     const access = entry.access;
     const refresh = entry.refresh;

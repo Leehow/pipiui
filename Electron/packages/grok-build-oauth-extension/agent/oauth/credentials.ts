@@ -10,6 +10,7 @@ export type GrokBuildOAuthExtra = {
 };
 
 export type StoredOAuthCredential = {
+  type: "oauth";
   access: string;
   refresh: string;
   expires: number;
@@ -52,6 +53,7 @@ export function toOAuthCredentials(tokens: {
   const tierName = hasNewTierClaim ? tierInfo.name : meta.previousTier?.tier;
   const tierRaw = hasNewTierClaim ? tierInfo.raw : meta.previousTier?.tier_raw;
   return {
+    type: "oauth",
     access: tokens.access_token,
     refresh,
     expires,

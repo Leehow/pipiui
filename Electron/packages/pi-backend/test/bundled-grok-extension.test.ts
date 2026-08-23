@@ -245,4 +245,47 @@ describe("bundled grok-build-oauth host integration", () => {
     const disk = JSON.parse(await readFile(join(agent, "models.json"), "utf8"));
     expect(disk.providers["grok-build"]).toBeUndefined();
   });
+
+  it("treats a typeless grok-build oauth entry as logged in without leaking secrets", async () => {
+    const { backend, agent } = await backendWithBundledGrok([]);
+    await writeFile(
+      join(agent, "auth.json"),
+      JSON.stringify({
+        "grok-build": { access: "tok-secret", refresh: "ref-secret", expires: 9_999_999_999 },
+      }),
+    );
+    const status = await backend.handle("getExtensionAuthStatus" as never, [GROK_EXTENSION_ID]) as Record<string, unknown>;
+    expect(status).toMatchObject({
+      extensionId: GROK_EXTENSION_ID,
+      providerId: "grok-build",
+      loggedIn: true,
+      usable: true,
+    });
+    expect(authStatusContainsSecrets(status)).toBe(false);
+    expect(JSON.stringify(status)).not.toContain("tok-secret");
+    expect(JSON.stringify(status)).not.toContain("ref-secret");
+  });
+
+  it("stays logged in from stored grok-build credentials when the helper registry omits the provider", async () => {
+    const { backend, agent, authRuntime } = await backendWithBundledGrok([]);
+    await writeFile(
+      join(agent, "auth.json"),
+      JSON.stringify({
+        "grok-build": { access: "tok-secret", refresh: "ref-secret", expires: 9_999_999_999 },
+      }),
+    );
+    authRuntime.getProviders = async () => [
+      { id: "anthropic", name: "Anthropic", auth: { apiKey: { login: {} } } },
+    ];
+    const status = await backend.handle("getExtensionAuthStatus" as never, [GROK_EXTENSION_ID]) as Record<string, unknown>;
+    expect(status).toMatchObject({
+      extensionId: GROK_EXTENSION_ID,
+      providerId: "grok-build",
+      loggedIn: true,
+      usable: true,
+    });
+    expect(authStatusContainsSecrets(status)).toBe(false);
+    expect(JSON.stringify(status)).not.toContain("tok-secret");
+    expect(JSON.stringify(status)).not.toContain("ref-secret");
+  });
 });

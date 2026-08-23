@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { resolveOAuthConfig, PROD_ISSUER, PROD_CLIENT_ID, defaultScopes } from "../agent/oauth/config.js";
+import { toOAuthCredentials } from "../agent/oauth/credentials.js";
 import { requestDeviceCode, pollDeviceToken, refreshAccessToken, OAuthError } from "../agent/oauth/device.js";
 import { redactMessage, redactObject } from "../agent/oauth/redact.js";
 import { importFromGlobalGrok } from "../agent/oauth/import.js";
@@ -269,6 +270,17 @@ describe("refreshAccessToken", () => {
     const ac = new AbortController();
     ac.abort();
     await expect(refreshAccessToken({ issuer: "https://auth.x.ai", clientId: "c", refreshToken: "rt", signal: ac.signal })).rejects.toThrow(/Abort/);
+  });
+});
+
+describe("toOAuthCredentials", () => {
+  it("writes type oauth so stored credentials stay typed", () => {
+    const cred = toOAuthCredentials(
+      { access_token: "at", refresh_token: "rt", expires_in: 3600 },
+      { issuer: "https://auth.x.ai", clientId: "c", scopes: ["openid"] },
+    );
+    expect(cred.type).toBe("oauth");
+    expect(JSON.stringify(cred)).not.toMatch(/"type":(?!"oauth")/);
   });
 });
 
