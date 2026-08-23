@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileViewerRenderers, type FileViewerRenderersPluginOptions } from '@file-viewer/vite-plugin'
+import { fileViewerPptVendorAssetPlugin } from './file-viewer-ppt-vendor-assets'
 
 // Default chunkStrategy:'renderer' splits word/ofd into circular chunks
 // that TDZ-crash the web bundle before React mounts. Match Electron.
@@ -15,7 +16,7 @@ export const fileViewerAssetOptions = {
 const here = dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig({
-  plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
+  plugins: [fileViewerPptVendorAssetPlugin(), fileViewerRenderers(fileViewerAssetOptions), react()],
   resolve: {
     alias: {
       '@pipiui/extension-api': resolve(here, '../extension-api/src/index.ts'),

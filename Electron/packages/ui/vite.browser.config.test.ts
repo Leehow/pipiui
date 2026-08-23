@@ -11,6 +11,7 @@ import { dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { resolveFileViewerCopyAssetsTarget } from '@file-viewer/vite-plugin'
+import { fileViewerPptVendorAssetPlugin } from './file-viewer-ppt-vendor-assets'
 import browserConfig, { fileViewerAssetOptions } from './vite.browser.config'
 
 describe('browser file-viewer build avoids renderer-chunk TDZ', () => {
@@ -36,5 +37,16 @@ describe('browser file-viewer build avoids renderer-chunk TDZ', () => {
       outDir: 'dist/browser'
     })
     expect(target.targetRoot.replace(/\\/g, '/')).toMatch(/packages\/ui\/dist\/browser\/file-viewer$/)
+  })
+
+  it('registers the PPT vendor rewrite plugin before file-viewer renderers', () => {
+    const plugin = fileViewerPptVendorAssetPlugin()
+    expect(plugin.name).toBe('file-viewer-ppt-vendor-assets')
+    expect(plugin.enforce).toBe('pre')
+    const names = (browserConfig.plugins ?? []).map((entry) => {
+      const plugin = Array.isArray(entry) ? entry[0] : entry
+      return plugin && typeof plugin === 'object' && 'name' in plugin ? plugin.name : undefined
+    })
+    expect(names[0]).toBe('file-viewer-ppt-vendor-assets')
   })
 })
