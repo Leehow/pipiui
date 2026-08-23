@@ -58,6 +58,11 @@ describe('macOS packaging contract', () => {
     const codeRetrieval = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/code-retrieval')
     expect(codeRetrieval?.filter).toContain('!**/target/**')
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/deepseek',
+      to: 'pipiui-runtime/extensions/deepseek',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/pdf-inspector/node_modules',
       to: 'pipiui-runtime/pdf-inspector/node_modules',
       filter: ['**/*', '!**/.bin', '!**/.bin/**']
