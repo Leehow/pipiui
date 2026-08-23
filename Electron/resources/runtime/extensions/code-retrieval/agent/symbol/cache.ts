@@ -13,7 +13,7 @@ import { collectSourceEntries, type SourceEntry } from "./files.js";
 import type { SourceFile, SymbolInfo } from "./types.js";
 
 /** Bump when extract queries / SymbolInfo shape change. */
-export const CACHE_SCHEMA = 1;
+export const CACHE_SCHEMA = 2;
 const PARSE_BATCH = 6;
 
 export interface CachedExtractStats {

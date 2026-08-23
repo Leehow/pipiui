@@ -31,6 +31,8 @@ export interface SymbolInfo {
   signature?: string;
   /** Enclosing class / impl type, when known. */
   container?: string;
+  /** Enclosing function / method for a call site (`Class.method` when known). */
+  caller?: string;
   lang: SupportedLang;
 }
 
@@ -94,7 +96,7 @@ export interface CodeNavResult {
   /** Empty definition/references → caller may fall back to exact (D4). */
   degraded: boolean;
   fallbackExact?: boolean;
-  /** callers/callees are stage 3 — do not pretend we have a call graph. */
+  /** Reserved: only set when an operation is genuinely not implemented. */
   unsupported?: boolean;
   incomplete?: boolean;
   reason?: string;

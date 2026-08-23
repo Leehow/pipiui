@@ -11,7 +11,7 @@
  */
 
 import { executeCodeSearch } from "./code-search.js";
-import { getSymbolLayer, setSymbolLayer } from "./hooks.js";
+import { getSymbolLayer, normalizeCodeNavResult, setSymbolLayer } from "./hooks.js";
 import { SeenRangeLedger } from "./ledger.js";
 import { EXTENSION_ID } from "./paths.js";
 import { buildToolResult, emptyDegraded, formatCompressedContent, RefRegistry } from "./protocol.js";
@@ -269,21 +269,37 @@ export default function (pi: ExtensionAPI): void {
         if (!operation) {
           return emptyDegraded("code-retrieval.nav", "code_nav requires operation.");
         }
-        const hits = await impl({
-          operation,
-          symbol: asString(params.symbol),
-          path: asString(params.path),
-          line: asNumber(params.line),
-          column: asNumber(params.column),
-          projectRoot: runtime.projectRoot,
-        });
-        const assigned = runtime.registry.assignAll(hits);
+        const nav = normalizeCodeNavResult(
+          await impl({
+            operation,
+            symbol: asString(params.symbol),
+            path: asString(params.path),
+            line: asNumber(params.line),
+            column: asNumber(params.column),
+            projectRoot: runtime.projectRoot,
+          }),
+        );
+        if (nav.unsupported) {
+          return emptyDegraded(
+            "code-retrieval.nav",
+            nav.reason ?? `code_nav ${operation} is not supported. Use grep / code_search.`,
+          );
+        }
+        if (nav.degraded && nav.hits.length === 0) {
+          return emptyDegraded(
+            "code-retrieval.nav",
+            nav.reason ?? `code_nav ${operation} found no symbol hits. Use grep / code_search.`,
+          );
+        }
+        const assigned = runtime.registry.assignAll(nav.hits);
+        const note = [nav.incomplete ? nav.reason : undefined].filter(Boolean).join(" ");
         return buildToolResult({
           projectRoot: runtime.projectRoot,
           kind: "code-retrieval.nav",
           hits: assigned,
-          degraded: false,
-          content: formatCompressedContent(assigned),
+          degraded: Boolean(nav.degraded),
+          content: formatCompressedContent(assigned, note || undefined),
+          degradeReason: nav.degraded ? nav.reason : undefined,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);

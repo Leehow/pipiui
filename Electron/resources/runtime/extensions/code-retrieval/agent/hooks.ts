@@ -38,9 +38,22 @@ export type CodeNavArgs = {
   projectRoot: string;
 };
 
+export type CodeNavHookResult = {
+  hits: UnassignedHit[];
+  degraded?: boolean;
+  reason?: string;
+  incomplete?: boolean;
+  unsupported?: boolean;
+};
+
 export type SymbolSearchFn = (args: SymbolSearchArgs) => Promise<UnassignedHit[]>;
 export type RepoMapFn = (args: RepoMapArgs) => Promise<UnassignedHit[]>;
-export type CodeNavFn = (args: CodeNavArgs) => Promise<UnassignedHit[]>;
+export type CodeNavFn = (args: CodeNavArgs) => Promise<UnassignedHit[] | CodeNavHookResult>;
+
+export function normalizeCodeNavResult(raw: UnassignedHit[] | CodeNavHookResult): CodeNavHookResult {
+  if (Array.isArray(raw)) return { hits: raw };
+  return raw;
+}
 export type SymbolBodyFn = (args: {
   path: string;
   symbol: string;

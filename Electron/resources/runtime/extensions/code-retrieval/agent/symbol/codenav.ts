@@ -1,10 +1,11 @@
 /**
  * code_nav (D4 / D6).
  * definition / references / implementations / workspace_symbols use the symbol graph.
+ * callers / callees use the name-based tree-sitter call graph (stage 3).
  * Miss → empty + degraded + fallbackExact (caller may exact-search).
- * callers / callees are stage 3: marked unsupported, no fake call graph.
  */
 
+import { findCallees, findCallers } from "./callgraph.js";
 import { extractProjectCached } from "./cache.js";
 import { extractMany, findDefinition, findReferences } from "./extract.js";
 import { initTreeSitter, isTreeSitterReady, treeSitterInitError } from "./treesitter.js";
@@ -85,24 +86,35 @@ function workspaceSymbols(query: string, symbols: SymbolInfo[], limit = 40): Sym
 
 /** In-memory nav over an already extracted symbol list. */
 export function navigateSymbols(req: CodeNavRequest, symbols: SymbolInfo[]): CodeNavResult {
-  if (req.operation === "callers" || req.operation === "callees") {
-    return {
-      operation: req.operation,
-      hits: [],
-      degraded: false,
-      unsupported: true,
-      incomplete: true,
-      reason:
-        "callers/callees are stage 3 (spec D4). v1 has no call graph — not a type system, will not invent one.",
-    };
-  }
-
   let name = req.symbol?.trim() ?? "";
   if (!name && req.path && req.line !== undefined) {
     const at = atPosition(symbols, req.path, req.line, req.column);
     if (at) name = at.container ? `${at.container}.${at.name}` : at.name;
   }
   if (!name) return miss(req.operation, "symbol name required");
+
+  if (req.operation === "callers") {
+    const found = findCallers({ name, path: req.path, line: req.line }, symbols);
+    if (!found.hits.length) return miss("callers", found.reason ?? "no callers");
+    return {
+      operation: "callers",
+      hits: found.hits,
+      degraded: false,
+      incomplete: found.incomplete,
+      reason: found.reason,
+    };
+  }
+  if (req.operation === "callees") {
+    const found = findCallees({ name, path: req.path, line: req.line }, symbols);
+    if (!found.hits.length) return miss("callees", found.reason ?? "no callees");
+    return {
+      operation: "callees",
+      hits: found.hits,
+      degraded: false,
+      incomplete: found.incomplete,
+      reason: found.reason,
+    };
+  }
 
   if (req.operation === "definition") {
     return ok("definition", findDefinition(name, symbols).map(toHit));

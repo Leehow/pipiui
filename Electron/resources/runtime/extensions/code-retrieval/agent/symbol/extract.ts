@@ -4,7 +4,7 @@
  */
 
 import { compileQuery, createParser, isTreeSitterReady, langFromPath, type TsNode } from "./treesitter.js";
-import { querySourceFor } from "./queries.js";
+import { extraCallQuerySourceFor, querySourceFor } from "./queries.js";
 import {
   lastNameSegment,
   type SourceFile,
@@ -14,6 +14,7 @@ import {
 } from "./types.js";
 
 const queryCache = new Map<SupportedLang, ReturnType<typeof compileQuery>>();
+const extraCallQueryCache = new Map<SupportedLang, ReturnType<typeof compileQuery> | null>();
 const parserCache = new Map<SupportedLang, ReturnType<typeof createParser>>();
 
 function parserFor(lang: SupportedLang) {
@@ -31,6 +32,18 @@ function queryFor(lang: SupportedLang) {
     query = compileQuery(lang, querySourceFor(lang));
     queryCache.set(lang, query);
   }
+  return query;
+}
+
+function extraCallQueryFor(lang: SupportedLang) {
+  if (extraCallQueryCache.has(lang)) return extraCallQueryCache.get(lang) ?? null;
+  const src = extraCallQuerySourceFor(lang);
+  if (!src) {
+    extraCallQueryCache.set(lang, null);
+    return null;
+  }
+  const query = compileQuery(lang, src);
+  extraCallQueryCache.set(lang, query);
   return query;
 }
 
@@ -57,6 +70,16 @@ const CONTAINER_TYPES = new Set([
   "abstract_class_declaration",
 ]);
 
+const FUNCTION_TYPES = new Set([
+  "function_definition",
+  "function_declaration",
+  "generator_function_declaration",
+  "method_definition",
+  "function_expression",
+  "arrow_function",
+  "function_item",
+]);
+
 function containerName(node: TsNode): string | undefined {
   let cur: TsNode | null = node.parent;
   while (cur) {
@@ -67,6 +90,45 @@ function containerName(node: TsNode): string | undefined {
     cur = cur.parent;
   }
   return undefined;
+}
+
+function nameFromDeclarator(fnNode: TsNode): string | undefined {
+  let cur: TsNode | null = fnNode.parent;
+  while (cur) {
+    if (
+      cur.type === "variable_declarator" ||
+      cur.type === "pair" ||
+      cur.type === "public_field_definition" ||
+      cur.type === "field_definition" ||
+      cur.type === "pair_pattern"
+    ) {
+      const named = cur.childForFieldName("name") ?? cur.childForFieldName("key");
+      if (named?.text) return named.text.replace(/['"]/g, "");
+    }
+    if (FUNCTION_TYPES.has(cur.type) || CONTAINER_TYPES.has(cur.type)) break;
+    cur = cur.parent;
+  }
+  return undefined;
+}
+
+/** Nearest enclosing function / method, qualified with class/impl when known. */
+function enclosingCaller(node: TsNode): string | undefined {
+  let cur: TsNode | null = node.parent;
+  let funcName: string | undefined;
+  let className: string | undefined;
+  while (cur) {
+    if (!funcName && FUNCTION_TYPES.has(cur.type)) {
+      const named = cur.childForFieldName("name");
+      funcName = named?.text?.trim() || nameFromDeclarator(cur);
+    } else if (CONTAINER_TYPES.has(cur.type) && !className) {
+      const named = cur.childForFieldName("name") ?? cur.childForFieldName("type");
+      if (named?.text) className = named.text.trim();
+    }
+    cur = cur.parent;
+  }
+  if (!funcName) return undefined;
+  if (className && !funcName.includes(".")) return `${className}.${funcName}`;
+  return funcName;
 }
 
 function signatureOf(node: TsNode, source: string): string {
@@ -89,6 +151,7 @@ function toSymbol(
   let kindOut = kind;
   if (kind === "function" && container) kindOut = "method";
   const name = nameNode.text.trim();
+  const caller = kind === "call" ? enclosingCaller(spanNode) : undefined;
   return {
     name,
     kind: kindOut,
@@ -99,6 +162,7 @@ function toSymbol(
     endColumn: spanNode.endPosition.column,
     signature: kindOut === "call" ? name : signatureOf(spanNode, source),
     container,
+    caller,
     lang,
   };
 }
@@ -118,7 +182,29 @@ export function extractSymbols(path: string, source: string, lang: SupportedLang
   const out: SymbolInfo[] = [];
   const seen = new Set<string>();
   try {
-  for (const match of query.matches(tree.rootNode)) {
+    collectQuerySymbols(query, tree.rootNode, path, lang, source, seen, out);
+    const extra = extraCallQueryFor(lang);
+    if (extra) collectQuerySymbols(extra, tree.rootNode, path, lang, source, seen, out);
+    return out;
+  } finally {
+    try {
+      tree.delete();
+    } catch {
+      /* WASM tree already gone */
+    }
+  }
+}
+
+function collectQuerySymbols(
+  query: NonNullable<ReturnType<typeof compileQuery>>,
+  root: TsNode,
+  path: string,
+  lang: SupportedLang,
+  source: string,
+  seen: Set<string>,
+  out: SymbolInfo[],
+): void {
+  for (const match of query.matches(root)) {
     let span: TsNode | null = null;
     let nameNode: TsNode | null = null;
     let kind: SymbolKind | null = null;
@@ -146,14 +232,6 @@ export function extractSymbols(path: string, source: string, lang: SupportedLang
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(sym);
-  }
-  return out;
-  } finally {
-    try {
-      tree.delete();
-    } catch {
-      /* WASM tree already gone */
-    }
   }
 }
 

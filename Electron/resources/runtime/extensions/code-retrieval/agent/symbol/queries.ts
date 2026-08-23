@@ -139,3 +139,18 @@ const BY_LANG: Record<SupportedLang, string> = {
 export function querySourceFor(lang: SupportedLang): string {
   return BY_LANG[lang];
 }
+
+/**
+ * Extra call-site patterns compiled independently of the main tag query.
+ * A compile failure here must not take down function/class extraction.
+ */
+export function extraCallQuerySourceFor(lang: SupportedLang): string | null {
+  if (lang === "rust") {
+    return `
+(call_expression
+  function: (scoped_identifier
+    name: (identifier) @name.reference.call)) @reference.call
+`;
+  }
+  return null;
+}

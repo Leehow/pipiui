@@ -61,7 +61,13 @@ export async function codeNavHook(args: {
   line?: number;
   column?: number;
   projectRoot: string;
-}): Promise<UnassignedHit[]> {
+}): Promise<{
+  hits: UnassignedHit[];
+  degraded?: boolean;
+  reason?: string;
+  incomplete?: boolean;
+  unsupported?: boolean;
+}> {
   const result = await navigateProject(args.projectRoot, {
     operation: args.operation,
     symbol: args.symbol,
@@ -69,13 +75,19 @@ export async function codeNavHook(args: {
     line: args.line,
     column: args.column,
   });
-  return result.hits.map((h) => ({
-    path: h.path,
-    startLine: h.startLine,
-    endLine: h.endLine,
-    symbol: h.symbol,
-    text: h.signature,
-  }));
+  return {
+    hits: result.hits.map((h) => ({
+      path: h.path,
+      startLine: h.startLine,
+      endLine: h.endLine,
+      symbol: h.symbol,
+      text: h.signature,
+    })),
+    degraded: result.degraded,
+    reason: result.reason,
+    incomplete: result.incomplete,
+    unsupported: result.unsupported,
+  };
 }
 
 export async function searchSymbolsHook(args: {

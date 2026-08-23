@@ -238,7 +238,7 @@ function renderEntry(
     }
     if (s.kind === "call") {
       if (isNoiseCall(s.name)) continue;
-      const from = s.container ? `${s.container}.${s.name}` : s.name;
+      const from = s.caller || (s.container ? `${s.container}.${s.name}` : s.name);
       const key = `${from}->${s.name}`;
       if (!seenCall.has(key) && calls.length < MAX_CALLS_PER_FILE) {
         seenCall.add(key);

@@ -22,6 +22,7 @@ export {
 
 export { buildRepoMap, buildRepoMapFromSymbols, computeRepoMap, formatRepoMapText } from "./repomap.js";
 export { navigate, navigateProject, navigateSymbols, navigateFiles } from "./codenav.js";
+export { buildCallGraph, findCallers, findCallees } from "./callgraph.js";
 export { collectSourceFiles, collectSourceEntries } from "./files.js";
 export {
   extractProjectCached,

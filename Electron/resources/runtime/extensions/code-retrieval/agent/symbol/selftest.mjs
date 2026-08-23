@@ -87,7 +87,10 @@ async function runRepo(id, pass) {
     const r = await navigateProject(root, { operation: "references", symbol: q });
     refs.push({ q, n: r.hits.length, degraded: r.degraded, sample: r.hits[0] });
   }
-  const callers = await navigateProject(root, { operation: "callers", symbol: "send" });
+  const callerQuery = id === "flask" ? "url_for" : "resolve_redirects";
+  const calleeQuery = id === "flask" ? "render_template" : "Session.send";
+  const callers = await navigateProject(root, { operation: "callers", symbol: callerQuery });
+  const callees = await navigateProject(root, { operation: "callees", symbol: calleeQuery });
   const navMs = Date.now() - tNav;
   const navCache = lastCachedExtractStats();
   const totalMs = Date.now() - t0;
@@ -110,7 +113,20 @@ async function runRepo(id, pass) {
     navCache,
     defs,
     refs,
-    callersUnsupported: Boolean(callers.unsupported),
+    callers: {
+      q: callerQuery,
+      n: callers.hits.length,
+      degraded: callers.degraded,
+      unsupported: Boolean(callers.unsupported),
+      sample: callers.hits[0],
+    },
+    callees: {
+      q: calleeQuery,
+      n: callees.hits.length,
+      degraded: callees.degraded,
+      unsupported: Boolean(callees.unsupported),
+      sample: callees.hits[0],
+    },
     sampleEntry: map.entries[0]
       ? {
           path: map.entries[0].path,
@@ -137,14 +153,23 @@ async function runRepo(id, pass) {
   }
   for (const d of defs) console.log(`definition ${d.q}: ${d.n}${d.sample ? `  e.g. ${d.sample.path}:${d.sample.startLine} ${d.sample.symbol}` : ""}`);
   for (const r of refs) console.log(`references ${r.q}: ${r.n}${r.sample ? `  e.g. ${r.sample.path}:${r.sample.startLine}` : ""}`);
-  console.log(`callers unsupported=${row.callersUnsupported}`);
+  console.log(
+    `callers ${row.callers.q}: ${row.callers.n} degraded=${row.callers.degraded}` +
+      (row.callers.sample ? `  e.g. ${row.callers.sample.path}:${row.callers.sample.startLine} ${row.callers.sample.symbol}` : ""),
+  );
+  console.log(
+    `callees ${row.callees.q}: ${row.callees.n} degraded=${row.callees.degraded}` +
+      (row.callees.sample ? `  e.g. ${row.callees.sample.path}:${row.callees.sample.startLine} ${row.callees.sample.symbol}` : ""),
+  );
 
   if (map.degraded || row.mapEntries === 0) fail(`${id}: repo_map empty/degraded`);
   if (sigCount === 0) fail(`${id}: repo_map has no signatures`);
   if (callEdges === 0) fail(`${id}: repo_map has no call edges`);
   if (row.definitionHits === 0) fail(`${id}: definition hits empty`);
   if (row.referenceHits === 0) fail(`${id}: references hits empty`);
-  if (!row.callersUnsupported) fail(`${id}: callers must be marked unsupported`);
+  if (row.callers.unsupported || row.callees.unsupported) fail(`${id}: callers/callees must not be unsupported`);
+  if (row.callers.degraded || row.callers.n === 0) fail(`${id}: callers empty/degraded`);
+  if (row.callees.degraded || row.callees.n === 0) fail(`${id}: callees empty/degraded`);
   return row;
 }
 
@@ -171,6 +196,6 @@ writeFileSync(
   outPath,
   JSON.stringify({ ok: true, when: new Date().toISOString(), passTimings, results }, null, 2),
 );
-console.log(`\nOK flask+requests repo_map + definition/references non-empty`);
+console.log(`\nOK flask+requests repo_map + definition/references + callers/callees non-empty`);
 console.log(`pass1=${first}ms pass2=${second}ms speedup=${first && second ? (first / Math.max(second, 1)).toFixed(2) : "n/a"}x`);
 console.log(`wrote ${outPath}`);
