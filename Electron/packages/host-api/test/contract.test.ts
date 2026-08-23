@@ -1187,7 +1187,9 @@ describe('extension architecture M1 host-api contract', () => {
     await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.invokeExtension?.('quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' })).resolves.toEqual({ ok: true, data: settings })
     await expect(host.listExtensions?.()).resolves.toEqual([descriptor])
+    await expect(host.listExtensions?.('project-1')).resolves.toEqual([descriptor])
     await expect(host.setExtensionEnabled?.('quota', true, 'project')).resolves.toEqual({ ...descriptor, state: 'enabled' })
+    await expect(host.setExtensionEnabled?.('quota', true, 'project', 'project-1')).resolves.toEqual({ ...descriptor, state: 'enabled' })
     await expect(host.uninstallExtension?.('quota')).resolves.toBeUndefined()
     await expect(host.getCapabilityGrant?.('quota')).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.confirmCapabilityGrant?.('quota', ['settings.read'])).resolves.toEqual({ capabilities: ['settings.read'] })
@@ -1202,7 +1204,9 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }] },
       { method: 'invokeExtension', params: ['quota', 'snapshot', { n: 1 }, { sessionId: 'sess-1' }] },
       { method: 'listExtensions', params: [] },
+      { method: 'listExtensions', params: ['project-1'] },
       { method: 'setExtensionEnabled', params: ['quota', true, 'project'] },
+      { method: 'setExtensionEnabled', params: ['quota', true, 'project', 'project-1'] },
       { method: 'uninstallExtension', params: ['quota'] },
       { method: 'getCapabilityGrant', params: ['quota'] },
       { method: 'confirmCapabilityGrant', params: ['quota', ['settings.read']] },

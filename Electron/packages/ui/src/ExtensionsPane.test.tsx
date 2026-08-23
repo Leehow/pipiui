@@ -108,14 +108,14 @@ function managementHost(initial: ExtensionDescriptor[]) {
   const host = {
     listUserMcpServers: async () => [],
     listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
-    listExtensions: vi.fn(async () => items.map(item => ({ ...item, grantedCapabilities: grants.get(item.id) }))),
+    listExtensions: vi.fn(async (_projectId?: string) => items.map(item => ({ ...item, grantedCapabilities: grants.get(item.id) }))),
     getCapabilityGrant: vi.fn(async (id: string) => ({ capabilities: grants.get(id) ?? [] })),
     confirmCapabilityGrant: vi.fn(async (id: string, capabilities: readonly string[]) => {
       grants.set(id, [...capabilities])
       items = items.map(item => item.id === id ? { ...item, grantedCapabilities: [...capabilities] } : item)
       return { capabilities: [...capabilities] }
     }),
-    setExtensionEnabled: vi.fn(async (id: string, enabled: boolean, scope: 'app' | 'project') => {
+    setExtensionEnabled: vi.fn(async (id: string, enabled: boolean, scope: 'app' | 'project', _projectId?: string) => {
       items = items.map(item => item.id === id ? { ...item, state: enabled ? 'enabled' as const : 'disabled' as const } : item)
       return items.find(item => item.id === id)!
     }),
@@ -159,6 +159,24 @@ describe('ExtensionsPane package management', () => {
     await waitFor(() => expect(host.setExtensionEnabled).toHaveBeenCalledWith('quota', false, 'project'))
     expect(host.confirmCapabilityGrant).not.toHaveBeenCalled()
     await waitFor(() => expect(screen.getByTestId('extensions-pkg-meta-quota').textContent).toContain('已禁用'))
+  })
+
+  it('lists the merged project view so a project enable overlay wins over App disable', async () => {
+    const host = managementHost([pkg({ id: 'quota', state: 'disabled', source: 'app' })])
+    host.listExtensions = vi.fn(async (projectId?: string) => [
+      pkg({
+        id: 'quota',
+        name: 'Quota',
+        source: 'app',
+        // App-only (no projectId) stays disabled; merged project view is enabled.
+        state: projectId === 'project-1' ? 'enabled' : 'disabled',
+      }),
+    ])
+    render(<ExtensionsPane host={host} projectId="project-1" addOpen={false} onCloseAdd={() => undefined} />)
+    await waitFor(() => expect(host.listExtensions).toHaveBeenCalledWith('project-1'))
+    expect((await screen.findByTestId('extensions-pkg-meta-quota')).textContent).toContain('已启用')
+    fireEvent.click(screen.getByTestId('extensions-pkg-toggle-quota'))
+    await waitFor(() => expect(host.setExtensionEnabled).toHaveBeenCalledWith('quota', false, 'project', 'project-1'))
   })
 
   it('uninstalls a non-builtin package after a second confirmation', async () => {

@@ -928,8 +928,8 @@ export interface PipiHostAPI {
   updateExtensionSettings?(id: string, patch: Record<string, unknown>): Promise<ExtInvokeResult<Record<string, unknown>>>;
   /** Reserved: M2 wires this to the session's pi RPC. */
   invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
-  listExtensions?(): Promise<ExtensionDescriptor[]>;
-  setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope): Promise<ExtensionDescriptor>;
+  listExtensions?(projectId?: string): Promise<ExtensionDescriptor[]>;
+  setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope, projectId?: string): Promise<ExtensionDescriptor>;
   /** Remove a non-builtin package (spec D9). Builtins are not uninstallable. */
   uninstallExtension?(id: string): Promise<void>;
   /** Currently confirmed capabilities for this package (empty = none granted). */
@@ -1102,8 +1102,10 @@ function apiFrom(
     invokeExtension: (id, method, params, opts) => opts === undefined
       ? invoke("invokeExtension", id, method, params)
       : invoke("invokeExtension", id, method, params, opts),
-    listExtensions: () => invoke("listExtensions"),
-    setExtensionEnabled: (id, enabled, scope) => invoke("setExtensionEnabled", id, enabled, scope),
+    listExtensions: projectId => projectId === undefined ? invoke("listExtensions") : invoke("listExtensions", projectId),
+    setExtensionEnabled: (id, enabled, scope, projectId) => projectId === undefined
+      ? invoke("setExtensionEnabled", id, enabled, scope)
+      : invoke("setExtensionEnabled", id, enabled, scope, projectId),
     uninstallExtension: id => invoke("uninstallExtension", id),
     getCapabilityGrant: id => invoke("getCapabilityGrant", id),
     confirmCapabilityGrant: (id, capabilities) => invoke("confirmCapabilityGrant", id, capabilities),

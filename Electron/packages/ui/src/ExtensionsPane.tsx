@@ -374,11 +374,12 @@ function ExtensionPackageRow({
   )
 }
 
-function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
+function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; projectId?: string }) {
   const [items, setItems] = useState<ExtensionDescriptor[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
   const [grantTarget, setGrantTarget] = useState<ExtensionDescriptor | null>(null)
   const [uninstallTarget, setUninstallTarget] = useState<ExtensionDescriptor | null>(null)
+  const resolvedProjectId = projectId || lastProjectId()
 
   const refresh = useCallback(async () => {
     if (!host.listExtensions) {
@@ -386,11 +387,11 @@ function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
       return
     }
     try {
-      setItems(await host.listExtensions())
+      setItems(await (resolvedProjectId ? host.listExtensions(resolvedProjectId) : host.listExtensions()))
     } catch {
       setItems([])
     }
-  }, [host])
+  }, [host, resolvedProjectId])
 
   useEffect(() => { void refresh() }, [refresh])
 
@@ -398,7 +399,8 @@ function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
     if (!host.setExtensionEnabled) return
     setBusyId(ext.id)
     try {
-      await host.setExtensionEnabled(ext.id, enabled, 'project')
+      if (resolvedProjectId) await host.setExtensionEnabled(ext.id, enabled, 'project', resolvedProjectId)
+      else await host.setExtensionEnabled(ext.id, enabled, 'project')
       await refresh()
     } finally {
       setBusyId(null)
@@ -435,7 +437,8 @@ function ExtensionPackagesSection({ host }: { host: PipiHostAPI }) {
     setBusyId(ext.id)
     try {
       await host.confirmCapabilityGrant?.(ext.id, requested)
-      await host.setExtensionEnabled?.(ext.id, true, 'project')
+      if (resolvedProjectId) await host.setExtensionEnabled?.(ext.id, true, 'project', resolvedProjectId)
+      else await host.setExtensionEnabled?.(ext.id, true, 'project')
       await refresh()
     } finally {
       setBusyId(null)
@@ -534,7 +537,7 @@ export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOp
 
   return (
     <div className="extensions-pane" data-testid="extensions-pane">
-      {resolvedHost?.listExtensions && <ExtensionPackagesSection host={resolvedHost} />}
+      {resolvedHost?.listExtensions && <ExtensionPackagesSection host={resolvedHost} projectId={projectId} />}
       <section className="update-center-group" data-testid="extensions-builtin">
         <header className="update-center-group-header">
           <div>
