@@ -1856,6 +1856,27 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).toContain('website'))
   })
 
+  it('does not auto-expand a collapsed project when selecting a pinned session', async () => {
+    const host = createMockHost()
+    const workspace = await host.listProjects()
+    localStorage.setItem(sidebarPreferencesKey(workspace), JSON.stringify({
+      expandedIds: [],
+      pinnedSessionIds: ['layout'],
+      visibleLimit: 10,
+    }))
+    const { container } = render(<App host={host} />)
+    const pinned = await waitFor(() => {
+      const row = container.querySelector('.sb-pinned-section [data-session-id="layout"]')
+      expect(row).toBeTruthy()
+      return row!
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy())
+    fireEvent.click(pinned)
+    await waitFor(() => expect(pinned.getAttribute('aria-current')).toBe('true'))
+    expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy()
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).not.toContain('pipiui'))
+  })
+
   it('uses host semantic sidebar preferences after one-time local migration while keeping disclosure local', async () => {
     const host = createMockHost()
     const workspace = await host.listProjects()

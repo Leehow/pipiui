@@ -7,7 +7,7 @@ import { PromptRail, useActivePromptId } from './PromptRail'
 import { SubagentSignalCard } from './SubagentSignalCard'
 import { UserMessageBubble } from './UserMessageBubble'
 import { WaitingPlaceholder, type WaitingPhase } from './WaitingPlaceholder'
-import { buildRailPrompts } from './prompt-rail'
+import { buildRailPrompts, isNavigationEligibleUserPrompt } from './prompt-rail'
 import { parseSubagentNotice } from './subagent-notice'
 import { parseSubagentSignal } from './subagent-signal'
 import { TruncatedText } from './TruncatedText'
@@ -20,6 +20,15 @@ type SubagentOpenProps = { onOpenSubagents?: (agentId?: string) => void }
 
 function transcriptItemKey(index: number, message: ChatMessage) {
   return `${index}:${message.id}`
+}
+
+/** Nearest earlier human user prompt. Skips tools, assistants, and injected user-role signals. */
+export function findPreviousUserMessageIndex(messages: readonly ChatMessage[], fromIndex: number): number | null {
+  for (let index = fromIndex - 1; index >= 0; index -= 1) {
+    const candidate = messages[index]
+    if (candidate && isNavigationEligibleUserPrompt(candidate)) return index
+  }
+  return null
 }
 
 function assignVirtuosoRef(ref: React.RefObject<VirtuosoHandle> | undefined, value: VirtuosoHandle | null) {
@@ -191,13 +200,13 @@ export function Transcript({ messages, transcriptRef, waiting, active = true, do
   }
   return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef} onWheelCapture={handleWheel} onTouchStartCapture={handleTouchStart} onTouchMoveCapture={handleTouchMove}>
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />
-    <MessageList ref={setVirtuosoHandle} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} />
+    <MessageList ref={setVirtuosoHandle} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} onJump={jump} />
     {waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}
     {active && !atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
 }
 
-export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; active?: boolean; shouldFollow: () => boolean; onAtBottom: (value: boolean) => void; onListHeightChanged: () => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ messages, active = true, shouldFollow, onAtBottom, onListHeightChanged, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }, ref) {
+export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; active?: boolean; shouldFollow: () => boolean; onAtBottom: (value: boolean) => void; onListHeightChanged: () => void; onJump: (index: number, id: string) => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ messages, active = true, shouldFollow, onAtBottom, onListHeightChanged, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId, onJump }, ref) {
   const ids = useMemo(() => messages.map(transcriptMessageIdentity), [messages])
   const previousIdsRef = useRef<readonly string[]>([])
   const firstItemIndexRef = useRef(TRANSCRIPT_FIRST_ITEM_BASE)
@@ -218,19 +227,22 @@ export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessa
       const dataIndex = transcriptDataIndex(index, firstItemIndex)
       const next = messages[dataIndex + 1]
       const isTurnEnd = message.role === 'user' || (!message.streaming && (!next || next.role !== 'assistant'))
-      return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} />
+      const previousUserIndex = message.role === 'assistant' ? findPreviousUserMessageIndex(messages, dataIndex) : null
+      const previousUser = previousUserIndex === null ? undefined : messages[previousUserIndex]
+      return <MessageView message={message} showFooter={isTurnEnd} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copied={copiedId === message.id} canJump={previousUser != null} onJump={previousUserIndex === null || !previousUser ? undefined : () => onJump(previousUserIndex, previousUser.id)} />
     }}
   /></div>
 }))
 
 function messageTime(timestamp?: number): string { if (!timestamp) return ''; const date = new Date(timestamp); const pad = (value: number) => String(value).padStart(2, '0'); return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}` }
 
-export const MessageView = memo(function MessageView({ message, showFooter, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copied }: { message: ChatMessage; showFooter?: boolean; copied?: boolean } & DocumentOpenProps & SubagentOpenProps & Omit<MessageActionHandlers, 'copiedId'>) {
+export const MessageView = memo(function MessageView({ message, showFooter, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copied, canJump = false, onJump }: { message: ChatMessage; showFooter?: boolean; copied?: boolean; canJump?: boolean; onJump?: () => void } & DocumentOpenProps & SubagentOpenProps & Omit<MessageActionHandlers, 'copiedId'>) {
   const signal = message.role === 'user' ? parseSubagentSignal(message.content) : null
   const copyDisabled = !message.content.trim()
   const copy = () => { void onCopy(message).catch(() => undefined) }
   const time = showFooter && message.timestamp ? <time className="message-time" dateTime={new Date(message.timestamp).toISOString()}>{messageTime(message.timestamp)}</time> : null
-  const actions = showFooter && !signal ? <MessageActionBar alignment="trailing" canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} copied={copied} /> : null
+  const alignment = message.role === 'user' ? 'trailing' : 'leading'
+  const actions = showFooter && !signal ? <MessageActionBar alignment={alignment} canCopy canResend={message.role === 'user' && Boolean(message.content.trim())} canJump={canJump && message.role === 'assistant'} copyDisabled={copyDisabled} resendDisabled={resendDisabled} onCopy={copy} onResend={() => onResend(message)} onJump={onJump} copied={copied} /> : null
   const footer = actions || time ? <div className="message-footer">{time}{actions}</div> : null
   if (message.role === 'compaction') return <CompactionDivider message={message} />
   if (message.role === 'user') return signal ? <article className="message user-message subagent-signal-message"><div className="subagent-signal-stack"><SubagentSignalCard content={message.content} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} />{time}</div></article> : <article className="message user-message" data-user-prompt={message.id} data-queued={message.queued ? 'true' : undefined}><div className="user-message-stack"><UserMessageBubble text={message.content} images={message.images} queued={message.queued} /></div>{footer}</article>

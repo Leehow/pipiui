@@ -39,10 +39,31 @@ describe('MessageActionBar', () => {
     expect(screen.getByRole('status').textContent).toBe('已复制')
   })
 
+  it('exposes an accessible jump control beside copy and invokes its callback', () => {
+    const onCopy = vi.fn()
+    const onJump = vi.fn()
+    render(<MessageActionBar alignment="leading" canCopy canJump onCopy={onCopy} onJump={onJump} />)
+    const toolbar = screen.getByRole('toolbar', { name: '消息操作' })
+    expect(toolbar.className).toContain('leading')
+    const copy = screen.getByRole('button', { name: '复制消息' })
+    const jump = screen.getByRole('button', { name: '跳转到上一条用户消息' })
+    expect(jump.getAttribute('title')).toBe('跳转到上一条用户消息')
+    expect(copy.compareDocumentPosition(jump) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    fireEvent.click(jump)
+    expect(onJump).toHaveBeenCalledOnce()
+    expect(onCopy).not.toHaveBeenCalled()
+  })
+
+  it('hides the jump control unless it is explicitly enabled', () => {
+    render(<MessageActionBar alignment="leading" canCopy onCopy={() => undefined} />)
+    expect(screen.queryByRole('button', { name: '跳转到上一条用户消息' })).toBeNull()
+  })
+
   it('uses one fixed-size control and icon treatment for every message action', () => {
     const css = readFileSync(join(import.meta.dirname, 'message-actions.css'), 'utf8')
     expect(css).toMatch(/\.message-action-button\{[^}]*width:32px;[^}]*height:32px;/)
     expect(css).toMatch(/\.message-action-icon\{[^}]*width:17px;[^}]*height:17px;/)
+    expect(css).toMatch(/\.message-action-icon-svg\{[^}]*width:17px;[^}]*height:17px/)
   })
 
   it('keeps the complete user message group on the trailing edge', () => {
@@ -51,5 +72,7 @@ describe('MessageActionBar', () => {
     expect(css).toContain('.message-footer{display:flex;width:100%;')
     const actionCss = readFileSync(join(import.meta.dirname, 'message-actions.css'), 'utf8')
     expect(actionCss).toContain('.message-action-bar.trailing{justify-content:flex-end;margin-left:auto}')
+    expect(actionCss).toContain('.message-action-bar.leading{justify-content:flex-start}')
+    expect(actionCss).not.toMatch(/\.message-action-bar\.leading\{[^}]*margin-left:auto/)
   })
 })

@@ -66,6 +66,15 @@ describe('toolArgsSummary', () => {
     ] }))).toBe('核对 Electron 生命周期、验证跨会话隔离')
   })
 
+  it('renders skill_load name and skill_search query', () => {
+    expect(toolArgsSummary('skill_load', '{"name":"code-review"}')).toBe('code-review')
+    expect(toolArgsSummary('skill_load', '{}')).toBe('…')
+    expect(toolArgsSummary('skill_search', '{"query":"office document"}')).toBe('office document')
+    expect(toolArgsSummary('skill_search', '{}')).toBe('…')
+    expect(toolArgsSummary('skill_load', '{"name":"code-review')).toBe('code-review')
+    expect(toolArgsSummary('skill_search', '{"query":"office document')).toBe('office document')
+  })
+
   it('scrapes truncated JSON while streaming', () => {
     expect(toolArgsSummary('bash', '{"command":"ls -')).toBe('ls -')
     expect(toolArgsSummary('write', '{"path":"Src')).toBe('Src')
@@ -100,6 +109,10 @@ describe('toolDisplaySummary', () => {
   it('keeps "name · summary" for non-bash tools', () => {
     expect(toolDisplaySummary('edit', '{"file_path":"App.tsx"}')).toBe('edit · App.tsx')
     expect(toolDisplaySummary('grep', '{"pattern":"foo","path":"src"}')).toBe('grep · /foo/ in src')
+    expect(toolDisplaySummary('skill_load', '{"name":"code-review"}')).toBe('skill_load · code-review')
+    expect(toolDisplaySummary('skill_search', '{"query":"office document"}')).toBe('skill_search · office document')
+    expect(toolDisplaySummary('skill_load', '{}')).toBe('skill_load')
+    expect(toolDisplaySummary('skill_search', '')).toBe('skill_search')
   })
 
   it('scrapes truncated bash JSON while streaming', () => {

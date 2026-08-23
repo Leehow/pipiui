@@ -491,6 +491,31 @@ describe('Sidebar', () => {
     expect(props.onNewSession).toHaveBeenCalledWith('p1')
   })
 
+  it('selects a pinned session without asking the parent to expand its collapsed project', () => {
+    const props = defaultProps({
+      expandedIds: [],
+      pinnedSessions: [session({ id: 'pin1', projectId: 'p1', status: 'completed' })],
+    })
+    render(<Sidebar {...props} />)
+    expect(screen.getAllByTestId('project-row')[0].getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(screen.getByText('pin1').closest('.sb-session')!)
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+    expect(props.onSelectSession).toHaveBeenCalledWith('pin1', { expandProject: false })
+    expect(props.onToggleProject).not.toHaveBeenCalled()
+    expect(screen.getAllByTestId('project-row')[0].getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('selects a pinned external session without asking the parent to expand its project', () => {
+    const props = defaultProps({
+      expandedIds: [],
+      pinnedSessions: [session({ id: 'ext:claude:abc', projectId: 'p1', title: 'Claude 记录', source: 'claude', provider: 'claude' })],
+    })
+    render(<Sidebar {...props} />)
+    fireEvent.click(screen.getByLabelText('Anthropic/Claude · Claude 记录'))
+    expect(props.onSelectSession).toHaveBeenCalledWith('ext:claude:abc', { expandProject: false })
+    expect(props.onToggleProject).not.toHaveBeenCalled()
+  })
+
   it.each([
     ['running', '进行中'],
     ['stalled', '停滞']

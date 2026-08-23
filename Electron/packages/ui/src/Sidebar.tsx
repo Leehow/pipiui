@@ -124,7 +124,8 @@ export interface SidebarProps {
   collapsed: boolean
   onToggleCollapsed: () => void
   onToggleProject: (projectId: string) => void
-  onSelectSession: (sessionId: string) => void
+  /** Pinned rows pass `{ expandProject: false }` so App does not open the folder. */
+  onSelectSession: (sessionId: string, options?: { expandProject?: boolean }) => void
   onNewSession: (projectId: string) => void
   /** Menu actions are reported, never applied here (reveal/remove). Rename is inline. */
   onProjectMenu: (projectId: string, action: ProjectMenuAction) => void
@@ -672,7 +673,7 @@ export function Sidebar(props: SidebarProps) {
           <section className="sb-section sb-pinned-section" aria-label="置顶会话" data-drop-active={dragged?.type === 'session' || undefined} onDragOver={event => dragOverPinned(event)} onDrop={event => dropOnPinned(event)}>
             <h2 className="sb-section-title">置顶</h2>
             {visiblePinned.map(session => (
-              <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} isPinned onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} draggable={!query && Boolean(onMoveSessionToPinned)} dragging={dragged?.type === 'session' && dragged.id === session.id} dropPlacement={sessionDrop?.id === session.id ? sessionDrop.placement : undefined} onDragStart={startSessionDrag} onDragEnd={finishDrag} onDragOver={(event, target) => dragOverPinned(event, target)} onDrop={(event, target) => dropOnPinned(event, target)} />
+              <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={id => onSelectSession(id, { expandProject: false })} isPinned onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} draggable={!query && Boolean(onMoveSessionToPinned)} dragging={dragged?.type === 'session' && dragged.id === session.id} dropPlacement={sessionDrop?.id === session.id ? sessionDrop.placement : undefined} onDragStart={startSessionDrag} onDragEnd={finishDrag} onDragOver={(event, target) => dragOverPinned(event, target)} onDrop={(event, target) => dropOnPinned(event, target)} />
             ))}
           </section>
         )}

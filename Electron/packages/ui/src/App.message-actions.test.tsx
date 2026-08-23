@@ -42,7 +42,7 @@ function hostWithHistory(overrides: Partial<PipiHostAPI> = {}) {
 }
 
 describe('App message actions', () => {
-  it('shows a full date and time before right-aligned message actions', () => {
+  it('shows a full date and time before left-aligned assistant message actions', () => {
     const timestamp = new Date(2026, 7, 13, 0, 16).getTime()
     const onCopy = vi.fn(async () => undefined)
     const onResend = vi.fn()
@@ -51,7 +51,7 @@ describe('App message actions', () => {
     const time = within(footer).getByText(/2026.*08.*13.*00:16/)
     const toolbar = within(footer).getByRole('toolbar', { name: '消息操作' })
     expect(time.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(toolbar.className).toContain('trailing')
+    expect(toolbar.className).toContain('leading')
   })
 
   it('copies the complete user source text and reports success', async () => {

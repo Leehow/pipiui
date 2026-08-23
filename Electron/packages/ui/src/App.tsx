@@ -2625,7 +2625,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const toggleSidebarProject = (projectId: string) => {
     setSidebarExpandedIds(current => current.includes(projectId) ? current.filter(id => id !== projectId) : [...current, projectId])
   }
-  const selectSidebarSession = (sessionId: string) => {
+  const selectSidebarSession = (sessionId: string, options?: { expandProject?: boolean }) => {
     if (selectedSession && selectedSession !== sessionId) {
       messagesBySessionRef.current.set(selectedSession, messagesRef.current)
     }
@@ -2639,6 +2639,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const session = sessions.find(item => item.id === sessionId)
     const external = externalSessions.find(item => item.id === sessionId)
+    const allowExpandProject = options?.expandProject !== false
     const expandProjectIfSessionHidden = (projectId: string, status: SessionStatus) => {
       setSidebarExpandedIds(current => {
         if (current.includes(projectId)) return current
@@ -2649,11 +2650,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     if (session) {
       setSelectedProject(session.projectId)
-      const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents).status
-      expandProjectIfSessionHidden(session.projectId, status)
+      if (allowExpandProject) {
+        const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents).status
+        expandProjectIfSessionHidden(session.projectId, status)
+      }
     } else if (external) {
       setSelectedProject(external.projectId)
-      setSidebarExpandedIds(current => current.includes(external.projectId) ? current : [...current, external.projectId])
+      if (allowExpandProject) {
+        setSidebarExpandedIds(current => current.includes(external.projectId) ? current : [...current, external.projectId])
+      }
     }
     if (isExternalSessionId(sessionId)) {
       setModelState(null)

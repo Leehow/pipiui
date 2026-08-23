@@ -14,6 +14,7 @@
 .message-action-buttons{display:flex;gap:4px;min-height:32px}
 .message-action-button{display:grid;width:32px;height:32px;place-items:center;padding:0;border-radius:7px;color:var(--muted)}
 .message-action-icon{display:block;width:17px;height:17px;background:currentColor;-webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;-webkit-mask-position:center;mask-position:center;-webkit-mask-size:contain;mask-size:contain}
+.message-action-icon-svg{display:block;width:17px;height:17px}
 .message-action-button:hover{background:color-mix(in srgb,var(--text) 7%,transparent);color:var(--text)}
 .message-action-button:active{background:color-mix(in srgb,var(--text) 12%,transparent)}
 .message-action-button:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 72%,transparent);outline-offset:1px}

@@ -313,6 +313,7 @@ function promptScrape(text: string): string | undefined {
 
 const querySummary = (args: Record<string, unknown>) => stringField(args, 'query') ?? '…'
 const urlSummary = (args: Record<string, unknown>) => stringField(args, 'url') ?? '…'
+const skillNameSummary = (args: Record<string, unknown>) => stringField(args, 'name') ?? '…'
 
 for (const contribution of [
   { toolName: 'write', summarizeArgs: pathSummary, scrapeSummary: pathScrape },
@@ -330,6 +331,8 @@ for (const contribution of [
   { toolName: 'grep', summarizeArgs: grepSummary, scrapeSummary: grepScrapedSummary },
   { toolName: 'subagent', summarizeArgs: subagentSummary, scrapeSummary: (text: string) => scrapeJSONString('title', text) ?? scrapeJSONString('task', text) },
   { toolName: 'computer_task', summarizeArgs: computerTaskSummary, scrapeSummary: (text: string) => scrapeJSONString('goal', text) },
+  { toolName: 'skill_load', summarizeArgs: skillNameSummary, scrapeSummary: (text: string) => scrapeJSONString('name', text) },
+  { toolName: 'skill_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
 ]) {
   registerToolRenderer(BUILTIN_EXTENSION_ID, contribution)
 }

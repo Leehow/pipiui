@@ -3,7 +3,7 @@ import { createRef } from 'react'
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { VirtuosoHandle } from 'react-virtuoso'
-import { Transcript } from './Transcript'
+import { findPreviousUserMessageIndex, Transcript } from './Transcript'
 import type { ChatMessage } from './transcript-model'
 import { TRANSCRIPT_FIRST_ITEM_BASE, transcriptTailVirtualIndex } from './transcript-scroll'
 
@@ -287,5 +287,89 @@ describe('Transcript prepend and follow', () => {
     fireEvent.click(view.getByRole('button', { name: '回到最新' }))
     await waitFor(() => expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 'LAST', align: 'end', behavior: 'auto' }))
     expect(virtuosoInstances[0]!.followOutput?.(false)).toBe('auto')
+  })
+})
+
+describe('findPreviousUserMessageIndex', () => {
+  it('selects the nearest earlier eligible user and skips tools, compaction, and injected signals', () => {
+    const history: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: '第一问', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '先答一', timestamp: 2 },
+      { id: 't1', role: 'tool', content: 'read: package.json', timestamp: 3 },
+      { id: 'hb', role: 'user', content: '[subagent-heartbeat] outstanding=1 vanished=0', timestamp: 4 },
+      { id: 'a2', role: 'assistant', content: '长回复', timestamp: 5 },
+      { id: 'u2', role: 'user', content: '第二问', timestamp: 6 },
+      { id: 'a3', role: 'assistant', content: '再答', timestamp: 7 },
+    ]
+    expect(findPreviousUserMessageIndex(history, 4)).toBe(0)
+    expect(findPreviousUserMessageIndex(history, 6)).toBe(5)
+    expect(findPreviousUserMessageIndex(history, 0)).toBeNull()
+    expect(findPreviousUserMessageIndex([{ id: 'a0', role: 'assistant', content: '开头就是助手', timestamp: 1 }], 0)).toBeNull()
+  })
+})
+
+describe('Transcript jump to previous user', () => {
+  it('left-aligns assistant actions, keeps user actions trailing, and scrolls by data index', async () => {
+    const transcriptRef = createRef<VirtuosoHandle>()
+    const history: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: '请实现导航', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '先看结构', timestamp: 2 },
+      { id: 't1', role: 'tool', content: 'read: package.json', timestamp: 3 },
+      { id: 'a2', role: 'assistant', content: '正在实现长回复', timestamp: 4 },
+    ]
+    const view = render(<Transcript messages={history} transcriptRef={transcriptRef} {...handlers} />)
+    const assistantBars = Array.from(view.container.querySelectorAll('.assistant-message .message-action-bar'))
+    expect(assistantBars.length).toBeGreaterThan(0)
+    for (const bar of assistantBars) expect(bar.className).toContain('leading')
+    expect(view.container.querySelector('.user-message .message-action-bar')!.className).toContain('trailing')
+    expect(view.getAllByRole('button', { name: '复制消息' }).length).toBeGreaterThan(1)
+    expect(view.queryAllByRole('button', { name: '重发消息' })).toHaveLength(1)
+
+    await flushPin()
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+    const jumps = view.getAllByRole('button', { name: '跳转到上一条用户消息' })
+    expect(jumps).toHaveLength(2)
+    fireEvent.click(jumps[1]!)
+    expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 0, align: 'start', behavior: 'smooth' })
+    expect(virtuosoInstances[0]!.scrollToIndex.mock.calls[0]![0].index).not.toBe(virtuosoInstances[0]!.firstItemIndex)
+  })
+
+  it('hides jump when no earlier user exists and keeps using data index after a prepend', async () => {
+    const leadingAssistant: ChatMessage[] = [
+      { id: 'a0', role: 'assistant', content: '没有更早的用户消息', timestamp: 0 },
+    ]
+    const view = render(<Transcript messages={leadingAssistant} {...handlers} />)
+    expect(view.queryByRole('button', { name: '跳转到上一条用户消息' })).toBeNull()
+    expect(view.getByRole('button', { name: '复制消息' })).toBeTruthy()
+
+    const newest: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: '请继续', timestamp: 3 },
+      { id: 'a1', role: 'assistant', content: '好的', timestamp: 4 },
+    ]
+    view.rerender(<Transcript messages={newest} {...handlers} />)
+    await flushPin()
+    const first = virtuosoInstances[0]!.firstItemIndex
+    expect(first).toBe(TRANSCRIPT_FIRST_ITEM_BASE)
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+    fireEvent.click(view.getByRole('button', { name: '跳转到上一条用户消息' }))
+    expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 0, align: 'start', behavior: 'smooth' })
+
+    const prepended: ChatMessage[] = [
+      { id: 'u0', role: 'user', content: '更早的问题', timestamp: 1 },
+      { id: 'a0', role: 'assistant', content: '更早的回答', timestamp: 2 },
+      ...newest,
+    ]
+    view.rerender(<Transcript messages={prepended} {...handlers} />)
+    expect(virtuosoInstances[0]!.firstItemIndex).toBe(first! - 2)
+    await flushPin()
+    virtuosoInstances[0]!.scrollToIndex.mockClear()
+    const jumps = view.getAllByRole('button', { name: '跳转到上一条用户消息' })
+    fireEvent.click(jumps[jumps.length - 1]!)
+    expect(virtuosoInstances[0]!.scrollToIndex).toHaveBeenCalledWith({ index: 2, align: 'start', behavior: 'smooth' })
+    expect(virtuosoInstances[0]!.scrollToIndex).not.toHaveBeenCalledWith({
+      index: virtuosoInstances[0]!.firstItemIndex! + 2,
+      align: 'start',
+      behavior: 'smooth',
+    })
   })
 })
