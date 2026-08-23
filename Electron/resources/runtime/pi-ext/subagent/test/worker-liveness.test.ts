@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
 	classifyCpuProgress,
 	formatCpuEvidence,
+	isQuietToolStalled,
 	parseCpuTime,
 	parsePsRows,
 	sumSubtreeCpu,
@@ -51,4 +52,97 @@ test("evidence is a measurement, or it says nothing at all", () => {
 	assert.match(formatCpuEvidence("no-progress", before, { ...busy, seconds: 10 })!, /^no measurable progress/);
 	assert.match(formatCpuEvidence("gone", before, { ...busy, processes: 0 })!, /process tree gone/);
 	assert.equal(formatCpuEvidence("unknown", undefined, busy), undefined);
+});
+
+function watchdogWouldSkip(info: { inTool?: unknown; stalled: boolean }): boolean {
+	// Mirrors index.ts: if (stallInfo.inTool && !stallInfo.stalled) continue;
+	return Boolean(info.inTool && !info.stalled);
+}
+
+test("a silent in-tool wait eventually stalls even without CPU samples", () => {
+	// Repro: remote bash/scp/ssh stays in the tool phase with no stdout and no CPU pair.
+	// The old verdict required no-progress|gone, so the watchdog skipped forever.
+	const firstTick = isQuietToolStalled({
+		quiet: true,
+		idleMs: 121_000,
+		stallThresholdMs: 120_000,
+		sampleGraceMs: 30_000,
+	});
+	assert.equal(firstTick, false, "first quiet tick still allows one sample window");
+	assert.equal(
+		watchdogWouldSkip({ inTool: { names: ["bash"], forSec: 121 }, stalled: firstTick }),
+		true,
+		"the first tick may still skip while we gather a CPU pair",
+	);
+
+	const afterGrace = isQuietToolStalled({
+		quiet: true,
+		idleMs: 150_000,
+		stallThresholdMs: 120_000,
+		sampleGraceMs: 30_000,
+	});
+	assert.equal(afterGrace, true, "no evidence after the sample window is a stall");
+	assert.equal(
+		watchdogWouldSkip({ inTool: { names: ["bash"], forSec: 150 }, stalled: afterGrace }),
+		false,
+		"watchdog must stop skipping a silent tool after the bound",
+	);
+
+	assert.equal(
+		isQuietToolStalled({
+			quiet: true,
+			verdict: "unknown",
+			idleMs: 150_000,
+			stallThresholdMs: 120_000,
+			sampleGraceMs: 30_000,
+		}),
+		true,
+		"unknown after the sample window is also a stall",
+	);
+});
+
+test("measured tool progress is not a stall", () => {
+	const stalled = isQuietToolStalled({
+		quiet: true,
+		verdict: "working",
+		idleMs: 600_000,
+		stallThresholdMs: 120_000,
+		sampleGraceMs: 30_000,
+	});
+	assert.equal(stalled, false);
+	assert.equal(
+		watchdogWouldSkip({ inTool: { names: ["bash"], forSec: 600 }, stalled }),
+		true,
+		"a busy long tool must keep the in-tool exemption",
+	);
+});
+
+test("measured no-progress or gone stalls at the quiet threshold", () => {
+	assert.equal(
+		isQuietToolStalled({
+			quiet: true,
+			verdict: "no-progress",
+			idleMs: 120_000,
+			stallThresholdMs: 120_000,
+		}),
+		true,
+	);
+	assert.equal(
+		isQuietToolStalled({
+			quiet: true,
+			verdict: "gone",
+			idleMs: 120_000,
+			stallThresholdMs: 120_000,
+		}),
+		true,
+	);
+	assert.equal(
+		isQuietToolStalled({
+			quiet: false,
+			verdict: "no-progress",
+			idleMs: 30_000,
+			stallThresholdMs: 120_000,
+		}),
+		false,
+	);
 });

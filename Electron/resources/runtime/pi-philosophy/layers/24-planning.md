@@ -1,7 +1,7 @@
 ---
 id: planning
 name: 规划哲学
-summary: 计划是可执行的列表不是文档；什么时候才值得正式规划。
+summary: 计划是可执行的列表不是文档；正式规划覆盖完整 spec，同一 plan.id 贯穿执行。
 order: 24
 requires: []
 requires-capabilities: []
@@ -66,8 +66,11 @@ untouched: grilling is never a gate for ordinary work.
    prose — not only as a Markdown artifact. A file may accompany it when the user asked for a
    document; the transcript remains the primary presentation.
 3. **Publish** the structured plan as runtime data with `plan_publish`, carrying a **stable
-   unique `plan.id`**, a title, and ordered tasks with stable task ids and initial states.
-   Then stop.
+   unique `plan.id`**, a title that names the whole spec, and ordered tasks with stable task
+   ids and initial states. The task list MUST cover the spec's entire scope — usually one
+   top-level task per executable phase or milestone. Publishing only the first implementation
+   wave (e.g. 阶段0+1) as if it were the plan is forbidden; later phases belong on this same
+   list as pending tasks. Then stop.
 
    End the transcript-facing plan with a concise approval invitation in the user's language:
    they can click **批准** below the chat, or reply in their own words. Do not ask the user to
@@ -78,14 +81,17 @@ untouched: grilling is never a gate for ordinary work.
    work, start task updates, or otherwise begin execution.
 
    - **Execute** — call `plan_approve` with the stable `plan.id`, then dispatch. The published
-     task list is the dispatch manifest: one worker per independent task, all in the same turn,
-     serializing only real dependencies. Handing a multi-task plan to a single general-purpose
-     worker is a fan-out violation. Drive `plan_task_update` as each task's worker starts,
-     completes, fails, blocks, or is skipped, always passing the same `planId` and task id.
-     Never invent a new plan id mid-execution; never omit `planId` on an update.
-   - **Adjust** — call `plan_cancel` for the current plan, then revise and republish a
-     replacement under a **new** `plan.id`. Revising in place would leave the cancelled id
-     receiving task updates.
+     task list is the dispatch manifest for the whole spec: one worker per independent task,
+     all in the same turn, serializing only real dependencies. Handing a multi-task plan to a
+     single general-purpose worker is a fan-out violation. A milestone that still needs slices
+     is refined with worker briefs and dependencies, not a new stage plan. Drive
+     `plan_task_update` as each task's worker starts, completes, fails, blocks, or is skipped,
+     always passing the same `planId` and task id. Never invent a new plan id mid-execution;
+     never publish a stage2/stage3 plan to replace this one; never omit `planId` on an update.
+   - **Adjust** — only when the user explicitly changes scope or asks to revise. Call
+     `plan_cancel` for the current plan, then revise and republish a replacement under a
+     **new** `plan.id`. Revising in place would leave the cancelled id receiving task updates.
+     Starting the next already-published phase is not Adjust.
    - **Ignore** — call `plan_cancel` and do not dispatch. This plan path ends there.
 
    If any of `plan_publish`, `plan_approve`, `plan_cancel`, or `plan_task_update` is

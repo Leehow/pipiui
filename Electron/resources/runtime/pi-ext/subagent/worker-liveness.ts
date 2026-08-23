@@ -114,6 +114,28 @@ export function sampleSubtreeCpu(rows: readonly PsRow[], pid: number, now: numbe
 
 export type LivenessVerdict = "working" | "no-progress" | "gone" | "unknown";
 
+/** One watchdog tick: enough wall time to take a second CPU sample. */
+export const TOOL_STALL_SAMPLE_GRACE_MS = 30_000;
+
+/**
+ * In-tool silence is excused only while CPU evidence shows real work.
+ * Missing or unknown evidence is given one sampling window after the quiet
+ * threshold, then treated as stalled so a wedged remote tool cannot hide forever.
+ */
+export function isQuietToolStalled(input: {
+	quiet: boolean;
+	verdict?: LivenessVerdict;
+	idleMs: number;
+	stallThresholdMs: number;
+	sampleGraceMs?: number;
+}): boolean {
+	if (!input.quiet) return false;
+	if (input.verdict === "working") return false;
+	if (input.verdict === "no-progress" || input.verdict === "gone") return true;
+	const grace = input.sampleGraceMs ?? TOOL_STALL_SAMPLE_GRACE_MS;
+	return input.idleMs >= input.stallThresholdMs + grace;
+}
+
 /**
  * Compare two samples of the same subtree. `minCpuSeconds` is the floor that
  * separates real work from scheduler noise and accounting granularity; below it

@@ -141,7 +141,8 @@ your own transcript-facing plan yourself.
 The publish → approval → Execute/Adjust/Ignore lifecycle and its `plan_*` calls belong to the
 planning layer. What orchestration adds is what happens after: an approval classified as
 Execute means execution routing applies immediately, and the approved task list is the
-dispatch manifest.
+dispatch manifest. Keep that same approved plan through later phases: refine leftover slices
+with worker briefs and dependencies; do not replace it with a new stage plan.
 
 ## Task briefs
 

@@ -5,6 +5,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type Tool = {
   name: string;
+  description?: string;
+  promptSnippet?: string;
   execute: (id: string, params: any, signal?: unknown, onUpdate?: unknown, ctx?: { cwd: string }) => Promise<any>;
 };
 
@@ -85,6 +87,8 @@ describe("pipiui plan tools", () => {
     expect(approved.guidance).toMatch(/1\. implement/);
     expect(approved.guidance).toMatch(/2\. test/);
     expect(approved.guidance).toMatch(/plan_task_update/);
+    expect(approved.guidance).toMatch(/same plan\.id through later phases/);
+    expect(approved.guidance).toMatch(/do not publish a stage2\/stage3 replacement plan/);
     expect(approved.plan.lifecycle).toBe("approved");
     expect(approved.plan.approvedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
@@ -113,6 +117,16 @@ describe("pipiui plan tools", () => {
     expect(posts[1].body.event.event).toBe("plan_task_update");
     expect(posts[2].body.event.event).toBe("plan_approve");
     expect(posts[2].body.event.plan.lifecycle).toBe("approved");
+  });
+
+  it("describes plan_publish as a full-spec stable-id tool", async () => {
+    const tools = await loadExtension();
+    expect(tools.plan_publish.description).toMatch(/full-spec/);
+    expect(tools.plan_publish.description).toMatch(/entire spec/);
+    expect(tools.plan_publish.description).toMatch(/Do not publish only the current stage/);
+    expect(tools.plan_publish.description).toMatch(/do not publish a stage2\/stage3 replacement/);
+    expect(tools.plan_publish.promptSnippet).toMatch(/later phases stay on this plan/);
+    expect(tools.plan_task_update.description).toMatch(/including when starting the next phase/);
   });
 
   it("rejects duplicate plan ids, wrong planId, and unknown taskId", async () => {

@@ -273,6 +273,7 @@ import {
 	type LivenessVerdict,
 	classifyCpuProgress,
 	formatCpuEvidence,
+	isQuietToolStalled,
 	readProcessTable,
 	sampleSubtreeCpu,
 } from "./worker-liveness.ts";
@@ -1885,6 +1886,8 @@ function cancelInterruptedReminders(agentId: string, runId?: string): void {
 const STALL_THRESHOLD_MS = 120_000;
 const COMPUTER_USE_SYNC_RECOVERY_GRACE_MS = 10 * 60_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
+/** Start CPU pairs one tick after silence so the stall pass has a verdict at 120s. */
+const LIVENESS_SAMPLE_AFTER_MS = STALL_WATCHDOG_INTERVAL_MS;
 /** Max automatic re-spawns after a retryable transport/API death (total runs = 1 + this). */
 const AUTO_RESUME_MAX = 2;
 /** Backoff before each auto-resume attempt (ms). Index 0 = first resume. */
@@ -2349,8 +2352,9 @@ function stalledInfoFor(agentId: string, now: number): {
 } {
 	const handle = runningAgents.get(agentId);
 	if (!handle || handle.finalizing) return { stalled: false, idleSec: 0 };
-	const idleSec = Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000));
-	const quiet = idleSec * 1000 >= STALL_THRESHOLD_MS;
+	const idleMs = now - handle.lastActivityAt;
+	const idleSec = Math.max(0, Math.floor(idleMs / 1000));
+	const quiet = idleMs >= STALL_THRESHOLD_MS;
 	const verdict = handle.cpuSample
 		? classifyCpuProgress(handle.cpuSamplePrevious, handle.cpuSample)
 		: undefined;
@@ -2359,9 +2363,16 @@ function stalledInfoFor(agentId: string, now: number): {
 		names: handle.toolWaitNames ?? ["tool"],
 		forSec: Math.max(0, Math.floor((now - handle.toolWaitSince) / 1000)),
 	};
-	// Measured lack of progress overrides the explanation: a build that wedged is
-	// still inside its tool call, and that is exactly the case the Boss must catch.
-	const stalled = quiet && (verdict === "no-progress" || verdict === "gone");
+	// In-tool silence is excused only while CPU evidence shows real work.
+	// Missing or unknown evidence is bounded: a wedged remote bash/scp/ssh
+	// must still become stalled so the watchdog can notify and abort.
+	const stalled = isQuietToolStalled({
+		quiet,
+		verdict,
+		idleMs,
+		stallThresholdMs: STALL_THRESHOLD_MS,
+		sampleGraceMs: STALL_WATCHDOG_INTERVAL_MS,
+	});
 	return { stalled, idleSec, inTool, verdict };
 }
 
@@ -8303,10 +8314,11 @@ export default function (pi: ExtensionAPI) {
 		// (2b) Progress evidence for every quiet worker, from one shared `ps` table.
 		// Sampled before the stall pass so `stalledInfoFor` can let measured progress
 		// excuse a long tool call and, just as importantly, refuse to excuse a wedge.
+		// Start one tick after silence so a CPU pair already exists at the 120s threshold.
 		const quietWorkers = [...runningAgents.values()].filter(
 			(handle) => !handle.finalizing
 				&& handle.pid !== undefined
-				&& now - handle.lastActivityAt >= STALL_THRESHOLD_MS,
+				&& now - handle.lastActivityAt >= LIVENESS_SAMPLE_AFTER_MS,
 		);
 		if (quietWorkers.length > 0) {
 			const rows = readProcessTable();

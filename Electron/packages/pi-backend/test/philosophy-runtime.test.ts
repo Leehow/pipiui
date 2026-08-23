@@ -167,6 +167,18 @@ describe("vendored philosophy: delivery", () => {
     expect(planning).toMatch(/plan_approve` with the stable `plan\.id`/);
   });
 
+  it("requires the published plan to cover the whole spec on one plan.id", () => {
+    const planning = layers.find((l) => l.id === "planning")!.body;
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(planning).toMatch(/entire scope/);
+    expect(planning).toMatch(/stage2\/stage3/);
+    expect(planning).toMatch(/not Adjust/);
+    expect(planning).toMatch(/worker briefs and dependencies, not a new stage plan/);
+    expect(orchestration).toMatch(/same approved plan through later phases/);
+    expect(orchestration).toMatch(/do not replace it with a new stage plan/);
+    expect(orchestration).not.toMatch(/plan_publish/);
+  });
+
   it("states the plan lifecycle in exactly one layer", () => {
     // Two copies drifted before this guard existed: orchestration required `plan_cancel` plus
     // a fresh `plan.id` on Adjust, while planning said only "revises and republishes". A

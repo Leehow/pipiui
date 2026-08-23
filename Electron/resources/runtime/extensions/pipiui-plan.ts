@@ -261,8 +261,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_publish",
     label: "Plan Publish",
-    description: "Publish a structured execution plan with a stable unique plan.id and ordered tasks. Replaces transcript-only planning when formal planning is required. Split tasks so each can be independently dispatched; after approval, each independent task gets its own worker.",
-    promptSnippet: "Publish a structured plan with stable plan.id and tasks",
+    description: "Publish the full-spec structured execution plan with one stable unique plan.id and ordered tasks covering the entire spec — usually one top-level task per executable phase or milestone. Replaces transcript-only planning when formal planning is required. Do not publish only the current stage. After approval, keep this plan.id and update tasks; do not publish a stage2/stage3 replacement.",
+    promptSnippet: "Publish the full-spec plan with one stable plan.id; later phases stay on this plan",
     parameters: Type.Object({
       plan: Type.Object({
         id: Type.String({ minLength: 1 }),
@@ -283,7 +283,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_task_update",
     label: "Plan Task Update",
-    description: "Update one task on the active plan. Always pass the same planId published earlier; never invent a new plan id mid-execution.",
+    description: "Update one task on the active plan. Always pass the same planId published earlier; never invent a new plan id mid-execution, including when starting the next phase.",
     promptSnippet: "Update a published plan task state",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
@@ -317,6 +317,8 @@ export default function (pi: ExtensionAPI) {
           "Never hand the whole plan to a single general-purpose worker.",
           "dispatch one worker per independent task in the SAME turn.",
           "Drive plan_task_update as each task's worker starts and ends.",
+          "Keep this same plan.id through later phases; do not publish a stage2/stage3 replacement plan.",
+          "Refine leftover slices with worker briefs and dependencies, not a new plan.",
           "Tasks:",
           listed,
         ].join(" "),
