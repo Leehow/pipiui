@@ -9,7 +9,7 @@ import { join, relative } from "node:path";
  * previously installed runtime.
  */
 /** Dev-only build artifacts. The shipped tree carries none of them (`pi-ext` is ~1.5 MB). */
-const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist", "release", ".cua-driver-cache"]);
+const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist", "release", "target", ".cua-driver-cache"]);
 /**
  * Bundled manifest extensions whose compiled agent/app halves live in `dist/`
  * (spec D10: builtins live in the Bundled runtime extensions tree). They are

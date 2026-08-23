@@ -28,6 +28,21 @@ describe("syncTree", () => {
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
+  it("skips cargo target directories so rust build artifacts never install", async () => {
+    const root = await temp();
+    try {
+      const source = join(root, "src"); const dest = join(root, "dest");
+      await mkdir(join(source, "sidecar-rust", "target"), { recursive: true });
+      await writeFile(join(source, "index.ts"), "export const a = 1\n");
+      await writeFile(join(source, "sidecar-rust", "Cargo.toml"), "[package]\nname = \"x\"\n");
+      await writeFile(join(source, "sidecar-rust", "target", "huge.rlib"), "x".repeat(1000));
+
+      expect(syncTree(source, dest).installed).toEqual([dest]);
+      expect(existsSync(join(dest, "sidecar-rust", "Cargo.toml"))).toBe(true);
+      expect(existsSync(join(dest, "sidecar-rust", "target"))).toBe(false);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
   it("leaves the previous tree in place when the source is missing", async () => {
     const root = await temp();
     try {

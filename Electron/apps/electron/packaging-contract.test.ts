@@ -54,6 +54,9 @@ describe('macOS packaging contract', () => {
     const runtimeSource = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime')
     const embedded = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-embedded')
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
+    expect(runtimeSource?.filter).toContain('!**/target/**')
+    const codeRetrieval = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/code-retrieval')
+    expect(codeRetrieval?.filter).toContain('!**/target/**')
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/pdf-inspector/node_modules',
       to: 'pipiui-runtime/pdf-inspector/node_modules',

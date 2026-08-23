@@ -73,6 +73,7 @@
           "!**/out/**",
           "!**/dist/**",
           "!**/release/**",
+          "!**/target/**",
           "!**/.cua-driver-cache/**"
         ]
       },
@@ -102,7 +103,8 @@
           "**/*",
           "!**/node_modules/**",
           "!**/.git/**",
-          "!**/*.tsbuildinfo"
+          "!**/*.tsbuildinfo",
+          "!**/target/**"
         ]
       },
       {
