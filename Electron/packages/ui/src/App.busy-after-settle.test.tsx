@@ -386,7 +386,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '批次仍在处理' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
     await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 300)) })
 
     durableSummaryAvailable = true
@@ -486,7 +486,7 @@ describe('settled turn stays idle after a late streaming status', () => {
 
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['Supervisor notification'] }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [staleSending] }) })
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
 
     // The canonical D trace had already rendered the durable final branch by
     // the time the terminal-triggered history pull completed. Secret redaction
@@ -551,7 +551,7 @@ describe('settled turn stays idle after a late streaming status', () => {
 
     expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
     expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
@@ -693,7 +693,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '是的，pi-coc 的调用方式和普通工具明显不同。' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
 
     terminalQueueEmpty = true
     const queueReadsBeforeTerminal = listQueue.mock.calls.length
@@ -748,7 +748,7 @@ describe('settled turn stays idle after a late streaming status', () => {
       expect(screen.getByLabelText('消息输入框')).toBe(input)
       expect(document.activeElement).toBe(input)
       expect(input.value).toBe('批次 E 输入法草稿')
-      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将加入队列…')
+      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
       expect(input.classList.contains('queue-busy')).toBe(true)
       expect(input.getAttribute('aria-busy')).toBeNull()
 

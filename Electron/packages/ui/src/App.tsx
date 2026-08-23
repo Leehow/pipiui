@@ -2368,7 +2368,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
     if (sessionQueue.busy) {
       // Optimistic local echo even while busy — mirrors direct send's mutateLocalTranscript + pendingLocalUserRef.
-      // Host user_message will dedup via pendingLocalUserRef / queued content match; queued flag gives light "排队中" visual.
+      // Host user_message will dedup via pendingLocalUserRef / queued content match. We then steer into the
+      // running turn so a follow-up is inserted now (not parked until subagents finish). queued is only kept
+      // if steer fails and FIFO has to wait.
       const localUserId = crypto.randomUUID()
       pendingLocalUserRef.current = { id: localUserId, content: prompt }
       mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now(), queued: true } as ChatMessage])
@@ -2379,7 +2381,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
       const result = await sessionQueue.enqueue(prompt, payload)
-      if (result.outcome === 'queued' || selectedSession !== targetSession) return true
+      if (selectedSession !== targetSession) return true
+      if (result.outcome === 'queued') {
+        try {
+          await sessionQueue.steer(result.message.id)
+          mutateLocalTranscript(items => items.map(message => message.id === localUserId ? { ...message, queued: undefined } as ChatMessage : message))
+        } catch {
+          // Steer is best-effort: FIFO remains the fallback and keeps 排队中.
+        }
+        return true
+      }
       // Race: host dispatched directly despite busy check. Clear queued visual and open turn (bubble already exists).
       mutateLocalTranscript(items => items.map(m => m.id === localUserId && (m as ChatMessage).queued ? { ...m, queued: undefined } as ChatMessage : m))
       activeUserTurnRef.current = true
@@ -3425,7 +3436,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       </div>
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将插入当前对话…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>

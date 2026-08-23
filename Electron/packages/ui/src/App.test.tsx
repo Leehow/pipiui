@@ -2323,11 +2323,12 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.getByText(/已开始处理/)).toBeTruthy())
   })
 
-  it('keeps idle submits direct and routes busy composer submits through enqueueMessage', async () => {
+  it('keeps idle submits direct and injects busy composer submits into the running turn', async () => {
     const base = createMockHost()
     const sendPrompt = vi.fn(async () => undefined)
     const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('busy-item', sessionId, text) }))
-    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, listQueue: async () => [] }
+    const steerQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'busy insert', 'sending'))
+    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, steerQueuedMessage, listQueue: async () => [] }
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
 
@@ -2338,10 +2339,11 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle direct'))
     expect(enqueueMessage).not.toHaveBeenCalled()
 
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy queue' } })
-    await waitFor(() => expect(screen.getByLabelText('加入消息队列')).toBeTruthy())
-    fireEvent.click(screen.getByLabelText('加入消息队列'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy queue', undefined))
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy insert' } })
+    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('插入当前对话'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy insert', undefined))
+    await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'busy-item'))
     expect(sendPrompt).toHaveBeenCalledTimes(1)
   })
 

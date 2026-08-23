@@ -134,7 +134,7 @@ describe('selected-session working stop control', () => {
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '下一条' } })
     expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('加入消息队列')).toBeTruthy()
+    expect(screen.getByLabelText('插入当前对话')).toBeTruthy()
   })
 
   it('keeps idle and subagent-only sessions on the ordinary send control', async () => {
