@@ -686,6 +686,12 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
 const PIPIUI_WEBVIEW_EXT = process.env.PIPIUI_WEBVIEW_EXT;
 const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
+// The philosophy package. Workers run with `--no-extensions`, so unless it is mounted here
+// explicitly a dispatched child loads no philosophy at all — and every layer written for one
+// (`craft` to whoever writes code, `research` to explore, `retrieval` to anything that reads
+// code) silently reaches nobody, along with the model-scoped corrections. The scope markers
+// below (PIPI_PHILOSOPHY_ROLE / _AGENT) address a package that has to be present to read them.
+const PIPIUI_PHILOSOPHY_EXT = process.env.PIPIUI_PHILOSOPHY_EXT;
 const PIPIUI_OFFICE_DOC_SHOT_GATE_EXT = process.env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
@@ -5553,6 +5559,9 @@ async function runSingleAgent(
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
+	// Not for computer workers: their Leader owns their process discipline, and the layers
+	// here are written about code work.
+	if (PIPIUI_PHILOSOPHY_EXT && !options?.computerWorker) args.push("-e", PIPIUI_PHILOSOPHY_EXT);
 	if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT && !options?.computerWorker) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT);
 	// Registry-enabled project extensions: remount the main-session snapshot (D3 / D9).
 	// Same `-e` paths assemblePiSpawn already mounted; do not scan bare files here.

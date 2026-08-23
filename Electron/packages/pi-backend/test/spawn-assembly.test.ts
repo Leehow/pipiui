@@ -714,6 +714,28 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
     expect(source).toContain("PIPIUI_EXT_REGISTERED_PATHS");
     expect(source).toContain("args.push(\"-e\", mount)");
   });
+
+  it("exports the philosophy path so a dispatched worker can mount it", async () => {
+    // Workers spawn with `--no-extensions` and build their own argv, so a package the main
+    // session mounted reaches them only through an exported path. Philosophy mounted without
+    // exporting one for years: the runtime set PIPI_PHILOSOPHY_ROLE / _AGENT on every child
+    // for a package no child ever loaded, and every agent-addressed layer reached nobody.
+    const philosophy = "/runtime/pi-philosophy/philosophy.ts";
+    const { args, env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { philosophy: true },
+      paths: { philosophy, updateCenter, runtimeInfo },
+    });
+    expect(args).toContain(philosophy);
+    expect(env.PIPIUI_PHILOSOPHY_EXT).toBe(philosophy);
+
+    const off = assemblePiSpawn({ cwd: "/tmp/project", features: { philosophy: false }, paths: { philosophy, updateCenter, runtimeInfo } });
+    expect(off.env.PIPIUI_PHILOSOPHY_EXT).toBeUndefined();
+
+    const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
+    expect(source).toContain("process.env.PIPIUI_PHILOSOPHY_EXT");
+    expect(source).toContain("args.push(\"-e\", PIPIUI_PHILOSOPHY_EXT)");
+  });
 });
 
 describe("grok-build delegation marker and media compat gate (M5)", () => {
