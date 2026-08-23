@@ -171,7 +171,7 @@ describe('ExtensionsPane package management', () => {
         // App-only (no projectId) stays disabled; merged project view is enabled.
         state: projectId === 'project-1' ? 'enabled' : 'disabled',
       }),
-    ])
+    ]) as typeof host.listExtensions
     render(<ExtensionsPane host={host} projectId="project-1" addOpen={false} onCloseAdd={() => undefined} />)
     await waitFor(() => expect(host.listExtensions).toHaveBeenCalledWith('project-1'))
     expect((await screen.findByTestId('extensions-pkg-meta-quota')).textContent).toContain('已启用')
