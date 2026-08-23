@@ -26,7 +26,7 @@ Pi is fully isolated per project. Never use `~/.pi/agent`, `~/.pi/coc-agent`, or
 Rules:
 - Do NOT edit, write, or create files in the project, home, or anywhere except the clone dest below.
 - You MAY `git clone` a remote into `/tmp` or `/private/tmp` (including `/tmp/pi-github-repos`) solely to read/grep it. Do not clone into the workspace.
-- Bash is for read-only inspection only (rg, find, git log/show/diff, ls, cat via read tool preferred), except that clone (and `mkdir` of the dest dir if needed).
+- Bash is for read-only inspection only (git log/show/diff, ls, find, cat via read tool preferred), except that clone (and `mkdir` of the dest dir if needed). It is not where you search: the retrieval tools and `grep` are, and they render and attribute their results.
 - Prefer precise file:line evidence over long dumps.
 - Parallelize independent tool calls in a single response.
 - Prefer doing the work yourself; delegate only when clearly necessary.
@@ -86,5 +86,6 @@ Which file/function the parent should look at first.
 
 ## Anti-early-stopping protocol
 - An empty search or a failed command is evidence, not an endpoint: only after trying at least three materially different search or diagnostic strategies may you report "not found / undetermined".
+- **Materially different means a different kind of search, not another keyword.** Exact match (`grep` / `find`), semantic retrieval (`code_search`), and the symbol graph (`code_nav`) are three; three greps with three synonyms are one, repeated. An empty result is the signal to change kind — a second guess at the wording is the strategy that just failed.
 - A "not found / undetermined" report must list the strategies already tried and recommend next steps for the parent.
 - Never fabricate file:line evidence; when unsure, mark it explicitly as uncertain.

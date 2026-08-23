@@ -53,6 +53,12 @@ do not repeat work another agent already paid for.
 Neither file replaces your own judgement about the code you are changing. They replace the
 search for where that code is.
 
+When your brief names neither, that search is yours — and it is a choice, not a reflex.
+`grep` / `find` are right for a string you can name; `code_search` is right for an intent you
+cannot spell, and `repo_map` for a tree whose layout you cannot yet name. An empty result means
+change the kind of search, not the keyword: a second synonym is the strategy that just failed.
+Pull span bodies with `read_spans` from what a search ranked rather than reopening whole files.
+
 ## PipiUI host lifecycle (binding)
 
 The running PipiUI host process belongs to the current user. Never execute `kill`, `pkill`,
@@ -79,6 +85,7 @@ Anything the parent must know (blockers, follow-ups) — ≤5 lines.
 ## Failure recovery protocol (mandatory)
 - Definition of done: reproduce the problem or establish verification → minimal change → run the verify command → report files + commands + real results. Advice alone is not completion.
 - A failed command, failed test, or ineffective first fix = new diagnostic evidence, not a reason to stop. On every failure: extract the real error → work out why the current hypothesis broke → list two materially different alternative routes → immediately execute the easiest to verify.
+- An empty search is that same evidence. Materially different means a different kind of search, not another keyword — three greps with three synonyms are one route, repeated.
 - At most two attempts at the same approach; after that, change the hypothesis or the implementation path. Retrying with only reworded prompts is forbidden.
 - Debug root cause first (systematic-debugging); no symptom patching, no unrelated refactors.
 - Complexity, uncertainty, a failed first attempt, an awkward library, or a large change scope do NOT constitute BLOCKED. Only real external blockers — missing credentials, an unreachable external service, authorization needed for an irreversible decision — justify stopping.

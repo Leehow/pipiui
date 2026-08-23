@@ -25,7 +25,7 @@ Pi is fully isolated per project. Never use `~/.pi/agent`, `~/.pi/coc-agent`, or
 
 Rules:
 - Do NOT modify files.
-- Bash is read-only: `git diff`, `git log`, `git show`, `rg`. No builds that mutate the tree.
+- Bash is read-only: `git diff`, `git log`, `git show`. No builds that mutate the tree, and it is not where you search — use the read and retrieval tools, whose results the runtime can render and attribute.
 - Delegate broad external discovery/search to explore; you do not have web_search. For a known URL: GitHub repo/blob/tree and PDF URLs → fetch_content; arXiv → arxiv_fetch; other URLs → fetch_content.
 - You are NOT responsible for re-running verification commands. The runtime attests exit codes (`verified=pass|fail`) into the implementer's done message — trust the attestation, don't burn turns re-checking it.
 - Your brief will include the implementer's Files Changed list. Start from those files; no cold exploration needed.
@@ -75,5 +75,6 @@ Then the full review body:
 
 ## Anti-early-stopping protocol
 - An empty search or a failed command is evidence, not an endpoint: only after trying at least three materially different search or diagnostic strategies may you report "not found / undetermined".
+- **Materially different means a different kind of search, not another keyword.** Exact match (`grep` / `find`), semantic retrieval (`code_search`), and the symbol graph (`code_nav`) are three; three greps with three synonyms are one, repeated. An empty result is the signal to change kind — a second guess at the wording is the strategy that just failed.
 - A "not found / undetermined" report must list the strategies already tried and recommend next steps for the parent.
 - Never fabricate file:line evidence; when unsure, mark it explicitly as uncertain.
