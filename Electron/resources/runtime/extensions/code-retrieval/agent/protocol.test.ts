@@ -11,18 +11,36 @@ import {
   formatRefLine,
 } from "./protocol.js";
 import { executeReadSpans } from "./read-spans.js";
-import { routeQuery } from "./route.js";
+import { extractLexicalTerms, routeQuery } from "./route.js";
 import { writeFile, mkdir } from "node:fs/promises";
 
 test("route table follows D4 morphologies", () => {
   assert.equal(routeQuery("src/auth/session.ts:12"), "exact");
   assert.equal(routeQuery("TypeError: cannot read"), "exact");
   assert.equal(routeQuery("foo.*bar"), "exact");
+  assert.equal(routeQuery("validateSession"), "exact");
   assert.equal(routeQuery("谁定义 validateSession"), "symbol");
   assert.equal(routeQuery("who defines signToken"), "symbol");
-  assert.equal(routeQuery("how does authentication work?"), "semantic");
+  assert.equal(routeQuery("how does authentication work?"), "hybrid");
+  assert.equal(routeQuery("how does authentication work?", "semantic"), "semantic");
   assert.equal(routeQuery("validate the session store wiring across worker spawn"), "hybrid");
+  assert.equal(routeQuery("哪个模块负责扩展禁用后不挂载 agent 工具"), "hybrid");
+  assert.equal(routeQuery("哪个模块负责 extension disabled mounted tools"), "hybrid");
+  assert.equal(routeQuery("扩展禁用 registeredExtensionsForSpawn"), "hybrid");
   assert.equal(routeQuery("validateSession", "symbol"), "symbol");
+});
+
+test("lexical term extraction prefers identifiers and code words", () => {
+  assert.deepEqual(extractLexicalTerms("validateSession"), ["validateSession"]);
+  const mixed = extractLexicalTerms("哪个模块负责 extension disabled mounted tools");
+  for (const term of ["extension", "disabled", "mounted", "tools"]) {
+    assert.ok(mixed.includes(term), `expected ${term} in ${JSON.stringify(mixed)}`);
+  }
+  const ident = extractLexicalTerms("扩展禁用 registeredExtensionsForSpawn");
+  assert.ok(ident.includes("registeredExtensionsForSpawn"));
+  const chinese = extractLexicalTerms("哪个模块负责扩展禁用后不挂载 agent 工具");
+  assert.ok(chinese.includes("agent"));
+  assert.ok(!chinese.some((term) => term.includes("哪个模块负责扩展禁用后不挂载")));
 });
 
 test("stable R# refs are assigned in order and content is top-12 compressed", () => {

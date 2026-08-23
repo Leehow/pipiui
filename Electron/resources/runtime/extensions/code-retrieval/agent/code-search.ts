@@ -1,7 +1,14 @@
 import { exactSearch } from "./grep-exact.js";
 import { getSymbolLayer } from "./hooks.js";
 import { buildToolResult, emptyDegraded, formatCompressedContent, type RefRegistry } from "./protocol.js";
-import { routeQuery, type SearchMode } from "./route.js";
+import {
+  extractLexicalTerms,
+  isIdentifierLike,
+  looksLikeOpenQuery,
+  routeQuery,
+  SEMANTIC_UNAVAILABLE_NOTE,
+  type SearchMode,
+} from "./route.js";
 import { sidecarSearch } from "./sidecar-lifecycle.js";
 import type { RetrievalHit, SidecarConnection, ToolResult, UnassignedHit } from "./types.js";
 
@@ -18,6 +25,8 @@ export type CodeSearchArgs = {
   signal?: AbortSignal;
 };
 
+const DEFAULT_TOP_K = 20;
+
 export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResult> {
   const query = args.query.trim();
   if (!query) {
@@ -29,41 +38,58 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     const notes: string[] = [];
     let degraded = false;
     let hits: UnassignedHit[] = [];
+    const open = looksLikeOpenQuery(query) || routed === "semantic";
+    const useLexicalFallback = routed === "hybrid" || routed === "semantic";
 
-    if (routed === "semantic") {
-      degraded = true;
+    if (open) {
       notes.push(
-        "Semantic retrieval is phase 4 and is not enabled. Falling back to exact (rg) so the session stays usable (details.degraded=true).",
+        "Semantic retrieval is phase 4 and is not enabled; using lexical+symbol fallback.",
       );
+      degraded = true;
     }
 
-    if (routed === "symbol" || routed === "hybrid") {
-      const symbolHits = await trySymbolSearch(args);
-      if (symbolHits) {
-        hits = mergeHits(hits, symbolHits);
-      } else {
+    if (useLexicalFallback) {
+      const terms = extractLexicalTerms(query);
+      if (terms.length === 0) {
         degraded = true;
-        notes.push(
-          routed === "symbol"
-            ? "Symbol index is not ready; used exact grep fallback (details.degraded=true)."
-            : "Symbol layer unavailable; hybrid search used exact only (details.degraded=true).",
-        );
+        notes.push(SEMANTIC_UNAVAILABLE_NOTE);
+        return emptySearchResult(args, query, routed, notes, degraded);
       }
-    }
+      const lexical = await runLexicalSymbol(args, terms);
+      hits = lexical.hits;
+      degraded = degraded || lexical.degraded;
+      for (const note of lexical.notes) {
+        if (!notes.includes(note)) notes.push(note);
+      }
+    } else {
+      if (routed === "symbol") {
+        const symbolHits = await trySymbolSearch(args, [query]);
+        if (symbolHits) {
+          hits = mergeHits(hits, symbolHits);
+        } else {
+          degraded = true;
+          notes.push("Symbol index is not ready; used exact grep fallback (details.degraded=true).");
+        }
+      }
 
-    if (routed === "exact" || routed === "semantic" || routed === "hybrid" || hits.length === 0) {
-      const exact = await runExact(args);
-      hits = mergeHits(hits, exact.hits);
-      if (exact.degraded) {
-        degraded = true;
-        notes.push(
-          exact.reason ??
-            "Sidecar unreachable; used grep fallback (details.degraded=true).",
-        );
+      if (routed === "exact" || hits.length === 0) {
+        const exact = await runExact(args, query);
+        hits = mergeHits(hits, exact.hits);
+        if (exact.degraded) {
+          degraded = true;
+          notes.push(
+            exact.reason ??
+              "Sidecar unreachable; used grep fallback (details.degraded=true).",
+          );
+        }
       }
     }
 
     if (hits.length === 0) {
+      if (useLexicalFallback || open) {
+        degraded = true;
+        if (!notes.includes(SEMANTIC_UNAVAILABLE_NOTE)) notes.push(SEMANTIC_UNAVAILABLE_NOTE);
+      }
       const message = [
         `No hits for ${JSON.stringify(query)} (mode ${routed}).`,
         ...notes,
@@ -131,29 +157,156 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
   }
 }
 
-async function trySymbolSearch(args: CodeSearchArgs): Promise<UnassignedHit[] | undefined> {
+async function runLexicalSymbol(
+  args: CodeSearchArgs,
+  terms: string[],
+): Promise<{ hits: UnassignedHit[]; notes: string[]; degraded: boolean }> {
+  const notes: string[] = [];
+  let degraded = false;
+  const identTerms = terms.filter(isIdentifierLike);
+  const symbolTerms = identTerms.length > 0 ? identTerms : terms.slice(0, 4);
+  const perTermK = Math.max(1, Math.min((args.topK ?? DEFAULT_TOP_K) * 3, 100));
+  const termArgs = { ...args, topK: perTermK };
+
+  const symbolFn = getSymbolLayer().searchSymbols;
+  const symbolBatches = symbolFn
+    ? await Promise.all(
+        symbolTerms.map(async (term) => ({
+          term,
+          hits: await trySymbolSearch(termArgs, [term]),
+        })),
+      )
+    : [];
+  if (!symbolFn) {
+    degraded = true;
+    notes.push("Symbol layer unavailable; hybrid search used exact only (details.degraded=true).");
+  }
+
+  const exactBatches = await Promise.all(
+    terms.map(async (term) => ({
+      term,
+      result: await runExact(termArgs, literalQuery(term)),
+    })),
+  );
+
+  const collected: UnassignedHit[] = [];
+  const termHits = new Map<string, Set<string>>();
+
+  const addHits = (batchHits: UnassignedHit[] | undefined, term: string) => {
+    if (!batchHits) return;
+    for (const hit of batchHits) {
+      const key = hitKey(hit);
+      let set = termHits.get(key);
+      if (!set) {
+        set = new Set();
+        termHits.set(key, set);
+        collected.push(hit);
+      }
+      set.add(term);
+    }
+  };
+
+  for (const batch of symbolBatches) addHits(batch.hits ?? undefined, batch.term);
+  for (const batch of exactBatches) {
+    if (batch.result.degraded) {
+      degraded = true;
+      if (batch.result.reason && !notes.includes(batch.result.reason)) {
+        notes.push(batch.result.reason);
+      }
+    }
+    addHits(batch.result.hits, batch.term);
+  }
+
+  const topK = Math.max(1, Math.min(args.topK ?? DEFAULT_TOP_K, 100));
+  const identSet = new Set(identTerms);
+  const pathTerms = new Map<string, Set<string>>();
+  for (const [key, set] of termHits) {
+    const path = key.slice(0, key.indexOf(":"));
+    let bucket = pathTerms.get(path);
+    if (!bucket) {
+      bucket = new Set();
+      pathTerms.set(path, bucket);
+    }
+    for (const term of set) bucket.add(term);
+  }
+  const ranked = collected
+    .map((hit) => ({
+      ...hit,
+      score: scoreHit(hit, termHits.get(hitKey(hit)) ?? new Set(), identSet, pathTerms.get(hit.path) ?? new Set()),
+    }))
+    .sort((a, b) => {
+      const fileA = pathTerms.get(a.path)?.size ?? 0;
+      const fileB = pathTerms.get(b.path)?.size ?? 0;
+      return (
+        fileB - fileA ||
+        (b.score ?? 0) - (a.score ?? 0) ||
+        a.path.localeCompare(b.path) ||
+        a.startLine - b.startLine
+      );
+    })
+    .slice(0, topK);
+
+  notes.push(`Used lexical+symbol fallback (terms: ${terms.join(", ")}).`);
+  return { hits: ranked, notes, degraded };
+}
+
+function scoreHit(
+  hit: UnassignedHit,
+  terms: Set<string>,
+  identTerms: Set<string>,
+  fileTerms: Set<string>,
+): number {
+  let score = 0;
+  for (const term of fileTerms) {
+    score += identTerms.has(term) || isIdentifierLike(term) ? 2 : 0.5;
+  }
+  for (const term of terms) {
+    score += identTerms.has(term) || isIdentifierLike(term) ? 3 : 1;
+    if (hit.symbol && (hit.symbol === term || hit.symbol.includes(term))) score += 2;
+  }
+  if (hit.symbol) score += 0.5;
+  return score;
+}
+
+function hitKey(hit: UnassignedHit): string {
+  return `${hit.path}:${hit.startLine}:${hit.endLine}`;
+}
+
+function literalQuery(term: string): string {
+  return term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function trySymbolSearch(args: CodeSearchArgs, queries: string[]): Promise<UnassignedHit[] | undefined> {
   const fn = getSymbolLayer().searchSymbols;
   if (!fn) return undefined;
-  try {
-    const hits = await fn({
-      query: args.query,
-      path: args.path,
-      glob: args.glob,
-      topK: args.topK,
-      projectRoot: args.projectRoot,
-    });
-    return Array.isArray(hits) ? hits : undefined;
-  } catch {
-    return undefined;
+  const merged: UnassignedHit[] = [];
+  let any = false;
+  for (const query of queries) {
+    try {
+      const hits = await fn({
+        query,
+        path: args.path,
+        glob: args.glob,
+        topK: args.topK,
+        projectRoot: args.projectRoot,
+      });
+      if (!Array.isArray(hits)) continue;
+      any = true;
+      for (const hit of hits) merged.push(hit);
+    } catch {
+      // one term failing must not abort the rest
+    }
   }
+  return any ? mergeHits([], merged) : undefined;
 }
 
 async function runExact(
   args: CodeSearchArgs,
+  query: string,
 ): Promise<{ hits: UnassignedHit[]; degraded: boolean; reason?: string }> {
   if (args.sidecar) {
     const remote = await sidecarSearch(args.sidecar, {
-      query: args.query,
+      query,
       path: args.path,
       glob: args.glob,
       topK: args.topK,
@@ -166,7 +319,7 @@ async function runExact(
       };
     }
     const local = await exactSearch({
-      query: args.query,
+      query,
       projectRoot: args.projectRoot,
       path: args.path,
       glob: args.glob,
@@ -182,7 +335,7 @@ async function runExact(
   }
 
   const local = await exactSearch({
-    query: args.query,
+    query,
     projectRoot: args.projectRoot,
     path: args.path,
     glob: args.glob,
@@ -228,4 +381,29 @@ function mergeHits(left: UnassignedHit[], right: UnassignedHit[]): UnassignedHit
     out.push(hit);
   }
   return out;
+}
+
+function emptySearchResult(
+  args: CodeSearchArgs,
+  query: string,
+  routed: string,
+  notes: string[],
+  degraded: boolean,
+): Promise<ToolResult> {
+  const message = [
+    `No hits for ${JSON.stringify(query)} (mode ${routed}).`,
+    ...notes,
+    degraded ? "Not pretending this was a successful empty index result." : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return buildToolResult({
+    projectRoot: args.projectRoot,
+    kind: "code-retrieval.search",
+    hits: [],
+    degraded,
+    content: message,
+    query,
+    degradeReason: notes[0],
+  });
 }

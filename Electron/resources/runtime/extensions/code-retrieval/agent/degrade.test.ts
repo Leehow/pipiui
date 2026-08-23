@@ -74,7 +74,7 @@ test("semantic queries degrade honestly instead of pretending success", async ()
     await mkdir(join(root, "src"), { recursive: true });
     await writeFile(join(root, "src", "x.ts"), "export const architecture = 1;\n", "utf8");
     const result = await executeCodeSearch({
-      query: "how does the architecture work?",
+      query: "why does zqglorb fizzbuzzwizzle work this way?",
       mode: "auto",
       projectRoot: root,
       registry: new RefRegistry(),
@@ -82,7 +82,8 @@ test("semantic queries degrade honestly instead of pretending success", async ()
       sidecar: undefined,
     });
     assert.equal(result.details.degraded, true);
-    assert.match(result.content[0]!.text, /phase 4|Semantic|semantic/i);
+    assert.equal(result.details.hits.length, 0);
+    assert.match(result.content[0]!.text, /semantic unavailable; attempted lexical\+symbol fallback/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
