@@ -1,4 +1,4 @@
-#!/usr/bin/env node --experimental-strip-types
+#!/usr/bin/env node --experimental-transform-types
 /**
  * Load the extensions named on stdin and report the tools each one registers, as JSON.
  *
@@ -12,7 +12,12 @@
  * Output (stdout): {"registered": [{name, path, promptSnippet}], "unloadable": [{path, reason}]}
  */
 import { readFileSync } from "node:fs";
+import { register } from "node:module";
 import { join, resolve } from "node:path";
+
+// Our sources import each other with `.js` specifiers that only exist after `tsc`. See the
+// hook for why this is a resolve hook and not a different loader.
+register("./ts-specifier-resolve-hook.mjs", import.meta.url);
 
 const { paths, env } = JSON.parse(readFileSync(0, "utf8"));
 for (const [key, value] of Object.entries(env ?? {})) process.env[key] = value;
@@ -35,7 +40,11 @@ const noop = () => {};
 
 for (const path of paths) {
 	try {
-		const module = await import(path.endsWith(".ts") ? path : directoryEntrypoint(path));
+		// A bundled manifest extension mounts its own compiled entry file (`agent/dist/index.js`),
+		// so "not a .ts path" no longer implies "a directory". Treat anything with a module
+		// extension as the entry it already is; only a bare path is resolved as a package.
+		const isEntryFile = /\.(m?[jt]s)$/.test(path);
+		const module = await import(isEntryFile ? path : directoryEntrypoint(path));
 		module.default?.({
 			registerTool: (definition) => registered.push({
 				name: definition.name,
@@ -43,6 +52,12 @@ for (const path of paths) {
 				promptSnippet: definition.promptSnippet ?? null,
 			}),
 			registerCommand: noop, registerShortcut: noop, registerFlag: noop, on: noop,
+			// Anything an extension touches at registration time needs a stub, or the module
+			// throws and every tool it declares is reported as uncovered rather than checked.
+			// `registerProvider` is the bundled manifest extensions; `events` is pi-goal,
+			// which subscribes to its managed-run bus before it registers a single tool.
+			registerProvider: noop,
+			events: { on: noop, off: noop, emit: noop },
 			getFlag: () => undefined,
 		});
 	} catch (error) {

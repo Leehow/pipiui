@@ -19,12 +19,19 @@
  *
  *   npm run check:boss-tools
  *
- * Node's own type stripping, not tsx: an extension that imports `@earendil-works/pi-ai` at
+ * Node's own type transform, not tsx: an extension that imports `@earendil-works/pi-ai` at
  * runtime resolves only under ESM, and tsx loads these files as CommonJS, where that package's
  * export map has no `require` condition. Under tsx the three biggest extensions — including
  * the one registering `ledger_note` — silently fall into the "not covered" bucket.
+ *
+ * `--experimental-transform-types` rather than `--experimental-strip-types`: strip-only
+ * refuses TypeScript parameter properties, which is a syntax two of our extensions use. That
+ * refusal cost coverage rather than correctness — an extension the loader cannot open is one
+ * whose tools this check never sees. `scripts/ts-specifier-resolve-hook.mjs` closes the other
+ * half, where a source tree imports itself by the specifiers only `tsc` output satisfies.
  */
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -40,6 +47,33 @@ const { assemblePiSpawn, resolveSpawnPaths, mergedSpawnEnvironment, resolvePiExe
 const { DEFAULT_FEATURES } = await import(join(electronRoot, "packages/pi-backend/src/features.ts"));
 const { BOSS_MUTATION_TOOL_NAMES, resolveMainSessionExcludedTools } =
 	await import(join(electronRoot, "packages/pi-backend/src/main-tool-policy.ts"));
+const { BUNDLED_MANIFEST_EXTENSIONS } =
+	await import(join(electronRoot, "packages/pi-backend/src/runtime-install.ts"));
+
+/**
+ * Bundled manifest extensions mount through `registeredExtensions`, not through the `-e`
+ * paths `SpawnPaths` enumerates — so a spawn assembled without them advertises a session
+ * that has no `code_search`, and both sides of this check agree on a tool set the real app
+ * never runs. That blind spot is why the retrieval tools shipped uninstructed: enabled,
+ * callable, and mentioned in no prompt, exactly the `ledger_note` failure this file exists
+ * to catch. Resolve them here the way `ExtensionRegistry.rememberAgent` does — manifest
+ * `agent.extension`, relative to the package directory.
+ */
+function bundledRegisteredExtensions() {
+	return BUNDLED_MANIFEST_EXTENSIONS.flatMap((id) => {
+		const directory = join(runtimeRoot, "extensions", id);
+		try {
+			const declared = JSON.parse(readFileSync(join(directory, "pipiui-extension.json"), "utf8"))?.agent?.extension;
+			if (!declared) return [];
+			return [{ id, enabled: true, extensionPath: join(directory, declared) }];
+		} catch {
+			// A missing or unreadable manifest is reported by the loader below as an
+			// uncovered path, not swallowed into a smaller tool set here.
+			return [];
+		}
+	});
+}
+const registeredExtensions = bundledRegisteredExtensions();
 
 const failures = [];
 const fail = (message) => { failures.push(message); console.log(`  FAIL  ${message}`); };
@@ -57,7 +91,7 @@ async function capturePrompt(features) {
 	const out = join(root, "probe.json");
 	await mkdir(cwd, { recursive: true });
 	try {
-		const { args, env } = assemblePiSpawn({ cwd, runtimeRoot, features, resourceMode: "explicit", paths: resolveSpawnPaths(runtimeRoot) });
+		const { args, env } = assemblePiSpawn({ cwd, runtimeRoot, features, resourceMode: "explicit", paths: resolveSpawnPaths(runtimeRoot), registeredExtensions });
 		/*
 		 * Report which binary answered. `resolvePiExecutable` searches PATH first, and under
 		 * `npm run` npm puts `node_modules/.bin` at the front — where a stale
@@ -145,10 +179,10 @@ async function registeredTools(features) {
 	// Same inputs as capturePrompt, deliberately: giving this side a bridge the captured
 	// session never had would count bridge-gated tools that were never mounted, and report
 	// them as missing from a prompt that was right not to mention them.
-	const { args, env } = assemblePiSpawn({ cwd: "/tmp", runtimeRoot, features, resourceMode: "explicit", paths: resolveSpawnPaths(runtimeRoot) });
+	const { args, env } = assemblePiSpawn({ cwd: "/tmp", runtimeRoot, features, resourceMode: "explicit", paths: resolveSpawnPaths(runtimeRoot), registeredExtensions });
 	const paths = [...new Set(args.filter((_, index) => args[index - 1] === "-e"))];
 
-	const child = spawn(process.execPath, ["--experimental-strip-types", "--no-warnings", join(electronRoot, "scripts/collect-extension-tools.mjs")], {
+	const child = spawn(process.execPath, ["--experimental-transform-types", "--no-warnings", join(electronRoot, "scripts/collect-extension-tools.mjs")], {
 		cwd: electronRoot,
 		stdio: ["pipe", "pipe", "pipe"],
 	});

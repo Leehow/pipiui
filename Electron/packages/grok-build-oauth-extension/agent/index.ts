@@ -391,6 +391,10 @@ export default function (pi: ExtensionAPI): void {
     label: "Grok Build image_gen",
     description:
       "Generate a new image from a text description using xAI Grok Imagine; returns a typed image plus the saved file's absolute path under the session attachments directory. When telling the user where it was saved, refer to the short path. To produce multiple images, emit multiple tool calls with distinct prompts.",
+    // This mount takes ownership of `image_gen` from pipiui-media, so it has to carry the
+    // snippet too — without one the tool never appears in Pi's `Available tools:` list and
+    // ships with no steering at all.
+    promptSnippet: "Generate images after the user confirms",
     parameters: {
       type: "object",
       properties: {
@@ -415,6 +419,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Grok Build image_edit",
     description:
       "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Each `image` entry is a `data:image/...;base64,...` URL or a path to a JPEG/PNG ≤400KB inside the current workspace or the session attachments directory (arbitrary absolute paths are rejected). Returns a typed image plus the saved file's absolute path.",
+    promptSnippet: "Edit images after the user confirms",
     parameters: {
       type: "object",
       properties: {
