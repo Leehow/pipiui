@@ -95,14 +95,31 @@ function formatObservation(r: any): string {
     `Loading: ${r.loading === true}`,
     `Viewport: ${r.viewport?.width || 0}x${r.viewport?.height || 0}`,
     `Scroll: ${r.scroll?.pixelsAbove || 0}px above, ${r.scroll?.pixelsBelow || 0}px below (${r.scroll?.positionPercent || 0}%)`,
-    "Elements:",
   ];
+  if (Array.isArray(r.regions) && r.regions.length) {
+    lines.push("Regions:");
+    for (const region of r.regions) {
+      lines.push(JSON.stringify({
+        id: region.id,
+        name: region.name,
+        role: region.role,
+        count: region.count,
+        more: region.more,
+        expanded: region.expanded,
+      }));
+      for (const element of region.preview || []) lines.push(`  ${JSON.stringify(element)}`);
+    }
+  }
+  if (r.nextCursor) lines.push(`Next cursor: ${r.nextCursor}`);
+  lines.push("Elements:");
   for (const element of r.elements || []) lines.push(JSON.stringify(element));
-  if (r.truncated) lines.push("[observation truncated: refine scope or scroll]");
+  if (r.truncated) lines.push("[observation truncated: refine region, role, name, cursor, or scroll]");
   if (Array.isArray(r.limitations) && r.limitations.length) {
     lines.push("Limitations:", ...r.limitations.map((item: string) => `- ${item}`));
   }
   if (r.action) lines.push(`Action: ${JSON.stringify(r.action)}`);
+  if (r.relocated) lines.push("Relocated: true");
+  if (r.mutation) lines.push(`Mutation: ${JSON.stringify(r.mutation)}`);
   if (r.note) lines.push(`Note: ${r.note}`);
   return lines.join("\n");
 }
@@ -116,7 +133,11 @@ const HELP = [
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
   "                        localhost defaults to http. Settles on didFinish + a short network-idle",
   "                        window (resource timing heuristic). Returns a fresh observation.",
-  "observe {scope?,target?} Snapshot interactive DOM. scope='viewport' (default) or 'page'.",
+  "observe {scope?,target?,region?,role?,name?,cursor?}",
+  "                        Snapshot interactive DOM. Default returns region summaries",
+  "                        (region name, element count, first items). region expands one",
+  "                        region; role/name filter elements; cursor pages the current view.",
+  "                        scope='viewport' (default) or 'page'.",
   "                        target='active' (default), 'desktop', 'mobile', or 'both'.",
   "wait {mode?, selector?, timeout?, idle_ms?, snapshot_id?, element_index|element_token?}",
   "                        mode='selector' (default when selector/target given): wait until a CSS",
@@ -130,7 +151,13 @@ const HELP = [
   "select {snapshot_id, element_index|element_token, option}",
   "scroll {direction?, amount?, snapshot_id?, element_index|element_token?}",
   "                        amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
-  "                        invalidate the prior snapshot and return a fresh observation.",
+  "                        invalidate the prior snapshot and return a fresh observation plus",
+  "                        a compressed mutation summary (DOM add/remove/attr, dialogs, URL).",
+  "                        If the original node went stale on the same URL, a unique visible",
+  "                        in-viewport match of DOM path+role+name+ordinal is relocated and",
+  "                        marked relocated; zero or multiple matches, off-screen/obscured",
+  "                        candidates, or any URL change, stay stale. Over-budget mutations",
+  "                        report magnitude only (few/some/many), not exact counts.",
   "                        Password, OTP, and payment fields require user handoff in the panel.",
   "content {mode?}         Raw fallback. mode='text' (default) or 'html'; may be large.",
   "                        WARNING: bypasses structured redaction — may expose credentials,",
@@ -182,6 +209,8 @@ export default function (pi: ExtensionAPI) {
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, wait, click, input, type, select, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
       "eval is page-DOM only (no literals/keep-alive). Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
+      "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
+      "Same-page stale refs relocate on a unique in-viewport DOM path+role+name+ordinal match. Actions include a mutation summary. " +
       "Optional target selects active (default), desktop, mobile, or both (observe/screenshot only). " +
       "Ordinary browsing may use target=active (default). For frontend or responsive-layout implementation/debugging, before claiming responsive visual acceptance, call observe with target=both for structured inspection, then screenshot with target=both and visually review both labeled desktop/mobile images. " +
       'Call with action:"help" for full parameter docs.',
@@ -214,6 +243,10 @@ export default function (pi: ExtensionAPI) {
       target: Type.Optional(Type.Union([
         Type.Literal("active"), Type.Literal("desktop"), Type.Literal("mobile"), Type.Literal("both"),
       ])),
+      region: Type.Optional(Type.String()),
+      role: Type.Optional(Type.String()),
+      name: Type.Optional(Type.String()),
+      cursor: Type.Optional(Type.Union([Type.String(), Type.Number()])),
     }),
     async execute(_id, params, signal) {
       const target = params.target;
@@ -228,7 +261,14 @@ export default function (pi: ExtensionAPI) {
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "observe": {
-          const r = await bridge("observe", { scope: params.scope ?? "viewport", ...targetParams }, signal);
+          const r = await bridge("observe", {
+            scope: params.scope ?? "viewport",
+            ...targetParams,
+            ...(typeof params.region === "string" ? { region: params.region } : {}),
+            ...(typeof params.role === "string" ? { role: params.role } : {}),
+            ...(typeof params.name === "string" ? { name: params.name } : {}),
+            ...(params.cursor !== undefined ? { cursor: params.cursor } : {}),
+          }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "wait": {

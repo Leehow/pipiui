@@ -8,6 +8,15 @@
   const MAX_REDACTION_ENTRIES = 64;
   const MAX_REDACTION_VALUE_UNITS = 4096;
   const MAX_REDACTION_TOTAL_UNITS = 16384;
+  const REGION_PREVIEW_LIMIT = 3;
+  const REGION_PAGE_SIZE = 8;
+  const ELEMENT_PAGE_SIZE = 32;
+  const MAX_MUTATION_SAMPLES = 8;
+  const LANDMARK_ROLES = new Set([
+    "banner", "navigation", "main", "complementary", "contentinfo",
+    "form", "search", "dialog", "alertdialog", "region",
+  ]);
+  const LANDMARK_TAGS = new Set(["header", "nav", "main", "aside", "footer", "form", "dialog", "search"]);
   const SENSITIVE_AUTOCOMPLETE_TOKEN = /^(current-password|new-password|one-time-code|cc(?:-|$))/i;
   // Query/hash parameter names whose values must never appear in public observations.
   const SENSITIVE_URL_PARAM = /(?:^|[._-])(?:token|password|passwd|secret|key|reset|auth|otp|code|session|sig|signature|credential|bearer)(?:[._-]|$)|^(?:token|password|passwd|secret|key|reset|auth|otp|code|session|sig|signature|credential|bearer)$/i;
@@ -26,6 +35,8 @@
     code: 128,
     token: 128,
     snapshotID: 128,
+    description: 256,
+    region: 160,
   });
 
   const state = {
@@ -37,6 +48,13 @@
     sequence: 0,
     highlight: null,
     highlightTimer: null,
+    mutationObserver: null,
+    mutationAdded: 0,
+    mutationRemoved: 0,
+    mutationAttributes: 0,
+    mutationSamples: [],
+    mutationDialogs: [],
+    mutationURL: "",
   };
 
   function opaqueID(prefix) {
@@ -125,6 +143,7 @@
 
   function stringLimitForKey(key) {
     if (key === "limitations") return STRING_LIMITS.limitation;
+    if (key === "id" || key === "nextCursor") return STRING_LIMITS.region;
     return STRING_LIMITS[key] || 512;
   }
 
@@ -156,18 +175,34 @@
     const envelope = sanitizePublic(value, variants);
     const elementLists = [];
     const limitationLists = [];
+    const regionLists = [];
+    const sampleLists = [];
     function findDroppable(current) {
       if (!current || typeof current !== "object") return;
       if (Array.isArray(current.elements)) elementLists.push(current.elements);
+      if (Array.isArray(current.preview)) elementLists.push(current.preview);
+      if (Array.isArray(current.regions)) regionLists.push(current.regions);
       if (Array.isArray(current.limitations)) limitationLists.push(current.limitations);
+      if (Array.isArray(current.samples) && ("added" in current || "removed" in current)) sampleLists.push(current.samples);
       for (const child of Object.values(current)) findDroppable(child);
     }
     findDroppable(envelope);
+    const markTruncated = () => {
+      if (envelope.observation && typeof envelope.observation === "object") envelope.observation.truncated = true;
+      else envelope.truncated = true;
+    };
+    while (serializedLength(envelope) > MAX_UTF16_UNITS && sampleLists.some((list) => list.length)) {
+      sampleLists.find((candidate) => candidate.length).pop();
+      if (envelope.mutation && typeof envelope.mutation === "object") envelope.mutation.truncated = true;
+    }
     while (serializedLength(envelope) > MAX_UTF16_UNITS && elementLists.some((list) => list.length)) {
       const list = elementLists.find((candidate) => candidate.length);
       list.pop();
-      if (envelope.observation && typeof envelope.observation === "object") envelope.observation.truncated = true;
-      else envelope.truncated = true;
+      markTruncated();
+    }
+    while (serializedLength(envelope) > MAX_UTF16_UNITS && regionLists.some((list) => list.length)) {
+      regionLists.find((candidate) => candidate.length).pop();
+      markTruncated();
     }
     while (serializedLength(envelope) > MAX_UTF16_UNITS && limitationLists.some((list) => list.length)) {
       limitationLists.find((candidate) => candidate.length).pop();
@@ -250,6 +285,12 @@
     if (tag === "footer") return "contentinfo";
     if (tag === "aside") return "complementary";
     if (tag === "form") return "form";
+    if (tag === "dialog") return "dialog";
+    if (tag === "search") return "search";
+    if (tag === "summary") return "button";
+    if (tag === "option") return "option";
+    if (tag === "progress") return "progressbar";
+    if (tag === "meter") return "meter";
     return "";
   }
 
@@ -263,18 +304,49 @@
     return normalizedText(ids.map((id) => element.ownerDocument.getElementById(id)?.textContent || "").join(" "));
   }
 
+  function associatedLabels(element) {
+    if (element.labels && element.labels.length) return Array.from(element.labels);
+    const id = element.id;
+    if (!id || !element.ownerDocument?.querySelectorAll) return [];
+    try {
+      return Array.from(element.ownerDocument.querySelectorAll("label")).filter((label) => {
+        const htmlFor = label.htmlFor || label.getAttribute("for");
+        return htmlFor === id;
+      });
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function ownVisibleText(element) {
+    let text = "";
+    const nodes = element.childNodes || [];
+    for (let i = 0; i < nodes.length; i += 1) {
+      const node = nodes[i];
+      if (node.nodeType === 3) text += node.textContent || "";
+      else if (node.nodeType === 1 && !isSelfHidden(node)) text += ` ${ownVisibleText(node)} `;
+    }
+    return normalizedText(text);
+  }
+
+  function accessibleDescription(element) {
+    const described = referencedText(element, "aria-describedby")
+      || referencedText(element, "aria-errormessage")
+      || referencedText(element, "aria-details");
+    return truncateUTF16(described, STRING_LIMITS.description);
+  }
+
   function accessibleName(element) {
     const labelled = referencedText(element, "aria-labelledby");
     if (labelled) return truncateUTF16(labelled, STRING_LIMITS.name);
     const aria = normalizedText(element.getAttribute("aria-label"));
     if (aria) return truncateUTF16(aria, STRING_LIMITS.name);
-    if (element.labels && element.labels.length) {
-      const labelText = normalizedText(Array.from(element.labels).map((label) => label.textContent || "").join(" "));
-      if (labelText) return truncateUTF16(labelText, STRING_LIMITS.name);
-    }
-    for (const attribute of ["alt", "title", "placeholder"]) {
-      const value = normalizedText(element.getAttribute(attribute));
-      if (value) return truncateUTF16(value, STRING_LIMITS.name);
+    const labelText = normalizedText(associatedLabels(element).map((label) => label.textContent || "").join(" "));
+    if (labelText) return truncateUTF16(labelText, STRING_LIMITS.name);
+    if (element.localName === "fieldset") {
+      const legend = Array.from(element.children || []).find((child) => child.localName === "legend");
+      const legendText = normalizedText(legend?.textContent);
+      if (legendText) return truncateUTF16(legendText, STRING_LIMITS.name);
     }
     if (element.localName === "input") {
       const type = (element.getAttribute("type") || "text").toLowerCase();
@@ -282,6 +354,21 @@
         const value = normalizedText(element.value);
         if (value) return truncateUTF16(value, STRING_LIMITS.name);
       }
+      if (type === "image") {
+        const alt = normalizedText(element.getAttribute("alt"));
+        if (alt) return truncateUTF16(alt, STRING_LIMITS.name);
+      }
+    }
+    for (const attribute of ["alt", "title", "placeholder"]) {
+      const value = normalizedText(element.getAttribute(attribute));
+      if (value) return truncateUTF16(value, STRING_LIMITS.name);
+    }
+    const elementRole = role(element);
+    if (["button", "a", "summary", "label", "option"].includes(element.localName)
+      || ["button", "link", "menuitem", "option", "tab"].includes(elementRole)
+      || element.isContentEditable) {
+      const text = ownVisibleText(element);
+      if (text) return truncateUTF16(text, STRING_LIMITS.name);
     }
     return truncateUTF16(normalizedText(element.textContent), STRING_LIMITS.name);
   }
@@ -399,7 +486,7 @@
   }
 
   function isSelfHidden(element) {
-    if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true") return true;
+    if (element.hasAttribute("hidden") || element.getAttribute("aria-hidden") === "true" || element.hasAttribute("inert")) return true;
     if (element.hasAttribute(OVERLAY_ATTRIBUTE) || element.closest?.(`[${OVERLAY_ATTRIBUTE}]`)) return true;
     const view = element.ownerDocument?.defaultView;
     const style = view?.getComputedStyle(element);
@@ -444,24 +531,42 @@
   function isContext(element, elementRole) {
     return /^h[1-6]$/.test(element.localName)
       || element.localName === "label"
-      || ["heading", "main", "navigation", "banner", "contentinfo", "complementary", "form"].includes(elementRole);
+      || ["heading", "main", "navigation", "banner", "contentinfo", "complementary", "form", "search", "dialog", "region"].includes(elementRole);
   }
 
   function stateDescription(element) {
     const values = [];
     if (element.matches?.(":checked") || element.getAttribute("aria-checked") === "true") values.push("checked");
+    if (element.getAttribute("aria-checked") === "mixed") values.push("mixed");
+    if (element.getAttribute("aria-pressed") === "true") values.push("pressed");
     if (element.getAttribute("aria-expanded") === "true") values.push("expanded");
     if (element.getAttribute("aria-expanded") === "false") values.push("collapsed");
     if (element.getAttribute("aria-selected") === "true") values.push("selected");
+    const current = normalizedText(element.getAttribute("aria-current"));
+    if (current && current !== "false") values.push(current === "true" ? "current" : `current:${current}`);
     if (element.matches?.(":focus")) values.push("focused");
     if (element.hasAttribute("required") || element.getAttribute("aria-required") === "true") values.push("required");
-    return values.join(",");
+    if (element.getAttribute("aria-invalid") === "true" || element.matches?.(":invalid")) values.push("invalid");
+    if (element.hasAttribute("readonly") || element.getAttribute("aria-readonly") === "true") values.push("readonly");
+    const roleDescription = normalizedText(element.getAttribute("aria-roledescription"));
+    if (roleDescription) values.push(`roledescription:${roleDescription}`);
+    const description = accessibleDescription(element);
+    if (description) values.push(`described:${description}`);
+    return truncateUTF16(values.join(","), STRING_LIMITS.state);
   }
 
   function valueHint(element) {
     if (isSensitive(element)) return "sensitive value hidden";
+    const type = (element.getAttribute("type") || "").toLowerCase();
     if (element.localName === "select") {
       return truncateUTF16(normalizedText(element.selectedOptions?.[0]?.textContent || element.value), STRING_LIMITS.valueHint);
+    }
+    if (element.localName === "progress" || element.localName === "meter" || type === "range") {
+      const valueText = normalizedText(element.getAttribute("aria-valuetext") || element.value);
+      const min = element.min ?? element.getAttribute("min") ?? element.getAttribute("aria-valuemin") ?? "";
+      const max = element.max ?? element.getAttribute("max") ?? element.getAttribute("aria-valuemax") ?? "";
+      const range = min !== "" || max !== "" ? ` ${min}–${max}` : "";
+      return truncateUTF16(valueText ? `${valueText}${range}` : `empty${range}`, STRING_LIMITS.valueHint);
     }
     if (element.localName === "input" || element.localName === "textarea") {
       const value = normalizedText(element.value);
@@ -525,6 +630,159 @@
     return [action, method];
   }
 
+  function composedParentElement(element) {
+    if (element.parentElement) return element.parentElement;
+    const root = element.getRootNode?.();
+    return root && root.host instanceof Element ? root.host : null;
+  }
+
+  function isLandmark(element) {
+    const elementRole = role(element);
+    if (elementRole === "region" || element.localName === "section") {
+      return Boolean(accessibleName(element));
+    }
+    if (LANDMARK_ROLES.has(elementRole)) return true;
+    return LANDMARK_TAGS.has(element.localName);
+  }
+
+  function nearestLandmark(element) {
+    let current = element;
+    const visited = new Set();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      if (isLandmark(current)) return current;
+      const parent = composedParentElement(current);
+      if (parent) {
+        current = parent;
+        continue;
+      }
+      const root = current.getRootNode?.();
+      if (root && root.host) {
+        current = root.host;
+        continue;
+      }
+      current = owningFrameElement(current.ownerDocument);
+    }
+    return null;
+  }
+
+  function fallbackRegionHost(element) {
+    let current = element;
+    let top = element;
+    const visited = new Set();
+    while (current && !visited.has(current)) {
+      visited.add(current);
+      const parent = composedParentElement(current);
+      if (!parent || parent.localName === "body" || parent.localName === "html") {
+        top = current.localName === "body" || current.localName === "html"
+          ? (document.body || document.documentElement || current)
+          : current;
+        break;
+      }
+      top = current;
+      current = parent;
+    }
+    if (!top || top.localName === "html" || top.localName === "body") {
+      return document.body || document.documentElement || top;
+    }
+    return top;
+  }
+
+  function domPath(element) {
+    const parts = [];
+    let current = element;
+    const visited = new Set();
+    while (current && current.nodeType === 1 && !visited.has(current)) {
+      visited.add(current);
+      const tag = current.localName || "*";
+      const parent = composedParentElement(current);
+      if (parent) {
+        let same = 0;
+        let idx = 0;
+        for (const child of parent.children || []) {
+          if (child.localName !== tag) continue;
+          if (child === current) idx = same;
+          same += 1;
+        }
+        parts.push(same > 1 ? `${tag}[${idx}]` : tag);
+        current = parent;
+        continue;
+      }
+      const root = current.getRootNode?.();
+      if (root && root.host) {
+        parts.push(`${tag}::shadow`);
+        current = root.host;
+        continue;
+      }
+      parts.push(tag);
+      break;
+    }
+    return parts.reverse().join("/");
+  }
+
+  function assignIdentity(candidates) {
+    const groups = new Map();
+    for (const candidate of candidates) {
+      const key = `${candidate.public.role}${candidate.public.name}`;
+      const list = groups.get(key) || [];
+      list.push(candidate);
+      groups.set(key, list);
+    }
+    for (const list of groups.values()) {
+      list.forEach((candidate, index) => {
+        candidate.ordinal = index + 1;
+        candidate.namedUnique = list.length === 1;
+        candidate.identityKey = `${candidate.public.role}${candidate.public.name}${candidate.ordinal}`;
+        candidate.semanticFingerprint = `${candidate.domPath}${candidate.identityKey}`;
+      });
+    }
+  }
+
+  function assignRegions(candidates) {
+    const seen = new Map();
+    const roleCounts = Object.create(null);
+    function metaFor(element, idPrefix, fallbackName) {
+      if (seen.has(element)) return seen.get(element);
+      const elementRole = role(element) || element.localName || fallbackName;
+      roleCounts[idPrefix] = (roleCounts[idPrefix] || 0) + 1;
+      const n = roleCounts[idPrefix];
+      const id = n === 1 ? idPrefix : `${idPrefix}:${n}`;
+      const meta = {
+        id,
+        name: accessibleName(element) || fallbackName || elementRole,
+        role: elementRole,
+        element,
+      };
+      seen.set(element, meta);
+      return meta;
+    }
+    let usedLandmark = false;
+    for (const candidate of candidates) {
+      const landmark = nearestLandmark(candidate.element);
+      if (!landmark) continue;
+      usedLandmark = true;
+      const elementRole = role(landmark) || landmark.localName || "region";
+      candidate.region = metaFor(landmark, elementRole, elementRole);
+    }
+    if (!usedLandmark) {
+      for (const candidate of candidates) {
+        const host = fallbackRegionHost(candidate.element);
+        candidate.region = metaFor(host, "dom", host?.localName || "page");
+      }
+      return;
+    }
+    for (const candidate of candidates) {
+      if (!candidate.region) {
+        candidate.region = {
+          id: "page",
+          name: "page",
+          role: "document",
+          element: document.body || document.documentElement,
+        };
+      }
+    }
+  }
+
   function fingerprint(element, frame, elementRole, name) {
     const [formAction, formMethod] = submitSemantics(element);
     return [
@@ -568,6 +826,7 @@
               rootNode: current.getRootNode(),
               owningFrameElement: owningFrameElement(current.ownerDocument),
               frame,
+              domPath: domPath(current),
               fingerprint: fingerprint(current, frame, currentRole, name),
               public: {
                 tag: current.localName,
@@ -615,6 +874,8 @@
     if (sawFileInput) {
       limitations.push("file_input_present; structured browser cannot set file paths — use user handoff or Computer Use");
     }
+    assignIdentity(candidates);
+    assignRegions(candidates);
     return { candidates, limitations };
   }
 
@@ -634,7 +895,36 @@
     };
   }
 
-  function observe(scope, action, secretValues) {
+  function parseCursor(value) {
+    if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, Math.floor(value));
+    if (typeof value === "string" && /^\d+$/.test(value.trim())) return parseInt(value.trim(), 10);
+    return 0;
+  }
+
+  function matchesRoleName(candidate, roleFilter, nameFilter) {
+    if (roleFilter && String(candidate.public.role || "").toLowerCase() !== roleFilter) return false;
+    if (nameFilter && !String(candidate.public.name || "").toLowerCase().includes(nameFilter)) return false;
+    return true;
+  }
+
+  function matchesRegionFilter(region, regionFilter) {
+    if (!regionFilter) return true;
+    const needle = regionFilter.toLowerCase();
+    return String(region.id || "").toLowerCase() === needle
+      || String(region.name || "").toLowerCase() === needle
+      || String(region.role || "").toLowerCase() === needle;
+  }
+
+  function publishElement(candidate, index, variants) {
+    const token = opaqueID("element");
+    return {
+      token,
+      publicElement: sanitizePublic({ index, token, ...candidate.public }, variants),
+      record: { ...candidate, index, token },
+    };
+  }
+
+  function observe(scope, action, secretValues, query = {}) {
     const normalizedScope = scope === "page" ? "page" : "viewport";
     if (!retainRedactions(secretValues) || !retainCurrentSensitiveValues()) {
       return redactionCapacityFailure();
@@ -643,6 +933,16 @@
     const { candidates, limitations } = collect(normalizedScope);
     const snapshotID = opaqueID("snapshot");
     const map = new Map();
+    const regionFilter = typeof query.region === "string" ? query.region.trim() : "";
+    const roleFilter = typeof query.role === "string" ? query.role.trim().toLowerCase() : "";
+    const nameFilter = typeof query.name === "string" ? query.name.trim().toLowerCase() : "";
+    const cursor = parseCursor(query.cursor);
+    const filtered = candidates.filter((candidate) => {
+      if (!matchesRoleName(candidate, roleFilter, nameFilter)) return false;
+      if (regionFilter && !matchesRegionFilter(candidate.region || {}, regionFilter)) return false;
+      return true;
+    });
+    const expand = Boolean(regionFilter || roleFilter || nameFilter);
     const envelope = sanitizePublic({
       ok: true,
       snapshotID,
@@ -652,6 +952,7 @@
       loading: document.readyState !== "complete",
       viewport: viewportInfo(),
       scroll: scrollInfo(),
+      regions: [],
       elements: [],
       limitations: [],
       truncated: false,
@@ -667,21 +968,85 @@
       }
     }
 
-    for (const candidate of candidates) {
-      if (envelope.elements.length >= MAX_ELEMENTS) {
-        envelope.truncated = true;
-        continue;
+    const grouped = [];
+    const groupIndex = new Map();
+    for (const candidate of filtered) {
+      const region = candidate.region || { id: "page", name: "page", role: "document" };
+      let group = groupIndex.get(region.id);
+      if (!group) {
+        group = { id: region.id, name: region.name, role: region.role, items: [] };
+        groupIndex.set(region.id, group);
+        grouped.push(group);
       }
-      const token = opaqueID("element");
-      const index = envelope.elements.length;
-      const publicElement = sanitizePublic({ index, token, ...candidate.public }, variants);
-      envelope.elements.push(publicElement);
-      if (serializedLength(envelope) > MAX_UTF16_UNITS) {
-        envelope.elements.pop();
-        envelope.truncated = true;
-        continue;
+      group.items.push(candidate);
+    }
+
+    if (!expand) {
+      const page = grouped.slice(cursor, cursor + REGION_PAGE_SIZE);
+      for (const group of page) {
+        const preview = [];
+        for (let i = 0; i < Math.min(REGION_PREVIEW_LIMIT, group.items.length); i += 1) {
+          if (envelope.elements.length >= MAX_ELEMENTS) {
+            envelope.truncated = true;
+            break;
+          }
+          const published = publishElement(group.items[i], envelope.elements.length, variants);
+          preview.push(published.publicElement);
+          envelope.elements.push(published.publicElement);
+          if (serializedLength(envelope) > MAX_UTF16_UNITS) {
+            preview.pop();
+            envelope.elements.pop();
+            envelope.truncated = true;
+            break;
+          }
+          map.set(published.token, published.record);
+        }
+        envelope.regions.push(sanitizePublic({
+          id: group.id,
+          name: group.name,
+          role: group.role,
+          count: group.items.length,
+          more: group.items.length > preview.length,
+          preview,
+        }, variants));
+        if (serializedLength(envelope) > MAX_UTF16_UNITS) {
+          envelope.regions.pop();
+          envelope.truncated = true;
+          break;
+        }
       }
-      map.set(token, { ...candidate, index, token });
+      if (cursor + page.length < grouped.length) envelope.nextCursor = String(cursor + page.length);
+    } else {
+      const pageSize = Math.min(ELEMENT_PAGE_SIZE, MAX_ELEMENTS);
+      const page = filtered.slice(cursor, cursor + pageSize);
+      const regionSummaries = grouped.map((group) => sanitizePublic({
+        id: group.id,
+        name: group.name,
+        role: group.role,
+        count: group.items.length,
+        expanded: regionFilter ? matchesRegionFilter(group, regionFilter) : false,
+      }, variants));
+      envelope.regions.push(...regionSummaries);
+      for (const candidate of page) {
+        if (envelope.elements.length >= MAX_ELEMENTS) {
+          envelope.truncated = true;
+          break;
+        }
+        const published = publishElement(candidate, envelope.elements.length, variants);
+        envelope.elements.push(published.publicElement);
+        if (serializedLength(envelope) > MAX_UTF16_UNITS) {
+          envelope.elements.pop();
+          envelope.truncated = true;
+          break;
+        }
+        map.set(published.token, published.record);
+      }
+      if (cursor + page.length < filtered.length) envelope.nextCursor = String(cursor + page.length);
+    }
+
+    if (envelope.truncated && envelope.nextCursor == null) {
+      const consumed = expand ? cursor + envelope.elements.length : cursor + envelope.regions.length;
+      envelope.nextCursor = String(consumed);
     }
 
     state.activeSnapshot = { id: snapshotID, url: String(location.href), map };
@@ -702,25 +1067,50 @@
     return failure(error, "stale_browser_snapshot", true);
   }
 
-  function validateEntry(entry) {
+  function validateEntry(entry, invalidateOnFailure = true) {
     const snapshot = state.activeSnapshot;
     if (!snapshot) return stale("The document changed; observe again.");
-    if (snapshot.url !== String(location.href)) return stale("The document URL changed; observe again.");
+    if (snapshot.url !== String(location.href)) {
+      return invalidateOnFailure ? stale("The document URL changed; observe again.") : failure("The document URL changed; observe again.", "stale_browser_snapshot", true);
+    }
+    const reject = (message) => (invalidateOnFailure ? stale(message) : failure(message, "stale_browser_snapshot", true));
     const element = entry.element;
     if (!element.isConnected
       || element.ownerDocument !== entry.ownerDocument
       || element.getRootNode() !== entry.rootNode
       || owningFrameElement(element.ownerDocument) !== entry.owningFrameElement) {
-      return stale("The requested element moved to a different document or composed root.");
+      return reject("The requested element moved to a different document or composed root.");
     }
     if (isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)) {
-      return stale("The requested element is now hidden or disabled.");
+      return reject("The requested element is now hidden or disabled.");
     }
     const currentRole = role(element);
     const currentName = accessibleName(element);
     if (fingerprint(element, entry.frame, currentRole, currentName) !== entry.fingerprint) {
-      return stale("The requested element changed; observe again.");
+      return reject("The requested element changed; observe again.");
     }
+    return null;
+  }
+
+  function isUsableRelocation(candidate) {
+    const element = candidate.element;
+    if (!element || isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)) return false;
+    if (!isInteractive(element, role(element))) return false;
+    const rect = candidate.public?.rect;
+    if (!rect || !inViewport(rect)) return false;
+    return true;
+  }
+
+  function tryRelocate(entry) {
+    if (!entry?.semanticFingerprint || !entry.fingerprint) return null;
+    const { candidates } = collect("page");
+    const matches = candidates.filter((candidate) => (
+      candidate.semanticFingerprint === entry.semanticFingerprint
+      && candidate.fingerprint === entry.fingerprint
+      && isUsableRelocation(candidate)
+    ));
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) return { ambiguous: true, count: matches.length };
     return null;
   }
 
@@ -728,6 +1118,9 @@
     const snapshot = state.activeSnapshot;
     if (!snapshot || typeof params.snapshot_id !== "string" || params.snapshot_id !== snapshot.id) {
       return { error: stale("The browser snapshot is stale; observe again.") };
+    }
+    if (snapshot.url !== String(location.href)) {
+      return { error: stale("The document URL changed; observe again.") };
     }
     const hasIndex = Number.isInteger(params.element_index);
     const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
@@ -738,9 +1131,25 @@
     if (hasToken) entry = snapshot.map.get(params.element_token) || null;
     else entry = Array.from(snapshot.map.values()).find((candidate) => candidate.index === params.element_index) || null;
     if (!entry) return { error: stale("The requested element is no longer in the active snapshot.") };
-    const validationError = validateEntry(entry);
-    if (validationError) return { error: validationError };
-    return { entry };
+    const validationError = validateEntry(entry, false);
+    if (!validationError) return { entry };
+    const relocated = tryRelocate(entry);
+    if (relocated?.ambiguous) {
+      return { error: stale("The requested element matched multiple candidates; observe again.") };
+    }
+    if (!relocated) {
+      return { error: validationError.code === "stale_browser_snapshot"
+        ? stale("The requested element could not be relocated; observe again.")
+        : validationError };
+    }
+    const next = {
+      ...relocated,
+      index: entry.index,
+      token: entry.token,
+      relocated: true,
+    };
+    snapshot.map.set(entry.token, next);
+    return { entry: next, relocated: true };
   }
 
   function resolveElement(token) {
@@ -796,12 +1205,6 @@
     element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
   }
 
-  function composedParentElement(element) {
-    if (element.parentElement) return element.parentElement;
-    const root = element.getRootNode?.();
-    return root && root.host instanceof Element ? root.host : null;
-  }
-
   function isScrollableOnAxis(element, vertical) {
     const view = element.ownerDocument?.defaultView || globalThis;
     const style = view.getComputedStyle(element);
@@ -836,18 +1239,154 @@
     return false;
   }
 
-  function clickHitTarget(element) {
+  function clickCenter(element) {
     const rect = element.getBoundingClientRect();
-    if (!(rect.width > 0 && rect.height > 0)) return null;
+    if (!(rect.width > 0 && rect.height > 0)) return { kind: "missing" };
     const ownerDocument = element.ownerDocument || document;
     const view = ownerDocument.defaultView || globalThis;
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) return null;
+    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) return { kind: "offscreen" };
     const hit = ownerDocument.elementFromPoint(x, y);
-    if (!hit) return null;
-    if (composedContains(element, hit) || composedContains(hit, element)) return null;
-    return hit;
+    if (!hit) return { kind: "missing" };
+    if (composedContains(element, hit) || composedContains(hit, element)) return { kind: "clear" };
+    return { kind: "obscured", hit };
+  }
+
+  function isInternalMutationNode(node) {
+    return Boolean(node && node.nodeType === 1 && (
+      node.hasAttribute?.(OVERLAY_ATTRIBUTE) || node.closest?.(`[${OVERLAY_ATTRIBUTE}]`)
+    ));
+  }
+
+  function mutationSample(kind, node, attributeName) {
+    if (state.mutationSamples.length >= MAX_MUTATION_SAMPLES) return;
+    if (!node || node.nodeType !== 1) {
+      state.mutationSamples.push({ op: kind, attribute: attributeName || "" });
+      return;
+    }
+    const sample = {
+      op: kind,
+      tag: node.localName || "",
+      role: role(node),
+      name: accessibleName(node),
+    };
+    if (attributeName) sample.attribute = attributeName;
+    state.mutationSamples.push(sample);
+  }
+
+  function noteDialog(node) {
+    if (!node || node.nodeType !== 1) return;
+    const dialogRole = role(node);
+    const isDialog = node.localName === "dialog" || dialogRole === "dialog" || dialogRole === "alertdialog";
+    if (!isDialog) {
+      try {
+        const nested = node.querySelector?.("dialog,[role='dialog'],[role='alertdialog']");
+        if (nested) noteDialog(nested);
+      } catch (_) {}
+      return;
+    }
+    const open = node.localName !== "dialog" || node.hasAttribute("open") || node.open === true;
+    if (!open || isHiddenComposed(node)) return;
+    const label = accessibleName(node) || dialogRole || "dialog";
+    if (!state.mutationDialogs.includes(label)) state.mutationDialogs.push(label);
+  }
+
+  function processMutationRecords(records) {
+    for (const record of records || []) {
+      if (isInternalMutationNode(record.target)) continue;
+      if (record.type === "childList") {
+        const added = record.addedNodes || [];
+        for (let i = 0; i < added.length; i += 1) {
+          const node = added[i];
+          if (!node || node.nodeType !== 1 || isInternalMutationNode(node)) continue;
+          state.mutationAdded += 1;
+          mutationSample("added", node);
+          noteDialog(node);
+        }
+        const removed = record.removedNodes || [];
+        for (let i = 0; i < removed.length; i += 1) {
+          const node = removed[i];
+          if (!node || node.nodeType !== 1 || isInternalMutationNode(node)) continue;
+          state.mutationRemoved += 1;
+          mutationSample("removed", node);
+        }
+      } else if (record.type === "attributes") {
+        if (isInternalMutationNode(record.target)) continue;
+        state.mutationAttributes += 1;
+        mutationSample("attr", record.target, record.attributeName || "");
+      }
+    }
+  }
+
+  function ensureMutationObserver() {
+    if (state.mutationObserver || typeof MutationObserver !== "function") return;
+    try {
+      state.mutationObserver = new MutationObserver((records) => processMutationRecords(records));
+      const root = document.documentElement || document.body || document;
+      state.mutationObserver.observe(root, { subtree: true, childList: true, attributes: true });
+    } catch (_) {
+      state.mutationObserver = null;
+    }
+  }
+
+  function beginMutationWindow() {
+    ensureMutationObserver();
+    try { processMutationRecords(state.mutationObserver?.takeRecords?.() || []); } catch (_) {}
+    state.mutationAdded = 0;
+    state.mutationRemoved = 0;
+    state.mutationAttributes = 0;
+    state.mutationSamples = [];
+    state.mutationDialogs = [];
+    state.mutationURL = String(location.href);
+  }
+
+  function countMagnitude(count) {
+    const n = Math.max(0, Number(count) || 0);
+    if (n === 0) return "none";
+    if (n <= 8) return "few";
+    if (n <= 80) return "some";
+    return "many";
+  }
+
+  function mutationSummary() {
+    try { processMutationRecords(state.mutationObserver?.takeRecords?.() || []); } catch (_) {}
+    const urlNow = String(location.href);
+    const urlChanged = urlNow !== state.mutationURL;
+    const total = state.mutationAdded + state.mutationRemoved + state.mutationAttributes;
+    const overBudget = state.mutationSamples.length >= MAX_MUTATION_SAMPLES || total > 80;
+    if (overBudget) {
+      const summary = {
+        added: countMagnitude(state.mutationAdded),
+        removed: countMagnitude(state.mutationRemoved),
+        attributes: countMagnitude(state.mutationAttributes),
+        dialogs: countMagnitude(state.mutationDialogs.length),
+        urlChanged,
+        truncated: true,
+      };
+      if (urlChanged) summary.url = redactURLForObservation(urlNow);
+      return summary;
+    }
+    const summary = {
+      added: state.mutationAdded,
+      removed: state.mutationRemoved,
+      attributes: state.mutationAttributes,
+      dialogs: state.mutationDialogs.slice(0, 8),
+      urlChanged,
+    };
+    if (urlChanged) summary.url = redactURLForObservation(urlNow);
+    if (state.mutationSamples.length) summary.samples = state.mutationSamples.slice();
+    return summary;
+  }
+
+  function attachMutation(result, extra = {}) {
+    if (!result || typeof result !== "object") return result;
+    if (result.code === "browser_redaction_capacity_exceeded") return result;
+    return enforceEnvelopeBudget({
+      ...result,
+      mutation: mutationSummary(),
+      ...extra,
+    }, activeRedactionVariants());
   }
 
   function actionObservation(scope, action, secretValues = []) {
@@ -1012,7 +1551,8 @@
   function dispatch(params) {
     const action = String(params?.action || "");
     const scope = params?.scope === "page" ? "page" : "viewport";
-    if (action === "observe") return observe(scope, params.action_metadata || null, []);
+    ensureMutationObserver();
+    if (action === "observe") return observe(scope, params.action_metadata || null, [], params);
     if (action === "wait_check") return waitCheck(params, scope);
     if (action === "clear") {
       invalidateSnapshot();
@@ -1092,10 +1632,17 @@
     if (resolved?.error) return resolved.error;
     const entry = resolved?.entry || null;
     const element = entry?.element || null;
+    const relocated = resolved?.relocated === true || entry?.relocated === true;
+    const relocatedExtra = relocated ? { relocated: true } : {};
 
     try {
+      if (["click", "input", "select", "scroll"].includes(action)) beginMutationWindow();
       if (action === "click") {
-        if (clickHitTarget(element)) {
+        const hit = clickCenter(element);
+        if (relocated && hit.kind !== "clear") {
+          return stale("The requested element could not be relocated; observe again.");
+        }
+        if (hit.kind === "obscured") {
           invalidateSnapshot();
           return failure(
             "The target is obscured at its center; observe again before retrying.",
@@ -1182,13 +1729,13 @@
           pending.activationCancelled = activationCancelled;
           pending.navigationBearing = initiallyNavigationBearing && !activationCancelled;
         }
-        return enforceEnvelopeBudget({
+        return attachMutation({
           ok: true,
           deferObservation: true,
           targetFrame: entry.frame,
           navigationBearing: state.pendingFrameClick?.navigationBearing === true,
-          action: { kind: "click" },
-        }, activeRedactionVariants());
+          action: { kind: "click", ...(relocated ? { relocated: true } : {}) },
+        }, relocatedExtra);
       }
 
       if (action === "input") {
@@ -1225,7 +1772,10 @@
         }
         dispatchInputEvents(element, params.text);
         invalidateSnapshot();
-        return actionObservation(scope, { kind: "input", characterCount: params.text.length }, [params.text]);
+        return attachMutation(
+          actionObservation(scope, { kind: "input", characterCount: params.text.length, ...(relocated ? { relocated: true } : {}) }, [params.text]),
+          relocatedExtra,
+        );
       }
 
       if (action === "select") {
@@ -1249,7 +1799,10 @@
         element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
         element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
         invalidateSnapshot();
-        return actionObservation(scope, { kind: "select", selected: truncateUTF16(option.label || option.value, STRING_LIMITS.selected) });
+        return attachMutation(
+          actionObservation(scope, { kind: "select", selected: truncateUTF16(option.label || option.value, STRING_LIMITS.selected), ...(relocated ? { relocated: true } : {}) }),
+          relocatedExtra,
+        );
       }
 
       if (action === "scroll") {
@@ -1264,7 +1817,10 @@
         const height = target === target.ownerDocument?.scrollingElement ? ownerView.innerHeight : target.clientHeight;
         target.scrollBy({ left: vertical ? 0 : sign * width * amount, top: vertical ? sign * height * amount : 0, behavior: "auto" });
         invalidateSnapshot();
-        return actionObservation(scope, { kind: "scroll", direction, amount, target: targetKind });
+        return attachMutation(
+          actionObservation(scope, { kind: "scroll", direction, amount, target: targetKind, ...(relocated ? { relocated: true } : {}) }),
+          relocatedExtra,
+        );
       }
     } catch (_) {
       invalidateSnapshot();

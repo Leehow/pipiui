@@ -5,6 +5,8 @@ import { BROWSER_DEBUG_MAX_OUTPUT, BROWSER_SCRIPT_MAX_INPUT, remapScriptStack, s
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
+import vm from 'node:vm'
 import { BROWSER_TOOL_DECLARED_ACTIONS } from '../../../../resources/runtime/extensions/pipiui-electron-webview.ts'
 
 const webviewSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../../resources/runtime/extensions/pipiui-electron-webview.ts'), 'utf8')
@@ -22,6 +24,7 @@ class FakeWebContents {
   deferCommit = false
   waitReady = true
   scriptResult: Record<string, unknown> | undefined
+  pageRuntime: { evaluate(code: string): unknown } | null = null
   openDevTools = vi.fn()
   isDevToolsOpened = vi.fn(() => false)
   readonly listeners = new Map<string, Array<(...args: any[]) => void>>()
@@ -40,6 +43,7 @@ class FakeWebContents {
   getURL = vi.fn(() => this.url)
   stop = vi.fn()
   executeJavaScript = vi.fn(async (code: string) => {
+    if (this.pageRuntime && code.includes('__pipiBrowserDOM')) return this.pageRuntime.evaluate(code)
     if (code.includes('window.scrollX')) return { ...this.scroll }
     if (code.startsWith('window.scrollTo(')) {
       const [x, y] = code.slice('window.scrollTo('.length, -1).split(',').map(Number)
@@ -1403,6 +1407,8 @@ describe('browser debug actions', () => {
     const descriptionMatch = webviewSource.match(/actions: ([^.]+)\./)
     expect(descriptionMatch?.[1].split(/,\s*/).map(item => item.trim()).filter(item => item && item !== 'help').sort()).toEqual([...BROWSER_HOST_TOOL_ACTIONS].sort())
     expect(webviewSource).toMatch(/script \{js\}/)
+    expect(webviewSource).toMatch(/region\?,role\?,name\?,cursor\?/)
+    expect(webviewSource).toContain('region: Type.Optional')
     expect(webviewSource).toMatch(/timeout is seconds \(default 5, max 25\)/)
     expect(webviewSource).toContain('console {clear?, since_seq?')
     expect(webviewSource).toMatch(/maximum: 25/)
@@ -1675,5 +1681,704 @@ describe('browser-debug helpers', () => {
       error: 'browser wait timed out',
       truncated: true,
     })
+  })
+})
+
+type PageSpec = {
+  tag: string
+  attrs?: Record<string, string>
+  text?: string
+  value?: string
+  onClick?: (el: MiniElement, win: MiniWindow) => void
+  children?: Array<PageSpec | string>
+}
+
+class MiniEvent {
+  type: string
+  bubbles: boolean
+  cancelable: boolean
+  composed: boolean
+  defaultPrevented = false
+  target: MiniNode | null = null
+  data?: string
+  inputType?: string
+  constructor(type: string, init: Record<string, unknown> = {}) {
+    this.type = type
+    this.bubbles = init.bubbles === true
+    this.cancelable = init.cancelable === true
+    this.composed = init.composed === true
+    this.data = typeof init.data === 'string' ? init.data : undefined
+    this.inputType = typeof init.inputType === 'string' ? init.inputType : undefined
+  }
+  preventDefault() { if (this.cancelable) this.defaultPrevented = true }
+  composedPath() { return this.target ? [this.target] : [] }
+}
+class MiniInputEvent extends MiniEvent {}
+
+class MiniNode {
+  nodeType: number
+  parentNode: MiniNode | null = null
+  childNodes: MiniNode[] = []
+  ownerDocument: MiniDocument | null = null
+  textContentValue = ''
+  constructor(nodeType: number) { this.nodeType = nodeType }
+  get parentElement(): MiniElement | null {
+    return this.parentNode instanceof MiniElement ? this.parentNode : null
+  }
+  get textContent(): string {
+    if (this.nodeType === 3) return this.textContentValue
+    return this.childNodes.map(child => child.textContent).join('')
+  }
+  set textContent(value: string) {
+    this.childNodes = []
+    this.textContentValue = String(value ?? '')
+    if (this.nodeType === 1 && this.textContentValue) {
+      const text = new MiniNode(3)
+      text.textContentValue = this.textContentValue
+      text.ownerDocument = this.ownerDocument
+      text.parentNode = this
+      this.childNodes = [text]
+    }
+  }
+}
+
+class MiniElement extends MiniNode {
+  localName: string
+  attrs = new Map<string, string>()
+  _value = ''
+  checked = false
+  disabled = false
+  open = false
+  isContentEditable = false
+  shadowRoot: MiniElement | null = null
+  contentDocument: MiniDocument | null = null
+  _listeners = new Map<string, Array<(event: MiniEvent) => void>>()
+  _onClick?: (el: MiniElement, win: MiniWindow) => void
+  style: Record<string, string> = {}
+  _rect = { x: 0, y: 0, left: 0, top: 0, width: 120, height: 20, right: 120, bottom: 20 }
+  constructor(tag: string) {
+    super(1)
+    this.localName = tag
+  }
+  get id() { return this.getAttribute('id') || '' }
+  get className() { return this.getAttribute('class') || '' }
+  get htmlFor() { return this.getAttribute('for') || '' }
+  get children(): MiniElement[] { return this.childNodes.filter((node): node is MiniElement => node instanceof MiniElement) }
+  get isConnected(): boolean {
+    let current: MiniNode | null = this
+    while (current) {
+      if (current.nodeType === 9) return true
+      current = current.parentNode
+    }
+    return false
+  }
+  get labels(): MiniElement[] {
+    const doc = this.ownerDocument
+    if (!doc || !this.id) return []
+    return walkElements(doc.documentElement).filter(el => el.localName === 'label' && el.htmlFor === this.id)
+  }
+  get form(): MiniElement | null {
+    let current: MiniElement | null = this
+    while (current) {
+      if (current.localName === 'form') return current
+      current = current.parentElement
+    }
+    return null
+  }
+  get value() { return this._value }
+  set value(next: string) { this._value = String(next ?? '') }
+  get selectedOptions() {
+    const selected = this.children.filter(child => child.localName === 'option' && (child.hasAttribute('selected') || child === this.children.find(item => item.localName === 'option')))
+    return selected.length ? [selected[0]] : []
+  }
+  get options() { return this.children.filter(child => child.localName === 'option') }
+  getAttribute(name: string) { return this.attrs.has(name) ? this.attrs.get(name)! : null }
+  setAttribute(name: string, value: string) {
+    const previous = this.attrs.get(name)
+    this.attrs.set(name, String(value))
+    if (name === 'value') this._value = String(value)
+    if (name === 'open') this.open = true
+    notifyMutation(this, { type: 'attributes', target: this, attributeName: name, addedNodes: [], removedNodes: [] })
+    void previous
+  }
+  hasAttribute(name: string) { return this.attrs.has(name) }
+  removeAttribute(name: string) {
+    this.attrs.delete(name)
+    notifyMutation(this, { type: 'attributes', target: this, attributeName: name, addedNodes: [], removedNodes: [] })
+  }
+  appendChild<T extends MiniNode>(child: T): T {
+    child.parentNode = this
+    child.ownerDocument = this.ownerDocument
+    this.childNodes.push(child)
+    notifyMutation(this, { type: 'childList', target: this, addedNodes: [child], removedNodes: [] })
+    return child
+  }
+  removeChild<T extends MiniNode>(child: T): T {
+    this.childNodes = this.childNodes.filter(node => node !== child)
+    child.parentNode = null
+    notifyMutation(this, { type: 'childList', target: this, addedNodes: [], removedNodes: [child] })
+    return child
+  }
+  remove() { this.parentNode instanceof MiniElement && this.parentNode.removeChild(this) }
+  replaceWith(next: MiniElement) {
+    const parent = this.parentElement
+    if (!parent) return
+    const index = parent.childNodes.indexOf(this)
+    parent.removeChild(this)
+    next.ownerDocument = parent.ownerDocument
+    next.parentNode = parent
+    parent.childNodes.splice(index, 0, next)
+    notifyMutation(parent, { type: 'childList', target: parent, addedNodes: [next], removedNodes: [] })
+  }
+  getRootNode() { return this.ownerDocument || this }
+  getBoundingClientRect() { return { ...this._rect } }
+  closest(selector: string) {
+    let current: MiniElement | null = this
+    while (current) {
+      if (matchesSelector(current, selector)) return current
+      current = current.parentElement
+    }
+    return null
+  }
+  matches(selector: string) { return matchesSelector(this, selector) }
+  querySelector(selector: string) { return this.querySelectorAll(selector)[0] || null }
+  querySelectorAll(selector: string) { return walkElements(this).filter(el => el !== this && matchesSelector(el, selector)) }
+  focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this }
+  click() {
+    const event = new MiniEvent('click', { bubbles: true, cancelable: true, composed: true })
+    this.dispatchEvent(event)
+    if (!event.defaultPrevented) this._onClick?.(this, this.ownerDocument!.defaultView)
+  }
+  addEventListener(type: string, listener: (event: MiniEvent) => void) {
+    const list = this._listeners.get(type) ?? []
+    list.push(listener)
+    this._listeners.set(type, list)
+  }
+  removeEventListener(type: string, listener: (event: MiniEvent) => void) {
+    this._listeners.set(type, (this._listeners.get(type) ?? []).filter(item => item !== listener))
+  }
+  dispatchEvent(event: MiniEvent) {
+    event.target = this
+    let current: MiniElement | null = this
+    while (current) {
+      for (const listener of current._listeners.get(event.type) ?? []) listener(event)
+      current = event.bubbles ? current.parentElement : null
+    }
+    return !event.defaultPrevented
+  }
+}
+
+class MiniInput extends MiniElement {}
+class MiniTextArea extends MiniElement {}
+Object.defineProperty(MiniInput.prototype, 'value', {
+  get(this: MiniInput) { return this._value },
+  set(this: MiniInput, value: string) { this._value = String(value ?? '') },
+})
+Object.defineProperty(MiniTextArea.prototype, 'value', {
+  get(this: MiniTextArea) { return this._value },
+  set(this: MiniTextArea, value: string) { this._value = String(value ?? '') },
+})
+
+class MiniDocument extends MiniNode {
+  documentElement!: MiniElement
+  body!: MiniElement
+  defaultView!: MiniWindow
+  readyState = 'complete'
+  title = ''
+  URL = 'https://shop.example/'
+  activeElement: MiniElement | null = null
+  images: MiniElement[] = []
+  scrollingElement: MiniElement
+  constructor() {
+    super(9)
+    this.ownerDocument = this
+    this.scrollingElement = new MiniElement('html')
+    Object.assign(this.scrollingElement, { scrollTop: 0, scrollHeight: 800, clientHeight: 800, scrollWidth: 1280, clientWidth: 1280 })
+  }
+  createElement(tag: string) {
+    const el = tag === 'input' ? new MiniInput(tag) : tag === 'textarea' ? new MiniTextArea(tag) : new MiniElement(tag)
+    el.ownerDocument = this
+    return el
+  }
+  createTextNode(text: string) {
+    const node = new MiniNode(3)
+    node.textContentValue = text
+    node.ownerDocument = this
+    return node
+  }
+  getElementById(id: string) { return walkElements(this.documentElement).find(el => el.id === id) || null }
+  querySelector(selector: string) { return this.querySelectorAll(selector)[0] || null }
+  querySelectorAll(selector: string) { return walkElements(this.documentElement).filter(el => matchesSelector(el, selector)) }
+  addEventListener(type: string, listener: (event: MiniEvent) => void) {
+    this.documentElement.addEventListener(type, listener)
+  }
+  removeEventListener(type: string, listener: (event: MiniEvent) => void) {
+    this.documentElement.removeEventListener(type, listener)
+  }
+  elementFromPoint(x: number, y: number) {
+    return (this.defaultView.elementFromPoint as (x: number, y: number) => MiniElement | null)(x, y)
+  }
+}
+
+class MiniMutationObserver {
+  callback: (records: Array<Record<string, unknown>>) => void
+  target: MiniElement | MiniDocument | null = null
+  options: { subtree?: boolean; childList?: boolean; attributes?: boolean } | null = null
+  constructor(callback: (records: Array<Record<string, unknown>>) => void) { this.callback = callback }
+  observe(target: MiniElement | MiniDocument, options: { subtree?: boolean; childList?: boolean; attributes?: boolean }) {
+    this.target = target
+    this.options = options
+    const win = (target as MiniDocument).defaultView || (target as MiniElement).ownerDocument?.defaultView
+    win?._observers.push(this)
+  }
+  disconnect() {
+    const win = (this.target as MiniDocument)?.defaultView || (this.target as MiniElement)?.ownerDocument?.defaultView
+    if (win) win._observers = win._observers.filter(item => item !== this)
+  }
+  takeRecords() { return [] }
+  _emit(record: Record<string, unknown>) { this.callback([record]) }
+}
+
+type MiniWindow = {
+  document: MiniDocument
+  location: { href: string }
+  innerWidth: number
+  innerHeight: number
+  _observers: MiniMutationObserver[]
+  [key: string]: unknown
+}
+
+function walkElements(root: MiniElement | null): MiniElement[] {
+  if (!root) return []
+  const out: MiniElement[] = [root]
+  for (const child of root.children) out.push(...walkElements(child))
+  return out
+}
+
+function matchesOne(el: MiniElement, selector: string): boolean {
+  const sel = selector.trim()
+  if (!sel) return false
+  if (sel === ':disabled') return el.disabled || el.hasAttribute('disabled')
+  if (sel === ':checked') return el.checked || el.hasAttribute('checked')
+  if (sel === ':focus') return el.ownerDocument?.activeElement === el
+  if (sel === ':invalid') return false
+  let rest = sel
+  const tag = rest.match(/^[a-zA-Z][\w-]*/)
+  if (tag) {
+    if (el.localName !== tag[0].toLowerCase()) return false
+    rest = rest.slice(tag[0].length)
+  }
+  while (rest) {
+    if (rest.startsWith('.')) {
+      const item = rest.match(/^\.([\w-]+)/)
+      if (!item || !el.className.split(/\s+/).includes(item[1])) return false
+      rest = rest.slice(item[0].length)
+      continue
+    }
+    if (rest.startsWith('#')) {
+      const item = rest.match(/^#([\w-]+)/)
+      if (!item || el.id !== item[1]) return false
+      rest = rest.slice(item[0].length)
+      continue
+    }
+    if (rest.startsWith('[')) {
+      const item = rest.match(/^\[([^\]]+)\]/)
+      if (!item) return false
+      const eq = item[1].match(/^([\w-]+)(?:\s*=\s*['"]?([^'"\]]*)['"]?)?$/)
+      if (!eq) return false
+      if (eq[2] === undefined) {
+        if (!el.hasAttribute(eq[1])) return false
+      } else if (el.getAttribute(eq[1]) !== eq[2]) return false
+      rest = rest.slice(item[0].length)
+      continue
+    }
+    if (rest.startsWith(':')) {
+      const item = rest.match(/^(:[\w-]+)/)
+      if (!item || !matchesOne(el, item[1])) return false
+      rest = rest.slice(item[0].length)
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+function matchesSelector(el: MiniElement, selector: string): boolean {
+  return selector.split(',').some(part => matchesOne(el, part.trim()))
+}
+
+function containsNode(ancestor: MiniNode, node: MiniNode | null): boolean {
+  let current = node
+  while (current) {
+    if (current === ancestor) return true
+    current = current.parentNode
+  }
+  return false
+}
+
+function notifyMutation(target: MiniElement, record: Record<string, unknown>) {
+  const win = target.ownerDocument?.defaultView
+  if (!win) return
+  for (const observer of win._observers) {
+    if (!observer.options || !observer.target) continue
+    const root = observer.target as MiniNode
+    if (!observer.options.subtree && observer.target !== target) continue
+    if (observer.options.subtree && !containsNode(root, target)) continue
+    if (record.type === 'childList' && !observer.options.childList) continue
+    if (record.type === 'attributes' && !observer.options.attributes) continue
+    observer._emit(record)
+  }
+}
+
+function layoutTree(root: MiniElement, startY = 8) {
+  let y = startY
+  for (const el of walkElements(root)) {
+    el._rect = { x: 8, y, left: 8, top: y, width: 200, height: 20, right: 208, bottom: y + 20 }
+    y += 24
+  }
+}
+
+function mountSpec(parent: MiniElement, spec: PageSpec | string): MiniElement | MiniNode {
+  if (typeof spec === 'string') return parent.appendChild(parent.ownerDocument!.createTextNode(spec))
+  const el = parent.ownerDocument!.createElement(spec.tag)
+  for (const [key, value] of Object.entries(spec.attrs || {})) el.setAttribute(key, value)
+  if (spec.value !== undefined) el.value = spec.value
+  if (spec.onClick) el._onClick = spec.onClick
+  if (spec.text) el.appendChild(parent.ownerDocument!.createTextNode(spec.text))
+  for (const child of spec.children || []) mountSpec(el, child)
+  parent.appendChild(el)
+  return el
+}
+
+function createPageRuntime(options: { url?: string; title?: string; tree?: PageSpec[] } = {}) {
+  const document = new MiniDocument()
+  const html = document.createElement('html')
+  const body = document.createElement('body')
+  html.appendChild(body)
+  html.parentNode = document
+  document.childNodes = [html]
+  document.documentElement = html
+  document.body = body
+  document.title = options.title || 'Shop'
+  document.URL = options.url || 'https://shop.example/'
+  const location = { href: document.URL }
+  const win = {
+    document,
+    location,
+    innerWidth: 1280,
+    innerHeight: 800,
+    _observers: [] as MiniMutationObserver[],
+    Node: { ELEMENT_NODE: 1, TEXT_NODE: 3, DOCUMENT_NODE: 9 },
+    Element: MiniElement,
+    HTMLInputElement: MiniInput,
+    HTMLTextAreaElement: MiniTextArea,
+    MutationObserver: MiniMutationObserver,
+    InputEvent: MiniInputEvent,
+    Event: MiniEvent,
+    performance: { now: () => Date.now(), getEntriesByType: () => [] },
+    crypto: { randomUUID },
+    setTimeout,
+    clearTimeout,
+    getComputedStyle: (el: MiniElement) => ({
+      display: el.hasAttribute('hidden') ? 'none' : 'block',
+      visibility: 'visible',
+      opacity: '1',
+      overflowX: 'visible',
+      overflowY: 'visible',
+    }),
+    elementFromPoint: (x: number, y: number) => walkElements(document.body).reverse().find(el => {
+      const rect = el.getBoundingClientRect()
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+    }) || null,
+  } as MiniWindow
+  document.defaultView = win
+  document.scrollingElement = html
+  Object.assign(html, { scrollTop: 0, scrollHeight: 800, clientHeight: 800, scrollWidth: 1280, clientWidth: 1280, scrollBy() {} })
+  for (const spec of options.tree || []) mountSpec(body, spec)
+  layoutTree(html)
+  const context = vm.createContext(win)
+  context.globalThis = context
+  context.window = context
+  return {
+    window: win,
+    document,
+    evaluate(code: string) {
+      return vm.runInContext(code, context, { timeout: 8000 })
+    },
+    setURL(url: string) {
+      location.href = url
+      document.URL = url
+    },
+    remount(tree: PageSpec[]) {
+      body.childNodes = []
+      for (const spec of tree) mountSpec(body, spec)
+      layoutTree(html)
+    },
+    replace(predicate: (el: MiniElement) => boolean, spec: PageSpec) {
+      const found = walkElements(body).find(predicate)
+      if (!found) throw new Error('replace target missing')
+      const next = document.createElement(spec.tag) as MiniElement
+      for (const [key, value] of Object.entries(spec.attrs || {})) next.setAttribute(key, value)
+      if (spec.text) next.appendChild(document.createTextNode(spec.text))
+      if (spec.onClick) next._onClick = spec.onClick
+      found.replaceWith(next)
+      layoutTree(html)
+      return next
+    },
+  }
+}
+
+function shopTree(extra: PageSpec[] = []): PageSpec[] {
+  return [
+    { tag: 'header', children: [{ tag: 'a', attrs: { href: '/' }, text: 'Home' }] },
+    { tag: 'nav', children: [{ tag: 'a', attrs: { href: '/about' }, text: 'About' }, { tag: 'a', attrs: { href: '/blog' }, text: 'Blog' }] },
+    {
+      tag: 'main',
+      children: [
+        { tag: 'h1', text: 'Catalog' },
+        { tag: 'form', attrs: { 'aria-label': 'Search' }, children: [
+          { tag: 'input', attrs: { type: 'search', 'aria-label': 'Query' } },
+          { tag: 'button', text: 'Go' },
+        ] },
+        { tag: 'button', text: 'Checkout' },
+        ...extra,
+      ],
+    },
+    { tag: 'footer', children: [{ tag: 'a', attrs: { href: '/legal' }, text: 'Legal' }] },
+  ]
+}
+
+async function liveBrowser(tree: PageSpec[] = shopTree(), url = 'https://shop.example/') {
+  const runtime = createPageRuntime({ url, title: 'Shop', tree })
+  const harness = browserHarness()
+  harness.contents.pageRuntime = runtime
+  harness.contents.url = url
+  harness.contents.viewport = { width: 1280, height: 800 }
+  await harness.host.setViewBounds({ x: 0, y: 0, width: 1280, height: 800, visible: true })
+  await harness.host.loadURL(url.replace(/^https?:\/\//, ''))
+  harness.contents.url = url
+  runtime.setURL(url)
+  return { ...harness, runtime }
+}
+
+describe('browser regional observe and stable refs', () => {
+  it('forwards region/role/name/cursor on observe', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.toolAction(asRequest({ action: 'observe', region: 'main', role: 'button', name: 'Go', cursor: '8' }))
+    const injected = String(contents.executeJavaScript.mock.calls.find(([code]) => String(code).includes('__pipiBrowserDOM.dispatch'))?.[0] || '')
+    expect(injected).toContain('"region":"main"')
+    expect(injected).toContain('"role":"button"')
+    expect(injected).toContain('"name":"Go"')
+    expect(injected).toContain('"cursor":"8"')
+  })
+
+  it('returns region summaries by default', async () => {
+    const { host } = await liveBrowser()
+    const observed = await host.toolAction({ action: 'observe' })
+    expect(observed.ok).toBe(true)
+    const regions = observed.regions as Array<{ id: string; name: string; count: number; preview: unknown[] }>
+    expect(regions.map(region => region.id)).toEqual(expect.arrayContaining(['banner', 'navigation', 'main', 'form', 'contentinfo']))
+    const main = regions.find(region => region.id === 'main')
+    expect(main?.count).toBeGreaterThan(0)
+    expect(main?.preview?.length).toBeGreaterThan(0)
+    expect(main?.preview?.length).toBeLessThanOrEqual(3)
+    expect(Array.isArray(observed.elements)).toBe(true)
+    expect(webviewSource).toContain('Default returns region summaries')
+  })
+
+  it('expands a region and filters by role/name', async () => {
+    const { host } = await liveBrowser()
+    const expanded = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    const elements = expanded.elements as Array<{ role: string; name: string; token: string }>
+    expect(elements.some(item => item.name === 'Checkout')).toBe(true)
+    expect((expanded.regions as Array<{ expanded?: boolean; id: string }>).some(region => region.id === 'main' && region.expanded)).toBe(true)
+    const buttons = await host.toolAction(asRequest({ action: 'observe', role: 'button', name: 'Go' }))
+    const filtered = buttons.elements as Array<{ role: string; name: string }>
+    expect(filtered.length).toBeGreaterThan(0)
+    expect(filtered.every(item => item.role === 'button' && item.name.toLowerCase().includes('go'))).toBe(true)
+  })
+
+  it('pages regions with cursor and keeps the 20k budget', async () => {
+    const manyNavs: PageSpec[] = Array.from({ length: 12 }, (_, index) => ({
+      tag: 'nav',
+      attrs: { 'aria-label': `Section ${index}` },
+      children: [{ tag: 'a', attrs: { href: `/${index}` }, text: `Link ${index}` }],
+    }))
+    const { host } = await liveBrowser(manyNavs)
+    const first = await host.toolAction({ action: 'observe' })
+    const firstRegions = first.regions as unknown[]
+    expect(firstRegions.length).toBeLessThanOrEqual(8)
+    expect(first.nextCursor).toBeDefined()
+    const second = await host.toolAction(asRequest({ action: 'observe', cursor: String(first.nextCursor) }))
+    expect((second.regions as unknown[]).length).toBeGreaterThan(0)
+    expect(JSON.stringify(first).length).toBeLessThanOrEqual(20_000)
+  })
+
+  it('relocates a unique same-page remount and marks relocated', async () => {
+    const { host, runtime } = await liveBrowser()
+    const expanded = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    const checkout = (expanded.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Checkout')
+    expect(checkout?.token).toBeTruthy()
+    runtime.replace(el => el.localName === 'button' && el.textContent === 'Checkout', { tag: 'button', text: 'Checkout' })
+    const clicked = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: checkout!.token,
+    })
+    expect(clicked).toMatchObject({ ok: true, relocated: true })
+  })
+
+  it('does not relocate a unique remount that sits outside the viewport', async () => {
+    const { host, runtime } = await liveBrowser()
+    const expanded = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    const checkout = (expanded.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Checkout')
+    const next = runtime.replace(el => el.localName === 'button' && el.textContent === 'Checkout', { tag: 'button', text: 'Checkout' })
+    next._rect = { x: 8, y: 4000, left: 8, top: 4000, width: 200, height: 20, right: 208, bottom: 4020 }
+    const failed = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: checkout!.token,
+    })
+    expect(failed).toMatchObject({ ok: false, code: 'stale_browser_snapshot' })
+    expect(String(failed.error)).toMatch(/could not be relocated|URL changed|multiple candidates/i)
+  })
+
+  it('refuses to relocate when multiple same-name controls remain', async () => {
+    const { host, runtime } = await liveBrowser([
+      ...shopTree(),
+      { tag: 'main', children: [{ tag: 'button', text: 'Save' }, { tag: 'button', text: 'Save' }] },
+    ])
+    const expanded = await host.toolAction(asRequest({ action: 'observe', role: 'button', name: 'Save' }))
+    const first = (expanded.elements as Array<{ name: string; token: string }>)[0]
+    const save = walkElements(runtime.document.body).find(el => el.localName === 'button' && el.textContent === 'Save')
+    save?.remove()
+    const failed = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: first.token,
+    })
+    expect(failed).toMatchObject({ ok: false, code: 'stale_browser_snapshot' })
+    expect(String(failed.error)).toMatch(/multiple candidates|could not be relocated/i)
+  })
+
+  it('does not relocate after the document URL changes', async () => {
+    const { host, runtime } = await liveBrowser()
+    const expanded = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    const checkout = (expanded.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Checkout')
+    runtime.setURL('https://shop.example/cart')
+    const failed = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: checkout!.token,
+    })
+    expect(failed).toMatchObject({ ok: false, code: 'stale_browser_snapshot' })
+    expect(String(failed.error)).toMatch(/URL changed/i)
+  })
+
+  it('attaches a compressed mutation summary after a click', async () => {
+    const { host } = await liveBrowser(shopTree([
+      {
+        tag: 'button',
+        text: 'Open dialog',
+        onClick(_el, win) {
+          const dialog = win.document.createElement('dialog')
+          dialog.setAttribute('role', 'dialog')
+          dialog.setAttribute('open', '')
+          dialog.appendChild(win.document.createTextNode('Confirm purchase'))
+          win.document.body.appendChild(dialog)
+        },
+      },
+    ]))
+    const expanded = await host.toolAction(asRequest({ action: 'observe', role: 'button', name: 'open dialog' }))
+    const button = (expanded.elements as Array<{ name: string; token: string }>)[0]
+    const clicked = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: button.token,
+    })
+    expect(clicked.ok).toBe(true)
+    expect(clicked.mutation).toEqual(expect.objectContaining({
+      added: expect.any(Number),
+      removed: expect.any(Number),
+      attributes: expect.any(Number),
+      urlChanged: false,
+    }))
+    expect((clicked.mutation as { added: number }).added).toBeGreaterThan(0)
+    expect((clicked.mutation as { dialogs: string[] }).dialogs.join(' ')).toMatch(/Confirm purchase|dialog/i)
+  })
+
+  it('reports mutation magnitudes instead of exact counts when over budget', async () => {
+    const { host } = await liveBrowser(shopTree([
+      {
+        tag: 'button',
+        text: 'Burst',
+        onClick(_el, win) {
+          for (let index = 0; index < 100; index += 1) {
+            const node = win.document.createElement('div')
+            node.appendChild(win.document.createTextNode(`row-${index}`))
+            win.document.body.appendChild(node)
+          }
+        },
+      },
+    ]))
+    const expanded = await host.toolAction(asRequest({ action: 'observe', role: 'button', name: 'burst' }))
+    const button = (expanded.elements as Array<{ name: string; token: string }>)[0]
+    const clicked = await host.toolAction({
+      action: 'click',
+      snapshot_id: String(expanded.snapshotID),
+      element_token: button.token,
+    })
+    expect(clicked.ok).toBe(true)
+    const mutation = clicked.mutation as { added: unknown; removed: unknown; attributes: unknown; dialogs: unknown; truncated?: boolean; samples?: unknown }
+    expect(mutation.truncated).toBe(true)
+    expect(mutation.added).toBe('many')
+    expect(['none', 'few', 'some', 'many']).toContain(mutation.removed)
+    expect(['none', 'few', 'some', 'many']).toContain(mutation.attributes)
+    expect(mutation.samples).toBeUndefined()
+    expect(JSON.stringify(mutation)).not.toMatch(/"added":\s*100/)
+  })
+
+  it('redacts secrets in the regional observe envelope', async () => {
+    const secret = 's3cret-token-zz'
+    const { host } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          { tag: 'input', attrs: { type: 'password', 'aria-label': 'Password' }, value: secret },
+          { tag: 'button', text: secret },
+        ],
+      },
+    ])
+    const observed = await host.toolAction({ action: 'observe' })
+    expect(JSON.stringify(observed)).not.toContain(secret)
+    expect(JSON.stringify(observed)).toContain('[redacted]')
+    const expanded = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    expect(JSON.stringify(expanded)).not.toContain(secret)
+  })
+
+  it('keeps target=both regional observations viewport-scoped', async () => {
+    const { host, created } = multiViewHarness()
+    const desktopRuntime = createPageRuntime({ url: 'https://shop.example/', title: 'Shop', tree: shopTree() })
+    const mobileRuntime = createPageRuntime({ url: 'https://shop.example/', title: 'Shop', tree: shopTree() })
+    await host.setViewBounds(asBounds({
+      x: 10, y: 20, width: 700, height: 500, visible: true, mode: 'desktop',
+      mobileOverlay: { visible: true, applyDeviceEmulation: true },
+    }))
+    created[0].contents.pageRuntime = desktopRuntime
+    created[1].contents.pageRuntime = mobileRuntime
+    await host.loadURL('shop.example')
+    desktopRuntime.setURL('https://shop.example/')
+    mobileRuntime.setURL('https://shop.example/')
+    const both = await host.toolAction(asRequest({ action: 'observe', target: 'both' }))
+    expect(both).toMatchObject({ ok: true, target: 'both' })
+    expect(both.desktop).toMatchObject({ viewportTarget: 'desktop' })
+    expect(both.mobile).toMatchObject({ viewportTarget: 'mobile' })
+    expect(String((both.desktop as { snapshotID: string }).snapshotID)).toMatch(/^desktop:/)
+    expect(String((both.mobile as { snapshotID: string }).snapshotID)).toMatch(/^mobile:/)
+    const desktopPreview = ((both.desktop as { regions: Array<{ preview: Array<{ token: string }> }> }).regions[0]?.preview || [])[0]
+    const mobilePreview = ((both.mobile as { regions: Array<{ preview: Array<{ token: string }> }> }).regions[0]?.preview || [])[0]
+    expect(desktopPreview?.token).toMatch(/^desktop:/)
+    expect(mobilePreview?.token).toMatch(/^mobile:/)
   })
 })
