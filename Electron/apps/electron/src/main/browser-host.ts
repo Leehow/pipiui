@@ -555,11 +555,11 @@ export class BrowserTabsHost {
       if (request.action === 'navigate') {
         if (!request.url) return { ok: false, error: 'browser navigate requires url' }
         await this.loadURLForTool(request.url)
-        return this.observeTargets(resolved.kinds, request.scope ?? 'viewport')
+        return this.observeTargets(resolved.kinds, request)
       }
-      if (request.action === 'back') { await this.goBack(); if (this.active) await this.show(this.active, 'history', true); return this.observeTargets(resolved.kinds, request.scope ?? 'viewport') }
-      if (request.action === 'forward') { await this.goForward(); if (this.active) await this.show(this.active, 'history', true); return this.observeTargets(resolved.kinds, request.scope ?? 'viewport') }
-      if (request.action === 'reload') { if (this.active) await this.show(this.active, 'reload', true); return this.observeTargets(resolved.kinds, request.scope ?? 'viewport') }
+      if (request.action === 'back') { await this.goBack(); if (this.active) await this.show(this.active, 'history', true); return this.observeTargets(resolved.kinds, request) }
+      if (request.action === 'forward') { await this.goForward(); if (this.active) await this.show(this.active, 'history', true); return this.observeTargets(resolved.kinds, request) }
+      if (request.action === 'reload') { if (this.active) await this.show(this.active, 'reload', true); return this.observeTargets(resolved.kinds, request) }
       if (request.action === 'screenshot') return this.screenshotTargets(resolved.kinds)
       if (request.action === 'type') {
         if (request.selector) return this.selectorAction({ ...request, action: 'input', mode: 'append' }, resolved.kinds[0])
@@ -577,7 +577,7 @@ export class BrowserTabsHost {
       if (request.action === 'console') return this.consoleAction(request, resolved.kinds[0])
       if (request.action === 'content') return this.contentAction(request, resolved.kinds[0])
       if (['observe', 'click', 'input', 'select', 'scroll'].includes(request.action)) {
-        if (request.action === 'observe') return this.observeTargets(resolved.kinds, request.scope ?? 'viewport')
+        if (request.action === 'observe') return this.observeTargets(resolved.kinds, request)
         return this.domActionOn(request, resolved.kinds[0])
       }
       return this.debugEnvelope(request, { ok: false, code: 'unknown_action', error: `unknown browser action: ${request.action}` })
@@ -682,23 +682,41 @@ export class BrowserTabsHost {
     return next
   }
 
-  private tagObservation(result: BrowserToolResult, kind: BrowserViewportKind): BrowserToolResult {
-    const snapshotID = typeof result.snapshotID === 'string' ? tagBrowserSnapshotId(result.snapshotID, kind) : result.snapshotID
-    const elements = Array.isArray(result.elements)
-      ? result.elements.map(element => {
-          if (!element || typeof element !== 'object') return element
-          const record = element as { token?: unknown }
-          if (typeof record.token !== 'string') return element
-          return { ...record, token: tagBrowserSnapshotId(record.token, kind) }
-        })
-      : result.elements
-    return { ...result, snapshotID, elements, viewportTarget: kind }
+  private tagObservationTokens(value: unknown, kind: BrowserViewportKind): unknown {
+    if (Array.isArray(value)) return value.map(item => this.tagObservationTokens(item, kind))
+    if (!value || typeof value !== 'object') return value
+    const record = value as Record<string, unknown>
+    const next: Record<string, unknown> = { ...record }
+    if (typeof next.token === 'string') next.token = tagBrowserSnapshotId(next.token, kind)
+    if (Array.isArray(next.elements)) next.elements = this.tagObservationTokens(next.elements, kind) as unknown[]
+    if (Array.isArray(next.preview)) next.preview = this.tagObservationTokens(next.preview, kind) as unknown[]
+    if (Array.isArray(next.regions)) next.regions = this.tagObservationTokens(next.regions, kind) as unknown[]
+    return next
   }
 
-  private async observeTargets(kinds: BrowserViewportKind[], scope: string): Promise<BrowserToolResult> {
-    if (kinds.length === 1) return this.domActionOn({ action: 'observe', scope }, kinds[0])
-    const desktop = this.tagObservation(await this.domActionOn({ action: 'observe', scope }, 'desktop'), 'desktop')
-    const mobile = this.tagObservation(await this.domActionOn({ action: 'observe', scope }, 'mobile'), 'mobile')
+  private observePayload(request: Record<string, unknown> | { scope?: string }): Record<string, unknown> {
+    const record = request as Record<string, unknown>
+    return {
+      action: 'observe',
+      scope: typeof record.scope === 'string' ? record.scope : 'viewport',
+      ...(typeof record.region === 'string' ? { region: record.region } : {}),
+      ...(typeof record.role === 'string' ? { role: record.role } : {}),
+      ...(typeof record.name === 'string' ? { name: record.name } : {}),
+      ...(record.cursor !== undefined && record.cursor !== null ? { cursor: record.cursor } : {}),
+    }
+  }
+
+  private tagObservation(result: BrowserToolResult, kind: BrowserViewportKind): BrowserToolResult {
+    const tagged = this.tagObservationTokens(result, kind) as BrowserToolResult
+    const snapshotID = typeof tagged.snapshotID === 'string' ? tagBrowserSnapshotId(tagged.snapshotID, kind) : tagged.snapshotID
+    return { ...tagged, snapshotID, viewportTarget: kind }
+  }
+
+  private async observeTargets(kinds: BrowserViewportKind[], request: Record<string, unknown> | { scope?: string } = {}): Promise<BrowserToolResult> {
+    const payload = this.observePayload(request)
+    if (kinds.length === 1) return this.domActionOn(payload, kinds[0])
+    const desktop = this.tagObservation(await this.domActionOn(payload, 'desktop'), 'desktop')
+    const mobile = this.tagObservation(await this.domActionOn(payload, 'mobile'), 'mobile')
     const ok = desktop.ok === true && mobile.ok === true
     return {
       ok,
