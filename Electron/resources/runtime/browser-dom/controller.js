@@ -37,6 +37,9 @@
     snapshotID: 128,
     description: 256,
     region: 160,
+    content: 100000,
+    result: 100000,
+    resultJson: 100000,
   });
 
   const state = {
@@ -483,6 +486,55 @@
 
   function retainCurrentSensitiveValues() {
     return retainRedactions(collectCurrentSensitiveValues());
+  }
+
+  function looksLikeAbsoluteURL(value) {
+    const raw = String(value ?? "");
+    return /^(?:https?:|about:)\/\//i.test(raw) || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/\S+$/.test(raw);
+  }
+
+  function redactEmbeddedURLs(value) {
+    const raw = String(value ?? "");
+    const rawHref = String(location.href || "");
+    const cleanHref = redactURLForObservation(rawHref);
+    let next = raw;
+    if (rawHref && cleanHref !== rawHref) {
+      next = next.split(rawHref).join(cleanHref);
+      const escapedHref = rawHref.replace(/&/g, "&amp;");
+      const escapedClean = cleanHref.replace(/&/g, "&amp;");
+      if (escapedHref !== rawHref) next = next.split(escapedHref).join(escapedClean);
+    }
+    next = next.replace(/https?:\/\/[^\s"'<>]+/gi, (match) => {
+      const encodedAmp = match.includes("&amp;");
+      const decoded = encodedAmp ? match.replace(/&amp;/g, "&") : match;
+      const cleaned = redactURLForObservation(decoded);
+      if (cleaned === decoded) return match;
+      return encodedAmp ? cleaned.replace(/&/g, "&amp;") : cleaned;
+    });
+    return next;
+  }
+
+  function prepareBypassURLs(value, key = "") {
+    if (typeof value === "string") {
+      if (key === "url" || key === "href" || looksLikeAbsoluteURL(value)) {
+        return redactURLForObservation(redactEmbeddedURLs(value));
+      }
+      return redactEmbeddedURLs(value);
+    }
+    if (Array.isArray(value)) return value.map((item) => prepareBypassURLs(item, key));
+    if (value && typeof value === "object") {
+      const result = {};
+      for (const [childKey, childValue] of Object.entries(value)) {
+        result[childKey] = prepareBypassURLs(childValue, childKey);
+      }
+      return result;
+    }
+    return value;
+  }
+
+  function sanitizeBypassOutput(value) {
+    if (!retainCurrentSensitiveValues()) return redactionCapacityFailure();
+    return sanitizePublic(prepareBypassURLs(value), activeRedactionVariants());
   }
 
   function isSelfHidden(element) {
@@ -1068,6 +1120,13 @@
   }
 
   function validateEntry(entry, invalidateOnFailure = true) {
+    if (entry && entry.locatorResolved) {
+      const element = entry.element;
+      if (!element || !element.isConnected || isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)) {
+        return failure("The requested element is now hidden or disabled.", "browser_target_not_actionable");
+      }
+      return null;
+    }
     const snapshot = state.activeSnapshot;
     if (!snapshot) return stale("The document changed; observe again.");
     if (snapshot.url !== String(location.href)) {
@@ -1114,30 +1173,282 @@
     return null;
   }
 
-  function resolveTarget(params) {
-    const snapshot = state.activeSnapshot;
-    if (!snapshot || typeof params.snapshot_id !== "string" || params.snapshot_id !== snapshot.id) {
-      return { error: stale("The browser snapshot is stale; observe again.") };
+  function hasLocatorParam(params) {
+    return Boolean(params) && params.locator != null && typeof params.locator === "object" && !Array.isArray(params.locator);
+  }
+
+  function forEachElement(visitor) {
+    function walk(root, iframeDepth) {
+      const children = root.nodeType === Node.DOCUMENT_NODE
+        ? (root.documentElement ? [root.documentElement] : [])
+        : Array.from(root.children || []);
+      for (const current of children) {
+        visitor(current);
+        if (current.shadowRoot) walk(current.shadowRoot, iframeDepth);
+        if (current.localName === "iframe" && iframeDepth < 1) {
+          try {
+            const childDocument = current.contentDocument;
+            if (childDocument && childDocument.documentElement) walk(childDocument, iframeDepth + 1);
+          } catch (_) {}
+        }
+        walk(current, iframeDepth);
+      }
     }
-    if (snapshot.url !== String(location.href)) {
-      return { error: stale("The document URL changed; observe again.") };
+    walk(document, 0);
+  }
+
+  function visibleText(element) {
+    return ownVisibleText(element) || normalizedText(element.textContent);
+  }
+
+  function namesEqual(actual, expected) {
+    return normalizedText(actual).toLowerCase() === normalizedText(expected).toLowerCase();
+  }
+
+  function uniqueElements(elements) {
+    const seen = new Set();
+    const out = [];
+    for (const element of elements) {
+      if (!element || seen.has(element)) continue;
+      seen.add(element);
+      out.push(element);
     }
+    return out;
+  }
+
+  function locatorCandidate(element) {
+    return {
+      role: role(element) || "",
+      tag: element.localName || "",
+      name: accessibleName(element) || "",
+    };
+  }
+
+  function firstCandidateObjects(elements, limit) {
+    return uniqueElements(elements).slice(0, limit || 5).map(locatorCandidate);
+  }
+
+  function nearbyLocatorCandidates(preferredRole) {
+    const collected = collect("page");
+    const candidates = collected.candidates || [];
+    const want = normalizedText(preferredRole).toLowerCase();
+    const preferred = want
+      ? candidates.filter((candidate) => String(candidate.public && candidate.public.role || "").toLowerCase() === want)
+      : candidates;
+    const source = preferred.length ? preferred : candidates;
+    return source.slice(0, 5).map((candidate) => {
+      const pub = candidate.public || {};
+      return { role: pub.role || "", tag: pub.tag || "", name: pub.name || "" };
+    });
+  }
+
+  function isActionable(element) {
+    if (!element || !element.isConnected) return false;
+    if (isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)) return false;
+    return isInteractive(element, role(element));
+  }
+
+  function entryFromElement(element) {
+    const currentRole = role(element);
+    const currentName = accessibleName(element);
+    const frame = "main";
+    return {
+      element: element,
+      ownerDocument: element.ownerDocument,
+      rootNode: element.getRootNode(),
+      owningFrameElement: owningFrameElement(element.ownerDocument),
+      frame: frame,
+      fingerprint: fingerprint(element, frame, currentRole, currentName),
+      public: {
+        tag: element.localName,
+        role: currentRole,
+        name: currentName,
+      },
+      locatorResolved: true,
+    };
+  }
+
+  function parseLocator(locator) {
+    if (!locator || typeof locator !== "object" || Array.isArray(locator)) {
+      return { error: failure("locator must be an object {role,name} | {label} | {text} | {css}.", "invalid_browser_target") };
+    }
+    const roleValue = typeof locator.role === "string" ? locator.role.trim() : "";
+    const nameValue = typeof locator.name === "string" ? locator.name.trim() : "";
+    const labelValue = typeof locator.label === "string" ? locator.label.trim() : "";
+    const textValue = typeof locator.text === "string" ? locator.text.trim() : "";
+    const cssValue = typeof locator.css === "string" ? locator.css.trim() : "";
+    if (nameValue && !roleValue) {
+      return { error: failure("locator.name requires locator.role.", "invalid_browser_target") };
+    }
+    const kinds = [Boolean(roleValue), Boolean(labelValue), Boolean(textValue), Boolean(cssValue)].filter(Boolean).length;
+    if (kinds !== 1) {
+      return { error: failure("locator requires exactly one of role, label, text, or css.", "invalid_browser_target") };
+    }
+    let nth;
+    if (locator.nth !== undefined && locator.nth !== null) {
+      if (!Number.isInteger(locator.nth) || locator.nth < 0) {
+        return { error: failure("locator.nth must be a non-negative integer.", "invalid_browser_target") };
+      }
+      nth = locator.nth;
+    }
+    return {
+      spec: {
+        role: roleValue,
+        name: nameValue,
+        label: labelValue,
+        text: textValue,
+        css: cssValue,
+        nth: nth,
+      },
+    };
+  }
+
+  function matchLocatorElements(spec) {
+    if (spec.css) {
+      try {
+        return Array.from(document.querySelectorAll(spec.css) || []);
+      } catch (_) {
+        return { error: failure("Invalid CSS selector.", "invalid_browser_target") };
+      }
+    }
+    const matches = [];
+    forEachElement((element) => {
+      if (spec.role) {
+        if (role(element).toLowerCase() !== spec.role.toLowerCase()) return;
+        if (spec.name && !namesEqual(accessibleName(element), spec.name)) return;
+        matches.push(element);
+        return;
+      }
+      if (spec.text) {
+        if (visibleText(element).toLowerCase() === spec.text.toLowerCase()) matches.push(element);
+        return;
+      }
+      if (!spec.label) return;
+      if (element.localName === "label") {
+        if (!namesEqual(element.textContent, spec.label)) return;
+        const htmlFor = element.htmlFor || element.getAttribute("for");
+        if (htmlFor) {
+          const control = element.ownerDocument && element.ownerDocument.getElementById(htmlFor);
+          if (control) matches.push(control);
+          return;
+        }
+        const nested = element.querySelector && element.querySelector("input,textarea,select,button");
+        if (nested) matches.push(nested);
+        else matches.push(element);
+        return;
+      }
+      const aria = normalizedText(element.getAttribute("aria-label"));
+      if (aria && namesEqual(aria, spec.label)) {
+        matches.push(element);
+        return;
+      }
+      const labelled = referencedText(element, "aria-labelledby");
+      if (labelled && namesEqual(labelled, spec.label)) {
+        matches.push(element);
+        return;
+      }
+      const associated = associatedLabels(element).some((label) => namesEqual(label.textContent, spec.label));
+      if (associated) matches.push(element);
+    });
+    const unique = uniqueElements(matches);
+    return spec.text ? dropAncestorMatches(unique) : unique;
+  }
+
+  function dropAncestorMatches(elements) {
+    return elements.filter((element) => !elements.some((other) => other !== element && composedContains(element, other)));
+  }
+
+  function resolveLocator(locator) {
+    const parsed = parseLocator(locator);
+    if (parsed.error) return { error: parsed.error };
+    const spec = parsed.spec;
+    const matched = matchLocatorElements(spec);
+    if (matched.error) return { error: matched.error };
+    const elements = matched;
+    if (elements.length === 0) {
+      const candidates = nearbyLocatorCandidates(spec.role);
+      return {
+        error: failure(
+          "locator matched 0 elements. Candidates: " + JSON.stringify(candidates),
+          "browser_locator_not_found",
+          false,
+          { candidates: candidates },
+        ),
+      };
+    }
+    let chosen = elements;
+    if (spec.nth !== undefined) {
+      if (spec.nth >= elements.length) {
+        const candidates = firstCandidateObjects(elements);
+        return {
+          error: failure(
+            "locator.nth " + spec.nth + " is out of range (" + elements.length + " matches); add name to disambiguate or pass a valid nth. Candidates: " + JSON.stringify(candidates),
+            "browser_locator_ambiguous",
+            false,
+            { candidates: candidates },
+          ),
+        };
+      }
+      chosen = [elements[spec.nth]];
+    } else if (elements.length > 1) {
+      const candidates = firstCandidateObjects(elements);
+      return {
+        error: failure(
+          "locator matched " + elements.length + " elements; add name to disambiguate or pass nth. Candidates: " + JSON.stringify(candidates),
+          "browser_locator_ambiguous",
+          false,
+          { candidates: candidates },
+        ),
+      };
+    }
+    const element = chosen[0];
+    if (!isActionable(element)) {
+      return {
+        error: failure(
+          "The requested element is hidden, disabled, or not interactive.",
+          "browser_target_not_actionable",
+        ),
+      };
+    }
+    return { entry: entryFromElement(element) };
+  }
+
+  function resolveTarget(params, options) {
     const hasIndex = Number.isInteger(params.element_index);
     const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
+    const hasLocator = hasLocatorParam(params);
+    if (hasLocator && (hasIndex || hasToken)) {
+      return { error: failure("Provide exactly one of element_index, element_token, or locator.", "invalid_browser_target") };
+    }
+    if (hasLocator) return resolveLocator(params.locator);
+    const preserveSnapshot = options?.preserveSnapshot === true;
+    const miss = (message) => (
+      preserveSnapshot
+        ? { error: failure(message, "stale_browser_snapshot", true) }
+        : { error: stale(message) }
+    );
+    const snapshot = state.activeSnapshot;
+    if (!snapshot || typeof params.snapshot_id !== "string" || params.snapshot_id !== snapshot.id) {
+      return miss("The browser snapshot is stale; observe again.");
+    }
+    if (snapshot.url !== String(location.href)) {
+      return miss("The document URL changed; observe again.");
+    }
     if (hasIndex === hasToken) {
       return { error: failure("Provide exactly one of element_index or element_token.", "invalid_browser_target") };
     }
     let entry = null;
     if (hasToken) entry = snapshot.map.get(params.element_token) || null;
     else entry = Array.from(snapshot.map.values()).find((candidate) => candidate.index === params.element_index) || null;
-    if (!entry) return { error: stale("The requested element is no longer in the active snapshot.") };
+    if (!entry) return miss("The requested element is no longer in the active snapshot.");
     const validationError = validateEntry(entry, false);
     if (!validationError) return { entry };
     const relocated = tryRelocate(entry);
     if (relocated?.ambiguous) {
-      return { error: stale("The requested element matched multiple candidates; observe again.") };
+      return miss("The requested element matched multiple candidates; observe again.");
     }
     if (!relocated) {
+      if (preserveSnapshot) return { error: validationError };
       return { error: validationError.code === "stale_browser_snapshot"
         ? stale("The requested element could not be relocated; observe again.")
         : validationError };
@@ -1150,6 +1461,157 @@
     };
     snapshot.map.set(entry.token, next);
     return { entry: next, relocated: true };
+  }
+
+  const MAX_FILL_FIELDS = 32;
+
+  function formFieldLocator(field) {
+    if (field.locator && typeof field.locator === "object" && !Array.isArray(field.locator)) {
+      return field.locator;
+    }
+    const flat = {
+      role: field.role,
+      name: field.name,
+      label: field.label,
+      text: field.text,
+      css: field.css,
+      nth: field.nth,
+    };
+    const hasFlat = [flat.role, flat.label, flat.text, flat.css].some((value) => typeof value === "string" && value.trim());
+    return hasFlat ? flat : null;
+  }
+
+  function fieldErrorCode(result) {
+    if (!result || typeof result !== "object") return "browser_action_failed";
+    if (typeof result.code === "string" && result.code) return result.code;
+    if (typeof result.error === "string" && result.error) return result.error;
+    return "browser_action_failed";
+  }
+
+  function resolveFormField(field, snapshotId) {
+    if (!field || typeof field !== "object") {
+      return { error: failure("Each fill_form field must be an object.", "invalid_browser_input") };
+    }
+    const hasToken = typeof field.element_token === "string" && field.element_token.length > 0;
+    const hasIndex = Number.isInteger(field.element_index);
+    const loc = formFieldLocator(field);
+    if ((hasToken || hasIndex) && loc) {
+      return { error: failure("Provide exactly one of element_index, element_token, or locator.", "invalid_browser_target") };
+    }
+    if (hasToken || hasIndex) {
+      return resolveTarget({
+        snapshot_id: typeof field.snapshot_id === "string" ? field.snapshot_id : snapshotId,
+        element_token: hasToken ? field.element_token : undefined,
+        element_index: hasIndex ? field.element_index : undefined,
+      }, { preserveSnapshot: true });
+    }
+    if (loc) return resolveLocator(loc);
+    return { error: failure("Each field needs element_token or a locator (role+name / label / text / css).", "invalid_browser_target") };
+  }
+
+  function fillControl(element, value, fieldType) {
+    const kind = String(fieldType || "input").toLowerCase();
+    if (element.localName === "input" && (element.getAttribute("type") || "").toLowerCase() === "file") {
+      return { ok: false, error: "file_input_not_supported" };
+    }
+    if (kind === "select" || element.localName === "select") {
+      if (element.localName !== "select") return { ok: false, error: "unsupported_browser_action" };
+      const option = Array.from(element.options || []).find((candidate) => (
+        candidate.label === value || candidate.value === value || normalizedText(candidate.textContent) === value
+      ));
+      if (!option) return { ok: false, error: "option_not_found" };
+      element.value = option.value;
+      option.selected = true;
+      element.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      element.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return { ok: true };
+    }
+    if (!dispatchBeforeInput(element, value)) {
+      return { ok: false, error: "browser_input_cancelled" };
+    }
+    if (isSensitive(element)) return { ok: false, error: "user_handoff_required" };
+    if (element.localName === "input" || element.localName === "textarea") {
+      nativeValueSetter(element, value);
+    } else if (element.isContentEditable) {
+      element.textContent = value;
+    } else {
+      return { ok: false, error: "unsupported_browser_action" };
+    }
+    dispatchInputEvents(element, value);
+    return { ok: true };
+  }
+
+  function fillOneField(field, index, snapshotId) {
+    if (!field || typeof field !== "object") {
+      return { index, ok: false, error: "invalid_browser_input" };
+    }
+    if (typeof field.value !== "string") {
+      return { index, ok: false, error: "invalid_browser_input" };
+    }
+    if (!retainRedactions([field.value])) {
+      return { index, ok: false, error: "browser_redaction_capacity_exceeded" };
+    }
+    const resolved = resolveFormField(field, snapshotId);
+    if (resolved?.error) {
+      return { index, ok: false, error: fieldErrorCode(resolved.error) };
+    }
+    const entry = resolved.entry;
+    const element = entry?.element;
+    if (!element) return { index, ok: false, error: "stale_browser_snapshot" };
+    if (isSensitive(element)) {
+      return { index, ok: false, error: "user_handoff_required" };
+    }
+    const hit = clickCenter(element);
+    if (hit.kind !== "clear") {
+      return { index, ok: false, error: "browser_target_obscured" };
+    }
+    highlight(element);
+    element.focus?.({ preventScroll: true });
+    if (isSensitive(element)) {
+      return { index, ok: false, error: "user_handoff_required" };
+    }
+    if (entry.fingerprint && state.activeSnapshot) {
+      const postFocusError = validateEntry(entry, false);
+      if (postFocusError) return { index, ok: false, error: fieldErrorCode(postFocusError) };
+    }
+    const written = fillControl(element, field.value, field.type);
+    if (!written.ok) return { index, ok: false, error: written.error || "browser_action_failed" };
+    const extra = resolved.relocated === true || entry.relocated === true ? { relocated: true } : {};
+    return { index, ok: true, ...extra };
+  }
+
+  function fillForm(params) {
+    const fields = Array.isArray(params?.fields) ? params.fields : null;
+    if (!fields || fields.length === 0) {
+      return failure("fill_form requires a non-empty fields array.", "invalid_browser_input");
+    }
+    if (fields.length > MAX_FILL_FIELDS) {
+      return failure(`fill_form supports at most ${MAX_FILL_FIELDS} fields.`, "invalid_browser_input");
+    }
+    beginMutationWindow();
+    const snapshotId = typeof params.snapshot_id === "string" ? params.snapshot_id : "";
+    const results = [];
+    let filled = 0;
+    let failed = 0;
+    for (let index = 0; index < fields.length; index += 1) {
+      let outcome;
+      try {
+        outcome = fillOneField(fields[index], index, snapshotId);
+      } catch (_) {
+        outcome = { index, ok: false, error: "browser_action_failed" };
+      }
+      results.push(outcome);
+      if (outcome.ok) filled += 1;
+      else failed += 1;
+    }
+    if (filled > 0) invalidateSnapshot();
+    return attachMutation({
+      ok: true,
+      filled,
+      failed,
+      results,
+      action: { kind: "fill_form", filled, failed },
+    });
   }
 
   function resolveElement(token) {
@@ -1552,7 +2014,9 @@
     const action = String(params?.action || "");
     const scope = params?.scope === "page" ? "page" : "viewport";
     ensureMutationObserver();
+    if (action === "sanitize") return sanitizeBypassOutput(params.value);
     if (action === "observe") return observe(scope, params.action_metadata || null, [], params);
+    if (action === "fill_form") return fillForm(params);
     if (action === "wait_check") return waitCheck(params, scope);
     if (action === "clear") {
       invalidateSnapshot();

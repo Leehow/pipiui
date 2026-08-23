@@ -204,7 +204,7 @@ const BROWSER_DESKTOP_VIEWPORT = { width: 1280, height: 800 } as const
 const BROWSER_MOBILE_VIEWPORT = { width: 390, height: 844 } as const
 const DEFAULT_MOBILE_DEVICE: BrowserMobileDevice = { width: 390, height: 844, deviceScaleFactor: 2 }
 const defaultPartition = 'persist:pipiui-browser'
-const unsafeBothActions = new Set(['click', 'input', 'type', 'select', 'scroll', 'eval', 'content', 'console', 'wait'])
+const unsafeBothActions = new Set(['click', 'input', 'type', 'select', 'fill_form', 'scroll', 'eval', 'content', 'console', 'wait'])
 
 export function browserViewportPreset(kind: BrowserViewportKind, device: BrowserMobileDevice = DEFAULT_MOBILE_DEVICE): { width: number; height: number } {
   return kind === 'mobile' ? { width: device.width, height: device.height } : BROWSER_DESKTOP_VIEWPORT
@@ -225,6 +225,11 @@ function requestTarget(request: BrowserToolRequest): unknown {
 function requestElementToken(request: BrowserToolRequest): string | undefined {
   const token = (request as BrowserToolRequest & { element_token?: unknown }).element_token
   return typeof token === 'string' ? token : undefined
+}
+
+function hasStructuredLocator(request: BrowserToolRequest): boolean {
+  const locator = (request as BrowserToolRequest & { locator?: unknown }).locator
+  return Boolean(locator) && typeof locator === 'object' && !Array.isArray(locator)
 }
 
 function boundsMode(bounds: BrowserViewBounds): unknown {
@@ -565,18 +570,18 @@ export class BrowserTabsHost {
         if (request.selector) return this.selectorAction({ ...request, action: 'input', mode: 'append' }, resolved.kinds[0])
         return this.domActionOn({ ...request, action: 'input', text: request.text ?? '' }, resolved.kinds[0])
       }
-      if (request.selector && (request.action === 'click' || request.action === 'input')) {
+      if (request.selector && !hasStructuredLocator(request) && (request.action === 'click' || request.action === 'input')) {
         return this.selectorAction(request, resolved.kinds[0])
       }
       // eval/content run against the live page directly; the structured DOM
-      // controller only models observe/click/input/select/scroll, so routing
+      // controller only models observe/click/input/select/scroll/fill_form, so routing
       // these through domAction would surface "unsupported browser action".
       if (request.action === 'eval') return this.evalAction(request, resolved.kinds[0])
       if (request.action === 'script') return this.scriptAction(request, resolved.kinds[0])
       if (request.action === 'wait') return this.waitAction(request, resolved.kinds[0])
       if (request.action === 'console') return this.consoleAction(request, resolved.kinds[0])
       if (request.action === 'content') return this.contentAction(request, resolved.kinds[0])
-      if (['observe', 'click', 'input', 'select', 'scroll'].includes(request.action)) {
+      if (['observe', 'click', 'input', 'select', 'scroll', 'fill_form'].includes(request.action)) {
         if (request.action === 'observe') return this.observeTargets(resolved.kinds, request)
         return this.domActionOn(request, resolved.kinds[0])
       }
@@ -679,6 +684,14 @@ export class BrowserTabsHost {
     const next = { ...request }
     if (snapshot.kind === kind) next.snapshot_id = snapshot.id
     if (token.kind === kind) next.element_token = token.id
+    if (Array.isArray(request.fields)) {
+      next.fields = request.fields.map(field => {
+        if (!field || typeof field !== 'object') return field
+        const record = field as Record<string, unknown>
+        const fieldToken = parseBrowserSnapshotTarget(typeof record.element_token === 'string' ? record.element_token : undefined)
+        return fieldToken.kind === kind ? { ...record, element_token: fieldToken.id } : field
+      })
+    }
     return next
   }
 
@@ -778,9 +791,9 @@ export class BrowserTabsHost {
     if (typeof request.js !== 'string' || request.js.length === 0) return { ok: false, error: 'browser eval requires js' }
     try {
       const result = await execute.call(pane.view!.webContents, request.js)
-      return { ok: true, result, viewportTarget: kind }
+      return this.sanitizeBypassResult(pane, kind, { ok: true, result, viewportTarget: kind })
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      return this.sanitizeBypassResult(pane, kind, { ok: false, error: error instanceof Error ? error.message : String(error), viewportTarget: kind })
     }
   }
 
@@ -809,11 +822,12 @@ export class BrowserTabsHost {
     const requestId = requestIdOf(request as { requestID?: unknown; requestId?: unknown })
     const wrapped = buildScriptWrapper(request.js, requestId, BROWSER_SCRIPT_DEADLINE_MS)
     const source = `${this.controllerPrelude()};${wrapped.source}`
+    const finish = (extra: Record<string, unknown>) => this.sanitizeBypassResult(pane, kind, this.debugEnvelope(request, extra))
     try {
       const raw = await execute.call(pane.view!.webContents, source) as Record<string, unknown> | undefined
       const drift = this.contextDrift(ctx)
       if (drift) {
-        return this.debugEnvelope(request, {
+        return finish({
           ok: false,
           startedAt,
           code: drift,
@@ -822,7 +836,7 @@ export class BrowserTabsHost {
         })
       }
       if (!raw || typeof raw !== 'object') {
-        return this.debugEnvelope(request, { ok: false, startedAt, code: 'unsupported_result', error: 'browser script returned no result', partialSideEffects: true })
+        return finish({ ok: false, startedAt, code: 'unsupported_result', error: 'browser script returned no result', partialSideEffects: true })
       }
       if (raw.ok === false) {
         let stack = typeof raw.stack === 'string' ? raw.stack : undefined
@@ -834,7 +848,7 @@ export class BrowserTabsHost {
           line = mapped.line ?? line
           column = mapped.column ?? column
         }
-        return this.debugEnvelope(request, {
+        return finish({
           ok: false,
           startedAt,
           code: typeof raw.code === 'string' ? raw.code : 'script_error',
@@ -852,7 +866,7 @@ export class BrowserTabsHost {
       if (typeof raw.resultJson === 'string') {
         try { result = JSON.parse(raw.resultJson) } catch { result = raw.resultJson }
       }
-      return this.debugEnvelope(request, {
+      return finish({
         ok: true,
         startedAt,
         result,
@@ -863,9 +877,9 @@ export class BrowserTabsHost {
     } catch (error) {
       const drift = this.contextDrift(ctx)
       if (drift) {
-        return this.debugEnvelope(request, { ok: false, startedAt, code: drift, error: 'browser page changed during script', partialSideEffects: true })
+        return finish({ ok: false, startedAt, code: drift, error: 'browser page changed during script', partialSideEffects: true })
       }
-      return this.debugEnvelope(request, {
+      return finish({
         ok: false,
         startedAt,
         code: 'script_error',
@@ -873,6 +887,49 @@ export class BrowserTabsHost {
         stack: error instanceof Error ? error.stack : undefined,
         partialSideEffects: true,
       })
+    }
+  }
+
+  private async sanitizeBypassResult(pane: ViewPane, kind: BrowserViewportKind, payload: BrowserToolResult): Promise<BrowserToolResult> {
+    const execute = pane.view?.webContents.executeJavaScript
+    if (!execute) return payload
+    let serialized: string
+    try {
+      serialized = JSON.stringify({ action: 'sanitize', value: payload })
+    } catch {
+      return {
+        ok: false,
+        error: 'browser redaction capacity exceeded; reload the document before continuing',
+        code: 'browser_redaction_capacity_exceeded',
+        requiresObservation: true,
+        redacted: true,
+        viewportTarget: kind,
+      }
+    }
+    const source = `${this.controllerPrelude()}globalThis.__pipiBrowserDOM.dispatch(${serialized})`
+    try {
+      const sanitized = await execute.call(pane.view!.webContents, source)
+      if (!sanitized || typeof sanitized !== 'object') {
+        return {
+          ok: false,
+          error: 'browser redaction capacity exceeded; reload the document before continuing',
+          code: 'browser_redaction_capacity_exceeded',
+          requiresObservation: true,
+          redacted: true,
+          viewportTarget: kind,
+        }
+      }
+      const result = sanitized as BrowserToolResult
+      return result.viewportTarget == null ? { ...result, viewportTarget: kind } : result
+    } catch {
+      return {
+        ok: false,
+        error: 'browser redaction capacity exceeded; reload the document before continuing',
+        code: 'browser_redaction_capacity_exceeded',
+        requiresObservation: true,
+        redacted: true,
+        viewportTarget: kind,
+      }
     }
   }
 
@@ -971,9 +1028,18 @@ export class BrowserTabsHost {
       const raw = await execute.call(pane.view!.webContents, source) as { content?: unknown } | undefined
       const full = typeof raw?.content === 'string' ? raw.content : ''
       const truncated = full.length > 100_000
-      return { ok: true, content: truncated ? full.slice(0, 100_000) : full, truncated, viewportTarget: kind }
+      return this.sanitizeBypassResult(pane, kind, {
+        ok: true,
+        content: truncated ? full.slice(0, 100_000) : full,
+        truncated,
+        viewportTarget: kind,
+      })
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
+      return this.sanitizeBypassResult(pane, kind, {
+        ok: false,
+        error: error instanceof Error ? error.message : String(error),
+        viewportTarget: kind,
+      })
     }
   }
 
@@ -1023,8 +1089,11 @@ export class BrowserTabsHost {
     const append = request.action === 'input' && request.mode === 'append'
     const code = `(()=>{const e=document.querySelector(${selector});if(!e)return {ok:false,error:'selector not found'};if(${JSON.stringify(request.action)}==='click'){e.click();return {ok:true}};const p=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;p?p.call(e,${append ? `String(e.value??'')+${text}` : text}):e.value=${text};e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:true}})()`
     const result = await execute.call(pane.view!.webContents, code)
-    if (!result || typeof result !== 'object' || !(result as any).ok) return result as BrowserToolResult
-    return this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
+    if (!result || typeof result !== 'object' || !(result as any).ok) {
+      return this.sanitizeBypassResult(pane, kind, (result && typeof result === 'object' ? result : { ok: false, error: 'selector not found' }) as BrowserToolResult)
+    }
+    const observed = await this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
+    return this.sanitizeBypassResult(pane, kind, observed)
   }
 
   async setViewBounds(bounds: BrowserViewBounds, restoreActivePage = true): Promise<boolean> {

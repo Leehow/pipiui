@@ -19,6 +19,7 @@ export const BROWSER_HOST_TOOL_ACTIONS = [
   'input',
   'type',
   'select',
+  'fill_form',
   'scroll',
   'content',
   'eval',

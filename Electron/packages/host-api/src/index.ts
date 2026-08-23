@@ -477,7 +477,22 @@ export const BROWSER_MOBILE_DEVICES: readonly BrowserMobileDevicePreset[] = [
 export function browserMobileDeviceById(id: string | undefined): BrowserMobileDevicePreset {
   return BROWSER_MOBILE_DEVICES.find(item => item.id === id) ?? BROWSER_MOBILE_DEVICES[0]!;
 }
-export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
+export type BrowserLocator = { role?: string; name?: string; label?: string; text?: string; css?: string; nth?: number };
+export type BrowserFormLocator = BrowserLocator;
+export type BrowserFormField = {
+  element_token?: string;
+  element_index?: number;
+  locator?: BrowserLocator;
+  role?: string;
+  name?: string;
+  label?: string;
+  text?: string;
+  css?: string;
+  nth?: number;
+  value: string;
+  type?: string;
+};
+export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; locator?: BrowserLocator; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; fields?: BrowserFormField[]; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
 export type BrowserToolImage = { viewport: BrowserViewportKind; base64: string; mimeType: string; width?: number; height?: number };
 export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string; images?: BrowserToolImage[] };
 export type BrowserTabOptions = { url?: string };

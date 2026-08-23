@@ -13,14 +13,15 @@ describe('pipiui-electron-webview target schema', () => {
     expect(source).toContain('Type.Literal("both")')
     expect(source).toContain('const targetParams = target ? { target } : {}')
     expect(source).toContain('bridge("screenshot", { ...targetParams }')
-    expect(source).toContain('bridge("observe", { scope: params.scope ?? "viewport", ...targetParams }')
+    expect(source).toContain('bridge("observe", {')
+    expect(source).toContain('scope: params.scope ?? "viewport"')
   })
 
   it('maps screenshot both onto two labeled image parts and rejects unsafe both actions', () => {
     expect(source).toContain('content.push({ type: "image"')
     expect(source).toContain('viewport')
     expect(source).toContain('cannot target both viewports; specify target=desktop or target=mobile')
-    expect(source).toContain('["click", "input", "type", "select", "scroll", "eval", "content", "console", "wait"]')
+    expect(source).toContain('["click", "input", "type", "select", "fill_form", "scroll", "eval", "content", "console", "wait"]')
   })
 
   it('requires dual structured and visual review only for responsive frontend acceptance', () => {

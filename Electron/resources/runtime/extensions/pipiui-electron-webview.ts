@@ -13,7 +13,7 @@ const REQUEST_TIMEOUT_MS = 35_000;
 const CANCEL_TIMEOUT_MS = 1_500;
 
 export const BROWSER_TOOL_DECLARED_ACTIONS = [
-  "navigate", "observe", "wait", "click", "input", "type", "select", "scroll",
+  "navigate", "observe", "wait", "click", "input", "type", "select", "fill_form", "scroll",
   "content", "eval", "script", "console", "screenshot", "back", "forward", "reload", "help",
 ] as const;
 
@@ -76,6 +76,7 @@ function bridgeFailure(r: any) {
     requiresObservation: r?.requiresObservation,
     requiresUserInput: r?.requiresUserInput,
     observation: r?.observation,
+    ...(Array.isArray(r?.candidates) ? { candidates: r.candidates } : {}),
   };
   return {
     content: [{ type: "text" as const, text: JSON.stringify(summary, null, 2) }],
@@ -118,8 +119,13 @@ function formatObservation(r: any): string {
     lines.push("Limitations:", ...r.limitations.map((item: string) => `- ${item}`));
   }
   if (r.action) lines.push(`Action: ${JSON.stringify(r.action)}`);
+  if (typeof r.filled === "number" || Array.isArray(r.results)) {
+    lines.push(`Fill form: filled=${r.filled ?? 0} failed=${r.failed ?? 0}`);
+    for (const item of r.results || []) lines.push(`  ${JSON.stringify(item)}`);
+  }
   if (r.relocated) lines.push("Relocated: true");
   if (r.mutation) lines.push(`Mutation: ${JSON.stringify(r.mutation)}`);
+  if (Array.isArray(r.candidates) && r.candidates.length) lines.push(`Candidates: ${JSON.stringify(r.candidates)}`);
   if (r.note) lines.push(`Note: ${r.note}`);
   return lines.join("\n");
 }
@@ -146,9 +152,24 @@ const HELP = [
   "                        complete and Performance resource timing stays quiet for idle_ms",
   "                        (default 400ms). timeout is seconds (default 5, max 25). On success",
   "                        returns a fresh observation; on timeout code=timeout.",
-  "click {snapshot_id, element_index|element_token}",
-  "input {snapshot_id, element_index|element_token, text}",
-  "select {snapshot_id, element_index|element_token, option}",
+  "click {snapshot_id, element_index|element_token} | {locator}",
+  "input {snapshot_id, element_index|element_token, text} | {locator, text}",
+  "select {snapshot_id, element_index|element_token, option} | {locator, option}",
+  "locator               Live query, no snapshot. Exactly one of:",
+  "                        {role, name?}  ARIA role + accessible name",
+  "                        {label}        label for/text, aria-label, aria-labelledby",
+  "                        {text}         visible text",
+  "                        {css}          CSS selector (structured selector path)",
+  "                      Optional 0-based nth disambiguates. Zero match lists up to",
+  "                      5 candidates (role/tag/name); multiple matches require name or nth.",
+  "fill_form {fields, snapshot_id?}",
+  "                        fields[] = {element_token|locator, value, type?}. locator is",
+  "                        {role,name} / {label} / {text} / {css} plus optional nth.",
+  "                        Each field is independent: one failure does not stop the rest.",
+  "                        Password, OTP, and payment fields return user_handoff_required",
+  "                        and are skipped; other fields continue. Result is",
+  "                        {filled, failed, results[{index,ok,error?,relocated?}]} plus a",
+  "                        batch mutation summary.",
   "scroll {direction?, amount?, snapshot_id?, element_index|element_token?}",
   "                        amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
   "                        invalidate the prior snapshot and return a fresh observation plus",
@@ -160,14 +181,16 @@ const HELP = [
   "                        report magnitude only (few/some/many), not exact counts.",
   "                        Password, OTP, and payment fields require user handoff in the panel.",
   "content {mode?}         Raw fallback. mode='text' (default) or 'html'; may be large.",
-  "                        WARNING: bypasses structured redaction — may expose credentials,",
-  "                        tokens, and payment details. Avoid on auth/checkout pages.",
+  "                        Output is sanitized with the same redaction as observe",
+  "                        (sensitive values → [redacted], sensitive URL params cleaned).",
+  "                        Over-capacity fails closed. Prefer observe/click/input.",
   "eval {js}               Page-DOM only. Never string literals / keep-alive; use observe then click/input.",
-  "                        WARNING: can read DOM values and secrets directly. Avoid on",
-  "                        auth/checkout pages; prefer observe/click/input.",
+  "                        Return values are sanitized with the same redaction as observe.",
+  "                        Over-capacity fails closed. Prefer observe/click/input.",
   "script {js}             Async page script with await/return, step(label), and el(token).",
   "                        25s deadline; results are JSON-safe and truncated (~20k). Failures",
   "                        include stack/line/steps; side effects are not rolled back.",
+  "                        step()/el() return values are sanitized with the same redaction as observe.",
   "console {clear?, since_seq?, level?, limit?}",
   "                        Console output (log/info/warn/error) for the current virtual tab.",
   "                        Cursor is since_seq; limit caps at 200. clear=true empties the buffer.",
@@ -186,8 +209,8 @@ const HELP = [
   "Sensitive-field heuristics cover password/OTP/payment-ish controls but do NOT guarantee",
   "capture of SSN, ID numbers, cardholder name, or CAPTCHA fields; when unsure, hand off.",
   "target                  Optional viewport: active (default), desktop, mobile, both.",
-  "                        observe/screenshot support both. click/input/type/select/scroll/eval/",
-  "                        content/console/wait reject both — specify desktop or mobile.",
+  "                        observe/screenshot support both. click/input/type/select/fill_form/",
+  "                        scroll/eval/content/console/wait reject both — specify desktop or mobile.",
   "                        Snapshot IDs and element tokens are viewport-scoped; do not mix them.",
   "For frontend/responsive-layout implementation or debugging, before claiming responsive visual acceptance, run observe target='both' for structured inspection, then screenshot target='both' and visually review the two labeled desktop/mobile images.",
   "Ordinary browsing may keep target='active' (default).",
@@ -207,16 +230,17 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
-      "actions: navigate, observe, wait, click, input, type, select, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
-      "eval is page-DOM only (no literals/keep-alive). Fallbacks content/eval/screenshot bypass structured redaction and may expose credentials — avoid on auth/checkout pages. " +
+      "actions: navigate, observe, wait, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "eval is page-DOM only (no literals/keep-alive). content/eval/script output is sanitized with the same redaction as observe. screenshot pixels are not redacted — avoid capturing auth/checkout UI. " +
       "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
+      "click/input/select accept locator {role,name}|{label}|{text}|{css} without a snapshot. " +
       "Same-page stale refs relocate on a unique in-viewport DOM path+role+name+ordinal match. Actions include a mutation summary. " +
       "Optional target selects active (default), desktop, mobile, or both (observe/screenshot only). " +
       "Ordinary browsing may use target=active (default). For frontend or responsive-layout implementation/debugging, before claiming responsive visual acceptance, call observe with target=both for structured inspection, then screenshot with target=both and visually review both labeled desktop/mobile images. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({
-        description: "navigate | observe | wait | click | input | select | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+        description: "navigate | observe | wait | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
       }),
       url: Type.Optional(Type.String()),
       js: Type.Optional(Type.String()),
@@ -228,6 +252,14 @@ export default function (pi: ExtensionAPI) {
       snapshot_id: Type.Optional(Type.String()),
       element_index: Type.Optional(Type.Number()),
       element_token: Type.Optional(Type.String()),
+      locator: Type.Optional(Type.Object({
+        role: Type.Optional(Type.String()),
+        name: Type.Optional(Type.String()),
+        label: Type.Optional(Type.String()),
+        text: Type.Optional(Type.String()),
+        css: Type.Optional(Type.String()),
+        nth: Type.Optional(Type.Number()),
+      })),
       text: Type.Optional(Type.String()),
       option: Type.Optional(Type.String()),
       direction: Type.Optional(Type.Union([
@@ -247,11 +279,30 @@ export default function (pi: ExtensionAPI) {
       role: Type.Optional(Type.String()),
       name: Type.Optional(Type.String()),
       cursor: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+      fields: Type.Optional(Type.Array(Type.Object({
+        value: Type.String(),
+        element_token: Type.Optional(Type.String()),
+        element_index: Type.Optional(Type.Number()),
+        locator: Type.Optional(Type.Object({
+          role: Type.Optional(Type.String()),
+          name: Type.Optional(Type.String()),
+          label: Type.Optional(Type.String()),
+          text: Type.Optional(Type.String()),
+          css: Type.Optional(Type.String()),
+          nth: Type.Optional(Type.Number()),
+        })),
+        role: Type.Optional(Type.String()),
+        name: Type.Optional(Type.String()),
+        label: Type.Optional(Type.String()),
+        text: Type.Optional(Type.String()),
+        css: Type.Optional(Type.String()),
+        type: Type.Optional(Type.String()),
+      }))),
     }),
     async execute(_id, params, signal) {
       const target = params.target;
       const targetParams = target ? { target } : {};
-      if (target === "both" && ["click", "input", "type", "select", "scroll", "eval", "content", "console", "wait"].includes(params.action)) {
+      if (target === "both" && ["click", "input", "type", "select", "fill_form", "scroll", "eval", "content", "console", "wait"].includes(params.action)) {
         return text(`browser ${params.action} cannot target both viewports; specify target=desktop or target=mobile.\n\n${HELP}`);
       }
       switch (params.action) {
@@ -319,8 +370,12 @@ export default function (pi: ExtensionAPI) {
         case "select": {
           const hasIndex = typeof params.element_index === "number";
           const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
-          if (!params.snapshot_id || hasIndex === hasToken) {
-            return text(`browser ${params.action} requires snapshot_id and exactly one of element_index or element_token.\n\n${HELP}`);
+          const locator = params.locator && typeof params.locator === "object" && !Array.isArray(params.locator)
+            ? params.locator
+            : undefined;
+          const targets = [hasIndex, hasToken, Boolean(locator)].filter(Boolean).length;
+          if (targets !== 1 || (!locator && !params.snapshot_id)) {
+            return text(`browser ${params.action} requires snapshot_id and exactly one of element_index or element_token, or a locator.\n\n${HELP}`);
           }
           if (params.action === "input" && typeof params.text !== "string") {
             return text(`browser input requires text.\n\n${HELP}`);
@@ -331,10 +386,24 @@ export default function (pi: ExtensionAPI) {
           const r = await bridge(params.action, {
             scope: params.scope ?? "viewport",
             ...targetParams,
-            snapshot_id: params.snapshot_id,
-            ...(hasIndex ? { element_index: params.element_index } : { element_token: params.element_token }),
+            ...(locator ? { locator } : {
+              snapshot_id: params.snapshot_id,
+              ...(hasIndex ? { element_index: params.element_index } : { element_token: params.element_token }),
+            }),
             ...(params.action === "input" ? { text: params.text } : {}),
             ...(params.action === "select" ? { option: params.option } : {}),
+          }, signal);
+          return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
+        }
+        case "fill_form": {
+          if (!Array.isArray(params.fields) || params.fields.length === 0) {
+            return text(`browser fill_form requires a non-empty fields array.\n\n${HELP}`);
+          }
+          const r = await bridge("fill_form", {
+            scope: params.scope ?? "viewport",
+            ...targetParams,
+            ...(typeof params.snapshot_id === "string" ? { snapshot_id: params.snapshot_id } : {}),
+            fields: params.fields,
           }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
