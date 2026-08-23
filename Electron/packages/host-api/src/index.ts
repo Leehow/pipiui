@@ -236,14 +236,49 @@ export type AgentDefinition = { name: string; description: string };
 export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "interrupted";
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
+/** Metadata-only stall probe. Never carries prompt, tool args, or output text. */
+export type AgentCpuVerdict = "working" | "no-progress" | "gone" | "unknown";
+export type AgentDiagnostics = {
+  agentId?: string;
+  runId?: string;
+  eventSeq?: number;
+  processGeneration?: string;
+  supervisorPid?: number;
+  childPid?: number;
+  lastActivityAt?: number;
+  lastOutputAt?: number;
+  lastToolAt?: number;
+  lastStdoutAt?: number;
+  lastStderrAt?: number;
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  toolWaitName?: string;
+  lastCpuSampleAt?: number;
+  lastCpuDeltaMs?: number;
+  cpuVerdict?: AgentCpuVerdict;
+  watchdogDecision?: string;
+  watchdogReason?: string;
+  abortReason?: string;
+  exitReason?: string;
+  hostReceivedAt?: number;
+  hostEventSeq?: number;
+  lastHostEventSeq?: number;
+  seqGap?: number;
+  generationMatch?: boolean;
+  persistedRunning?: boolean;
+  reconciliation?: "interrupted" | "none";
+  hostGeneration?: string;
+};
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
-export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;
+export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; /** True only while a tool is in-flight. Missing means the field was not provided. */ activityActive?: boolean; /** In-flight tool id when the runtime supplied one. */ activityToolCallId?: string; /** Set when the last in-flight tool ended/failed/aborted. */ activityEndedAt?: number; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;
   /**
    * Writable isolation failed on an existing git repo (worktree add / unborn HEAD).
    * Non-git folders do not isolate and do not set this field — workers run in
    * the project directory. Verbatim technical reason; the UI maps it to a Chinese hint.
    */
-  worktreeError?: string };
+  worktreeError?: string;
+  /** Runtime/host stall probe. Metadata only. */
+  diagnostics?: AgentDiagnostics };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
 export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };

@@ -4,7 +4,7 @@ import type { LiveSubagentProjection } from './live-subagent-projection'
 import './live-subagent-card.css'
 
 function rowLine(agent: AgentSummary): string {
-  if (agent.state === 'running' || agent.state === 'stalled') return agent.listSubtitle?.trim() || '思考中…'
+  if (agent.state === 'running' || agent.state === 'stalled') return agent.activityActive === true && agent.listSubtitle?.trim() ? agent.listSubtitle.trim() : '思考中…'
   if (agent.state === 'ok') return `完成${agent.turns ? ` · ${agent.turns} turns` : ''}`
   if (agent.state === 'failed') return '失败'
   if (agent.state === 'aborted') return '已中止'

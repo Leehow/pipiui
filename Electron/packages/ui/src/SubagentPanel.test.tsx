@@ -346,7 +346,7 @@ describe('SubagentPanel', () => {
       harness.host.listAgents = async () => [{
         agentId: 'run', runId: 'r1', name: 'explore', title: '查 Electron GLM 鉴权与 MCP 链路',
         task: 'research', state: 'running', createdAt: startedAt, updatedAt: Date.now(),
-        listSubtitle: 'tool',
+        listSubtitle: 'tool', activityActive: true,
       }]
       render(<SubagentPanel host={harness.host} />)
       const row = await screen.findByTestId('agent-row-run')
@@ -360,7 +360,7 @@ describe('SubagentPanel', () => {
           agent: {
             agentId: 'run', runId: 'r1', name: 'explore', title: '查 Electron GLM 鉴权与 MCP 链路',
             task: 'research', state: 'running', createdAt: Date.now(), updatedAt: Date.now(),
-            listSubtitle: 'tool read',
+            listSubtitle: 'tool read', activityActive: true,
           },
         })
         vi.advanceTimersByTime(3_000)
@@ -430,7 +430,7 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     const now = Date.now()
     harness.host.listAgents = async () => [{
-      agentId: 'quiet-operator', runId: 'r-quiet', name: 'operator', task: '在 TextEdit 中打开文件',
+      agentId: 'quiet-operator', runId: 'r-quiet', name: 'operator', task: '在 TextEdit 中打开文件', activityActive: true,
       state: 'running', createdAt: now - 60_000, updatedAt: now - 45_000,
       deadlineAt: now + 105_000, listSubtitle: 'desktop_act {"actions":[{"type":"key","keys":["CMD","O"]}]}'
     } as AgentSummary]
@@ -448,16 +448,86 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     const now = Date.now()
     harness.host.listAgents = async () => [{
-      agentId: 'stale-operator', runId: 'r-stale', name: 'operator', task: '在 TextEdit 中打开文件',
+      agentId: 'stale-operator', runId: 'r-stale', name: 'operator', task: '在 TextEdit 中打开文件', activityActive: true,
       state: 'running', createdAt: now - 150_000, updatedAt: now - 120_000,
       deadlineAt: now + 30_000, listSubtitle: 'desktop_act {"actions":[{"type":"key","keys":["CMD","O"]}]}'
     } as AgentSummary]
     render(<SubagentPanel host={harness.host} />)
 
     await screen.findByTestId('agent-row-stale-operator')
-    expect(screen.getAllByText(/可能卡住 · 最近活动 · desktop_act/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/界面暂无新事件 · 最近活动 · desktop_act/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/120 秒无新进展/).length).toBeGreaterThan(0)
     expect(screen.getAllByText(/30 秒后自动中止/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/可能卡住/)).toBeNull()
+  })
+
+  it('shows stall diagnostics in technical details without calling a live tool stuck', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'probe', runId: 'r-probe', name: 'general-purpose', task: 'fast-app', activityActive: true,
+      state: 'running', createdAt: now - 150_000, updatedAt: now - 120_000,
+      listSubtitle: 'bash ~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app',
+      diagnostics: {
+        eventSeq: 12,
+        processGeneration: '77:1',
+        hostGeneration: '77:1',
+        generationMatch: true,
+        toolWaitName: 'bash',
+        cpuVerdict: 'working',
+        lastCpuDeltaMs: 1800,
+        watchdogDecision: 'cpu-progress',
+        hostReceivedAt: now - 5_000,
+      }
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-probe')
+    expect(screen.getAllByText(/工具仍在推进/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/可能卡住/)).toBeNull()
+    fireEvent.click(screen.getByText('技术详情'))
+    expect(screen.getByTestId('agent-stall-conclusion').textContent).toContain('尚未构成真实卡死')
+    expect(screen.getByTestId('agent-stall-diagnostics').textContent).toContain('事件序号：12')
+  })
+
+  it('does not keep showing progress after the last probe snapshot is stale', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'stale-probe', runId: 'r-stale-probe', name: 'general-purpose', task: 'fast-app', activityActive: true,
+      state: 'running', createdAt: now - 150_000, updatedAt: now - 120_000,
+      listSubtitle: 'bash pack',
+      diagnostics: {
+        eventSeq: 12,
+        generationMatch: true,
+        cpuVerdict: 'working',
+        watchdogDecision: 'cpu-progress',
+        hostReceivedAt: now - 90_000,
+      }
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-stale-probe')
+    expect(screen.getAllByText(/事件链路无新序号/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/工具仍在推进/)).toBeNull()
+  })
+
+  it('does not call a quiet-not-stalled tool still advancing', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'quiet-tool', runId: 'r-quiet-tool', name: 'general-purpose', task: 'fast-app', activityActive: true,
+      state: 'running', createdAt: now - 150_000, updatedAt: now - 120_000,
+      listSubtitle: 'bash pack',
+      diagnostics: {
+        eventSeq: 4,
+        generationMatch: true,
+        watchdogDecision: 'tool-quiet-alive',
+        hostReceivedAt: now - 5_000,
+      }
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-quiet-tool')
+    expect(screen.getAllByText(/工具静默未过门槛/).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/工具仍在推进/)).toBeNull()
   })
 
   it('uses tool-result logs to distinguish provider waiting from sticky tool activity', async () => {
@@ -466,7 +536,7 @@ describe('SubagentPanel', () => {
     harness.host.listAgents = async () => [{
       agentId: 'returned-tool', runId: 'r-returned', name: 'explore', task: '检查事件日志',
       state: 'running', createdAt: now - 60_000, updatedAt: now - 45_000,
-      listSubtitle: 'grep ./heartbeat/agent_events.jsonl'
+      listSubtitle: 'grep ./heartbeat/agent_events.jsonl', activityActive: false, activityEndedAt: now - 46_000
     } as AgentSummary]
     harness.host.getAgentLogs = vi.fn(async () => [
       { itemType: 'tool' as const, name: 'grep', text: './heartbeat/agent_events.jsonl' },
@@ -475,8 +545,41 @@ describe('SubagentPanel', () => {
     render(<SubagentPanel host={harness.host} />)
 
     await screen.findByTestId('agent-row-returned-tool')
-    await waitFor(() => expect(screen.getAllByText(/工具结果已返回 · 等待模型响应/).length).toBeGreaterThan(0))
+    await waitFor(() => expect(screen.getAllByText(/等待模型响应/).length).toBeGreaterThan(0))
+    expect(screen.queryByText(/最近活动 · grep/)).toBeNull()
     expect(screen.queryByText(/等待工具返回/)).toBeNull()
+  })
+
+  it('shows the remaining overlapping tool after git diff would have ended first', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'overlap', runId: 'r-overlap', name: 'explore', task: 'inspect',
+      state: 'running', createdAt: now - 20_000, updatedAt: now - 5_000,
+      listSubtitle: 'read b.ts', activityActive: true, activityToolCallId: 'tc-read',
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-overlap')
+    expect(row.textContent).toContain('最近活动 · read')
+    expect(row.textContent).not.toContain('git diff')
+  })
+
+  it('stops showing a finished git diff as the live activity', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'diff-done', runId: 'r-diff', name: 'explore', title: '查 activity 投影',
+      task: 'inspect', state: 'running', createdAt: now - 20_000, updatedAt: now - 5_000,
+      listSubtitle: 'bash git diff HEAD -- Electron/packages/pi-backend/src/index.ts',
+      activityActive: false, activityEndedAt: now - 4_000,
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    const row = await screen.findByTestId('agent-row-diff-done')
+    expect(row.textContent).toContain('等待模型响应')
+    expect(row.textContent).not.toContain('最近活动 · bash')
+    expect(row.textContent).not.toContain('git diff HEAD')
+    fireEvent.click(screen.getByText('技术详情'))
+    expect(screen.getByText(/上一工具已结束于/).textContent).toMatch(/上一工具已结束于/)
   })
 
   it('shows a quiet Leader as coordinating while one of its children is still active', async () => {
@@ -923,7 +1026,7 @@ describe('SubagentPanel', () => {
       agent: {
         agentId: 'run', runId: 'r1', name: 'general-purpose', title: '视觉模型设置收尾验证',
         task: 'verify', state: 'running', createdAt: now - 10_000, updatedAt: now,
-        listSubtitle: 'bash npm test --workspaces',
+        listSubtitle: 'bash npm test --workspaces', activityActive: true,
       },
     })
     await screen.findByTestId('agent-row-run')
@@ -1256,7 +1359,7 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [{
       agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running',
-      createdAt: Date.now(), updatedAt: Date.now(), listSubtitle: 'write src/a.ts',
+      createdAt: Date.now(), updatedAt: Date.now(), listSubtitle: 'write src/a.ts', activityActive: true,
     }]
     render(<SubagentPanel host={harness.host} />)
     await screen.findByTestId('agent-row-run')

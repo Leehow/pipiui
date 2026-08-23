@@ -11,6 +11,7 @@ import { providerBrand, type ProviderBrand } from './provider-logo'
 import { AssistantTranscriptContent, type AssistantTranscriptMessage, type TranscriptActivity, type TranscriptTool } from './AssistantTranscriptContent'
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
+import { diagnoseAgentProgress } from './agent-stall-diagnostics'
 import { staleRunningAgentIDs, statusChannelWarningText } from './subagent-status-check'
 
 type Log = {
@@ -247,15 +248,6 @@ function latestWriteEditTokenLabel(agent: Agent): string | undefined {
   return undefined
 }
 
-function toolResultWasObserved(agent: Agent, toolName: string | undefined): boolean {
-  if (!toolName) return false
-  const toolIndex = agent.logs.findLastIndex(log => log.itemType === 'tool' && (log.name ?? '').trim() === toolName)
-  if (toolIndex < 0) return false
-  return agent.logs.slice(toolIndex + 1).some(log =>
-    log.itemType === 'toolResult' && (!(log.name ?? '').trim() || (log.name ?? '').trim() === toolName)
-  )
-}
-
 const QUIET_STATUS_SECONDS = 30
 const POSSIBLY_STUCK_SECONDS = 120
 
@@ -264,17 +256,16 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
 		return { severity: 'active', text: `正在协调 · ${activeChildCount} 个子 agent 运行中` }
 	}
   const quietSeconds = agent.updatedAt === undefined ? undefined : Math.max(0, Math.floor((now - agent.updatedAt) / 1000))
-  const rawActivity = visibleAgentText(agent.listSubtitle ?? '').trim()
+  const activityActive = agent.activityActive === true
+  const rawActivity = activityActive ? visibleAgentText(agent.listSubtitle ?? '').trim() : ''
   const liveName = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)?.[1]
   const tokenSuffix = liveName === 'write' || liveName === 'edit' ? latestWriteEditTokenLabel(agent) : undefined
-  const toolLabel = liveToolActivityLabel(rawActivity, tokenSuffix)
+  const toolLabel = activityActive ? liveToolActivityLabel(rawActivity, tokenSuffix) : undefined
   const replanning = /^(?:Revise this Computer Task plan|Repair this Computer Task plan)/i.test(agent.task)
   const phase = replanning
     ? '正在调查失败并重新规划'
     : toolLabel
-      ? toolResultWasObserved(agent, liveName)
-        ? '工具结果已返回 · 等待模型响应'
-        : `最近活动 · ${toolLabel}`
+      ? `最近活动 · ${toolLabel}`
       : '等待模型响应'
   const deadlineSeconds = agent.deadlineAt ? Math.max(0, Math.ceil((agent.deadlineAt - now) / 1000)) : undefined
   if (quietSeconds === undefined) {
@@ -284,8 +275,26 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
     return { text: `正在自动中止 · ${phase} · ${quietSeconds} 秒无新进展`, severity: 'deadline' }
   }
   if (quietSeconds >= POSSIBLY_STUCK_SECONDS) {
+    const probe = diagnoseAgentProgress({
+      now,
+      state: agent.state,
+      updatedAt: agent.updatedAt,
+      stalled: agent.stalled,
+      diagnostics: agent.diagnostics,
+    })
+    const prefix = probe.kind === 'output-recent' || probe.kind === 'cpu-progress'
+      ? '工具仍在推进'
+      : probe.kind === 'tool-quiet-alive'
+        ? '工具静默未过门槛'
+        : probe.kind === 'child-gone' || probe.kind === 'generation-mismatch'
+          ? '进程已中断或世代失配'
+          : probe.kind === 'seq-stale'
+            ? '事件链路无新序号'
+            : probe.kind === 'watchdog-stalled'
+              ? '可能卡住'
+              : '界面暂无新事件'
     return {
-      text: `可能卡住 · ${phase} · ${quietSeconds} 秒无新进展${deadlineSeconds === undefined ? '' : ` · ${deadlineSeconds} 秒后自动中止`}`,
+      text: `${prefix} · ${phase} · ${quietSeconds} 秒无新进展${deadlineSeconds === undefined ? '' : ` · ${deadlineSeconds} 秒后自动中止`}`,
       severity: 'quiet'
     }
   }
@@ -968,6 +977,8 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         <span>Provider / Model：{providerLabel(agent)} · {model}</span>
         {agent.sessionId && <span>Session：{agent.sessionId}</span>}
         <DetailMetrics agent={agent} now={now} pricing={pricingFor([agent])} />
+        {agent.activityEndedAt && agent.activityActive === false && <span>上一工具已结束于 {completedAt(agent.activityEndedAt)}</span>}
+        <AgentStallDiagnostics agent={agent} now={now} />
         <button type="button" data-testid="subagent-detail-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" onClick={() => void onCheck(agent)}>手动检查</button>
       </div>
       <p className="agent-task">{visibleAgentText(agent.task)}</p>
@@ -997,6 +1008,22 @@ function AgentDetailUsage({ agent }: { agent: Agent }) {
     </div>}
     {usage.io && <div className="agent-detail-usage-row"><div><dt>入/出</dt><dd title="输入 / 输出 tokens">{usage.io}</dd></div></div>}
   </dl>
+}
+
+function AgentStallDiagnostics({ agent, now }: { agent: Agent; now: number }) {
+  const view = diagnoseAgentProgress({
+    now,
+    state: agent.state,
+    updatedAt: agent.updatedAt,
+    stalled: agent.stalled,
+    diagnostics: agent.diagnostics,
+  })
+  return <div className="agent-stall-diagnostics" data-testid="agent-stall-diagnostics">
+    <p data-testid="agent-stall-conclusion">{view.conclusion}</p>
+    {view.fields.filter(field => field.label !== '诊断结论').map(field => (
+      <span key={field.label}>{field.label}：{field.value}</span>
+    ))}
+  </div>
 }
 
 function DetailMetrics({ agent, now, pricing }: { agent: Agent; now: number; pricing: Pricing }) {

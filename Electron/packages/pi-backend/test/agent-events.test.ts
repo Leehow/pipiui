@@ -205,8 +205,256 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(END);
     expect(latest()).toMatchObject({ state: "ok", finalResult: "最终结果全文", cost: 0.55, turns: 4 });
     expect(latest().endedAt).toBeGreaterThan(0);
-    // Everything learned earlier survives the terminal event.
-    expect(latest()).toMatchObject({ model: "deepseek/deepseek-v4-flash", contextTokens: 153_000, listSubtitle: "bash cd Electron && npm run build" });
+    // Model/tokens survive; a finished worker must not keep a live tool line.
+    expect(latest()).toMatchObject({ model: "deepseek/deepseek-v4-flash", contextTokens: 153_000, activityActive: false });
+    expect(latest().listSubtitle).toBeUndefined();
+  });
+
+  it("clears a git-diff tool after tool_end and does not restore it", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    const startedAt = Date.now();
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "bash git diff HEAD -- Electron/packages/pi-backend/src/index.ts",
+      activityActive: true,
+      activityToolCallId: "tc-diff",
+      activityStartedAt: startedAt,
+    });
+    expect(latest()).toMatchObject({
+      listSubtitle: "bash git diff HEAD -- Electron/packages/pi-backend/src/index.ts",
+      activityActive: true,
+    });
+    const updatedAt = latest().updatedAt;
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: null,
+      activityActive: false,
+      activityEndedAt: startedAt + 18,
+    });
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest()).toMatchObject({ activityActive: false, activityEndedAt: startedAt + 18 });
+    expect(latest().updatedAt).toBe(updatedAt);
+    deliver(USAGE);
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+    deliver({ kind: "update", agentId: "a1", runId: "r1", output: "partial", cost: 0.45, turns: 3 });
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+  });
+
+  it("does not let an explicit activity null be restored by a later merge", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({ ...UPDATE, activity: "bash git diff HEAD -- a.ts", activityActive: true });
+    deliver({ kind: "update", agentId: "a1", runId: "r1", activity: null, activityActive: false });
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+    deliver({ kind: "update", agentId: "a1", runId: "r1", cost: 0.5, turns: 4 });
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+  });
+
+  it("keeps the remaining tool after an overlapping git-diff ends", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "bash git diff HEAD -- a.ts",
+      activityActive: true,
+      activityToolCallId: "tc-diff",
+    });
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "read b.ts",
+      activityActive: true,
+      activityToolCallId: "tc-read",
+    });
+    expect(latest()).toMatchObject({
+      listSubtitle: "read b.ts",
+      activityActive: true,
+      activityToolCallId: "tc-read",
+    });
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "read b.ts",
+      activityActive: true,
+      activityToolCallId: "tc-read",
+    });
+    expect(latest()).toMatchObject({
+      listSubtitle: "read b.ts",
+      activityActive: true,
+      activityToolCallId: "tc-read",
+    });
+    expect(latest().listSubtitle).not.toContain("git diff");
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: null,
+      activityActive: false,
+      activityEndedAt: Date.now(),
+    });
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+    expect(latest().activityToolCallId).toBeUndefined();
+  });
+
+  it("does not restore lastLine or abort text from a stalled event", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "bash git diff HEAD -- a.ts",
+      activityActive: true,
+      activityToolCallId: "tc-diff",
+    });
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: null,
+      activityActive: false,
+    });
+    expect(latest().activityActive).toBe(false);
+    deliver({
+      kind: "stalled",
+      agentId: "a1",
+      runId: "r1",
+      stalled: true,
+      idle: 130,
+      activity: "auto-aborted after stall: bash git diff HEAD -- a.ts",
+    });
+    expect(latest().state).toBe("stalled");
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+    expect(latest().activityToolCallId).toBeUndefined();
+  });
+
+  it("does not refresh hostReceivedAt on activity, even with legacy diagnostics", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 4,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    const receivedAt = latest().diagnostics?.hostReceivedAt;
+    expect(receivedAt).toEqual(expect.any(Number));
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "write /tmp/a.ts",
+      activityActive: true,
+      activityToolCallId: "tc-write",
+      diagnostics: {
+        eventSeq: 99,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    expect(latest().listSubtitle).toBe("write /tmp/a.ts");
+    expect(latest().activityActive).toBe(true);
+    expect(latest().diagnostics?.hostReceivedAt).toBe(receivedAt);
+    expect(latest().diagnostics?.eventSeq).toBe(4);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 5,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    expect(latest().diagnostics?.hostReceivedAt).toBeGreaterThan(receivedAt ?? 0);
+    expect(latest().diagnostics?.eventSeq).toBe(5);
+  });
+
+  it("does not keep the previous activityToolCallId when the next live tool has none", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "bash git diff HEAD -- a.ts",
+      activityActive: true,
+      activityToolCallId: "tc-diff",
+    });
+    expect(latest().activityToolCallId).toBe("tc-diff");
+    deliver({
+      kind: "activity",
+      agentId: "a1",
+      runId: "r1",
+      activity: "write /tmp/a.ts",
+      activityActive: true,
+    });
+    expect(latest().listSubtitle).toBe("write /tmp/a.ts");
+    expect(latest().activityActive).toBe(true);
+    expect(latest().activityToolCallId).toBeUndefined();
+  });
+
+  it("does not refresh hostReceivedAt on usage without a diagnostics snapshot", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 4,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    const receivedAt = latest().diagnostics?.hostReceivedAt;
+    expect(receivedAt).toEqual(expect.any(Number));
+    deliver(USAGE);
+    expect(latest().diagnostics?.hostReceivedAt).toBe(receivedAt);
+    expect(latest().diagnostics?.cpuVerdict).toBe("working");
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 5,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    expect(latest().diagnostics?.hostReceivedAt).toBeGreaterThan(receivedAt ?? 0);
+  });
+
+  it("clears live activity on abort and worker exit", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({ ...UPDATE, activity: "bash git diff HEAD -- a.ts", activityActive: true });
+    deliver({ kind: "end", agentId: "a1", runId: "r1", ok: false, aborted: true, output: "stopped" });
+    expect(latest().state).toBe("aborted");
+    expect(latest().listSubtitle).toBeUndefined();
+    expect(latest().activityActive).toBe(false);
+    expect(latest().activityEndedAt).toBeGreaterThan(0);
   });
 
   it("replaces streaming usage totals instead of adding them", async () => {
@@ -379,6 +627,106 @@ describe("subagent lifecycle → AgentSummary", () => {
     ]);
   });
 
+  it("retains runtime diagnostics and does not treat a probe as progress", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({ ...UPDATE, activity: "bash pack" });
+    const updatedAt = latest().updatedAt;
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 4,
+        processGeneration: "11:100",
+        supervisorPid: 11,
+        childPid: 99,
+        toolWaitName: "bash",
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+        lastCpuDeltaMs: 900,
+      },
+    });
+    expect(latest().updatedAt).toBe(updatedAt);
+    expect(latest().state).toBe("running");
+    expect(latest().diagnostics).toMatchObject({
+      eventSeq: 4,
+      toolWaitName: "bash",
+      cpuVerdict: "working",
+      watchdogDecision: "cpu-progress",
+      hostReceivedAt: expect.any(Number),
+      generationMatch: true,
+    });
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 9,
+        processGeneration: "11:100",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    expect(latest().diagnostics?.seqGap).toBe(5);
+    expect(latest().updatedAt).toBe(updatedAt);
+  });
+
+  it("projects child-exit diagnostics over a previous cpu-progress snapshot", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 4,
+        cpuVerdict: "working",
+        watchdogDecision: "cpu-progress",
+      },
+    });
+    const updatedAt = latest().updatedAt;
+    deliver({
+      kind: "diagnostics",
+      agentId: "a1",
+      runId: "r1",
+      diagnostics: {
+        eventSeq: 6,
+        exitReason: "child-close:0",
+        watchdogDecision: "process-exited",
+      },
+    });
+    expect(latest().updatedAt).toBe(updatedAt);
+    expect(latest().state).toBe("running");
+    expect(latest().diagnostics).toMatchObject({
+      exitReason: "child-close:0",
+      watchdogDecision: "process-exited",
+      eventSeq: 6,
+    });
+  });
+
+  it("keeps vanished end diagnostics instead of dropping exitReason", async () => {
+    const { deliver, latest } = await harness();
+    deliver(START);
+    deliver({
+      kind: "end",
+      agentId: "a1",
+      runId: "r1",
+      ok: false,
+      aborted: true,
+      interrupted: true,
+      output: "process gone after 2m, no result reported",
+      diagnostics: {
+        eventSeq: 7,
+        exitReason: "vanished",
+        watchdogDecision: "process-exited",
+      },
+    });
+    expect(latest().diagnostics).toMatchObject({
+      exitReason: "vanished",
+      watchdogDecision: "process-exited",
+    });
+  });
+
   it("does not persist the durable agent index on every streamed log_delta", async () => {
     const { backend, deliver } = await harness();
     deliver(START);
@@ -497,7 +845,8 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver({ ...UPDATE, agentId: "leader", runId: "plan-1" });
     deliver({ ...END, agentId: "leader", runId: "plan-1", output: "old plan" });
     await backend.handle("resolveAgent", ["leader"]);
-    expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan", handled: true, model: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: 0.55, turns: 4, outputCount: 1, inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, listSubtitle: "bash cd Electron && npm run build" });
+    expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan", handled: true, model: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: 0.55, turns: 4, outputCount: 1, inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, activityActive: false });
+    expect(latest().listSubtitle).toBeUndefined();
     expect(latest().endedAt).toBeGreaterThan(0);
     deliver({
       ...START,
@@ -541,8 +890,18 @@ describe("subagent lifecycle → AgentSummary", () => {
     backends.push(first);
     const firstRows = await first.handle("listAgents", ["session-1"]) as AgentSummary[];
     expect(firstRows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ agentId: "running", state: "interrupted", endedAt: 777 }),
-      expect.objectContaining({ agentId: "stalled", state: "interrupted", endedAt: expect.any(Number) }),
+      expect.objectContaining({
+        agentId: "running",
+        state: "interrupted",
+        endedAt: 777,
+        diagnostics: expect.objectContaining({ persistedRunning: true, generationMatch: false, reconciliation: "interrupted" }),
+      }),
+      expect.objectContaining({
+        agentId: "stalled",
+        state: "interrupted",
+        endedAt: expect.any(Number),
+        diagnostics: expect.objectContaining({ persistedRunning: true, reconciliation: "interrupted" }),
+      }),
     ]));
     await closeTracked(first);
 
@@ -572,20 +931,19 @@ describe("subagent lifecycle → AgentSummary", () => {
     const restarted = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
     backends.push(restarted);
     await expect(restarted.handle("listAgents", ["another-session"])).resolves.toEqual([]);
-    await expect(restarted.handle("listAgents", ["session-1"])).resolves.toMatchObject([{
+    const rehydrated = await restarted.handle("listAgents", ["session-1"]) as AgentSummary[];
+    expect(rehydrated).toMatchObject([{
       agentId: "a1",
       runId: "r1",
       toolCallId: "tc1",
-      state: "interrupted",
       task: "接入真实左侧栏",
       title: "接入真实左侧栏",
-      listSubtitle: "bash cd Electron && npm run build",
       sessionId: "session-1"
     }]);
+    expect(rehydrated[0]?.state).not.toBe("running");
     await expect(restarted.handle("listAgents", ["session-2"])).resolves.toMatchObject([{
       agentId: "a1",
       runId: "r-other",
-      state: "interrupted",
       task: "另一个项目里的同名切片",
       sessionId: "session-2"
     }]);

@@ -45,6 +45,8 @@ import {
   isSessionAdoptedFrom,
   type SessionAdoptedFrom,
 } from "@pipi/host-api";
+import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.js";
+import { enrichHostDiagnostics, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
 import { ThinkingControlReporter } from "./thinking-control.js";
 import { PlanStore, readPlanStore } from "./plan-store.js";
 import { readUserMcpServers } from "./user-mcp-servers.js";
@@ -1643,6 +1645,7 @@ export class PiHostBackend implements HostBackend {
   private readonly agentPersistMinIntervalMs: number;
   private readonly agentLogPersistDebounceMs: number;
   private readonly agentRetentionMaxTerminal: number;
+  private readonly hostProcessGeneration = `${process.pid}:${Date.now()}`;
   /** Cache-first stats refreshes that must settle during graceful close. */
   private backgroundStatsRefreshes = new Set<Promise<void>>();
   private models: Model[] = [];
@@ -6980,6 +6983,14 @@ export class PiHostBackend implements HostBackend {
         if (agent.state === "running" || agent.state === "stalled") {
           agent.state = "interrupted";
           agent.endedAt = agent.endedAt ?? restartedAt;
+          agent.activityActive = false;
+          agent.listSubtitle = undefined;
+          agent.activityToolCallId = undefined;
+          agent.activityEndedAt = agent.activityEndedAt ?? restartedAt;
+          agent.diagnostics = markPersistedRunningReconciliation(agent, {
+            receivedAt: restartedAt,
+            generation: this.hostProcessGeneration,
+          });
           normalized = true;
         }
         const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
@@ -7296,6 +7307,9 @@ export class PiHostBackend implements HostBackend {
         stalled: false,
         stalledIdleSec: undefined,
         listSubtitle: "",
+        activityActive: false,
+        activityToolCallId: undefined,
+        activityEndedAt: agent.activityEndedAt ?? now,
         endedAt: agent.endedAt ?? now,
         closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
       };
@@ -7584,12 +7598,60 @@ export class PiHostBackend implements HostBackend {
     this.worktrees.set(raw.agentId, status);
     this.agent({ type: "worktree", status });
   }
+  private mergeAgentDiagnostics(raw: any, current: AgentSummary | undefined, receivedAt = Date.now()) {
+    return enrichHostDiagnostics(
+      sanitizeAgentDiagnostics(raw?.diagnostics),
+      current?.diagnostics,
+      { receivedAt, generation: this.hostProcessGeneration },
+    );
+  }
   private mapAgentEvent(raw: any, sessionId?: string) {
     const key = this.agentKey(raw.agentId, sessionId, raw.runId);
     const current = this.agents.get(key);
-    const eventKind = ["start", "end", "update", "usage", "log", "log_delta", "closeout"].includes(raw.kind)
+    const eventKind = ["start", "end", "update", "usage", "log", "log_delta", "closeout", "diagnostics", "activity", "stalled"].includes(raw.kind)
       ? String(raw.kind)
       : "unknown";
+    if (raw.kind === "diagnostics") {
+      if (!current || current.runId !== raw.runId) return;
+      const agent: AgentSummary = {
+        ...current,
+        diagnostics: this.mergeAgentDiagnostics(raw, current),
+      };
+      this.agents.set(key, agent);
+      this.projectionDebug("agent_event", {
+        session: this.projectionDebugSessionTag(sessionId),
+        kind: eventKind,
+        key: this.projectionDebugAgentTag(key),
+        before: current.state,
+        after: agent.state,
+        seq: agent.diagnostics?.eventSeq,
+        seqGap: agent.diagnostics?.seqGap,
+      });
+      this.agent({ type: "agent", agent });
+      return;
+    }
+    if (raw.kind === "activity") {
+      if (!current || current.runId !== raw.runId) return;
+      const activity = mergeAgentActivity(raw, current, {
+        sameRun: true,
+        terminal: false,
+        now: Date.now(),
+      });
+      const agent: AgentSummary = {
+        ...current,
+        ...activity,
+      };
+      this.agents.set(key, agent);
+      this.projectionDebug("agent_event", {
+        session: this.projectionDebugSessionTag(sessionId),
+        kind: eventKind,
+        key: this.projectionDebugAgentTag(key),
+        before: current.state,
+        after: agent.state,
+      });
+      this.agent({ type: "agent", agent });
+      return;
+    }
     if (raw.kind === "closeout") {
       if (
         !current ||
@@ -7662,6 +7724,12 @@ export class PiHostBackend implements HostBackend {
     const terminal = raw.kind === "end";
     const sameRun = current?.runId === raw.runId;
 		const eventAt = raw.at ? asTime(raw.at) : Date.now();
+    const activity = mergeAgentActivity(raw, sameRun ? current : undefined, {
+      sameRun,
+      terminal: terminal || Boolean(raw.aborted),
+      now: eventAt,
+    });
+    const activityOnly = isActivityOnlyAgentEvent(raw);
 		const currentIsTerminal = sameRun && current !== undefined && current.state !== "running" && current.state !== "stalled";
 		// HTTP lifecycle reports can arrive out of order. Once one run reaches a
 		// terminal state, a late preview/update/log/stall may enrich metrics but it
@@ -7688,7 +7756,7 @@ export class PiHostBackend implements HostBackend {
       createdAt:
         raw.createdAt ??
 				(raw.at ? asTime(raw.at) : (sameRun ? current?.createdAt : undefined) ?? Date.now()),
-			updatedAt: eventAt,
+			updatedAt: activityOnly ? (sameRun ? current?.updatedAt : undefined) ?? eventAt : eventAt,
 			// A terminal event always drops the stored deadline: a dead worker must never keep
 			// showing "最迟 NNN 秒后自动中止" from a budget that no longer exists.
 			deadlineAt: num2(raw.deadlineAt) ?? (terminal ? undefined : (sameRun ? current?.deadlineAt : undefined)),
@@ -7696,9 +7764,11 @@ export class PiHostBackend implements HostBackend {
       // clobber a model a later `usage` event resolved.
       model: modelRef(raw.model) ?? (sameRun ? current?.model : undefined),
       provider: providerOf(modelRef(raw.model)) ?? (sameRun ? current?.provider : undefined),
-      // The extension's `activity` is the one-line "what this worker is doing right now"; it is what
-      // Swift shows as the row subtitle and in the 正在执行 block.
-      listSubtitle: nonEmpty(raw.activity) ?? (sameRun ? current?.listSubtitle : undefined),
+      // Live tool line. Explicit null/false clears; omitting the field keeps the previous state.
+      listSubtitle: activity.listSubtitle,
+      activityActive: activity.activityActive,
+      activityEndedAt: activity.activityEndedAt,
+      activityToolCallId: activity.activityToolCallId,
       // `update` carries a rolling snapshot of the output; only the terminal event is the real result,
       // so a running worker never renders a 最终结果 card built from a half-written answer.
       finalResult: terminal
@@ -7713,6 +7783,7 @@ export class PiHostBackend implements HostBackend {
       cacheTokens: num2(usage?.cacheRead) ?? (sameRun ? current?.cacheTokens : undefined),
       contextTokens: num2(usage?.contextTokens) ?? (sameRun ? current?.contextTokens : undefined),
       contextWindowTokens: positiveWindow(usage?.contextWindow) ?? positiveWindow(raw.contextWindow) ?? (sameRun ? current?.contextWindowTokens : undefined) ?? (sessionId ? this.sessionContextLastKnown.get(sessionId)?.contextWindow : undefined),
+      diagnostics: this.mergeAgentDiagnostics(raw, sameRun ? current : undefined),
     };
     this.agents.set(key, agent);
     this.agentProjectionChanged(agent.sessionId);

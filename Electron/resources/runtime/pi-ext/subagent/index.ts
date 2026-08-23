@@ -277,6 +277,32 @@ import {
 	readProcessTable,
 	sampleSubtreeCpu,
 } from "./worker-liveness.ts";
+import {
+	type StallDiagnosticsState,
+	classifyWatchdogProbe,
+	createStallDiagnosticsState,
+	formatDiagnosticsCompactLine,
+	ioByteLength,
+	logStallProbe,
+	noteDiagnosticsAbort,
+	noteDiagnosticsChildExit,
+	noteDiagnosticsCpuSample,
+	noteDiagnosticsIo,
+	noteDiagnosticsToolEnd,
+	noteDiagnosticsToolStart,
+	preferSpecificExitReason,
+	recordWatchdogDecision,
+	snapshotStallDiagnostics,
+} from "./stall-diagnostics.ts";
+import {
+	type ActiveTool,
+	activeToolForContentIndex,
+	boundActivitySummary,
+	latestActiveTool,
+	removeActiveTool,
+	summarizeActiveToolArgs,
+	upsertActiveTool,
+} from "./active-tools.ts";
 import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
 import {
 	createUsageEmitter,
@@ -1102,38 +1128,7 @@ function boundedEditPayloadForUI(args: Record<string, unknown>): string {
 }
 
 function summarizeToolArgsForUI(toolName: string, args: Record<string, unknown>): string {
-	const pathOf = () => String(args.file_path || args.path || "…");
-	switch (toolName) {
-		case "edit":
-		case "write":
-		case "read":
-		case "ls":
-			return pathOf();
-		case "bash":
-		case "shell": {
-			const command = String(args.command || "…");
-			return command.length > 120 ? `${command.slice(0, 120)}…` : command;
-		}
-		case "web_search":
-			return String(args.query || "…");
-		case "fetch_content":
-			return String(args.url || args.urls?.[0] || "…");
-		case "generate_image":
-		case "image_gen":
-		case "image_edit": {
-			const prompt = String(args.prompt || "…").trim();
-			return prompt.length > 80 ? `${prompt.slice(0, 80)}…` : prompt || "…";
-		}
-		case "browser": {
-			const action = String(args.action || "…");
-			const detail = String(args.url || args.js || args.mode || "");
-			return detail ? `${action} ${detail}` : action;
-		}
-		default: {
-			const raw = JSON.stringify(args ?? {});
-			return raw.length > 120 ? `${raw.slice(0, 120)}…` : raw;
-		}
-	}
+	return summarizeActiveToolArgs(toolName, args) ?? "";
 }
 
 function formatToolCall(
@@ -2218,6 +2213,8 @@ interface RunningAgentHandle {
 	/** Latest subtree CPU sample and the one before it; the pair is the progress evidence. */
 	cpuSample?: CpuSample;
 	cpuSamplePrevious?: CpuSample;
+	/** Metadata-only stall probe for this exact run. */
+	diagnostics: StallDiagnosticsState;
 }
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
@@ -2316,15 +2313,65 @@ function noteAgentToolWait(agentId: string, runId: string, names: string[]): voi
 	if (!handle) return;
 	handle.toolWaitSince = Date.now();
 	handle.toolWaitNames = names.length > 0 ? names : undefined;
+	noteDiagnosticsToolStart(handle.diagnostics, handle.toolWaitSince);
 }
 
-
-function markAgentFinalizing(agentId: string, runId: string): void {
+function noteAgentToolEnd(agentId: string, runId: string): void {
 	const handle = handleForRun(agentId, runId);
 	if (!handle) return;
+	noteDiagnosticsToolEnd(handle.diagnostics, Date.now());
+}
+
+function diagnosticsSnapshotFor(agentId: string, handle: RunningAgentHandle, now = Date.now()): ReturnType<typeof snapshotStallDiagnostics> {
+	const stall = stalledInfoFor(agentId, now);
+	return snapshotStallDiagnostics({
+		agentId,
+		runId: handle.runId,
+		state: handle.diagnostics,
+		lastActivityAt: handle.lastActivityAt,
+		childPid: handle.pid,
+		toolWaitName: handle.toolWaitNames?.[0],
+		cpuVerdict: stall.verdict,
+	});
+}
+
+function attachDiagnostics<T extends { agentId: string; runId: string }>(payload: T, handle?: RunningAgentHandle): T & { diagnostics?: ReturnType<typeof snapshotStallDiagnostics> } {
+	if (!handle || handle.runId !== payload.runId) return payload;
+	return { ...payload, diagnostics: diagnosticsSnapshotFor(payload.agentId, handle) };
+}
+
+function projectChildExitDiagnostics(agentId: string, handle: RunningAgentHandle, exitReason: string): ReturnType<typeof snapshotStallDiagnostics> {
+	const changed = noteDiagnosticsChildExit(handle.diagnostics, exitReason);
+	if (changed) {
+		logStallProbe("watchdog_decision", {
+			agent: agentId,
+			run: handle.runId,
+			seq: handle.diagnostics.eventSeq,
+			decision: "process-exited",
+			reason: exitReason,
+			childPid: handle.pid,
+		});
+	}
+	const snapshot = diagnosticsSnapshotFor(agentId, handle);
+	pipiuiReport({
+		kind: "diagnostics",
+		agentId,
+		runId: handle.runId,
+		diagnostics: snapshot,
+	});
+	return snapshot;
+}
+
+function markAgentFinalizing(agentId: string, runId: string, exitReason = "child-close"): void {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return;
+	const keptReason = preferSpecificExitReason(handle.diagnostics.exitReason, exitReason);
+	const already = handle.finalizing;
 	handle.pid = undefined;
 	handle.finalizing = true;
-	noteAgentActivity(agentId, runId);
+	if (already && handle.diagnostics.exitReason === keptReason) return;
+	projectChildExitDiagnostics(agentId, handle, keptReason);
+	if (!already) noteAgentActivity(agentId, runId);
 }
 
 function resumeAgentHandle(agentId: string, runId: string): void {
@@ -2386,8 +2433,13 @@ function stalledInfoFor(agentId: string, now: number): {
 function sampleWorkerCpu(handle: RunningAgentHandle, rows: ReturnType<typeof readProcessTable>, now: number): void {
 	if (handle.pid === undefined) return;
 	const sample = sampleSubtreeCpu(rows, handle.pid, now);
-	handle.cpuSamplePrevious = handle.cpuSample;
+	const previous = handle.cpuSample;
+	handle.cpuSamplePrevious = previous;
 	handle.cpuSample = sample;
+	const deltaMs = previous && previous.at < sample.at
+		? Math.round((sample.seconds - previous.seconds) * 1000)
+		: undefined;
+	noteDiagnosticsCpuSample(handle.diagnostics, now, deltaMs);
 }
 
 function cpuEvidenceFor(agentId: string): string | undefined {
@@ -2481,6 +2533,7 @@ function abortRunningAgent(
 			message: `Cannot abort agentId=${agentId}: child process already exited and is already finalizing closeout.`,
 		};
 	}
+	noteDiagnosticsAbort(handle.diagnostics, options?.reportTerminalToSupervisor ? "stall" : "user");
 	const abortExactRun = () => handle.controller.abort();
 	if (options?.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
 		supervisorAbortTerminalCloseout.requestExternal(
@@ -2953,6 +3006,7 @@ function markWorkerInterrupted(agentId: string, reason: string): boolean {
 		return false;
 	}
 
+	const exitSnapshot = handle ? projectChildExitDiagnostics(agentId, handle, "vanished") : undefined;
 	const changed = jobFinalize(agentId, runId, {
 		name: handle?.name ?? job?.name,
 		task: handle?.task ?? job?.task,
@@ -2973,9 +3027,13 @@ function markWorkerInterrupted(agentId: string, reason: string): boolean {
 		ok: false,
 		aborted: true,
 		interrupted: true,
+		activity: null,
+		activityActive: false,
+		activityEndedAt: Date.now(),
 		output: reason,
 		...(job?.cost !== undefined ? { cost: job.cost } : {}),
 		...(job?.turns !== undefined ? { turns: job.turns } : {}),
+		...(exitSnapshot ? { diagnostics: exitSnapshot } : {}),
 	});
 	return true;
 }
@@ -3216,7 +3274,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 					`name: ${historical.name}`,
 					...(historical.title ? [`title: ${historical.title}`] : []),
 					...(historical.state === "running"
-						? ["state: interrupted (not running in this process)", "last recorded state: running"]
+						? ["state: interrupted (not running in this process)", "last recorded state: running", "diagnostics: persisted-running leftover; process generation mismatch"]
 						: [`state: ${historical.state ?? "not running in this process"}`]),
 					`stored conversation: ${resumable ? "yes" : "no"}`,
 					`Task: ${historical.task}`,
@@ -3250,6 +3308,11 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				? [`blocked-by: ${job.blockedBy.join(", ")}`]
 				: []),
 			`state: ${formatJobStateWithStall(job, now)}`,
+			...(handleForRun(job.agentId, job.runId)
+				? [`diagnostics: ${formatDiagnosticsCompactLine(diagnosticsSnapshotFor(job.agentId, handleForRun(job.agentId, job.runId)!))}`]
+				: job.state === "running"
+					? ["diagnostics: persisted-running leftover; not live in this process generation"]
+					: []),
 			`turns: ${turns}`,
 			`cost: ${cost}`,
 			`elapsed: ${elapsed}`,
@@ -5478,6 +5541,9 @@ async function runSingleAgent(
 			agentId: pipiuiAgentId,
 			runId,
 			ok: false,
+			activity: null,
+			activityActive: false,
+			activityEndedAt: Date.now(),
 			output: message,
 			worktreeError: placement.worktreeError,
 		});
@@ -5628,6 +5694,43 @@ async function runSingleAgent(
 
 	let pipiuiLastUpdate = 0;
 	let pipiuiActivity = "";
+	let pipiuiActiveTools: ActiveTool[] = [];
+	const currentActiveTool = (): ActiveTool | undefined => latestActiveTool(pipiuiActiveTools);
+	const projectActiveTool = (emit: boolean) => {
+		const tool = currentActiveTool();
+		pipiuiActivity = tool?.summary ?? "";
+		if (!emit) return;
+		pipiuiReport(tool ? {
+			kind: "activity",
+			agentId: pipiuiAgentId,
+			runId,
+			activity: tool.summary,
+			activityActive: true,
+			...(tool.toolCallId ? { activityToolCallId: tool.toolCallId } : {}),
+			activityToolName: tool.name,
+			activityStartedAt: tool.startedAt,
+		} : {
+			kind: "activity",
+			agentId: pipiuiAgentId,
+			runId,
+			activity: null,
+			activityActive: false,
+			activityEndedAt: Date.now(),
+		});
+	};
+	const beginActiveTool = (tool: ActiveTool, emit = true) => {
+		pipiuiActiveTools = upsertActiveTool(pipiuiActiveTools, tool);
+		projectActiveTool(emit);
+	};
+	const finishActiveTool = (ref: { toolCallId?: string; name?: string }) => {
+		pipiuiActiveTools = removeActiveTool(pipiuiActiveTools, ref);
+		projectActiveTool(true);
+	};
+	const clearActiveTools = () => {
+		pipiuiActiveTools = [];
+		projectActiveTool(true);
+	};
+	const stallDiagnostics = createStallDiagnosticsState();
 	await postPipiuiReport({
 		kind: "start",
 		agentId: pipiuiAgentId,
@@ -5645,6 +5748,12 @@ async function runSingleAgent(
 		...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 		...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 		...(placement.worktreeError ? { worktreeError: placement.worktreeError } : {}),
+		diagnostics: snapshotStallDiagnostics({
+			agentId: pipiuiAgentId,
+			runId,
+			state: stallDiagnostics,
+			lastActivityAt: Date.now(),
+		}),
 	});
 	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
 	// Both foreground Computer Workers and background jobs need a separately
@@ -5668,21 +5777,33 @@ async function runSingleAgent(
 			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 			readOnly: Boolean(agent.traits.readOnly),
 			syncWait: !isBackground,
+			diagnostics: stallDiagnostics,
 		});
 		armIdleFoldForDispatch(pipiuiAgentId);
 	const pipiuiUpdate = (force = false) => {
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
 		pipiuiLastUpdate = now;
-		pipiuiReport({
+		const liveHandle = handleForRun(pipiuiAgentId, runId);
+		const liveTool = currentActiveTool();
+		pipiuiReport(attachDiagnostics({
 			kind: "update",
 			agentId: pipiuiAgentId,
 			runId,
 			output: (getFinalOutput(currentResult.messages) || "").slice(-4000),
-			activity: pipiuiActivity,
+			...(liveTool ? {
+				activity: liveTool.summary,
+				activityActive: true,
+				...(liveTool.toolCallId ? { activityToolCallId: liveTool.toolCallId } : {}),
+				activityToolName: liveTool.name,
+				activityStartedAt: liveTool.startedAt,
+			} : {
+				activity: null,
+				activityActive: false,
+			}),
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
-		});
+		}, liveHandle));
 		jobPatchRunning(pipiuiAgentId, runId, {
 			activity: pipiuiActivity,
 			cost: currentResult.usage.cost,
@@ -5943,6 +6064,7 @@ async function runSingleAgent(
 				const streamParts = new Map<number, StreamPart>();
 				const streamDirty = new Set<number>();
 				const fileChangeBuffers = new Map<number, { name: string; raw: string }>();
+				const toolCallIdsByContentIndex = new Map<number, string>();
 				let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
 				// Throttle state and the openai-completions output estimate live in the emitter
 				// now (streaming-usage.ts), where the read→fallback→combine→throttle sequence is
@@ -6097,7 +6219,18 @@ async function runSingleAgent(
 								forceFlushStreamParts();
 							} else if (ctype === "toolcall_start") {
 								const toolName = String(ame.name ?? "tool");
-								pipiuiActivity = `${toolName} …`;
+								const toolCallId = typeof ame.id === "string" && ame.id
+									? ame.id
+									: typeof ame.toolCallId === "string" && ame.toolCallId
+										? ame.toolCallId
+										: undefined;
+								beginActiveTool({
+									...(toolCallId ? { toolCallId } : {}),
+									name: toolName,
+									startedAt: Date.now(),
+									summary: boundActivitySummary(toolName),
+								});
+								if (toolCallId) toolCallIdsByContentIndex.set(contentIndex, toolCallId);
 								if (toolName === "write" || toolName === "edit") {
 									fileChangeBuffers.set(contentIndex, { name: toolName, raw: "" });
 									upsertStreamPart(contentIndex, "tool", "", toolName, stringifyCompactFileChange({
@@ -6116,7 +6249,19 @@ async function runSingleAgent(
 									const compact = compactFileChangeFromPartial(buf.name, buf.raw);
 									if (compact) {
 										const pathLabel = compact.path && compact.path !== "…" ? compact.path : "…";
-										pipiuiActivity = `${buf.name} ${pathLabel}`;
+										const mappedId = toolCallIdsByContentIndex.get(contentIndex);
+										const target = activeToolForContentIndex(
+											pipiuiActiveTools,
+											toolCallIdsByContentIndex,
+											contentIndex,
+											buf.name,
+										);
+										beginActiveTool({
+											...(mappedId ? { toolCallId: mappedId } : {}),
+											name: buf.name,
+											startedAt: target?.startedAt ?? Date.now(),
+											summary: boundActivitySummary(buf.name, pathLabel),
+										}, false);
 										upsertStreamPart(contentIndex, "tool", "", buf.name, stringifyCompactFileChange(compact));
 									}
 								}
@@ -6200,8 +6345,14 @@ async function runSingleAgent(
 									if (typeof part.name === "string" && part.name) toolNames.push(part.name);
 									const args = (part.arguments ?? {}) as Record<string, unknown>;
 									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
-									pipiuiActivity = `${part.name} ${summary}`;
-									const toolName = String(part.name ?? "");
+									const toolName = String(part.name ?? "tool");
+									const live = currentActiveTool();
+									beginActiveTool({
+										...(typeof part.id === "string" && part.id ? { toolCallId: part.id } : {}),
+										name: toolName,
+										startedAt: live?.name === toolName ? live.startedAt : Date.now(),
+										summary: boundActivitySummary(toolName, summary),
+									});
 									const compact = compactFileChangeFromArgs(toolName, args);
 									if (compact) {
 										let extra: Record<string, unknown> | undefined;
@@ -6275,6 +6426,7 @@ async function runSingleAgent(
 							streamParts.clear();
 							streamDirty.clear();
 							fileChangeBuffers.clear();
+							toolCallIdsByContentIndex.clear();
 							usageEmitter.resetEstimate();
 						}
 						emitUpdate();
@@ -6282,9 +6434,17 @@ async function runSingleAgent(
 					}
 
 					if (event.type === "tool_result_end" && event.message) {
+						noteAgentToolEnd(pipiuiAgentId, runId);
 							const resultMsg: any = projectToolResultMessageForParent(event.message);
 							currentResult.messages.push(resultMsg as Message);
 						providerWait.noteToolResult(String(resultMsg.toolCallId ?? ""));
+						const endedId = typeof resultMsg.toolCallId === "string" && resultMsg.toolCallId
+							? resultMsg.toolCallId
+							: undefined;
+						const endedName = typeof resultMsg.toolName === "string" && resultMsg.toolName
+							? resultMsg.toolName
+							: undefined;
+						finishActiveTool({ ...(endedId ? { toolCallId: endedId } : {}), ...(endedName ? { name: endedName } : {}) });
 						const resultText = (
 							Array.isArray(resultMsg.content)
 								? resultMsg.content
@@ -6313,12 +6473,16 @@ async function runSingleAgent(
 
 					const stdoutScanner = new JSONLChunkScanner(processLine);
 					proc.stdout.on("data", (data) => {
+						const live = handleForRun(pipiuiAgentId, runId);
+						if (live) noteDiagnosticsIo(live.diagnostics, "stdout", ioByteLength(data), Date.now());
 						noteAgentActivity(pipiuiAgentId, runId);
 						options?.onActivity?.();
 						stdoutScanner.push(data);
 				});
 
 				proc.stderr.on("data", (data) => {
+					const live = handleForRun(pipiuiAgentId, runId);
+						if (live) noteDiagnosticsIo(live.diagnostics, "stderr", ioByteLength(data), Date.now());
 					noteAgentActivity(pipiuiAgentId, runId);
 					currentResult.stderr += data.toString();
 				});
@@ -6329,14 +6493,14 @@ async function runSingleAgent(
 						stdoutScanner.end();
 					// The process is known closed. Keep the background handle alive as finalizing
 					// while verify/end reporting runs; only an unreported dead live child is vanished.
-					markAgentFinalizing(pipiuiAgentId, runId);
+					markAgentFinalizing(pipiuiAgentId, runId, `child-close:${code ?? 0}`);
 					resolve(code ?? 0);
 				});
 
 				proc.on("error", () => {
 					procExited = true;
 					providerWait.dispose();
-					markAgentFinalizing(pipiuiAgentId, runId);
+					markAgentFinalizing(pipiuiAgentId, runId, "child-error");
 					resolve(1);
 				});
 
@@ -6663,12 +6827,17 @@ async function runSingleAgent(
 			// finalization did not run at all, which must be visible but must not lose the run.
 			finalization = `finalization error: ${error instanceof Error ? error.message : String(error)}`;
 		}
-		await postTerminalPipiuiReport({
+		const endHandle = handleForRun(pipiuiAgentId, runId);
+		clearActiveTools();
+		await postTerminalPipiuiReport(attachDiagnostics({
 			kind: "end",
 			agentId: pipiuiAgentId,
 			runId,
 			ok: endOk,
 			aborted: externallyAborted,
+			activity: null,
+			activityActive: false,
+			activityEndedAt: Date.now(),
 			output: endOutput,
 			cost: currentResult.usage.cost,
 			turns: currentResult.usage.turns,
@@ -6685,7 +6854,7 @@ async function runSingleAgent(
 						verifyExit: currentResult.verify.timedOut ? -1 : (currentResult.verify.exitCode ?? -1),
 					}
 				: {}),
-		});
+		}, endHandle));
 		if (wasAborted && !runtimeTimedOut) throw Object.assign(new Error("Subagent was aborted"), {
 			agentId: pipiuiAgentId,
 			runId,
@@ -8334,6 +8503,56 @@ export default function (pi: ExtensionAPI) {
 			if (rows.length > 0) for (const handle of quietWorkers) sampleWorkerCpu(handle, rows, now);
 		}
 
+		// (2c) Metadata-only stall probe. Logs only on decision change; never changes abort policy.
+		for (const [agentId, handle] of runningAgents) {
+			if (handle.finalizing) continue;
+			const stallInfo = stalledInfoFor(agentId, now);
+			const idleMs = now - handle.lastActivityAt;
+			const action = decideStallWatchdogAction({
+				idleMs,
+				stallThresholdMs: STALL_THRESHOLD_MS,
+				notifyCount: handle.stallNotifyCount,
+				maxNotifies: STALL_RENOTIFY_MAX,
+				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
+				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
+				syncWait: handle.syncWait === true,
+				...(handle.name === "computer-use" ? { syncRecoveryGraceMs: COMPUTER_USE_SYNC_RECOVERY_GRACE_MS } : {}),
+			});
+			const probe = classifyWatchdogProbe({
+				inTool: Boolean(stallInfo.inTool),
+				stalled: stallInfo.stalled,
+				stallAction: action,
+				stallNotifyCount: handle.stallNotifyCount,
+				childPid: handle.pid,
+				finalizing: handle.finalizing,
+				cpuVerdict: stallInfo.verdict,
+				lastOutputAt: handle.diagnostics.lastOutputAt,
+				lastActivityAt: handle.lastActivityAt,
+				now,
+			});
+			const changed = recordWatchdogDecision(handle.diagnostics, probe.decision, probe.reason);
+			if (changed) {
+				logStallProbe("watchdog_decision", {
+					agent: agentId,
+					run: handle.runId,
+					seq: handle.diagnostics.eventSeq,
+					decision: probe.decision,
+					reason: probe.reason,
+					childPid: handle.pid,
+					cpuDeltaMs: handle.diagnostics.lastCpuDeltaMs,
+					tool: handle.toolWaitNames?.[0],
+				});
+			}
+			if (changed || idleMs >= LIVENESS_SAMPLE_AFTER_MS) {
+				pipiuiReport({
+					kind: "diagnostics",
+					agentId,
+					runId: handle.runId,
+					diagnostics: diagnosticsSnapshotFor(agentId, handle, now),
+				});
+			}
+		}
+
 		// (3) stall 推送 / 复推 / 预裁决 abort
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing) continue;
@@ -8363,17 +8582,26 @@ export default function (pi: ExtensionAPI) {
 			if (action === "abort") {
 				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true });
 				if (!aborted.ok) continue;
+				logStallProbe("abort", {
+					agent: agentId,
+					run: handle.runId,
+					seq: handle.diagnostics.eventSeq,
+					reason: "stall",
+					childPid: handle.pid,
+				});
 				if (handle.syncWait !== true) {
 					void deliverStallWake(pi, formatBlockedMessage({ agentId, title, idleSec, lastLine }));
 				}
-				pipiuiReport({
+				pipiuiReport(attachDiagnostics({
 					kind: "stalled",
 					agentId,
 					runId: handle.runId,
 					stalled: true,
 					idle: idleSec,
-					activity: `auto-aborted after stall: ${lastLine}`,
-				});
+					activity: null,
+					activityActive: false,
+					activityEndedAt: Date.now(),
+				}, handle));
 				continue;
 			}
 			if (!claimStallNotification(handle, now, STALL_RENOTIFY_MAX, STALL_RENOTIFY_INTERVAL_MS)) continue;
@@ -8388,14 +8616,16 @@ export default function (pi: ExtensionAPI) {
 					...(cpuEvidenceFor(agentId) ? { liveness: cpuEvidenceFor(agentId) as string } : {}),
 				}),
 			).then((ok) => confirmStallNotification(handle, ok));
-			pipiuiReport({
+			pipiuiReport(attachDiagnostics({
 				kind: "stalled",
 				agentId,
 				runId: handle.runId,
 				stalled: true,
 				idle: idleSec,
-				activity: lastLine,
-			});
+				activity: null,
+				activityActive: false,
+				activityEndedAt: Date.now(),
+			}, handle));
 		}
 
 		// (4) wall-clock check-in: still-active workers only. Stalled/vanished/finalizing stay
