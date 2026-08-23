@@ -2025,6 +2025,13 @@ export class PiHostBackend implements HostBackend {
   async close(): Promise<void> {
     this.persistAgentLogs();
     this.persistAgents();
+    // Sweep before closed=true: abortSessionTurn no longer stops workers, so host
+    // exit is the remaining path that must reap leftover subagent processes.
+    const sessionIds = new Set<string>(this.live.keys());
+    for (const agent of this.agents.values()) {
+      if (agent.sessionId && agent.state === "running") sessionIds.add(agent.sessionId);
+    }
+    await Promise.allSettled([...sessionIds].map((sessionId) => this.sweepSessionAgents(sessionId)));
     this.closed = true;
     this.stopEscalation.cancelAll();
     this.stopOrphanReconcileTimer();
@@ -2169,6 +2176,7 @@ export class PiHostBackend implements HostBackend {
   /**
    * Host abort: emit stopped immediately, write abort without waiting for ack,
    * escalate hung descendants in the background. User stop never FIFO-drains.
+   * Background subagents keep running; only close() sweeps them.
    */
   private async abortSessionTurn(
     sessionId: string,
@@ -2196,7 +2204,6 @@ export class PiHostBackend implements HostBackend {
       turnEpoch: after?.turnEpoch ?? live?.turnEpoch,
     });
     after?.compaction.settleTurn();
-    void this.sweepSessionAgents(sessionId);
     const abortPid = after?.process?.pid ?? live?.process?.pid;
     if (abortPid !== undefined && this.childStillRunning(after?.process ?? live?.process)) {
       queueMicrotask(() => {
@@ -7171,10 +7178,11 @@ export class PiHostBackend implements HostBackend {
     this.persistAgents();
   }
   /**
-   * Stop-sweep the session's background subagents. Reuses the /subagent_abort_all
-   * extension command so the kill paths, receipt suppression, and the host-stop
-   * quiet gate stay owned by the runtime extension. Force-aborts any panel entry
-   * still running afterwards so the UI never wedges on 运行中.
+   * Host-shutdown sweep of the session's background subagents. Reuses
+   * /subagent_abort_all so kill paths, receipt suppression, and the quiet gate
+   * stay owned by the runtime extension. Force-aborts any panel entry still
+   * running afterwards so the UI never wedges on 运行中. User stop / cut-in
+   * must not call this.
    */
   private async sweepSessionAgents(sessionId: string): Promise<void> {
     if (this.closed) return;

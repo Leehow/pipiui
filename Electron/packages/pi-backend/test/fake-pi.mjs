@@ -9,6 +9,8 @@ function logPrompt(message) {
   try { appendFileSync(promptLogPath, message + "\n"); } catch {}
 }
 let prompted = false;
+/** When set, later emitTurn cycles must not end the long-running background agent. */
+let durableAgent = false;
 let omitUsage = false;
 let failStats = false;
 let heldTurn = false;
@@ -33,8 +35,10 @@ function emitTurn(message, images) {
   if (images) {
     send({ type: "agent_event", event: { kind: "log", agentId: "agent-images", name: "capture", items: [{ itemType: "text", text: "IMAGES=" + JSON.stringify(images) }] } });
   }
-  send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Build fixture", task: "implement fixture", depth: 1, at: "2026-08-10T00:00:02.000Z", worktreePath: "/tmp/fake-worktree", worktreeBranch: "pipiui/fake", worktreeLifecycle: "active" } });
-  send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: true, worktreePath: "/tmp/fake-worktree", worktreeBranch: "pipiui/fake", worktreeLifecycle: "pendingReview" } });
+  if (!durableAgent) {
+    send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Build fixture", task: "implement fixture", depth: 1, at: "2026-08-10T00:00:02.000Z", worktreePath: "/tmp/fake-worktree", worktreeBranch: "pipiui/fake", worktreeLifecycle: "active" } });
+    send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: true, worktreePath: "/tmp/fake-worktree", worktreeBranch: "pipiui/fake", worktreeLifecycle: "pendingReview" } });
+  }
   send({ type: "agent_start" });
   send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "think" } });
   send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hello" } });
@@ -131,16 +135,19 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "fill-context-slow") { contextTokens = 240000; slowCompact = true }
     ok();
     logPrompt(command.message);
-    if (command.message === "__agent_running__") {
-      // A background subagent starts and the turn settles, but the agent never
-      // ends: the panel holds one running worker for the stop-sweep test.
+    if (command.message === "__agent_running__" || command.message === "__hold_agent_running__") {
+      // A background subagent starts and never ends. `__hold_agent_running__`
+      // also parks the Boss turn so cut-in must abort it without sweeping.
+      durableAgent = true;
       send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Sweep fixture", task: "long task", depth: 1, at: new Date().toISOString() } });
       send({ type: "agent_start" });
-      send({ type: "agent_settled" });
+      if (command.message === "__hold_agent_running__") heldTurn = true;
+      else send({ type: "agent_settled" });
       return;
     }
     if (command.message === "/subagent_abort_all") {
       // The runtime extension aborts every worker; simulate its terminal events.
+      durableAgent = false;
       send({ type: "agent_event", event: { kind: "end", agentId: "agent-1", runId: "run-1", ok: false, aborted: true, at: new Date().toISOString() } });
       return;
     }

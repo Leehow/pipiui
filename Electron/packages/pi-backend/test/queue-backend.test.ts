@@ -620,14 +620,17 @@ describe("PiHostBackend message queue integration", () => {
 
     expect(children).toHaveLength(spawnCount);
     expect((backend as any).live.get("s1")).toBeUndefined();
-    const after = (await backend.handle("listAgents", ["s1"]) as any[]).find(agent => agent.agentId === "agent-1");
-    expect(after).toMatchObject({
+    const afterStop = (await backend.handle("listAgents", ["s1"]) as any[]).find(agent => agent.agentId === "agent-1");
+    expect(afterStop).toMatchObject({ agentId: "agent-1", state: "running" });
+    expect(writes.filter(item => isAbortLike(item.text))).toHaveLength(abortLikeBefore);
+    expect(writes.filter(item => item.pid !== oldPid && isAbortLike(item.text))).toEqual([]);
+    await backend.close();
+    await sweeps.waitForIdle();
+    const afterClose = [...(backend as any).agents.values()].find((agent: any) => agent.agentId === "agent-1");
+    expect(afterClose).toMatchObject({
       agentId: "agent-1",
       state: "aborted",
       closeout: expect.stringMatching(/无主 Agent 进程/),
     });
-    expect(writes.filter(item => isAbortLike(item.text))).toHaveLength(abortLikeBefore);
-    expect(writes.filter(item => item.pid !== oldPid && isAbortLike(item.text))).toEqual([]);
-    await backend.close();
   });
 });
