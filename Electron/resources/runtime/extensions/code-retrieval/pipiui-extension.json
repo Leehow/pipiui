@@ -37,7 +37,7 @@
       }
     },
     "ui": {
-      "panels": [{ "slot": "toolPanel", "id": "retrieval", "title": "索引", "entry": "app/dist/panel.js" }],
+      "panels": [],
       "toolRenderers": [
         { "tool": "code_search", "entry": "app/dist/search-card.js" },
         { "tool": "repo_map", "entry": "app/dist/map-card.js" }
