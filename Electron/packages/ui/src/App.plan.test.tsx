@@ -389,6 +389,26 @@ describe('Plan approval bar in main chat', () => {
     expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
   })
 
+  it('keeps 批准 hidden after click even if the host object is replaced while the plan stays draft', async () => {
+    const sendPrompt = vi.fn(async () => undefined)
+    const host: PipiHostAPI = {
+      ...createMockHost(),
+      capabilities: async () => CAPABILITIES,
+      getPlans: async () => [draftPlan()],
+      sendPrompt,
+    }
+    const view = render(<App host={host} />)
+    await screen.findByTestId('plan-approval-bar')
+    fireEvent.click(screen.getByTestId('plan-approval-approve'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划'))
+    expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
+
+    const nextHost: PipiHostAPI = { ...host, getPlans: async () => [draftPlan()] }
+    view.rerender(<App host={nextHost} />)
+    await waitFor(() => expect(screen.queryByTestId('plan-approval-bar')).toBeNull())
+    expect(screen.getByText('批准该计划')).toBeTruthy()
+  })
+
   it('dismisses only the current draft without sending and shows a new draft', async () => {
     const plans = multicastPlans()
     const sendPrompt = vi.fn(async () => undefined)

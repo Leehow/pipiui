@@ -4,20 +4,38 @@ import './plan-approval-bar.css'
 
 export const PLAN_APPROVE_PROMPT = '批准该计划'
 
+export type PlanApprovalLastUser = {
+  content: string
+  timestamp?: number
+}
+
 function newestDraftLivePlan(plans: PlanSnapshot[]): PlanSnapshot | null {
   const drafts = sortPlans(plans.filter(plan => plan.lifecycle === 'draft' && planIsLive(plan)))
   return drafts[0] ?? null
+}
+
+/** True when the latest user turn already approved this draft (click or typed 批准该计划). */
+export function userHasApprovedDraft(plan: PlanSnapshot, lastUser?: PlanApprovalLastUser | null): boolean {
+  if (!lastUser || lastUser.content.trim() !== PLAN_APPROVE_PROMPT) return false
+  if (lastUser.timestamp == null) return true
+  const created = Date.parse(plan.createdAt)
+  if (Number.isNaN(created)) return true
+  return lastUser.timestamp >= created
 }
 
 export function PlanApprovalBar({
   host,
   sessionId,
   readOnly,
+  busy,
+  lastUser,
   onSend,
 }: {
   host: PipiHostAPI
   sessionId?: string
   readOnly?: boolean
+  busy?: boolean
+  lastUser?: PlanApprovalLastUser | null
   onSend: (prompt: string) => void | Promise<boolean | void>
 }) {
   const [plans, setPlans] = useState<PlanSnapshot[]>([])
@@ -29,9 +47,15 @@ export function PlanApprovalBar({
     setPlans(current => sortPlans([...current.filter(item => item.id !== plan.id), plan]))
   }, [])
 
+  // Host identity is not a session change. Clearing dismiss here is what revived
+  // "计划待确认" after 批准 while the model was still thinking (plan stays draft
+  // until it calls plan_approve).
+  useEffect(() => {
+    setDismissedPlanId(null)
+  }, [sessionId])
+
   useEffect(() => {
     setPlans([])
-    setDismissedPlanId(null)
     if (!sessionId || !host.getPlans) return
     let cancelled = false
     void host.getPlans(sessionId).then(loaded => {
@@ -51,7 +75,10 @@ export function PlanApprovalBar({
   }, [host, apply])
 
   const draft = useMemo(() => newestDraftLivePlan(plans), [plans])
-  if (!sessionId || readOnly || !draft || draft.id === dismissedPlanId) return null
+  const hidden = !sessionId || readOnly || !draft || busy
+    || draft.id === dismissedPlanId
+    || userHasApprovedDraft(draft, lastUser)
+  if (hidden) return null
 
   return (
     <div className="plan-approval-bar" data-testid="plan-approval-bar" data-plan-id={draft.id}>
