@@ -236,7 +236,6 @@ function hasNonEmptyString(value: unknown): value is string {
 
 const KNOWN_AGENT_TYPES = new Set([
 	"computer-terminal",
-	"computer-use-leader",
 	"computer-verifier",
 	"explore",
 	"general-purpose",

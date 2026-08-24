@@ -17,7 +17,7 @@ const context = {
 };
 
 test("all shipped roles have bounded host-enforced recall and write policies", () => {
-  for (const name of ["explore", "general-purpose", "reviewer", "computer-use-leader", "operator", "computer-verifier", "computer-terminal", "secretary"]) {
+  for (const name of ["explore", "general-purpose", "reviewer", "operator", "computer-verifier", "computer-terminal", "secretary"]) {
     const policy = subagentMemoryPolicy(name);
     assert.ok(policy, name);
     assert.ok(policy.recall.maximumItems >= 1 && policy.recall.maximumItems <= 3);
@@ -45,7 +45,7 @@ test("terminal writes require role-specific evidence and computer/secretary role
   assert.equal(terminalMemoryEvidence({ agentName: "general-purpose", terminalText: "implemented", outcome: "success", verificationPassed: false }), undefined);
   assert.equal(terminalMemoryEvidence({ agentName: "general-purpose", terminalText: "implemented", outcome: "success", verificationPassed: true }), "verification-passed");
   assert.equal(terminalMemoryEvidence({ agentName: "long-test", terminalText: "suite passed", outcome: "success", verificationPassed: true }), undefined);
-  for (const agentName of ["secretary", "computer-use-leader", "operator", "computer-verifier", "computer-terminal"]) {
+  for (const agentName of ["secretary", "operator", "computer-verifier", "computer-terminal"]) {
     assert.equal(terminalMemoryEvidence({ agentName, terminalText: "Evidence: screenshot and credentials", outcome: "success", verificationPassed: true }), undefined);
   }
 });

@@ -9,7 +9,7 @@ import { runGuardedActionBlock, type ActionBlockRequest, type ActionBlockResult,
 import { taskFamilyForGoal, type WorkflowMemoryStore } from "./workflows.ts";
 
 export type ComputerWorkerRole = "gui-operator" | "terminal-worker" | "verifier";
-export type ComputerDesktopRole = ComputerWorkerRole | "computer-use-agent";
+export type ComputerDesktopRole = ComputerWorkerRole | "computer-use-agent" | "boss-direct";
 export type ComputerWorkerGrant = "observe" | "mutate" | "openApplication";
 export type ComputerWorkerOperation = ComputerWorkerGrant | "locate" | "actionBlock";
 type ComputerWorkerFatalCode = "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress";
@@ -91,8 +91,13 @@ export function mutationSignature(actions: unknown): string {
   return createHash("sha256").update(stable(actions)).digest("hex");
 }
 
+/** Host-paced roles observe/act without the legacy worker no-progress fences. */
+export function isHostPacedDesktopRole(role: ComputerDesktopRole): boolean {
+  return role === "computer-use-agent" || role === "boss-direct";
+}
+
 export function grantsForComputerRole(role: ComputerDesktopRole): ComputerWorkerGrant[] {
-  if (role === "gui-operator" || role === "computer-use-agent") return ["observe", "mutate", "openApplication"];
+  if (role === "gui-operator" || role === "computer-use-agent" || role === "boss-direct") return ["observe", "mutate", "openApplication"];
   if (role === "verifier") return ["observe"];
   return [];
 }
@@ -256,7 +261,7 @@ export class ComputerWorkerBroker {
     }
     if (request.operation === "mutate") {
       validateDesktopActions(request.payload.actions);
-      if (grant.role !== "computer-use-agent") {
+      if (!isHostPacedDesktopRole(grant.role)) {
         const actions = request.payload.actions as Array<Record<string, unknown>>;
         const mutationIndexes = actions.flatMap((action, index) => ["wait", "screenshot"].includes(String(action.type)) ? [] : [index]);
         if (mutationIndexes.length > 1 || (mutationIndexes.length === 1 && actions.slice(mutationIndexes[0] + 1).some((action) => action.type !== "wait"))) {
@@ -276,15 +281,15 @@ export class ComputerWorkerBroker {
         }
       }
     }
-    const signature = request.operation === "mutate" && grant.role !== "computer-use-agent" ? mutationSignature(request.payload.actions) : undefined;
-    if (request.operation === "mutate" && grant.role !== "computer-use-agent" && signature && grant.noProgress?.exhausted) {
+    const signature = request.operation === "mutate" && !isHostPacedDesktopRole(grant.role) ? mutationSignature(request.payload.actions) : undefined;
+    if (request.operation === "mutate" && !isHostPacedDesktopRole(grant.role) && signature && grant.noProgress?.exhausted) {
       if (grant.noProgress.signature === signature) {
         throw new Error("no_progress_budget_exhausted: equivalent UI mutation is blocked until the UI or strategy changes");
       }
       grant.noProgress = undefined;
     }
 	    if (request.operation === "openApplication" && ![request.payload.bundle_identifier, request.payload.application_name].some((value) => typeof value === "string" && value.trim().length > 0)) throw new Error("openApplication requires an exact application identity");
-		if (request.operation === "observe" && grant.role !== "computer-use-agent") {
+		if (request.operation === "observe" && !isHostPacedDesktopRole(grant.role)) {
 			grant.consecutiveObservations += 1;
 			if (grant.consecutiveObservations > MAX_CONSECUTIVE_OBSERVATIONS) {
 				this.#markFatal(grant, "computer_worker_no_progress");
@@ -301,7 +306,7 @@ export class ComputerWorkerBroker {
 		if (grant.busy) throw new Error("computer_worker_request_in_progress");
 		grant.busy = true;
     grant.controllers.add(controller);
-    if (grant.role !== "computer-use-agent" && (request.operation === "mutate" || request.operation === "openApplication")) grant.requiresFreshObservation = true;
+    if (!isHostPacedDesktopRole(grant.role) && (request.operation === "mutate" || request.operation === "openApplication")) grant.requiresFreshObservation = true;
     let timedOut = false;
     let callerAborted = false;
     const abort = () => { callerAborted = true; controller.abort(); };
@@ -330,7 +335,7 @@ export class ComputerWorkerBroker {
 			catch (error) {
 				const driverTimedOut = error && typeof error === "object" && (error as { code?: unknown }).code === "cua_driver_rpc_timeout";
 				if (timedOut || driverTimedOut) {
-					if (grant.role !== "computer-use-agent") {
+					if (!isHostPacedDesktopRole(grant.role)) {
 						this.#markFatal(grant, "computer_worker_runtime_timeout");
 						throw new Error("computer_worker_runtime_timeout");
 					}
@@ -362,7 +367,7 @@ export class ComputerWorkerBroker {
       }
     }
 	    if (["observe", "mutate", "openApplication"].includes(request.operation)) grant.lastObservation = result;
-		if (grant.role !== "computer-use-agent" && request.operation === "observe" && request.payload.fresh !== false) grant.requiresFreshObservation = false;
+		if (!isHostPacedDesktopRole(grant.role) && request.operation === "observe" && request.payload.fresh !== false) grant.requiresFreshObservation = false;
 		if (request.operation === "mutate" || request.operation === "openApplication") grant.consecutiveObservations = 0;
     if (grant.checkpoint && ["observe", "mutate", "openApplication"].includes(request.operation)) {
       reconcileTaskCheckpoint(grant.checkpoint, result);

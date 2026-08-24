@@ -43,7 +43,7 @@ describe('computer_task result card', () => {
     const card = screen.getByTestId('computer-result-card')
     expect(card.textContent).toContain('任务受阻')
     expect(card.textContent).toContain('Visually verify the bottom of Settings')
-    expect(card.textContent).toContain('执行步骤')
+    expect(card.textContent).not.toContain('执行步骤')
     expect(card.textContent).toContain('成功条件')
     // The raw ledger stays folded inside the technical details.
     const details = card.querySelector('details.computer-raw') as HTMLDetailsElement | null

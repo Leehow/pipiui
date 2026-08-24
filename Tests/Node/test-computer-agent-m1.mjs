@@ -7,9 +7,6 @@ import {
   grantsForComputerRole,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/worker-broker.ts";
 import {
-  ComputerAgentCoordinator,
-} from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/coordinator.ts";
-import {
   ComputerWorkerBrokerServer,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/worker-broker-server.ts";
 import {
@@ -71,155 +68,8 @@ test("worker broker attenuates grants per role and revokes a completed step", as
   );
 });
 
-test("direct task uses one GUI worker and deterministic postcondition without verifier model", async () => {
-  const dispatches = [];
-  const coordinator = new ComputerAgentCoordinator({
-    planner: {
-      plan: async (goal) => ({
-        goal,
-        mode: "direct",
-        successConditions: [{ kind: "visible_text", contains: "周会记录" }],
-        steps: [{
-          id: "gui-1",
-          role: "gui-operator",
-          objective: "Open TextEdit and enter the requested title",
-          dependsOn: [],
-          postconditions: [{ kind: "visible_text", contains: "周会记录" }],
-        }],
-      }),
-      replan: async () => {
-        throw new Error("direct happy path must not replan");
-      },
-    },
-    dispatcher: {
-      dispatch: async (request) => {
-        dispatches.push(request);
-        return {
-          outcome: "completed",
-          summary: "TextEdit shows 周会记录",
-          observation: {
-            id: "obs-2",
-            visibleText: ["周会记录"],
-          },
-        };
-      },
-    },
-  });
 
-  const result = await coordinator.run({ goal: "在 TextEdit 输入周会记录" });
-  assert.equal(result.outcome, "succeeded");
-  assert.equal(result.verification.status, "verified");
-  assert.deepEqual(dispatches.map((item) => item.role), ["gui-operator"]);
-  assert.equal(result.planRevisions, 0);
-});
 
-test("unknown mutation outcome observes before a materially revised GUI retry", async () => {
-  const dispatches = [];
-  let replans = 0;
-  const coordinator = new ComputerAgentCoordinator({
-    planner: {
-      plan: async (goal) => ({
-        goal,
-        mode: "direct",
-        successConditions: [{ kind: "element_exists", name: "Saved" }],
-        steps: [{
-          id: "gui-1",
-          role: "gui-operator",
-          objective: "Save the document with the primary route",
-          dependsOn: [],
-          postconditions: [{ kind: "element_exists", name: "Saved" }],
-        }],
-      }),
-      replan: async ({ plan }) => {
-        replans += 1;
-        return {
-          ...plan,
-          revision: 1,
-          steps: [{
-            ...plan.steps[0],
-            id: "gui-2",
-            objective: "Use the File menu after observing current state",
-          }],
-        };
-      },
-    },
-    dispatcher: {
-      dispatch: async (request) => {
-        dispatches.push(request);
-        if (request.role === "verifier") {
-          return {
-            outcome: "completed",
-            summary: "Fresh observation shows the document is not saved",
-            observation: { id: "obs-fresh", elements: [] },
-          };
-        }
-        if (dispatches.filter((item) => item.role === "gui-operator").length === 1) {
-          return { outcome: "outcome_unknown", summary: "driver timed out" };
-        }
-        return {
-          outcome: "completed",
-          summary: "Saved is visible",
-          observation: {
-            id: "obs-success",
-            elements: [{ name: "Saved" }],
-          },
-        };
-      },
-    },
-  });
-
-  const result = await coordinator.run({ goal: "保存当前文档" });
-  assert.equal(result.outcome, "succeeded");
-  assert.equal(replans, 1);
-  assert.deepEqual(dispatches.map((item) => item.role), [
-    "gui-operator",
-    "verifier",
-    "gui-operator",
-  ]);
-  assert.match(dispatches[1].objective, /fresh observation/i);
-  assert.notEqual(dispatches[0].objective, dispatches[2].objective);
-});
-
-test("subjective postcondition dispatches an observe-only verifier", async () => {
-  const dispatches = [];
-  const coordinator = new ComputerAgentCoordinator({
-    planner: {
-      plan: async (goal) => ({
-        goal,
-        mode: "planned",
-        successConditions: [{ kind: "visual_judgement", description: "layout is readable" }],
-        steps: [{
-          id: "gui-1",
-          role: "gui-operator",
-          objective: "Apply the requested layout",
-          dependsOn: [],
-          postconditions: [{ kind: "visual_judgement", description: "layout is readable" }],
-        }],
-      }),
-      replan: async () => {
-        throw new Error("verification succeeds");
-      },
-    },
-    dispatcher: {
-      dispatch: async (request) => {
-        dispatches.push(request);
-        return request.role === "gui-operator"
-          ? { outcome: "completed", summary: "layout applied", observation: { id: "obs-1" } }
-          : {
-              outcome: "verified",
-              summary: "layout is readable",
-              claims: ["The requested layout is visibly readable"],
-              observation: { id: "obs-2" },
-            };
-      },
-    },
-  });
-
-  const result = await coordinator.run({ goal: "把版式调整得清楚易读" });
-  assert.equal(result.outcome, "succeeded");
-  assert.deepEqual(dispatches.map((item) => item.role), ["gui-operator", "verifier"]);
-  assert.deepEqual(dispatches[1].grants, ["observe"]);
-});
 
 test("loopback worker broker enforces attenuated capability server-side", async () => {
   const runtimeCalls = [];
@@ -306,28 +156,3 @@ test("verifier child extension registers observation tools but no mutation tools
   assert.equal(requests[0].token, "z".repeat(48));
 });
 
-test("subagent runtime mounts scoped worker extension and exposes one computer_task interface", async () => {
-  const root = new URL("../../Electron/resources/runtime/pi-ext/", import.meta.url);
-  const [subagent, leader, operator, verifier, packageJSON] = await Promise.all([
-    readFile(new URL("subagent/index.ts", root), "utf8"),
-    readFile(new URL("agents/computer-use-leader/AGENT.md", root), "utf8"),
-    readFile(new URL("agents/operator/AGENT.md", root), "utf8"),
-    readFile(new URL("agents/computer-verifier/AGENT.md", root), "utf8"),
-    readFile(new URL("packages/computer-agent/package.json", root), "utf8"),
-  ]);
-  assert.match(subagent, /name:\s*"computer_task"/);
-  assert.match(subagent, /ComputerAgentCoordinator/);
-  assert.match(subagent, /PIPIUI_COMPUTER_WORKER_BROKER_URL/);
-  assert.match(subagent, /computer-worker\.ts/);
-  assert.match(subagent, /delete env\.PIPIUI_COMPUTER_WORKER_BROKER_TOKEN/);
-  assert.match(leader, /name: computer-use-leader/);
-  assert.match(leader, /desktop: none/);
-  assert.match(leader, /delegation: false/);
-  assert.match(operator, /desktop_observe/);
-  assert.match(operator, /desktop_act/);
-  assert.match(verifier, /name: computer-verifier/);
-  assert.match(verifier, /desktop_verify/);
-  assert.doesNotMatch(verifier, /desktop_act/);
-  const manifest = JSON.parse(packageJSON);
-  assert.ok(manifest.files.includes("skills/**"));
-});

@@ -201,7 +201,7 @@ describe('resolveRuntimeAssets', () => {
     expect(source).toContain('replan inside the dedicated Computer Use agent')
   })
 
-  it('preserves only the structured unknown-mutation failure through the coordinator adapter', async () => {
+  it('preserves only the structured unknown-mutation failure through the computer runtime adapter', async () => {
     const source = await readFile(new URL('../../../../resources/runtime/pi-ext/subagent/index.ts', import.meta.url), 'utf8')
     expect(source).toContain('const structuredUnknown = json.ok === false')
     expect(source).toContain('&& json.outcomeUnknown === true')
@@ -209,7 +209,7 @@ describe('resolveRuntimeAssets', () => {
     expect(source).toContain('runtimeError?.requiresObservation === true')
     expect(source).toContain('if (hostOutcomeUnknown) return "outcome_unknown"')
     expect(source).toContain('&& !structuredUnknown')
-    expect(source).toContain('summary: outcome === "outcome_unknown" ? "Computer Worker outcome unknown"')
+    expect(source).not.toContain('new ComputerAgentCoordinator')
     expect(source).not.toContain('summary: runtimeError?.message')
   })
 

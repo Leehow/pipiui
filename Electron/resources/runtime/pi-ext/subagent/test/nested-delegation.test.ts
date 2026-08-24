@@ -76,7 +76,6 @@ test("other built-in roles remain non-delegating", () => {
 		"secretary",
 		"operator",
 		"computer-use",
-		"computer-use-leader",
 		"computer-verifier",
 		"computer-terminal",
 	]) {
@@ -131,7 +130,6 @@ test("depth-1 general-purpose may dispatch only explore and general-purpose", ()
 		"secretary",
 		"operator",
 		"computer-use",
-		"computer-use-leader",
 		"computer-verifier",
 		"computer-terminal",
 	]) {

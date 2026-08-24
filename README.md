@@ -46,7 +46,7 @@ pi coding agent 的图形界面，Electron 实现，支持 macOS 14+ 与 Linux a
 
 ## Computer Use（macOS 桌面控制，opt-in）
 
-设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只看到 `computer_task({goal})`；每次调用创建一个私有、不可委派的 `computer-use` episode，由同一个 Agent 完成规划、操作、状态恢复和验证。它继承会话中适用的普通非管理工具，桌面侧只看到 `desktop_observe`、`desktop_open_application` 和 Host-guarded `desktop_run_action_block`，不会拿到 raw Host capability。
+设置 → 工具与 Skills 中可显式开启 Computer Use。默认关闭时不导出桌面能力，工具不存在、没有前缀成本。开启后主会话只看到 `computer_task`：用显式 `desktop` 授权打开 Boss 直驱桌面会话，再用 `sessionId` + `observe`/`act` 自己持有截图—动作闭环。不再启动 Computer Use Leader 或长任务 Computer Use Agent。直驱动作走现有 Cua broker；`operator` 仅作有界单操作逃生门。
 
 Guarded block 采用语义 just-in-time binding，按 Workflow 成熟度限制 Cold/Candidate/Practiced 为 2/4/12 次 mutation，并在 modal、target/window 漂移、stale locator、人工接管或 `outcome_unknown` 时停止剩余动作。Task Checkpoint 支持跳过用户已完成的步骤和最短安全后缀恢复；Workflow Memory v2 只位于当前项目 `.pi/agent/computer-use`，两次独立成功后晋升 Practiced，敏感应用不学习，也不会导入旧全局 Procedure Store。
 

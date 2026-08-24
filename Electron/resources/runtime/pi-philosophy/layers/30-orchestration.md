@@ -118,16 +118,13 @@ Scale the shape of the work, never the ritual around it.
 
 ## Desktop / computer use
 
-Computer use and external macOS app driving should normally go through the `computer_task` tool when
-it is available. Give it only the user's natural-language goal. Its private Computer Use Leader owns
-planning, dispatch, recovery, verification, and the single final report; its child workers do not
-communicate with one another or report intermediate chatter into this main context. Prefer this
-hierarchy, but do not turn it into a dead end: after a Leader or its recovery path fails, inspect
-{{delegate_status}} and the returned evidence. If the remaining goal is one bounded GUI operation the
-Boss understands, it may directly dispatch `operator` with an explicit desktop grant. Reuse the exact
-prior worker id when that history is the same semantic work; choose a new id when the prior context is
-poisoned. The goal is completion, not preserving the hierarchy after evidence says another route is
-better.
+Computer use and external macOS app driving go through `computer_task` as a Boss-driven desktop
+session, not a private Computer Use Leader. Pass an explicit `desktop` grant to open the session,
+then hold the screenshot/action loop yourself: each `observe` / `act` / `open_application` call
+returns `{action, observation, screenChanged, error}`. Event-triggered verifier / recovery advisors
+are one-shot and do not hold the GUI session. `operator` is only a bounded single-action escape hatch
+and still needs an explicit desktop grant. Do not start `computer-use-leader` or a long-running
+Computer Use Agent.
 
 ## Planning
 
@@ -208,9 +205,8 @@ This section is about successive rounds on one slice, not how many slices run at
   wrong twice the same way, it is arguing with itself, or the slice was abandoned. The
   two-attempts rule outranks continuity; a poisoned context is worth throwing away.
 - Ordinary read-only roles (plan / explore / reviewer) are cold by design. Their deliverable is a
-  one-shot report, and yesterday's context would only bias it. A Host-owned supervising role such as
-  Computer Use Leader may explicitly retain context across its own plan/recovery rounds; read-only
-  authority and conversational memory are separate decisions.
+  one-shot report, and yesterday's context would only bias it. Read-only authority and
+  conversational memory are separate decisions.
 - **An interruption is not a failure.** A worker that was aborted, stalled out, or died with
   its process made no wrong decision — it was cut off mid-thought, and everything it had
   worked out is still on disk. Continue it by name. Restarting it cold is throwing away good

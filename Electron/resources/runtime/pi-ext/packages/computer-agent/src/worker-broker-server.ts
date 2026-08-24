@@ -3,6 +3,7 @@ import type { AddressInfo } from "node:net";
 import {
   ComputerWorkerBroker,
   type ComputerDesktopRole,
+  type ComputerWorkerBrokerRequest,
   type ComputerWorkerOperation,
   type IssuedComputerWorkerGrant,
 } from "./worker-broker.ts";
@@ -101,6 +102,10 @@ export class ComputerWorkerBrokerServer {
         PIPIUI_COMPUTER_WORKER_BROKER_URL: this.#url,
       },
     };
+  }
+
+  execute(token: string, request: ComputerWorkerBrokerRequest, signal?: AbortSignal) {
+    return this.#broker.execute(token, request, signal);
   }
 
   revokeStep(taskId: string, stepId: string): void {
