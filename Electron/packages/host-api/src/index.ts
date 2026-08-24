@@ -857,6 +857,8 @@ export type HostEvent =
 
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
+  /** Electron shell hint: project full stream/log payloads only for this visible session. */
+  setEventProjectionSession?(sessionId?: string): Promise<void>;
   listProjects(): Promise<Project[]>; listSessions(projectId: string): Promise<Session[]>;
   /**
    * Read-only sessions written by other local agents for this project cwd.
@@ -1330,12 +1332,13 @@ function responseError(response: Extract<HostResponse, { ok: false }>): Error & 
 }
 
 export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean }): PipiHostAPI {
-  return apiFrom(
-    async (method, params) => {
-      const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });
-      if (!response.ok) throw responseError(response);
-      return response.result;
-    },
+  const call = async (method: HostMethod, params: unknown[]) => {
+    const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });
+    if (!response.ok) throw responseError(response);
+    return response.result;
+  };
+  const host = apiFrom(
+    call,
     (wanted, predicate, listener) => {
       const handler = (_event: unknown, frame: HostWireFrame) => {
         if (frame.type === "event" && frame.channel === wanted && predicate(frame)) listener(frame);
@@ -1345,6 +1348,8 @@ export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHAN
     },
     options
   );
+  host.setEventProjectionSession = sessionId => call("setEventProjectionSession", [sessionId]).then(() => undefined);
+  return host;
 }
 
 /** Stable client error when a socket drops with in-flight Host API requests. Never replay mutations. */

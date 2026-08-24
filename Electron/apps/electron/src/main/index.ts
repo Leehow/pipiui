@@ -32,6 +32,7 @@ import {
   registerRemoteControlIpc
 } from './remote-control.js'
 import { createRemoteDebugService, resolveRemoteDebugStaticDir } from './remote-debug.js'
+import { normalizeEventProjectionSession, shouldForwardRendererEvent } from './renderer-event-projection.js'
 export { createPtyTerminalBackend, resolveTerminalCwd, resolveTerminalShell } from './terminal-host.js'
 
 export interface IpcMainLike {
@@ -50,15 +51,22 @@ export function registerPipiHostIpc(
   backend: HostBackend,
   channel = PIPI_HOST_IPC_CHANNEL
 ): void {
-  const renderers = new Set<{ send(channel: string, frame: HostWireFrame): void }>()
+  type RendererSender = { send(channel: string, frame: HostWireFrame): void }
+  const renderers = new Map<RendererSender, string | undefined>()
   backend.subscribe((frame) => {
     if (process.env.PIPIUI_STREAM_DEBUG) console.log(`[stream-debug] ipc-send ch=${(frame as { channel?: string }).channel} t=${Date.now()}`)
-    for (const renderer of renderers) renderer.send(channel, { type: 'event', ...frame })
+    for (const [renderer, selectedSession] of renderers) {
+      if (shouldForwardRendererEvent(frame, selectedSession)) renderer.send(channel, { type: 'event', ...frame })
+    }
   })
   ipc.handle(channel, async (event, request) => {
-    renderers.add(event.sender)
+    if (!renderers.has(event.sender)) renderers.set(event.sender, undefined)
     if (request.protocolVersion !== PIPI_HOST_PROTOCOL_VERSION || request.type !== 'request') {
       return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id ?? '', type: 'response', ok: false, error: 'unsupported protocol' }
+    }
+    if (request.method === 'setEventProjectionSession') {
+      renderers.set(event.sender, normalizeEventProjectionSession(request.params[0]))
+      return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: 'response', ok: true, result: undefined }
     }
     try {
       return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: 'response', ok: true, result: await backend.handle(request.method, request.params) }

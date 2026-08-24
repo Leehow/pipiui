@@ -1405,6 +1405,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
   useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setPlanAvailable(Boolean(capabilities.plan && host.getPlans)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setPlanAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
   useEffect(() => {
+    if (!host.setEventProjectionSession) return
+    void host.setEventProjectionSession(selectedSession || undefined).catch(() => undefined)
+  }, [host, selectedSession])
+  useEffect(() => {
     if (!host.browser || !selectedSession || isExternalSessionId(selectedSession)) return
     void host.browser.selectSession(selectedSession)
   }, [host, selectedSession])
