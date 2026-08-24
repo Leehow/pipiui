@@ -64,6 +64,11 @@ import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/
 import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeComputerTaskRecoveryPolicy, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
 import { toolNamesForComputerUseAgent, toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
 import {
+	createBossDesktopDirectDrive,
+	formatDirectDriveToolResult,
+	isComputerTaskDirectDrive,
+} from "../packages/computer-agent/src/direct-drive.ts";
+import {
 	type AgentConfig,
 	type AgentScope,
 	discoverAgents,
@@ -7312,6 +7317,7 @@ const computerWorkerFatalControllers = new Map<string, AbortController>();
 const computerWorkerFatalCodes = new Map<string, "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled">();
 const runningComputerTasks = new Map<string, { runId: string; controller: AbortController; generation?: number; closed?: boolean }>();
 let computerTaskGenerations: ReturnType<ComputerAgentModule["createComputerTaskGenerationRegistry"]> | undefined;
+let bossDesktopDirectDrive: ReturnType<typeof createBossDesktopDirectDrive> | undefined;
 const computerWorkerKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
 
 function loadComputerAgentModule(): Promise<ComputerAgentModule> {
@@ -8145,19 +8151,55 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 		continuationObligationId = undefined;
 		return { messages };
 	});
-	pi.on("session_shutdown", () => { continuationWatchdog.dispose(); continuationObligationId = undefined; });
+	pi.on("session_shutdown", () => {
+		continuationWatchdog.dispose();
+		continuationObligationId = undefined;
+		bossDesktopDirectDrive?.closeAll();
+	});
 
 	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
-		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
+		goal: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
+		desktop: Type.Optional(Type.Union([
+			Type.Literal("user-requested"),
+			Type.Literal("ui-verify"),
+		], { description: "Per-task desktop grant. Required to open a Boss-driven session; omitted goal-only calls keep the existing Computer Use Agent path." })),
+		sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Existing Boss-driven desktop session." })),
+		action: Type.Optional(Type.Union([
+			Type.Literal("session"),
+			Type.Literal("observe"),
+			Type.Literal("open_application"),
+			Type.Literal("act"),
+			Type.Literal("close"),
+		], { description: "Direct-drive operation. Omit with only goal to keep the legacy Computer Use Agent episode." })),
+		actions: Type.Optional(Type.Array(Type.Object({
+			type: Type.String({ minLength: 1 }),
+		}, { additionalProperties: true }), { minItems: 1, maxItems: 64 })),
+		expectedEffect: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Optional caller-supplied expected effect. Omitted when the caller has none; never invented." })),
+		fresh: Type.Optional(Type.Boolean()),
+		bundle_identifier: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
+		application_name: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
 	}, { additionalProperties: false }));
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
-		description: "Complete one desktop goal through one private Computer Use Agent episode that plans, operates, reconciles, recovers, and verifies without delegation.",
+		description: "Authorize a Boss-driven desktop session or run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each action returns {action, observation, screenChanged, error}. A goal-only call still starts the existing Computer Use Agent episode and does not use this direct path.",
 		parameters: computerTaskParameters,
 		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			params = omitNulls(params);
+			if (isComputerTaskDirectDrive(params)) {
+				bossDesktopDirectDrive ??= createBossDesktopDirectDrive({
+					acquireBroker: async () => ensureComputerWorkerBroker(),
+				});
+				const result = await bossDesktopDirectDrive.execute(params, {
+					hostAvailable: !!process.env.PIPIUI_COMPUTER_CAPABILITY,
+					signal,
+				});
+				return formatDirectDriveToolResult(result);
+			}
+			if (typeof params.goal !== "string" || !params.goal.trim()) {
+				throw new Error("computer_task requires goal for the legacy Computer Use Agent path, or desktop/sessionId/action for Boss-direct drive");
+			}
 			const goal = String(params.goal).trim();
 			const taskId = `computer-use-${randomUUID()}`;
 			const runId = DeliveryObligationStore.runId();
