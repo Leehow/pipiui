@@ -13,6 +13,10 @@ const CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
 
 const REQUEST_TIMEOUT_MS = 35_000;
 const CANCEL_TIMEOUT_MS = 1_500;
+// Whole-batch ceiling: per-item timeouts alone would allow 8 × 35s ≈ 280s, which
+// can exceed the caller's tool-call deadline. Items not yet started when the budget
+// runs out are reported as skipped with budgetExhaustedAt in details.
+const BATCH_BUDGET_MS = 150_000;
 
 export const BROWSER_TOOL_DECLARED_ACTIONS = [
   "navigate", "observe", "wait", "click", "input", "type", "select", "fill_form", "scroll",
@@ -75,6 +79,13 @@ async function bridge(
 
 function text(t: string, details: Record<string, unknown> = {}) {
   return { content: [{ type: "text" as const, text: t }], details };
+}
+
+// Parameter-validation failures carry isError: true so batch failure detection never
+// depends on the rendered help text — a successful content/eval result may legitimately
+// end with the full HELP string.
+function usage(t: string) {
+  return { ...text(t), isError: true as const };
 }
 
 function bridgeFailure(r: any) {
@@ -144,6 +155,17 @@ function formatObservation(r: any): string {
 const HELP = [
   "browser actions:",
   "",
+  "Prefer actions[] (1..8) for consecutive steps that do not need an intermediate observation:",
+  "  fill_form all fields then click submit; click then wait; type then Enter.",
+  "Pass exactly one of action (single) or actions (batch).",
+  "Stop and observe after navigate, after submitting a form, and when a dialog, captcha, or login wall may appear.",
+  "A failed step stops the batch; remaining items are skipped. The result lists each index and outcome.",
+  "observe/screenshot usually belong at the end of a batch: params are fixed when the batch",
+  "starts, so later items cannot consume an earlier item's fresh observation. watch inside a",
+  "batch only registers its non-blocking listener; the batch never waits for the condition.",
+  "",
+  "actions[]               Ordered batch (1..8). Each item is {action, ...same params as a single call}.",
+  "                        Mutually exclusive with top-level action.",
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
   "                        localhost defaults to http. Settles on didFinish + a short network-idle",
   "                        window (resource timing heuristic). Returns a fresh observation.",
@@ -264,6 +286,124 @@ function formatWatchResult(r: any): string {
   return "ok";
 }
 
+function isBrowserActionError(result: any): boolean {
+  return result?.isError === true;
+}
+
+function formatBrowserActionBatch(
+  entries: Array<{ index: number; action: string; status: "ok" | "failed" | "skipped"; reason?: string; result?: any }>,
+  failedIndex: number | null,
+  budgetExhaustedAt: number | null = null,
+) {
+  const incomplete = failedIndex != null || budgetExhaustedAt != null;
+  const skipped = entries.filter((entry) => entry.status === "skipped");
+  const header = failedIndex != null
+    ? `browser batch: stopped at index ${failedIndex} (${entries[failedIndex]?.action || "?"}); ${skipped.length} skipped.`
+    : budgetExhaustedAt != null
+      ? `browser batch: time budget exhausted before index ${budgetExhaustedAt}; ${skipped.length} skipped.`
+      : `browser batch: ${entries.length} executed, all ok.`;
+  const lines = [header, ""];
+  const content: Array<Record<string, unknown>> = [];
+  for (const entry of entries) {
+    if (entry.status === "skipped") {
+      lines.push(`[${entry.index}] ${entry.action || "?"} skipped${entry.reason ? ` (${entry.reason})` : ""}`);
+      continue;
+    }
+    lines.push(`[${entry.index}] ${entry.action} ${entry.status}`);
+    for (const part of entry.result?.content || []) {
+      if (part?.type === "text" && typeof part.text === "string") lines.push(part.text);
+    }
+  }
+  content.push({ type: "text", text: lines.join("\n") });
+  for (const entry of entries) {
+    for (const part of entry.result?.content || []) {
+      // Label each image with its batch step so multiple screenshots stay attributable.
+      if (part?.type === "image") {
+        const viewport = typeof part.viewport === "string" ? ` ${part.viewport}` : "";
+        content.push({ type: "text", text: `[${entry.index}] ${entry.action || "?"}${viewport}` });
+        content.push(part);
+      }
+    }
+  }
+  return {
+    content,
+    details: {
+      batch: true,
+      ok: !incomplete,
+      failedIndex,
+      ...(budgetExhaustedAt != null ? { budgetExhaustedAt } : {}),
+      skipped: skipped.map((entry) => entry.index),
+      results: entries.map((entry) => ({
+        index: entry.index,
+        action: entry.action,
+        status: entry.status,
+        ...(entry.result?.details ? { details: entry.result.details } : {}),
+        ...(entry.result?.isError ? { isError: true } : {}),
+      })),
+    },
+    ...(incomplete ? { isError: true } : {}),
+  };
+}
+
+async function executeBrowserActionBatch(items: any[], signal?: AbortSignal) {
+  if (!Array.isArray(items) || items.length < 1 || items.length > 8) {
+    return usage("browser actions must be an array of 1..8 items.\n\n" + HELP);
+  }
+  const entries: Array<{ index: number; action: string; status: "ok" | "failed" | "skipped"; reason?: string; result?: any }> = [];
+  let failedIndex: number | null = null;
+  let budgetExhaustedAt: number | null = null;
+  const deadline = Date.now() + BATCH_BUDGET_MS;
+  const markSkipped = (from: number, reason?: string) => {
+    for (let j = from; j < items.length; j++) {
+      entries.push({
+        index: j,
+        action: typeof items[j]?.action === "string" ? items[j].action : "",
+        status: "skipped",
+        ...(reason ? { reason } : {}),
+      });
+    }
+  };
+  for (let i = 0; i < items.length; i++) {
+    if (Date.now() > deadline) {
+      budgetExhaustedAt = i;
+      markSkipped(i, "batch time budget exhausted");
+      break;
+    }
+    const item = items[i] && typeof items[i] === "object" && !Array.isArray(items[i]) ? items[i] : {};
+    if (typeof item.action !== "string") {
+      entries.push({
+        index: i,
+        action: "",
+        status: "failed",
+        result: usage(`browser actions[${i}] requires "action".\n\n` + HELP),
+      });
+      failedIndex = i;
+      markSkipped(i + 1);
+      break;
+    }
+    let result;
+    try {
+      result = await executeBrowserAction(item, signal);
+    } catch (error) {
+      // bridge() throws instead of returning isError on timeout, external cancellation,
+      // connection failure, or JSON parse failure. The batch contract still owes the model
+      // a per-index report, so the throw becomes this item's failure and the rest are
+      // skipped. An external AbortSignal cancel is deliberately NOT re-thrown: the tool
+      // result is the only channel that says which steps actually ran before the cancel,
+      // and the caller does not need the rejection to finish an aborted tool call.
+      result = bridgeFailure({ error: error instanceof Error ? error.message : String(error) });
+    }
+    const failed = isBrowserActionError(result);
+    entries.push({ index: i, action: item.action, status: failed ? "failed" : "ok", result });
+    if (failed) {
+      failedIndex = i;
+      markSkipped(i + 1);
+      break;
+    }
+  }
+  return formatBrowserActionBatch(entries, failedIndex, budgetExhaustedAt);
+}
+
 export default function (pi: ExtensionAPI) {
   if (!PORT || !KEY) return; // Not running inside Pipi UI; stay dormant.
 
@@ -294,6 +434,8 @@ export default function (pi: ExtensionAPI) {
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, wait, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "Prefer packing consecutive actions that do not need an intermediate observation into one actions[] call (1..8 items), e.g. fill_form then submit click, click then wait, type then Enter. Pass exactly one of action or actions. Stop and observe after navigate, after submitting a form, and when a dialog, captcha, or login wall may appear. " +
+      "observe/screenshot are best as the final step of a batch (later items cannot consume an earlier item's observation), and watch in a batch only registers its non-blocking listener without waiting. " +
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
       "eval is page-DOM only (no literals/keep-alive). content/eval/script output is sanitized with the same redaction as observe. screenshot pixels are not redacted — avoid capturing auth/checkout UI. " +
       "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
@@ -303,9 +445,84 @@ export default function (pi: ExtensionAPI) {
       "Ordinary browsing may use target=active (default). For frontend or responsive-layout implementation/debugging, before claiming responsive visual acceptance, call observe with target=both for structured inspection, then screenshot with target=both and visually review both labeled desktop/mobile images. " +
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
-      action: Type.String({
+      action: Type.Optional(Type.String({
         description: "navigate | observe | wait | watch | unwatch | watches | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
-      }),
+      })),
+      actions: Type.Optional(Type.Array(Type.Object({
+        action: Type.String({
+          description: "navigate | observe | wait | watch | unwatch | watches | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+        }),
+        url: Type.Optional(Type.String()),
+        js: Type.Optional(Type.String()),
+        mode: Type.Optional(Type.Union([
+          Type.Literal("text"), Type.Literal("html"), Type.Literal("selector"), Type.Literal("idle"),
+        ])),
+        clear: Type.Optional(Type.Boolean()),
+        scope: Type.Optional(Type.Union([Type.Literal("viewport"), Type.Literal("page")])),
+        snapshot_id: Type.Optional(Type.String()),
+        element_index: Type.Optional(Type.Number()),
+        element_token: Type.Optional(Type.String()),
+        locator: Type.Optional(Type.Object({
+          role: Type.Optional(Type.String()),
+          name: Type.Optional(Type.String()),
+          label: Type.Optional(Type.String()),
+          text: Type.Optional(Type.String()),
+          css: Type.Optional(Type.String()),
+          nth: Type.Optional(Type.Number()),
+        })),
+        text: Type.Optional(Type.String()),
+        option: Type.Optional(Type.String()),
+        direction: Type.Optional(Type.Union([
+          Type.Literal("up"), Type.Literal("down"), Type.Literal("left"), Type.Literal("right"),
+        ])),
+        amount: Type.Optional(Type.Number({ minimum: 0.1, maximum: 10 })),
+        selector: Type.Optional(Type.String()),
+        timeout: Type.Optional(Type.Number({ minimum: 0.05, maximum: 25 })),
+        timeoutSecs: Type.Optional(Type.Number({
+          minimum: 1,
+          maximum: 1800,
+          description: "Required for action=watch (1..1800). Do not use watch for waits ≤25s.",
+        })),
+        intervalMs: Type.Optional(Type.Number({ minimum: 50 })),
+        url_matches: Type.Optional(Type.String()),
+        expression: Type.Optional(Type.String()),
+        idle: Type.Optional(Type.Union([Type.Boolean(), Type.Number({ minimum: 50, maximum: 5000 })])),
+        watchId: Type.Optional(Type.String()),
+        idle_ms: Type.Optional(Type.Number({ minimum: 50, maximum: 5000 })),
+        since_seq: Type.Optional(Type.Number()),
+        level: Type.Optional(Type.String()),
+        limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200 })),
+        target: Type.Optional(Type.Union([
+          Type.Literal("active"), Type.Literal("desktop"), Type.Literal("mobile"), Type.Literal("both"),
+        ])),
+        region: Type.Optional(Type.String()),
+        role: Type.Optional(Type.String()),
+        name: Type.Optional(Type.String()),
+        cursor: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+        fields: Type.Optional(Type.Array(Type.Object({
+          value: Type.String(),
+          element_token: Type.Optional(Type.String()),
+          element_index: Type.Optional(Type.Number()),
+          locator: Type.Optional(Type.Object({
+            role: Type.Optional(Type.String()),
+            name: Type.Optional(Type.String()),
+            label: Type.Optional(Type.String()),
+            text: Type.Optional(Type.String()),
+            css: Type.Optional(Type.String()),
+            nth: Type.Optional(Type.Number()),
+          })),
+          role: Type.Optional(Type.String()),
+          name: Type.Optional(Type.String()),
+          label: Type.Optional(Type.String()),
+          text: Type.Optional(Type.String()),
+          css: Type.Optional(Type.String()),
+          type: Type.Optional(Type.String()),
+        }))),
+      }), {
+        minItems: 1,
+        maxItems: 8,
+        description: "Ordered batch of 1..8 browser actions, each shaped like a single call. Mutually exclusive with action.",
+      })),
       url: Type.Optional(Type.String()),
       js: Type.Optional(Type.String()),
       mode: Type.Optional(Type.Union([
@@ -374,14 +591,35 @@ export default function (pi: ExtensionAPI) {
       }))),
     }),
     async execute(_id, params, signal) {
+      return executeBrowserTool(params, signal);
+    },
+  });
+}
+
+// Tool entry point, exported for behavioral tests. Kept below the registerTool call so
+// the first `actions: ...` text in this file stays the tool description (browser-host
+// contract tests parse it positionally).
+export async function executeBrowserTool(params: any, signal?: AbortSignal) {
+  const hasAction = typeof params.action === "string";
+  const hasActions = Array.isArray((params as { actions?: unknown }).actions);
+  if (hasAction === hasActions) {
+    return usage('browser requires exactly one of "action" or "actions".\n\n' + HELP);
+  }
+  if (hasActions) {
+    return executeBrowserActionBatch((params as { actions: unknown[] }).actions, signal);
+  }
+  return executeBrowserAction(params, signal);
+}
+
+async function executeBrowserAction(params: any, signal?: AbortSignal) {
       const target = params.target;
       const targetParams = target ? { target } : {};
       if (target === "both" && ["click", "input", "type", "select", "fill_form", "scroll", "eval", "content", "console", "wait"].includes(params.action)) {
-        return text(`browser ${params.action} cannot target both viewports; specify target=desktop or target=mobile.\n\n${HELP}`);
+        return usage(`browser ${params.action} cannot target both viewports; specify target=desktop or target=mobile.\n\n${HELP}`);
       }
       switch (params.action) {
         case "navigate": {
-          if (!params.url) return text('browser navigate requires "url".\n\n' + HELP);
+          if (!params.url) return usage('browser navigate requires "url".\n\n' + HELP);
           const r = await bridge("navigate", { url: params.url, scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
@@ -409,17 +647,17 @@ export default function (pi: ExtensionAPI) {
             const hasIndex = typeof params.element_index === "number";
             const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
             if (!hasSelector && hasIndex === hasToken) {
-              return text(`browser wait selector mode requires selector or exactly one of element_index or element_token.\n\n${HELP}`);
+              return usage(`browser wait selector mode requires selector or exactly one of element_index or element_token.\n\n${HELP}`);
             }
             if (hasSelector && (hasIndex || hasToken || params.snapshot_id)) {
-              return text(`browser wait selector mode accepts selector or a snapshot element target, not both.\n\n${HELP}`);
+              return usage(`browser wait selector mode accepts selector or a snapshot element target, not both.\n\n${HELP}`);
             }
             if (!hasSelector && !params.snapshot_id) {
-              return text(`browser wait with an element target requires snapshot_id.\n\n${HELP}`);
+              return usage(`browser wait with an element target requires snapshot_id.\n\n${HELP}`);
             }
           } else if (params.mode && params.mode !== "idle" && params.mode !== "selector"
             && params.mode !== "text" && params.mode !== "html") {
-            return text(`browser wait mode must be "selector" or "idle".\n\n${HELP}`);
+            return usage(`browser wait mode must be "selector" or "idle".\n\n${HELP}`);
           }
           const r = await bridge("wait", {
             mode,
@@ -435,7 +673,7 @@ export default function (pi: ExtensionAPI) {
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "type": {
-          if (!params.selector || typeof params.text !== "string") return text("browser type requires selector and text.\n\n" + HELP);
+          if (!params.selector || typeof params.text !== "string") return usage("browser type requires selector and text.\n\n" + HELP);
           const r = await bridge("type", { selector: params.selector, text: params.text, scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
@@ -449,13 +687,13 @@ export default function (pi: ExtensionAPI) {
             : undefined;
           const targets = [hasIndex, hasToken, Boolean(locator)].filter(Boolean).length;
           if (targets !== 1 || (!locator && !params.snapshot_id)) {
-            return text(`browser ${params.action} requires snapshot_id and exactly one of element_index or element_token, or a locator.\n\n${HELP}`);
+            return usage(`browser ${params.action} requires snapshot_id and exactly one of element_index or element_token, or a locator.\n\n${HELP}`);
           }
           if (params.action === "input" && typeof params.text !== "string") {
-            return text(`browser input requires text.\n\n${HELP}`);
+            return usage(`browser input requires text.\n\n${HELP}`);
           }
           if (params.action === "select" && typeof params.option !== "string") {
-            return text(`browser select requires option.\n\n${HELP}`);
+            return usage(`browser select requires option.\n\n${HELP}`);
           }
           const r = await bridge(params.action, {
             scope: params.scope ?? "viewport",
@@ -471,7 +709,7 @@ export default function (pi: ExtensionAPI) {
         }
         case "fill_form": {
           if (!Array.isArray(params.fields) || params.fields.length === 0) {
-            return text(`browser fill_form requires a non-empty fields array.\n\n${HELP}`);
+            return usage(`browser fill_form requires a non-empty fields array.\n\n${HELP}`);
           }
           const r = await bridge("fill_form", {
             scope: params.scope ?? "viewport",
@@ -486,7 +724,7 @@ export default function (pi: ExtensionAPI) {
           const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
           const hasTarget = Boolean(params.snapshot_id || hasIndex || hasToken);
           if (hasTarget && (!params.snapshot_id || hasIndex === hasToken)) {
-            return text(`targeted browser scroll requires snapshot_id and exactly one of element_index or element_token.\n\n${HELP}`);
+            return usage(`targeted browser scroll requires snapshot_id and exactly one of element_index or element_token.\n\n${HELP}`);
           }
           const r = await bridge("scroll", {
             scope: params.scope ?? "viewport",
@@ -507,9 +745,9 @@ export default function (pi: ExtensionAPI) {
           return text((r.content || "(empty page)") + suffix);
         }
         case "eval": {
-          if (!params.js) return text('browser eval requires "js".\n\n' + HELP);
+          if (!params.js) return usage('browser eval requires "js".\n\n' + HELP);
           if (isTrivialBrowserEval(params.js)) {
-            return text(
+            return usage(
               "eval rejected because js does not read or change the page. " +
                 "do not use eval to return string literals / count / keep-alive / print progress. " +
                 "to click/type: observe then snapshot_id + element_index or element_token.\n\n" +
@@ -521,7 +759,7 @@ export default function (pi: ExtensionAPI) {
           return text(String(r.result ?? "undefined"));
         }
         case "script": {
-          if (!params.js) return text('browser script requires "js".\n\n' + HELP);
+          if (!params.js) return usage('browser script requires "js".\n\n' + HELP);
           const r = await bridge("script", { js: params.js, ...targetParams }, signal);
           if (!r.ok) return bridgeFailure(r);
           return text(JSON.stringify(r, null, 2), r);
@@ -565,10 +803,10 @@ export default function (pi: ExtensionAPI) {
         case "watch": {
           const timeoutSecs = typeof params.timeoutSecs === "number" ? params.timeoutSecs : undefined;
           if (timeoutSecs == null) {
-            return text(`browser watch requires timeoutSecs (1..${WATCH_MAX_TIMEOUT_SECS}). Use watch for waits longer than 25s; it returns immediately with a watchId.\n\n${HELP}`);
+            return usage(`browser watch requires timeoutSecs (1..${WATCH_MAX_TIMEOUT_SECS}). Use watch for waits longer than 25s; it returns immediately with a watchId.\n\n${HELP}`);
           }
           if (timeoutSecs < 1 || timeoutSecs > WATCH_MAX_TIMEOUT_SECS) {
-            return text(`browser watch timeoutSecs must be between 1 and ${WATCH_MAX_TIMEOUT_SECS}.\n\n${HELP}`);
+            return usage(`browser watch timeoutSecs must be between 1 and ${WATCH_MAX_TIMEOUT_SECS}.\n\n${HELP}`);
           }
           const r = await bridge("watch", {
             op: "register",
@@ -588,7 +826,7 @@ export default function (pi: ExtensionAPI) {
         }
         case "unwatch": {
           const watchId = typeof params.watchId === "string" ? params.watchId : undefined;
-          if (!watchId) return text(`browser unwatch requires watchId.\n\n${HELP}`);
+          if (!watchId) return usage(`browser unwatch requires watchId.\n\n${HELP}`);
           const r = await bridge("unwatch", { op: "unwatch", watchId }, signal, "browser_watch");
           return r.ok ? text("ok", r) : bridgeFailure(r);
         }
@@ -599,8 +837,6 @@ export default function (pi: ExtensionAPI) {
         case "help":
           return text(HELP);
         default:
-          return text(`Unknown browser action "${params.action}".\n\n${HELP}`);
+          return usage(`Unknown browser action "${params.action}".\n\n${HELP}`);
       }
-    },
-  });
 }

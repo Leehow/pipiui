@@ -32,11 +32,27 @@ description: Drive the built-in WebView with the browser tool. Use when navigati
 
 ## 批量优先
 
-多字段表单先 `observe` 拿到 token，再用一次 `script` 填完，禁止「observe → input → observe → input」逐格循环。
+默认批量：把无需中间观察的连续动作打进一次 `browser` `actions[]`（1..8），不要每个微动作单独调用。
+
+可安全连发：
+
+- `fill_form` 一次填完全部字段，同一批里再 `click` 提交
+- `click` 后立刻 `wait`（`idle` 或目标 `selector`）
+- `type` / `input` 后立刻回车（同批下一项）
+
+「可安全连发」仅表示技术上无需中间观察；最终提交、支付、删除仍受下方授权红线约束（用户没明示就不要点）。
+
+强制断点（做完必须停下来观察，再开下一批）：
+
+- `navigate` / `back` / `forward` / `reload` 之后
+- 提交表单之后
+- 可能出现弹窗、验证码、登录墙时
+
+多字段表单先 `observe` 拿到 token，再用一次 `fill_form`（或 `script`）填完，禁止「observe → input → observe → input」逐格循环。
 
 `script` 提供 `step(label)` 与 `el(token)`：用 `el` 取当前快照元素，用 `step` 标进度。25s 截止；失败不回滚已发生的副作用。`script` **不**刷新 snapshot、**不**附 `mutation`、**不**返回新观察——有副作用后必须再 `observe`，再用新 token 继续。token 失效时 `el` 抛 `stale_snapshot` → 重新 `observe`，不要改字面重跑同一脚本。
 
-单字段、点一下、选一个 option：用 `input` / `click` / `select`。`script` 不是通用 eval；读密钥或绕过结构化保护改用下面的红线。
+单字段、点一下、选一个 option：用 `input` / `click` / `select`（能连发就放进 `actions[]`）。`script` 不是通用 eval；读密钥或绕过结构化保护改用下面的红线。
 
 ## 失败恢复决策树
 
