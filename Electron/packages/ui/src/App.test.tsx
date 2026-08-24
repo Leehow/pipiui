@@ -2327,8 +2327,9 @@ describe('PipiUI Electron main layout', () => {
     const base = createMockHost()
     const sendPrompt = vi.fn(async () => undefined)
     const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('busy-item', sessionId, text) }))
+    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'busy insert', 'sending'))
     const steerQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'busy insert', 'sending'))
-    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, steerQueuedMessage, listQueue: async () => [] }
+    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, cutInQueuedMessage, steerQueuedMessage, listQueue: async () => [] }
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
 
@@ -2343,8 +2344,149 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
     fireEvent.click(screen.getByLabelText('插入当前对话'))
     await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy insert', undefined))
-    await waitFor(() => expect(steerQueuedMessage).toHaveBeenCalledWith('welcome', 'busy-item'))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'busy-item'))
+    expect(steerQueuedMessage).not.toHaveBeenCalled()
     expect(sendPrompt).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a busy cut-in bubble pending until the user echo arrives', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    const sendPrompt = vi.fn(async () => undefined)
+    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-item', sessionId, text) }))
+    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in pending', 'sending'))
+    const steerQueuedMessage = vi.fn()
+    const host: PipiHostAPI = {
+      ...base,
+      sendPrompt,
+      enqueueMessage,
+      cutInQueuedMessage,
+      steerQueuedMessage,
+      listQueue: async () => [],
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in pending' } })
+    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('插入当前对话'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in pending', undefined))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-item'))
+    expect(steerQueuedMessage).not.toHaveBeenCalled()
+    const pendingBubble = await screen.findByTestId('user-bubble-queued')
+    expect(pendingBubble.closest('[data-user-prompt]')?.textContent).toContain('cut-in pending')
+    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
+
+    await act(async () => {
+      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-cut-in', content: 'cut-in pending' })
+    })
+    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
+    const confirmed = screen.getAllByText('cut-in pending').filter(node => node.closest('[data-user-prompt]'))
+    expect(confirmed).toHaveLength(1)
+    expect(confirmed[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
+  })
+
+  it('busy cut-in survives stopped reconciliation', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    const sendPrompt = vi.fn(async () => undefined)
+    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-stop', sessionId, text) }))
+    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in after stop', 'sending'))
+    const steerQueuedMessage = vi.fn()
+    const historyOnlyMarker = 'HISTORY_ONLY_STOPPED_RECONCILE_MARKER'
+    const durableHistory: HistoryEntry[] = [
+      { id: 'u1', role: 'user', content: '请实现 Electron 三栏主界面。', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '我会先检查现有结构，然后完成 UI。', timestamp: 2 },
+    ]
+    const abortedHistory: HistoryEntry[] = [
+      ...durableHistory,
+      { id: 'u-idle', role: 'user', content: 'idle hold', timestamp: 3 },
+      { id: 'a-aborted', role: 'assistant', content: 'partial before cut-in', timestamp: 4 },
+      { id: 'u-history-only', role: 'user', content: historyOnlyMarker, timestamp: 5 },
+    ]
+    let serveAbortedHistory = false
+    const getSessionHistory = vi.fn(async () => serveAbortedHistory ? abortedHistory : durableHistory)
+    const host: PipiHostAPI = {
+      ...base,
+      sendPrompt,
+      enqueueMessage,
+      cutInQueuedMessage,
+      steerQueuedMessage,
+      getSessionHistory,
+      listQueue: async () => [],
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+    await act(async () => {
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'started' })
+      listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'partial before cut-in' })
+    })
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in after stop' } })
+    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('插入当前对话'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in after stop', undefined))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-stop'))
+    expect(steerQueuedMessage).not.toHaveBeenCalled()
+    expect((await screen.findByTestId('user-bubble-queued')).closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
+
+    serveAbortedHistory = true
+    await act(async () => {
+      listener?.({ type: 'status', sessionId: 'welcome', status: 'stopped' })
+    })
+    expect(await screen.findByText(historyOnlyMarker)).toBeTruthy()
+    const pendingAfterStop = await screen.findByTestId('user-bubble-queued')
+    expect(pendingAfterStop.closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
+    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
+
+    await act(async () => {
+      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-after-stop', content: 'cut-in after stop' })
+    })
+    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
+    const confirmedAfterStop = screen.getAllByText('cut-in after stop').filter(node => node.closest('[data-user-prompt]'))
+    expect(confirmedAfterStop).toHaveLength(1)
+    expect(confirmedAfterStop[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
+  })
+
+  it('busy cut-in failure removes queued item', async () => {
+    const base = createMockHost()
+    const sendPrompt = vi.fn(async () => undefined)
+    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-fail', sessionId, text) }))
+    const cutInQueuedMessage = vi.fn(async () => { throw new Error('cut-in rejected') })
+    const removeQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in fail'))
+    const steerQueuedMessage = vi.fn()
+    const host: PipiHostAPI = {
+      ...base,
+      sendPrompt,
+      enqueueMessage,
+      cutInQueuedMessage,
+      removeQueuedMessage,
+      steerQueuedMessage,
+      listQueue: async () => [],
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in fail' } })
+    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('插入当前对话'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in fail', undefined))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
+    await waitFor(() => expect(removeQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
+    expect(steerQueuedMessage).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
+    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in fail'))).toBe(true)
   })
 
   it('consumes queue_update snapshots only for the selected session and retains attachment/status metadata', async () => {

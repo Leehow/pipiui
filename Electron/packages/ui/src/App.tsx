@@ -968,6 +968,19 @@ function useNarrowViewport(): boolean {
   return narrow
 }
 
+/** Keep the in-flight cut-in optimistic user across a JSONL snapshot that has not persisted it yet. Match the current receipt id only. */
+function retainReceiptOptimisticUser(
+  snapshot: ChatMessage[],
+  live: readonly ChatMessage[],
+  receipt: { sessionId: string; id: string } | null,
+  sessionId: string,
+): ChatMessage[] {
+  if (!receipt || receipt.sessionId !== sessionId) return snapshot
+  if (snapshot.some(message => message.id === receipt.id)) return snapshot
+  const extra = live.find(message => message.role === 'user' && message.id === receipt.id)
+  return extra ? [...snapshot, extra] : snapshot
+}
+
 export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const theme = useSystemTheme()
   // Do not allocate a default mock during every render: its changing identity
@@ -1201,6 +1214,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
    *  `user_message` echo merges back into this bubble by id, so an assistant
    *  placeholder that already streamed past it cannot wedge a duplicate below. */
   const pendingLocalUserRef = useRef<{ id: string; content: string } | null>(null)
+  /** Id-only receipt for the current busy cut-in optimistic user. Echo or failure clears it. */
+  const persistLocalUserReceiptRef = useRef<{ sessionId: string; id: string } | null>(null)
   const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
   const historyContextRef = useRef<{ host: PipiHostAPI; sessionId: string } | null>(null)
@@ -1256,10 +1271,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const selectedObservedClosed = selectedObservedStatus === 'completed' || selectedObservedStatus === 'interrupted'
   const messageStreaming = messages.some(message => message.role === 'assistant' && message.streaming)
   const selectedStopping = stoppingSessionId === selectedSession
-  // A leftover sending queue item after settle/stop must not keep the composer
-  // locked. Host stop is authoritative; `sending` is only meaningful while the
+  // Leftover `queued` after a UI settle/stop means the host never went idle.
+  // Keep stop and insert-on-send. Leftover `sending` after settle/stop must not
+  // lock: host stop is authoritative, and `sending` is only meaningful while the
   // turn is still open.
-  const queueLocksComposer = sessionQueue.busy && !selectedObservedClosed
+  const leftoverQueued = sessionQueue.items.some(item => item.status === 'queued')
+  const strandedHostBusy = leftoverQueued && selectedObservedClosed
+  const queueLocksComposer = strandedHostBusy || (sessionQueue.busy && !selectedObservedClosed)
   // A leftover streaming assistant after settle (late text/tool) must not keep
   // the stop button once the authoritative turn is already closed.
   const sessionWorking = streaming || selectedObservedRunning || (messageStreaming && !selectedObservedClosed) || queueLocksComposer || compacting || selectedStopping
@@ -1271,7 +1289,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (selectedSessionRef.current !== sessionId) return
     mainTurnOpenRef.current = false
     turnJustSettledRef.current = true
-    pendingLocalUserRef.current = null
+    const receipt = persistLocalUserReceiptRef.current
+    const keepReceipt = Boolean(
+      receipt
+      && receipt.sessionId === sessionId
+      && messagesRef.current.some(message => message.id === receipt.id),
+    )
+    if (!keepReceipt) {
+      pendingLocalUserRef.current = null
+      if (receipt?.sessionId === sessionId) persistLocalUserReceiptRef.current = null
+    }
     setStreaming(false)
     setCompacting(false)
     setStatsRefreshKey(key => key + 1)
@@ -1831,17 +1858,23 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       const liveBefore = messagesRef.current
       const restored = restoreOpenHop(next, liveBefore)
-      messagesBySessionRef.current.set(selectedSession, restored)
-      setMessages(restored)
-      messagesRef.current = restored
+      const retained = retainReceiptOptimisticUser(
+        restored,
+        liveBefore,
+        persistLocalUserReceiptRef.current,
+        selectedSession,
+      )
+      messagesBySessionRef.current.set(selectedSession, retained)
+      setMessages(retained)
+      messagesRef.current = retained
       if (resumedRunning) {
         if (historyConfirmsLostSettle(next, liveBefore)) closeLostSettle()
         else {
-          openResumeWait(liveBefore, restored)
-          scheduleSettledReplacementConfirmation(restored)
+          openResumeWait(liveBefore, retained)
+          scheduleSettledReplacementConfirmation(retained)
         }
       } else {
-        const last = restored[restored.length - 1]
+        const last = retained[retained.length - 1]
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
       }
     }
@@ -2035,6 +2068,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         const pendingEcho = pendingLocalUserRef.current
         pendingLocalUserRef.current = null
         const next = appendLiveUserMessage(messagesRef.current, event, pendingEcho ?? undefined)
+        const receipt = persistLocalUserReceiptRef.current
+        if (receipt && receipt.sessionId === event.sessionId && !next.some(message => message.id === receipt.id && message.queued)) {
+          persistLocalUserReceiptRef.current = null
+        }
         if (next !== messagesRef.current) transcriptLiveRevisionRef.current += 1
         messagesRef.current = next
         setMessages(next)
@@ -2366,44 +2403,44 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       mutateLocalTranscript(items => items.map(message => message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
     }
 
-    if (sessionQueue.busy) {
-      // Optimistic local echo even while busy — mirrors direct send's mutateLocalTranscript + pendingLocalUserRef.
-      // Host user_message will dedup via pendingLocalUserRef / queued content match. We then steer into the
-      // running turn so a follow-up is inserted now (not parked until subagents finish). queued is only kept
-      // if steer fails and FIFO has to wait.
+    if (sessionQueue.busy || leftoverQueued) {
+      // Optimistic local echo even while busy. Host user_message dedups via pendingLocalUserRef.
+      // Composer insert cut-ins the parent turn; background subagents keep running.
+      // queued stays until a real user echo (cut-in ack is not delivery).
       const localUserId = crypto.randomUUID()
       pendingLocalUserRef.current = { id: localUserId, content: prompt }
+      persistLocalUserReceiptRef.current = { sessionId: targetSession, id: localUserId }
       mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now(), queued: true } as ChatMessage])
-      const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
-      if (payload?.length) {
-        const converted = chatImagesFromAttachments(payload)
-        mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
+      const dropOptimistic = () => {
+        if (pendingLocalUserRef.current?.id === localUserId) pendingLocalUserRef.current = null
+        if (persistLocalUserReceiptRef.current?.id === localUserId) persistLocalUserReceiptRef.current = null
+        mutateLocalTranscript(items => items.filter(message => message.id !== localUserId))
       }
-      if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
-      const result = await sessionQueue.enqueue(prompt, payload)
-      if (selectedSession !== targetSession) return true
-      if (result.outcome === 'queued') {
-        try {
-          await sessionQueue.steer(result.message.id)
-          mutateLocalTranscript(items => items.map(message => message.id === localUserId ? { ...message, queued: undefined } as ChatMessage : message))
-        } catch {
-          // Steer is best-effort: FIFO remains the fallback and keeps 排队中.
+      try {
+        const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
+        if (payload?.length) {
+          const converted = chatImagesFromAttachments(payload)
+          mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
         }
+        if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
+        const result = await sessionQueue.enqueue(prompt, payload)
+        if (selectedSession !== targetSession) return true
+        if (result.outcome === 'queued') {
+          try {
+            await sessionQueue.cutIn(result.message.id)
+          } catch {
+            dropOptimistic()
+            void host.removeQueuedMessage(targetSession, result.message.id).catch(() => undefined)
+            return false
+          }
+          return true
+        }
+        // Race: host dispatched directly despite busy check. Keep queued until the real echo.
         return true
+      } catch {
+        dropOptimistic()
+        return false
       }
-      // Race: host dispatched directly despite busy check. Clear queued visual and open turn (bubble already exists).
-      mutateLocalTranscript(items => items.map(m => m.id === localUserId && (m as ChatMessage).queued ? { ...m, queued: undefined } as ChatMessage : m))
-      activeUserTurnRef.current = true
-      mainTurnOpenRef.current = true
-      mainTurnEpochRef.current += 1
-      applyObservedStatus(targetSession, 'running')
-      setStreaming(true)
-      setWaitingStartedAt(Date.now())
-      setWaitingVisible(true)
-      setWaitingPhase('awaiting')
-      setWaitingDetail(undefined)
-      setSessions(current => current.map(session => session.id === targetSession ? { ...session, updatedAt: Date.now() } : session))
-      return true
     }
 
     beginDirectTurn()
@@ -2988,7 +3025,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
         <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} onSend={send} />
-        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
+        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy || leftoverQueued} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
         <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
@@ -3436,7 +3473,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       </div>
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将插入当前对话…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>

@@ -386,7 +386,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '批次仍在处理' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
     await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 300)) })
 
     durableSummaryAvailable = true
@@ -486,7 +486,7 @@ describe('settled turn stays idle after a late streaming status', () => {
 
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['Supervisor notification'] }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [staleSending] }) })
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
 
     // The canonical D trace had already rendered the durable final branch by
     // the time the terminal-triggered history pull completed. Secret redaction
@@ -551,7 +551,7 @@ describe('settled turn stays idle after a late streaming status', () => {
 
     expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
     expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
@@ -660,6 +660,59 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
+  it('keeps stop and injects send when leftover queued items remain after settle', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const leftover = {
+      id: 'leftover-q',
+      sessionId: 'welcome',
+      text: '?',
+      attachments: [],
+      createdAt: 1,
+      state: 'queued' as const,
+    }
+    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({
+      outcome: 'queued' as const,
+      message: { ...leftover, id: 'next-q', text },
+    }))
+    const cutInQueuedMessage = vi.fn(async (_sessionId: string, messageId: string) => ({
+      ...leftover,
+      id: messageId,
+      state: 'sending' as const,
+    }))
+    const steerQueuedMessage = vi.fn()
+    const sendPrompt = vi.fn(async () => undefined)
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      sendPrompt,
+      enqueueMessage,
+      cutInQueuedMessage,
+      steerQueuedMessage,
+      listQueue: async () => [leftover],
+      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
+    }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'started' }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: '上一轮已经说完。' }) })
+    act(() => { listener?.({ type: 'queue_update', sessionId: 'welcome', queue: [leftover] }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
+
+    await waitFor(() => expect(screen.getByLabelText('停止生成')).toBeTruthy())
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    fireEvent.click(screen.getByTestId('message-queue-toggle'))
+    expect(screen.getByLabelText('立即发送第 1 条')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '所以呢' } })
+    fireEvent.click(screen.getByLabelText('插入当前对话'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', '所以呢', undefined))
+    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'next-q'))
+    expect(steerQueuedMessage).not.toHaveBeenCalled()
+    expect(sendPrompt).not.toHaveBeenCalled()
+  })
+
   it('does not keep the composer busy on a leftover sending item after stop', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     let terminalQueueEmpty = false
@@ -693,7 +746,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '是的，pi-coc 的调用方式和普通工具明显不同。' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
 
     terminalQueueEmpty = true
     const queueReadsBeforeTerminal = listQueue.mock.calls.length
@@ -748,7 +801,7 @@ describe('settled turn stays idle after a late streaming status', () => {
       expect(screen.getByLabelText('消息输入框')).toBe(input)
       expect(document.activeElement).toBe(input)
       expect(input.value).toBe('批次 E 输入法草稿')
-      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将插入当前对话…')
+      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
       expect(input.classList.contains('queue-busy')).toBe(true)
       expect(input.getAttribute('aria-busy')).toBeNull()
 
