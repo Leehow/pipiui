@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::{Schema, TantivyDocument, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Term};
 
@@ -54,12 +54,17 @@ pub struct Engine {
     baseline: Option<Layer>,
     overlay: Option<Layer>,
     /// Overlay paths that hide the same path in baseline (live or tombstone).
-    overlay_cover: HashSet<String>,
-    overlay_deleted: HashSet<String>,
+    pub(crate) overlay_cover: HashSet<String>,
+    pub(crate) overlay_deleted: HashSet<String>,
+    /// Paths present in the HEAD baseline, so directory deletes can tombstone them.
+    pub(crate) baseline_paths: HashSet<String>,
     pub ready: bool,
     pub head: Option<String>,
     pub baseline_docs: u64,
     pub overlay_docs: u64,
+    /// Overlay writer commits (each also reloads the reader). Watcher batches should
+    /// increment this once per drained window, not once per file event.
+    pub overlay_commits: u64,
 }
 
 impl Engine {
@@ -78,10 +83,12 @@ impl Engine {
             overlay: None,
             overlay_cover: HashSet::new(),
             overlay_deleted: HashSet::new(),
+            baseline_paths: HashSet::new(),
             ready: false,
             head: None,
             baseline_docs: 0,
             overlay_docs: 0,
+            overlay_commits: 0,
         }
     }
 
@@ -106,6 +113,7 @@ impl Engine {
             match open_layer(&baseline_dir, self.schema.clone()) {
                 Ok(layer) => {
                     self.baseline_docs = count_docs(&layer);
+                    self.baseline_paths = collect_layer_paths(&layer, self.fields);
                     self.baseline = Some(layer);
                 }
                 Err(_) => {
@@ -143,6 +151,7 @@ impl Engine {
         if dir.exists() {
             let _ = fs::remove_dir_all(dir);
         }
+        self.baseline_paths.clear();
         let mut layer = create_layer(dir, self.schema.clone())?;
         let mut count = 0u64;
         let mut pending = 0usize;
@@ -159,6 +168,7 @@ impl Engine {
                     let Ok(text) = String::from_utf8(bytes) else { continue };
                     let hash = sha256_hex(text.as_bytes());
                     upsert(&mut layer, &self.fields, &rel, &text, &hash)?;
+                    self.baseline_paths.insert(rel);
                     count += 1;
                     pending += 1;
                     if pending >= COMMIT_EVERY {
@@ -173,6 +183,7 @@ impl Engine {
                     continue;
                 };
                 upsert(&mut layer, &self.fields, &rel, &text, &hash)?;
+                self.baseline_paths.insert(rel);
                 count += 1;
                 pending += 1;
                 if pending >= COMMIT_EVERY {
@@ -197,50 +208,65 @@ impl Engine {
             return Ok(());
         }
         let dirty = git::dirty_set(&self.project_root);
+        let mut changed = false;
         for rel in dirty.deleted {
-            self.delete_overlay_path(&rel, true)?;
+            changed |= self.stage_overlay_delete(&rel, true)?;
         }
         for rel in dirty.changed {
-            self.update_overlay_from_disk(&rel)?;
+            changed |= self.stage_overlay_from_disk(&rel)?;
         }
-        if let Some(layer) = self.overlay.as_mut() {
-            layer.commit()?;
+        if changed {
+            self.commit_overlay()?;
         }
         Ok(())
     }
 
     pub fn update_overlay_from_disk(&mut self, rel: &str) -> Result<(), String> {
-        if should_skip_file(rel) {
-            return Ok(());
+        if self.stage_overlay_from_disk(rel)? {
+            self.commit_overlay()?;
         }
-        let abs = join_project(&self.project_root, rel);
-        if !abs.exists() {
-            return self.delete_overlay_path(rel, true);
-        }
-        let Some((text, hash)) = read_working_file(&self.project_root, rel) else {
-            return Ok(());
-        };
-        if let Some(head_bytes) = git::show_head_file(&self.project_root, rel) {
-            if sha256_hex(&head_bytes) == hash {
-                // Working tree matches HEAD — drop overlay so baseline wins.
-                return self.delete_overlay_path(rel, false);
-            }
-        }
-        let layer = self
-            .overlay
-            .as_mut()
-            .ok_or_else(|| "overlay not open".to_string())?;
-        upsert(layer, &self.fields, rel, &text, &hash)?;
-        layer.commit()?;
-        self.overlay_cover.insert(rel.to_string());
-        self.overlay_deleted.remove(rel);
-        self.overlay_docs = self.overlay_cover.len() as u64;
         Ok(())
     }
 
     pub fn update_overlay_content(&mut self, rel: &str, content: &str) -> Result<(), String> {
+        if self.stage_overlay_content(rel, content)? {
+            self.commit_overlay()?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_overlay_path(&mut self, rel: &str, tombstone: bool) -> Result<(), String> {
+        if self.stage_overlay_delete(rel, tombstone)? {
+            self.commit_overlay()?;
+        }
+        Ok(())
+    }
+
+    /// Stage a working-tree upsert/delete without committing. Returns whether
+    /// the overlay writer changed and needs `commit_overlay`.
+    pub fn stage_overlay_from_disk(&mut self, rel: &str) -> Result<bool, String> {
         if should_skip_file(rel) {
-            return Ok(());
+            return Ok(false);
+        }
+        let abs = join_project(&self.project_root, rel);
+        if !abs.exists() {
+            return self.stage_overlay_delete(rel, true);
+        }
+        let Some((text, hash)) = read_working_file(&self.project_root, rel) else {
+            return Ok(false);
+        };
+        if let Some(head_bytes) = git::show_head_file(&self.project_root, rel) {
+            if sha256_hex(&head_bytes) == hash {
+                // Working tree matches HEAD — drop overlay so baseline wins.
+                return self.stage_overlay_delete(rel, false);
+            }
+        }
+        self.stage_overlay_content(rel, &text)
+    }
+
+    pub fn stage_overlay_content(&mut self, rel: &str, content: &str) -> Result<bool, String> {
+        if should_skip_file(rel) {
+            return Ok(false);
         }
         let hash = sha256_hex(content.as_bytes());
         let layer = self
@@ -248,19 +274,19 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| "overlay not open".to_string())?;
         upsert(layer, &self.fields, rel, content, &hash)?;
-        layer.commit()?;
         self.overlay_cover.insert(rel.to_string());
         self.overlay_deleted.remove(rel);
         self.overlay_docs = self.overlay_cover.len() as u64;
-        Ok(())
+        Ok(true)
     }
 
-    pub fn delete_overlay_path(&mut self, rel: &str, tombstone: bool) -> Result<(), String> {
+    pub fn stage_overlay_delete(&mut self, rel: &str, tombstone: bool) -> Result<bool, String> {
         if let Some(layer) = self.overlay.as_mut() {
             layer
                 .writer
                 .delete_term(Term::from_field_text(self.fields.path, rel));
-            layer.commit()?;
+        } else {
+            return Ok(false);
         }
         if tombstone {
             self.overlay_cover.insert(rel.to_string());
@@ -270,6 +296,37 @@ impl Engine {
             self.overlay_deleted.remove(rel);
         }
         self.overlay_docs = self.overlay_cover.len() as u64;
+        Ok(true)
+    }
+
+    /// Tombstone `rel` and descendants from overlay **and** HEAD baseline.
+    /// A directory remove (`rm -rf src`) must hide `src/a.ts` even if it never
+    /// entered the overlay, otherwise search resurrects the file from baseline.
+    pub fn stage_overlay_delete_tree(&mut self, rel: &str) -> Result<bool, String> {
+        let prefix = format!("{rel}/");
+        let mut paths: Vec<String> = self
+            .overlay_cover
+            .iter()
+            .chain(self.overlay_deleted.iter())
+            .chain(self.baseline_paths.iter())
+            .filter(|p| *p == rel || p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        if !paths.iter().any(|p| p == rel) {
+            paths.push(rel.to_string());
+        }
+        let mut changed = false;
+        for p in paths {
+            changed |= self.stage_overlay_delete(&p, true)?;
+        }
+        Ok(changed)
+    }
+
+    pub fn commit_overlay(&mut self) -> Result<(), String> {
+        if let Some(layer) = self.overlay.as_mut() {
+            layer.commit()?;
+            self.overlay_commits += 1;
+        }
         Ok(())
     }
 
@@ -277,10 +334,7 @@ impl Engine {
         if let Some(layer) = self.baseline.as_mut() {
             layer.commit()?;
         }
-        if let Some(layer) = self.overlay.as_mut() {
-            layer.commit()?;
-        }
-        Ok(())
+        self.commit_overlay()
     }
 
     pub fn search(
@@ -547,6 +601,29 @@ fn layer_from_index(index: Index) -> Result<Layer, String> {
 
 fn count_docs(layer: &Layer) -> u64 {
     layer.reader.searcher().num_docs()
+}
+
+fn collect_layer_paths(layer: &Layer, fields: Fields) -> HashSet<String> {
+    let searcher = layer.reader.searcher();
+    let n = searcher.num_docs() as usize;
+    if n == 0 {
+        return HashSet::new();
+    }
+    let Ok(top) = searcher.search(&AllQuery, &TopDocs::with_limit(n).order_by_score()) else {
+        return HashSet::new();
+    };
+    let mut out = HashSet::new();
+    for (_score, addr) in top {
+        let Ok(retrieved) = searcher.doc::<TantivyDocument>(addr) else {
+            continue;
+        };
+        if let Some(path) = retrieved.get_first(fields.path).and_then(|v| v.as_str()) {
+            if !path.is_empty() {
+                out.insert(path.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn read_state(path: &Path) -> IndexState {

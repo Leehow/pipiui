@@ -9,11 +9,17 @@ pub const DEFAULT_TOP_K: usize = 20;
 
 const SKIP_DIRS: &[&str] = &[
     ".git",
+    ".hg",
+    ".svn",
     "node_modules",
     "dist",
     "build",
+    "out",
+    "release",
+    "coverage",
     ".pi",
     ".worktrees",
+    "pipiui-wt",
     "target",
     "__pycache__",
     ".venv",
@@ -23,6 +29,10 @@ const SKIP_DIRS: &[&str] = &[
     ".pytest_cache",
     ".idea",
     ".vscode",
+    ".next",
+    ".turbo",
+    ".cache",
+    ".eggs",
     "vendor",
 ];
 
@@ -61,6 +71,12 @@ pub fn should_skip_file(rel: &str) -> bool {
         }
     }
     false
+}
+
+/// Watcher/index hot path: skip VCS, sidecar/index home, worktree bookkeeping,
+/// and generated/build trees before an event is queued.
+pub fn should_ignore_watch_rel(rel: &str) -> bool {
+    should_skip_file(rel)
 }
 
 pub fn to_project_rel(project_root: &Path, abs: &Path) -> Option<String> {
@@ -221,8 +237,13 @@ pub fn now_ms() -> u64 {
 
 /// Walk text files under `root` (project-relative paths). Does not follow symlinks.
 pub fn walk_text_files(project_root: &Path) -> Vec<String> {
+    walk_text_files_from(project_root, project_root)
+}
+
+/// Walk text files starting at `start` (must be inside `project_root`).
+pub fn walk_text_files_from(project_root: &Path, start: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut stack = vec![project_root.to_path_buf()];
+    let mut stack = vec![start.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(v) => v,
@@ -261,4 +282,30 @@ pub fn walk_text_files(project_root: &Path) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_ignore_covers_bookkeeping_and_generated() {
+        for rel in [
+            ".pi/agent/code-retrieval/index/overlay/meta.json",
+            ".git/HEAD",
+            ".worktrees/foo/src/a.ts",
+            "pipiui-wt/foo/src/a.ts",
+            "node_modules/pkg/index.js",
+            "dist/bundle.js",
+            "build/out.js",
+            "target/debug/foo",
+            "coverage/lcov.info",
+            ".next/server.js",
+        ] {
+            assert!(should_ignore_watch_rel(rel), "should ignore {rel}");
+        }
+        assert!(!should_ignore_watch_rel("src/main.rs"));
+        assert!(!should_ignore_watch_rel("Electron/packages/ui/src/App.tsx"));
+        assert!(should_ignore_watch_rel("assets/logo.png"));
+    }
 }

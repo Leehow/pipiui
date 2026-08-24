@@ -17,7 +17,14 @@ import { EXTENSION_ID } from "./paths.js";
 import { buildToolResult, emptyDegraded, formatCompressedContent, RefRegistry } from "./protocol.js";
 import { executeReadSpans } from "./read-spans.js";
 import { loadRetrievalSettings } from "./settings.js";
-import { attachSidecar, detachSidecar, pingSidecar, readSidecarSnapshot } from "./sidecar-lifecycle.js";
+import {
+  attachSidecar,
+  detachSidecar,
+  pingSidecar,
+  readSidecarSnapshot,
+  startSidecarHeartbeat,
+  type HeartbeatHandle,
+} from "./sidecar-lifecycle.js";
 import { extractProjectCached } from "./symbol/cache.js";
 import { installSymbolLayer } from "./symbol/hooks-adapter.js";
 import { initTreeSitter, isTreeSitterReady } from "./symbol/treesitter.js";
@@ -57,38 +64,101 @@ type ExtensionAPI = {
   ): void;
 };
 
-class SessionRuntime {
+export class SessionRuntime {
   projectRoot = "";
   sessionId = `sess-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   readonly registry = new RefRegistry();
   readonly ledger = new SeenRangeLedger();
   sidecar: SidecarConnection | undefined;
   started = false;
+  /** Bumped first in `shutdown` so an in-flight `ensure` cannot start a zombie heartbeat. */
+  generation = 0;
+  /** Test seam: delay or wrap attach to reproduce ensure/shutdown interleaving. */
+  attachSidecarFn: typeof attachSidecar = attachSidecar;
+  /** Test seam: delay only the root-switch detach inside ensure (shutdown uses real detach). */
+  detachSidecarFn: typeof detachSidecar = detachSidecar;
+  private heartbeat: HeartbeatHandle | undefined;
+
+  get heartbeatRunning(): boolean {
+    return this.heartbeat !== undefined;
+  }
+
+  private stillCurrent(epoch: number): boolean {
+    return this.generation === epoch;
+  }
+
+  private noteLeaseMissing(epoch: number): void {
+    if (!this.stillCurrent(epoch)) return;
+    this.heartbeat?.stop();
+    this.heartbeat = undefined;
+    this.sidecar = undefined;
+    this.started = false;
+  }
 
   async ensure(cwd?: string): Promise<void> {
     const root = cwd || this.projectRoot || process.cwd();
     if (this.started && this.projectRoot === root) return;
+    const epoch = this.generation;
+    if (this.started && this.projectRoot && this.projectRoot !== root) {
+      const previous = this.projectRoot;
+      this.heartbeat?.stop();
+      this.heartbeat = undefined;
+      try {
+        await this.detachSidecarFn(previous, this.sessionId);
+      } catch {
+        // old root lease expires on TTL if detach fails
+      }
+      if (!this.stillCurrent(epoch)) return;
+    }
+    if (!this.stillCurrent(epoch)) return;
     this.projectRoot = root;
     this.started = true;
+    let sidecar: SidecarConnection | undefined;
     try {
-      this.sidecar = await attachSidecar({
+      sidecar = await this.attachSidecarFn({
         projectRoot: root,
         sessionId: this.sessionId,
       });
     } catch {
-      this.sidecar = undefined;
+      sidecar = undefined;
     }
+    if (!this.stillCurrent(epoch)) {
+      if (sidecar) {
+        try {
+          await detachSidecar(root, this.sessionId);
+        } catch {
+          // abandoned attach must not pin the sidecar
+        }
+      }
+      return;
+    }
+    this.sidecar = sidecar;
+    this.heartbeat?.stop();
+    this.heartbeat = this.sidecar
+      ? startSidecarHeartbeat({
+          projectRoot: root,
+          sessionId: this.sessionId,
+          onMissing: () => this.noteLeaseMissing(epoch),
+        })
+      : undefined;
+    if (!this.sidecar) this.started = false;
   }
 
   async shutdown(): Promise<void> {
-    if (!this.started) return;
-    try {
-      if (this.projectRoot) await detachSidecar(this.projectRoot, this.sessionId);
-    } catch {
-      // D2: shutdown only drops our ref; never throw into the session.
-    }
+    this.generation += 1;
+    this.heartbeat?.stop();
+    this.heartbeat = undefined;
+    const root = this.projectRoot;
+    const hadSession = this.started || this.sidecar !== undefined;
     this.sidecar = undefined;
     this.started = false;
+    if (hadSession && root) {
+      try {
+        await detachSidecar(root, this.sessionId);
+      } catch {
+        // D2: shutdown only drops our ref; never throw into the session.
+      }
+    }
     this.registry.clear();
     this.ledger.clear();
   }

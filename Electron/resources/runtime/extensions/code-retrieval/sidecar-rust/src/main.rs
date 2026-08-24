@@ -3,6 +3,7 @@
 //! Compatible with the existing Node query-sidecar HTTP surface:
 //!   GET  /health
 //!   POST /attach
+//!   POST /heartbeat
 //!   POST /detach
 //!   POST /search
 //! plus index management:
@@ -21,7 +22,7 @@ mod watch;
 use engine::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -32,14 +33,21 @@ use util::{now_ms, random_token, retrieval_home, sidecar_json_path};
 
 static SNAPSHOT_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug)]
+struct SessionLease {
+    last_seen_at: u64,
+    expires_at: u64,
+}
+
 struct Shared {
     project_root: PathBuf,
     token: String,
     idle_ms: u64,
+    session_ttl_ms: u64,
     port: AtomicU16,
     last_used: AtomicU64,
     ready: AtomicBool,
-    sessions: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, SessionLease>>,
     engine: Arc<Mutex<Engine>>,
     shutting_down: AtomicBool,
 }
@@ -86,12 +94,9 @@ fn main() {
                 .unwrap_or_else(|_| ".".into())
         }),
     );
-    let idle_ms = std::env::var("PIPIUI_CODE_RETRIEVAL_IDLE_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(60_000)
-        .max(50);
+    let idle_ms = parse_positive_ms(std::env::var("PIPIUI_CODE_RETRIEVAL_IDLE_MS").ok(), 60_000);
+    let session_ttl_ms =
+        parse_positive_ms(std::env::var("PIPIUI_CODE_RETRIEVAL_SESSION_TTL_MS").ok(), 300_000);
     let token = std::env::var("PIPIUI_CODE_RETRIEVAL_TOKEN").unwrap_or_else(|_| random_token());
 
     let _ = std::fs::create_dir_all(retrieval_home(&project_root));
@@ -104,10 +109,11 @@ fn main() {
         project_root: project_root.clone(),
         token: token.clone(),
         idle_ms,
+        session_ttl_ms,
         port: AtomicU16::new(port),
         last_used: AtomicU64::new(now_ms()),
         ready: AtomicBool::new(false),
-        sessions: Mutex::new(HashSet::new()),
+        sessions: Mutex::new(HashMap::new()),
         engine: Arc::clone(&engine),
         shutting_down: AtomicBool::new(false),
     });
@@ -178,6 +184,68 @@ fn lock_engine(engine: &Mutex<Engine>) -> std::sync::MutexGuard<'_, Engine> {
     }
 }
 
+fn parse_positive_ms(raw: Option<String>, default_ms: u64) -> u64 {
+    raw.and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default_ms)
+        .max(50)
+}
+
+fn renew_lease(
+    sessions: &mut HashMap<String, SessionLease>,
+    session_id: String,
+    now: u64,
+    ttl_ms: u64,
+) -> SessionLease {
+    let lease = SessionLease {
+        last_seen_at: now,
+        expires_at: now.saturating_add(ttl_ms),
+    };
+    sessions.insert(session_id, lease);
+    lease
+}
+
+/// Renew an existing session only. Unknown / detached ids must not upsert.
+fn touch_lease(
+    sessions: &mut HashMap<String, SessionLease>,
+    session_id: &str,
+    now: u64,
+    ttl_ms: u64,
+) -> Option<SessionLease> {
+    let lease = sessions.get_mut(session_id)?;
+    lease.last_seen_at = now;
+    lease.expires_at = now.saturating_add(ttl_ms);
+    Some(*lease)
+}
+
+fn expire_sessions(sessions: &mut HashMap<String, SessionLease>, now: u64) {
+    sessions.retain(|_, lease| lease.expires_at > now);
+}
+
+fn lock_sessions(shared: &Shared) -> std::sync::MutexGuard<'_, HashMap<String, SessionLease>> {
+    match shared.sessions.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+fn live_session_payload(sessions: &HashMap<String, SessionLease>) -> Vec<Value> {
+    sessions
+        .iter()
+        .map(|(session_id, lease)| {
+            json!({
+                "sessionId": session_id,
+                "lastSeenAt": lease.last_seen_at,
+                "expiresAt": lease.expires_at,
+            })
+        })
+        .collect()
+}
+
+fn oldest_expires_at(sessions: &HashMap<String, SessionLease>) -> Option<u64> {
+    sessions.values().map(|lease| lease.expires_at).min()
+}
+
 fn idle_loop(shared: Arc<Shared>) {
     let slice = shared.idle_ms.min(250).max(40);
     loop {
@@ -185,7 +253,11 @@ fn idle_loop(shared: Arc<Shared>) {
         if shared.shutting_down.load(Ordering::SeqCst) {
             return;
         }
-        let refs = shared.sessions.lock().map(|s| s.len()).unwrap_or(0);
+        let refs = {
+            let mut sessions = lock_sessions(&shared);
+            expire_sessions(&mut sessions, now_ms());
+            sessions.len()
+        };
         if refs > 0 {
             continue;
         }
@@ -293,7 +365,14 @@ fn handle_client(mut stream: TcpStream, shared: &Shared) -> Result<(), String> {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => {
             touch(shared);
-            let refs = shared.sessions.lock().map(|s| s.len()).unwrap_or(0);
+            let now = now_ms();
+            let (refs, sessions, oldest) = {
+                let mut sessions = lock_sessions(shared);
+                expire_sessions(&mut sessions, now);
+                let payload = live_session_payload(&sessions);
+                let oldest = oldest_expires_at(&sessions);
+                (sessions.len(), payload, oldest)
+            };
             let (head, baseline, overlay, ready) = {
                 let eng = lock_engine(&shared.engine);
                 (eng.head.clone(), eng.baseline_docs, eng.overlay_docs, eng.ready)
@@ -309,6 +388,9 @@ fn handle_client(mut stream: TcpStream, shared: &Shared) -> Result<(), String> {
                     "port": shared.port.load(Ordering::SeqCst),
                     "refcount": refs,
                     "lastUsed": shared.last_used.load(Ordering::SeqCst),
+                    "sessionTtlMs": shared.session_ttl_ms,
+                    "oldestExpiresAt": oldest,
+                    "sessions": sessions,
                     "provider": "tantivy",
                     "head": head,
                     "baselineDocs": baseline,
@@ -322,13 +404,17 @@ fn handle_client(mut stream: TcpStream, shared: &Shared) -> Result<(), String> {
                 .session_id
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("anon-{}", now_ms()));
-            let refs = {
-                let mut sessions = match shared.sessions.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                sessions.insert(session_id.clone());
-                sessions.len()
+            let now = now_ms();
+            let (refs, lease) = {
+                let mut sessions = lock_sessions(shared);
+                expire_sessions(&mut sessions, now);
+                let lease = renew_lease(
+                    &mut sessions,
+                    session_id.clone(),
+                    now,
+                    shared.session_ttl_ms,
+                );
+                (sessions.len(), lease)
             };
             touch(shared);
             write_json(
@@ -340,16 +426,59 @@ fn handle_client(mut stream: TcpStream, shared: &Shared) -> Result<(), String> {
                     "refcount": refs,
                     "pid": std::process::id(),
                     "port": shared.port.load(Ordering::SeqCst),
+                    "lastSeenAt": lease.last_seen_at,
+                    "expiresAt": lease.expires_at,
+                }),
+            )
+        }
+        ("POST", "/heartbeat") => {
+            let body: AttachBody = serde_json::from_str(&req.body).unwrap_or_default();
+            let Some(session_id) = body.session_id.filter(|s| !s.is_empty()) else {
+                return write_json(
+                    &mut stream,
+                    400,
+                    json!({"ok": false, "error": "sessionId required"}),
+                );
+            };
+            let now = now_ms();
+            let renewed = {
+                let mut sessions = lock_sessions(shared);
+                expire_sessions(&mut sessions, now);
+                touch_lease(
+                    &mut sessions,
+                    &session_id,
+                    now,
+                    shared.session_ttl_ms,
+                )
+                .map(|lease| (sessions.len(), lease))
+            };
+            let Some((refs, lease)) = renewed else {
+                return write_json(
+                    &mut stream,
+                    404,
+                    json!({"ok": false, "error": "session not found"}),
+                );
+            };
+            touch(shared);
+            write_json(
+                &mut stream,
+                200,
+                json!({
+                    "ok": true,
+                    "sessionId": session_id,
+                    "refcount": refs,
+                    "pid": std::process::id(),
+                    "port": shared.port.load(Ordering::SeqCst),
+                    "lastSeenAt": lease.last_seen_at,
+                    "expiresAt": lease.expires_at,
                 }),
             )
         }
         ("POST", "/detach") => {
             let body: AttachBody = serde_json::from_str(&req.body).unwrap_or_default();
             let refs = {
-                let mut sessions = match shared.sessions.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
+                let mut sessions = lock_sessions(shared);
+                expire_sessions(&mut sessions, now_ms());
                 if let Some(id) = body.session_id {
                     sessions.remove(&id);
                 }
@@ -554,4 +683,76 @@ fn write_json(stream: &mut TcpStream, status: u16, body: Value) -> Result<(), St
         .and_then(|_| stream.write_all(text.as_bytes()))
         .and_then(|_| stream.flush())
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_ttl_defaults_conservatively() {
+        assert_eq!(parse_positive_ms(None, 300_000), 300_000);
+        assert_eq!(parse_positive_ms(Some("0".into()), 300_000), 300_000);
+        assert_eq!(parse_positive_ms(Some("abc".into()), 300_000), 300_000);
+        assert_eq!(parse_positive_ms(Some("200".into()), 300_000), 200);
+        assert_eq!(parse_positive_ms(Some("10".into()), 300_000), 50);
+    }
+
+    #[test]
+    fn expire_removes_stale_and_keeps_live() {
+        let mut sessions = HashMap::new();
+        renew_lease(&mut sessions, "stale".into(), 1_000, 100);
+        renew_lease(&mut sessions, "live".into(), 1_050, 100);
+        expire_sessions(&mut sessions, 1_101);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("live"));
+        assert!(!sessions.contains_key("stale"));
+    }
+
+    #[test]
+    fn renew_is_idempotent_and_extends() {
+        let mut sessions = HashMap::new();
+        let first = renew_lease(&mut sessions, "A".into(), 1_000, 300);
+        let second = renew_lease(&mut sessions, "A".into(), 1_200, 300);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(first.expires_at, 1_300);
+        assert_eq!(second.expires_at, 1_500);
+        assert_eq!(sessions.get("A").unwrap().last_seen_at, 1_200);
+    }
+
+    #[test]
+    fn health_session_payload_has_no_token() {
+        let mut sessions = HashMap::new();
+        renew_lease(&mut sessions, "A".into(), 10, 50);
+        let payload = live_session_payload(&sessions);
+        let text = serde_json::to_string(&payload).unwrap();
+        assert!(text.contains("sessionId"));
+        assert!(text.contains("lastSeenAt"));
+        assert!(text.contains("expiresAt"));
+        assert!(!text.contains("token"));
+        assert_eq!(oldest_expires_at(&sessions), Some(60));
+    }
+
+    #[test]
+    fn heartbeat_unknown_does_not_insert() {
+        let mut sessions = HashMap::new();
+        assert!(touch_lease(&mut sessions, "ghost", 1_000, 100).is_none());
+        assert!(sessions.is_empty());
+        renew_lease(&mut sessions, "H".into(), 1_000, 100);
+        sessions.remove("H");
+        assert!(touch_lease(&mut sessions, "H", 1_200, 100).is_none());
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn heartbeat_renews_existing_only() {
+        let mut sessions = HashMap::new();
+        renew_lease(&mut sessions, "H".into(), 1_000, 300);
+        let lease = touch_lease(&mut sessions, "H", 1_200, 300).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(lease.last_seen_at, 1_200);
+        assert_eq!(lease.expires_at, 1_500);
+        assert!(touch_lease(&mut sessions, "other", 1_300, 300).is_none());
+        assert_eq!(sessions.len(), 1);
+    }
 }

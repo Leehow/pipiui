@@ -12,6 +12,7 @@ import { exactSearch } from "./grep-exact.js";
 import { sidecarJsonPath } from "./paths.js";
 
 type AttachBody = { sessionId?: string };
+type SessionLease = { lastSeenAt: number; expiresAt: number };
 type SearchBody = {
   query?: string;
   path?: string;
@@ -22,9 +23,13 @@ type SearchBody = {
 
 const projectRoot = process.env.PIPIUI_CODE_RETRIEVAL_PROJECT ?? process.cwd();
 const idleMs = Math.max(50, Number(process.env.PIPIUI_CODE_RETRIEVAL_IDLE_MS ?? 60_000) || 60_000);
+const sessionTtlMs = Math.max(
+  50,
+  Number(process.env.PIPIUI_CODE_RETRIEVAL_SESSION_TTL_MS ?? 300_000) || 300_000,
+);
 const token = process.env.PIPIUI_CODE_RETRIEVAL_TOKEN || randomBytes(24).toString("base64url");
 
-const sessions = new Set<string>();
+const sessions = new Map<string, SessionLease>();
 let lastUsed = Date.now();
 let idleTimer: NodeJS.Timeout | undefined;
 let shuttingDown = false;
@@ -60,12 +65,42 @@ function touch(): void {
 
 function scheduleIdle(): void {
   if (idleTimer) clearTimeout(idleTimer);
+  const slice = Math.max(40, Math.min(idleMs, 250));
   idleTimer = setTimeout(() => {
     void maybeIdleExit();
-  }, idleMs);
+  }, slice);
+}
+
+function expireSessions(now = Date.now()): void {
+  for (const [id, lease] of sessions) {
+    if (lease.expiresAt <= now) sessions.delete(id);
+  }
+}
+
+function renewLease(sessionId: string, now = Date.now()): SessionLease {
+  const lease = { lastSeenAt: now, expiresAt: now + sessionTtlMs };
+  sessions.set(sessionId, lease);
+  return lease;
+}
+
+/** Renew an existing session only. Unknown / detached ids must not upsert. */
+function touchLease(sessionId: string, now = Date.now()): SessionLease | undefined {
+  expireSessions(now);
+  if (!sessions.has(sessionId)) return undefined;
+  return renewLease(sessionId, now);
+}
+
+function liveSessionPayload(now = Date.now()): Array<{ sessionId: string; lastSeenAt: number; expiresAt: number }> {
+  expireSessions(now);
+  return [...sessions.entries()].map(([sessionId, lease]) => ({
+    sessionId,
+    lastSeenAt: lease.lastSeenAt,
+    expiresAt: lease.expiresAt,
+  }));
 }
 
 async function maybeIdleExit(): Promise<void> {
+  expireSessions();
   if (sessions.size > 0) {
     scheduleIdle();
     return;
@@ -115,26 +150,68 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/health") {
       touch();
+      const live = liveSessionPayload();
+      const oldestExpiresAt = live.reduce<number | null>(
+        (min, row) => (min === null || row.expiresAt < min ? row.expiresAt : min),
+        null,
+      );
       json(res, 200, {
         ok: true,
         ready: true,
         pid: process.pid,
         port: listenPort(),
-        refcount: sessions.size,
+        refcount: live.length,
         lastUsed,
+        sessionTtlMs,
+        oldestExpiresAt,
+        sessions: live,
       });
       return;
     }
     if (req.method === "POST" && url.pathname === "/attach") {
       const body = parseJson<AttachBody>(await readBody(req));
       const sessionId = body.sessionId || `anon-${Date.now()}`;
-      sessions.add(sessionId);
+      expireSessions();
+      const lease = renewLease(sessionId);
       touch();
-      json(res, 200, { ok: true, sessionId, refcount: sessions.size, pid: process.pid, port: listenPort() });
+      json(res, 200, {
+        ok: true,
+        sessionId,
+        refcount: sessions.size,
+        pid: process.pid,
+        port: listenPort(),
+        lastSeenAt: lease.lastSeenAt,
+        expiresAt: lease.expiresAt,
+      });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/heartbeat") {
+      const body = parseJson<AttachBody>(await readBody(req));
+      const sessionId = typeof body.sessionId === "string" ? body.sessionId.trim() : "";
+      if (!sessionId) {
+        json(res, 400, { ok: false, error: "sessionId required" });
+        return;
+      }
+      const lease = touchLease(sessionId);
+      if (!lease) {
+        json(res, 404, { ok: false, error: "session not found" });
+        return;
+      }
+      touch();
+      json(res, 200, {
+        ok: true,
+        sessionId,
+        refcount: sessions.size,
+        pid: process.pid,
+        port: listenPort(),
+        lastSeenAt: lease.lastSeenAt,
+        expiresAt: lease.expiresAt,
+      });
       return;
     }
     if (req.method === "POST" && url.pathname === "/detach") {
       const body = parseJson<AttachBody>(await readBody(req));
+      expireSessions();
       if (body.sessionId) sessions.delete(body.sessionId);
       touch();
       json(res, 200, { ok: true, refcount: sessions.size, pid: process.pid });
