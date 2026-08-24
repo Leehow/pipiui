@@ -352,7 +352,13 @@ function ModelFamilyIcon({ agent }: { agent: Agent }) {
 }
 
 export function agentDisplayName(agent: Pick<Agent, 'agentId' | 'name' | 'role'>): string {
-  return agent.name || agent.role || 'subagent'
+  // Identity comes only from explicit stable fields: the worker role/type the
+  // backend establishes on start (or a new run), then the name, then the id.
+  // `name` alone is not trusted for display because same-run update events used
+  // to overwrite it with the *active tool* (bash/grep/read/…) before the backend
+  // kept run identity stable; role-first also covers unknown future tool names
+  // and old persisted rows where only `name` was polluted.
+  return agent.role?.trim() || agent.name?.trim() || agent.agentId
 }
 
 function latestReadableResult(agent: Agent): string {
@@ -547,7 +553,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       // The session-change effect already cleared the previous chat. Merge the
       // snapshot into any events that arrived while this request was in flight,
       // otherwise a fast START can be erased by a slower empty snapshot.
-      setAgents(current => snapshot.reduce((next, agent) => applyAgentEvent(next, { type: 'agent', agent }), current))
+      setAgents(current => snapshot.reduce((next, agent) => applyAgentEvent(next, { type: 'agent', agent }, 'snapshot', sessionId), current))
     } catch (error) {
       if (generation !== loadGeneration.current) return
       setLoadError(error instanceof Error ? error.message : '无法加载 subagents')
@@ -570,7 +576,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 		setAbortingIds(new Set())
     void load()
     const off = host.subscribeAgents(event => setAgents(current => sessionScopedEvent(current, event, sessionId)
-      ? applyAgentEvent(current, event)
+      ? applyAgentEvent(current, event, 'live', sessionId)
       : current))
     return () => {
       loadGeneration.current += 1
@@ -717,8 +723,16 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   }
   const check = async (agent: Agent) => {
     requestManualStatusCheck([agent.agentId])
+    // Capture the session this probe belongs to. The user may switch chats while the
+    // host read is pending; a response for the old session must never write into the
+    // new session's list, and an unmounted panel must not setState at all.
+    const session = sessionId
+    const generation = loadGeneration.current
     const update = await host.checkAgent(agent.agentId)
-    setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }))
+    if (generation !== loadGeneration.current || session !== sessionId) return
+    // A probe response is an async host read: it may describe a run the live feed
+    // already replaced, so it merges with snapshot precedence, never live trust.
+    setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }, 'snapshot', session))
   }
   const worktree = async (agentId: string, action: 'merge' | 'discard') => {
     const status = action === 'merge' ? await host.mergeWorktree(agentId) : await host.discardWorktree(agentId)
@@ -822,27 +836,138 @@ function sessionScopedEvent(current: Agent[], event: AgentEvent, sessionId?: str
   return current.some(agent => agent.agentId === agentId)
 }
 
-function applyAgentEvent(current: Agent[], event: AgentEvent): Agent[] {
+const TERMINAL_AGENT_STATES: readonly AgentState[] = ['ok', 'failed', 'aborted', 'interrupted']
+
+/**
+ * Resolve the transient stall flag for one merged agent event. A terminal state
+ * always wins over an inherited stall, and a running event that does not itself
+ * carry `stalled: true` is progress that clears the previous stall; only a fresh
+ * stall (state `stalled`, or an explicit flag) may re-flag the agent.
+ */
+export function resolveAgentStalled(state: AgentState, stalled: boolean): boolean {
+  if (TERMINAL_AGENT_STATES.includes(state)) return false
+  if (state === 'stalled') return true
+  return stalled
+}
+
+/**
+ * Timing guard for merging one agent event/snapshot row into a displayed row.
+ *
+ * The live subscription and the async `listAgents()`/`checkAgent()` reads land in whatever
+ * order the host delivers them, so `applyAgentEvent` must not blindly spread by agentId:
+ *
+ * - Same run: once a row reached a terminal verdict, a late running/stalled event for
+ *   that same run (or an older snapshot row captured before the verdict) must never
+ *   downgrade it back to live. Terminal→terminal refresh is still allowed.
+ * - Different run with comparable, unequal `createdAt`: only a strictly newer time
+ *   replaces the displayed run; an equal time can never supersede in either direction.
+ * - Different run with missing/equal `createdAt`: the backend keys each run separately
+ *   (its own mapper never reopens a terminal run), so the first live event for a
+ *   never-before-seen runId is that run's start and is trusted — but only as `running`.
+ *   Everything else (a snapshot, a stall/end, or any event for a run the panel has
+ *   already displayed and replaced) is conservatively rejected: a retired run can
+ *   never come back.
+ */
+export type AgentEventSource = 'live' | 'snapshot'
+
+/**
+ * Renderer-lifetime ledger of runs the panel has already displayed and replaced,
+ * keyed `${sessionId}\u0000${agentId}` so different chats never pollute each other.
+ *
+ * It deliberately lives OUTSIDE React state: session switches and remounts clear the
+ * row list (`setAgents([])`), but retiring a run is permanent — after the panel comes
+ * back, a late event for a run a newer run already replaced must still be rejected,
+ * even before any row exists for that agent again. It is never cleared on a session
+ * switch. The host emits no reliable "forget this run" signal, so entries are kept for
+ * the renderer's life; each actual runId is stored exactly once (Set dedupes) and O(1)
+ * lookup replaces per-row array copies. Correctness outranks memory here: no
+ * capacity-based eviction that could resurrect an old run.
+ */
+const agentRunLineages = new Map<string, Set<string>>()
+
+const agentRunLineageKey = (sessionId: string | undefined, agentId: string) => `${sessionId ?? ''}\u0000${agentId}`
+
+function retireAgentRun(sessionId: string | undefined, agentId: string, runId: string) {
+  const key = agentRunLineageKey(sessionId, agentId)
+  let retired = agentRunLineages.get(key)
+  if (!retired) {
+    retired = new Set()
+    agentRunLineages.set(key, retired)
+  }
+  retired.add(runId)
+}
+
+/** Test-only: reset the renderer-lifetime ledger so suites stay independent. */
+export function resetAgentRunLineageForTest() {
+  agentRunLineages.clear()
+}
+
+/** Test-only: total retired runs recorded, to assert the ledger never re-grows. */
+export function agentRunLineageSizeForTest(): number {
+  let total = 0
+  for (const retired of agentRunLineages.values()) total += retired.size
+  return total
+}
+
+export function agentEventSupersedes(
+  previous: Pick<AgentSummary, 'state' | 'runId' | 'createdAt'>,
+  incoming: Pick<AgentSummary, 'state' | 'runId' | 'createdAt'>,
+  source: AgentEventSource = 'live',
+  retiredRunIds?: ReadonlySet<string>,
+): boolean {
+  const previousTerminal = TERMINAL_AGENT_STATES.includes(previous.state)
+  const incomingTerminal = TERMINAL_AGENT_STATES.includes(incoming.state)
+  if (!previous.runId || !incoming.runId || previous.runId === incoming.runId) {
+    return !(previousTerminal && !incomingTerminal)
+  }
+  // A run the panel already displayed and then replaced is permanently retired:
+  // no late live event or snapshot for it may ever rewrite the row again.
+  if (retiredRunIds?.has(incoming.runId)) return false
+  const before = previous.createdAt
+  const at = incoming.createdAt
+  if (typeof before === 'number' && Number.isFinite(before) && typeof at === 'number' && Number.isFinite(at) && before !== at) {
+    return at > before
+  }
+  // Missing or equal timestamps cannot order the runs: accept only a live first
+  // sight of a brand-new run (its start, per backend run isolation). Snapshots and
+  // non-running events are rejected — they can never prove they are the newer run.
+  return source === 'live' && incoming.state === 'running'
+}
+
+function applyAgentEvent(current: Agent[], event: AgentEvent, source: AgentEventSource = 'live', sessionId?: string): Agent[] {
   if (event.type === 'worktree') return current.map(agent => agent.agentId === event.status.agentId ? { ...agent, worktree: event.status } : agent)
   if (event.type !== 'agent') return current
   const incoming = event.agent
   const index = current.findIndex(agent => agent.agentId === incoming.agentId)
   const previous = current[index]
+  // The lineage ledger is checked even when no row exists yet: after a session switch or
+  // remount the list is empty, and a retired run's late live event must not reinsert it
+  // ahead of the current run's snapshot. Survives list clears; see agentRunLineages.
+  const retiredRunIds = agentRunLineages.get(agentRunLineageKey(sessionId ?? incoming.sessionId, incoming.agentId))
+  if (incoming.runId && retiredRunIds?.has(incoming.runId)) return current
+  // A row that already reached a verdict — or already shows a newer run — must not
+  // be rewritten by a late event or a slower listAgents() snapshot taken before
+  // that verdict/new run existed. See agentEventSupersedes for the precedence rules.
+  if (previous && !agentEventSupersedes(previous, incoming, source)) return current
   const active = incoming.state === 'running'
+  const switchedRun = Boolean(previous?.runId && incoming.runId && previous.runId !== incoming.runId)
   // A new run restarts contentIndex at 0; forget the previous run's slot keys so its
   // rows are never rewritten by the next run's first deltas (Swift clears its stream
   // slots on `start` for the same reason).
-  const newRun = active && Boolean(previous?.runId && incoming.runId && incoming.runId !== previous.runId)
   const logs = previous?.logs
-    ? newRun
+    ? switchedRun
       ? previous.logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined })
       : previous.logs
     : []
-  const startedCandidates = [incoming.createdAt, newRun ? undefined : previous?.startedAt]
+  const startedCandidates = [incoming.createdAt, switchedRun ? undefined : previous?.startedAt]
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
+  if (switchedRun && previous.runId) retireAgentRun(sessionId ?? incoming.sessionId, incoming.agentId, previous.runId)
   const next: Agent = {
     ...previous,
     ...incoming,
+    // Shallow-merge alone would inherit the previous run's stalled flag when the
+    // incoming event omits it; resolve it per event instead (see resolveAgentStalled).
+    stalled: resolveAgentStalled(incoming.state, incoming.stalled === true),
     startedAt: startedCandidates.length ? Math.min(...startedCandidates) : Date.now(),
     endedAt: active ? undefined : incoming.endedAt ?? previous?.endedAt ?? Date.now(),
     logs,

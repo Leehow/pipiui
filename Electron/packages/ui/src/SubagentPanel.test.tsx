@@ -3,13 +3,14 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
-import { agentDetailUsage, SubagentPanel } from './SubagentPanel'
+import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
 import { PLAN_JSON } from './computer-task-report.test.fixture'
 
 afterEach(() => {
   cleanup()
   document.querySelectorAll('.jsdom-header-slot').forEach(el => el.remove())
   localStorage.removeItem('pipiui:subagent-list-ratio')
+  resetAgentRunLineageForTest()
 })
 
 function Fixture(props: ComponentProps<typeof SubagentPanel>) {
@@ -74,6 +75,79 @@ describe('agentDetailUsage', () => {
 
   it('returns empty facts when the agent has no usage', () => {
     expect(agentDetailUsage({})).toEqual({})
+  })
+})
+
+describe('resolveAgentStalled', () => {
+  it('drops the stall flag on every terminal state', () => {
+    for (const state of ['ok', 'failed', 'aborted', 'interrupted'] as const) {
+      expect(resolveAgentStalled(state, true)).toBe(false)
+    }
+  })
+
+  it('clears an inherited stall on running progress and re-flags only a fresh stall', () => {
+    expect(resolveAgentStalled('running', false)).toBe(false)
+    expect(resolveAgentStalled('running', true)).toBe(true)
+    expect(resolveAgentStalled('stalled', false)).toBe(true)
+  })
+})
+
+describe('agentEventSupersedes', () => {
+  it('never downgrades a same-run terminal verdict', () => {
+    const previous = { state: 'ok' as const, runId: 'r1', createdAt: 1_000 }
+    expect(agentEventSupersedes(previous, { state: 'running', runId: 'r1', createdAt: 2_000 })).toBe(false)
+    expect(agentEventSupersedes(previous, { state: 'stalled', runId: 'r1', createdAt: 2_000 })).toBe(false)
+    // Terminal→terminal refresh (closeout/handled, a later verdict) still lands.
+    expect(agentEventSupersedes(previous, { state: 'ok', runId: 'r1', createdAt: 2_000 })).toBe(true)
+  })
+
+  it('keeps same-run progress paths open', () => {
+    const live = { state: 'running' as const, runId: 'r1', createdAt: 1_000 }
+    expect(agentEventSupersedes(live, { state: 'stalled', runId: 'r1', createdAt: 2_000 })).toBe(true)
+    expect(agentEventSupersedes({ ...live, state: 'stalled' }, { state: 'running', runId: 'r1', createdAt: 2_000 })).toBe(true)
+    expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1', createdAt: 2_000 })).toBe(true)
+  })
+
+  it('orders different runs strictly by createdAt: older loses, equal never supersedes', () => {
+    const newRun = { state: 'running' as const, runId: 'r2', createdAt: 5_000 }
+    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 1_000 })).toBe(false)
+    expect(agentEventSupersedes(newRun, { state: 'stalled', runId: 'r1', createdAt: 1_000 })).toBe(false)
+    expect(agentEventSupersedes(newRun, { state: 'ok', runId: 'r1', createdAt: 1_000 })).toBe(false)
+    // Equal timestamps cannot order two runs, so they follow the missing-time rule:
+    // a live first-sight start is accepted once; retirement then blocks the reverse.
+    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 5_000 })).toBe(true)
+    expect(agentEventSupersedes(newRun, { state: 'ok', runId: 'r1', createdAt: 5_000 })).toBe(false)
+    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 5_000 }, 'snapshot')).toBe(false)
+
+    const oldTerminal = { state: 'ok' as const, runId: 'r1', createdAt: 1_000 }
+    expect(agentEventSupersedes(oldTerminal, { state: 'running', runId: 'r2', createdAt: 5_000 })).toBe(true)
+    expect(agentEventSupersedes(oldTerminal, { state: 'ok', runId: 'r2', createdAt: 5_000 }, 'snapshot')).toBe(true)
+  })
+
+  it('without usable createdAt trusts only a live first-sight start', () => {
+    const live = { state: 'running' as const, runId: 'r2' }
+    // An unseen run's first live event is its start (the backend keys runs separately), so it is trusted — but only as running.
+    expect(agentEventSupersedes(live, { state: 'running', runId: 'r9' })).toBe(true)
+    // A stall/end for an unknown run, or any snapshot row, can never prove it is the newer run.
+    expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1' })).toBe(false)
+    expect(agentEventSupersedes(live, { state: 'stalled', runId: 'r1' })).toBe(false)
+    expect(agentEventSupersedes(live, { state: 'running', runId: 'r1' }, 'snapshot')).toBe(false)
+    expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1' }, 'snapshot')).toBe(false)
+
+    const dead = { state: 'ok' as const, runId: 'r1' }
+    expect(agentEventSupersedes(dead, { state: 'running', runId: 'r2' })).toBe(true)
+    expect(agentEventSupersedes(dead, { state: 'failed', runId: 'r2' })).toBe(false)
+    expect(agentEventSupersedes(dead, { state: 'stalled', runId: 'r2' })).toBe(false)
+  })
+
+  it('permanently rejects a retired run regardless of state, source, or timestamps', () => {
+    const previous = { state: 'running' as const, runId: 'r2', createdAt: 5_000 }
+    const retired = new Set(['r1'])
+    expect(agentEventSupersedes(previous, { state: 'running', runId: 'r1', createdAt: 9_000 }, 'live', retired)).toBe(false)
+    expect(agentEventSupersedes(previous, { state: 'ok', runId: 'r1', createdAt: 9_000 }, 'snapshot', retired)).toBe(false)
+    expect(agentEventSupersedes(previous, { state: 'stalled', runId: 'r1' }, 'live', retired)).toBe(false)
+    // A run that was never displayed stays free to start.
+    expect(agentEventSupersedes(previous, { state: 'running', runId: 'r3', createdAt: 9_000 })).toBe(true)
   })
 })
 
@@ -1539,5 +1613,354 @@ describe('SubagentPanel', () => {
     const row = await screen.findByTestId('agent-row-done')
     expect(row.textContent).not.toContain('收尾中')
     expect(row.textContent).not.toContain('思考中')
+  })
+
+  it('clears a sticky 卡住 badge on running progress and terminal events, and re-flags a fresh stall', async () => {
+    const harness = hostHarness()
+    const base = { agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', createdAt: Date.now() - 571_000 }
+    harness.host.listAgents = async () => [{ ...base, state: 'stalled', stalled: true } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-smoke')
+    expect(screen.getAllByText('卡住', { selector: '.stalled-badge' }).length).toBeGreaterThan(0)
+
+    // Running progress without a stall flag clears the transient badge.
+    harness.emitAgent({ type: 'agent', agent: { ...base, state: 'running' } as AgentSummary })
+    await waitFor(() => expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull())
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+
+    // The watchdog may re-flag a still-quiet worker with a fresh stall event.
+    harness.emitAgent({ type: 'agent', agent: { ...base, state: 'stalled', stalled: true } as AgentSummary })
+    await waitFor(() => expect(screen.getAllByText('卡住', { selector: '.stalled-badge' }).length).toBeGreaterThan(0))
+
+    // A terminal event wins even when it arrives carrying a stale stalled:true flag.
+    harness.emitAgent({ type: 'agent', agent: { ...base, state: 'ok', stalled: true, finalResult: '全部通过', endedAt: Date.now() } as AgentSummary })
+    await waitFor(() => expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull())
+    expect(screen.getByTitle('已完成')).toBeTruthy()
+  })
+
+  it('keeps a terminal verdict when a slower listAgents snapshot still shows the run as live', async () => {
+    const harness = hostHarness()
+    let resolveSnapshot!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
+    render(<SubagentPanel host={harness.host} />)
+
+    // The terminal event lands through the live subscription while listAgents() is in flight.
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'ok', createdAt: 1_000, endedAt: 2_000, finalResult: '全部通过' } as AgentSummary })
+
+    // The snapshot was captured before the end event: same run, still running.
+    await act(async () => resolveSnapshot([{ agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'running', createdAt: 1_000, updatedAt: 1_500 } as AgentSummary]))
+    expect(await screen.findByTitle('已完成')).toBeTruthy()
+    expect(screen.queryByLabelText('中止 general-purpose')).toBeNull()
+    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
+
+    // A late same-run stall event must not re-flag the finished run either.
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'stalled', stalled: true, createdAt: 2_500 } as AgentSummary })
+    expect(screen.getByTitle('已完成')).toBeTruthy()
+    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
+  })
+
+  it('keeps a displayed new run when the previous run\u2019s late events and snapshot rows arrive', async () => {
+    const harness = hostHarness()
+    let resolveSnapshot!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
+    render(<SubagentPanel host={harness.host} />)
+
+    // Old run ends, then the same agentId is re-dispatched as a genuinely newer run.
+    const base = { agentId: 'smoke', name: 'general-purpose' }
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', createdAt: 1_000, endedAt: 2_000 } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running', createdAt: 5_000 } as AgentSummary })
+
+    // A slower listAgents snapshot captured during the old run merges after the new start.
+    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true, createdAt: 1_000, updatedAt: 1_500 } as AgentSummary]))
+    expect(await screen.findByTitle('运行中')).toBeTruthy()
+    expect(screen.getByLabelText('中止 general-purpose')).toBeTruthy()
+    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
+    expect(screen.queryByTitle('已完成')).toBeNull()
+
+    // Late old-run live events are equally rejected: the new run keeps the row.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running', createdAt: 1_200 } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', createdAt: 2_000 } as AgentSummary })
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.getByLabelText('中止 general-purpose')).toBeTruthy()
+    const row = screen.getByTestId('agent-row-smoke')
+    expect(row.textContent).toContain('第二轮任务')
+  })
+
+  it('retires a run once a new run starts, rejecting its late events and snapshots without createdAt', async () => {
+    const harness = hostHarness()
+    let resolveSnapshot!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
+    render(<SubagentPanel host={harness.host} />)
+    const base = { agentId: 'smoke', name: 'general-purpose' }
+
+    // While listAgents() is still in flight, the live feed shows r1's verdict and then
+    // a never-seen r2 start (no createdAt anywhere): the start is trusted.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    // The retired r1 can no longer rewrite the row: running, stalled, and ok are all rejected.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    // A slower snapshot captured during r1 merges after the r2 start and is rejected too.
+    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary]))
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.queryByTitle('已完成')).toBeNull()
+    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+
+    // A genuinely newer run can still take over the row.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+  })
+
+  it('never lets an equal createdAt resurrect the run a live start already replaced', async () => {
+    const harness = hostHarness()
+    const at = Date.now() - 5_000
+    let resolveSnapshot!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
+    render(<SubagentPanel host={harness.host} />)
+    const base = { agentId: 'smoke', name: 'general-purpose', createdAt: at }
+
+    // r1 ends and a new r2 starts with the very same createdAt: equal times cannot
+    // order the runs, so the live first-sight start wins and retires r1.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', endedAt: at } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    // The same timestamp for r1 proves nothing anymore: a snapshot cannot switch runs…
+    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'ok', endedAt: at } as AgentSummary]))
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+
+    // …and neither may a live stall/end for the retired run claim the row.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true } as AgentSummary })
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+  })
+
+  it('keeps r1 retired across a session A→B→A round trip, even when its live event beats the snapshot', async () => {
+    const harness = hostHarness()
+    let resolveA!: (agents: AgentSummary[]) => void
+    let resolveB!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = vi.fn((id?: string) => id === 'B'
+      ? new Promise<AgentSummary[]>(resolve => { resolveB = resolve })
+      : new Promise<AgentSummary[]>(resolve => { resolveA = resolve }))
+    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
+    const view = render(<Fixture host={harness.host} sessionId="A" />)
+
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    await act(async () => resolveA([]))
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
+
+    // Leaving and re-entering session A clears the row list but not the run lineage.
+    view.rerender(<Fixture host={harness.host} sessionId="B" />)
+    await act(async () => resolveB([]))
+    view.rerender(<Fixture host={harness.host} sessionId="A" />)
+
+    // The retired r1's late live running arrives before any snapshot: it must not reinsert.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
+    // The legitimate r2 snapshot lands afterwards and owns the row.
+    await act(async () => resolveA([{ ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary]))
+    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+
+    // A genuinely new r3 live start still takes over and retires r2; r2 then stays rejected.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务')
+  })
+
+  it('keeps r1 retired across a full panel unmount/remount', async () => {
+    const harness = hostHarness()
+    let resolveA!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveA = resolve })
+    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
+    const first = render(<Fixture host={harness.host} sessionId="A" />)
+
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    await act(async () => resolveA([]))
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
+    first.unmount()
+
+    // A remounted panel starts with an empty list: the retired r1 live event arrives first.
+    render(<Fixture host={harness.host} sessionId="A" />)
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
+    await act(async () => resolveA([{ ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary]))
+    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+  })
+
+  it('keeps another session\u2019s ledger independent even for the same agentId and runId', async () => {
+    const harness = hostHarness()
+    let resolveA!: (agents: AgentSummary[]) => void
+    let resolveB!: (agents: AgentSummary[]) => void
+    harness.host.listAgents = vi.fn((id?: string) => id === 'B'
+      ? new Promise<AgentSummary[]>(resolve => { resolveB = resolve })
+      : new Promise<AgentSummary[]>(resolve => { resolveA = resolve }))
+    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
+    const view = render(<Fixture host={harness.host} sessionId="A" />)
+
+    // Retire r1 for agent 'smoke' in session A.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    await act(async () => resolveA([]))
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
+
+    // Session B reuses both the agentId and the runId: its r1 must display untouched.
+    view.rerender(<Fixture host={harness.host} sessionId="B" />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', name: 'general-purpose', sessionId: 'B', runId: 'r1', task: 'B 的独立任务', state: 'running' } as AgentSummary })
+    await act(async () => resolveB([]))
+    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('B 的独立任务')
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+  })
+
+  it('records each retired run exactly once regardless of how often its late events repeat', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => []
+    render(<SubagentPanel host={harness.host} />)
+    const base = { agentId: 'smoke', name: 'general-purpose', runId: 'r1', task: '第一轮任务' }
+
+    harness.emitAgent({ type: 'agent', agent: { ...base, state: 'ok' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
+    expect(agentRunLineageSizeForTest()).toBe(1)
+
+    // Repeated late traffic for the retired run never duplicates ledger entries.
+    for (let repeat = 0; repeat < 10; repeat += 1) {
+      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'running' } as AgentSummary })
+      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'stalled', stalled: true } as AgentSummary })
+      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'ok' } as AgentSummary })
+    }
+    expect(agentRunLineageSizeForTest()).toBe(1)
+
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
+    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
+    expect(agentRunLineageSizeForTest()).toBe(2)
+  })
+
+  it('discards a manual-check response that resolves after the session switched away', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    let resolveCheck!: (update: AgentSummary) => void
+    let resolveB!: (agents: AgentSummary[]) => void
+    let checkAgentId = ''
+    harness.host.checkAgent = (agentId: string) => {
+      checkAgentId = agentId
+      return new Promise<AgentSummary>(resolve => { resolveCheck = resolve })
+    }
+    harness.host.listAgents = vi.fn((id?: string) => id === 'B'
+      ? new Promise<AgentSummary[]>(resolve => { resolveB = resolve })
+      : Promise.resolve([{ agentId: 'worker-a', runId: 'ra', name: 'explore', task: 'A 的任务', state: 'running', sessionId: 'A', createdAt: now, updatedAt: now } as AgentSummary]))
+    const view = render(<Fixture host={harness.host} sessionId="A" />)
+    await screen.findByTestId('agent-row-worker-a')
+    fireEvent.click(screen.getByText('技术详情'))
+    fireEvent.click(screen.getByTestId('subagent-detail-status-check'))
+    expect(checkAgentId).toBe('worker-a')
+
+    // Switch to session B while the probe response is still pending.
+    view.rerender(<Fixture host={harness.host} sessionId="B" />)
+    await act(async () => resolveB([{ agentId: 'worker-b', runId: 'rb', name: 'explore', task: 'B 的任务', state: 'running', sessionId: 'B', createdAt: now, updatedAt: now } as AgentSummary]))
+    expect(await screen.findByTestId('agent-row-worker-b')).toBeTruthy()
+
+    // Session A's probe response arrives late: it must not write into B's list.
+    await act(async () => resolveCheck({ agentId: 'worker-a', runId: 'ra', name: 'explore', task: 'A 的任务', state: 'ok', sessionId: 'A', createdAt: now, updatedAt: now, endedAt: now } as AgentSummary))
+    expect(screen.queryByTestId('agent-row-worker-a')).toBeNull()
+    expect(screen.getByTestId('agent-row-worker-b').textContent).toContain('B 的任务')
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+
+    // Switching back to A re-hydrates from A's own snapshot/live — never from the stale probe.
+    view.rerender(<Fixture host={harness.host} sessionId="A" />)
+    await waitFor(() => expect(screen.getByTestId('agent-row-worker-a')).toBeTruthy())
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.queryByTitle('已完成')).toBeNull()
+  })
+
+  it('discards a manual-check response for the same agentId after the session switched away', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    let resolveCheck!: (update: AgentSummary) => void
+    harness.host.checkAgent = () => new Promise<AgentSummary>(resolve => { resolveCheck = resolve })
+    const row = (sessionId: string, task: string, state: AgentSummary['state'] = 'running') =>
+      ({ agentId: 'shared-worker', runId: `run-${sessionId}`, name: 'explore', task, state, sessionId, createdAt: now, updatedAt: now } as AgentSummary)
+    harness.host.listAgents = vi.fn((id?: string) => Promise.resolve(id === 'B' ? [row('B', 'B 的任务')] : [row('A', 'A 的任务')]))
+    const view = render(<Fixture host={harness.host} sessionId="A" />)
+    await screen.findByTestId('agent-row-shared-worker')
+    fireEvent.click(screen.getByText('技术详情'))
+    fireEvent.click(screen.getByTestId('subagent-detail-status-check'))
+
+    view.rerender(<Fixture host={harness.host} sessionId="B" />)
+    await waitFor(() => expect(screen.getByTestId('agent-row-shared-worker').textContent).toContain('B 的任务'))
+
+    // The stale A probe reports the same agentId as terminal — it must not overwrite B's live row.
+    await act(async () => resolveCheck(row('A', 'A 的任务', 'ok')))
+    expect(screen.getByTestId('agent-row-shared-worker').textContent).toContain('B 的任务')
+    expect(screen.getByTitle('运行中')).toBeTruthy()
+    expect(screen.queryByTitle('已完成')).toBeNull()
+  })
+
+  it('applies a same-session manual-check response through the snapshot merge path', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    let resolveCheck!: (update: AgentSummary) => void
+    harness.host.checkAgent = () => new Promise<AgentSummary>(resolve => { resolveCheck = resolve })
+    harness.host.listAgents = async () => [
+      { agentId: 'worker-1', runId: 'r1', name: 'explore', task: 'look around', state: 'running', createdAt: now, updatedAt: now },
+    ]
+    render(<SubagentPanel host={harness.host} />)
+    await screen.findByTestId('agent-row-worker-1')
+    fireEvent.click(screen.getByText('技术详情'))
+    fireEvent.click(screen.getByTestId('subagent-detail-status-check'))
+
+    // The same session's probe verdict updates the row: snapshot precedence, no cross-run switch.
+    await act(async () => resolveCheck({ agentId: 'worker-1', runId: 'r1', name: 'explore', task: 'look around', state: 'ok', createdAt: now, updatedAt: now, endedAt: now } as AgentSummary))
+    expect(await screen.findByTitle('已完成')).toBeTruthy()
+    expect(screen.queryByLabelText('中止 explore')).toBeNull()
+  })
+})
+
+describe('agentDisplayName identity pollution', () => {
+  it('prefers the stable worker role over a tool-polluted name', () => {
+    expect(agentDisplayName({ agentId: 'a1', name: 'bash', role: 'general-purpose' })).toBe('general-purpose')
+    expect(agentDisplayName({ agentId: 'a2', name: 'grep', role: 'explore' })).toBe('explore')
+    expect(agentDisplayName({ agentId: 'a3', name: 'read', role: 'explore' })).toBe('explore')
+  })
+
+  it('shows the role for any unknown or future tool-style name — no blocklist involved', () => {
+    expect(agentDisplayName({ agentId: 'a1', name: 'mcp__server__thing', role: 'explore' })).toBe('explore')
+    expect(agentDisplayName({ agentId: 'a2', name: 'future_unknown_tool', role: 'general-purpose' })).toBe('general-purpose')
+  })
+
+  it('falls back to name only when role is missing, then to the agent id', () => {
+    expect(agentDisplayName({ agentId: 'a1', name: 'quota-pill' })).toBe('quota-pill')
+    // A custom agent that wants its own label carries it as an explicit role.
+    expect(agentDisplayName({ agentId: 'a2', name: 'irrelevant', role: 'quota-pill' })).toBe('quota-pill')
+    expect(agentDisplayName({ agentId: 'a3', name: 'grep' })).toBe('grep')
+    expect(agentDisplayName({ agentId: 'a4', name: '', role: 'reviewer' })).toBe('reviewer')
+    expect(agentDisplayName({ agentId: 'a5', name: '', role: '' })).toBe('a5')
+  })
+
+  it('renders the worker type in list rows for tool-polluted summaries (user screenshot)', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [
+      { agentId: 'polluted-bash', runId: 'r1', name: 'bash', role: 'general-purpose', title: '继续排查假卡住', task: '继续排查假卡住', state: 'running', createdAt: 1 },
+      { agentId: 'polluted-grep', runId: 'r2', name: 'grep', role: 'explore', title: '重查 stalled 状态链', task: '重查 stalled 状态链', state: 'running', createdAt: 2 }
+    ] as AgentSummary[]
+    render(<SubagentPanel host={harness.host} />)
+
+    const bashRow = await screen.findByTestId('agent-row-polluted-bash')
+    expect(bashRow.querySelector('strong')?.textContent).toBe('general-purpose')
+    expect(bashRow.querySelector('strong')?.textContent).not.toBe('bash')
+    expect(bashRow.textContent).toContain('继续排查假卡住')
+
+    const grepRow = screen.getByTestId('agent-row-polluted-grep')
+    expect(grepRow.querySelector('strong')?.textContent).toBe('explore')
+    expect(grepRow.querySelector('strong')?.textContent).not.toBe('grep')
+    expect(grepRow.textContent).toContain('重查 stalled 状态链')
   })
 })

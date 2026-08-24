@@ -1216,6 +1216,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
   const historyContextRef = useRef<{ host: PipiHostAPI; sessionId: string } | null>(null)
+  /** Caps empty-page history retries per selection. The 250ms retry used to bump
+   *  `historyRefreshKey`, re-run this effect, and reset the local scheduled flag,
+   *  so a session whose JSONL page stayed empty (21MB+ files that parse to no
+   *  visible rows, or a wedged host) rescanned forever and pinned the main process. */
+  const emptyPageRetriesBySessionRef = useRef(new Map<string, number>())
   /** Send from the empty "新会话" state creates the session first; the pending
    *  prompt is dispatched by the auto-send effect once the new session's history
    *  load and stream subscription are live (a direct sendPrompt would race them). */
@@ -1654,12 +1659,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const requestLiveRevision = transcriptLiveRevisionRef.current
     let staleRetryScheduled = false
     let staleRetryTimer: number | undefined
-    let emptyPageRetryScheduled = false
     let emptyPageRetryTimer: number | undefined
     let settleConfirmRetryTimer: number | undefined
     const previousContext = historyContextRef.current
     const contextChanged = previousContext?.host !== host || previousContext.sessionId !== selectedSession
     historyContextRef.current = { host, sessionId: selectedSession }
+    if (contextChanged && selectedSession) emptyPageRetriesBySessionRef.current.delete(selectedSession)
     if (!selectedSession) {
       setMessages([])
       setLease(null)
@@ -1905,8 +1910,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           if (page.length === 0) {
             const cachedMessages = messagesBySessionRef.current.get(selectedSession)
             const hasCached = (cachedMessages?.length ?? 0) > 0
-            if (!hasCached && !emptyPageRetryScheduled) {
-              emptyPageRetryScheduled = true
+            const emptyRetries = emptyPageRetriesBySessionRef.current.get(selectedSession) ?? 0
+            if (!hasCached && emptyRetries < 1) {
+              emptyPageRetriesBySessionRef.current.set(selectedSession, emptyRetries + 1)
               emptyPageRetryTimer = window.setTimeout(() => {
                 if (historyLoadRef.current === request
                   && historyContextRef.current?.host === host
@@ -1926,6 +1932,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             return
           }
 
+          emptyPageRetriesBySessionRef.current.delete(selectedSession)
           // Preserve already fetched older pages only when the refreshed newest
           // page overlaps the same branch. A rewrite/branch switch with no
           // overlap deliberately drops the stale prefix.

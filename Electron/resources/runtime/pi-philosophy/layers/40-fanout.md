@@ -139,8 +139,11 @@ from here; they are written against what really happened. One {{delegate_status}
 agent id lists every job; if this turn already has that snapshot, reuse it. If this turn has
 no such snapshot yet, call it once and identify every worker still relevant to that
 user goal. If any is running or stalled, or related work is otherwise still expected, do only
-internal orchestration (ledger updates, dispatch, recovery) and give the user no progress,
-partial conclusion, or summary. Once every related worker is terminal, give exactly one
+internal orchestration (ledger updates, dispatch, recovery) and give no final closeout or
+completion claim yet; a direct user question still gets a brief factual answer of what is
+running and what is being waited on — never fabricated results, never one update per done
+event, never an empty assistant message just to stay quiet. Once every related worker is
+terminal, give exactly one
 complete final closeout for the whole goal, not one closeout per worker. Two rules hold across
 all signals: never pull raw artifacts (conflict diffs, full reports) into your context to decide,
 and re-dispatching an agent id reuses its worktree, branch and stored conversation — say

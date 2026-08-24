@@ -422,6 +422,49 @@ test("heartbeat mandates status plus drift classification", () => {
 	assert.doesNotMatch(runtimeIndex, /Call subagent_status only if this snapshot is not enough to decide/);
 });
 
+test("subagent_status description gates the final closeout, not all progress speech", () => {
+	// Regression: the description used to demand "Keep user-facing progress and summaries
+	// silent while related work remains running", which made the Boss answer a direct user
+	// question ("?") with an empty assistant message. The gate must sit on the final
+	// closeout only; factual interim answers stay allowed and required.
+	const runtimeIndex = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	const descStart = runtimeIndex.indexOf('"Before a user-facing conclusion');
+	const descEnd = runtimeIndex.indexOf('"Prefer reading finished results', descStart);
+	assert.ok(descStart >= 0 && descEnd > descStart, "subagent_status description block not found");
+	const desc = runtimeIndex.slice(descStart, descEnd);
+	assert.doesNotMatch(desc, /progress[^"]*silent/i);
+	assert.doesNotMatch(desc, /Keep user-facing/);
+	assert.match(desc, /do not claim final completion or summarize the goal as finished until status confirms the whole related goal is terminal/);
+	assert.match(desc, /when the user directly asks about progress or what is going on/);
+	assert.match(desc, /brief factual natural-language update grounded in this tool's output/);
+	assert.match(desc, /Never fabricate results, never emit one update per done event/);
+	assert.match(desc, /never send an empty assistant message to comply with the waiting protocol/);
+});
+
+test("philosophy layers gate the final closeout, not all progress speech", () => {
+	// Same family, injected into the Boss system prompt via pi-philosophy: the layers used to
+	// say "do not give the user a progress update, partial conclusion, or summary" outright.
+	const orchestration = readFileSync(
+		new URL("../../../pi-philosophy/layers/30-orchestration.md", import.meta.url),
+		"utf8",
+	);
+	const fanout = readFileSync(
+		new URL("../../../pi-philosophy/layers/40-fanout.md", import.meta.url),
+		"utf8",
+	);
+	for (const layer of [orchestration, fanout]) {
+		assert.doesNotMatch(layer, /do not give the user a progress update, partial conclusion/);
+		assert.doesNotMatch(layer, /give the user no progress,/);
+		assert.match(layer, /never an empty assistant\s+message just to stay quiet/);
+		assert.match(layer, /never one update per done\s+event/);
+		assert.match(layer, /never fabricat(?:e|ed) results/);
+	}
+	assert.match(orchestration, /the gate is on the final conclusion: do not present the/);
+	assert.match(orchestration, /when the user directly asks what is going/);
+	assert.match(fanout, /a direct user question still gets a brief factual answer/);
+	assert.match(fanout, /give no final closeout or\s+completion claim yet/);
+});
+
 test("direct general-purpose placement does not require a branch-shaped agentId", async () => {
 	const { unnamedWritableDispatchProblem } = await import("../index.ts");
 	assert.equal(

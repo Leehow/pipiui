@@ -2797,6 +2797,17 @@ describe('session switch transcript cache', () => {
     expect(await screen.findByText('late recovered history')).toBeTruthy()
   })
 
+  it('stops retrying an empty history page after one follow-up instead of looping', async () => {
+    const base = createMockHost()
+    const getSessionHistory = vi.fn(async () => [])
+    render(<App host={{ ...base, getSessionHistory }} />)
+    await waitFor(() => expect(getSessionHistory).toHaveBeenCalled())
+    await waitFor(() => expect(getSessionHistory.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 1_000 })
+    const afterRetry = getSessionHistory.mock.calls.length
+    await new Promise(resolve => setTimeout(resolve, 800))
+    expect(getSessionHistory.mock.calls.length).toBe(afterRetry)
+  })
+
   it('does not drop a locally created session when listSessions returns empty', async () => {
     const base = createMockHost()
     const host: PipiHostAPI = { ...base, listSessions: async () => [] }

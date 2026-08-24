@@ -41,4 +41,32 @@ describe('live subagent projection', () => {
     expect(old).toMatchObject({ totalCount: 0, runningCount: 0 })
     expect(next.agents.map(item => item.agentId)).toEqual(['stable-worker'])
   })
+
+  it('treats { state: "ok", stalled: true } as completed instead of stalled or running', () => {
+    const projection = projectLiveSubagents(tool, 'A', [agent('root', 'A', 'ok', { toolCallId: 'call-1', stalled: true })])
+    expect(projection).toMatchObject({ completedCount: 1, stalledCount: 0, runningCount: 0, failedCount: 0 })
+    expect(projection.visibleAgents[0].state).toBe('ok')
+  })
+
+  it('treats { state: "failed", stalled: true } as failed, not stalled', () => {
+    const projection = projectLiveSubagents(tool, 'A', [
+      agent('root', 'A', 'failed', { toolCallId: 'call-1', stalled: true }),
+      agent('child', 'A', 'ok', { parentId: 'root' }),
+    ])
+    expect(projection).toMatchObject({ failedCount: 1, stalledCount: 0, runningCount: 0, completedCount: 1 })
+  })
+
+  it('still counts a genuinely stalled non-terminal agent as stalled', () => {
+    const projection = projectLiveSubagents(tool, 'A', [agent('root', 'A', 'running', { toolCallId: 'call-1', stalled: true })])
+    expect(projection).toMatchObject({ stalledCount: 1, runningCount: 1, completedCount: 0 })
+  })
+
+  it('ranks a real stall above a stale-flagged terminal row in the visible ordering', () => {
+    const projection = projectLiveSubagents(tool, 'A', [
+      agent('done', 'A', 'ok', { toolCallId: 'call-1', stalled: true }),
+      agent('worker', 'A', 'stalled', { parentId: 'done' }),
+    ])
+    expect(projection.visibleAgents[0].agentId).toBe('worker')
+    expect(projection).toMatchObject({ stalledCount: 1, completedCount: 1 })
+  })
 })

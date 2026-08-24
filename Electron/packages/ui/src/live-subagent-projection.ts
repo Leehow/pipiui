@@ -15,7 +15,10 @@ export type LiveSubagentProjection = {
 
 export const LIVE_SUBAGENT_ROW_LIMIT = 12
 
-const stalled = (agent: AgentSummary) => agent.stalled === true || agent.state === 'stalled'
+const TERMINAL_SUBAGENT_STATES: ReadonlySet<AgentSummary['state']> = new Set(['ok', 'failed', 'aborted', 'interrupted'])
+// A terminal state outranks a stale `stalled: true` flag: a finished worker must
+// never render as 卡住 or keep counting as running because of a stall it outlived.
+const stalled = (agent: AgentSummary) => !TERMINAL_SUBAGENT_STATES.has(agent.state) && (agent.stalled === true || agent.state === 'stalled')
 const running = (agent: AgentSummary) => agent.state === 'running' && !stalled(agent)
 const failed = (agent: AgentSummary) => agent.state === 'failed' || agent.state === 'aborted' || agent.state === 'interrupted'
 const problematic = (agent: AgentSummary) => stalled(agent) || failed(agent)

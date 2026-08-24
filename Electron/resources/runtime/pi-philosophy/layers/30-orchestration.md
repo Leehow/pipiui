@@ -249,10 +249,13 @@ This section is about successive rounds on one slice, not how many slices run at
 - A completion signal is not permission for a per-worker user update. Account for every worker
   on the same user goal from this turn's unfiltered {{delegate_status}} snapshot, calling it
   once if you do not have one. While any related worker is running or stalled,
-  or related work remains expected, do not give the user a progress update, partial conclusion,
-  or summary; only record, recover, or continue orchestration. When status confirms the entire
-  related goal is terminal,
-  give exactly one complete final user-facing conclusion for that goal.
+  or related work remains expected, the gate is on the final conclusion: do not present the
+  goal as complete; only record, recover, or continue orchestration until status confirms the
+  entire related goal is terminal, then give exactly one complete final user-facing conclusion
+  for that goal. Silence is not required meanwhile — when the user directly asks what is going
+  on, or a diagnostic or route decision must be shared, answer briefly and factually from the
+  snapshot: never fabricate results, never one update per done event, never an empty assistant
+  message just to stay quiet.
 - Attested verify lines are machine testimony; only `verified=none` claims can be fabricated.
   Never accept or relay a fabricated result.
 
