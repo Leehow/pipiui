@@ -550,6 +550,48 @@ test("success end seals the current run so same-run late enqueue is dropped", as
 	assert.equal(queue.sealedRun("explore-5"), "run-ok");
 });
 
+test("same-run beginRun is idempotent: keeps terminal seal and does not rebuild the queue", async () => {
+	const queue = createCloseoutReportQueue<{ agentId: string; runId: string; kind: string }>();
+	const sent: string[] = [];
+	let release: (() => void) | undefined;
+	const hold = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	queue.beginRun("explore-6", "run-same");
+	const inflight = queue.enqueue(
+		{ agentId: "explore-6", runId: "run-same", kind: "end" },
+		async (payload, signal) => {
+			await hold;
+			if (signal.aborted) return;
+			sent.push(`${payload.runId}:${payload.kind}`);
+		},
+	);
+	assert.equal(queue.has("explore-6"), true);
+	queue.beginRun("explore-6", "run-same");
+	assert.equal(queue.has("explore-6"), true);
+	release?.();
+	await inflight;
+	assert.deepEqual(sent, ["run-same:end"]);
+	queue.seal("explore-6", "run-same");
+	queue.beginRun("explore-6", "run-same");
+	assert.equal(queue.ignores("explore-6", "run-same"), true);
+	assert.equal(queue.isSealedRun("explore-6", "run-same"), true);
+	assert.equal(queue.sealedRun("explore-6"), "run-same");
+	let posts = 0;
+	await queue.enqueue({ agentId: "explore-6", runId: "run-same", kind: "late" }, async () => {
+		posts += 1;
+	});
+	assert.equal(posts, 0);
+	queue.beginRun("explore-6", "run-next");
+	assert.equal(queue.currentRun("explore-6"), "run-next");
+	assert.equal(queue.ignores("explore-6", "run-same"), true);
+	assert.equal(queue.ignores("explore-6", "run-next"), false);
+	await queue.enqueue({ agentId: "explore-6", runId: "run-next", kind: "start" }, async (payload) => {
+		sent.push(`${payload.runId}:${payload.kind}`);
+	});
+	assert.deepEqual(sent, ["run-same:end", "run-next:start"]);
+});
+
 test("timeout abort is a real signal fetch can observe and dispose clears the timer", async () => {
 	const parent = new AbortController();
 	const live = createTimeoutAbort(1_000, parent.signal);

@@ -165,8 +165,9 @@ type CloseoutReportAgentState<T> = {
 
 /**
  * Per-agentId ordered report queue with an O(agentId) current-run epoch.
- * beginRun owns the live run; any other runId is stale. Terminal end seals
- * the current run so same-run late enqueue cannot POST. Timeout also aborts.
+ * beginRun owns the live run; any other runId is stale. Same-run beginRun is
+ * idempotent: it must not unseal or abort the current queue. Terminal end
+ * seals the current run so same-run late enqueue cannot POST. Timeout also aborts.
  */
 type CloseoutReportEpoch = {
 	runId: string;
@@ -217,7 +218,8 @@ export function createCloseoutReportQueue<T extends CloseoutReportRef>(): {
 
 	const beginRun = (agentId: string, runId: string): void => {
 		const epoch = epochs.get(agentId);
-		if (!epoch || epoch.runId !== runId) abortAgent(agentId);
+		if (epoch?.runId === runId) return;
+		abortAgent(agentId);
 		epochs.set(agentId, { runId, sealed: false });
 	};
 
