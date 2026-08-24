@@ -1035,6 +1035,22 @@ describe("subagent lifecycle → AgentSummary", () => {
     persist.mockRestore();
   });
 
+  it("keeps streamed previews in memory without scheduling a full durable-log rewrite", async () => {
+    const { backend, deliver } = await harness();
+    deliver(START);
+    const schedule = vi.spyOn(backend as any, "schedulePersistAgentLogs");
+    for (let i = 1; i <= 80; i++) {
+      deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "text", text: "x".repeat(i) });
+    }
+    expect(schedule).not.toHaveBeenCalled();
+
+    // A text-only worker can end without a separate terminal log batch. The
+    // lifecycle boundary still checkpoints the final cached preview once.
+    deliver(END);
+    expect(schedule).toHaveBeenCalled();
+    schedule.mockRestore();
+  });
+
   it("coalesces persistAgents bursts to one snapshot write", async () => {
     const { backend, deliver } = await harness();
     deliver(START);

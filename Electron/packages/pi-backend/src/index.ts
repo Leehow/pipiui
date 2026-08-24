@@ -758,7 +758,10 @@ const ORPHAN_RECONCILE_INTERVAL_MS = 60 * 1000;
  * time-throttled and every event burst merges into a single snapshot.
  */
 const AGENT_PERSIST_MIN_INTERVAL_MS = 2_000;
-const AGENT_LOG_PERSIST_DEBOUNCE_MS = 2_000;
+// The log store is a whole-file snapshot (currently several MB), so a short
+// interval turns a few active workers into a permanent stringify/write loop.
+// Turn boundaries still schedule a checkpoint and graceful close flushes it.
+const AGENT_LOG_PERSIST_DEBOUNCE_MS = 10_000;
 /** Retention for terminal agent rows: keep live rows plus the newest N terminal rows. */
 const AGENT_RETENTION_MAX_TERMINAL = 400;
 const ORPHAN_CLOSEOUT =
@@ -2264,18 +2267,23 @@ export class PiHostBackend implements HostBackend {
     this.agentLogCache.set(key, logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined }))
     this.schedulePersistAgentLogs()
   }
-  private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: CachedAgentLog) {
+  private cacheAgentLog(sessionId: string, agentId: string, runId: string, entry: CachedAgentLog, persist = true) {
     const key = this.agentLogKey(sessionId, agentId, runId)
     const logs = this.agentLogCache.get(key) ?? []
     // log_delta pushes cumulative snapshots keyed by contentIndex; upsert in place.
     if (entry.contentIndex !== undefined) {
       const idx = logs.findIndex(l => l.contentIndex === entry.contentIndex)
-      if (idx >= 0) { logs[idx] = entry; this.agentLogCache.set(key, logs); this.schedulePersistAgentLogs(); return }
+      if (idx >= 0) {
+        logs[idx] = entry
+        this.agentLogCache.set(key, logs)
+        if (persist) this.schedulePersistAgentLogs()
+        return
+      }
     }
     logs.push(entry)
     if (logs.length > 500) logs.splice(0, logs.length - 500)
     this.agentLogCache.set(key, logs)
-    this.schedulePersistAgentLogs()
+    if (persist) this.schedulePersistAgentLogs()
   }
   private queueChanged(id: string, items: QueuedMessage[]) {
     if (this.closed) return;
@@ -8218,7 +8226,11 @@ export class PiHostBackend implements HostBackend {
       const contentIndex = num2(raw.contentIndex);
       const charCount = num2(raw.charCount);
       const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(typeof raw.toolCallId === "string" && raw.toolCallId ? { toolCallId: raw.toolCallId } : {}), ...(contentIndex === undefined ? {} : { contentIndex }), ...(charCount === undefined ? {} : { charCount }) };
-      this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
+      // A streamed preview is superseded by the next cumulative snapshot and
+      // remains recoverable from the in-memory cache. Persist at the runtime's
+      // authoritative turn boundary instead of rewriting the whole log store
+      // for every 50ms preview frame.
+      this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry, false);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
     } else if (raw.kind === "log" && logSessionId) {
       this.resetAgentLogStreamSlots(logSessionId, agent.agentId, agent.runId);
@@ -8230,6 +8242,10 @@ export class PiHostBackend implements HostBackend {
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
     }
+    // A text-only turn may produce no terminal `log` batch because its streamed
+    // slot is already authoritative. The final lifecycle event still checkpoints
+    // that in-memory slot, coalesced with other workers by the durable-log timer.
+    if (raw.kind === "end" && logSessionId) this.schedulePersistAgentLogs();
     if (raw.kind !== "log_delta") {
       this.projectionDebug("agent_broadcast", {
         source: "event",

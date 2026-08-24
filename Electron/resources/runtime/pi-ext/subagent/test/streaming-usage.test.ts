@@ -66,7 +66,7 @@ test("combineCompletedAndStreamingUsage is completed + current message, not a re
 	);
 });
 
-test("shouldEmitStreamingUsage throttles to ~500ms and only when tokens change", () => {
+test("shouldEmitStreamingUsage obeys the live telemetry interval and only emits changes", () => {
 	const first = {
 		input: 10,
 		output: 1,
@@ -178,6 +178,10 @@ test("index.ts drives usage through the extracted emitter, not its own inline se
 	assert.match(source, /createUsageEmitter\(/);
 	assert.match(source, /event\.type === "message_update"/);
 	assert.match(source, /event\.type === "message_end" && event\.message/);
+	const flushStart = source.indexOf("const flushStreamParts =");
+	const flushEnd = source.indexOf("const scheduleStreamFlush =", flushStart);
+	assert.ok(flushStart >= 0 && flushEnd > flushStart);
+	assert.doesNotMatch(source.slice(flushStart, flushEnd), /pipiuiUpdate\(/, "a log preview flush must not also emit a full agent summary");
 });
 
 function harness(overrides: Partial<UsageEmitterSession> = {}) {

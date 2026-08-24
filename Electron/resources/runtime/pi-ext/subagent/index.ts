@@ -6451,7 +6451,10 @@ async function runSingleAgent(
 					},
 				});
 				const countLiveEstimate = (delta: string) => usageEmitter.countDelta(delta);
-				const STREAM_FLUSH_MS = 50;
+				// The host/UI show a cumulative preview, not a token animation. A 50ms
+				// cadence forced Electron to structured-clone and rebuild the complete
+				// detail transcript twenty times per second for every selected worker.
+				const STREAM_FLUSH_MS = 200;
 				const STREAM_TEXT_CAP = 4000;
 				const STREAM_THINKING_CAP = 600;
 
@@ -6478,7 +6481,9 @@ async function runSingleAgent(
 							...(part.toolCallId ? { toolCallId: part.toolCallId } : {}),
 						});
 					}
-					pipiuiUpdate();
+					// log_delta already carries live preview/liveness. Emitting a second
+					// full summary for the same flush made every worker invalidate the
+					// root App as well as the selected detail transcript.
 				};
 
 				const scheduleStreamFlush = () => {

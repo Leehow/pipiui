@@ -1177,6 +1177,27 @@ describe('SubagentPanel', () => {
     expect(await screen.findByText('plan')).toBeTruthy()
   })
 
+  it('batches a burst of cumulative live-log snapshots into one visible refresh', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'batch', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+    await screen.findByTestId('agent-row-batch')
+    await waitFor(() => expect(harness.hasLogSubscriber('batch')).toBe(true))
+
+    await act(async () => {
+      for (let i = 0; i < 80; i += 1) {
+        harness.emitLog('batch', { type: 'agent_log', agentId: 'batch', itemType: 'text', text: `LIVE_BATCH_FINAL_${i}`, contentIndex: 0 })
+      }
+    })
+
+    // The renderer must not rebuild the complete Markdown/detail tree 80 times
+    // in the producer's burst. The latest cumulative snapshot appears when the
+    // bounded render batch flushes.
+    expect(screen.queryByText('LIVE_BATCH_FINAL_79')).toBeNull()
+    expect(await screen.findAllByText('LIVE_BATCH_FINAL_79')).toHaveLength(1)
+    expect(screen.queryByText('LIVE_BATCH_FINAL_78')).toBeNull()
+  })
+
   it('streams thinking and tools as chronological detail steps instead of one overwritten Thinking header', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)

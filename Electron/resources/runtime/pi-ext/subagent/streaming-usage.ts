@@ -9,7 +9,10 @@
  * `message_end` remains the authoritative close-out.
  */
 
-export const STREAMING_USAGE_MIN_INTERVAL_MS = 500;
+// Token totals are informational UI telemetry. Two updates per second per
+// worker caused a many-worker wave to continuously invalidate the root App;
+// terminal message_end remains immediate and authoritative.
+export const STREAMING_USAGE_MIN_INTERVAL_MS = 2_000;
 
 export type StreamingUsageSnapshot = {
 	input: number;

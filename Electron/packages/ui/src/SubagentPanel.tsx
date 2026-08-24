@@ -39,6 +39,7 @@ type Pricing = { unit: CostUnit; exchangeRate: number }
 
 const splitKey = 'pipiui:subagent-list-ratio'
 const pageSize = 30
+const AGENT_LOG_RENDER_INTERVAL_MS = 200
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
 const terminalIcon: Record<AgentState, string> = { running: '◌', stalled: '!', ok: '✓', failed: '×', aborted: '■', interrupted: '⚡' }
 
@@ -514,6 +515,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const [now, setNow] = useState(() => Date.now())
   const listRef = useRef<HTMLDivElement>(null)
   const loadGeneration = useRef(0)
+  const logRenderTimers = useRef<Set<number>>(new Set())
   // Agents already running when the panel mounts (initial snapshot or a session
   // switch) are not "new runs": seed the baseline from the snapshot so they
   // never fire onAgentStarted and force-open a pane the user (or the narrow
@@ -521,6 +523,11 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const hydratedRef = useRef(false)
   const previousRunningRef = useRef(0)
   const selected = agents.find(agent => agent.agentId === selectedId)
+
+  useEffect(() => () => {
+    for (const timer of logRenderTimers.current) window.clearTimeout(timer)
+    logRenderTimers.current.clear()
+  }, [sessionId])
 
   // Extracted so the full-page load-error state can retry the same loader.
   const load = useCallback(async () => {
@@ -597,9 +604,40 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 
   useEffect(() => {
     if (!selected) return
-    return host.subscribeAgentLog(selected.agentId, event => setAgents(current => current.map(agent => agent.agentId === selected.agentId
-      ? { ...agent, logs: applyLogDelta(agent.logs, event) }
-      : agent)), selected.sessionId ?? '', selected.runId ?? '')
+    const agentId = selected.agentId
+    const sessionId = selected.sessionId ?? ''
+    const runId = selected.runId ?? ''
+    let timer: number | undefined
+    let pending: Extract<AgentEvent, { type: 'agent_log' }>[] = []
+    const flush = () => {
+      if (timer !== undefined) logRenderTimers.current.delete(timer)
+      timer = undefined
+      if (!pending.length) return
+      const batch = pending
+      pending = []
+      setAgents(current => current.map(agent => {
+        if (agent.agentId !== agentId) return agent
+        const matching = batch.filter(event =>
+          (!event.runId || !agent.runId || event.runId === agent.runId)
+          && (!event.sessionId || !agent.sessionId || event.sessionId === agent.sessionId))
+        if (!matching.length) return agent
+        const logs = matching.reduce((next, event) => applyLogDelta(next, event), agent.logs)
+        return logs === agent.logs ? agent : { ...agent, logs }
+      }))
+    }
+    const off = host.subscribeAgentLog(agentId, event => {
+      pending.push(event)
+      if (timer === undefined) {
+        timer = window.setTimeout(flush, AGENT_LOG_RENDER_INTERVAL_MS)
+        logRenderTimers.current.add(timer)
+      }
+    }, sessionId, runId)
+    return () => {
+      off()
+      // Keep an already queued batch alive across a same-agent run switch. The
+      // event identity check in flush rejects stale old-run frames, while a
+      // legacy identity-less host retains its pre-batching behavior.
+    }
   }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
 
   // Fetch cached logs for the selected agent so completed subagents show their
@@ -951,8 +989,18 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   const scrollRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
   const [atBottom, setAtBottom] = useState(true)
-  const output = agent ? latestReadableResult(agent) : ''
+  const output = useMemo(
+    () => agent ? latestReadableResult(agent) : '',
+    [agent?.logs, agent?.finalResult],
+  )
   const latestLog = agent?.logs.at(-1)
+  // Summary/usage events arrive independently from logs. Reuse the expensive
+  // unified transcript (and its memoized Markdown subtree) until one of the
+  // fields that actually changes transcript output changes.
+  const transcript = useMemo(
+    () => agent ? agentTranscript(agent, output) : [],
+    [agent?.logs, agent?.startedAt, agent?.state, agent?.worktreeError, output],
+  )
 
   useEffect(() => {
     followRef.current = true
@@ -991,7 +1039,6 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
       ? liveAgentStatus(agent, now, activeChildCount)
       : undefined
   const detailTitle = detailTaskTitle(agent, output)
-  const transcript = agentTranscript(agent, output)
 
   return <div className="agent-detail" style={{ position: 'relative' }}>
     <header className="agent-detail-header">
