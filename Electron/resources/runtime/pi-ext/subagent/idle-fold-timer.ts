@@ -6,12 +6,13 @@
  * ~5 minutes, so a long wait can re-enter the next turn with an unfolder prefix.
  *
  * This module owns a one-shot setTimeout per session/wave — not the watchdog
- * interval. When it fires with no remaining completion and usage still above a
- * low watermark, it runs the existing deterministic fold API once. Worker
- * completion cancels the pending agent; an empty wave cancels the timer.
- * Session shutdown / extension reload dispose every pending handle.
+ * interval. The wait measures continuous inactivity: worker activity re-arms
+ * the session timer. When it fires with no remaining completion and usage
+ * still above a low watermark, it runs the existing deterministic fold API
+ * once. Worker completion cancels the pending agent; an empty wave cancels
+ * the timer. Session shutdown / extension reload dispose every pending handle.
  */
-export const IDLE_FOLD_TTL_MS_DEFAULT = 300_000;
+export const IDLE_FOLD_TTL_MS_DEFAULT = 4 * 60 * 1000;
 export const IDLE_FOLD_LOW_WATERMARK_DEFAULT = 0.45;
 export const IDLE_FOLD_FALLBACK_MS_DEFAULT = 60_000;
 
@@ -53,6 +54,8 @@ export interface IdleFoldRegistryOptions {
 
 export interface IdleFoldRegistry {
 	arm(key: string, agentId: string): void;
+	/** Re-arm the shared session timer from this agent’s activity. */
+	noteActivity(agentId: string): void;
 	noteCompleted(agentId: string): void;
 	/** Cancel pending nudge/fallback after a successful fold in this idle epoch. */
 	noteFolded(key?: string): void;
@@ -90,7 +93,7 @@ function envFraction(env: NodeJS.ProcessEnv, name: string, fallback: number): nu
 	return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback;
 }
 
-/** Parse PIPIUI_IDLE_FOLD_* knobs. Defaults: enabled, 5 min TTL, 45% watermark, nudge+fallback. */
+/** Parse PIPIUI_IDLE_FOLD_* knobs. Defaults: enabled, 4 min idle TTL, 45% watermark, nudge+fallback. */
 export function idleFoldConfigFromEnv(env: NodeJS.ProcessEnv = process.env): IdleFoldConfig {
 	return {
 		enabled: envFlag(env, "PIPIUI_IDLE_FOLD_ENABLED", true),
@@ -193,6 +196,13 @@ export function createIdleFoldRegistry(options: IdleFoldRegistryOptions): IdleFo
 		runFold(state, info);
 	};
 
+	const startTimer = (state: IdleFoldState): void => {
+		clearTimer(state);
+		const timer = schedule(() => fire(state.key), ttlMs);
+		(timer as { unref?: () => void }).unref?.();
+		state.timer = timer;
+	};
+
 	return {
 		arm(key, agentId) {
 			if (!enabled || !key || !agentId) return;
@@ -202,12 +212,21 @@ export function createIdleFoldRegistry(options: IdleFoldRegistryOptions): IdleFo
 				states.set(key, state);
 			}
 			state.agentIds.add(agentId);
-			// Merge: later workers join the same wait. Do not reset TTL, and do not
-			// re-arm after this epoch has already folded once.
+			// Merge: later workers join the same wait. Do not reset TTL on arm, and
+			// do not re-arm after this epoch has already folded once. Activity uses
+			// noteActivity to re-arm the unfired session timer.
 			if (state.fired || state.timer !== undefined) return;
-			const timer = schedule(() => fire(key), ttlMs);
-			(timer as { unref?: () => void }).unref?.();
-			state.timer = timer;
+			startTimer(state);
+		},
+		noteActivity(agentId) {
+			if (!enabled || !agentId) return;
+			for (const state of states.values()) {
+				if (!state.agentIds.has(agentId)) continue;
+				// Activity postpones an unfired idle wait. A fired epoch (nudge /
+				// fallback) stays one-shot until the wave drains.
+				if (state.fired || state.folded) continue;
+				startTimer(state);
+			}
 		},
 		noteCompleted(agentId) {
 			if (!agentId) return;

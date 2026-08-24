@@ -82,12 +82,12 @@ function registryWithClock(
 	return { registry, folds, nudges };
 }
 
-test("idle fold knobs default to 5 minutes and the 45% conservative watermark", () => {
-	assert.equal(IDLE_FOLD_TTL_MS_DEFAULT, 300_000);
+test("idle fold knobs default to 4 minutes and the 45% conservative watermark", () => {
+	assert.equal(IDLE_FOLD_TTL_MS_DEFAULT, 4 * 60 * 1000);
 	assert.equal(IDLE_FOLD_LOW_WATERMARK_DEFAULT, 0.45);
 	assert.deepEqual(idleFoldConfigFromEnv({}), {
 		enabled: true,
-		ttlMs: 300_000,
+		ttlMs: 240_000,
 		lowWatermark: 0.45,
 		nudge: true,
 		fallback: true,
@@ -111,11 +111,11 @@ test("watermark is conservative when usage is missing or below the line", () => 
 	assert.equal(contextAboveIdleFoldWatermark({ tokens: 90_000, contextWindow: 200_000 }, 0.5), false);
 });
 
-test("dispatch plus 5 minutes without completion triggers one deterministic fold", () => {
+test("dispatch plus 4 minutes without completion triggers one deterministic fold", () => {
 	const clock = createFakeClock();
 	const { registry, folds } = registryWithClock(clock);
 	registry.arm("session-a", "worker-a");
-	clock.advance(299_999);
+	clock.advance(239_999);
 	assert.equal(folds.length, 0);
 	assert.equal(registry.pendingTimerCount(), 1);
 	clock.advance(1);
@@ -131,7 +131,7 @@ test("completion at 3 minutes cancels the timer so fold never fires", () => {
 	clock.advance(180_000);
 	registry.noteCompleted("worker-a");
 	assert.equal(registry.pendingTimerCount(), 0);
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 });
 
@@ -139,7 +139,7 @@ test("TTL fire below the low watermark does not fold", () => {
 	const clock = createFakeClock();
 	const { registry, folds } = registryWithClock(clock, { aboveWatermark: false });
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 	assert.equal(registry.pendingTimerCount(), 0);
 });
@@ -152,7 +152,9 @@ test("concurrent workers in one session share one timer; the wave folds once", (
 	registry.arm("session-a", "worker-b");
 	assert.equal(registry.pendingTimerCount(), 1);
 	assert.deepEqual(registry.trackedAgentIds("session-a").sort(), ["worker-a", "worker-b"]);
-	clock.advance(240_000);
+	clock.advance(179_999);
+	assert.equal(folds.length, 0);
+	clock.advance(1);
 	assert.equal(folds.length, 1);
 	assert.deepEqual(folds[0]?.agentIds.sort(), ["worker-a", "worker-b"]);
 });
@@ -165,7 +167,9 @@ test("one worker finishing early does not cancel a still-running wave mate", () 
 	clock.advance(180_000);
 	registry.noteCompleted("worker-a");
 	assert.equal(registry.pendingTimerCount(), 1);
-	clock.advance(120_000);
+	clock.advance(59_999);
+	assert.equal(folds.length, 0);
+	clock.advance(1);
 	assert.equal(folds.length, 1);
 	assert.deepEqual(folds[0]?.agentIds, ["worker-b"]);
 });
@@ -178,7 +182,7 @@ test("all workers completing cancels the shared session timer", () => {
 	registry.noteCompleted("worker-a");
 	registry.noteCompleted("worker-b");
 	assert.equal(registry.pendingTimerCount(), 0);
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 });
 
@@ -189,7 +193,7 @@ test("different session keys keep independent timers", () => {
 	registry.arm("session-b", "worker-b");
 	assert.equal(registry.pendingTimerCount(), 2);
 	registry.noteCompleted("worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 1);
 	assert.equal(folds[0]?.key, "session-b");
 });
@@ -198,15 +202,15 @@ test("a fired epoch does not fold again until the wave drains and a new dispatch
 	const clock = createFakeClock();
 	const { registry, folds } = registryWithClock(clock);
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 1);
 	registry.arm("session-a", "worker-b");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 1);
 	registry.noteCompleted("worker-a");
 	registry.noteCompleted("worker-b");
 	registry.arm("session-a", "worker-c");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 2);
 	assert.deepEqual(folds[1]?.agentIds, ["worker-c"]);
 });
@@ -220,7 +224,7 @@ test("session dispose clears pending timers so later ticks cannot fold", () => {
 	registry.disposeAll();
 	assert.equal(registry.pendingTimerCount(), 0);
 	assert.equal(clock.pending(), 0);
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 });
 
@@ -233,7 +237,7 @@ test("orphan sweep cancels agents that left runningAgents", () => {
 	assert.deepEqual(registry.trackedAgentIds("session-a"), ["worker-b"]);
 	registry.sweepOrphans(new Set());
 	assert.equal(registry.pendingTimerCount(), 0);
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 });
 
@@ -242,7 +246,7 @@ test("disabled registry never arms a timer", () => {
 	const { registry, folds } = registryWithClock(clock, { enabled: false });
 	registry.arm("session-a", "worker-a");
 	assert.equal(registry.pendingTimerCount(), 0);
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 0);
 });
 
@@ -279,6 +283,7 @@ test("index.ts arms, cancels, and disposes the idle-fold timer off the 30s watch
 	assert.match(source, /from "\.\/idle-fold-timer\.ts"/);
 	assert.match(source, /createIdleFoldRegistry/);
 	assert.match(source, /armIdleFoldForDispatch/);
+	assert.match(source, /noteIdleFoldActivity/);
 	assert.match(source, /noteIdleFoldCompleted/);
 	assert.match(source, /disposeAllIdleFoldTimers/);
 	assert.match(source, /runDeterministicIdleFold/);
@@ -289,6 +294,7 @@ test("index.ts arms, cancels, and disposes the idle-fold timer off the 30s watch
 	assert.match(source, /restoreNudgeThinking/);
 	assert.match(source, /onSuccessfulFold/);
 	assert.match(source, /runningAgents\.set\([\s\S]*?armIdleFoldForDispatch/);
+	assert.match(source, /function noteAgentActivity\([\s\S]*?noteIdleFoldActivity/);
 	assert.match(source, /function notifySubagentDone\([\s\S]*?noteIdleFoldCompleted/);
 	assert.match(source, /function markWorkerInterrupted\([\s\S]*?noteIdleFoldCompleted/);
 	assert.match(source, /session_shutdown[\s\S]*?disposeAllIdleFoldTimers/);
@@ -309,7 +315,7 @@ test("TTL above watermark injects one nudge and does not fold immediately", () =
 		onNudge: () => true,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 1);
 	assert.equal(folds.length, 0);
 	clock.advance(59_999);
@@ -326,9 +332,9 @@ test("the same idle epoch only nudges once", () => {
 		onNudge: () => true,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	registry.arm("session-a", "worker-b");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 1);
 	assert.equal(folds.length, 0);
 });
@@ -341,7 +347,7 @@ test("below the low watermark does not inject a nudge", () => {
 		onNudge: () => true,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 0);
 	assert.equal(folds.length, 0);
 });
@@ -354,7 +360,7 @@ test("a failed nudge falls back to deterministic fold immediately", () => {
 		onNudge: () => false,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 1);
 	assert.equal(folds.length, 1);
 });
@@ -368,7 +374,7 @@ test("a successful fold cancels the 60s deterministic fallback", () => {
 		onNudge: () => true,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 1);
 	assert.equal(folds.length, 0);
 	assert.equal(registry.pendingTimerCount(), 1);
@@ -387,8 +393,50 @@ test("fallback still runs when the nudge is ignored", () => {
 		onNudge: () => true,
 	});
 	registry.arm("session-a", "worker-a");
-	clock.advance(300_000);
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(nudges.length, 1);
 	clock.advance(60_000);
+	assert.equal(folds.length, 1);
+});
+
+test("activity just before 4 minutes does not fold; fold waits 4 minutes from last activity", () => {
+	const clock = createFakeClock();
+	const { registry, folds } = registryWithClock(clock);
+	registry.arm("session-a", "worker-a");
+	clock.advance(239_999);
+	registry.noteActivity("worker-a");
+	assert.equal(folds.length, 0);
+	assert.equal(registry.pendingTimerCount(), 1);
+	clock.advance(1);
+	assert.equal(folds.length, 0);
+	clock.advance(239_998);
+	assert.equal(folds.length, 0);
+	clock.advance(1);
+	assert.equal(folds.length, 1);
+	assert.deepEqual(folds[0], { key: "session-a", agentIds: ["worker-a"] });
+});
+
+test("any worker activity in a shared session re-arms the session timer", () => {
+	const clock = createFakeClock();
+	const { registry, folds } = registryWithClock(clock);
+	registry.arm("session-a", "worker-a");
+	registry.arm("session-a", "worker-b");
+	clock.advance(120_000);
+	registry.noteActivity("worker-b");
+	clock.advance(239_999);
+	assert.equal(folds.length, 0);
+	clock.advance(1);
+	assert.equal(folds.length, 1);
+	assert.deepEqual(folds[0]?.agentIds.sort(), ["worker-a", "worker-b"]);
+});
+
+test("activity after a fired epoch does not start another fold", () => {
+	const clock = createFakeClock();
+	const { registry, folds } = registryWithClock(clock);
+	registry.arm("session-a", "worker-a");
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
+	assert.equal(folds.length, 1);
+	registry.noteActivity("worker-a");
+	clock.advance(IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(folds.length, 1);
 });

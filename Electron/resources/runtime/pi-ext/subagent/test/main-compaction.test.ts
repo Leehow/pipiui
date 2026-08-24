@@ -6,7 +6,9 @@ import {
 	buildDeterministicSummary,
 	COMPACTION_CHECKPOINT_HEADINGS,
 	evaluateCompactionLlmSummary,
+	extractSerializedGoal,
 	handleSessionBeforeCompact,
+	isNonTaskUserText,
 	mergeCheckpointSummary,
 } from "../main-compaction.ts";
 
@@ -226,4 +228,56 @@ test("previousSummary is included in the LLM prompt as UPDATE", async () => {
 	);
 	assert.match(prompt, /This is an UPDATE/);
 	assert.match(prompt, /Prior work/);
+});
+
+test("injected git / in-flight / command-wrapper user lines are not the Goal", () => {
+	assert.equal(isNonTaskUserText("## Git (Pipi UI)\nbranch: main"), true);
+	assert.equal(isNonTaskUserText("## Background workers in flight (live this turn)\n- worker"), true);
+	assert.equal(isNonTaskUserText("[subagent-done] worker finished"), true);
+	assert.equal(isNonTaskUserText("Ran 3 commands 你说得对，我该把「模型」这个解释扔掉"), true);
+	assert.equal(isNonTaskUserText("查清 Boss 与 worker 的工具差异"), false);
+
+	const serialized = `[User]: ## Git (Pipi UI)
+branch: 0.1.0版本
+dirty: yes
+
+[User]: Ran 3 commands 你说得对，我该把「模型」这个解释扔掉
+
+[User]: 查清 Boss 与 worker 的工具差异，worker 不要再误用 Boss 工具。
+
+[Assistant]: ok`;
+	assert.match(extractSerializedGoal(serialized), /Boss 与 worker/);
+	assert.doesNotMatch(extractSerializedGoal(serialized), /Ran 3 commands/);
+	assert.doesNotMatch(extractSerializedGoal(serialized), /## Git/);
+
+	const summary = buildDeterministicSummary({
+		serialized,
+		previousSummary: "## Goal\nRan 3 commands 你说得对，我该把「模型」这个解释扔掉\n\n## Progress\nold",
+		tokensBefore: 80_000,
+		messageCount: 4,
+		reason: "auto",
+	});
+	const goal = summary.split("## Goal")[1]?.split("## ")[0] ?? "";
+	assert.match(goal, /Boss 与 worker/);
+	assert.doesNotMatch(goal, /Ran 3 commands/);
+});
+
+test("LLM Goal that is tool-output / injection is merged from the deterministic Goal", () => {
+	const llm = structuredSummary.replace("Ship compaction quality.", "Ran 3 commands 你说得对，我该把「模型」这个解释扔掉");
+	const gate = evaluateCompactionLlmSummary(llm);
+	assert.equal(gate.accept, false);
+	assert.equal(gate.merge, true);
+	assert.ok(gate.missing.includes("Goal"));
+
+	const det = buildDeterministicSummary({
+		serialized: "[User]: 查清 Boss 与 worker 的工具差异\n[Assistant]: ok",
+		tokensBefore: 1,
+		messageCount: 2,
+		reason: "auto",
+	});
+	const merged = mergeCheckpointSummary(llm, det);
+	const goal = merged.split("## Goal")[1]?.split("## ")[0] ?? "";
+	assert.match(goal, /Boss 与 worker/);
+	assert.doesNotMatch(goal, /Ran 3 commands/);
+	assert.match(buildCompactionLlmPrompt("x", "", "auto"), /never git status snapshots/i);
 });

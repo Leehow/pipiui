@@ -73,8 +73,26 @@ describe("ProactiveCompactionPolicy", () => {
       quietDelayMs: 10,
       failureBackoffMs: 20,
     });
-    expect(policy.configuration.waitWatermark).toBe(0.5);
+    expect(policy.configuration.waitWatermark).toBe(0.75);
     expect(policy.configuration.waitQuietDelayMs).toBe(30_000);
+    expect(policy.configuration.minSuccessIntervalMs).toBe(10 * 60 * 1000);
+    expect(policy.configuration.emergencyWatermark).toBe(0.92);
+  });
+
+  it("does not re-schedule within the success cooldown unless usage is an emergency", () => {
+    const policy = new ProactiveCompactionPolicy();
+    policy.observeFreshUsage(high, 1);
+    policy.recordCompactionSuccess(2, 1_000);
+    policy.observeFreshUsage(low, 3);
+    expect(policy.isArmed).toBe(true);
+    policy.observeFreshUsage(high, 4);
+    expect(policy.nextSchedulingDelay(1_000 + 60_000)).toBeUndefined();
+    expect(policy.nextSchedulingDelay(1_000 + STANDARD_PROACTIVE_COMPACTION.minSuccessIntervalMs))
+      .toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+
+    policy.observeFreshUsage({ tokens: 93, contextWindow: 100 }, 5);
+    expect(policy.nextSchedulingDelay(1_000 + 60_000))
+      .toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
   });
 });
 
@@ -122,9 +140,9 @@ function harness(options: { idle?: boolean; liveAgents?: boolean; compact?: () =
 }
 
 const HIGH = { tokens: 90, contextWindow: 100 };
-const WAIT_BOUNDARY = { tokens: 50, contextWindow: 100 };
-const WAIT_HIGH = { tokens: 55, contextWindow: 100 };
-const WAIT_LOW = { tokens: 49, contextWindow: 100 };
+const WAIT_BOUNDARY = { tokens: 75, contextWindow: 100 };
+const WAIT_HIGH = { tokens: 78, contextWindow: 100 };
+const WAIT_LOW = { tokens: 74, contextWindow: 100 };
 const LOW = { tokens: 10, contextWindow: 100 };
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -221,19 +239,19 @@ describe("ProactiveCompactionScheduler", () => {
   });
 
   describe("quiet Boss wait with live subagents", () => {
-    it("does not schedule between 50% and 79% without live agents", () => {
+    it("does not schedule between 75% and 79% without live agents", () => {
       const h = harness();
       h.scheduler.observeUsage(WAIT_HIGH, h.scheduler.beginUsageRequest());
       expect(h.pending).toBe(0);
     });
 
-    it("does not schedule below 50% with live agents", () => {
+    it("does not schedule below 75% with live agents", () => {
       const h = harness({ liveAgents: true });
       h.scheduler.observeUsage(WAIT_LOW, h.scheduler.beginUsageRequest());
       expect(h.pending).toBe(0);
     });
 
-    it("waits 30 seconds at 50-79%, then compacts only once in the same live wave", async () => {
+    it("waits 30 seconds at 75-79%, then compacts only once in the same live wave", async () => {
       const h = harness({ liveAgents: true });
       h.scheduler.observeUsage(WAIT_BOUNDARY, h.scheduler.beginUsageRequest());
       expect(h.pending).toBe(1);
