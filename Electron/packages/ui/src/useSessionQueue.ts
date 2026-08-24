@@ -34,7 +34,7 @@ export type UseSessionQueueResult = {
   edit: (messageId: string, text: string) => Promise<void>
   remove: (messageId: string) => Promise<void>
   promote: (messageId: string) => Promise<void>
-  steer: (messageId: string) => Promise<void>
+  steer: (messageId: string) => Promise<QueuedMessage>
   cutIn: (messageId: string) => Promise<void>
   retry: (messageId: string) => Promise<void>
 }
@@ -139,7 +139,7 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
   }, [host, mutate])
   const remove = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.removeQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
   const promote = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.promoteQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
-  const steer = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.steerQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
+  const steer = useCallback((messageId: string) => mutate(activeSessionId => host.steerQueuedMessage(activeSessionId, messageId)), [host, mutate])
   const cutIn = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.cutInQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
   const retry = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.retryQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
 

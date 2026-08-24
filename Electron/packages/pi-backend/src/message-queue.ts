@@ -398,6 +398,28 @@ export class SessionMessageQueue {
     return snapshot(retried);
   }
 
+  /**
+   * Reinsert undelivered payloads at the head of the FIFO as `queued`,
+   * preserving order (the first input is delivered first). Used by the host
+   * when an acknowledged steer never landed in pi's transcript; the caller
+   * owns any subsequent drain — this method never dispatches.
+   */
+  requeueAtHead(sessionId: string, inputs: EnqueueInput[]): QueuedMessage[] {
+    const session = this.state(sessionId);
+    const created: QueuedMessage[] = [];
+    for (const input of inputs) {
+      const text = input.text ?? "";
+      const attachments = snapshot(input.attachments ?? []);
+      if (!text.trim() && attachments.length === 0) continue;
+      created.push(freeze({ id: crypto.randomUUID(), sessionId, text, attachments, createdAt: this.now(), state: "queued" as const }));
+    }
+    if (created.length) {
+      session.items.splice(0, 0, ...created);
+      this.changed(sessionId);
+    }
+    return created.map(snapshot);
+  }
+
   /** A turn started outside the queue (host-dispatched prompt, pi agent_start). */
   markBusy(sessionId: string): number {
     const session = this.state(sessionId);

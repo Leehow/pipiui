@@ -110,9 +110,14 @@ describe("PiHostBackend message queue integration", () => {
     expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["A"]);
     expect((await backend.handle("removeQueuedMessage", ["s1", a.message.id]) as any).text).toBe("A");
 
+    // The steer ack never produced a user echo; stop recycles "B edited" to
+    // the FIFO head. Release the held turn naturally so the drain delivers
+    // the recycled item before the `__queue_fail__` probe.
     const failed = await backend.handle("enqueueMessage", ["s1", "__queue_fail__"]) as any;
     expect(failed.outcome).toBe("queued");
     await backend.handle("stop", ["s1"]);
+    await eventually(() => (backend as any).queue.isBusy("s1") === false);
+    expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["B edited", "__queue_fail__"]);
     (backend as any).queue.markBusy("s1");
     await (backend as any).queue.notifyIdle("s1");
     await eventually(() => ((backend as any).queue.listQueue("s1")[0]?.state) === "failed");
@@ -122,6 +127,50 @@ describe("PiHostBackend message queue integration", () => {
     const retried = await backend.handle("retryQueuedMessage", ["s1", failedItem.id]) as any;
     expect(retried).toMatchObject({ state: "queued", error: undefined, text: "recovered" });
     await eventually(() => (backend as any).queue.listQueue("s1").length === 0);
+    await backend.close();
+  });
+
+  it("requeues a steered message whose turn settled without echoing it", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const item = await backend.handle("enqueueMessage", ["s1", "interrupt lost"]) as any;
+    const steered = await backend.handle("steerQueuedMessage", ["s1", item.message.id]) as any;
+    expect(steered.state).toBe("sending");
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+
+    // fake-pi acks the steer but never echoes it, like pi when the running
+    // turn is aborted/compacted before its steering queue drains. The settle
+    // must recycle the payload to the FIFO head instead of losing it.
+    await backend.handle("stop", ["s1"]);
+    await eventually(() => (backend as any).queue.isBusy("s1") === false);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([
+      expect.objectContaining({ text: "interrupt lost", state: "queued" }),
+    ]);
+
+    // The next turn delivers it as a normal prompt.
+    (backend as any).queue.markBusy("s1");
+    await (backend as any).queue.notifyIdle("s1");
+    await eventually(() => (backend as any).queue.listQueue("s1").length === 0);
+    await backend.close();
+  });
+
+  it("does not redeliver a steered message once pi echoes it as a user message", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const userEchoes: any[] = [];
+    const off = backend.subscribe(event => { if (event.channel === "stream" && event.event.type === "user_message") userEchoes.push(event.event); });
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    const item = await backend.handle("enqueueMessage", ["s1", "__steer_echo__ hello"]) as any;
+    const steered = await backend.handle("steerQueuedMessage", ["s1", item.message.id]) as any;
+    expect(steered.state).toBe("sending");
+    await eventually(() => userEchoes.some(event => event.content === "__steer_echo__ hello"));
+
+    // The echo is the delivery receipt: settle recycles nothing.
+    await backend.handle("stop", ["s1"]);
+    await eventually(() => (backend as any).queue.isBusy("s1") === false);
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+    off();
     await backend.close();
   });
 

@@ -328,6 +328,20 @@ describe("SessionMessageQueue", () => {
     await steer;
   });
 
+  it("requeueAtHead restores payloads at the FIFO head without dispatching", () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    queue.enqueue("s1", { text: "existing" });
+    const restored = queue.requeueAtHead("s1", [{ text: "first" }, { text: "second" }]);
+    expect(restored.map((item) => item.text)).toEqual(["first", "second"]);
+    expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["first", "second", "existing"]);
+    expect(queue.listQueue("s1").every((item) => item.state === "queued")).toBe(true);
+    expect(host.calls).toHaveLength(0); // the caller owns the drain
+    expect(queue.requeueAtHead("s1", [{ text: "   " }])).toEqual([]); // empty payloads are skipped
+    expect(queue.listQueue("s1")).toHaveLength(3);
+  });
+
   it("preserves the full attachment payload and snapshots it immutably", () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch });
