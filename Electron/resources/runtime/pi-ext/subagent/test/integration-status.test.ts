@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
 	dependentStepIntegrationProblem,
+	formatCompactSubagentIntegrationStatus,
 	formatSubagentIntegrationStatus,
 	integrationDependencyAdmission,
 } from "../integration-status.ts";
@@ -72,4 +73,48 @@ test("dependency admission distinguishes in-flight integration from terminal non
 	assert.equal(integrationDependencyAdmission({ ...worktree, integrationState: "merged" }), "ready");
 	assert.equal(integrationDependencyAdmission({ ...worktree, integrationState: "mergedCleanupPending" }), "ready");
 	assert.equal(integrationDependencyAdmission({ workerState: "ok" }), "ready");
+});
+
+test("compact status keeps unmerged delivery and recovery path in the one-snapshot view", () => {
+	assert.equal(
+		formatCompactSubagentIntegrationStatus({
+			workerState: "ok",
+			integrationState: "pendingReview",
+			worktreePath: "/tmp/project/.pi/worktrees/memory-pack",
+			worktreeBranch: "pipiui/memory-pack",
+		}),
+		"worker=ok integration=pendingReview worktree=/tmp/project/.pi/worktrees/memory-pack",
+	);
+	assert.equal(
+		formatCompactSubagentIntegrationStatus({
+			workerState: "ok",
+			integrationState: "merged",
+			worktreePath: "/tmp/project/.pi/worktrees/landed",
+			worktreeBranch: "pipiui/landed",
+		}),
+		"worker=ok integration=merged",
+	);
+	assert.equal(formatCompactSubagentIntegrationStatus({ workerState: "ok" }), "worker=ok");
+});
+
+test("discarded delivery never recommends recovery from a removed worktree", () => {
+	const input = {
+		workerState: "ok",
+		integrationState: "discarded",
+		worktreePath: "/tmp/project/.pi/worktrees/discarded",
+		worktreeBranch: "pipiui/discarded",
+	} as const;
+	const detailed = formatSubagentIntegrationStatus(input).join("\n");
+	assert.match(detailed, /discarded/i);
+	assert.match(detailed, /artifact.*unavailable/i);
+	assert.doesNotMatch(detailed, /recover or read/i);
+
+	const dependent = dependentStepIntegrationProblem(input) ?? "";
+	assert.match(dependent, /discarded/i);
+	assert.match(dependent, /no artifact recovery/i);
+	assert.doesNotMatch(dependent, /Recover from/);
+
+	const compact = formatCompactSubagentIntegrationStatus(input);
+	assert.equal(compact, "worker=ok integration=discarded artifact=unavailable");
+	assert.doesNotMatch(compact, /worktree=\/tmp/);
 });

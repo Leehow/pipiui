@@ -243,6 +243,7 @@ import {
 } from "./worktree-finalize.ts";
 import {
 	dependentStepIntegrationProblem,
+	formatCompactSubagentIntegrationStatus,
 	formatSubagentIntegrationStatus,
 	integrationDependencyAdmission,
 	type SubagentIntegrationState,
@@ -3468,9 +3469,13 @@ function formatHistoricalSection(exclude: Set<string>, cap = 8): string[] {
 	const rows = history.map((item) => {
 		const task = item.task.replace(/\s+/g, " ").trim().slice(0, 120) || "(task unavailable)";
 		const result = item.resultSummary?.replace(/\s+/g, " ").trim().slice(0, 120);
-		const state = item.state === "running"
-			? "state=interrupted (not running in this process); last recorded state=running"
-			: `state=${item.state ?? "unknown"}`;
+		const state = formatCompactSubagentIntegrationStatus({
+			workerState: item.state === "running" ? "interrupted(last-recorded=running)" : (item.state ?? "unknown"),
+			integrationState: item.integrationState,
+			worktreePath: item.worktreePath,
+			worktreeBranch: item.worktreeBranch,
+			finalizationSummary: item.worktreeFinalization,
+		});
 		return `- \`${item.agentId}\` (${item.name}) — ${state}; stored conversation=${stored.has(item.agentId) ? "yes" : "no"}; task=${task}${result ? `; result=${result}` : ""}`;
 	});
 	return [
@@ -3632,7 +3637,14 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				: notes
 			: previewBase
 		).slice(0, 80);
-		return `| ${j.agentId} | ${j.runId} | ${j.name} | ${formatJobStateWithStall(j, now)} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
+		const state = formatCompactSubagentIntegrationStatus({
+			workerState: formatJobStateWithStall(j, now),
+			integrationState: j.integrationState,
+			worktreePath: j.worktreePath,
+			worktreeBranch: j.worktreeBranch,
+			finalizationSummary: j.worktreeFinalization,
+		});
+		return `| ${j.agentId} | ${j.runId} | ${j.name} | ${state} | ${turns} | ${cost} | ${elapsed} | ${preview || "-"} |`;
 	});
 	const listedIds = new Set(jobs.map((j) => j.agentId));
 	return [
