@@ -25,6 +25,7 @@ import { MemoryAdminService } from "./memory-admin.ts";
 import { IngestionStateReporter, type IngestionUnwiredReason } from "./ingestion-state.ts";
 import { compactFailureMemoryAtShutdown } from "./memory-watermark.ts";
 import { MemoryRuntimeMetricsCollector } from "./runtime-metrics.ts";
+import { rewriteHermesProjectMemoryToolResult } from "./hermes-tool-result-target.ts";
 import type {
   ChildCapabilityInput,
   MemoryBrokerServer,
@@ -303,6 +304,9 @@ export async function installMemoryBrokerExtension(
   env: Record<string, string | undefined> = process.env,
 ): Promise<void> {
   const mode = memoryBrokerMode(env);
+  if (mode === "main") {
+    pi.on("tool_result", (event) => rewriteHermesProjectMemoryToolResult(event));
+  }
   let server: MemoryBrokerServer | undefined;
   let publishedEnvironment: Record<string, string> | undefined;
   let operatorApplicationScope: OperatorComputerApplicationScope | undefined;

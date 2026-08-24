@@ -35,3 +35,37 @@ test("invalid or absent host override fails soft without erasing an existing Her
     await rm(agentDir, { recursive: true, force: true });
   }
 });
+
+test("missing overflow settings receive PipiUI product defaults", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pipi-memory-overflow-"));
+  try {
+    const result = await mergeHermesConfiguration({ PI_CODING_AGENT_DIR: agentDir });
+    assert.equal(result.config.overflowGraceMs, 0);
+    assert.equal(result.config.projectCharLimit, 8000);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("explicit overflow settings survive and global and project limits remain independent", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pipi-memory-overflow-"));
+  try {
+    const configPath = join(agentDir, "hermes-memory-config.json");
+    await writeFile(configPath, JSON.stringify({
+      overflowGraceMs: 1234,
+      memoryCharLimit: 6100,
+      projectCharLimit: 9200,
+    }));
+    const explicit = await mergeHermesConfiguration({ PI_CODING_AGENT_DIR: agentDir });
+    assert.equal(explicit.config.overflowGraceMs, 1234);
+    assert.equal(explicit.config.memoryCharLimit, 6100);
+    assert.equal(explicit.config.projectCharLimit, 9200);
+
+    await writeFile(configPath, JSON.stringify({ memoryCharLimit: 7300 }));
+    const globalOnly = await mergeHermesConfiguration({ PI_CODING_AGENT_DIR: agentDir });
+    assert.equal(globalOnly.config.memoryCharLimit, 7300);
+    assert.equal(globalOnly.config.projectCharLimit, 8000);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});

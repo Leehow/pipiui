@@ -19,6 +19,8 @@ import type {
 /** The one upstream version whose internal adapter shape is verified below. */
 export const HERMES_MEMORY_PACKAGE_NAME = "pi-hermes-memory";
 export const HERMES_MEMORY_PACKAGE_VERSION = "0.9.6";
+export const PIPIUI_HERMES_OVERFLOW_GRACE_MS = 0;
+export const PIPIUI_HERMES_PROJECT_CHAR_LIMIT = 8_000;
 const EXPERIENCE_QUEUE_FILE = "pipiui-memory-broker-experience-v1.jsonl";
 const MAX_STATUS_DETAIL = 300;
 
@@ -137,6 +139,12 @@ export async function mergeHermesConfiguration(
   const reviewModel = configuredMemoryReviewModel(env);
   const config: UnknownRecord = {
     ...existing,
+    ...(!Object.prototype.hasOwnProperty.call(existing, "overflowGraceMs")
+      ? { overflowGraceMs: PIPIUI_HERMES_OVERFLOW_GRACE_MS }
+      : {}),
+    ...(!Object.prototype.hasOwnProperty.call(existing, "projectCharLimit")
+      ? { projectCharLimit: PIPIUI_HERMES_PROJECT_CHAR_LIMIT }
+      : {}),
     memoryMode: "policy-only",
     flushOnCompact: false,
     ...(reviewModel ? { llmModelOverride: reviewModel } : {}),
