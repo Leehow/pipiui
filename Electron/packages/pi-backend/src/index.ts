@@ -1162,10 +1162,8 @@ function visibleHistoryEntry(entry: any, secrets: RevealedSecret[] = []): Histor
 
 /**
  * Visible ids on the active leaf parentId chain.
- * Small-file chat history keeps the full leaf (compaction is a card; firstKept
- * does not hide earlier bubbles). Large-file fallback matches SessionManager
- * buildContextEntries: latest compaction, then firstKept through the cut, then
- * everything after the compaction.
+ * Chat history keeps the full leaf at every file size: compaction is a visible
+ * card and firstKeptEntryId affects model context, not transcript bubbles.
  * Metadata rows written with parentId=null (thinking/model/session_info) are
  * stitched to the previous file-order entry instead of starting a new root.
  */
@@ -1174,7 +1172,6 @@ type ContextEntrySummary = {
   parentId: string | null;
   type: string;
   visible: boolean;
-  firstKeptEntryId?: string;
 };
 
 function isMetadataReroot(type: string): boolean {
@@ -1206,33 +1203,11 @@ function leafBranchFromFileOrder(ordered: ContextEntrySummary[]): ContextEntrySu
   return branch;
 }
 
-/** Same reorder as SessionManager.buildContextEntries on the leaf path. */
-function applyLatestCompactionContext(path: ContextEntrySummary[]): ContextEntrySummary[] {
-  let compaction: ContextEntrySummary | undefined;
-  for (const entry of path) {
-    if (entry.type === "compaction") compaction = entry;
-  }
-  if (!compaction) return path;
-  const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
-  if (compactionIdx < 0) return path;
-  const contextEntries: ContextEntrySummary[] = [compaction];
-  let foundFirstKept = false;
-  for (let i = 0; i < compactionIdx; i++) {
-    const entry = path[i]!;
-    if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
-    if (foundFirstKept) contextEntries.push(entry);
-  }
-  contextEntries.push(...path.slice(compactionIdx + 1));
-  return contextEntries;
+function visibleIdsFromFileOrder(ordered: ContextEntrySummary[]): string[] {
+  return leafBranchFromFileOrder(ordered).filter(entry => entry.visible).map(entry => entry.id);
 }
 
-function visibleIdsFromFileOrder(ordered: ContextEntrySummary[], matchSessionManagerContext = false): string[] {
-  const branch = leafBranchFromFileOrder(ordered);
-  const path = matchSessionManagerContext ? applyLatestCompactionContext(branch) : branch;
-  return path.filter(entry => entry.visible).map(entry => entry.id);
-}
-
-async function activeVisibleIds(path: string, matchSessionManagerContext = false): Promise<string[]> {
+async function activeVisibleIds(path: string): Promise<string[]> {
   const ordered: ContextEntrySummary[] = [];
   const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
   for await (const line of lines) {
@@ -1246,10 +1221,9 @@ async function activeVisibleIds(path: string, matchSessionManagerContext = false
       visible: entry.type === "message"
         || isVisibleCustomMessage(entry)
         || entry.type === "compaction",
-      firstKeptEntryId: typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined,
     });
   }
-  return visibleIdsFromFileOrder(ordered, matchSessionManagerContext);
+  return visibleIdsFromFileOrder(ordered);
 }
 
 function historyPage(entries: HistoryEntry[], before: number | string, limit: number): HistoryEntry[] {
@@ -1265,11 +1239,10 @@ async function readHistoryFallback(
   path: string,
   before: number | string = 0,
   limit = 500,
-  matchSessionManagerContext = false,
   vaultDir?: string,
   sessionId?: string,
 ): Promise<HistoryEntry[]> {
-  const visibleIds = await activeVisibleIds(path, matchSessionManagerContext);
+  const visibleIds = await activeVisibleIds(path);
   const end = typeof before === "string"
     ? visibleIds.indexOf(before)
     : Math.max(0, visibleIds.length - before);
@@ -1332,7 +1305,7 @@ async function loadSessionManager() {
       SessionManager: any;
     }>);
 }
-/** Chat-window history: stitched leaf walk. Large files skip SessionManager and match its context order. */
+/** Chat-window history: full stitched leaf walk, streamed in two passes for bounded paging. */
 async function readHistory(
   path: string,
   before: number | string = 0,
@@ -1347,7 +1320,7 @@ async function readHistory(
       `[pipi-backend] SessionManager skipped for ${path}: ${stat.size} bytes exceeds bounded history limit`,
     );
   }
-  return readHistoryFallback(path, before, limit, large, vaultDir, sessionId);
+  return readHistoryFallback(path, before, limit, vaultDir, sessionId);
 }
 
 const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
