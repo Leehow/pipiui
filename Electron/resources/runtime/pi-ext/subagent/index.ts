@@ -239,7 +239,14 @@ import {
 	reenterFinalizeOnBossAccept,
 	summarizeFinalization,
 	terminalStateForFinalization,
+	type WorktreeLifecycleProjectionV1,
 } from "./worktree-finalize.ts";
+import {
+	dependentStepIntegrationProblem,
+	formatSubagentIntegrationStatus,
+	integrationDependencyAdmission,
+	type SubagentIntegrationState,
+} from "./integration-status.ts";
 import {
 	WorktreeRecoveryStoreV1,
 	scheduleWaitingForMainRetry,
@@ -1344,6 +1351,11 @@ interface SingleResult {
 	reportsInFull?: boolean;
 	/** Continued an existing worker's conversation instead of starting it cold. */
 	resumed?: boolean;
+	/** Delivery state is orthogonal to the worker process outcome. */
+	integrationState?: SubagentIntegrationState;
+	worktreePath?: string;
+	worktreeBranch?: string;
+	worktreeFinalization?: string;
 }
 
 interface SubagentDetails {
@@ -1980,6 +1992,8 @@ interface JobRecord {
 	closeoutAt?: number;
 	worktreePath?: string;
 	worktreeBranch?: string;
+	integrationState?: SubagentIntegrationState;
+	worktreeFinalization?: string;
 }
 
 interface InterruptedReminder {
@@ -2799,7 +2813,7 @@ function resolveSubagentEpisode(
  */
 async function reportResolvedCloseout(job: JobRecord): Promise<void> {
 	if (!isHandledJob(job)) return;
-	let worktreeLifecycle: string | undefined;
+	let worktreeLifecycle: WorktreeLifecycleProjectionV1 | undefined;
 	let worktreeFinalization: string | undefined;
 	try {
 		const state = await reenterFinalizeOnBossAccept({
@@ -2843,6 +2857,12 @@ async function reportResolvedCloseout(job: JobRecord): Promise<void> {
 		}
 	} catch (error) {
 		worktreeFinalization = `finalization error: ${error instanceof Error ? error.message : String(error)}`;
+	}
+	if (job.worktreePath && job.worktreeBranch) {
+		jobPatchIntegration(job.agentId, job.runId, {
+			integrationState: worktreeLifecycle ?? "pendingReview",
+			...(worktreeFinalization ? { worktreeFinalization } : {}),
+		});
 	}
 	await postTerminalPipiuiReport({
 		kind: "closeout",
@@ -2953,6 +2973,8 @@ type JobFinalizeFields = {
 	verify?: VerifyAttestation;
 	worktreePath?: string;
 	worktreeBranch?: string;
+	integrationState?: SubagentIntegrationState;
+	worktreeFinalization?: string;
 	/** Only watchdog disappearance settle uses this; the real terminal callback may replace it. */
 	provisional?: boolean;
 };
@@ -2964,6 +2986,10 @@ function mergeTerminalJobFields(existing: JobRecord, fields: JobFinalizeFields):
 	if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
 	if (!existing.activity && fields.activity) existing.activity = fields.activity;
 	if (!existing.verify && fields.verify) existing.verify = fields.verify;
+	if (fields.worktreePath) existing.worktreePath = fields.worktreePath;
+	if (fields.worktreeBranch) existing.worktreeBranch = fields.worktreeBranch;
+	if (fields.integrationState) existing.integrationState = fields.integrationState;
+	if (fields.worktreeFinalization) existing.worktreeFinalization = fields.worktreeFinalization;
 }
 
 /**
@@ -2983,7 +3009,11 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		fields.provisional !== true &&
 		(fields.state === "ok" || fields.state === "failed" || fields.state === "aborted");
 	if (existing && existing.state !== "running" && !correctsProvisionalInterrupted) {
-		if (existing.state === fields.state) mergeTerminalJobFields(existing, fields);
+		if (existing.state === fields.state) {
+			mergeTerminalJobFields(existing, fields);
+			rememberAgentSliceTerminal(agentId, runId, existing);
+			dispatchQueue.onAgentTerminal(agentId);
+		}
 		return false;
 	}
 
@@ -3011,6 +3041,8 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		verify: fields.verify ?? existing?.verify,
 		worktreePath: fields.worktreePath ?? existing?.worktreePath,
 		worktreeBranch: fields.worktreeBranch ?? existing?.worktreeBranch,
+		integrationState: fields.integrationState ?? existing?.integrationState,
+		worktreeFinalization: fields.worktreeFinalization ?? existing?.worktreeFinalization,
 		...(existing?.closeoutDisposition === "cleaned"
 			? {
 					closeoutDisposition: existing.closeoutDisposition,
@@ -3023,7 +3055,7 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 	jobPrune();
 	const ledgerStatus = ledgerStatusFor(fields.state);
 	const finalized = jobRegistry.get(agentId);
-	if (finalized) rememberAgentSliceTerminal(agentId, runId, finalized.state, finalized.resultText ?? "");
+	if (finalized) rememberAgentSliceTerminal(agentId, runId, finalized);
 	if (PIPIUI_DEPTH === 0 && ledgerStatus && finalized) {
 		const attestation = finalized.verify;
 		recordTaskTerminal({
@@ -3047,6 +3079,21 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 	return true;
 }
 
+/** Persist finalizer output onto the already-terminal worker episode before status publication. */
+function jobPatchIntegration(
+	agentId: string,
+	runId: string,
+	patch: Pick<JobRecord, "integrationState" | "worktreeFinalization">,
+): void {
+	const job = jobRegistry.get(agentId);
+	if (!job || job.runId !== runId || job.state === "running") return;
+	if (patch.integrationState) job.integrationState = patch.integrationState;
+	if (patch.worktreeFinalization) job.worktreeFinalization = patch.worktreeFinalization;
+	rememberAgentSliceTerminal(agentId, runId, job);
+	// A dependency held while integration was active may now be releasable.
+	dispatchQueue.onAgentTerminal(agentId);
+}
+
 /**
  * Boss-facing signal channel for the dispatch queue, bound once the extension has `pi`.
  * A held task that nobody is told about is the forgetting this queue exists to end.
@@ -3063,7 +3110,14 @@ const dispatchQueue = new DispatchQueueV1({
 		if (!job) return "unknown";
 		if (job.state === "running") return "running";
 		// Only a clean finish satisfies a dependency; aborted and interrupted are not successes.
-		return job.state === "ok" ? "ok" : "failed";
+		if (job.state !== "ok") return "failed";
+		const admission = integrationDependencyAdmission({
+			workerState: job.state,
+			integrationState: job.integrationState,
+			worktreePath: job.worktreePath,
+			worktreeBranch: job.worktreeBranch,
+		});
+		return admission === "ready" ? "ok" : admission === "waiting" ? "running" : "failed";
 	},
 	notify: (text) => dispatchQueueNotify(text),
 });
@@ -3214,6 +3268,10 @@ function ensureJobTerminalFromResult(
 		cost: result.usage.cost,
 		turns: result.usage.turns,
 		verify: result.verify,
+		worktreePath: result.worktreePath,
+		worktreeBranch: result.worktreeBranch,
+		integrationState: result.integrationState,
+		worktreeFinalization: result.worktreeFinalization,
 	});
 	return runId;
 }
@@ -3308,6 +3366,10 @@ interface AgentSliceMetadata {
 	runId?: string;
 	state?: JobState;
 	resultSummary?: string;
+	worktreePath?: string;
+	worktreeBranch?: string;
+	integrationState?: SubagentIntegrationState;
+	worktreeFinalization?: string;
 	updatedAt: number;
 }
 
@@ -3363,13 +3425,23 @@ function rememberAgentSlice(agentId: string, name: string, task: string, title: 
 	]);
 }
 
-function rememberAgentSliceTerminal(agentId: string, runId: string, state: JobState, resultText: string): void {
+function rememberAgentSliceTerminal(agentId: string, runId: string, job: JobRecord): void {
 	const all = readAgentSliceMetadata();
 	const current = all.find((item) => item.agentId === agentId);
 	if (!current || (current.runId && current.runId !== runId)) return;
-	const resultSummary = resultText.replace(/\s+/g, " ").trim().slice(0, 4_000);
+	const resultSummary = (job.resultText ?? "").replace(/\s+/g, " ").trim().slice(0, 4_000);
 	writeAgentSliceMetadata([
-		{ ...current, runId, state, ...(resultSummary ? { resultSummary } : {}), updatedAt: Date.now() },
+		{
+			...current,
+			runId,
+			state: job.state,
+			...(resultSummary ? { resultSummary } : {}),
+			...(job.worktreePath ? { worktreePath: job.worktreePath } : {}),
+			...(job.worktreeBranch ? { worktreeBranch: job.worktreeBranch } : {}),
+			...(job.integrationState ? { integrationState: job.integrationState } : {}),
+			...(job.worktreeFinalization ? { worktreeFinalization: job.worktreeFinalization } : {}),
+			updatedAt: Date.now(),
+		},
 		...all.filter((item) => item.agentId !== agentId),
 	]);
 }
@@ -3425,6 +3497,13 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 					...(historical.state === "running"
 						? ["state: interrupted (not running in this process)", "last recorded state: running", "diagnostics: persisted-running leftover; process generation mismatch"]
 						: [`state: ${historical.state ?? "not running in this process"}`]),
+					...formatSubagentIntegrationStatus({
+						workerState: historical.state === "running" ? "interrupted" : (historical.state ?? "unknown"),
+						integrationState: historical.integrationState,
+						worktreePath: historical.worktreePath,
+						worktreeBranch: historical.worktreeBranch,
+						finalizationSummary: historical.worktreeFinalization,
+					}),
 					`stored conversation: ${resumable ? "yes" : "no"}`,
 					`Task: ${historical.task}`,
 					...(historical.resultSummary ? ["Result:", opts.full ? historical.resultSummary : truncateTextHead(historical.resultSummary, JOB_RESULT_DISPLAY_CAP)] : []),
@@ -3457,6 +3536,13 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				? [`blocked-by: ${job.blockedBy.join(", ")}`]
 				: []),
 			`state: ${formatJobStateWithStall(job, now)}`,
+			...formatSubagentIntegrationStatus({
+				workerState: job.state,
+				integrationState: job.integrationState,
+				worktreePath: job.worktreePath,
+				worktreeBranch: job.worktreeBranch,
+				finalizationSummary: job.worktreeFinalization,
+			}),
 			...(handleForRun(job.agentId, job.runId)
 				? [`diagnostics: ${formatDiagnosticsCompactLine(diagnosticsSnapshotFor(job.agentId, handleForRun(job.agentId, job.runId)!))}`]
 				: job.state === "running"
@@ -7107,6 +7193,9 @@ async function runSingleAgent(
 				verify: currentResult.verify,
 				...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 				...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+				...(placement.worktreePath && placement.worktreeBranch
+					? { integrationState: "active" as const }
+					: {}),
 			});
 			logCloseoutProbe("job-finalize", {
 				agent: pipiuiAgentId,
@@ -7155,7 +7244,7 @@ async function runSingleAgent(
 		// a host that handed finalization to pi must not see "ok" while the branch is still
 		// unmerged. A host that kept finalization gets undefined here and is unaffected.
 		let finalization: string | undefined;
-		let worktreeLifecycle: string | undefined;
+		let worktreeLifecycle: WorktreeLifecycleProjectionV1 | undefined;
 		const worktreeStartedAt = Date.now();
 		const worktreeProber = createWorktreePhaseProber((event, fields) => {
 			const error = closeoutPhaseError(event, fields.state);
@@ -7247,6 +7336,17 @@ async function runSingleAgent(
 			});
 			projectFinalizationPhase(pipiuiAgentId, runId, handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "reconciling", {
 				error: "finalization-error",
+			});
+		}
+		if (placement.worktreePath && placement.worktreeBranch) {
+			const integrationState: SubagentIntegrationState = worktreeLifecycle ?? "pendingReview";
+			currentResult.integrationState = integrationState;
+			currentResult.worktreePath = placement.worktreePath;
+			currentResult.worktreeBranch = placement.worktreeBranch;
+			if (finalization) currentResult.worktreeFinalization = finalization;
+			jobPatchIntegration(pipiuiAgentId, runId, {
+				integrationState,
+				...(finalization ? { worktreeFinalization: finalization } : {}),
 			});
 		}
 		const endHandle = handleForRun(pipiuiAgentId, runId);
@@ -9168,6 +9268,23 @@ export default function (pi: ExtensionAPI) {
 									text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
 								},
 							],
+							details: makeDetails("chain")(results),
+							isError: true,
+						};
+					}
+					const integrationProblem = dependentStepIntegrationProblem({
+						workerState: "ok",
+						integrationState: result.integrationState,
+						worktreePath: result.worktreePath,
+						worktreeBranch: result.worktreeBranch,
+						finalizationSummary: result.worktreeFinalization,
+					});
+					if (integrationProblem) {
+						return {
+							content: [{
+								type: "text",
+								text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${integrationProblem}`,
+							}],
 							details: makeDetails("chain")(results),
 							isError: true,
 						};
