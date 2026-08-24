@@ -1,15 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
-import { SubagentPanel } from './SubagentPanel'
-import { PlanPanel } from './PlanPanel'
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { PlanApprovalBar } from './PlanApprovalBar'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
-import { DocumentPanel } from './DocumentPanel'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
-import { TerminalPanel } from './TerminalPanel'
-import { BrowserPanel } from './BrowserPanel'
-import { documentKindForName, resolveThinkingLevel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
+import './builtin-panels'
+import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
 import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
+import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
@@ -19,13 +16,10 @@ import { ProviderLogo } from './ProviderLogo'
 import { Sidebar, type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarSession, type SessionStatus } from './Sidebar'
 import { canAdoptExternalHistory, externalHistoryToMessages, externalSessionLooksAdoptable, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
 import { SlashMenu } from './SlashMenu'
-import personGroupIcon from './sf-icons/person-2.png'
-import globeIcon from './sf-icons/globe.png'
-import docTextIcon from './sf-icons/doc-text.png'
-import terminalIcon from './sf-icons/terminal.png'
 import { ThinkingChip } from './thinking-chip'
 import type { WaitingPhase } from './WaitingPlaceholder'
 import { StreamEventCoalescer } from './StreamEventCoalescer'
+import { freezeProbe, freezeProbeHistoryIpcEnd, freezeProbeHistoryIpcStart } from './freeze-probe'
 import { QuotaPill, QWEN_TOKEN_PLAN_LOGIN_URL } from './QuotaPill'
 import { BalancePill } from './BalancePill'
 import { SessionStatsPill } from './SessionStatsPill'
@@ -33,25 +27,28 @@ import { MessageQueue } from './MessageQueue'
 import { useSessionQueue } from './useSessionQueue'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 export { parseSubagentNotice } from './subagent-notice'
-import { compactionNotice } from './compaction-notice'
-import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, type SlashCommandDef } from './slash-commands'
+import { compactionNotice, compactionPillLabel } from './compaction-notice'
+import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, useSlashCommands, type SlashCommandDef } from './slash-commands'
+import { useDeclarativeContributionLoader } from './contribution-loader'
+import { DEFAULT_PANEL_TAB, usePanels, type PanelRailContext, type PanelTab } from './ui-registries'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
 import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
+import { DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
 import { parseSubagentSignal } from './subagent-signal'
 import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
+import { DismissibleError } from './DismissibleError'
 import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
 import './app.css'
 import './message-actions.css'
 import './subagent.css'
 
-type PanelTab = 'Subagents' | 'Plan' | 'Browser' | 'Document' | 'Terminal'
 type PaneWidths = { sidebar: number; tools: number; browserTools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
 type SessionWithSidebarMetadata = Session & { provider?: unknown; modelId?: unknown; modelRef?: unknown; model?: unknown }
@@ -75,20 +72,6 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
   return lease.holder?.holder || '另一客户端'
 }
 
-const tabs: PanelTab[] = ['Subagents', 'Plan', 'Browser', 'Document', 'Terminal']
-/** SF Symbols `checklist` traced inline: the rail masks a shape, and a two-row
- *  checklist stays legible at 13px without shipping another bitmap. */
-const checklistIcon = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 13"><g fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M.9 3.1 2.5 4.7 5.5 1.3"/><path d="M.9 9.5 2.5 11.1 5.5 7.7"/><path d="M8.2 3.3h7.9"/><path d="M8.2 9.7h7.9"/></g></svg>')}`
-/** SF Symbols parity tool-rail glyphs (Swift panelQuickRail: person.2/globe/doc.text/terminal).
- *  Rendered from system-exported SF Symbols bitmaps via CSS mask, so the icon shape matches
- *  Swift's `systemName` glyphs exactly and the color follows `currentColor` (accent when active). */
-const toolRailIcons: Record<PanelTab, { src: string; ratio: number }> = {
-  Subagents: { src: personGroupIcon, ratio: 70 / 49 },
-  Plan: { src: checklistIcon, ratio: 17 / 13 },
-  Browser: { src: globeIcon, ratio: 46 / 46 },
-  Document: { src: docTextIcon, ratio: 44 / 49 },
-  Terminal: { src: terminalIcon, ratio: 57 / 43 },
-}
 function initialBrowserToolsWidth(sidebar = 258): number {
   const viewportWidth = typeof window === 'undefined' ? 1280 : window.innerWidth
   return Math.min(920, Math.max(520, Math.round((viewportWidth - sidebar - 12) * 0.58)))
@@ -227,10 +210,38 @@ function modelStateFromSession(session: Session | undefined, catalog: readonly M
 function reconcileModelStateWithCatalog(state: ModelState, catalog: readonly Model[]): ModelState {
   const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
   if (!known) return state
+  const availableThinkingLevels = thinkingLevelsForHydratedModel(known, state.availableThinkingLevels)
   return {
     ...state,
     model: known,
-    availableThinkingLevels: thinkingLevelsForModel(known, state.availableThinkingLevels)
+    thinkingLevel: resolveThinkingLevel(state.thinkingLevel, availableThinkingLevels) ?? state.thinkingLevel,
+    availableThinkingLevels,
+  }
+}
+
+function fallbackModelIfMissing(state: ModelState, catalog: readonly Model[]): { state: ModelState; fellBack: boolean } {
+  if (catalog.length === 0) return { state, fellBack: false }
+  const known = catalog.find(model => model.provider === state.model.provider && model.id === state.model.id)
+  if (known) {
+    const availableThinkingLevels = thinkingLevelsForHydratedModel(known, state.availableThinkingLevels)
+    return {
+      state: {
+        ...state,
+        model: known,
+        thinkingLevel: resolveThinkingLevel(state.thinkingLevel, availableThinkingLevels) ?? state.thinkingLevel,
+        availableThinkingLevels,
+      },
+      fellBack: false,
+    }
+  }
+  const next = catalog[0]
+  return {
+    state: {
+      model: next,
+      thinkingLevel: resolveThinkingLevel(state.thinkingLevel, thinkingLevelsForModel(next)) ?? 'off',
+      availableThinkingLevels: thinkingLevelsForModel(next),
+    },
+    fellBack: true,
   }
 }
 
@@ -609,6 +620,7 @@ export function createMockHost(): PipiHostAPI {
   }
   const listeners = new Map<string, Set<(event: StreamEvent) => void>>()
   const allStreamListeners = new Set<(event: StreamEvent) => void>()
+  const catalogListeners = new Set<(event: { type: 'catalog_changed'; reason: 'auth' | 'extension' | 'refresh' }) => void>()
   // Subagent fixtures are per-session, mirroring the real backend's
   // `filter(agent => !sessionId || agent.sessionId === sessionId)`:
   // switching sessions in the right panel shows that session's own tree.
@@ -734,9 +746,9 @@ export function createMockHost(): PipiHostAPI {
     stop: async sessionId => emit(sessionId, { type: 'status', sessionId, status: 'stopped' }),
     queueFollowUp: async () => undefined,
     compact: async sessionId => {
-      emit(sessionId, { type: 'compaction', sessionId, phase: 'start', reason: 'manual' })
+      emit(sessionId, { type: 'compaction', sessionId, phase: 'start', reason: 'manual', operation: 'context_compaction', trigger: 'manual', executed: true })
       await new Promise(resolve => window.setTimeout(resolve, 300))
-      emit(sessionId, { type: 'compaction', sessionId, phase: 'end', reason: 'manual' })
+      emit(sessionId, { type: 'compaction', sessionId, phase: 'end', reason: 'manual', operation: 'context_compaction', trigger: 'manual', executed: true })
     },
     // The Composer still sends directly; queue controls are hosted elsewhere.
     listQueue: async () => [],
@@ -750,6 +762,10 @@ export function createMockHost(): PipiHostAPI {
     subscribeStream: (sessionId, listener) => { const bucket = listeners.get(sessionId) ?? new Set(); bucket.add(listener); listeners.set(sessionId, bucket); return () => bucket.delete(listener) },
     subscribeAllStreams: listener => { allStreamListeners.add(listener); return () => allStreamListeners.delete(listener) },
     listModels: async () => mockModels,
+    subscribeModelCatalog: listener => {
+      catalogListeners.add(listener)
+      return () => { catalogListeners.delete(listener) }
+    },
     getModelState: async sessionId => {
       // Per-session binding, mirroring the real host: each session answers with
       // its own model (JSONL-backed there, fixture/localStorage here).
@@ -953,12 +969,26 @@ function useNarrowViewport(): boolean {
   return narrow
 }
 
+/** Keep the in-flight cut-in optimistic user across a JSONL snapshot that has not persisted it yet. Match the current receipt id only. */
+function retainReceiptOptimisticUser(
+  snapshot: ChatMessage[],
+  live: readonly ChatMessage[],
+  receipt: { sessionId: string; id: string } | null,
+  sessionId: string,
+): ChatMessage[] {
+  if (!receipt || receipt.sessionId !== sessionId) return snapshot
+  if (snapshot.some(message => message.id === receipt.id)) return snapshot
+  const extra = live.find(message => message.role === 'user' && message.id === receipt.id)
+  return extra ? [...snapshot, extra] : snapshot
+}
+
 export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const theme = useSystemTheme()
   // Do not allocate a default mock during every render: its changing identity
   // re-ran all host effects on each composer keystroke.
   const mockHost = useRef<PipiHostAPI>()
   const host = injectedHost ?? (mockHost.current ??= createMockHost())
+  useDeclarativeContributionLoader(host)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [externalSessions, setExternalSessions] = useState<ProjectExternalSession[]>([])
@@ -1009,6 +1039,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const documentsBySessionRef = useRef(new Map<string, ComposerDocument[]>())
   const [streaming, setStreaming] = useState(false)
   const [compacting, setCompacting] = useState(false)
+  const [compactingLabel, setCompactingLabel] = useState<string | null>(null)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [statsRefreshKey, setStatsRefreshKey] = useState(0)
   const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
@@ -1019,7 +1050,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null)
   const [stopError, setStopError] = useState<{ sessionId: string; message: string } | null>(null)
   const [lease, setLease] = useState<SessionLease | null>(null)
-  const [activeTab, setActiveTab] = useState<PanelTab>('Subagents')
+  const [activeTab, setActiveTab] = useState<PanelTab>(DEFAULT_PANEL_TAB)
   const [toolReturnTab, setToolReturnTab] = useState<PanelTab | null>(null)
   const activeTabRef = useRef(activeTab)
   activeTabRef.current = activeTab
@@ -1063,8 +1094,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const messagesRef = useRef<ChatMessage[]>(messages)
   messagesRef.current = messages
   const messagesBySessionRef = useRef(new Map<string, ChatMessage[]>())
+  const historyEntriesBySessionRef = useRef(new Map<string, HistoryEntry[]>())
+  const historyCursorBySessionRef = useRef(new Map<string, string>())
+  const historyOlderLoadInFlightRef = useRef(new Set<string>())
   const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
   const historyFingerprintBySessionRef = useRef(new Map<string, string>())
+  const historySettledReplacementRef = useRef(new Map<string, { fingerprint: string; liveRevision: number }>())
   const locallyCreatedSessionIdsRef = useRef(new Set<string>())
   const skippedInitialEmptyHistoryRef = useRef(new Set<string>())
   const transcriptLiveRevisionRef = useRef(0)
@@ -1079,19 +1114,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setMessages(next)
     return next
   }, [])
-  const [mountedSessionIds, setMountedSessionIds] = useState<string[]>([])
   useEffect(() => {
     if (selectedSession && messagesBySessionRef.current.has(selectedSession)) {
       messagesBySessionRef.current.set(selectedSession, messages)
     }
   }, [selectedSession, messages])
-  useEffect(() => {
-    if (!selectedSession) return
-    setMountedSessionIds(current => {
-      if (current[0] === selectedSession) return current
-      return [selectedSession, ...current.filter(id => id !== selectedSession)].slice(0, 6)
-    })
-  }, [selectedSession])
   const [hasPlansBySession, setHasPlansBySession] = useState<Record<string, boolean>>({})
   const handleHasPlansChange = useCallback((sessionId: string, hasPlans: boolean) => {
     setHasPlansBySession(current => current[sessionId] === hasPlans ? current : { ...current, [sessionId]: hasPlans })
@@ -1099,12 +1126,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const selectedHasPlans = selectedSession ? hasPlansBySession[selectedSession] === true : false
   useEffect(() => {
     if (!selectedSession) return
-    const remembered = activeTabBySessionRef.current[selectedSession] ?? 'Subagents'
+    const remembered = activeTabBySessionRef.current[selectedSession] ?? DEFAULT_PANEL_TAB
     // When the last live plan settles, drop the Plan tab and leave the page so
     // the user is not stranded on a hidden/blank Plan surface.
     if ((remembered === 'Plan' || activeTabRef.current === 'Plan') && !selectedHasPlans) {
       setToolReturnTab(current => current === 'Plan' ? null : current)
-      applyActiveTab('Subagents')
+      applyActiveTab(DEFAULT_PANEL_TAB)
       return
     }
     setActiveTab(remembered)
@@ -1143,6 +1170,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [subagentModelsOpen, setSubagentModelsOpen] = useState(false)
   const browserOccluded = modalOpen || computerUseOpen || remoteOpen || subagentModelsOpen
   const modalVisibility = useModelVisibility(host, modelState?.model)
+  const [catalogNotice, setCatalogNotice] = useState<string | null>(null)
+  const lastCatalogFallbackKeyRef = useRef('')
+  const announceCatalogFallback = useCallback((sessionId: string, previous: Model, next: ModelState) => {
+    const key = `${sessionId}:${previous.provider}/${previous.id}->${next.model.provider}/${next.model.id}`
+    if (lastCatalogFallbackKeyRef.current === key) return
+    lastCatalogFallbackKeyRef.current = key
+    setCatalogNotice(`当前模型已不可用，已切换到 ${next.model.name}`)
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    // Persist the fallback for future turns. Never stop an in-flight response.
+    void host.setModel(sessionId, next.model.provider, next.model.id).catch(() => {
+      // Local chip already shows the fallback; a host persist miss must not abort the turn.
+    })
+  }, [host])
   const copiedTimerRef = useRef<number | null>(null)
   const archiveCleanupInFlightRef = useRef(new Set<string>())
   const sidebarStorageKey = useMemo(() => sidebarPreferencesKey(projects), [projects])
@@ -1171,9 +1211,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
    *  `user_message` echo merges back into this bubble by id, so an assistant
    *  placeholder that already streamed past it cannot wedge a duplicate below. */
   const pendingLocalUserRef = useRef<{ id: string; content: string } | null>(null)
+  /** Id-only receipt for the current busy cut-in optimistic user. Echo or failure clears it. */
+  const persistLocalUserReceiptRef = useRef<{ sessionId: string; id: string } | null>(null)
   const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
   const historyContextRef = useRef<{ host: PipiHostAPI; sessionId: string } | null>(null)
+  /** Caps empty-page history retries per selection. The 250ms retry used to bump
+   *  `historyRefreshKey`, re-run this effect, and reset the local scheduled flag,
+   *  so a session whose JSONL page stayed empty (21MB+ files that parse to no
+   *  visible rows, or a wedged host) rescanned forever and pinned the main process. */
+  const emptyPageRetriesBySessionRef = useRef(new Map<string, number>())
   /** Send from the empty "新会话" state creates the session first; the pending
    *  prompt is dispatched by the auto-send effect once the new session's history
    *  load and stream subscription are live (a direct sendPrompt would race them). */
@@ -1216,6 +1263,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       // selected main-stream `settled` event is lost. Re-read the authoritative
       // JSONL; the existing history/live-revision gates decide whether this
       // exact turn is terminal and refuse to close a newer one.
+      freezeProbe('history_refresh', { reason: 'subagents_idle', session: selectedSession, turnEpoch: mainTurnEpochRef.current })
       setHistoryRefreshKey(key => key + 1)
     }
   }, [selectedSession, subagentsRunningCount])
@@ -1225,13 +1273,24 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const selectedObservedClosed = selectedObservedStatus === 'completed' || selectedObservedStatus === 'interrupted'
   const messageStreaming = messages.some(message => message.role === 'assistant' && message.streaming)
   const selectedStopping = stoppingSessionId === selectedSession
-  // A leftover sending queue item after settle/stop must not keep the composer
-  // locked. Host stop is authoritative; `sending` is only meaningful while the
+  // Leftover `queued` after a UI settle/stop means the host never went idle.
+  // Keep stop and insert-on-send. Leftover `sending` after settle/stop must not
+  // lock: host stop is authoritative, and `sending` is only meaningful while the
   // turn is still open.
-  const queueLocksComposer = sessionQueue.busy && !selectedObservedClosed
+  const leftoverQueued = sessionQueue.items.some(item => item.status === 'queued')
+  const strandedHostBusy = leftoverQueued && selectedObservedClosed
+  const queueLocksComposer = strandedHostBusy || (sessionQueue.busy && !selectedObservedClosed)
   // A leftover streaming assistant after settle (late text/tool) must not keep
   // the stop button once the authoritative turn is already closed.
   const sessionWorking = streaming || selectedObservedRunning || (messageStreaming && !selectedObservedClosed) || queueLocksComposer || compacting || selectedStopping
+  const lastUserForPlanApproval = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (message.role !== 'user') continue
+      return { content: message.content, timestamp: message.timestamp }
+    }
+    return undefined
+  }, [messages])
   const closeOpenTurn = useCallback((sessionId: string, status: 'completed' | 'interrupted', options?: { keepStopGuard?: boolean }) => {
     applyObservedStatus(sessionId, status)
     if (!options?.keepStopGuard && stoppingSessionRef.current === sessionId) stoppingSessionRef.current = null
@@ -1240,7 +1299,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (selectedSessionRef.current !== sessionId) return
     mainTurnOpenRef.current = false
     turnJustSettledRef.current = true
-    pendingLocalUserRef.current = null
+    const receipt = persistLocalUserReceiptRef.current
+    const keepReceipt = Boolean(
+      receipt
+      && receipt.sessionId === sessionId
+      && messagesRef.current.some(message => message.id === receipt.id),
+    )
+    if (!keepReceipt) {
+      pendingLocalUserRef.current = null
+      if (receipt?.sessionId === sessionId) persistLocalUserReceiptRef.current = null
+    }
     setStreaming(false)
     setCompacting(false)
     setStatsRefreshKey(key => key + 1)
@@ -1341,6 +1409,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [beginSessionListRequest, host, isCurrentSessionListRequest])
 
   useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setPlanAvailable(Boolean(capabilities.plan && host.getPlans)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setPlanAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
+  useEffect(() => {
+    if (!host.setEventProjectionSession) return
+    void host.setEventProjectionSession(selectedSession || undefined).catch(() => undefined)
+  }, [host, selectedSession])
   useEffect(() => {
     if (!host.browser || !selectedSession || isExternalSessionId(selectedSession)) return
     void host.browser.selectSession(selectedSession)
@@ -1570,15 +1642,29 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return () => { current = false }
   }, [host, modalVisibility.models, selectedSession])
   useEffect(() => {
+    if (modalVisibility.catalogEpoch === 0 || modalVisibility.loading) return
+    const sessionId = selectedSessionRef.current
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    const current = modelStatesBySessionRef.current.get(sessionId) ?? modelState
+    if (!current) return
+    const { state, fellBack } = fallbackModelIfMissing(current, modalVisibility.models)
+    if (!fellBack) return
+    modelStatesBySessionRef.current.set(sessionId, state)
+    rememberSessionModel(sessionId, state.model)
+    setModelState(state)
+    announceCatalogFallback(sessionId, current.model, state)
+  }, [announceCatalogFallback, modalVisibility.catalogEpoch, modalVisibility.loading, modalVisibility.models, modelState])
+  useEffect(() => {
     const request = ++historyLoadRef.current
     const requestLiveRevision = transcriptLiveRevisionRef.current
     let staleRetryScheduled = false
     let staleRetryTimer: number | undefined
-    let emptyPageRetryScheduled = false
     let emptyPageRetryTimer: number | undefined
+    let settleConfirmRetryTimer: number | undefined
     const previousContext = historyContextRef.current
     const contextChanged = previousContext?.host !== host || previousContext.sessionId !== selectedSession
     historyContextRef.current = { host, sessionId: selectedSession }
+    if (contextChanged && selectedSession) emptyPageRetriesBySessionRef.current.delete(selectedSession)
     if (!selectedSession) {
       setMessages([])
       setLease(null)
@@ -1660,6 +1746,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setLease(null)
     }
     const closeLostSettle = () => {
+      historySettledReplacementRef.current.delete(selectedSession)
       mainTurnOpenRef.current = false
       activeUserTurnRef.current = false
       turnJustSettledRef.current = true
@@ -1668,6 +1755,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingStartedAt(null)
       setWaitingDetail(undefined)
       applyObservedStatus(selectedSession, 'completed')
+      void sessionQueue.resync()
       const settled = finishStreamingMessage(messagesRef.current)
       if (settled !== messagesRef.current) {
         transcriptLiveRevisionRef.current += 1
@@ -1686,11 +1774,37 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const resumeOrCloseLostSettle = (historyMessages: ChatMessage[], liveMessages = messagesRef.current) => {
       if (!resumedRunning) return
-      if (historyConfirmsLostSettle(historyMessages, liveMessages)) {
+      const candidate = historySettledReplacementRef.current.get(selectedSession)
+      const replacementConfirmed = Boolean(candidate
+        && candidate.liveRevision === transcriptLiveRevisionRef.current
+        && candidate.fingerprint === transcriptFingerprint(liveMessages)
+        && candidate.fingerprint === transcriptFingerprint(historyMessages))
+      if (candidate && !replacementConfirmed) historySettledReplacementRef.current.delete(selectedSession)
+      if (historyConfirmsLostSettle(historyMessages, liveMessages, replacementConfirmed)) {
         closeLostSettle()
         return
       }
       openResumeWait(liveMessages, historyMessages)
+    }
+    const scheduleSettledReplacementConfirmation = (snapshot: ChatMessage[]) => {
+      if (!resumedRunning || !mainTurnOpenRef.current) return
+      const last = snapshot[snapshot.length - 1]
+      if (!last || last.role !== 'assistant' || !assistantLooksSettled(last) || assistantEndedAwaitingModel(last)) return
+      const fingerprint = transcriptFingerprint(snapshot)
+      const existing = historySettledReplacementRef.current.get(selectedSession)
+      if (existing?.fingerprint === fingerprint && existing.liveRevision === transcriptLiveRevisionRef.current) return
+      historySettledReplacementRef.current.set(selectedSession, {
+        fingerprint,
+        liveRevision: transcriptLiveRevisionRef.current,
+      })
+      if (settleConfirmRetryTimer !== undefined) window.clearTimeout(settleConfirmRetryTimer)
+      settleConfirmRetryTimer = window.setTimeout(() => {
+        if (historyLoadRef.current === request
+          && historyContextRef.current?.host === host
+          && historyContextRef.current.sessionId === selectedSession) {
+          setHistoryRefreshKey(key => key + 1)
+        }
+      }, 250)
     }
     const restoreOpenHop = (snapshot: ChatMessage[], live: ChatMessage[]): ChatMessage[] => {
       if (!mainTurnOpenRef.current) return snapshot
@@ -1708,11 +1822,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const applyHistory = (entries: HistoryEntry[]) => {
       if (historyLoadRef.current !== request) return
+      const previousFingerprint = historyFingerprintBySessionRef.current.get(selectedSession)
       const reconciliation = reconcileHistorySnapshot(
         entries,
         requestLiveRevision,
         transcriptLiveRevisionRef.current,
-        historyFingerprintBySessionRef.current.get(selectedSession),
+        previousFingerprint,
         messagesRef.current,
       )
       if (reconciliation.status === 'retained-longer-live') {
@@ -1730,6 +1845,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
             if (historyLoadRef.current === request
               && historyContextRef.current?.host === host
               && historyContextRef.current.sessionId === selectedSession) {
+              freezeProbe('history_refresh', { reason: 'stale_request_retry', session: selectedSession })
               setHistoryRefreshKey(key => key + 1)
             }
           }, 0)
@@ -1745,19 +1861,34 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       historyFingerprintBySessionRef.current.set(selectedSession, reconciliation.fingerprint)
       if (transcriptFingerprint(messagesRef.current) === reconciliation.fingerprint) {
         resumeOrCloseLostSettle(next)
+        // The first accepted durable final may already be byte-for-byte equal
+        // to the live transcript (the D exact-abort trace did this). It is still
+        // a newly advanced disk snapshot, so require one bounded unchanged pull
+        // before closing the scalar turn instead of waiting forever for a
+        // replacement which will never occur.
+        if (previousFingerprint !== reconciliation.fingerprint) scheduleSettledReplacementConfirmation(next)
         applyRestoredOpenHop(messagesRef.current)
         return
       }
       const liveBefore = messagesRef.current
       const restored = restoreOpenHop(next, liveBefore)
-      messagesBySessionRef.current.set(selectedSession, restored)
-      setMessages(restored)
-      messagesRef.current = restored
+      const retained = retainReceiptOptimisticUser(
+        restored,
+        liveBefore,
+        persistLocalUserReceiptRef.current,
+        selectedSession,
+      )
+      messagesBySessionRef.current.set(selectedSession, retained)
+      setMessages(retained)
+      messagesRef.current = retained
       if (resumedRunning) {
         if (historyConfirmsLostSettle(next, liveBefore)) closeLostSettle()
-        else openResumeWait(liveBefore, restored)
+        else {
+          openResumeWait(liveBefore, retained)
+          scheduleSettledReplacementConfirmation(retained)
+        }
       } else {
-        const last = restored[restored.length - 1]
+        const last = retained[retained.length - 1]
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
       }
     }
@@ -1767,60 +1898,60 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!knownNewEmptySession) {
       historyCompleteBySessionRef.current.set(selectedSession, false)
       void (async () => {
-        let before: string | undefined
-        let accumulated: HistoryEntry[] = []
-        let loadedPage = false
-        let cursorRestarts = 0
         try {
-          while (historyLoadRef.current === request) {
-            let page: HistoryEntry[]
-            try {
-              page = before === undefined
-                ? await host.getSessionHistory(selectedSession)
-                : await host.getSessionHistory(selectedSession, before, HISTORY_PAGE_SIZE)
-            } catch (error) {
-              // A compaction landing mid-pagination rewrites the visible branch
-              // and retires the cursor id. Restart from the newest page instead
-              // of failing the whole load (bounded so a pathological loop ends).
-              if (cursorRestarts < 2 && error instanceof Error && error.message.includes('history cursor no longer exists')) {
-                cursorRestarts += 1
-                before = undefined
-                accumulated = []
-                loadedPage = false
-                continue
-              }
-              throw error
-            }
-            if (historyLoadRef.current !== request) return
-            if (page.length === 0) {
-              const cachedMessages = messagesBySessionRef.current.get(selectedSession)
-              const hasCached = (cachedMessages?.length ?? 0) > 0
-              if (!loadedPage && !hasCached && !emptyPageRetryScheduled) {
-                emptyPageRetryScheduled = true
-                emptyPageRetryTimer = window.setTimeout(() => {
-                  if (historyLoadRef.current === request
-                    && historyContextRef.current?.host === host
-                    && historyContextRef.current.sessionId === selectedSession) {
-                    setHistoryRefreshKey(key => key + 1)
-                  }
-                }, 250)
-                return
-              }
-              if (!loadedPage && !hasCached) applyHistory([])
-              historyCompleteBySessionRef.current.set(selectedSession, true)
-              return
-            }
-            accumulated = [...page, ...accumulated]
-            applyHistory(accumulated)
-            loadedPage = true
-            if (page.length < HISTORY_PAGE_SIZE) {
-              historyCompleteBySessionRef.current.set(selectedSession, true)
-              return
-            }
-            const nextBefore = page[0]?.id
-            if (!nextBefore || nextBefore === before) throw new Error('主机返回了无效的会话历史游标')
-            before = nextBefore
+          freezeProbeHistoryIpcStart({ session: selectedSession, page: 'latest' })
+          let page: HistoryEntry[]
+          try {
+            page = await host.getSessionHistory(selectedSession)
+          } finally {
+            freezeProbeHistoryIpcEnd({ session: selectedSession })
           }
+          if (historyLoadRef.current !== request) return
+          if (page.length === 0) {
+            const cachedMessages = messagesBySessionRef.current.get(selectedSession)
+            const hasCached = (cachedMessages?.length ?? 0) > 0
+            const emptyRetries = emptyPageRetriesBySessionRef.current.get(selectedSession) ?? 0
+            if (!hasCached && emptyRetries < 1) {
+              emptyPageRetriesBySessionRef.current.set(selectedSession, emptyRetries + 1)
+              emptyPageRetryTimer = window.setTimeout(() => {
+                if (historyLoadRef.current === request
+                  && historyContextRef.current?.host === host
+                  && historyContextRef.current.sessionId === selectedSession) {
+                  freezeProbe('history_refresh', { reason: 'empty_page_retry', session: selectedSession })
+                  setHistoryRefreshKey(key => key + 1)
+                }
+              }, 250)
+              return
+            }
+            if (!hasCached) {
+              historyEntriesBySessionRef.current.set(selectedSession, [])
+              applyHistory([])
+            }
+            historyCursorBySessionRef.current.delete(selectedSession)
+            historyCompleteBySessionRef.current.set(selectedSession, true)
+            return
+          }
+
+          emptyPageRetriesBySessionRef.current.delete(selectedSession)
+          // Preserve already fetched older pages only when the refreshed newest
+          // page overlaps the same branch. A rewrite/branch switch with no
+          // overlap deliberately drops the stale prefix.
+          const existing = historyEntriesBySessionRef.current.get(selectedSession) ?? []
+          const overlap = existing.findIndex(entry => entry.id === page[0]?.id)
+          const accumulated = page.length === HISTORY_PAGE_SIZE && overlap >= 0
+            ? [...existing.slice(0, overlap), ...page]
+            : page
+          historyEntriesBySessionRef.current.set(selectedSession, accumulated)
+          applyHistory(accumulated)
+          if (page.length < HISTORY_PAGE_SIZE) {
+            historyCursorBySessionRef.current.delete(selectedSession)
+            historyCompleteBySessionRef.current.set(selectedSession, true)
+            return
+          }
+          const nextBefore = accumulated[0]?.id
+          if (!nextBefore) throw new Error('主机返回了无效的会话历史游标')
+          historyCursorBySessionRef.current.set(selectedSession, nextBefore)
+          historyCompleteBySessionRef.current.set(selectedSession, false)
         } catch (error) {
           if (historyLoadRef.current !== request) return
           historyCompleteBySessionRef.current.set(selectedSession, false)
@@ -1833,8 +1964,74 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return () => {
       if (staleRetryTimer !== undefined) window.clearTimeout(staleRetryTimer)
       if (emptyPageRetryTimer !== undefined) window.clearTimeout(emptyPageRetryTimer)
+      if (settleConfirmRetryTimer !== undefined) window.clearTimeout(settleConfirmRetryTimer)
     }
-  }, [historyRefreshKey, host, selectedSession])
+  }, [historyRefreshKey, host, selectedSession, sessionQueue.resync])
+  const loadOlderHistory = useCallback(() => {
+    const sessionId = selectedSessionRef.current
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    if (mainTurnOpenRef.current || historyCompleteBySessionRef.current.get(sessionId) === true) return
+    if (historyOlderLoadInFlightRef.current.has(sessionId)) return
+    const before = historyCursorBySessionRef.current.get(sessionId)
+    if (!before) return
+
+    const request = historyLoadRef.current
+    const requestLiveRevision = transcriptLiveRevisionRef.current
+    historyOlderLoadInFlightRef.current.add(sessionId)
+    freezeProbeHistoryIpcStart({ session: sessionId, page: before })
+    void host.getSessionHistory(sessionId, before, HISTORY_PAGE_SIZE).then(page => {
+      if (historyLoadRef.current !== request || selectedSessionRef.current !== sessionId) return
+      if (page.length === 0) {
+        historyCursorBySessionRef.current.delete(sessionId)
+        historyCompleteBySessionRef.current.set(sessionId, true)
+        return
+      }
+      const currentEntries = historyEntriesBySessionRef.current.get(sessionId) ?? []
+      if (currentEntries[0]?.id !== before) return
+      const accumulated = [...page, ...currentEntries]
+      const previousFingerprint = historyFingerprintBySessionRef.current.get(sessionId)
+      const reconciliation = reconcileHistorySnapshot(
+        accumulated,
+        requestLiveRevision,
+        transcriptLiveRevisionRef.current,
+        previousFingerprint,
+        messagesRef.current,
+      )
+      if (reconciliation.status === 'stale-request' || reconciliation.status === 'retained-longer-live') return
+
+      historyEntriesBySessionRef.current.set(sessionId, accumulated)
+      if (page.length < HISTORY_PAGE_SIZE) {
+        historyCursorBySessionRef.current.delete(sessionId)
+        historyCompleteBySessionRef.current.set(sessionId, true)
+      } else {
+        const nextBefore = page[0]?.id
+        if (!nextBefore || nextBefore === before) throw new Error('主机返回了无效的会话历史游标')
+        historyCursorBySessionRef.current.set(sessionId, nextBefore)
+        historyCompleteBySessionRef.current.set(sessionId, false)
+      }
+      if (reconciliation.status === 'unchanged') return
+      historyFingerprintBySessionRef.current.set(sessionId, reconciliation.fingerprint)
+      const retained = retainReceiptOptimisticUser(
+        reconciliation.messages,
+        messagesRef.current,
+        persistLocalUserReceiptRef.current,
+        sessionId,
+      )
+      messagesBySessionRef.current.set(sessionId, retained)
+      messagesRef.current = retained
+      setMessages(retained)
+    }).catch(error => {
+      if (historyLoadRef.current !== request || selectedSessionRef.current !== sessionId) return
+      if (error instanceof Error && error.message.includes('history cursor no longer exists')) {
+        setHistoryRefreshKey(key => key + 1)
+        return
+      }
+      setProjectError(`读取更早会话记录失败：${error instanceof Error ? error.message : String(error)}`)
+    }).finally(() => {
+      freezeProbeHistoryIpcEnd({ session: sessionId })
+      historyOlderLoadInFlightRef.current.delete(sessionId)
+    })
+  }, [host])
   useEffect(() => {
     if (!selectedSession || isExternalSessionId(selectedSession) || !leaseConflictError) return
     let cancelled = false
@@ -1895,12 +2092,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const scheduleTerminalReconciliation = () => {
       if (terminalReconcilePending) return
       terminalReconcilePending = true
+      freezeProbe('history_refresh', { reason: 'terminal_immediate', session: selectedSession })
       setHistoryRefreshKey(key => key + 1)
       terminalReconcileTimer = window.setTimeout(() => {
         terminalReconcilePending = false
         if (active
           && selectedSessionRef.current === selectedSession
           && historyContextRef.current?.host === host) {
+          freezeProbe('history_refresh', { reason: 'terminal_trailing', session: selectedSession })
           setHistoryRefreshKey(key => key + 1)
         }
       }, 250)
@@ -1918,14 +2117,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (event.type === 'compaction') {
-        setCompacting(event.phase === 'start')
+        // Notice-only events (compaction check / idle-fold nudge / skip) never
+        // ran anything: no transcript line, no pill — and never “已压缩”.
+        if (event.executed === false) return
+        if (event.phase === 'start') {
+          // In-progress state lives in the pill only; the transcript gets one
+          // completion line per compaction instead of a start+end pair.
+          setCompacting(true)
+          setCompactingLabel(compactionPillLabel(event))
+          return
+        }
+        setCompacting(false)
+        setCompactingLabel(null)
         transcriptLiveRevisionRef.current += 1
         const next = [...messagesRef.current, { id: crypto.randomUUID(), role: 'tool' as const, content: compactionNotice(event) }]
         messagesRef.current = next
         setMessages(next)
         // Post-compaction pi reports null tokens until the next assistant usage;
         // pull one authoritative snapshot so the pill drops the stale number.
-        if (event.phase === 'end') setStatsRefreshKey(key => key + 1)
+        setStatsRefreshKey(key => key + 1)
         return
       }
       if (event.type === 'secret_redact') {
@@ -1942,6 +2152,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         const pendingEcho = pendingLocalUserRef.current
         pendingLocalUserRef.current = null
         const next = appendLiveUserMessage(messagesRef.current, event, pendingEcho ?? undefined)
+        const receipt = persistLocalUserReceiptRef.current
+        if (receipt && receipt.sessionId === event.sessionId && !next.some(message => message.id === receipt.id && message.queued)) {
+          persistLocalUserReceiptRef.current = null
+        }
         if (next !== messagesRef.current) transcriptLiveRevisionRef.current += 1
         messagesRef.current = next
         setMessages(next)
@@ -2043,12 +2257,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         || observedSessionStatusesRef.current[event.sessionId] === 'interrupted'
       )
       if (turnClosed) {
-        // Do not unconditionally drop late live events after settle — they would
-        // otherwise wait for the 250ms history reconcile and appear as "stuck then flood".
-        // Tradeoff: immediate apply may briefly diverge from history, but the
-        // fingerprint-based reconcile dedups and preserves source of truth;
-        // immediate refresh avoids batch涌出 while keeping content不丢不双显.
-        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'
+        // Do not drop late live events after settle — they would otherwise wait
+        // for the 250ms history reconcile and appear as "stuck then flood".
+        // Apply them to the live transcript only. Reloading JSONL on every
+        // thinking/text delta stacked overlapping full-file scans on large
+        // sessions and froze the main process.
+        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'hosted_search' || event.type === 'hosted_code_interpreter' || event.type === 'citations' || event.type === 'input_file_sources' || event.type === 'error'
         if (isLiveContent) {
           const lateNext = applyStreamEvent(messagesRef.current, event)
           if (lateNext !== messagesRef.current) {
@@ -2059,8 +2273,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           if (event.type === 'text' && event.delta.trim()) setWaitingVisible(false)
           else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
           else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
+          else if (event.type === 'hosted_search') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary(event.kind, JSON.stringify({ query: event.query, phase: event.phase }))) }
+          else if (event.type === 'hosted_code_interpreter' && event.phase !== 'completed' && event.phase !== 'failed') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary('code_interpreter', JSON.stringify({ code: event.code, phase: event.phase }))) }
           else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
-          if (historyContextRef.current?.host === host && historyContextRef.current.sessionId === event.sessionId) setHistoryRefreshKey(key => key + 1)
+          freezeProbe('late_live_applied', { session: event.sessionId, type: event.type })
           return
         }
         return
@@ -2082,6 +2298,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         setWaitingPhase('tool')
         if (event.name === 'subagent') setWaitingDetail('子任务执行中')
         else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? ''))
+      } else if (event.type === 'hosted_search') {
+        setWaitingVisible(true)
+        setWaitingPhase('tool')
+        setWaitingDetail(toolDisplaySummary(event.kind, JSON.stringify({ query: event.query, phase: event.phase })))
+      } else if (event.type === 'hosted_code_interpreter') {
+        if (event.phase === 'completed' || event.phase === 'failed') {
+          if (streamingAssistantToolsAllFinished(messagesRef.current)) {
+            setWaitingVisible(true)
+            setWaitingStartedAt(Date.now())
+            setWaitingPhase('thinking')
+            setWaitingDetail(undefined)
+          } else {
+            setWaitingPhase('tool')
+          }
+        } else {
+          setWaitingVisible(true)
+          setWaitingPhase('tool')
+          setWaitingDetail(toolDisplaySummary('code_interpreter', JSON.stringify({ code: event.code, phase: event.phase })))
+        }
       } else if (event.type === 'tool_result') {
         if (streamingAssistantToolsAllFinished(messagesRef.current)) {
           setWaitingVisible(true)
@@ -2210,6 +2445,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const session = await host.newSession(selectedProject)
     locallyCreatedSessionIdsRef.current.add(session.id)
     messagesBySessionRef.current.set(session.id, [])
+    historyEntriesBySessionRef.current.set(session.id, [])
+    historyCursorBySessionRef.current.delete(session.id)
     historyCompleteBySessionRef.current.set(session.id, true)
     beforeSelect?.(session.id)
     setSessions(items => [session, ...items])
@@ -2219,9 +2456,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return session.id
   }
 
-  const send = async (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => {
+  const send = async (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[], hasReadyInputFiles = false) => {
     const documentPaths = documents?.map(document => document.path).filter(Boolean) ?? []
-    const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : '')
+    const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : hasReadyInputFiles ? DEFAULT_COMPOSER_INPUT_FILES_PROMPT : '')
     if (!prompt && !attachments?.length) return false
     if (selectedSession && isExternalSessionId(selectedSession)) return false
     let targetSession: string | null = selectedSession
@@ -2273,33 +2510,44 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       mutateLocalTranscript(items => items.map(message => message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
     }
 
-    if (sessionQueue.busy) {
-      // Optimistic local echo even while busy — mirrors direct send's mutateLocalTranscript + pendingLocalUserRef.
-      // Host user_message will dedup via pendingLocalUserRef / queued content match; queued flag gives light "排队中" visual.
+    if (sessionQueue.busy || leftoverQueued) {
+      // Optimistic local echo even while busy. Host user_message dedups via pendingLocalUserRef.
+      // Composer insert cut-ins the parent turn; background subagents keep running.
+      // queued stays until a real user echo (cut-in ack is not delivery).
       const localUserId = crypto.randomUUID()
       pendingLocalUserRef.current = { id: localUserId, content: prompt }
+      persistLocalUserReceiptRef.current = { sessionId: targetSession, id: localUserId }
       mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now(), queued: true } as ChatMessage])
-      const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
-      if (payload?.length) {
-        const converted = chatImagesFromAttachments(payload)
-        mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
+      const dropOptimistic = () => {
+        if (pendingLocalUserRef.current?.id === localUserId) pendingLocalUserRef.current = null
+        if (persistLocalUserReceiptRef.current?.id === localUserId) persistLocalUserReceiptRef.current = null
+        mutateLocalTranscript(items => items.filter(message => message.id !== localUserId))
       }
-      if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
-      const result = await sessionQueue.enqueue(prompt, payload)
-      if (result.outcome === 'queued' || selectedSession !== targetSession) return true
-      // Race: host dispatched directly despite busy check. Clear queued visual and open turn (bubble already exists).
-      mutateLocalTranscript(items => items.map(m => m.id === localUserId && (m as ChatMessage).queued ? { ...m, queued: undefined } as ChatMessage : m))
-      activeUserTurnRef.current = true
-      mainTurnOpenRef.current = true
-      mainTurnEpochRef.current += 1
-      applyObservedStatus(targetSession, 'running')
-      setStreaming(true)
-      setWaitingStartedAt(Date.now())
-      setWaitingVisible(true)
-      setWaitingPhase('awaiting')
-      setWaitingDetail(undefined)
-      setSessions(current => current.map(session => session.id === targetSession ? { ...session, updatedAt: Date.now() } : session))
-      return true
+      try {
+        const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
+        if (payload?.length) {
+          const converted = chatImagesFromAttachments(payload)
+          mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
+        }
+        if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
+        const result = await sessionQueue.enqueue(prompt, payload)
+        if (selectedSession !== targetSession) return true
+        if (result.outcome === 'queued') {
+          try {
+            await sessionQueue.cutIn(result.message.id)
+          } catch {
+            dropOptimistic()
+            void host.removeQueuedMessage(targetSession, result.message.id).catch(() => undefined)
+            return false
+          }
+          return true
+        }
+        // Race: host dispatched directly despite busy check. Keep queued until the real echo.
+        return true
+      } catch {
+        dropOptimistic()
+        return false
+      }
     }
 
     beginDirectTurn()
@@ -2364,6 +2612,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     locallyCreatedSessionIdsRef.current.add(session.id)
     messagesBySessionRef.current.set(session.id, [])
+    historyEntriesBySessionRef.current.set(session.id, [])
+    historyCursorBySessionRef.current.delete(session.id)
     historyCompleteBySessionRef.current.set(session.id, true)
     setSessions(items => [session, ...items])
     setSelectedProject(projectId)
@@ -2396,6 +2646,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setSelectedSession(adopted.externalSessionId)
   }
   const completeAddProject = async (normalizedPath: string): Promise<boolean> => {
+    // Adding a folder must not silently `git init` it. Non-git projects stay
+    // plain folders; writable workers then run in the project directory.
     const snapshot = { projects, sessions, selectedProject, selectedSession }
     const name = normalizedPath.replace(/[\\/]+$/, '').split(/[\\/]/).filter(Boolean).pop() || normalizedPath
     const optimistic: Project = { id: `pending-project:${normalizedPath}`, name, path: normalizedPath }
@@ -2441,21 +2693,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!path) return false
     const normalizedPath = path.trim()
     if (!normalizedPath) return false
-    // Writable workers are isolated in git worktrees, but "init or not" is not a
-    // question a non-technical user can answer — PipiUI answers it for them:
-    // a plain folder silently gains version management before joining the
-    // sidebar. Every failure falls through to a normal add: the main session
-    // still works, only parallel writable workers would be unavailable.
-    if (host.probeDirectoryGit && host.gitInitDirectory) {
-      try {
-        const status = await host.probeDirectoryGit(normalizedPath)
-        if (!status.isRepo) {
-          try { await host.gitInitDirectory(normalizedPath) } catch { /* git missing/permission: add anyway */ }
-        }
-      } catch {
-        // A failed probe must not block adding — behave exactly like a host without one.
-      }
-    }
     return completeAddProject(normalizedPath)
   }
   const removeProject = async (projectId: string) => {
@@ -2545,7 +2782,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const toggleSidebarProject = (projectId: string) => {
     setSidebarExpandedIds(current => current.includes(projectId) ? current.filter(id => id !== projectId) : [...current, projectId])
   }
-  const selectSidebarSession = (sessionId: string) => {
+  const selectSidebarSession = (sessionId: string, options?: { expandProject?: boolean }) => {
     if (selectedSession && selectedSession !== sessionId) {
       messagesBySessionRef.current.set(selectedSession, messagesRef.current)
     }
@@ -2559,12 +2796,26 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const session = sessions.find(item => item.id === sessionId)
     const external = externalSessions.find(item => item.id === sessionId)
+    const allowExpandProject = options?.expandProject !== false
+    const expandProjectIfSessionHidden = (projectId: string, status: SessionStatus) => {
+      setSidebarExpandedIds(current => {
+        if (current.includes(projectId)) return current
+        // Peeked working rows stay visible under a collapsed folder; don't auto-expand.
+        if (status === 'running' || status === 'subagents-running') return current
+        return [...current, projectId]
+      })
+    }
     if (session) {
       setSelectedProject(session.projectId)
-      setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
+      if (allowExpandProject) {
+        const status = sidebarStatusForSession(session.id, selectedSession, streaming, observedSessionStatuses[session.id], sidebarAgents).status
+        expandProjectIfSessionHidden(session.projectId, status)
+      }
     } else if (external) {
       setSelectedProject(external.projectId)
-      setSidebarExpandedIds(current => current.includes(external.projectId) ? current : [...current, external.projectId])
+      if (allowExpandProject) {
+        setSidebarExpandedIds(current => current.includes(external.projectId) ? current : [...current, external.projectId])
+      }
     }
     if (isExternalSessionId(sessionId)) {
       setModelState(null)
@@ -2751,7 +3002,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     expandTools()
   }, [expandTools, rememberToolReturn])
   const goBackTool = useCallback(() => {
-    const target = toolReturnTab ?? 'Subagents'
+    const target = toolReturnTab ?? DEFAULT_PANEL_TAB
     setToolReturnTab(null)
     applyActiveTab(target)
   }, [applyActiveTab, toolReturnTab])
@@ -2853,42 +3104,36 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           </div>
         ) : (
         <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
-          {(() => {
-            const ids = (selectedSession && !mountedSessionIds.includes(selectedSession)
-              ? [selectedSession, ...mountedSessionIds]
-              : mountedSessionIds).slice(0, 6)
-            if (ids.length === 0) {
-              return <Transcript messages={messages} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
-            }
-            return ids.map(id => (
-              <div key={id} className="session-transcript-slot" data-session-transcript={id} hidden={id !== selectedSession}>
-                <Transcript
-                  active={id === selectedSession}
-                  messages={id === selectedSession ? messages : (messagesBySessionRef.current.get(id) ?? [])}
-                  documentBasePath={selectedProjectPath}
-                  onOpenDocument={openDocument}
-                  onOpenSubagents={openSubagents}
-                  onCopy={handleCopy}
-                  onResend={handleResend}
-                  resendDisabled={resendDisabled}
-                  copiedId={id === selectedSession ? copiedId : null}
-                  waiting={id === selectedSession ? firstResponseWaiting ?? subagentWaiting : undefined}
-                />
-              </div>
-            ))
-          })()}
+          {selectedSession ? (
+            <div key={selectedSession} className="session-transcript-slot" data-session-transcript={selectedSession}>
+              <Transcript
+                messages={messages}
+                onLoadOlder={loadOlderHistory}
+                documentBasePath={selectedProjectPath}
+                onOpenDocument={openDocument}
+                onOpenSubagents={openSubagents}
+                onCopy={handleCopy}
+                onResend={handleResend}
+                resendDisabled={resendDisabled}
+                copiedId={copiedId}
+                waiting={firstResponseWaiting ?? subagentWaiting}
+              />
+            </div>
+          ) : (
+            <Transcript messages={messages} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
+          )}
         </LiveSubagentBindingProvider>
         )}
       </div>
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
-        <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} onSend={send} />
-        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
-        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
+        <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} busy={sessionWorking} lastUser={lastUserForPlanApproval} onSend={send} />
+        <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy || leftoverQueued} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
+        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} compactingLabel={compactingLabel} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== 'Subagents'} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
@@ -2896,6 +3141,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       void host.browser.newTab(selectedSession, { url }).then(() => navigateTool('Browser')).catch(() => undefined)
     }} />}
     {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
+    <ExtensionUiHost host={host} sessionId={selectedSession || undefined} />
   </main>
 }
 
@@ -2923,7 +3169,7 @@ function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
  *  That is a lost `settled` only when this assistant was still marked
  *  streaming. A finished historical conclusion plus a new `started` is a
  *  first-token wait — closing it is the idle-composer side of the seesaw. */
-function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages: ChatMessage[]): boolean {
+function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages: ChatMessage[], settledReplacementConfirmed = false): boolean {
   const historyLast = historyMessages[historyMessages.length - 1]
   if (!historyLast || !assistantLooksSettled(historyLast)) return false
   const liveLast = liveMessages[liveMessages.length - 1]
@@ -2932,7 +3178,11 @@ function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages:
   // content+finished tools, which looks settled and must not close the wait.
   if (assistantEndedAwaitingModel(liveLast)) return false
   if ((liveLast.content ?? '').trim() !== (historyLast.content ?? '').trim()) return false
-  return Boolean(liveLast.streaming)
+  // An immediate history pull may already have replaced the streaming live
+  // row with this exact settled snapshot while the independent scalar status
+  // remains running. Only the bounded, revision-stable replacement candidate
+  // may close that split state; an unchanged old final cannot close a new wait.
+  return Boolean(liveLast.streaming || settledReplacementConfirmed)
 }
 
 function streamingAssistantToolsAllFinished(messages: ChatMessage[]): boolean {
@@ -2951,12 +3201,13 @@ function waitingPhaseForTurn(messages: ChatMessage[], pendingFollowUps?: string[
   return hasVisibleAssistantOutput(messages) ? 'continuing' : 'awaiting'
 }
 
-/** A terminal from another host epoch must not close the turn now on screen. */
+/** An older terminal must not close the turn now on screen. A newer terminal
+ *  is authoritative when the renderer missed its matching `started`. */
 function staleTurnTerminal(event: Extract<StreamEvent, { type: 'status' }>, openedEpoch?: number): boolean {
   return (event.status === 'settled' || event.status === 'stopped')
     && event.turnEpoch !== undefined
     && openedEpoch !== undefined
-    && event.turnEpoch !== openedEpoch
+    && event.turnEpoch < openedEpoch
 }
 
 /** A `started` after a finished assistant is real when it advances the backend
@@ -3032,7 +3283,14 @@ function toPromptAttachment(a: ComposerAttachment): Promise<PromptAttachment> {
   return fileToPromptAttachment(a.file).catch(() => { throw new Error('无法读取图片') })
 }
 
-function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
+/** Stable composer chrome (model chip, quick menu, thinking control, stats/quota/balance
+ * pills). Memoized with useCallback-backed handlers so per-keystroke draft updates,
+ * which re-render only the Composer, never re-render this row. */
+const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readOnly, streaming, compacting, compactingLabel, statsRefreshKey, host, sessionId, modelState, visibility, quickOpen, onOpenBrowserLogin, onSelectModel, onThinkingChange, onQuickOpenChange }: { hideSessionChrome?: boolean; readOnly: boolean; streaming: boolean; compacting: boolean; compactingLabel?: string | null; statsRefreshKey: number; host: PipiHostAPI; sessionId: string; modelState: ModelState | null; visibility: ModelVisibilityController; quickOpen: boolean; onOpenBrowserLogin?: () => void; onSelectModel: (model: Model) => void; onThinkingChange: (level: ThinkingLevel) => void; onQuickOpenChange: (value: boolean | ((previous: boolean) => boolean)) => void }) {
+  return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} compactingLabel={compactingLabel ?? undefined} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
+})
+
+function Composer({ streaming, working, stopping, stopError, compacting, compactingLabel, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, catalogNotice, onDismissCatalogNotice, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; compactingLabel?: string | null; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; catalogNotice?: string | null; onDismissCatalogNotice?: () => void; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[], hasReadyInputFiles?: boolean) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
   const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(initialAttachments)
   const [documents, setDocuments] = useState<ComposerDocument[]>(initialDocuments)
@@ -3046,6 +3304,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [attachError, setAttachError] = useState<string | null>(null)
   const [sendError, setSendError] = useState<string | null>(null)
+  const [inputFileGate, setInputFileGate] = useState<InputFileGate>(EMPTY_INPUT_FILE_GATE)
+  const [inputFilesEpoch, setInputFilesEpoch] = useState(0)
   const [quickOpen, setQuickOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashHidden, setSlashHidden] = useState(false)
@@ -3060,6 +3320,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     setAttachError(null)
     setSendError(null)
     setQuickOpen(false)
+    setInputFileGate(EMPTY_INPUT_FILE_GATE)
   }, [sessionId])
   // Esc closes the lightbox and the quick menu.
   useEffect(() => {
@@ -3069,19 +3330,30 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     return () => window.removeEventListener('keydown', onKey)
   }, [lightboxIndex, quickOpen])
 
-  const slashQuery = slashPaletteQuery(draft)
-  const slashMatches = useMemo(() => (slashQuery === null ? [] : filterSlashCommands(slashQuery)), [slashQuery])
+  const registeredSlashCommands = useSlashCommands()
+  // Memoized on the draft so re-renders that don't change the text (palette
+  // navigation, streaming flags, error states) skip re-parsing the draft.
+  const slashQuery = useMemo(() => slashPaletteQuery(draft), [draft])
+  const slashMatches = useMemo(() => (slashQuery === null ? [] : filterSlashCommands(slashQuery)), [slashQuery, registeredSlashCommands])
   const slashVisible = slashQuery !== null && !slashHidden
 
   useEffect(() => { setSlashIndex(0) }, [slashQuery])
   useEffect(() => { setSlashIndex(i => Math.min(i, Math.max(0, slashMatches.length - 1))) }, [slashMatches.length])
   // Auto-grow: typing, paste, deletion and programmatic clears all flow through `draft`.
+  // The cheap line estimate is applied during render (textarea style below) so the
+  // height tracks the draft without layout; the exact scrollHeight measurement is
+  // coalesced into one animation frame per input burst, and the effect cleanup cancels
+  // the pending frame whenever a newer draft arrives. The frame after the final change
+  // (last keystroke, IME composition end, post-send reset) settles the height.
   useEffect(() => {
-    const el = textareaRef.current
-    if (!el) return
-    el.style.height = 'auto'
-    const measured = el.scrollHeight > 0 ? el.scrollHeight : estimatedTextareaHeight(draft)
-    el.style.height = `${Math.min(measured, MAX_COMPOSER_HEIGHT)}px`
+    const frame = requestAnimationFrame(() => {
+      const el = textareaRef.current
+      if (!el) return
+      el.style.height = 'auto'
+      const measured = el.scrollHeight > 0 ? el.scrollHeight : estimatedTextareaHeight(draft)
+      el.style.height = `${Math.min(measured, MAX_COMPOSER_HEIGHT)}px`
+    })
+    return () => cancelAnimationFrame(frame)
   }, [draft])
 
   const persistDraft = (value: string) => { setDraft(value); onDraftChange?.(value) }
@@ -3189,7 +3461,11 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   const dispatchSend = async (outgoing: string) => {
     if (readOnly) return
     const hasText = outgoing.trim() !== ''
-    if (!hasText && attachments.length === 0 && documents.length === 0) return
+    if (!hasText && attachments.length === 0 && documents.length === 0 && !inputFileGate.hasReady) return
+    if (inputFileGate.blockingReason) {
+      setSendError(inputFileGate.blockingReason)
+      return
+    }
     if (attachments.length > 0 && modelState?.model && modelState.model.supportsImages === false) {
       // 识图路由开启且已选识图模型时放行：图片交给识图模型识别后路由给主线文字模型
       // （后端负责 describe+route，UI 只负责不拦截）。否则保持原拦截提示。
@@ -3211,7 +3487,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     onDocumentsChange?.([])
     setAttachError(null)
     try {
-      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined, outgoingDocuments.length ? outgoingDocuments : undefined)
+      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined, outgoingDocuments.length ? outgoingDocuments : undefined, inputFileGate.hasReady)
+      if (ok) setInputFilesEpoch(value => value + 1)
       if (!ok) {
         persistDraft(outgoing)
         setAttachments(outgoingAttachments)
@@ -3251,7 +3528,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       void submit()
     }
   }
-  const setThinking = async (level: ThinkingLevel) => {
+  const setThinking = useCallback(async (level: ThinkingLevel) => {
     const previous = modelState
     if (previous) onModel({ ...previous, thinkingLevel: level })
     try {
@@ -3263,8 +3540,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       if (previous) onModel(previous)
       setSendError(`切换思考级别失败：${err instanceof Error ? err.message : String(err)}`)
     }
-  }
-  const handleQuickSelect = async (model: Model) => {
+  }, [modelState, host, sessionId, onEnsureSession, onModel])
+  const handleQuickSelect = useCallback(async (model: Model) => {
     setQuickOpen(false)
     const previous = modelState
     const availableThinkingLevels = thinkingLevelsForModel(model)
@@ -3282,9 +3559,13 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       if (previous) onModel(previous)
       setSendError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`)
     }
-  }
-  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0)
+  }, [modelState, host, sessionId, onEnsureSession, onModel])
+  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0 || inputFileGate.hasReady || inputFileGate.hasUnsent)
   const showQueueSubmit = queueBusy && canSend
+  // Chromium's AXObjectCache invalidates an existing text field on `class`
+  // changes but not on `placeholder` changes. Keep the same textarea (and thus
+  // draft/focus/IME ownership) while making busy → idle dirty the AX node.
+  const inputStateClass = queueBusy ? 'composer-input queue-busy' : working ? 'composer-input working' : 'composer-input idle'
   return <footer className="composer" onDragEnter={onComposerFileDrag} onDragOver={onComposerFileDrag} onDrop={onComposerFileDrop}>
     {readOnly && <div className="composer-read-only" data-testid="composer-read-only" role="status"><span>{readOnlyMessage ?? `当前由 ${leaseOwner ?? '另一客户端'} 持有，会话只读。`}</span>{onTakeover && <button type="button" data-testid="composer-lease-takeover" onClick={onTakeover}>强制接管</button>}</div>}
     {slashVisible && <SlashMenu commands={slashMatches} selectedIndex={Math.min(slashIndex, Math.max(0, slashMatches.length - 1))} onHighlight={setSlashIndex} onSelect={executeSlash} onDismiss={dismissSlash} />}
@@ -3304,40 +3585,48 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
         </div>
       ))}
     </div>}
+    <InputFileAttachments host={host} sessionId={sessionId} model={modelState?.model} readOnly={readOnly} working={working} refreshKey={inputFilesEpoch} onEnsureSession={onEnsureSession} onGateChange={setInputFileGate} onNotice={setAttachError} />
+    {catalogNotice && onDismissCatalogNotice && (
+      <div data-testid="catalog-fallback-notice">
+        <DismissibleError className="composer-catalog-notice" message={catalogNotice} onDismiss={onDismissCatalogNotice} />
+      </div>
+    )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将加入队列…' : '给 PipiUI 发送消息…'} rows={1} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '加入消息队列' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
-    <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) setQuickOpen(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void handleQuickSelect(model)} onClose={() => setQuickOpen(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void setThinking(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} title={showQueueSubmit ? '将终止当前回复并立即插入；后台子任务继续' : undefined} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} compactingLabel={compactingLabel} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
 function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; planTabVisible: boolean; planProgress: { completed: number; total: number } | null; subagentsRunningCount: number }) {
+  const panels = usePanels()
+  const railCtx: PanelRailContext = { host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }
   return <nav className={`tool-quick-rail tool-quick-rail-${variant}`} aria-label="工具面板" data-testid="tool-quick-rail">
-    {tabs.map(tab => {
-      if (tab === 'Plan' && !planTabVisible) return null
-      const browserUnavailable = tab === 'Browser' && (browserAvailable === false || !host.browser)
-      const terminalUnavailable = tab === 'Terminal' && (terminalAvailable === false || !host.terminal)
-      const unavailable = browserUnavailable || terminalUnavailable
-      const unavailableTitle = browserUnavailable ? '当前连接不支持内置浏览器' : '当前连接不支持终端'
-      const active = activeTab === tab && !toolsCollapsed
-      return <button key={tab} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={tab} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : tab} onClick={() => onSelect(tab)}>
-        <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * toolRailIcons[tab].ratio, WebkitMaskImage: `url(${toolRailIcons[tab].src})`, maskImage: `url(${toolRailIcons[tab].src})` }} />
-        {tab === 'Subagents' && subagentsRunningCount > 0 && <span className="tool-rail-running" aria-label={`${subagentsRunningCount} 个运行中的 subagent`}>{subagentsRunningCount}</span>}
-        {tab === 'Plan' && planProgress && <span className="tool-rail-running tool-rail-progress" data-testid="tool-rail-plan-progress" aria-label={`计划进度 ${planProgress.completed}/${planProgress.total}`}>{planProgress.completed}/{planProgress.total}</span>}
+    {panels.map(panel => {
+      if (panel.visibleInRail && !panel.visibleInRail(railCtx)) return null
+      const unavailableTitle = panel.railUnavailable?.(railCtx)
+      const unavailable = Boolean(unavailableTitle)
+      const active = activeTab === panel.id && !toolsCollapsed
+      return <button key={panel.id} className={`tool-rail-button${active ? ' active' : ''}`} aria-label={panel.id} aria-current={active ? 'page' : undefined} aria-disabled={unavailable || undefined} disabled={unavailable} title={unavailable ? unavailableTitle : panel.id} onClick={() => onSelect(panel.id)}>
+        <span className="tool-rail-icon" aria-hidden="true" style={{ width: 13 * panel.icon.ratio, WebkitMaskImage: `url(${panel.icon.src})`, maskImage: `url(${panel.icon.src})` }} />
+        {panel.railBadge?.(railCtx)}
       </button>
     })}
   </nav>
 }
 function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void; workspaceFullscreen?: boolean; onToggleWorkspaceFullscreen?: () => void }) {
+  const panels = usePanels()
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
-  const [terminalMounted, setTerminalMounted] = useState(activeTab === 'Terminal')
-  const [documentMounted, setDocumentMounted] = useState(activeTab === 'Document')
-  const [browserMounted, setBrowserMounted] = useState(activeTab === 'Browser')
+  const [mountedIds, setMountedIds] = useState<Set<string>>(() => {
+    const initial = new Set<string>()
+    for (const panel of panels) {
+      if (!panel.lazy || panel.id === activeTab) initial.add(panel.id)
+    }
+    return initial
+  })
   const [dropActive, setDropActive] = useState(false)
   const dropDepthRef = useRef(0)
   useEffect(() => {
-    if (activeTab === 'Terminal') setTerminalMounted(true)
-    if (activeTab === 'Document') setDocumentMounted(true)
-    if (activeTab === 'Browser') setBrowserMounted(true)
+    setMountedIds(current => current.has(activeTab) ? current : new Set(current).add(activeTab))
   }, [activeTab])
   const hasFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes('Files')
   const onDragEnter = (event: DragEvent) => {
@@ -3368,11 +3657,16 @@ function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, o
     <div className="tool-panel-drop-overlay" aria-hidden="true" />
     {!collapsed && <header className="tool-panel-header">{rail}{canGoBack && <button type="button" className="tool-panel-back" data-testid="tool-panel-back" aria-label="返回上一栏" onClick={onBack}>‹ 返回</button>}<div className="tool-panel-header-slot" ref={el => setHeaderSlot(el)} /><button className="pane-toggle" data-testid="toggle-tools" title="收起右栏" aria-label="收起右栏" aria-expanded="true" onClick={onToggleCollapsed}><RightPaneToggleIcon expanded /></button></header>}
     <div className="tool-content">
-      <div className="tool-page subagent-content" hidden={activeTab !== 'Subagents'}><SubagentPanel host={host} sessionId={sessionId} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} visible={activeTab === 'Subagents' && !collapsed} headerSlot={headerSlot} onRunningCountChange={onSubagentsRunningCountChange} onAgentStarted={onSubagentStarted} onManualStatusCheck={onManualSubagentStatusCheck} /></div>
-      {planAvailable === false ? (activeTab === 'Plan' ? <div className="tool-page"><div className="empty-panel" data-testid="plan-unavailable"><b>Plan 不可用</b><p>当前连接未提供计划能力。</p></div></div> : null) : <div className="tool-page plan-content" hidden={activeTab !== 'Plan'}><PlanPanel host={host} sessionId={sessionId} visible={activeTab === 'Plan' && !collapsed} headerSlot={headerSlot} onProgressChange={onPlanProgressChange} onHasPlansChange={onHasPlansChange} /></div>}
-      {activeTab === 'Terminal' && terminalAvailable === false ? <div className="tool-page"><div className="empty-panel" data-testid="terminal-unavailable"><b>Terminal 不可用</b><p>当前连接未提供终端能力。</p></div></div> : terminalMounted || activeTab === 'Terminal' ? <div className="tool-page terminal-content" hidden={activeTab !== 'Terminal'}><TerminalPanel host={host} theme={theme} sessionId={sessionId} announcedTerminal={announcedTerminal} revealedTerminalId={revealedTerminalId} projectId={projectId} projectPath={projectPath} visible={activeTab === 'Terminal'} headerSlot={headerSlot} /></div> : null}
-      {documentMounted || activeTab === 'Document' ? <div className="tool-page document-content" hidden={activeTab !== 'Document'}><DocumentPanel host={host} documentPath={openedDocumentPath} /></div> : null}
-      {browserMounted || activeTab === 'Browser' ? <div className="tool-page browser-content" hidden={activeTab !== 'Browser'}>{browserAvailable === true && host.browser ? <BrowserPanel host={host} sessionId={sessionId} occluded={browserOccluded || activeTab !== 'Browser'} headerSlot={headerSlot} workspaceFullscreen={workspaceFullscreen} onToggleWorkspaceFullscreen={onToggleWorkspaceFullscreen} /> : <div className="empty-panel browser-placeholder" data-testid="browser-unavailable"><b>Browser 不可用</b><p>{browserAvailable === undefined ? '正在检查当前连接的浏览器能力…' : '当前连接未提供桌面浏览器能力。'}</p></div>}</div> : null}
+      {panels.map(panel => {
+        if (panel.lazy && !mountedIds.has(panel.id) && panel.id !== activeTab) return null
+        return <Fragment key={panel.id}>{panel.render({
+          host, theme, sessionId, collapsed, active: activeTab === panel.id, headerSlot,
+          announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted,
+          onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable,
+          onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath,
+          openedDocumentPath, onOpenDocument, workspaceFullscreen, onToggleWorkspaceFullscreen,
+        })}</Fragment>
+      })}
     </div>
   </aside>
 }
