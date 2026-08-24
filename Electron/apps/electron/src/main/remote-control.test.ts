@@ -232,6 +232,26 @@ describe('createRemoteControlService', () => {
     const event = await nextBusinessFrame(browserQ, browser)
     expect(event).toMatchObject({ type: 'event', channel: 'stream' })
 
+    browser.send(JSON.stringify({
+      protocolVersion: 2,
+      id: 'project-events',
+      type: 'request',
+      method: 'setEventProjectionSession',
+      params: ['selected']
+    }))
+    await expect(nextBusinessFrame(browserQ, browser)).resolves.toMatchObject({
+      type: 'response',
+      id: 'project-events',
+      ok: true
+    })
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'background', contentIndex: 0, delta: 'drop before relay' } })
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'selected', contentIndex: 0, delta: 'keep selected' } })
+    await expect(nextBusinessFrame(browserQ, browser)).resolves.toMatchObject({
+      type: 'event',
+      channel: 'stream',
+      event: { type: 'text', sessionId: 'selected', delta: 'keep selected' }
+    })
+
     browser.send(JSON.stringify({ protocolVersion: 2, id: 'cap', type: 'request', method: 'capabilities', params: [] }))
     const caps = await nextBusinessFrame(browserQ, browser)
     expect(caps).toMatchObject({

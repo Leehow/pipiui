@@ -643,6 +643,50 @@ describe('Host API v2 transport contract', () => {
     off()
   })
 
+  it('projects WebSocket event payloads to the selected session before serialization', async () => {
+    const [client, server] = pairedSockets()
+    const [otherClient, otherServer] = pairedSockets()
+    const backend = transportBackend()
+    bindHostBackend(backend, server)
+    bindHostBackend(backend, otherServer)
+    const host = createWsHost(client)
+    const otherHost = createWsHost(otherClient)
+
+    expect(host.setEventProjectionSession).toBeTypeOf('function')
+    await host.setEventProjectionSession?.('selected')
+    await otherHost.setEventProjectionSession?.('other')
+    const sentBeforeEvents = server.sent.length
+    const otherSentBeforeEvents = otherServer.sent.length
+
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'selected', contentIndex: 0, delta: 'selected text' } })
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'other', contentIndex: 0, delta: 'other text' } })
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'background', contentIndex: 0, delta: 'background text' } })
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'status', sessionId: 'background', status: 'started' } })
+    backend.emit({ protocolVersion: 2, channel: 'agents', event: { type: 'agent_log', sessionId: 'background', agentId: 'background-worker', runId: 'run', itemType: 'text', text: 'background log' } })
+    backend.emit({ protocolVersion: 2, channel: 'agents', event: { type: 'agent_log', sessionId: 'selected', agentId: 'selected-worker', runId: 'run', itemType: 'text', text: 'selected log' } })
+    backend.emit({ protocolVersion: 2, channel: 'agents', event: { type: 'agent', agent: { agentId: 'background-worker', runId: 'run', sessionId: 'background', name: 'worker', task: '', state: 'running' } } })
+
+    const projected = server.sent.slice(sentBeforeEvents).map(frame => JSON.parse(frame) as HostWireFrame)
+    expect(projected).toEqual([
+      { protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'text', sessionId: 'selected', contentIndex: 0, delta: 'selected text' } },
+      { protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'status', sessionId: 'background', status: 'started' } },
+      { protocolVersion: 2, type: 'event', channel: 'agents', event: { type: 'agent_log', sessionId: 'selected', agentId: 'selected-worker', runId: 'run', itemType: 'text', text: 'selected log' } },
+      { protocolVersion: 2, type: 'event', channel: 'agents', event: { type: 'agent', agent: { agentId: 'background-worker', runId: 'run', sessionId: 'background', name: 'worker', task: '', state: 'running' } } },
+    ])
+    expect(otherServer.sent.slice(otherSentBeforeEvents).map(frame => JSON.parse(frame) as HostWireFrame)).toEqual([
+      { protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'text', sessionId: 'other', contentIndex: 0, delta: 'other text' } },
+      { protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'status', sessionId: 'background', status: 'started' } },
+      { protocolVersion: 2, type: 'event', channel: 'agents', event: { type: 'agent', agent: { agentId: 'background-worker', runId: 'run', sessionId: 'background', name: 'worker', task: '', state: 'running' } } },
+    ])
+
+    await host.setEventProjectionSession?.(undefined)
+    const sentBeforeReset = server.sent.length
+    backend.emit({ protocolVersion: 2, channel: 'stream', event: { type: 'text', sessionId: 'background', contentIndex: 0, delta: 'restored text' } })
+    expect(server.sent.slice(sentBeforeReset).map(frame => JSON.parse(frame))).toEqual([
+      { protocolVersion: 2, type: 'event', channel: 'stream', event: { type: 'text', sessionId: 'background', contentIndex: 0, delta: 'restored text' } },
+    ])
+  })
+
   it('settles pending client requests with transport_disconnected on socket close and does not replay', async () => {
     const [client, server] = pairedSockets()
     let calls = 0

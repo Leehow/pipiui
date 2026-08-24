@@ -855,9 +855,36 @@ export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: `ext.${string}`; event: ExtEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "extui"; event: ExtUiEvent };
 
+const BACKGROUND_PROJECTED_STREAM_EVENTS = new Set([
+  "secret_redact",
+  "session_title",
+  "status",
+  "user_message",
+]);
+
+export function normalizeEventProjectionSession(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/**
+ * Renderers keep full transcript/log state only for their selected session. Keep
+ * background lifecycle events for sidebar correctness, but drop large transcript
+ * and agent-log payloads before a transport clones or serializes them.
+ */
+export function shouldForwardProjectedHostEvent(frame: HostEvent, selectedSession?: string): boolean {
+  if (!selectedSession) return true;
+  if (frame.channel === "stream") {
+    return frame.event.sessionId === selectedSession || BACKGROUND_PROJECTED_STREAM_EVENTS.has(frame.event.type);
+  }
+  if (frame.channel === "agents" && frame.event.type === "agent_log") {
+    return !frame.event.sessionId || frame.event.sessionId === selectedSession;
+  }
+  return true;
+}
+
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
-  /** Electron shell hint: project full stream/log payloads only for this visible session. */
+  /** Renderer hint: project full stream/log payloads only for this visible session. */
   setEventProjectionSession?(sessionId?: string): Promise<void>;
   listProjects(): Promise<Project[]>; listSessions(projectId: string): Promise<Session[]>;
   /**
@@ -1459,8 +1486,11 @@ export function createHostBackendSession(
   options: BindHostBackendOptions = {}
 ): HostBackendSession {
   let closed = false;
+  let selectedEventProjectionSession: string | undefined;
   const unsubscribe = backend.subscribe(event => {
-    if (!closed) send({ type: "event", ...event });
+    if (!closed && shouldForwardProjectedHostEvent(event, selectedEventProjectionSession)) {
+      send({ type: "event", ...event });
+    }
   });
   return {
     receive(raw) {
@@ -1471,6 +1501,11 @@ export function createHostBackendSession(
         return;
       }
       const request = parsed.frame;
+      if (request.method === "setEventProjectionSession") {
+        selectedEventProjectionSession = normalizeEventProjectionSession(request.params[0]);
+        send({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: "response", ok: true, result: undefined });
+        return;
+      }
       void Promise.resolve(backend.handle(request.method, request.params)).then(
         result => {
           if (!closed) send({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id, type: "response", ok: true, result });
@@ -1554,32 +1589,35 @@ export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions
   socket.addEventListener("message", onMessage);
   socket.addEventListener("close", failPending);
   socket.addEventListener("error", failPending);
-  return apiFrom(
-    (method, params) => new Promise((resolve, reject) => {
-      if (disconnected || socket.readyState === 2 || socket.readyState === 3) {
-        reject(transportDisconnectedError());
-        return;
-      }
-      const id = requestId();
-      const timer = setTimeout(() => {
-        const item = pending.get(id);
-        if (!item) return;
-        pending.delete(id);
-        item.reject(transportTimeoutError());
-      }, requestTimeoutMs);
-      pending.set(id, { resolve, reject, timer });
-      try {
-        socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
-      } catch {
-        pending.delete(id);
-        clearTimeout(timer);
-        reject(transportDisconnectedError());
-      }
-    }),
+  const call = (method: HostMethod, params: unknown[]) => new Promise<unknown>((resolve, reject) => {
+    if (disconnected || socket.readyState === 2 || socket.readyState === 3) {
+      reject(transportDisconnectedError());
+      return;
+    }
+    const id = requestId();
+    const timer = setTimeout(() => {
+      const item = pending.get(id);
+      if (!item) return;
+      pending.delete(id);
+      item.reject(transportTimeoutError());
+    }, requestTimeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    try {
+      socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
+    } catch {
+      pending.delete(id);
+      clearTimeout(timer);
+      reject(transportDisconnectedError());
+    }
+  });
+  const host = apiFrom(
+    call,
     (channel, predicate, listener) => {
       const relay = (event: HostEvent) => { if (event.channel === channel && predicate(event)) listener(event); };
       events.add(relay);
       return () => events.delete(relay);
     }
   );
+  host.setEventProjectionSession = sessionId => call("setEventProjectionSession", [sessionId]).then(() => undefined);
+  return host;
 }
