@@ -11,8 +11,28 @@
  */
 export declare const AUTH_PROVIDER_ID = "grok-build";
 export declare const GROK_BUILD_PROVIDER_ID = "grok-build";
-export declare const GROK_BUILD_CHAT_API: "openai-completions";
+export declare const GROK_BUILD_CHAT_API: "openai-responses";
 export declare const GROK_BUILD_BASE_URL = "https://api.x.ai/v1";
+export type GrokBuildNativeSearch = {
+    tools: Array<"web_search" | "x_search">;
+    domains?: {
+        allow?: string[];
+        deny?: string[];
+    };
+};
+export type GrokBuildHostedTools = {
+    tools: Array<"web_search" | "x_search" | "code_interpreter">;
+    domains?: {
+        allow?: string[];
+        deny?: string[];
+    };
+};
+export type GrokBuildModelCapabilities = {
+    hostedTools: GrokBuildHostedTools;
+    structuredOutputs: true;
+    inputFiles: true;
+    nativeSearch: GrokBuildNativeSearch;
+};
 export type GrokBuildConversationModel = {
     id: string;
     name: string;
@@ -31,11 +51,16 @@ export type GrokBuildConversationModel = {
     compat?: {
         supportsReasoningEffort?: boolean;
     };
+    capabilities?: GrokBuildModelCapabilities;
 };
+/** Hosted Agent Tools on the Responses API. Domain policy is optional overlay. */
+export declare const GROK_BUILD_NATIVE_SEARCH: GrokBuildNativeSearch;
+export declare const GROK_BUILD_HOSTED_TOOLS: GrokBuildHostedTools;
+export declare const GROK_BUILD_CAPABILITIES: GrokBuildModelCapabilities;
 /**
- * Concrete, tested Grok Build chat models. Official xAI Chat Completions ids
+ * Concrete, tested Grok Build chat models. Official xAI Responses ids
  * reachable with the grok-build OAuth access token. Keep this list small and
- * explicit — do not scrape a live catalog.
+ * explicit — do not scrape a live catalog. Reasoning flags stay as declared.
  */
 export declare const GROK_BUILD_CONVERSATION_MODELS: readonly GrokBuildConversationModel[];
 export declare const GROK_BUILD_CONVERSATION_MODEL_IDS: readonly string[];
@@ -46,4 +71,5 @@ export declare function grokBuildManifestModels(): Array<{
     api: typeof GROK_BUILD_CHAT_API;
     input: string[];
     reasoning: boolean;
+    capabilities: GrokBuildModelCapabilities;
 }>;

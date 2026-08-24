@@ -18,6 +18,14 @@ export { NoAgentHomeError } from "./oauth/home.js";
 export { ImagesError } from "./images/errors.js";
 export { OAuthError } from "./oauth/device.js";
 export { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID, GROK_BUILD_CONVERSATION_MODELS, createAuthProvider, createGrokBuildProvider, } from "./provider.js";
+export { createInputFilesService } from "./files/service.js";
+export type { InputFilesService, InputFilesServiceOptions } from "./files/service.js";
+export { StructuredOutputController, createStructuredOutputController, } from "./structured-output-controller.js";
+export { normalizeStructuredOutputRequest, normalizeStructuredOutputResult, structuredOutputsEnabled, } from "./structured-output.js";
+export type { StructuredOutputRequest, StructuredOutputResult, } from "./structured-output.js";
+export { FilesError } from "./files/errors.js";
+export { modelHasInputFiles, publicInputFile, toMaterializedInputFile, } from "./files/types.js";
+export type { InputFileStatus, MaterializedInputFile, SafeFileSource, SafeInputFile, } from "./files/types.js";
 export type HostStatus = {
     loggedIn: boolean;
     expired: boolean;

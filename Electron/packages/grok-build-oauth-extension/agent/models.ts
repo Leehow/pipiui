@@ -13,8 +13,25 @@
 export const AUTH_PROVIDER_ID = "grok-build";
 export const GROK_BUILD_PROVIDER_ID = AUTH_PROVIDER_ID;
 
-export const GROK_BUILD_CHAT_API = "openai-completions" as const;
+export const GROK_BUILD_CHAT_API = "openai-responses" as const;
 export const GROK_BUILD_BASE_URL = "https://api.x.ai/v1";
+
+export type GrokBuildNativeSearch = {
+  tools: Array<"web_search" | "x_search">;
+  domains?: { allow?: string[]; deny?: string[] };
+};
+
+export type GrokBuildHostedTools = {
+  tools: Array<"web_search" | "x_search" | "code_interpreter">;
+  domains?: { allow?: string[]; deny?: string[] };
+};
+
+export type GrokBuildModelCapabilities = {
+  hostedTools: GrokBuildHostedTools;
+  structuredOutputs: true;
+  inputFiles: true;
+  nativeSearch: GrokBuildNativeSearch;
+};
 
 export type GrokBuildConversationModel = {
   id: string;
@@ -27,14 +44,31 @@ export type GrokBuildConversationModel = {
   maxTokens: number;
   thinkingLevelMap?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string | null>>;
   compat?: { supportsReasoningEffort?: boolean };
+  capabilities?: GrokBuildModelCapabilities;
 };
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
+/** Hosted Agent Tools on the Responses API. Domain policy is optional overlay. */
+export const GROK_BUILD_NATIVE_SEARCH: GrokBuildNativeSearch = {
+  tools: ["web_search", "x_search"],
+};
+
+export const GROK_BUILD_HOSTED_TOOLS: GrokBuildHostedTools = {
+  tools: ["web_search", "x_search", "code_interpreter"],
+};
+
+export const GROK_BUILD_CAPABILITIES: GrokBuildModelCapabilities = {
+  hostedTools: { tools: [...GROK_BUILD_HOSTED_TOOLS.tools] },
+  structuredOutputs: true,
+  inputFiles: true,
+  nativeSearch: { tools: [...GROK_BUILD_NATIVE_SEARCH.tools] },
+};
+
 /**
- * Concrete, tested Grok Build chat models. Official xAI Chat Completions ids
+ * Concrete, tested Grok Build chat models. Official xAI Responses ids
  * reachable with the grok-build OAuth access token. Keep this list small and
- * explicit — do not scrape a live catalog.
+ * explicit — do not scrape a live catalog. Reasoning flags stay as declared.
  */
 export const GROK_BUILD_CONVERSATION_MODELS: readonly GrokBuildConversationModel[] = [
   {
@@ -55,6 +89,7 @@ export const GROK_BUILD_CONVERSATION_MODELS: readonly GrokBuildConversationModel
       xhigh: "xhigh",
     },
     compat: { supportsReasoningEffort: true },
+    capabilities: { ...GROK_BUILD_CAPABILITIES },
   },
   {
     id: "grok-4-fast",
@@ -65,6 +100,7 @@ export const GROK_BUILD_CONVERSATION_MODELS: readonly GrokBuildConversationModel
     cost: { ...ZERO_COST },
     contextWindow: 256000,
     maxTokens: 16384,
+    capabilities: { ...GROK_BUILD_CAPABILITIES },
   },
   {
     id: "grok-code-fast-1",
@@ -75,6 +111,7 @@ export const GROK_BUILD_CONVERSATION_MODELS: readonly GrokBuildConversationModel
     cost: { ...ZERO_COST },
     contextWindow: 256000,
     maxTokens: 16384,
+    capabilities: { ...GROK_BUILD_CAPABILITIES },
   },
 ];
 
@@ -89,6 +126,7 @@ export function grokBuildManifestModels(): Array<{
   api: typeof GROK_BUILD_CHAT_API;
   input: string[];
   reasoning: boolean;
+  capabilities: GrokBuildModelCapabilities;
 }> {
   return GROK_BUILD_CONVERSATION_MODELS.map((model) => ({
     id: model.id,
@@ -96,5 +134,15 @@ export function grokBuildManifestModels(): Array<{
     api: model.api,
     input: [...model.input],
     reasoning: model.reasoning,
+    capabilities: {
+      hostedTools: {
+        tools: [...(model.capabilities?.hostedTools.tools ?? GROK_BUILD_HOSTED_TOOLS.tools)],
+      },
+      structuredOutputs: true,
+      inputFiles: true,
+      nativeSearch: {
+        tools: [...(model.capabilities?.nativeSearch.tools ?? GROK_BUILD_NATIVE_SEARCH.tools)],
+      },
+    },
   }));
 }

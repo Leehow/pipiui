@@ -36,6 +36,7 @@ import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
 import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
+import { DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
@@ -1281,6 +1282,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   // A leftover streaming assistant after settle (late text/tool) must not keep
   // the stop button once the authoritative turn is already closed.
   const sessionWorking = streaming || selectedObservedRunning || (messageStreaming && !selectedObservedClosed) || queueLocksComposer || compacting || selectedStopping
+  const lastUserForPlanApproval = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index]
+      if (message.role !== 'user') continue
+      return { content: message.content, timestamp: message.timestamp }
+    }
+    return undefined
+  }, [messages])
   const closeOpenTurn = useCallback((sessionId: string, status: 'completed' | 'interrupted', options?: { keepStopGuard?: boolean }) => {
     applyObservedStatus(sessionId, status)
     if (!options?.keepStopGuard && stoppingSessionRef.current === sessionId) stoppingSessionRef.current = null
@@ -2178,7 +2187,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         // Apply them to the live transcript only. Reloading JSONL on every
         // thinking/text delta stacked overlapping full-file scans on large
         // sessions and froze the main process.
-        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'error'
+        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'hosted_search' || event.type === 'hosted_code_interpreter' || event.type === 'citations' || event.type === 'input_file_sources' || event.type === 'error'
         if (isLiveContent) {
           const lateNext = applyStreamEvent(messagesRef.current, event)
           if (lateNext !== messagesRef.current) {
@@ -2189,6 +2198,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           if (event.type === 'text' && event.delta.trim()) setWaitingVisible(false)
           else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
           else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
+          else if (event.type === 'hosted_search') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary(event.kind, JSON.stringify({ query: event.query, phase: event.phase }))) }
+          else if (event.type === 'hosted_code_interpreter' && event.phase !== 'completed' && event.phase !== 'failed') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary('code_interpreter', JSON.stringify({ code: event.code, phase: event.phase }))) }
           else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
           freezeProbe('late_live_applied', { session: event.sessionId, type: event.type })
           return
@@ -2212,6 +2223,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         setWaitingPhase('tool')
         if (event.name === 'subagent') setWaitingDetail('子任务执行中')
         else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? ''))
+      } else if (event.type === 'hosted_search') {
+        setWaitingVisible(true)
+        setWaitingPhase('tool')
+        setWaitingDetail(toolDisplaySummary(event.kind, JSON.stringify({ query: event.query, phase: event.phase })))
+      } else if (event.type === 'hosted_code_interpreter') {
+        if (event.phase === 'completed' || event.phase === 'failed') {
+          if (streamingAssistantToolsAllFinished(messagesRef.current)) {
+            setWaitingVisible(true)
+            setWaitingStartedAt(Date.now())
+            setWaitingPhase('thinking')
+            setWaitingDetail(undefined)
+          } else {
+            setWaitingPhase('tool')
+          }
+        } else {
+          setWaitingVisible(true)
+          setWaitingPhase('tool')
+          setWaitingDetail(toolDisplaySummary('code_interpreter', JSON.stringify({ code: event.code, phase: event.phase })))
+        }
       } else if (event.type === 'tool_result') {
         if (streamingAssistantToolsAllFinished(messagesRef.current)) {
           setWaitingVisible(true)
@@ -2349,9 +2379,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     return session.id
   }
 
-  const send = async (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => {
+  const send = async (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[], hasReadyInputFiles = false) => {
     const documentPaths = documents?.map(document => document.path).filter(Boolean) ?? []
-    const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : '')
+    const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : hasReadyInputFiles ? DEFAULT_COMPOSER_INPUT_FILES_PROMPT : '')
     if (!prompt && !attachments?.length) return false
     if (selectedSession && isExternalSessionId(selectedSession)) return false
     let targetSession: string | null = selectedSession
@@ -3024,7 +3054,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
-        <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} onSend={send} />
+        <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} busy={sessionWorking} lastUser={lastUserForPlanApproval} onSend={send} />
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy || leftoverQueued} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
         <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
@@ -3187,7 +3217,7 @@ const ComposerOptions = memo(function ComposerOptions({ hideSessionChrome, readO
   return <div className="composer-options"><div className="composer-options-left">{!hideSessionChrome && <><div className="quick-menu-anchor"><button className="model-chip" aria-label="当前模型" title="切换模型" data-testid="model-chip" disabled={readOnly} onClick={() => { if (!readOnly) onQuickOpenChange(value => !value) }}>{modelState?.model && <ProviderLogo provider={modelState.model.provider} modelId={modelState.model.id} size={13} />}<span className="model-chip-name">{modelState?.model.name ?? '加载模型…'}</span></button>{quickOpen && !readOnly && <ModelQuickMenu groups={visibility.quickGroups} current={modelState?.model ?? null} onSelect={model => void onSelectModel(model)} onClose={() => onQuickOpenChange(false)} />}</div><ThinkingChip level={modelState?.thinkingLevel ?? 'off'} levels={modelState?.availableThinkingLevels ?? []} onChange={level => void onThinkingChange(level)} /></>}</div>{!hideSessionChrome && <div className="composer-stats" data-testid="composer-session-stats"><SessionStatsPill host={host} sessionId={sessionId} isStreaming={streaming} isCompacting={compacting} refreshKey={statsRefreshKey} /><QuotaPill host={host} sessionId={sessionId} provider={modelState?.model.provider} modelId={modelState?.model.id} refreshKey={statsRefreshKey} onOpenBrowserLogin={onOpenBrowserLogin} /><BalancePill host={host} sessionId={sessionId} provider={modelState?.model.provider} refreshKey={statsRefreshKey} /></div>}</div>
 })
 
-function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, catalogNotice, onDismissCatalogNotice, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; catalogNotice?: string | null; onDismissCatalogNotice?: () => void; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[]) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
+function Composer({ streaming, working, stopping, stopError, compacting, queueBusy, readOnly, leaseOwner, onTakeover, readOnlyMessage, hideSessionChrome, modelState, host, sessionId, initialDraft = '', initialAttachments = EMPTY_COMPOSER_ATTACHMENTS, initialDocuments = EMPTY_COMPOSER_DOCUMENTS, onDraftChange, onAttachmentsChange, onDocumentsChange, statsRefreshKey, visibility, catalogNotice, onDismissCatalogNotice, onOpenModelManager, onCompact, onSend, onStop, onDismissStopError, onModel, onEnsureSession, onOpenBrowserLogin, visionEnabled, visionModelRef }: { streaming: boolean; working: boolean; stopping: boolean; stopError: string | null; compacting: boolean; queueBusy: boolean; readOnly: boolean; leaseOwner?: string; onTakeover?: () => void; readOnlyMessage?: string; hideSessionChrome?: boolean; modelState: ModelState | null; host: PipiHostAPI; sessionId: string; initialDraft?: string; initialAttachments?: ComposerAttachment[]; initialDocuments?: ComposerDocument[]; onDraftChange?: (draft: string) => void; onAttachmentsChange?: (attachments: ComposerAttachment[]) => void; onDocumentsChange?: (documents: ComposerDocument[]) => void; statsRefreshKey: number; visibility: ModelVisibilityController; catalogNotice?: string | null; onDismissCatalogNotice?: () => void; onOpenModelManager: () => void; onCompact: () => void; onSend: (draft: string, attachments?: ComposerAttachment[], documents?: ComposerDocument[], hasReadyInputFiles?: boolean) => Promise<boolean>; onStop: () => void; onDismissStopError: () => void; onModel: (state: ModelState) => void; onEnsureSession: () => Promise<string | null>; onOpenBrowserLogin?: () => void; visionEnabled: boolean; visionModelRef: string | null }) {
   const [draft, setDraft] = useState(initialDraft)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>(initialAttachments)
   const [documents, setDocuments] = useState<ComposerDocument[]>(initialDocuments)
@@ -3201,6 +3231,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null)
   const [attachError, setAttachError] = useState<string | null>(null)
   const [sendError, setSendError] = useState<string | null>(null)
+  const [inputFileGate, setInputFileGate] = useState<InputFileGate>(EMPTY_INPUT_FILE_GATE)
+  const [inputFilesEpoch, setInputFilesEpoch] = useState(0)
   const [quickOpen, setQuickOpen] = useState(false)
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashHidden, setSlashHidden] = useState(false)
@@ -3215,6 +3247,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     setAttachError(null)
     setSendError(null)
     setQuickOpen(false)
+    setInputFileGate(EMPTY_INPUT_FILE_GATE)
   }, [sessionId])
   // Esc closes the lightbox and the quick menu.
   useEffect(() => {
@@ -3348,7 +3381,11 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
   const dispatchSend = async (outgoing: string) => {
     if (readOnly) return
     const hasText = outgoing.trim() !== ''
-    if (!hasText && attachments.length === 0 && documents.length === 0) return
+    if (!hasText && attachments.length === 0 && documents.length === 0 && !inputFileGate.hasReady) return
+    if (inputFileGate.blockingReason) {
+      setSendError(inputFileGate.blockingReason)
+      return
+    }
     if (attachments.length > 0 && modelState?.model && modelState.model.supportsImages === false) {
       // 识图路由开启且已选识图模型时放行：图片交给识图模型识别后路由给主线文字模型
       // （后端负责 describe+route，UI 只负责不拦截）。否则保持原拦截提示。
@@ -3370,7 +3407,8 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
     onDocumentsChange?.([])
     setAttachError(null)
     try {
-      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined, outgoingDocuments.length ? outgoingDocuments : undefined)
+      const ok = await onSend(outgoing, outgoingAttachments.length ? outgoingAttachments : undefined, outgoingDocuments.length ? outgoingDocuments : undefined, inputFileGate.hasReady)
+      if (ok) setInputFilesEpoch(value => value + 1)
       if (!ok) {
         persistDraft(outgoing)
         setAttachments(outgoingAttachments)
@@ -3442,7 +3480,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
       setSendError(`切换模型失败：${err instanceof Error ? err.message : String(err)}`)
     }
   }, [modelState, host, sessionId, onEnsureSession, onModel])
-  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0)
+  const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0 || inputFileGate.hasReady || inputFileGate.hasUnsent)
   const showQueueSubmit = queueBusy && canSend
   // Chromium's AXObjectCache invalidates an existing text field on `class`
   // changes but not on `placeholder` changes. Keep the same textarea (and thus
@@ -3467,13 +3505,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, queueBu
         </div>
       ))}
     </div>}
+    <InputFileAttachments host={host} sessionId={sessionId} model={modelState?.model} readOnly={readOnly} working={working} refreshKey={inputFilesEpoch} onEnsureSession={onEnsureSession} onGateChange={setInputFileGate} onNotice={setAttachError} />
     {catalogNotice && onDismissCatalogNotice && (
       <div data-testid="catalog-fallback-notice">
         <DismissibleError className="composer-catalog-notice" message={catalogNotice} onDismiss={onDismissCatalogNotice} />
       </div>
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? '会话由另一版本运行中' : queueBusy ? '当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} title={showQueueSubmit ? '将终止当前回复并立即插入；后台子任务继续' : undefined} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>

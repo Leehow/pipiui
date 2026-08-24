@@ -21,9 +21,15 @@ describe('toolArgsSummary', () => {
     expect(toolArgsSummary('bash', `{"command":"${'x'.repeat(200)}"}`)).toBe(`${'x'.repeat(120)}…`)
   })
 
+  it('renders code_interpreter first line', () => {
+    expect(toolArgsSummary('code_interpreter', '{"phase":"in_progress","code":"print(1)\\nprint(2)"}')).toBe('print(1)')
+    expect(toolArgsSummary('code_interpreter', '{"phase":"queued"}')).toBe('…')
+  })
+
   it('renders web_search query', () => {
     expect(toolArgsSummary('web_search', '{"query":"SwiftUI 折叠"}')).toBe('SwiftUI 折叠')
     expect(toolArgsSummary('web_search', '{"query":""}')).toBe('…')
+    expect(toolArgsSummary('x_search', '{"query":"from:xai","phase":"searching"}')).toBe('from:xai')
   })
 
   it('renders built-in browser search/fetch like their HTTP twins', () => {

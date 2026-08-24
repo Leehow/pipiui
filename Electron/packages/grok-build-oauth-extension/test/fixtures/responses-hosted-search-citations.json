@@ -1,0 +1,54 @@
+[
+  { "type": "response.created", "response": { "id": "resp_cite" } },
+  { "type": "response.output_item.added", "output_index": 0, "item": { "type": "message", "id": "msg_1" } },
+  {
+    "type": "response.output_text.annotation.added",
+    "annotation": {
+      "type": "url_citation",
+      "url": "https://docs.example/a",
+      "title": "Example A",
+      "start_index": 0,
+      "end_index": 12
+    }
+  },
+  {
+    "type": "response.output_item.done",
+    "output_index": 0,
+    "item": {
+      "type": "message",
+      "id": "msg_1",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "See [[1]](https://docs.example/a) and more.",
+          "annotations": [
+            { "type": "url_citation", "url": "https://docs.example/a", "title": "Example A", "start_index": 0, "end_index": 12 },
+            { "type": "url_citation", "url": "https://docs.example/b", "title": "Example B", "start_index": 13, "end_index": 24 }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "type": "response.completed",
+    "response": {
+      "id": "resp_cite",
+      "status": "completed",
+      "citations": ["https://docs.example/a", "https://docs.example/c"],
+      "output": [
+        {
+          "type": "message",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "See [[1]](https://docs.example/a) and more.",
+              "annotations": [
+                { "type": "url_citation", "url": "https://docs.example/a", "title": "Example A", "start_index": 0, "end_index": 12 }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

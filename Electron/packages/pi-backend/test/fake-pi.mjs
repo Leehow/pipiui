@@ -119,6 +119,14 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (compacting) {
       return response(command.type, command.id, false, undefined, "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.");
     }
+    if (command.message === "__release_hold__") {
+      // Ends a parked __hold__ turn without abort: settles so the host can
+      // drain the queue into real follow-up turns.
+      heldTurn = false;
+      ok();
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__no_ack__") return;
     if (command.message === "__queue_fail__") return response(command.type, command.id, false, undefined, "queue dispatch failed");
     if (heldTurn && !command.streamingBehavior) {
@@ -179,6 +187,79 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_start" });
       return;
     }
+    if (command.message === "__file_sources_end__") {
+      send({ type: "agent_start" });
+      send({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: "Based on the upload. See [[1]](https://docs.example)",
+            annotations: [
+              { type: "file_citation", file_id: "file-secret", filename: "/secret/report.pdf" },
+              { type: "url_citation", url: "https://docs.example", title: "Docs" },
+            ],
+          }],
+          citations: [
+            { type: "file_citation", fileId: "file-2", fileName: "C:\\Users\\haoli\\notes.md" },
+          ],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__hosted_search__") {
+      send({ type: "agent_start" });
+      send({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "hosted_search",
+          callId: "ws_live",
+          kind: "web_search",
+          phase: "searching",
+          query: "pipiui",
+          outputIndex: 1,
+        },
+      });
+      send({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "hosted_search",
+          callId: "ws_live",
+          kind: "web_search",
+          phase: "completed",
+          query: "pipiui",
+          outputIndex: 1,
+        },
+      });
+      send({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "citations",
+          citations: [{ url: "https://docs.example", title: "Docs", startIndex: 0, endIndex: 4, type: "url_citation" }],
+        },
+      });
+      send({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "toolcall_end",
+          contentIndex: 3,
+          toolCall: { id: "read-1", name: "read", arguments: { path: "README.md" } },
+        },
+      });
+      send({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "See [[1]](https://docs.example)" }],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__tool_start_only__") {
       // Real Pi emits toolcall_start as soon as the first tool token arrives.
       // The host must surface a card then — waiting for toolcall_end is the
@@ -226,6 +307,13 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
   }
   if (command.type === "steer") {
     if (command.message === "__steer_fail__") return response(command.type, command.id, false, undefined, "steer rejected");
+    if (typeof command.message === "string" && command.message.startsWith("__steer_echo__")) {
+      // Real pi drains the steering queue into the run loop and persists the
+      // injected text as a user message; echo it so the host can confirm delivery.
+      ok();
+      send({ type: "message_end", message: { id: "steer-echo", role: "user", content: [{ type: "text", text: command.message }] } });
+      return;
+    }
     ok();
     return;
   }

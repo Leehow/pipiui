@@ -5,12 +5,13 @@
 // Docs: https://docs.x.ai/docs/guides/tools/overview
 //
 // Grok Build / xAI Agent Tools run on the Responses API as hosted
-// `{ type: "web_search" }`. Every channel whose provider field is `xai`
-// (official api.x.ai, relays, custom endpoints, any Grok model id) is
-// remapped onto openai-responses and the hosted tool is injected. Client
-// function tools named `web_search` are dropped so they cannot collide.
-// Incompatible relays must fail visibly — no silent fallback to Pipi
-// pi-web-access web_search.
+// `{ type: "web_search" }` / `{ type: "x_search" }` plus optional
+// `{ type: "code_interpreter" }` with `include: ["code_interpreter_call.outputs"]`.
+// Tool injection keys off catalog `capabilities` (`nativeSearch`,
+// `hostedTools.code_interpreter`, `inputFiles`) — never a provider id and
+// never a default search fallback. The `xai` catalog is still remapped onto
+// openai-responses. Client function tools named `web_search` are dropped only
+// when native `web_search` is declared. Incompatible relays must fail visibly.
 //
 // Prompt cache: every xAI request is pinned with `x-grok-conv-id` (and
 // Responses `prompt_cache_key`) set to the Pi session id so Grok hits the
@@ -22,12 +23,14 @@
 import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { installHostedSearchCapture } from "./hosted-search-events.ts";
 
 const XAI_WEB_SEARCH_TOOL = {
   type: "web_search",
 } as const;
 
 const XAI_RESPONSES_API = "openai-responses";
+const WEB_SEARCH_DOMAIN_LIMIT = 5;
 
 type ProviderPayload = {
   model?: string;
@@ -45,6 +48,100 @@ function isXaiProvider(model: { provider?: string } | undefined): boolean {
   return (model?.provider || "").toLowerCase() === "xai";
 }
 
+type NativeSearchToolName = "web_search" | "x_search";
+type NativeSearchCapability = {
+  tools: NativeSearchToolName[];
+  domains?: { allow?: string[]; deny?: string[] };
+};
+
+function hostedToolsList(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === "string");
+  if (isRecord(value) && Array.isArray(value.tools)) {
+    return value.tools.filter((item): item is string => typeof item === "string");
+  }
+  return undefined;
+}
+
+function modelHasCodeInterpreter(model: { capabilities?: unknown } | undefined): boolean {
+  if (!isRecord(model?.capabilities) || model.capabilities.hostedTools === undefined) return false;
+  return hostedToolsList(model.capabilities.hostedTools)?.includes("code_interpreter") === true;
+}
+
+function modelHasInputFiles(model: { capabilities?: unknown } | undefined): boolean {
+  return isRecord(model?.capabilities) && model.capabilities.inputFiles === true;
+}
+
+function isClientNamedToolName(tool: Record<string, unknown>, name: string): boolean {
+  if (typeof tool.name === "string" && tool.name === name) return true;
+  if (tool.type === "function") {
+    const fn = isRecord(tool.function) ? tool.function : undefined;
+    return typeof fn?.name === "string" && fn.name === name;
+  }
+  return false;
+}
+
+function isHostedCodeInterpreterTool(tool: Record<string, unknown>): boolean {
+  return tool.type === "code_interpreter"
+    && tool.function === undefined
+    && (typeof tool.name !== "string" || tool.name === "code_interpreter");
+}
+
+const HOSTED_CODE_INTERPRETER_INCLUDE = "code_interpreter_call.outputs";
+
+function mergeCodeInterpreterTool(existing: unknown): unknown[] {
+  const current = Array.isArray(existing) ? [...existing] : [];
+  const filtered = current.filter((tool) => {
+    if (!isRecord(tool)) return true;
+    if (isClientNamedToolName(tool, "code_interpreter")) return false;
+    if (isHostedCodeInterpreterTool(tool)) return false;
+    return true;
+  });
+  return [...filtered, { type: "code_interpreter" }];
+}
+
+function mergeCodeInterpreterInclude(existing: unknown): unknown[] {
+  const current = Array.isArray(existing) ? [...existing] : [];
+  if (current.includes(HOSTED_CODE_INTERPRETER_INCLUDE)) return current;
+  return [...current, HOSTED_CODE_INTERPRETER_INCLUDE];
+}
+
+function uniqueTrimmed(list: unknown, limit: number): string[] | undefined {
+  if (!Array.isArray(list) || !list.every((item) => typeof item === "string" && item.trim())) {
+    return undefined;
+  }
+  const next = [...new Set(list.map((item) => String(item).trim()))].slice(0, limit);
+  return next.length ? next : undefined;
+}
+
+function nativeSearchFromUnknown(value: unknown): NativeSearchCapability | undefined {
+  if (Array.isArray(value)) {
+    const tools = value.filter((item): item is NativeSearchToolName => item === "web_search" || item === "x_search");
+    const unique = [...new Set(tools)];
+    return unique.length ? { tools: unique } : undefined;
+  }
+  if (!isRecord(value) || !Array.isArray(value.tools)) return undefined;
+  const tools = value.tools.filter((item): item is NativeSearchToolName => item === "web_search" || item === "x_search");
+  const unique = [...new Set(tools)];
+  if (!unique.length) return undefined;
+  const capability: NativeSearchCapability = { tools: unique };
+  if (isRecord(value.domains)) {
+    const allow = uniqueTrimmed(value.domains.allow, WEB_SEARCH_DOMAIN_LIMIT);
+    const deny = uniqueTrimmed(value.domains.deny, WEB_SEARCH_DOMAIN_LIMIT);
+    if (allow || deny) capability.domains = { ...(allow ? { allow } : {}), ...(deny ? { deny } : {}) };
+  }
+  return capability;
+}
+
+function nativeSearchOfModel(model: { capabilities?: unknown } | undefined): NativeSearchCapability | undefined {
+  if (!isRecord(model?.capabilities)) return undefined;
+  return nativeSearchFromUnknown(model.capabilities.nativeSearch)
+    ?? nativeSearchFromUnknown(model.capabilities.hostedTools);
+}
+
+function effectiveNativeSearch(model: { provider?: string; capabilities?: unknown } | undefined): NativeSearchCapability | undefined {
+  return nativeSearchOfModel(model);
+}
+
 /** Stable per-session id for xAI prompt-cache affinity. */
 function grokConversationId(ctx: { sessionManager?: { getSessionId?: () => string } } | undefined): string | undefined {
   const id = ctx?.sessionManager?.getSessionId?.();
@@ -53,13 +150,8 @@ function grokConversationId(ctx: { sessionManager?: { getSessionId?: () => strin
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function isXaiResponsesRequest(
-  model: { provider?: string; api?: string } | undefined,
-  payload: unknown,
-): payload is ProviderPayload {
-  if (!isXaiProvider(model)) return false;
-  if (!isRecord(payload)) return false;
-  return Array.isArray(payload.input);
+function isResponsesPayload(payload: unknown): payload is ProviderPayload {
+  return isRecord(payload) && Array.isArray(payload.input);
 }
 
 function isXaiCompletionsRequest(
@@ -71,37 +163,68 @@ function isXaiCompletionsRequest(
   return Array.isArray(payload.messages) && !Array.isArray(payload.input);
 }
 
-function isClientWebSearchTool(tool: Record<string, unknown>): boolean {
-  const type = typeof tool.type === "string" ? tool.type : "";
-  const name = typeof tool.name === "string" ? tool.name : "";
-  if (name === "web_search") return true;
-  if (type === "function") {
+function isClientNamedTool(tool: Record<string, unknown>, name: string): boolean {
+  if (tool.type === name && tool.function === undefined && (typeof tool.name !== "string" || tool.name === name)) {
+    return false;
+  }
+  if (typeof tool.name === "string" && tool.name === name) return true;
+  if (tool.type === "function") {
     const fn = isRecord(tool.function) ? tool.function : undefined;
-    const fnName = typeof fn?.name === "string" ? fn.name : "";
-    return fnName === "web_search";
+    return typeof fn?.name === "string" && fn.name === name;
   }
   return false;
 }
 
-function isHostedWebSearchTool(tool: Record<string, unknown>): boolean {
-  return tool.type === "web_search" && (typeof tool.name !== "string" || tool.name === "web_search")
-    && tool.function === undefined;
+function isHostedSearchTool(tool: Record<string, unknown>, type: NativeSearchToolName): boolean {
+  return tool.type === type && tool.function === undefined && (typeof tool.name !== "string" || tool.name === type);
+}
+
+function hostedWebSearchTool(capability: NativeSearchCapability): Record<string, unknown> {
+  const allow = capability.domains?.allow?.slice(0, WEB_SEARCH_DOMAIN_LIMIT);
+  const deny = capability.domains?.deny?.slice(0, WEB_SEARCH_DOMAIN_LIMIT);
+  if (!allow?.length && !deny?.length) return { ...XAI_WEB_SEARCH_TOOL };
+  return {
+    type: "web_search",
+    filters: {
+      ...(allow?.length ? { allowed_domains: allow } : {}),
+      ...(deny?.length ? { excluded_domains: deny } : {}),
+    },
+  };
+}
+
+function hostedSearchToolsOf(capability: NativeSearchCapability): Record<string, unknown>[] {
+  const tools: Record<string, unknown>[] = [];
+  if (capability.tools.includes("web_search")) tools.push(hostedWebSearchTool(capability));
+  if (capability.tools.includes("x_search")) tools.push({ type: "x_search" });
+  return tools;
 }
 
 function dropClientWebSearch(existing: unknown): unknown[] {
   const current = Array.isArray(existing) ? [...existing] : [];
   return current.filter((tool) => {
     if (!isRecord(tool)) return true;
-    if (isHostedWebSearchTool(tool)) return true;
-    return !isClientWebSearchTool(tool);
+    if (isHostedSearchTool(tool, "web_search")) return true;
+    return !isClientNamedTool(tool, "web_search");
   });
 }
 
+function mergeHostedSearchTools(existing: unknown, capability: NativeSearchCapability): unknown[] {
+  const dropWeb = capability.tools.includes("web_search");
+  const hosted = hostedSearchToolsOf(capability);
+  const current = Array.isArray(existing) ? [...existing] : [];
+  const filtered = current.filter((tool) => {
+    if (!isRecord(tool)) return true;
+    if (dropWeb && isClientNamedTool(tool, "web_search")) return false;
+    if (hosted.some((item) => typeof item.type === "string" && isHostedSearchTool(tool, item.type as NativeSearchToolName))) {
+      return false;
+    }
+    return true;
+  });
+  return [...filtered, ...hosted];
+}
+
 function mergeHostedWebSearch(existing: unknown): unknown[] {
-  const filtered = dropClientWebSearch(existing);
-  const hasHosted = filtered.some((tool) => isRecord(tool) && isHostedWebSearchTool(tool));
-  if (!hasHosted) filtered.push({ ...XAI_WEB_SEARCH_TOOL });
-  return filtered;
+  return mergeHostedSearchTools(existing, { tools: ["web_search"] });
 }
 
 function withoutSearchParameters(payload: ProviderPayload): ProviderPayload {
@@ -169,6 +292,16 @@ function captureRateLimitHeaders(headers: Record<string, unknown> | undefined, n
 }
 
 export default function (pi: ExtensionAPI) {
+  let captureInstalled = false;
+  const ensureHostedSearchCapture = () => {
+    if (captureInstalled) return;
+    captureInstalled = true;
+    // Tee /responses SSE so hosted web_search / x_search / citations reach the
+    // host as message_update events. The openai-responses streamer otherwise
+    // drops unknown SSE types. Never execute hosted search as a local tool.
+    installHostedSearchCapture();
+  };
+
   pi.on("session_start", (_event, ctx) => {
     return applyXaiResponsesApi(pi, ctx).catch((error) => {
       console.error(
@@ -179,19 +312,28 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_provider_request", (event, ctx) => {
     const model = ctx.model;
-    if (!isXaiProvider(model) || !isRecord(event.payload)) {
-      return;
-    }
+    if (!isRecord(event.payload)) return;
+    const nativeSearch = effectiveNativeSearch(model);
+    const codeInterpreter = modelHasCodeInterpreter(model);
+    const inputFiles = modelHasInputFiles(model);
+    // Capture tees /responses even when only Chat-with-Files is live. Do not
+    // inject search/code tools or rewrite the payload for inputFiles alone.
+    if ((nativeSearch || codeInterpreter || inputFiles) && isResponsesPayload(event.payload)) ensureHostedSearchCapture();
+    if (!nativeSearch && !codeInterpreter && !isXaiProvider(model)) return;
 
     const conversationId = grokConversationId(ctx);
+    const cachePin = isXaiProvider(model) || Boolean(nativeSearch);
 
-    if (isXaiResponsesRequest(model, event.payload)) {
+    if (isResponsesPayload(event.payload) && (nativeSearch || codeInterpreter || (cachePin && conversationId))) {
       const payload = withoutSearchParameters(event.payload);
+      let tools = payload.tools;
+      if (nativeSearch) tools = mergeHostedSearchTools(tools, nativeSearch);
+      if (codeInterpreter) tools = mergeCodeInterpreterTool(tools);
       return {
         ...payload,
-        tools: mergeHostedWebSearch(payload.tools),
-        // Responses sticky routing: same id as x-grok-conv-id.
-        ...(conversationId ? { prompt_cache_key: conversationId } : {}),
+        ...(nativeSearch || codeInterpreter ? { tools } : {}),
+        ...(codeInterpreter ? { include: mergeCodeInterpreterInclude(payload.include) } : {}),
+        ...(cachePin && conversationId ? { prompt_cache_key: conversationId } : {}),
       };
     }
 
@@ -203,11 +345,11 @@ export default function (pi: ExtensionAPI) {
       const payload = withoutSearchParameters(event.payload);
       return {
         ...payload,
-        tools: dropClientWebSearch(payload.tools),
+        tools: nativeSearch?.tools.includes("web_search") ? dropClientWebSearch(payload.tools) : payload.tools,
       };
     }
 
-    if (Object.prototype.hasOwnProperty.call(event.payload, "search_parameters")) {
+    if (isXaiProvider(model) && Object.prototype.hasOwnProperty.call(event.payload, "search_parameters")) {
       return withoutSearchParameters(event.payload as ProviderPayload);
     }
   });
@@ -216,7 +358,7 @@ export default function (pi: ExtensionAPI) {
   // some Responses hops) land on a cold replica and report cacheRead≈128 even
   // when the prefix is unchanged. Same session id as prompt_cache_key.
   pi.on("before_provider_headers", (event, ctx) => {
-    if (!isXaiProvider(ctx.model)) return;
+    if (!isXaiProvider(ctx.model) && !effectiveNativeSearch(ctx.model)) return;
     const conversationId = grokConversationId(ctx);
     if (!conversationId) return;
     event.headers["x-grok-conv-id"] = conversationId;
@@ -231,21 +373,32 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", (event, ctx) => {
     const model = ctx.model;
-    if (!isXaiProvider(model)) {
-      return;
-    }
+    const nativeSearch = effectiveNativeSearch(model);
+    const codeInterpreter = modelHasCodeInterpreter(model);
+    if (!nativeSearch && !codeInterpreter) return;
 
+    const heading = isXaiProvider(model) ? "## xAI server tools" : "## Hosted search tools";
+    if (event.systemPrompt.includes(heading)) return;
+    const lines = [
+      ...(nativeSearch?.tools.includes("web_search")
+        ? ["- `web_search` — live web search executed on the provider (prefer over bash/curl and over client/pi-web-access web_search)"]
+        : []),
+      ...(nativeSearch?.tools.includes("x_search")
+        ? ["- `x_search` — live X/Twitter search executed on the provider"]
+        : []),
+      ...(codeInterpreter
+        ? ["- `code_interpreter` — Python executed on the provider (never run this locally; never register a client function with this name)"]
+        : []),
+    ];
     const tip = [
       "",
-      "## xAI server tools",
-      "When the active model is any `xai` provider channel, xAI Responses hosted Agent Tools are enabled on every request:",
-      "- `web_search` — live web search executed on xAI servers (prefer over bash/curl and over client/pi-web-access web_search)",
+      heading,
+      isXaiProvider(model)
+        ? "When the active model is any `xai` provider channel, xAI Responses hosted Agent Tools are enabled on every request:"
+        : "This model declared native hosted search. Responses Agent Tools are enabled on every request:",
+      ...lines,
       "Do not send `search_parameters` (retired Live Search, returns 410). Keep using local `read`/`bash`/`edit`/`write` for the workspace.",
     ].join("\n");
-
-    if (event.systemPrompt.includes("## xAI server tools")) {
-      return;
-    }
     return {
       systemPrompt: `${event.systemPrompt}${tip}`,
     };

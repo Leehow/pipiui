@@ -9,6 +9,7 @@ import {
   disposeUiContributions,
   listPanels,
   listSettingsSections,
+  isLiveProjectedTool,
   listToolRendererNames,
   registerPanel,
   registerSettingsSection,
@@ -31,8 +32,9 @@ describe('dogfood lists match the pre-registry hardcoded sets', () => {
   it('tool renderer names (summarizeArgs switch + live cards)', () => {
     expect(listToolRendererNames()).toEqual([
       'write', 'edit', 'generate_image', 'image_gen', 'image_edit',
-      'web_search', 'browser_search', 'fetch_content', 'browser_fetch',
+      'web_search', 'x_search', 'code_interpreter', 'browser_search', 'fetch_content', 'browser_fetch',
       'browser', 'computer', 'find', 'grep', 'subagent', 'computer_task',
+      'skill_load', 'skill_search',
     ])
   })
 
@@ -43,6 +45,12 @@ describe('dogfood lists match the pre-registry hardcoded sets', () => {
 
   it('panels', () => {
     expect(listPanels().map(panel => panel.id)).toEqual(['Subagents', 'Plan', 'Browser', 'Document', 'Terminal'])
+  })
+
+  it('treats code_interpreter as a hosted renderer, not a live-projected picker tool', () => {
+    expect(listToolRendererNames()).toContain('code_interpreter')
+    expect(isLiveProjectedTool('code_interpreter')).toBe(false)
+    expect(listSlashCommands().some(command => command.name === 'code_interpreter')).toBe(false)
   })
 })
 

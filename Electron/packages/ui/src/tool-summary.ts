@@ -206,8 +206,13 @@ function scrapeFields(name: string, text: string): string | undefined {
       return cmd == null ? undefined : truncate(cmd)
     }
     case 'web_search':
+    case 'x_search':
     case 'browser_search':
       return scrapeJSONString('query', text)
+    case 'code_interpreter': {
+      const code = scrapeJSONString('code', text)
+      return code == null ? undefined : truncate(code.split('\n')[0] ?? code)
+    }
     case 'fetch_content':
     case 'browser_fetch':
       return scrapeJSONString('url', text)
@@ -322,6 +327,20 @@ for (const contribution of [
   { toolName: 'image_gen', summarizeArgs: promptSummary, scrapeSummary: promptScrape },
   { toolName: 'image_edit', summarizeArgs: promptSummary, scrapeSummary: promptScrape },
   { toolName: 'web_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
+  { toolName: 'x_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
+  {
+    toolName: 'code_interpreter',
+    summarizeArgs: (args: Record<string, unknown>) => {
+      const code = stringField(args, 'code')
+      if (!code) return '…'
+      const line = code.trim().split('\n').find(item => item.trim()) ?? code.trim()
+      return truncate(line)
+    },
+    scrapeSummary: (text: string) => {
+      const code = scrapeJSONString('code', text)
+      return code == null ? undefined : truncate(code.split('\n')[0] ?? code)
+    },
+  },
   { toolName: 'browser_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
   { toolName: 'fetch_content', summarizeArgs: fetchContentSummary, scrapeSummary: (text: string) => scrapeJSONString('url', text) },
   { toolName: 'browser_fetch', summarizeArgs: urlSummary, scrapeSummary: (text: string) => scrapeJSONString('url', text) },

@@ -25,6 +25,8 @@ export type BridgeHandlers = {
   onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
   onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
+  /** One-shot Structured Outputs take. Session id comes from the capability, never the body. */
+  onStructuredOutput?(event: Record<string, unknown>, sessionId: string): Promise<unknown> | unknown;
   /** Spec D4 `ext.emit`. Fail closed when omitted. */
   onExtEmit?(
     input: { extensionId: string; event: string; payload?: unknown },
@@ -194,6 +196,20 @@ export class HostBridge {
       else if (body.action === "browser_action") return this.reply(response, 200, await (this.handlers.onBrowserAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "browser host unavailable" })));
       else if (body.action === "browser_watch") return this.reply(response, 200, await Promise.resolve(this.handlers.onBrowserWatch?.(event as Record<string, unknown>, sessionId) ?? { ok: false, error: "browser watch unavailable" }));
       else if (body.action === "terminal_action") return this.reply(response, 200, await (this.handlers.onTerminalAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "terminal host unavailable" })));
+      else if (body.action === "structured_output") {
+        try {
+          return this.reply(response, 200, {
+            ok: true,
+            result: await (this.handlers.onStructuredOutput?.(event as Record<string, unknown>, sessionId)
+              ?? Promise.resolve(null)),
+          });
+        } catch (error) {
+          return this.reply(response, 200, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       else if (body.action === "vault_action") {
         try {
           return this.reply(response, 200, {

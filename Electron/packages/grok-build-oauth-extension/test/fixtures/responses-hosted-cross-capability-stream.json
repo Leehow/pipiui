@@ -1,0 +1,106 @@
+[
+  {
+    "type": "response.web_search_call.in_progress",
+    "item_id": "ws_cross",
+    "output_index": 1,
+    "action": { "query": "pipiui hosted" }
+  },
+  {
+    "type": "response.output_item.added",
+    "output_index": 2,
+    "item": { "type": "code_interpreter_call", "id": "ci_cross", "status": "queued" }
+  },
+  {
+    "type": "response.output_text.annotation.added",
+    "annotation": {
+      "type": "file_citation",
+      "file_id": "file-secret",
+      "filename": "/secret/docs/report.pdf",
+      "url": "https://files.example/report.pdf?access_token=abc"
+    }
+  },
+  {
+    "type": "response.web_search_call.searching",
+    "item_id": "ws_cross",
+    "output_index": 1
+  },
+  {
+    "type": "response.code_interpreter_call.in_progress",
+    "item_id": "ci_cross",
+    "output_index": 2
+  },
+  {
+    "type": "response.output_text.annotation.added",
+    "annotation": {
+      "type": "url_citation",
+      "url": "https://docs.example/guide",
+      "title": "Guide",
+      "start_index": 1,
+      "end_index": 4
+    }
+  },
+  {
+    "type": "response.code_interpreter_call_code.done",
+    "item_id": "ci_cross",
+    "output_index": 2,
+    "code": "print(42)"
+  },
+  {
+    "type": "response.output_text.annotation.added",
+    "annotation": { "type": "url_citation", "url": "https://docs.example/guide" }
+  },
+  {
+    "type": "response.web_search_call.completed",
+    "item_id": "ws_cross",
+    "output_index": 1
+  },
+  {
+    "type": "response.code_interpreter_call.completed",
+    "item_id": "ci_cross",
+    "output_index": 2
+  },
+  {
+    "type": "response.output_item.done",
+    "output_index": 2,
+    "item": {
+      "type": "code_interpreter_call",
+      "id": "ci_cross",
+      "status": "completed",
+      "code": "print(42)",
+      "outputs": [
+        { "type": "logs", "logs": "42\n" },
+        { "type": "image", "filename": "plot.png", "mime_type": "image/png", "url": "https://files.example/plot.png?token=secret" }
+      ]
+    }
+  },
+  {
+    "type": "response.output_item.done",
+    "item": {
+      "type": "message",
+      "content": [{
+        "type": "output_text",
+        "text": "See [[1]](https://docs.example/guide)",
+        "annotations": [
+          { "type": "file_citation", "file_id": "file-secret", "filename": "report.pdf" },
+          { "type": "file_citation", "file_id": "file-notes", "name": "notes.md" },
+          { "type": "file_citation", "file_id": "file-anon" },
+          { "type": "url_citation", "url": "https://docs.example/guide", "title": "Guide", "start_index": 1, "end_index": 4 }
+        ]
+      }]
+    }
+  },
+  {
+    "type": "response.completed",
+    "response": {
+      "usage": {
+        "input_tokens": 12,
+        "output_tokens": 6,
+        "total_tokens": 18,
+        "server_side_tool_usage": {
+          "SERVER_SIDE_TOOL_WEB_SEARCH": 1,
+          "SERVER_SIDE_TOOL_CODE_EXECUTION": 1
+        }
+      }
+    }
+  }
+]

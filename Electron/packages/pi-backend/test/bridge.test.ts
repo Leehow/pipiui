@@ -16,7 +16,12 @@ async function started() {
     onBrowserAction: async (event, sessionId) => { received.push({ channel: "browser", sessionId, payload: event }); return { ok: true, text: "page text" } },
     onTerminalAction: async (event, sessionId) => { received.push({ channel: "terminal", sessionId, payload: event }); return { ok: true, terminalId: "term-1" } },
     onComputerAction: async (event, sessionId) => { received.push({ channel: "computer", sessionId, payload: event }); return { ok: true, screenshotId: "shot" } },
-    onVaultAction: async (event, sessionId) => { received.push({ channel: "vault", sessionId, payload: event }); return { secrets: [{ id: "1", name: "demo", envName: "DEMO_TOKEN" }], mounts: [], sessionId } }
+    onVaultAction: async (event, sessionId) => { received.push({ channel: "vault", sessionId, payload: event }); return { secrets: [{ id: "1", name: "demo", envName: "DEMO_TOKEN" }], mounts: [], sessionId } },
+    onStructuredOutput: async (event, sessionId) => {
+      received.push({ channel: "structured_output", sessionId, payload: event });
+      if (event.op !== "take") throw new Error("unsupported structured_output op");
+      return sessionId === "session-1" ? { name: "flag", schema: { type: "object" }, strict: true } : null;
+    },
   });
   const port = await bridge.listen();
   return { port, received, bridge: bridge! };
@@ -69,6 +74,40 @@ describe("HostBridge", () => {
     const response = await post(port, { schemaVersion: 1, sessionCapability: capability, action: "browser_action", event: { action: "observe" } });
     expect(await response.json()).toEqual({ ok: true, text: "page text" });
     expect(received).toContainEqual({ channel: "browser", sessionId: "session-1", payload: { action: "observe" } });
+  });
+
+  it("takes structured output only for the capability-mapped session", async () => {
+    const { port, received, bridge } = await started();
+    const capability = bridge.register("session-1");
+    const other = bridge.register("session-2");
+    const first = await post(port, {
+      schemaVersion: 1,
+      sessionCapability: capability,
+      action: "structured_output",
+      event: { op: "take", sessionId: "forged" },
+    });
+    expect(await first.json()).toEqual({
+      ok: true,
+      result: { name: "flag", schema: { type: "object" }, strict: true },
+    });
+    expect(received.at(-1)).toEqual({
+      channel: "structured_output",
+      sessionId: "session-1",
+      payload: { op: "take", sessionId: "forged" },
+    });
+    const second = await post(port, {
+      schemaVersion: 1,
+      sessionCapability: other,
+      action: "structured_output",
+      event: { op: "take" },
+    });
+    expect(await second.json()).toEqual({ ok: true, result: null });
+    expect((await post(port, {
+      schemaVersion: 1,
+      sessionCapability: "forged",
+      action: "structured_output",
+      event: { op: "take" },
+    })).status).toBe(403);
   });
 
   it("routes vault actions to existing host methods without echoing values", async () => {

@@ -488,6 +488,16 @@ describe("bridge-free subagent orchestration", () => {
     expect(env.PIPIUI_SUBAGENT_MODELS_FILE).toBe("/electron/agent/subagent-models.json");
   });
 
+  it("binds the native-search catalog file for worker tool-list filtering", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { subagent: true },
+      paths,
+      subagentNativeSearchFile: "/electron/agent/native-search.json",
+    });
+    expect(env.PIPIUI_SUBAGENT_NATIVE_SEARCH_FILE).toBe("/electron/agent/native-search.json");
+  });
+
   it("keeps genuinely bridge-dependent extensions gated", () => {
     const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true, memoryBroker: true, browser: true, browserSearch: true, philosophy: true }, paths });
     expect(args).not.toContain("/ext/memory");
@@ -575,10 +585,15 @@ describe("default feature set", () => {
   });
 
   it("injects Electron-owned built-in skills only when the skill loader resolves", () => {
-    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { skillLoader: true }, paths: { skillLoader: "/runtime/extensions/pipiui-skillloader.ts", builtInSkills: "/runtime/built-in-skills" } });
+    const skillLoader = "/runtime/extensions/pipiui-skillloader.ts";
+    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { skillLoader: true }, paths: { skillLoader, builtInSkills: "/runtime/built-in-skills" } });
     expect(ready.env.PIPIUI_BUILT_IN_SKILL_ROOT).toBe("/runtime/built-in-skills");
+    expect(ready.env.PIPIUI_SKILLLOADER_EXT).toBe(skillLoader);
+    expect(ready.args).toEqual(expect.arrayContaining(["-e", skillLoader]));
     const unavailable = assemblePiSpawn({ cwd: "/tmp/project", features: { skillLoader: true }, paths: { builtInSkills: "/runtime/built-in-skills" } });
     expect(unavailable.env.PIPIUI_BUILT_IN_SKILL_ROOT).toBeUndefined();
+    expect(unavailable.env.PIPIUI_SKILLLOADER_EXT).toBeUndefined();
+    expect(sanitizeEnvironment({ PIPIUI_SKILLLOADER_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 
   it("exports computer runtime routing only with a resolved extension, descriptor and capability", () => {

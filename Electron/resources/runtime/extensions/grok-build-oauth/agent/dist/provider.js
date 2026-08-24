@@ -20,8 +20,10 @@ import { redactMessage } from "./oauth/redact.js";
 import { AUTH_PROVIDER_ID, GROK_BUILD_CONVERSATION_MODELS, GROK_BUILD_PROVIDER_ID, } from "./models.js";
 import { accessTokenFromCredentials, conversationProviderTransport } from "./conversation.js";
 export { AUTH_PROVIDER_ID, GROK_BUILD_PROVIDER_ID };
-export { GROK_BUILD_BASE_URL, GROK_BUILD_CHAT_API, GROK_BUILD_CONVERSATION_MODEL_IDS, GROK_BUILD_CONVERSATION_MODELS, grokBuildManifestModels, } from "./models.js";
-export { accessTokenFromCredentials, buildConversationRequest, conversationProviderTransport } from "./conversation.js";
+export { GROK_BUILD_BASE_URL, GROK_BUILD_CHAT_API, GROK_BUILD_CONVERSATION_MODEL_IDS, GROK_BUILD_CONVERSATION_MODELS, GROK_BUILD_NATIVE_SEARCH, grokBuildManifestModels, } from "./models.js";
+export { accessTokenFromCredentials, applyMaterializedInputFiles, applyStructuredOutput, buildConversationRequest, conversationProviderTransport, modelHasInputFiles, normalizeStructuredOutputResult, structuredOutputsEnabled, } from "./conversation.js";
+export { applyHostedSearchToPayload, collectResponsesStream, hostedSearchToolsOf, mergeHostedSearchTools, } from "./hosted-search.js";
+export { applyCodeInterpreterToPayload, collectCodeInterpreterStream, mergeCodeInterpreterTool, modelHasCodeInterpreter, } from "./hosted-code-interpreter.js";
 function displayUriOf(code) {
     if (code.verification_uri_complete)
         return code.verification_uri_complete;

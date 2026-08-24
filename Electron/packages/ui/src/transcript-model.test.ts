@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, safeHttpsFileUrl, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -418,5 +418,255 @@ describe('transcript model', () => {
     expect(messages[0].streaming).toBe(false)
     expect(messages[0].error).toBe('WebSocket error')
     expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+  })
+
+  it('accumulates hosted search lifecycle onto one tool card and attaches citations', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'in_progress', query: 'pipiui', outputIndex: 1 })
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'searching', query: 'pipiui', outputIndex: 1 })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ws_1', name: 'web_search', finished: false })
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_search',
+      sessionId: 's',
+      callId: 'ws_1',
+      kind: 'web_search',
+      phase: 'completed',
+      query: 'pipiui',
+      sources: [{ url: 'https://docs.example', title: 'Docs' }],
+      outputIndex: 1,
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'citations',
+      sessionId: 's',
+      citations: [{ url: 'https://docs.example', title: 'Docs', startIndex: 0, endIndex: 4, type: 'url_citation' }],
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'server_side_usage',
+      sessionId: 's',
+      usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 3, serverSideToolUsage: { SERVER_SIDE_TOOL_WEB_SEARCH: 1 } },
+    })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ws_1', name: 'web_search', finished: true, error: undefined })
+    expect(messages[0].citations).toEqual([
+      { url: 'https://docs.example', title: 'Docs', startIndex: 0, endIndex: 4, type: 'url_citation' },
+    ])
+    expect(messages[0].serverSideToolUsage).toEqual({ SERVER_SIDE_TOOL_WEB_SEARCH: 1 })
+    const fromHistory = historyMessages([
+      { id: 'a', role: 'assistant', content: 'See [[1]](https://docs.example)', timestamp: 1, citations: [{ url: 'https://docs.example', title: 'Docs' }] },
+    ])
+    expect(fromHistory[0].citations).toEqual([{ url: 'https://docs.example', title: 'Docs' }])
+  })
+
+  it('merges live input_file_sources onto the current assistant without disturbing citations or tools', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'completed', query: 'q', outputIndex: 1 })
+    messages = applyStreamEvent(messages, {
+      type: 'citations',
+      sessionId: 's',
+      citations: [{ url: 'https://docs.example', title: 'Docs' }],
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'input_file_sources',
+      sessionId: 's',
+      sources: [{ name: '/secret/report.pdf' }, { name: 'notes.md', url: 'https://files.example/notes.md?access_token=abc' }],
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'input_file_sources',
+      sessionId: 's',
+      sources: [{ name: 'report.pdf' }, { name: 'notes.md', url: 'https://files.example/notes.md' }],
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'server_side_usage',
+      sessionId: 's',
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, serverSideToolUsage: { SERVER_SIDE_TOOL_WEB_SEARCH: 1 } },
+    })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ws_1', name: 'web_search', finished: true })
+    expect(messages[0].citations).toEqual([{ url: 'https://docs.example', title: 'Docs' }])
+    expect(messages[0].fileSources).toEqual([
+      { name: 'report.pdf' },
+      { name: 'notes.md', url: 'https://files.example/notes.md' },
+    ])
+    expect(messages[0].serverSideToolUsage).toEqual({ SERVER_SIDE_TOOL_WEB_SEARCH: 1 })
+    expect(JSON.stringify(messages[0].fileSources)).not.toContain('/secret/')
+    expect(JSON.stringify(messages[0].fileSources)).not.toContain('access_token')
+  })
+
+  it('keeps fileSources from resumed history and dedupes a later terminal replay', () => {
+    const fromHistory = historyMessages([
+      {
+        id: 'a',
+        role: 'assistant',
+        content: 'Based on the upload',
+        timestamp: 1,
+        citations: [{ url: 'https://docs.example', title: 'Docs' }],
+        fileSources: [{ name: 'report.pdf' }, { name: 'notes.md', url: 'https://files.example/notes.md' }],
+      },
+    ])
+    expect(fromHistory[0].fileSources).toEqual([
+      { name: 'report.pdf' },
+      { name: 'notes.md', url: 'https://files.example/notes.md' },
+    ])
+    expect(fromHistory[0].citations).toEqual([{ url: 'https://docs.example', title: 'Docs' }])
+    let replayed = applyStreamEvent(fromHistory.map(message => ({ ...message, streaming: true })), {
+      type: 'input_file_sources',
+      sessionId: 's',
+      sources: [{ name: 'report.pdf' }, { name: 'notes.md', url: 'https://files.example/notes.md' }],
+    })
+    expect(replayed[0].fileSources).toEqual(fromHistory[0].fileSources)
+  })
+
+  it('accumulates hosted code interpreter lifecycle onto one dedicated tool card', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'queued', outputIndex: 1 })
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'in_progress', code: 'print(', outputIndex: 1 })
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'in_progress', code: 'print(1)', outputIndex: 1 })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_1', name: 'code_interpreter', finished: false })
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_1',
+      phase: 'completed',
+      code: 'print(1)',
+      outputs: [{ type: 'logs', text: '1' }],
+      files: [{ filename: 'out.csv', mimeType: 'text/csv', url: 'https://files.example/out.csv' }],
+      outputIndex: 1,
+    })
+    messages = applyStreamEvent(messages, {
+      type: 'server_side_usage',
+      sessionId: 's',
+      usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 3, serverSideToolUsage: { SERVER_SIDE_TOOL_CODE_EXECUTION: 1 } },
+    })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_1', name: 'code_interpreter', finished: true, error: undefined, result: '1' })
+    expect(JSON.parse(messages[0].tools?.[0].input ?? '{}')).toMatchObject({
+      phase: 'completed',
+      code: 'print(1)',
+      outputs: [{ type: 'logs', text: '1' }],
+      files: [{ filename: 'out.csv', mimeType: 'text/csv', url: 'https://files.example/out.csv' }],
+    })
+    expect(messages[0].serverSideToolUsage).toEqual({ SERVER_SIDE_TOOL_CODE_EXECUTION: 1 })
+    const replayed = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_1',
+      phase: 'completed',
+      code: 'print(1)',
+      outputs: [{ type: 'logs', text: '1' }],
+      outputIndex: 1,
+    })
+    expect(replayed[0].tools).toHaveLength(1)
+    expect(replayed[0].tools?.[0].id).toBe('ci_1')
+    const fromHistory = historyMessages([
+      { id: 'a', role: 'assistant', content: 'done', timestamp: 1, tools: [{ id: 'ci_1', name: 'code_interpreter', input: JSON.stringify({ phase: 'completed', code: 'print(1)', outputs: [{ type: 'logs', text: '1' }] }) }] },
+    ])
+    expect(fromHistory[0].tools?.[0]).toMatchObject({ id: 'ci_1', name: 'code_interpreter', finished: true })
+  })
+
+  it('marks a failed hosted code interpreter card without leaking secrets', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_fail',
+      phase: 'failed',
+      code: 'raise SystemExit',
+      error: { code: 'execution_error', message: 'boom' },
+    })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_fail', name: 'code_interpreter', finished: true, error: true, result: 'boom' })
+  })
+
+  it('keeps queued/in_progress/interpreting running and merges incremental logs/files for one call', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'queued', outputIndex: 1 })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_1', finished: false })
+    expect(messages[0].tools?.[0].error).toBeFalsy()
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'interpreting', code: 'print(', outputs: [{ type: 'logs', text: 'a' }], outputIndex: 1 })
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'interpreting', code: 'print(1)', outputs: [{ type: 'logs', text: 'b' }], files: [{ filename: 'a.csv', url: 'https://files.example/a.csv' }], outputIndex: 1 })
+    expect(messages[0].tools?.[0].finished).toBeFalsy()
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_1',
+      phase: 'completed',
+      files: [{ filename: 'b.png', url: 'https://files.example/b.png?token=SECRET&download_token=ALSO' }],
+      outputs: [{ type: 'logs', text: 'b' }],
+      outputIndex: 1,
+    })
+    expect(messages[0].tools).toHaveLength(1)
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_1', finished: true, result: 'a\nb' })
+    const input = JSON.parse(messages[0].tools?.[0].input ?? '{}') as { code?: string; outputs?: unknown; files?: Array<{ filename?: string; url?: string }> }
+    expect(input.code).toBe('print(1)')
+    expect(input.outputs).toEqual([{ type: 'logs', text: 'a' }, { type: 'logs', text: 'b' }])
+    expect(input.files).toEqual([
+      { filename: 'a.csv', url: 'https://files.example/a.csv' },
+      { filename: 'b.png', url: 'https://files.example/b.png' },
+    ])
+    expect(JSON.stringify(input)).not.toContain('SECRET')
+    expect(JSON.stringify(input)).not.toContain('token=')
+  })
+
+  it('applies a late hosted code interpreter event onto a settled turn without a new bubble', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_late', phase: 'in_progress', code: 'print(1)' })
+    messages = finishStreamingMessage(messages)
+    expect(messages).toHaveLength(1)
+    expect(messages[0].streaming).toBe(false)
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_late',
+      phase: 'completed',
+      code: 'print(1)',
+      outputs: [{ type: 'logs', text: '1' }],
+    })
+    expect(messages).toHaveLength(1)
+    expect(messages[0].streaming).toBe(false)
+    expect(messages[0].tools).toHaveLength(1)
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'ci_late', name: 'code_interpreter', finished: true, result: '1' })
+    expect(messages[0].activities?.some(activity => activity.type === 'thinking' && activity.id === PENDING_THINKING_ID)).toBe(false)
+  })
+
+  it('redacts secret placeholders and drops non-https file URLs on hosted code events', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_secret',
+      phase: 'failed',
+      code: 'print("{{secret:API_KEY}}")',
+      outputs: [{ type: 'logs', text: 'leak {{secret:API_KEY}}' }],
+      files: [{ filename: 'out.csv', url: 'http://evil.example/out.csv' }],
+      error: { code: 'execution_error', message: 'boom {{secret:API_KEY}}' },
+    })
+    const tool = messages[0].tools?.[0]
+    expect(tool).toMatchObject({ id: 'ci_secret', finished: true, error: true, result: 'boom [API_KEY]' })
+    expect(tool?.input).toContain('[API_KEY]')
+    expect(tool?.input).not.toContain('{{secret:')
+    expect(JSON.parse(tool?.input ?? '{}').files).toEqual([{ filename: 'out.csv' }])
+    expect(safeHttpsFileUrl('https://files.example/a.csv?access_token=abc')).toBe('https://files.example/a.csv')
+    expect(safeHttpsFileUrl('http://files.example/a.csv')).toBeUndefined()
+  })
+
+  it('does not reorder hosted search, ordinary tools or thinking when a code interpreter card is present', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, delta: 'plan' })
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'completed', query: 'q', outputIndex: 1 })
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'completed', code: '1', outputIndex: 2 })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'read-1', name: 'read', delta: '{}', contentIndex: 3 })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'read-1', content: 'ok' })
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 4, delta: 'done' })
+    expect(messages[0].activities?.map(activity => {
+      if (activity.type === 'thinking') return `thinking:${activity.content}`
+      if (activity.type === 'text') return `text:${activity.content}`
+      return `tool:${activity.tool.name}`
+    })).toEqual(['thinking:plan', 'tool:web_search', 'tool:code_interpreter', 'tool:read', 'text:done'])
+    expect(messages[0].tools?.every(tool => tool.finished)).toBe(true)
+    const untouched = [{ id: 'a', role: 'assistant' as const, content: 'old', timestamp: 1 }]
+    expect(applyStreamEvent(untouched, { type: 'session_title', sessionId: 's', title: 'x', source: 'model' } as never)).toEqual(untouched)
+  })
+
+  it('finishes a hosted search fallback tool_call via status without a tool_result', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'xs_1', name: 'x_search', delta: '{"query":"from:xai","phase":"searching"}', status: 'running' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'xs_1', name: 'x_search', delta: '{"query":"from:xai","phase":"completed"}', status: 'completed' })
+    expect(messages[0].tools?.[0]).toMatchObject({ id: 'xs_1', name: 'x_search', finished: true })
   })
 })

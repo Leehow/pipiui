@@ -29,7 +29,14 @@
  * Scope: this governs the main pi process only. Dispatched workers assemble their own tool
  * selection from their agent definition (`resolveSubagentToolSelection`) and never inherit
  * this process's argv, so a read-only Boss still commands fully capable workers.
+ *
+ * Generic `web_search` is also excluded when the selected model has effective native
+ * `web_search` (declared `nativeSearch` or the search slice of `hostedTools`). That
+ * decision is capability-driven — see `hidesGenericWebSearch` — never a provider-name
+ * branch at this seam.
  */
+
+import { extraExcludedGenericSearchTools, type NativeSearchModelRef } from "./generic-search-filter.js";
 
 /**
  * Tools removed from the main session when the Boss is read-only. Every entry is a
@@ -54,6 +61,8 @@ export interface MainToolPolicyInput {
   bossReadOnly?: boolean;
   /** The user's own Settings → 工具开关 denylist, as stored (group ids allowed). */
   disabledToolNames?: readonly string[];
+  /** Selected session model; used only for native-search tool-list filtering. */
+  model?: NativeSearchModelRef;
 }
 
 /**
@@ -69,6 +78,7 @@ export function resolveMainSessionExcludedTools(input: MainToolPolicyInput = {})
     names.add(name);
   }
   if (input.bossReadOnly) for (const name of BOSS_MUTATION_TOOL_NAMES) names.add(name);
+  for (const name of extraExcludedGenericSearchTools(input.model)) names.add(name);
   for (const reserved of RESERVED_DESKTOP_TOOL_NAMES) names.delete(reserved);
   return [...names].sort();
 }

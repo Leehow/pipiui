@@ -2,6 +2,8 @@ import { resolveOAuthConfig } from "./oauth/config.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok, parseImportConfirm } from "./oauth/import.js";
 import { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
+import { registerInputFilesHooks } from "./input-files-hooks.js";
+import { registerStructuredOutputHooks } from "./structured-output-hooks.js";
 import { createBroker } from "./oauth/broker.js";
 import { authJsonPath } from "./oauth/home.js";
 import { ImagesClient, resolveImageReference, } from "./images/client.js";
@@ -66,6 +68,11 @@ export default function (pi) {
     // The canonical provider config lives in ./provider.js and is shared with
     // the PipiUI host auth runtime (single source, no copied OAuth transport).
     pi.registerProvider(GROK_BUILD_PROVIDER_ID, createGrokBuildProvider({ emit: (event, payload) => emit(event, payload) }));
+    // Production Chat-with-Files seam. Existing test harnesses may omit `on`.
+    if (typeof pi.on === "function") {
+        registerInputFilesHooks(pi);
+        registerStructuredOutputHooks(pi);
+    }
     // Explicit one-shot import from the official grok CLI's ~/.grok/auth.json
     // (US-09): requires --confirm, reads the source exactly once, validates
     // issuer/client/expiry, persists via the broker (never deletes the source).
@@ -318,6 +325,10 @@ export default function (pi) {
         name: "image_gen",
         label: "Grok Build image_gen",
         description: "Generate a new image from a text description using xAI Grok Imagine; returns a typed image plus the saved file's absolute path under the session attachments directory. When telling the user where it was saved, refer to the short path. To produce multiple images, emit multiple tool calls with distinct prompts.",
+        // This mount takes ownership of `image_gen` from pipiui-media, so it has to carry the
+        // snippet too — without one the tool never appears in Pi's `Available tools:` list and
+        // ships with no steering at all.
+        promptSnippet: "Generate images after the user confirms",
         parameters: {
             type: "object",
             properties: {
@@ -339,6 +350,7 @@ export default function (pi) {
         name: "image_edit",
         label: "Grok Build image_edit",
         description: "Edit or transform existing image(s) via the xAI Imagine API; use instead of image_gen for image-to-image work (preserve likeness, transfer style, remix). Each `image` entry is a `data:image/...;base64,...` URL or a path to a JPEG/PNG ≤400KB inside the current workspace or the session attachments directory (arbitrary absolute paths are rejected). Returns a typed image plus the saved file's absolute path.",
+        promptSnippet: "Edit images after the user confirms",
         parameters: {
             type: "object",
             properties: {

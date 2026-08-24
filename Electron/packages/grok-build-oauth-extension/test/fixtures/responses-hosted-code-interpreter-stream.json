@@ -1,0 +1,65 @@
+[
+  {
+    "type": "response.output_item.added",
+    "output_index": 1,
+    "item": { "type": "code_interpreter_call", "id": "ci_1", "status": "queued" }
+  },
+  {
+    "type": "response.code_interpreter_call.in_progress",
+    "item_id": "ci_1",
+    "output_index": 1
+  },
+  {
+    "type": "response.code_interpreter_call_code.delta",
+    "item_id": "ci_1",
+    "output_index": 1,
+    "delta": "print("
+  },
+  {
+    "type": "response.code_interpreter_call_code.delta",
+    "item_id": "ci_1",
+    "output_index": 1,
+    "delta": "42)"
+  },
+  {
+    "type": "response.code_interpreter_call_code.done",
+    "item_id": "ci_1",
+    "output_index": 1,
+    "code": "print(42)"
+  },
+  {
+    "type": "response.code_interpreter_call.interpreting",
+    "item_id": "ci_1",
+    "output_index": 1
+  },
+  {
+    "type": "response.code_interpreter_call.completed",
+    "item_id": "ci_1",
+    "output_index": 1
+  },
+  {
+    "type": "response.output_item.done",
+    "output_index": 1,
+    "item": {
+      "type": "code_interpreter_call",
+      "id": "ci_1",
+      "status": "completed",
+      "code": "print(42)",
+      "outputs": [
+        { "type": "logs", "logs": "42\n" },
+        { "type": "image", "filename": "plot.png", "mime_type": "image/png", "url": "https://files.example/plot.png?token=secret" }
+      ]
+    }
+  },
+  {
+    "type": "response.completed",
+    "response": {
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 4,
+        "total_tokens": 14,
+        "server_side_tool_usage": { "SERVER_SIDE_TOOL_CODE_EXECUTION": 1 }
+      }
+    }
+  }
+]

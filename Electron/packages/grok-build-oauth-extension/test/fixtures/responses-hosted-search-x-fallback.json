@@ -1,0 +1,30 @@
+[
+  { "type": "response.created", "response": { "id": "resp_x" } },
+  {
+    "type": "response.output_item.added",
+    "output_index": 2,
+    "item": {
+      "type": "x_search_call",
+      "id": "xs_item",
+      "action": { "query": "from:xai", "sources": [{ "url": "https://x.com/xai/status/1", "title": "post" }] }
+    }
+  },
+  {
+    "type": "response.output_item.done",
+    "output_index": 2,
+    "item": {
+      "type": "x_keyword_search_call",
+      "id": "xs_item",
+      "status": "completed",
+      "action": { "query": "from:xai" }
+    }
+  },
+  {
+    "type": "response.custom_tool_call_input.done",
+    "name": "x_search",
+    "item_id": "xs_custom",
+    "output_index": 3,
+    "input": "{\"query\":\"grok\"}"
+  },
+  { "type": "response.completed", "response": { "id": "resp_x", "status": "completed" } }
+]

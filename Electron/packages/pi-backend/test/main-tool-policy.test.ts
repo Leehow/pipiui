@@ -44,6 +44,28 @@ describe("boss read-only tool policy", () => {
     expect(a).toEqual(b);
     expect(a).toEqual(["--exclude-tools", "abacus,bash,edit,write,zed"]);
   });
+
+  it("hides generic web_search only when effective native web_search is present", () => {
+    const nativeWeb = { capabilities: { nativeSearch: { tools: ["web_search", "x_search"] as const } } };
+    const xOnly = { capabilities: { nativeSearch: { tools: ["x_search"] as const } } };
+    const ordinary = { provider: "anthropic", id: "claude" };
+    const undeclaredXai = { provider: "xai", id: "grok-3" };
+    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: nativeWeb })).toEqual(["web_search"]);
+    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: xOnly })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: ordinary })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: undeclaredXai })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({
+      bossReadOnly: false,
+      model: { capabilities: { hostedTools: { tools: ["web_search"] as const } } },
+    })).toEqual(["web_search"]);
+    expect(resolveMainSessionExcludedTools({
+      bossReadOnly: false,
+      model: { capabilities: { hostedTools: { tools: ["code_interpreter"] as const } } },
+    })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ bossReadOnly: true, model: nativeWeb })).toEqual(["bash", "edit", "web_search", "write"]);
+    expect(mainSessionExcludeToolArgs({ bossReadOnly: false, model: nativeWeb })).toEqual(["--exclude-tools", "web_search"]);
+    expect(mainSessionExcludeToolArgs({ bossReadOnly: false, model: xOnly })).toEqual([]);
+  });
 });
 
 describe("main session spawn", () => {
@@ -80,5 +102,21 @@ describe("main session spawn", () => {
     const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: DEFAULT_FEATURES, paths });
     expect(args.filter((a) => a === "--exclude-tools")).toHaveLength(1);
     expect(Object.values(env)).not.toContain("bash,edit,write");
+  });
+
+  it("excludes generic web_search from the main spawn when the model hides it", () => {
+    const { args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { git: true },
+      paths,
+      model: { capabilities: { nativeSearch: { tools: ["web_search"] } } },
+    });
+    expect(args).toEqual(expect.arrayContaining(["--exclude-tools", "web_search"]));
+    expect(assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { git: true },
+      paths,
+      model: { capabilities: { nativeSearch: { tools: ["x_search"] } } },
+    }).args).not.toContain("--exclude-tools");
   });
 });

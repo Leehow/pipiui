@@ -1,8 +1,10 @@
 /** Versioned, transport-neutral contract used by every Pipi UI. */
 export * from "./plan.js";
 export * from "./external-session.js";
+export * from "./native-search.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
 import type { ExternalSession, ExternalSessionHistory, SessionAdoptedFrom } from "./external-session.js";
+import type { ModelCapabilities } from "./native-search.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -25,6 +27,18 @@ export type Session = {
 };
 export type SessionLease = { sessionId: string; writable: boolean; holder?: { protocolVersion: number; holder: string; pid: number; hostname: string; acquiredAt: string; heartbeatAt: string; expiresAt: string } };
 export type HistoryTool = { id: string; name: string; input: string };
+export type TranscriptCitation = {
+  url: string;
+  title?: string;
+  startIndex?: number;
+  endIndex?: number;
+  type?: string;
+};
+/** Live Chat-with-Files citation. Never includes provider file ids, paths, or tokens. */
+export type TranscriptFileSource = {
+  name: string;
+  url?: string;
+};
 export type HistoryActivity =
   | { type: "thinking"; contentIndex: number; content: string }
   | { type: "text"; contentIndex: number; content: string }
@@ -48,6 +62,10 @@ export type HistoryEntry = {
   activities?: HistoryActivity[];
   /** assistant only: terminal failure (`stopReason: "error"`) with no text content. */
   errorMessage?: string;
+  /** assistant only: preserved Responses url_citation / inline source URLs. */
+  citations?: TranscriptCitation[];
+  /** assistant only: Chat-with-Files sources. Never includes provider file ids. */
+  fileSources?: TranscriptFileSource[];
   /** tool (toolResult) only: the tool call this result belongs to. */
   toolCallId?: string;
   toolName?: string;
@@ -162,6 +180,8 @@ export type Model = {
   provider: string;
   id: string;
   name: string;
+  /** Pi streamer id, e.g. `openai-responses`. Absent = unknown (Structured Outputs stays capability-gated). */
+  api?: string;
   /** Pi model metadata. Absent means the runtime did not report whether this is a reasoning model. */
   reasoning?: boolean;
   /** Pi's tri-state map: string = supported provider value, null = explicitly unsupported, absent key = provider default. */
@@ -170,6 +190,8 @@ export type Model = {
   thinkingConfigurable?: boolean;
   /** Mirrors Swift ModelInfo.supportsImages (pi input array or heuristic). Absent = unknown (defaults to supported). */
   supportsImages?: boolean;
+  /** Declared hosted-tool capabilities. Absent = none declared. */
+  capabilities?: ModelCapabilities;
 };
 export type ModelState = { model: Model; thinkingLevel: ThinkingLevel; availableThinkingLevels: ThinkingLevel[] };
 
@@ -388,6 +410,32 @@ export type PromptAttachment = {
   /** Preserve transport-safe attachment metadata added by future clients. */
   [extra: string]: unknown;
 };
+/** Provider-scoped chat file. Never includes credentials or a local absolute path. */
+export type InputFileStatus = "uploading" | "ready" | "failed" | "cancelled";
+export type InputFileAttachment = {
+  id: string;
+  name: string;
+  size: number;
+  mimeType: string;
+  status: InputFileStatus;
+  fileId?: string;
+  sent?: boolean;
+  error?: string;
+};
+export type InputFileStageRequest = {
+  name: string;
+  size: number;
+  mimeType?: string;
+  dataBase64: string;
+  id?: string;
+};
+/** One-shot Responses Structured Outputs request. Never persisted by the host. */
+export type StructuredOutputRequest = {
+  name: string;
+  schema: Record<string, unknown>;
+  strict?: boolean;
+  description?: string;
+};
 /** Host-owned product queue lifecycle (matches the MessageQueue UI states). */
 export type QueuedMessageState = "queued" | "sending" | "failed";
 /** Durable, actionable message payload. Completed messages leave the active queue. */
@@ -533,22 +581,7 @@ export const BROWSER_MOBILE_DEVICES: readonly BrowserMobileDevicePreset[] = [
 export function browserMobileDeviceById(id: string | undefined): BrowserMobileDevicePreset {
   return BROWSER_MOBILE_DEVICES.find(item => item.id === id) ?? BROWSER_MOBILE_DEVICES[0]!;
 }
-export type BrowserLocator = { role?: string; name?: string; label?: string; text?: string; css?: string; nth?: number };
-export type BrowserFormLocator = BrowserLocator;
-export type BrowserFormField = {
-  element_token?: string;
-  element_index?: number;
-  locator?: BrowserLocator;
-  role?: string;
-  name?: string;
-  label?: string;
-  text?: string;
-  css?: string;
-  nth?: number;
-  value: string;
-  type?: string;
-};
-export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; locator?: BrowserLocator; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; fields?: BrowserFormField[]; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
+export type BrowserToolRequest = { action: string; url?: string; scope?: "viewport" | "page"; snapshot_id?: string; element_index?: number; element_token?: string; selector?: string; text?: string; option?: string; direction?: "up" | "down" | "left" | "right"; amount?: number; mode?: string; js?: string; region?: string; role?: string; name?: string; cursor?: string | number; /** Defaults to the UI's active viewport. Omitted on old clients. */ target?: BrowserToolTarget };
 export type BrowserToolImage = { viewport: BrowserViewportKind; base64: string; mimeType: string; width?: number; height?: number };
 export type BrowserToolResult = Record<string, unknown> & { ok: boolean; error?: string; base64?: string; mimeType?: string; images?: BrowserToolImage[] };
 export type BrowserTabOptions = { url?: string };
@@ -609,7 +642,34 @@ export type StreamEvent =
   | { type: "user_message"; sessionId: string; content: string; id?: string }
   | { type: "text"; sessionId: string; contentIndex: number; delta: string; segment?: number }
   | { type: "thinking"; sessionId: string; contentIndex: number; delta: string; segment?: number }
-  | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string; segment?: number }
+  | { type: "tool_call"; sessionId: string; contentIndex?: number; toolCallId: string; name: string; delta?: string; segment?: number; status?: "running" | "completed" | "failed" }
+  | {
+    type: "hosted_search";
+    sessionId: string;
+    callId: string;
+    kind: "web_search" | "x_search";
+    phase: "in_progress" | "searching" | "completed" | "failed";
+    query?: string;
+    sources?: Array<{ url: string; title?: string; snippet?: string }>;
+    error?: { code?: string; message: string };
+    outputIndex?: number;
+    segment?: number;
+  }
+  | {
+    type: "hosted_code_interpreter";
+    sessionId: string;
+    callId: string;
+    phase: "queued" | "in_progress" | "interpreting" | "completed" | "failed";
+    code?: string;
+    outputs?: Array<{ type: "logs"; text: string }>;
+    files?: Array<{ filename?: string; mimeType?: string; size?: number; url?: string }>;
+    error?: { code?: string; message: string };
+    outputIndex?: number;
+    segment?: number;
+  }
+  | { type: "citations"; sessionId: string; citations: TranscriptCitation[] }
+  | { type: "input_file_sources"; sessionId: string; sources: TranscriptFileSource[] }
+  | { type: "server_side_usage"; sessionId: string; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; totalTokens: number; serverSideToolUsage?: Record<string, number> } }
   | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[]; details?: unknown }
   | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[]; turnEpoch?: number }
@@ -702,7 +762,7 @@ export type ExtensionProviderModelContribution = {
   api?: string;
   input?: readonly string[];
   reasoning?: boolean;
-  capabilities?: Record<string, unknown>;
+  capabilities?: ModelCapabilities;
 };
 export type ExtensionProviderContribution = {
   id: string;
@@ -804,6 +864,14 @@ export interface PipiHostAPI {
   notifyDocumentsDropped?(sessionId: string, paths: string[]): Promise<void>;
   /** Composer chips: inject path+excerpt into the next prompt without opening the document panel. */
   notifyComposerDocumentsDropped?(sessionId: string, paths: string[]): Promise<void>;
+  /** Explicit Chat with Files: stage/upload a user-selected file. Gated by model `inputFiles`. */
+  stageInputFile?(sessionId: string, file: InputFileStageRequest): Promise<InputFileAttachment>;
+  listInputFiles?(sessionId: string): Promise<InputFileAttachment[]>;
+  removeInputFile?(sessionId: string, attachmentId: string): Promise<InputFileAttachment[]>;
+  retryInputFile?(sessionId: string, attachmentId: string, file?: InputFileStageRequest): Promise<InputFileAttachment>;
+  cancelInputFile?(sessionId: string, attachmentId: string): Promise<InputFileAttachment>;
+  /** Session-scoped one-shot Structured Outputs request for the next provider turn. `null` clears. */
+  setStructuredOutput?(sessionId: string, request: StructuredOutputRequest | null): Promise<void>;
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
   /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
   getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
@@ -1064,6 +1132,12 @@ function apiFrom(
     unwatchDocument: () => invoke("unwatchDocument"),
     notifyDocumentsDropped: (sessionId, paths) => invoke("notifyDocumentsDropped", sessionId, paths),
     notifyComposerDocumentsDropped: (sessionId, paths) => invoke("notifyComposerDocumentsDropped", sessionId, paths),
+    stageInputFile: (sessionId, file) => invoke("stageInputFile", sessionId, file),
+    listInputFiles: (sessionId) => invoke("listInputFiles", sessionId),
+    removeInputFile: (sessionId, attachmentId) => invoke("removeInputFile", sessionId, attachmentId),
+    retryInputFile: (sessionId, attachmentId, file) => file ? invoke("retryInputFile", sessionId, attachmentId, file) : invoke("retryInputFile", sessionId, attachmentId),
+    cancelInputFile: (sessionId, attachmentId) => invoke("cancelInputFile", sessionId, attachmentId),
+    setStructuredOutput: (sessionId, request) => invoke("setStructuredOutput", sessionId, request),
     subscribeDocuments: listener => subscribe("document", event => event.channel === "document", event => listener((event as Extract<HostEvent, { channel: "document" }>).event)),
     newSession: (projectId, name) => invoke("newSession", projectId, name),
     resumeSession: sessionId => invoke("resumeSession", sessionId),
@@ -1253,6 +1327,10 @@ export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHAN
 
 /** Stable client error when a socket drops with in-flight Host API requests. Never replay mutations. */
 export const TRANSPORT_DISCONNECTED = "transport_disconnected" as const;
+/** Stable client error when a WebSocket RPC never receives a matching response. */
+export const TRANSPORT_TIMEOUT = "transport_timeout" as const;
+/** Default wait for a matching WebSocket response. Tests override via `requestTimeoutMs`. */
+export const WS_HOST_REQUEST_TIMEOUT_MS = 30_000;
 
 export type HostWireParseResult =
   | { ok: true; frame: HostWireFrame }
@@ -1285,6 +1363,12 @@ function decodeWirePayload(raw: unknown): unknown {
 function transportDisconnectedError(): Error & { code: typeof TRANSPORT_DISCONNECTED } {
   const error = new Error("transport disconnected") as Error & { code: typeof TRANSPORT_DISCONNECTED };
   error.code = TRANSPORT_DISCONNECTED;
+  return error;
+}
+
+function transportTimeoutError(): Error & { code: typeof TRANSPORT_TIMEOUT } {
+  const error = new Error("transport request timed out") as Error & { code: typeof TRANSPORT_TIMEOUT };
+  error.code = TRANSPORT_TIMEOUT;
   return error;
 }
 
@@ -1405,15 +1489,24 @@ export function bindHostBackend(backend: HostBackend, socket: WebSocketLike, opt
 
 export interface WebSocketLike { readyState: number; send(data: string): void; addEventListener(type: "message" | "close" | "error", listener: (event: any) => void): void; removeEventListener(type: "message" | "close" | "error", listener: (event: any) => void): void; }
 
-export function createWsHost(socket: WebSocketLike): PipiHostAPI {
-  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+export type CreateWsHostOptions = {
+  /** Per-request wait for a matching response. Omit to use `WS_HOST_REQUEST_TIMEOUT_MS`. */
+  requestTimeoutMs?: number;
+};
+
+export function createWsHost(socket: WebSocketLike, options: CreateWsHostOptions = {}): PipiHostAPI {
+  const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   const events = new Set<(event: HostEvent) => void>();
   let disconnected = socket.readyState === 2 || socket.readyState === 3;
+  const requestTimeoutMs = options.requestTimeoutMs ?? WS_HOST_REQUEST_TIMEOUT_MS;
   const failPending = () => {
     if (disconnected) return;
     disconnected = true;
     const error = transportDisconnectedError();
-    for (const item of pending.values()) item.reject(error);
+    for (const item of pending.values()) {
+      clearTimeout(item.timer);
+      item.reject(error);
+    }
     pending.clear();
   };
   const onMessage = (raw: unknown) => {
@@ -1425,6 +1518,7 @@ export function createWsHost(socket: WebSocketLike): PipiHostAPI {
       const item = pending.get(frame.id);
       if (!item) return;
       pending.delete(frame.id);
+      clearTimeout(item.timer);
       frame.ok ? item.resolve(frame.result) : item.reject(responseError(frame));
     } else {
       events.forEach(listener => listener(frame));
@@ -1440,11 +1534,18 @@ export function createWsHost(socket: WebSocketLike): PipiHostAPI {
         return;
       }
       const id = requestId();
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        const item = pending.get(id);
+        if (!item) return;
+        pending.delete(id);
+        item.reject(transportTimeoutError());
+      }, requestTimeoutMs);
+      pending.set(id, { resolve, reject, timer });
       try {
         socket.send(JSON.stringify({ protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id, type: "request", method, params } satisfies HostRequest));
       } catch {
         pending.delete(id);
+        clearTimeout(timer);
         reject(transportDisconnectedError());
       }
     }),

@@ -11,13 +11,26 @@
  */
 export const AUTH_PROVIDER_ID = "grok-build";
 export const GROK_BUILD_PROVIDER_ID = AUTH_PROVIDER_ID;
-export const GROK_BUILD_CHAT_API = "openai-completions";
+export const GROK_BUILD_CHAT_API = "openai-responses";
 export const GROK_BUILD_BASE_URL = "https://api.x.ai/v1";
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+/** Hosted Agent Tools on the Responses API. Domain policy is optional overlay. */
+export const GROK_BUILD_NATIVE_SEARCH = {
+    tools: ["web_search", "x_search"],
+};
+export const GROK_BUILD_HOSTED_TOOLS = {
+    tools: ["web_search", "x_search", "code_interpreter"],
+};
+export const GROK_BUILD_CAPABILITIES = {
+    hostedTools: { tools: [...GROK_BUILD_HOSTED_TOOLS.tools] },
+    structuredOutputs: true,
+    inputFiles: true,
+    nativeSearch: { tools: [...GROK_BUILD_NATIVE_SEARCH.tools] },
+};
 /**
- * Concrete, tested Grok Build chat models. Official xAI Chat Completions ids
+ * Concrete, tested Grok Build chat models. Official xAI Responses ids
  * reachable with the grok-build OAuth access token. Keep this list small and
- * explicit — do not scrape a live catalog.
+ * explicit — do not scrape a live catalog. Reasoning flags stay as declared.
  */
 export const GROK_BUILD_CONVERSATION_MODELS = [
     {
@@ -38,6 +51,7 @@ export const GROK_BUILD_CONVERSATION_MODELS = [
             xhigh: "xhigh",
         },
         compat: { supportsReasoningEffort: true },
+        capabilities: { ...GROK_BUILD_CAPABILITIES },
     },
     {
         id: "grok-4-fast",
@@ -48,6 +62,7 @@ export const GROK_BUILD_CONVERSATION_MODELS = [
         cost: { ...ZERO_COST },
         contextWindow: 256000,
         maxTokens: 16384,
+        capabilities: { ...GROK_BUILD_CAPABILITIES },
     },
     {
         id: "grok-code-fast-1",
@@ -58,6 +73,7 @@ export const GROK_BUILD_CONVERSATION_MODELS = [
         cost: { ...ZERO_COST },
         contextWindow: 256000,
         maxTokens: 16384,
+        capabilities: { ...GROK_BUILD_CAPABILITIES },
     },
 ];
 export const GROK_BUILD_CONVERSATION_MODEL_IDS = GROK_BUILD_CONVERSATION_MODELS.map((model) => model.id);
@@ -69,5 +85,15 @@ export function grokBuildManifestModels() {
         api: model.api,
         input: [...model.input],
         reasoning: model.reasoning,
+        capabilities: {
+            hostedTools: {
+                tools: [...(model.capabilities?.hostedTools.tools ?? GROK_BUILD_HOSTED_TOOLS.tools)],
+            },
+            structuredOutputs: true,
+            inputFiles: true,
+            nativeSearch: {
+                tools: [...(model.capabilities?.nativeSearch.tools ?? GROK_BUILD_NATIVE_SEARCH.tools)],
+            },
+        },
     }));
 }

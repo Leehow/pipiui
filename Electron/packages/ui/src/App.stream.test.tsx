@@ -1,19 +1,25 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 
 // App imports browser-only panels; this reducer suite must not rely on xterm's layout implementation.
 vi.mock('@xterm/xterm', () => ({ Terminal: class { buffer = { active: { viewportY: 0, baseY: 0 } }; options = {}; open = vi.fn(); write = vi.fn(); clear = vi.fn(); focus = vi.fn(); scrollToBottom = vi.fn(); loadAddon = vi.fn(); dispose = vi.fn(); onData() { return { dispose: vi.fn() } } onScroll() { return { dispose: vi.fn() } } } }))
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
+vi.mock('react-virtuoso', async () => {
+  const React = await import('react')
+  return { Virtuoso: React.forwardRef(({ data, itemContent }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element }, ref) => { React.useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
+})
+vi.mock('streamdown', () => ({ Streamdown: ({ children }: { children: unknown }) => <>{children}</> }))
+vi.mock('@streamdown/code', () => ({ code: {} }))
 
 afterEach(() => cleanup())
 
-import { mergeAgentSummary, selectedSessionAgentSummaries } from './App'
+import { App, createMockHost, mergeAgentSummary, selectedSessionAgentSummaries } from './App'
 import { MessageView } from './Transcript'
 import { applyStreamEvent, finishStreamingMessage, historyMessages, type ChatMessage, type TranscriptActivity } from './transcript-model'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { projectLiveSubagents } from './live-subagent-projection'
-import type { AgentSummary, HistoryEntry } from '@pipi/host-api'
+import type { AgentSummary, HistoryEntry, StreamEvent } from '@pipi/host-api'
 
 function activityLabel(activity: TranscriptActivity): string {
   if (activity.type === 'thinking') return `thinking:${activity.content}`
@@ -526,5 +532,146 @@ describe('active tool-card semantics', () => {
     expect(card).toMatch(/\+1/)
     expect(card).toMatch(/\u22121/)
     view.unmount()
+  })
+})
+
+describe('hosted code interpreter card', () => {
+  it('renders running then success states with expandable code and a safe file link', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_1', phase: 'in_progress', code: 'print(1)' })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    expect(screen.getByTestId('active-tool').textContent).toMatch(/code_interpreter/)
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_1',
+      phase: 'completed',
+      code: 'print(1)',
+      outputs: [{ type: 'logs', text: '1' }],
+      files: [{ filename: 'plot.png', mimeType: 'image/png', url: 'https://files.example/plot.png?token=SECRET' }],
+    })
+    messages = finishStreamingMessage(messages)
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
+    const card = screen.getByTestId('hosted-code-interpreter-card')
+    expect(card.getAttribute('data-phase')).toBe('completed')
+    fireEvent.click(screen.getByRole('button', { name: /代码解释器 · print\(1\)/ }))
+    expect(card.textContent).toContain('print(1)')
+    expect(card.textContent).toContain('1')
+    const link = screen.getByRole('link', { name: /plot.png/ })
+    expect(link.getAttribute('href')).toBe('https://files.example/plot.png')
+    expect(link.getAttribute('rel')).toMatch(/noopener/)
+    expect(card.textContent).not.toMatch(/token=/)
+    expect(card.textContent).not.toContain('SECRET')
+    view.unmount()
+  })
+
+  it('shows a late completed card on a settled turn without duplicating the call', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'thinking', sessionId: 's', contentIndex: 0, delta: 'plan' })
+    messages = applyStreamEvent(messages, { type: 'hosted_code_interpreter', sessionId: 's', callId: 'ci_late', phase: 'interpreting', code: 'print(2)' })
+    messages = finishStreamingMessage(messages)
+    messages = applyStreamEvent(messages, {
+      type: 'hosted_code_interpreter',
+      sessionId: 's',
+      callId: 'ci_late',
+      phase: 'completed',
+      code: 'print(2)',
+      outputs: [{ type: 'logs', text: '2' }],
+    })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    fireEvent.click(screen.getByRole('button', { name: /2 个步骤/ }))
+    expect(screen.getAllByTestId('hosted-code-interpreter-card')).toHaveLength(1)
+    expect(screen.getByTestId('hosted-code-interpreter-card').getAttribute('data-phase')).toBe('completed')
+    expect(screen.getByRole('button', { name: /代码解释器 · print\(2\)/ })).toBeTruthy()
+    view.unmount()
+  })
+})
+
+describe('hosted search status and citations', () => {
+  it('renders a web_search status card and clickable source links', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'searching', query: 'pipiui' })
+    const view = render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    expect(screen.getByTestId('active-tool').querySelector('b')?.textContent).toBe('web_search · pipiui')
+    messages = applyStreamEvent(messages, { type: 'hosted_search', sessionId: 's', callId: 'ws_1', kind: 'web_search', phase: 'completed', query: 'pipiui' })
+    messages = applyStreamEvent(messages, { type: 'text', sessionId: 's', contentIndex: 0, delta: 'See [[1]](https://docs.example)' })
+    messages = applyStreamEvent(messages, { type: 'citations', sessionId: 's', citations: [{ url: 'https://docs.example', title: 'Docs' }] })
+    messages = finishStreamingMessage(messages)
+    view.rerender(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
+    expect(screen.getByRole('button', { name: /web_search · pipiui/ })).toBeTruthy()
+    const link = screen.getByRole('link', { name: 'Docs' })
+    expect(link.getAttribute('href')).toBe('https://docs.example')
+    view.unmount()
+  })
+})
+
+describe('late input_file_sources after settle', () => {
+  it('applies same-session late file sources immediately without waiting or history reload', async () => {
+    const host = createMockHost()
+    const listeners = new Set<(event: StreamEvent) => void>()
+    const originalSubscribe = host.subscribeStream.bind(host)
+    host.subscribeStream = (sessionId, listener) => {
+      listeners.add(listener)
+      const unsubscribe = originalSubscribe(sessionId, listener)
+      return () => { listeners.delete(listener); unsubscribe() }
+    }
+    host.getSessionHistory = vi.fn(async (): Promise<HistoryEntry[]> => [
+      { id: 'u1', role: 'user' as const, content: '分析附件', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: 'Based on the upload', timestamp: 2 },
+    ])
+    host.sendPrompt = vi.fn(async sessionId => {
+      for (const listener of listeners) listener({ type: 'status', sessionId, status: 'started' })
+    })
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '分析附件' } })
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalled())
+    await act(async () => {
+      for (const listener of listeners) {
+        listener({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'Based on the upload' })
+        listener({ type: 'status', sessionId: 'welcome', status: 'settled' })
+      }
+    })
+    expect(screen.queryByTestId('assistant-file-sources')).toBeNull()
+    const waitingBefore = screen.queryByTestId('waiting-placeholder')?.getAttribute('data-phase') ?? null
+    await act(async () => {
+      for (const listener of listeners) {
+        listener({
+          type: 'input_file_sources',
+          sessionId: 'welcome',
+          sources: [{ name: 'report.pdf', url: 'https://files.example/report.pdf' }],
+        })
+      }
+    })
+    const nav = screen.getByTestId('assistant-file-sources')
+    expect(nav.getAttribute('aria-label')).toBe('附件来源')
+    expect(within(nav).getByRole('link', { name: 'report.pdf' }).getAttribute('href')).toBe('https://files.example/report.pdf')
+    expect(nav.closest('[data-testid="assistant-transcript-content"]')?.textContent).toContain('Based on the upload')
+    expect(screen.queryByTestId('waiting-placeholder')?.getAttribute('data-phase') ?? null).toBe(waitingBefore)
+    await act(async () => {
+      for (const listener of listeners) {
+        listener({
+          type: 'input_file_sources',
+          sessionId: 'welcome',
+          sources: [{ name: 'report.pdf', url: 'https://files.example/report.pdf' }],
+        })
+      }
+    })
+    expect(screen.getAllByTestId('assistant-file-sources')).toHaveLength(1)
+    expect(within(screen.getByTestId('assistant-file-sources')).getAllByRole('link')).toHaveLength(1)
+    await act(async () => {
+      for (const listener of listeners) {
+        listener({
+          type: 'input_file_sources',
+          sessionId: 'layout',
+          sources: [{ name: 'other.pdf', url: 'https://files.example/other.pdf' }],
+        })
+      }
+    })
+    expect(screen.queryByText('other.pdf')).toBeNull()
+    expect(screen.queryByTestId('waiting-placeholder')?.getAttribute('data-phase') ?? null).toBe(waitingBefore)
   })
 })

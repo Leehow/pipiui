@@ -12,6 +12,7 @@ import { LiveSubagentCard } from './LiveSubagentCard'
 import { useLiveSubagentBindings } from './LiveSubagentBinding'
 import { TruncatedText } from './TruncatedText'
 import { TranscriptMarkdown } from './TranscriptMarkdown'
+import { HostedCodeInterpreterCard } from './HostedCodeInterpreterCard'
 import { ComputerPlanCard } from './ComputerPlanCard'
 import { ComputerTaskResultCard, ComputerWorkerResultCard, computerTaskGoalFromInput } from './ComputerTaskResultCard'
 import { parseComputerPlanSegment, parseComputerTaskResult, parseComputerWorkerResult } from './computer-task-report'
@@ -21,7 +22,19 @@ import { activitiesFromMessage, PENDING_THINKING_ID, planAssistantTranscript } f
 
 export type { TranscriptActivity, TranscriptTool } from './transcript-model'
 export { TranscriptMarkdown } from './TranscriptMarkdown'
-export type AssistantTranscriptMessage = Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities' | 'streaming' | 'error'>
+export type AssistantTranscriptMessage = Pick<ChatMessage, 'content' | 'thinking' | 'tools' | 'activities' | 'streaming' | 'error' | 'citations' | 'fileSources'>
+
+const FILE_SOURCE_FALLBACK = '已上传文件'
+
+function displayFileSourceName(name: string): string {
+  const slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'))
+  const base = (slash >= 0 ? name.slice(slash + 1) : name).replace(/[\u0000-\u001f\u007f]/g, '').trim()
+  return base || FILE_SOURCE_FALLBACK
+}
+
+function displayFileSourceUrl(url: string | undefined): string | undefined {
+  return url && /^https:\/\//i.test(url) ? url : undefined
+}
 
 function elapsed(startedAt: number, endedAt = Date.now()) { return `${Math.max(0, Math.round((endedAt - startedAt) / 1000))}s` }
 function toolRunSummary(steps: number, thinking: string | null, tools: { name: string }[]): string {
@@ -150,8 +163,32 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
       })}</ActivityCard>
     })}
     {activeTool && <ActiveToolCard key={`active-tool:${activeTool.tool.id}`} tool={activeTool.tool} />}
+    {message.citations && message.citations.length > 0 && <nav className="assistant-citations" data-testid="assistant-citations" aria-label="来源">
+      <div className="assistant-citations-label">来源</div>
+      <ol className="assistant-citations-list">
+        {message.citations.map((citation, index) => {
+          const label = citation.title?.trim() || citation.url
+          return <li key={`${citation.url}:${citation.startIndex ?? ''}:${index}`}><a href={citation.url} target="_blank" rel="noreferrer">{label}</a></li>
+        })}
+      </ol>
+    </nav>}
+    {message.fileSources && message.fileSources.length > 0 && <nav className="assistant-file-sources" data-testid="assistant-file-sources" aria-label="附件来源">
+      <div className="assistant-file-sources-label">附件来源</div>
+      <ol className="assistant-file-sources-list">
+        {message.fileSources.map((source, index) => {
+          const label = displayFileSourceName(source.name)
+          const url = displayFileSourceUrl(source.url)
+          return <li key={`${label}:${url ?? ''}:${index}`}>{url ? <a href={url} target="_blank" rel="noreferrer">{label}</a> : <span>{label}</span>}</li>
+        })}
+      </ol>
+    </nav>}
     {message.error && !errorDismissed && <div className="assistant-turn-error" data-testid="assistant-turn-error" role="alert"><span className="assistant-turn-error-message">{message.error}</span><button type="button" className="assistant-turn-error-close" aria-label="关闭错误提示" title="关闭错误提示" data-testid="assistant-turn-error-close" onClick={() => setErrorDismissed(true)}>×</button></div>}
   </div>
+})
+
+registerToolRenderer(BUILTIN_EXTENSION_ID, {
+  toolName: 'code_interpreter',
+  render: ({ tool, streaming }) => <HostedCodeInterpreterCard key={`tool:${tool.id}`} tool={tool} streaming={streaming} />,
 })
 
 registerToolRenderer(BUILTIN_EXTENSION_ID, {

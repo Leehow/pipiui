@@ -41,6 +41,22 @@ describe("grok-build conversation catalog gating", () => {
       ...GROK_BUILD_CONVERSATION_MODEL_IDS,
     ]);
     expect(GROK_BUILD_CONVERSATION_MODEL_IDS).not.toContain("grok-imagine-image-quality");
+    expect(grokBuildManifestModels().every((model) => model.api === "openai-responses")).toBe(true);
+    expect(grokBuildManifestModels().every((model) => (
+      model.capabilities.nativeSearch.tools.includes("web_search")
+      && model.capabilities.nativeSearch.tools.includes("x_search")
+      && model.capabilities.hostedTools.tools.includes("web_search")
+      && model.capabilities.hostedTools.tools.includes("x_search")
+      && model.capabilities.hostedTools.tools.includes("code_interpreter")
+      && model.capabilities.structuredOutputs === true
+      && model.capabilities.inputFiles === true
+    ))).toBe(true);
+    expect(claim.contribution.provider.models.every((model) => (
+      model.capabilities?.hostedTools && Array.isArray((model.capabilities.hostedTools as { tools?: unknown }).tools)
+        && (model.capabilities.hostedTools as { tools: string[] }).tools.includes("code_interpreter")
+        && model.capabilities.structuredOutputs === true
+        && model.capabilities.inputFiles === true
+    ))).toBe(true);
     const source = JSON.parse(readFileSync(join(pkgRoot, "pipiui-extension.json"), "utf8"));
     expect(source.app?.ui?.panels ?? []).toEqual([]);
   });

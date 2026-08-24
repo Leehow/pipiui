@@ -31,9 +31,37 @@ export {
   GROK_BUILD_CHAT_API,
   GROK_BUILD_CONVERSATION_MODEL_IDS,
   GROK_BUILD_CONVERSATION_MODELS,
+  GROK_BUILD_NATIVE_SEARCH,
   grokBuildManifestModels,
 } from "./models.js";
-export { accessTokenFromCredentials, buildConversationRequest, conversationProviderTransport } from "./conversation.js";
+export {
+  accessTokenFromCredentials,
+  applyMaterializedInputFiles,
+  applyStructuredOutput,
+  buildConversationRequest,
+  conversationProviderTransport,
+  modelHasInputFiles,
+  normalizeStructuredOutputResult,
+  structuredOutputsEnabled,
+} from "./conversation.js";
+export type {
+  MaterializedInputFile,
+  SafeInputFile,
+  StructuredOutputRequest,
+  StructuredOutputResult,
+} from "./conversation.js";
+export {
+  applyHostedSearchToPayload,
+  collectResponsesStream,
+  hostedSearchToolsOf,
+  mergeHostedSearchTools,
+} from "./hosted-search.js";
+export {
+  applyCodeInterpreterToPayload,
+  collectCodeInterpreterStream,
+  mergeCodeInterpreterTool,
+  modelHasCodeInterpreter,
+} from "./hosted-code-interpreter.js";
 
 export type GrokBuildEmit = (event: string, payload?: unknown) => Promise<void> | void;
 

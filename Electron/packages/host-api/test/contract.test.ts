@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url'
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
-import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtUiEvent, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
+import { bindHostBackend, createHostBackendSession, createIpcHost, createWsHost, encodePipiuiUpdateEvaluationIntent, parseHostWireFrame, PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX, PIPIUI_UPDATE_EVALUATION_INTENT_VERSION, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED, TRANSPORT_TIMEOUT, type ExtEvent, type ExtInvokeErrorCode, type ExtInvokeResult, type ExtUiEvent, type ExtensionContributions, type ExtensionDescriptor, type HostBackend, type HostEvent, type HostWireFrame, type IpcRendererLike, type PipiHostAPI, type SidebarSessionPreferences, type StreamEvent, type WebSocketLike } from '../src/index.js'
 import { registerPipiHostIpc } from '../../../apps/electron/src/main/index.js'
 import { createWsHostServer } from '../../../apps/server/src/index.js'
 
@@ -667,6 +667,38 @@ describe('Host API v2 transport contract', () => {
     const pending = host.listProjects()
     client.emit('error', {})
     await expect(pending).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+  })
+
+  it('rejects a hanging WebSocket RPC after requestTimeoutMs and forgets the pending id', async () => {
+    const [client, server] = pairedSockets()
+    const host = createWsHost(client, { requestTimeoutMs: 40 })
+    const hung = host.listProjects()
+    await expect(hung).rejects.toMatchObject({ message: 'transport request timed out', code: TRANSPORT_TIMEOUT })
+    expect(client.sent).toHaveLength(1)
+    const stale = JSON.parse(client.sent[0]) as { id: string }
+    server.send(JSON.stringify({ protocolVersion: 2, id: stale.id, type: 'response', ok: true, result: [{ id: 'stale' }] }))
+    bindHostBackend(transportBackend(), server)
+    await expect(host.listProjects()).resolves.toEqual([{ id: 'p1', name: 'P', path: '/tmp/p' }])
+  })
+
+  it('does not time out a WebSocket RPC that responds in time', async () => {
+    const [client, server] = pairedSockets()
+    bindHostBackend(transportBackend(async () => {
+      await new Promise(resolve => setTimeout(resolve, 15))
+      return [{ id: 'p1', name: 'P', path: '/tmp/p' }]
+    }), server)
+    const host = createWsHost(client, { requestTimeoutMs: 80 })
+    await expect(host.listProjects()).resolves.toEqual([{ id: 'p1', name: 'P', path: '/tmp/p' }])
+  })
+
+  it('close still wins over a pending timeout and does not double-reject', async () => {
+    const [client, server] = pairedSockets()
+    bindHostBackend(transportBackend(async () => new Promise(() => {})), server)
+    const host = createWsHost(client, { requestTimeoutMs: 50 })
+    const pending = host.listProjects()
+    client.close()
+    await expect(pending).rejects.toMatchObject({ code: TRANSPORT_DISCONNECTED })
+    await new Promise(resolve => setTimeout(resolve, 80))
   })
 
   it('ignores unknown or duplicate response ids and wrong-direction client frames', async () => {

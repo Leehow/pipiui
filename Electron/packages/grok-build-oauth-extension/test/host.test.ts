@@ -2,7 +2,17 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createGrokBuildHostLibrary, HOST_LIBRARY_VERSION } from "../agent/host.js";
+import {
+  createGrokBuildHostLibrary,
+  createInputFilesService,
+  createStructuredOutputController,
+  HOST_LIBRARY_VERSION,
+  modelHasInputFiles,
+  normalizeStructuredOutputRequest,
+  structuredOutputsEnabled,
+  FilesError,
+} from "../agent/host.js";
+import * as host from "../agent/host.js";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, join as joinPath } from "node:path";
@@ -114,6 +124,38 @@ describe("host library entry (reviewer MUST-FIX #9) — same build artifact, byt
       fetchImpl: (async () => { throw new Error("must not be called"); }) as unknown as typeof fetch,
     });
     await expect(lib.generateImage({ prompt: "x" })).rejects.toMatchObject({ code: "tier_restricted" });
+  });
+});
+
+describe("host input-files export", () => {
+  it("exports createInputFilesService and safe types, not credentials/tokens", () => {
+    expect(typeof createInputFilesService).toBe("function");
+    expect(typeof modelHasInputFiles).toBe("function");
+    expect(FilesError).toBeTypeOf("function");
+    expect(modelHasInputFiles({ capabilities: { inputFiles: true } })).toBe(true);
+    const service = createInputFilesService({
+      authPath: join(tmpdir(), "missing-auth.json"),
+      fetchImpl: (async () => { throw new Error("must not upload from export test"); }) as unknown as typeof fetch,
+    });
+    expect(Object.keys(service).sort()).toEqual(["remove", "upload"]);
+    expect(host).not.toHaveProperty("accessTokenFromCredentials");
+    expect(host).not.toHaveProperty("toOAuthCredentials");
+    expect(JSON.stringify(Object.keys(host))).not.toMatch(/accessToken|refreshToken|bearer/i);
+  });
+
+  it("exports structured-output normalize/controller without credentials", () => {
+    expect(typeof createStructuredOutputController).toBe("function");
+    expect(typeof normalizeStructuredOutputRequest).toBe("function");
+    expect(structuredOutputsEnabled({ structuredOutputs: true })).toBe(true);
+    const ctl = createStructuredOutputController();
+    const request = ctl.set("sess-a", {
+      name: "flag",
+      schema: { type: "object", properties: {} },
+    });
+    expect(request?.strict).toBe(true);
+    expect(ctl.take("sess-a")?.name).toBe("flag");
+    expect(ctl.take("sess-a")).toBeUndefined();
+    expect(host).not.toHaveProperty("accessTokenFromCredentials");
   });
 });
 

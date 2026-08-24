@@ -1,0 +1,11 @@
+[
+  { "type": "response.created", "response": { "id": "resp_err" } },
+  { "type": "response.web_search_call.in_progress", "item_id": "ws_err", "output_index": 1 },
+  {
+    "type": "response.failed",
+    "response": {
+      "status": "failed",
+      "error": { "code": "rate_limited", "message": "too many hosted search calls" }
+    }
+  }
+]

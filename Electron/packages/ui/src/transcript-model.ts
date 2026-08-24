@@ -1,4 +1,4 @@
-import type { HistoryEntry, HistoryTool, StreamEvent } from '@pipi/host-api'
+import type { HistoryEntry, HistoryTool, StreamEvent, TranscriptCitation, TranscriptFileSource } from '@pipi/host-api'
 import { stripAttachmentPathsForDisplay } from './attachments'
 import { displaySecretPlaceholders } from './secret-display'
 
@@ -43,6 +43,12 @@ export type ChatMessage = {
   images?: { data: string; mimeType: string }[]
   /** assistant only: terminal provider error (stopReason "error") rendered as an error bubble. */
   error?: string
+  /** assistant only: Responses url_citation / inline source URLs. */
+  citations?: TranscriptCitation[]
+  /** assistant only: live Chat-with-Files sources. Never includes provider file ids. */
+  fileSources?: TranscriptFileSource[]
+  /** assistant only: provider server-side tool usage counts, when present. */
+  serverSideToolUsage?: Record<string, number>
   /** Local optimistic state for messages sent while queue is busy; cleared on host echo. */
   queued?: boolean
 }
@@ -73,6 +79,53 @@ function isPendingThinking(activity: TranscriptActivity | undefined): activity i
 
 function stripPendingThinking(activities: TranscriptActivity[]): TranscriptActivity[] {
   return activities.filter(activity => !isPendingThinking(activity))
+}
+
+function sanitizeTranscriptFileName(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || !raw.trim()) return undefined
+  const trimmed = raw.trim()
+  const slash = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'))
+  const base = (slash >= 0 ? trimmed.slice(slash + 1) : trimmed).trim()
+  const cleaned = base.replace(/[\u0000-\u001f\u007f]/g, '').replace(/^\.+/, '')
+  return cleaned.slice(0, 200).trim() || undefined
+}
+
+function mergeFileSources(existing: TranscriptFileSource[] | undefined, incoming: TranscriptFileSource[] | undefined): TranscriptFileSource[] | undefined {
+  const merged = [...(existing ?? [])]
+  for (const source of incoming ?? []) {
+    const name = sanitizeTranscriptFileName(source.name)
+    if (!name) continue
+    const url = typeof source.url === 'string' ? safeHttpsFileUrl(source.url) : undefined
+    const index = merged.findIndex(item => item.name === name && (item.url ?? '') === (url ?? ''))
+    const next = { name, ...(url ? { url } : {}) }
+    if (index < 0) {
+      merged.push(next)
+      continue
+    }
+    merged[index] = { ...merged[index], ...next }
+  }
+  return merged.length ? merged : existing
+}
+
+function mergeCitations(existing: TranscriptCitation[] | undefined, incoming: TranscriptCitation[] | undefined): TranscriptCitation[] | undefined {
+  const merged = [...(existing ?? [])]
+  for (const citation of incoming ?? []) {
+    if (!citation.url || !/^https?:\/\//i.test(citation.url)) continue
+    const index = merged.findIndex(item => item.url === citation.url)
+    if (index < 0) {
+      merged.push(citation)
+      continue
+    }
+    merged[index] = {
+      ...merged[index],
+      ...citation,
+      title: citation.title ?? merged[index].title,
+      startIndex: citation.startIndex ?? merged[index].startIndex,
+      endIndex: citation.endIndex ?? merged[index].endIndex,
+      type: citation.type ?? merged[index].type,
+    }
+  }
+  return merged.length ? merged : existing
 }
 
 function allToolsFinished(tools: TranscriptTool[] | undefined): boolean {
@@ -168,9 +221,11 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
         previous.content = entry.content
         previous.id = entry.id
         previous.timestamp = entry.timestamp
+        if (entry.citations?.length) previous.citations = entry.citations
+        if (entry.fileSources?.length) previous.fileSources = entry.fileSources
         continue
       }
-      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, activities, timestamp: entry.timestamp, ...(entry.errorMessage ? { error: entry.errorMessage } : {}) })
+      messages.push({ id: entry.id, role: 'assistant', content: entry.content, thinking: entry.thinking, tools, activities, timestamp: entry.timestamp, ...(entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.citations?.length ? { citations: entry.citations } : {}), ...(entry.fileSources?.length ? { fileSources: entry.fileSources } : {}) })
       continue
     }
     if (entry.role === 'tool' && entry.toolCallId && cards.has(entry.toolCallId)) {
@@ -189,9 +244,11 @@ export function historyMessages(entries: HistoryEntry[]): ChatMessage[] {
       previous.content = entry.content
       previous.id = entry.id
       previous.timestamp = entry.timestamp
+      if (entry.citations?.length) previous.citations = entry.citations
+      if (entry.fileSources?.length) previous.fileSources = entry.fileSources
       continue
     }
-    messages.push({ id: entry.id, role: entry.role, content: entry.role === 'user' ? stripAttachmentPathsForDisplay(entry.content) : entry.content, timestamp: entry.timestamp, ...(entry.role === 'assistant' && entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
+    messages.push({ id: entry.id, role: entry.role, content: entry.role === 'user' ? stripAttachmentPathsForDisplay(entry.content) : entry.content, timestamp: entry.timestamp, ...(entry.role === 'assistant' && entry.errorMessage ? { error: entry.errorMessage } : {}), ...(entry.role === 'assistant' && entry.citations?.length ? { citations: entry.citations } : {}), ...(entry.role === 'assistant' && entry.fileSources?.length ? { fileSources: entry.fileSources } : {}), ...(entry.role === 'user' && entry.images?.length ? { images: entry.images } : {}) })
   }
   return messages
 }
@@ -210,6 +267,8 @@ export function transcriptFingerprint(messages: readonly ChatMessage[]): string 
     activities: message.activities?.map(activity => activity.type === 'tool'
       ? { type: activity.type, contentIndex: activity.contentIndex, toolId: activity.tool.id, result: activity.tool.result, error: activity.tool.error }
       : { type: activity.type, contentIndex: activity.contentIndex, content: activity.content }),
+    citations: message.citations?.map(citation => ({ url: citation.url, title: citation.title, startIndex: citation.startIndex, endIndex: citation.endIndex })),
+    fileSources: message.fileSources?.map(source => ({ name: source.name, url: source.url })),
     images: message.images?.map(image => ({ mimeType: image.mimeType, size: image.data.length })),
   })))
 }
@@ -348,6 +407,106 @@ export function appendLiveUserMessage(messages: ChatMessage[], incoming: { conte
   return [...messages, { id: incoming.id ?? `user-${Date.now()}`, role: 'user', content, timestamp: Date.now(), ...(incoming.images?.length ? { images: incoming.images } : {}) }]
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Display-safe https URL: drop non-https and strip token/signature query keys. */
+export function safeHttpsFileUrl(url: string | undefined): string | undefined {
+  if (!url || !/^https:\/\//i.test(url)) return undefined
+  if (!/[?&](?:token|access_token|sig|signature|key|auth)=/i.test(url) && !/[?&](?:access|container|file|download)[_-]?token=/i.test(url)) {
+    return url
+  }
+  try {
+    const parsed = new URL(url)
+    for (const key of [...parsed.searchParams.keys()]) {
+      if (/token|sig|signature|key|auth/i.test(key)) parsed.searchParams.delete(key)
+    }
+    return parsed.toString()
+  } catch {
+    return undefined
+  }
+}
+
+function mergeHostedCodeText(prev: unknown, next: unknown): string | undefined {
+  const prevCode = typeof prev === 'string' ? prev : undefined
+  const nextCode = typeof next === 'string' ? next : undefined
+  if (nextCode == null) return prevCode
+  if (prevCode == null) return nextCode
+  if (nextCode.startsWith(prevCode) || prevCode.startsWith(nextCode)) {
+    return nextCode.length >= prevCode.length ? nextCode : prevCode
+  }
+  return nextCode
+}
+
+function mergeHostedCodeOutputs(prev: unknown, next: unknown): Array<{ type: 'logs'; text: string }> | undefined {
+  const list: Array<{ type: 'logs'; text: string }> = []
+  const seen = new Set<string>()
+  for (const source of [prev, next]) {
+    if (!Array.isArray(source)) continue
+    for (const item of source) {
+      if (!isRecord(item) || typeof item.text !== 'string' || !item.text) continue
+      if (seen.has(item.text)) continue
+      seen.add(item.text)
+      list.push({ type: 'logs', text: item.text })
+    }
+  }
+  return list.length ? list : undefined
+}
+
+function mergeHostedCodeFiles(prev: unknown, next: unknown): Array<{ filename?: string; mimeType?: string; size?: number; url?: string }> | undefined {
+  const list: Array<{ filename?: string; mimeType?: string; size?: number; url?: string }> = []
+  const seen = new Set<string>()
+  for (const source of [prev, next]) {
+    if (!Array.isArray(source)) continue
+    for (const item of source) {
+      if (!isRecord(item)) continue
+      const filename = typeof item.filename === 'string' ? item.filename : undefined
+      const mimeType = typeof item.mimeType === 'string' ? item.mimeType : undefined
+      const size = typeof item.size === 'number' ? item.size : undefined
+      const url = typeof item.url === 'string' ? safeHttpsFileUrl(item.url) : undefined
+      if (!filename && !mimeType && size === undefined && !url) continue
+      const key = url || `${filename ?? ''}:${mimeType ?? ''}:${size ?? ''}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      list.push({
+        ...(filename ? { filename } : {}),
+        ...(mimeType ? { mimeType } : {}),
+        ...(size !== undefined ? { size } : {}),
+        ...(url ? { url } : {}),
+      })
+    }
+  }
+  return list.length ? list : undefined
+}
+
+function hostedCodeLogText(outputs: Array<{ type: 'logs'; text: string }> | undefined): string | undefined {
+  const text = outputs?.map(item => item.text).filter(Boolean).join('\n')
+  return text || undefined
+}
+
+function mergeHostedCodeInterpreterInput(previousInput: string | undefined, event: Extract<StreamEvent, { type: 'hosted_code_interpreter' }>): string {
+  let prev: Record<string, unknown> = {}
+  try { prev = JSON.parse(previousInput || '{}') as Record<string, unknown> } catch { /* keep empty */ }
+  const incoming: Record<string, unknown> = {
+    phase: event.phase,
+    ...(event.code ? { code: event.code } : {}),
+    ...(event.outputs?.length ? { outputs: event.outputs } : {}),
+    ...(event.files?.length ? { files: event.files } : {}),
+    ...(event.error?.message ? { error: event.error.message } : {}),
+  }
+  const code = mergeHostedCodeText(prev.code, incoming.code)
+  const outputs = mergeHostedCodeOutputs(prev.outputs, incoming.outputs)
+  const files = mergeHostedCodeFiles(prev.files, incoming.files)
+  return JSON.stringify({
+    ...prev,
+    ...incoming,
+    ...(code !== undefined ? { code } : {}),
+    ...(outputs ? { outputs } : {}),
+    ...(files ? { files } : {}),
+  })
+}
+
 export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamEvent, { type: 'status' }>): ChatMessage[] {
   if (event.type === 'secret_redact') return applySecretRedact(previous, event.messages)
   if (event.type === 'error') return applyTurnError(previous, displaySecretPlaceholders(event.content))
@@ -355,11 +514,23 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     if (event.delta) event = { ...event, delta: displaySecretPlaceholders(event.delta) }
   } else if (event.type === 'tool_result') {
     event = { ...event, content: displaySecretPlaceholders(event.content) }
+  } else if (event.type === 'hosted_code_interpreter') {
+    event = {
+      ...event,
+      ...(event.code ? { code: displaySecretPlaceholders(event.code) } : {}),
+      ...(event.outputs?.length ? {
+        outputs: event.outputs.map(item => ({ ...item, text: displaySecretPlaceholders(item.text) })),
+      } : {}),
+      ...(event.error?.message ? { error: { ...event.error, message: displaySecretPlaceholders(event.error.message) } } : {}),
+    }
   }
-  if (event.type !== 'text' && event.type !== 'thinking' && event.type !== 'tool_call' && event.type !== 'tool_result') return previous
+  if (event.type !== 'text' && event.type !== 'thinking' && event.type !== 'tool_call' && event.type !== 'tool_result' && event.type !== 'hosted_search' && event.type !== 'hosted_code_interpreter' && event.type !== 'citations' && event.type !== 'input_file_sources' && event.type !== 'server_side_usage') return previous
   const index = previous.findLastIndex(item => item.role === 'assistant')
-  const current = index >= 0 && previous[index].streaming ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
-  const next = index >= 0 && previous[index].streaming ? [...previous] : [...previous, current]
+  // Late hosted code-interpreter events after settle still update the last
+  // assistant in place so the virtual card appears immediately.
+  const reuseSettled = (event.type === 'hosted_code_interpreter' || event.type === 'input_file_sources') && index >= 0
+  const current = index >= 0 && (previous[index].streaming || reuseSettled) ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
+  const next = index >= 0 && (previous[index].streaming || reuseSettled) ? [...previous] : [...previous, current]
   const tools = (current.tools ?? []).map(tool => ({ ...tool }))
   const toolsById = new Map(tools.map(tool => [tool.id, tool]))
   const activities = (current.activities ?? []).map(activity => cloneActivity(activity, toolsById))
@@ -428,11 +599,145 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
       toolIndex = updated.tools!.length - 1
     }
     const tool = updated.tools![toolIndex]
-    if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
+    if (event.status === 'completed' || event.status === 'failed') {
+      const completed = {
+        ...tool,
+        finished: true,
+        finishedAt: Date.now(),
+        error: event.status === 'failed' || tool.error,
+      }
+      updated.tools![toolIndex] = completed
+      if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity
+      else {
+        const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+        activities.push({ type: 'tool', contentIndex, segment, tool: completed })
+      }
+      if (allToolsFinished(updated.tools)) openPendingThinking(activities)
+    } else if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
     else {
       const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
       activities.push({ type: 'tool', contentIndex, segment, tool })
     }
+  }
+  if (event.type === 'hosted_search') {
+    const pendingIndex = activities.findIndex(isPendingThinking)
+    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
+    const segment = event.segment ?? lastSegment(activities)
+    const delta = JSON.stringify({
+      phase: event.phase,
+      ...(event.query ? { query: event.query } : {}),
+      ...(event.sources?.length ? { sources: event.sources } : {}),
+      ...(event.error?.message ? { error: event.error.message } : {}),
+    })
+    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
+    if (activityIndex < 0 && event.outputIndex !== undefined) {
+      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
+    }
+    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
+      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : updated.tools!.findIndex(item => item.id === event.callId)
+    const finished = event.phase === 'completed' || event.phase === 'failed'
+    if (toolIndex >= 0) {
+      const previous = updated.tools![toolIndex]
+      updated.tools![toolIndex] = {
+        ...previous,
+        id: event.callId,
+        name: event.kind,
+        input: event.query || event.sources?.length || event.error ? delta : previous.input || delta,
+        finished,
+        finishedAt: finished ? Date.now() : previous.finishedAt,
+        error: event.phase === 'failed' ? true : previous.error,
+        result: event.phase === 'failed' ? (event.error?.message ?? previous.result) : previous.result,
+      }
+    } else {
+      updated.tools!.push({
+        id: event.callId,
+        name: event.kind,
+        input: delta,
+        startedAt: Date.now(),
+        finished,
+        finishedAt: finished ? Date.now() : undefined,
+        ...(event.phase === 'failed' ? { error: true } : {}),
+        result: event.phase === 'failed' ? event.error?.message : undefined,
+      })
+      toolIndex = updated.tools!.length - 1
+    }
+    const tool = updated.tools![toolIndex]
+    if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
+    else {
+      const contentIndex = event.outputIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+      activities.push({ type: 'tool', contentIndex, segment, tool })
+    }
+    if (finished && allToolsFinished(updated.tools)) openPendingThinking(activities)
+    if (event.sources?.length) {
+      updated.citations = mergeCitations(updated.citations, event.sources.map(source => ({
+        url: source.url,
+        ...(source.title ? { title: source.title } : {}),
+      })))
+    }
+  }
+  if (event.type === 'hosted_code_interpreter') {
+    const pendingIndex = activities.findIndex(isPendingThinking)
+    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
+    const segment = event.segment ?? lastSegment(activities)
+    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
+    if (activityIndex < 0 && event.outputIndex !== undefined) {
+      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
+    }
+    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
+      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : updated.tools!.findIndex(item => item.id === event.callId)
+    const finished = event.phase === 'completed' || event.phase === 'failed'
+    const previousTool = toolIndex >= 0 ? updated.tools![toolIndex] : undefined
+    const merged = mergeHostedCodeInterpreterInput(previousTool?.input, event)
+    let parsedOutputs: Array<{ type: 'logs'; text: string }> | undefined
+    try {
+      const parsed = JSON.parse(merged) as Record<string, unknown>
+      parsedOutputs = mergeHostedCodeOutputs(parsed.outputs, undefined)
+    } catch { /* ignore */ }
+    const logText = hostedCodeLogText(parsedOutputs)
+    if (toolIndex >= 0 && previousTool) {
+      updated.tools![toolIndex] = {
+        ...previousTool,
+        id: event.callId,
+        name: 'code_interpreter',
+        input: merged,
+        finished,
+        finishedAt: finished ? Date.now() : previousTool.finishedAt,
+        error: event.phase === 'failed' ? true : previousTool.error,
+        result: event.phase === 'failed'
+          ? (event.error?.message ?? previousTool.result)
+          : logText || previousTool.result,
+      }
+    } else {
+      updated.tools!.push({
+        id: event.callId,
+        name: 'code_interpreter',
+        input: merged,
+        startedAt: Date.now(),
+        finished,
+        finishedAt: finished ? Date.now() : undefined,
+        ...(event.phase === 'failed' ? { error: true } : {}),
+        result: event.phase === 'failed' ? event.error?.message : logText,
+      })
+      toolIndex = updated.tools!.length - 1
+    }
+    const tool = updated.tools![toolIndex]
+    if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
+    else {
+      const contentIndex = event.outputIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+      activities.push({ type: 'tool', contentIndex, segment, tool })
+    }
+    if (finished && allToolsFinished(updated.tools) && updated.streaming) openPendingThinking(activities)
+  }
+  if (event.type === 'citations') {
+    updated.citations = mergeCitations(updated.citations, event.citations)
+  }
+  if (event.type === 'input_file_sources') {
+    updated.fileSources = mergeFileSources(updated.fileSources, event.sources)
+  }
+  if (event.type === 'server_side_usage' && event.usage.serverSideToolUsage) {
+    updated.serverSideToolUsage = { ...updated.serverSideToolUsage, ...event.usage.serverSideToolUsage }
   }
   if (event.type === 'tool_result') {
     const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)

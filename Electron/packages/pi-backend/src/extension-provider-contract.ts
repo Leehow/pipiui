@@ -4,8 +4,21 @@
  * extension renderer. Models are never written to models.json here.
  */
 
+import {
+  mergeModelCapabilities,
+  parseModelCapabilities,
+  type ModelCapabilities,
+} from "@pipi/host-api";
+
 export const EXTENSION_PROVIDER_ID_RE = /^[a-z][a-z0-9-]*$/;
 export const EXTENSION_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]*$/;
+
+export type ExtensionModelCost = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
 
 /** Pi provider `models[]` shape used as the single host-visible model source. */
 export type ExtensionProviderModelContribution = {
@@ -14,7 +27,12 @@ export type ExtensionProviderModelContribution = {
   api?: string;
   input?: string[];
   reasoning?: boolean;
-  capabilities?: Record<string, unknown>;
+  capabilities?: ModelCapabilities;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: ExtensionModelCost;
+  thinkingLevelMap?: Record<string, unknown>;
+  compat?: Record<string, unknown>;
 };
 
 export type ExtensionProviderContribution = {
@@ -46,7 +64,12 @@ export type ExtensionCatalogModel = {
   api?: string;
   input?: string[];
   reasoning?: boolean;
-  capabilities?: Record<string, unknown>;
+  capabilities?: ModelCapabilities;
+  contextWindow?: number;
+  maxTokens?: number;
+  cost?: ExtensionModelCost;
+  thinkingLevelMap?: Record<string, unknown>;
+  compat?: Record<string, unknown>;
 };
 
 export type ContributionValidation =
@@ -71,6 +94,26 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function asPositiveInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function asFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseCost(value: unknown): ExtensionModelCost | undefined {
+  if (!isRecord(value)) return undefined;
+  const input = asFiniteNumber(value.input);
+  const output = asFiniteNumber(value.output);
+  const cacheRead = asFiniteNumber(value.cacheRead);
+  const cacheWrite = asFiniteNumber(value.cacheWrite);
+  if (input === undefined || output === undefined || cacheRead === undefined || cacheWrite === undefined) {
+    return undefined;
+  }
+  return { input, output, cacheRead, cacheWrite };
 }
 
 function parseModel(
@@ -117,7 +160,52 @@ function parseModel(
     if (!isRecord(value.capabilities)) {
       errors.push(`auth.provider.models[${index}].capabilities must be an object`);
     } else {
-      model.capabilities = { ...value.capabilities };
+      const parsed = parseModelCapabilities(
+        value.capabilities,
+        `auth.provider.models[${index}].capabilities`,
+      );
+      if (!parsed.ok) errors.push(parsed.error);
+      else if (parsed.capabilities) model.capabilities = parsed.capabilities;
+    }
+  }
+  if (value.contextWindow !== undefined) {
+    const contextWindow = asPositiveInt(value.contextWindow);
+    if (contextWindow === undefined) {
+      errors.push(`auth.provider.models[${index}].contextWindow must be a positive integer`);
+    } else {
+      model.contextWindow = contextWindow;
+    }
+  }
+  if (value.maxTokens !== undefined) {
+    const maxTokens = asPositiveInt(value.maxTokens);
+    if (maxTokens === undefined) {
+      errors.push(`auth.provider.models[${index}].maxTokens must be a positive integer`);
+    } else {
+      model.maxTokens = maxTokens;
+    }
+  }
+  if (value.cost !== undefined) {
+    const cost = parseCost(value.cost);
+    if (!cost) {
+      errors.push(
+        `auth.provider.models[${index}].cost must be {input,output,cacheRead,cacheWrite} numbers`,
+      );
+    } else {
+      model.cost = cost;
+    }
+  }
+  if (value.thinkingLevelMap !== undefined) {
+    if (!isRecord(value.thinkingLevelMap)) {
+      errors.push(`auth.provider.models[${index}].thinkingLevelMap must be an object`);
+    } else {
+      model.thinkingLevelMap = { ...value.thinkingLevelMap };
+    }
+  }
+  if (value.compat !== undefined) {
+    if (!isRecord(value.compat)) {
+      errors.push(`auth.provider.models[${index}].compat must be an object`);
+    } else {
+      model.compat = { ...value.compat };
     }
   }
   return model;
@@ -315,11 +403,59 @@ export function resolveContributedCatalog(input: {
         ...(model.input ? { input: model.input } : {}),
         ...(model.reasoning === undefined ? {} : { reasoning: model.reasoning }),
         ...(model.capabilities ? { capabilities: model.capabilities } : {}),
+        ...(model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow }),
+        ...(model.maxTokens === undefined ? {} : { maxTokens: model.maxTokens }),
+        ...(model.cost ? { cost: model.cost } : {}),
+        ...(model.thinkingLevelMap ? { thinkingLevelMap: model.thinkingLevelMap } : {}),
+        ...(model.compat ? { compat: model.compat } : {}),
       });
     }
   }
 
   return { models, suppressedProviders };
+}
+
+function activeContributionClaims(
+  claims: readonly ContributionClaim[],
+  authenticatedProviders: ReadonlySet<string>,
+): ContributionClaim[] {
+  const collisions = new Set(detectContributionCollisions(claims).map((item) => item.extensionId));
+  return claims.filter((claim) => (
+    claim.enabled
+    && !collisions.has(claim.extensionId)
+    && authenticatedProviders.has(claim.contribution.provider.id)
+  ));
+}
+
+/**
+ * Attach declared capabilities onto runtime/configured catalog rows that already
+ * own the same provider/id. Runtime `nativeSearch` wins when both declare it.
+ */
+export function mergeContributedModelCapabilities<T extends {
+  provider: string;
+  id: string;
+  capabilities?: ModelCapabilities;
+}>(
+  models: readonly T[],
+  input: {
+    claims: readonly ContributionClaim[];
+    authenticatedProviders: ReadonlySet<string>;
+  },
+): T[] {
+  const byKey = new Map<string, ModelCapabilities>();
+  for (const claim of activeContributionClaims(input.claims, input.authenticatedProviders)) {
+    for (const model of claim.contribution.provider.models) {
+      if (!model.capabilities) continue;
+      byKey.set(modelKey(claim.contribution.provider.id, model.id), model.capabilities);
+    }
+  }
+  if (!byKey.size) return [...models];
+  return models.map((model) => {
+    const contributed = byKey.get(modelKey(model.provider, model.id));
+    if (!contributed) return model;
+    const capabilities = mergeModelCapabilities(contributed, model.capabilities);
+    return capabilities ? { ...model, capabilities } : model;
+  });
 }
 
 /**

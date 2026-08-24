@@ -3,6 +3,8 @@ import { resolveOAuthConfig } from "./oauth/config.js";
 import { redactMessage } from "./oauth/redact.js";
 import { importFromGlobalGrok, parseImportConfirm } from "./oauth/import.js";
 import { createGrokBuildProvider, GROK_BUILD_PROVIDER_ID } from "./provider.js";
+import { registerInputFilesHooks } from "./input-files-hooks.js";
+import { registerStructuredOutputHooks } from "./structured-output-hooks.js";
 import { createBroker, type GrokCredentialBroker } from "./oauth/broker.js";
 import { authJsonPath } from "./oauth/home.js";
 import {
@@ -75,6 +77,12 @@ export default function (pi: ExtensionAPI): void {
     GROK_BUILD_PROVIDER_ID,
     createGrokBuildProvider({ emit: (event, payload) => emit(event, payload) }) as never,
   );
+
+  // Production Chat-with-Files seam. Existing test harnesses may omit `on`.
+  if (typeof pi.on === "function") {
+    registerInputFilesHooks(pi);
+    registerStructuredOutputHooks(pi);
+  }
 
   // Explicit one-shot import from the official grok CLI's ~/.grok/auth.json
   // (US-09): requires --confirm, reads the source exactly once, validates

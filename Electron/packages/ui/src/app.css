@@ -268,6 +268,16 @@ body{overscroll-behavior:none}
 .assistant-turn-error-message{flex:1;min-width:0}
 .assistant-turn-error-close{flex:none;display:grid;width:20px;height:20px;place-items:center;margin:0;padding:0;border-radius:5px;color:var(--muted);font-size:15px;line-height:1}
 .assistant-turn-error-close:hover{color:var(--text-strong);background:var(--surface-hover)}
+.assistant-citations{margin:8px 0 0;padding:8px 12px;border:1px solid color-mix(in srgb,var(--border) 88%,var(--muted));border-radius:8px;background:color-mix(in srgb,var(--surface-raised) 78%,transparent)}
+.assistant-citations-label{margin:0 0 4px;color:var(--muted);font-size:11px;letter-spacing:.02em}
+.assistant-citations-list{margin:0;padding-left:18px;color:var(--text);font-size:12.5px;line-height:1.55}
+.assistant-citations-list a{color:var(--accent, #4c8dff);overflow-wrap:anywhere}
+.assistant-file-sources{margin:8px 0 0;padding:8px 12px;border:1px solid color-mix(in srgb,var(--border) 88%,var(--muted));border-radius:8px;background:color-mix(in srgb,var(--surface-raised) 78%,transparent)}
+.assistant-file-sources-label{margin:0 0 4px;color:var(--muted);font-size:11px;letter-spacing:.02em}
+.assistant-file-sources-list{margin:0;padding-left:18px;color:var(--text);font-size:12.5px;line-height:1.55}
+.assistant-file-sources-list a{color:var(--accent, #4c8dff);overflow-wrap:anywhere}
+.hosted-code-files{margin:0;padding-left:18px;color:var(--text);font-size:12.5px;line-height:1.55}
+.hosted-code-files a{color:var(--accent, #4c8dff);overflow-wrap:anywhere}
 
 /* ── Overlay scrollbars (Swift OverlayScrollers parity) ──────────────
    Thin and subtle by default (always faintly visible so the scrollbar
@@ -430,3 +440,18 @@ body{overscroll-behavior:none}
 .markdown hr { margin: 1.9em 0; border: 0; border-top: 1px solid var(--border); }
 /* After .electron-chrome .pane-restore-sidebar{left:78px} so this wins on phones. */
 @media (max-width:720px){.electron-chrome .pane-restore-sidebar,.pane-restore-sidebar{left:max(10px,env(safe-area-inset-left,0px));top:max(11px,env(safe-area-inset-top,0px))}.sidebar-collapsed .chat-header,.electron-chrome.sidebar-collapsed .chat-header{padding-left:54px}.electron-chrome .sb-topbar{-webkit-app-region:no-drag;padding-left:10px}}
+
+/* Chat with Files composer chips — status only, no fake percent. */
+.composer-input-files{display:flex;flex-direction:column;gap:6px;padding:0 0 8px}
+.composer-input-file{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 8px;border:1px solid var(--border-strong);border-radius:8px;background:var(--surface-raised);font-size:12px}
+.composer-input-file-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-strong)}
+.composer-input-file-meta{color:var(--muted);font-size:11px}
+.composer-input-file-error{flex:1 1 100%;color:var(--danger);font-size:11px}
+.composer-input-file-retry,.composer-input-file-cancel{padding:1px 7px;border-radius:999px;color:var(--accent);background:var(--accent-soft);font-size:11px}
+.composer-input-file-retry:disabled,.composer-input-file-cancel:disabled,.composer-input-file-remove:disabled,.composer-input-file-add:disabled{cursor:not-allowed;opacity:.45}
+.composer-input-file-remove{margin-left:auto;width:16px;height:16px;border-radius:50%;color:#fff;background:var(--danger);font-size:11px;line-height:1}
+.composer-input-file-actions{padding:0 0 8px}
+.composer-input-file-add{padding:4px 8px;border-radius:999px;color:var(--text);background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px}
+.composer-input-file-add:hover:not(:disabled){background:color-mix(in srgb,var(--text) 12%,transparent)}
+.composer-input-files-warning{margin:0 0 8px;padding:5px 7px;border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));border-radius:7px;color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-raised));font-size:11px}
+@media (max-width:899px){.composer-input-files,.composer-input-file-actions{padding-bottom:6px}}

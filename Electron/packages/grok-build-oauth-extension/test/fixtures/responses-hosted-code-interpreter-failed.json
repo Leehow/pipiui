@@ -1,0 +1,24 @@
+[
+  {
+    "type": "response.output_item.added",
+    "output_index": 0,
+    "item": { "type": "code_interpreter_call", "id": "ci_fail", "status": "in_progress" }
+  },
+  {
+    "type": "response.code_interpreter_call_code.done",
+    "item_id": "ci_fail",
+    "output_index": 0,
+    "code": "raise RuntimeError('boom')"
+  },
+  {
+    "type": "response.output_item.done",
+    "output_index": 0,
+    "item": {
+      "type": "code_interpreter_call",
+      "id": "ci_fail",
+      "status": "failed",
+      "code": "raise RuntimeError('boom')",
+      "error": { "code": "execution_error", "message": "RuntimeError: boom Bearer sk-secret" }
+    }
+  }
+]

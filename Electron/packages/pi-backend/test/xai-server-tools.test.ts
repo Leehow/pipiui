@@ -2,7 +2,8 @@ import { dirname, join } from "node:path";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { uninstallHostedSearchCapture } from "../../../resources/runtime/extensions/hosted-search-events.ts";
 
 const EXTENSION = pathToFileURL(
   join(dirname(fileURLToPath(import.meta.url)), "../../../resources/runtime/extensions/pipiui-xai-server-tools.ts"),
@@ -89,7 +90,24 @@ function toolNames(tools: unknown): string[] {
 }
 
 describe("pipiui-xai-server-tools", () => {
-  it("injects hosted web_search on any xai Responses channel, including custom endpoints", async () => {
+  afterEach(() => {
+    uninstallHostedSearchCapture();
+  });
+
+  it("installs Responses stream capture when native hosted search is on the wire", async () => {
+    const originalFetch = globalThis.fetch;
+    const { handlers } = await loadXaiServerTools();
+    handlers.get("before_provider_request")?.[0]?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      xaiResponsesContext({ capabilities: { nativeSearch: { tools: ["web_search"] } } }),
+    );
+    expect(globalThis.fetch).not.toBe(originalFetch);
+    uninstallHostedSearchCapture();
+    expect(globalThis.fetch).toBe(originalFetch);
+  });
+
+  it("does not inject hosted search for provider=xai without nativeSearch", async () => {
+    const originalFetch = globalThis.fetch;
     const { handlers } = await loadXaiServerTools();
     const beforeRequest = handlers.get("before_provider_request")?.[0];
     const payload = responsesPayload({
@@ -102,11 +120,26 @@ describe("pipiui-xai-server-tools", () => {
 
     expect(result).toBeDefined();
     expect(result).not.toHaveProperty("search_parameters");
-    expect(JSON.stringify(result)).not.toMatch(/search_parameters/);
+    expect(result?.tools).toEqual(payload.tools);
+    expect(JSON.stringify(result?.tools)).not.toContain('"type":"web_search"');
+    expect(globalThis.fetch).toBe(originalFetch);
+  });
+
+  it("injects hosted web_search when an xai catalog model declares nativeSearch", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload({ search_parameters: { mode: "auto" } }) },
+      xaiResponsesContext({
+        id: "custom-grok",
+        baseUrl: "https://relay.example/v1",
+        capabilities: { nativeSearch: { tools: ["web_search"] } },
+      }),
+    ) as Record<string, unknown> | undefined;
+
+    expect(result).not.toHaveProperty("search_parameters");
     expect(toolNames(result?.tools)).toEqual(["bash", "read", "web_search"]);
-    expect(result?.tools).toEqual(
-      expect.arrayContaining([{ type: "web_search" }]),
-    );
+    expect(result?.tools).toEqual(expect.arrayContaining([{ type: "web_search" }]));
     expect(result?.tools).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "function", name: "web_search" })]),
     );
@@ -126,7 +159,7 @@ describe("pipiui-xai-server-tools", () => {
           ],
         }),
       },
-      xaiResponsesContext(),
+      xaiResponsesContext({ capabilities: { nativeSearch: { tools: ["web_search"] } } }),
     ) as Record<string, unknown> | undefined;
 
     const hosted = (result?.tools as unknown[]).filter(
@@ -141,7 +174,15 @@ describe("pipiui-xai-server-tools", () => {
     const payload = completionsPayload({ search_parameters: { mode: "auto" } });
     const result = beforeRequest?.(
       { type: "before_provider_request", payload },
-      xaiCompletionsContext(),
+      {
+        model: {
+          provider: "xai",
+          api: "openai-completions",
+          id: "grok-4.6",
+          name: "Grok 4.6",
+          capabilities: { nativeSearch: { tools: ["web_search"] } },
+        },
+      },
     ) as Record<string, unknown> | undefined;
 
     expect(result).not.toHaveProperty("search_parameters");
@@ -154,7 +195,7 @@ describe("pipiui-xai-server-tools", () => {
     const beforeStart = handlers.get("before_agent_start")?.[0];
     const result = beforeStart?.(
       { type: "before_agent_start", systemPrompt: "You are a coding agent." },
-      xaiResponsesContext(),
+      xaiResponsesContext({ capabilities: { nativeSearch: { tools: ["web_search"] } } }),
     ) as { systemPrompt?: string } | undefined;
 
     expect(result?.systemPrompt).toContain("## xAI server tools");
@@ -248,6 +289,247 @@ describe("pipiui-xai-server-tools", () => {
         { id: "custom-id", api: "openai-responses", provider: "xai", baseUrl: "https://relay.example/v1" },
       ],
     });
+  });
+
+  it("injects declared hosted web_search and x_search for capability models, with domain policy", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      {
+        type: "before_provider_request",
+        payload: responsesPayload({
+          tools: [
+            { type: "function", name: "bash" },
+            { type: "function", name: "web_search" },
+            { type: "function", name: "image_gen" },
+          ],
+        }),
+      },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          name: "Grok 4.6",
+          capabilities: {
+            nativeSearch: {
+              tools: ["web_search", "x_search"],
+              domains: { allow: ["docs.example"], deny: ["tracker.example"] },
+            },
+          },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+
+    expect(result?.tools).toEqual([
+      { type: "function", name: "bash" },
+      { type: "function", name: "image_gen" },
+      {
+        type: "web_search",
+        filters: { allowed_domains: ["docs.example"], excluded_domains: ["tracker.example"] },
+      },
+      { type: "x_search" },
+    ]);
+  });
+
+  it("does not hide generic web_search when only native x_search is declared", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      {
+        model: {
+          provider: "acme-chat",
+          api: "openai-responses",
+          id: "acme-x",
+          capabilities: { nativeSearch: { tools: ["x_search"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+
+    expect(toolNames(result?.tools)).toEqual(["bash", "web_search", "read", "x_search"]);
+    expect(result?.tools).toEqual(expect.arrayContaining([{ type: "x_search" }]));
+    expect(result?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "web_search" })]),
+    );
+  });
+
+  it("injects hosted search from hostedTools and drops generic web_search without duplicating", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      {
+        model: {
+          provider: "acme-chat",
+          api: "openai-responses",
+          id: "acme-hosted",
+          capabilities: { hostedTools: { tools: ["web_search", "x_search"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+
+    expect(result?.tools).toEqual([
+      { type: "function", name: "bash", parameters: { type: "object" } },
+      { type: "function", name: "read", parameters: { type: "object" } },
+      { type: "web_search" },
+      { type: "x_search" },
+    ]);
+    expect(JSON.stringify(result?.tools).match(/"type":"web_search"/g)).toHaveLength(1);
+    expect(JSON.stringify(result?.tools).match(/"type":"x_search"/g)).toHaveLength(1);
+    expect(result).not.toHaveProperty("include");
+  });
+
+  it("does not hide or inject search for hostedTools code_interpreter only", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      {
+        model: {
+          provider: "acme-chat",
+          api: "openai-responses",
+          id: "acme-code",
+          capabilities: { hostedTools: { tools: ["code_interpreter"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+
+    expect(toolNames(result?.tools)).toEqual(["bash", "web_search", "read", "code_interpreter"]);
+    expect(result?.tools).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "function", name: "web_search" })]),
+    );
+    expect(JSON.stringify(result?.tools)).not.toContain('"type":"web_search"');
+    expect(JSON.stringify(result?.tools)).not.toContain('"type":"x_search"');
+    expect((result?.tools as unknown[]).filter(
+      (tool) => tool && typeof tool === "object" && (tool as { type?: string }).type === "code_interpreter",
+    )).toHaveLength(1);
+    expect(result?.include).toEqual(["code_interpreter_call.outputs"]);
+  });
+
+  it("advertises declared hosted search tools for capability models", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeStart = handlers.get("before_agent_start")?.[0];
+    const result = beforeStart?.(
+      { type: "before_agent_start", systemPrompt: "You are a coding agent." },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          capabilities: { nativeSearch: { tools: ["web_search", "x_search"] } },
+        },
+      },
+    ) as { systemPrompt?: string } | undefined;
+
+    expect(result?.systemPrompt).toContain("## Hosted search tools");
+    expect(result?.systemPrompt).toContain("`x_search`");
+    expect(result?.systemPrompt).toContain("`web_search`");
+    expect(result?.systemPrompt).not.toContain("## xAI server tools");
+  });
+
+  it("injects hosted code_interpreter only when hostedTools declares it", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const on = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          capabilities: { hostedTools: { tools: ["web_search", "x_search", "code_interpreter"] }, nativeSearch: { tools: ["web_search", "x_search"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+    expect(on?.tools).toEqual(expect.arrayContaining([
+      { type: "web_search" },
+      { type: "x_search" },
+      { type: "code_interpreter" },
+    ]));
+    expect((on?.tools as unknown[]).filter((tool) => tool && typeof tool === "object" && (tool as { type?: string }).type === "code_interpreter")).toHaveLength(1);
+    expect(on?.include).toEqual(["code_interpreter_call.outputs"]);
+    const again = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload({ include: ["file_search_call.results", "code_interpreter_call.outputs"] }) },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          capabilities: { hostedTools: { tools: ["code_interpreter"] }, nativeSearch: { tools: ["web_search"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+    expect(again?.include).toEqual(["file_search_call.results", "code_interpreter_call.outputs"]);
+
+    const off = beforeRequest?.(
+      { type: "before_provider_request", payload: responsesPayload() },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          capabilities: { hostedTools: { tools: ["web_search"] }, nativeSearch: { tools: ["web_search"] } },
+        },
+      },
+    ) as Record<string, unknown> | undefined;
+    expect(JSON.stringify(off?.tools)).not.toContain("code_interpreter");
+    expect(off?.tools).toEqual(expect.arrayContaining([{ type: "web_search" }]));
+  });
+
+  it("leaves ordinary chat models without nativeSearch untouched", async () => {
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const payload = responsesPayload();
+    expect(
+      beforeRequest?.(
+        { type: "before_provider_request", payload },
+        { model: { provider: "grok-build", api: "openai-responses", id: "grok-4.6" } },
+      ),
+    ).toBeUndefined();
+  });
+
+  it("installs Responses capture for live inputFiles without changing payload or tools", async () => {
+    const originalFetch = globalThis.fetch;
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    const payload = responsesPayload();
+    const result = beforeRequest?.(
+      { type: "before_provider_request", payload },
+      {
+        model: {
+          provider: "grok-build",
+          api: "openai-responses",
+          id: "grok-4.6",
+          capabilities: { inputFiles: true },
+        },
+      },
+    );
+    expect(result).toBeUndefined();
+    expect(payload.tools).toEqual(responsesPayload().tools);
+    expect(globalThis.fetch).not.toBe(originalFetch);
+    uninstallHostedSearchCapture();
+    expect(globalThis.fetch).toBe(originalFetch);
+  });
+
+  it("does not install capture when inputFiles is not the live boolean true", async () => {
+    const originalFetch = globalThis.fetch;
+    const { handlers } = await loadXaiServerTools();
+    const beforeRequest = handlers.get("before_provider_request")?.[0];
+    expect(
+      beforeRequest?.(
+        { type: "before_provider_request", payload: responsesPayload() },
+        {
+          model: {
+            provider: "grok-build",
+            api: "openai-responses",
+            id: "grok-4.6",
+            capabilities: { inputFiles: { upload: true } },
+          },
+        },
+      ),
+    ).toBeUndefined();
+    expect(globalThis.fetch).toBe(originalFetch);
   });
 
   it("captures xAI rate-limit headers for the quota pill and throttles repeat writes", async () => {
