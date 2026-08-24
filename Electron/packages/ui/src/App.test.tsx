@@ -2323,7 +2323,7 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.getByText(/已开始处理/)).toBeTruthy())
   })
 
-  it('keeps idle submits direct and injects busy composer submits into the running turn', async () => {
+  it('keeps idle submits direct and cut-in busy composer submits as a new turn', async () => {
     const base = createMockHost()
     const sendPrompt = vi.fn(async () => undefined)
     const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('busy-item', sessionId, text) }))
