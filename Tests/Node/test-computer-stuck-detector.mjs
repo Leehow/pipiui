@@ -13,7 +13,6 @@ import {
   stepFromDirectDriveResult,
   summarizeTrajectory,
   toBossEscalationInput,
-  withDirectDriveStuckGuard,
 } from "../../Electron/resources/runtime/pi-ext/packages/computer-agent/src/stuck-detector.ts";
 
 const click = (x = 12, y = 40) => ({ type: "act", actions: [{ type: "click", x, y }] });
@@ -180,37 +179,38 @@ test("detector cannot override a safety boundary or mint a desktop grant", async
   assert.equal(denied.event?.recommendedAction === "grant" || denied.injection?.prompt.includes("desktop:"), false);
 });
 
-test("paused wrapper blocks further mutations and still allows close", async () => {
-  const calls = [];
-  const drive = withDirectDriveStuckGuard({
-    async execute(params) {
-      calls.push(params);
-      if (params.action === "close") {
-        return { action: { type: "close" }, observation: null, screenChanged: null, error: null, sessionId: params.sessionId };
-      }
-      return {
-        action: { type: "act", actions: params.actions },
-        observation: { observationId: `obs-${calls.length}` },
-        screenChanged: false,
-        error: null,
-        sessionId: "desktop-wrap",
-      };
-    },
-  }, { stepBudget: 2 });
+test("paused guard consumes DirectDriveResult and blocks further mutations", async () => {
+  const guard = createDirectDriveStuckGuard({ sessionId: "desktop-wrap", stepBudget: 2 });
+  const asResult = (overrides) => ({
+    action: { type: "act", actions: [{ type: "click", x: 1, y: 1 }] },
+    observation: { observationId: "obs-1" },
+    screenChanged: false,
+    error: null,
+    sessionId: "desktop-wrap",
+    spawnedLeader: false,
+    ...overrides,
+  });
 
-  await drive.execute({ action: "act", sessionId: "desktop-wrap", actions: [{ type: "click", x: 1, y: 1 }] }, {});
-  const paused = await drive.execute({ action: "act", sessionId: "desktop-wrap", actions: [{ type: "click", x: 2, y: 2 }] }, {});
-  assert.equal(paused.progress.paused, true);
-  assert.equal(paused.progress.event.kind, DIRECT_DRIVE_PROGRESS_EVENT_KIND);
+  const firstStep = stepFromDirectDriveResult(asResult({ observation: { observationId: "obs-1" } }));
+  const secondStep = stepFromDirectDriveResult(asResult({
+    action: { type: "act", actions: [{ type: "click", x: 2, y: 2 }] },
+    observation: { observationId: "obs-2" },
+  }));
+  await guard.record(firstStep);
+  const paused = await guard.record(secondStep);
+  assert.equal(paused.paused, true);
+  assert.equal(paused.event.kind, DIRECT_DRIVE_PROGRESS_EVENT_KIND);
 
-  const blocked = await drive.execute({ action: "act", sessionId: "desktop-wrap", actions: [{ type: "click", x: 3, y: 3 }] }, {});
-  assert.equal(blocked.code, DIRECT_DRIVE_PAUSED_CODE);
-  assert.match(blocked.error, /paused/);
-  assert.equal(calls.length, 2);
+  const third = stepFromDirectDriveResult(asResult({
+    action: { type: "act", actions: [{ type: "click", x: 3, y: 3 }] },
+    observation: { observationId: "obs-3" },
+  }));
+  const blocked = await guard.record(third);
+  assert.equal(blocked.paused, true);
+  assert.equal(blocked.verdict, "stuck");
+  assert.equal(DIRECT_DRIVE_PAUSED_CODE, "direct_drive_paused");
 
-  const closed = await drive.execute({ action: "close", sessionId: "desktop-wrap" }, {});
-  assert.equal(closed.action.type, "close");
-  assert.equal(drive.progressFor("desktop-wrap"), undefined);
+  assert.equal(stepFromDirectDriveResult(asResult({ action: { type: "close" }, observation: null })), null);
 });
 
 test("trajectory summary stays bounded and the phase-3 seam maps onto a Boss escalation envelope", () => {

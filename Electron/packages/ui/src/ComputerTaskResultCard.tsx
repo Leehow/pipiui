@@ -5,7 +5,6 @@ import { TruncatedText } from './TruncatedText'
 import {
   computerOutcomeLabel,
   computerRoleLabel,
-  computerStepStatuses,
   computerTaskOutcome,
   type ComputerTaskResultView,
   type ComputerWorkerResultView,
@@ -14,26 +13,17 @@ import './computer-cards.css'
 
 const GOAL_LIMIT = 80
 
-const STEP_STATUS: Record<string, { icon: string; label: string }> = {
-  ok: { icon: '✓', label: '完成' },
-  failed: { icon: '×', label: '失败' },
-  unknown: { icon: '?', label: '结果未知' },
-  pending: { icon: '○', label: '未执行' },
-}
-
 function shortAgentId(agentId: string | undefined): string | undefined {
   return agentId ? agentId.slice(0, 12) : undefined
 }
 
 /**
- * Structured view of a finished `computer_task` tool result. Replaces the raw
- * `prose + Episode ledger JSON` dump: outcome header, the leader's conclusion
- * as markdown, a per-step checklist, verification conditions, and the raw
- * payload collapsed into technical details.
+ * Structured view of a finished `computer_task` tool result. New results are
+ * Boss-direct envelopes; historical episode ledgers still render summary and
+ * conditions, without the retired Leader step-progress checklist.
  */
 export const ComputerTaskResultCard = memo(function ComputerTaskResultCard({ result, goal, raw, elapsed, onOpenSubagents }: { result: ComputerTaskResultView; goal?: string; raw?: string; elapsed?: string; onOpenSubagents?: (agentId?: string) => void }) {
   const outcome = computerTaskOutcome(result)
-  const statuses = computerStepStatuses(result)
   const conditions = result.plan?.successConditions ?? []
   const conditionResults = result.verification?.conditionResults ?? []
   const goalText = (result.plan?.goal ?? goal ?? '').replace(/\s+/g, ' ').trim()
@@ -52,20 +42,6 @@ export const ComputerTaskResultCard = memo(function ComputerTaskResultCard({ res
     </button>
     <div className="computer-card-body">
       {result.summary && <div className="computer-result-summary"><TranscriptMarkdown content={result.summary} /></div>}
-      {statuses.length > 0 && <div className="computer-step-list">
-        <div className="computer-section-label">执行步骤</div>
-        {statuses.map(({ step, status, attempt }, index) => {
-          const state = STEP_STATUS[status] ?? STEP_STATUS.unknown
-          return <div key={step.id ?? index} className="computer-step-row computer-step-done">
-            <span className={`computer-step-status ${status}`} aria-hidden="true">{state.icon}</span>
-            <span className="computer-step-role">{computerRoleLabel(step.role)}</span>
-            <span className="computer-step-objective">{step.objective || step.id}</span>
-            <small className="computer-step-meta">
-              {state.label}{attempt?.failureCode ? ` · ${attempt.failureCode}` : ''}
-            </small>
-          </div>
-        })}
-      </div>}
       {conditions.length > 0 && <div className="computer-condition-list">
         <div className="computer-section-label">成功条件</div>
         {conditions.map((condition, index) => {

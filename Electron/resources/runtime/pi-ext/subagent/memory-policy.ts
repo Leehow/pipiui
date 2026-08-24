@@ -1,5 +1,5 @@
 export const SUBAGENT_MEMORY_AGENT_NAMES = [
-	"explore", "general-purpose", "reviewer", "computer-use-leader",
+	"explore", "general-purpose", "reviewer",
 	"operator", "computer-verifier", "computer-terminal", "secretary",
 ] as const;
 
@@ -24,7 +24,6 @@ const POLICIES: Record<SubagentMemoryAgentName, SubagentMemoryPolicy> = {
 	explore: { recall: { maximumItems: 3, maximumCharacters: 1_000, allowedKinds: ["semantic", "episodic", "procedural"], allowedScopes: PROJECT }, write: "source-backed" },
 	"general-purpose": { recall: { maximumItems: 2, maximumCharacters: 800, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "verification-passed" },
 	reviewer: { recall: { maximumItems: 1, maximumCharacters: 600, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "source-backed" },
-	"computer-use-leader": { recall: { maximumItems: 2, maximumCharacters: 700, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "never" },
 	operator: { recall: { maximumItems: 1, maximumCharacters: 500, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },
 	"computer-verifier": { recall: { maximumItems: 2, maximumCharacters: 700, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "never" },
 	"computer-terminal": { recall: { maximumItems: 1, maximumCharacters: 450, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },

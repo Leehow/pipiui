@@ -176,23 +176,21 @@ test("boss-direct broker role can observe repeatedly without the legacy worker f
   }
 });
 
-test("registerComputerTaskTool routes desktop/session/action through direct drive and keeps the legacy episode body", async () => {
+test("registerComputerTaskTool is Boss-direct only and never starts Leader or a long Computer Use Agent", async () => {
   const source = await readFile(new URL("../../Electron/resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
   const start = source.indexOf("function registerComputerTaskTool");
   const end = source.indexOf("function registerLedgerNoteTool", start);
   assert.ok(start >= 0 && end > start);
   const body = source.slice(start, end);
-  assert.match(body, /isComputerTaskDirectDrive/);
   assert.match(body, /createBossDesktopDirectDrive/);
   assert.match(body, /formatDirectDriveToolResult/);
-  assert.match(body, /runRegisteredComputerTaskLifecycle/);
-  assert.match(body, /role: "computer-use-agent"/);
-  assert.doesNotMatch(body, /runSingleAgent\([\s\S]*computer-use-leader/);
-  const directStart = body.indexOf("if (isComputerTaskDirectDrive(params))");
-  const directEnd = body.indexOf("const goal = String(params.goal).trim();", directStart);
-  const direct = body.slice(directStart, directEnd);
-  assert.match(direct, /return formatDirectDriveToolResult/);
-  assert.doesNotMatch(direct, /runRegisteredComputerTaskLifecycle/);
-  assert.doesNotMatch(direct, /ComputerAgentCoordinator/);
-  assert.doesNotMatch(direct, /computer-use-leader/);
+  assert.match(body, /stepFromDirectDriveResult/);
+  assert.match(body, /createDirectDriveStuckGuard/);
+  assert.match(body, /adviseFromDirectDriveResult/);
+  assert.match(body, /computer_task_leader_retired/);
+  assert.doesNotMatch(body, /withDirectDriveStuckGuard/);
+  assert.doesNotMatch(body, /runRegisteredComputerTaskLifecycle/);
+  assert.doesNotMatch(body, /role: "computer-use-agent"/);
+  assert.doesNotMatch(body, /ComputerAgentCoordinator/);
+  assert.doesNotMatch(body, /computer-use-leader/);
 });

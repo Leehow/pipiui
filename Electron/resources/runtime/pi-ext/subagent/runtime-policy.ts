@@ -1,6 +1,7 @@
 import type { AgentConfig } from "./agents.ts";
 
-export const PRIVATE_COMPUTER_AGENT_NAMES = ["computer-use-leader", "operator", "computer-verifier", "computer-terminal"] as const;
+export const PRIVATE_COMPUTER_AGENT_NAMES = ["operator", "computer-verifier", "computer-terminal"] as const;
+export const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
 
 /** Bind Computer Task protocol principals to exact App-shipped definitions. */
 export function bindCanonicalComputerAgents(discovered: AgentConfig[], canonical: AgentConfig[]): AgentConfig[] {

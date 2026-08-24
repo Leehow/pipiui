@@ -1,7 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import ts from "../../Electron/node_modules/typescript/lib/typescript.js";
 import {
   createComputerPlanRepairTracker,
   diagnoseComputerPlanAdmissionFailure,
@@ -14,25 +12,6 @@ import {
 
 const visible = { kind: "visible_text", contains: "edited interface" };
 const goal = "Use GUI Operator for two serial UI edits, then Verifier to independently verify the edited interface";
-
-async function loadElectronComputerPlanParser() {
-  const source = await readFile(new URL("../../Electron/resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
-  const start = source.indexOf("function computerPlanFromOutput(");
-  const end = source.indexOf("const PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES", start);
-  const javascript = ts.transpileModule(source.slice(start, end), { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } }).outputText;
-  return new Function(
-    "parseComputerJSON", "COMPUTER_WORKER_ROLES", "normalizeComputerPostconditionProposals", "normalizeTerminalWorkerObjective", "validateTerminalPolicyBoundary", "validateComputerPlanCandidateCuaOnly", "validateComputerPlanGoalBindings",
-    `${javascript}\nreturn computerPlanFromOutput;`,
-  )(
-    JSON.parse,
-    new Set(["gui-operator", "terminal-worker", "verifier"]),
-    normalizeComputerPostconditionProposals,
-    normalizeTerminalWorkerObjective,
-    () => { throw new Error("terminal policy validation ran before Cua admission"); },
-    validateComputerPlanCandidateCuaOnly,
-    validateComputerPlanGoalBindings,
-  );
-}
 
 test("plan admission follows serial GUI dependencies to the verifier", () => {
   const serial = {
@@ -184,15 +163,9 @@ test("Computer Task admission distinguishes prohibited non-Cua actions from requ
   )), /Computer Task accepts only Cua desktop actions/);
 });
 
-test("Electron plan parser diagnoses the captured terminal candidate before terminal policy repair", async () => {
-  const parse = await loadElectronComputerPlanParser();
-  const captured = JSON.stringify({
-    goal: "Read README and launch Electron",
-    mode: "planned",
-    successConditions: [{ kind: "file_exists", path: "/tmp/README.md" }],
-    steps: [{ id: "read", role: "terminal-worker", objective: "Use terminalreadfile to read README.md", dependsOn: [], postconditions: [{ kind: "file_exists", path: "/tmp/README.md" }], terminalPolicy: { cwd: "/tmp", writeRoots: [], allowedExecutables: [], maxCommands: 0 } }],
-  });
-  assert.throws(() => parse(captured, "First use terminalreadfile, then launch Electron"), /Computer Task accepts only Cua desktop actions/);
+test("Leader plan parser is retired from the computer_task runtime", async () => {
+  const source = await import("node:fs/promises").then((fs) => fs.readFile(new URL("../../Electron/resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8"));
+  assert.equal(source.includes("function computerPlanFromOutput("), false);
 });
 
 test("plan repair tracker stops a semantically equivalent revision", () => {

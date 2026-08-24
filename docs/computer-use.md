@@ -3,11 +3,11 @@
 可替换策略与公开 Runtime API 见
 [`computer-runtime-v1.md`](./computer-runtime-v1.md)。
 
-状态（2026-08-19）：Electron 默认路径已切换为单个 Computer Use Agent episode；Cua Driver Runtime v1 的精确目标、坐标变换、mutex、取消、急停、输入清理和 `outcome_unknown` 语义保持不变。真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由 worktree 的 Node/TypeScript 测试代替。
+状态（2026-08-24）：主会话通过 `computer_task` 开启 Boss 直驱桌面会话并自己持有观察—动作闭环。Computer Use Leader 与长任务 Computer Use Agent 已退役。Cua Driver Runtime v1 的精确目标、坐标变换、mutex、取消、急停、输入清理和 `outcome_unknown` 语义保持不变。真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由 worktree 的 Node/TypeScript 测试代替。
 
 ## 架构
 
-主会话只暴露 `computer_task({goal})`。每次调用创建一个私有 `computer-use` 子 episode，由同一个 Agent 完成规划、操作、恢复和验证；它没有 `subagent`、agent management 或其他 delegation 工具。旧 Leader → GUI Operator / Terminal Worker / Verifier 层级不再是普通入口。
+主会话暴露 `computer_task`：用 `desktop:"user-requested"|"ui-verify"` 申请授权并打开会话，再用 `sessionId` + `action`（`observe` / `act` / `open_application` / `close`）逐步驱动。每次调用返回 `{action, observation, screenChanged, error}`。运行时按需触发一次性 verifier / recovery 顾问；`operator` 只作为有界单操作逃生门。不再启动 `computer-use-leader` 或长任务 `computer-use` episode。
 
 子 episode 继承当前 Pi 会话中适用的普通非管理工具，但桌面能力只通过三个小接口提供：
 

@@ -11,6 +11,8 @@ import { createBossEscalation, type BossEscalationEnvelope } from "../../../suba
 import { grantsForComputerRole, type ComputerWorkerGrant } from "./worker-broker.ts";
 // @ts-ignore -- bundled runtime executes TypeScript directly.
 import { toolNamesForComputerWorkerRole } from "../extensions/computer-worker.ts";
+// @ts-ignore -- bundled runtime executes TypeScript directly.
+import type { DirectDriveResult } from "./direct-drive.ts";
 
 export const DIRECT_DRIVE_ADVISOR_STATUSES = ["progressing", "blocked", "needs_help"] as const;
 export type DirectDriveAdvisorStatus = (typeof DIRECT_DRIVE_ADVISOR_STATUSES)[number];
@@ -578,13 +580,7 @@ export function adviseFromStuckRecord(
 
 export function adviseFromDirectDriveResult(
 	advisor: ReturnType<typeof createDirectDriveAdvisor>,
-	result: {
-		sessionId?: string;
-		action?: Record<string, unknown>;
-		observation?: unknown;
-		screenChanged?: boolean | null;
-		error?: string | null;
-		expectedEffect?: unknown;
+	result: DirectDriveResult & {
 		progress?: { verdict?: string; reason?: string; paused?: boolean; event?: Phase2EscalationLike };
 		claim?: { kind?: string };
 	},

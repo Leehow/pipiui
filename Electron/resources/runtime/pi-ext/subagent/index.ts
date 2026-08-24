@@ -53,21 +53,17 @@ import {
 	recordRunningDispatchScope,
 } from "./scope-overlap.ts";
 import {
-	COMPUTER_WORKER_FAILURE_CODES,
-	type ComputerPlan,
-	type ComputerAgentEpisode,
-	type ComputerWorkerFailureCode,
-	type ComputerWorkerDispatch,
-	type ComputerWorkerResult,
-} from "../packages/computer-agent/src/index.ts";
-import { normalizeTerminalPolicyProposal } from "../packages/computer-agent/src/terminal-policy.ts";
-import { createComputerPlanRepairTracker, diagnoseComputerPlanAdmissionFailure, normalizeComputerPostconditionProposals, normalizeComputerTaskRecoveryPolicy, normalizeTerminalWorkerObjective, shouldRepairComputerPlanAdmission, validateComputerPlanCandidateCuaOnly, validateComputerPlanGoalBindings, type ComputerPlanAdmissionDiagnostic } from "../packages/computer-agent/src/plan-proposal.ts";
-import { toolNamesForComputerUseAgent, toolNamesForComputerWorkerRole } from "../packages/computer-agent/extensions/computer-worker.ts";
-import {
 	createBossDesktopDirectDrive,
 	formatDirectDriveToolResult,
-	isComputerTaskDirectDrive,
-} from "../packages/computer-agent/src/direct-drive.ts";
+	createDirectDriveStuckGuard,
+	stepFromDirectDriveResult,
+	DIRECT_DRIVE_PAUSED_CODE,
+	createDirectDriveAdvisor,
+	adviseFromDirectDriveResult,
+	adviseFromStuckRecord,
+	queueAdvisorFollowUp,
+	evaluateBoundedOperatorEscape,
+} from "../packages/computer-agent/src/index.ts";
 import {
 	type AgentConfig,
 	type AgentScope,
@@ -256,6 +252,7 @@ import {
 } from "../subagent-host/worktree/preflight.ts";
 import {
 	bindCanonicalComputerAgents,
+	RETIRED_COMPUTER_AGENT_NAMES,
 	childReceivesDelegationTools,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
@@ -2579,14 +2576,6 @@ function abortRunningAgent(
 			message: `Dropped queued agentId=${agentId} before it started; no process ran and no [subagent-done] will arrive for it.`,
 		};
 	}
-	const computerTask = runningComputerTasks.get(agentId);
-	if (computerTask) {
-		computerTask.controller.abort();
-		return {
-			ok: true,
-			message: `Abort requested for the whole Computer Task agentId=${agentId}; planning, active workers, recovery, and verification will stop together.`,
-		};
-	}
 	const job = jobRegistry.get(agentId);
 	if (job && job.state !== "running") {
 		return {
@@ -2639,7 +2628,6 @@ function abortAllRunningAgents(): { aborted: string[] } {
 	const ids = new Set<string>([
 		...dispatchQueue.snapshot().map((item) => item.agentId),
 		...runningAgents.keys(),
-		...runningComputerTasks.keys(),
 	]);
 	const aborted: string[] = [];
 	for (const id of ids) {
@@ -5377,6 +5365,25 @@ async function runSingleAgent(
 		localAgentReservations.delete(pipiuiAgentId);
 		return fail;
 	}
+	if ((RETIRED_COMPUTER_AGENT_NAMES as readonly string[]).includes(agentName)) {
+		const message = `computer_task_leader_retired: "${agentName}" is retired. Boss holds the screenshot/action loop via computer_task; dispatch operator only as a bounded single-action escape hatch with an explicit desktop grant.`;
+		localAgentReservations.delete(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
+	}
 	const identityProblem = callerAgentId
 		? agentResumeIdentityProblem({
 			agentId: pipiuiAgentId,
@@ -5508,6 +5515,32 @@ async function runSingleAgent(
 		hostAvailable:
 			!!PIPIUI_COMPUTER_EXT && !!process.env.PIPIUI_COMPUTER_CAPABILITY,
 	});
+	if (agent.name === "operator" && options?.desktop) {
+		const escape = evaluateBoundedOperatorEscape({
+			goal: task,
+			desktop: options?.desktop,
+			agentName: agent.name,
+			retainContext: options?.retainContext,
+		});
+		if (!escape.ok) {
+			const message = escape.error;
+			return {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				title: options?.title,
+				exitCode: 1,
+				messages: [],
+				stderr: message,
+				errorMessage: message,
+				usage: emptyUsage(),
+				step,
+				agentId: pipiuiAgentId,
+				runId,
+				stopReason: "error",
+			};
+		}
+	}
 	if (desktopGrant.problem) {
 		const message = desktopGrant.problem;
 		return {
@@ -5863,8 +5896,6 @@ async function runSingleAgent(
 		projectFinalizationPhase(pipiuiAgentId, runId, "generating");
 		armIdleFoldForDispatch(pipiuiAgentId);
 	const pipiuiUpdate = (force = false) => {
-		const closedComputerTask = runningComputerTasks.get(pipiuiAgentId);
-		if (closedComputerTask?.closed && closedComputerTask.runId === runId) return;
 		const now = Date.now();
 		if (!force && now - pipiuiLastUpdate < 500) return;
 		pipiuiLastUpdate = now;
@@ -7301,7 +7332,6 @@ const COMPUTER_AGENT_ROOT = fileURLToPath(new URL("../packages/computer-agent", 
 const COMPUTER_WORKER_EXTENSION = path.join(COMPUTER_AGENT_ROOT, "extensions/computer-worker.ts");
 const COMPUTER_TERMINAL_EXTENSION = path.join(COMPUTER_AGENT_ROOT, "extensions/computer-terminal.ts");
 const COMPUTER_AGENT_SKILLS = path.join(COMPUTER_AGENT_ROOT, "skills");
-const COMPUTER_WORKER_ROLES = new Set(["gui-operator", "terminal-worker", "verifier"] as const);
 const TERMINAL_WORKER_ENV_KEYS = [
 	"PIPIUI_TERMINAL_WORKER_BROKER_URL",
 	"PIPIUI_TERMINAL_WORKER_BROKER_TOKEN",
@@ -7313,12 +7343,9 @@ const TERMINAL_WORKER_ENV_KEYS = [
 type ComputerAgentModule = typeof import("../packages/computer-agent/src/index.ts");
 let computerAgentModule: Promise<ComputerAgentModule> | undefined;
 let computerWorkerBrokerServer: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
-const computerWorkerFatalControllers = new Map<string, AbortController>();
-const computerWorkerFatalCodes = new Map<string, "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled">();
-const runningComputerTasks = new Map<string, { runId: string; controller: AbortController; generation?: number; closed?: boolean }>();
-let computerTaskGenerations: ReturnType<ComputerAgentModule["createComputerTaskGenerationRegistry"]> | undefined;
 let bossDesktopDirectDrive: ReturnType<typeof createBossDesktopDirectDrive> | undefined;
-const computerWorkerKey = (taskId: string, stepId: string) => `${taskId}\u0000${stepId}`;
+let bossDesktopAdvisor: ReturnType<typeof createDirectDriveAdvisor> | undefined;
+const bossDesktopStuckGuards = new Map<string, ReturnType<typeof createDirectDriveStuckGuard>>();
 
 function loadComputerAgentModule(): Promise<ComputerAgentModule> {
 	computerAgentModule ??= import("../packages/computer-agent/src/index.ts");
@@ -7347,94 +7374,6 @@ function assertComputerAgentRuntimeContract(): void {
 	if (!expected || !actual || expected !== actual) {
 		throw new Error(`Computer Agent Cua private skill/driver contract mismatch (skill=${expected ?? "missing"}, driver=${actual ?? "missing"})`);
 	}
-}
-
-function privateComputerSkills(names: string[]): string[] {
-	return names.map((name) => {
-		if (!/^[a-z0-9-]+$/.test(name)) throw new Error(`Invalid Computer Agent private skill name: ${name}`);
-		return containedRegularComputerResource(COMPUTER_AGENT_SKILLS, path.join(COMPUTER_AGENT_SKILLS, name, "SKILL.md"));
-	});
-}
-
-function parseComputerJSON(text: string): any {
-	const trimmed = text.trim();
-	const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
-	const candidate = fenced ?? trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1);
-	if (!candidate) throw new Error("Computer Agent child returned no JSON object");
-	return JSON.parse(candidate);
-}
-
-function computerWorkerOutcomeFromOutput(
-	text: string,
-	hostOutcomeUnknown = false,
-): "verified" | "outcome_unknown" | "blocked" | "failed" | "completed" {
-	if (hostOutcomeUnknown) return "outcome_unknown";
-	try {
-		const output = parseComputerJSON(text);
-		const outcome = output?.outcome ?? output?.status;
-		return ["verified", "outcome_unknown", "blocked", "failed", "completed"].includes(outcome)
-			? outcome
-			: "failed";
-	} catch {
-		return "failed";
-	}
-}
-
-function computerWorkerFailureCodeFromOutput(text: string): ComputerWorkerFailureCode | undefined {
-	try {
-		const failureCode = parseComputerJSON(text)?.failureCode;
-		return COMPUTER_WORKER_FAILURE_CODES.includes(failureCode) ? failureCode : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-export function computerWorkerManualBlockFromOutput(
-	text: string,
-): Pick<ComputerWorkerResult, "recoveryDisposition" | "blockedReason" | "nextAction"> | undefined {
-	try {
-		const output = parseComputerJSON(text);
-		if (
-			output?.outcome !== "blocked"
-			|| output?.recoveryDisposition !== "manual_intervention"
-			|| output?.blockedReason !== "target_state_mismatch"
-			|| output?.nextAction !== "restore_target_state_manually"
-		) return undefined;
-		return {
-			recoveryDisposition: "manual_intervention",
-			blockedReason: "target_state_mismatch",
-			nextAction: "restore_target_state_manually",
-		};
-	} catch {
-		return undefined;
-	}
-}
-
-function computerVerifierAttestationsFromOutput(
-	text: string,
-	requested: ComputerPostcondition[],
-): ComputerPostcondition[] {
-	try {
-		const output = parseComputerJSON(text);
-		if (output?.outcome !== "verified" || !Array.isArray(output.claims)) return [];
-		const requestedByKey = new Map(requested.map((condition) => [JSON.stringify(condition), condition]));
-		const accepted = new Map<string, ComputerPostcondition>();
-		for (const claim of output.claims) {
-			if (!claim || typeof claim !== "object" || Array.isArray(claim)) continue;
-			const exact = requestedByKey.get(JSON.stringify(claim));
-			if (exact) accepted.set(JSON.stringify(exact), exact);
-		}
-		return [...accepted.values()];
-	} catch {
-		return [];
-	}
-}
-
-function validateTerminalPolicyBoundary(value: unknown, objective: string, postconditions: ComputerPostcondition[]): NonNullable<ComputerPlan["steps"][number]["terminalPolicy"]> {
-	return normalizeTerminalPolicyProposal(value, {
-		typedFileWriteOnly: /\bterminal_write_file\b/.test(objective) && !/\bterminal_execute\b/.test(objective),
-		typedFileWritePaths: postconditions.flatMap((condition) => condition.kind === "file_exists" ? [condition.path] : []),
-	});
 }
 
 async function computerRuntimeRequest(request: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -7487,10 +7426,7 @@ async function ensureComputerWorkerBroker(): Promise<InstanceType<ComputerAgentM
 				await computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000));
 			},
 			workflowMemory: new WorkflowMemoryStore(activeProjectPiHome),
-			onFatal: ({ taskId, stepId, code }) => {
-				const key = computerWorkerKey(taskId, stepId);
-				computerWorkerFatalCodes.set(key, code);
-				computerWorkerFatalControllers.get(key)?.abort();
+			onFatal: ({ code }) => {
 				if (code !== "computer_worker_no_progress") void computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000)).catch(() => {});
 			},
 		}));
@@ -7499,662 +7435,27 @@ async function ensureComputerWorkerBroker(): Promise<InstanceType<ComputerAgentM
 	return computerWorkerBrokerServer;
 }
 
-function computerPlanFromOutput(output: string, goal: string): ComputerPlan {
-	const value = parseComputerJSON(output);
-	if (!value || !Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > 4) {
-		throw new Error("Computer Use Leader returned an invalid step list");
-	}
-	validateComputerPlanCandidateCuaOnly(value);
-	let procedureContext: ComputerPlan["procedureContext"];
-	if (value.procedureContext !== undefined) {
-		const context = value.procedureContext;
-		if (!context || typeof context !== "object" || Array.isArray(context)
-			|| Object.keys(context).some((key) => !["application", "parameters", "qualification"].includes(key))
-			|| !context.application || typeof context.application !== "object" || Array.isArray(context.application)
-			|| Object.keys(context.application).some((key) => !["bundleId", "appName"].includes(key))
-			|| typeof context.application.bundleId !== "string" || !context.application.bundleId.trim()
-			|| typeof context.application.appName !== "string" || !context.application.appName.trim()
-			|| !context.parameters || typeof context.parameters !== "object" || Array.isArray(context.parameters)
-			|| Object.entries(context.parameters).some(([key, item]) => !/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(key) || typeof item !== "string" || item.length > 1_000_000)) {
-			throw new Error("Computer Plan procedureContext requires closed exact application identity and typed string parameter bindings");
-		}
-		if (context.qualification !== undefined && typeof context.qualification !== "boolean") throw new Error("procedureContext.qualification must be boolean");
-		procedureContext = { application: { bundleId: context.application.bundleId.trim(), appName: context.application.appName.trim() }, parameters: { ...context.parameters }, ...(context.qualification === true ? { qualification: true } : {}) };
-	}
-	const plan: ComputerPlan = {
-		goal,
-		mode: value.mode === "planned" ? "planned" : "direct",
-		successConditions: normalizeComputerPostconditionProposals(value.successConditions ?? [], "successConditions"),
-		steps: value.steps.map((step: any, index: number) => {
-			if (!step || typeof step !== "object" || !COMPUTER_WORKER_ROLES.has(step.role)) {
-				throw new Error(`Unknown Computer Worker role at step ${index + 1}`);
-			}
-			if (typeof step.objective !== "string" || !step.objective.trim()) {
-				throw new Error(`Computer Plan step ${index + 1} requires an objective`);
-			}
-			if (step.role !== "terminal-worker" && step.terminalPolicy !== undefined) {
-				throw new Error("Only Terminal Worker steps may carry terminalPolicy");
-			}
-			const postconditions = normalizeComputerPostconditionProposals(step.postconditions ?? [], String(step.id ?? `step-${index + 1}`));
-			const objective = step.role === "terminal-worker"
-				? normalizeTerminalWorkerObjective(step.objective.trim(), postconditions)
-				: step.objective.trim();
-			return {
-				id: typeof step.id === "string" && step.id ? step.id : `step-${index + 1}`,
-				role: step.role,
-				objective,
-				dependsOn: Array.isArray(step.dependsOn) ? step.dependsOn.filter((item: unknown) => typeof item === "string") : [],
-				postconditions,
-					...(step.role === "terminal-worker" ? { terminalPolicy: validateTerminalPolicyBoundary(step.terminalPolicy, objective, postconditions) } : {}),
-			};
-		}),
-		...(Number.isInteger(value.revision) ? { revision: value.revision } : {}),
-		...(procedureContext ? { procedureContext } : {}),
-	};
-	if (plan.successConditions.length === 0) {
-		throw new Error("Computer Plan requires at least one task success condition");
-	}
-	const stepPostconditions = plan.steps.flatMap((step) => step.postconditions.map((condition) => JSON.stringify(condition)));
-	if (plan.successConditions.some((condition) => !stepPostconditions.includes(JSON.stringify(condition)))) {
-		throw new Error("Every Computer Plan success condition must exactly match a step Postcondition");
-	}
-	validateComputerPlanGoalBindings(plan, goal);
-	return plan;
-}
-
-const PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES = 6;
-
-function candidateFingerprint(candidate: string): string {
-	return createHash("sha256").update(candidate.trim()).digest("hex");
-}
-
-function selectComputerTaskLeaderAgentId(requestedAgentId: string | undefined): string {
-	const agentId = requestedAgentId?.trim() || generatePipiuiAgentId();
-	const invalid = validateAgentId(agentId);
-	if (invalid) throw new Error(invalid);
-	const historical = readAgentSliceMetadata().find((item) => item.agentId === agentId);
-	if (historical && historical.name !== "computer-use-leader") {
-		throw new Error(`agentId ${JSON.stringify(agentId)} belongs to ${JSON.stringify(historical.name)}, not computer-use-leader`);
-	}
-	return agentId;
-}
-
-function computerWorkerAgentId(taskId: string, role: "operator" | "computer-terminal"): string {
-	const prefix = role === "operator" ? "cua-op" : "cua-term";
-	const digest = createHash("sha256").update(`${taskId}\0${role}`).digest("hex").slice(0, 12);
-	return `${prefix}-${digest}`;
-}
-
-function computerWorkerDispatchFailureCode(input: {
-	fatalCode?: "computer_worker_runtime_timeout" | "computer_worker_request_cancelled" | "computer_worker_no_progress" | "gui_child_stalled";
-	hadMessages?: boolean;
-	taskAborted: boolean;
-}): string | undefined {
-	// The parent tool signal owns cancellation. A child that was already running may
-	// have persisted tool calls/results before that signal arrives; synthesizing a
-	// second failed start/end row rewrites that real episode as a prestart failure.
-	if (input.taskAborted) return undefined;
-	return input.fatalCode ?? (input.hadMessages ? "gui_child_failed" : "gui_child_prestart_failed");
-}
-
-class ComputerPlanInvestigationError extends Error {
-	readonly diagnostic: ComputerPlanAdmissionDiagnostic;
-	readonly attempts: number;
-
-	constructor(diagnostic: ComputerPlanAdmissionDiagnostic, attempts: number) {
-		super(diagnostic.summary);
-		this.name = "ComputerPlanInvestigationError";
-		this.diagnostic = diagnostic;
-		this.attempts = attempts;
-	}
-}
-
-function computerPlanInvestigationReport(error: ComputerPlanInvestigationError) {
-	const { diagnostic, attempts } = error;
-	const summary = `Computer Task 未开始执行：Computer Use Leader 已检查 ${attempts} 个计划候选，但仍无法生成安全可执行的计划。原因：${diagnostic.summary} 下一步：${diagnostic.leaderInstruction}`;
-	return {
-		content: [{ type: "text" as const, text: summary }],
-		details: {
-			outcome: "blocked" as const,
-			summary,
-			investigation: { stage: "plan_admission", code: diagnostic.code, attempts, nextAction: diagnostic.leaderInstruction },
-			verification: { status: "not_verified" as const, conditionResults: [] },
-			planRevisions: 0,
-		},
-	};
-}
-
-function registerLegacyComputerTaskTool(pi: ExtensionAPI): void {
-	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
-	assertComputerAgentRuntimeContract();
-	let continuationObligationId: string | undefined;
-	let continuationAbortRequested = false;
-	const continuationWatchdog = createComputerTaskContinuationWatchdog({
-		deadlineMs: COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
-		onContinue() {
-			const obligationId = continuationObligationId;
-			if (!obligationId) return;
-			const timer = setTimeout(() => {
-				if (continuationObligationId !== obligationId) return;
-				queueComputerTaskContinuation(pi, obligationId);
-			}, 0);
-			timer.unref?.();
-		},
-	});
-	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName !== "computer_task") return;
-		continuationObligationId = event.toolCallId;
-		continuationAbortRequested = false;
-		continuationWatchdog.arm(() => {
-			continuationAbortRequested = true;
-			ctx.abort();
-		});
-	});
-	const noteComputerTaskAssistantActivity = () => {
-		continuationWatchdog.noteAssistantActivity();
-		if (!continuationAbortRequested) continuationObligationId = undefined;
-	};
-	pi.on("message_update", (event) => {
-		if (event.message.role !== "assistant") return;
-		if (!isComputerTaskAssistantActivity(event)) return;
-		noteComputerTaskAssistantActivity();
-	});
-	pi.on("agent_settled", () => {
-		const continuationRequested = continuationWatchdog.noteSettled();
-		if (!continuationRequested && !continuationAbortRequested) continuationObligationId = undefined;
-		continuationAbortRequested = false;
-	});
-	pi.on("context", (event) => {
-		const obligationId = continuationObligationId;
-		if (!obligationId) return;
-		const messages = stripComputerTaskContinuationTrigger(event.messages, obligationId);
-		if (messages === event.messages) return;
-		continuationObligationId = undefined;
-		return { messages };
-	});
-	pi.on("session_shutdown", () => {
-		continuationWatchdog.dispose();
-		continuationObligationId = undefined;
-		continuationAbortRequested = false;
-	});
-	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
-		goal: Type.String({ minLength: 1, maxLength: 12_000 }),
-		agentId: Type.Optional(Type.String({ description: "Exact historical computer-use-leader id selected by the Boss after inspecting subagent_status. Omit for a new hierarchy." })),
-		recoveryPolicy: Type.Optional(Type.Union([
-			Type.Literal("auto"),
-			Type.Literal("fail_fast"),
-		], { description: "Closed recovery policy. fail_fast stops after the first failed Worker or Verifier without revision or replacement; auto preserves bounded recovery." })),
-	}, { additionalProperties: false }));
-	pi.registerTool({
-		name: "computer_task",
-		label: "Computer Task",
-		description: "Complete one natural-language desktop goal through an isolated planning, GUI operation, recovery, and verification workflow. Before repeating related work, inspect subagent_status and pass the exact prior Computer Use Leader agentId when its task/result show that it should continue; omit agentId to start a deliberate new hierarchy.",
-		parameters: computerTaskParameters,
-		// pi validates before execute(); strip null fillers / unknown keys first.
-		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			params = omitNulls(params);
-			const toolCallId = _toolCallId;
-			const taskId = selectComputerTaskLeaderAgentId(params.agentId);
-			const recoveryPolicy = normalizeComputerTaskRecoveryPolicy(params.goal, params.recoveryPolicy);
-			const coordinatorRunId = randomUUID();
-			const taskController = new AbortController();
-			const taskSignal = signal ? AbortSignal.any([signal, taskController.signal]) : taskController.signal;
-			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task agentId=${taskId} is already running`);
-			runningComputerTasks.set(taskId, { runId: coordinatorRunId, controller: taskController });
-			try {
-			const { ComputerAgentCoordinator, ProcedureHostRuntime, COMPUTER_LEADER_PROGRESS_GRACE_MS, COMPUTER_LEADER_STALL_TIMEOUT_MS, COMPUTER_WORKER_STALL_TIMEOUT_MS, computerOperatorContextOptions, computerTaskContent, computerTaskDetails, computerTaskRootTerminalState, finalizeComputerTaskWithOptionalSummary, runComputerLeaderWithStallDeadline, runComputerWorkerWithStallDeadline } = await loadComputerAgentModule();
-			const rootLifecycle = createComputerTaskRootLifecycle(
-				{ agentId: taskId, runId: coordinatorRunId },
-				postPipiuiReport,
-				postTerminalPipiuiReport,
-			);
-			const discovery = discoverAgents(ctx.cwd, "user");
-			const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
-			if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Agent roles failed validation");
-			const computerAgents = bindCanonicalComputerAgents(discovery.agents, canonicalDiscovery.agents);
-			const sessionModel = formatCtxModel(ctx.model);
-			const contextWindow = ctxContextWindow(ctx.model as { contextWindow?: number } | undefined);
-			const leaderEpisodes: ComputerAgentEpisode[] = [];
-			const childRole = (agentName: string): ComputerAgentEpisode["role"] => agentName === "computer-use-leader" ? "computer-use-leader" : agentName === "computer-verifier" ? "verifier" : agentName === "computer-terminal" ? "terminal-worker" : "gui-operator";
-			const childEpisode = (agentName: string, result: Pick<SingleResult, "agentId" | "runId" | "exitCode" | "stopReason" | "errorMessage">, outcome: ComputerAgentEpisode["result"]["outcome"]): ComputerAgentEpisode | undefined => {
-				if (!result.agentId || !result.runId) return undefined;
-				const terminalState: ComputerAgentEpisode["terminalState"] = result.stopReason === "aborted"
-					? "aborted"
-					: result.stopReason === "interrupted"
-						? "interrupted"
-						: result.stopReason === "runtime_timeout" || result.stopReason === "provider_stall_timeout"
-							? "stalled"
-							: result.exitCode === 0 && !result.errorMessage ? "ok" : "failed";
-				return {
-					agentId: result.agentId,
-					runId: result.runId,
-					parentId: agentName === "computer-use-leader" ? PIPIUI_PARENT : taskId,
-					name: agentName as ComputerAgentEpisode["name"],
-					role: childRole(agentName),
-					terminalState,
-					result: { outcome, summary: outcome === "verified" ? "Verifier completed" : outcome === "completed" ? "Worker completed" : outcome === "cancelled" ? "Computer Task cancelled" : "Worker failed" },
-				};
-			};
-			const rootEpisode = (result: { outcome: string; summary: string }): ComputerAgentEpisode => ({
-				agentId: taskId,
-				runId: coordinatorRunId,
-				parentId: PIPIUI_PARENT,
-				name: "computer-use-leader",
-				role: "computer-use-leader",
-				terminalState: computerTaskRootTerminalState(result),
-				result: { outcome: result.outcome === "succeeded" ? "completed" : result.outcome === "cancelled" ? "cancelled" : "blocked", summary: result.summary },
-			});
-			const runChild = async (agentName: string, task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}, childSignal?: AbortSignal) => {
-				const leader = agentName === "computer-use-leader";
-				const effectiveSignal = childSignal ? AbortSignal.any([taskSignal, childSignal]) : taskSignal;
-				try {
-					const result = await runSingleAgent(ctx.cwd, computerAgents, agentName, task, undefined, undefined, effectiveSignal, onUpdate,
-						(results) => ({ mode: "single", agentScope: "user", projectAgentsDir: discovery.projectAgentsDir, results }),
-						{ ...options, toolCallId, ...(leader ? { agentId: taskId, parentAgentId: PIPIUI_PARENT, depth: PIPIUI_DEPTH + 1, retainContext: true, fresh: false } : { parentAgentId: taskId, depth: PIPIUI_DEPTH + 2 }), sessionModel, contextWindow, background: false });
-					const episode = childEpisode(agentName, result, result.exitCode === 0 && !result.errorMessage ? "completed" : "failed");
-					if (leader && episode) leaderEpisodes.push(episode);
-					if (result.exitCode !== 0 || result.errorMessage) throw Object.assign(new Error(result.errorMessage || result.stderr || `${agentName} failed`), {
-						agentId: result.agentId, runId: result.runId, resolvedModel: result.model, hadMessages: result.messages.length > 0, episode,
-					});
-					return { text: getFinalOutput(result.messages) || result.stderr, episode };
-				} catch (error) {
-					const diagnostic = error as { agentId?: string; runId?: string; exitCode?: number; stopReason?: string; errorMessage?: string; episode?: ComputerAgentEpisode };
-					const episode = diagnostic.episode ?? childEpisode(agentName, { agentId: diagnostic.agentId, runId: diagnostic.runId, exitCode: diagnostic.exitCode ?? 1, stopReason: diagnostic.stopReason, errorMessage: diagnostic.errorMessage ?? "child failed" }, "failed");
-					if (leader && episode && !leaderEpisodes.some((candidate) => candidate.runId === episode.runId)) leaderEpisodes.push(episode);
-					throw Object.assign(error instanceof Error ? error : new Error(String(error)), { episode });
-				}
-			};
-			const runLeader = async (task: string, options: Omit<RunSingleAgentOptions, "toolCallId"> = {}) => {
-				const leaderController = new AbortController();
-				const deadlineAt = Date.now() + COMPUTER_LEADER_STALL_TIMEOUT_MS;
-				let lastProgressAt: number | undefined;
-				return runComputerLeaderWithStallDeadline(
-					() => runChild("computer-use-leader", task, { ...options, deadlineAt, onActivity: () => { lastProgressAt = Date.now(); } }, leaderController.signal),
-					() => leaderController.abort(),
-					COMPUTER_LEADER_STALL_TIMEOUT_MS,
-					{
-						lastProgressAt: () => lastProgressAt,
-						progressGraceMs: COMPUTER_LEADER_PROGRESS_GRACE_MS,
-						onExtended: (extendedDeadlineAt) => {
-							const handle = runningAgents.get(taskId);
-							if (!handle || handle.name !== "computer-use-leader") return;
-							handle.deadlineAt = extendedDeadlineAt;
-							pipiuiReport({ kind: "update", agentId: taskId, runId: handle.runId, deadlineAt: extendedDeadlineAt });
-						},
-					},
-				).then((episode) => episode.text);
-			};
-			const markComputerLeaderCoordinating = async () => {
-				await rootLifecycle.start({
-					parentId: PIPIUI_PARENT,
-					toolCallId,
-					name: "computer-use-leader",
-					task: params.goal,
-					depth: PIPIUI_DEPTH + 1,
-					// Coordination is a Host-owned lifecycle phase, not a new model run.
-					// `null` preserves the actual Leader model reported by the preceding
-					// runChild start/usage/end events instead of relabelling it as the
-					// main session model.
-					model: null,
-					title: "Computer Use Leader",
-				});
-			};
-			const repairRejectedPlan = async (goal: string, output: string, phase: "initial" | "recovery"): Promise<ComputerPlan> => {
-				let candidate = output;
-				const seenCandidateFingerprints = createComputerPlanRepairTracker();
-				for (let attempt = 0; ; attempt += 1) {
-					if (!seenCandidateFingerprints.admit(candidate)) {
-						const repeated: ComputerPlanAdmissionDiagnostic = {
-							code: "plan_repair_stalled",
-							summary: "Leader 再次返回了已经被拒绝的同一份计划，本轮没有产生新的修复方案。",
-							leaderInstruction: "主 Agent 应先查看该 Leader 与相关 Worker 的历史任务和结果，再判断是继续这个 Leader、换一条执行路线，还是在上下文已经固化错误时启动新的 Leader。",
-						};
-						throw new ComputerPlanInvestigationError(repeated, attempt + 1);
-					}
-					try {
-						return computerPlanFromOutput(candidate, goal);
-					} catch (error) {
-						const diagnostic = diagnoseComputerPlanAdmissionFailure(error);
-						if (!shouldRepairComputerPlanAdmission(diagnostic)) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
-						if (seenCandidateFingerprints.size >= PLAN_ADMISSION_MAX_DISTINCT_CANDIDATES) throw new ComputerPlanInvestigationError(diagnostic, attempt + 1);
-						candidate = await runLeader([
-							`The Host rejected your ${phase === "initial" ? "initial" : "recovery"} plan before any new worker was dispatched. Investigate the rejected plan yourself, then return a corrected complete JSON plan only.`,
-							`Admission diagnosis: ${JSON.stringify({ code: diagnostic.code, explanation: diagnostic.summary, correction: diagnostic.leaderInstruction })}`,
-							`Rejected plan candidate: ${truncateTextHead(candidate, 24 * 1024)}`,
-							`Original goal (unchanged): ${goal}`,
-							"Repair the supplied candidate in place: preserve every already-valid field and change only what the diagnosis requires. Do not reconstruct a different plan from memory.",
-							"Do not report this diagnostic to the user. Preserve the goal's explicit values and do not invent a different task.",
-						].join("\n"), {
-							privateSkillPaths: privateComputerSkills(["computer-task-recovery"]), title: "Investigate Computer Plan Admission",
-						});
-						await markComputerLeaderCoordinating();
-					}
-				}
-			};
-			const planner = {
-				plan: async (goal: string) => {
-					const output = await runLeader(`Plan this Computer Task: ${goal}`, {
-						privateSkillPaths: privateComputerSkills(["computer-task-planning"]), title: "Plan Computer Task",
-					});
-					await markComputerLeaderCoordinating();
-					return repairRejectedPlan(goal, output, "initial");
-				},
-				replan: async ({ plan, failedStep, result, observation }: any) => {
-					const output = await runLeader([
-						`Revise this Computer Task plan after real failure. Goal: ${plan.goal}`,
-						`Previous plan: ${JSON.stringify(plan)}`,
-						`Failed step: ${JSON.stringify(failedStep)}`,
-						`Result: ${JSON.stringify({ outcome: result.outcome, summary: result.summary, ...(result.failureCode ? { failureCode: result.failureCode } : {}) })}`,
-						`Fresh observation summary: ${JSON.stringify(observation ?? null)}`,
-						"Return a materially different JSON plan and increment revision.",
-					].join("\n"), { privateSkillPaths: privateComputerSkills(["computer-task-recovery"]), title: "Revise Computer Task" });
-					await markComputerLeaderCoordinating();
-					return repairRejectedPlan(plan.goal, output, "recovery");
-				},
-			};
-			let initialPlan: ComputerPlan | undefined;
-			// Latest validated plan (initial or revised) for the tool-result envelope.
-			let latestPlan: ComputerPlan | undefined;
-			const originalPlan = planner.plan;
-			planner.plan = async (goal: string) => {
-				const plan = initialPlan ??= await originalPlan(goal);
-				latestPlan = plan;
-				return plan;
-			};
-			const originalReplan = planner.replan;
-			planner.replan = async (input: any) => latestPlan = await originalReplan(input);
-			let broker: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
-			let terminalBroker: InstanceType<ComputerAgentModule["TerminalWorkerBrokerServer"]> | undefined;
-			const dispatcher = {
-				dispatch: async (request: ComputerWorkerDispatch): Promise<any> => {
-					const role = request.role;
-					if (role === "terminal-worker") {
-						if (!request.terminalPolicy) throw new Error("Terminal Worker dispatch requires a bounded terminalPolicy");
-						if (!terminalBroker) {
-							const { TerminalWorkerBrokerServer } = await loadComputerAgentModule();
-							terminalBroker = new TerminalWorkerBrokerServer();
-							await terminalBroker.start();
-							}
-							const terminalIssued = terminalBroker.issue({ taskId: request.taskId, stepId: request.stepId, runId: randomUUID(), policy: request.terminalPolicy });
-							try {
-								const terminalEnvironment = {
-								...terminalIssued.environment,
-							PIPIUI_TERMINAL_WORKER_CWD: request.terminalPolicy.cwd,
-							PIPIUI_TERMINAL_WORKER_WRITE_ROOTS: JSON.stringify(request.terminalPolicy.writeRoots),
-							PIPIUI_TERMINAL_WORKER_EXECUTABLES: JSON.stringify(request.terminalPolicy.allowedExecutables),
-							PIPIUI_TERMINAL_WORKER_MAX_COMMANDS: String(request.terminalPolicy.maxCommands),
-						};
-								const child = await runChild("computer-terminal", [
-							request.objective,
-							`Postconditions: ${JSON.stringify(request.postconditions)}`,
-							"For file content mutation, call terminal_write_file directly with the exact requested path and content. Do not use terminal_execute with printf, echo, a shell, >, or >>; argv is literal. Do not add or remove a trailing newline unless the goal explicitly requests it.",
-							"Return the role's required final JSON only. Do not include raw file contents or terminal output in the summary.",
-						].join("\n"), {
-							agentId: computerWorkerAgentId(taskId, "computer-terminal"),
-							retainContext: true,
-							title: "Terminal Computer Task",
-							computerWorker: { role, environment: terminalEnvironment, extensionPath: COMPUTER_TERMINAL_EXTENSION, toolNames: ["terminal_read_file", "terminal_write_file", "terminal_file_status", "terminal_execute"] },
-							privateSkillPaths: privateComputerSkills(["terminal-investigation", "procedure-learning"]),
-						});
-								const records = terminalBroker.consumeExecutions(request.taskId, request.stepId);
-								const observedFiles = terminalBroker.consumeFileObservations(request.taskId, request.stepId);
-								const hostEffectsSatisfyPostconditions = request.postconditions.length > 0 && request.postconditions.every((condition) =>
-									condition.kind === "file_exists" && observedFiles.some((file) => file.path === condition.path && file.exists),
-								);
-								// Host-owned typed effects remain authoritative: a malformed or pessimistic
-								// worker verdict cannot cause an already-proven write to run twice.
-								const outcome = hostEffectsSatisfyPostconditions ? "completed" : computerWorkerOutcomeFromOutput(child.text);
-								const failureCode = hostEffectsSatisfyPostconditions ? undefined : computerWorkerFailureCodeFromOutput(child.text);
-								return { workerResult: { outcome, summary: `Terminal Worker ${outcome}`, ...(failureCode ? { failureCode } : {}), observation: observedFiles.length ? { id: records.at(-1)?.observationId ?? `file:${randomUUID()}`, files: observedFiles } : undefined }, hostExecutionRecords: records.map((record) => ({ ...record, role: "terminal-worker" })), episode: child.episode };
-							} finally { terminalBroker.revokeStep(request.taskId, request.stepId); }
-					}
-					const stageError = (failureCode: string, error: unknown) => {
-						const episode = (error as { episode?: ComputerAgentEpisode })?.episode;
-						return Object.assign(new Error(error instanceof Error ? error.message : String(error)), {
-							failureCode,
-							...(episode ? { episode, agentId: episode.agentId, runId: episode.runId } : {}),
-						});
-					};
-					try { broker ??= await ensureComputerWorkerBroker(); }
-					catch (error) { throw stageError("gui_broker_start_failed", error); }
-					let issued: any;
-					try { issued = broker.issue({ taskId: request.taskId, stepId: request.stepId, runId: randomUUID(), role }); }
-					catch (error) { throw stageError("gui_grant_issue_failed", error); }
-					const workerKey = computerWorkerKey(request.taskId, request.stepId);
-					const workerController = new AbortController();
-					computerWorkerFatalControllers.set(workerKey, workerController);
-					try {
-						const agentName = role === "verifier" ? "computer-verifier" : "operator";
-						const objective = [request.objective, `Postconditions: ${JSON.stringify(request.postconditions)}`, "Return the role's required final JSON only."].join("\n");
-						let privateSkillPaths: string[];
-						try { privateSkillPaths = role === "verifier" ? privateComputerSkills(["desktop-verification"]) : privateComputerSkills(["cua-driver-operation", "desktop-investigation"]); }
-						catch (error) { throw stageError("gui_private_resource_failed", error); }
-						let child: Awaited<ReturnType<typeof runChild>>;
-						let failedEpisode: ComputerAgentEpisode | undefined;
-						const deadlineAt = Date.now() + COMPUTER_WORKER_STALL_TIMEOUT_MS;
-						try { child = await runComputerWorkerWithStallDeadline(() => runChild(agentName, objective, {
-							...(role === "verifier"
-								? { fresh: true }
-								: computerOperatorContextOptions(request, computerWorkerAgentId(taskId, "operator"))),
-							title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task",
-							computerWorker: { role, environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerWorkerRole(role) },
-								privateSkillPaths,
-								deadlineAt,
-							}, workerController.signal).catch((error) => {
-								failedEpisode = (error as { episode?: ComputerAgentEpisode })?.episode;
-								throw error;
-							}), () => {
-								computerWorkerFatalCodes.set(workerKey, "gui_child_stalled");
-								workerController.abort();
-							}, COMPUTER_WORKER_STALL_TIMEOUT_MS); } catch (error) {
-							if (failedEpisode && !(error as { episode?: ComputerAgentEpisode })?.episode) Object.assign(error as object, { episode: failedEpisode });
-							const diagnostic = error as { agentId?: string; runId?: string; resolvedModel?: string; hadMessages?: boolean };
-							const failureCode = computerWorkerDispatchFailureCode({
-								fatalCode: computerWorkerFatalCodes.get(workerKey),
-								hadMessages: diagnostic.hadMessages,
-								taskAborted: taskSignal.aborted,
-							});
-							if (!failureCode) throw error;
-							if (diagnostic.agentId && diagnostic.runId) {
-								await postPipiuiReport({ kind: "start", agentId: diagnostic.agentId, runId: diagnostic.runId, parentId: taskId, toolCallId, name: agentName, task: "Computer Worker dispatch diagnostic", depth: PIPIUI_DEPTH + 2, model: diagnostic.resolvedModel ?? null, title: role === "verifier" ? "Verify Computer Task" : "Operate Computer Task" });
-								await postTerminalPipiuiReport({ kind: "end", agentId: diagnostic.agentId, runId: diagnostic.runId, ok: false, output: failureCode });
-							}
-							throw stageError(failureCode, error);
-						}
-						const runtimeObservation = broker.observation(request.taskId, request.stepId);
-						const runtimeError = runtimeObservation?.runtimeError as Record<string, unknown> | undefined;
-						const hostOutcomeUnknown = runtimeObservation?.outcomeUnknown === true
-							&& runtimeError?.code === "mutation_outcome_unknown"
-							&& runtimeError?.requiresObservation === true;
-						const outcome = computerWorkerOutcomeFromOutput(child.text, hostOutcomeUnknown);
-						const attestedPostconditions = role === "verifier" ? computerVerifierAttestationsFromOutput(child.text, request.postconditions) : [];
-						const manualBlock = role === "gui-operator" ? computerWorkerManualBlockFromOutput(child.text) : undefined;
-						return { workerResult: { outcome, summary: outcome === "outcome_unknown" ? "Computer Worker outcome unknown" : outcome === "failed" ? "Computer Worker failed" : "Computer Worker completed", observation: computerObservationFromRuntime(runtimeObservation), ...(attestedPostconditions.length ? { attestedPostconditions } : {}), ...(manualBlock ?? {}) }, hostExecutionRecords: broker.consumeExecutions(request.taskId, request.stepId).map((record) => ({ ...record, role: "gui-operator" as const })), episode: child.episode };
-						} finally { computerWorkerFatalControllers.delete(workerKey); computerWorkerFatalCodes.delete(workerKey); broker.revokeStep(request.taskId, request.stepId); }
-				},
-			};
-			try {
-			initialPlan = await planner.plan(params.goal);
-			const procedureContext = initialPlan.procedureContext;
-			let procedureRuntime: InstanceType<typeof ProcedureHostRuntime> | undefined;
-			let repairsProcedureId: string | undefined;
-			const procedureStorePath = process.env.PIPIUI_COMPUTER_PROCEDURE_STORE;
-			if (procedureStorePath && procedureContext) {
-				const observations = new Map<string, any>();
-				const observationFrom = (raw: any) => {
-					const id = String(raw?.observationId ?? raw?.screenshotId ?? `observation:${randomUUID()}`);
-					observations.set(id, raw);
-					return { id, capturedAt: new Date().toISOString() };
-				};
-				const policy = { isSensitiveApplication: (application: { bundleId: string; appName: string }) => /(?:keychain|1password|password|systempreferences|systemsettings)/i.test(`${application.bundleId} ${application.appName}`) };
-				procedureRuntime = await ProcedureHostRuntime.open({ storePath: procedureStorePath, policy, adapters: {
-					evaluate: async (condition: any, _phase: any, parameters: Record<string, unknown>, observation?: { id: string }) => {
-						if (taskSignal.aborted) return { met: false, observationId: `cancelled:${randomUUID()}`, observedAt: new Date().toISOString() };
-						if (condition.kind === "file_exists") { const file = String(parameters[condition.pathParameter] ?? ""); return { met: !!file && fs.existsSync(file), observationId: `file:${randomUUID()}`, observedAt: new Date().toISOString() }; }
-						let raw = observation ? observations.get(observation.id) : undefined;
-						if (!raw) raw = await computerRuntimeRequest({ action: "computer_batch", actions: [{ type: "screenshot" }] }, taskSignal);
-						const ref = observationFrom(raw); const elements = Array.isArray(raw?.accessibility?.elements) ? raw.accessibility.elements : [];
-						const met = condition.kind === "application_available" ? [raw?.target?.bundle_identifier, raw?.target?.bundleId].includes(condition.bundleId)
-							: condition.kind === "element_exists" ? elements.some((item: any) => item.role === condition.locator.role && item.name === (condition.locator.nameLiteral ?? parameters[condition.locator.nameParameter]))
-							: condition.kind === "visible_text" ? elements.some((item: any) => [item.name, item.value, item.text].some((value) => String(value ?? "").includes(String(parameters[condition.textParameter] ?? "")))) : false;
-						return { met, observationId: ref.id, observedAt: ref.capturedAt };
-					},
-					execute: async (step: any, parameters: Record<string, unknown>, replaySignal?: AbortSignal) => {
-						if (replaySignal?.aborted) return { ok: false };
-						if (step.action.kind === "write_parameterized_file") {
-							const planned = initialPlan!.steps.find((item) => item.role === "terminal-worker" && step.id.startsWith(`${item.id}-`));
-							if (!planned?.terminalPolicy) return { ok: false };
-							terminalBroker ??= new (await loadComputerAgentModule()).TerminalWorkerBrokerServer(); await terminalBroker.start();
-							const issued = terminalBroker.issue({ taskId, stepId: `replay-${step.id}`, runId: randomUUID(), policy: planned.terminalPolicy });
-							const response = await fetch(issued.environment.PIPIUI_TERMINAL_WORKER_BROKER_URL, { method: "POST", headers: { authorization: `Bearer ${issued.token}`, "content-type": "application/json" }, signal: replaySignal, body: JSON.stringify({ operation: "write", path: parameters[step.action.pathParameter], content: parameters[step.action.contentParameter] }) });
-							if (!response.ok) return { ok: false }; const record = terminalBroker.consumeExecutions(taskId, `replay-${step.id}`)[0]; return record ? { ok: true, observation: { id: record.observationId, capturedAt: record.observedAt } } : { ok: false };
-						}
-						if (step.action.kind === "activate_application") { const raw = await computerRuntimeRequest({ action: "computer_open_application", bundle_identifier: procedureContext.application.bundleId }, replaySignal); return { ok: true, observation: observationFrom(raw) }; }
-						const raw = await computerRuntimeRequest({ action: "computer_batch", actions: [{ type: "screenshot" }] }, replaySignal); const elements = Array.isArray(raw?.accessibility?.elements) ? raw.accessibility.elements : [];
-						const name = step.action.locator.nameLiteral ?? parameters[step.action.locator.nameParameter]; const matches = elements.filter((item: any) => item.role === step.action.locator.role && item.name === name && typeof item.element_token === "string");
-						if (matches.length !== 1) return { ok: false }; const action = step.action.kind === "click" ? { type: "click", element_token: matches[0].element_token } : { type: "type", element_token: matches[0].element_token, text: parameters[step.action.textParameter] };
-						return { ok: true, observation: observationFrom(await computerRuntimeRequest({ action: "computer_batch", actions: [action] }, replaySignal)) };
-					},
-				} });
-				const replay = await procedureRuntime.run({ intent: params.goal.trim(), bundleId: procedureContext.application.bundleId, parameters: procedureContext.parameters, taskId, runId: randomUUID(), qualifyCandidate: procedureContext.qualification === true }, taskSignal).catch(() => ({ outcome: "fallback_to_agent" as const }));
-				if (replay.outcome === "succeeded") { await rootLifecycle.close({ ok: true, output: "Computer Task completed" }); const replayResult = { outcome: "succeeded" as const, summary: "Computer Task completed", verification: { status: "verified" as const, conditionResults: [] }, planRevisions: 0 }; const details = computerTaskDetails(replayResult, rootEpisode(replayResult), leaderEpisodes); return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details }; }
-				if (replay.outcome === "drift" && "procedureId" in replay) repairsProcedureId = replay.procedureId;
-			}
-			const coordinator = new ComputerAgentCoordinator({ planner, dispatcher, ...(procedureRuntime ? { procedureLearning: { recordVerifiedExecution: (input: any) => procedureRuntime!.recordCoordinatorExecution({ ...input, ...(repairsProcedureId ? { repairsProcedureId } : {}) }).then(() => undefined) } } : {}) });
-				const result = await coordinator.run({ goal: params.goal, taskId, recoveryPolicy }, taskSignal);
-				if (result.outcome === "cancelled") {
-					await rootLifecycle.close({ ok: false, aborted: true, output: "Computer Task cancelled" });
-					const details = computerTaskDetails(result, rootEpisode(result), leaderEpisodes);
-					return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
-				}
-				await rootLifecycle.close({ ok: result.outcome === "succeeded", output: result.outcome === "succeeded" ? "Computer Task completed" : "Computer Task blocked" });
-				const finalized = await finalizeComputerTaskWithOptionalSummary(result, () => runLeader([
-					`Give the main agent the final result of this Computer Task. Goal: ${params.goal}`,
-					`Coordinator result: ${JSON.stringify(result)}`,
-					"Before concluding, reconcile investigation.workerAttempts with investigation.failedConditions. Preserve completed subordinate work, name the first missing evidence category, and never claim that nothing ran when the ledger shows completed attempts.",
-					"Return only a short user-facing conclusion. If blocked or failed, explain the evidence-backed concrete cause, recovery already attempted, and one practical next action in ordinary language. Do not reveal intermediate clicks, private worker chatter, raw errors, or internal JSON.",
-				].join("\n"), {
-					privateSkillPaths: privateComputerSkills(["computer-task-planning"]),
-					title: "Computer Use Leader",
-				}));
-				const details = computerTaskDetails(finalized.result, rootEpisode(finalized.result), leaderEpisodes, finalized.leaderSummary);
-				return { content: [{ type: "text", text: computerTaskContent(details, finalized.leaderSummary, latestPlan) }], details };
-			} catch (error) {
-				if (error instanceof ComputerPlanInvestigationError) {
-					await rootLifecycle.close({ ok: false, output: `Computer Task plan admission blocked: ${error.diagnostic.code}` });
-					const report = computerPlanInvestigationReport(error);
-					const details = computerTaskDetails(report.details as any, rootEpisode(report.details), leaderEpisodes);
-					return { ...report, content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
-				}
-				if ((error as { failureCode?: unknown })?.failureCode === "computer_leader_stalled") {
-					await rootLifecycle.close({ ok: false, stalled: true, output: "Computer Task paused: computer_leader_stalled" });
-					const summary = "Computer Use Leader 长时间没有响应，当前规划调用已安全停止。主 Agent 应先调用 subagent_status 查看这个 Leader 及其下属的任务和结果，再根据证据使用同一个 Leader agentId 继续，或改走其他可行路线。";
-					const stalledResult = {
-						outcome: "blocked" as const,
-						summary,
-						failureCode: "computer_leader_stalled" as const,
-						leaderAgentId: taskId,
-						investigation: {
-							stage: "leader_runtime",
-							code: "computer_leader_stalled",
-							nextAction: "Call subagent_status, inspect this Leader and its children, then retry with the same leaderAgentId when the evidence supports continuing.",
-						},
-						verification: { status: "unknown" as const, conditionResults: [] },
-						planRevisions: 0,
-					};
-					const details = computerTaskDetails(stalledResult as any, rootEpisode(stalledResult), leaderEpisodes);
-					return { content: [{ type: "text", text: computerTaskContent(details, undefined, latestPlan) }], details };
-				}
-				await rootLifecycle.close({ ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
-				throw error;
-			} finally {
-				await rootLifecycle.close({ ok: false, ...(taskSignal.aborted ? { aborted: true } : {}), output: taskSignal.aborted ? "Computer Task cancelled" : "Computer Task failed" });
-				broker?.revokeTask(taskId);
-				terminalBroker?.revokeTask(taskId);
-				await terminalBroker?.stop().catch(() => {});
-				if (taskSignal.aborted) {
-					await computerRuntimeRequest({ action: "computer_cancel" }).catch(() => {});
-				}
-			}
-			} finally {
-				if (runningComputerTasks.get(taskId)?.runId === coordinatorRunId) runningComputerTasks.delete(taskId);
-			}
-		},
-	});
-}
-
-type SingleComputerTaskResult = {
-	outcome: "succeeded" | "blocked" | "failed" | "cancelled";
-	summary: string;
-	verification: {
-		status: "verified" | "unverified" | "partial";
-		claims: Array<{ claim: string; evidenceRef: string }>;
-	};
-	handoff?: string;
-};
-
-function parseSingleComputerTaskResult(text: string, fallback: SingleComputerTaskResult): SingleComputerTaskResult {
-	const value = parseComputerJSON(text);
-	if (!value || !["succeeded", "blocked", "failed", "cancelled"].includes(String(value.outcome))
-		|| typeof value.summary !== "string" || !value.summary.trim()
-		|| !value.verification || !["verified", "unverified", "partial"].includes(String(value.verification.status))
-		|| !Array.isArray(value.verification.claims)) return fallback;
-	const claims = value.verification.claims.flatMap((item: any) =>
-		item && typeof item.claim === "string" && typeof item.evidenceRef === "string"
-			? [{ claim: item.claim.slice(0, 500), evidenceRef: item.evidenceRef.slice(0, 500) }]
-			: []).slice(0, 32);
-	return {
-		outcome: value.outcome,
-		summary: value.summary.trim().slice(0, 2_000),
-		verification: { status: value.verification.status, claims },
-		...(typeof value.handoff === "string" && value.handoff.trim() ? { handoff: value.handoff.trim().slice(0, 1_000) } : {}),
-	};
-}
-
 function registerComputerTaskTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
 	assertComputerAgentRuntimeContract();
-	let continuationObligationId: string | undefined;
-	let continuationAbortRequested = false;
-	const continuationWatchdog = createComputerTaskContinuationWatchdog({
-		deadlineMs: COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
-		onContinue() {
-			const obligationId = continuationObligationId;
-			if (!obligationId) return;
-			const timer = setTimeout(() => {
-				if (continuationObligationId === obligationId) queueComputerTaskContinuation(pi, obligationId);
-			}, 0);
-			timer.unref?.();
+	const followUpPi = pi as ExtensionAPI & {
+		sendMessage?: (
+			message: { customType: string; content: string; display: boolean; details: Record<string, unknown> },
+			options: { triggerTurn: true; deliverAs: "followUp" },
+		) => unknown;
+	};
+	bossDesktopAdvisor ??= createDirectDriveAdvisor({
+		injectFollowUp: (text, envelope, report) => {
+			if (typeof followUpPi.sendMessage === "function") {
+				return queueAdvisorFollowUp(followUpPi as never, text, envelope, report);
+			}
+			void trySendUserMessage(pi, text);
+			return true;
 		},
 	});
-	pi.on("tool_result", (event, ctx) => {
-		if (event.toolName !== "computer_task") return;
-		continuationObligationId = event.toolCallId;
-		continuationAbortRequested = false;
-		continuationWatchdog.arm(() => { continuationAbortRequested = true; ctx.abort(); });
-	});
-	pi.on("message_update", (event) => {
-		if (event.message.role !== "assistant" || !isComputerTaskAssistantActivity(event)) return;
-		continuationWatchdog.noteAssistantActivity();
-		if (!continuationAbortRequested) continuationObligationId = undefined;
-	});
-	pi.on("agent_settled", () => {
-		const requested = continuationWatchdog.noteSettled();
-		if (!requested && !continuationAbortRequested) continuationObligationId = undefined;
-		continuationAbortRequested = false;
-	});
-	pi.on("context", (event) => {
-		if (!continuationObligationId) return;
-		const messages = stripComputerTaskContinuationTrigger(event.messages, continuationObligationId);
-		if (messages === event.messages) return;
-		continuationObligationId = undefined;
-		return { messages };
-	});
 	pi.on("session_shutdown", () => {
-		continuationWatchdog.dispose();
-		continuationObligationId = undefined;
-		bossDesktopDirectDrive?.closeAll();
+		bossDesktopDirectDrive?.closeAll?.();
+		bossDesktopStuckGuards.clear();
 	});
 
 	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
@@ -8162,7 +7463,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 		desktop: Type.Optional(Type.Union([
 			Type.Literal("user-requested"),
 			Type.Literal("ui-verify"),
-		], { description: "Per-task desktop grant. Required to open a Boss-driven session; omitted goal-only calls keep the existing Computer Use Agent path." })),
+		], { description: "Per-task desktop grant required to open a Boss-driven session." })),
 		sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Existing Boss-driven desktop session." })),
 		action: Type.Optional(Type.Union([
 			Type.Literal("session"),
@@ -8170,7 +7471,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			Type.Literal("open_application"),
 			Type.Literal("act"),
 			Type.Literal("close"),
-		], { description: "Direct-drive operation. Omit with only goal to keep the legacy Computer Use Agent episode." })),
+		], { description: "Direct-drive operation. computer_task never starts Computer Use Leader or a long Computer Use Agent." })),
 		actions: Type.Optional(Type.Array(Type.Object({
 			type: Type.String({ minLength: 1 }),
 		}, { additionalProperties: true }), { minItems: 1, maxItems: 64 })),
@@ -8182,146 +7483,79 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
-		description: "Authorize a Boss-driven desktop session or run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each action returns {action, observation, screenChanged, error}. A goal-only call still starts the existing Computer Use Agent episode and does not use this direct path.",
+		description: "Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
 		parameters: computerTaskParameters,
 		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
 			params = omitNulls(params);
-			if (isComputerTaskDirectDrive(params)) {
-				bossDesktopDirectDrive ??= createBossDesktopDirectDrive({
-					acquireBroker: async () => ensureComputerWorkerBroker(),
+			if (params && typeof params === "object" && ("agentId" in params || "recoveryPolicy" in params)) {
+				return formatDirectDriveToolResult({
+					action: { type: "session" },
+					observation: null,
+					screenChanged: null,
+					error: "computer_task_leader_retired: Computer Use Leader is retired. Open a Boss-driven session with desktop:\"user-requested\" or desktop:\"ui-verify\", then observe/act yourself. Do not pass agentId or recoveryPolicy.",
+					sessionId: "",
+					spawnedLeader: false,
+					code: "computer_task_leader_retired",
 				});
-				const result = await bossDesktopDirectDrive.execute(params, {
-					hostAvailable: !!process.env.PIPIUI_COMPUTER_CAPABILITY,
-					signal,
+			}
+			bossDesktopDirectDrive ??= createBossDesktopDirectDrive({
+				acquireBroker: async () => ensureComputerWorkerBroker(),
+			});
+			const requested = typeof params.action === "string" ? params.action : "";
+			const existingId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
+			const existingGuard = existingId ? bossDesktopStuckGuards.get(existingId) : undefined;
+			if (existingGuard?.paused && requested !== "close" && requested !== "observe" && requested !== "session") {
+				const paused = {
+					action: { type: requested || "act" },
+					observation: null,
+					screenChanged: null,
+					error: `${DIRECT_DRIVE_PAUSED_CODE}: desktop session is paused after a stuck or step-budget escalation.`,
+					sessionId: existingId,
+					spawnedLeader: false as const,
+					code: DIRECT_DRIVE_PAUSED_CODE,
+				};
+				const advice = await adviseFromDirectDriveResult(bossDesktopAdvisor!, {
+					...paused,
+					progress: { verdict: "stuck", reason: "direct_drive_paused", paused: true },
 				});
-				return formatDirectDriveToolResult(result);
+				const formatted = formatDirectDriveToolResult(paused);
+				if (advice.fired) formatted.details = { ...formatted.details, advisor: advice };
+				return formatted;
 			}
-			if (typeof params.goal !== "string" || !params.goal.trim()) {
-				throw new Error("computer_task requires goal for the legacy Computer Use Agent path, or desktop/sessionId/action for Boss-direct drive");
+			const result = await bossDesktopDirectDrive.execute(params, {
+				hostAvailable: !!process.env.PIPIUI_COMPUTER_CAPABILITY,
+				signal,
+			});
+			if (result.action?.type === "close" && result.sessionId) {
+				bossDesktopStuckGuards.delete(result.sessionId);
+			} else if (result.sessionId) {
+				let guard = bossDesktopStuckGuards.get(result.sessionId);
+				if (!guard) {
+					guard = createDirectDriveStuckGuard({ sessionId: result.sessionId });
+					bossDesktopStuckGuards.set(result.sessionId, guard);
+				}
+				const step = stepFromDirectDriveResult(result);
+				if (step) {
+					const progress = await guard.record(step);
+					const advice = await adviseFromStuckRecord(bossDesktopAdvisor!, progress, result.sessionId);
+					const formatted = formatDirectDriveToolResult(result);
+					formatted.details = {
+						...formatted.details,
+						progress,
+						...(advice.fired ? { advisor: advice } : {}),
+					};
+					return formatted;
+				}
 			}
-			const goal = String(params.goal).trim();
-			const taskId = `computer-use-${randomUUID()}`;
-			const runId = DeliveryObligationStore.runId();
-			const stepId = "episode";
-			const controller = new AbortController();
-			const taskSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
-			if (runningComputerTasks.has(taskId)) throw new Error(`Computer Task ${taskId} is already running`);
-			runningComputerTasks.set(taskId, { runId, controller });
-			let broker: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
-			let generations: NonNullable<typeof computerTaskGenerations> | undefined;
-			let generation: ReturnType<NonNullable<typeof computerTaskGenerations>["begin"]> | undefined;
-			try {
-				const {
-					COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS,
-					COMPUTER_WORKER_STALL_TIMEOUT_MS,
-					createComputerTaskGenerationRegistry,
-					projectComputerTaskActiveToolsAborted,
-					runRegisteredComputerTaskLifecycle,
-				} = await loadComputerAgentModule();
-				generations = computerTaskGenerations ??= createComputerTaskGenerationRegistry();
-				const discovery = discoverAgents(ctx.cwd, "user");
-				const canonicalDiscovery = discoverBundledAgentsFromDirectory(fileURLToPath(new URL("../agents", import.meta.url)));
-				if (canonicalDiscovery.diagnostics.some((entry) => entry.severity === "error")) throw new Error("Canonical Computer Use Agent failed validation");
-				const canonicalAgent = canonicalDiscovery.agents.find((agent) => agent.name === "computer-use" && agent.origin === "bundled");
-				if (!canonicalAgent || canonicalAgent.capabilities.delegation) throw new Error("Canonical non-delegating Computer Use Agent is unavailable");
-				const computerAgents = [canonicalAgent];
-				broker = await ensureComputerWorkerBroker();
-				const issued = broker.issue({ taskId, stepId, runId, role: "computer-use-agent", goal });
-				const abortOnce = () => {
-					if (!controller.signal.aborted) controller.abort();
-				};
-				generation = generations.begin(taskId, runId);
-				const liveTask = runningComputerTasks.get(taskId);
-				if (liveTask?.runId === runId) liveTask.generation = generation.generation;
-				const finished = await runRegisteredComputerTaskLifecycle({
-					runChild: (childUpdate) => runSingleAgent(ctx.cwd, computerAgents, "computer-use", goal, undefined, undefined, taskSignal, childUpdate,
-						(results) => ({ mode: "single", agentScope: "bundled", projectAgentsDir: discovery.projectAgentsDir, results }),
-						{
-							toolCallId: _toolCallId,
-							agentId: taskId,
-							parentAgentId: PIPIUI_PARENT,
-							depth: PIPIUI_DEPTH + 1,
-							fresh: true,
-							retainContext: false,
-							runId,
-							sessionModel: formatCtxModel(ctx.model),
-							contextWindow: ctxContextWindow(ctx.model as { contextWindow?: number } | undefined),
-							background: false,
-							computerAgent: { environment: issued.environment, extensionPath: COMPUTER_WORKER_EXTENSION, toolNames: toolNamesForComputerUseAgent() },
-						}),
-					abortOnce,
-					signal: controller.signal,
-					onUpdate,
-					onClosedLatch: () => {
-						const record = runningComputerTasks.get(taskId);
-						if (record?.runId === runId) record.closed = true;
-					},
-					stallTimeoutMs: COMPUTER_WORKER_STALL_TIMEOUT_MS,
-					cleanupTimeoutMs: COMPUTER_TASK_CHILD_CLEANUP_TIMEOUT_MS,
-					onAbandoned: (outcome) => {
-						const projected = projectComputerTaskActiveToolsAborted(outcome);
-						pipiuiReport({
-							kind: "activity",
-							agentId: taskId,
-							runId,
-							activity: projected.details.activity,
-							activityActive: projected.details.activityActive,
-							activityEndedAt: projected.details.activityEndedAt,
-						});
-						onUpdate?.(projected);
-					},
-					generation,
-					generationRegistry: generations,
-					cancelRuntime: (cancelSignal) => computerRuntimeRequest({ action: "computer_cancel" }, cancelSignal),
-				});
-				const child = finished.child;
-				if (finished.childError && !finished.outcome && !child) throw finished.childError;
-				const fallback: SingleComputerTaskResult = finished.outcome ?? (taskSignal.aborted
-					? { outcome: "cancelled", summary: "Computer Task was cancelled.", verification: { status: "unverified", claims: [] } }
-					: { outcome: "failed", summary: (child && (child.errorMessage || child.stderr)) || "Computer Use Agent did not return a valid result.", verification: { status: "unverified", claims: [] } });
-				const projected = finished.outcome
-					?? (child && child.exitCode === 0 && !child.errorMessage
-						? parseSingleComputerTaskResult(getFinalOutput(child.messages) || child.stderr, fallback)
-						: fallback);
-				if (projected.outcome === "succeeded" && projected.verification.status === "verified") await broker.recordTaskSuccess(taskId, stepId);
-				const checkpoint = broker.checkpoint(taskId, stepId);
-				const episode = {
-					agentId: child?.agentId ?? taskId,
-					runId: child?.runId ?? runId,
-					parentId: PIPIUI_PARENT,
-					name: "computer-use",
-					role: "computer-use-agent",
-					terminalState: projected.outcome === "succeeded" ? "ok" : projected.outcome === "cancelled" ? "aborted" : "failed",
-					result: { outcome: projected.outcome, summary: projected.summary },
-				};
-				const details = {
-					...projected,
-					taskId,
-					runId,
-					episodeCount: 1,
-					episode,
-					checkpoint,
-				};
-				const envelope = { episodeLedger: [episode], verification: projected.verification, checkpoint };
-				return { content: [{ type: "text", text: `${projected.summary}\n\nEpisode ledger:\n${JSON.stringify(envelope)}` }], details };
-			} finally {
-				if (generation) generations?.end(generation);
-				try { broker?.revokeTask(taskId); } catch { /* revoke is best-effort and must not delay the Boss return */ }
-				if (runningComputerTasks.get(taskId)?.runId === runId) runningComputerTasks.delete(taskId);
-			}
+			const advice = await adviseFromDirectDriveResult(bossDesktopAdvisor!, result);
+			const formatted = formatDirectDriveToolResult(result);
+			if (advice.fired) formatted.details = { ...formatted.details, advisor: advice };
+			return formatted;
 		},
 	});
 }
 
-/**
- * The Boss's ledger write, restored as a tool that can reach nothing else.
- *
- * Depth 0 only: a worker has no ledger and no business writing one. See boss-note.ts for why
- * this exists at all — with the main session read-only, `write` and `edit` are gone, and this
- * is the one write the orchestration layer has always called a management action rather than
- * working the floor.
- */
 function registerLedgerNoteTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_MAIN_CWD) return;
 	pi.registerTool(bossLedgerNoteTool({ mainCwd: PIPIUI_MAIN_CWD, sessionKey: PIPIUI_SESSION }) as never);

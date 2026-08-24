@@ -3,8 +3,12 @@
  *
  * Hard signals only trigger a check or enforce a safety cap. Semantic judgment
  * is injectable; the default is a conservative deterministic fallback. This
- * module never grants desktop access and never confirms a dangerous action.
+ * module never grants desktop access, never wraps execute(), and never confirms
+ * a dangerous action. Callers feed `DirectDriveResult` through `stepFromDirectDriveResult`.
  */
+
+// @ts-ignore -- the bundled runtime executes TypeScript directly; keep its explicit runtime extension.
+import type { DirectDriveResult } from "./direct-drive.ts";
 
 export const DIRECT_DRIVE_PROGRESS_VERDICTS = ["progressing", "looping", "stuck"] as const;
 export type DirectDriveProgressVerdict = (typeof DIRECT_DRIVE_PROGRESS_VERDICTS)[number];
@@ -276,12 +280,7 @@ export function summarizeTrajectory(
   }));
 }
 
-export function stepFromDirectDriveResult(result: {
-  action: Record<string, unknown>;
-  screenChanged?: boolean | null;
-  error?: string | null;
-  observation?: Record<string, unknown> | null;
-}): TrajectoryStep | null {
+export function stepFromDirectDriveResult(result: DirectDriveResult): TrajectoryStep | null {
   const type = typeof result.action?.type === "string" ? result.action.type : "";
   if (type === "session" || type === "close") return null;
   const observation = result.observation;
@@ -431,76 +430,4 @@ export function createDirectDriveStuckGuard(options: StuckGuardOptions): {
       return pause(judged.reason, judged, step.error);
     },
   };
-}
-
-export type DirectDriveLikeResult = {
-  action: Record<string, unknown>;
-  observation: Record<string, unknown> | null;
-  screenChanged: boolean | null;
-  error: string | null;
-  sessionId: string;
-  code?: string;
-};
-
-export function withDirectDriveStuckGuard<
-  TDrive extends {
-    execute(params: Record<string, unknown>, options: Record<string, unknown>): Promise<DirectDriveLikeResult>;
-  },
->(
-  drive: TDrive,
-  options: Omit<StuckGuardOptions, "sessionId"> = {},
-): TDrive & {
-  progressFor(sessionId: string): ReturnType<typeof createDirectDriveStuckGuard> | undefined;
-} {
-  const guards = new Map<string, ReturnType<typeof createDirectDriveStuckGuard>>();
-
-  const wrapped = {
-    ...drive,
-    progressFor(sessionId: string) {
-      return guards.get(sessionId);
-    },
-    async execute(params: Record<string, unknown>, execOptions: Record<string, unknown>) {
-      const requested = typeof params.action === "string" ? params.action : "";
-      const existingId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
-      const existing = existingId ? guards.get(existingId) : undefined;
-      if (existing?.paused && requested !== "close" && requested !== "observe" && requested !== "session") {
-        return {
-          action: { type: requested || "act" },
-          observation: null,
-          screenChanged: null,
-          error: `${DIRECT_DRIVE_PAUSED_CODE}: desktop session is paused after a stuck or step-budget escalation.`,
-          sessionId: existingId,
-          code: DIRECT_DRIVE_PAUSED_CODE,
-          progress: {
-            verdict: "stuck" as const,
-            reason: "direct_drive_paused",
-            evidence: {
-              hardSignals: computeHardSignals([], { stepBudget: options.stepBudget }),
-              steps: [],
-              observationRefs: [],
-            },
-            event: undefined,
-            paused: true,
-          },
-        };
-      }
-
-      const result = await drive.execute(params, execOptions);
-      if (result.action?.type === "close" && result.sessionId) {
-        guards.delete(result.sessionId);
-        return result;
-      }
-      if (!result.sessionId) return result;
-      let guard = guards.get(result.sessionId);
-      if (!guard) {
-        guard = createDirectDriveStuckGuard({ ...options, sessionId: result.sessionId });
-        guards.set(result.sessionId, guard);
-      }
-      const step = stepFromDirectDriveResult(result);
-      if (!step) return result;
-      const progress = await guard.record(step);
-      return { ...result, progress };
-    },
-  };
-  return wrapped as TDrive & { progressFor(sessionId: string): ReturnType<typeof createDirectDriveStuckGuard> | undefined };
 }

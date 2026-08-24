@@ -115,10 +115,10 @@ if(enabled(f,"terminal"))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(inpu
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
 if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse&&input.computerCapability&&input.computerDescriptor){
-// The main Pi session owns only computer_task orchestration through the subagent
-// extension mounted above. Export the reviewed strategy for explicitly granted
-// GUI Operator children; never register mutating computer/open_application tools
-// directly in the main session.
+// The main Pi session owns computer_task as a Boss-driven desktop session through
+// the subagent extension. Export the reviewed strategy for explicitly granted
+// bounded operator children; never register mutating computer/open_application
+// tools directly in the main session.
 env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.20.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
