@@ -1485,6 +1485,39 @@
 
   const MAX_FILL_FIELDS = 32;
 
+  function resolveScrollSelector(selector) {
+    // Reuses the locator machinery for uniqueness and error conventions, but scroll
+    // targets are often plain containers: require visibility, not interactivity,
+    // and never fall back to the page when the selector itself fails to resolve.
+    const parsed = parseLocator({ css: selector });
+    if (parsed.error) return { error: parsed.error };
+    const matched = matchLocatorElements(parsed.spec);
+    if (matched.error) return { error: matched.error };
+    const elements = uniqueElements(matched);
+    if (elements.length === 0) {
+      return { error: failure("scroll selector matched 0 elements.", "browser_locator_not_found") };
+    }
+    if (elements.length > 1) {
+      const candidates = firstCandidateObjects(elements);
+      return {
+        error: failure(
+          "scroll selector matched " + elements.length + " elements; pass a unique selector. Candidates: " + JSON.stringify(candidates),
+          "browser_locator_ambiguous",
+          false,
+          { candidates },
+        ),
+      };
+    }
+    const element = elements[0];
+    // Scroll targets are often disabled or non-interactive regions (e.g.
+    // aria-disabled="true" lists): scrolling stays allowed, only connected/
+    // rendered visibility is required. Click/input keep their stricter checks.
+    if (!element.isConnected || isHiddenComposed(element) || !hasVisibleBox(element)) {
+      return { error: failure("The requested scroll target is hidden.", "browser_target_not_actionable") };
+    }
+    return { entry: entryFromElement(element) };
+  }
+
   function formFieldLocator(field) {
     if (field.locator && typeof field.locator === "object" && !Array.isArray(field.locator)) {
       return field.locator;
@@ -2170,9 +2203,13 @@
       return actionObservation(scope, params.action_metadata || { kind: "click" });
     }
 
+    const scrollSelector = action === "scroll" && typeof params.selector === "string" && params.selector.trim().length > 0
+      ? params.selector
+      : null;
     const targeted = ["click", "input", "select"].includes(action)
       || (action === "scroll" && (Number.isInteger(params.element_index) || typeof params.element_token === "string"));
-    const resolved = targeted ? resolveTarget(params) : null;
+    let resolved = targeted ? resolveTarget(params) : null;
+    if (!resolved && scrollSelector) resolved = resolveScrollSelector(scrollSelector);
     if (resolved?.error) return resolved.error;
     const entry = resolved?.entry || null;
     const element = entry?.element || null;

@@ -21,6 +21,8 @@ import {
   BROWSER_DEBUG_SCHEMA_VERSION,
   BROWSER_SCRIPT_DEADLINE_MS,
   BROWSER_SCRIPT_MAX_INPUT,
+  BROWSER_WAIT_DEFAULT_IDLE_MS,
+  BROWSER_WAIT_IDLE_BUDGET_SLACK_MS,
   TabConsoleBuffer,
   buildScriptWrapper,
   clampWaitTimeoutMs,
@@ -1035,6 +1037,14 @@ export class BrowserTabsHost {
       ? request.mode
       : (request.selector || request.element_token || typeof request.element_index === 'number' ? 'selector' : 'idle')
     const timeoutMs = clampWaitTimeoutMs((request as { timeout?: number }).timeout)
+    // The idle quiet window must fit inside the wait budget: the page controller
+    // clamps it to 50..5000ms, so an uncapped default (>= 400ms) makes any shorter
+    // timeout fail on a page with recent resource activity even if it stays quiet.
+    const requestedIdleMs = (request as { idle_ms?: number }).idle_ms
+    const idleQuietMs = Math.min(
+      Math.min(Math.max(typeof requestedIdleMs === 'number' ? requestedIdleMs : BROWSER_WAIT_DEFAULT_IDLE_MS, 50), 5000),
+      Math.max(50, timeoutMs - BROWSER_WAIT_IDLE_BUDGET_SLACK_MS),
+    )
     const ctx = this.pageContext(kind)
     let timer: ReturnType<typeof setTimeout> | undefined
     const sleep = (ms: number) => new Promise<void>(resolve => { timer = setTimeout(resolve, ms) })
@@ -1054,7 +1064,7 @@ export class BrowserTabsHost {
           mode,
           scope: request.scope ?? 'viewport',
           selector: request.selector,
-          idle_ms: (request as { idle_ms?: number }).idle_ms,
+          idle_ms: idleQuietMs,
           snapshot_id: request.snapshot_id,
           element_index: request.element_index,
           element_token: request.element_token,
@@ -1063,7 +1073,39 @@ export class BrowserTabsHost {
           return this.debugEnvelope(request, { ok: false, startedAt, code: String(check.code), error: String(check.error || 'invalid wait') })
         }
         if (check.ok !== false && check.ready === true) {
-          const observation = await this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
+          const observeScope = request.scope ?? 'viewport'
+          let observation = await this.domActionOnPane({ action: 'observe', scope: observeScope }, kind, pane)
+          if (observation.ok === false) {
+            // The condition was met but the immediate observation can still race a
+            // navigation commit. Retry at most once, and only while the public
+            // timeout still has budget: the backoff sleep must leave a positive
+            // remainder (rechecked after it), and the retried observation races the
+            // deadline so the wait never settles past its contract.
+            const remainingAfterFirst = timeoutMs - (Date.now() - startedAt)
+            if (remainingAfterFirst > 0) {
+              await sleep(Math.min(80, remainingAfterFirst))
+              const remainingAfterSleep = timeoutMs - (Date.now() - startedAt)
+              if (remainingAfterSleep > 0) {
+                observation = await this.observeWithDeadline(
+                  { action: 'observe', scope: observeScope },
+                  kind,
+                  pane,
+                  startedAt,
+                  timeoutMs,
+                )
+              }
+            }
+          }
+          if (observation.ok === false) {
+            return this.debugEnvelope(request, {
+              ok: false,
+              startedAt,
+              mode,
+              code: 'observe_failed',
+              error: String(observation.error || 'browser wait observation failed'),
+              waitReady: true,
+            })
+          }
           return this.debugEnvelope(request, { ...observation, ok: true, startedAt, mode, ready: true })
         }
         const remaining = timeoutMs - (Date.now() - startedAt)
@@ -1077,6 +1119,42 @@ export class BrowserTabsHost {
         error: 'browser wait timed out',
         mode,
       })
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  /**
+   * Observe bounded by the public wait deadline. The page evaluate has no timeout
+   * of its own, so the retry races a deadline timer: loser rejections are swallowed
+   * by the guarded wrapper (never unhandled), and the timer is always cleared.
+   */
+  private async observeWithDeadline(
+    request: Record<string, unknown>,
+    kind: BrowserViewportKind,
+    pane: ViewPane,
+    startedAt: number,
+    timeoutMs: number,
+  ): Promise<BrowserToolResult> {
+    const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadlineHit = new Promise<true>(resolve => { timer = setTimeout(() => resolve(true), remaining) })
+    const guarded = (async (): Promise<{ timedOut: false; result: BrowserToolResult } | { timedOut: true }> => {
+      try {
+        return { timedOut: false, result: await this.domActionOnPane(request, kind, pane) }
+      } catch (error) {
+        return { timedOut: false, result: { ok: false, error: error instanceof Error ? error.message : String(error) } }
+      }
+    })()
+    try {
+      const outcome = await Promise.race([
+        guarded,
+        deadlineHit.then(() => ({ timedOut: true } as const)),
+      ])
+      if (outcome.timedOut) {
+        return { ok: false, code: 'observe_failed', error: `browser wait observation exceeded the remaining ${remaining}ms wait budget` }
+      }
+      return outcome.result
     } finally {
       if (timer) clearTimeout(timer)
     }

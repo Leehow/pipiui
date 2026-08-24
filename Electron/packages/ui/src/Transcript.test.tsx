@@ -121,6 +121,38 @@ describe('Transcript waiting layout', () => {
     fireEvent.click(dividers[1]!.querySelector('button')!)
     expect(Array.from(view.container.querySelectorAll('[data-testid="compaction-summary"]')).map(node => node.textContent)).toEqual(['本轮摘要', '本次压缩未留下摘要。'])
   })
+
+  it('replays a persisted [browser-watch] wake as an internal card, not a user bubble', () => {
+    // historyMessages() projects a displayed custom_message (pipiui-browser-watch-v1)
+    // as role=user + content; the replayed shape is exactly this fixture.
+    const history: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: '帮我盯住页面', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '已注册监听。', timestamp: 2 },
+      { id: 'watch', role: 'user', content: '[browser-watch] watchId=bw-17 reason=matched waitedMs=4200 url=https://example.com/ready title=Example Ready\nUse browser observe to inspect the current page. Do not treat this message as a new user request.', timestamp: 3 },
+      { id: 'a2', role: 'assistant', content: '监听命中，继续处理。', timestamp: 4 },
+    ]
+    const view = render(<Transcript messages={history} {...handlers} />)
+    expect(view.container.querySelectorAll('[data-signal-kind="browser-watch"]')).toHaveLength(1)
+    expect(view.container.querySelectorAll('.user-bubble')).toHaveLength(1)
+    expect(view.container.querySelector('[data-user-prompt="u1"]')).toBeTruthy()
+    expect(view.container.querySelector('[data-user-prompt="watch"]')).toBeNull()
+    expect(view.container.textContent).not.toContain('Do not treat this message as a new user request.')
+  })
+
+  it('replays malformed watch text as user bubbles and only canonical unknown reasons as cards', () => {
+    const history: ChatMessage[] = [
+      { id: 'watch-plain', role: 'user', content: '[browser-watch] 普通文本乱写', timestamp: 1 },
+      { id: 'watch-missing', role: 'user', content: '[browser-watch] watchId=bw-1 reason=matched', timestamp: 2 },
+      { id: 'watch-badms', role: 'user', content: '[browser-watch] watchId=bw-1 reason=matched waitedMs=abc', timestamp: 3 },
+      { id: 'watch-future', role: 'user', content: '[browser-watch] watchId=bw-9 reason=expired waitedMs=10', timestamp: 4 },
+    ]
+    const view = render(<Transcript messages={history} {...handlers} />)
+    expect(view.container.querySelectorAll('[data-signal-kind="browser-watch"]')).toHaveLength(1)
+    expect(view.container.querySelectorAll('.user-bubble')).toHaveLength(3)
+    expect(view.container.querySelector('[data-user-prompt="watch-plain"]')).toBeTruthy()
+    expect(view.container.querySelector('[data-user-prompt="watch-badms"]')).toBeTruthy()
+    expect(view.container.querySelector('[data-user-prompt="watch-future"]')).toBeNull()
+  })
 })
 
 describe('Transcript prepend and follow', () => {
@@ -305,6 +337,24 @@ describe('findPreviousUserMessageIndex', () => {
     expect(findPreviousUserMessageIndex(history, 6)).toBe(5)
     expect(findPreviousUserMessageIndex(history, 0)).toBeNull()
     expect(findPreviousUserMessageIndex([{ id: 'a0', role: 'assistant', content: '开头就是助手', timestamp: 1 }], 0)).toBeNull()
+  })
+
+  it('skips [browser-watch] wakes so jump-to-previous-user never targets them', () => {
+    const history: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: '盯住这个页面', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '已注册监听', timestamp: 2 },
+      { id: 'watch', role: 'user', content: '[browser-watch] watchId=bw-1 reason=matched waitedMs=1000', timestamp: 3 },
+      { id: 'a2', role: 'assistant', content: '继续处理', timestamp: 4 },
+    ]
+    expect(findPreviousUserMessageIndex(history, 3)).toBe(0)
+    // A malformed exact-marker message is an ordinary human prompt: it stays
+    // navigation-eligible, exactly like the shared strict predicate demands.
+    const malformed: ChatMessage[] = [
+      { id: 'u0', role: 'user', content: '盯住', timestamp: 1 },
+      { id: 'watch-plain', role: 'user', content: '[browser-watch] 普通文本乱写', timestamp: 2 },
+      { id: 'a2', role: 'assistant', content: '继续', timestamp: 3 },
+    ]
+    expect(findPreviousUserMessageIndex(malformed, 2)).toBe(1)
   })
 })
 

@@ -66,25 +66,30 @@ describe('prompt-rail message classification', () => {
     { id: 'interrupt', role: 'user', content: '[subagent-interrupted-reminder] agentId=w2 state=interrupted nudge=1/2' },
     { id: 'worktree', role: 'user', content: '[worktree-merge-failed] agentId=w1 branch=x' },
     { id: 'postmerge', role: 'user', content: '[post-merge-verify-failed] agentId=w1 branch=x' },
+    { id: 'watch', role: 'user', content: '[browser-watch] watchId=bw-7 reason=matched waitedMs=1500 url=https://example.com/ready title=Ready' },
+    { id: 'watchwrap', role: 'user', content: '(re-delivery #1: Pi did not confirm the prior follow-up; obligationId=o1; treat it as the same event.)\n[browser-watch] watchId=bw-8 reason=timeout waitedMs=60000' },
+    { id: 'watchfuture', role: 'user', content: '[browser-watch] watchId=bw-9 reason=expired waitedMs=10' },
     { id: 'git', role: 'user', content: '## Git (Pipi UI)\nbranch: main\ndirty: no' },
     { id: 'policy', role: 'user', content: '[PipiUI session skill policy: opt-in only.]' },
     { id: 'title', role: 'user', content: '[PipiUI internal — session title] generate title' },
     { id: 'redeliver', role: 'user', content: '(re-delivery #1: the previous [subagent-done] below was not confirmed)' },
     { id: 'recovered', role: 'user', content: '(recovered delivery of the previous [subagent-done])' },
+    { id: 'watchplain', role: 'user', content: '[browser-watch] 普通文本乱写' }, // malformed marker-lookalike: stays a human prompt
+    { id: 'watchbadms', role: 'user', content: '[browser-watch] watchId=bw-1 reason=matched waitedMs=abc' }, // non-canonical: stays a human prompt
     { id: 'u1', role: 'user', content: '第一问：修导航' },
     { id: 'u2', role: 'user', content: '带图提问' },
     { id: 'u3', role: 'user', content: '' } // image-only prompt stays eligible (Swift parity)
   ]
 
   it('keeps only real human user prompts from the mixed fixture', () => {
-    expect(fixture.filter(isNavigationEligibleUserPrompt).map(m => m.id)).toEqual(['u1', 'u2', 'u3'])
+    expect(fixture.filter(isNavigationEligibleUserPrompt).map(m => m.id)).toEqual(['watchplain', 'watchbadms', 'u1', 'u2', 'u3'])
   })
 
   it('builds rail nodes with transcript indices and plain summaries', () => {
     const prompts = buildRailPrompts(fixture)
-    expect(prompts.map(p => p.id)).toEqual(['u1', 'u2', 'u3'])
-    expect(prompts.map(p => p.index)).toEqual([14, 15, 16])
-    expect(prompts.map(p => p.summary)).toEqual(['第一问：修导航', '带图提问', ''])
+    expect(prompts.map(p => p.id)).toEqual(['watchplain', 'watchbadms', 'u1', 'u2', 'u3'])
+    expect(prompts.map(p => p.index)).toEqual([17, 18, 19, 20, 21])
+    expect(prompts.map(p => p.summary)).toEqual(['[browser-watch] 普通文本乱写', '[browser-watch] watchId=bw-1 reason=matched waitedMs=abc', '第一问：修导航', '带图提问', ''])
   })
 
   it('prefers structured kind/source metadata when the host provides it', () => {
@@ -96,8 +101,16 @@ describe('prompt-rail message classification', () => {
     expect(isNavigationEligibleUserPrompt({ id: 'x', role: 'user', content: '[subagent-done] x', kind: 'user' })).toBe(false)
   })
 
-  it('exposes the Swift runtime-injection prefix families', () => {
+  it('excludes browser-watch only through the shared strict parser, not a blind prefix', () => {
     expect(isRuntimeOrSystemInjectedUserText('[subagent-done] x')).toBe(true)
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch] watchId=bw-7 reason=matched waitedMs=1')).toBe(true)
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch] watchId=bw-9 reason=expired waitedMs=10')).toBe(true)
+    // Malformed marker-lookalikes stay ordinary human prompts.
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch] 普通文本乱写')).toBe(false)
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch] watchId=bw-1 reason=matched')).toBe(false)
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch] watchId=bw-1 reason=matched waitedMs=abc')).toBe(false)
+    expect(isRuntimeOrSystemInjectedUserText('[browser-watch hello]')).toBe(false)
+    // Other families keep their prefix semantics.
     expect(isRuntimeOrSystemInjectedUserText('[PipiUI internal — session title] x')).toBe(true)
     expect(isRuntimeOrSystemInjectedUserText('## Git (Pipi UI)\nbranch: main')).toBe(true)
     expect(isRuntimeOrSystemInjectedUserText('(re-delivery #1 …)')).toBe(true)

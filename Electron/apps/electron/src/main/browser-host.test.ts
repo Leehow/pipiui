@@ -1475,6 +1475,131 @@ describe('browser debug actions', () => {
     await expect(host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.05 })).resolves.toMatchObject({ ok: false, code: 'timeout' })
   })
 
+  it('caps the idle quiet window below a short wait timeout so sub-second waits succeed', async () => {
+    const { host, contents, runtime } = await liveBrowser()
+    // A resource that just finished keeps the page "not quiet" under the default
+    // idle window (>= 400ms), which a 0.3s timeout could never out-wait without
+    // capping the quiet window inside the wait budget.
+    const recentActivity = Date.now() - 50
+    ;(runtime.window.performance as unknown as { getEntriesByType: (type: string) => unknown[] }).getEntriesByType = (type: string) =>
+      type === 'resource' ? [{ responseEnd: recentActivity }] : []
+    const result = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.3 })
+    expect(result).toMatchObject({ ok: true, mode: 'idle', ready: true })
+    const waitCheckSource = contents.executeJavaScript.mock.calls
+      .map(([code]) => String(code))
+      .find(code => code.includes('"action":"wait_check"'))
+    expect(waitCheckSource).toBeTruthy()
+    const payloadStart = waitCheckSource!.lastIndexOf('dispatch(') + 'dispatch('.length
+    const payload = JSON.parse(waitCheckSource!.slice(payloadStart).replace(/\)\s*$/, '')) as { idle_ms?: number }
+    expect(payload.idle_ms).toBeLessThanOrEqual(240)
+  })
+
+  it('retries the post-ready observation once and reports a structured failure instead of an empty ok', async () => {
+    const { host, runtime } = await liveBrowser()
+    const realEvaluate = runtime.evaluate.bind(runtime)
+    let observeCalls = 0
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) {
+        observeCalls += 1
+        if (observeCalls === 1) return { ok: false, error: 'browser page is unavailable' }
+      }
+      return realEvaluate(code)
+    }
+    const recovered = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 1 })
+    expect(recovered).toMatchObject({ ok: true, ready: true })
+    expect(String(recovered.snapshotID)).toBeTruthy()
+    expect(String(recovered.url)).toBeTruthy()
+
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) return { ok: false, error: 'browser page is unavailable' }
+      return realEvaluate(code)
+    }
+    const failed = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 1 })
+    expect(failed).toMatchObject({ ok: false, code: 'observe_failed', error: 'browser page is unavailable', waitReady: true })
+  })
+
+  it('skips the post-ready observation retry when the wait budget is already exhausted', async () => {
+    const { host, runtime } = await liveBrowser()
+    const realEvaluate = runtime.evaluate.bind(runtime)
+    let observeCalls = 0
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) {
+        observeCalls += 1
+        // The first observe consumes the whole public timeout budget.
+        vi.setSystemTime(Date.now() + 5_000)
+        return { ok: false, error: 'observe raced a navigation commit' }
+      }
+      return realEvaluate(code)
+    }
+    vi.useFakeTimers()
+    try {
+      const failed = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 1 }, { reveal: false })
+      expect(failed).toMatchObject({ ok: false, code: 'observe_failed', error: 'observe raced a navigation commit' })
+      // No retry past the deadline: exactly one observe call was issued.
+      expect(observeCalls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips the post-ready retry when the backoff sleep consumes the remaining budget', async () => {
+    const { host, runtime } = await liveBrowser()
+    const realEvaluate = runtime.evaluate.bind(runtime)
+    let observeCalls = 0
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) {
+        observeCalls += 1
+        // Leaves 50ms of budget: enough to start the backoff sleep, not enough
+        // for a retry after it.
+        vi.setSystemTime(Date.now() + 950)
+        return { ok: false, error: 'observe raced a navigation commit' }
+      }
+      return realEvaluate(code)
+    }
+    vi.useFakeTimers()
+    try {
+      const pending = host.toolAction({ action: 'wait', mode: 'idle', timeout: 1 }, { reveal: false })
+      // Fires the 50ms backoff sleep and advances the clock past the deadline.
+      await vi.advanceTimersByTimeAsync(80)
+      const failed = await pending
+      expect(failed).toMatchObject({ ok: false, code: 'observe_failed', error: 'observe raced a navigation commit' })
+      expect(observeCalls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds a slow retry observation by the remaining wait budget', async () => {
+    const { host, runtime } = await liveBrowser()
+    const realEvaluate = runtime.evaluate.bind(runtime)
+    let observeCalls = 0
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) {
+        observeCalls += 1
+        if (observeCalls === 1) {
+          vi.setSystemTime(Date.now() + 800) // leaves 200ms
+          return { ok: false, error: 'observe raced a navigation commit' }
+        }
+        // The retry hangs: slower than the remaining public budget.
+        return new Promise(() => {})
+      }
+      return realEvaluate(code)
+    }
+    vi.useFakeTimers()
+    try {
+      const pending = host.toolAction({ action: 'wait', mode: 'idle', timeout: 1 }, { reveal: false })
+      await vi.advanceTimersByTimeAsync(80) // backoff sleep → retry starts with 120ms left
+      await vi.advanceTimersByTimeAsync(120) // retry deadline fires
+      const failed = await pending
+      expect(failed).toMatchObject({ ok: false, code: 'observe_failed' })
+      expect(String(failed.error)).toContain('exceeded the remaining 120ms wait budget')
+      expect(failed.elapsedMs).toBeLessThanOrEqual(1000)
+      expect(observeCalls).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('isolates console buffers per virtual tab and supports cursor/clear/caps', async () => {
     const { host, contents } = browserHarness()
     await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
@@ -2114,8 +2239,8 @@ function createPageRuntime(options: { url?: string; title?: string; tree?: PageS
       display: el.hasAttribute('hidden') ? 'none' : 'block',
       visibility: 'visible',
       opacity: '1',
-      overflowX: 'visible',
-      overflowY: 'visible',
+      overflowX: el.style.overflowX || 'visible',
+      overflowY: el.style.overflowY || 'visible',
     }),
     elementFromPoint: (x: number, y: number) => walkElements(document.body).reverse().find(el => {
       const rect = el.getBoundingClientRect()
@@ -2411,6 +2536,155 @@ describe('browser regional observe and stable refs', () => {
     const mobilePreview = ((both.mobile as { regions: Array<{ preview: Array<{ token: string }> }> }).regions[0]?.preview || [])[0]
     expect(desktopPreview?.token).toMatch(/^desktop:/)
     expect(mobilePreview?.token).toMatch(/^mobile:/)
+  })
+})
+
+describe('browser selector-targeted scroll', () => {
+  function scrollContainerTree(): PageSpec[] {
+    return [
+      {
+        tag: 'main',
+        children: [
+          {
+            tag: 'div',
+            attrs: { id: 'scroll-container' },
+            children: [
+              { tag: 'p', attrs: { id: 'inner-row' }, text: 'row one' },
+              { tag: 'p', text: 'row two' },
+            ],
+          },
+          { tag: 'button', text: 'Checkout' },
+        ],
+      },
+    ]
+  }
+
+  function makeScrollable(el: MiniElement, scrollHeight: number, clientHeight: number) {
+    const scrollBy = vi.fn()
+    el.style.overflowY = 'auto'
+    Object.assign(el, { scrollTop: 0, scrollHeight, clientHeight, scrollWidth: 1280, clientWidth: 1280, scrollBy })
+    return scrollBy
+  }
+
+  function guardPageScroll(runtime: { document: MiniDocument }) {
+    const page = runtime.document.scrollingElement
+    const scrollBy = vi.fn()
+    Object.assign(page, { scrollBy })
+    return { page, scrollBy }
+  }
+
+  it('scrolls the unique selector-matched container and leaves the page unscrolled', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const container = walkElements(runtime.document.body).find(el => el.id === 'scroll-container')!
+    const containerScrollBy = makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', selector: '#scroll-container', direction: 'down', amount: 0.8 }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', direction: 'down', target: 'element' })
+    expect(containerScrollBy).toHaveBeenCalledTimes(1)
+    expect(containerScrollBy).toHaveBeenCalledWith(expect.objectContaining({ left: 0, top: 320 }))
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('climbs from a selector-matched child to the scrollable ancestor', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const container = walkElements(runtime.document.body).find(el => el.id === 'scroll-container')!
+    const containerScrollBy = makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', selector: '#inner-row', direction: 'up', amount: 1 }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', target: 'ancestor' })
+    expect(containerScrollBy).toHaveBeenCalledWith(expect.objectContaining({ top: -400 }))
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('scrolls a visible aria-disabled container instead of rejecting it as disabled', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          {
+            tag: 'div',
+            attrs: { id: 'disabled-scroll', 'aria-disabled': 'true' },
+            children: [{ tag: 'p', text: 'row one' }, { tag: 'p', text: 'row two' }],
+          },
+        ],
+      },
+    ])
+    const container = walkElements(runtime.document.body).find(el => el.id === 'disabled-scroll')!
+    const containerScrollBy = makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', selector: '#disabled-scroll', direction: 'down', amount: 0.8 }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', target: 'element' })
+    expect(containerScrollBy).toHaveBeenCalledWith(expect.objectContaining({ left: 0, top: 320 }))
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('fails a zero-match scroll selector instead of scrolling the page', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', selector: '#missing' }))
+
+    expect(result).toMatchObject({ ok: false, code: 'browser_locator_not_found' })
+    expect(String(result.error)).toMatch(/0 elements/)
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('fails an ambiguous scroll selector instead of picking silently', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          { tag: 'div', attrs: { 'class': 'scroller' }, text: 'one' },
+          { tag: 'div', attrs: { 'class': 'scroller' }, text: 'two' },
+        ],
+      },
+    ])
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', selector: '.scroller' }))
+
+    expect(result).toMatchObject({ ok: false, code: 'browser_locator_ambiguous' })
+    expect(String(result.error)).toMatch(/matched 2 elements/)
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('keeps selector-less page scroll unchanged', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', direction: 'down', amount: 0.5 }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', target: 'page' })
+    expect(pageScrollBy).toHaveBeenCalledWith(expect.objectContaining({ top: 400 }))
+  })
+
+  it('keeps snapshot-targeted scroll working', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const observed = await host.toolAction(asRequest({ action: 'observe', region: 'main' }))
+    const checkout = (observed.elements as Array<{ name: string; token: string }>).find(item => item.name === 'Checkout')
+    expect(checkout?.token).toBeTruthy()
+
+    const result = await host.toolAction(asRequest({
+      action: 'scroll',
+      snapshot_id: String(observed.snapshotID),
+      element_token: checkout!.token,
+    }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', target: 'page' })
+    expect(pageScrollBy).toHaveBeenCalled()
   })
 })
 

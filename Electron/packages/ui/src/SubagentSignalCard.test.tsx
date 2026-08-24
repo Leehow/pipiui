@@ -71,3 +71,67 @@ describe('SubagentSignalCard MessageView integration', () => {
     expect(screen.getByRole('button', { name: '重发消息' })).toBeTruthy()
   })
 })
+
+const WATCH_MATCHED = '[browser-watch] watchId=bw-17 reason=matched waitedMs=4200 url=https://example.com/ready title=Example Ready\n页面出现 .ready 元素\nUse browser observe to inspect the current page. Do not treat this message as a new user request.'
+
+describe('BrowserWatchCard MessageView integration', () => {
+  it('renders a watch wake as one compact internal card without human bubble, prompt marker or resend', () => {
+    const message: ChatMessage = { id: 'watch', role: 'user', content: WATCH_MATCHED, timestamp: 1 }
+    const { container } = render(<MessageView message={message} showFooter documentBasePath="/tmp/project" {...handlers} />)
+    expect(container.querySelectorAll('[data-testid="subagent-signal-card"]')).toHaveLength(1)
+    const card = container.querySelector('[data-signal-kind="browser-watch"]')!
+    expect(card).toBeTruthy()
+    expect(card.className).toContain('subagent-signal-success')
+    expect(container.querySelector('.user-bubble')).toBeNull()
+    expect(container.querySelector('[data-user-prompt]')).toBeNull()
+    expect(screen.queryByRole('button', { name: '重发消息' })).toBeNull()
+    const disclosure = screen.getByRole('button', { name: /浏览器监听.*条件命中 · Example Ready/ })
+    expect(disclosure.getAttribute('aria-expanded')).toBe('false')
+    // Collapsed: the raw protocol trailer must not leak as visible prose.
+    expect(screen.queryByText(/Do not treat this message as a new user request/)).toBeNull()
+  })
+
+  it('expands to the page summary and trailer on demand', () => {
+    const message: ChatMessage = { id: 'watch', role: 'user', content: WATCH_MATCHED }
+    render(<MessageView message={message} {...handlers} />)
+    fireEvent.click(screen.getByRole('button', { name: /条件命中 · Example Ready/ }))
+    expect(screen.getByText(/页面出现 \.ready 元素/)).toBeTruthy()
+    expect(screen.getByText(/Do not treat this message as a new user request/)).toBeTruthy()
+  })
+
+  it('renders wrapped re-delivery and timeout wakes as internal cards, never bubbles', () => {
+    const wrapped: ChatMessage = { id: 'watch-retry', role: 'user', content: `(re-delivery #2: Pi did not confirm the prior follow-up; obligationId=o1; treat it as the same event.)\n[browser-watch] watchId=bw-8 reason=timeout waitedMs=65000 url=https://example.com/pending\nUse browser observe to inspect the current page. Do not treat this message as a new user request.` }
+    const { container } = render(<MessageView message={wrapped} showFooter {...handlers} />)
+    expect(container.querySelector('[data-signal-kind="browser-watch"]')).toBeTruthy()
+    expect(container.querySelector('.subagent-signal-warning')).toBeTruthy()
+    expect(container.querySelector('.user-bubble')).toBeNull()
+    expect(container.querySelector('[data-user-prompt]')).toBeNull()
+  })
+
+  it('renders a structurally valid unknown reason as a neutral internal card', () => {
+    const message: ChatMessage = { id: 'watch-future', role: 'user', content: '[browser-watch] watchId=bw-9 reason=expired waitedMs=10' }
+    const { container } = render(<MessageView message={message} showFooter {...handlers} />)
+    const card = container.querySelector('[data-signal-kind="browser-watch"]')!
+    expect(card).toBeTruthy()
+    expect(card.className).toContain('subagent-signal-neutral')
+    expect(container.querySelector('.user-bubble')).toBeNull()
+    expect(container.querySelector('[data-user-prompt]')).toBeNull()
+  })
+
+  it('keeps malformed and non-canonical watch text as ordinary human bubbles', () => {
+    const cases = [
+      '[browser-watch] 普通文本乱写',
+      '[browser-watch] watchId=bw-1 reason=matched',
+      '[browser-watch] watchId=bw-1 reason=matched waitedMs=abc',
+      '[browser-watch] watchId=a watchId=b reason=matched waitedMs=1',
+    ]
+    for (const content of cases) {
+      const message: ChatMessage = { id: 'watch-odd', role: 'user', content }
+      const { container } = render(<MessageView message={message} showFooter {...handlers} />)
+      expect(container.querySelector('[data-signal-kind="browser-watch"]')).toBeNull()
+      expect(container.querySelector('.user-bubble')).toBeTruthy()
+      expect(container.querySelector('[data-user-prompt="watch-odd"]')).toBeTruthy()
+      cleanup()
+    }
+  })
+})

@@ -6,6 +6,14 @@ export const BROWSER_DEBUG_MAX_OUTPUT = 20_000
 export const BROWSER_SCRIPT_DEADLINE_MS = 25_000
 export const BROWSER_WAIT_DEFAULT_MS = 5_000
 export const BROWSER_WAIT_MAX_MS = 25_000
+/** Documented idle_ms default (browser help: "default 400ms"). */
+export const BROWSER_WAIT_DEFAULT_IDLE_MS = 400
+/**
+ * Headroom subtracted from the wait budget when capping the idle quiet window: the
+ * poll loop needs at least one check after the (capped) quiet window elapses and
+ * before the timeout deadline, otherwise a short wait still cannot report idle.
+ */
+export const BROWSER_WAIT_IDLE_BUDGET_SLACK_MS = 60
 export const BROWSER_CONSOLE_BUFFER = 500
 export const BROWSER_CONSOLE_QUERY_CAP = 200
 export const BROWSER_CONSOLE_MESSAGE_MAX = 4_000
@@ -34,6 +42,7 @@ export const BROWSER_HOST_TOOL_ACTIONS = [
 export type BrowserDebugErrorCode =
   | 'timeout'
   | 'cancelled'
+  | 'observe_failed'
   | 'script_error'
   | 'stale_snapshot'
   | 'navigation_interrupted'

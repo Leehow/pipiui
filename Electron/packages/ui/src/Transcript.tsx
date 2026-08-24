@@ -9,7 +9,7 @@ import { UserMessageBubble } from './UserMessageBubble'
 import { WaitingPlaceholder, type WaitingPhase } from './WaitingPlaceholder'
 import { buildRailPrompts, isNavigationEligibleUserPrompt } from './prompt-rail'
 import { parseSubagentNotice } from './subagent-notice'
-import { parseSubagentSignal } from './subagent-signal'
+import { parseInternalUserSignal } from './subagent-signal'
 import { TruncatedText } from './TruncatedText'
 import type { ChatMessage } from './transcript-model'
 import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PIN_MAX_ATTEMPTS, transcriptDataIndex, transcriptMessageIdentity } from './transcript-scroll'
@@ -239,7 +239,7 @@ export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessa
 function messageTime(timestamp?: number): string { if (!timestamp) return ''; const date = new Date(timestamp); const pad = (value: number) => String(value).padStart(2, '0'); return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}` }
 
 export const MessageView = memo(function MessageView({ message, showFooter, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copied, canJump = false, onJump }: { message: ChatMessage; showFooter?: boolean; copied?: boolean; canJump?: boolean; onJump?: () => void } & DocumentOpenProps & SubagentOpenProps & Omit<MessageActionHandlers, 'copiedId'>) {
-  const signal = message.role === 'user' ? parseSubagentSignal(message.content) : null
+  const signal = message.role === 'user' ? parseInternalUserSignal(message.content) : null
   const copyDisabled = !message.content.trim()
   const copy = () => { void onCopy(message).catch(() => undefined) }
   const time = showFooter && message.timestamp ? <time className="message-time" dateTime={new Date(message.timestamp).toISOString()}>{messageTime(message.timestamp)}</time> : null

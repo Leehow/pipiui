@@ -15,6 +15,8 @@
  * to the same conservative content-prefix rules Swift uses.
  */
 
+import { isBrowserWatchSignalText } from './subagent-signal'
+
 export type RailPromptInput = {
   id: string
   role: string
@@ -39,8 +41,11 @@ export const RAIL_TOOLTIP_MAX_LENGTH = 96
 
 /**
  * Family prefixes for runtime/system content stored or streamed with the user
- * role but not authored by the human. Mirrors Swift's
- * `isRuntimeOrSystemInjectedUserText` exactly.
+ * role but not authored by the human. Mirrors the retired Swift
+ * `isRuntimeOrSystemInjectedUserText`. `[browser-watch]` is deliberately NOT
+ * here: a blind prefix would swallow malformed marker-lookalikes typed by a
+ * human, so that family is excluded through the shared strict parser
+ * (isBrowserWatchSignalText) instead.
  */
 export const RUNTIME_INJECTION_PREFIXES = [
   '[subagent-', // heartbeat / done / stalled / interrupted-reminder / …
@@ -55,6 +60,7 @@ export const RUNTIME_INJECTION_PREFIXES = [
 export function isRuntimeOrSystemInjectedUserText(text: string): boolean {
   if (!text) return false
   return RUNTIME_INJECTION_PREFIXES.some(prefix => text.startsWith(prefix))
+    || isBrowserWatchSignalText(text)
 }
 
 /**

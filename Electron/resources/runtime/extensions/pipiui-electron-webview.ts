@@ -180,7 +180,8 @@ const HELP = [
   "                        selector is visible, or a snapshot element target is valid again.",
   "                        mode='idle' (default otherwise): wait until document.readyState is",
   "                        complete and Performance resource timing stays quiet for idle_ms",
-  "                        (default 400ms). timeout is seconds (default 5, max 25). On success",
+  "                        (default 400ms, capped below timeout so short waits can report",
+  "                        idle). timeout is seconds (default 5, max 25). On success",
   "                        returns a fresh observation; on timeout code=timeout.",
   "                        For waits longer than 25s use watch — wait will not block past 25s.",
   "watch {timeoutSecs, selector? | idle? | url_matches? | expression?}",
@@ -214,8 +215,10 @@ const HELP = [
   "                        and are skipped; other fields continue. Result is",
   "                        {filled, failed, results[{index,ok,error?,relocated?}]} plus a",
   "                        batch mutation summary.",
-  "scroll {direction?, amount?, snapshot_id?, element_index|element_token?}",
-  "                        amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
+  "scroll {direction?, amount?, selector? | snapshot_id?, element_index|element_token?}",
+  "                        selector scrolls the unique CSS-matched element or its nearest",
+  "                        scrollable ancestor; 0 or multiple matches error instead of",
+  "                        scrolling the page. amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
   "                        invalidate the prior snapshot and return a fresh observation plus",
   "                        a compressed mutation summary (DOM add/remove/attr, dialogs, URL).",
   "                        If the original node went stale on the same URL, a unique visible",
@@ -290,6 +293,64 @@ function isBrowserActionError(result: any): boolean {
   return result?.isError === true;
 }
 
+// Batch text budget: actions[] concatenates up to 8 results; repeated large outputs
+// (e.g. content of the same page) must not re-expand toward the tool-result
+// truncation cap (~100k chars). BATCH_TEXT_CHAR_BUDGET is a true global budget for
+// the sum of all rendered entry bodies: the final substantial entry's evidence is
+// allocated first, earlier entries share what is left. Only per-entry header lines,
+// failure texts (reserved in full), and small duplicate markers sit on top.
+// Labeled images and details.results keep their full data regardless.
+const BATCH_TEXT_CHAR_BUDGET = 48_000;
+const BATCH_PER_ENTRY_MAX = 8_000;
+const BATCH_FINAL_ENTRY_MAX = 40_000;
+const BATCH_DEDUP_MIN = 400;
+
+/** UTF-16 surrogate-safe truncation: never splits an astral character pair. */
+function safeTruncateText(t: string, max: number): string {
+  if (t.length <= max) return t;
+  let end = max;
+  if (end > 0) {
+    const prev = t.charCodeAt(end - 1);
+    const next = t.charCodeAt(end);
+    if (prev >= 0xd800 && prev <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) end -= 1;
+  }
+  return t.slice(0, end);
+}
+
+function entryTextParts(result: any): string[] {
+  return (result?.content || [])
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text);
+}
+
+// Parameter-validation failures embed the full HELP; inside a batch that repeats the
+// whole manual for one wrong item. Keep the specific message plus a one-line pointer.
+function withoutEmbeddedHelp(t: string): string {
+  const i = t.indexOf(HELP);
+  if (i < 0) return t;
+  return `${t.slice(0, i).trimEnd()}\n(full parameter docs: run browser with action:"help")`;
+}
+
+// Lightweight DOM results (e.g. click with deferred observation) carry no page
+// snapshot: printing their URL/Title/Viewport header fabricates empty metadata.
+// Inside a batch they render as a compact action/mutation summary instead.
+function isCompactDomResult(details: any): boolean {
+  if (!details || typeof details !== "object") return false;
+  if (details.deferObservation === true) return true;
+  return !details.url && !details.snapshotID && typeof details.mutation === "object";
+}
+
+function formatCompactDomResult(details: any): string {
+  const lines: string[] = [];
+  if (details?.action && typeof details.action === "object") lines.push(`Action: ${JSON.stringify(details.action)}`);
+  if (details?.relocated) lines.push("Relocated: true");
+  if (details?.mutation) lines.push(`Mutation: ${JSON.stringify(details.mutation)}`);
+  if (Array.isArray(details?.candidates) && details.candidates.length) lines.push(`Candidates: ${JSON.stringify(details.candidates)}`);
+  if (details?.note) lines.push(`Note: ${details.note}`);
+  if (details?.error) lines.push(`Note: ${details.error}`);
+  return lines.length ? lines.join("\n") : "ok";
+}
+
 function formatBrowserActionBatch(
   entries: Array<{ index: number; action: string; status: "ok" | "failed" | "skipped"; reason?: string; result?: any }>,
   failedIndex: number | null,
@@ -302,6 +363,71 @@ function formatBrowserActionBatch(
     : budgetExhaustedAt != null
       ? `browser batch: time budget exhausted before index ${budgetExhaustedAt}; ${skipped.length} skipped.`
       : `browser batch: ${entries.length} executed, all ok.`;
+
+  // Bodies of ok entries, deduplicated when a large output repeats verbatim.
+  const okEntries = entries.filter((entry) => entry.status === "ok");
+  const bodies = new Map<number, { text: string; duplicateOf: number | null }>();
+  const seen = new Map<string, number>();
+  for (const entry of okEntries) {
+    const raw = isCompactDomResult(entry.result?.details)
+      ? formatCompactDomResult(entry.result?.details)
+      : entryTextParts(entry.result).join("\n");
+    let duplicateOf: number | null = null;
+    if (raw.length >= BATCH_DEDUP_MIN) {
+      const first = seen.get(raw);
+      if (first === undefined) seen.set(raw, entry.index);
+      else duplicateOf = first;
+    }
+    bodies.set(entry.index, { text: raw, duplicateOf });
+  }
+
+  // Global budget: failure/skipped lines are reserved first and never trimmed; the
+  // last substantial non-duplicate output is the batch's final page evidence and is
+  // allocated its cap out of the same budget; earlier substantial outputs share
+  // whatever is left, so the sum of all bodies stays within BATCH_TEXT_CHAR_BUDGET.
+  const fixedLen = entries.reduce((total, entry) => {
+    if (entry.status === "skipped") return total + 64;
+    if (entry.status === "failed") return total + 32 + withoutEmbeddedHelp(entryTextParts(entry.result).join("\n")).length;
+    return total + 32;
+  }, header.length);
+  const bodyBudget = Math.max(0, BATCH_TEXT_CHAR_BUDGET - fixedLen);
+
+  const renderCapped = (raw: string, cap: number): { text: string; used: number } => {
+    if (raw.length <= cap) return { text: raw, used: raw.length };
+    const marker = `\n[... ${raw.length} chars omitted (batch text budget)]`;
+    const room = cap - marker.length;
+    if (room > 160) {
+      const text = `${safeTruncateText(raw, room)}${marker}`;
+      return { text, used: text.length };
+    }
+    const text = `[output omitted: ${raw.length} chars (batch text budget)]`;
+    return { text, used: text.length };
+  };
+
+  const rendered = new Map<number, string>();
+  let share = bodyBudget;
+  const finalEntry = [...okEntries].reverse().find((entry) => {
+    const body = bodies.get(entry.index)!;
+    return body.text.length >= BATCH_DEDUP_MIN && body.duplicateOf === null;
+  });
+  if (finalEntry != null) {
+    const { text, used } = renderCapped(
+      bodies.get(finalEntry.index)!.text,
+      Math.min(BATCH_FINAL_ENTRY_MAX, bodyBudget),
+    );
+    rendered.set(finalEntry.index, text);
+    share = Math.max(0, share - used);
+  }
+  for (const entry of okEntries) {
+    if (finalEntry != null && entry.index === finalEntry.index) continue;
+    const body = bodies.get(entry.index)!;
+    const text = body.duplicateOf !== null
+      ? `[duplicate of index ${body.duplicateOf}: same ${body.text.length}-char output, not repeated]`
+      : renderCapped(body.text, Math.min(BATCH_PER_ENTRY_MAX, share)).text;
+    rendered.set(entry.index, text);
+    share = Math.max(0, share - text.length);
+  }
+
   const lines = [header, ""];
   const content: Array<Record<string, unknown>> = [];
   for (const entry of entries) {
@@ -310,9 +436,10 @@ function formatBrowserActionBatch(
       continue;
     }
     lines.push(`[${entry.index}] ${entry.action} ${entry.status}`);
-    for (const part of entry.result?.content || []) {
-      if (part?.type === "text" && typeof part.text === "string") lines.push(part.text);
-    }
+    const body = entry.status === "failed"
+      ? withoutEmbeddedHelp(entryTextParts(entry.result).join("\n"))
+      : rendered.get(entry.index) || "";
+    if (body) lines.push(body);
   }
   content.push({ type: "text", text: lines.join("\n") });
   for (const entry of entries) {
@@ -722,7 +849,14 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
         case "scroll": {
           const hasIndex = typeof params.element_index === "number";
           const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
+          const hasSelector = typeof params.selector === "string" && params.selector.trim().length > 0;
           const hasTarget = Boolean(params.snapshot_id || hasIndex || hasToken);
+          if (hasSelector && hasTarget) {
+            return usage(`browser scroll accepts selector or a snapshot element target, not both.\n\n${HELP}`);
+          }
+          if (hasSelector && params.locator) {
+            return usage(`browser scroll accepts selector or locator, not both.\n\n${HELP}`);
+          }
           if (hasTarget && (!params.snapshot_id || hasIndex === hasToken)) {
             return usage(`targeted browser scroll requires snapshot_id and exactly one of element_index or element_token.\n\n${HELP}`);
           }
@@ -731,6 +865,7 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
             ...targetParams,
             direction: params.direction ?? "down",
             amount: params.amount ?? 0.8,
+            ...(hasSelector ? { selector: params.selector } : {}),
             ...(hasTarget ? {
               snapshot_id: params.snapshot_id,
               ...(hasIndex ? { element_index: params.element_index } : { element_token: params.element_token }),
