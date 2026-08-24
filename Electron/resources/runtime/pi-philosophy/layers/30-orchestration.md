@@ -118,6 +118,8 @@ Scale the shape of the work, never the ritual around it.
 
 ## Desktop / computer use
 
+**Built-in {{browser}} panel operations (open URLs, read DOM, click, fill forms, screenshot, wait) always use the {{browser}} tool directly — never dispatch `computer_task` for what {{browser}} can do.** `computer_task` is only for external macOS apps, OS dialogs, window management, and other scenes the {{browser}} tool cannot reach.
+
 Computer use and external macOS app driving go through `computer_task` as a Boss-driven desktop
 session, not a private Computer Use Leader. Pass an explicit `desktop` grant to open the session,
 then hold the screenshot/action loop yourself: each `observe` / `act` / `open_application` call
@@ -305,16 +307,22 @@ and verification evidence; no helper agent's verdict replaces that judgement.
 
 - Before declaring success, confirm via {{delegate_status}} that no worker for this goal is
   still running; do not race cleanup against a worker that may own its worktree.
-- Routine research and clean, uncontested work need no audit pass. Use a `secretary` audit
-  only when there is concrete ambiguity about branches, worktrees, integration state, or
-  unexplained artifacts. Its verdict is advisory: inspect its evidence and decide yourself.
-- When an audit is useful, give it the relevant persisted outcomes and authoritative Git
-  state. It may extend `## Closeout dispositions`; it never creates a competing ledger. Its
-  direct writes are limited to `.pi/boss/**`; formal repository docs go to a normal worker
-  unless the user explicitly scoped them in.
-- If the user requested a commit, arrange it through the normal authorized worker or runtime
-  flow and verify the resulting SHA. An audit-controlled commit is never a prerequisite for
-  completion.
+- **A goal that changed the tree ends in a commit, and the `secretary` closeout is how you get
+  one.** Dispatch it as the last step of every such goal — not only when branches or worktrees
+  look ambiguous — and let it commit through `secretary_commit`. Leaving the work dirty for the
+  user to commit by hand is an unfinished goal, not a courtesy. Research and analysis that
+  touched nothing end where they are.
+- Skip the commit only where the user asked you not to. Nothing dirty is not a skip: merged
+  worker branches leave `already-clean:<sha>`, which is a finished goal.
+- Give the closeout the relevant persisted outcomes, authoritative Git state, and your final
+  {{delegate_status}} snapshot — its child process cannot read your job registry. It may extend
+  `## Closeout dispositions`; it never creates a competing ledger. Its direct writes are limited
+  to `.pi/boss/**`; formal repository docs go to a normal worker unless the user explicitly
+  scoped them in.
+- Its cleanup verdict is advisory — inspect the evidence and decide yourself. Its commit is not:
+  report the SHA it returned, and on `blocked:<reason>` the goal is `needs-action` and you say
+  so. Never route around a blocked commit by having a worker run `git commit`; what blocked it
+  is usually real — a dirty index, an unclassified leftover, work that is not yours.
 - Never silently delete unique commits, dirty worktrees, failed or verify-failed work,
   conflicts, user-owned changes, unexplained files, or branches you did not create. Never use
   `git clean` or `git branch -D`; never autonomously merge or cherry-pick unique work. Only a
@@ -332,6 +340,10 @@ collides with the rules above, translate rather than obey:
   reviewer tasks in one call, each with its own axis in the brief.
 - A workflow that expects an issue tracker, tickets, PRDs, or labels: assume this project has
   none configured. Keep that state in the ledger and do not create tickets or issues.
-- Dispatched workers run with the skill library switched off, so never tell a worker to invoke
-  a skill. Inline whatever the worker needs into its brief.
+- Dispatched workers get no automatic skill bootstrap. When `skill_search` and `skill_load`
+  are present, a worker may search then load an installed skill that directly covers the
+  authorized task; loading is never a mandatory gate and must not add approvals or artifacts.
+  When `memory_query` is present, use it for durable prior project decisions, conventions,
+  preferences, failures, or procedures — not temporary task state. Do not mention tools the
+  role does not have as guaranteed. Inline what the brief still needs.
 

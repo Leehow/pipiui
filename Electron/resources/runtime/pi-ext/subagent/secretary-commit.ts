@@ -18,6 +18,11 @@ export interface SecretaryCommitDisposition {
 export interface SecretaryCommitInput {
 	closeout: "pass" | "needs-action" | "blocked";
 	integrationVerify: "pass" | "fail" | "none";
+	/**
+	 * Required when `integrationVerify` is `"none"`: why this task has no executable
+	 * verification. See `verificationBlockReason`.
+	 */
+	verificationUnavailable?: string;
 	commitMessage: string;
 	paths: string[];
 	allRelevantItemsClassified: boolean;
@@ -104,7 +109,8 @@ function canonicalGitRoot(mainCwd: string | undefined): string | null {
 	}
 }
 
-function safeCommitMessage(value: unknown): string | null {
+/** One trimmed line, short enough for a commit message or a ledger declaration, no control characters. */
+function safeOneLine(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const trimmed = value.trim();
 	if (
@@ -116,6 +122,24 @@ function safeCommitMessage(value: unknown): string | null {
 		return null;
 	}
 	return trimmed;
+}
+
+/**
+ * Verification gate.
+ *
+ * `pass` is the ordinary route. `none` is not a hole in it: a docs, config, or prompt-layer
+ * change often has no executable verification at all, and refusing those was exactly why a
+ * finished task still ended with the user committing by hand. It is admitted only when the
+ * secretary states, in its own words, why this task has none — a sentence that lands in the
+ * ledger beside the SHA, and that a run which merely skipped the tests cannot honestly write.
+ * `fail` is never admitted.
+ */
+function verificationBlockReason(input: SecretaryCommitInput): string | null {
+	if (input.integrationVerify === "pass") return null;
+	if (input.integrationVerify !== "none") return "integration-verify-not-pass";
+	return safeOneLine(input.verificationUnavailable)
+		? null
+		: "verification-none-without-stated-reason";
 }
 
 function safeManifest(values: unknown): { ok: true; paths: string[] } | { ok: false; reason: string } {
@@ -198,7 +222,8 @@ export function runSecretaryCommit(
 	const cwd = canonicalGitRoot(context.mainCwd);
 	if (!cwd) return blocked("main-cwd-is-not-canonical-git-root");
 	if (input.closeout !== "pass") return blocked("closeout-not-pass", cwd);
-	if (input.integrationVerify !== "pass") return blocked("integration-verify-not-pass", cwd);
+	const verificationBlock = verificationBlockReason(input);
+	if (verificationBlock) return blocked(verificationBlock, cwd);
 	if (!dispositionsAreFinal(input)) return blocked("dispositions-not-final", cwd);
 
 	const preStaged = git(cwd, ["diff", "--cached", "--name-only", "-z", "--"]);
@@ -211,7 +236,7 @@ export function runSecretaryCommit(
 		return blocked("pre-staged-changes", cwd);
 	}
 
-	const message = safeCommitMessage(input.commitMessage);
+	const message = safeOneLine(input.commitMessage);
 	if (!message) return blocked("invalid-commit-message", cwd);
 
 	const manifest = safeManifest(input.paths);

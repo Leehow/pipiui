@@ -103,7 +103,7 @@
     },
     {
       "name": "secretary",
-      "use": "optional closeout audit: reconciles worktrees, branches and leftover artifacts. Advisory, and never owns the completion decision."
+      "use": "closeout for any goal that changed the tree, and the only commit route: reconciles worktrees, branches and leftover artifacts, then commits the accepted paths. Its cleanup verdict is advisory; you still own the completion decision."
     }
   ]
 }

@@ -47,10 +47,17 @@ Git and cleanup safety:
 - Never run raw `git add`, `git commit`, `git commit -a`, `git update-ref`, `git rm`,
   `git mv`, worktree mutation, `git clean`, `git branch -D`, reset/restore/checkout
   rollback, stash, merge, cherry-pick, rebase, push, deploy, or history rewrite.
-- For a code-affecting task that reaches `closeout=pass` and
-  `integration_verify=pass`, call `secretary_commit` with the exact accepted-path
-  manifest unless the user explicitly requested no commit. This dedicated tool is
-  the only commit route. Never imitate it through bash.
+- Committing is the default ending of a code-affecting task, not a favour asked for.
+  Whenever one reaches `closeout=pass`, call `secretary_commit` with the exact
+  accepted-path manifest unless the user explicitly requested no commit. This dedicated
+  tool is the only commit route. Never imitate it through bash.
+- Verification: pass `integration_verify=pass` when it ran and passed. When the task
+  genuinely has no executable verification — a docs, config, or prompt-layer change with
+  nothing to build or run — pass `integration_verify=none` together with
+  `verificationUnavailable`, one line saying why none exists. Never write that line for a
+  task whose verification you skipped, could not run, or did not think to look for: the
+  honest report there is `needs-action`, not a commit. A failed verification is never
+  committed.
 - The commit manifest must contain only accepted task paths. Do not include unrelated
   dirty files, `.git/**`, `.pi/**`, absolute paths, traversal, or guessed artifacts.
   A dirty pre-existing index, a non-final disposition, a failed verification, or a
@@ -100,7 +107,8 @@ relevant leftover classified; required integration verification passed; and no
 cleanup warnings remains `needs-action`, not pass.
 
 For code-affecting tasks, final success additionally requires `commit=created:<sha>` or
-`commit=already-clean:<sha>`, and the ledger must record the SHA and exact manifest.
+`commit=already-clean:<sha>`, and the ledger must record the SHA, the exact manifest, and —
+when verification was `none` — the `verificationUnavailable` line you gave the tool.
 Use `commit=not-required` only for a non-code task or an explicit user instruction not
 to commit. If `secretary_commit` returns `blocked:<reason>`, change closeout to
 `needs-action` or `blocked` as appropriate; never report a successful closeout.
