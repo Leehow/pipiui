@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { PipiHostAPI } from '@pipi/host-api'
+import type { DocumentContent, PipiHostAPI } from '@pipi/host-api'
 import { DocumentPanel } from './DocumentPanel'
 
 vi.mock('@file-viewer/react', async () => {
@@ -193,5 +193,154 @@ describe('DocumentPanel', () => {
     expect(screen.getByTestId('office-viewer')).toBe(viewer)
     expect(screen.getByTestId('office-viewer').getAttribute('data-generations')).toBe('1')
     expect(readDocument).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('DocumentPanel office behavior baseline (frozen for office-extension-refactor-v1 T1)', () => {
+  it('routes spreadsheet and legacy presentation binaries to the office viewer', async () => {
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) =>
+      path.endsWith('.ppt')
+        ? { id: path, name: '旧版幻灯.ppt', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }
+        : { id: path, name: '台账.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes })
+    const host = documentHost(readDocument)
+    const { rerender } = render(<DocumentPanel host={host} documentPath="/work/台账.xlsx" />)
+    const xlsxViewer = await screen.findByTestId('office-viewer')
+    expect(xlsxViewer.getAttribute('data-name')).toBe('台账.xlsx')
+    expect(xlsxViewer.getAttribute('data-type')).toBe('xlsx')
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    rerender(<DocumentPanel host={host} documentPath="/work/旧版幻灯.ppt" />)
+    const pptViewer = await screen.findByTestId('office-viewer')
+    expect(pptViewer.getAttribute('data-name')).toBe('旧版幻灯.ppt')
+    expect(pptViewer.getAttribute('data-type')).toBe('ppt')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('falls back to anydoc markdown when the spreadsheet viewer fails', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: '台账.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# 表格回退\n\nA1 单元格内容。')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/台账.xlsx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('xlsx engine failed') })
+    expect(await screen.findByRole('heading', { name: '表格回退' })).toBeTruthy()
+    expect(screen.getByTestId('document-fallback')).toBeTruthy()
+    expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/台账.xlsx')
+  })
+
+  it('falls back to anydoc markdown when the presentation viewer fails', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'deck.pptx', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# 幻灯回退')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/deck.pptx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('pptx engine failed') })
+    expect(await screen.findByRole('heading', { name: '幻灯回退' })).toBeTruthy()
+    expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/deck.pptx')
+  })
+
+  it('keeps a closable error when the anydoc conversion itself fails', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => { throw new Error('anydoc engine missing') })
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('renderer engine failed')
+    expect(screen.queryByTestId('document-fallback')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '关闭文档错误' }))
+    await screen.findByTestId('office-viewer')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('keeps a closable error when the conversion yields empty markdown', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => '')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('renderer engine failed')
+    expect(convertDocumentToMarkdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('never routes PDF viewer failures to the anydoc fallback', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, updatedAt: 1, bytes: new Uint8Array([1, 2, 3, 4]) }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# should never render')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/report.pdf" />)
+    await screen.findByTestId('office-viewer')
+    viewerModule.__emitViewerState({ error: new Error('pdf engine failed') })
+    expect((await screen.findByRole('alert')).textContent).toContain('pdf engine failed')
+    expect(convertDocumentToMarkdown).not.toHaveBeenCalled()
+  })
+
+  it('shows a deterministic error when the host returns invalid office content', async () => {
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'broken.docx', path, kind: 'word' as const, size: 4, content: 'no bytes here' }) as unknown as DocumentContent)
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/broken.docx" />)
+    expect((await screen.findByRole('alert')).textContent).toContain('宿主返回了无效的文档内容')
+  })
+
+  it('shows a deterministic error for unsupported document types', async () => {
+    const readDocument = vi.fn(async () => { throw Object.assign(new Error('unsupported document type'), { code: 'document_unsupported_type' }) })
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/template.dot" />)
+    expect((await screen.findByRole('alert')).textContent).toContain('unsupported document type')
+    expect(screen.queryByTestId('office-viewer')).toBeNull()
+  })
+
+  it('preserves Chinese and space-containing names through viewer and fallback', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    const path = '/工作 目录/2026 报告 表格.xlsx'
+    const readDocument = vi.fn(async () => ({ id: path, name: '2026 报告 表格.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# 空格路径回退成功')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath={path} />)
+    const viewer = await screen.findByTestId('office-viewer')
+    expect(viewer.getAttribute('data-name')).toBe('2026 报告 表格.xlsx')
+    expect(viewer.getAttribute('data-type')).toBe('xlsx')
+    viewerModule.__emitViewerState({ error: new Error('engine failed') })
+    expect(await screen.findByRole('heading', { name: '空格路径回退成功' })).toBeTruthy()
+    expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/工作 目录/2026 报告 表格.xlsx')
+  })
+
+  it('reloads office bytes only for a matching documentChanged event', async () => {
+    const listeners = new Set<(event: { type: 'documentChanged'; path: string }) => void>()
+    let generation = 0
+    const readDocument = vi.fn(async (path: string) => {
+      generation += 1
+      const bytes = generation === 1 ? new Uint8Array([1, 2, 3, 4]) : new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8])
+      return { id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: generation, bytes }
+    })
+    const host = {
+      ...documentHost(readDocument),
+      watchDocument: vi.fn(async () => undefined),
+      unwatchDocument: vi.fn(async () => undefined),
+      subscribeDocuments: (listener: (event: { type: 'documentChanged'; path: string }) => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      }
+    } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
+    const first = await screen.findByTestId('office-viewer')
+    await waitFor(() => expect(first.getAttribute('data-size')).toBe('4'))
+    for (const listener of [...listeners]) listener({ type: 'documentChanged', path: '/tmp/form.docx' })
+    await waitFor(() => expect(readDocument).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(screen.getByTestId('office-viewer').getAttribute('data-size')).toBe('8'))
+    for (const listener of [...listeners]) listener({ type: 'documentChanged', path: '/tmp/other.docx' })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(readDocument).toHaveBeenCalledTimes(2)
   })
 })

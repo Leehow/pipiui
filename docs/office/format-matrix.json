@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "frozenForPlan": "office-extension-refactor-v1/T1",
+  "frozenAt": "2026-08-25",
+  "purpose": "Machine-readable Office format contract frozen in T1. T4/T6 use this as the compatibility corpus input. Any change to DOCUMENT_KIND_BY_EXTENSION (packages/host-api) or OFFICE_DOCUMENT_EXTENSIONS (resources/runtime/extensions/office-doc-shot-gate.ts) must be reflected here or office-format-baseline.test.ts fails.",
+  "uniformPolicies": {
+    "macroExecutionPolicy": "PipiUI never executes VBA/macro code in any Office file. Macro-enabled and legacy containers are previewed and preserved only.",
+    "readLimits": "text kinds 2MB, binary kinds 50MB, absolute path + regular file + extension allowlist required (readLocalDocument).",
+    "unsupportedError": "Extensions outside documentKindForName get a deterministic document_unsupported_type error; no viewer, no fallback, no external open."
+  },
+  "tiers": {
+    "tier1-guaranteed-edit": ".docx/.xlsx/.pptx: first release guarantees OfficeCLI edit AND native office viewer preview.",
+    "macro-preview-preserve": ".docm/.xlsm/.pptm: preview and in-place preservation only; VBA macros are never executed; layout fidelity not guaranteed.",
+    "tier2-best-effort-preview": "Legacy and open formats: best-effort office viewer preview + generic anydoc markdown fallback + external open. No edit or layout-fidelity promise.",
+    "gate-only-template": "Office template extensions covered by the screenshot gate but not previewable in the Document panel (deterministic unsupported error)."
+  },
+  "formats": [
+    { "extension": ".docx", "tier": "tier1-guaranteed-edit", "documentKind": "word", "previewContract": "native-office-viewer", "editContract": "guaranteed", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".xlsx", "tier": "tier1-guaranteed-edit", "documentKind": "spreadsheet", "previewContract": "native-office-viewer", "editContract": "guaranteed", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".pptx", "tier": "tier1-guaranteed-edit", "documentKind": "presentation", "previewContract": "native-office-viewer", "editContract": "guaranteed", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": true },
+
+    { "extension": ".docm", "tier": "macro-preview-preserve", "documentKind": "word", "previewContract": "native-office-viewer", "editContract": "preserve-only", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".xlsm", "tier": "macro-preview-preserve", "documentKind": "spreadsheet", "previewContract": "native-office-viewer", "editContract": "preserve-only", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".pptm", "tier": "macro-preview-preserve", "documentKind": "presentation", "previewContract": "native-office-viewer", "editContract": "preserve-only", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+
+    { "extension": ".doc", "tier": "tier2-best-effort-preview", "documentKind": "word", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".rtf", "tier": "tier2-best-effort-preview", "documentKind": "word", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": false },
+    { "extension": ".odt", "tier": "tier2-best-effort-preview", "documentKind": "word", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": false },
+    { "extension": ".epub", "tier": "tier2-best-effort-preview", "documentKind": "word", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": false },
+    { "extension": ".xls", "tier": "tier2-best-effort-preview", "documentKind": "spreadsheet", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".xlsb", "tier": "tier2-best-effort-preview", "documentKind": "spreadsheet", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".ods", "tier": "tier2-best-effort-preview", "documentKind": "spreadsheet", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": false },
+    { "extension": ".ppt", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".pps", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".ppsx", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".ppsm", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": false },
+    { "extension": ".pot", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": true, "shotGateCovered": true },
+    { "extension": ".odp", "tier": "tier2-best-effort-preview", "documentKind": "presentation", "previewContract": "best-effort-office-viewer", "editContract": "not-promised", "fallbackContract": "anydoc-markdown", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": true, "shotGateCovered": false },
+
+    { "extension": ".dot", "tier": "gate-only-template", "documentKind": null, "previewContract": "unsupported-deterministic-error", "editContract": "not-promised", "fallbackContract": "none", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": false, "shotGateCovered": true },
+    { "extension": ".dotx", "tier": "gate-only-template", "documentKind": null, "previewContract": "unsupported-deterministic-error", "editContract": "not-promised", "fallbackContract": "none", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": false, "shotGateCovered": true },
+    { "extension": ".xlt", "tier": "gate-only-template", "documentKind": null, "previewContract": "unsupported-deterministic-error", "editContract": "not-promised", "fallbackContract": "none", "macroExecutionPolicy": "never-execute", "macroContainer": true, "externalOpen": false, "shotGateCovered": true },
+    { "extension": ".xltx", "tier": "gate-only-template", "documentKind": null, "previewContract": "unsupported-deterministic-error", "editContract": "not-promised", "fallbackContract": "none", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": false, "shotGateCovered": true },
+    { "extension": ".potx", "tier": "gate-only-template", "documentKind": null, "previewContract": "unsupported-deterministic-error", "editContract": "not-promised", "fallbackContract": "none", "macroExecutionPolicy": "never-execute", "macroContainer": false, "externalOpen": false, "shotGateCovered": true }
+  ]
+}

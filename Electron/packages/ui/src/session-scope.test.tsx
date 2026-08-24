@@ -66,6 +66,40 @@ describe('right panel session scoping', () => {
     expect(readDocument).toHaveBeenCalledTimes(2)
   })
 
+  it('watches only the opened document and rewatches when the path changes', async () => {
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: path.split('/').at(-1)!, path, kind: 'markdown' as const, content: `# ${path}` }))
+    const watchDocument = vi.fn(async () => undefined)
+    const unwatchDocument = vi.fn(async () => undefined)
+    const host = { readDocument, watchDocument, unwatchDocument } as unknown as PipiHostAPI
+    const { rerender } = render(<DocumentPanel host={host} documentPath="/project-a/a.md" />)
+    await waitFor(() => expect(watchDocument).toHaveBeenCalledWith('/project-a/a.md'))
+    rerender(<DocumentPanel host={host} documentPath="/project-b/b.md" />)
+    await waitFor(() => expect(watchDocument).toHaveBeenCalledWith('/project-b/b.md'))
+    expect(watchDocument).toHaveBeenCalledTimes(2)
+    await waitFor(() => expect(unwatchDocument).toHaveBeenCalledTimes(1))
+  })
+
+  it('ignores documentChanged events addressed to a different path', async () => {
+    let generation = 0
+    const readDocument = vi.fn(async (path: string) => { generation += 1; return { id: path, name: 'notes.md', path, kind: 'markdown' as const, content: `# gen ${generation}` } })
+    const listeners = new Set<(event: { type: 'documentChanged'; path: string }) => void>()
+    const host = {
+      readDocument,
+      watchDocument: vi.fn(async () => undefined),
+      unwatchDocument: vi.fn(async () => undefined),
+      subscribeDocuments: (listener: (event: { type: 'documentChanged'; path: string }) => void) => {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      }
+    } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/project-a/a.md" />)
+    await screen.findByRole('heading', { name: 'gen 1' })
+    await waitFor(() => expect(listeners.size).toBeGreaterThan(0))
+    for (const listener of [...listeners]) listener({ type: 'documentChanged', path: '/project-b/b.md' })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(readDocument).toHaveBeenCalledTimes(1)
+  })
+
   it('gives each session its own terminal and keeps the other one alive', async () => {
     let sequence = 0
     const open = vi.fn(async (): Promise<TerminalSession> => ({ id: `terminal-${++sequence}`, title: `终端 ${sequence}`, cwd: '/tmp' }))

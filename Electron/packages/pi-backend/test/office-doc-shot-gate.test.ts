@@ -5,11 +5,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   OFFICECLI_MCP_TOOL,
+  OFFICE_DOCUMENT_EXTENSIONS,
   OFFICE_DOC_SHOT_GATE_FAILED_MESSAGE,
   OFFICE_DOC_SHOT_GATE_FOLLOW_UP_LIMIT,
   OfficeDocShotLedger,
   bashInvokesOfficecli,
   formatViewScreenshotCommand,
+  isOfficeDocumentPath,
+  isOfficecliToolName,
   normalizeOfficeDocumentPath,
   parseOfficecliCommand,
   workerOfficeDocShotGateArgs,
@@ -247,6 +250,104 @@ describe("OfficeDocShotLedger", () => {
     expect(blocked.action).toBe("block");
     expect(bashInvokesOfficecli("echo officecli")).toBe(false);
     expect(bashInvokesOfficecli("/usr/local/bin/officecli view report.docx screenshot --grid auto")).toBe(true);
+  });
+});
+
+describe("office gate baseline freeze (office-extension-refactor-v1 T1)", () => {
+  it("binds the gate to the officecli MCP tool name family and leaves other tools ungated", () => {
+    expect(OFFICECLI_MCP_TOOL).toBe("mcp_officecli_officecli");
+    expect(isOfficecliToolName("mcp_officecli_officecli")).toBe(true);
+    expect(isOfficecliToolName("officecli")).toBe(true);
+    expect(isOfficecliToolName("OfficeCLI")).toBe(true);
+    expect(isOfficecliToolName("mcp_other_officecli")).toBe(true);
+    expect(isOfficecliToolName("officeclix")).toBe(false);
+    expect(isOfficecliToolName("mcp_officecli_officeclix")).toBe(false);
+    expect(isOfficecliToolName("mcp_xofficecli")).toBe(false);
+
+    const gate = ledger();
+    expect(gate.beginCall({
+      toolCallId: "w9",
+      toolName: "mcp_something_else",
+      input: { command: set() },
+      cwd: CWD,
+    }).action).toBe("allow");
+    expect(gate.beginCall({
+      toolCallId: "w10",
+      toolName: "officecli",
+      input: { command: set() },
+      cwd: CWD,
+    }).action).toBe("block");
+  });
+
+  it("gates every shipped office extension including macro, legacy, and template formats", () => {
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".docm");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".xlsm");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".pptm");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".doc");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".xls");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".ppt");
+    expect(OFFICE_DOCUMENT_EXTENSIONS).toContain(".dot");
+    for (const extension of OFFICE_DOCUMENT_EXTENSIONS) {
+      expect(isOfficeDocumentPath(`probe${extension}`)).toBe(true);
+    }
+    // Macro containers are gated exactly like plain documents: baseline first.
+    const gate = ledger([`${CWD}/macros.xlsm`]);
+    expect(gate.beginCall({
+      toolCallId: "w1",
+      toolName: TOOL,
+      input: { command: set("macros.xlsm") },
+      cwd: CWD,
+    }).action).toBe("block");
+  });
+
+  it("quotes and normalizes Chinese and space-containing document paths", () => {
+    const file = "托班 报告.docx";
+    const absolute = `${CWD}/${file}`;
+    expect(formatViewScreenshotCommand(absolute)).toBe(`officecli view "${absolute}" screenshot --grid auto`);
+    expect(normalizeOfficeDocumentPath(`@${file}`, CWD)).toBe(normalizeOfficeDocumentPath(absolute, CWD));
+
+    const gate = ledger([absolute]);
+    const blocked = gate.beginCall({
+      toolCallId: "w1",
+      toolName: TOOL,
+      input: { command: `set "${file}" /body/p[1] --prop text=hi` },
+      cwd: CWD,
+    });
+    expect(blocked.action).toBe("block");
+    gate.beginCall({
+      toolCallId: "s1",
+      toolName: TOOL,
+      input: { command: `view "${file}" screenshot --grid auto` },
+      cwd: CWD,
+    });
+    gate.finishCall({ toolCallId: "s1", isError: false });
+    expect(gate.beginCall({
+      toolCallId: "w2",
+      toolName: TOOL,
+      input: { command: `set "${file}" /body/p[1] --prop text=hi` },
+      cwd: CWD,
+    }).action).toBe("allow");
+  });
+
+  it("adds no final obligation for a failed write and does not clear it with a failed screenshot", () => {
+    const gate = ledger();
+    gate.beginCall({ toolCallId: "s1", toolName: TOOL, input: { command: view() }, cwd: CWD });
+    gate.finishCall({ toolCallId: "s1", isError: false });
+    gate.beginCall({ toolCallId: "w1", toolName: TOOL, input: { command: set() }, cwd: CWD });
+    gate.finishCall({ toolCallId: "w1", isError: true });
+    expect(gate.pendingFinalPaths()).toEqual([]);
+
+    gate.beginCall({ toolCallId: "w2", toolName: TOOL, input: { command: set() }, cwd: CWD });
+    gate.finishCall({ toolCallId: "w2", isError: false });
+    expect(gate.pendingFinalPaths()).toEqual(["report.docx"]);
+
+    gate.beginCall({ toolCallId: "s2", toolName: TOOL, input: { command: view() }, cwd: CWD });
+    gate.finishCall({ toolCallId: "s2", isError: true });
+    expect(gate.pendingFinalPaths()).toEqual(["report.docx"]);
+
+    gate.beginCall({ toolCallId: "s3", toolName: TOOL, input: { command: view() }, cwd: CWD });
+    gate.finishCall({ toolCallId: "s3", isError: false });
+    expect(gate.pendingFinalPaths()).toEqual([]);
   });
 });
 
