@@ -63,6 +63,11 @@ describe('macOS packaging contract', () => {
       filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
     }))
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/qoder',
+      to: 'pipiui-runtime/extensions/qoder',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/pdf-inspector/node_modules',
       to: 'pipiui-runtime/pdf-inspector/node_modules',
       filter: ['**/*', '!**/.bin', '!**/.bin/**']

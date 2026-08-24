@@ -118,6 +118,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/qoder",
+        "to": "pipiui-runtime/extensions/qoder",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/anydoc/node_modules",
         "to": "pipiui-runtime/anydoc/node_modules",
         "filter": [

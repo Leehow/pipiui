@@ -2,17 +2,20 @@ pi-provider-qoder — Third-Party Notice
 ======================================
 
 Source:  https://github.com/simonsmh/pi-provider-qoder
-Version: 0.2.9 (npm tarball pi-provider-qoder-0.2.9.tgz)
+Version: 0.3.0 (local clone /tmp/pi-provider-qoder; package.json version 0.3.0)
 License: MIT, as declared in the package's package.json `license` field and by
          the npm registry. The upstream repository and published tarball
          contain no LICENSE file and publish no copyright line; in accordance
          with the upstream's own publication, no year or legal holder name is
          asserted here beyond the package name and repository.
 
-This notice covers the vendored, minimally-patched port of the package's
-`streamQoder` and its helpers in
-Electron/resources/runtime/pi-ext/subagent/qoder-stream.ts (see that file's header for the
-exact sync baseline and behavioral divergence).
+This notice covers the vendored 0.3.0 TypeScript sources in
+Electron/packages/qoder-extension/agent/vendor/ (synced into
+Electron/resources/runtime/extensions/qoder/). PipiUI patches
+`models.ts` so `contextWindow` / request `model_config` keep the API
+`is_default` tier instead of promoting the largest `context_config`
+tier. See that directory's VENDOR.md for the exact baseline and
+behavioral divergence.
 
 MIT License
 

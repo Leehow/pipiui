@@ -16,4 +16,8 @@ node_modules/
 dist/
 !resources/runtime/extensions/grok-build-oauth/
 !resources/runtime/extensions/grok-build-oauth/**
+!resources/runtime/extensions/qoder/
+!resources/runtime/extensions/qoder/**
+!resources/runtime/extensions/deepseek/
+!resources/runtime/extensions/deepseek/**
 out/

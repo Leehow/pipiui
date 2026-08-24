@@ -110,6 +110,7 @@ describe("installRuntimeTree", () => {
       // M5: bundled manifest extensions keep their compiled `dist` halves even though
       // the generic extensions sync strips `dist`.
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("grok-build-oauth");
+      expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("qoder");
       const grokDir = join(root, "extensions", "grok-build-oauth");
       const grokManifest = JSON.parse(await readFile(join(grokDir, "pipiui-extension.json"), "utf8")) as {
         agent?: { extension?: string };

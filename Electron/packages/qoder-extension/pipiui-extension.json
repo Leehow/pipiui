@@ -1,0 +1,92 @@
+{
+  "id": "qoder",
+  "name": "Qoder",
+  "version": "0.3.0",
+  "capabilities": [
+    "settings.read",
+    "settings.write"
+  ],
+  "auth": {
+    "provider": {
+      "id": "qoder",
+      "name": "Qoder",
+      "api": "qoder-api",
+      "oauth": true,
+      "models": [
+        {
+          "id": "auto",
+          "name": "Qoder Auto",
+          "api": "qoder-api",
+          "input": ["text", "image"],
+          "reasoning": true
+        },
+        {
+          "id": "qmodel_preview",
+          "name": "Qwen3.8 Max Preview",
+          "api": "qoder-api",
+          "input": ["text", "image"],
+          "reasoning": true
+        },
+        {
+          "id": "qmodel_latest",
+          "name": "Qwen3.7 Max",
+          "api": "qoder-api",
+          "input": ["text", "image"],
+          "reasoning": false
+        },
+        {
+          "id": "dmodel",
+          "name": "DeepSeek V4 Pro",
+          "api": "qoder-api",
+          "input": ["text", "image"],
+          "reasoning": true
+        },
+        {
+          "id": "kmodel_latest",
+          "name": "Kimi K3",
+          "api": "qoder-api",
+          "input": ["text", "image"],
+          "reasoning": false
+        }
+      ]
+    }
+  },
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "host": {
+    "entry": "agent/dist/host.js",
+    "description": "Stable host library entry; same createAuthProvider as the agent half."
+  },
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.qoder.pat": {
+            "type": "string",
+            "format": "secret",
+            "title": "Qoder PAT (global)"
+          },
+          "ext.qoder.cnPat": {
+            "type": "string",
+            "format": "secret",
+            "title": "Qoder CN PAT"
+          }
+        }
+      }
+    },
+    "ui": {
+      "settingsSections": [
+        { "id": "qoder", "title": "Qoder" }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}
