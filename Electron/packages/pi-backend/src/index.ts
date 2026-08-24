@@ -271,6 +271,22 @@ export {
   type BridgeAgentEvent,
   type BridgeHandlers,
 } from "./bridge.js";
+export {
+  BROWSER_WATCH_ACTION,
+  BROWSER_WATCH_MAX_TIMEOUT_SECS,
+  BROWSER_WATCH_TRIGGER_ACTION,
+  BrowserWatchCallbackRegistry,
+  deliveryReasonFor,
+  handleBrowserWatchEvent,
+  parseTimeoutSecs,
+  parseWatchCondition,
+  postBrowserWatchTrigger,
+  summarizeWatchCondition,
+  type BrowserWatchCallbackTarget,
+  type BrowserWatchCondition,
+  type BrowserWatchHost,
+  type BrowserWatchTriggerPayload,
+} from "./browser-watch-bridge.js";
 export { DEFAULT_FEATURES } from "./features.js";
 export {
   listExternalSessionsForProject,
@@ -559,6 +575,11 @@ export type PiBackendOptions = {
     request: Record<string, unknown>,
     sessionId: string,
   ) => Promise<Record<string, unknown>>;
+  /** Long-lived browser watch register/unwatch/list/subscribe. */
+  browserWatch?: (
+    request: Record<string, unknown>,
+    sessionId: string,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   terminalAction?: (
     request: Record<string, unknown>,
     sessionId: string,
@@ -1926,6 +1947,10 @@ export class PiHostBackend implements HostBackend {
         options.browserAction
           ? options.browserAction(event, sessionId)
           : { ok: false, error: "browser host unavailable" },
+      onBrowserWatch: async (event, sessionId) =>
+        options.browserWatch
+          ? options.browserWatch(event, sessionId)
+          : { ok: false, error: "browser watch unavailable" },
       onTerminalAction: async (event, sessionId) =>
         options.terminalAction
           ? options.terminalAction(event, sessionId)

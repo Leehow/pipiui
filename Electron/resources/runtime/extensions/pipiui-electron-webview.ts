@@ -4,6 +4,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { randomUUID } from "node:crypto";
 import { isTrivialBrowserEval } from "./browser-eval-guard.ts";
+import { startBrowserWatchCallbackServer } from "../pi-ext/subagent/browser-watch-callback.ts";
+import { registerBrowserWatchDelivery } from "../pi-ext/subagent/browser-watch-delivery.ts";
 
 const PORT = process.env.PIPIUI_BRIDGE_PORT;
 const KEY = process.env.PIPIUI_SESSION_KEY;
@@ -16,6 +18,11 @@ export const BROWSER_TOOL_DECLARED_ACTIONS = [
   "navigate", "observe", "wait", "click", "input", "type", "select", "fill_form", "scroll",
   "content", "eval", "script", "console", "screenshot", "back", "forward", "reload", "help",
 ] as const;
+
+/** Watch actions ride a dedicated browser_watch RPC, not the DOM host dispatcher. */
+export const BROWSER_WATCH_TOOL_ACTIONS = ["watch", "unwatch", "watches"] as const;
+
+const WATCH_MAX_TIMEOUT_SECS = 1800;
 
 async function cancelBridgeRequest(requestID: string): Promise<void> {
   const controller = new AbortController();
@@ -38,6 +45,7 @@ async function bridge(
   action: string,
   params: Record<string, unknown> = {},
   externalSignal?: AbortSignal,
+  rpcAction = "browser_action",
 ): Promise<any> {
   const requestID = randomUUID();
   const controller = new AbortController();
@@ -50,7 +58,7 @@ async function bridge(
       method: "POST",
       headers: { "content-type": "application/json" },
       signal: controller.signal,
-      body: JSON.stringify({ schemaVersion: 1, sessionCapability: CAPABILITY, action: "browser_action", event: { action, requestID, ...params } }),
+      body: JSON.stringify({ schemaVersion: 1, sessionCapability: CAPABILITY, action: rpcAction, event: { action, requestID, ...params } }),
     });
     return await res.json();
   } catch (error) {
@@ -152,6 +160,20 @@ const HELP = [
   "                        complete and Performance resource timing stays quiet for idle_ms",
   "                        (default 400ms). timeout is seconds (default 5, max 25). On success",
   "                        returns a fresh observation; on timeout code=timeout.",
+  "                        For waits longer than 25s use watch — wait will not block past 25s.",
+  "watch {timeoutSecs, selector? | idle? | url_matches? | expression?}",
+  "                        Register a one-shot long wait and return immediately with watchId.",
+  "                        timeoutSecs is required (1..1800). Optional intervalMs (min ~2s).",
+  "                        Conditions (exactly one, or none = timer alarm at timeoutSecs):",
+  "                          selector        CSS selector becomes visible",
+  "                          idle / idle_ms  network idle",
+  "                          url_matches     URL matches this JS regular expression",
+  "                          expression      page JS evaluates strictly === true",
+  "                        Use watch when the wait exceeds 25 seconds. After register, do other",
+  "                        work or end the turn — you will receive a [browser-watch] message",
+  "                        (watchId + reason + waitedMs + URL/title) when it fires.",
+  "unwatch {watchId}      Cancel a watch. Missing ids still return ok.",
+  "watches                 List active watches for this session.",
   "click {snapshot_id, element_index|element_token} | {locator}",
   "input {snapshot_id, element_index|element_token, text} | {locator, text}",
   "select {snapshot_id, element_index|element_token, option} | {locator, option}",
@@ -220,8 +242,49 @@ const HELP = [
   "help                    This text.",
 ].join("\n");
 
+function formatWatchResult(r: any): string {
+  if (!r?.ok) return JSON.stringify({ error: r?.error || "browser watch failed" }, null, 2);
+  if (Array.isArray(r.watches)) {
+    if (r.watches.length === 0) return "No active browser watches.";
+    return r.watches.map((watch: any) => {
+      const summary = watch.conditionSummary || JSON.stringify(watch.condition);
+      return `${watch.watchId} ${summary} status=${watch.status || "active"}`;
+    }).join("\n");
+  }
+  if (r.subscribed) return "browser watch callback subscribed";
+  if (r.watchId) {
+    return [
+      `Registered watch ${r.watchId}`,
+      `condition: ${r.conditionSummary || JSON.stringify(r.condition)}`,
+      `timeoutSecs: ${typeof r.watch?.timeoutAt === "number" && typeof r.watch?.createdAt === "number" ? Math.round((r.watch.timeoutAt - r.watch.createdAt) / 1000) : "?"}`,
+      `intervalMs: ${r.intervalMs ?? ""}`,
+      "Watch is non-blocking. Continue other work or end the turn. You will receive a [browser-watch] message when it fires.",
+    ].join("\n");
+  }
+  return "ok";
+}
+
 export default function (pi: ExtensionAPI) {
   if (!PORT || !KEY) return; // Not running inside Pipi UI; stay dormant.
+
+  const watchDelivery = registerBrowserWatchDelivery({
+    pi,
+    sessionKey: () => process.env.PIPIUI_SESSION_KEY,
+  });
+  pi.on("session_start", () => {
+    try { watchDelivery.recover(); } catch { /* recover is best-effort */ }
+  });
+  if (CAPABILITY) {
+    void startBrowserWatchCallbackServer({ secret: CAPABILITY }).then(async (server) => {
+      try {
+        await bridge("subscribe", { op: "subscribe", callbackPort: server.port, callbackSecret: CAPABILITY }, undefined, "browser_watch");
+      } catch (error) {
+        console.error("[pipiui-browser-watch] subscribe failed:", error);
+      }
+    }).catch((error) => {
+      console.error("[pipiui-browser-watch] callback listen failed:", error);
+    });
+  }
 
   // One stable tool instead of five browser_* tools. The tool set never changes, so the
   // prompt prefix stays cached, and the per-request schema cost drops ~400 tokens.
@@ -231,6 +294,7 @@ export default function (pi: ExtensionAPI) {
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
       "actions: navigate, observe, wait, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
       "eval is page-DOM only (no literals/keep-alive). content/eval/script output is sanitized with the same redaction as observe. screenshot pixels are not redacted — avoid capturing auth/checkout UI. " +
       "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
       "click/input/select accept locator {role,name}|{label}|{text}|{css} without a snapshot. " +
@@ -240,7 +304,7 @@ export default function (pi: ExtensionAPI) {
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.String({
-        description: "navigate | observe | wait | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+        description: "navigate | observe | wait | watch | unwatch | watches | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
       }),
       url: Type.Optional(Type.String()),
       js: Type.Optional(Type.String()),
@@ -268,6 +332,16 @@ export default function (pi: ExtensionAPI) {
       amount: Type.Optional(Type.Number({ minimum: 0.1, maximum: 10 })),
       selector: Type.Optional(Type.String()),
       timeout: Type.Optional(Type.Number({ minimum: 0.05, maximum: 25 })),
+      timeoutSecs: Type.Optional(Type.Number({
+        minimum: 1,
+        maximum: 1800,
+        description: "Required for action=watch (1..1800). Do not use watch for waits ≤25s.",
+      })),
+      intervalMs: Type.Optional(Type.Number({ minimum: 50 })),
+      url_matches: Type.Optional(Type.String()),
+      expression: Type.Optional(Type.String()),
+      idle: Type.Optional(Type.Union([Type.Boolean(), Type.Number({ minimum: 50, maximum: 5000 })])),
+      watchId: Type.Optional(Type.String()),
       idle_ms: Type.Optional(Type.Number({ minimum: 50, maximum: 5000 })),
       since_seq: Type.Optional(Type.Number()),
       level: Type.Optional(Type.String()),
@@ -487,6 +561,40 @@ export default function (pi: ExtensionAPI) {
         case "reload": {
           const r = await bridge(params.action, { scope: params.scope ?? "viewport", ...targetParams }, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
+        }
+        case "watch": {
+          const timeoutSecs = typeof params.timeoutSecs === "number" ? params.timeoutSecs : undefined;
+          if (timeoutSecs == null) {
+            return text(`browser watch requires timeoutSecs (1..${WATCH_MAX_TIMEOUT_SECS}). Use watch for waits longer than 25s; it returns immediately with a watchId.\n\n${HELP}`);
+          }
+          if (timeoutSecs < 1 || timeoutSecs > WATCH_MAX_TIMEOUT_SECS) {
+            return text(`browser watch timeoutSecs must be between 1 and ${WATCH_MAX_TIMEOUT_SECS}.\n\n${HELP}`);
+          }
+          const r = await bridge("watch", {
+            op: "register",
+            timeoutSecs,
+            ...targetParams,
+            ...(typeof params.selector === "string" ? { selector: params.selector } : {}),
+            ...(typeof params.idle !== "undefined" ? { idle: params.idle } : {}),
+            ...(typeof params.idle_ms === "number" ? { idle_ms: params.idle_ms } : {}),
+            ...(typeof params.url_matches === "string" ? { url_matches: params.url_matches } : {}),
+            ...(typeof params.expression === "string" ? { expression: params.expression } : {}),
+            ...(typeof params.intervalMs === "number" ? { intervalMs: params.intervalMs } : {}),
+            ...(typeof params.snapshot_id === "string" ? { snapshot_id: params.snapshot_id } : {}),
+            ...(typeof params.element_index === "number" ? { element_index: params.element_index } : {}),
+            ...(typeof params.element_token === "string" ? { element_token: params.element_token } : {}),
+          }, signal, "browser_watch");
+          return r.ok ? text(formatWatchResult(r), r) : bridgeFailure(r);
+        }
+        case "unwatch": {
+          const watchId = typeof params.watchId === "string" ? params.watchId : undefined;
+          if (!watchId) return text(`browser unwatch requires watchId.\n\n${HELP}`);
+          const r = await bridge("unwatch", { op: "unwatch", watchId }, signal, "browser_watch");
+          return r.ok ? text("ok", r) : bridgeFailure(r);
+        }
+        case "watches": {
+          const r = await bridge("watches", { op: "list" }, signal, "browser_watch");
+          return r.ok ? text(formatWatchResult(r), r) : bridgeFailure(r);
         }
         case "help":
           return text(HELP);

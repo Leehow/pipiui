@@ -31,8 +31,30 @@ import {
   truncateEnvelope,
   type BrowserDebugEnvelope,
 } from './browser-debug.js'
+import {
+  WatcherRegistry,
+  type WatchPageSummary,
+  type WatchRegisterInput,
+  type WatchRegisterResult,
+  type WatchTriggerHandler,
+  type WatchUnwatchResult,
+  type WatchWaitCheckRequest,
+} from './watcher-registry.js'
 
 export { BROWSER_HOST_TOOL_ACTIONS, shouldOpenBrowserDevTools } from './browser-debug.js'
+export {
+  WATCHER_DEFAULT_INTERVAL_MS,
+  WatcherRegistry,
+  type WatchCondition,
+  type WatchPageSummary,
+  type WatchRecord,
+  type WatchRegisterInput,
+  type WatchRegisterResult,
+  type WatchTriggerHandler,
+  type WatchTriggerReason,
+  type WatchUnwatchResult,
+  type WatchWaitCheckRequest,
+} from './watcher-registry.js'
 
 /** Minimal structural types keep this controller unit-testable without Electron. */
 export interface BrowserWebContentsLike {
@@ -413,12 +435,67 @@ export class BrowserTabsHost {
   private pendingDocumentOwnerTabId?: string
   private navigationGeneration = 0
   private viewGeneration = 0
+  /** Bumps on main-frame start-loading and view retirement so in-flight watch evaluates can detect a new document. */
+  private documentEpoch = 0
   private readonly consoles = new TabConsoleBuffer()
   private readonly consoleListeners = new WeakMap<BrowserWebContentsLike, (...args: any[]) => void>
   private readonly zoomByTab = new Map<string, number>()
+  private readonly watchLifecycleListeners = new Set<(event: { type: 'destroyed' }) => void>()
 
   constructor(private readonly createView: BrowserViewFactory, private readonly partition = defaultPartition) {
     this.createTab()
+  }
+
+  /** WatcherRegistry hangs session cleanup on view retirement / destroy. */
+  subscribeWatchLifecycle(listener: (event: { type: 'destroyed' }) => void): Unsubscribe {
+    this.watchLifecycleListeners.add(listener)
+    return () => this.watchLifecycleListeners.delete(listener)
+  }
+
+  /** Inspect the live pane without creating or revealing a WebView. */
+  watchInspect(): { hasView: boolean; navigating: boolean; url: string; title: string; documentEpoch: number } {
+    const pane = this.primaryPaneIfCreated()
+    const tab = this.active
+    const contents = pane?.view?.webContents
+    const hasView = Boolean(contents && !contents.isDestroyed?.())
+    const navigating = Boolean(tab?.isLoading || pane?.pending || this.toolNavigationPending)
+    const url = (hasView && contents?.getURL?.()) || tab?.url || pane?.loadedUrl || ''
+    const title = tab?.title || ''
+    return { hasView, navigating, url, title, documentEpoch: this.documentEpoch }
+  }
+
+  /** Reuse the injected controller `wait_check` path. Does not reveal the pane. */
+  async watchWaitCheck(request: WatchWaitCheckRequest): Promise<{ ready: boolean } | { unavailable: true }> {
+    const pane = this.primaryPaneIfCreated()
+    const execute = pane?.view?.webContents.executeJavaScript
+    if (!pane || !execute || !this.active || pane.shownTabId !== this.active.id) return { unavailable: true }
+    const dispatched = this.untaggedRequest({
+      action: 'wait_check',
+      mode: request.mode,
+      scope: 'viewport',
+      selector: request.selector,
+      idle_ms: request.idleMs,
+      snapshot_id: request.snapshotId,
+      element_index: request.elementIndex,
+      element_token: request.elementToken,
+    }, pane.kind)
+    const source = `if(!globalThis.__pipiBrowserDOM){${browserDOMControllerSource}}\n;globalThis.__pipiBrowserDOM.dispatch(${JSON.stringify(dispatched)})`
+    try {
+      const result = await execute.call(pane.view!.webContents, source)
+      if (!result || typeof result !== 'object') return { unavailable: true }
+      const rec = result as { ok?: boolean; ready?: boolean }
+      return { ready: rec.ok !== false && rec.ready === true }
+    } catch {
+      return { unavailable: true }
+    }
+  }
+
+  /** Evaluate a page expression via `executeJavaScript`. Result is used as `=== true`. */
+  async watchEvaluate(expression: string): Promise<unknown> {
+    const pane = this.primaryPaneIfCreated()
+    const execute = pane?.view?.webContents.executeJavaScript
+    if (!execute) return undefined
+    return execute.call(pane.view!.webContents, expression)
   }
 
   /** A later BrowserWindow can become the sole owner after the prior one closes. */
@@ -1407,6 +1484,7 @@ export class BrowserTabsHost {
     })
     view.webContents.on('did-start-loading', () => {
       if (pane.view !== view) return
+      this.documentEpoch += 1
       this.setLoading(pane, true)
     })
     view.webContents.on('did-stop-loading', () => {
@@ -1499,6 +1577,7 @@ export class BrowserTabsHost {
       pane.attachedVisible = undefined
       pane.pending = undefined
       this.viewGeneration += 1
+      this.documentEpoch += 1
       if (this.createdPanes().length === 0) this.resetDocumentOwnership()
     }
     if (this.retiredViews.has(view)) return undefined
@@ -1513,6 +1592,9 @@ export class BrowserTabsHost {
       this.attach?.(view, 'detach', pane.kind, this.mobileWindowDevice())
     } finally {
       view.webContents?.stop?.()
+    }
+    if (this.createdPanes().length === 0) {
+      this.watchLifecycleListeners.forEach(listener => listener({ type: 'destroyed' }))
     }
     return view.webContents
   }
@@ -1736,14 +1818,52 @@ type BrowserSessionRecord = {
  * storage partition, virtual tabs, and an operation queue. Queues are
  * independent, so background sessions never block each other.
  */
+export type BrowserSessionHostOptions = {
+  /** Optional at construct time; `setWatchTrigger` can attach it later for the bridge. */
+  onWatchTrigger?: WatchTriggerHandler
+  now?: () => number
+  watchIntervalMs?: number
+}
+
 export class BrowserSessionHost implements BrowserHostAPI {
   private readonly records = new Map<string, BrowserSessionRecord>()
+  /** Sessions that have been disposeSession'd; missing record is otherwise "not created yet". */
+  private readonly disposedSessionIds = new Set<string>()
   private readonly listeners = new Set<(event: BrowserEvent) => void>()
   private attach?: BrowserSessionViewAttach
   private selectedSessionId?: string
   private visibleSessionId?: string
+  /** Long-lived page watches. Bridge tasks call `setWatchTrigger` then `registerWatch`. */
+  readonly watchers: WatcherRegistry
 
-  constructor(private readonly createView: BrowserViewFactory) {}
+  constructor(private readonly createView: BrowserViewFactory, options: BrowserSessionHostOptions = {}) {
+    this.watchers = new WatcherRegistry({
+      page: this.watchPageAccess(),
+      onTrigger: options.onWatchTrigger,
+      now: options.now,
+      intervalMs: options.watchIntervalMs,
+    })
+  }
+
+  /** Later bridge work attaches follow-up delivery here. Default is a no-op. */
+  setWatchTrigger(handler: WatchTriggerHandler): void {
+    this.watchers.setTrigger(handler)
+  }
+
+  /** Register a one-shot page watch for `sessionKey`. */
+  registerWatch(input: WatchRegisterInput): WatchRegisterResult {
+    return this.watchers.register(input)
+  }
+
+  /** Cancel a watch without firing the trigger. Missing ids still return ok. */
+  unwatch(watchId: string): WatchUnwatchResult {
+    return this.watchers.unwatch(watchId)
+  }
+
+  /** List active watches, optionally filtered by session. */
+  listWatches(sessionKey?: string) {
+    return this.watchers.list(sessionKey)
+  }
 
   attachToWindow(attach: BrowserSessionViewAttach): void {
     this.attach = attach
@@ -1813,6 +1933,8 @@ export class BrowserSessionHost implements BrowserHostAPI {
   }
 
   async disposeSession(sessionId: string): Promise<void> {
+    this.disposedSessionIds.add(sessionId)
+    this.watchers.notifyDisposed(sessionId)
     const record = this.records.get(sessionId)
     if (!record || record.disposing) return
     record.disposing = true
@@ -1834,13 +1956,52 @@ export class BrowserSessionHost implements BrowserHostAPI {
     const host = new BrowserTabsHost(this.createView, browserPartitionForSession(id))
     if (this.attach) host.attachToWindow((view, placement, kind, device) => this.attach?.(id, view, placement, kind, device))
     const record = { host, tail: Promise.resolve(), disposing: false, unsubscribe: () => undefined }
-    record.unsubscribe = host.subscribe(event => {
+    const unsubscribeEvents = host.subscribe(event => {
       if (event.type === 'reveal' && id !== this.selectedSessionId) return
       const scoped = { ...event, sessionId: id } as BrowserEvent
       this.listeners.forEach(listener => listener(scoped))
     })
+    const unsubscribeWatch = host.subscribeWatchLifecycle(() => {
+      if (record.disposing) return
+      this.watchers.notifyDisposed(id)
+    })
+    record.unsubscribe = () => {
+      unsubscribeEvents()
+      unsubscribeWatch()
+    }
+    this.disposedSessionIds.delete(id)
     this.records.set(id, record)
     return record
+  }
+
+  private watchPageAccess() {
+    const inspect = (sessionKey: string) => this.records.get(sessionKey)?.host.watchInspect()
+    const summary = (sessionKey: string): WatchPageSummary => {
+      const state = inspect(sessionKey)
+      return { url: state?.url ?? '', title: state?.title ?? '' }
+    }
+    return {
+      sessionAlive: (sessionKey: string) => {
+        const record = this.records.get(sessionKey)
+        if (record) return !record.disposing
+        return !this.disposedSessionIds.has(sessionKey)
+      },
+      hasView: (sessionKey: string) => inspect(sessionKey)?.hasView === true,
+      isNavigating: (sessionKey: string) => inspect(sessionKey)?.navigating === true,
+      getPageSummary: summary,
+      getURL: (sessionKey: string) => inspect(sessionKey)?.url ?? '',
+      getNavigationEpoch: (sessionKey: string) => inspect(sessionKey)?.documentEpoch ?? 0,
+      waitCheck: (sessionKey: string, request: WatchWaitCheckRequest) => {
+        const record = this.records.get(sessionKey)
+        if (!record || record.disposing) return Promise.resolve({ unavailable: true as const })
+        return record.host.watchWaitCheck(request)
+      },
+      evaluate: (sessionKey: string, expression: string) => {
+        const record = this.records.get(sessionKey)
+        if (!record || record.disposing) return Promise.resolve(undefined)
+        return record.host.watchEvaluate(expression)
+      },
+    }
   }
 
   private recordIsCurrent(sessionId: string, record: BrowserSessionRecord): boolean {

@@ -1,7 +1,7 @@
 import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { createCanonicalModelsWriteQueue, createPiHostBackend, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from '@pipi/pi-backend'
+import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from '@pipi/pi-backend'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -167,6 +167,16 @@ if (app) {
       )
       return view
     })
+    const watchCallbacks = new BrowserWatchCallbackRegistry()
+    browser.setWatchTrigger((watch, reason, pageSummary) => {
+      void watchCallbacks.deliver(watch.sessionKey, {
+        watchId: watch.watchId,
+        reason,
+        waitedMs: Date.now() - watch.createdAt,
+        url: pageSummary.url,
+        title: pageSummary.title,
+      })
+    })
     const primary = screen.getPrimaryDisplay()
     const display = { displayID: primary.id, width: primary.size.width, height: primary.size.height }
     const userData = app.getPath('userData')
@@ -218,6 +228,7 @@ if (app) {
       piCommand: assets.piCommand,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
       browserAction: (request, sessionId) => browser.toolAction(sessionId, request as any),
+      browserWatch: (request, sessionId) => handleBrowserWatchEvent(request, sessionId, browser, watchCallbacks),
       terminalAction: (request, sessionId) => terminalHost.toolAction(sessionId, request as any),
       terminalSessionDeleted: sessionId => terminalHost.disposeSession(sessionId),
       computerAction: request => computer.handle(request),
