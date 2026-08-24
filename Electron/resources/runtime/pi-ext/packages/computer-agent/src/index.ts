@@ -12,3 +12,4 @@ export * from "./workers.ts";
 export * from "./checkpoint.ts";
 export * from "./action-block.ts";
 export * from "./workflows.ts";
+export * from "./verifier-recovery.ts";
