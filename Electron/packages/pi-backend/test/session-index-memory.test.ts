@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { createPiHostBackend } from "../src/index.js";
 
 async function writeLargeSession(path: string, id: string, cwd: string): Promise<void> {
@@ -147,7 +146,7 @@ describe("lazy session metadata index", () => {
     await backend.close();
   });
 
-  it("matches SessionManager visible ordering when compaction moves its summary before retained context", async () => {
+  it("keeps the full active leaf visible and chronological after compaction in a large session", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-session-large-compaction-"));
     const cwd = join(root, "project");
     const dir = join(root, "sessions", "project");
@@ -163,15 +162,13 @@ describe("lazy session metadata index", () => {
       { type: "message", id: "u2", parentId: "compact", timestamp: "2026-08-10T00:00:06.000Z", message: { role: "user", content: "after" } },
     ];
     await writeFile(path, rows.map(JSON.stringify).join("\n") + "\n");
-    const manager = SessionManager.open(path);
-    const expectedIds = manager.buildContextEntries()
-      .filter((entry: any) => entry.type === "message" || (entry.type === "custom_message" && entry.display) || (entry.type === "compaction" && entry.summary))
-      .map((entry: any) => entry.id);
     const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions"), canonicalProjectPaths: async () => undefined });
     await backend.handle("setProjectPaths", [[cwd]]);
 
     const entries = await backend.handle("getSessionHistory", ["large-compaction"]) as any[];
-    expect(entries.map(entry => entry.id)).toEqual(expectedIds);
+    expect(entries.map(entry => entry.id)).toEqual(["u0", "a0", "u1", "a1", "compact", "u2"]);
+    expect(entries.find(entry => entry.id === "compact")).toMatchObject({ role: "compaction", content: "summary" });
+    expect(entries.at(-1)).toMatchObject({ role: "user", content: "after" });
     await backend.close();
   });
 
@@ -197,8 +194,8 @@ describe("lazy session metadata index", () => {
     expect(originalIds).toEqual(Array.from({ length: 601 }, (_, i) => `m-${i}`));
     expect(new Set(originalIds).size).toBe(601);
     await writeFile(path, JSON.stringify({ type: "compaction", id: "new-compaction", parentId: "m-620", timestamp: "2026-08-10T01:00:00.000Z", summary: "new summary", firstKeptEntryId: "m-500", tokensBefore: 1_000 }) + "\n", { flag: "a" });
-    await expect(backend.handle("getSessionHistory", ["stable-cursor", latest[0].id, 500]))
-      .rejects.toThrow(`history cursor no longer exists: ${latest[0].id}`);
+    const olderAfterCompaction = await backend.handle("getSessionHistory", ["stable-cursor", latest[0].id, 500]) as any[];
+    expect(olderAfterCompaction.map(entry => entry.id)).toEqual(Array.from({ length: 101 }, (_, i) => `m-${i}`));
     await backend.close();
   });
 
