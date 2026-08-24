@@ -13,3 +13,4 @@ export * from "./checkpoint.ts";
 export * from "./action-block.ts";
 export * from "./workflows.ts";
 export * from "./direct-drive.ts";
+export * from "./stuck-detector.ts";
