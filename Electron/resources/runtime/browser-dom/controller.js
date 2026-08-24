@@ -398,7 +398,16 @@
       ? (element.getAttribute("type") || "text").toLowerCase()
       : "";
     const autocompleteTokens = normalizedText(element.getAttribute("autocomplete")).split(" ");
-    if (type === "password" || autocompleteTokens.some((token) => SENSITIVE_AUTOCOMPLETE_TOKEN.test(token))) {
+    // Ant Design Select (and similar) uses a readonly combobox input with
+    // autocomplete="new-password" only to suppress browser autofill. That is
+    // not a password field; skip the autocomplete token check for it.
+    const readonlyCombobox = element.localName === "input"
+      && element.hasAttribute("readonly")
+      && (
+        (element.getAttribute("role") || "").toLowerCase() === "combobox"
+        || (element.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox"
+      );
+    if (type === "password" || (!readonlyCombobox && autocompleteTokens.some((token) => SENSITIVE_AUTOCOMPLETE_TOKEN.test(token)))) {
       return true;
     }
 
@@ -572,7 +581,7 @@
 
   function hasVisibleBox(element) {
     const rect = element.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return rect.width > 0 || rect.height > 0;
   }
 
   function isInteractive(element, elementRole) {
@@ -1760,16 +1769,30 @@
 
   function clickCenter(element) {
     const rect = element.getBoundingClientRect();
-    if (!(rect.width > 0 && rect.height > 0)) return { kind: "missing" };
+    if (!(rect.width > 0 || rect.height > 0)) return { kind: "missing" };
     const ownerDocument = element.ownerDocument || document;
     const view = ownerDocument.defaultView || globalThis;
-    const x = rect.left + rect.width / 2;
-    const y = rect.top + rect.height / 2;
-    if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) return { kind: "offscreen" };
-    const hit = ownerDocument.elementFromPoint(x, y);
-    if (!hit) return { kind: "missing" };
-    if (composedContains(element, hit) || composedContains(hit, element)) return { kind: "clear" };
-    return { kind: "obscured", hit };
+    const probes = (rect.width > 0 && rect.height > 0)
+      ? [{ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }]
+      : [
+          { x: rect.left + 1, y: rect.top + rect.height / 2 },
+          { x: rect.left + Math.max(rect.width, 1) / 2, y: rect.top + Math.max(rect.height, 1) / 2 },
+        ];
+    let obscuredHit = null;
+    let sawOffscreen = false;
+    for (const { x, y } of probes) {
+      if (x < 0 || y < 0 || x >= view.innerWidth || y >= view.innerHeight) {
+        sawOffscreen = true;
+        continue;
+      }
+      const hit = ownerDocument.elementFromPoint(x, y);
+      if (!hit) continue;
+      if (composedContains(element, hit) || composedContains(hit, element)) return { kind: "clear" };
+      obscuredHit = hit;
+    }
+    if (obscuredHit) return { kind: "obscured", hit: obscuredHit };
+    if (sawOffscreen) return { kind: "offscreen" };
+    return { kind: "missing" };
   }
 
   function isInternalMutationNode(node) {

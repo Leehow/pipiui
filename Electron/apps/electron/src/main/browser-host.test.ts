@@ -2535,6 +2535,28 @@ describe('browser semantic locators', () => {
     const typed = await host.toolAction(asRequest({ action: 'input', locator: { label: 'Note' }, text: 'nope' }))
     expect(typed).toMatchObject({ ok: false, code: 'browser_target_not_actionable' })
   })
+
+  it('clicks a zero-width in-viewport option via locator hit-test fallback', async () => {
+    let selected = ''
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'div',
+        attrs: { role: 'listbox', 'aria-label': 'Name' },
+        children: [
+          { tag: 'div', attrs: { role: 'option' }, text: 'jack', onClick: () => { selected = 'jack' } },
+        ],
+      },
+    ])
+    const listbox = walkElements(runtime.document.body).find(el => el.getAttribute('role') === 'listbox')
+    const option = walkElements(runtime.document.body).find(el => el.getAttribute('role') === 'option')
+    expect(listbox && option).toBeTruthy()
+    const box = { x: 304, y: 716, left: 304, top: 716, width: 200, height: 22, right: 504, bottom: 738 }
+    listbox!._rect = box
+    option!._rect = { ...box, width: 0, right: 304 }
+    const clicked = await host.toolAction(asRequest({ action: 'click', locator: { role: 'option', name: 'jack' } }))
+    expect(clicked.ok).toBe(true)
+    expect(selected).toBe('jack')
+  })
 })
 
 function checkoutFormTree(): PageSpec[] {
@@ -2864,6 +2886,49 @@ describe('browser bypass redaction', () => {
     expect(result).toMatchObject({ ok: false, code: 'user_handoff_required' })
     expect(formControls(runtime).password.value).toBe('')
     expect(JSON.stringify(result)).not.toContain('s3cret-should-not-write')
+  })
+
+  it('does not treat readonly combobox autocomplete traps as sensitive fields', async () => {
+    const { host, runtime } = await liveBrowser([{
+      tag: 'form',
+      attrs: { 'aria-label': 'Profile' },
+      children: [
+        { tag: 'label', attrs: { for: 'city' }, text: 'City' },
+        {
+          tag: 'input',
+          attrs: {
+            id: 'city',
+            readonly: '',
+            autocomplete: 'new-password',
+            role: 'combobox',
+            'aria-label': 'City',
+          },
+        },
+        { tag: 'label', attrs: { for: 'province' }, text: 'Province' },
+        {
+          tag: 'input',
+          attrs: {
+            id: 'province',
+            readonly: '',
+            autocomplete: 'new-password',
+            'aria-haspopup': 'listbox',
+            'aria-label': 'Province',
+          },
+        },
+        { tag: 'label', attrs: { for: 'pw' }, text: 'Password' },
+        { tag: 'input', attrs: { id: 'pw', type: 'password', 'aria-label': 'Password' } },
+      ],
+    }])
+    const city = await host.toolAction({ action: 'click', selector: '#city' })
+    expect(city).toMatchObject({ ok: true })
+    expect(city).not.toMatchObject({ code: 'user_handoff_required' })
+    const province = await host.toolAction({ action: 'click', selector: '#province' })
+    expect(province).toMatchObject({ ok: true })
+    expect(province).not.toMatchObject({ code: 'user_handoff_required' })
+    const password = await host.toolAction({ action: 'input', selector: '#pw', text: 's3cret-should-not-write' })
+    expect(password).toMatchObject({ ok: false, code: 'user_handoff_required' })
+    expect(walkElements(runtime.document.body).find(el => el.id === 'pw')?.value).toBe('')
+    expect(JSON.stringify(password)).not.toContain('s3cret-should-not-write')
   })
 
   it('sanitizes selector execution errors', async () => {
