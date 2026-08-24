@@ -13,17 +13,25 @@ import {
   PIPI_REMOTE_CONTROL_IPC_CHANNEL,
   type RemoteControlCommand,
   type RemoteControlState,
-  type RemoteControlStatus
+  type RemoteControlStatus,
+  type RemoteLinkCheck
 } from './remote-control-ipc.js'
 import type { RemoteDebugService, RemoteDebugState } from './remote-debug.js'
+import {
+  probeRemotePairLink,
+  type ProbeSocket
+} from './remote-link-probe.js'
 
 export {
   PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
   PIPI_REMOTE_CONTROL_IPC_CHANNEL,
   type RemoteControlCommand,
   type RemoteControlState,
-  type RemoteControlStatus
+  type RemoteControlStatus,
+  type RemoteLinkCheck,
+  type RemoteLinkCheckStatus
 } from './remote-control-ipc.js'
+export { probeRemotePairLink, browserWsUrl } from './remote-link-probe.js'
 
 export const REMOTE_CONTROL_STORE_FILE = 'remote-control.json'
 
@@ -65,6 +73,9 @@ export type RemoteControlServiceOptions = {
   relayOrigin?: string
   now?: () => number
   connect?: (url: string) => SocketLike
+  connectBrowser?: (url: string, cookie: string) => ProbeSocket
+  fetchImpl?: typeof fetch
+  probeTimeoutMs?: number
   backoffMs?: (attempt: number) => number
   pingIntervalMs?: number
   sleep?: (ms: number, signal: AbortSignal) => Promise<void>
@@ -200,6 +211,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   const backoffMs = options.backoffMs ?? defaultBackoff
   const pingIntervalMs = options.pingIntervalMs ?? 20_000
   const sleep = options.sleep ?? defaultSleep
+  const probeTimeoutMs = options.probeTimeoutMs ?? 8_000
   const storePath = join(options.userDataDir, REMOTE_CONTROL_STORE_FILE)
 
   let state = idleState()
@@ -213,6 +225,8 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
   let pingTimer: ReturnType<typeof setInterval> | undefined
   let loopAbort: AbortController | null = null
   let stopping = false
+  let checkSeq = 0
+  let suppressPaired = 0
 
   const emit = (patch: Partial<RemoteControlState>) => {
     state = { ...state, ...patch }
@@ -293,6 +307,12 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       if (value.type === 'paired') {
         hostEpoch = typeof value.hostEpoch === 'number' ? value.hostEpoch : hostEpoch
         generation = typeof value.generation === 'number' ? value.generation : generation
+        // A link-check claim also triggers Relay `paired`. Swallow exactly
+        // one such frame so the UI does not show “浏览器已连接” for our probe.
+        if (suppressPaired > 0) {
+          suppressPaired -= 1
+          return
+        }
         publishIdentity('paired')
         return
       }
@@ -428,8 +448,79 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     return stored
   }
 
+  const invalidateChecks = (linkCheck?: RemoteLinkCheck) => {
+    checkSeq += 1
+    suppressPaired = 0
+    if (linkCheck) emit({ linkCheck })
+  }
+
+  const waitForHostReady = (timeoutMs: number): Promise<boolean> => {
+    if (state.status === 'ready' || state.status === 'paired') return Promise.resolve(true)
+    return new Promise(resolve => {
+      let settled = false
+      const finish = (ok: boolean) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        listeners.delete(listener)
+        resolve(ok)
+      }
+      const listener = (next: RemoteControlState) => {
+        if (next.status === 'ready' || next.status === 'paired') finish(true)
+      }
+      const timer = setTimeout(() => finish(false), timeoutMs)
+      listeners.add(listener)
+      if (state.status === 'ready' || state.status === 'paired') finish(true)
+    })
+  }
+
+  const finishCheck = (seq: number, url: string | null, linkCheck: RemoteLinkCheck): RemoteControlState => {
+    if (seq !== checkSeq || pairUrl() !== url) return getState()
+    emit({ linkCheck })
+    return getState()
+  }
+
+  const checkLink = async (): Promise<RemoteControlState> => {
+    const seq = ++checkSeq
+    const url = pairUrl()
+    emit({ linkCheck: { status: 'checking', pairUrl: url } })
+    if (!stored || !url) {
+      return finishCheck(seq, url, { status: 'failed', pairUrl: url, reason: '未生成配对链接', checkedAt: now() })
+    }
+    if (stored.enabled && state.status !== 'ready' && state.status !== 'paired') {
+      const ready = await waitForHostReady(probeTimeoutMs)
+      if (seq !== checkSeq || pairUrl() !== url) return getState()
+      if (!ready && state.status !== 'ready' && state.status !== 'paired') {
+        return finishCheck(seq, url, { status: 'failed', pairUrl: url, reason: 'Host 连接超时', checkedAt: now() })
+      }
+    }
+    // A live browser already completed claim + /ws. Claiming again would
+    // replaceBrowser and steal their session — treat paired as proven.
+    if (state.status === 'paired') {
+      return finishCheck(seq, url, { status: 'ok', pairUrl: url, reason: '浏览器已连接', checkedAt: now() })
+    }
+    const suppressBefore = suppressPaired
+    const result = await probeRemotePairLink({
+      origin: stored.relayOrigin,
+      roomID: stored.roomID,
+      pairSecret: stored.pairSecret,
+      fetchImpl: options.fetchImpl,
+      connectBrowser: options.connectBrowser,
+      timeoutMs: probeTimeoutMs,
+      onClaimed: () => { suppressPaired += 1 }
+    })
+    if (suppressPaired > suppressBefore && !result.ok) suppressPaired = suppressBefore
+    if (seq !== checkSeq || pairUrl() !== url) return getState()
+    if (result.ok) {
+      return finishCheck(seq, url, { status: 'ok', pairUrl: url, checkedAt: now() })
+    }
+    return finishCheck(seq, url, { status: 'failed', pairUrl: url, reason: result.reason, checkedAt: now() })
+  }
+
   const start = async (relayOrigin?: string) => {
+    const previousUrl = pairUrl()
     stored = { ...ensureStored(relayOrigin), enabled: true }
+    if (pairUrl() !== previousUrl) invalidateChecks({ status: 'idle', pairUrl: null })
     await persist()
     reconnectAttempt = 0
     void runLoop()
@@ -440,6 +531,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     stopping = true
     runToken += 1
     loopAbort?.abort()
+    invalidateChecks({ status: 'idle', pairUrl: null })
     if (stored) stored = { ...stored, enabled: false }
     await persist()
     await clearTransport()
@@ -455,6 +547,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     stopping = true
     runToken += 1
     loopAbort?.abort()
+    invalidateChecks({ status: 'idle', pairUrl: null })
     await clearTransport()
     stored = { enabled: true, relayOrigin: origin, ...newRemoteIdentity() }
     hostEpoch = 0
@@ -492,6 +585,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     stop,
     reset,
     restore,
+    checkLink,
     subscribe(listener: (state: RemoteControlState) => void) {
       listeners.add(listener)
       return () => { listeners.delete(listener) }
@@ -535,6 +629,7 @@ export function registerRemoteControlIpc(
     if (type === 'start') return mergeRemoteState(await service.start(command.relayOrigin), debug?.getState())
     if (type === 'stop') return mergeRemoteState(await service.stop(), debug?.getState())
     if (type === 'reset') return mergeRemoteState(await service.reset(command.relayOrigin), debug?.getState())
+    if (type === 'checkLink') return mergeRemoteState(await service.checkLink(), debug?.getState())
     if (type === 'startDebug') {
       const next = debug ? await debug.start() : { debugEnabled: false, debugUrl: null, debugError: 'debug service unavailable' }
       return mergeRemoteState(service.getState(), next)

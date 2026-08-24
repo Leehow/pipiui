@@ -10,6 +10,7 @@ import {
   REMOTE_SELF_HOST_LESSON_KEY,
   REMOTE_SELF_HOST_PROMPT,
   RemoteConnectionPanel,
+  linkCheckLabel,
   statusLabel,
   type PipiRemoteControlAPI,
   type RemoteControlState
@@ -86,8 +87,17 @@ function mockApi(initial: RemoteControlState = idle()): PipiRemoteControlAPI & {
         status: 'ready',
         pairUrl: `${PAIR}ff`,
         roomID: '22222222-2222-4222-8222-222222222222',
-        relayOrigin: relayOrigin ?? 'https://relay.example'
+        relayOrigin: relayOrigin ?? 'https://relay.example',
+        linkCheck: { status: 'idle', pairUrl: null }
       }))
+    },
+    checkLink: async () => {
+      calls.push(`checkLink:${state.pairUrl ?? ''}`)
+      if (!state.pairUrl) return state
+      return publish({
+        ...state,
+        linkCheck: { status: 'ok', pairUrl: state.pairUrl }
+      })
     },
     subscribe(listener) {
       listeners.push(listener)
@@ -98,6 +108,17 @@ function mockApi(initial: RemoteControlState = idle()): PipiRemoteControlAPI & {
     }
   }
 }
+
+describe('linkCheckLabel', () => {
+  it('maps link-check statuses to Chinese copy', () => {
+    expect(linkCheckLabel(undefined)).toBeNull()
+    expect(linkCheckLabel({ status: 'idle', pairUrl: null })).toBeNull()
+    expect(linkCheckLabel({ status: 'checking', pairUrl: PAIR })).toBe('验证中')
+    expect(linkCheckLabel({ status: 'ok', pairUrl: PAIR })).toBe('可用')
+    expect(linkCheckLabel({ status: 'failed', pairUrl: PAIR, reason: '连接超时' })).toBe('不可用：连接超时')
+    expect(linkCheckLabel({ status: 'failed', pairUrl: PAIR })).toBe('不可用')
+  })
+})
 
 describe('statusLabel', () => {
   it('maps remote-control statuses to Chinese copy', () => {
@@ -319,5 +340,52 @@ describe('RemoteConnectionPanel', () => {
     render(<RemoteConnectionPanel onClose={() => undefined} remoteControl={api} />)
     fireEvent.click(await screen.findByRole('switch', { name: '本地 Debug 模式' }))
     await waitFor(() => expect(screen.getByTestId('remote-debug-error').textContent).toContain('静态目录'))
+  })
+
+  it('auto-checks the pair url when the panel opens enabled', async () => {
+    const api = mockApi(idle({
+      enabled: true,
+      status: 'ready',
+      pairUrl: PAIR,
+      roomID: '11111111-1111-4111-8111-111111111111',
+      relayOrigin: 'https://relay.example'
+    }))
+    render(<RemoteConnectionPanel onClose={() => undefined} remoteControl={api} />)
+    await waitFor(() => expect(api.calls.some(call => call.startsWith('checkLink:'))).toBe(true))
+    await waitFor(() => expect(screen.getByTestId('remote-link-check').textContent).toBe('可用'))
+  })
+
+  it('shows unavailable with the probe reason', async () => {
+    const api = mockApi(idle({
+      enabled: true,
+      status: 'ready',
+      pairUrl: PAIR,
+      relayOrigin: 'https://relay.example'
+    }))
+    api.checkLink = async () => {
+      api.calls.push('checkLink')
+      const next = idle({
+        enabled: true,
+        status: 'ready',
+        pairUrl: PAIR,
+        linkCheck: { status: 'failed', pairUrl: PAIR, reason: '连接超时' }
+      })
+      api.listeners.forEach(listener => listener(next))
+      return next
+    }
+    render(<RemoteConnectionPanel onClose={() => undefined} remoteControl={api} />)
+    await waitFor(() => expect(screen.getByTestId('remote-link-check').textContent).toBe('不可用：连接超时'))
+  })
+
+  it('re-checks after start and after reset mint a new url', async () => {
+    const api = mockApi()
+    const confirm = vi.fn().mockReturnValue(true)
+    vi.stubGlobal('confirm', confirm)
+    render(<RemoteConnectionPanel onClose={() => undefined} remoteControl={api} />)
+    fireEvent.click(await screen.findByRole('switch', { name: '开启远程控制' }))
+    await waitFor(() => expect(api.calls.some(call => call === `checkLink:${PAIR}`)).toBe(true))
+    fireEvent.click(screen.getByRole('button', { name: '重新生成链接' }))
+    await waitFor(() => expect(api.calls.some(call => call === `checkLink:${PAIR}ff`)).toBe(true))
+    expect(api.calls.filter(call => call.startsWith('checkLink:')).length).toBeGreaterThanOrEqual(2)
   })
 })

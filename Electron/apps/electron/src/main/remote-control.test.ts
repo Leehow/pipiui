@@ -9,6 +9,7 @@ import { createHostAPIRelay } from '../../../../../Relay/src/host-api-relay.js'
 import {
   createRemoteControlService,
   pairUrlFor,
+  probeRemotePairLink,
   registerRemoteControlIpc,
   REMOTE_CONTROL_STORE_FILE,
   withRemoteSessionCapabilities,
@@ -461,4 +462,204 @@ describe('createRemoteControlService', () => {
     expect(stopped?.debugEnabled).toBe(false)
     await debug.close()
   })
+})
+
+describe('remote pair link check', () => {
+  const temps: string[] = []
+  const relays: Array<{ close(): Promise<void> }> = []
+  const services: Array<{ stop(): Promise<RemoteControlState> }> = []
+
+  afterEach(async () => {
+    for (const service of services.splice(0)) await service.stop().catch(() => undefined)
+    for (const relay of relays.splice(0)) await relay.close().catch(() => undefined)
+    for (const dir of temps.splice(0)) await rm(dir, { recursive: true, force: true })
+  })
+
+  async function userData(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), 'pipi-remote-link-check-'))
+    temps.push(dir)
+    return dir
+  }
+
+  function connectWs(url: string) {
+    return new WebSocket(url) as unknown as WebSocket
+  }
+
+  it('proves claim + browser ws + capabilities without flipping host to paired', async () => {
+    const relay = await startRelay()
+    relays.push(relay)
+    const dir = await userData()
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: relay.origin,
+      backoffMs: () => 50,
+      connect: connectWs
+    })
+    services.push(service)
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const checked = await service.checkLink()
+    expect(checked.linkCheck?.status).toBe('ok')
+    expect(checked.linkCheck?.pairUrl).toBe(service.getState().pairUrl)
+    expect(service.getState().status).toBe('ready')
+    const persisted = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
+    expect((await claim(relay.origin, persisted.roomID, persisted.pairSecret)).status).toBe(204)
+  }, 15_000)
+
+  it('fails when the relay origin is unreachable', async () => {
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: await userData(),
+      relayOrigin: 'http://127.0.0.1:1',
+      probeTimeoutMs: 400,
+      backoffMs: () => 10_000,
+      connect: connectWs
+    })
+    services.push(service)
+    await service.start()
+    const checked = await service.checkLink()
+    expect(checked.linkCheck?.status).toBe('failed')
+    expect(checked.linkCheck?.reason).toMatch(/超时|不可达/)
+  })
+
+  it('reports expired or wrong secret without consuming the real pair grant', async () => {
+    const relay = await startRelay({ ttlMs: 700 })
+    relays.push(relay)
+    const dir = await userData()
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: relay.origin,
+      backoffMs: () => 30,
+      connect: connectWs
+    })
+    services.push(service)
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const live = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
+
+    const wrong = await probeRemotePairLink({
+      origin: relay.origin,
+      roomID: live.roomID,
+      pairSecret: 'ab'.repeat(32)
+    })
+    expect(wrong).toEqual({ ok: false, reason: '链接已过期或配对密钥错误' })
+    expect((await claim(relay.origin, live.roomID, live.pairSecret)).status).toBe(204)
+
+    const expiredRoom = live.roomID
+    const expiredSecret = live.pairSecret
+    await waitFor(() => service.getState().roomID !== expiredRoom, 'expired room identity was not rotated')
+    const expired = await probeRemotePairLink({
+      origin: relay.origin,
+      roomID: expiredRoom,
+      pairSecret: expiredSecret
+    })
+    expect(expired).toEqual({ ok: false, reason: '链接已过期或配对密钥错误' })
+  }, 15_000)
+
+  it('does not let a stale check overwrite the regenerated pair url', async () => {
+    const relay = await startRelay()
+    relays.push(relay)
+    let releaseFirst: (() => void) | undefined
+    const firstGate = new Promise<void>(resolve => { releaseFirst = resolve })
+    let claims = 0
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: await userData(),
+      relayOrigin: relay.origin,
+      backoffMs: () => 50,
+      connect: connectWs,
+      fetchImpl: async (input, init) => {
+        const url = String(input)
+        if (url.includes('/claim')) {
+          claims += 1
+          if (claims === 1) await firstGate
+        }
+        return fetch(input, init)
+      }
+    })
+    services.push(service)
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const oldUrl = service.getState().pairUrl
+    const first = service.checkLink()
+    await waitFor(() => service.getState().linkCheck?.status === 'checking', 'first check did not start')
+    await service.reset()
+    await waitFor(() => service.getState().status === 'ready', 'reset host never ready')
+    const second = await service.checkLink()
+    expect(second.linkCheck?.status).toBe('ok')
+    expect(second.linkCheck?.pairUrl).toBe(service.getState().pairUrl)
+    expect(second.linkCheck?.pairUrl).not.toBe(oldUrl)
+    releaseFirst?.()
+    await first
+    expect(service.getState().linkCheck?.pairUrl).not.toBe(oldUrl)
+    expect(service.getState().linkCheck?.status).toBe('ok')
+    expect(service.getState().linkCheck?.pairUrl).toBe(second.linkCheck?.pairUrl)
+  }, 15_000)
+
+  it('does not claim over a live browser session', async () => {
+    const relay = await startRelay()
+    relays.push(relay)
+    const dir = await userData()
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: relay.origin,
+      backoffMs: () => 50,
+      connect: connectWs
+    })
+    services.push(service)
+    await service.start()
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const persisted = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
+    const granted = await claim(relay.origin, persisted.roomID, persisted.pairSecret)
+    const browser = new WebSocket(`ws://127.0.0.1:${new URL(relay.origin).port}/ws`, {
+      headers: { Cookie: cookieHeader(granted.headers.get('set-cookie')) }
+    } as never)
+    const browserQ = installQueue(browser)
+    await new Promise((resolve, reject) => {
+      browser.addEventListener('open', resolve, { once: true })
+      browser.addEventListener('error', () => reject(new Error('browser ws')), { once: true })
+    })
+    await waitFor(() => service.getState().status === 'paired', 'host never paired')
+    const checked = await service.checkLink()
+    expect(checked.linkCheck?.status).toBe('ok')
+    browser.send(JSON.stringify({
+      protocolVersion: 2,
+      id: 'after-check',
+      type: 'request',
+      method: 'listProjects',
+      params: []
+    }))
+    await expect(nextBusinessFrame(browserQ, browser)).resolves.toMatchObject({
+      type: 'response',
+      id: 'after-check',
+      ok: true
+    })
+    browser.close()
+  }, 15_000)
+
+  it('exposes checkLink over IPC', async () => {
+    const relay = await startRelay()
+    relays.push(relay)
+    let handler: ((event: { sender: { send(): void } }, command: RemoteControlCommand) => Promise<RemoteControlState>) | undefined
+    const ipc = {
+      handle(_channel: string, listener: typeof handler) {
+        handler = listener
+      }
+    }
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: await userData(),
+      relayOrigin: relay.origin,
+      connect: connectWs
+    })
+    services.push(service)
+    registerRemoteControlIpc(ipc as never, service)
+    await handler?.({ sender: { send() {} } }, { type: 'start' })
+    await waitFor(() => service.getState().status === 'ready', 'host never ready')
+    const checked = await handler?.({ sender: { send() {} } }, { type: 'checkLink' })
+    expect(checked?.linkCheck?.status).toBe('ok')
+  }, 15_000)
 })

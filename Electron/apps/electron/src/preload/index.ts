@@ -19,6 +19,7 @@ export type PipiRemoteControlAPI = {
   reset(relayOrigin?: string): Promise<RemoteControlState>
   startDebug(): Promise<RemoteControlState>
   stopDebug(): Promise<RemoteControlState>
+  checkLink(): Promise<RemoteControlState>
   subscribe(listener: (state: RemoteControlState) => void): () => void
 }
 
@@ -48,6 +49,7 @@ export function exposePipiRemoteControl(
     reset: relayOrigin => ipc.invoke(PIPI_REMOTE_CONTROL_IPC_CHANNEL, { type: 'reset', relayOrigin }),
     startDebug: () => ipc.invoke(PIPI_REMOTE_CONTROL_IPC_CHANNEL, { type: 'startDebug' }),
     stopDebug: () => ipc.invoke(PIPI_REMOTE_CONTROL_IPC_CHANNEL, { type: 'stopDebug' }),
+    checkLink: () => ipc.invoke(PIPI_REMOTE_CONTROL_IPC_CHANNEL, { type: 'checkLink' }),
     subscribe(listener) {
       const handler = (_event: unknown, state: RemoteControlState) => listener(state)
       ipc.on(PIPI_REMOTE_CONTROL_EVENT_CHANNEL, handler)

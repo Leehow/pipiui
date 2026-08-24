@@ -11,6 +11,15 @@ export type RemoteControlStatus =
   | 'stopped'
   | 'error'
 
+export type RemoteLinkCheckStatus = 'idle' | 'checking' | 'ok' | 'failed'
+
+export type RemoteLinkCheck = {
+  status: RemoteLinkCheckStatus
+  pairUrl: string | null
+  reason?: string
+  checkedAt?: number
+}
+
 export type RemoteControlState = {
   enabled: boolean
   status: RemoteControlStatus
@@ -23,6 +32,7 @@ export type RemoteControlState = {
   debugEnabled?: boolean
   debugUrl?: string | null
   debugError?: string
+  linkCheck?: RemoteLinkCheck
 }
 
 export type PipiRemoteControlAPI = {
@@ -33,6 +43,7 @@ export type PipiRemoteControlAPI = {
   reset(relayOrigin?: string): Promise<RemoteControlState>
   startDebug?: () => Promise<RemoteControlState>
   stopDebug?: () => Promise<RemoteControlState>
+  checkLink?: () => Promise<RemoteControlState>
   subscribe(listener: (state: RemoteControlState) => void): () => void
 }
 
@@ -51,6 +62,13 @@ export const REMOTE_SELF_HOST_LESSON_DISMISSED = 'dismissed'
 export const DEFAULT_RELAY_ORIGIN = 'https://remote.deepwood.cn'
 export const REMOTE_SELF_HOST_PROMPT =
   '我想自己搭建远程链接服务器。请按仓库 Relay/README.md 和 skill self-host-relay，先问我云服务器的 SSH 登录方式和域名，再把 Relay 和 browser-ui 传上去配好 HTTPS。完成后告诉我在「远程控制」里填哪个 https 地址。不要用 remote.deepwood.cn。'
+
+export function linkCheckLabel(check?: RemoteLinkCheck | null): string | null {
+  if (!check || check.status === 'idle') return null
+  if (check.status === 'checking') return '验证中'
+  if (check.status === 'ok') return '可用'
+  return check.reason ? `不可用：${check.reason}` : '不可用'
+}
 
 export function statusLabel(status: RemoteControlStatus): string {
   switch (status) {
@@ -152,6 +170,17 @@ export function RemoteConnectionPanel({
       unsubscribe?.()
     }
   }, [api])
+
+  useEffect(() => {
+    if (!api?.checkLink || !state.enabled || !state.pairUrl) return
+    let active = true
+    void api.checkLink().catch(err => {
+      if (active) setError(`验证链接失败：${err instanceof Error ? err.message : String(err)}`)
+    })
+    return () => {
+      active = false
+    }
+  }, [api, state.enabled, state.pairUrl])
 
   useEffect(() => {
     const next = state.status
@@ -369,6 +398,15 @@ export function RemoteConnectionPanel({
                 )}
                 <label className="remote-pair-label" htmlFor="remote-pair-url">配对链接</label>
                 <code id="remote-pair-url" className="remote-pair-url" data-testid="remote-pair-url">{state.pairUrl}</code>
+                {state.enabled && (api.checkLink || state.linkCheck) && (
+                  <p
+                    className={`remote-link-check ${state.linkCheck?.status === 'ok' ? 'ok' : state.linkCheck?.status === 'failed' ? 'failed' : 'checking'}`}
+                    data-testid="remote-link-check"
+                    data-status={state.linkCheck?.status ?? 'checking'}
+                  >
+                    {linkCheckLabel(state.linkCheck) ?? '验证中'}
+                  </p>
+                )}
                 <div className="remote-pair-actions">
                   <button type="button" aria-label="复制配对链接" onClick={() => void copyLink()}>{copied ? '已复制' : '复制链接'}</button>
                   <button type="button" aria-label="重新生成链接" disabled={busy} onClick={() => void regenerate()}>重新生成链接</button>

@@ -10,6 +10,15 @@ export type RemoteControlStatus =
   | 'stopped'
   | 'error'
 
+export type RemoteLinkCheckStatus = 'idle' | 'checking' | 'ok' | 'failed'
+
+export type RemoteLinkCheck = {
+  status: RemoteLinkCheckStatus
+  pairUrl: string | null
+  reason?: string
+  checkedAt?: number
+}
+
 export type RemoteControlState = {
   enabled: boolean
   status: RemoteControlStatus
@@ -22,6 +31,7 @@ export type RemoteControlState = {
   debugEnabled?: boolean
   debugUrl?: string | null
   debugError?: string
+  linkCheck?: RemoteLinkCheck
 }
 
 export type RemoteControlCommand =
@@ -31,3 +41,4 @@ export type RemoteControlCommand =
   | { type: 'reset'; relayOrigin?: string }
   | { type: 'startDebug' }
   | { type: 'stopDebug' }
+  | { type: 'checkLink' }

@@ -29,3 +29,7 @@
 .remote-pair-actions button:disabled{cursor:default;color:var(--subtle);border-color:var(--border);background:transparent}
 .remote-pair-qr{align-self:center;padding:8px;border-radius:8px;background:#fff}
 .remote-pair-qr svg{display:block}
+.remote-link-check{margin:0;font-size:11px;font-weight:600}
+.remote-link-check.checking{color:var(--muted)}
+.remote-link-check.ok{color:var(--success)}
+.remote-link-check.failed{color:var(--danger)}
