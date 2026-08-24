@@ -1,5 +1,5 @@
 /**
- * Canonical `deepseek` provider config (single source).
+ * Canonical `deepseek-extended` provider config (single source).
  *
  * Consumed twice, never copied:
  * - the extension entry (`agent/index.ts`) registers it via `pi.registerProvider`;
@@ -11,8 +11,8 @@
  * `ext.deepseek.apiKey` is a settings fallback passed as `apiKey` so Pi's
  * composer uses it only when no stored credential exists.
  */
-import { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, type DeepSeekConversationModel } from "./models.js";
-export { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID };
+import { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, DEEPSEEK_PROVIDER_NAME, type DeepSeekConversationModel } from "./models.js";
+export { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, DEEPSEEK_PROVIDER_NAME };
 export { DEEPSEEK_BASE_URL, DEEPSEEK_CHAT_API, DEEPSEEK_CONVERSATION_MODEL_IDS, DEEPSEEK_CONVERSATION_MODELS, DEEPSEEK_VISION_MODEL_ID, deepseekManifestModels, } from "./models.js";
 export { apiKeyFromCredentials, buildConversationRequest, conversationProviderTransport, resolveDeepSeekApiKey, } from "./conversation.js";
 export type DeepSeekProviderOptions = {

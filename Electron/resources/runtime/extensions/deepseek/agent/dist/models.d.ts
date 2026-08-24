@@ -8,8 +8,10 @@
  *
  * These ids are conversation models only. They are never written to models.json.
  */
-export declare const AUTH_PROVIDER_ID = "deepseek";
-export declare const DEEPSEEK_PROVIDER_ID = "deepseek";
+/** Independent extension provider. Must not collide with reserved official `deepseek`. */
+export declare const AUTH_PROVIDER_ID = "deepseek-extended";
+export declare const DEEPSEEK_PROVIDER_ID = "deepseek-extended";
+export declare const DEEPSEEK_PROVIDER_NAME = "DeepSeek Extended";
 export declare const DEEPSEEK_CHAT_API: "openai-responses";
 export declare const DEEPSEEK_RESPONSES_API: "openai-responses";
 export declare const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
@@ -54,12 +56,22 @@ export declare const DEEPSEEK_CAPABILITIES: DeepSeekModelCapabilities;
  */
 export declare const DEEPSEEK_CONVERSATION_MODELS: readonly DeepSeekConversationModel[];
 export declare const DEEPSEEK_CONVERSATION_MODEL_IDS: readonly string[];
-/** Slim Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
+/** Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
 export declare function deepseekManifestModels(): Array<{
     id: string;
     name: string;
     api: typeof DEEPSEEK_CHAT_API;
     input: string[];
     reasoning: boolean;
+    contextWindow: number;
+    maxTokens: number;
+    cost: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+    };
+    thinkingLevelMap?: DeepSeekConversationModel["thinkingLevelMap"];
+    compat?: DeepSeekConversationModel["compat"];
     capabilities: DeepSeekModelCapabilities;
 }>;

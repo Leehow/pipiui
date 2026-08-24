@@ -43,6 +43,8 @@ Electron/**/dist/
 # Bundled manifest extensions ship their compiled halves (synced from the workspace package)
 !Electron/resources/runtime/extensions/grok-build-oauth/
 !Electron/resources/runtime/extensions/grok-build-oauth/**
+!Electron/resources/runtime/extensions/deepseek/
+!Electron/resources/runtime/extensions/deepseek/**
 Electron/**/out/
 
 # file-viewer vite-plugin copies (regenerated on build; manifest has machine paths)
