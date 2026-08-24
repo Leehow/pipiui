@@ -345,6 +345,10 @@ import {
 	summarizeActiveToolArgs,
 	upsertActiveTool,
 } from "./active-tools.ts";
+import {
+	applyToolResultEvent,
+	readAssistantToolCall,
+} from "./assistant-tool-call.ts";
 import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
 import {
 	createUsageEmitter,
@@ -6423,7 +6427,7 @@ async function runSingleAgent(
 				// Assemble text/thinking by contentIndex and push throttled cumulative
 				// snapshots (kind: log_delta) so the native panel streams live.
 				// message_end remains authoritative for tools + non-streamed fallback.
-				type StreamPart = { itemType: "text" | "thinking" | "tool"; text: string; name: string; charCount?: number };
+				type StreamPart = { itemType: "text" | "thinking" | "tool"; text: string; name: string; toolCallId?: string; charCount?: number };
 				const streamParts = new Map<number, StreamPart>();
 				const streamDirty = new Set<number>();
 				const fileChangeBuffers = new Map<number, { name: string; raw: string }>();
@@ -6471,6 +6475,7 @@ async function runSingleAgent(
 								? { charCount: part.charCount }
 								: {}),
 							...(part.name ? { name: part.name } : {}),
+							...(part.toolCallId ? { toolCallId: part.toolCallId } : {}),
 						});
 					}
 					pipiuiUpdate();
@@ -6628,8 +6633,30 @@ async function runSingleAgent(
 										upsertStreamPart(contentIndex, "tool", "", buf.name, stringifyCompactFileChange(compact));
 									}
 								}
+							} else if (ctype === "toolcall_end") {
+								const call = ame.toolCall && typeof ame.toolCall === "object" ? ame.toolCall : {};
+								const parsed = readAssistantToolCall(call) ?? readAssistantToolCall(ame);
+								const toolName = parsed?.name ?? (typeof call.name === "string" && call.name ? call.name : "tool");
+								const toolCallId = parsed?.id
+									?? (typeof call.id === "string" && call.id ? call.id : undefined);
+								const args = parsed?.arguments ?? ((call.arguments ?? {}) as Record<string, unknown>);
+								if (toolCallId) toolCallIdsByContentIndex.set(contentIndex, toolCallId);
+								beginActiveTool({
+									...(toolCallId ? { toolCallId } : {}),
+									name: toolName,
+									startedAt: Date.now(),
+									summary: boundActivitySummary(toolName, summarizeToolArgsForUI(toolName, args)),
+								});
+								if (toolName !== "write" && toolName !== "edit") {
+									upsertStreamPart(contentIndex, "tool", "", toolName, summarizeToolArgsForUI(toolName, args));
+									if (toolCallId) {
+										const streamedPart = streamParts.get(contentIndex);
+										if (streamedPart) streamedPart.toolCallId = toolCallId;
+									}
+									forceFlushStreamParts();
+								}
+								pipiuiUpdate();
 							}
-							// toolcall_end: ignore (message_end owns final tool rows)
 							return;
 						}
 						// Legacy cumulative snapshot message_update (pre-0.84 / jcode-style).
@@ -6674,9 +6701,8 @@ async function runSingleAgent(
 									// message_update preview so the panel never snaps backwards.
 									const toolSet = new Set<string>();
 									for (const part of (msg as any).content ?? []) {
-										if (part?.type === "toolCall" && typeof part.name === "string" && part.name) {
-											toolSet.add(part.name);
-										}
+										const call = readAssistantToolCall(part);
+										if (call?.name) toolSet.add(call.name);
 									}
 									const tools = [...toolSet].sort();
 									emitUsageSnapshot({
@@ -6702,16 +6728,17 @@ async function runSingleAgent(
 							const pipiuiItems: Record<string, unknown>[] = [];
 							const toolCallIds: string[] = [];
 							const toolNames: string[] = [];
-							for (const part of (msg as any).content ?? []) {
-								if (part?.type === "toolCall") {
-									if (typeof part.id === "string" && part.id) toolCallIds.push(part.id);
-									if (typeof part.name === "string" && part.name) toolNames.push(part.name);
-									const args = (part.arguments ?? {}) as Record<string, unknown>;
-									const summary = summarizeToolArgsForUI(String(part.name ?? ""), args);
-									const toolName = String(part.name ?? "tool");
+							for (const [partIndex, part] of ((msg as any).content ?? []).entries()) {
+								const parsedCall = readAssistantToolCall(part);
+								if (parsedCall) {
+									if (parsedCall.id) toolCallIds.push(parsedCall.id);
+									if (parsedCall.name) toolNames.push(parsedCall.name);
+									const args = parsedCall.arguments;
+									const summary = summarizeToolArgsForUI(parsedCall.name, args);
+									const toolName = parsedCall.name;
 									const live = currentActiveTool();
 									beginActiveTool({
-										...(typeof part.id === "string" && part.id ? { toolCallId: part.id } : {}),
+										...(parsedCall.id ? { toolCallId: parsedCall.id } : {}),
 										name: toolName,
 										startedAt: live?.name === toolName ? live.startedAt : Date.now(),
 										summary: boundActivitySummary(toolName, summary),
@@ -6737,18 +6764,20 @@ async function runSingleAgent(
 												itemType: "tool",
 												text: compactText,
 												name: toolName,
+												...(parsedCall.id ? { toolCallId: parsedCall.id } : {}),
 											});
 											fileChangeBuffers.delete(contentIndex);
 											continue;
 										}
-										pipiuiItems.push({ itemType: "tool", name: toolName, text: compactText });
+										pipiuiItems.push({ itemType: "tool", name: toolName, text: compactText, ...(parsedCall.id ? { toolCallId: parsedCall.id } : {}) });
 										continue;
 									}
+									if (streamParts.get(partIndex)?.itemType === "tool") continue;
 									// Edit keeps a bounded, valid JSON payload so the native subagent log can
 									// render the same line diff as the main-agent transcript. Other tools
 									// retain their compact human-readable summary.
-									const text = part.name === "edit" ? boundedEditPayloadForUI(args) : summary;
-									pipiuiItems.push({ itemType: "tool", name: part.name, text });
+									const text = toolName === "edit" ? boundedEditPayloadForUI(args) : summary;
+									pipiuiItems.push({ itemType: "tool", name: toolName, text, ...(parsedCall.id ? { toolCallId: parsedCall.id } : {}) });
 								} else if (part?.type === "text" && String(part.text ?? "").trim()) {
 									if (didStreamTextOrThinking) continue;
 									pipiuiItems.push({ itemType: "text", text: String(part.text).slice(0, 4000) });
@@ -6800,42 +6829,16 @@ async function runSingleAgent(
 						pipiuiUpdate();
 					}
 
-					if (event.type === "tool_result_end" && event.message) {
-						noteAgentToolEnd(pipiuiAgentId, runId);
-							const resultMsg: any = projectToolResultMessageForParent(event.message);
-							currentResult.messages.push(resultMsg as Message);
-						providerWait.noteToolResult(String(resultMsg.toolCallId ?? ""));
-						const endedId = typeof resultMsg.toolCallId === "string" && resultMsg.toolCallId
-							? resultMsg.toolCallId
-							: undefined;
-						const endedName = typeof resultMsg.toolName === "string" && resultMsg.toolName
-							? resultMsg.toolName
-							: undefined;
-						finishActiveTool({ ...(endedId ? { toolCallId: endedId } : {}), ...(endedName ? { name: endedName } : {}) });
-						const resultText = (
-							Array.isArray(resultMsg.content)
-								? resultMsg.content
-										.filter((c: any) => c?.type === "text")
-										.map((c: any) => c.text)
-										.join("\n")
-								: ""
-						).slice(-1500);
-						pipiuiReport({
-							kind: "log",
-							agentId: pipiuiAgentId,
-							runId,
-							items: [
-								{
-									itemType: "toolResult",
-									name: resultMsg.toolName ?? "",
-									isError: !!resultMsg.isError,
-									text: resultText,
-								},
-							],
-						});
-						emitUpdate();
-						pipiuiUpdate();
-					}
+					applyToolResultEvent(event, currentResult, {
+						noteAgentToolEnd: () => noteAgentToolEnd(pipiuiAgentId, runId),
+						noteToolResult: (toolCallId) => providerWait.noteToolResult(toolCallId),
+						finishActiveTool,
+						reportLog: (items) => pipiuiReport({ kind: "log", agentId: pipiuiAgentId, runId, items }),
+						onProjected: () => {
+							emitUpdate();
+							pipiuiUpdate();
+						},
+					});
 				};
 
 					const stdoutScanner = new JSONLChunkScanner(processLine);

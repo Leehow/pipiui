@@ -42,6 +42,10 @@ export function summarizeActiveToolArgs(
 		case "bash":
 		case "shell":
 			return cleanBounded(args.command, MAX_COMMAND);
+		case "skill_load":
+			return cleanBounded(args.name, MAX_PATH);
+		case "skill_search":
+			return cleanBounded(args.query, MAX_COMMAND);
 		default:
 			return undefined;
 	}

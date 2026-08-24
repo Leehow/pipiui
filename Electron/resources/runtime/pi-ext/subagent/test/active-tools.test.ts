@@ -83,6 +83,8 @@ test("activity summaries never include prompts, raw args, or unknown-tool JSON",
 		"git diff HEAD -- Electron/packages/pi-backend/src/index.ts",
 	);
 	assert.equal(summarizeActiveToolArgs("write", { contents: "SECRET FILE", path: "/tmp/a.ts" }), "/tmp/a.ts");
+	assert.equal(summarizeActiveToolArgs("skill_search", { query: "office document" }), "office document");
+	assert.equal(summarizeActiveToolArgs("skill_load", { name: "tdd" }), "tdd");
 	assert.doesNotMatch(
 		boundActivitySummary("generate_image", summarizeActiveToolArgs("generate_image", { prompt: "SECRET" }) ?? ""),
 		/SECRET|prompt|\{/,
@@ -183,7 +185,7 @@ test("activity events do not attach diagnostics and deltas do not use latest too
 	assert.ok(projectFn);
 	assert.doesNotMatch(projectFn[0], /attachDiagnostics/);
 	assert.doesNotMatch(projectFn[0], /diagnostics/);
-	const delta = source.match(/ctype === "toolcall_delta"[\s\S]*?\/\/ toolcall_end/);
+	const delta = source.match(/ctype === "toolcall_delta"[\s\S]*?ctype === "toolcall_end"/);
 	assert.ok(delta);
 	assert.doesNotMatch(delta[0], /currentActiveTool/);
 	assert.match(delta[0], /toolCallIdsByContentIndex/);

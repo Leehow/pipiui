@@ -1110,6 +1110,42 @@ describe("subagent lifecycle → AgentSummary", () => {
     await closeTracked(restarted);
   });
 
+  it("keeps toolCallId on tool/toolResult log rows through broadcast, cache, and durable restart", async () => {
+    const { backend, deliver, events } = await harness();
+    deliver(START);
+    deliver({ kind: "log", agentId: "a1", runId: "r1", items: [
+      { itemType: "tool", name: "read", text: "A.tsx", toolCallId: "ta" },
+      { itemType: "tool", name: "read", text: "B.tsx", toolCallId: "tb" },
+      { itemType: "toolResult", name: "read", text: "RESULT_B", toolCallId: "tb" },
+      { itemType: "toolResult", name: "read", text: "RESULT_A", toolCallId: "ta" },
+    ] });
+    const logs = events.filter((event): event is Extract<AgentEvent, { type: "agent_log" }> => event.type === "agent_log" && !event.resetStreamSlots && event.itemType !== "text");
+    expect(logs.map(log => [log.itemType, log.text, log.toolCallId])).toEqual([
+      ["tool", "A.tsx", "ta"],
+      ["tool", "B.tsx", "tb"],
+      ["toolResult", "RESULT_B", "tb"],
+      ["toolResult", "RESULT_A", "ta"],
+    ]);
+    await expect(backend.handle("getAgentLogs", ["a1", "session-1", "r1"])).resolves.toMatchObject([
+      { itemType: "tool", toolCallId: "ta" },
+      { itemType: "tool", toolCallId: "tb" },
+      { itemType: "toolResult", toolCallId: "tb" },
+      { itemType: "toolResult", toolCallId: "ta" },
+    ]);
+    deliver(END);
+    await closeTracked(backend);
+
+    const restarted = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
+    backends.push(restarted);
+    await expect(restarted.handle("getAgentLogs", ["a1", "session-1", "r1"])).resolves.toMatchObject([
+      { itemType: "tool", toolCallId: "ta" },
+      { itemType: "tool", toolCallId: "tb" },
+      { itemType: "toolResult", toolCallId: "tb" },
+      { itemType: "toolResult", toolCallId: "ta" },
+    ]);
+    await closeTracked(restarted);
+  });
+
   it("resets cached contentIndex slots on batched log so the next turn does not overwrite", async () => {
     const { backend, deliver } = await harness();
     deliver(START);

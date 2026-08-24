@@ -1041,6 +1041,75 @@ describe('SubagentPanel', () => {
     expect(screen.queryByText('输入')).toBeNull()
   })
 
+  it('shows skill_search and skill_load in subagent activity alongside ordinary tools', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({
+      type: 'agent',
+      agent: {
+        agentId: 'skills', runId: 'r-skill', name: 'explore', task: 'load a skill', state: 'running',
+        listSubtitle: 'skill_load tdd', activityActive: true,
+      },
+    })
+    await screen.findByTestId('agent-row-skills')
+    await waitFor(() => expect(harness.hasLogSubscriber('skills')).toBe(true))
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'tool', name: 'skill_search', text: '{"query":"office document"}' })
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'toolResult', name: 'skill_search', text: 'skill_load({name}).' })
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'tool', name: 'skill_load', text: '{"name":"tdd"}' })
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'toolResult', name: 'skill_load', text: '# Skill: tdd' })
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'tool', name: 'read', text: '{"path":"src/a.ts"}' })
+    harness.emitLog('skills', { type: 'agent_log', agentId: 'skills', itemType: 'toolResult', name: 'read', text: 'file body' })
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    expect(await screen.findByRole('button', { name: /^skill_search/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^skill_load/ })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^read/ })).toBeTruthy()
+    expect(screen.getAllByText(/最近活动 · skill_load · tdd/).length).toBeGreaterThan(0)
+  })
+
+  it('pairs same-name tool results by toolCallId even when results arrive in reverse order', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'ids', runId: 'r1', name: 'explore', task: 'pair by id', state: 'running' } })
+    await screen.findByTestId('agent-row-ids')
+    await waitFor(() => expect(harness.hasLogSubscriber('ids')).toBe(true))
+    harness.emitLog('ids', { type: 'agent_log', agentId: 'ids', itemType: 'tool', name: 'read', text: '{"path":"A.ts"}', toolCallId: 'ta' })
+    harness.emitLog('ids', { type: 'agent_log', agentId: 'ids', itemType: 'tool', name: 'read', text: '{"path":"B.ts"}', toolCallId: 'tb' })
+    // Same-name concurrent calls, results arriving in reverse order.
+    harness.emitLog('ids', { type: 'agent_log', agentId: 'ids', itemType: 'toolResult', name: 'read', text: 'RESULT_B', toolCallId: 'tb' })
+    harness.emitLog('ids', { type: 'agent_log', agentId: 'ids', itemType: 'toolResult', name: 'read', text: 'RESULT_A', toolCallId: 'ta' })
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    expandTranscriptCards()
+    const cardA = screen.getByText('RESULT_A').closest('[data-activity-card="tool"]')
+    const cardB = screen.getByText('RESULT_B').closest('[data-activity-card="tool"]')
+    expect(cardA).toBeTruthy()
+    expect(cardB).toBeTruthy()
+    expect(cardA?.textContent).toContain('A.ts')
+    expect(cardA?.textContent).not.toContain('RESULT_B')
+    expect(cardB?.textContent).toContain('B.ts')
+    expect(cardB?.textContent).not.toContain('RESULT_A')
+  })
+
+  it('binds a nameless toolResult to its toolCallId instead of the first same-name tool', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'nameless', runId: 'r1', name: 'explore', task: 'nameless result', state: 'running' } })
+    await screen.findByTestId('agent-row-nameless')
+    await waitFor(() => expect(harness.hasLogSubscriber('nameless')).toBe(true))
+    harness.emitLog('nameless', { type: 'agent_log', agentId: 'nameless', itemType: 'tool', name: 'read', text: '{"path":"A.ts"}', toolCallId: 'ta' })
+    harness.emitLog('nameless', { type: 'agent_log', agentId: 'nameless', itemType: 'tool', name: 'read', text: '{"path":"B.ts"}', toolCallId: 'tb' })
+    // No toolName on the result; only the call identity identifies the owner.
+    harness.emitLog('nameless', { type: 'agent_log', agentId: 'nameless', itemType: 'toolResult', text: 'ONLY_B', toolCallId: 'tb' })
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    expandTranscriptCards()
+    const cardB = screen.getByText('ONLY_B').closest('[data-activity-card="tool"]')
+    expect(cardB?.textContent).toContain('B.ts')
+    expect(cardB?.textContent).not.toContain('A.ts')
+    // The first call stays unpaired rather than stealing the nameless result.
+    const summaries = [...document.querySelectorAll('[data-activity-card="tool"] b')].map(node => node.textContent)
+    expect(summaries.some(summary => summary?.includes('A.ts'))).toBe(true)
+    expect([...document.querySelectorAll('[data-activity-card="tool"]')].filter(card => card.textContent?.includes('A.ts')).every(card => !card.textContent?.includes('ONLY_B'))).toBe(true)
+  })
+
   it('keeps a running tool card collapsed so execution details stay folded', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)

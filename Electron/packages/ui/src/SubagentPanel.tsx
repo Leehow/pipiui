@@ -21,6 +21,8 @@ type Log = {
   text: string
   name?: string
   isError?: boolean
+  /** Stable call identity shared by a tool row and its toolResult row; legacy logs have none. */
+  toolCallId?: string
   /** Runtime log_delta key (cumulative snapshot upsert); undefined for terminal `log` batches. */
   contentIndex?: number
   /** Uncapped thinking length when preview `text` is sliced. */
@@ -381,6 +383,14 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
   const consumed = new Set<number>()
   const nameOf = (log: Log) => (log.name ?? '').trim()
   const takeResult = (tool: Log, toolIndex: number): Log | undefined => {
+    // Stable identity wins: a call id binds its own result even among same-name
+    // concurrent tools whose results arrive out of order. Legacy rows (no id)
+    // keep the contentIndex/adjacency/name fallbacks below.
+    if (tool.toolCallId) {
+      const byId = agent.logs.findIndex(log => log.itemType === 'toolResult' && log.toolCallId === tool.toolCallId)
+      if (byId >= 0) { consumed.add(byId); return agent.logs[byId] }
+      return undefined
+    }
     if (tool.contentIndex !== undefined) {
       const same = agent.logs.findIndex(log => log.itemType === 'toolResult' && log.contentIndex === tool.contentIndex)
       if (same >= 0) { consumed.add(same); return agent.logs[same] }
@@ -816,20 +826,20 @@ function sealStreamSlots(logs: Log[]): Log[] {
 }
 
 function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_log' }>): Log[] {
-  const { itemType, text, name, isError, charCount } = event
+  const { itemType, text, name, isError, charCount, toolCallId } = event
   if (event.resetStreamSlots) logs = sealStreamSlots(logs)
   if (event.contentIndex !== undefined) {
     const index = logs.findIndex(log => log.contentIndex === event.contentIndex)
     if (index >= 0) {
       const old = logs[index]
       return logs.map((log, itemIndex) => itemIndex === index
-        ? { ...old, itemType, text, name: name || old.name, isError: old.isError, charCount: charCount ?? old.charCount }
+        ? { ...old, itemType, text, name: name || old.name, isError: old.isError, charCount: charCount ?? old.charCount, toolCallId: toolCallId ?? old.toolCallId }
         : log)
     }
     // Skip empty placeholders (delta before the first real chunk) so the panel
     // doesn't flash a blank row.
     if (!text && itemType !== 'tool') return logs
-    return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex, charCount }]
+    return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex, charCount, ...(toolCallId ? { toolCallId } : {}) }]
   }
   if (event.resetStreamSlots && !text && itemType !== 'tool') return logs
   // A no-index `kind:"log"` item is a turn boundary: forget live slots so the
@@ -839,7 +849,7 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
   if (last && last.itemType === itemType && text.length > last.text.length && text.startsWith(last.text)) {
     return logs.map(log => log.id === last.id ? { ...log, text, charCount: charCount ?? log.charCount } : log)
   }
-  return [...logs, { id: logs.length + 1, itemType, text, name, isError, charCount }]
+  return [...logs, { id: logs.length + 1, itemType, text, name, isError, charCount, ...(toolCallId ? { toolCallId } : {}) }]
 }
 
 function SubagentHeader({ total, running, runningTokens, succeeded, failed, onClear }: {

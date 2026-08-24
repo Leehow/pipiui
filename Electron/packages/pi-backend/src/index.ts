@@ -1555,11 +1555,12 @@ function sanitizeAttachmentName(
   const safe = base.replace(/[^\w.\-() ]/g, "").trim();
   return safe || fallback;
 }
-type CachedAgentLog = { itemType: string; text: string; name?: string; isError?: boolean; contentIndex?: number; charCount?: number };
+type CachedAgentLog = { itemType: string; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number };
 function isCachedAgentLog(value: unknown): value is CachedAgentLog {
   if (!isRecord(value) || typeof value.itemType !== "string" || typeof value.text !== "string") return false;
   if (value.name !== undefined && typeof value.name !== "string") return false;
   if (value.isError !== undefined && typeof value.isError !== "boolean") return false;
+  if (value.toolCallId !== undefined && typeof value.toolCallId !== "string") return false;
   if (value.contentIndex !== undefined && typeof value.contentIndex !== "number") return false;
   if (value.charCount !== undefined && typeof value.charCount !== "number") return false;
   return true;
@@ -3193,7 +3194,7 @@ export class PiHostBackend implements HostBackend {
           const logs: CachedAgentLog[] = [];
           for (const run of runs) {
             for (const entry of this.agentLogCache.get(this.agentLogKey(sessionId, agentId, run.runId)) ?? []) {
-              logs.push({ itemType: entry.itemType, text: entry.text, name: entry.name, isError: entry.isError });
+              logs.push({ itemType: entry.itemType, text: entry.text, name: entry.name, isError: entry.isError, ...(entry.toolCallId ? { toolCallId: entry.toolCallId } : {}) });
             }
           }
           return logs;
@@ -8058,7 +8059,7 @@ export class PiHostBackend implements HostBackend {
       // the key so the panel upserts one row instead of adding one per chunk.
       const contentIndex = num2(raw.contentIndex);
       const charCount = num2(raw.charCount);
-      const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(contentIndex === undefined ? {} : { contentIndex }), ...(charCount === undefined ? {} : { charCount }) };
+      const entry = { itemType: raw.itemType, text: raw.text ?? "", name: raw.name, isError: raw.isError, ...(typeof raw.toolCallId === "string" && raw.toolCallId ? { toolCallId: raw.toolCallId } : {}), ...(contentIndex === undefined ? {} : { contentIndex }), ...(charCount === undefined ? {} : { charCount }) };
       this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
     } else if (raw.kind === "log" && logSessionId) {
@@ -8066,7 +8067,7 @@ export class PiHostBackend implements HostBackend {
       this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, itemType: "text", text: "", resetStreamSlots: true });
       for (const item of raw.items ?? []) {
         const charCount = num2(item.charCount);
-        const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError, ...(charCount === undefined ? {} : { charCount }) };
+        const entry = { itemType: item.itemType, text: item.text, name: item.name, isError: item.isError, ...(typeof item.toolCallId === "string" && item.toolCallId ? { toolCallId: item.toolCallId } : {}), ...(charCount === undefined ? {} : { charCount }) };
         this.cacheAgentLog(logSessionId, agent.agentId, agent.runId, entry);
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
