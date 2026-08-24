@@ -7,12 +7,18 @@ import type { AgentEvent, AgentSummary, HistoryEntry, Model, ModelState, PipiHos
 import { visionHostMethods } from './useVisionRouting'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
+const virtuosoHarness = {
+  atBottom: undefined as undefined | ((value: boolean) => void),
+  startReached: undefined as undefined | ((index: number) => void),
+  scrollToIndex: vi.fn(),
+}
 
 beforeEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   localStorage.clear()
   Reflect.deleteProperty(window, 'pipiHost')
+  virtuosoHarness.startReached = undefined
 })
 afterEach(() => {
   cleanup()
@@ -38,10 +44,9 @@ function fileDataTransfer(file: File) {
   }
 }
 
-const virtuosoHarness = { atBottom: undefined as undefined | ((value: boolean) => void), scrollToIndex: vi.fn() }
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
-  return { Virtuoso: React.forwardRef(({ data, itemContent, atBottomStateChange }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; atBottomStateChange?: (value: boolean) => void }, ref) => { virtuosoHarness.atBottom = atBottomStateChange; React.useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoHarness.scrollToIndex })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
+  return { Virtuoso: React.forwardRef(({ data, itemContent, atBottomStateChange, startReached }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; atBottomStateChange?: (value: boolean) => void; startReached?: (index: number) => void }, ref) => { virtuosoHarness.atBottom = atBottomStateChange; virtuosoHarness.startReached = startReached; React.useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoHarness.scrollToIndex })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
 })
 
 vi.mock('streamdown', () => ({ Streamdown: ({ children }: { children: unknown }) => <>{children}</> }))
@@ -274,6 +279,7 @@ describe('PipiUI Electron main layout', () => {
     const host: PipiHostAPI = { ...base, getSessionHistory: history }
     render(<App host={host} />)
     expect(await screen.findByText('newest marker')).toBeTruthy()
+    act(() => virtuosoHarness.startReached?.(0))
     await waitFor(() => expect(history).toHaveBeenCalledWith('welcome', 'new-0', 500))
     expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('older page unavailable')
     expect(screen.getByText('newest marker')).toBeTruthy()
@@ -298,12 +304,14 @@ describe('PipiUI Electron main layout', () => {
     const host: PipiHostAPI = { ...base, getSessionHistory: history }
     const view = render(<App host={host} />)
     expect(await screen.findByText('retry newest marker')).toBeTruthy()
+    act(() => virtuosoHarness.startReached?.(0))
     await screen.findByText(/temporary older failure/)
 
     fireEvent.click(view.container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(view.container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
     fireEvent.click(view.container.querySelector('[data-session-id="welcome"]')!)
     expect(screen.getByText('retry newest marker')).toBeTruthy()
+    act(() => virtuosoHarness.startReached?.(0))
     expect(await screen.findByText('recovered older marker')).toBeTruthy()
     expect(screen.getByText('retry newest marker')).toBeTruthy()
     expect(olderAttempts).toBe(2)
@@ -639,8 +647,9 @@ describe('PipiUI Electron main layout', () => {
     }
     render(<App host={host} />)
     expect(await screen.findByText('游标消息 519', undefined, { timeout: 2_000 })).toBeTruthy()
+    act(() => virtuosoHarness.startReached?.(0))
+    await waitFor(() => expect(calls).toBe(3))
     expect(screen.queryByText(/读取会话记录失败/)).toBeNull()
-    expect(calls).toBe(3)
   })
 
   it('cancels a terminal delayed refresh when the selected session changes', async () => {
@@ -2621,7 +2630,7 @@ async function reopenModelModal(composer: HTMLTextAreaElement) {
 }
 
 describe('session switch transcript cache', () => {
-  it('keeps a visited session transcript visible while revalidating it on return', async () => {
+  it('keeps only the selected transcript mounted while revalidating cached content on return', async () => {
     const base = createMockHost()
     let welcomeLoads = 0
     const host: PipiHostAPI = {
@@ -2640,16 +2649,41 @@ describe('session switch transcript cache', () => {
 
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await screen.findByText('左栏宽度要能持久化。')
-    const welcomeTranscript = screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null
+    expect(screen.queryByText('请实现 Electron 三栏主界面。')).toBeNull()
     const layoutTranscript = screen.getByText('左栏宽度要能持久化。').closest('[data-session-transcript]') as HTMLElement | null
-    expect(welcomeTranscript?.getAttribute('data-session-transcript')).toBe('welcome')
-    expect(welcomeTranscript?.hidden).toBe(true)
     expect(layoutTranscript?.hidden).toBe(false)
+    expect(container.querySelectorAll('[data-session-transcript]')).toHaveLength(1)
 
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
+    const welcomeTranscript = screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null
     expect(welcomeTranscript?.hidden).toBe(false)
-    expect(layoutTranscript?.hidden).toBe(true)
+    expect(screen.queryByText('左栏宽度要能持久化。')).toBeNull()
+    expect(container.querySelectorAll('[data-session-transcript]')).toHaveLength(1)
     expect(welcomeLoads).toBe(2)
+  })
+
+  it('loads only the newest history page until Virtuoso reaches the top', async () => {
+    const base = createMockHost()
+    const latest = Array.from({ length: 500 }, (_, index) => ({
+      id: `latest-${index}`,
+      role: 'user' as const,
+      content: `latest page ${index}`,
+      timestamp: 1_000 + index,
+    }))
+    let releaseOlder: ((entries: HistoryEntry[]) => void) | undefined
+    const getSessionHistory = vi.fn(async (_sessionId: string, before?: number | string) => {
+      if (before !== undefined) return new Promise<HistoryEntry[]>(resolve => { releaseOlder = resolve })
+      return latest
+    })
+    render(<App host={{ ...base, getSessionHistory }} />)
+    await screen.findByText('latest page 499')
+    await act(async () => { await Promise.resolve() })
+    expect(getSessionHistory).toHaveBeenCalledTimes(1)
+
+    act(() => virtuosoHarness.startReached?.(0))
+    await waitFor(() => expect(getSessionHistory).toHaveBeenCalledTimes(2))
+    await act(async () => { releaseOlder?.([{ id: 'older-1', role: 'user', content: 'older page', timestamp: 1 }]) })
+    await screen.findByText('older page')
   })
 
   it('does not paint the previous session transcript into an uncached session slot', async () => {
@@ -2688,7 +2722,7 @@ describe('session switch transcript cache', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
     await waitFor(() => expect(screen.getByLabelText('消息输入框')).toBeTruthy())
-    expect((screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null)?.hidden).toBe(true)
+    expect(screen.queryByText('请实现 Electron 三栏主界面。')).toBeNull()
     expect(getSessionHistory.mock.calls.length).toBe(loadsBeforeNew)
   })
 

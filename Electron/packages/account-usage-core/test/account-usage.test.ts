@@ -254,6 +254,15 @@ describe("built-in adapters", () => {
     expect(result).toEqual({ status: "no-data", reason: "missing-credential" });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
+  it("does not inspect browser cookies when Cursor has a valid desktop token", async () => {
+    const token = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64url")}.signature`;
+    const readCookie = vi.fn(async () => "WorkosCursorSessionToken=unused");
+    const fetchSpy = vi.fn(async () => response({ includedUsagePercent: 22 })) as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({ fetch: fetchSpy, readCursorAuth: async () => token, readCookie });
+
+    expect((await monitor.snapshot("cursor", true)).status).toBe("ready");
+    expect(readCookie).not.toHaveBeenCalled();
+  });
   it("loads OpenCode Go only through the injected local reader", async () => {
     const result = await monitor.snapshot("opencode-go", true);
     expect(result.status).toBe("ready");

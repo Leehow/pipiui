@@ -1110,6 +1110,24 @@ describe("subagent lifecycle → AgentSummary", () => {
     await closeTracked(restarted);
   });
 
+  it("streams log_delta without rebroadcasting an unchanged full agent summary", async () => {
+    const { deliver, events } = await harness();
+    deliver(START);
+    const summariesBefore = events.filter(event => event.type === "agent").length;
+
+    deliver({ kind: "log_delta", agentId: "a1", runId: "r1", contentIndex: 0, itemType: "text", text: "streamed preview" });
+
+    expect(events.filter(event => event.type === "agent")).toHaveLength(summariesBefore);
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "agent_log",
+      sessionId: "session-1",
+      agentId: "a1",
+      runId: "r1",
+      contentIndex: 0,
+      text: "streamed preview",
+    }));
+  });
+
   it("keeps toolCallId on tool/toolResult log rows through broadcast, cache, and durable restart", async () => {
     const { backend, deliver, events } = await harness();
     deliver(START);

@@ -9,6 +9,7 @@ type CookieReader = (provider: 'kimi' | 'qwen-token-plan' | 'cursor') => Promise
 type CookiePersister = (provider: 'qwen-token-plan', cookie: string) => Promise<void>
 
 const DEFAULT_BROWSER_PARTITION = 'pipiui-browser'
+const RECENT_BROWSER_PARTITION_LIMIT = 8
 const COOKIE_CACHE_FILE = 'qwen-token-plan-cookie.json'
 
 /**
@@ -47,15 +48,34 @@ async function cachedCookie(userDataPath: string): Promise<string | undefined> {
   }
 }
 
-async function qwenTokenPlanCookie(userDataPath: string): Promise<string | undefined> {
-  // Default browser space first, then every per-session partition on disk.
-  const partitions = [DEFAULT_BROWSER_PARTITION]
+/**
+ * `session.fromPartition()` creates a Chromium Session when one is not already
+ * alive. Directory enumeration therefore must not be used as an instruction to
+ * instantiate every historical browser profile. The default profile plus the
+ * most recently touched per-session profiles cover current login flows while
+ * bounding the permanent process/thread cost of a quota refresh.
+ */
+async function recentBrowserPartitions(userDataPath: string): Promise<string[]> {
+  const root = join(userDataPath, 'Partitions')
   try {
-    for (const entry of await fs.readdir(join(userDataPath, 'Partitions'))) {
-      if (entry.startsWith(`${DEFAULT_BROWSER_PARTITION}-`)) partitions.push(entry)
-    }
-  } catch { /* no partitions yet */ }
-  for (const partition of partitions) {
+    const entries = (await fs.readdir(root)).filter(entry => entry.startsWith(`${DEFAULT_BROWSER_PARTITION}-`))
+    const recent = (await Promise.all(entries.map(async entry => {
+      try { return { entry, mtimeMs: (await fs.stat(join(root, entry))).mtimeMs } }
+      catch { return undefined }
+    })))
+      .filter((entry): entry is { entry: string; mtimeMs: number } => entry !== undefined)
+      .sort((left, right) => right.mtimeMs - left.mtimeMs || right.entry.localeCompare(left.entry))
+      .slice(0, RECENT_BROWSER_PARTITION_LIMIT)
+      .map(entry => entry.entry)
+    return [DEFAULT_BROWSER_PARTITION, ...recent]
+  } catch {
+    return [DEFAULT_BROWSER_PARTITION]
+  }
+}
+
+async function qwenTokenPlanCookie(userDataPath: string): Promise<string | undefined> {
+  // Default browser space first, then a bounded MRU slice of per-session profiles.
+  for (const partition of await recentBrowserPartitions(userDataPath)) {
     try {
       const cookies = await session.fromPartition(`persist:${partition}`).cookies.get({})
       const header = aliyunCookieHeader(cookies)
@@ -83,13 +103,7 @@ function cursorCookieHeader(cookies: Electron.Cookie[]): string | undefined {
 }
 
 async function cursorBrowserCookie(userDataPath: string): Promise<string | undefined> {
-  const partitions = [DEFAULT_BROWSER_PARTITION]
-  try {
-    for (const entry of await fs.readdir(join(userDataPath, 'Partitions'))) {
-      if (entry.startsWith(`${DEFAULT_BROWSER_PARTITION}-`)) partitions.push(entry)
-    }
-  } catch { /* no partitions yet */ }
-  for (const partition of partitions) {
+  for (const partition of await recentBrowserPartitions(userDataPath)) {
     try {
       const cookies = await session.fromPartition(`persist:${partition}`).cookies.get({})
       const header = cursorCookieHeader(cookies)

@@ -8198,7 +8198,10 @@ export class PiHostBackend implements HostBackend {
         : this.mergeAgentDiagnostics(raw, sameRun ? current : undefined, eventAt),
     };
     this.agents.set(key, agent);
-    this.agentProjectionChanged(agent.sessionId);
+    // log_delta is preview/liveness data. It refreshes the in-memory timestamp
+    // for orphan detection, but it does not change the durable/live-agent
+    // state seen by compaction scheduling.
+    if (raw.kind !== "log_delta") this.agentProjectionChanged(agent.sessionId);
     this.projectionDebugProvenance.set(key, eventKind);
     this.projectionDebug("agent_event", {
       session: this.projectionDebugSessionTag(sessionId),
@@ -8207,7 +8210,7 @@ export class PiHostBackend implements HostBackend {
       before: current?.state ?? "missing",
       after: agent.state,
     });
-    this.projectWorktreeFromEvent(raw, state);
+    if (raw.kind !== "log_delta") this.projectWorktreeFromEvent(raw, state);
     const logSessionId = agent.sessionId;
     if (raw.kind === "log_delta" && logSessionId) {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
@@ -8227,14 +8230,16 @@ export class PiHostBackend implements HostBackend {
         this.agent({ type: "agent_log", sessionId: logSessionId, agentId: agent.agentId, runId: agent.runId, ...entry });
       }
     }
-    this.projectionDebug("agent_broadcast", {
-      source: "event",
-      key: this.projectionDebugAgentTag(key),
-      state: agent.state,
-      provenance: eventKind,
-      listeners: this.listeners.size,
-    });
-    this.agent({ type: "agent", agent });
+    if (raw.kind !== "log_delta") {
+      this.projectionDebug("agent_broadcast", {
+        source: "event",
+        key: this.projectionDebugAgentTag(key),
+        state: agent.state,
+        provenance: eventKind,
+        listeners: this.listeners.size,
+      });
+      this.agent({ type: "agent", agent });
+    }
     // Streaming log_delta is preview-only. Persisting the whole index on every
     // 50ms flush queued one JSON snapshot per event and froze the Electron main
     // process (100% CPU, multi-GB heap) once a few workers were live.

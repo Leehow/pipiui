@@ -1094,6 +1094,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const messagesRef = useRef<ChatMessage[]>(messages)
   messagesRef.current = messages
   const messagesBySessionRef = useRef(new Map<string, ChatMessage[]>())
+  const historyEntriesBySessionRef = useRef(new Map<string, HistoryEntry[]>())
+  const historyCursorBySessionRef = useRef(new Map<string, string>())
+  const historyOlderLoadInFlightRef = useRef(new Set<string>())
   const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
   const historyFingerprintBySessionRef = useRef(new Map<string, string>())
   const historySettledReplacementRef = useRef(new Map<string, { fingerprint: string; liveRevision: number }>())
@@ -1111,19 +1114,11 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     setMessages(next)
     return next
   }, [])
-  const [mountedSessionIds, setMountedSessionIds] = useState<string[]>([])
   useEffect(() => {
     if (selectedSession && messagesBySessionRef.current.has(selectedSession)) {
       messagesBySessionRef.current.set(selectedSession, messages)
     }
   }, [selectedSession, messages])
-  useEffect(() => {
-    if (!selectedSession) return
-    setMountedSessionIds(current => {
-      if (current[0] === selectedSession) return current
-      return [selectedSession, ...current.filter(id => id !== selectedSession)].slice(0, 6)
-    })
-  }, [selectedSession])
   const [hasPlansBySession, setHasPlansBySession] = useState<Record<string, boolean>>({})
   const handleHasPlansChange = useCallback((sessionId: string, hasPlans: boolean) => {
     setHasPlansBySession(current => current[sessionId] === hasPlans ? current : { ...current, [sessionId]: hasPlans })
@@ -1894,66 +1889,58 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!knownNewEmptySession) {
       historyCompleteBySessionRef.current.set(selectedSession, false)
       void (async () => {
-        let before: string | undefined
-        let accumulated: HistoryEntry[] = []
-        let loadedPage = false
-        let cursorRestarts = 0
         try {
-          while (historyLoadRef.current === request) {
-            let page: HistoryEntry[]
-            try {
-              freezeProbeHistoryIpcStart({ session: selectedSession, page: before ?? 'latest' })
-              try {
-                page = before === undefined
-                  ? await host.getSessionHistory(selectedSession)
-                  : await host.getSessionHistory(selectedSession, before, HISTORY_PAGE_SIZE)
-              } finally {
-                freezeProbeHistoryIpcEnd({ session: selectedSession })
-              }
-            } catch (error) {
-              // A compaction landing mid-pagination rewrites the visible branch
-              // and retires the cursor id. Restart from the newest page instead
-              // of failing the whole load (bounded so a pathological loop ends).
-              if (cursorRestarts < 2 && error instanceof Error && error.message.includes('history cursor no longer exists')) {
-                cursorRestarts += 1
-                before = undefined
-                accumulated = []
-                loadedPage = false
-                continue
-              }
-              throw error
-            }
-            if (historyLoadRef.current !== request) return
-            if (page.length === 0) {
-              const cachedMessages = messagesBySessionRef.current.get(selectedSession)
-              const hasCached = (cachedMessages?.length ?? 0) > 0
-              if (!loadedPage && !hasCached && !emptyPageRetryScheduled) {
-                emptyPageRetryScheduled = true
-                emptyPageRetryTimer = window.setTimeout(() => {
-                  if (historyLoadRef.current === request
-                    && historyContextRef.current?.host === host
-                    && historyContextRef.current.sessionId === selectedSession) {
-                    freezeProbe('history_refresh', { reason: 'empty_page_retry', session: selectedSession })
-                    setHistoryRefreshKey(key => key + 1)
-                  }
-                }, 250)
-                return
-              }
-              if (!loadedPage && !hasCached) applyHistory([])
-              historyCompleteBySessionRef.current.set(selectedSession, true)
-              return
-            }
-            accumulated = [...page, ...accumulated]
-            applyHistory(accumulated)
-            loadedPage = true
-            if (page.length < HISTORY_PAGE_SIZE) {
-              historyCompleteBySessionRef.current.set(selectedSession, true)
-              return
-            }
-            const nextBefore = page[0]?.id
-            if (!nextBefore || nextBefore === before) throw new Error('主机返回了无效的会话历史游标')
-            before = nextBefore
+          freezeProbeHistoryIpcStart({ session: selectedSession, page: 'latest' })
+          let page: HistoryEntry[]
+          try {
+            page = await host.getSessionHistory(selectedSession)
+          } finally {
+            freezeProbeHistoryIpcEnd({ session: selectedSession })
           }
+          if (historyLoadRef.current !== request) return
+          if (page.length === 0) {
+            const cachedMessages = messagesBySessionRef.current.get(selectedSession)
+            const hasCached = (cachedMessages?.length ?? 0) > 0
+            if (!hasCached && !emptyPageRetryScheduled) {
+              emptyPageRetryScheduled = true
+              emptyPageRetryTimer = window.setTimeout(() => {
+                if (historyLoadRef.current === request
+                  && historyContextRef.current?.host === host
+                  && historyContextRef.current.sessionId === selectedSession) {
+                  freezeProbe('history_refresh', { reason: 'empty_page_retry', session: selectedSession })
+                  setHistoryRefreshKey(key => key + 1)
+                }
+              }, 250)
+              return
+            }
+            if (!hasCached) {
+              historyEntriesBySessionRef.current.set(selectedSession, [])
+              applyHistory([])
+            }
+            historyCursorBySessionRef.current.delete(selectedSession)
+            historyCompleteBySessionRef.current.set(selectedSession, true)
+            return
+          }
+
+          // Preserve already fetched older pages only when the refreshed newest
+          // page overlaps the same branch. A rewrite/branch switch with no
+          // overlap deliberately drops the stale prefix.
+          const existing = historyEntriesBySessionRef.current.get(selectedSession) ?? []
+          const overlap = existing.findIndex(entry => entry.id === page[0]?.id)
+          const accumulated = page.length === HISTORY_PAGE_SIZE && overlap >= 0
+            ? [...existing.slice(0, overlap), ...page]
+            : page
+          historyEntriesBySessionRef.current.set(selectedSession, accumulated)
+          applyHistory(accumulated)
+          if (page.length < HISTORY_PAGE_SIZE) {
+            historyCursorBySessionRef.current.delete(selectedSession)
+            historyCompleteBySessionRef.current.set(selectedSession, true)
+            return
+          }
+          const nextBefore = accumulated[0]?.id
+          if (!nextBefore) throw new Error('主机返回了无效的会话历史游标')
+          historyCursorBySessionRef.current.set(selectedSession, nextBefore)
+          historyCompleteBySessionRef.current.set(selectedSession, false)
         } catch (error) {
           if (historyLoadRef.current !== request) return
           historyCompleteBySessionRef.current.set(selectedSession, false)
@@ -1969,6 +1956,71 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (settleConfirmRetryTimer !== undefined) window.clearTimeout(settleConfirmRetryTimer)
     }
   }, [historyRefreshKey, host, selectedSession, sessionQueue.resync])
+  const loadOlderHistory = useCallback(() => {
+    const sessionId = selectedSessionRef.current
+    if (!sessionId || isExternalSessionId(sessionId)) return
+    if (mainTurnOpenRef.current || historyCompleteBySessionRef.current.get(sessionId) === true) return
+    if (historyOlderLoadInFlightRef.current.has(sessionId)) return
+    const before = historyCursorBySessionRef.current.get(sessionId)
+    if (!before) return
+
+    const request = historyLoadRef.current
+    const requestLiveRevision = transcriptLiveRevisionRef.current
+    historyOlderLoadInFlightRef.current.add(sessionId)
+    freezeProbeHistoryIpcStart({ session: sessionId, page: before })
+    void host.getSessionHistory(sessionId, before, HISTORY_PAGE_SIZE).then(page => {
+      if (historyLoadRef.current !== request || selectedSessionRef.current !== sessionId) return
+      if (page.length === 0) {
+        historyCursorBySessionRef.current.delete(sessionId)
+        historyCompleteBySessionRef.current.set(sessionId, true)
+        return
+      }
+      const currentEntries = historyEntriesBySessionRef.current.get(sessionId) ?? []
+      if (currentEntries[0]?.id !== before) return
+      const accumulated = [...page, ...currentEntries]
+      const previousFingerprint = historyFingerprintBySessionRef.current.get(sessionId)
+      const reconciliation = reconcileHistorySnapshot(
+        accumulated,
+        requestLiveRevision,
+        transcriptLiveRevisionRef.current,
+        previousFingerprint,
+        messagesRef.current,
+      )
+      if (reconciliation.status === 'stale-request' || reconciliation.status === 'retained-longer-live') return
+
+      historyEntriesBySessionRef.current.set(sessionId, accumulated)
+      if (page.length < HISTORY_PAGE_SIZE) {
+        historyCursorBySessionRef.current.delete(sessionId)
+        historyCompleteBySessionRef.current.set(sessionId, true)
+      } else {
+        const nextBefore = page[0]?.id
+        if (!nextBefore || nextBefore === before) throw new Error('主机返回了无效的会话历史游标')
+        historyCursorBySessionRef.current.set(sessionId, nextBefore)
+        historyCompleteBySessionRef.current.set(sessionId, false)
+      }
+      if (reconciliation.status === 'unchanged') return
+      historyFingerprintBySessionRef.current.set(sessionId, reconciliation.fingerprint)
+      const retained = retainReceiptOptimisticUser(
+        reconciliation.messages,
+        messagesRef.current,
+        persistLocalUserReceiptRef.current,
+        sessionId,
+      )
+      messagesBySessionRef.current.set(sessionId, retained)
+      messagesRef.current = retained
+      setMessages(retained)
+    }).catch(error => {
+      if (historyLoadRef.current !== request || selectedSessionRef.current !== sessionId) return
+      if (error instanceof Error && error.message.includes('history cursor no longer exists')) {
+        setHistoryRefreshKey(key => key + 1)
+        return
+      }
+      setProjectError(`读取更早会话记录失败：${error instanceof Error ? error.message : String(error)}`)
+    }).finally(() => {
+      freezeProbeHistoryIpcEnd({ session: sessionId })
+      historyOlderLoadInFlightRef.current.delete(sessionId)
+    })
+  }, [host])
   useEffect(() => {
     if (!selectedSession || isExternalSessionId(selectedSession) || !leaseConflictError) return
     let cancelled = false
@@ -2382,6 +2434,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const session = await host.newSession(selectedProject)
     locallyCreatedSessionIdsRef.current.add(session.id)
     messagesBySessionRef.current.set(session.id, [])
+    historyEntriesBySessionRef.current.set(session.id, [])
+    historyCursorBySessionRef.current.delete(session.id)
     historyCompleteBySessionRef.current.set(session.id, true)
     beforeSelect?.(session.id)
     setSessions(items => [session, ...items])
@@ -2547,6 +2601,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     locallyCreatedSessionIdsRef.current.add(session.id)
     messagesBySessionRef.current.set(session.id, [])
+    historyEntriesBySessionRef.current.set(session.id, [])
+    historyCursorBySessionRef.current.delete(session.id)
     historyCompleteBySessionRef.current.set(session.id, true)
     setSessions(items => [session, ...items])
     setSelectedProject(projectId)
@@ -3037,30 +3093,24 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           </div>
         ) : (
         <LiveSubagentBindingProvider host={host} sessionId={selectedSession}>
-          {(() => {
-            const ids = (selectedSession && !mountedSessionIds.includes(selectedSession)
-              ? [selectedSession, ...mountedSessionIds]
-              : mountedSessionIds).slice(0, 6)
-            if (ids.length === 0) {
-              return <Transcript messages={messages} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
-            }
-            return ids.map(id => (
-              <div key={id} className="session-transcript-slot" data-session-transcript={id} hidden={id !== selectedSession}>
-                <Transcript
-                  active={id === selectedSession}
-                  messages={id === selectedSession ? messages : (messagesBySessionRef.current.get(id) ?? [])}
-                  documentBasePath={selectedProjectPath}
-                  onOpenDocument={openDocument}
-                  onOpenSubagents={openSubagents}
-                  onCopy={handleCopy}
-                  onResend={handleResend}
-                  resendDisabled={resendDisabled}
-                  copiedId={id === selectedSession ? copiedId : null}
-                  waiting={id === selectedSession ? firstResponseWaiting ?? subagentWaiting : undefined}
-                />
-              </div>
-            ))
-          })()}
+          {selectedSession ? (
+            <div key={selectedSession} className="session-transcript-slot" data-session-transcript={selectedSession}>
+              <Transcript
+                messages={messages}
+                onLoadOlder={loadOlderHistory}
+                documentBasePath={selectedProjectPath}
+                onOpenDocument={openDocument}
+                onOpenSubagents={openSubagents}
+                onCopy={handleCopy}
+                onResend={handleResend}
+                resendDisabled={resendDisabled}
+                copiedId={copiedId}
+                waiting={firstResponseWaiting ?? subagentWaiting}
+              />
+            </div>
+          ) : (
+            <Transcript messages={messages} documentBasePath={selectedProjectPath} onOpenDocument={openDocument} onOpenSubagents={openSubagents} onCopy={handleCopy} onResend={handleResend} resendDisabled={resendDisabled} copiedId={copiedId} waiting={firstResponseWaiting ?? subagentWaiting} />
+          )}
         </LiveSubagentBindingProvider>
         )}
       </div>

@@ -516,7 +516,10 @@ export const builtinAccountUsageAdapters: AccountUsageAdapter[] = [
     id: "cursor", kind: "subscription", matches: includes("cursor"), async load(ctx) {
       const rawToken = clean(await ctx.readCursorAuth?.());
       const access = rawToken && jwtUnexpired(rawToken, ctx.now()) ? rawToken : undefined;
-      const cookie = await ctx.readCookie?.("cursor");
+      // A valid desktop JWT is sufficient and avoids materializing every
+      // historical Electron browser partition merely to build an unused
+      // Cookie header. Browser cookies remain the fallback when no JWT exists.
+      const cookie = access ? undefined : await ctx.readCookie?.("cursor");
       if (!access && !cookie) return;
       const headers: Record<string, string> = { Accept: "application/json" };
       if (access) headers.Authorization = `Bearer ${access}`;
