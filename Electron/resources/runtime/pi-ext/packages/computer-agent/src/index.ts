@@ -14,3 +14,4 @@ export * from "./action-block.ts";
 export * from "./workflows.ts";
 export * from "./direct-drive.ts";
 export * from "./stuck-detector.ts";
+export * from "./verifier-recovery.ts";
