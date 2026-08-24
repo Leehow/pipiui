@@ -45,6 +45,24 @@ export type ExtensionUiPanel = {
 };
 
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };
+
+/**
+ * Manifest `app.ui.documentRenderers[]` item: a controlled renderer for the
+ * document surface. Declaring (and enabling) the contribution is the whole
+ * authorization — there is no `document.preview` capability.
+ */
+export type ExtensionUiDocumentRenderer = {
+  id: string;
+  /** App-half entry module exporting the renderer component. */
+  entry: string;
+  /** Host document kinds claimed by this renderer (opaque strings, e.g. "diagram"). */
+  kinds?: string[];
+  /** File extensions with a leading dot, normalized lowercase (e.g. ".svg"). */
+  extensions?: string[];
+  mimeTypes?: string[];
+  /** Higher wins; ties break on id, then extension id. */
+  priority?: number;
+};
 export type ExtensionUiSettingsSection = { id: string; title: string; entry?: string };
 export type ExtensionUiSlashCommand = { name: string; description?: string };
 export type ExtensionUiStatusBar = {
@@ -102,6 +120,7 @@ export type ExtensionManifest = {
     ui?: {
       panels?: ExtensionUiPanel[];
       toolRenderers?: ExtensionUiToolRenderer[];
+      documentRenderers?: ExtensionUiDocumentRenderer[];
       settingsSections?: ExtensionUiSettingsSection[];
       slashCommands?: ExtensionUiSlashCommand[];
       themes?: unknown[];
@@ -132,6 +151,49 @@ export type SettingsSectionProps = {
   api: ExtensionHostAPI;
   id: string;
   title?: string;
+};
+
+/**
+ * Document renderer contract version. Entries receive `DocumentRendererProps`
+ * of this version; incompatible changes bump the constant and add a v2 shape.
+ */
+export const DOCUMENT_RENDERER_CONTRACT_VERSION = 1 as const;
+
+/**
+ * Host-prepared, path-free summary of the document being rendered.
+ * The renderer never reads the disk; the host owns path validation and reads.
+ */
+export type DocumentRendererDescriptor = {
+  /** Stable opaque document id (session-scoped); never a filesystem path. */
+  documentId: string;
+  name: string;
+  /** File extension with a leading dot, lowercase (e.g. ".svg"). */
+  extension: string;
+  /** Host document classification; an opaque string to this contract. */
+  documentKind: string;
+  mimeType?: string;
+  /** Byte size of the host-loaded document. */
+  size: number;
+  /** Monotonic content revision; the host bumps it on every reload. */
+  revision: number;
+};
+
+/** Restricted, host-mediated actions. No paths, no host API, no IPC surface. */
+export type DocumentRendererActions = {
+  reload: () => Promise<void>;
+  openExternally: () => Promise<void>;
+  /** Ask the host shell to swap this document to the generic fallback view. */
+  useGenericFallback: () => Promise<void>;
+};
+
+/** Props injected into a controlled `documentRenderers` entry (v1). */
+export type DocumentRendererProps = {
+  document: DocumentRendererDescriptor;
+  /** Raw bytes as loaded by the host, when the kind is binary. */
+  bytes?: Uint8Array;
+  /** Host-derived text preview (e.g. converted markdown), when available. */
+  text?: string;
+  actions: DocumentRendererActions;
 };
 
 export type ExtensionSettingsAPI = {

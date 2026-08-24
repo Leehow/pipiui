@@ -2,7 +2,7 @@ import { createElement, type ComponentType } from 'react'
 import { createExtensionHostAPI, type ExtensionHostAPI } from '@pipiui/extension-api'
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { Disposer } from './contribution-registry'
-import { registerPanel, registerSettingsSection, registerToolRenderer } from './ui-registries'
+import { registerDocumentRenderer, registerPanel, registerSettingsSection, registerToolRenderer } from './ui-registries'
 
 const EXTENSION_PANEL_ICON = {
   src: `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="#000" stroke-width="1.6"/></svg>')}`,
@@ -11,6 +11,14 @@ const EXTENSION_PANEL_ICON = {
 
 export type ControlledUiPanel = { id: string; title?: string; slot?: string; entry?: string }
 export type ControlledUiToolRenderer = { tool: string; entry?: string }
+export type ControlledUiDocumentRenderer = {
+  id: string
+  entry?: string
+  kinds?: readonly string[]
+  extensions?: readonly string[]
+  mimeTypes?: readonly string[]
+  priority?: number
+}
 export type ControlledUiSettingsSection = { id: string; title?: string; description?: string; entry?: string }
 
 export type LoadableExtensionDescriptor = {
@@ -23,6 +31,7 @@ export type LoadableExtensionDescriptor = {
   ui?: {
     panels?: readonly ControlledUiPanel[]
     toolRenderers?: readonly ControlledUiToolRenderer[]
+    documentRenderers?: readonly ControlledUiDocumentRenderer[]
     settingsSections?: readonly ControlledUiSettingsSection[]
     slashCommands?: readonly { name: string; description?: string }[]
     statusBar?: readonly { id: string; text?: string; tooltip?: string; alignment?: 'left' | 'right' }[]
@@ -59,7 +68,7 @@ function componentFromModule(mod: unknown): ComponentType<Record<string, unknown
   if (typeof mod === 'function') return mod as ComponentType<Record<string, unknown>>
   if (mod && typeof mod === 'object') {
     const record = mod as Record<string, unknown>
-    for (const key of ['default', 'render', 'Panel', 'SettingsSection', 'ToolRenderer']) {
+    for (const key of ['default', 'render', 'Panel', 'SettingsSection', 'ToolRenderer', 'DocumentRenderer']) {
       if (typeof record[key] === 'function') return record[key] as ComponentType<Record<string, unknown>>
     }
   }
@@ -142,6 +151,7 @@ export async function loadControlledContributions(
   const seenPanel = new Set<string>()
   const seenTool = new Set<string>()
   const seenSection = new Set<string>()
+  const seenDocumentRenderer = new Set<string>()
   const api = createApi(descriptor, host)
 
   for (const panel of panels) {
@@ -178,6 +188,28 @@ export async function loadControlledContributions(
     }
   }
 
+  // Document renderers receive host-prepared props only (descriptor / bytes /
+  // derived text / restricted actions) — never paths, host APIs, or `window.pipiHost`.
+  for (const renderer of ui?.documentRenderers ?? []) {
+    const entry = renderer.entry?.trim()
+    if (!entry || !renderer.id || seenDocumentRenderer.has(renderer.id)) continue
+    seenDocumentRenderer.add(renderer.id)
+    try {
+      const Component = await loadComponent(directory, entry, importModule)
+      disposers.push(registerDocumentRenderer(descriptor.id, {
+        id: renderer.id,
+        kinds: renderer.kinds?.length ? [...renderer.kinds] : undefined,
+        extensions: renderer.extensions?.length ? [...renderer.extensions] : undefined,
+        mimeTypes: renderer.mimeTypes?.length ? [...renderer.mimeTypes] : undefined,
+        priority: renderer.priority,
+        render: props => createElement(Component, props),
+      }))
+    } catch {
+      // No renderer slot to placeholder: the document surface keeps builtin
+      // rendering. Do not crash the host over one broken or conflicting entry.
+    }
+  }
+
   for (const section of sections) {
     const entry = section.entry?.trim()
     if (!entry || !section.id || seenSection.has(section.id)) continue
@@ -205,7 +237,7 @@ export function hasControlledEntry(descriptor: LoadableExtensionDescriptor): boo
   const contrib = descriptor.contributions
   const has = (items: ReadonlyArray<{ entry?: string }> | undefined) =>
     (items ?? []).some(item => Boolean(item.entry?.trim()))
-  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.settingsSections)
+  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections)
     || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections)
 }
 

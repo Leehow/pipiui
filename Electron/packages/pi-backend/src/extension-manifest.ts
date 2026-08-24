@@ -41,12 +41,30 @@ export type ExtensionPanelSlot = (typeof EXTENSION_PANEL_SLOTS)[number];
 
 export type ExtensionUiPanel = { slot: ExtensionPanelSlot; id: string; title: string; entry?: string };
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };
+
+/**
+ * Manifest `app.ui.documentRenderers[]` item (document renderer contract v1).
+ * Declaring + enabling the contribution is the authorization; there is no
+ * `document.preview` capability. Matching is static manifest data only.
+ */
+export type ExtensionUiDocumentRenderer = {
+  id: string;
+  entry: string;
+  /** Host document kinds claimed (opaque strings to the validator). */
+  kinds?: string[];
+  /** File extensions with a leading dot, normalized lowercase. */
+  extensions?: string[];
+  mimeTypes?: string[];
+  /** Higher wins; ties break on id, then extension id. */
+  priority?: number;
+};
 export type ExtensionUiSettingsSection = { id: string; title: string; entry?: string };
 export type ExtensionUiSlashCommand = { name: string; description?: string };
 
 export type ExtensionUiSummary = {
   panels?: ExtensionUiPanel[];
   toolRenderers?: ExtensionUiToolRenderer[];
+  documentRenderers?: ExtensionUiDocumentRenderer[];
   settingsSections?: ExtensionUiSettingsSection[];
   slashCommands?: ExtensionUiSlashCommand[];
 };
@@ -79,6 +97,41 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** Array of non-empty strings, or push one deterministic error. `undefined` = not declared. */
+function collectNonEmptyStrings(
+  value: unknown,
+  label: string,
+  errors: string[],
+  normalize?: (item: string) => string,
+): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    errors.push(`${label} must be an array of non-empty strings`);
+    return undefined;
+  }
+  const out = (value as string[]).map((item) => (normalize ? normalize(item) : item.trim()));
+  return out.length ? out : undefined;
+}
+
+/** Extension allowlist entries: non-empty, leading dot, lowercase. */
+function collectDocumentExtensions(value: unknown, label: string, errors: string[]): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    errors.push(`${label} must be an array of non-empty strings`);
+    return undefined;
+  }
+  const out: string[] = [];
+  for (const item of value as string[]) {
+    const normalized = item.trim().toLowerCase();
+    if (!normalized.startsWith(".")) {
+      errors.push(`${label} entries must start with a dot (e.g. '.svg')`);
+      return undefined;
+    }
+    out.push(normalized);
+  }
+  return out.length ? out : undefined;
 }
 
 function settingsPrefix(id: string): string {
@@ -282,6 +335,66 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
             settingsSections.push(entry ? { id: sectionId, title, entry } : { id: sectionId, title });
           }
           if (settingsSections.length) summary.settingsSections = settingsSections;
+        }
+      }
+      if (appUi.documentRenderers !== undefined) {
+        if (!Array.isArray(appUi.documentRenderers)) {
+          errors.push("app.ui.documentRenderers must be an array");
+        } else {
+          const documentRenderers: ExtensionUiDocumentRenderer[] = [];
+          const seenRendererIds = new Set<string>();
+          for (const [index, renderer] of appUi.documentRenderers.entries()) {
+            if (!isRecord(renderer)) {
+              errors.push(`app.ui.documentRenderers[${index}] must be an object`);
+              continue;
+            }
+            const rendererId = asNonEmptyString(renderer.id);
+            const entry = asNonEmptyString(renderer.entry);
+            if (!rendererId) errors.push(`app.ui.documentRenderers[${index}] missing id`);
+            if (!entry) errors.push(`app.ui.documentRenderers[${index}] missing entry`);
+            const kinds = collectNonEmptyStrings(
+              renderer.kinds,
+              `app.ui.documentRenderers[${index}].kinds`,
+              errors,
+            );
+            const extensions = collectDocumentExtensions(
+              renderer.extensions,
+              `app.ui.documentRenderers[${index}].extensions`,
+              errors,
+            );
+            const mimeTypes = collectNonEmptyStrings(
+              renderer.mimeTypes,
+              `app.ui.documentRenderers[${index}].mimeTypes`,
+              errors,
+              (item) => item.trim().toLowerCase(),
+            );
+            let priority: number | undefined;
+            if (renderer.priority !== undefined) {
+              if (typeof renderer.priority !== "number" || !Number.isFinite(renderer.priority)) {
+                errors.push(`app.ui.documentRenderers[${index}].priority must be a finite number`);
+              } else {
+                priority = renderer.priority;
+              }
+            }
+            if (rendererId && seenRendererIds.has(rendererId)) {
+              errors.push(`duplicate document renderer id '${rendererId}'`);
+            }
+            if (!kinds?.length && !extensions?.length && !mimeTypes?.length) {
+              errors.push(
+                `app.ui.documentRenderers[${index}] must declare at least one of kinds, extensions, mimeTypes`,
+              );
+            }
+            if (rendererId) seenRendererIds.add(rendererId);
+            if (rendererId && entry && (kinds?.length || extensions?.length || mimeTypes?.length)) {
+              const item: ExtensionUiDocumentRenderer = { id: rendererId, entry };
+              if (kinds?.length) item.kinds = kinds;
+              if (extensions?.length) item.extensions = extensions;
+              if (mimeTypes?.length) item.mimeTypes = mimeTypes;
+              if (priority !== undefined) item.priority = priority;
+              documentRenderers.push(item);
+            }
+          }
+          if (documentRenderers.length) summary.documentRenderers = documentRenderers;
         }
       }
       if (appUi.slashCommands !== undefined) {
