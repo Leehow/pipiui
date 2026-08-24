@@ -6,6 +6,8 @@ import {
 	IDLE_FOLD_ENGINE_KEY,
 	IDLE_FOLD_FALLBACK_MS_DEFAULT,
 	IDLE_FOLD_LOW_WATERMARK_DEFAULT,
+	IDLE_FOLD_LOW_WATERMARK_FLOOR,
+	IDLE_FOLD_TTL_FLOOR_MS,
 	IDLE_FOLD_TTL_MS_DEFAULT,
 	contextAboveIdleFoldWatermark,
 	createIdleFoldRegistry,
@@ -97,16 +99,34 @@ test("idle fold knobs default to 4 minutes and the 45% conservative watermark", 
 	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_FALLBACK: "0" }).fallback, false);
 	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_FALLBACK_MS: "15000" }).fallbackMs, 15_000);
 	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_ENABLED: "0" }).enabled, false);
-	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "120000" }).ttlMs, 120_000);
-	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "0.3" }).lowWatermark, 0.3);
 	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "-1" }).ttlMs, IDLE_FOLD_TTL_MS_DEFAULT);
 	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "1.5" }).lowWatermark, IDLE_FOLD_LOW_WATERMARK_DEFAULT);
+});
+
+test("env knobs cannot relax the mandatory 4-minute / 45% floors", () => {
+	assert.equal(IDLE_FOLD_TTL_FLOOR_MS, 240_000);
+	assert.equal(IDLE_FOLD_LOW_WATERMARK_FLOOR, 0.45);
+	// Aggressively relaxed env values are clamped back up to the floors.
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "1" }).ttlMs, 240_000);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "0.01" }).lowWatermark, 0.45);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "120000" }).ttlMs, 240_000);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "0.3" }).lowWatermark, 0.45);
+	// Invalid values fall back to the defaults, which equal the floors.
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "-1" }).ttlMs, 240_000);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "1.5" }).lowWatermark, 0.45);
+	// More conservative (longer / higher) env values are preserved.
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "600000" }).ttlMs, 600_000);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_TTL_MS: "3600000" }).ttlMs, 3_600_000);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "0.6" }).lowWatermark, 0.6);
+	assert.equal(idleFoldConfigFromEnv({ PIPIUI_IDLE_FOLD_LOW_WATERMARK: "1" }).lowWatermark, 1);
 });
 
 test("watermark is conservative when usage is missing or below the line", () => {
 	assert.equal(contextAboveIdleFoldWatermark(undefined), false);
 	assert.equal(contextAboveIdleFoldWatermark({ tokens: null, contextWindow: 200_000 }), false);
 	assert.equal(contextAboveIdleFoldWatermark({ tokens: 80_000, contextWindow: 200_000 }), false);
+	// 44.999% — idle satisfied elsewhere — still never trips the 45% line.
+	assert.equal(contextAboveIdleFoldWatermark({ tokens: 89_998, contextWindow: 200_000 }), false);
 	assert.equal(contextAboveIdleFoldWatermark({ tokens: 90_000, contextWindow: 200_000 }), true);
 	assert.equal(contextAboveIdleFoldWatermark({ tokens: 90_000, contextWindow: 200_000 }, 0.5), false);
 });

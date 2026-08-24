@@ -27,6 +27,8 @@
  * always return `agent.state.messages`, never the pre-compact snapshot.
  */
 
+import { noteAutoCompactionActivity } from "./follow-up-compaction.ts";
+
 const INSTALLED = Symbol.for("pipiui.midTurnCompaction.installed");
 const WRAPPED = Symbol.for("pipiui.midTurnCompaction.wrapped");
 const COMPACTING = Symbol.for("pipiui.midTurnCompaction.compacting");
@@ -275,7 +277,9 @@ export async function compactMessagesIfNeeded(
 
 /**
  * Wrap `session.agent.transformContext`: original emitContext first, then
- * `compactMessagesIfNeeded`. Idempotent (second wrap is a no-op).
+ * `compactMessagesIfNeeded`. Every provider request is session activity —
+ * it restarts the auto-compaction idle clock so a running turn can never
+ * look "continuously idle". Idempotent (second wrap is a no-op).
  */
 export function wrapAgentTransformContext<T extends MidTurnSession>(session: T): T {
 	const agent = session?.agent;
@@ -284,6 +288,7 @@ export function wrapAgentTransformContext<T extends MidTurnSession>(session: T):
 
 	const original = agent.transformContext;
 	agent.transformContext = async (messages, signal) => {
+		noteAutoCompactionActivity(session);
 		let next = asMessages(messages) ?? [];
 		if (typeof original === "function") {
 			try {

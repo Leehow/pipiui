@@ -1,36 +1,55 @@
 /**
- * Extension follow-up / heartbeat pre-prompt compaction guard (PipiUI).
+ * Auto-compaction idle policy + follow-up/heartbeat guard (PipiUI).
  *
- * BUG BEING FIXED
- * ---------------
- * Pi native `_checkCompaction` runs in two places:
- *   - before every `prompt()` (agent-session.js:865)
- *   - after `agent_end` (agent-session.js:776)
- * The pre-prompt gate uses `shouldCompact` = tokens > contextWindow - 16384.
- * Heartbeats / stall-adjacent events wake the Boss via
- * `pi.sendUserMessage(..., { deliverAs: "followUp" })`, which always starts a
- * new turn with `source: "extension"`. Sitting near the reserve line therefore
- * compactes on every wake — the "heartbeat arrives, context already compacted"
- * symptom. Mid-turn soft-threshold was not this path.
+ * POLICY (user-mandated, AND semantics)
+ * -------------------------------------
+ * A non-urgent automatic compaction may run ONLY when BOTH hold:
+ *   A) context usage >= 45% of the model window, and
+ *   B) the session has been continuously idle for >= 4 minutes.
+ * Busy periods (user/extension prompt, tool loop provider requests,
+ * subagent-driven turns) reset the idle clock, so no ordinary
+ * threshold/proactive compaction may run while the session is busy.
  *
- * THIS LAYER
- * ----------
- * Wraps `AgentSession.prototype` (same mechanism as mid-turn-compaction.ts):
- *   - `prompt` marks the turn when `options.source === "extension"` and gates
- *     `_runAutoCompaction("threshold")` for that whole turn (covers native
- *     pre-prompt *and* mid-turn's official `_runAutoCompaction` call).
- *   - `_checkCompaction(..., skipAbortedCheck=false)` is the pre-prompt call.
- *     Same policy: overflow always; threshold only at `tokens >= contextWindow`.
+ * Exemptions (always allowed, even while busy):
+ *   - `overflow`: real provider context-overflow recovery.
+ *   - Near-overflow / model-safety line: `tokens > contextWindow -
+ *     reserveTokens` (pi default 16384). This is the same line pi's own
+ *     `shouldCompact` and the mid-turn guard use; compaction there protects
+ *     the next provider request, not context hygiene.
+ *   - Manual `/compact` never routes through `_runAutoCompaction` and is not
+ *     gated anywhere in this module.
  *
- * User / RPC turns (`source` missing, `"interactive"`, or `"rpc"`) are unchanged.
- * Manual `/compact` does not go through `_runAutoCompaction`. node_modules is not
- * patched; fetch-pi-runtime cannot overwrite this wrap.
+ * GENUINELY IDLE normal compaction is owned by the idle-fold timer (boss
+ * waves, 45% watermark + 4-minute TTL, activity re-arms) and by the host
+ * ProactiveCompactionScheduler (45% + 4-minute continuous quiet). This
+ * module's 45%+idle branch is defense-in-depth: any threshold call that
+ * fires BELOW the near-overflow line must satisfy it.
+ *
+ * WRAPS (same mechanism as mid-turn-compaction.ts)
+ * ------------------------------------------------
+ *   - `prompt` notes session activity (any source) and, for
+ *     `source === "extension"` turns, gates `_runAutoCompaction` for the
+ *     whole turn — covers native pre-prompt checks *and* mid-turn's official
+ *     `_runAutoCompaction` call during heartbeat-driven turns.
+ *   - `_checkCompaction` is gated on EVERY turn (pre-prompt and post-
+ *     agent_end, user/RPC/extension alike): a "threshold" decision below the
+ *     near-overflow line is vetoed unless 45% + 4-minute idle both hold.
+ *
+ * node_modules is not patched; fetch-pi-runtime cannot overwrite this wrap.
  */
 
 const INSTALLED = Symbol.for("pipiui.followUpCompaction.installed");
 const EXTENSION_TURN = Symbol.for("pipiui.followUpCompaction.extensionTurn");
+const LAST_ACTIVITY = Symbol.for("pipiui.autoCompaction.lastActivityMs");
 
 const LOG_PREFIX = "[pipiui-follow-up-compaction]";
+
+/** Policy A: usage fraction at or above this enables normal auto-compaction. */
+export const AUTO_COMPACTION_USAGE_FRACTION_DEFAULT = 0.45;
+/** Policy B: continuous idle required for normal auto-compaction. */
+export const AUTO_COMPACTION_IDLE_MS_DEFAULT = 4 * 60 * 1000;
+/** pi default compaction reserve; the near-overflow/model-safety line. */
+export const AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT = 16_384;
 
 export type FollowUpUsageLike = {
 	input?: number;
@@ -49,8 +68,17 @@ export type FollowUpAssistantLike = {
 	[key: string]: unknown;
 };
 
+export type FollowUpCompactionSettings = {
+	enabled?: boolean;
+	reserveTokens?: number;
+	[key: string]: unknown;
+};
+
 export type FollowUpSession = {
 	model?: { contextWindow?: number } | null;
+	settingsManager?: {
+		getCompactionSettings?: () => FollowUpCompactionSettings | undefined;
+	};
 	agent?: { state?: { messages?: FollowUpAssistantLike[] } };
 	_runAutoCompaction?: (reason: string, willRetry: boolean) => Promise<unknown>;
 	_checkCompaction?: (
@@ -59,6 +87,7 @@ export type FollowUpSession = {
 	) => Promise<unknown>;
 	prompt?: (text: string, options?: { source?: string }) => unknown;
 	[EXTENSION_TURN]?: boolean;
+	[LAST_ACTIVITY]?: number;
 	[key: symbol]: unknown;
 };
 
@@ -89,17 +118,80 @@ export function isHardContextOverflow(tokens: number, contextWindow: number): bo
 }
 
 /**
- * Policy for an extension-injected pre-prompt check.
- * Overflow recovery always allowed. Threshold only at the hard window.
+ * Near-overflow / model-safety line: pi's own `shouldCompact` reserve
+ * (`tokens > contextWindow - reserveTokens`). Compaction at or beyond this
+ * line protects the next provider request and stays allowed while busy.
  */
-export function shouldAllowExtensionPrePromptCompaction(args: {
+export function isNearContextOverflow(
+	tokens: number,
+	contextWindow: number,
+	reserveTokens: number = AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT,
+): boolean {
+	if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return false;
+	if (
+		typeof contextWindow !== "number" ||
+		!Number.isFinite(contextWindow) ||
+		contextWindow <= 0
+	) {
+		return false;
+	}
+	if (!Number.isFinite(reserveTokens) || reserveTokens < 0) return false;
+	return tokens > contextWindow - reserveTokens;
+}
+
+/**
+ * The unified auto-compaction gate.
+ *
+ * - `overflow` (real provider context-overflow recovery): always allowed.
+ * - `threshold`: allowed when near-overflow (model safety, busy included), or
+ *   when usage >= 45% AND `idleMs` >= 4 minutes of continuous idleness.
+ * - Any other reason (manual never routes here; unknown future reasons stay
+ *   permissive): allowed.
+ */
+export function shouldAllowAutoCompaction(args: {
 	reason: string;
 	tokens: number;
 	contextWindow: number;
+	idleMs?: number;
+	reserveTokens?: number;
+	usageFraction?: number;
+	idleThresholdMs?: number;
 }): boolean {
 	if (args.reason === "overflow") return true;
 	if (args.reason !== "threshold") return true;
-	return isHardContextOverflow(args.tokens, args.contextWindow);
+	if (isNearContextOverflow(args.tokens, args.contextWindow, args.reserveTokens)) return true;
+	const fraction = args.usageFraction ?? AUTO_COMPACTION_USAGE_FRACTION_DEFAULT;
+	const idleThresholdMs = args.idleThresholdMs ?? AUTO_COMPACTION_IDLE_MS_DEFAULT;
+	if (typeof args.contextWindow !== "number" || !Number.isFinite(args.contextWindow) || args.contextWindow <= 0) {
+		return false;
+	}
+	if (!Number.isFinite(fraction) || fraction <= 0) return false;
+	if (typeof args.idleMs !== "number" || !Number.isFinite(args.idleMs)) return false;
+	if (args.tokens / args.contextWindow < fraction) return false;
+	if (args.idleMs < idleThresholdMs) return false;
+	return true;
+}
+
+/** Note session activity (a prompt or a provider request) on the idle clock. */
+export function noteAutoCompactionActivity(session: FollowUpSession, atMs: number = Date.now()): void {
+	session[LAST_ACTIVITY] = atMs;
+}
+
+/** Continuous-idle milliseconds since the last noted activity, else undefined. */
+export function autoCompactionIdleMs(session: FollowUpSession, now: number = Date.now()): number | undefined {
+	const last = session[LAST_ACTIVITY];
+	if (typeof last !== "number" || !Number.isFinite(last)) return undefined;
+	return Math.max(0, now - last);
+}
+
+function compactionReserveTokens(session: FollowUpSession): number {
+	try {
+		const reserve = session.settingsManager?.getCompactionSettings?.()?.reserveTokens;
+		if (typeof reserve === "number" && Number.isFinite(reserve) && reserve >= 0) return reserve;
+	} catch {
+		// fall through to the default
+	}
+	return AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT;
 }
 
 function lastValidContextTokens(
@@ -140,13 +232,22 @@ function restoreAfter(result: unknown, restore: () => void): unknown {
 	return result;
 }
 
+/** Gate `_runAutoCompaction` with the unified policy for the whole turn. */
 function gateThresholdAutoCompaction(session: FollowUpSession): () => void {
 	const origRun = session._runAutoCompaction;
 	if (typeof origRun !== "function") return () => {};
 	session._runAutoCompaction = async (reason: string, willRetry: boolean) => {
 		const contextWindow = session.model?.contextWindow ?? 0;
 		const tokens = lastValidContextTokens(session, undefined);
-		if (!shouldAllowExtensionPrePromptCompaction({ reason, tokens, contextWindow })) {
+		if (
+			!shouldAllowAutoCompaction({
+				reason,
+				tokens,
+				contextWindow,
+				idleMs: autoCompactionIdleMs(session),
+				reserveTokens: compactionReserveTokens(session),
+			})
+		) {
 			return false;
 		}
 		return origRun.call(session, reason, willRetry);
@@ -167,6 +268,9 @@ export function installFollowUpCompactionGuard(sessionClass?: FollowUpSessionCto
 
 	const wrappedPrompt = wrapPrototypeMethod(record, "prompt", (original) => {
 		return function wrappedPrompt(this: FollowUpSession, ...args: unknown[]) {
+			// Any prompt — user, RPC, or extension-injected — is session
+			// activity and restarts the 4-minute idle window.
+			noteAutoCompactionActivity(this);
 			const options = args[1] as { source?: string } | undefined;
 			const prev = this[EXTENSION_TURN];
 			const restoreFns: Array<() => void> = [
@@ -192,22 +296,24 @@ export function installFollowUpCompactionGuard(sessionClass?: FollowUpSessionCto
 
 	const wrappedCheck = wrapPrototypeMethod(record, "_checkCompaction", (original) => {
 		return function wrappedCheckCompaction(this: FollowUpSession, ...args: unknown[]) {
-			const assistantMessage = args[0] as FollowUpAssistantLike | undefined;
-			const skipAbortedCheck = args[1] !== false;
-			const suppressSoft = this[EXTENSION_TURN] === true && skipAbortedCheck === false;
-			if (!suppressSoft) return original.apply(this, args);
-
+			// Gate every `_checkCompaction` call — pre-prompt and
+			// post-agent_end, on user/RPC turns as well as extension turns.
+			// A threshold decision is vetoed unless it is near-overflow or the
+			// 45% + 4-minute-idle policy holds; overflow always passes.
 			const origRun = this._runAutoCompaction;
 			if (typeof origRun !== "function") return original.apply(this, args);
 
+			const assistantMessage = args[0] as FollowUpAssistantLike | undefined;
 			const contextWindow = this.model?.contextWindow ?? 0;
 			const tokens = lastValidContextTokens(this, assistantMessage);
 			this._runAutoCompaction = async (reason: string, willRetry: boolean) => {
 				if (
-					!shouldAllowExtensionPrePromptCompaction({
+					!shouldAllowAutoCompaction({
 						reason,
 						tokens,
 						contextWindow,
+						idleMs: autoCompactionIdleMs(this),
+						reserveTokens: compactionReserveTokens(this),
 					})
 				) {
 					return false;
