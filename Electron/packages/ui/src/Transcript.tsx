@@ -196,7 +196,7 @@ export function Transcript({ messages, transcriptRef, waiting, active = true, do
     if (!touch || !start) return
     const deltaX = touch.clientX - start.x
     const deltaY = touch.clientY - start.y
-    if (deltaY >= 14 && deltaY > Math.abs(deltaX)) cancelFollow()
+    if (deltaY >= 5 && deltaY > Math.abs(deltaX)) cancelFollow()
   }
   return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef} onWheelCapture={handleWheel} onTouchStartCapture={handleTouchStart} onTouchMoveCapture={handleTouchMove}>
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />

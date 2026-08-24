@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { planProgress, planIsLive, sortPlans, type PlanEvent, type PlanSnapshot, type PlanTask, type PlanTaskState, type PipiHostAPI } from '@pipi/host-api'
 import './plan-panel.css'
@@ -48,8 +48,36 @@ function ProgressBar({ plan }: { plan: PlanSnapshot }) {
 
 export function PlanCard({ plan, defaultOpen }: { plan: PlanSnapshot; defaultOpen: boolean }) {
   const progress = useMemo(() => planProgress(plan), [plan])
-  return <details className="plan-card" data-testid="plan-card" data-plan-id={plan.id} open={defaultOpen}>
-    <summary className="plan-card-summary">
+  // Controlled `open={defaultOpen}` with no toggle state snaps the card back
+  // closed (or open) on every click. Desktop live plans stay forced-open so
+  // the full task list is visible; on touch the native <details> toggle plus
+  // that snap-back leaves the card stuck collapsed.
+  const [open, setOpen] = useState(defaultOpen)
+  const openRef = useRef(open)
+  openRef.current = open
+  const skipNativeToggleUntilRef = useRef(0)
+  const toggleFromPointer = (event: ReactPointerEvent<HTMLElement>) => {
+    if (event.pointerType !== 'touch' && event.pointerType !== 'pen') return
+    event.preventDefault()
+    // The same tap still synthesizes a click that would flip <details> again.
+    skipNativeToggleUntilRef.current = performance.now() + 500
+    setOpen(value => !value)
+  }
+  const suppressGhostClick = (event: { preventDefault: () => void; currentTarget: HTMLDetailsElement | HTMLElement }) => {
+    if (performance.now() >= skipNativeToggleUntilRef.current) {
+      const card = event.currentTarget instanceof HTMLDetailsElement
+        ? event.currentTarget
+        : event.currentTarget.closest('details')
+      if (card) setOpen(card.open)
+      return
+    }
+    event.preventDefault()
+    const card = event.currentTarget.closest('details')
+    if (card) card.open = openRef.current
+    setOpen(openRef.current)
+  }
+  return <details className="plan-card" data-testid="plan-card" data-plan-id={plan.id} open={open} onToggle={suppressGhostClick}>
+    <summary className="plan-card-summary" aria-expanded={open} onPointerDown={toggleFromPointer} onClick={suppressGhostClick}>
       <div className="plan-card-heading">
         <b className="plan-card-title">{plan.title}</b>
         <span className={`plan-lifecycle plan-lifecycle-${plan.lifecycle}`}>{LIFECYCLE_TEXT[plan.lifecycle]}</span>

@@ -269,6 +269,12 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       aria-current={selected ? 'true' : undefined}
       aria-label={rowLabel}
       title={rowLabel}
+      onPointerDown={event => {
+        if ((event.pointerType !== 'touch' && event.pointerType !== 'pen') || renaming) return
+        if ((event.target as HTMLElement | null)?.closest('button')) return
+        event.preventDefault()
+        onSelect(session.id)
+      }}
       onClick={() => { if (!renaming) onSelect(session.id) }}
       onKeyDown={event => { if (!renaming && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(session.id) } }}
       onDragStart={event => { if (!external) onDragStart?.(event, session) }}

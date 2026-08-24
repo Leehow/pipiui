@@ -261,9 +261,9 @@ describe('Transcript prepend and follow', () => {
     expect(virtuosoInstances[0]!.followOutput?.(true)).toBe('auto')
 
     fireEvent.touchStart(area, { touches: [{ clientX: 100, clientY: 100 }] })
-    fireEvent.touchMove(area, { touches: [{ clientX: 102, clientY: 108 }] })
+    fireEvent.touchMove(area, { touches: [{ clientX: 102, clientY: 104 }] })
     expect(virtuosoInstances[0]!.followOutput?.(true)).toBe('auto')
-    fireEvent.touchMove(area, { touches: [{ clientX: 103, clientY: 115 }] })
+    fireEvent.touchMove(area, { touches: [{ clientX: 103, clientY: 106 }] })
     expect(virtuosoInstances[0]!.followOutput?.(true)).toBe(false)
   })
 

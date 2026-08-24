@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI, PlanEvent, PlanSnapshot } from '@pipi/host-api'
 import { PlanPanel } from './PlanPanel'
@@ -203,5 +203,36 @@ describe('PlanPanel', () => {
 
     expect(await screen.findByText('第二个会话的计划')).toBeTruthy()
     expect(screen.queryByText('接上 plan 前端')).toBeNull()
+  })
+
+  it('lets a settled plan expand on click instead of snapping back closed', async () => {
+    const settled = plan({
+      id: 'plan-done',
+      title: '已完成的计划',
+      tasks: [{ id: 'a', title: '收尾', state: 'completed' }],
+    })
+    const { host } = hostWith([settled])
+    render(<PlanPanel host={host} sessionId="s1" />)
+    const card = await screen.findByTestId('plan-card')
+    expect(card.hasAttribute('open')).toBe(false)
+    fireEvent.click(card.querySelector('summary')!)
+    expect(card.hasAttribute('open')).toBe(true)
+    expect(card.textContent).toContain('收尾')
+  })
+
+  it('expands a settled plan from a touch pointerdown', async () => {
+    const settled = plan({
+      id: 'plan-done',
+      title: '已完成的计划',
+      tasks: [{ id: 'a', title: '收尾', state: 'completed' }],
+    })
+    const { host } = hostWith([settled])
+    render(<PlanPanel host={host} sessionId="s1" />)
+    const card = await screen.findByTestId('plan-card')
+    fireEvent.pointerDown(card.querySelector('summary')!, { pointerType: 'touch' })
+    expect(card.hasAttribute('open')).toBe(true)
+    fireEvent.click(card.querySelector('summary')!)
+    expect(card.hasAttribute('open')).toBe(true)
+    expect(screen.getByTestId('plan-task').textContent).toContain('收尾')
   })
 })

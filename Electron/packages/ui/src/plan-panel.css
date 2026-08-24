@@ -1,4 +1,4 @@
-.plan-content{display:flex;padding:0;place-items:stretch}
+.plan-content{display:flex;flex-direction:column;padding:0;place-items:stretch;min-width:0;min-height:0;height:100%}
 .plan-panel{display:flex;width:100%;height:100%;min-width:0;min-height:0;flex-direction:column;overflow:hidden;background:var(--surface)}
 .plan-scroll{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px;overscroll-behavior:contain}
 .plan-scroll>.empty-panel{align-self:center;margin:auto 0}
@@ -7,8 +7,8 @@
 .plan-error{padding:10px 12px;border:1px solid var(--danger);border-radius:8px;color:var(--danger);background:color-mix(in srgb,var(--danger) 10%,transparent);font-size:12px}
 .plan-section-title{padding:6px 2px 0;color:var(--muted);font-size:11px;font-weight:650;letter-spacing:.06em}
 
-.plan-card{flex:none;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised);overflow:hidden}
-.plan-card-summary{display:grid;gap:6px;padding:10px 12px;cursor:pointer;list-style:none}
+.plan-card{flex:none;border:1px solid var(--border-strong);border-radius:9px;background:var(--surface-raised)}
+.plan-card-summary{display:grid;gap:6px;padding:10px 12px;cursor:pointer;list-style:none;touch-action:manipulation}
 .plan-card-summary::-webkit-details-marker{display:none}
 .plan-card-heading{display:flex;min-width:0;align-items:center;gap:6px}
 .plan-card-title{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:13px}
@@ -50,3 +50,16 @@
 .plan-task-in_progress .plan-task-state{color:var(--accent)}
 .plan-task-failed .plan-task-state{color:var(--danger)}
 .plan-task-blocked .plan-task-state{color:var(--warning)}
+
+/* Narrow overlay: the right pane is position:fixed with height:auto. Percentage
+   heights on .plan-panel then collapse and clip the task list. Pin the page to
+   the pane below the 50px header so .plan-scroll can actually overflow. */
+@media (max-width:720px){
+  .plan-content{position:absolute;inset:0;top:50px;height:auto;max-height:none;display:flex;flex-direction:column;min-height:0}
+  .plan-panel{flex:1 1 auto;height:auto;max-height:100%;min-height:0}
+  .plan-scroll{flex:1 1 auto;min-height:0;-webkit-overflow-scrolling:touch}
+  .plan-card-summary{min-height:44px;padding:12px}
+  .plan-task{padding:10px 12px}
+  .plan-task-title{font-size:14px}
+  .plan-task-state{font-size:11px}
+}
