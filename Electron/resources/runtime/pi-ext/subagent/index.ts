@@ -35,6 +35,7 @@ import {
 	CONFIG_DIR_NAME,
 	createAgentSession,
 	DefaultResourceLoader,
+	ExtensionRunner,
 	type ExtensionAPI,
 	getAgentDir,
 	getMarkdownTheme,
@@ -74,13 +75,13 @@ import {
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
 import { registerMidTurnCompactionGuard } from "./mid-turn-compaction.ts";
 import { registerFollowUpCompactionGuard } from "./follow-up-compaction.ts";
+import { registerFatalHookPropagation } from "./fatal-hook.ts";
 import {
 	formatFindingsIndexBlock,
 	listFindings,
 	writeFindingsArtifact,
 } from "./findings-artifact.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
-import { registerQoderContextWindowCompat } from "./qoder-context-window.ts";
 import {
 	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
 	createComputerTaskContinuationWatchdog,
@@ -96,6 +97,11 @@ import {
 	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
 	isDelegationTool,
+	hideGenericWebSearchForModelRef,
+	diagnoseWorkerReadToolOmissions,
+	formatWorkerReadToolOmissions,
+	resolveWorkerSkillLoaderPath,
+	workerSkillLoaderMountArgs,
 } from "./desktop-tool-policy.mjs";
 import {
 	deliveryRetryDue,
@@ -735,9 +741,10 @@ const PIPIUI_OFFICE_DOC_SHOT_GATE_EXT = process.env.PIPIUI_OFFICE_DOC_SHOT_GATE_
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
 const PIPIUI_ARXIV_EXT = process.env.PIPIUI_ARXIV_EXT;
-// Every dispatched subagent runs with the external skill library switched off: a worker
-// follows its own agent prompt plus the brief, never a skill SOP it discovered on its own.
+// Automatic skill catalog/bootstrap stays off. An explicit skillloader mount may still
+// register skill_search/skill_load; loading is never a mandatory gate.
 const PIPIUI_SUBAGENT_SKILL_ISOLATION = process.env.PIPIUI_SUBAGENT_SKILL_ISOLATION === "1";
+const PIPIUI_SKILLLOADER_EXT = process.env.PIPIUI_SKILLLOADER_EXT;
 // Read-only planners additionally cannot pull SKILL.md through the read tool.
 const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
 
@@ -1540,6 +1547,19 @@ function capabilityForSubagentModel(
 	return catalog[stripModelThinkingSuffix(model.trim())];
 }
 
+/** Host-written `provider/id` → effective nativeSearch map. Invalid/missing is empty. */
+function loadNativeSearchCatalog(): Record<string, { tools?: unknown }> {
+	const file = process.env.PIPIUI_SUBAGENT_NATIVE_SEARCH_FILE;
+	if (!file) return {};
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		return parsed as Record<string, { tools?: unknown }>;
+	} catch {
+		return {};
+	}
+}
+
 /** A fallback may inherit tool thinking only with explicit catalog proof. */
 function modelExplicitlyAllowsThinking(model: string, thinking: string): boolean {
 	const capability = capabilityForSubagentModel(model);
@@ -2272,8 +2292,9 @@ interface RunningAgentHandle {
 const runningAgents = new Map<string, RunningAgentHandle>();
 
 /**
- * Dispatch-idle fold timer. Independent one-shot setTimeout (default 5 min), not the
- * 30s stall watchdog. Shared per Boss session so a wave folds once; completion cancels.
+ * Dispatch-idle fold timer. Independent one-shot setTimeout (default 4 min of
+ * continuous inactivity), not the 30s stall watchdog. Shared per Boss session so
+ * a wave folds once; any worker activity re-arms; completion cancels.
  */
 const IDLE_FOLD_REGISTRY_KEY = "__pipiuiIdleFoldRegistry";
 const idleFoldConfig = idleFoldConfigFromEnv();
@@ -2326,6 +2347,11 @@ function armIdleFoldForDispatch(agentId: string): void {
 	idleFoldRegistry?.arm(idleFoldSessionKey(), agentId);
 }
 
+function noteIdleFoldActivity(agentId: string): void {
+	if (PIPIUI_DEPTH !== 0 || !agentId) return;
+	idleFoldRegistry?.noteActivity(agentId);
+}
+
 function noteIdleFoldCompleted(agentId: string | undefined): void {
 	if (!agentId) return;
 	idleFoldRegistry?.noteCompleted(agentId);
@@ -2356,6 +2382,7 @@ function noteAgentActivity(agentId: string, runId?: string): void {
 	handle.toolWaitNames = undefined;
 	handle.cpuSample = undefined;
 	handle.cpuSamplePrevious = undefined;
+	noteIdleFoldActivity(agentId);
 }
 
 /** The worker asked for tools; the silence until the results arrive is expected. */
@@ -5258,7 +5285,7 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 const SUBAGENT_SKILL_ISOLATION = `[DISPATCHED SUBAGENT ISOLATION — HIGHEST PRIORITY]
-This session is a dispatched subagent. External skill libraries are switched off here: you MUST NOT load, read, or follow using-superpowers, brainstorming, writing-plans, subagent-driven-development, or any other SKILL.md, and no skill may add gates, approvals, or extra process on top of your brief. You MUST NOT write a spec or plan document unless your brief names its exact path. Follow only this agent's own system prompt and the brief.`;
+This session is a dispatched subagent. Automatic skill bootstrap and the ambient skill catalog are switched off here: you MUST NOT follow using-superpowers, brainstorming, writing-plans, subagent-driven-development, or any other implicit SKILL.md, and no skill may add gates, approvals, or extra process on top of your brief. You MUST NOT write a spec or plan document unless your brief names its exact path. Follow only this agent's own system prompt and the brief. When skill_search and skill_load are available, you may use them by name if the current task matches; loading is never a mandatory gate.`;
 
 const PLAN_SUBAGENT_ARTIFACT_BAN = `You are read-only: you MUST NOT create or save plan artifacts. Your deliverable is the plan text in your final message.`;
 
@@ -5701,8 +5728,9 @@ async function runSingleAgent(
 	} else {
 		args.push("--no-session");
 	}
-	// Skill libraries are off for every dispatched role, not just plan: a worker that
+	// Automatic skill catalog stays off for every dispatched role: a worker that
 	// discovers a process skill on its own turns a scoped brief into someone else's SOP.
+	// Explicit `-e` skillloader below may still register skill_search/skill_load.
 	args.push("--no-skills");
 	// MAIN already uses `--no-extensions` so `settings.json` packages never load.
 	// Workers must do the same: a discovered package can call `setActiveTools()`
@@ -5711,11 +5739,39 @@ async function runSingleAgent(
 	args.push("--no-extensions");
 	// PipiUI-only tool names must be filtered before `--tools`: Pi 0.84 applies that flag to
 	// extension/custom registrations too, so an absent feature path cannot leave a dead name in
-	// a role's allowlist. `web_search` stays independent because it may be provider-native.
+	// a role's allowlist. Generic `web_search` stays independent of that set because it may be
+	// provider-native; it is hidden only when the worker model has effective native web_search.
 	const pipiuiExtensionRouting = resolvePipiUIExtensionRouting({
 		webAccessExtension: PIPIUI_WEB_ACCESS_EXT,
 		arxivExtension: PIPIUI_ARXIV_EXT,
 	});
+	const hideGenericWebSearch = hideGenericWebSearchForModelRef(
+		resolvedModel ? stripModelThinkingSuffix(resolvedModel) : undefined,
+		loadNativeSearchCatalog(),
+	);
+	const workerSkillLoaderPath = options?.computerWorker
+		? undefined
+		: resolveWorkerSkillLoaderPath({
+			env: { PIPIUI_SKILLLOADER_EXT },
+			bundledPath: fileURLToPath(new URL("../../extensions/pipiui-skillloader.ts", import.meta.url)),
+			existsSync: (candidate) => fs.existsSync(candidate),
+		});
+	const memoryOmissionReason = terminalMemoryBrokerEnvironment
+		? undefined
+		: !memoryBrokerRole
+			? "disabled-by-role"
+			: !mainMemoryBrokerIssuer()
+				? "no-host-broker"
+				: !issuedMemoryBrokerEnvironment
+					? "capability-not-issued"
+					: "package-not-verified";
+	const workerReadToolOmissions = diagnoseWorkerReadToolOmissions({
+		hasMemoryBrokerCapability: !!terminalMemoryBrokerEnvironment,
+		hasSessionRecall: Boolean(PIPIUI_SUBAGENT_EXT),
+		hasSkillLoader: Boolean(workerSkillLoaderPath),
+		memoryOmissionReason,
+	});
+	const workerReadToolOmissionText = formatWorkerReadToolOmissions(workerReadToolOmissions);
 	const normalToolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
@@ -5730,8 +5786,10 @@ async function runSingleAgent(
 		// (`-e PIPIUI_SUBAGENT_EXT`); without recall a compacted worker cannot
 		// find its own task back from the raw JSONL.
 		hasSessionRecall: Boolean(PIPIUI_SUBAGENT_EXT),
+		hasSkillLoader: Boolean(workerSkillLoaderPath),
 		allowRecursiveDelegation,
 		availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,
+		hideGenericWebSearch,
 	});
 	const toolSelection = options?.computerWorker
 		? { flag: "--tools" as const, names: [...options.computerWorker.toolNames] }
@@ -5739,6 +5797,11 @@ async function runSingleAgent(
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
 	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
+	for (const part of workerSkillLoaderMountArgs(workerSkillLoaderPath, {
+		computerWorker: Boolean(options?.computerWorker),
+	})) {
+		args.push(part);
+	}
 	// Not for computer workers: their Leader owns their process discipline, and the layers
 	// here are written about code work.
 	if (PIPIUI_PHILOSOPHY_EXT && !options?.computerWorker) args.push("-e", PIPIUI_PHILOSOPHY_EXT);
@@ -6042,10 +6105,13 @@ async function runSingleAgent(
 					// Without it every dispatched agent looks alike and only role-wide layers land.
 					PIPI_PHILOSOPHY_AGENT: agentName,
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
-					// Every dispatched child runs isolated from external skill libraries; an agent
-					// that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
+					// Automatic skill catalog stays off; explicit skill_search/skill_load may still mount.
+					// An agent that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.
 					PIPIUI_SUBAGENT_SKILL_ISOLATION: "1",
 					PIPIUI_SKILL_READ_BLOCK: agent.traits.blockSkillReads ? "1" : undefined,
+					...(workerReadToolOmissionText
+						? { PIPIUI_WORKER_READ_TOOLS_OMISSION: workerReadToolOmissionText }
+						: {}),
 					...(runtimePolicy.worktree === "main-session"
 						? { PIPIUI_WORKTREE: "0", PIPIUI_AGENT_NO_DELEGATION: "1" }
 						: {}),
@@ -7305,6 +7371,12 @@ const ParallelSubagentParams = Type.Object({
 const SecretaryCommitParams = Type.Object({
 	closeout: StringEnum(["pass", "needs-action", "blocked"] as const),
 	integrationVerify: StringEnum(["pass", "fail", "none"] as const),
+	verificationUnavailable: Type.Optional(
+		Type.String({
+			description:
+				"Required only when integrationVerify is none: one line stating why this task has no executable verification (for example a docs-only or prompt-layer change). Omit it when verification ran.",
+		}),
+	),
 	commitMessage: Type.String({
 		description: "Safe, non-empty one-line Git commit message (maximum 200 characters).",
 	}),
@@ -7483,7 +7555,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
-		description: "Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
+		description: "Drive external macOS apps and OS-level UI (native dialogs, window management, apps other than the in-app browser). For the built-in browser panel, use the browser tool instead. Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
 		parameters: computerTaskParameters,
 		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
 		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -7556,6 +7628,14 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	});
 }
 
+/**
+ * The Boss's ledger write, restored as a tool that can reach nothing else.
+ *
+ * Depth 0 only: a worker has no ledger and no business writing one. See boss-note.ts for why
+ * this exists at all — with the main session read-only, `write` and `edit` are gone, and this
+ * is the one write the orchestration layer has always called a management action rather than
+ * working the floor.
+ */
 function registerLedgerNoteTool(pi: ExtensionAPI): void {
 	if (PIPIUI_DEPTH !== 0 || !PIPIUI_MAIN_CWD) return;
 	pi.registerTool(bossLedgerNoteTool({ mainCwd: PIPIUI_MAIN_CWD, sessionKey: PIPIUI_SESSION }) as never);
@@ -7621,10 +7701,7 @@ export default function (pi: ExtensionAPI) {
 	registerMainSessionCompactionHook(pi);
 	registerMidTurnCompactionGuard(AgentSession);
 	registerFollowUpCompactionGuard(AgentSession);
-	// Qoder CN / Qwen 3.8-Max-Preview contextWindow 修复：按 API default tier
-	// 归一化 model.contextWindow（真实影响 pi shouldCompact/session stats），
-	// 并用 vendored stream 保持请求 model_config 的 API 默认档。
-	registerQoderContextWindowCompat(pi);
+	registerFatalHookPropagation(ExtensionRunner);
 	pi.on("session_start", (_event, ctx) => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
@@ -7835,7 +7912,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Secretary Commit",
 		description: [
 			"Runtime-owned final commit gate for the closeout secretary.",
-			"Requires closeout=pass, integrationVerify=pass, a final structured disposition set, an empty pre-existing index, and an exact accepted-path manifest.",
+			"Requires closeout=pass, a final structured disposition set, an empty pre-existing index, and an exact accepted-path manifest.",
+			"Verification must be integrationVerify=pass, or integrationVerify=none plus verificationUnavailable stating why this task has no executable verification; integrationVerify=fail is never committed.",
 			"Stages and commits only that manifest; raw git add/commit remains forbidden in bash.",
 			"Returns commit=created:<sha>, already-clean:<sha>, or blocked:<reason>, plus committed and remaining dirty paths.",
 		].join(" "),

@@ -163,6 +163,9 @@ export const READONLY_RETRIEVAL_TOOL_NAMES = [
 	"repo_map",
 	"read_spans",
 	"memory_query",
+	"memory_status",
+	"skill_search",
+	"skill_load",
 ] as const;
 const READONLY_RETRIEVAL_TOOL_SET = new Set<string>(READONLY_RETRIEVAL_TOOL_NAMES);
 const MCP_TOOL_NAME = /^mcp_[A-Za-z0-9_-]+_[A-Za-z0-9_.-]+$/;

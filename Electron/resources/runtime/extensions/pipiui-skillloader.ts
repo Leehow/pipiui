@@ -35,29 +35,56 @@ const PIPIUI_BUILT_IN_SKILL_ROOT = process.env.PIPIUI_BUILT_IN_SKILL_ROOT;
  * The user's explicit PIPIUI_SKILL_ROOTS override and this project's `.pi/agent`
  * skills/settings remain discoverable afterwards. Never `~/.pi`. First root wins.
  */
-function projectAgentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR || path.join(process.cwd(), ".pi", "agent");
+function isGlobalPiHomeRoot(root: string): boolean {
+  const resolved = path.resolve(homePath(root));
+  const globalPi = path.resolve(os.homedir(), ".pi");
+  return resolved === globalPi || resolved.startsWith(`${globalPi}${path.sep}`);
+}
+
+function projectAgentDir(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const configured = env.PI_CODING_AGENT_DIR?.trim();
+  const candidate = configured || path.join(process.cwd(), ".pi", "agent");
+  return isGlobalPiHomeRoot(candidate) ? undefined : candidate;
+}
+
+/** Bundled + explicit configured + current project `PI_CODING_AGENT_DIR/skills`. Never `~/.pi`. */
+export function resolveSkillRoots(env: NodeJS.ProcessEnv = process.env): string[] {
+  const builtIn = env.PIPIUI_BUILT_IN_SKILL_ROOT?.trim() || PIPIUI_BUILT_IN_SKILL_ROOT;
+  const roots: string[] = builtIn && !isGlobalPiHomeRoot(builtIn) ? [builtIn] : [];
+  const override = env.PIPIUI_SKILL_ROOTS;
+  if (override) {
+    for (const entry of override.split(path.delimiter).filter(Boolean).map(homePath)) {
+      if (entry && !isGlobalPiHomeRoot(entry)) roots.push(entry);
+    }
+  }
+  const agentDir = projectAgentDir(env);
+  if (agentDir) {
+    roots.push(path.join(agentDir, "skills"));
+    try {
+      const settings = JSON.parse(
+        fs.readFileSync(path.join(agentDir, "settings.json"), "utf-8"),
+      ) as { skills?: unknown };
+      if (Array.isArray(settings.skills)) {
+        for (const entry of settings.skills) {
+          if (typeof entry === "string" && entry.trim()) {
+            const resolved = homePath(entry.trim());
+            if (resolved && !isGlobalPiHomeRoot(resolved)) roots.push(resolved);
+          }
+        }
+      }
+    } catch {
+      // No project settings file / unreadable: bundled and override roots still apply.
+    }
+  }
+  return roots.filter((root, index) => root && roots.indexOf(root) === index);
 }
 
 function skillRoots(): string[] {
-  const roots: string[] = PIPIUI_BUILT_IN_SKILL_ROOT ? [PIPIUI_BUILT_IN_SKILL_ROOT] : [];
-  const override = process.env.PIPIUI_SKILL_ROOTS;
-  if (override) roots.push(...override.split(path.delimiter).filter(Boolean).map(homePath));
-  const agentDir = projectAgentDir();
-  roots.push(path.join(agentDir, "skills"));
-  try {
-    const settings = JSON.parse(
-      fs.readFileSync(path.join(agentDir, "settings.json"), "utf-8"),
-    ) as { skills?: unknown };
-    if (Array.isArray(settings.skills)) {
-      for (const entry of settings.skills) {
-        if (typeof entry === "string" && entry.trim()) roots.push(homePath(entry.trim()));
-      }
-    }
-  } catch {
-    // No project settings file / unreadable: bundled and override roots still apply.
-  }
-  return roots.filter((root, index) => root && roots.indexOf(root) === index);
+  return resolveSkillRoots();
+}
+
+export function shouldInjectSkillCatalog(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PIPIUI_SUBAGENT_SKILL_ISOLATION !== "1";
 }
 
 /** Pi's rule: a directory holding SKILL.md is a skill root and is not recursed into. */
@@ -200,7 +227,6 @@ function scoreEntry(entry: SkillEntry, terms: string[]): number {
 
 export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event) => {
-    const entries = loadCatalog();
     let systemPrompt = event.systemPrompt.replace(AVAILABLE_SKILLS_BLOCK, "");
     const preambleAt = systemPrompt.indexOf(PI_SKILLS_PREAMBLE_HEAD);
     if (preambleAt >= 0) {
@@ -210,7 +236,8 @@ export default function (pi: ExtensionAPI) {
       systemPrompt =
         systemPrompt.slice(0, preambleAt) + (after >= 0 ? systemPrompt.slice(after + 2) : "");
     }
-    const rebuilt = `${systemPrompt.trimEnd()}${indexBlock(entries)}`;
+    const catalog = shouldInjectSkillCatalog() ? indexBlock(loadCatalog()) : "";
+    const rebuilt = `${systemPrompt.trimEnd()}${catalog}`;
     if (rebuilt === event.systemPrompt) return;
     return { systemPrompt: rebuilt };
   });

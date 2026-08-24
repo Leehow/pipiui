@@ -607,6 +607,38 @@ export async function installMemoryBrokerExtension(
     });
   }
 
+  if (mode === "main" || childClient) {
+    pi.registerTool({
+      name: "memory_status",
+      label: "Memory Status",
+      description: "Report whether the optional memory backend is ready. This tool does not initialize or modify a backend.",
+      parameters: Type.Object({}),
+      async execute() {
+        if (mode === "main") {
+          if (!server) return textResult("Memory broker is not started.", { ok: false }, true);
+          const response = await server.handleMainRequest({
+            version: MEMORY_BROKER_HTTP_VERSION,
+            operation: "memory.status",
+          });
+          await publishMemoryBrokerStatus(env, response).catch(() => {});
+          if (!response.ok || !response.status) return textResult(`Memory status unavailable: ${response.error || "broker unavailable"}.`, { ok: false }, true);
+          return textResult(
+            response.status.ready ? "Memory backend is ready." : `Memory backend unavailable${response.status.detail ? `: ${response.status.detail}` : "."}`,
+            { ok: true, ...response.status },
+          );
+        }
+        const response = await childClient!.status();
+        if (!response.available || !response.value) {
+          return textResult(`Memory status unavailable: ${response.error || "broker unavailable"}.`, { ok: false }, true);
+        }
+        return textResult(
+          response.value.ready ? "Memory backend is ready." : `Memory backend unavailable${response.value.detail ? `: ${response.value.detail}` : "."}`,
+          { ok: true, ...response.value },
+        );
+      },
+    });
+  }
+
   if (mode === "main") {
     // Bare Pi and PipiUI use the same short-lived opaque descriptor. The full
     // CSRF-protected domain remains in MemoryAdminService, never in the host.
@@ -616,25 +648,6 @@ export async function installMemoryBrokerExtension(
         const descriptor = server?.issueAdminSession();
         if (!descriptor) { ctx.ui.notify("Memory Center is unavailable; retry after the memory extension is ready.", "error"); return; }
         ctx.ui.notify(JSON.stringify(descriptor), "info");
-      },
-    });
-    pi.registerTool({
-      name: "memory_status",
-      label: "Memory Status",
-      description: "Report whether the optional memory backend is ready. This tool does not initialize or modify a backend.",
-      parameters: Type.Object({}),
-      async execute() {
-        if (!server) return textResult("Memory broker is not started.", { ok: false }, true);
-        const response = await server.handleMainRequest({
-          version: MEMORY_BROKER_HTTP_VERSION,
-          operation: "memory.status",
-        });
-        await publishMemoryBrokerStatus(env, response).catch(() => {});
-        if (!response.ok || !response.status) return textResult(`Memory status unavailable: ${response.error || "broker unavailable"}.`, { ok: false }, true);
-        return textResult(
-          response.status.ready ? "Memory backend is ready." : `Memory backend unavailable${response.status.detail ? `: ${response.status.detail}` : "."}`, 
-          { ok: true, ...response.status },
-        );
       },
     });
   }
