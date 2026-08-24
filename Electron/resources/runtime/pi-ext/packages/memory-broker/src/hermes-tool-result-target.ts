@@ -1,6 +1,18 @@
-import type { ToolResultEventResult } from "@earendil-works/pi-coding-agent";
-
 type UnknownRecord = Record<string, unknown>;
+export type HermesToolResultEvent = {
+  type: "tool_result";
+  toolCallId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  content: Array<{ type: string; [key: string]: unknown }>;
+  details: unknown;
+  isError: boolean;
+  usage?: unknown;
+};
+type HermesToolResultPatch = {
+  content?: HermesToolResultEvent["content"];
+  details?: unknown;
+};
 
 function isRecord(value: unknown): value is UnknownRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -43,12 +55,7 @@ function rewriteSerializedResult(value: unknown): { value: unknown; changed: boo
  * routed the operation through the memory target. The original tool input is
  * authoritative; global memory results and ordinary text are left untouched.
  */
-export function rewriteHermesProjectMemoryToolResult(event: {
-  toolName?: unknown;
-  input?: unknown;
-  content?: unknown;
-  details?: unknown;
-}): ToolResultEventResult | undefined {
+export function rewriteHermesProjectMemoryToolResult(event: HermesToolResultEvent): HermesToolResultPatch | undefined {
   if (typeof event.toolName !== "string" || !event.toolName.startsWith("memory_")) return undefined;
   if (!isRecord(event.input) || event.input.target !== "project") return undefined;
 
@@ -65,6 +72,6 @@ export function rewriteHermesProjectMemoryToolResult(event: {
   if (!details.changed && !contentChanged) return undefined;
   return {
     ...(details.changed ? { details: details.value } : {}),
-    ...(contentChanged ? { content: content as ToolResultEventResult["content"] } : {}),
+    ...(contentChanged ? { content: content as HermesToolResultEvent["content"] } : {}),
   };
 }

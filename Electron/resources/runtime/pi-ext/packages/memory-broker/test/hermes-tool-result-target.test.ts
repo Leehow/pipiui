@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rewriteHermesProjectMemoryToolResult } from "../src/hermes-tool-result-target.ts";
+import {
+  rewriteHermesProjectMemoryToolResult,
+  type HermesToolResultEvent,
+} from "../src/hermes-tool-result-target.ts";
 
 test("project memory result retains its logical target in details and serialized JSON", () => {
-  const event = {
+  const event: HermesToolResultEvent = {
     type: "tool_result",
     toolName: "memory_add",
     toolCallId: "memory-call-1",
@@ -33,7 +36,7 @@ test("project memory result retains its logical target in details and serialized
     target: "project",
     note: "ordinary memory prose stays unchanged",
   });
-  assert.deepEqual(JSON.parse((patch?.content?.[0] as { text: string }).text), patch?.details);
+  assert.deepEqual(JSON.parse(patch?.content?.[0]?.text as string), patch?.details);
 });
 
 test("global memory results and arbitrary text are not rewritten", () => {
