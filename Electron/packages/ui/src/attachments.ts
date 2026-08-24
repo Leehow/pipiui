@@ -156,3 +156,13 @@ export function imageFilesFromClipboard(clipboardData: DataTransfer | null): Fil
   return files
 }
 
+/** Extract image files from a drag-and-drop FileList payload. */
+export function imageFilesFromFileList(files: FileList | null | undefined): File[] {
+  const out: File[] = []
+  if (!files) return out
+  for (const file of Array.from(files)) {
+    if (file.type.startsWith('image/') || imageMimeForFile(file)) out.push(file)
+  }
+  return out
+}
+

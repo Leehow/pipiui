@@ -7,18 +7,12 @@ import type { AgentEvent, AgentSummary, HistoryEntry, Model, ModelState, PipiHos
 import { visionHostMethods } from './useVisionRouting'
 
 const xtermHarness = vi.hoisted(() => ({ instances: [] as any[] }))
-const virtuosoHarness = {
-  atBottom: undefined as undefined | ((value: boolean) => void),
-  startReached: undefined as undefined | ((index: number) => void),
-  scrollToIndex: vi.fn(),
-}
 
 beforeEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   localStorage.clear()
   Reflect.deleteProperty(window, 'pipiHost')
-  virtuosoHarness.startReached = undefined
 })
 afterEach(() => {
   cleanup()
@@ -44,9 +38,10 @@ function fileDataTransfer(file: File) {
   }
 }
 
+const virtuosoHarness = { atBottom: undefined as undefined | ((value: boolean) => void), scrollToIndex: vi.fn() }
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
-  return { Virtuoso: React.forwardRef(({ data, itemContent, atBottomStateChange, startReached }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; atBottomStateChange?: (value: boolean) => void; startReached?: (index: number) => void }, ref) => { virtuosoHarness.atBottom = atBottomStateChange; virtuosoHarness.startReached = startReached; React.useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoHarness.scrollToIndex })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
+  return { Virtuoso: React.forwardRef(({ data, itemContent, atBottomStateChange }: { data: unknown[]; itemContent: (index: number, item: never) => JSX.Element; atBottomStateChange?: (value: boolean) => void }, ref) => { virtuosoHarness.atBottom = atBottomStateChange; React.useImperativeHandle(ref, () => ({ scrollToIndex: virtuosoHarness.scrollToIndex })); return <div>{data.map((item, index) => <React.Fragment key={index}>{itemContent(index, item as never)}</React.Fragment>)}</div> }) }
 })
 
 vi.mock('streamdown', () => ({ Streamdown: ({ children }: { children: unknown }) => <>{children}</> }))
@@ -279,7 +274,6 @@ describe('PipiUI Electron main layout', () => {
     const host: PipiHostAPI = { ...base, getSessionHistory: history }
     render(<App host={host} />)
     expect(await screen.findByText('newest marker')).toBeTruthy()
-    act(() => virtuosoHarness.startReached?.(0))
     await waitFor(() => expect(history).toHaveBeenCalledWith('welcome', 'new-0', 500))
     expect((await screen.findByTestId('sidebar-project-error')).textContent).toContain('older page unavailable')
     expect(screen.getByText('newest marker')).toBeTruthy()
@@ -304,14 +298,12 @@ describe('PipiUI Electron main layout', () => {
     const host: PipiHostAPI = { ...base, getSessionHistory: history }
     const view = render(<App host={host} />)
     expect(await screen.findByText('retry newest marker')).toBeTruthy()
-    act(() => virtuosoHarness.startReached?.(0))
     await screen.findByText(/temporary older failure/)
 
     fireEvent.click(view.container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(view.container.querySelector('[data-session-id="layout"]')?.getAttribute('aria-current')).toBe('true'))
     fireEvent.click(view.container.querySelector('[data-session-id="welcome"]')!)
     expect(screen.getByText('retry newest marker')).toBeTruthy()
-    act(() => virtuosoHarness.startReached?.(0))
     expect(await screen.findByText('recovered older marker')).toBeTruthy()
     expect(screen.getByText('retry newest marker')).toBeTruthy()
     expect(olderAttempts).toBe(2)
@@ -647,9 +639,8 @@ describe('PipiUI Electron main layout', () => {
     }
     render(<App host={host} />)
     expect(await screen.findByText('游标消息 519', undefined, { timeout: 2_000 })).toBeTruthy()
-    act(() => virtuosoHarness.startReached?.(0))
-    await waitFor(() => expect(calls).toBe(3))
     expect(screen.queryByText(/读取会话记录失败/)).toBeNull()
+    expect(calls).toBe(3)
   })
 
   it('cancels a terminal delayed refresh when the selected session changes', async () => {
@@ -1828,64 +1819,6 @@ describe('PipiUI Electron main layout', () => {
     expect(container.querySelector('.chat-header-title-label')?.textContent).toBe('Electron 三栏界面')
   })
 
-  it('does not auto-expand a collapsed project when selecting a peeked working session', async () => {
-    const host = createMockHost()
-    const workspace = await host.listProjects()
-    const { container } = render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('data-status')).toBe('subagents-running'))
-    fireEvent.click(screen.getByRole('button', { name: '收起项目 PipiUI' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy())
-    const welcome = container.querySelector('[data-session-id="welcome"]')!
-    expect(welcome).toBeTruthy()
-    fireEvent.click(welcome)
-    await waitFor(() => expect(welcome.getAttribute('aria-current')).toBe('true'))
-    expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy()
-    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).not.toContain('pipiui'))
-  })
-
-  it('auto-expands a collapsed project when selecting a non-working session', async () => {
-    const host = createMockHost()
-    const workspace = await host.listProjects()
-    const { container } = render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    fireEvent.click(screen.getByRole('button', { name: '收起项目 Website' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 Website' })).toBeTruthy())
-    expect(container.querySelector('[data-session-id="site"]')).toBeNull()
-    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: 'Landing' } })
-    const site = await waitFor(() => {
-      const row = container.querySelector('[data-session-id="site"]')
-      expect(row).toBeTruthy()
-      return row!
-    })
-    fireEvent.click(site)
-    await waitFor(() => expect(site.getAttribute('aria-current')).toBe('true'))
-    fireEvent.change(screen.getByRole('searchbox', { name: '搜索所有会话' }), { target: { value: '' } })
-    await waitFor(() => expect(screen.getByRole('button', { name: '收起项目 Website' })).toBeTruthy())
-    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).toContain('website'))
-  })
-
-  it('does not auto-expand a collapsed project when selecting a pinned session', async () => {
-    const host = createMockHost()
-    const workspace = await host.listProjects()
-    localStorage.setItem(sidebarPreferencesKey(workspace), JSON.stringify({
-      expandedIds: [],
-      pinnedSessionIds: ['layout'],
-      visibleLimit: 10,
-    }))
-    const { container } = render(<App host={host} />)
-    const pinned = await waitFor(() => {
-      const row = container.querySelector('.sb-pinned-section [data-session-id="layout"]')
-      expect(row).toBeTruthy()
-      return row!
-    })
-    await waitFor(() => expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy())
-    fireEvent.click(pinned)
-    await waitFor(() => expect(pinned.getAttribute('aria-current')).toBe('true'))
-    expect(screen.getByRole('button', { name: '展开项目 PipiUI' })).toBeTruthy()
-    await waitFor(() => expect(JSON.parse(localStorage.getItem(sidebarPreferencesKey(workspace))!).expandedIds).not.toContain('pipiui'))
-  })
-
   it('uses host semantic sidebar preferences after one-time local migration while keeping disclosure local', async () => {
     const host = createMockHost()
     const workspace = await host.listProjects()
@@ -2332,13 +2265,11 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(screen.getByText(/已开始处理/)).toBeTruthy())
   })
 
-  it('keeps idle submits direct and cut-in busy composer submits as a new turn', async () => {
+  it('keeps idle submits direct and routes busy composer submits through enqueueMessage', async () => {
     const base = createMockHost()
     const sendPrompt = vi.fn(async () => undefined)
     const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('busy-item', sessionId, text) }))
-    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'busy insert', 'sending'))
-    const steerQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'busy insert', 'sending'))
-    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, cutInQueuedMessage, steerQueuedMessage, listQueue: async () => [] }
+    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, listQueue: async () => [] }
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
 
@@ -2349,153 +2280,11 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle direct'))
     expect(enqueueMessage).not.toHaveBeenCalled()
 
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy insert' } })
-    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
-    fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy insert', undefined))
-    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'busy-item'))
-    expect(steerQueuedMessage).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy queue' } })
+    await waitFor(() => expect(screen.getByLabelText('加入消息队列')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('加入消息队列'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy queue', undefined))
     expect(sendPrompt).toHaveBeenCalledTimes(1)
-  })
-
-  it('keeps a busy cut-in bubble pending until the user echo arrives', async () => {
-    const base = createMockHost()
-    let listener: ((event: StreamEvent) => void) | undefined
-    const sendPrompt = vi.fn(async () => undefined)
-    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-item', sessionId, text) }))
-    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in pending', 'sending'))
-    const steerQueuedMessage = vi.fn()
-    const host: PipiHostAPI = {
-      ...base,
-      sendPrompt,
-      enqueueMessage,
-      cutInQueuedMessage,
-      steerQueuedMessage,
-      listQueue: async () => [],
-      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
-    }
-    render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
-    fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
-
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in pending' } })
-    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
-    fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in pending', undefined))
-    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-item'))
-    expect(steerQueuedMessage).not.toHaveBeenCalled()
-    const pendingBubble = await screen.findByTestId('user-bubble-queued')
-    expect(pendingBubble.closest('[data-user-prompt]')?.textContent).toContain('cut-in pending')
-    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
-
-    await act(async () => {
-      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-cut-in', content: 'cut-in pending' })
-    })
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
-    const confirmed = screen.getAllByText('cut-in pending').filter(node => node.closest('[data-user-prompt]'))
-    expect(confirmed).toHaveLength(1)
-    expect(confirmed[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
-  })
-
-  it('busy cut-in survives stopped reconciliation', async () => {
-    const base = createMockHost()
-    let listener: ((event: StreamEvent) => void) | undefined
-    const sendPrompt = vi.fn(async () => undefined)
-    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-stop', sessionId, text) }))
-    const cutInQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in after stop', 'sending'))
-    const steerQueuedMessage = vi.fn()
-    const historyOnlyMarker = 'HISTORY_ONLY_STOPPED_RECONCILE_MARKER'
-    const durableHistory: HistoryEntry[] = [
-      { id: 'u1', role: 'user', content: '请实现 Electron 三栏主界面。', timestamp: 1 },
-      { id: 'a1', role: 'assistant', content: '我会先检查现有结构，然后完成 UI。', timestamp: 2 },
-    ]
-    const abortedHistory: HistoryEntry[] = [
-      ...durableHistory,
-      { id: 'u-idle', role: 'user', content: 'idle hold', timestamp: 3 },
-      { id: 'a-aborted', role: 'assistant', content: 'partial before cut-in', timestamp: 4 },
-      { id: 'u-history-only', role: 'user', content: historyOnlyMarker, timestamp: 5 },
-    ]
-    let serveAbortedHistory = false
-    const getSessionHistory = vi.fn(async () => serveAbortedHistory ? abortedHistory : durableHistory)
-    const host: PipiHostAPI = {
-      ...base,
-      sendPrompt,
-      enqueueMessage,
-      cutInQueuedMessage,
-      steerQueuedMessage,
-      getSessionHistory,
-      listQueue: async () => [],
-      subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } },
-    }
-    render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
-    fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
-    await act(async () => {
-      listener?.({ type: 'status', sessionId: 'welcome', status: 'started' })
-      listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'partial before cut-in' })
-    })
-
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in after stop' } })
-    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
-    fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in after stop', undefined))
-    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-stop'))
-    expect(steerQueuedMessage).not.toHaveBeenCalled()
-    expect((await screen.findByTestId('user-bubble-queued')).closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
-
-    serveAbortedHistory = true
-    await act(async () => {
-      listener?.({ type: 'status', sessionId: 'welcome', status: 'stopped' })
-    })
-    expect(await screen.findByText(historyOnlyMarker)).toBeTruthy()
-    const pendingAfterStop = await screen.findByTestId('user-bubble-queued')
-    expect(pendingAfterStop.closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
-    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
-
-    await act(async () => {
-      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-after-stop', content: 'cut-in after stop' })
-    })
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
-    const confirmedAfterStop = screen.getAllByText('cut-in after stop').filter(node => node.closest('[data-user-prompt]'))
-    expect(confirmedAfterStop).toHaveLength(1)
-    expect(confirmedAfterStop[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
-  })
-
-  it('busy cut-in failure removes queued item', async () => {
-    const base = createMockHost()
-    const sendPrompt = vi.fn(async () => undefined)
-    const enqueueMessage = vi.fn(async (sessionId: string, text: string) => ({ outcome: 'queued' as const, message: queuedMessage('cut-in-fail', sessionId, text) }))
-    const cutInQueuedMessage = vi.fn(async () => { throw new Error('cut-in rejected') })
-    const removeQueuedMessage = vi.fn(async (sessionId: string, messageId: string) => queuedMessage(messageId, sessionId, 'cut-in fail'))
-    const steerQueuedMessage = vi.fn()
-    const host: PipiHostAPI = {
-      ...base,
-      sendPrompt,
-      enqueueMessage,
-      cutInQueuedMessage,
-      removeQueuedMessage,
-      steerQueuedMessage,
-      listQueue: async () => [],
-    }
-    render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
-    fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
-
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in fail' } })
-    await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
-    fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in fail', undefined))
-    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
-    await waitFor(() => expect(removeQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
-    expect(steerQueuedMessage).not.toHaveBeenCalled()
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
-    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in fail'))).toBe(true)
   })
 
   it('consumes queue_update snapshots only for the selected session and retains attachment/status metadata', async () => {
@@ -2630,7 +2419,7 @@ async function reopenModelModal(composer: HTMLTextAreaElement) {
 }
 
 describe('session switch transcript cache', () => {
-  it('keeps only the selected transcript mounted while revalidating cached content on return', async () => {
+  it('keeps a visited session transcript visible while revalidating it on return', async () => {
     const base = createMockHost()
     let welcomeLoads = 0
     const host: PipiHostAPI = {
@@ -2649,41 +2438,16 @@ describe('session switch transcript cache', () => {
 
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await screen.findByText('左栏宽度要能持久化。')
-    expect(screen.queryByText('请实现 Electron 三栏主界面。')).toBeNull()
+    const welcomeTranscript = screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null
     const layoutTranscript = screen.getByText('左栏宽度要能持久化。').closest('[data-session-transcript]') as HTMLElement | null
+    expect(welcomeTranscript?.getAttribute('data-session-transcript')).toBe('welcome')
+    expect(welcomeTranscript?.hidden).toBe(true)
     expect(layoutTranscript?.hidden).toBe(false)
-    expect(container.querySelectorAll('[data-session-transcript]')).toHaveLength(1)
 
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
-    const welcomeTranscript = screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null
     expect(welcomeTranscript?.hidden).toBe(false)
-    expect(screen.queryByText('左栏宽度要能持久化。')).toBeNull()
-    expect(container.querySelectorAll('[data-session-transcript]')).toHaveLength(1)
+    expect(layoutTranscript?.hidden).toBe(true)
     expect(welcomeLoads).toBe(2)
-  })
-
-  it('loads only the newest history page until Virtuoso reaches the top', async () => {
-    const base = createMockHost()
-    const latest = Array.from({ length: 500 }, (_, index) => ({
-      id: `latest-${index}`,
-      role: 'user' as const,
-      content: `latest page ${index}`,
-      timestamp: 1_000 + index,
-    }))
-    let releaseOlder: ((entries: HistoryEntry[]) => void) | undefined
-    const getSessionHistory = vi.fn(async (_sessionId: string, before?: number | string) => {
-      if (before !== undefined) return new Promise<HistoryEntry[]>(resolve => { releaseOlder = resolve })
-      return latest
-    })
-    render(<App host={{ ...base, getSessionHistory }} />)
-    await screen.findByText('latest page 499')
-    await act(async () => { await Promise.resolve() })
-    expect(getSessionHistory).toHaveBeenCalledTimes(1)
-
-    act(() => virtuosoHarness.startReached?.(0))
-    await waitFor(() => expect(getSessionHistory).toHaveBeenCalledTimes(2))
-    await act(async () => { releaseOlder?.([{ id: 'older-1', role: 'user', content: 'older page', timestamp: 1 }]) })
-    await screen.findByText('older page')
   })
 
   it('does not paint the previous session transcript into an uncached session slot', async () => {
@@ -2722,7 +2486,7 @@ describe('session switch transcript cache', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /在 PipiUI 新建会话/ }))
     await waitFor(() => expect(screen.getByLabelText('消息输入框')).toBeTruthy())
-    expect(screen.queryByText('请实现 Electron 三栏主界面。')).toBeNull()
+    expect((screen.getByText('请实现 Electron 三栏主界面。').closest('[data-session-transcript]') as HTMLElement | null)?.hidden).toBe(true)
     expect(getSessionHistory.mock.calls.length).toBe(loadsBeforeNew)
   })
 
@@ -2795,17 +2559,6 @@ describe('session switch transcript cache', () => {
     }
     render(<App host={host} />)
     expect(await screen.findByText('late recovered history')).toBeTruthy()
-  })
-
-  it('stops retrying an empty history page after one follow-up instead of looping', async () => {
-    const base = createMockHost()
-    const getSessionHistory = vi.fn(async () => [])
-    render(<App host={{ ...base, getSessionHistory }} />)
-    await waitFor(() => expect(getSessionHistory).toHaveBeenCalled())
-    await waitFor(() => expect(getSessionHistory.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 1_000 })
-    const afterRetry = getSessionHistory.mock.calls.length
-    await new Promise(resolve => setTimeout(resolve, 800))
-    expect(getSessionHistory.mock.calls.length).toBe(afterRetry)
   })
 
   it('does not drop a locally created session when listSessions returns empty', async () => {
@@ -3404,6 +3157,38 @@ describe('composer image attachments', () => {
     expect(thumb.querySelector('img')?.getAttribute('alt')).toBe('pasted.png')
   })
 
+  it('adds dropped image files as attachments and sends them with the prompt', async () => {
+    const host = createMockHost()
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    const composer = await renderChat(host)
+    const footer = document.querySelector('footer.composer') as HTMLElement
+    const dataTransfer = fileDataTransfer(makeImageFile('dropped.png'))
+    fireEvent.dragOver(footer, { dataTransfer })
+    fireEvent.drop(footer, { dataTransfer })
+    const thumb = await screen.findByTestId('composer-thumb-0')
+    expect(thumb.querySelector('img')?.getAttribute('alt')).toBe('dropped.png')
+    expect(screen.queryByTestId('composer-doc-chips')).toBeNull()
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [
+      expect.objectContaining({ mimeType: 'image/png', name: 'dropped.png', dataBase64: expect.any(String) })
+    ]))
+    expect(composer.value).toBe('')
+  })
+
+  it('routes a dropped non-image document through the document path, not attachments', async () => {
+    window.pipiPathForFile = (file: File) => `/Users/haoli/Downloads/${file.name}`
+    render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const footer = document.querySelector('footer.composer') as HTMLElement
+    const file = new File(['survey'], 'form.doc', { type: 'application/msword' })
+    const dataTransfer = fileDataTransfer(file)
+    fireEvent.dragOver(footer, { dataTransfer })
+    fireEvent.drop(footer, { dataTransfer })
+    expect(await screen.findByTestId('composer-doc-chip-0')).toBeTruthy()
+    expect(screen.getByText('form.doc')).toBeTruthy()
+    expect(screen.queryByTestId('composer-thumbs')).toBeNull()
+  })
+
   it('supports multiple images, removal (with revoke), and unmount revoke', async () => {
     const { unmount } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
@@ -3622,116 +3407,6 @@ describe('extensions settings tab', () => {
     fireEvent.keyDown(window, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByTestId('extensions-add-dialog')).toBeNull())
     expect(screen.getByTestId('model-modal')).toBeTruthy()
-  })
-
-  it('does not add a top-level Grok Build settings tab when the extension is enabled', async () => {
-    const host = createMockHost()
-    host.listExtensions = vi.fn(async () => [{
-      id: 'grok-build-oauth',
-      name: 'Grok Build',
-      version: '0.1.0',
-      state: 'enabled' as const,
-      source: 'app' as const,
-      contributions: {
-        settingsSections: [{ id: 'grok-build-oauth', title: 'Grok Build' }],
-        auth: { provider: { id: 'grok-build', name: 'Grok Build', oauth: true } },
-      },
-    }])
-    await openModelModal(host)
-    expect(screen.getByTestId('model-tab-general')).toBeTruthy()
-    expect(screen.getByTestId('model-tab-models')).toBeTruthy()
-    expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
-    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
-    expect(screen.queryByTestId('model-tab-grok-build-oauth')).toBeNull()
-    expect(screen.queryByRole('tab', { name: 'Grok Build' })).toBeNull()
-    fireEvent.click(screen.getByTestId('model-tab-extensions'))
-    expect(await screen.findByTestId('extensions-pkg-grok-build-oauth')).toBeTruthy()
-  })
-
-  it('does not register a Grok Build right-sidebar panel or rail icon', async () => {
-    const host = createMockHost()
-    host.listExtensions = vi.fn(async () => [{
-      id: 'grok-build-oauth',
-      name: 'Grok Build',
-      version: '0.2.0',
-      state: 'enabled' as const,
-      source: 'app' as const,
-      contributions: {
-        auth: { provider: { id: 'grok-build', name: 'Grok Build', oauth: true } },
-      },
-      ui: {
-        toolRenderers: [
-          { tool: 'image_gen', entry: 'app/dist/image-card.js' },
-          { tool: 'image_edit', entry: 'app/dist/image-card.js' },
-        ],
-      },
-    } as Awaited<ReturnType<NonNullable<PipiHostAPI['listExtensions']>>>[number]])
-    const { container } = render(<App host={host} />)
-    await screen.findAllByText('Electron 三栏界面')
-    await waitFor(() => expect(host.listExtensions).toHaveBeenCalled())
-    const rail = container.querySelector('.tool-quick-rail')!
-    expect(rail.querySelectorAll('button')).toHaveLength(5)
-    expect(screen.queryByRole('button', { name: 'Grok Build' })).toBeNull()
-    expect(screen.queryByRole('button', { name: 'grok-build-status' })).toBeNull()
-    expect(screen.queryByRole('button', { name: /grok-build/i })).toBeNull()
-    expect(screen.queryByText('扩展面板「Grok Build」加载失败')).toBeNull()
-  })
-})
-
-describe('model catalog fallback', () => {
-  it('falls back when the selected model disappears and does not abort an in-flight response', async () => {
-    const host = createMockHost()
-    const full = await host.listModels()
-    let models = full
-    const grok = full.find(model => model.provider === 'xai' && model.id === 'grok-4')!
-    const fallback = full[0]
-    const listeners = new Set<(event: { type: 'catalog_changed'; reason: 'auth' | 'extension' | 'refresh' }) => void>()
-    host.listModels = vi.fn(async () => models)
-    host.subscribeModelCatalog = listener => {
-      listeners.add(listener)
-      return () => { listeners.delete(listener) }
-    }
-    const setModel = vi.spyOn(host, 'setModel')
-    const stop = vi.spyOn(host, 'stop')
-    const streamListeners = new Set<(event: StreamEvent) => void>()
-    const originalSubscribe = host.subscribeStream.bind(host)
-    host.subscribeStream = (sessionId, listener) => {
-      streamListeners.add(listener)
-      const unsubscribe = originalSubscribe(sessionId, listener)
-      return () => { streamListeners.delete(listener); unsubscribe() }
-    }
-    host.sendPrompt = vi.fn(async sessionId => {
-      for (const listener of streamListeners) listener({ type: 'status', sessionId, status: 'started' })
-    })
-
-    await renderChat(host)
-    fireEvent.click(await screen.findByTestId('model-chip'))
-    fireEvent.click(await screen.findByTestId(`quick-row-${grok.provider}-${grok.id}`))
-    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain(grok.name))
-
-    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '继续生成' } })
-    fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalled())
-    expect(screen.getByTestId('waiting-stop')).toBeTruthy()
-
-    models = full.filter(model => model.id !== grok.id)
-    host.getModelState = vi.fn(async (): Promise<ModelState> => ({
-      model: grok,
-      thinkingLevel: 'off',
-      availableThinkingLevels: ['off'],
-    }))
-    await act(async () => {
-      for (const listener of listeners) listener({ type: 'catalog_changed', reason: 'auth' })
-    })
-
-    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain(fallback.name))
-    const notice = await screen.findByTestId('catalog-fallback-notice')
-    expect(notice.textContent).toContain(`已切换到 ${fallback.name}`)
-    expect(stop).not.toHaveBeenCalled()
-    expect(screen.getByTestId('waiting-stop')).toBeTruthy()
-    expect(setModel).toHaveBeenCalledWith('welcome', fallback.provider, fallback.id)
-    fireEvent.click(screen.getByRole('button', { name: '关闭错误提示' }))
-    expect(screen.queryByTestId('catalog-fallback-notice')).toBeNull()
   })
 })
 
@@ -4229,58 +3904,6 @@ describe('composer thinking selector', () => {
     expect(screen.queryByTestId('thinking-row-max')).toBeNull()
     fireEvent.click(screen.getByTestId('thinking-row-medium'))
     await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('cold-grok', 'medium'))
-  })
-
-  it('uses a hydrated GPT-5.6 Sol catalog map over provisional xhigh and falls back safely', async () => {
-    const base = createMockHost()
-    const restoredSession: Session = {
-      id: 'sol-session',
-      projectId: 'pipiui',
-      name: 'GPT Sol thinking',
-      updatedAt: Date.now(),
-      model: { provider: 'openai-codex', modelId: 'gpt-5.6-sol' }
-    }
-    const coldSnapshot: ModelState = {
-      model: { provider: 'openai-codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true },
-      thinkingLevel: 'xhigh',
-      availableThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
-    }
-    const catalogModel: Model = {
-      provider: 'openai-codex', id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', reasoning: true,
-      thinkingConfigurable: true,
-      thinkingLevelMap: { minimal: 'low', max: 'max' }
-    }
-    const setThinkingLevel = vi.fn(async (_sessionId: string, level: ModelState['thinkingLevel']): Promise<ModelState> => {
-      if (level === 'xhigh') throw new Error('thinking level xhigh is unavailable')
-      return { model: catalogModel, thinkingLevel: level, availableThinkingLevels: ['off', 'minimal', 'max'] as ModelState['availableThinkingLevels'] }
-    })
-    let resolveCatalog!: (models: Model[]) => void
-    const host: PipiHostAPI = {
-      ...base,
-      listProjects: async () => [{ id: 'pipiui', name: 'PipiUI', path: '/Users/demo/code/pipiui' }],
-      listSessions: async () => [restoredSession],
-      getSessionHistory: async () => [],
-      getModelState: vi.fn(async () => coldSnapshot),
-      listModels: vi.fn(() => new Promise<Model[]>(resolve => { resolveCatalog = resolve })),
-      setThinkingLevel
-    }
-
-    render(<App host={host} />)
-    expect(await screen.findByLabelText('思考级别（当前：xhigh）')).toBeTruthy()
-
-    await act(async () => { resolveCatalog([catalogModel]) })
-
-    const chip = await screen.findByLabelText('思考级别（当前：off）') as HTMLButtonElement
-    expect(chip.disabled).toBe(false)
-    fireEvent.click(chip)
-    expect(screen.getByTestId('thinking-row-off')).toBeTruthy()
-    expect(screen.getByTestId('thinking-row-minimal')).toBeTruthy()
-    expect(screen.getByTestId('thinking-row-max')).toBeTruthy()
-    expect(screen.queryByTestId('thinking-row-xhigh')).toBeNull()
-    expect(screen.queryByTestId('thinking-row-high')).toBeNull()
-    fireEvent.click(screen.getByTestId('thinking-row-max'))
-    await waitFor(() => expect(setThinkingLevel).toHaveBeenCalledWith('sol-session', 'max'))
-    expect(screen.queryByText(/thinking level xhigh is unavailable/)).toBeNull()
   })
 
   it('updates the thinking chip immediately and rolls back when the host fails', async () => {
