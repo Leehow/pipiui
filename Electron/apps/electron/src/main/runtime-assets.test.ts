@@ -203,12 +203,13 @@ describe('resolveRuntimeAssets', () => {
 
   it('preserves only the structured unknown-mutation failure through the computer runtime adapter', async () => {
     const source = await readFile(new URL('../../../../resources/runtime/pi-ext/subagent/index.ts', import.meta.url), 'utf8')
+    const classifier = await readFile(new URL('../../../../resources/runtime/pi-ext/packages/computer-agent/src/action-block.ts', import.meta.url), 'utf8')
     expect(source).toContain('const structuredUnknown = json.ok === false')
     expect(source).toContain('&& json.outcomeUnknown === true')
     expect(source).toContain('runtimeError?.code === "mutation_outcome_unknown"')
     expect(source).toContain('runtimeError?.requiresObservation === true')
-    expect(source).toContain('if (hostOutcomeUnknown) return "outcome_unknown"')
     expect(source).toContain('&& !structuredUnknown')
+    expect(classifier).toContain('if (result.outcomeUnknown === true || result.runtimeError?.code === "mutation_outcome_unknown") return "outcome_unknown"')
     expect(source).not.toContain('new ComputerAgentCoordinator')
     expect(source).not.toContain('summary: runtimeError?.message')
   })
