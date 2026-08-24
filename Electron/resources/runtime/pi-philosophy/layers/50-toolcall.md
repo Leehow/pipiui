@@ -1,12 +1,11 @@
 ---
 id: toolcall
 name: 工具调用纪律
-summary: 该调工具时调工具：首轮就动手、不用 shell 复刻已有工具、说不了要报出缺的是什么。
+summary: 该调工具时调工具：首轮就动手、不用 shell 复刻已有工具、复合检索走工具参数、说不了要报出缺的是什么。
 order: 50
 requires: []
 requires-capabilities: []
-requires-models: deepseek/deepseek-v4-*, deepseek-extended/deepseek-v4-*
-scope: [main, lead, worker]
+scope: [main, lead, worker, explore, plan, general-purpose, reviewer]
 ---
 # Tool discipline
 
@@ -27,6 +26,25 @@ saw a call for, so the work lands as unreviewable text.
 - Fetching a page or looking something up: use {{fetch}}, {{search}} or {{browser}}.
 - `bash` is for what only a shell does — builds, tests, linters, git, processes. That is
   a large and important set, and none of it is a fallback for the rest.
+
+## Composites are parameters, not shell chains
+
+The search tools absorb the combinations you would otherwise chain in bash. Reach for
+the parameter before reaching for a shell:
+
+- Another directory or repo? `grep`/`ls`/`find`/`read` take `path` — absolute paths
+  included. Never `cd` somewhere first in bash; there is no directory you cannot point at.
+- Several searches at once? `grep` takes `patterns` (one section each) and `paths`
+  (several roots in one call). One call, not an `echo ===; grep; echo ===; grep` script.
+- How many, or which files? `grep` with `mode: "count"` or `mode: "files"` — not
+  `grep -c` / `grep -rl` in bash.
+- Noise to skip? `grep` takes `exclude` globs — not a `| grep -v` pipe.
+- Several small files to see? `read` takes `paths` — not `cat a b c`.
+- Several directories to list? `ls` takes `paths` — not `ls a b c`.
+
+A chain is still fine when the shell genuinely does the work (test output into a log,
+then grep the log). The line: if every step of the chain is a search or a read, it
+belongs in one tool call.
 
 ## Act on the first turn
 

@@ -88,3 +88,146 @@ export function readToolDescription(base: string): string {
 	if (/directory/i.test(withGrep)) return withGrep;
 	return `${withGrep} If path is a directory, lists its entries instead of failing. Prefer the ls tool for directories.`;
 }
+
+/* ------------------------------------------------------------------ */
+/* Composite search helpers: let one grep/read/ls call absorb the      */
+/* `cd X && grep/ls/cat` chains models otherwise assemble in bash.     */
+/* ------------------------------------------------------------------ */
+
+export interface GrepLine {
+	kind: "match" | "before" | "after";
+	path: string;
+	lineNumber: number;
+	raw: string;
+}
+
+const MATCH_LINE = /^(.+):(\d+):(.*)$/;
+const CONTEXT_LINE = /^(.+)-(\d+)-(.*)$/;
+
+/** Split a base grep tool output into structured lines, dropping notices.
+ *  Context lines before a match become `before` once the match follows. */
+export function parseGrepOutput(text: string): GrepLine[] {
+	const trimmed = text.trim();
+	if (!trimmed || trimmed === "No matches found") return [];
+	// Notices are appended as a trailing "\n\n[...]" block.
+	const body = trimmed.replace(/\n\n\[[^\]]*\]$/, "");
+	const lines: GrepLine[] = [];
+	let pendingBefore: GrepLine[] = [];
+	let lastMatch: GrepLine | undefined;
+	for (const raw of body.split("\n")) {
+		const match = raw.match(MATCH_LINE);
+		if (match) {
+			lines.push(...pendingBefore);
+			pendingBefore = [];
+			lastMatch = { kind: "match", path: match[1], lineNumber: Number(match[2]), raw };
+			lines.push(lastMatch);
+			continue;
+		}
+		const context = raw.match(CONTEXT_LINE);
+		if (context) {
+			const line: GrepLine = { kind: "after", path: context[1], lineNumber: Number(context[2]), raw };
+			if (lastMatch && line.lineNumber > lastMatch.lineNumber) {
+				lines.push(line);
+			} else {
+				line.kind = "before";
+				pendingBefore.push(line);
+			}
+			continue;
+		}
+		if (raw.trim()) lines.push({ kind: "match", path: "", lineNumber: 0, raw });
+	}
+	lines.push(...pendingBefore);
+	return lines;
+}
+
+export function globToRegExp(glob: string): RegExp {
+	let re = "";
+	for (let i = 0; i < glob.length; i++) {
+		const ch = glob[i];
+		if (ch === "*") {
+			if (glob[i + 1] === "*") {
+				re += ".*";
+				i++;
+				if (glob[i + 1] === "/") i++;
+			} else {
+				re += "[^/]*";
+			}
+		} else if (ch === "?") re += "[^/]";
+		else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+	}
+	return new RegExp(`^${re}$`);
+}
+
+/** Does a search-relative path hit any exclude glob (as path or ancestor dir)?
+ *  Slash-free globs also match any single path segment, so `*.jsonl` reaches
+ *  nested files and `node_modules` reaches nested directories. */
+export function pathMatchesExcludes(relPath: string, excludes: string[]): boolean {
+	if (excludes.length === 0) return false;
+	const normalized = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
+	const parts = normalized.split("/");
+	const candidates: string[] = [normalized];
+	for (let i = 1; i < parts.length; i++) candidates.push(parts.slice(0, i).join("/"));
+	for (const glob of excludes) {
+		const re = globToRegExp(glob);
+		if (candidates.some((c) => re.test(c))) return true;
+		if (!glob.includes("/") && parts.some((segment) => re.test(segment))) return true;
+	}
+	return false;
+}
+
+/** Group parsed grep lines into keep/drop decisions per match, preserving
+ *  context lines of kept matches. Returns renderable output lines. */
+export function filterGrepLines(lines: GrepLine[], excludes: string[]): string[] {
+	if (excludes.length === 0) return lines.map((l) => l.raw);
+	const out: string[] = [];
+	let pendingBefore: string[] = [];
+	let keepAfter = false;
+	for (const line of lines) {
+		if (line.kind === "match") {
+			const keep = !pathMatchesExcludes(line.path, excludes);
+			if (keep) {
+				out.push(...pendingBefore, line.raw);
+				keepAfter = true;
+			} else {
+				keepAfter = false;
+			}
+			pendingBefore = [];
+		} else if (line.kind === "before") {
+			pendingBefore.push(line.raw);
+		} else if (keepAfter) {
+			out.push(line.raw);
+		}
+	}
+	return out;
+}
+
+/** Summarize parsed matches as `grep -c` style per-file counts. */
+export function grepCountSummary(lines: GrepLine[]): string {
+	const counts = new Map<string, number>();
+	for (const line of lines) {
+		if (line.kind !== "match" || !line.path) continue;
+		counts.set(line.path, (counts.get(line.path) ?? 0) + 1);
+	}
+	if (counts.size === 0) return "No matches found";
+	const body = [...counts.entries()].map(([path, n]) => `${path}: ${n}`).join("\n");
+	const total = [...counts.values()].reduce((a, b) => a + b, 0);
+	return `${body}\n\ntotal: ${total} matches in ${counts.size} files`;
+}
+
+/** Summarize parsed matches as `grep -l` style file list. */
+export function grepFilesSummary(lines: GrepLine[]): string {
+	const files = new Set<string>();
+	for (const line of lines) {
+		if (line.kind === "match" && line.path) files.add(line.path);
+	}
+	if (files.size === 0) return "No matches found";
+	return `${[...files].join("\n")}\n\n${files.size} files`;
+}
+
+const COMPOSITE_MAX_BYTES = 64 * 1024;
+
+export function capCompositeOutput(text: string): string {
+	if (text.length <= COMPOSITE_MAX_BYTES) return text;
+	return `${text.slice(0, COMPOSITE_MAX_BYTES)}\n\n[Composite output truncated to ${COMPOSITE_MAX_BYTES / 1024}KB. Narrow paths, add exclude, or lower limit.]`;
+}
+

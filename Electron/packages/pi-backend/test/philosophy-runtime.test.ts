@@ -93,21 +93,32 @@ describe("vendored philosophy: delivery", () => {
     // exactly where the correction pays for itself.
     // `retrieval` rides along on every code-reading role for the same reason: choosing the
     // exact matcher for a semantic question is a drift the recon tier pays for most.
-    expect(workerIds("explore")).toEqual(["retrieval", "research", "thinking"]);
-    expect(workerIds("plan")).toEqual(["retrieval", "planning", "thinking"]);
-    expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "thinking"]);
+    // `toolcall` names the code-reading agents directly: session-log measurement showed
+    // every model family rebuilding grep/ls/cat in bash, so the correction is addressed to
+    // whoever searches, not gated on a model allowlist.
+    expect(workerIds("explore")).toEqual(["retrieval", "research", "toolcall", "thinking"]);
+    expect(workerIds("plan")).toEqual(["retrieval", "planning", "toolcall", "thinking"]);
+    expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
   });
 
-  it("gives an unaddressed worker only model-scoped corrections while bulk distribution is off", () => {
+  it("gives an unaddressed worker the corrections that name an audience while bulk distribution is off", () => {
     // The switch declines the ~1.6k judgement prefix per worker. It has never governed
-    // model-scoped corrections, and `thinking` is one — now by exclusion rather than by
-    // an allowlist, which is why it reaches an unnamed model here.
-    expect(workerIds()).toEqual(["thinking"]);
+    // layers that name their audience: `thinking` reaches an unnamed model by exclusion
+    // rather than by an allowlist, and `toolcall` names the roster's code-reading agents,
+    // which marks the whole layer as addressed — so it rides along even for an unnamed
+    // worker. Tool-selection drift costs every dispatch; the bulk switch saves prose, not
+    // this correction.
+    expect(workerIds()).toEqual(["toolcall", "thinking"]);
   });
 
-  it("delivers a model-scoped layer to a worker regardless of the bulk switch", () => {
+  it("delivers toolcall to a named worker regardless of the bulk switch", () => {
+    // The layer names general-purpose in its scope, so the bulk gate — which only governs
+    // role-only scopes — cannot withhold it. The old deepseek allowlist was removed after
+    // session-log measurement showed the drift on every model family, grok included.
     const result = compose({ role: "worker", agent: "general-purpose", model: SCOPED_MODEL });
     expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
+    const grok = compose({ role: "worker", agent: "general-purpose", model: "xai/grok-4.6" });
+    expect(grok.included.map((l) => l.id)).toContain("toolcall");
   });
 
   it("keeps deepseek worker toolcall when the dispatch tool is absent", () => {
@@ -145,6 +156,7 @@ describe("vendored philosophy: delivery", () => {
       "orchestration",
       "same-turn",
       "fanout",
+      "toolcall",
       "thinking",
     ]);
     expect(result.text).not.toContain("{{");
@@ -333,7 +345,7 @@ describe("vendored philosophy: delivery", () => {
     // Same bypass `requires-models` layers get: the bulk switch declines to buy judgement
     // prefix, not a correction that keeps the worker's own model from misbehaving.
     const result = compose({ role: "worker", agent: "general-purpose", model: "kimi-coding/k3-256k" });
-    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "thinking"]);
+    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
   });
 
   it("keeps the boss's whole prefix inside budget", () => {
@@ -369,8 +381,12 @@ describe("vendored philosophy: delivery", () => {
     // so every finished goal left a dirty tree for the user to commit by hand.
     // Raised to 17200 for the worker read-only skill/memory contract: the old absolute
     // "never invoke a skill" line had to grow into a gated permit without restoring bootstrap.
+    // Raised to 17500 for the composite-search section of toolcall: session logs showed
+    // workers assembling `cd X && grep` chains the tools could already answer, so the
+    // layer now maps each chain shape to the parameter that absorbs it. The section pays
+    // for itself the first time it replaces a five-grep bash script with one call.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(17200);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(17500);
   });
 
   it("permits worker skill_search/load and memory_query without automatic bootstrap", () => {

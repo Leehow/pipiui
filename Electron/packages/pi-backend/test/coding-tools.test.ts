@@ -4,6 +4,13 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  capCompositeOutput,
+  filterGrepLines,
+  globToRegExp,
+  grepCountSummary,
+  grepFilesSummary,
+  parseGrepOutput,
+  pathMatchesExcludes,
   readPathIfDirectory,
   readToolDescription,
   rewriteReadToolText,
@@ -112,8 +119,14 @@ describe("workerCodingToolsArgs", () => {
 });
 
 describe("pipiui-coding-tools extension", () => {
+  interface RegisteredTool {
+    name: string;
+    description: string;
+    promptGuidelines?: string[];
+    execute: Function;
+  }
   async function loadExtension(active = ["read", "bash", "edit", "write"]) {
-    let tool: { name: string; description: string; execute: Function } | undefined;
+    const tools = new Map<string, RegisteredTool>();
     const activeTools = [...active];
     const pi = {
       getActiveTools: vi.fn(() => [...activeTools]),
@@ -121,12 +134,12 @@ describe("pipiui-coding-tools extension", () => {
         activeTools.splice(0, activeTools.length, ...names);
       }),
       on: vi.fn(),
-      registerTool: vi.fn((definition: { name: string; description: string; execute: Function }) => {
-        tool = definition;
+      registerTool: vi.fn((definition: RegisteredTool) => {
+        tools.set(definition.name, definition);
       }),
     };
     codingToolsExtension(pi as never);
-    return { pi, tool, activeTools };
+    return { pi, tools, tool: tools.get("read"), activeTools };
   }
 
   it("replaces read so a directory path returns a listing, not EISDIR", async () => {
@@ -177,7 +190,7 @@ describe("pipiui-coding-tools extension", () => {
   // snapshot raced with worker tool registration and locked subagent sessions read-only.
   // Inspection tools come from --tools now, so this extension must never touch the
   // active tool set — not during loading, and not from a lifecycle hook afterwards.
-  it("never touches the active tool set — it only replaces the read tool", () => {
+  it("never touches the active tool set — it only replaces read/grep/ls", () => {
     const loadingError = new Error(
       "Failed to load extension: Extension runtime not initialized. Action methods cannot be called during extension loading. Hint: Start without extensions using \"pi -ne\".",
     );
@@ -191,7 +204,177 @@ describe("pipiui-coding-tools extension", () => {
     expect(pi.setActiveTools).not.toHaveBeenCalled();
     expect(pi.getActiveTools).not.toHaveBeenCalled();
     expect(pi.on).not.toHaveBeenCalled();
-    expect(pi.registerTool).toHaveBeenCalledOnce();
-    expect((pi.registerTool as ReturnType<typeof vi.fn>).mock.calls[0][0].name).toBe("read");
+    expect(pi.registerTool).toHaveBeenCalledTimes(3);
+    const names = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].name);
+    expect(names).toEqual(["read", "grep", "ls"]);
+  });
+
+  describe("composite grep", () => {
+    async function grepFixture() {
+      const cwd = await fixture();
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await mkdir(join(cwd, "node_modules", "dep"), { recursive: true });
+      await writeFile(join(cwd, "src", "alpha.ts"), "export const heartbeat = 1\nexport const cadence = 2\nexport const heartbeatWorker = 3\n");
+      await writeFile(join(cwd, "src", "beta.ts"), "export const heartbeat = 9\n");
+      await writeFile(join(cwd, "node_modules", "dep", "index.js"), "module.exports.heartbeat = true\n");
+      const { tools } = await loadExtension();
+      const grep = tools.get("grep")!;
+      return { cwd, grep };
+    }
+
+    it("advertises the composite parameters in description and guidelines", async () => {
+      const { grep } = await grepFixture();
+      expect(grep.description).toMatch(/patterns/i);
+      expect(grep.description).toMatch(/paths/i);
+      expect(grep.description).toMatch(/count/);
+      expect(grep.description).toMatch(/exclude/i);
+      expect(grep.promptGuidelines?.join("\n")).toMatch(/never run `cd` \+ grep in bash/i);
+      expect(grep.promptGuidelines?.join("\n")).toMatch(/mode=count or mode=files/i);
+    });
+
+    it("delegates a simple search unchanged to the base tool", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c1", { pattern: "cadence" }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("src/alpha.ts:2:");
+      expect(text).not.toMatch(/^===/m);
+    });
+
+    it("searches several absolute paths in one call without cd", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute(
+        "c2",
+        { pattern: "heartbeat", paths: [join(cwd, "src"), join(cwd, "node_modules")] },
+        undefined,
+        undefined,
+        { cwd: "/tmp" },
+      );
+      const text = result.content[0].text as string;
+      expect(text).toContain(`--- in ${join(cwd, "src")} ---`);
+      expect(text).toContain(`--- in ${join(cwd, "node_modules")} ---`);
+      expect(text).toContain("alpha.ts:1:");
+      expect(text).toContain("dep/index.js:1:");
+    });
+
+    it("runs several patterns as labeled sections", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c3", { patterns: ["cadence", "heartbeatWorker"], path: "src" }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("=== pattern: cadence ===");
+      expect(text).toContain("=== pattern: heartbeatWorker ===");
+      expect(text).toContain("alpha.ts:2:");
+      expect(text).toContain("alpha.ts:3:");
+    });
+
+    it("reports per-file counts with mode=count like grep -c", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c4", { pattern: "heartbeat", path: "src", mode: "count" }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      // Paths are relative to the searched directory, same as the base tool.
+      expect(text).toContain("alpha.ts: 2");
+      expect(text).toContain("beta.ts: 1");
+      expect(text).toContain("total: 3 matches in 2 files");
+    });
+
+    it("lists matching files with mode=files like grep -l", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c5", { pattern: "heartbeat", path: ".", mode: "files" }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("src/alpha.ts");
+      expect(text).toContain("src/beta.ts");
+      expect(text).toContain("node_modules/dep/index.js");
+      expect(text).toMatch(/3 files/);
+    });
+
+    it("skips exclude globs instead of piping through grep -v", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c6", { pattern: "heartbeat", path: ".", exclude: ["node_modules"] }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("src/alpha.ts:1:");
+      expect(text).not.toContain("node_modules");
+    });
+
+    it("reports an empty composite search as no matches, not an error", async () => {
+      const { cwd, grep } = await grepFixture();
+      const result = await grep.execute("c7", { patterns: ["no-such-token-xyz"], paths: ["src", "node_modules"] }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toMatch(/No matches found/);
+    });
+  });
+
+  describe("composite read/ls", () => {
+    it("reads several files as labeled sections instead of cat-chaining", async () => {
+      const cwd = await fixture();
+      await writeFile(join(cwd, "a.json"), '{"a":1}\n');
+      await writeFile(join(cwd, "b.json"), '{"b":2}\n');
+      const { tools } = await loadExtension();
+      const read = tools.get("read")!;
+      const result = await read.execute("c8", { paths: ["a.json", "b.json", "missing.json"] }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("=== a.json ===");
+      expect(text).toContain('{"a":1}');
+      expect(text).toContain("=== b.json ===");
+      expect(text).toContain('{"b":2}');
+      expect(text).toContain("=== missing.json ===");
+      expect(text).toMatch(/read failed/i);
+    });
+
+    it("lists several directories in one call instead of ls-chaining", async () => {
+      const cwd = await fixture();
+      const { tools } = await loadExtension();
+      const ls = tools.get("ls")!;
+      expect(ls?.description).toMatch(/paths/);
+      const result = await ls.execute("c9", { paths: [".pi", join(cwd, ".pi", "boss")] }, undefined, undefined, { cwd });
+      const text = result.content[0].text as string;
+      expect(text).toContain("--- .pi ---");
+      expect(text).toContain("boss/");
+      expect(text).toContain(`--- ${join(cwd, ".pi", "boss")} ---`);
+    });
+  });
+});
+
+describe("composite grep helpers", () => {
+  it("parses base grep output into matches with context grouping", () => {
+    const lines = parseGrepOutput(
+      "src/a.ts-9- before line\nsrc/a.ts:10: match line\nsrc/a.ts-11- after line\n\n[100 matches limit reached. Use limit=200 for more, or refine pattern]",
+    );
+    expect(lines.map((l) => l.kind)).toEqual(["before", "match", "after"]);
+    expect(lines[1]).toMatchObject({ path: "src/a.ts", lineNumber: 10 });
+  });
+
+  it("treats 'No matches found' and empty output as no lines", () => {
+    expect(parseGrepOutput("No matches found")).toEqual([]);
+    expect(parseGrepOutput("")).toEqual([]);
+  });
+
+  it("matches exclude globs on paths and ancestor directories", () => {
+    expect(pathMatchesExcludes("node_modules/dep/index.js", ["node_modules"])).toBe(true);
+    expect(pathMatchesExcludes("deep/nested/node_modules/x.js", ["**/node_modules"])).toBe(true);
+    expect(pathMatchesExcludes("docs/plan.jsonl", ["*.jsonl"])).toBe(true);
+    expect(pathMatchesExcludes("src/alpha.ts", ["node_modules", "*.jsonl"])).toBe(false);
+    expect(globToRegExp("*.ts").test("a.ts")).toBe(true);
+    expect(globToRegExp("*.ts").test("a.tsx")).toBe(false);
+  });
+
+  it("drops excluded matches together with their context lines", () => {
+    const lines = parseGrepOutput(
+      "keep.ts-4- pre\nkeep.ts:5: kept\nkeep.ts-6- post\ndrop/node_modules/x.js-1- pre\ndrop/node_modules/x.js:2: dropped\ndrop/node_modules/x.js-3- post",
+    );
+    const out = filterGrepLines(lines, ["node_modules"]);
+    expect(out).toEqual(["keep.ts-4- pre", "keep.ts:5: kept", "keep.ts-6- post"]);
+  });
+
+  it("summarizes counts and files", () => {
+    const lines = parseGrepOutput("a.ts:1: x\na.ts:7: x\nb.ts:2: x");
+    expect(grepCountSummary(lines)).toBe("a.ts: 2\nb.ts: 1\n\ntotal: 3 matches in 2 files");
+    expect(grepFilesSummary(lines)).toBe("a.ts\nb.ts\n\n2 files");
+    expect(grepCountSummary([])).toBe("No matches found");
+  });
+
+  it("caps composite output with an actionable notice", () => {
+    const capped = capCompositeOutput("x".repeat(65 * 1024));
+    expect(capped).toMatch(/truncated to 64KB/);
+    expect(capped).toMatch(/Narrow paths/);
+    expect(capCompositeOutput("small")).toBe("small");
   });
 });
