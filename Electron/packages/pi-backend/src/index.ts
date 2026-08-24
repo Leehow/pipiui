@@ -1260,9 +1260,22 @@ function visibleIdsFromFileOrder(ordered: ContextEntrySummary[]): string[] {
   return leafBranchFromFileOrder(ordered).filter(entry => entry.visible).map(entry => entry.id);
 }
 
-async function activeVisibleIds(path: string): Promise<string[]> {
+function jsonlSnapshotStream(path: string, byteEnd?: number) {
+  if (byteEnd !== undefined && byteEnd < 0) {
+    return createReadStream(path, { encoding: "utf8", start: 0, end: 0 });
+  }
+  return createReadStream(
+    path,
+    byteEnd === undefined
+      ? { encoding: "utf8" }
+      : { encoding: "utf8", start: 0, end: byteEnd },
+  );
+}
+
+async function activeVisibleIds(path: string, byteEnd?: number): Promise<string[]> {
+  if (byteEnd !== undefined && byteEnd < 0) return [];
   const ordered: ContextEntrySummary[] = [];
-  const lines = createInterface({ input: createReadStream(path, { encoding: "utf8" }), crlfDelay: Infinity });
+  const lines = createInterface({ input: jsonlSnapshotStream(path, byteEnd), crlfDelay: Infinity });
   for await (const line of lines) {
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
@@ -1294,8 +1307,10 @@ async function readHistoryFallback(
   limit = 500,
   vaultDir?: string,
   sessionId?: string,
+  byteEnd?: number,
 ): Promise<HistoryEntry[]> {
-  const visibleIds = await activeVisibleIds(path);
+  if (byteEnd !== undefined && byteEnd < 0) return [];
+  const visibleIds = await activeVisibleIds(path, byteEnd);
   const end = typeof before === "string"
     ? visibleIds.indexOf(before)
     : Math.max(0, visibleIds.length - before);
@@ -1304,7 +1319,7 @@ async function readHistoryFallback(
   const wanted = new Set(pageIds);
   const mappedById = new Map<string, HistoryEntry>();
   const lines = createInterface({
-    input: createReadStream(path, { encoding: "utf8" }),
+    input: jsonlSnapshotStream(path, byteEnd),
     crlfDelay: Infinity,
   });
   for await (const line of lines) {
@@ -1373,7 +1388,8 @@ async function readHistory(
       `[pipi-backend] SessionManager skipped for ${path}: ${stat.size} bytes exceeds bounded history limit`,
     );
   }
-  return readHistoryFallback(path, before, limit, vaultDir, sessionId);
+  if (stat.size <= 0) return [];
+  return readHistoryFallback(path, before, limit, vaultDir, sessionId, stat.size - 1);
 }
 
 const TERMINAL_DURABILITY_TAIL_BYTES = 1024 * 1024;
@@ -1735,6 +1751,8 @@ export class PiHostBackend implements HostBackend {
   private ensureInFlight = new Map<string, Promise<Live>>();
   /** Parsed history for an unchanged JSONL. Switching back must not re-parse on the UI thread. */
   private historyCache = new Map<string, { mtimeMs: number; size: number; before: number | string; limit: number; entries: HistoryEntry[] }>();
+  /** One in-flight JSONL scan per path+cursor. Overlapping UI retries must not stack full-file parses. */
+  private historyInflight = new Map<string, Promise<HistoryEntry[]>>();
   /** At most one Swift-parity title side channel may be launched per placeholder session. */
   private titleGenerationStarted = new Set<string>();
   /** A user rename always wins over an already-running automatic title refinement. */
@@ -2522,6 +2540,16 @@ export class PiHostBackend implements HostBackend {
     return this.confirmSessionMeta(await this.findSession(id));
   }
   private async readHistoryCached(path: string, before: number | string, limit: number, sessionId?: string): Promise<HistoryEntry[]> {
+    const inflightKey = `${path}\0${String(before)}\0${limit}`;
+    const pending = this.historyInflight.get(inflightKey);
+    if (pending) return pending;
+    const run = this.readHistoryScan(path, before, limit, sessionId).finally(() => {
+      if (this.historyInflight.get(inflightKey) === run) this.historyInflight.delete(inflightKey);
+    });
+    this.historyInflight.set(inflightKey, run);
+    return run;
+  }
+  private async readHistoryScan(path: string, before: number | string, limit: number, sessionId?: string): Promise<HistoryEntry[]> {
     const stat = await fs.stat(path);
     const hit = this.historyCache.get(path);
     if (
@@ -8110,7 +8138,16 @@ export class PiHostBackend implements HostBackend {
       });
       return;
     }
-    const reportedName = raw.name ?? current?.name;
+    // Identity stability: `start` — or the first event of a new run — establishes
+    // name/role. Same-run update/log/usage/end events carry the *active tool* in
+    // `name` (bash/grep/read/…), which is activity detail, not who the worker is,
+    // so they must never rewrite the identity the start event set.
+    const sameRun = current?.runId === raw.runId;
+    const establishesIdentity = raw.kind === "start" || !sameRun;
+    const stableName = establishesIdentity
+      ? raw.name ?? current?.name ?? "subagent"
+      : current?.name ?? raw.name ?? "subagent";
+    const reportedName = stableName;
     const privateComputerWorker = reportedName === "operator" || reportedName === "computer-verifier" || reportedName === "computer-terminal";
     let closedWorkerOutcome: string | undefined;
     if (privateComputerWorker && raw.kind === "end" && typeof raw.output === "string") {
@@ -8137,7 +8174,6 @@ export class PiHostBackend implements HostBackend {
               : "running";
     const usage = isRecord(raw.usage) ? raw.usage : undefined;
     const terminal = raw.kind === "end";
-    const sameRun = current?.runId === raw.runId;
 		const eventAt = raw.at ? asTime(raw.at) : Date.now();
     const activity = mergeAgentActivity(raw, sameRun ? current : undefined, {
       sameRun,
@@ -8151,13 +8187,17 @@ export class PiHostBackend implements HostBackend {
 		// must never reopen that same run. A new runId remains free to start.
 		const staleAfterTerminal = currentIsTerminal && !terminal;
 		const state = staleAfterTerminal ? current.state : reportedState;
+		// A terminal state always drops the transient stall flag: a worker that
+		// finished, failed, or was aborted/interrupted must never keep showing
+		// 卡住 from a stall it recovered from — or outlived — before the end event.
+		const terminalState = state === "ok" || state === "failed" || state === "aborted" || state === "interrupted";
     const agent: AgentSummary = {
       agentId: raw.agentId,
       runId: raw.runId,
-      name: raw.name ?? current?.name ?? "subagent",
+      name: stableName,
       task: raw.task ?? current?.task ?? "",
       state,
-      stalled: staleAfterTerminal ? false : raw.stalled,
+      stalled: terminalState ? false : raw.stalled === true,
       handled: sameRun ? current?.handled : undefined,
       cost: raw.cost ?? usage?.cost ?? (sameRun ? current?.cost : undefined),
       turns: raw.turns ?? raw.turn ?? (sameRun ? current?.turns : undefined),
@@ -8166,7 +8206,13 @@ export class PiHostBackend implements HostBackend {
       parentId: raw.parentId !== undefined ? raw.parentId : current?.parentId,
       toolCallId: nonEmpty(raw.toolCallId) ?? (sameRun ? current?.toolCallId : undefined),
       depth: raw.depth ?? current?.depth,
-      role: raw.role ?? raw.agentType ?? current?.role ?? raw.name,
+      // `start` — and the first event of a new run — establishes identity: the
+      // runtime's START carries the worker type in `name`, so it may refresh
+      // both fields. current?.* stays as the field-less fallback so a replay
+      // with missing fields never blanks an established identity.
+      role: establishesIdentity
+        ? raw.role ?? raw.agentType ?? raw.name ?? current?.role
+        : current?.role ?? raw.role ?? raw.agentType ?? current?.name,
       title: raw.title ?? current?.title,
       createdAt:
         raw.createdAt ??
