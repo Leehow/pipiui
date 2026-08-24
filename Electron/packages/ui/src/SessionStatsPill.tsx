@@ -21,10 +21,12 @@ export interface SessionStatsPillProps {
   isStreaming?: boolean
   /**
    * Context compaction is running (pi's own threshold/overflow path, the host's
-   * idle-time one, or `/compact`). Shows a "压缩中…" indicator; it takes over the
+   * idle-time one, or `/compact`). Shows a “压缩中…” indicator; it takes over the
    * slot because a compaction never overlaps a streaming turn.
    */
   isCompacting?: boolean
+  /** Specific in-progress operation label (e.g. 压缩中（空闲自动）); defaults to 压缩中… */
+  compactingLabel?: string
   /** Display unit for the cost row. The host reports USD; CNY needs exchangeRate. */
   costUnit?: CostDisplayUnit
   /** USD→CNY rate; required to render CNY, otherwise cost falls back to USD. */
@@ -52,7 +54,7 @@ function hasPerformance(performance: SessionPerformance | undefined): boolean {
  * ```
  * Light/dark styling is fully self-contained in session-stats-pill.css.
  */
-export function SessionStatsPill({ host, sessionId, isStreaming = false, isCompacting = false, costUnit = 'USD', exchangeRate, refreshKey }: SessionStatsPillProps) {
+export function SessionStatsPill({ host, sessionId, isStreaming = false, isCompacting = false, compactingLabel, costUnit = 'USD', exchangeRate, refreshKey }: SessionStatsPillProps) {
   const { stats, status, error, retry } = useSessionStats(host, sessionId, refreshKey)
   const [open, setOpen] = useState(false)
   const [errorDismissed, setErrorDismissed] = useState(false)
@@ -135,9 +137,9 @@ export function SessionStatsPill({ host, sessionId, isStreaming = false, isCompa
   return (
     <div className="session-stats-pill" ref={rootRef}>
       {isCompacting ? (
-        <span className="session-stats-pill__streaming" data-testid="stats-compacting" aria-label="正在压缩上下文">
+        <span className="session-stats-pill__streaming" data-testid="stats-compacting" aria-label={compactingLabel ?? '正在压缩上下文'}>
           <span className="session-stats-pill__streaming-dot" aria-hidden="true" />
-          压缩中…
+          {compactingLabel ?? '压缩中…'}
         </span>
       ) : isStreaming && (
         <span className="session-stats-pill__streaming" data-testid="stats-streaming" aria-label="生成中">

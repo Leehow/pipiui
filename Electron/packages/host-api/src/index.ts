@@ -688,8 +688,30 @@ export type StreamEvent =
    * path, the host's proactive one, and `/compact` alike. `reason` is pi's
    * (`manual` | `threshold` | `overflow`); `aborted`/`error` are end-only and
    * mutually exclusive with a clean finish. Old clients may safely ignore it.
+   *
+   * Classification fields (backward-compatible, all optional; older hosts omit
+   * them and renderers fall back to "自动压缩/未知触发"):
+   * - `operation`: what ran. `context_compaction` is a real summary compaction;
+   *   `context_fold` is a deterministic idle fold (message rewrite, not a
+   *   compaction). Absent ⇒ legacy real compaction.
+   * - `trigger`: why it started — `manual` (user `/compact`), `proactive_idle`
+   *   (host scheduler: ≥45% AND ≥4min quiet), `near_overflow` (pi's reserve
+   *   line `window − reserveTokens`), `overflow` (provider overflow recovery),
+   *   `mid_turn` (in-turn tool-loop guard), `idle_fold` (fold inside the idle
+   *   scheduler's nudge turn), `auto_fold` (`context_manage` fold whose trigger
+   *   could not be confirmed). Absent ⇒ unknown; derive nothing beyond `reason`.
+   * - `executed`: false marks notice-only events (compaction check / idle-fold
+   *   nudge / skip) that never ran a compaction. Real lifecycle events are
+   *   `true`; absent ⇒ legacy real lifecycle event.
+   * - `skipReason`: why a notice-only event did not execute.
    */
-  | { type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string }
+  | {
+    type: "compaction"; sessionId: string; phase: "start" | "end"; reason?: string; aborted?: boolean; error?: string;
+    operation?: "context_compaction" | "context_fold";
+    trigger?: "manual" | "proactive_idle" | "near_overflow" | "overflow" | "mid_turn" | "idle_fold" | "auto_fold";
+    executed?: boolean;
+    skipReason?: string;
+  }
   /**
    * After the session writer is quiet, the host rewrites JSONL and pushes the
    * already-redacted texts so live bubbles replace plaintext. Old clients may

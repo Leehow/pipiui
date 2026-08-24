@@ -141,6 +141,11 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "fill-context") contextTokens = 240000;
     if (command.message === "fill-context-no-compact") { contextTokens = 240000; failCompact = true }
     if (command.message === "fill-context-slow") { contextTokens = 240000; slowCompact = true }
+    // Refuse the next compact RPC only, keeping context low so the scheduler
+    // stays quiet — isolates a failed MANUAL compact from scheduler activity.
+    if (command.message === "__fail_compact_once__") failCompact = true;
+    // Re-arm compaction and park high again after a refused compact.
+    if (command.message === "__allow_compact__") { failCompact = false; contextTokens = 240000 }
     ok();
     logPrompt(command.message);
     if (command.message === "__agent_running__" || command.message === "__hold_agent_running__") {
@@ -298,6 +303,90 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
           errorMessage: "Codex error: Invalid schema for function 'subagent': ...",
         },
       });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__overflow_compact__") {
+      // pi's own provider-overflow recovery: compaction before the turn continues.
+      ok();
+      send({ type: "compaction_start", reason: "overflow" });
+      send({ type: "compaction_end", reason: "overflow", aborted: false, willRetry: true, result: { summary: "…", firstKeptEntryId: "entry-1", tokensBefore: 300000, estimatedTokensAfter: 12000 } });
+      contextTokens = 12000;
+      send({ type: "agent_start" });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__midturn_compact__") {
+      // Mid-turn tool-loop guard: fires while the host has the turn marked busy.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "compaction_start", reason: "threshold" });
+      send({ type: "compaction_end", reason: "threshold", aborted: false, willRetry: false, result: { summary: "…", firstKeptEntryId: "entry-1", tokensBefore: 280000, estimatedTokensAfter: 12000 } });
+      contextTokens = 12000;
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__threshold_preprompt__") {
+      // pi's pre-prompt _checkCompaction: fires before any turn is busy.
+      send({ type: "compaction_start", reason: "threshold" });
+      send({ type: "compaction_end", reason: "threshold", aborted: false, willRetry: false, result: { summary: "…", firstKeptEntryId: "entry-1", tokensBefore: 260000, estimatedTokensAfter: 12000 } });
+      contextTokens = 12000;
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__pi_self_compact__") {
+      // pi-side compaction with reason "manual" that no host RPC initiated
+      // (an extension calling session.compact()): classification may read only
+      // a live intent, never one left behind by a failed RPC.
+      send({ type: "compaction_start", reason: "manual" });
+      send({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false, result: { summary: "…", firstKeptEntryId: "entry-1", tokensBefore: 200000, estimatedTokensAfter: 12000 } });
+      contextTokens = 12000;
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__fold_tool__") {
+      // The real idle path: pi-ext's idle-fold timer queues a hidden nudge
+      // custom message that triggers its own short turn; the model answers by
+      // calling the context_manage tool, whose execution fingerprint is the
+      // only fold signal the host sees.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "message_end", message: { id: "nudge-1", role: "custom", customType: "pipiui-context-manage-nudge", display: false, content: "[context-manage-nudge] Context is above the idle-fold watermark." } });
+      send({ type: "tool_execution_start", toolCallId: "fold-1", toolName: "context_manage", args: { action: "fold", ids: ["b-1"] } });
+      send({ type: "tool_execution_end", toolCallId: "fold-1", result: { content: [{ type: "text", text: "folded 1 block(s): b-1" }], details: { status: "ok", foldedIds: ["b-1"], skipped: [], llm: false } }, isError: false });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__fold_tool_no_nudge__") {
+      // Same tool and fingerprint, but inside a normal (non-nudge) turn: the
+      // agent tidying context on its own — must classify auto_fold, never idle.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "tool_execution_start", toolCallId: "fold-2", toolName: "context_manage", args: { action: "fold", ids: ["b-2"] } });
+      send({ type: "tool_execution_end", toolCallId: "fold-2", result: { content: [{ type: "text", text: "folded 1 block(s): b-2" }], details: { status: "ok", foldedIds: ["b-2"], skipped: [], llm: false } }, isError: false });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__fold_other_tool__") {
+      // A different tool returning the exact fold fingerprint: the details
+      // shape alone must never surface as a fold.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "tool_execution_start", toolCallId: "other-1", toolName: "bash", args: { command: "ls" } });
+      send({ type: "tool_execution_end", toolCallId: "other-1", result: { content: [{ type: "text", text: "folded 1 block(s): b-1" }], details: { status: "ok", foldedIds: ["b-1"], skipped: [], llm: false } }, isError: false });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__fold_unpaired_end__") {
+      // A fold-fingerprinted result with no tool_execution_start pairing: the
+      // tool identity is unknown, so no fold may be claimed.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "tool_execution_end", toolCallId: "ghost-1", result: { content: [{ type: "text", text: "folded 1 block(s): b-1" }], details: { status: "ok", foldedIds: ["b-1"], skipped: [], llm: false } }, isError: false });
       send({ type: "agent_settled" });
       return;
     }

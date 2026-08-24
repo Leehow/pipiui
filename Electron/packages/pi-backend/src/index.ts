@@ -668,6 +668,22 @@ type Live = {
   /** Idle-time context compaction; also tracks pi's own compaction lifecycle. */
   compaction: ProactiveCompactionScheduler;
   /**
+   * Which host side issued the pending `compact` RPC — `manual` (`/compact`) or
+   * `proactive_idle` (the scheduler). pi reports both as `reason: "manual"`, so
+   * this intent is what separates them; consumed by the next `compaction_start`.
+   */
+  compactionIntent?: "manual" | "proactive_idle";
+  /** Classification of the in-flight compaction, kept so `compaction_end` can repeat it. */
+  activeCompaction?: { operation: "context_compaction" | "context_fold"; trigger?: CompactionTrigger };
+  /** toolCallId → toolName, recorded from `tool_execution_start` so a later
+   *  `tool_execution_end` can prove which tool produced a result. Consumed on
+   *  end and cleared per turn. */
+  toolNames: Map<string, string>;
+  /** Turn epoch of the idle-fold nudge's own short turn. Only a
+   *  `context_manage` fold inside this exact epoch is attributable to the
+   *  idle scheduler; a fold in any other turn is an unconfirmed-trigger fold. */
+  nudgeTurnEpoch?: number;
+  /**
    * This compaction started outside a turn, so it — not `agent_settled` — owns
    * the queue's busy flag until `compaction_end`. Prompts typed meanwhile wait
    * in the normal queue instead of racing pi mid-compaction.
@@ -694,6 +710,40 @@ type Live = {
   lastTurnActivityAt?: number;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
+/** Custom-message type pi-ext's idle-fold timer uses for its nudge turn. */
+const CONTEXT_MANAGE_NUDGE_CUSTOM_TYPE = "pipiui-context-manage-nudge";
+/** Compaction classification carried on `compaction` stream events. Exported for tests. */
+export type CompactionTrigger =
+  | "manual"
+  | "proactive_idle"
+  | "near_overflow"
+  | "overflow"
+  | "mid_turn"
+  | "idle_fold"
+  /** A `context_manage` fold whose trigger cannot be confirmed (the agent
+   *  tidied context on its own, outside any idle-nudge turn). */
+  | "auto_fold";
+/**
+ * Why this compaction started. The host initiates `manual` (UI `/compact`) and
+ * `proactive_idle` (scheduler) compactions itself, so a recorded intent is
+ * authoritative for pi's `reason: "manual"` events; pi's own `overflow`
+ * recovery is self-describing. Every pi `threshold` compaction sits past the
+ * reserve line (`window − reserveTokens`, pi's own `shouldCompact`) — one that
+ * arrives while a turn is running was fired by the mid-turn tool-loop guard,
+ * the rest are pre-prompt/post-turn near-overflow protection.
+ */
+export function classifyCompactionTrigger(args: {
+  reason?: string;
+  intent?: "manual" | "proactive_idle";
+  busy: boolean;
+}): CompactionTrigger | undefined {
+  if (args.reason === "manual") return args.intent ?? "manual";
+  if (args.reason === "overflow") return "overflow";
+  if (args.reason === "threshold") return args.busy ? "mid_turn" : "near_overflow";
+  // Unknown/missing reason on a real lifecycle event: leave unclassified so the
+  // renderer's explicit "自动压缩" fallback applies.
+  return undefined;
+}
 /** Main-turn watchdog: turnActive with no event for this long is wedged. */
 export const TURN_WATCHDOG_TIMEOUT_MS = 120_000;
 export const TURN_WATCHDOG_CHECK_INTERVAL_MS = 30_000;
@@ -3905,12 +3955,26 @@ export class PiHostBackend implements HostBackend {
       pending: new Map(),
       followUps: [],
       toolArgs: new Map(),
+      toolNames: new Map(),
       messageEpoch: 0,
       compaction: new ProactiveCompactionScheduler({
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
         hasLiveAgents: () => this.sessionHasLiveAgents(id),
-        compact: () => this.command(id, { type: "compact" }),
+        compact: () => {
+          // pi reports the scheduler's compact RPC as `reason: "manual"`; this
+          // intent is what lets compaction_start attribute it to proactive idle.
+          live.compactionIntent = "proactive_idle";
+          return this.command(id, { type: "compact" }).finally(() => {
+            // Request/lifecycle ownership: pi emits `compaction_start`
+            // synchronously before doing any work and settles the compact RPC
+            // only after the whole lifecycle, so an intent still ours here was
+            // never consumed — the RPC failed (rejected, process died) without
+            // running anything. Clear it so it cannot paint the next manual
+            // compaction as proactive idle.
+            if (live.compactionIntent === "proactive_idle") live.compactionIntent = undefined;
+          });
+        },
       }),
     };
     this.live.set(id, live);
@@ -4031,6 +4095,8 @@ export class PiHostBackend implements HostBackend {
       live.turnEpoch = this.queue.markBusy(id);
       live.lastTurnActivityAt = Date.now();
       live.pendingFinalReconciliation = undefined;
+      // A fresh turn invalidates the previous turn's tool identities.
+      live.toolNames.clear();
       if (!this.queueLoads.has(id)) {
         // Load only for queue restoration; do not re-mark busy (second epoch would strand the turn).
         void this.loadQueue(id).catch((error) => {
@@ -4072,11 +4138,24 @@ export class PiHostBackend implements HostBackend {
           });
         }
       }
+      const trigger = classifyCompactionTrigger({
+        reason: typeof e.reason === "string" ? e.reason : undefined,
+        intent: live.compactionIntent,
+        // A streaming turn (not a pending prompt delivery, not the compaction
+        // gate this handler just armed) is what marks a threshold compaction as
+        // the mid-turn tool-loop guard's work.
+        busy: this.queue.isTurnActive(id),
+      });
+      live.activeCompaction = { operation: "context_compaction", trigger };
+      live.compactionIntent = undefined;
       this.stream({
         type: "compaction",
         sessionId: id,
         phase: "start",
         reason: typeof e.reason === "string" ? e.reason : undefined,
+        operation: "context_compaction",
+        ...(trigger ? { trigger } : {}),
+        executed: true,
       });
     } else if (e.type === "compaction_end") {
       const aborted = e.aborted === true;
@@ -4084,6 +4163,15 @@ export class PiHostBackend implements HostBackend {
         typeof e.errorMessage === "string" && e.errorMessage
           ? e.errorMessage
           : undefined;
+      const active = live.activeCompaction;
+      const trigger =
+        active?.operation === "context_compaction" && active.trigger
+          ? active.trigger
+          : classifyCompactionTrigger({
+              reason: typeof e.reason === "string" ? e.reason : undefined,
+              busy: this.queue.isTurnActive(id),
+            });
+      live.activeCompaction = undefined;
       live.compaction.compactionFinished(!aborted && !error);
       this.queue.clearCompacting(id);
       if (live.compactionHoldsQueue) {
@@ -4097,6 +4185,9 @@ export class PiHostBackend implements HostBackend {
         reason: typeof e.reason === "string" ? e.reason : undefined,
         aborted: aborted || undefined,
         error,
+        operation: "context_compaction",
+        ...(trigger ? { trigger } : {}),
+        executed: true,
       });
       // Compaction reports null tokens/percent until the next assistant usage;
       // refresh so the pill drops the stale number instead of showing 316k/200k.
@@ -4207,6 +4298,17 @@ export class PiHostBackend implements HostBackend {
       this.touchTurnActivity(live);
       const endingEpoch = live.messageEpoch;
       const endedMessage = e.message ?? {};
+      // The idle-fold nudge rides in as a hidden custom message that triggers
+      // its own short turn. Recording that turn's epoch is what lets a later
+      // `context_manage` fold inside it be attributed to the idle scheduler;
+      // a fold in any other turn keeps an unconfirmed trigger.
+      if (
+        live.turnEpoch !== undefined &&
+        (endedMessage.customType === CONTEXT_MANAGE_NUDGE_CUSTOM_TYPE ||
+          (e as { customType?: unknown }).customType === CONTEXT_MANAGE_NUDGE_CUSTOM_TYPE)
+      ) {
+        live.nudgeTurnEpoch = live.turnEpoch;
+      }
       const secrets = this.sessionSecrets(id);
       if (endedMessage.role === "assistant") {
         void this.persistAssistantUsage(id, endedMessage);
@@ -4298,6 +4400,13 @@ export class PiHostBackend implements HostBackend {
           void this.reconcileFinalAssistantTurn(live, epoch, identity);
         }
       }
+    } else if (e.type === "tool_execution_start") {
+      // Record the execution's tool identity so the fold check below can prove
+      // a result came from `context_manage` — the details shape alone is not
+      // proof; any tool could return a fold-shaped payload.
+      if (typeof e.toolCallId === "string" && typeof e.toolName === "string") {
+        live.toolNames.set(e.toolCallId, e.toolName);
+      }
     } else if (e.type === "tool_execution_end") {
       this.touchTurnActivity(live);
       const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
@@ -4310,6 +4419,42 @@ export class PiHostBackend implements HostBackend {
         isError: e.isError,
         ...toolResultDetailsField(e.result),
       });
+      // A successful `context_manage` fold (deterministic message rewrite, no
+      // summarizer) is a fold, not a compaction: pi emits no compaction
+      // lifecycle for it, so surface it here as `operation: "context_fold"` —
+      // never labeled 压缩 by the renderer. Identity is proven by the paired
+      // `tool_execution_start` (`toolCallId` → `context_manage`); the result's
+      // own `details` fingerprint (`{ status: "ok", foldedIds, llm: false }`)
+      // only says this execution really folded blocks.
+      const toolName = live.toolNames.get(e.toolCallId);
+      live.toolNames.delete(e.toolCallId);
+      const details = e.result && typeof e.result === "object" ? (e.result as { details?: unknown }).details : undefined;
+      if (
+        toolName === "context_manage" &&
+        e.isError !== true &&
+        details &&
+        typeof details === "object" &&
+        (details as { status?: unknown }).status === "ok" &&
+        (details as { llm?: unknown }).llm === false &&
+        Array.isArray((details as { foldedIds?: unknown }).foldedIds) &&
+        ((details as { foldedIds: unknown[] }).foldedIds.length > 0)
+      ) {
+        // Idle attribution is exact, not assumed: only a fold inside the nudge
+        // turn's own epoch (the idle-fold timer's shortcut) may claim
+        // `idle_fold`. A fold in any other turn — the agent tidying context on
+        // its own — reports the unconfirmed `auto_fold` trigger instead.
+        this.stream({
+          type: "compaction",
+          sessionId: id,
+          phase: "end",
+          operation: "context_fold",
+          trigger:
+            live.turnEpoch !== undefined && live.turnEpoch === live.nudgeTurnEpoch
+              ? "idle_fold"
+              : "auto_fold",
+          executed: true,
+        });
+      }
     }
   }
   private projectTurnTerminal(live: Live, status: "settled" | "stopped", pushStats = false): boolean {
@@ -7180,7 +7325,17 @@ export class PiHostBackend implements HostBackend {
     // The pending quiet-period timer is only a hint; an explicit compact
     // supersedes it rather than racing a second one behind it.
     live.compaction.cancel();
-    await this.command(live.session.id, { type: "compact" });
+    // User-initiated `/compact`: recorded so the lifecycle events it produces
+    // are attributed to a manual trigger rather than the scheduler's. Same
+    // ownership rule as the scheduler's compact: an intent still ours after the
+    // RPC settled was never consumed by a lifecycle, so the RPC failed — clear
+    // it instead of leaking the attribution onto the next compaction.
+    live.compactionIntent = "manual";
+    try {
+      await this.command(live.session.id, { type: "compact" });
+    } finally {
+      if (live.compactionIntent === "manual") live.compactionIntent = undefined;
+    }
   }
   /** Best-effort post-settle snapshot; the command query above stays authoritative. */
   private async pushSessionStats(id: string) {

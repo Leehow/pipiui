@@ -68,6 +68,14 @@ async function waitFor(condition: () => boolean | Promise<boolean>, timeoutMs = 
 const compactionEvents = (events: any[]) =>
   events.filter((e) => e.channel === "stream" && e.event.type === "compaction").map((e) => e.event);
 
+/** The classified start/end pair the host now emits for a real compaction. */
+function classifiedLifecycle(sessionId: string, reason: string, trigger: string) {
+  return [
+    { type: "compaction", sessionId, phase: "start", reason, operation: "context_compaction", trigger, executed: true },
+    { type: "compaction", sessionId, phase: "end", reason, aborted: undefined, error: undefined, operation: "context_compaction", trigger, executed: true },
+  ];
+}
+
 describe("context compaction", () => {
   it("runs `compact` on demand and reports the lifecycle as stream events", async () => {
     const backend = await fixture();
@@ -80,10 +88,7 @@ describe("context compaction", () => {
     await settle();
     off();
 
-    expect(compactionEvents(events)).toEqual([
-      { type: "compaction", sessionId: "session-1", phase: "start", reason: "manual" },
-      { type: "compaction", sessionId: "session-1", phase: "end", reason: "manual", aborted: undefined, error: undefined },
-    ]);
+    expect(compactionEvents(events)).toEqual(classifiedLifecycle("session-1", "manual", "manual"));
     // The post-compaction snapshot is what drops the stale context number.
     expect(events.some((e) => e.channel === "session_stats" && e.event.stats.contextUsage?.tokens === 12000)).toBe(true);
     await backend.close();
@@ -102,6 +107,53 @@ describe("context compaction", () => {
     await backend.close();
   });
 
+  it("clears the proactive intent when the scheduler's compact RPC fails, so a later host-uninitiated manual compaction stays manual", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    // 92% context + failCompact: the scheduler's compact RPC is refused with
+    // no lifecycle, so its `proactive_idle` intent must be released — a stale
+    // intent would paint the next reason:"manual" lifecycle as proactive idle.
+    await backend.handle("sendPrompt", ["session-1", "fill-context-no-compact"]);
+    await settle(200);
+    expect(compactionEvents(events)).toEqual([]);
+
+    // A pi-side reason:"manual" compaction that no host RPC initiated (an
+    // extension calling session.compact()): with the slot clean it must
+    // classify manual; with the failed RPC's residue it would read proactive_idle.
+    await backend.handle("sendPrompt", ["session-1", "__pi_self_compact__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    await settle();
+    off();
+
+    expect(compactionEvents(events)).toEqual(classifiedLifecycle("session-1", "manual", "manual"));
+    await backend.close();
+  });
+
+  it("clears the manual intent when its compact RPC fails, and a later scheduler compaction still attributes correctly", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    // A refused manual compact with context low: the scheduler stays quiet, so
+    // only the manual intent exists — and must be released on rejection.
+    await backend.handle("sendPrompt", ["session-1", "__fail_compact_once__"]);
+    await settle();
+    await expect(backend.handle("compact", ["session-1"])).rejects.toThrow(/Nothing to compact/);
+    expect(compactionEvents(events)).toEqual([]);
+
+    // Re-arm compaction and park high again: the scheduler's own successful
+    // compaction must still attribute proactive_idle (success path no-regress).
+    await backend.handle("sendPrompt", ["session-1", "__allow_compact__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    await settle();
+    off();
+
+    expect(compactionEvents(events)).toEqual(classifiedLifecycle("session-1", "manual", "proactive_idle"));
+    await backend.close();
+  });
+
   it("compacts on its own once an idle session parks above the high watermark", async () => {
     const backend = await fixture();
     const events: any[] = [];
@@ -114,9 +166,116 @@ describe("context compaction", () => {
     off();
 
     expect(compactionEvents(events).map((e) => e.phase)).toEqual(["start", "end"]);
+    // The scheduler issued the compact RPC, so reason "manual" is classified as
+    // proactive idle — not 手动.
+    expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["proactive_idle", "proactive_idle"]);
+    expect(compactionEvents(events).every((e: any) => e.operation === "context_compaction" && e.executed === true)).toBe(true);
     expect((await backend.handle("getSessionStats", ["session-1"])) as any).toMatchObject({
       contextUsage: { tokens: 12000 },
     });
+    await backend.close();
+  });
+
+  it("classifies pi's own overflow recovery as overflow", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__overflow_compact__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    off();
+
+    expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["overflow", "overflow"]);
+    await backend.close();
+  });
+
+  it("classifies a mid-turn threshold compaction as mid_turn, not near-overflow", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__midturn_compact__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    off();
+
+    expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["mid_turn", "mid_turn"]);
+    await backend.close();
+  });
+
+  it("classifies an idle (pre-prompt) threshold compaction as near_overflow", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__threshold_preprompt__"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    off();
+
+    expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["near_overflow", "near_overflow"]);
+    await backend.close();
+  });
+
+  it("surfaces a deterministic context_manage fold as context_fold, never as a compaction lifecycle", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "__fold_tool__"]);
+    await waitFor(() => compactionEvents(events).length >= 1);
+    await settle();
+    off();
+
+    expect(compactionEvents(events)).toEqual([
+      { type: "compaction", sessionId: "session-1", phase: "end", reason: undefined, aborted: undefined, error: undefined, operation: "context_fold", trigger: "idle_fold", executed: true },
+    ]);
+    await backend.close();
+  });
+
+  it("does not surface a fold-shaped result from a tool that is not context_manage", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    // Same details fingerprint, but the paired tool_execution_start names bash:
+    // the result shape alone must never read as a fold.
+    await backend.handle("sendPrompt", ["session-1", "__fold_other_tool__"]);
+    await settle(200);
+    off();
+
+    expect(compactionEvents(events)).toEqual([]);
+    await backend.close();
+  });
+
+  it("does not claim a fold from a result with no tool_execution_start pairing", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    // A fold-fingerprinted tool_execution_end whose toolCallId was never
+    // announced: the tool identity is unknown, so no fold may be claimed.
+    await backend.handle("sendPrompt", ["session-1", "__fold_unpaired_end__"]);
+    await settle(200);
+    off();
+
+    expect(compactionEvents(events)).toEqual([]);
+    await backend.close();
+  });
+
+  it("classifies a non-nudge context_manage fold as auto_fold, never as idle", async () => {
+    const backend = await fixture();
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    // context_manage folding inside a normal turn — the agent tidying context
+    // on its own — must not borrow the idle scheduler's label.
+    await backend.handle("sendPrompt", ["session-1", "__fold_tool_no_nudge__"]);
+    await waitFor(() => compactionEvents(events).length >= 1);
+    await settle();
+    off();
+
+    expect(compactionEvents(events)).toEqual([
+      { type: "compaction", sessionId: "session-1", phase: "end", reason: undefined, aborted: undefined, error: undefined, operation: "context_fold", trigger: "auto_fold", executed: true },
+    ]);
     await backend.close();
   });
 

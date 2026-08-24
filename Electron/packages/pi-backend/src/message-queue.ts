@@ -143,6 +143,12 @@ export class SessionMessageQueue {
     return session ? this.blocked(session) : false;
   }
 
+  /** True only while a turn is actually streaming (agent_start→settle); delivery and compaction gates never count. */
+  isTurnActive(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return session ? session.turnActive : false;
+  }
+
   /** Sessions whose FIFO is blocked on a turn, in-flight delivery, or compaction. */
   busySessionIds(): string[] {
     return [...this.sessions.entries()]
