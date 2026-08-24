@@ -301,6 +301,11 @@ import {
 	resetFinalizationFields,
 } from "./finalization-phase.ts";
 import {
+	DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS,
+	awaitTerminalCandidate,
+	terminalCandidatePhaseError,
+} from "./terminal-candidate.ts";
+import {
 	type ActiveTool,
 	activeToolForContentIndex,
 	boundActivitySummary,
@@ -812,7 +817,24 @@ async function submitBrokerTerminalCandidate(
 	input: { runID: string; task: string; title?: string; terminalText: string; outcome: "success" | "failure" },
 ): Promise<void> {
 	if (!environment) return;
-	try {
+	const startedAt = Date.now();
+	const agent = environment.PIPIUI_AGENT_ID;
+	const probe = (state: "wait" | "timeout" | "ok" | "error"): void => {
+		logStallProbe("terminal-candidate", {
+			agent,
+			run: input.runID,
+			state,
+			elapsedMs: Date.now() - startedAt,
+		});
+		const error = terminalCandidatePhaseError(state);
+		if (!agent || !error) return;
+		const phase = handleForRun(agent, input.runID)?.diagnostics.finalizationPhase ?? "final-received";
+		projectFinalizationPhase(agent, input.runID, phase, { error });
+	};
+	probe("wait");
+	// Memory broker HTTP already has its own 3s AbortController; this outer
+	// bound covers import / flight hang and a stale client without a timeout.
+	const outcome = await awaitTerminalCandidate((async () => {
 		const identity = issuedMemoryBrokerPackageForChild(environment);
 		if (!identity) return;
 		const clientPath = fs.realpathSync(path.join(identity.root, "src/client.ts"));
@@ -820,9 +842,25 @@ async function submitBrokerTerminalCandidate(
 		if (!clientPath.startsWith(prefix) || !fs.statSync(clientPath).isFile()) return;
 		const { createMemoryBrokerClient, submitTerminalExperienceCandidate } = await import(pathToFileURL(clientPath).href);
 		await submitTerminalExperienceCandidate(createMemoryBrokerClient(environment), input);
-	} catch {
-		// Optional memory must not interfere with terminal report/done delivery.
+	})(), DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS, {
+		onLate: (late) => {
+			logStallProbe("terminal-candidate", {
+				agent,
+				run: input.runID,
+				state: late.status === "rejected" ? "late-reject" : "late-ok",
+				elapsedMs: Date.now() - startedAt,
+			});
+		},
+	});
+	if (outcome.status === "timeout") {
+		probe("timeout");
+		return;
 	}
+	if (outcome.status === "rejected") {
+		probe("error");
+		return;
+	}
+	probe("ok");
 }
 
 function memoryBrokerExtensionPathForChild(
