@@ -19,6 +19,8 @@ export type BridgeHandlers = {
   /** Plan tools POST here; a host with no plan surface still has to answer. */
   onPlanEvent?(event: Record<string, unknown>, sessionId: string): void;
   onBrowserAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
+  /** register / unwatch / list / subscribe for long-lived browser watches. */
+  onBrowserWatch?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   onTerminalAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
@@ -190,6 +192,7 @@ export class HostBridge {
       if (body.action === "agent_event") this.handlers.onAgentEvent(event as BridgeAgentEvent, sessionId);
       else if (body.action === "plan_event") this.handlers.onPlanEvent?.(event as Record<string, unknown>, sessionId);
       else if (body.action === "browser_action") return this.reply(response, 200, await (this.handlers.onBrowserAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "browser host unavailable" })));
+      else if (body.action === "browser_watch") return this.reply(response, 200, await Promise.resolve(this.handlers.onBrowserWatch?.(event as Record<string, unknown>, sessionId) ?? { ok: false, error: "browser watch unavailable" }));
       else if (body.action === "terminal_action") return this.reply(response, 200, await (this.handlers.onTerminalAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "terminal host unavailable" })));
       else if (body.action === "vault_action") {
         try {

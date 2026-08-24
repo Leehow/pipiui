@@ -2898,3 +2898,87 @@ describe('browser bypass redaction', () => {
     expect(JSON.stringify(dumped)).not.toContain(secret.slice(0, 12))
   })
 })
+
+describe('BrowserSessionHost WatcherRegistry hooks', () => {
+  function watchHarness(onWatchTrigger?: (watch: { watchId: string }, reason: string, summary: { url: string; title: string }) => void) {
+    const created: Array<{ contents: FakeWebContents; view: BrowserViewLike }> = []
+    const createView = vi.fn(() => {
+      const contents = new FakeWebContents()
+      const view: BrowserViewLike = {
+        webContents: contents,
+        setBounds: vi.fn(),
+        setVisible: vi.fn(),
+      }
+      created.push({ contents, view })
+      return view
+    })
+    const host = new BrowserSessionHost(createView, { onWatchTrigger })
+    host.attachToWindow(vi.fn())
+    return { host, created }
+  }
+
+  it('fires disposed and unregisters watches when the session is disposed', async () => {
+    const triggers: Array<{ reason: string; url: string }> = []
+    const { host } = watchHarness((_watch, reason, summary) => {
+      triggers.push({ reason, url: summary.url })
+    })
+    await host.toolAction('sess', { action: 'navigate', url: 'example.com' })
+    const registered = host.registerWatch({
+      sessionKey: 'sess',
+      condition: { type: 'selector', selector: '.ready' },
+      timeoutMs: 60_000,
+    })
+    expect(registered.ok).toBe(true)
+    await host.disposeSession('sess')
+    expect(triggers).toEqual([expect.objectContaining({ reason: 'disposed', url: 'https://example.com' })])
+    expect(host.listWatches()).toEqual([])
+    host.watchers.dispose()
+  })
+
+  it('notifies disposed even when the session never created a BrowserTabsHost', async () => {
+    const triggers: string[] = []
+    const { host } = watchHarness((_watch, reason) => { triggers.push(reason) })
+    const registered = host.registerWatch({
+      sessionKey: 'never-opened',
+      condition: { type: 'timer' },
+      timeoutMs: 60_000,
+    })
+    expect(registered.ok).toBe(true)
+    expect(host.listWatches('never-opened')).toHaveLength(1)
+    await host.disposeSession('never-opened')
+    expect(triggers).toEqual(['disposed'])
+    expect(host.listWatches()).toEqual([])
+    host.watchers.dispose()
+  })
+
+  it('fires disposed when the WebView is destroyed', async () => {
+    const triggers: string[] = []
+    const { host, created } = watchHarness((_watch, reason) => { triggers.push(reason) })
+    await host.toolAction('sess', { action: 'navigate', url: 'example.com' })
+    host.registerWatch({
+      sessionKey: 'sess',
+      condition: { type: 'idle' },
+      timeoutMs: 60_000,
+    })
+    created[0].contents.emit('destroyed')
+    expect(triggers).toEqual(['disposed'])
+    expect(host.listWatches()).toEqual([])
+    host.watchers.dispose()
+  })
+
+  it('matches selector through the wait_check executeJavaScript channel', async () => {
+    const triggers: string[] = []
+    const { host, created } = watchHarness((_watch, reason) => { triggers.push(reason) })
+    await host.toolAction('sess', { action: 'navigate', url: 'example.com' })
+    created[0].contents.waitReady = true
+    host.registerWatch({
+      sessionKey: 'sess',
+      condition: { type: 'selector', selector: '.ready' },
+      timeoutMs: 60_000,
+    })
+    await host.watchers.tick()
+    expect(triggers).toEqual(['matched'])
+    expect(created[0].contents.executeJavaScript.mock.calls.some(([code]) => String(code).includes('"action":"wait_check"'))).toBe(true)
+    host.watchers.dispose()
+  })
+})
