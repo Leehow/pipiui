@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Canonical DeepSeek Responses provider + hosted web_search (generic extension auth/provider contribution)",
+  "description": "Independent DeepSeek Extended Responses provider + hosted web_search (does not merge into reserved deepseek)",
   "exports": {
     "./package.json": "./package.json",
     "./agent/provider": "./agent/dist/provider.js",
@@ -11,7 +11,7 @@
     "./agent/models": "./agent/dist/models.js"
   },
   "scripts": {
-    "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
+    "build": "tsc -p agent/tsconfig.json && esbuild app/usage-panel.tsx --bundle --format=esm --outfile=app/dist/usage-panel.js --jsx=automatic",
     "postbuild": "node scripts/postbuild.mjs",
     "test": "vitest run",
     "clean": "rm -rf agent/dist app/dist"

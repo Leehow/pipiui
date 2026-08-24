@@ -9,8 +9,10 @@
  * These ids are conversation models only. They are never written to models.json.
  */
 
-export const AUTH_PROVIDER_ID = "deepseek";
+/** Independent extension provider. Must not collide with reserved official `deepseek`. */
+export const AUTH_PROVIDER_ID = "deepseek-extended";
 export const DEEPSEEK_PROVIDER_ID = AUTH_PROVIDER_ID;
+export const DEEPSEEK_PROVIDER_NAME = "DeepSeek Extended";
 
 export const DEEPSEEK_CHAT_API = "openai-responses" as const;
 export const DEEPSEEK_RESPONSES_API = DEEPSEEK_CHAT_API;
@@ -113,13 +115,18 @@ export const DEEPSEEK_CONVERSATION_MODEL_IDS: readonly string[] = DEEPSEEK_CONVE
   (model) => model.id,
 );
 
-/** Slim Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
+/** Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
 export function deepseekManifestModels(): Array<{
   id: string;
   name: string;
   api: typeof DEEPSEEK_CHAT_API;
   input: string[];
   reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  thinkingLevelMap?: DeepSeekConversationModel["thinkingLevelMap"];
+  compat?: DeepSeekConversationModel["compat"];
   capabilities: DeepSeekModelCapabilities;
 }> {
   return DEEPSEEK_CONVERSATION_MODELS.map((model) => ({
@@ -128,6 +135,11 @@ export function deepseekManifestModels(): Array<{
     api: model.api,
     input: [...model.input],
     reasoning: model.reasoning,
+    contextWindow: model.contextWindow,
+    maxTokens: model.maxTokens,
+    cost: { ...model.cost },
+    ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+    ...(model.compat ? { compat: { ...model.compat } } : {}),
     capabilities: {
       hostedTools: {
         tools: [...(model.capabilities?.hostedTools.tools ?? DEEPSEEK_HOSTED_TOOLS.tools)],

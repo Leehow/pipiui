@@ -292,6 +292,13 @@ describe("pipiui-deepseek-server-tools", () => {
         { model: { provider: "openai", api: "openai-completions", id: "gpt-4.1" } },
       ),
     ).toBeUndefined();
+
+    const extended = beforeRequest?.(
+      { type: "before_provider_request", payload: completionsPayload() },
+      { model: { provider: "deepseek-extended", api: "openai-responses", id: "deepseek-v4-flash-vision-exp" } },
+    ) as Record<string, unknown> | undefined;
+    expect(extended).toBeDefined();
+    expect(toolNames(extended?.tools)).toEqual(["bash", "read", "web_search"]);
   });
 
   it("forces tool_choice from ext.deepseek.forceWebSearch and advertises hosted search", async () => {

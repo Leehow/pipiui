@@ -1,6 +1,6 @@
 # @pipiui/deepseek-extension
 
-DeepSeek Responses 提供方扩展：API Key 登录、`deepseek-v4-flash-vision-exp`（多模态，1M ctx / 384K max output）与 `deepseek-v4-flash` 文本模型，以及 hosted `web_search`。
+DeepSeek Responses 独立提供方扩展（`deepseek-extended` / DeepSeek Extended）：API Key 登录、`deepseek-extended/deepseek-v4-flash-vision-exp`（多模态，1M ctx / 384K max output）与 `deepseek-extended/deepseek-v4-flash` 文本模型，以及 hosted `web_search`。不合并、不替换内置 reserved provider `deepseek`（Flash + Pro）。
 
 一期只有 agent 半边（`agent/dist/index.js`）；`app/` UI、Files API、strict tool calls 属二期。凭证优先走 Pi `auth.json`，`ext.deepseek.apiKey` / `ext.deepseek.baseUrl`（默认 `https://api.deepseek.com`）作兜底。会话传输是 `openai-responses`（`POST /responses`）；`pipiui-deepseek-server-tools.ts` 负责 hosted search 注入、URL 重写和 citation 回映射。
 

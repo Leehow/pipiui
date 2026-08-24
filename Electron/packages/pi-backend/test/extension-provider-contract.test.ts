@@ -9,6 +9,7 @@ import {
   detectContributionCollisions,
   extensionAuthStatus,
   filterCatalogByContributions,
+  mergeContributedModelCapabilities,
   parseExtensionAuthContribution,
   reservedProviderClaimError,
   resolveContributedCatalog,
@@ -132,6 +133,104 @@ describe("extension auth contribution validation", () => {
     expect(dup?.errors.join("; ")).toMatch(/duplicate model id/);
   });
 
+  it("normalizes nativeSearch capabilities and rejects unknown tools", () => {
+    const parsed = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [{
+          id: "fast",
+          name: "Fast",
+          capabilities: {
+            nativeSearch: {
+              tools: ["web_search", "x_search"],
+              domains: { allow: ["docs.example"] },
+            },
+            other: { ok: true },
+          },
+        }],
+      },
+    });
+    expect(parsed).toMatchObject({
+      ok: true,
+      contribution: {
+        provider: {
+          models: [{
+            id: "fast",
+            capabilities: {
+              other: { ok: true },
+              nativeSearch: {
+                tools: ["web_search", "x_search"],
+                domains: { allow: ["docs.example"] },
+              },
+            },
+          }],
+        },
+      },
+    });
+    const shorthand = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [{ id: "fast", name: "Fast", capabilities: { nativeSearch: ["x_search"] } }],
+      },
+    });
+    expect(shorthand).toMatchObject({
+      ok: true,
+      contribution: { provider: { models: [{ capabilities: { nativeSearch: { tools: ["x_search"] } } }] } },
+    });
+    const bad = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [{ id: "fast", name: "Fast", capabilities: { nativeSearch: ["live_search"] } }],
+      },
+    });
+    expect(bad?.ok).toBe(false);
+    if (bad?.ok) return;
+    expect(bad?.errors.join("; ")).toMatch(/web_search or x_search/);
+  });
+
+  it("normalizes hostedTools and request-feature capabilities", () => {
+    const parsed = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [{
+          id: "fast",
+          name: "Fast",
+          capabilities: {
+            hostedTools: ["web_search", "code_interpreter"],
+            structuredOutputs: true,
+            inputFiles: { upload: true },
+          },
+        }],
+      },
+    });
+    expect(parsed).toMatchObject({
+      ok: true,
+      contribution: {
+        provider: {
+          models: [{
+            capabilities: {
+              hostedTools: { tools: ["web_search", "code_interpreter"] },
+              structuredOutputs: true,
+              inputFiles: { upload: true },
+            },
+          }],
+        },
+      },
+    });
+    const bad = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [{ id: "fast", name: "Fast", capabilities: { hostedTools: ["file_search"] } }],
+      },
+    });
+    expect(bad?.ok).toBe(false);
+  });
+
   it("rejects colliding enabled provider claims and reserved host ids", () => {
     const claims: ContributionClaim[] = [
       {
@@ -192,6 +291,58 @@ describe("extension auth contribution validation", () => {
     ]);
   });
 
+  it("preserves nativeSearch through overlay and merges it onto existing catalog rows", () => {
+    const claims: ContributionClaim[] = [
+      {
+        extensionId: "acme",
+        enabled: true,
+        contribution: {
+          provider: {
+            id: "acme-chat",
+            name: "Acme",
+            models: [
+              {
+                id: "acme-fast",
+                name: "Acme Fast",
+                capabilities: { nativeSearch: { tools: ["web_search", "x_search"] } },
+              },
+              {
+                id: "declared",
+                name: "Declared",
+                capabilities: {
+                  nativeSearch: { tools: ["web_search"], domains: { deny: ["tracker.example"] } },
+                },
+              },
+            ],
+          },
+        },
+      },
+    ];
+    const overlay = resolveContributedCatalog({
+      claims,
+      authenticatedProviders: new Set(["acme-chat"]),
+      existing: [{ provider: "acme-chat", id: "acme-fast" }],
+    });
+    expect(overlay.models).toEqual([{
+      provider: "acme-chat",
+      id: "declared",
+      name: "Declared",
+      capabilities: {
+        nativeSearch: { tools: ["web_search"], domains: { deny: ["tracker.example"] } },
+      },
+    }]);
+    const merged = mergeContributedModelCapabilities(
+      [{ provider: "acme-chat", id: "acme-fast", name: "Runtime Fast" }],
+      { claims, authenticatedProviders: new Set(["acme-chat"]) },
+    );
+    expect(merged[0]).toMatchObject({
+      provider: "acme-chat",
+      id: "acme-fast",
+      name: "Runtime Fast",
+      capabilities: { nativeSearch: { tools: ["web_search", "x_search"] } },
+    });
+  });
+
   it("does not let a disabled duplicate claim hide an enabled owner", () => {
     const claims: ContributionClaim[] = [
       {
@@ -232,6 +383,111 @@ describe("extension auth contribution validation", () => {
     });
     expect(authStatusContainsSecrets(status)).toBe(false);
     expect(authStatusContainsSecrets({ ...status, accessToken: "tok" })).toBe(true);
+  });
+
+  it("passes richer model fields through parse and resolveContributedCatalog", () => {
+    const parsed = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [
+          {
+            id: "vision",
+            name: "Vision",
+            api: "openai-responses",
+            input: ["text", "image"],
+            reasoning: true,
+            contextWindow: 1_000_000,
+            maxTokens: 384_000,
+            cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+            thinkingLevelMap: { high: "high", max: "max" },
+            compat: { thinkingFormat: "deepseek" },
+          },
+        ],
+      },
+    });
+    expect(parsed).toMatchObject({ ok: true });
+    if (!parsed || !parsed.ok) return;
+    expect(parsed.contribution.provider.models[0]).toMatchObject({
+      contextWindow: 1_000_000,
+      maxTokens: 384_000,
+      cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+      thinkingLevelMap: { high: "high", max: "max" },
+      compat: { thinkingFormat: "deepseek" },
+    });
+    const overlay = resolveContributedCatalog({
+      claims: [{ extensionId: "acme", enabled: true, contribution: parsed.contribution }],
+      authenticatedProviders: new Set(["acme-chat"]),
+      existing: [],
+    });
+    expect(overlay.models).toEqual([
+      {
+        provider: "acme-chat",
+        id: "vision",
+        name: "Vision",
+        api: "openai-responses",
+        input: ["text", "image"],
+        reasoning: true,
+        contextWindow: 1_000_000,
+        maxTokens: 384_000,
+        cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+        thinkingLevelMap: { high: "high", max: "max" },
+        compat: { thinkingFormat: "deepseek" },
+      },
+    ]);
+  });
+
+  it("rejects invalid richer model fields", () => {
+    const parsed = parseExtensionAuthContribution({
+      provider: {
+        id: "acme-chat",
+        name: "Acme",
+        models: [
+          {
+            id: "fast",
+            name: "Fast",
+            contextWindow: 0,
+            maxTokens: -1,
+            cost: { input: 1 },
+            thinkingLevelMap: "high",
+            compat: [],
+          },
+        ],
+      },
+    });
+    expect(parsed?.ok).toBe(false);
+    if (parsed?.ok) return;
+    expect(parsed?.errors.join("; ")).toMatch(/contextWindow/);
+    expect(parsed?.errors.join("; ")).toMatch(/maxTokens/);
+    expect(parsed?.errors.join("; ")).toMatch(/cost/);
+    expect(parsed?.errors.join("; ")).toMatch(/thinkingLevelMap/);
+    expect(parsed?.errors.join("; ")).toMatch(/compat/);
+  });
+
+  it("skips contributed models whose provider\/id already exists", () => {
+    const overlay = resolveContributedCatalog({
+      claims: [
+        {
+          extensionId: "deepseek",
+          enabled: true,
+          contribution: {
+            provider: {
+              id: "deepseek",
+              name: "DeepSeek",
+              models: [
+                { id: "deepseek-v4-flash", name: "Hijack Flash" },
+                { id: "deepseek-v4-flash-vision-exp", name: "Vision" },
+              ],
+            },
+          },
+        },
+      ],
+      authenticatedProviders: new Set(["deepseek"]),
+      existing: [{ provider: "deepseek", id: "deepseek-v4-flash" }],
+    });
+    expect(overlay.models).toEqual([
+      { provider: "deepseek", id: "deepseek-v4-flash-vision-exp", name: "Vision" },
+    ]);
   });
 });
 
@@ -385,6 +641,152 @@ describe("extension provider contribution host lifecycle", () => {
       .rejects.toThrow(/reserved/);
   });
 
+  it("keeps official deepseek Flash+Pro next to independent deepseek-extended Flash+Vision", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-deepseek-split-"));
+    const agent = join(root, "agent");
+    await mkdir(agent, { recursive: true });
+    await writeFile(
+      join(agent, "models.json"),
+      JSON.stringify({
+        providers: {
+          deepseek: {
+            apiKey: "official-key",
+            models: [
+              { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true },
+              { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true },
+            ],
+          },
+        },
+      }),
+    );
+    await writeFile(
+      join(agent, "auth.json"),
+      JSON.stringify({
+        "deepseek-extended": { type: "api_key", key: "ext-key" },
+        deepseek: { type: "api_key", key: "official-key" },
+      }),
+    );
+    await writeExtension(join(agent, "extensions"), "deepseek", {
+      id: "deepseek",
+      name: "DeepSeek Extended",
+      version: "0.1.0",
+      capabilities: [],
+      auth: {
+        provider: {
+          id: "deepseek-extended",
+          name: "DeepSeek Extended",
+          api: "openai-responses",
+          oauth: false,
+          models: [
+            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek V4 Flash Vision", api: "openai-responses" },
+            { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", api: "openai-responses" },
+          ],
+        },
+      },
+    });
+    const credentialed = new Set(["deepseek", "deepseek-extended"]);
+    backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      authRuntime: {
+        getProviders: async () => [
+          { id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } },
+          { id: "deepseek-extended", name: "DeepSeek Extended", auth: { apiKey: { login: {} } } },
+        ],
+        getAvailable: async () => [
+          { provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true },
+          { provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true },
+        ].filter((model) => credentialed.has(model.provider)),
+        login: async (providerId) => {
+          credentialed.add(providerId);
+          return { type: "api_key" };
+        },
+        logout: async (providerId) => {
+          credentialed.delete(providerId);
+        },
+      },
+    });
+    await backend.handle("setExtensionEnabled" as never, ["deepseek", true, "app"]);
+    const refs = (await backend.handle("listModels", []) as { provider: string; id: string }[])
+      .map((model) => `${model.provider}/${model.id}`);
+    expect(refs.filter((ref) => ref.startsWith("deepseek/"))).toEqual([
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+    ]);
+    expect(refs.filter((ref) => ref.startsWith("deepseek-extended/"))).toEqual([
+      "deepseek-extended/deepseek-v4-flash-vision-exp",
+      "deepseek-extended/deepseek-v4-flash",
+    ]);
+    expect(refs).not.toContain("deepseek/deepseek-v4-flash-vision-exp");
+    expect(refs).not.toContain("deepseek-extended/deepseek-v4-pro");
+  });
+
+  it("does not additively merge a reserved deepseek claim into the official catalog", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-deepseek-reserved-"));
+    const agent = join(root, "agent");
+    await mkdir(agent, { recursive: true });
+    await writeFile(
+      join(agent, "models.json"),
+      JSON.stringify({
+        providers: {
+          deepseek: {
+            apiKey: "official-key",
+            models: [
+              { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true },
+              { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true },
+            ],
+          },
+        },
+      }),
+    );
+    await writeFile(
+      join(agent, "pipiui-settings.json"),
+      JSON.stringify({ extensions: { "deepseek-hijack": { enabled: true } } }),
+    );
+    await writeFile(
+      join(agent, "auth.json"),
+      JSON.stringify({ deepseek: { type: "api_key", key: "official-key" } }),
+    );
+    await writeExtension(join(agent, "extensions"), "deepseek-hijack", {
+      id: "deepseek-hijack",
+      name: "DeepSeek Hijack",
+      version: "0.1.0",
+      capabilities: [],
+      auth: {
+        provider: {
+          id: "deepseek",
+          name: "DeepSeek",
+          models: [
+            { id: "deepseek-v4-flash-vision-exp", name: "DeepSeek V4 Flash Vision" },
+            { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash hijacked" },
+          ],
+        },
+      },
+    });
+    backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      authRuntime: {
+        getProviders: async () => [{ id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } }],
+        getAvailable: async () => [
+          { provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true },
+          { provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true },
+        ],
+        login: async () => ({ type: "api_key" }),
+        logout: async () => undefined,
+      },
+    });
+    await expect(backend.handle("setExtensionEnabled" as never, ["deepseek-hijack", true, "app"]))
+      .rejects.toThrow(/reserved/);
+    const refs = (await backend.handle("listModels", []) as { provider: string; id: string; name: string }[])
+      .filter((model) => model.provider === "deepseek");
+    expect(refs.map((model) => model.id)).toEqual(["deepseek-v4-flash", "deepseek-v4-pro"]);
+    expect(refs.find((model) => model.id === "deepseek-v4-flash")?.name).toBe("DeepSeek V4 Flash");
+    expect(refs.some((model) => model.id === "deepseek-v4-flash-vision-exp")).toBe(false);
+  });
+
   it("puts an invalid auth contribution into error and does not add models", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-ext-provider-bad-"));
     const agent = join(root, "agent");
@@ -407,5 +809,152 @@ describe("extension provider contribution host lifecycle", () => {
     expect(bad?.state).toBe("error");
     expect(bad?.error).toMatch(/auth\.provider\.id/);
     expect((await backend.handle("listModels", []) as { provider: string }[]).some((model) => model.provider === "Not Valid")).toBe(false);
+  });
+});
+
+describe("reserved official provider claims stay host-owned", () => {
+  let root = "";
+  let backend: ReturnType<typeof createPiHostBackend> | undefined;
+  afterEach(async () => {
+    await backend?.close?.();
+    backend = undefined;
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    root = "";
+  });
+
+  const visionContribution = {
+    id: "deepseek-v4-flash-vision-exp",
+    name: "DeepSeek V4 Flash Vision",
+    api: "openai-responses",
+    input: ["text", "image"],
+    reasoning: true,
+    contextWindow: 1_000_000,
+    maxTokens: 384_000,
+    cost: { input: 0.22, output: 0.66, cacheRead: 0.007, cacheWrite: 0 },
+    thinkingLevelMap: { high: "high", max: "max" },
+    compat: { thinkingFormat: "deepseek" },
+  };
+
+  async function setupReserved(options: { authenticated?: boolean; enabled?: boolean } = {}) {
+    const authenticated = options.authenticated !== false;
+    const enabled = options.enabled !== false;
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-reserved-"));
+    const agent = join(root, "agent");
+    await mkdir(agent, { recursive: true });
+    if (authenticated) {
+      await writeFile(
+        join(agent, "auth.json"),
+        JSON.stringify({ deepseek: { type: "api_key", key: "sk-test" } }),
+      );
+    }
+    await writeFile(
+      join(agent, "models.json"),
+      JSON.stringify({
+        providers: {
+          anthropic: { apiKey: "k", models: [{ id: "a1", name: "A1", reasoning: true }] },
+          deepseek: {
+            apiKey: "k",
+            models: [
+              { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true },
+              { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true },
+            ],
+          },
+        },
+      }),
+    );
+    if (enabled) {
+      await writeFile(
+        join(agent, "pipiui-settings.json"),
+        JSON.stringify({ extensions: { "deepseek-vision": { enabled: true } } }),
+      );
+    }
+    await writeExtension(join(agent, "extensions"), "deepseek-vision", {
+      id: "deepseek-vision",
+      name: "DeepSeek Vision",
+      version: "1.0.0",
+      capabilities: [],
+      auth: {
+        provider: {
+          id: "deepseek",
+          name: "DeepSeek",
+          api: "openai-responses",
+          models: [
+            visionContribution,
+            {
+              id: "deepseek-v4-flash",
+              name: "Hijacked Flash",
+              api: "openai-responses",
+              input: ["text"],
+              reasoning: true,
+            },
+          ],
+        },
+      },
+    });
+    const credentialed = new Set(authenticated ? ["deepseek", "anthropic"] : ["anthropic"]);
+    const catalog = [
+      { provider: "deepseek", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: true, input: ["text"] },
+      { provider: "deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true, input: ["text"] },
+      { provider: "anthropic", id: "a1", name: "A1", reasoning: true },
+    ];
+    backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      authRuntime: {
+        getProviders: async () => [
+          { id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } },
+          { id: "anthropic", name: "Anthropic", auth: { apiKey: { login: {} } } },
+        ],
+        getAvailable: async () => catalog.filter((model) => credentialed.has(model.provider)),
+        login: async () => ({ type: "api_key" }),
+        logout: async () => undefined,
+      },
+    });
+    return { agent, backend };
+  }
+
+  function keys(models: Array<{ provider: string; id: string; name?: string }>): string[] {
+    return models.map((model) => `${model.provider}/${model.id}`);
+  }
+
+  it("does not let a reserved claim filter or replace built-in models", async () => {
+    const { backend: host } = await setupReserved({ authenticated: false, enabled: true });
+    const listed = await host.handle("listModels", []) as Array<{ provider: string; id: string; name: string }>;
+    expect(keys(listed)).toEqual(expect.arrayContaining([
+      "anthropic/a1",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+    ]));
+    expect(keys(listed)).not.toContain("deepseek/deepseek-v4-flash-vision-exp");
+    expect(listed.find((model) => model.id === "deepseek-v4-flash")?.name).toBe("DeepSeek V4 Flash");
+  });
+
+  it("does not additively merge a reserved-provider model when enabled and authenticated", async () => {
+    const { backend: host } = await setupReserved({ authenticated: true, enabled: true });
+    const listed = await host.handle("listModels", []) as Array<{
+      provider: string;
+      id: string;
+      name: string;
+    }>;
+    expect(keys(listed)).toEqual(expect.arrayContaining([
+      "anthropic/a1",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+    ]));
+    expect(keys(listed)).not.toContain("deepseek/deepseek-v4-flash-vision-exp");
+    expect(listed.filter((model) => model.id === "deepseek-v4-flash")).toHaveLength(1);
+    expect(listed.find((model) => model.id === "deepseek-v4-flash")?.name).toBe("DeepSeek V4 Flash");
+  });
+
+  it("does not add a reserved-provider model when the extension is disabled", async () => {
+    const { backend: host } = await setupReserved({ authenticated: true, enabled: false });
+    const listed = await host.handle("listModels", []) as Array<{ provider: string; id: string }>;
+    expect(keys(listed)).toEqual(expect.arrayContaining([
+      "anthropic/a1",
+      "deepseek/deepseek-v4-flash",
+      "deepseek/deepseek-v4-pro",
+    ]));
+    expect(keys(listed)).not.toContain("deepseek/deepseek-v4-flash-vision-exp");
   });
 });

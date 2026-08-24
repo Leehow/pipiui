@@ -56,8 +56,10 @@ function stringOf(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
+const DEEPSEEK_HOSTED_SEARCH_PROVIDERS = new Set(["deepseek", "deepseek-extended"]);
+
 export function isDeepSeekProvider(model: { provider?: string } | undefined): boolean {
-  return (model?.provider || "").toLowerCase() === "deepseek";
+  return DEEPSEEK_HOSTED_SEARCH_PROVIDERS.has((model?.provider || "").toLowerCase());
 }
 
 export function isResponsesPayload(payload: unknown): payload is ProviderPayload {

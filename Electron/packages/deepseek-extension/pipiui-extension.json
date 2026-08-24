@@ -1,6 +1,6 @@
 {
   "id": "deepseek",
-  "name": "DeepSeek",
+  "name": "DeepSeek Extended",
   "version": "0.1.0",
   "capabilities": [
     "settings.read",
@@ -11,8 +11,8 @@
   ],
   "auth": {
     "provider": {
-      "id": "deepseek",
-      "name": "DeepSeek",
+      "id": "deepseek-extended",
+      "name": "DeepSeek Extended",
       "api": "openai-responses",
       "oauth": false,
       "models": [
@@ -22,6 +22,16 @@
           "api": "openai-responses",
           "input": ["text", "image"],
           "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "cost": { "input": 0.22, "output": 0.66, "cacheRead": 0.007, "cacheWrite": 0 },
+          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "max": "max" },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek"
+          },
           "capabilities": {
             "hostedTools": { "tools": ["web_search"] },
             "structuredOutputs": true,
@@ -34,6 +44,16 @@
           "api": "openai-responses",
           "input": ["text"],
           "reasoning": true,
+          "contextWindow": 1000000,
+          "maxTokens": 384000,
+          "cost": { "input": 0.22, "output": 0.66, "cacheRead": 0.007, "cacheWrite": 0 },
+          "thinkingLevelMap": { "minimal": null, "low": null, "medium": null, "high": "high", "max": "max" },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "requiresReasoningContentOnAssistantMessages": true,
+            "thinkingFormat": "deepseek"
+          },
           "capabilities": {
             "hostedTools": { "tools": ["web_search"] },
             "structuredOutputs": true,
@@ -75,11 +95,9 @@
       }
     },
     "ui": {
-      "panels": [
-        { "slot": "toolPanel", "id": "usage", "title": "用量", "entry": "app/dist/usage-panel.js" }
-      ],
+      "panels": [],
       "settingsSections": [
-        { "id": "deepseek", "title": "DeepSeek" }
+        { "id": "deepseek", "title": "DeepSeek Extended" }
       ],
       "slashCommands": [],
       "themes": [],

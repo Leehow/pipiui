@@ -28,7 +28,7 @@ describe("deepseek conversation request adapter", () => {
   it("routes contributed models through HTTPS openai-responses + stored API key", () => {
     const provider = createAuthProvider();
     expect(createAuthProvider).toBe(createDeepSeekProvider);
-    expect(DEEPSEEK_PROVIDER_ID).toBe("deepseek");
+    expect(DEEPSEEK_PROVIDER_ID).toBe("deepseek-extended");
     expect(provider.api).toBe("openai-responses");
     expect(provider.baseUrl).toBe("https://api.deepseek.com");
     expect(provider.authHeader).toBe(true);

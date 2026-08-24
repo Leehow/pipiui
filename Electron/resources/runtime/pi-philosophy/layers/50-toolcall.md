@@ -5,7 +5,7 @@ summary: 该调工具时调工具：首轮就动手、不用 shell 复刻已有�
 order: 50
 requires: []
 requires-capabilities: []
-requires-models: deepseek/deepseek-v4-*
+requires-models: deepseek/deepseek-v4-*, deepseek-extended/deepseek-v4-*
 scope: [main, lead, worker]
 ---
 # Tool discipline

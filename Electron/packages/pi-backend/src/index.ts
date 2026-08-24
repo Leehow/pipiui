@@ -9,6 +9,8 @@ import {
   PIPI_HOST_PROTOCOL_VERSION,
   THINKING_LEVELS,
   documentKindForName,
+  mergeModelCapabilities,
+  normalizeModelCapabilities,
   resolveThinkingLevel,
   thinkingLevelsForModel,
   type AgentDefinition,
@@ -25,7 +27,10 @@ import {
   type HostMethod,
   type HistoryEntry,
   type HistoryTool,
+  type InputFileAttachment,
+  type InputFileStageRequest,
   type Model,
+  type ModelCapabilities,
   type ModelCatalogEvent,
   type ModelState,
   type PromptAttachment,
@@ -63,6 +68,8 @@ import {
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
+import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
+import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
 import { LeaseManager } from "./lease.js";
@@ -80,6 +87,18 @@ import {
   installFreezeProbe,
 } from "./freeze-probe.js";
 import { buildDocumentsOpenedInjection, DocumentInjectionStore, prependDocumentInjection } from "./document-inject.js";
+import {
+  InputFilesController,
+  JsonInputFileStore,
+  loadGrokInputFilesRemote,
+  type InputFilesRemote,
+} from "./input-files.js";
+import {
+  StructuredOutputController,
+  loadGrokStructuredOutputNormalize,
+  type StructuredOutputNormalize,
+  type StructuredOutputsEnabled,
+} from "./structured-output.js";
 import { convertDocumentFileToMarkdown } from "./anydoc-convert.js";
 import { ProviderAuthBackend, type AuthRuntimeLike } from "./provider-auth.js";
 import { ExternalAuthRuntime } from "./external-auth-runtime.js";
@@ -155,6 +174,7 @@ import {
   detectContributionCollisions,
   extensionAuthStatus,
   filterCatalogByContributions,
+  mergeContributedModelCapabilities,
   redactAuthStatus,
   reservedProviderClaimError,
   resolveContributedCatalog,
@@ -555,6 +575,9 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
+  /** Test/host-injected Chat with Files uploader. Production loads the grok host entry. */ inputFilesRemote?: InputFilesRemote;
+  /** Test-injected Structured Outputs validator. Production loads the grok host entry. */ structuredOutputNormalize?: StructuredOutputNormalize;
+  structuredOutputsEnabled?: StructuredOutputsEnabled;
   /** In-memory vault namespace key. Never used as a disk path. */ vaultDir?: string;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
@@ -691,6 +714,17 @@ const text = (content: any) =>
     : Array.isArray(content)
       ? content.map((p) => p.text ?? p.thinking ?? "").join("")
       : "";
+/** Steer receipts match whitespace-tolerantly: pi may wrap the injected text
+ * (document injection prefix, line wrapping) before echoing it back. */
+export const normalizeSteerText = (value: string): string => value.replace(/\s+/g, " ").trim();
+export const previewSteerText = (value: string): string => {
+  const normalized = normalizeSteerText(value);
+  return normalized.length > 60 ? `${normalized.slice(0, 60)}…` : normalized;
+};
+/** Stable copy taken before send so later queue/caller mutation cannot rewrite the receipt. */
+export const snapshotAttachments = (
+  attachments: QueuedDispatchPayload["attachments"] | undefined,
+): QueuedDispatchPayload["attachments"] => structuredClone(attachments ?? []);
 const assistantVisibleText = (content: any) =>
   typeof content === "string"
     ? content
@@ -1037,6 +1071,28 @@ function historyEntryFromMessage(entry: any): HistoryEntry | undefined {
   if (thinking) result.thinking = thinking;
   if (tools && tools.length) result.tools = tools;
   if (activities && activities.length) result.activities = activities;
+  if (role === "assistant") {
+    const citations = extractHistoryCitations(message, textPart);
+    if (citations.length) result.citations = citations;
+    const fileSources = extractHistoryFileSources(message);
+    if (fileSources.length) result.fileSources = fileSources;
+    const hostedCode = extractHistoryCodeInterpreter(message);
+    if (hostedCode.length) {
+      const existing = new Set((result.tools ?? []).map((tool) => tool.id));
+      const extra = hostedCode.filter((tool) => !existing.has(tool.id));
+      if (extra.length) {
+        result.tools = [...(result.tools ?? []), ...extra];
+        result.activities = [
+          ...(result.activities ?? []),
+          ...extra.map((tool, index) => ({
+            type: "tool" as const,
+            contentIndex: (result.activities?.length ?? 0) + index,
+            tool,
+          })),
+        ];
+      }
+    }
+  }
   if (images && images.length) result.images = images;
   if (message.role === "toolResult") {
     result.toolCallId = message.toolCallId;
@@ -1457,6 +1513,12 @@ function thinkingLevelMapFrom(value: unknown): ThinkingLevelMap | undefined {
   }
   return result;
 }
+function capabilitiesForHostModel(raw: any, inherited: any): ModelCapabilities | undefined {
+  return mergeModelCapabilities(
+    normalizeModelCapabilities(inherited?.capabilities),
+    normalizeModelCapabilities(raw?.capabilities),
+  );
+}
 /** Reduce Pi's provider-shaped model into the small capability contract renderers need. */
 function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {}): Model {
   const provider = raw?.provider ?? fallbackProvider ?? inherited?.provider ?? "unknown";
@@ -1465,6 +1527,7 @@ function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {
     ? raw.reasoning
     : (typeof inherited?.reasoning === "boolean" ? inherited.reasoning : undefined);
   const thinkingLevelMap = thinkingLevelMapFrom(raw?.thinkingLevelMap ?? inherited?.thinkingLevelMap);
+  const capabilities = capabilitiesForHostModel(raw, inherited);
   let thinkingConfigurable: boolean | undefined;
   if (reasoning === false) {
     thinkingConfigurable = false;
@@ -1481,6 +1544,7 @@ function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {
     ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
     ...(thinkingConfigurable === undefined ? {} : { thinkingConfigurable }),
     supportsImages: supportsImagesFor(id, provider, raw?.input ?? inherited?.input),
+    ...(capabilities === undefined ? {} : { capabilities }),
   };
 }
 const ATTACHMENT_EXT: Record<string, string> = {
@@ -1748,6 +1812,10 @@ export class PiHostBackend implements HostBackend {
   private toolBatchTelemetry: ToolBatchTelemetry;
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
+  /** Steer payloads pi acknowledged but never echoed back as a user message.
+   * pi's ack only proves the text entered its in-memory steering queue, which
+   * an aborted/compacted turn can drop; settle recycles them to the FIFO head. */
+  private unconfirmedSteers = new Map<string, QueuedDispatchPayload[]>();
   private turnWatchdogTimer?: NodeJS.Timeout;
   private closed = false;
   private agentTerminalWaiters = new Set<() => void>();
@@ -1763,6 +1831,13 @@ export class PiHostBackend implements HostBackend {
   private terminalSessionDeleted?: (sessionId: string) => void;
   private externalSessionRoots: ExternalSessionRoots;
   private adoptInFlight = new Map<string, Promise<Session>>();
+  private inputFilesRemote?: InputFilesRemote;
+  private inputFiles?: InputFilesController;
+  private inputFilesReady?: Promise<InputFilesController>;
+  private structuredOutputs?: StructuredOutputController;
+  private structuredOutputsReady?: Promise<StructuredOutputController>;
+  private structuredOutputNormalize?: StructuredOutputNormalize;
+  private structuredOutputsEnabledFn?: StructuredOutputsEnabled;
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
@@ -1794,6 +1869,9 @@ export class PiHostBackend implements HostBackend {
         }
       : { executable: options.piPath ?? resolvePiExecutable(options.env ?? process.env) };
     this.runtimeRoot = options.runtimeRoot ?? defaultRuntimeRoot();
+    this.inputFilesRemote = options.inputFilesRemote;
+    this.structuredOutputNormalize = options.structuredOutputNormalize;
+    this.structuredOutputsEnabledFn = options.structuredOutputsEnabled;
     this.managedNodeModulesRoot = options.managedNodeModulesRoot;
     this.runtimeAssets = options.runtimeAssets;
     this.features = options.features ?? DEFAULT_FEATURES;
@@ -1864,6 +1942,11 @@ export class PiHostBackend implements HostBackend {
         return result
       },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
+      onStructuredOutput: async (event, sessionId) => {
+        const op = event.op;
+        if (op !== "take") throw new Error("unsupported structured_output op");
+        return this.structuredOutputs?.take(sessionId) ?? null;
+      },
       onExtEmit: (input, sessionId) => {
         const result = handleExtEmit(this.extensions, input, sessionId);
         if (!result.ok) return result;
@@ -2076,6 +2159,7 @@ export class PiHostBackend implements HostBackend {
     await this.thinkingControlWrite.catch(() => undefined);
     await Promise.allSettled([...this.backgroundTitleGenerations]);
     await this.bridge.close();
+    this.structuredOutputs?.clearAll();
     this.extensionUi.dispose();
     const live = [...this.live.values()];
     for (const sessionId of this.live.keys()) this.extensions.unmountSession(sessionId);
@@ -2188,6 +2272,10 @@ export class PiHostBackend implements HostBackend {
     await new Promise<void>((resolve) => setImmediate(resolve));
     await this.awaitUnusableLiveExit(id);
     if (!this.closed) {
+      // Steer acks only prove pi queued the text in memory; a turn that
+      // settles without echoing it (compaction/abort dropped it) loses the
+      // message. Recycle before notifyIdle so the drain can redeliver.
+      this.recycleUnconfirmedSteers(id);
       await this.queue.notifyIdle(id, epoch);
       // Stats and queue-idle completion can race after agent_settled. Recheck
       // after the authoritative idle transition so an eligible wait wave is
@@ -2275,6 +2363,7 @@ export class PiHostBackend implements HostBackend {
     attachments?: PromptAttachment[],
   ): Promise<QueueEnqueueResult> {
     if (isExternalSessionId(id)) throw new Error("external session is read-only");
+    this.structuredOutputs?.assertReadyToSend(id);
     await this.loadQueue(id);
     const result = this.queue.enqueue(id, { text, attachments });
     if (result.outcome === "dispatched") await this.queue.waitForDispatch(id);
@@ -2733,6 +2822,18 @@ export class PiHostBackend implements HostBackend {
         return this.notifyDocumentsDropped(params[0], params[1]);
       case "notifyComposerDocumentsDropped":
         return this.notifyComposerDocumentsDropped(params[0], params[1]);
+      case "stageInputFile":
+        return this.stageInputFile(params[0], params[1]);
+      case "listInputFiles":
+        return this.listInputFiles(params[0]);
+      case "removeInputFile":
+        return this.removeInputFile(params[0], params[1]);
+      case "retryInputFile":
+        return this.retryInputFile(params[0], params[1], params[2]);
+      case "cancelInputFile":
+        return this.cancelInputFile(params[0], params[1]);
+      case "setStructuredOutput":
+        return this.setStructuredOutput(params[0], params[1]);
       case "listSessions": {
         const pid = params[0] as string;
         const paths = await this.loadProjectPaths();
@@ -2801,6 +2902,7 @@ export class PiHostBackend implements HostBackend {
         await this.queueWrites.get(s.header.id)?.catch(() => undefined);
         await this.queueStore.remove(s.header.id);
         this.queueLoads.delete(s.header.id);
+        this.unconfirmedSteers.delete(s.header.id);
         await fs.rm(s.path);
         this.historyCache.delete(s.path);
         this.indexCache.delete(s.path);
@@ -2810,6 +2912,7 @@ export class PiHostBackend implements HostBackend {
         this.sessionModelStates.delete(s.header.id);
         this.sessionModelSnapshots.delete(s.header.id);
         this.manualTitleOverrides.delete(s.header.id);
+        this.structuredOutputs?.clear(s.header.id);
         return;
       }
       case "moveSession":
@@ -3202,6 +3305,91 @@ export class PiHostBackend implements HostBackend {
       return;
     }
     this.documentInjections.setPending(sessionId.trim(), injection, supported);
+  }
+  private async inputFilesAgentHome(sessionId: string): Promise<string> {
+    const cwd = this.live.get(sessionId)?.cwd ?? (await this.findSession(sessionId)).header.cwd;
+    if (this.profileMode === "isolated") {
+      const home = await this.ensureIsolatedProjectHome(cwd, { allowMissing: true });
+      if (home) return home.agentDir;
+    }
+    return projectPiAgentDir(cwd);
+  }
+  private resolveInputFilesModel(sessionId: string): Model | undefined {
+    const inMemory = this.sessionModelStates.get(sessionId) ?? this.sessionModelSnapshots.get(sessionId);
+    if (inMemory) return inMemory.model;
+    const meta = this.sessionById.get(sessionId);
+    if (meta) return this.desiredModelFor(meta).model;
+    return this.modelState.model;
+  }
+  private async inputFilesController(): Promise<InputFilesController> {
+    if (this.inputFiles) return this.inputFiles;
+    if (!this.inputFilesReady) {
+      this.inputFilesReady = (async () => {
+        const remote = this.inputFilesRemote ?? await loadGrokInputFilesRemote(
+          this.runtimeRoot,
+          join(this.agentDir, "auth.json"),
+        );
+        this.inputFilesRemote = remote;
+        this.inputFiles = new InputFilesController(
+          new JsonInputFileStore((sessionId) => this.inputFilesAgentHome(sessionId)),
+          remote,
+          (sessionId) => this.resolveInputFilesModel(sessionId),
+        );
+        return this.inputFiles;
+      })();
+    }
+    return this.inputFilesReady;
+  }
+  private async stageInputFile(sessionId: unknown, file: unknown): Promise<InputFileAttachment> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    if (!file || typeof file !== "object" || Array.isArray(file)) throw new Error("缺少文件");
+    return (await this.inputFilesController()).stage(sessionId.trim(), file as InputFileStageRequest);
+  }
+  private async listInputFiles(sessionId: unknown): Promise<InputFileAttachment[]> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    return (await this.inputFilesController()).list(sessionId.trim());
+  }
+  private async removeInputFile(sessionId: unknown, attachmentId: unknown): Promise<InputFileAttachment[]> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
+    return (await this.inputFilesController()).remove(sessionId.trim(), attachmentId.trim());
+  }
+  private async retryInputFile(sessionId: unknown, attachmentId: unknown, file?: unknown): Promise<InputFileAttachment> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
+    const request = file && typeof file === "object" && !Array.isArray(file) ? file as InputFileStageRequest : undefined;
+    return (await this.inputFilesController()).retry(sessionId.trim(), attachmentId.trim(), request);
+  }
+  private async cancelInputFile(sessionId: unknown, attachmentId: unknown): Promise<InputFileAttachment> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
+    return (await this.inputFilesController()).cancel(sessionId.trim(), attachmentId.trim());
+  }
+  private async structuredOutputController(): Promise<StructuredOutputController> {
+    if (this.structuredOutputs) return this.structuredOutputs;
+    if (!this.structuredOutputsReady) {
+      this.structuredOutputsReady = (async () => {
+        const loaded = this.structuredOutputNormalize
+          ? {
+            normalize: this.structuredOutputNormalize,
+            enabled: this.structuredOutputsEnabledFn,
+          }
+          : await loadGrokStructuredOutputNormalize(this.runtimeRoot);
+        if (!loaded?.normalize) throw new Error("当前环境未启用 Structured Outputs");
+        this.structuredOutputs = new StructuredOutputController(
+          loaded.normalize,
+          (sessionId) => this.resolveInputFilesModel(sessionId),
+          loaded.enabled ?? this.structuredOutputsEnabledFn,
+        );
+        return this.structuredOutputs;
+      })();
+    }
+    return this.structuredOutputsReady;
+  }
+  private async setStructuredOutput(sessionId: unknown, request: unknown): Promise<void> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    const ctl = await this.structuredOutputController();
+    ctl.set(sessionId.trim(), request);
   }
   /** Configured display path: project identity, settings keys, and returned `path`. */
   private async configuredProject(projectId: string): Promise<Project> {
@@ -3654,6 +3842,8 @@ export class PiHostBackend implements HostBackend {
       mainModelId: this.mainModelId(),
       memoryReviewModelId: (await this.loadMemoryReviewModel()) ?? undefined,
       subagentModelsFile: this.subagentModelsRuntimeFile(),
+      subagentNativeSearchFile: this.nativeSearchRuntimeFile(),
+      model: desired.model,
       bridgePort,
       bridgeRoutingKey: id,
       sessionCapability,
@@ -4009,6 +4199,11 @@ export class PiHostBackend implements HostBackend {
           delta: args,
         });
       }
+      if (isHostedAssistantEvent(d)) {
+        for (const event of projectHostedAssistantEvent(id, d, live.messageEpoch)) {
+          this.stream(event);
+        }
+      }
     } else if (e.type === "message_end") {
       this.touchTurnActivity(live);
       const endingEpoch = live.messageEpoch;
@@ -4037,6 +4232,10 @@ export class PiHostBackend implements HostBackend {
           this.stream({ type: "text", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: flushed });
         }
         live.streamedAssistantText = "";
+        const citations = extractHistoryCitations(endedMessage, fullText);
+        if (citations.length) this.stream({ type: "citations", sessionId: id, citations });
+        const fileSources = extractHistoryFileSources(endedMessage);
+        if (fileSources.length) this.stream({ type: "input_file_sources", sessionId: id, sources: fileSources });
         this.flushThinkingControl();
       }
       // A new message restarts content indexing; drop unclaimed tool buffers and
@@ -4050,6 +4249,9 @@ export class PiHostBackend implements HostBackend {
       if (message.role === "user" || isSubagentCompletion(message) || isSubagentCompletion(e)) {
         const content = text(message.content ?? e.content);
         if (content) {
+          // Pi echoes an injected steer back as a user message_end — that is
+          // the delivery receipt the steer ack alone never gives us.
+          if (message.role === "user") this.confirmUnconfirmedSteer(id, content);
           this.stream({
             type: "user_message",
             sessionId: id,
@@ -4507,6 +4709,7 @@ export class PiHostBackend implements HostBackend {
         const catalog = catalogModels.find(item => item.provider === reported.provider && item.id === reported.id);
         if (!catalog) return reported;
         const thinkingLevelMap = reported.thinkingLevelMap ?? catalog.thinkingLevelMap;
+        const capabilities = mergeModelCapabilities(catalog.capabilities, reported.capabilities);
         return {
           ...catalog,
           ...reported,
@@ -4514,6 +4717,7 @@ export class PiHostBackend implements HostBackend {
           thinkingConfigurable: thinkingLevelMap
             ? thinkingLevelsForModel({ ...reported, thinkingLevelMap }).length > 0
             : (reported.thinkingConfigurable ?? catalog.thinkingConfigurable),
+          ...(capabilities === undefined ? {} : { capabilities }),
         };
       });
       const state = await this.command(live.session.id, { type: "get_state" });
@@ -4756,6 +4960,27 @@ export class PiHostBackend implements HostBackend {
   private subagentModelsRuntimeFile(): string {
     return join(this.agentDir, "pipiui-subagent-models-runtime.json");
   }
+  private nativeSearchRuntimeFile(): string {
+    return join(this.agentDir, "pipiui-native-search-runtime.json");
+  }
+  private async materializeNativeSearchCatalog(): Promise<void> {
+    const fromModels = nativeSearchRuntimeCatalog(this.models);
+    const fromClaims = nativeSearchRuntimeCatalog(
+      this.extensionLoader.contributionClaims().flatMap((claim) =>
+        (claim.contribution.provider.models ?? []).map((model) => ({
+          provider: claim.contribution.provider.id,
+          id: model.id,
+          capabilities: model.capabilities,
+        })),
+      ),
+    );
+    const catalog = { ...fromClaims, ...fromModels };
+    const target = this.nativeSearchRuntimeFile();
+    await fs.mkdir(dirname(target), { recursive: true });
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+    await fs.writeFile(tmp, JSON.stringify(catalog, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    await fs.rename(tmp, target);
+  }
   private async materializeSubagentModels(value: Record<string, SubagentModelSetting[]>): Promise<void> {
     const target = this.subagentModelsRuntimeFile();
     await fs.mkdir(dirname(target), { recursive: true });
@@ -4766,6 +4991,7 @@ export class PiHostBackend implements HostBackend {
   private async loadAndMaterializeSubagentModels(waitForCatalog = false): Promise<Record<string, SubagentModelSetting[]>> {
     const value = await this.loadSubagentModels(waitForCatalog);
     await this.materializeSubagentModels(value);
+    await this.materializeNativeSearchCatalog();
     return value;
   }
   private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
@@ -5827,27 +6053,12 @@ export class PiHostBackend implements HostBackend {
       authenticatedProviders,
       existing: filtered,
     });
-    const next = [...filtered];
+    const next = mergeContributedModelCapabilities(filtered, {
+      claims: usable,
+      authenticatedProviders,
+    });
     for (const model of extra.models) {
       next.push(hostModelFromPi(model, model.provider));
-    }
-    // Reserved official providers stay host-owned: extensions cannot replace or
-    // filter their built-in models. Enabled, authenticated reserved claims may
-    // only append models whose `${provider}/${id}` key is not already in the catalog.
-    const reservedClaims = claims.filter(
-      (claim) =>
-        claim.enabled &&
-        Boolean(reservedProviderClaimError(claim.contribution.provider.id, reserved)),
-    );
-    if (reservedClaims.length) {
-      const additive = resolveContributedCatalog({
-        claims: reservedClaims,
-        authenticatedProviders,
-        existing: next,
-      });
-      for (const model of additive.models) {
-        next.push(hostModelFromPi(model, model.provider));
-      }
     }
     return next;
   }
@@ -6399,6 +6610,7 @@ export class PiHostBackend implements HostBackend {
       live.pendingDrainPrompt = payload.text;
     }
     try {
+      this.structuredOutputs?.assertReadyToSend(id);
       await this.command(id, body);
     } catch (error) {
       if (body.type !== "prompt" || !isAlreadyProcessingError(error)) {
@@ -6409,6 +6621,43 @@ export class PiHostBackend implements HostBackend {
       // running). Pi is the authority: re-send with the behavior it asked for
       // instead of surfacing the raw RPC error to the composer.
       await this.command(id, { ...body, streamingBehavior: "followUp" });
+    }
+    if (behavior === "steer" && payload.text.trim()) this.noteUnconfirmedSteer(id, payload);
+  }
+
+  // --- Steer delivery receipts -----------------------------------------
+  // `steer` resolves the moment pi pushes the text into its in-memory steering
+  // queue. If the running turn is aborted or compacted before the loop drains
+  // that queue, the message silently vanishes while the host already deleted
+  // the queue item. Track every acknowledged steer until pi echoes it back as
+  // a user message; anything still unacknowledged at settle is requeued.
+
+  private noteUnconfirmedSteer(id: string, payload: QueuedDispatchPayload): void {
+    const pending = this.unconfirmedSteers.get(id) ?? [];
+    pending.push({ text: payload.text, attachments: snapshotAttachments(payload.attachments) });
+    this.unconfirmedSteers.set(id, pending);
+    console.warn(`[pipi-backend] steer pending session=${id} count=${pending.length} text=${previewSteerText(payload.text)}`);
+  }
+
+  private confirmUnconfirmedSteer(id: string, content: string): void {
+    const pending = this.unconfirmedSteers.get(id);
+    if (!pending?.length) return;
+    const echoed = normalizeSteerText(content);
+    if (!echoed) return;
+    const remaining = pending.filter(item => !echoed.includes(normalizeSteerText(item.text)));
+    if (remaining.length === pending.length) return;
+    if (remaining.length) this.unconfirmedSteers.set(id, remaining);
+    else this.unconfirmedSteers.delete(id);
+    console.warn(`[pipi-backend] steer confirmed session=${id} remaining=${remaining.length}`);
+  }
+
+  private recycleUnconfirmedSteers(id: string): void {
+    const pending = this.unconfirmedSteers.get(id);
+    if (!pending?.length) return;
+    this.unconfirmedSteers.delete(id);
+    const restored = this.queue.requeueAtHead(id, pending.map(item => ({ text: item.text, attachments: item.attachments })));
+    for (const item of restored) {
+      console.warn(`[pipi-backend] steer requeued session=${id} id=${item.id} text=${previewSteerText(item.text)}`);
     }
   }
 
@@ -6614,6 +6863,7 @@ export class PiHostBackend implements HostBackend {
       this.sessionModelSnapshots.set(sessionId, state);
       if (state.model.provider === provider && state.model.id === modelId)
         await this.rememberManualModelSelection(state.model);
+      this.structuredOutputs?.clear(sessionId);
       return state;
     }
     const next = this.composeSessionModelState(sessionId, provider, modelId);
@@ -6621,6 +6871,7 @@ export class PiHostBackend implements HostBackend {
     this.sessionModelStates.set(sessionId, next);
     this.sessionModelSnapshots.set(sessionId, next);
     await this.rememberManualModelSelection(next.model);
+    this.structuredOutputs?.clear(sessionId);
     return next;
   }
   private async setThinking(sessionId: string, level: ThinkingLevel) {
@@ -6643,6 +6894,7 @@ export class PiHostBackend implements HostBackend {
       ...(reported.model.thinkingLevelMap
         ? { thinkingLevelMap: reported.model.thinkingLevelMap }
         : {}),
+      ...(reported.model.capabilities ? { capabilities: reported.model.capabilities } : {}),
     };
     const availableThinkingLevels = thinkingLevelsForModel(
       model,
@@ -7854,6 +8106,11 @@ export class PiHostBackend implements HostBackend {
 export function createPiHostBackend(options: PiBackendOptions = {}) {
   return new PiHostBackend(options);
 }
+export {
+  StructuredOutputController,
+  loadGrokStructuredOutputNormalize,
+  modelDeclaresStructuredOutputs,
+} from "./structured-output.js";
 export {
   memoryVaultDiagnosis,
   resetInMemoryVault,

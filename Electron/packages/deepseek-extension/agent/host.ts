@@ -9,6 +9,7 @@ export {
   AUTH_PROVIDER_ID,
   DEEPSEEK_CONVERSATION_MODELS,
   DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_PROVIDER_NAME,
   createAuthProvider,
   createDeepSeekProvider,
 } from "./provider.js";

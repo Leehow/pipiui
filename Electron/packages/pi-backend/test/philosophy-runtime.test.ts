@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 import {
   DEFAULT_CONFIG,
   composePhilosophy,
+  isModelScoped,
+  modelDeclaresCapability,
   parseLayer,
   placeholdersIn,
   scannableBody,
@@ -117,6 +119,15 @@ describe("vendored philosophy: delivery", () => {
     });
     expect(result.included.map((l) => l.id)).toEqual(["craft", "toolcall", "thinking"]);
     expect(result.text).not.toContain("{{");
+  });
+
+  it("applies deepseek toolcall corrections to the independent deepseek-extended provider", () => {
+    const result = compose({
+      role: "worker",
+      agent: "general-purpose",
+      model: "deepseek-extended/deepseek-v4-flash-vision-exp",
+    });
+    expect(result.included.map((l) => l.id)).toContain("toolcall");
   });
 
   it("survives a runtime that has only the single dispatch tool", () => {
@@ -354,7 +365,125 @@ describe("vendored philosophy: delivery", () => {
     // build does not have, so workers sent it the one question shape it cannot answer, got
     // nothing, and learned to distrust it. Saying what the tool actually ranks on — and what
     // an empty result means — costs the difference.
+    // Raised to 17000 for the commit default: the closeout was optional and commit-on-request,
+    // so every finished goal left a dirty tree for the user to commit by hand.
+    // Raised to 17200 for the worker read-only skill/memory contract: the old absolute
+    // "never invoke a skill" line had to grow into a gated permit without restoring bootstrap.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(16900);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(17200);
+  });
+
+  it("permits worker skill_search/load and memory_query without automatic bootstrap", () => {
+    // The old orchestration line said dispatched workers never have or invoke skills.
+    // That contradicts the read-only grant: bootstrap stays off, but present tools may be used.
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(orchestration).toMatch(/automatic skill bootstrap/);
+    expect(orchestration).toMatch(/skill_search/);
+    expect(orchestration).toMatch(/skill_load/);
+    expect(orchestration).toMatch(/search then load/);
+    expect(orchestration).toMatch(/never a mandatory gate/);
+    expect(orchestration).toMatch(/must not add approvals or artifacts/);
+    expect(orchestration).toMatch(/memory_query/);
+    expect(orchestration).toMatch(/durable prior project decisions/);
+    expect(orchestration).toMatch(/not temporary task state/);
+    expect(orchestration).toMatch(/Do not mention tools the\s*\n?\s*role does not have as guaranteed/);
+    expect(orchestration).not.toMatch(/skill library switched off/);
+    expect(orchestration).not.toMatch(/never tell a worker to invoke/);
+    expect(orchestration).not.toMatch(/never tell a worker to invoke\s+a skill/);
   });
 });
+
+describe("vendored philosophy: model-capability gating",
+  () => {
+    function hostedLayer() {
+      const parsed = parseLayer(
+        [
+          "---",
+          "id: grok-hosted",
+          "name: Hosted Grok",
+          "summary: only when the model declares hosted features",
+          "order: 90",
+          "scope: [main, lead, worker]",
+          "requires-model-capabilities: [hostedTools.code_interpreter, structuredOutputs]",
+          "---",
+          "Use hosted code and structured output only when the model declares them.",
+          "",
+        ].join("\n"),
+        "grok-hosted.md",
+      );
+      if (!parsed.ok) throw new Error(parsed.error);
+      return parsed.layer;
+    }
+
+    it("parses requires-model-capabilities and treats it as model-scoped",
+      () => {
+        const layer = hostedLayer();
+        expect(layer.requiresModelCapabilities).toEqual([
+          "hostedTools.code_interpreter",
+          "structuredOutputs",
+        ]);
+        expect(isModelScoped(layer)).toBe(true);
+      });
+
+    it("drops the layer when the model or its capabilities are unknown",
+      () => {
+        const layer = hostedLayer();
+        const unknown = composePhilosophy({
+          layers: [layer],
+          config: config(),
+          capabilities,
+          role: "main",
+          activeTools: ALL_TOOLS,
+          model: "grok-build/grok-4.6",
+        });
+        expect(unknown.included.map((item) => item.id)).not.toContain("grok-hosted");
+        expect(unknown.skipped.find((item) => item.id === "grok-hosted")?.reason).toMatch(/unknown/);
+
+        const empty = composePhilosophy({
+          layers: [layer],
+          config: config(),
+          capabilities,
+          role: "main",
+          activeTools: ALL_TOOLS,
+          model: "grok-build/grok-4.6",
+          modelCapabilities: {},
+        });
+        expect(empty.included.map((item) => item.id)).not.toContain("grok-hosted");
+        expect(empty.skipped.find((item) => item.id === "grok-hosted")?.reason).toMatch(/does not declare/);
+      });
+
+    it("includes the layer only when every required key is declared",
+      () => {
+        const layer = hostedLayer();
+        const declared = {
+          hostedTools: { tools: ["web_search", "x_search", "code_interpreter"] },
+          structuredOutputs: true,
+          inputFiles: true,
+        };
+        const result = composePhilosophy({
+          layers: [layer],
+          config: config(),
+          capabilities,
+          role: "main",
+          activeTools: ALL_TOOLS,
+          model: "grok-build/grok-4.6",
+          modelCapabilities: declared,
+        });
+        expect(result.included.map((item) => item.id)).toContain("grok-hosted");
+        expect(modelDeclaresCapability(declared, "hostedTools.code_interpreter")).toBe(true);
+        expect(modelDeclaresCapability({ nativeSearch: { tools: ["web_search"] } }, "hostedTools.web_search")).toBe(true);
+        expect(modelDeclaresCapability({ nativeSearch: { tools: ["web_search"] } }, "hostedTools.code_interpreter")).toBe(false);
+
+        const worker = composePhilosophy({
+          layers: [layer],
+          config: config(),
+          capabilities,
+          role: "worker",
+          agent: "general-purpose",
+          activeTools: ALL_TOOLS,
+          model: "grok-build/grok-4.6",
+          modelCapabilities: declared,
+        });
+        expect(worker.included.map((item) => item.id)).toContain("grok-hosted");
+      });
+  });

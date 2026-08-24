@@ -1,5 +1,5 @@
 /**
- * Canonical `deepseek` provider config (single source).
+ * Canonical `deepseek-extended` provider config (single source).
  *
  * Consumed twice, never copied:
  * - the extension entry (`agent/index.ts`) registers it via `pi.registerProvider`;
@@ -18,10 +18,11 @@ import {
   AUTH_PROVIDER_ID,
   DEEPSEEK_CONVERSATION_MODELS,
   DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_PROVIDER_NAME,
   type DeepSeekConversationModel,
 } from "./models.js";
 
-export { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID };
+export { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, DEEPSEEK_PROVIDER_NAME };
 export {
   DEEPSEEK_BASE_URL,
   DEEPSEEK_CHAT_API,
@@ -59,7 +60,7 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): {
   const cfg = resolveDeepSeekConfig(options);
   const transport = conversationProviderTransport();
   return {
-    name: "DeepSeek",
+    name: DEEPSEEK_PROVIDER_NAME,
     api: transport.api,
     baseUrl: options.baseUrl?.trim() ? cfg.baseUrl : transport.baseUrl,
     authHeader: transport.authHeader,
