@@ -287,12 +287,17 @@ package_mac_arch() {
     return 0
   fi
   log="$(mktemp "${TMPDIR:-/tmp}/pipiui-electron-builder-${arch}.XXXXXX.log")"
+  local version_args=()
+  if [[ -n "${PIPIUI_ELECTRON_BUILD_VERSION:-}" ]]; then
+    version_args+=(--config.extraMetadata.version="$PIPIUI_ELECTRON_BUILD_VERSION")
+  fi
   set +e
   (
     cd Electron/apps/electron
     CUA_TARGET_PLATFORM=darwin node ../../scripts/fetch-cua-driver.mjs \
       && PIPIUI_EMBEDDED_RUNTIMES_ROOT="$ROOT/Electron/.embedded-runtimes" node ../../scripts/fetch-pi-runtime.mjs --platform darwin --arch "$arch" --check \
-      && PIPIUI_EMBEDDED_RUNTIME_TARGET="darwin-$arch" ../../node_modules/.bin/electron-builder --mac --"$arch"
+      && PIPIUI_EMBEDDED_RUNTIME_TARGET="darwin-$arch" ../../node_modules/.bin/electron-builder --mac --"$arch" \
+           "${version_args[@]}"
   ) 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   set -e
