@@ -132,11 +132,12 @@ function allToolsFinished(tools: TranscriptTool[] | undefined): boolean {
   return (tools?.length ?? 0) > 0 && (tools ?? []).every(tool => Boolean(tool.finished))
 }
 
-function openPendingThinking(activities: TranscriptActivity[]): void {
-  if (activities.some(isPendingThinking)) return
+function openPendingThinking(activities: TranscriptActivity[]): boolean {
+  if (activities.some(isPendingThinking)) return false
   const last = activities[activities.length - 1]
-  if (last?.type === 'thinking') return
+  if (last?.type === 'thinking') return false
   activities.push({ type: 'thinking', id: PENDING_THINKING_ID, contentIndex: -1, content: '' })
+  return true
 }
 
 export function activitiesFromMessage(message: Pick<ChatMessage, 'thinking' | 'tools' | 'activities'>): TranscriptActivity[] {
@@ -529,39 +530,81 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
   // Late hosted code-interpreter events after settle still update the last
   // assistant in place so the virtual card appears immediately.
   const reuseSettled = (event.type === 'hosted_code_interpreter' || event.type === 'input_file_sources') && index >= 0
-  const current = index >= 0 && (previous[index].streaming || reuseSettled) ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
-  const next = index >= 0 && (previous[index].streaming || reuseSettled) ? [...previous] : [...previous, current]
-  const tools = (current.tools ?? []).map(tool => ({ ...tool }))
-  const toolsById = new Map(tools.map(tool => [tool.id, tool]))
-  const activities = (current.activities ?? []).map(activity => cloneActivity(activity, toolsById))
-  const updated: ChatMessage = { ...current, tools, activities }
+  const canUpdate = index >= 0 && (previous[index].streaming || reuseSettled)
+  const current = canUpdate ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
+  // Copy-on-write working containers: a streaming text/thinking delta only
+  // rewrites the one activity it appends to, so the previous message's tools
+  // array, untouched activity entries and tool objects keep their references
+  // instead of being cloned per token. A container is copied (shallowly, once)
+  // only by the event type that actually mutates it, and a value-identical
+  // no-op event returns the previous array untouched.
+  let tools = current.tools
+  let activities = current.activities
+  let toolsOwned = false
+  let activitiesOwned = false
+  let changed = !canUpdate
+  const ownTools = (): TranscriptTool[] => {
+    if (!toolsOwned) {
+      tools = [...(tools ?? [])]
+      toolsOwned = true
+    }
+    return tools!
+  }
+  const ownActivities = (): TranscriptActivity[] => {
+    if (!activitiesOwned) {
+      activities = [...(activities ?? [])]
+      activitiesOwned = true
+    }
+    return activities!
+  }
+  const updated: ChatMessage = { ...current }
   if (event.type === 'text') {
-    updated.content += event.delta
-    const pendingIndex = activities.findIndex(isPendingThinking)
-    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
+    const nextContent = updated.content + event.delta
+    if (nextContent !== updated.content) {
+      updated.content = nextContent
+      changed = true
+    }
+    const pendingIndex = (activities ?? []).findIndex(isPendingThinking)
+    if (pendingIndex >= 0) {
+      ownActivities().splice(pendingIndex, 1)
+      changed = true
+    }
     const segment = event.segment ?? 0
     const id = `text:${segment}:${event.contentIndex}`
-    const activityIndex = activities.findIndex(activity => activity.type === 'text' && activity.id === id)
+    const activityIndex = (activities ?? []).findIndex(activity => activity.type === 'text' && activity.id === id)
     if (activityIndex >= 0) {
-      const activity = activities[activityIndex]
-      if (activity.type === 'text') activities[activityIndex] = { ...activity, content: activity.content + event.delta }
+      const activity = activities![activityIndex]
+      // An empty delta onto an existing activity appends nothing; keep the
+      // entry object so repeated no-op deltas do not churn allocations.
+      if (activity.type === 'text' && event.delta) {
+        activities = ownActivities()
+        activities[activityIndex] = { ...activity, content: activity.content + event.delta }
+        changed = true
+      }
     } else {
+      activities = ownActivities()
       activities.push({ type: 'text', id, contentIndex: event.contentIndex, segment, content: event.delta })
+      changed = true
     }
   }
   if (event.type === 'thinking') {
-    updated.thinking = (updated.thinking ?? '') + event.delta
+    const nextThinking = (updated.thinking ?? '') + event.delta
+    if (nextThinking !== updated.thinking) {
+      updated.thinking = nextThinking
+      changed = true
+    }
     // Pi restarts contentIndex at every assistant message, so the segment epoch
     // must be part of the key: same-index thinking from a later message is a
     // distinct block, not a continuation of the first one (history parity).
     const segment = event.segment ?? 0
-    const pendingIndex = activities.findIndex(isPendingThinking)
+    const pendingIndex = (activities ?? []).findIndex(isPendingThinking)
     const activityIndex = pendingIndex >= 0
       ? pendingIndex
-      : activities.findIndex(activity => activity.type === 'thinking' && activity.contentIndex === event.contentIndex && activity.id === `thinking:${segment}:${event.contentIndex}`)
+      : (activities ?? []).findIndex(activity => activity.type === 'thinking' && activity.contentIndex === event.contentIndex && activity.id === `thinking:${segment}:${event.contentIndex}`)
     if (activityIndex >= 0) {
-      const activity = activities[activityIndex]
+      const activity = activities![activityIndex]
       if (activity.type === 'thinking') {
+        activities = ownActivities()
         activities[activityIndex] = {
           ...activity,
           id: `thinking:${segment}:${event.contentIndex}`,
@@ -569,36 +612,42 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
           segment,
           content: activity.id === PENDING_THINKING_ID ? event.delta : activity.content + event.delta,
         }
+        changed = true
       }
     } else {
+      activities = ownActivities()
       activities.push({ type: 'thinking', id: `thinking:${segment}:${event.contentIndex}`, contentIndex: event.contentIndex, segment, content: event.delta })
+      changed = true
     }
   }
   if (event.type === 'tool_call') {
-    const pendingIndex = activities.findIndex(isPendingThinking)
-    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
-    const segment = event.segment ?? lastSegment(activities)
-    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
+    const pendingIndex = (activities ?? []).findIndex(isPendingThinking)
+    if (pendingIndex >= 0) ownActivities().splice(pendingIndex, 1)
+    const acts = activities ?? []
+    const segment = event.segment ?? lastSegment(acts)
+    let activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
     if (activityIndex < 0 && event.contentIndex !== undefined) {
-      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.contentIndex && (activity.segment ?? 0) === segment)
+      activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.contentIndex && (activity.segment ?? 0) === segment)
     }
-    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
-      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
-      : updated.tools!.findIndex(item => item.id === event.toolCallId)
+    let toolIndex = activityIndex >= 0 && acts[activityIndex]?.type === 'tool'
+      ? (tools ?? []).findIndex(item => item.id === (acts[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : (tools ?? []).findIndex(item => item.id === event.toolCallId)
+    const nextTools = ownTools()
+    changed = true
     if (toolIndex >= 0) {
-      const previous = updated.tools![toolIndex]
-      const remapping = previous.id !== event.toolCallId
-      updated.tools![toolIndex] = {
-        ...previous,
+      const previousTool = nextTools[toolIndex]
+      const remapping = previousTool.id !== event.toolCallId
+      nextTools[toolIndex] = {
+        ...previousTool,
         id: event.toolCallId,
-        name: event.name && event.name !== 'tool' ? event.name : previous.name,
-        input: remapping && event.delta ? event.delta : previous.input + (event.delta ?? ''),
+        name: event.name && event.name !== 'tool' ? event.name : previousTool.name,
+        input: remapping && event.delta ? event.delta : previousTool.input + (event.delta ?? ''),
       }
     } else {
-      updated.tools!.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
-      toolIndex = updated.tools!.length - 1
+      nextTools.push({ id: event.toolCallId, name: event.name, input: event.delta ?? '', startedAt: Date.now() })
+      toolIndex = nextTools.length - 1
     }
-    const tool = updated.tools![toolIndex]
+    const tool = nextTools[toolIndex]
     if (event.status === 'completed' || event.status === 'failed') {
       const completed = {
         ...tool,
@@ -606,51 +655,58 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         finishedAt: Date.now(),
         error: event.status === 'failed' || tool.error,
       }
-      updated.tools![toolIndex] = completed
-      if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity
-      else {
-        const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-        activities.push({ type: 'tool', contentIndex, segment, tool: completed })
+      nextTools[toolIndex] = completed
+      if (activityIndex >= 0) {
+        const nextActivities = ownActivities()
+        nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool: completed } as TranscriptActivity
+      } else {
+        const contentIndex = event.contentIndex ?? (acts.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+        ownActivities().push({ type: 'tool', contentIndex, segment, tool: completed })
       }
-      if (allToolsFinished(updated.tools)) openPendingThinking(activities)
-    } else if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
-    else {
-      const contentIndex = event.contentIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-      activities.push({ type: 'tool', contentIndex, segment, tool })
+      if (allToolsFinished(nextTools)) openPendingThinking(ownActivities())
+    } else if (activityIndex >= 0) {
+      const nextActivities = ownActivities()
+      nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool } as TranscriptActivity
+    } else {
+      const contentIndex = event.contentIndex ?? (acts.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+      ownActivities().push({ type: 'tool', contentIndex, segment, tool })
     }
   }
   if (event.type === 'hosted_search') {
-    const pendingIndex = activities.findIndex(isPendingThinking)
-    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
-    const segment = event.segment ?? lastSegment(activities)
+    const pendingIndex = (activities ?? []).findIndex(isPendingThinking)
+    if (pendingIndex >= 0) ownActivities().splice(pendingIndex, 1)
+    const acts = activities ?? []
+    const segment = event.segment ?? lastSegment(acts)
+    let activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
+    if (activityIndex < 0 && event.outputIndex !== undefined) {
+      activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
+    }
+    let toolIndex = activityIndex >= 0 && acts[activityIndex]?.type === 'tool'
+      ? (tools ?? []).findIndex(item => item.id === (acts[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : (tools ?? []).findIndex(item => item.id === event.callId)
+    const finished = event.phase === 'completed' || event.phase === 'failed'
     const delta = JSON.stringify({
       phase: event.phase,
       ...(event.query ? { query: event.query } : {}),
       ...(event.sources?.length ? { sources: event.sources } : {}),
       ...(event.error?.message ? { error: event.error.message } : {}),
     })
-    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
-    if (activityIndex < 0 && event.outputIndex !== undefined) {
-      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
-    }
-    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
-      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
-      : updated.tools!.findIndex(item => item.id === event.callId)
-    const finished = event.phase === 'completed' || event.phase === 'failed'
+    const nextTools = ownTools()
+    changed = true
     if (toolIndex >= 0) {
-      const previous = updated.tools![toolIndex]
-      updated.tools![toolIndex] = {
-        ...previous,
+      const previousTool = nextTools[toolIndex]
+      nextTools[toolIndex] = {
+        ...previousTool,
         id: event.callId,
         name: event.kind,
-        input: event.query || event.sources?.length || event.error ? delta : previous.input || delta,
+        input: event.query || event.sources?.length || event.error ? delta : previousTool.input || delta,
         finished,
-        finishedAt: finished ? Date.now() : previous.finishedAt,
-        error: event.phase === 'failed' ? true : previous.error,
-        result: event.phase === 'failed' ? (event.error?.message ?? previous.result) : previous.result,
+        finishedAt: finished ? Date.now() : previousTool.finishedAt,
+        error: event.phase === 'failed' ? true : previousTool.error,
+        result: event.phase === 'failed' ? (event.error?.message ?? previousTool.result) : previousTool.result,
       }
     } else {
-      updated.tools!.push({
+      nextTools.push({
         id: event.callId,
         name: event.kind,
         input: delta,
@@ -660,15 +716,17 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         ...(event.phase === 'failed' ? { error: true } : {}),
         result: event.phase === 'failed' ? event.error?.message : undefined,
       })
-      toolIndex = updated.tools!.length - 1
+      toolIndex = nextTools.length - 1
     }
-    const tool = updated.tools![toolIndex]
-    if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
-    else {
-      const contentIndex = event.outputIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-      activities.push({ type: 'tool', contentIndex, segment, tool })
+    const tool = nextTools[toolIndex]
+    if (activityIndex >= 0) {
+      const nextActivities = ownActivities()
+      nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool } as TranscriptActivity
+    } else {
+      const contentIndex = event.outputIndex ?? (acts.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+      ownActivities().push({ type: 'tool', contentIndex, segment, tool })
     }
-    if (finished && allToolsFinished(updated.tools)) openPendingThinking(activities)
+    if (finished && allToolsFinished(nextTools)) openPendingThinking(ownActivities())
     if (event.sources?.length) {
       updated.citations = mergeCitations(updated.citations, event.sources.map(source => ({
         url: source.url,
@@ -677,18 +735,19 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     }
   }
   if (event.type === 'hosted_code_interpreter') {
-    const pendingIndex = activities.findIndex(isPendingThinking)
-    if (pendingIndex >= 0) activities.splice(pendingIndex, 1)
-    const segment = event.segment ?? lastSegment(activities)
-    let activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
+    const pendingIndex = (activities ?? []).findIndex(isPendingThinking)
+    if (pendingIndex >= 0) ownActivities().splice(pendingIndex, 1)
+    const acts = activities ?? []
+    const segment = event.segment ?? lastSegment(acts)
+    let activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.callId)
     if (activityIndex < 0 && event.outputIndex !== undefined) {
-      activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
+      activityIndex = acts.findIndex(activity => activity.type === 'tool' && activity.contentIndex === event.outputIndex && (activity.segment ?? 0) === segment)
     }
-    let toolIndex = activityIndex >= 0 && activities[activityIndex]?.type === 'tool'
-      ? updated.tools!.findIndex(item => item.id === (activities[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
-      : updated.tools!.findIndex(item => item.id === event.callId)
+    let toolIndex = activityIndex >= 0 && acts[activityIndex]?.type === 'tool'
+      ? (tools ?? []).findIndex(item => item.id === (acts[activityIndex] as Extract<TranscriptActivity, { type: 'tool' }>).tool.id)
+      : (tools ?? []).findIndex(item => item.id === event.callId)
     const finished = event.phase === 'completed' || event.phase === 'failed'
-    const previousTool = toolIndex >= 0 ? updated.tools![toolIndex] : undefined
+    const previousTool = toolIndex >= 0 ? (tools ?? [])[toolIndex] : undefined
     const merged = mergeHostedCodeInterpreterInput(previousTool?.input, event)
     let parsedOutputs: Array<{ type: 'logs'; text: string }> | undefined
     try {
@@ -696,8 +755,10 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
       parsedOutputs = mergeHostedCodeOutputs(parsed.outputs, undefined)
     } catch { /* ignore */ }
     const logText = hostedCodeLogText(parsedOutputs)
+    const nextTools = ownTools()
+    changed = true
     if (toolIndex >= 0 && previousTool) {
-      updated.tools![toolIndex] = {
+      nextTools[toolIndex] = {
         ...previousTool,
         id: event.callId,
         name: 'code_interpreter',
@@ -710,7 +771,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
           : logText || previousTool.result,
       }
     } else {
-      updated.tools!.push({
+      nextTools.push({
         id: event.callId,
         name: 'code_interpreter',
         input: merged,
@@ -720,38 +781,58 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         ...(event.phase === 'failed' ? { error: true } : {}),
         result: event.phase === 'failed' ? event.error?.message : logText,
       })
-      toolIndex = updated.tools!.length - 1
+      toolIndex = nextTools.length - 1
     }
-    const tool = updated.tools![toolIndex]
-    if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool } as TranscriptActivity
-    else {
-      const contentIndex = event.outputIndex ?? (activities.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
-      activities.push({ type: 'tool', contentIndex, segment, tool })
+    const tool = nextTools[toolIndex]
+    if (activityIndex >= 0) {
+      const nextActivities = ownActivities()
+      nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool } as TranscriptActivity
+    } else {
+      const contentIndex = event.outputIndex ?? (acts.reduce((highest, activity) => Math.max(highest, activity.contentIndex), -1) + 1)
+      ownActivities().push({ type: 'tool', contentIndex, segment, tool })
     }
-    if (finished && allToolsFinished(updated.tools) && updated.streaming) openPendingThinking(activities)
+    if (finished && allToolsFinished(nextTools) && updated.streaming) openPendingThinking(ownActivities())
   }
   if (event.type === 'citations') {
-    updated.citations = mergeCitations(updated.citations, event.citations)
+    const merged = mergeCitations(updated.citations, event.citations)
+    if (merged !== updated.citations) {
+      updated.citations = merged
+      changed = true
+    }
   }
   if (event.type === 'input_file_sources') {
-    updated.fileSources = mergeFileSources(updated.fileSources, event.sources)
+    const merged = mergeFileSources(updated.fileSources, event.sources)
+    if (merged !== updated.fileSources) {
+      updated.fileSources = merged
+      changed = true
+    }
   }
   if (event.type === 'server_side_usage' && event.usage.serverSideToolUsage) {
     updated.serverSideToolUsage = { ...updated.serverSideToolUsage, ...event.usage.serverSideToolUsage }
+    changed = true
   }
   if (event.type === 'tool_result') {
-    const toolIndex = updated.tools!.findIndex(item => item.id === event.toolCallId)
+    const toolIndex = (tools ?? []).findIndex(item => item.id === event.toolCallId)
     if (toolIndex >= 0) {
-      const tool = updated.tools![toolIndex]
+      const nextTools = ownTools()
+      const tool = nextTools[toolIndex]
       const completed = { ...tool, result: event.content, error: event.isError, finishedAt: Date.now(), finished: true, dispatched: tool.name === 'subagent' && !event.isError && isBackgroundSubagentAck(event.content), images: event.images, details: event.details }
-      updated.tools![toolIndex] = completed
-      const activityIndex = activities.findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
-      if (activityIndex >= 0) activities[activityIndex] = { ...activities[activityIndex], tool: completed } as TranscriptActivity
+      nextTools[toolIndex] = completed
+      changed = true
+      const activityIndex = (activities ?? []).findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
+      if (activityIndex >= 0) {
+        const nextActivities = ownActivities()
+        nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool: completed } as TranscriptActivity
+      }
     }
-    if (allToolsFinished(updated.tools)) openPendingThinking(activities)
+    if (allToolsFinished(tools) && openPendingThinking(ownActivities())) changed = true
   }
+  if (!changed) return previous
+  if (tools !== undefined) updated.tools = tools
+  if (activities !== undefined) updated.activities = activities
   // Keep insertion order. Sorting by contentIndex is wrong: Pi restarts the
   // index every assistant message, and text/thinking often share index 0.
+  const next = canUpdate ? [...previous] : [...previous, current]
   next[next.length - 1] = updated
   return next
 }
