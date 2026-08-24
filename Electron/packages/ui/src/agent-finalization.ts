@@ -1,28 +1,37 @@
-import type { AgentDiagnostics, AgentFinalizationPhase, AgentState } from '@pipi/host-api'
+import type { AgentDiagnostics, AgentState } from '@pipi/host-api'
 
-const PHASE_ORDER: AgentFinalizationPhase[] = [
+/** Runtime may report closeout probes before host-api union lists them. */
+const PHASE_ORDER = [
   'generating',
   'tool-active',
   'final-received',
   'verifying',
+  'queue-wait',
   'reconciling',
   'merging',
+  'on-merged',
   'cleaning',
   'post-verify',
   'done-await-host',
-]
+] as const
 
-export function isTerminalFinalizingPhase(phase: AgentFinalizationPhase | undefined): boolean {
-  return phase !== undefined && PHASE_ORDER.indexOf(phase) >= PHASE_ORDER.indexOf('final-received')
+type KnownFinalizationPhase = (typeof PHASE_ORDER)[number]
+
+export function isTerminalFinalizingPhase(phase: string | undefined): boolean {
+  if (phase === undefined) return false
+  const index = (PHASE_ORDER as readonly string[]).indexOf(phase)
+  return index >= PHASE_ORDER.indexOf('final-received')
 }
 
-const PHASE_LABEL: Record<AgentFinalizationPhase, string> = {
+const PHASE_LABEL: Record<KnownFinalizationPhase, string> = {
   generating: '',
   'tool-active': '',
   'final-received': '收尾中：总结已完成',
   verifying: '收尾中：验证',
+  'queue-wait': '收尾中：排队等待',
   reconciling: '收尾中：对账',
   merging: '收尾中：合并',
+  'on-merged': '收尾中：合并后处理',
   'post-verify': '收尾中：合并后验证',
   cleaning: '收尾中：清理',
   'done-await-host': '收尾中：等待状态同步',
@@ -39,7 +48,7 @@ export function formatFinalizationLine(
 ): string | undefined {
   const phase = diagnostics?.finalizationPhase
   if (!isTerminalFinalizingPhase(phase) || !phase) return undefined
-  const label = PHASE_LABEL[phase]
+  const label = PHASE_LABEL[phase as KnownFinalizationPhase]
   if (!label) return undefined
   const seconds = finalizationElapsedSeconds(diagnostics?.phaseSince, now)
   return seconds === undefined ? label : `${label} · ${seconds}s`

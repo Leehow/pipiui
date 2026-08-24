@@ -5,6 +5,16 @@ import { access, realpath } from "node:fs/promises";
 import * as path from "node:path";
 
 import type { WorktreeFinalizationInputV1 } from "./schema.ts";
+import {
+	DEFAULT_GIT_TIMEOUT_MS,
+	DEFAULT_SPAWN_TERMINATION_GRACE_MS,
+} from "./deadlines.ts";
+
+export {
+	DEFAULT_GIT_TIMEOUT_MS,
+	DEFAULT_VERIFY_TIMEOUT_MS,
+	DEFAULT_SPAWN_TERMINATION_GRACE_MS,
+} from "./deadlines.ts";
 
 export type GitOperationResultV1 = {
 	ok: boolean;
@@ -19,12 +29,6 @@ export type GitOperationResultV1 = {
 	signal?: string | null;
 	error?: string;
 };
-
-/** Local Git commands are expected to be quick; a hung hook must not hold main forever. */
-export const DEFAULT_GIT_TIMEOUT_MS = 30_000;
-/** Swift's post-merge runner uses a 120-second verify deadline. */
-export const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
-export const DEFAULT_SPAWN_TERMINATION_GRACE_MS = 1_000;
 
 export type SpawnOptionsV1 = {
 	cwd?: string;

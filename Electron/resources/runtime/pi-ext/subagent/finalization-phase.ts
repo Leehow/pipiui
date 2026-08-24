@@ -8,8 +8,10 @@ export const AGENT_FINALIZATION_PHASES = [
 	"tool-active",
 	"final-received",
 	"verifying",
+	"queue-wait",
 	"reconciling",
 	"merging",
+	"on-merged",
 	"cleaning",
 	"post-verify",
 	"done-await-host",
@@ -24,8 +26,10 @@ export type FinalizationFields = {
 	childExitedAt?: number;
 	verifyPid?: number;
 	verifyElapsedMs?: number;
+	queueWaitElapsedMs?: number;
 	reconcileElapsedMs?: number;
 	mergeElapsedMs?: number;
+	onMergedElapsedMs?: number;
 	cleanupElapsedMs?: number;
 	doneEventSeq?: number;
 };
@@ -43,11 +47,13 @@ const PHASE_RANK = new Map<AgentFinalizationPhase, number>(
 
 const ELAPSED_ON_LEAVE: Partial<Record<AgentFinalizationPhase, keyof Pick<
 	FinalizationFields,
-	"verifyElapsedMs" | "reconcileElapsedMs" | "mergeElapsedMs" | "cleanupElapsedMs"
+	"verifyElapsedMs" | "queueWaitElapsedMs" | "reconcileElapsedMs" | "mergeElapsedMs" | "onMergedElapsedMs" | "cleanupElapsedMs"
 >>> = {
 	verifying: "verifyElapsedMs",
+	"queue-wait": "queueWaitElapsedMs",
 	reconciling: "reconcileElapsedMs",
 	merging: "mergeElapsedMs",
+	"on-merged": "onMergedElapsedMs",
 	cleaning: "cleanupElapsedMs",
 };
 
@@ -138,8 +144,10 @@ export function resetFinalizationFields(state: FinalizationFields): void {
 	delete state.childExitedAt;
 	delete state.verifyPid;
 	delete state.verifyElapsedMs;
+	delete state.queueWaitElapsedMs;
 	delete state.reconcileElapsedMs;
 	delete state.mergeElapsedMs;
+	delete state.onMergedElapsedMs;
 	delete state.cleanupElapsedMs;
 	delete state.doneEventSeq;
 }
@@ -152,8 +160,10 @@ export function snapshotFinalizationFields(state: FinalizationFields): Finalizat
 	if (state.childExitedAt !== undefined) next.childExitedAt = state.childExitedAt;
 	if (state.verifyPid !== undefined) next.verifyPid = state.verifyPid;
 	if (state.verifyElapsedMs !== undefined) next.verifyElapsedMs = state.verifyElapsedMs;
+	if (state.queueWaitElapsedMs !== undefined) next.queueWaitElapsedMs = state.queueWaitElapsedMs;
 	if (state.reconcileElapsedMs !== undefined) next.reconcileElapsedMs = state.reconcileElapsedMs;
 	if (state.mergeElapsedMs !== undefined) next.mergeElapsedMs = state.mergeElapsedMs;
+	if (state.onMergedElapsedMs !== undefined) next.onMergedElapsedMs = state.onMergedElapsedMs;
 	if (state.cleanupElapsedMs !== undefined) next.cleanupElapsedMs = state.cleanupElapsedMs;
 	if (state.doneEventSeq !== undefined) next.doneEventSeq = state.doneEventSeq;
 	return next;

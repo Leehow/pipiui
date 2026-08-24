@@ -91,7 +91,18 @@ export interface FinalizeWorktreeRequest {
 	/** Boss/runtime re-entry after accept/resolve. Reuses the same ownership/readiness checks. */
 	acceptance?: { source: "boss" };
 	/** Observational closeout stages. Must never fail finalization. */
-	onProgress?: (phase: "reconciling" | "merging" | "cleaning" | "post-verify") => void;
+	onProgress?: (
+		phase: "queue-wait" | "reconciling" | "merging" | "on-merged" | "cleaning" | "post-verify",
+		detail?: {
+			stage?: string;
+			repositoryKey?: string;
+			queueDepth?: number;
+			waitedMs?: number;
+			callback?: "onMerged" | "postMergeVerify" | "queue";
+			timedOut?: boolean;
+			error?: string;
+		},
+	) => void;
 }
 
 const rememberedFinalizations = new Map<string, FinalizeWorktreeRequest>();

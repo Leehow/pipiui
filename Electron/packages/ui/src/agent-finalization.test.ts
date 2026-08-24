@@ -2,13 +2,31 @@
 import { createElement } from 'react'
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import type { AgentSummary } from '@pipi/host-api'
-import { formatFinalizationLine, liveRunningProgressLine } from './agent-finalization'
+import type { AgentDiagnostics, AgentSummary } from '@pipi/host-api'
+import { formatFinalizationLine, isTerminalFinalizingPhase, liveRunningProgressLine } from './agent-finalization'
 import { diagnoseAgentProgress } from './agent-stall-diagnostics'
 import { LiveSubagentCard } from './LiveSubagentCard'
 
 describe('finalization progress copy', () => {
   const now = 50_000
+
+  it('treats runtime closeout probes as terminal finalizing', () => {
+    expect(isTerminalFinalizingPhase('queue-wait')).toBe(true)
+    expect(isTerminalFinalizingPhase('on-merged')).toBe(true)
+    expect(isTerminalFinalizingPhase('generating')).toBe(false)
+    expect(isTerminalFinalizingPhase('tool-active')).toBe(false)
+    expect(isTerminalFinalizingPhase('not-a-phase')).toBe(false)
+    expect(isTerminalFinalizingPhase(undefined)).toBe(false)
+  })
+
+  it.each([
+    ['queue-wait', '收尾中：排队等待 · 5s'],
+    ['on-merged', '收尾中：合并后处理 · 5s'],
+  ] as const)('renders runtime probe %s as closeout', (phase, expected) => {
+    const diagnostics = { finalizationPhase: phase, phaseSince: now - 5_000 } as unknown as AgentDiagnostics
+    expect(formatFinalizationLine(diagnostics, now)).toBe(expected)
+    expect(liveRunningProgressLine({ state: 'running', diagnostics, now })).toBe(expected)
+  })
 
   it.each([
     ['final-received', '收尾中：总结已完成 · 5s'],

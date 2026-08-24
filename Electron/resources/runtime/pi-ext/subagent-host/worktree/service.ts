@@ -27,8 +27,19 @@ import {
 	NodeGitWorktreeAdapter,
 	runSpawnV1,
 } from "./adapter.ts";
-import type { MainRepoSerialQueueV1 } from "./queue.ts";
-import { PerMainRepoSerialQueueV1 } from "./queue.ts";
+import {
+	DEFAULT_FINALIZATION_DEADLINE_MS,
+	DEFAULT_ON_MERGED_TIMEOUT_MS,
+	DEFAULT_QUEUE_HEAD_TIMEOUT_MS,
+	DEFAULT_QUEUE_WAIT_TIMEOUT_MS,
+} from "./deadlines.ts";
+import type { MainRepoSerialQueueV1, SerialQueueGuardV1 } from "./queue.ts";
+import {
+	consumeLateSettlement,
+	createSerialQueueGuardV1,
+	SerialQueueTimeoutError,
+	sharedPerMainRepoSerialQueueV1,
+} from "./queue.ts";
 import { evaluateAutoMergeReadinessV1 } from "./policy.ts";
 import {
 	sweepLeftoverWorktreesV1,
@@ -92,13 +103,42 @@ export type WorktreeFinalizationServiceOptionsV1 = {
 	postMergeVerify?: PostMergeVerifyRunnerV1;
 	/**
 	 * Optional host hook after `result.merge === "merged"` and before cleanup.
-	 * Failures here must never fail finalization.
+	 * Timeout/failure retain the worktree and do not run destructive cleanup.
 	 */
 	onMerged?: (event: WorktreeMergedEventV1) => void | Promise<void>;
 	/** Live/persisted leases must block post-merge worktree removal. */
 	lease?: LeftoverWorktreeLeaseHooksV1;
 	/** Observational closeout stages. Must never fail finalization. */
-	onProgress?: (phase: "reconciling" | "merging" | "cleaning" | "post-verify") => void;
+	onProgress?: (
+		phase: WorktreeFinalizationProgressPhaseV1,
+		detail?: WorktreeFinalizationProgressDetailV1,
+	) => void;
+	/** Bound for waiting on a previous same-repo FIFO item. */
+	queueWaitTimeoutMs?: number;
+	/** Backup bound if a queue-head item ignores inner cancellation. */
+	queueHeadTimeoutMs?: number;
+	/** Bound for the host `onMerged` hook. */
+	onMergedTimeoutMs?: number;
+	/** Service-level envelope around one serialized finalize/retry. */
+	finalizationDeadlineMs?: number;
+};
+
+export type WorktreeFinalizationProgressPhaseV1 =
+	| "queue-wait"
+	| "reconciling"
+	| "merging"
+	| "on-merged"
+	| "cleaning"
+	| "post-verify";
+
+export type WorktreeFinalizationProgressDetailV1 = {
+	stage?: string;
+	repositoryKey?: string;
+	queueDepth?: number;
+	waitedMs?: number;
+	callback?: "onMerged" | "postMergeVerify" | "queue";
+	timedOut?: boolean;
+	error?: string;
 };
 
 export type WorktreeMergedEventV1 = {
@@ -108,6 +148,8 @@ export type WorktreeMergedEventV1 = {
 	branch: string;
 	preMergeHead?: string;
 	landedFiles: string[];
+	/** Cooperative cancellation for a bounded host hook. */
+	signal?: AbortSignal;
 };
 
 type CleanupOutcome = {
@@ -222,17 +264,25 @@ export class WorktreeFinalizationServiceV1 {
 	private readonly verifyTimeoutMs: number;
 	private readonly abortSignal?: AbortSignal;
 	private readonly terminationGraceMs: number;
+	private readonly queueWaitTimeoutMs: number;
+	private readonly queueHeadTimeoutMs: number;
+	private readonly onMergedTimeoutMs: number;
+	private readonly finalizationDeadlineMs: number;
 
 	constructor(options: WorktreeFinalizationServiceOptionsV1 = {}) {
 		this.verifyTimeoutMs = options.verifyTimeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
 		this.abortSignal = options.abortSignal;
 		this.terminationGraceMs = options.terminationGraceMs ?? DEFAULT_SPAWN_TERMINATION_GRACE_MS;
+		this.queueWaitTimeoutMs = options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS;
+		this.queueHeadTimeoutMs = options.queueHeadTimeoutMs ?? DEFAULT_QUEUE_HEAD_TIMEOUT_MS;
+		this.onMergedTimeoutMs = options.onMergedTimeoutMs ?? DEFAULT_ON_MERGED_TIMEOUT_MS;
+		this.finalizationDeadlineMs = options.finalizationDeadlineMs ?? DEFAULT_FINALIZATION_DEADLINE_MS;
 		this.adapter = options.adapter ?? new NodeGitWorktreeAdapter({
 			timeoutMs: options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
 			...(options.abortSignal ? { signal: options.abortSignal } : {}),
 			terminationGraceMs: this.terminationGraceMs,
 		});
-		this.queue = options.queue ?? new PerMainRepoSerialQueueV1();
+		this.queue = options.queue ?? sharedPerMainRepoSerialQueueV1();
 		this.clock = options.clock ?? systemClock;
 		this.logger = options.logger ?? {};
 		this.postMergeVerify = options.postMergeVerify;
@@ -241,12 +291,42 @@ export class WorktreeFinalizationServiceV1 {
 		this.lease = options.lease;
 	}
 
-	private emitProgress(phase: "reconciling" | "merging" | "cleaning" | "post-verify"): void {
+	private emitProgress(
+		phase: WorktreeFinalizationProgressPhaseV1,
+		detail?: WorktreeFinalizationProgressDetailV1,
+	): void {
 		try {
-			this.onProgress?.(phase);
+			this.onProgress?.(phase, detail);
 		} catch {
 			/* progress is observational */
 		}
+	}
+
+	private queueOptions(repositoryKey: string, guard: SerialQueueGuardV1) {
+		return {
+			waitTimeoutMs: this.queueWaitTimeoutMs,
+			headTimeoutMs: this.queueHeadTimeoutMs,
+			...(this.abortSignal ? { signal: this.abortSignal } : {}),
+			guard,
+			onProgress: (event: { phase: string; repositoryKey: string; depth: number; waitedMs: number }) => {
+				if (event.phase === "queue-wait" || event.phase === "queue-wait-timeout" || event.phase === "queue-head-timeout") {
+					this.emitProgress("queue-wait", {
+						stage: event.phase,
+						repositoryKey: event.repositoryKey || repositoryKey,
+						queueDepth: event.depth,
+						waitedMs: event.waitedMs,
+						callback: "queue",
+						...(event.phase.endsWith("timeout") ? { timedOut: true } : {}),
+					});
+				}
+				this.logger.debug?.("worktree-finalization-queue", {
+					phase: event.phase,
+					repositoryKey: event.repositoryKey || repositoryKey,
+					queueDepth: event.depth,
+					waitedMs: event.waitedMs,
+				});
+			},
+		};
 	}
 
 	/** Reap settled leftover `.pi/worktrees` entries without racing a live finalization. */
@@ -265,11 +345,30 @@ export class WorktreeFinalizationServiceV1 {
 			});
 			return { pruned: 0, kept: 0, dirty: 0, items: [] };
 		}
-		return this.queue.run(repositoryKey, () => sweepLeftoverWorktreesV1({
-			...input,
-			adapter: this.adapter,
-			logger: this.logger,
-		}));
+		const guard = createSerialQueueGuardV1(this.abortSignal);
+		try {
+			return await this.queue.run(
+				repositoryKey,
+				() => sweepLeftoverWorktreesV1({
+					...input,
+					adapter: this.adapter,
+					logger: this.logger,
+				}),
+				this.queueOptions(repositoryKey, guard),
+			);
+		} catch (error) {
+			if (error instanceof SerialQueueTimeoutError) {
+				this.logger.warn?.("worktree-leftover-sweep", {
+					pruned: 0,
+					kept: 0,
+					dirty: 0,
+					error: error.message,
+					stage: error.kind,
+				});
+				return { pruned: 0, kept: 0, dirty: 0, items: [] };
+			}
+			throw error;
+		}
 	}
 
 	/** Validate, serialize by canonical main repository, then either merge or return an actionable retained state. */
@@ -288,7 +387,7 @@ export class WorktreeFinalizationServiceV1 {
 		} catch (error) {
 			return this.failedToQueue(input, previous, error);
 		}
-		return this.queue.run(repositoryKey, () => this.finalizeSerialized(input, previous));
+		return this.runQueued(repositoryKey, input, previous, (guard) => this.finalizeSerialized(input, previous, guard));
 	}
 
 	/**
@@ -308,24 +407,161 @@ export class WorktreeFinalizationServiceV1 {
 			} catch (error) {
 				return this.failedToQueue(previous.input, previous, error);
 			}
-			return this.queue.run(repositoryKey, () => this.retryIntegratedSerialized(previous));
+			return this.runQueued(repositoryKey, previous.input, previous, (guard) => this.retryIntegratedSerialized(previous, guard));
 		}
 		return this.finalize(previous.input, previous);
 	}
 
+	private async runQueued(
+		repositoryKey: string,
+		input: WorktreeFinalizationInputV1,
+		previous: WorktreeFinalizationStateV1 | undefined,
+		operation: (guard: SerialQueueGuardV1) => Promise<WorktreeFinalizationStateV1>,
+	): Promise<WorktreeFinalizationStateV1> {
+		const guard = createSerialQueueGuardV1(this.abortSignal);
+		try {
+			return await this.queue.run(
+				repositoryKey,
+				() => this.runWithDeadline(input, previous, guard, () => operation(guard)),
+				this.queueOptions(repositoryKey, guard),
+			);
+		} catch (error) {
+			if (error instanceof SerialQueueTimeoutError) {
+				guard.release();
+				return this.timeoutState(input, previous, error.kind, error.timeoutMs);
+			}
+			throw error;
+		}
+	}
+
+	private async runWithDeadline(
+		input: WorktreeFinalizationInputV1,
+		previous: WorktreeFinalizationStateV1 | undefined,
+		guard: SerialQueueGuardV1,
+		operation: () => Promise<WorktreeFinalizationStateV1>,
+	): Promise<WorktreeFinalizationStateV1> {
+		const work = Promise.resolve().then(operation);
+		if (guard.isReleased()) {
+			consumeLateSettlement(work, (late) => this.noteLateSettlement("finalization", input, late));
+			return this.timeoutState(input, previous, "queue-head", this.finalizationDeadlineMs);
+		}
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<WorktreeFinalizationStateV1>((resolve) => {
+			timer = setTimeout(() => {
+				guard.release();
+				this.emitProgress("queue-wait", {
+					stage: "queue-head-timeout",
+					callback: "queue",
+					timedOut: true,
+					waitedMs: this.finalizationDeadlineMs,
+				});
+				this.logger.warn?.("worktree-finalization-deadline", {
+					agentId: input.agentId,
+					runId: input.runId,
+					timeoutMs: this.finalizationDeadlineMs,
+				});
+				resolve(this.timeoutState(input, previous, "queue-head", this.finalizationDeadlineMs));
+			}, this.finalizationDeadlineMs);
+		});
+		try {
+			const result = await Promise.race([work, deadline]);
+			if (guard.isReleased()) {
+				consumeLateSettlement(work, (late) => this.noteLateSettlement("finalization", input, late));
+			}
+			return result;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	}
+
+	private timeoutState(
+		input: WorktreeFinalizationInputV1,
+		previous: WorktreeFinalizationStateV1 | undefined,
+		kind: "queue-wait" | "queue-head",
+		timeoutMs: number,
+	): WorktreeFinalizationStateV1 {
+		const result = makeResult(input, iso(this.clock));
+		const stage = kind === "queue-wait" ? "queue-wait-timeout" : "queue-head-timeout";
+		result.disposition = "needs-user";
+		result.cleanup = "not-attempted";
+		result.merge = "not-attempted";
+		result.recovery = baseRecovery(
+			"needs-user",
+			"retry-finalization",
+			kind === "queue-wait"
+				? `per-repository FIFO wait timed out after ${timeoutMs}ms`
+				: `finalization timed out after ${timeoutMs}ms; worktree and branch were retained`,
+			["preserve the worktree and branch", "inspect the blocked closeout stage and retry"],
+		);
+		result.messages = [
+			kind === "queue-wait"
+				? `queue wait timed out after ${timeoutMs}ms; later same-repo items may proceed`
+				: `queue head timed out after ${timeoutMs}ms; worktree and branch were retained`,
+		];
+		this.logger.warn?.("worktree-finalization-timeout", {
+			agentId: input.agentId,
+			runId: input.runId,
+			stage,
+			timeoutMs,
+		});
+		return this.state(input, previous, result);
+	}
+
+	private noteLateSettlement(
+		callback: string,
+		input: WorktreeFinalizationInputV1,
+		late: { status: "fulfilled"; value: unknown } | { status: "rejected"; reason: unknown },
+	): void {
+		this.logger.warn?.("worktree-finalization-late-settlement", {
+			callback,
+			agentId: input.agentId,
+			runId: input.runId,
+			status: late.status,
+			...(late.status === "rejected"
+				? { error: late.reason instanceof Error ? late.reason.message : String(late.reason) }
+				: {}),
+		});
+	}
+
+	private releasedRetain(
+		input: WorktreeFinalizationInputV1,
+		previous: WorktreeFinalizationStateV1 | undefined,
+		result: WorktreeFinalizationResultV1,
+		reason: string,
+	): WorktreeFinalizationStateV1 {
+		result.disposition = "needs-user";
+		if (result.cleanup === "cleaned") result.cleanup = "not-attempted";
+		result.recovery = baseRecovery(
+			"needs-user",
+			"retry-finalization",
+			reason,
+			["preserve the worktree and branch", "retry only after the cancelled closeout has settled"],
+		);
+		appendMessages(result, [reason]);
+		result.updatedAt = iso(this.clock);
+		return this.state(input, previous, result);
+	}
+
 	private async finalizeSerialized(
 		input: WorktreeFinalizationInputV1,
-		previous?: WorktreeFinalizationStateV1,
+		previous: WorktreeFinalizationStateV1 | undefined,
+		guard: SerialQueueGuardV1,
 	): Promise<WorktreeFinalizationStateV1> {
 		const now = iso(this.clock);
 		const result = makeResult(input, now);
 		const attempt = (previous?.attempt ?? 0) + 1;
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled before reconcile");
+		}
 		this.emitProgress("reconciling");
 		this.logger.debug?.("worktree-finalization-preflight", { agentId: input.agentId, runId: input.runId, attempt });
 		let inspection;
 		try {
 			inspection = await this.adapter.inspect(input);
 		} catch (error) {
+			if (guard.isReleased()) {
+				return this.releasedRetain(input, previous, result, "finalization cancelled during inspect");
+			}
 			return this.state(input, previous, {
 				...result,
 				disposition: "needs-user",
@@ -344,6 +580,9 @@ export class WorktreeFinalizationServiceV1 {
 		result.conflict = readiness.conflict;
 		result.recovery = readiness.recovery;
 		appendMessages(result, readiness.messages);
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled after inspect");
+		}
 		if (!readiness.ready) {
 			result.updatedAt = iso(this.clock);
 			this.logger.info?.("worktree-finalization-retained", {
@@ -358,9 +597,12 @@ export class WorktreeFinalizationServiceV1 {
 		if (inspection.branchIsAncestorOfMain) {
 			result.merge = "already-integrated";
 			appendMessages(result, ["worker branch is already reachable from main HEAD; only safe cleanup remains"]);
-			return this.completeIntegrated(input, previous, result);
+			return this.completeIntegrated(input, previous, result, guard);
 		}
 
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled before merge");
+		}
 		this.emitProgress("merging");
 		this.logger.info?.("worktree-finalization-merge", { agentId: input.agentId, runId: input.runId, branch: input.worktree.branch });
 		let preMergeHead: string | undefined;
@@ -430,46 +672,133 @@ export class WorktreeFinalizationServiceV1 {
 		}
 		result.merge = "merged";
 		appendMessages(result, ["worker branch merged into main with PipiUI-Agent / PipiUI-Run trailers"]);
-		await this.notifyMerged(input, result, preMergeHead);
-		const completed = await this.completeIntegrated(input, previous, result);
-		await this.writeMergeAuditNote(input, result);
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled after merge; worktree and branch were retained");
+		}
+		const notified = await this.notifyMerged(input, result, preMergeHead, guard);
+		if (!notified) return this.state(input, previous, result);
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled after onMerged; worktree and branch were retained");
+		}
+		const completed = await this.completeIntegrated(input, previous, result, guard);
+		if (!guard.isReleased()) await this.writeMergeAuditNote(input, result);
 		return completed;
 	}
 
+	private retainAfterOnMerged(
+		result: WorktreeFinalizationResultV1,
+		kind: "timed-out" | "failed" | "aborted",
+		detail: string,
+	): false {
+		const needsUser = kind !== "failed";
+		result.disposition = needsUser ? "needs-user" : "needs-fixer";
+		result.cleanup = "not-attempted";
+		result.recovery = baseRecovery(
+			needsUser ? "needs-user" : "needs-fixer",
+			"retry-finalization",
+			kind === "timed-out"
+				? `onMerged timed out after ${this.onMergedTimeoutMs}ms; worktree and branch were retained`
+				: kind === "aborted"
+					? "onMerged was cancelled; worktree and branch were retained"
+					: `onMerged failed; worktree and branch were retained: ${detail}`,
+			["preserve the worktree and branch", "retry finalization after the host hook can finish"],
+		);
+		appendMessages(result, [
+			kind === "timed-out"
+				? `onMerged hook timed out after ${this.onMergedTimeoutMs}ms; cleanup was not attempted`
+				: kind === "aborted"
+					? "onMerged hook was aborted; cleanup was not attempted"
+					: `onMerged hook failed; cleanup was not attempted: ${detail}`,
+		]);
+		result.updatedAt = iso(this.clock);
+		this.emitProgress("on-merged", {
+			stage: kind === "timed-out" ? "on-merged-timeout" : kind === "aborted" ? "on-merged-aborted" : "on-merged-failed",
+			callback: "onMerged",
+			...(kind === "timed-out" ? { timedOut: true } : {}),
+			error: detail,
+		});
+		this.logger.warn?.("worktree-finalization-on-merged", {
+			agentId: result.agentId,
+			runId: result.runId,
+			stage: kind,
+			detail,
+		});
+		return false;
+	}
+
+	/** Returns true only when cleanup may proceed. Timeout/failure retain the tree. */
 	private async notifyMerged(
 		input: WorktreeFinalizationInputV1,
 		result: WorktreeFinalizationResultV1,
 		preMergeHead: string | undefined,
-	): Promise<void> {
-		if (!this.onMerged || result.merge !== "merged") return;
+		guard: SerialQueueGuardV1,
+	): Promise<boolean> {
+		if (!this.onMerged || result.merge !== "merged") return true;
+		if (guard.isReleased()) return this.retainAfterOnMerged(result, "aborted", "finalization already released");
+		this.emitProgress("on-merged", { stage: "on-merged", callback: "onMerged" });
 		let landedFiles: string[] = [];
-		try {
-			if (preMergeHead) {
+		if (preMergeHead) {
+			try {
 				const diff = await runSpawnV1(
 					"git",
-				["-C", input.mainCwd, "diff", "--name-only", `${preMergeHead}..HEAD`],
-				{
-					timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
-					...(this.abortSignal ? { signal: this.abortSignal } : {}),
-					terminationGraceMs: this.terminationGraceMs,
-				},
+					["-C", input.mainCwd, "diff", "--name-only", `${preMergeHead}..HEAD`],
+					{
+						timeoutMs: DEFAULT_GIT_TIMEOUT_MS,
+						signal: guard.signal,
+						terminationGraceMs: this.terminationGraceMs,
+					},
 				);
 				if (diff.ok) {
 					landedFiles = [...new Set(diff.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))].sort();
-				} else {
+				} else if (!diff.aborted) {
 					appendMessages(result, [`landed-files diff failed: ${diff.error || diff.stderr || `exit ${diff.exitCode ?? "?"}`}`]);
 				}
+			} catch (error) {
+				appendMessages(result, [`landed-files diff failed: ${error instanceof Error ? error.message : String(error)}`]);
 			}
-			await this.onMerged({
-				agentId: input.agentId,
-				runId: input.runId,
-				mainCwd: input.mainCwd,
-				branch: input.worktree.branch,
-				...(preMergeHead ? { preMergeHead } : {}),
-				landedFiles,
-			});
-		} catch (error) {
-			appendMessages(result, [`onMerged hook failed: ${error instanceof Error ? error.message : String(error)}`]);
+		}
+		if (guard.isReleased()) return this.retainAfterOnMerged(result, "aborted", "cancelled before onMerged hook");
+		const hook = Promise.resolve().then(() => this.onMerged!({
+			agentId: input.agentId,
+			runId: input.runId,
+			mainCwd: input.mainCwd,
+			branch: input.worktree.branch,
+			...(preMergeHead ? { preMergeHead } : {}),
+			landedFiles,
+			signal: guard.signal,
+		}));
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const deadline = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), this.onMergedTimeoutMs);
+		});
+		const aborted = new Promise<"aborted">((resolve) => {
+			if (guard.signal.aborted) {
+				resolve("aborted");
+				return;
+			}
+			guard.signal.addEventListener("abort", () => resolve("aborted"), { once: true });
+		});
+		const settled = hook.then(
+			() => "ok" as const,
+			(error: unknown) => ({ error }),
+		);
+		try {
+			const raced = await Promise.race([settled, deadline, aborted]);
+			if (raced === "timeout") {
+				consumeLateSettlement(hook, (late) => this.noteLateSettlement("onMerged", input, late));
+				return this.retainAfterOnMerged(result, "timed-out", `timed out after ${this.onMergedTimeoutMs}ms`);
+			}
+			if (raced === "aborted") {
+				consumeLateSettlement(hook, (late) => this.noteLateSettlement("onMerged", input, late));
+				return this.retainAfterOnMerged(result, "aborted", "AbortSignal");
+			}
+			if (raced !== "ok") {
+				const detail = raced.error instanceof Error ? raced.error.message : String(raced.error);
+				return this.retainAfterOnMerged(result, "failed", detail);
+			}
+			return true;
+		} finally {
+			if (timer) clearTimeout(timer);
 		}
 	}
 
@@ -518,12 +847,19 @@ export class WorktreeFinalizationServiceV1 {
 		input: WorktreeFinalizationInputV1,
 		previous: WorktreeFinalizationStateV1 | undefined,
 		result: WorktreeFinalizationResultV1,
+		guard: SerialQueueGuardV1,
 	): Promise<WorktreeFinalizationStateV1> {
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled before cleanup; worktree and branch were retained");
+		}
 		this.emitProgress("cleaning");
-		const cleanup = await this.cleanupAfterIntegration(input);
+		const cleanup = await this.cleanupAfterIntegration(input, guard);
 		result.cleanup = cleanup.disposition;
 		appendMessages(result, cleanup.messages);
-		const verification = await this.runPostMergeVerify(input);
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "finalization cancelled after cleanup");
+		}
+		const verification = await this.runPostMergeVerify(input, guard);
 		result.verify.postMerge = verification.postMerge;
 		if (verification.outputTail) result.verify.outputTail = verification.outputTail;
 		if (verification.exitCode !== undefined) result.verify.postMergeExitCode = verification.exitCode;
@@ -567,7 +903,15 @@ export class WorktreeFinalizationServiceV1 {
 		return this.state(input, previous, result);
 	}
 
-	private async cleanupAfterIntegration(input: WorktreeFinalizationInputV1): Promise<CleanupOutcome> {
+	private async cleanupAfterIntegration(input: WorktreeFinalizationInputV1, guard?: SerialQueueGuardV1): Promise<CleanupOutcome> {
+		if (guard?.isReleased()) {
+			return {
+				disposition: "not-attempted",
+				needsFixer: false,
+				needsUser: true,
+				messages: ["cleanup skipped because finalization was cancelled; worktree and branch were retained"],
+			};
+		}
 		let cleanupClaim: { release(): void | Promise<void> } | undefined;
 		if (this.lease?.claimCleanup) {
 			try {
@@ -622,6 +966,14 @@ export class WorktreeFinalizationServiceV1 {
 					messages: [`integration succeeded, but lease inspection failed: ${error instanceof Error ? error.message : String(error)}`],
 				};
 			}
+		}
+		if (guard?.isReleased()) {
+			return {
+				disposition: "not-attempted",
+				needsFixer: false,
+				needsUser: true,
+				messages: ["cleanup skipped because finalization was cancelled; worktree and branch were retained"],
+			};
 		}
 		try {
 			let removed: GitOperationResultV1;
@@ -682,8 +1034,11 @@ export class WorktreeFinalizationServiceV1 {
 		}
 	}
 
-	private async runPostMergeVerify(input: WorktreeFinalizationInputV1): Promise<VerifyOutcome> {
+	private async runPostMergeVerify(input: WorktreeFinalizationInputV1, guard?: SerialQueueGuardV1): Promise<VerifyOutcome> {
 		if (!verifyRequested(input)) return { kind: "none", postMerge: "not-requested" };
+		if (guard?.isReleased()) {
+			return { kind: "failed", postMerge: "failed", aborted: true, reason: "finalization cancelled before post-merge verify" };
+		}
 		this.emitProgress("post-verify");
 		const request: PostMergeVerifyRequestV1 = {
 			mainCwd: input.mainCwd,
@@ -695,12 +1050,12 @@ export class WorktreeFinalizationServiceV1 {
 		try {
 			let checked: PostMergeVerifyResultV1 | undefined;
 			if (this.postMergeVerify) {
-				checked = await this.runInjectedPostMergeVerify(request);
+				checked = await this.runInjectedPostMergeVerify(request, input, guard);
 			} else if (request.argv?.length) {
 				const spawned = await runSpawnV1(request.argv[0], request.argv.slice(1), {
 					cwd: input.mainCwd,
 					timeoutMs: this.verifyTimeoutMs,
-					...(this.abortSignal ? { signal: this.abortSignal } : {}),
+					signal: guard?.signal ?? this.abortSignal,
 					terminationGraceMs: this.terminationGraceMs,
 				});
 				checked = {
@@ -736,14 +1091,21 @@ export class WorktreeFinalizationServiceV1 {
 		}
 	}
 
-	/** An injected runner is never killed by this service; deadline/abort only releases the queue and signals it. */
-	private async runInjectedPostMergeVerify(request: PostMergeVerifyRequestV1): Promise<PostMergeVerifyResultV1> {
+	/** Deadline/abort the injected runner, await a bounded stop, and ignore later mutation. */
+	private async runInjectedPostMergeVerify(
+		request: PostMergeVerifyRequestV1,
+		input: WorktreeFinalizationInputV1,
+		guard?: SerialQueueGuardV1,
+	): Promise<PostMergeVerifyResultV1> {
 		if (!this.postMergeVerify) return { ok: false, error: "postMergeVerify runner is unavailable" };
 		if (!Number.isSafeInteger(this.verifyTimeoutMs) || this.verifyTimeoutMs < 1) {
 			return { ok: false, error: "verifyTimeoutMs must be a positive safe integer" };
 		}
-		if (this.abortSignal?.aborted) return { ok: false, aborted: true, error: "post-merge verify aborted before runner start" };
+		if (this.abortSignal?.aborted || guard?.signal.aborted) {
+			return { ok: false, aborted: true, error: "post-merge verify aborted before runner start" };
+		}
 		const controller = new AbortController();
+		let released = false;
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let resolveAbort: ((result: PostMergeVerifyResultV1) => void) | undefined;
 		const aborted = new Promise<PostMergeVerifyResultV1>((resolve) => { resolveAbort = resolve; });
@@ -752,9 +1114,15 @@ export class WorktreeFinalizationServiceV1 {
 			resolveAbort?.({ ok: false, aborted: true, error: "post-merge verify aborted by AbortSignal" });
 		};
 		this.abortSignal?.addEventListener("abort", onAbort, { once: true });
+		guard?.signal.addEventListener("abort", onAbort, { once: true });
 		const deadline = new Promise<PostMergeVerifyResultV1>((resolve) => {
 			timeout = setTimeout(() => {
 				controller.abort();
+				this.emitProgress("post-verify", {
+					stage: "post-verify-timeout",
+					callback: "postMergeVerify",
+					timedOut: true,
+				});
 				resolve({ ok: false, timedOut: true, error: `post-merge verify timed out after ${this.verifyTimeoutMs}ms` });
 			}, this.verifyTimeoutMs);
 		});
@@ -763,13 +1131,33 @@ export class WorktreeFinalizationServiceV1 {
 			timeoutMs: this.verifyTimeoutMs,
 			signal: controller.signal,
 		}));
+		const adoptLate = (): void => {
+			released = true;
+			consumeLateSettlement(runner, (late) => this.noteLateSettlement("postMergeVerify", input, late));
+		};
 		try {
-			return await Promise.race([runner, deadline, aborted]);
+			const raced = await Promise.race([runner, deadline, aborted]);
+			if (raced.timedOut || raced.aborted) {
+				if (!controller.signal.aborted) controller.abort();
+				const grace = Math.max(this.terminationGraceMs, 1);
+				const stopped = await Promise.race([
+					runner.then(() => true, () => true),
+					new Promise<false>((resolve) => setTimeout(() => resolve(false), grace + 50)),
+				]);
+				if (!stopped) adoptLate();
+				else released = true;
+				return raced;
+			}
+			released = true;
+			return raced;
 		} catch (error) {
+			released = true;
 			return { ok: false, error: error instanceof Error ? error.message : String(error) };
 		} finally {
 			if (timeout) clearTimeout(timeout);
 			this.abortSignal?.removeEventListener("abort", onAbort);
+			guard?.signal.removeEventListener("abort", onAbort);
+			if (!released) adoptLate();
 		}
 	}
 
@@ -784,7 +1172,7 @@ export class WorktreeFinalizationServiceV1 {
 		}
 	}
 
-	private async retryIntegratedSerialized(previous: WorktreeFinalizationStateV1): Promise<WorktreeFinalizationStateV1> {
+	private async retryIntegratedSerialized(previous: WorktreeFinalizationStateV1, guard: SerialQueueGuardV1): Promise<WorktreeFinalizationStateV1> {
 		const input = previous.input;
 		const result: WorktreeFinalizationResultV1 = {
 			...previous.result,
@@ -794,9 +1182,12 @@ export class WorktreeFinalizationServiceV1 {
 			messages: [...previous.result.messages, "retrying integrated finalization"],
 			updatedAt: iso(this.clock),
 		};
+		if (guard.isReleased()) {
+			return this.releasedRetain(input, previous, result, "integrated retry cancelled before cleanup");
+		}
 		if (result.cleanup !== "cleaned") {
 			const cleanup = result.cleanup === "retained-worktree" || result.cleanup === "not-attempted"
-				? await this.cleanupAfterIntegration(input)
+				? await this.cleanupAfterIntegration(input, guard)
 				: await this.cleanupBranchAfterRemoval(input);
 			result.cleanup = cleanup.disposition;
 			appendMessages(result, cleanup.messages);
@@ -813,7 +1204,7 @@ export class WorktreeFinalizationServiceV1 {
 				return this.state(input, previous, result);
 			}
 		}
-		const verification = await this.runPostMergeVerify(input);
+		const verification = await this.runPostMergeVerify(input, guard);
 		delete result.verify.postMergeTimedOut;
 		delete result.verify.postMergeAborted;
 		result.verify.postMerge = verification.postMerge;
