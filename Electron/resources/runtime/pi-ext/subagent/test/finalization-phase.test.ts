@@ -62,6 +62,7 @@ test("verify then reconcile merge cleanup post-verify records elapsed in order a
 	assert.equal(state.reconcileElapsedMs, 30);
 	assert.equal(state.mergeElapsedMs, 20);
 	assert.equal(state.cleanupElapsedMs, 20);
+	assert.equal(state.postVerifyElapsedMs, 30);
 	assert.equal(canTransitionFinalizationPhase("cleaning", "post-verify"), true);
 	assert.equal(canTransitionFinalizationPhase("post-verify", "cleaning"), false);
 	assert.equal(canTransitionFinalizationPhase("done-await-host", "verifying"), false);
@@ -99,11 +100,13 @@ test("runtime emits phases at real verify/worktree/done boundaries", () => {
 	assert.match(source, /projectFinalizationPhase\(pipiuiAgentId, runId, "final-received"\)/);
 	assert.match(source, /projectFinalizationPhase\(pipiuiAgentId, runId, "verifying"\)/);
 	assert.match(source, /runVerifyCommand\([\s\S]*onSpawn/);
-	assert.match(source, /onProgress\(phase\) \{[\s\S]*?projectFinalizationPhase\(pipiuiAgentId, runId, phase\)/);
+	assert.match(source, /onProgress\(phase(?:, detail)?\) \{[\s\S]*?projectFinalizationPhase\(pipiuiAgentId, runId, phase\)/);
 	assert.match(source, /projectFinalizationPhase\(pipiuiAgentId, runId, "done-await-host"\)/);
 	assert.match(source, /kind:\s*"diagnostics"/);
 	assert.doesNotMatch(source, /projectFinalizationPhase\([\s\S]{0,80}activity:/);
 	assert.doesNotMatch(source, /finalizationPhase[\s\S]{0,40}prompt/);
+	assert.doesNotMatch(source, /error: "job-finalize-error"[\s\S]{0,400}throw error/);
+	assert.match(source, /pipiuiReportQueue\.beginRun\(/);
 	const worktree = readFileSync(new URL("../../subagent-host/worktree/service.ts", import.meta.url), "utf8");
 	assert.match(worktree, /this\.emitProgress\("reconciling"\)/);
 	assert.match(worktree, /this\.emitProgress\("merging"\)/);

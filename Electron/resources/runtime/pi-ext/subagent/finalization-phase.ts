@@ -31,6 +31,7 @@ export type FinalizationFields = {
 	mergeElapsedMs?: number;
 	onMergedElapsedMs?: number;
 	cleanupElapsedMs?: number;
+	postVerifyElapsedMs?: number;
 	doneEventSeq?: number;
 };
 
@@ -47,7 +48,7 @@ const PHASE_RANK = new Map<AgentFinalizationPhase, number>(
 
 const ELAPSED_ON_LEAVE: Partial<Record<AgentFinalizationPhase, keyof Pick<
 	FinalizationFields,
-	"verifyElapsedMs" | "queueWaitElapsedMs" | "reconcileElapsedMs" | "mergeElapsedMs" | "onMergedElapsedMs" | "cleanupElapsedMs"
+	"verifyElapsedMs" | "queueWaitElapsedMs" | "reconcileElapsedMs" | "mergeElapsedMs" | "onMergedElapsedMs" | "cleanupElapsedMs" | "postVerifyElapsedMs"
 >>> = {
 	verifying: "verifyElapsedMs",
 	"queue-wait": "queueWaitElapsedMs",
@@ -55,6 +56,7 @@ const ELAPSED_ON_LEAVE: Partial<Record<AgentFinalizationPhase, keyof Pick<
 	merging: "mergeElapsedMs",
 	"on-merged": "onMergedElapsedMs",
 	cleaning: "cleanupElapsedMs",
+	"post-verify": "postVerifyElapsedMs",
 };
 
 export function isAgentFinalizationPhase(value: unknown): value is AgentFinalizationPhase {
@@ -149,6 +151,7 @@ export function resetFinalizationFields(state: FinalizationFields): void {
 	delete state.mergeElapsedMs;
 	delete state.onMergedElapsedMs;
 	delete state.cleanupElapsedMs;
+	delete state.postVerifyElapsedMs;
 	delete state.doneEventSeq;
 }
 
@@ -165,6 +168,7 @@ export function snapshotFinalizationFields(state: FinalizationFields): Finalizat
 	if (state.mergeElapsedMs !== undefined) next.mergeElapsedMs = state.mergeElapsedMs;
 	if (state.onMergedElapsedMs !== undefined) next.onMergedElapsedMs = state.onMergedElapsedMs;
 	if (state.cleanupElapsedMs !== undefined) next.cleanupElapsedMs = state.cleanupElapsedMs;
+	if (state.postVerifyElapsedMs !== undefined) next.postVerifyElapsedMs = state.postVerifyElapsedMs;
 	if (state.doneEventSeq !== undefined) next.doneEventSeq = state.doneEventSeq;
 	return next;
 }

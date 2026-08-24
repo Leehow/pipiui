@@ -314,6 +314,21 @@ import {
 	terminalCandidatePhaseError,
 } from "./terminal-candidate.ts";
 import {
+	DEFAULT_REPORT_DRAIN_BUDGET_MS,
+	DEFAULT_TERMINAL_REPORT_BUDGET_MS,
+	closeoutPhaseError,
+	createChildExitCloseout,
+	createCloseoutReportQueue,
+	createTimeoutAbort,
+	createWorktreePhaseProber,
+	detachCloseout,
+	isSupersededCloseoutReport,
+	logCloseoutProbe,
+	readonlyChildExitGraceMs,
+	runAbortableRetries,
+	settleCloseoutWait,
+} from "./closeout.ts";
+import {
 	type ActiveTool,
 	activeToolForContentIndex,
 	boundActivitySummary,
@@ -951,8 +966,13 @@ type PipiuiAgentReport = AgentBridgeEventPayloadV1;
  * bridge accepted the report); false only for transport/HTTP failure, which
  * lets terminal senders retry.
  */
-async function postPipiuiReport(payload: PipiuiAgentReport): Promise<boolean> {
+const pipiuiReportQueue = createCloseoutReportQueue<PipiuiAgentReport>();
+
+async function postPipiuiReport(payload: PipiuiAgentReport, signal?: AbortSignal): Promise<boolean> {
 	if (!PIPIUI_PORT) return true;
+	if (signal?.aborted) return false;
+	if (pipiuiReportQueue.ignores(payload.agentId, payload.runId)) return true;
+	if (isSupersededCloseoutReport(payload, runningAgents.get(payload.agentId)?.runId)) return true;
 	const body = encodeAgentEventBridgeRequestV1(payload, {
 		PIPIUI_HOST_PROTOCOL,
 		PIPIUI_SESSION_KEY: PIPIUI_SESSION,
@@ -962,46 +982,44 @@ async function postPipiuiReport(payload: PipiuiAgentReport): Promise<boolean> {
 	// send a second legacy fallback and never ask a host to infer a reusable run.
 	// Both are deterministic config states — retrying cannot fix them.
 	if (!body) return true;
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), PIPIUI_REPORT_TIMEOUT_MS);
-	timeout.unref?.();
+	const timeout = createTimeoutAbort(PIPIUI_REPORT_TIMEOUT_MS, signal);
 	try {
+		if (timeout.signal.aborted) return false;
+		if (pipiuiReportQueue.ignores(payload.agentId, payload.runId)) return true;
 		const response = await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
-			signal: controller.signal,
+			signal: timeout.signal,
 		});
 		return response.ok;
 	} catch {
 		// Bridge reporting is observability, never a reason to crash the worker.
 		return false;
 	} finally {
-		clearTimeout(timeout);
+		timeout.dispose();
 	}
 }
-
-const terminalPipiuiReportFlights = new Map<string, Promise<void>>();
 
 /**
  * Serialize every lifecycle report per bare agent ID. A fire-and-forget update
  * may otherwise complete after `end` and reopen a terminal row in hosts that
  * receive HTTP requests in completion order. The host still enforces terminal
  * monotonicity because network/process failures can drop or replay messages.
+ * Timeout paths must abandon() so a late retry cannot POST into a reused run.
  */
 function enqueuePipiuiReport(
 	payload: PipiuiAgentReport,
-	post: (payload: PipiuiAgentReport) => Promise<unknown> = postPipiuiReport,
+	post: (payload: PipiuiAgentReport, signal?: AbortSignal) => Promise<unknown> = postPipiuiReport,
 ): Promise<void> {
-	const previous = terminalPipiuiReportFlights.get(payload.agentId) ?? Promise.resolve();
-	const flight = previous.catch(() => {}).then(() => post(payload));
-	terminalPipiuiReportFlights.set(payload.agentId, flight);
-	void flight.finally(() => {
-		if (terminalPipiuiReportFlights.get(payload.agentId) === flight) {
-			terminalPipiuiReportFlights.delete(payload.agentId);
-		}
+	return pipiuiReportQueue.enqueue(payload, (item, signal) => {
+		if (isSupersededCloseoutReport(item, runningAgents.get(item.agentId)?.runId)) return Promise.resolve();
+		return post(item, signal);
 	});
-	return flight;
+}
+
+function abandonPipiuiReports(agentId: string, runId?: string): void {
+	pipiuiReportQueue.abandon(agentId, runId);
 }
 
 function pipiuiReport(payload: PipiuiAgentReport): void {
@@ -1012,31 +1030,66 @@ function pipiuiReport(payload: PipiuiAgentReport): void {
  *  host's orphan sweep skips sessions whose pi process is still alive. Bounded
  *  retries keep that row from sticking when the bridge hiccups. */
 const TERMINAL_REPORT_RETRY_DELAYS_MS = [1_000, 3_000] as const;
-async function postPipiuiReportWithRetry(payload: PipiuiAgentReport): Promise<void> {
-	for (let attempt = 0; ; attempt++) {
-		if (await postPipiuiReport(payload)) return;
-		if (attempt >= TERMINAL_REPORT_RETRY_DELAYS_MS.length) {
-			console.error(
-				`[pipiui-subagent] terminal bridge report dropped for agentId=${payload.agentId} after ${attempt + 1} attempts`,
-			);
-			return;
-		}
-		await new Promise((resolve) => {
-			const timer = setTimeout(resolve, TERMINAL_REPORT_RETRY_DELAYS_MS[attempt]!);
-			timer.unref?.();
-		});
+async function postPipiuiReportWithRetry(payload: PipiuiAgentReport, signal?: AbortSignal): Promise<void> {
+	const active = signal ?? new AbortController().signal;
+	const result = await runAbortableRetries(
+		(attemptSignal) => postPipiuiReport(payload, attemptSignal),
+		active,
+		TERMINAL_REPORT_RETRY_DELAYS_MS,
+	);
+	if (result === "exhausted") {
+		console.error(
+			`[pipiui-subagent] terminal bridge report dropped for agentId=${payload.agentId} after ${TERMINAL_REPORT_RETRY_DELAYS_MS.length + 1} attempts`,
+		);
 	}
+}
+
+function noteCloseoutLastPhaseError(agentId: string, runId: string | undefined, event: string, state: Parameters<typeof closeoutPhaseError>[1]): void {
+	const error = closeoutPhaseError(event, state);
+	if (!error || !runId) return;
+	const phase = handleForRun(agentId, runId)?.diagnostics.finalizationPhase ?? "done-await-host";
+	projectFinalizationPhase(agentId, runId, phase, { error });
 }
 
 /** The lease owner awaits the same ordered queue before it releases this agent ID. */
 function postTerminalPipiuiReport(payload: PipiuiAgentReport): Promise<void> {
-	return enqueuePipiuiReport(payload, postPipiuiReportWithRetry);
+	const flight = enqueuePipiuiReport(payload, postPipiuiReportWithRetry);
+	return settleCloseoutWait(flight, DEFAULT_TERMINAL_REPORT_BUDGET_MS, (state, elapsedMs) => {
+		const error = closeoutPhaseError("end-report", state);
+		logCloseoutProbe("end-report", {
+			agent: payload.agentId,
+			run: payload.runId,
+			phase: "end-report",
+			state,
+			elapsedMs,
+			...(error ? { error } : {}),
+		});
+		noteCloseoutLastPhaseError(payload.agentId, payload.runId, "end-report", state);
+		if (state === "timeout") abandonPipiuiReports(payload.agentId, payload.runId);
+	}).then((outcome) => {
+		if (outcome.status === "timeout") abandonPipiuiReports(payload.agentId, payload.runId);
+		else pipiuiReportQueue.seal(payload.agentId, payload.runId);
+	});
 }
 
-async function awaitTerminalPipiuiReports(agentId: string): Promise<void> {
-	while (terminalPipiuiReportFlights.has(agentId)) {
-		await terminalPipiuiReportFlights.get(agentId);
-	}
+async function awaitTerminalPipiuiReports(
+	agentId: string,
+	meta?: { run?: string; role?: string },
+): Promise<void> {
+	const outcome = await settleCloseoutWait(pipiuiReportQueue.drain(agentId), DEFAULT_REPORT_DRAIN_BUDGET_MS, (state, elapsedMs) => {
+		const error = closeoutPhaseError("report-drain", state);
+		logCloseoutProbe("report-drain", {
+			agent: agentId,
+			run: meta?.run,
+			role: meta?.role,
+			phase: "report-drain",
+			state,
+			elapsedMs,
+			...(error ? { error } : {}),
+		});
+		if (state === "timeout") abandonPipiuiReports(agentId, meta?.run);
+	});
+	if (outcome.status === "timeout") abandonPipiuiReports(agentId, meta?.run);
 }
 
 // ---- Cut-in hold：GUI「插队」后，批量 join 的用户消息必须先进入 turn ----
@@ -5656,6 +5709,7 @@ async function runSingleAgent(
 			runId,
 			stopReason: "error",
 		};
+		pipiuiReportQueue.beginRun(pipiuiAgentId, runId);
 		await postPipiuiReport({
 			kind: "start",
 			agentId: pipiuiAgentId,
@@ -5908,6 +5962,7 @@ async function runSingleAgent(
 		projectActiveTool(true);
 	};
 	const stallDiagnostics = createStallDiagnosticsState();
+	pipiuiReportQueue.beginRun(pipiuiAgentId, runId);
 	await postPipiuiReport({
 		kind: "start",
 		agentId: pipiuiAgentId,
@@ -6201,14 +6256,43 @@ async function runSingleAgent(
 					pipiuiReport({ kind: "update", agentId: pipiuiAgentId, runId, deadlineAt: runtimeTimeout.deadlineAt });
 				}
 				let procExited = false;
-				const terminateAttempt = () => {
-					if (procExited) return;
-					proc.kill("SIGTERM");
-					const forceKill = setTimeout(() => {
-						if (!procExited) proc.kill("SIGKILL");
-					}, 5000);
-					forceKill.unref?.();
+				let forceKill: ReturnType<typeof setTimeout> | undefined;
+				let detachChildAbort = (): void => {};
+				const clearChildExitTimers = (): void => {
+					if (forceKill !== undefined) {
+						clearTimeout(forceKill);
+						forceKill = undefined;
+					}
+					detachChildAbort();
+					detachChildAbort = () => {};
 				};
+				const terminateAttempt = () => {
+					if (procExited) return false;
+					if (forceKill === undefined) {
+						forceKill = setTimeout(() => {
+							forceKill = undefined;
+							if (!procExited) proc.kill("SIGKILL");
+						}, 5000);
+						forceKill.unref?.();
+					}
+					return proc.kill("SIGTERM");
+				};
+				const childExitRole = agent.traits.readOnly ? "read-only" : "writable";
+				const childExitCloseout = createChildExitCloseout({
+					agent: pipiuiAgentId,
+					run: runId,
+					role: childExitRole,
+					pid: proc.pid,
+					...(agent.traits.readOnly ? { graceMs: readonlyChildExitGraceMs() } : {}),
+					terminate: terminateAttempt,
+					onProbe(fields) {
+						logCloseoutProbe("child-exit", fields);
+						const error = closeoutPhaseError("child-exit", fields.state);
+						if (!error) return;
+						const phase = handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "final-received";
+						projectFinalizationPhase(pipiuiAgentId, runId, phase, { error });
+					},
+				});
 				let providerWait!: ReturnType<typeof createProviderWaitController>;
 				providerWait = createProviderWaitController({
 					model: currentResult.model || resolvedModel || agentName,
@@ -6596,7 +6680,10 @@ async function runSingleAgent(
 						// tools running, not a wedge. Claimed here rather than on stopReason so a
 						// provider that omits `toolUse` still gets the same explained window.
 						if (toolNames.length > 0) noteAgentToolWait(pipiuiAgentId, runId, toolNames);
-						else projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
+						else {
+							projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
+							childExitCloseout.arm();
+						}
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -6671,19 +6758,23 @@ async function runSingleAgent(
 
 				proc.on("close", (code) => {
 						procExited = true;
+						clearChildExitTimers();
 						providerWait.dispose();
 						stdoutScanner.end();
+					childExitCloseout.settled("ok");
 					// The process is known closed. Keep the background handle alive as finalizing
 					// while verify/end reporting runs; only an unreported dead live child is vanished.
 					markAgentFinalizing(pipiuiAgentId, runId, `child-close:${code ?? 0}`);
-					resolve(code ?? 0);
+					resolve(childExitCloseout.accepted() ? 0 : (code ?? 0));
 				});
 
 				proc.on("error", () => {
 					procExited = true;
+					clearChildExitTimers();
 					providerWait.dispose();
+					childExitCloseout.settled("error");
 					markAgentFinalizing(pipiuiAgentId, runId, "child-error");
-					resolve(1);
+					resolve(childExitCloseout.accepted() ? 0 : 1);
 				});
 
 				const effectiveSignal = signal ? AbortSignal.any([signal, dispatchAbort.signal]) : dispatchAbort.signal;
@@ -6691,10 +6782,14 @@ async function runSingleAgent(
 					const killProc = () => {
 						wasAborted = true;
 						providerWait.dispose();
+						childExitCloseout.cancel();
 						terminateAttempt();
 					};
 					if (effectiveSignal.aborted) killProc();
-					else effectiveSignal.addEventListener("abort", killProc, { once: true });
+					else {
+						effectiveSignal.addEventListener("abort", killProc, { once: true });
+						detachChildAbort = () => effectiveSignal.removeEventListener("abort", killProc);
+					}
 				}
 			});
 
@@ -6890,6 +6985,16 @@ async function runSingleAgent(
 		}
 		if (attestableVerify && attestableVerify.trim() && !wasAborted) {
 			projectFinalizationPhase(pipiuiAgentId, runId, "verifying");
+			const verifyStartedAt = Date.now();
+			const verifyRole = agent.traits.readOnly ? "read-only" : "writable";
+			logCloseoutProbe("verify", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: verifyRole,
+				phase: "verifying",
+				state: "enter",
+				elapsedMs: 0,
+			});
 			currentResult.verify = await runVerifyCommand(attestableVerify.trim(), spawnCwd, {
 				onSpawn(pid) {
 					if (pid === undefined) return;
@@ -6905,10 +7010,38 @@ async function runSingleAgent(
 					});
 				},
 			});
+			const verifyElapsedMs = Date.now() - verifyStartedAt;
 			if (currentResult.verify.timedOut) {
+				logCloseoutProbe("verify", {
+					agent: pipiuiAgentId,
+					run: runId,
+					role: verifyRole,
+					phase: "verifying",
+					state: "timeout",
+					elapsedMs: verifyElapsedMs,
+					error: "verify-timeout",
+				});
 				projectFinalizationPhase(pipiuiAgentId, runId, "verifying", { error: "verify-timeout" });
 			} else if (currentResult.verify.exitCode !== 0 && currentResult.verify.exitCode !== null) {
+				logCloseoutProbe("verify", {
+					agent: pipiuiAgentId,
+					run: runId,
+					role: verifyRole,
+					phase: "verifying",
+					state: "error",
+					elapsedMs: verifyElapsedMs,
+					error: "verify-failed",
+				});
 				projectFinalizationPhase(pipiuiAgentId, runId, "verifying", { error: "verify-failed" });
+			} else {
+				logCloseoutProbe("verify", {
+					agent: pipiuiAgentId,
+					run: runId,
+					role: verifyRole,
+					phase: "verifying",
+					state: "ok",
+					elapsedMs: verifyElapsedMs,
+				});
 			}
 		} else if (attestableVerify && attestableVerify.trim()) {
 			// Aborted: verify was in the brief but intentionally not run — record that
@@ -6951,37 +7084,98 @@ async function runSingleAgent(
 		// even while the bridge report is awaiting its bounded network timeout.
 		const externallyAborted = wasAborted && !runtimeTimedOut;
 		const endState: JobState = externallyAborted ? "aborted" : endOk ? "ok" : "failed";
-		const terminalFinalized = jobFinalize(pipiuiAgentId, runId, {
-			name: agentName,
-			task,
-			state: endState,
-			resultText: endResultText,
-			cost: currentResult.usage.cost,
-			turns: currentResult.usage.turns,
-			activity: pipiuiActivity,
-			verify: currentResult.verify,
-			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
-			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+		const closeoutRole = agent.traits.readOnly ? "read-only" : "writable";
+		const persistStartedAt = Date.now();
+		logCloseoutProbe("job-finalize", {
+			agent: pipiuiAgentId,
+			run: runId,
+			role: closeoutRole,
+			phase: "job-finalize",
+			state: "enter",
+			elapsedMs: 0,
 		});
+		let terminalFinalized = false;
+		try {
+			terminalFinalized = jobFinalize(pipiuiAgentId, runId, {
+				name: agentName,
+				task,
+				state: endState,
+				resultText: endResultText,
+				cost: currentResult.usage.cost,
+				turns: currentResult.usage.turns,
+				activity: pipiuiActivity,
+				verify: currentResult.verify,
+				...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
+				...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
+			});
+			logCloseoutProbe("job-finalize", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: closeoutRole,
+				phase: "job-finalize",
+				state: "ok",
+				elapsedMs: Date.now() - persistStartedAt,
+			});
+		} catch {
+			logCloseoutProbe("job-finalize", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: closeoutRole,
+				phase: "job-finalize",
+				state: "error",
+				elapsedMs: Date.now() - persistStartedAt,
+				error: "job-finalize-error",
+			});
+			noteCloseoutLastPhaseError(pipiuiAgentId, runId, "job-finalize", "error");
+			try {
+				const existing = jobRegistry.get(pipiuiAgentId);
+				if (existing?.runId === runId && existing.state !== "running") {
+					dispatchQueue.onAgentTerminal(pipiuiAgentId);
+				}
+			} catch {
+				/* best-effort idempotent release only */
+			}
+		}
 		// Candidate evidence comes only from the final assistant text. It never
 		// reads stream previews, tool results, stderr, or a non-terminal run.
 		// A desktop-granted operator receives only host-projected Computer
 		// candidates from settled open/batch paths. Do not turn its broad terminal
 		// report into a second memory source that could contain UI prose.
+		// Optional: never delay done. Timeout/error stay on this background task.
 		if (terminalFinalized && !wasAborted && !computerMemoryEnabled) {
-			await submitBrokerTerminalCandidate(terminalMemoryBrokerEnvironment, {
+			detachCloseout(submitBrokerTerminalCandidate(terminalMemoryBrokerEnvironment, {
 				runID: runId,
 				task,
 				title: options?.title,
 				terminalText: getFinalOutput(currentResult.messages),
 				outcome: endOk ? "success" : "failure",
-			});
+			}));
 		}
 		// Merge/cleanup runs before the terminal report so the report describes a settled tree:
 		// a host that handed finalization to pi must not see "ok" while the branch is still
 		// unmerged. A host that kept finalization gets undefined here and is unaffected.
 		let finalization: string | undefined;
 		let worktreeLifecycle: string | undefined;
+		const worktreeStartedAt = Date.now();
+		const worktreeProber = createWorktreePhaseProber((event, fields) => {
+			const error = closeoutPhaseError(event, fields.state);
+			logCloseoutProbe(event, {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: closeoutRole,
+				...fields,
+				...(error ? { error } : {}),
+			});
+			if (error) noteCloseoutLastPhaseError(pipiuiAgentId, runId, event, fields.state);
+		});
+		logCloseoutProbe("worktree-finalize", {
+			agent: pipiuiAgentId,
+			run: runId,
+			role: closeoutRole,
+			phase: "worktree-finalize",
+			state: "enter",
+			elapsedMs: 0,
+		});
 		try {
 			const state = await finalizeWorktreeIfOwned({
 				agentId: pipiuiAgentId,
@@ -6991,8 +7185,9 @@ async function runSingleAgent(
 				worktreeBranch: placement.worktreeBranch,
 				role: agentName === "secretary" ? "secretary" : "worker",
 				terminalState: terminalStateForFinalization({ ok: endOk, aborted: wasAborted }),
-				onProgress(phase) {
+				onProgress(phase, detail) {
 					projectFinalizationPhase(pipiuiAgentId, runId, phase);
+					worktreeProber.note(phase, detail);
 				},
 				...(currentResult.verify
 					? {
@@ -7027,10 +7222,29 @@ async function runSingleAgent(
 					verifyCommand: currentResult.verify?.command,
 				});
 			}
+			worktreeProber.finish("ok");
+			logCloseoutProbe("worktree-finalize", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: closeoutRole,
+				phase: "worktree-finalize",
+				state: "ok",
+				elapsedMs: Date.now() - worktreeStartedAt,
+			});
 		} catch (error) {
 			// The service retains unsafe work rather than forcing it; a thrown error here means
 			// finalization did not run at all, which must be visible but must not lose the run.
 			finalization = `finalization error: ${error instanceof Error ? error.message : String(error)}`;
+			worktreeProber.finish("error");
+			logCloseoutProbe("worktree-finalize", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: closeoutRole,
+				phase: "worktree-finalize",
+				state: "error",
+				elapsedMs: Date.now() - worktreeStartedAt,
+				error: "worktree-finalize-error",
+			});
 			projectFinalizationPhase(pipiuiAgentId, runId, handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "reconciling", {
 				error: "finalization-error",
 			});
@@ -7091,8 +7305,38 @@ async function runSingleAgent(
 				}
 	}
 	} finally {
-		await awaitTerminalPipiuiReports(pipiuiAgentId);
-		releaseAgentLease(agentLease);
+		const leaseRole = agent.traits.readOnly ? "read-only" : "writable";
+		await awaitTerminalPipiuiReports(pipiuiAgentId, { run: runId, role: leaseRole });
+		const leaseStartedAt = Date.now();
+		logCloseoutProbe("lease-release", {
+			agent: pipiuiAgentId,
+			run: runId,
+			role: leaseRole,
+			phase: "lease-release",
+			state: "enter",
+			elapsedMs: 0,
+		});
+		try {
+			releaseAgentLease(agentLease);
+			logCloseoutProbe("lease-release", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: leaseRole,
+				phase: "lease-release",
+				state: "ok",
+				elapsedMs: Date.now() - leaseStartedAt,
+			});
+		} catch {
+			logCloseoutProbe("lease-release", {
+				agent: pipiuiAgentId,
+				run: runId,
+				role: leaseRole,
+				phase: "lease-release",
+				state: "error",
+				elapsedMs: Date.now() - leaseStartedAt,
+				error: "lease-release-error",
+			});
+		}
 		localAgentReservations.delete(pipiuiAgentId);
 	}
 }
