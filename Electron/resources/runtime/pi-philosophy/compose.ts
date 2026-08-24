@@ -55,6 +55,13 @@ export interface Layer {
    * discipline until someone measures that it does not need it.
    */
   excludesModels: string[];
+  /**
+   * Model capability keys this layer needs (`hostedTools.web_search`,
+   * `hostedTools.code_interpreter`, `structuredOutputs`, `inputFiles`). Empty
+   * means no model-capability gate. Unknown or undeclared capabilities drop
+   * the layer — never guessed as supported.
+   */
+  requiresModelCapabilities: string[];
   /** Roles (`main`/`lead`/`worker`) and/or agent names (`explore`, `plan`, …). */
   scope: string[];
   body: string;
@@ -108,6 +115,12 @@ export interface ComposeInput {
    * model it has a known failure mode is simply false.
    */
   model?: string | null;
+  /**
+   * Declared capability bag from `ctx.model.capabilities`.
+   * `null`/`undefined` = unknown (drop layers that require model capabilities).
+   * `{}` = known model with no declarations (also does not satisfy any key).
+   */
+  modelCapabilities?: unknown | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +181,7 @@ export function parseLayer(
       requiresCapabilities: parseInlineList(fields["requires-capabilities"] ?? ""),
       requiresModels: parseInlineList(fields["requires-models"] ?? ""),
       excludesModels: parseInlineList(fields["excludes-models"] ?? ""),
+      requiresModelCapabilities: parseInlineList(fields["requires-model-capabilities"] ?? ""),
       scope,
       body,
       file,
@@ -198,7 +212,47 @@ export function parseLayer(
  * worker's model from misbehaving is not what that switch is declining to buy.
  */
 export function isModelScoped(layer: Layer): boolean {
-  return layer.requiresModels.length > 0 || layer.excludesModels.length > 0;
+  return layer.requiresModels.length > 0
+    || layer.excludesModels.length > 0
+    || layer.requiresModelCapabilities.length > 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hostedToolNames(caps: unknown): string[] {
+  if (!isRecord(caps)) return [];
+  const hosted = caps.hostedTools;
+  if (Array.isArray(hosted)) {
+    return hosted.filter((item): item is string => typeof item === "string");
+  }
+  if (isRecord(hosted) && Array.isArray(hosted.tools)) {
+    return hosted.tools.filter((item): item is string => typeof item === "string");
+  }
+  const native = caps.nativeSearch;
+  if (Array.isArray(native)) {
+    return native.filter((item): item is string => typeof item === "string");
+  }
+  if (isRecord(native) && Array.isArray(native.tools)) {
+    return native.tools.filter((item): item is string => typeof item === "string");
+  }
+  return [];
+}
+
+/** True only when the bag explicitly declares the named key. Never guesses. */
+export function modelDeclaresCapability(caps: unknown, key: string): boolean {
+  if (!isRecord(caps)) return false;
+  if (key === "structuredOutputs") {
+    return caps.structuredOutputs === true || isRecord(caps.structuredOutputs);
+  }
+  if (key === "inputFiles") {
+    return caps.inputFiles === true || isRecord(caps.inputFiles);
+  }
+  if (key.startsWith("hostedTools.")) {
+    return hostedToolNames(caps).includes(key.slice("hostedTools.".length));
+  }
+  return false;
 }
 
 export function modelMatches(model: string, pattern: string): boolean {
@@ -347,6 +401,22 @@ export function composePhilosophy(input: ComposeInput): ComposeResult {
     if (model && layer.excludesModels.some((pattern) => modelMatches(model, pattern))) {
       skip(layer, `excluded for model "${model}"`);
       continue;
+    }
+    if (layer.requiresModelCapabilities.length > 0) {
+      if (input.modelCapabilities == null) {
+        skip(
+          layer,
+          `needs model capabilities ${layer.requiresModelCapabilities.join(", ")}, and this session's model capabilities are unknown`,
+        );
+        continue;
+      }
+      const undeclared = layer.requiresModelCapabilities.filter(
+        (key) => !modelDeclaresCapability(input.modelCapabilities, key),
+      );
+      if (undeclared.length > 0) {
+        skip(layer, `needs model capabilities this session does not declare: ${undeclared.join(", ")}`);
+        continue;
+      }
     }
     const missing = layer.requiresCapabilities.filter((key) => {
       const capability = capabilities.capabilities[key];

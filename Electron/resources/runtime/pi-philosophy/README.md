@@ -137,6 +137,21 @@ inactive on this host's own default route while every measured session went on s
 `excludes-models` fails closed, so a provider added tomorrow inherits the correction
 until someone measures that it does not need it.
 
+### Scoping a layer to model capabilities
+
+A layer that only makes sense when the selected model actually hosts a feature — hosted
+`code_interpreter`, structured outputs, input files — uses `requires-model-capabilities`.
+Keys are the public capability contract, never a provider id:
+
+```
+requires-model-capabilities: [hostedTools.code_interpreter, structuredOutputs]
+```
+
+Known keys: `hostedTools.web_search`, `hostedTools.x_search`,
+`hostedTools.code_interpreter`, `structuredOutputs`, `inputFiles`. A missing bag, an
+unknown model, or a model that does not declare the key drops the layer. Nothing here
+inferrs support from a provider name.
+
 A layer scoped either way bypasses the `scopes.worker` bulk switch. That switch declines
 to buy ~1.6k of judgement prefix per worker; it was never about withholding a correction
 that keeps the worker's own model from misbehaving.

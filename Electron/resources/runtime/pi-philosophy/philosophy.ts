@@ -2,9 +2,10 @@
  * pipi-philosophy — a layered working philosophy that lives in pi, not in any one frontend.
  *
  * Installed as a pi package, so a bare TUI session, a GUI frontend, and every dispatched
- * worker load the same four layers from the same config. The only pi surface this file
- * touches is `before_agent_start` (+ `getActiveTools` for capability truth) — everything
- * else lives in `compose.ts`, which imports nothing and is fully testable with plain node.
+ * worker load the same four layers from the same config. The only pi surfaces this file
+ * touches are `before_agent_start` (+ `getActiveTools` for capability truth) and a
+ * best-effort `tool_call` observer that never blocks or mutates. Composition lives in
+ * `compose.ts`; attribution lives in `retrieval-attribution.ts`.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -23,6 +24,10 @@ import {
   resolveAgent,
   resolveRole,
 } from "./compose.ts";
+import {
+  createRetrievalAttribution,
+  hashPrompt,
+} from "./retrieval-attribution.ts";
 
 const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR || path.join(process.cwd(), ".pi", "agent");
@@ -49,6 +54,15 @@ const MARKER = "<!-- pipi-philosophy -->";
  * implementation detail of pi's module loader, while "same pid" is not.
  */
 const STATE_FILE = path.join(os.tmpdir(), `pipi-philosophy-${process.pid}.json`);
+
+function readPublishedLayers(): string[] {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8")) as { layers?: unknown };
+    return Array.isArray(raw.layers) ? raw.layers.filter((id): id is string => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
 
 function publishState(activeLayerIds: string[]): void {
   try {
@@ -155,6 +169,13 @@ function formatModel(model: { provider?: string; id?: string } | undefined | nul
   return `${model.provider}/${model.id}`;
 }
 
+function modelCapabilitiesOf(model: unknown): unknown | null {
+  if (!model || typeof model !== "object") return null;
+  return "capabilities" in model
+    ? (model as { capabilities?: unknown }).capabilities ?? {}
+    : {};
+}
+
 /** Hot-read on every turn: a toggle applies without restarting the session. */
 function readConfig(): PhilosophyConfig {
   try {
@@ -173,11 +194,23 @@ function writeConfig(config: PhilosophyConfig): void {
 // Report
 // ---------------------------------------------------------------------------
 
-function buildReport(activeTools: string[] | null, model: string | undefined): string {
+function buildReport(
+  activeTools: string[] | null,
+  model: string | undefined,
+  modelCapabilities: unknown | null = null,
+): string {
   const { layers, capabilities } = loadLayers();
   const config = readConfig();
   const role = resolveRole(process.env);
-  const result = composePhilosophy({ layers, config, capabilities, role, activeTools, model });
+  const result = composePhilosophy({
+    layers,
+    config,
+    capabilities,
+    role,
+    activeTools,
+    model,
+    modelCapabilities,
+  });
 
   const lines: string[] = [
     `# Philosophy — ${config.enabled ? "on" : "off"} (role: ${role}, model: ${model ?? "unknown"})`,
@@ -211,24 +244,82 @@ function buildReport(activeTools: string[] | null, model: string | undefined): s
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  let attribution: ReturnType<typeof createRetrievalAttribution> | undefined;
+  try {
+    attribution = createRetrievalAttribution({ agentDir: AGENT_DIR });
+  } catch {
+    attribution = undefined;
+  }
+
   pi.on("before_agent_start", (event, ctx) => {
-    if (event.systemPrompt.includes(MARKER)) return; // already injected by another copy
-    const { layers, capabilities } = loadLayers();
-    const result = composePhilosophy({
-      layers,
-      config: readConfig(),
-      capabilities,
-      role: resolveRole(process.env),
-      agent: resolveAgent(process.env),
-      activeTools: pi.getActiveTools(),
-      // Read per turn, not per session: `/model` mid-session must re-decide which
-      // model-scoped layers apply, exactly as an edited layer file does.
-      model: formatModel(ctx.model),
-    });
-    // Published before the turn runs, so any tool called during it sees this turn's truth.
-    publishState(result.included.map((l) => l.id));
-    if (!result.text) return;
-    return { systemPrompt: `${event.systemPrompt.trimEnd()}\n\n${MARKER}\n${result.text}` };
+    const role = resolveRole(process.env);
+    const agent = resolveAgent(process.env);
+    const model = formatModel(ctx.model);
+    let nextPrompt = event.systemPrompt;
+    let layerIds = readPublishedLayers();
+    let injected = false;
+    let activeTools: string[] | null = null;
+    if (!event.systemPrompt.includes(MARKER)) {
+      activeTools = pi.getActiveTools();
+      const { layers, capabilities } = loadLayers();
+      const result = composePhilosophy({
+        layers,
+        config: readConfig(),
+        capabilities,
+        role,
+        agent,
+        activeTools,
+        // Read per turn, not per session: `/model` mid-session must re-decide which
+        // model-scoped layers apply, exactly as an edited layer file does.
+        model,
+        modelCapabilities: modelCapabilitiesOf(ctx.model),
+      });
+      // Published before the turn runs, so any tool called during it sees this turn's truth.
+      layerIds = result.included.map((l) => l.id);
+      publishState(layerIds);
+      if (result.text) {
+        nextPrompt = `${event.systemPrompt.trimEnd()}\n\n${MARKER}\n${result.text}`;
+        injected = true;
+      }
+    } else {
+      try {
+        activeTools = pi.getActiveTools();
+      } catch {
+        activeTools = null;
+      }
+    }
+    try {
+      attribution?.noteTurn({
+        promptHash: hashPrompt(nextPrompt),
+        layerIds,
+        role,
+        agent,
+        model,
+        sessionId: ctx.sessionManager?.getSessionId?.(),
+        availableTools: activeTools ?? undefined,
+      });
+    } catch {
+      // Attribution must never change prompt assembly.
+    }
+    if (injected) return { systemPrompt: nextPrompt };
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    try {
+      const prompt = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined;
+      attribution?.observeToolCall({
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        input: event.input,
+        sessionId: ctx.sessionManager?.getSessionId?.(),
+        role: resolveRole(process.env),
+        agent: resolveAgent(process.env),
+        model: formatModel(ctx.model),
+        prompt,
+      });
+    } catch {
+      // Best-effort: never block or mutate a tool call.
+    }
   });
 
   // Leave no state behind for a future process that happens to reuse this pid.
@@ -238,6 +329,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Already gone, or never written.
     }
+    void attribution?.close();
   });
 
   pi.registerCommand("philosophy", {
@@ -280,6 +372,7 @@ export default function (pi: ExtensionAPI) {
       agent: resolveAgent(process.env),
           activeTools,
           model,
+          modelCapabilities: modelCapabilitiesOf(ctx.model),
         });
         pi.sendMessage({
           customType: "philosophy_text",
@@ -291,7 +384,7 @@ export default function (pi: ExtensionAPI) {
 
       pi.sendMessage({
         customType: "philosophy_status",
-        content: buildReport(activeTools, model),
+        content: buildReport(activeTools, model, modelCapabilitiesOf(ctx.model)),
         display: true,
       });
     },

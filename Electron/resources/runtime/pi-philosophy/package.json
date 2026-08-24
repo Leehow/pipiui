@@ -23,6 +23,8 @@
   "files": [
     "philosophy.ts",
     "compose.ts",
+    "retrieval-attribution.ts",
+    "scripts/summarize-retrieval-attribution.mjs",
     "capabilities.json",
     "layers",
     "README.md",
