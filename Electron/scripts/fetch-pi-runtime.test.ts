@@ -62,7 +62,7 @@ describe('persistent embedded Pi runtime CLI', () => {
       schemaVersion: 1,
       platform,
       arch,
-      nodeVersion: '22.23.2',
+      nodeVersion: '24.19.0',
       nodeExecutable: 'node/bin/node',
       piCli: 'pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
       piLauncher: 'pi/bin/pi',
@@ -189,7 +189,7 @@ describe('persistent embedded Pi runtime CLI', () => {
 
     const armCheck = run(['--platform', 'darwin', '--arch', 'arm64', '--check'], '')
     expect(armCheck.status).toBe(1)
-    expect(armCheck.stderr).toContain('Node is 22.18.0, expected 22.23.2')
+    expect(armCheck.stderr).toContain('Node is 22.18.0, expected 24.19.0')
     const x64Check = run(['--platform', 'darwin', '--arch', 'x64', '--check'], '')
     expect(x64Check.status).toBe(0)
   })

@@ -377,13 +377,13 @@ describe('macOS packaging contract', () => {
     expect(output).not.toContain('unrelated.dat')
   })
 
-  it('pins checksum-verified official Node 22.23.2 archives for every shipping target', () => {
-    expect(nodeRuntimeAssets.version).toBe('22.23.2')
+  it('pins checksum-verified official Node 24.19.0 archives for every shipping target', () => {
+    expect(nodeRuntimeAssets.version).toBe('24.19.0')
     expect(Object.keys(nodeRuntimeAssets.assets).sort()).toEqual([
       'darwin-arm64', 'darwin-x64', 'linux-x64', 'win32-x64'
     ])
     for (const asset of Object.values(nodeRuntimeAssets.assets)) {
-      expect(asset.archive).toContain('node-v22.23.2-')
+      expect(asset.archive).toContain('node-v24.19.0-')
       expect(asset.sha256).toMatch(/^[a-f0-9]{64}$/)
     }
   })
