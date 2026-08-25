@@ -131,7 +131,7 @@ describe('pipiui-electron-webview tool execute (behavioral)', () => {
     expect(ok.isError).toBeUndefined()
     expect(calls).toHaveLength(1)
     expect(calls[0].event).toMatchObject({ action: 'scroll', selector: '#scroll-container', direction: 'down', amount: 2, scope: 'viewport' })
-    expect(source).toContain('scroll {direction?, amount?, selector? | snapshot_id?, element_index|element_token?}')
+    expect(source).toContain('scroll {direction?, amount?, selector? | locator? | snapshot_id?, element_index|element_token?}')
 
     const mixedSnapshot = await executeBrowserTool({ action: 'scroll', selector: '#x', snapshot_id: 's1', element_index: 0 }, undefined)
     expect(mixedSnapshot.isError).toBe(true)
@@ -140,6 +140,63 @@ describe('pipiui-electron-webview tool execute (behavioral)', () => {
     expect(mixedToken.isError).toBe(true)
     expect(textOf(mixedToken)).toContain('browser scroll accepts selector or a snapshot element target, not both')
     expect(calls).toHaveLength(1)
+  })
+
+  it('forwards scroll locator to the bridge and rejects mixing locator with selector or snapshot', async () => {
+    const { calls } = installBridgeMock([OK_RELOAD])
+    const ok = await executeBrowserTool(
+      { action: 'scroll', locator: { role: 'region', name: 'Feed' }, direction: 'down', amount: 0.8 },
+      undefined,
+    )
+    expect(ok.isError).toBeUndefined()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].event).toMatchObject({
+      action: 'scroll',
+      locator: { role: 'region', name: 'Feed' },
+      direction: 'down',
+      amount: 0.8,
+      scope: 'viewport',
+    })
+    expect(calls[0].event.selector).toBeUndefined()
+    expect(source).toContain('click/input/select/scroll accept locator')
+    expect(source).toContain('locator uses the same {role,name}')
+
+    const mixedSelector = await executeBrowserTool(
+      { action: 'scroll', selector: '#x', locator: { css: '#x' } },
+      undefined,
+    )
+    expect(mixedSelector.isError).toBe(true)
+    expect(textOf(mixedSelector)).toContain('browser scroll accepts selector or locator, not both')
+    const mixedSnapshot = await executeBrowserTool(
+      { action: 'scroll', locator: { css: '#x' }, snapshot_id: 's1', element_index: 0 },
+      undefined,
+    )
+    expect(mixedSnapshot.isError).toBe(true)
+    expect(textOf(mixedSnapshot)).toContain('browser scroll accepts locator or a snapshot element target, not both')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('forwards locator scroll parameters inside a batch', async () => {
+    const { calls } = installBridgeMock([OK_RELOAD, OK_RELOAD])
+    const result = await executeBrowserTool(
+      {
+        actions: [
+          { action: 'scroll', locator: { css: '#scroll-container' }, direction: 'down', amount: 1 },
+          { action: 'observe' },
+        ],
+      },
+      undefined,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(calls[0].event).toMatchObject({
+      action: 'scroll',
+      locator: { css: '#scroll-container' },
+      direction: 'down',
+      amount: 1,
+    })
+    expect(calls[0].event.selector).toBeUndefined()
+    expect(calls[1].event).toMatchObject({ action: 'observe' })
+    expect(result.details.results.map((entry: any) => entry.status)).toEqual(['ok', 'ok'])
   })
 
   it('does not misread a successful result that happens to end with the help text as an error', async () => {
@@ -181,17 +238,61 @@ describe('pipiui-electron-webview tool execute (behavioral)', () => {
     expect(textOf(result)).toContain('bridge connection reset')
   })
 
-  it('reports an externally aborted signal as a failed item plus skipped remainder, not a rejection', async () => {
-    const { calls } = installBridgeMock([])
+  it('reports an already-aborted signal as a failed item plus skipped remainder without any bridge RPC', async () => {
+    const { calls, fetchMock } = installBridgeMock([])
     const result = await executeBrowserTool(
       { actions: [{ action: 'reload' }, { action: 'reload' }] },
       AbortSignal.abort(),
     )
     expect(result.isError).toBe(true)
     expect(result.details).toMatchObject({ ok: false, failedIndex: 0, skipped: [1] })
+    expect(result.details.results[0]).toMatchObject({ index: 0, action: 'reload', status: 'failed', isError: true })
     expect(textOf(result)).toContain('timed out or was cancelled')
-    // bridge() also registers disconnect cancellation for the aborted request.
-    expect(calls.map((call) => call.action)).toEqual(['reload', 'browser_cancel'])
+    // The pre-abort check runs before the item: no bridge request and no
+    // browser_cancel for a request that never started.
+    expect(fetchMock).toHaveBeenCalledTimes(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  it('does not issue the next item RPC when the signal aborts between items', async () => {
+    const controller = new AbortController()
+    const calls: BridgeCall[] = []
+    const fetchMock = vi.fn(async (_url: unknown, init?: { body?: string }) => {
+      const body = JSON.parse(init?.body ?? '{}')
+      calls.push({ rpcAction: body.action, action: body.event?.action, event: body.event ?? {} })
+      // Abort while item 0's bridge response is in flight: item 0 still completes
+      // ok, but the batch must not start item 1.
+      controller.abort()
+      return { json: async () => (OK_RELOAD) }
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const result = await executeBrowserTool(
+      { actions: [{ action: 'reload' }, { action: 'reload' }, { action: 'reload' }] },
+      controller.signal,
+    )
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(calls.map((call) => call.action)).toEqual(['reload'])
+    expect(result.isError).toBe(true)
+    expect(result.details).toMatchObject({ ok: false, failedIndex: 1, skipped: [2] })
+    expect(result.details.results[0]).toMatchObject({ index: 0, action: 'reload', status: 'ok' })
+    expect(result.details.results[1]).toMatchObject({ index: 1, action: 'reload', status: 'failed', isError: true })
+    expect(result.details.results[2]).toMatchObject({ index: 2, action: 'reload', status: 'skipped' })
+    expect(textOf(result)).toContain('stopped at index 1 (reload)')
+    expect(textOf(result)).toContain('[2] reload skipped')
+    expect(textOf(result)).toContain('timed out or was cancelled')
+  })
+
+  it('keeps a structured host wait timeout as a normal bridge result, not a generic cancellation', async () => {
+    const { calls } = installBridgeMock([{ ok: false, error: 'browser wait timed out', code: 'timeout' }])
+    const result = await executeBrowserTool(
+      { actions: [{ action: 'wait', mode: 'idle', timeout: 0.1 }, { action: 'eval', js: 'document.title' }] },
+      undefined,
+    )
+    expect(calls.map((call) => call.action)).toEqual(['wait'])
+    expect(result.isError).toBe(true)
+    expect(result.details).toMatchObject({ ok: false, failedIndex: 0, skipped: [1] })
+    expect(textOf(result)).toContain('browser wait timed out')
+    expect(textOf(result)).not.toContain('browser request timed out or was cancelled')
   })
 
   it('fails an item that lacks action and skips the rest of the batch', async () => {
@@ -419,5 +520,98 @@ describe('pipiui-electron-webview tool execute (behavioral)', () => {
     const batchText = textOf(result)
     expect(batchText).toContain('[1] wait ok')
     expect(batchText).toContain(`URL: ${waitObservation.url}`)
+  })
+
+  it('summarizes intermediate batch observation details while keeping final evidence and failed diagnostics', async () => {
+    const huge = (id: string) => ({
+      ok: true,
+      url: `https://example.com/${id}`,
+      title: `Page ${id}`,
+      snapshotID: `snap-${id}`,
+      viewport: { width: 800, height: 600 },
+      scroll: { pixelsAbove: 0, pixelsBelow: 400, positionPercent: 0 },
+      elements: Array.from({ length: 180 }, (_, i) => ({
+        index: i,
+        token: `tok-${id}-${i}`,
+        role: 'button',
+        name: `Btn ${id} ${i} ${'x'.repeat(24)}`,
+      })),
+      regions: [{
+        id: 'main',
+        name: 'main',
+        role: 'main',
+        count: 180,
+        preview: Array.from({ length: 40 }, (_, i) => ({ token: `p-${id}-${i}`, name: `preview ${i}` })),
+      }],
+    })
+    const first = huge('a')
+    const second = huge('b')
+    const third = huge('c')
+    installBridgeMock([first, second, third])
+    const result = await executeBrowserTool(
+      { actions: [{ action: 'observe' }, { action: 'observe' }, { action: 'observe' }] },
+      undefined,
+    )
+    expect(result.isError).toBeUndefined()
+    expect(result.details.results.map((entry: any) => ({ index: entry.index, action: entry.action, status: entry.status }))).toEqual([
+      { index: 0, action: 'observe', status: 'ok' },
+      { index: 1, action: 'observe', status: 'ok' },
+      { index: 2, action: 'observe', status: 'ok' },
+    ])
+    expect(result.details.results[0].details).toMatchObject({
+      url: first.url,
+      title: first.title,
+      snapshotID: first.snapshotID,
+      elementCount: 180,
+      summarized: true,
+    })
+    expect(result.details.results[0].details.elements).toBeUndefined()
+    expect(result.details.results[0].details.regions?.[0]?.preview).toBeUndefined()
+    expect(result.details.results[1].details.elements).toBeUndefined()
+    expect(result.details.results[2].details.elements).toHaveLength(180)
+    expect(result.details.results[2].details.snapshotID).toBe(third.snapshotID)
+    expect(result.details.results[2].details.summarized).toBeUndefined()
+    const structured = JSON.stringify(result.details)
+    expect(structured.length).toBeLessThan(JSON.stringify([first, second, third]).length)
+    expect(structured.length).toBeLessThan(80_000)
+    expect(textOf(result).length).toBeLessThan(52_000)
+
+    installBridgeMock([
+      first,
+      second,
+      {
+        ok: false,
+        error: 'locator matched 0 elements. Candidates: [{"role":"button","tag":"button","name":"Go"}]',
+        code: 'browser_locator_not_found',
+        candidates: [{ role: 'button', tag: 'button', name: 'Go' }],
+      },
+    ])
+    const failed = await executeBrowserTool(
+      {
+        actions: [
+          { action: 'observe' },
+          { action: 'observe' },
+          { action: 'click', locator: { role: 'button', name: 'Missing' } },
+        ],
+      },
+      undefined,
+    )
+    expect(failed.isError).toBe(true)
+    expect(failed.details).toMatchObject({ ok: false, failedIndex: 2, skipped: [] })
+    expect(failed.details.results[0].details.elements).toBeUndefined()
+    expect(failed.details.results[0].details.summarized).toBe(true)
+    expect(failed.details.results[1].details.elements).toHaveLength(180)
+    expect(failed.details.results[2]).toMatchObject({
+      index: 2,
+      action: 'click',
+      status: 'failed',
+      isError: true,
+      details: {
+        error: expect.stringContaining('0 elements'),
+        code: 'browser_locator_not_found',
+        candidates: [{ role: 'button', tag: 'button', name: 'Go' }],
+      },
+    })
+    expect(textOf(failed)).toContain('browser_locator_not_found')
   })
 })

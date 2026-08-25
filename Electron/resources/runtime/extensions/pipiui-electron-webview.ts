@@ -215,10 +215,12 @@ const HELP = [
   "                        and are skipped; other fields continue. Result is",
   "                        {filled, failed, results[{index,ok,error?,relocated?}]} plus a",
   "                        batch mutation summary.",
-  "scroll {direction?, amount?, selector? | snapshot_id?, element_index|element_token?}",
-  "                        selector scrolls the unique CSS-matched element or its nearest",
-  "                        scrollable ancestor; 0 or multiple matches error instead of",
-  "                        scrolling the page. amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
+  "scroll {direction?, amount?, selector? | locator? | snapshot_id?, element_index|element_token?}",
+  "                        selector or locator scrolls the unique matched element or its nearest",
+  "                        scrollable ancestor; 0 or multiple matches, or a hidden target, error",
+  "                        instead of scrolling the page. locator uses the same {role,name} /",
+  "                        {label} / {text} / {css} (+ optional nth) as click — not a CSS rewrite.",
+  "                        amount is 0.1..10 viewport lengths (default 0.8). Mutating actions",
   "                        invalidate the prior snapshot and return a fresh observation plus",
   "                        a compressed mutation summary (DOM add/remove/attr, dialogs, URL).",
   "                        If the original node went stale on the same URL, a unique visible",
@@ -299,11 +301,19 @@ function isBrowserActionError(result: any): boolean {
 // the sum of all rendered entry bodies: the final substantial entry's evidence is
 // allocated first, earlier entries share what is left. Only per-entry header lines,
 // failure texts (reserved in full), and small duplicate markers sit on top.
-// Labeled images and details.results keep their full data regardless.
+// Labeled images in content stay full. details.results keep status/error fields;
+// successful intermediate observations are summarized, and only the last
+// substantial observation keeps its full structured evidence.
 const BATCH_TEXT_CHAR_BUDGET = 48_000;
 const BATCH_PER_ENTRY_MAX = 8_000;
 const BATCH_FINAL_ENTRY_MAX = 40_000;
 const BATCH_DEDUP_MIN = 400;
+const BATCH_DETAILS_KEEP = [
+  "error", "code", "requiresObservation", "requiresUserInput", "candidates",
+  "ok", "action", "mutation", "relocated", "url", "title", "snapshotID",
+  "loading", "viewport", "scroll", "note", "truncated", "deferObservation",
+  "filled", "failed", "target", "nextCursor", "retryable", "limitations",
+] as const;
 
 /** UTF-16 surrogate-safe truncation: never splits an astral character pair. */
 function safeTruncateText(t: string, max: number): string {
@@ -349,6 +359,69 @@ function formatCompactDomResult(details: any): string {
   if (details?.note) lines.push(`Note: ${details.note}`);
   if (details?.error) lines.push(`Note: ${details.error}`);
   return lines.length ? lines.join("\n") : "ok";
+}
+
+function isSubstantialObservationDetails(details: any): boolean {
+  if (!details || typeof details !== "object") return false;
+  if (details.deferObservation === true) return false;
+  if (Array.isArray(details.elements) && details.elements.length > 0) return true;
+  if (Array.isArray(details.regions) && details.regions.length > 0) return true;
+  return Boolean(details.snapshotID && details.url);
+}
+
+function pickKeptDetailFields(details: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of BATCH_DETAILS_KEEP) {
+    if (details[key] !== undefined) out[key] = details[key];
+  }
+  if (Array.isArray(details.results)) out.results = details.results;
+  return out;
+}
+
+function summarizeObservationDetails(details: any, mode: "summary" | "final" | "error"): Record<string, unknown> {
+  if (!details || typeof details !== "object") return {};
+  const out = pickKeptDetailFields(details);
+  if (Array.isArray(details.images)) out.imageCount = details.images.length;
+  if (mode === "final") {
+    if (Array.isArray(details.elements)) out.elements = details.elements;
+    if (Array.isArray(details.regions)) out.regions = details.regions;
+    return out;
+  }
+  if (Array.isArray(details.elements)) out.elementCount = details.elements.length;
+  if (Array.isArray(details.regions)) {
+    out.regionCount = details.regions.length;
+    out.regions = details.regions.map((region: any) => ({
+      id: region.id,
+      name: region.name,
+      role: region.role,
+      count: region.count,
+      more: region.more,
+      expanded: region.expanded,
+    }));
+  }
+  if (details.observation && typeof details.observation === "object") {
+    out.observation = summarizeObservationDetails(details.observation, "summary");
+  }
+  if (mode === "summary") out.summarized = true;
+  return out;
+}
+
+function compactBatchEntryDetails(
+  entry: { index: number; status: "ok" | "failed" | "skipped"; result?: any },
+  finalEvidenceIndex: number | null,
+): Record<string, unknown> | undefined {
+  const details = entry.result?.details;
+  if (entry.status === "failed") {
+    const compact = summarizeObservationDetails(details, "error");
+    if (compact.error == null) {
+      const message = withoutEmbeddedHelp(entryTextParts(entry.result).join("\n")).trim();
+      if (message) compact.error = safeTruncateText(message, 2_000);
+    }
+    return compact;
+  }
+  if (!details || typeof details !== "object") return undefined;
+  if (entry.index === finalEvidenceIndex) return summarizeObservationDetails(details, "final");
+  return summarizeObservationDetails(details, "summary");
 }
 
 function formatBrowserActionBatch(
@@ -452,6 +525,9 @@ function formatBrowserActionBatch(
       }
     }
   }
+  const finalEvidenceIndex = [...okEntries].reverse().find((entry) => (
+    isSubstantialObservationDetails(entry.result?.details)
+  ))?.index ?? null;
   return {
     content,
     details: {
@@ -460,13 +536,16 @@ function formatBrowserActionBatch(
       failedIndex,
       ...(budgetExhaustedAt != null ? { budgetExhaustedAt } : {}),
       skipped: skipped.map((entry) => entry.index),
-      results: entries.map((entry) => ({
-        index: entry.index,
-        action: entry.action,
-        status: entry.status,
-        ...(entry.result?.details ? { details: entry.result.details } : {}),
-        ...(entry.result?.isError ? { isError: true } : {}),
-      })),
+      results: entries.map((entry) => {
+        const details = compactBatchEntryDetails(entry, finalEvidenceIndex);
+        return {
+          index: entry.index,
+          action: entry.action,
+          status: entry.status,
+          ...(details ? { details } : {}),
+          ...(entry.result?.isError ? { isError: true } : {}),
+        };
+      }),
     },
     ...(incomplete ? { isError: true } : {}),
   };
@@ -494,6 +573,20 @@ async function executeBrowserActionBatch(items: any[], signal?: AbortSignal) {
     if (Date.now() > deadline) {
       budgetExhaustedAt = i;
       markSkipped(i, "batch time budget exhausted");
+      break;
+    }
+    // The whole batch shares one outer AbortSignal. Once it has fired, no further
+    // bridge RPC (and no disconnect cancel for a request that never started) may be
+    // issued: this item is reported failed and the rest are skipped.
+    if (signal?.aborted) {
+      entries.push({
+        index: i,
+        action: typeof items[i]?.action === "string" ? items[i].action : "",
+        status: "failed",
+        result: bridgeFailure({ error: "browser request timed out or was cancelled", code: "cancelled" }),
+      });
+      failedIndex = i;
+      markSkipped(i + 1, "browser tool call was cancelled before this item started");
       break;
     }
     const item = items[i] && typeof items[i] === "object" && !Array.isArray(items[i]) ? items[i] : {};
@@ -566,7 +659,8 @@ export default function (pi: ExtensionAPI) {
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
       "eval is page-DOM only (no literals/keep-alive). content/eval/script output is sanitized with the same redaction as observe. screenshot pixels are not redacted — avoid capturing auth/checkout UI. " +
       "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
-      "click/input/select accept locator {role,name}|{label}|{text}|{css} without a snapshot. " +
+      "click/input/select/scroll accept locator {role,name}|{label}|{text}|{css} without a snapshot. " +
+      "scroll locator targets the matched element or its nearest scrollable ancestor; 0/ambiguous/hidden matches error instead of scrolling the page. " +
       "Same-page stale refs relocate on a unique in-viewport DOM path+role+name+ordinal match. Actions include a mutation summary. " +
       "Optional target selects active (default), desktop, mobile, or both (observe/screenshot only). " +
       "Ordinary browsing may use target=active (default). For frontend or responsive-layout implementation/debugging, before claiming responsive visual acceptance, call observe with target=both for structured inspection, then screenshot with target=both and visually review both labeled desktop/mobile images. " +
@@ -850,12 +944,18 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
           const hasIndex = typeof params.element_index === "number";
           const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
           const hasSelector = typeof params.selector === "string" && params.selector.trim().length > 0;
+          const locator = params.locator && typeof params.locator === "object" && !Array.isArray(params.locator)
+            ? params.locator
+            : undefined;
           const hasTarget = Boolean(params.snapshot_id || hasIndex || hasToken);
           if (hasSelector && hasTarget) {
             return usage(`browser scroll accepts selector or a snapshot element target, not both.\n\n${HELP}`);
           }
-          if (hasSelector && params.locator) {
+          if (hasSelector && locator) {
             return usage(`browser scroll accepts selector or locator, not both.\n\n${HELP}`);
+          }
+          if (locator && hasTarget) {
+            return usage(`browser scroll accepts locator or a snapshot element target, not both.\n\n${HELP}`);
           }
           if (hasTarget && (!params.snapshot_id || hasIndex === hasToken)) {
             return usage(`targeted browser scroll requires snapshot_id and exactly one of element_index or element_token.\n\n${HELP}`);
@@ -866,6 +966,7 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
             direction: params.direction ?? "down",
             amount: params.amount ?? 0.8,
             ...(hasSelector ? { selector: params.selector } : {}),
+            ...(locator ? { locator } : {}),
             ...(hasTarget ? {
               snapshot_id: params.snapshot_id,
               ...(hasIndex ? { element_index: params.element_index } : { element_token: params.element_token }),

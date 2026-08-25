@@ -1485,30 +1485,53 @@
 
   const MAX_FILL_FIELDS = 32;
 
-  function resolveScrollSelector(selector) {
+  function resolveVisibleScrollMatch(locator, kind) {
     // Reuses the locator machinery for uniqueness and error conventions, but scroll
     // targets are often plain containers: require visibility, not interactivity,
-    // and never fall back to the page when the selector itself fails to resolve.
-    const parsed = parseLocator({ css: selector });
+    // and never fall back to the page when the query itself fails to resolve.
+    const parsed = parseLocator(locator);
     if (parsed.error) return { error: parsed.error };
     const matched = matchLocatorElements(parsed.spec);
     if (matched.error) return { error: matched.error };
     const elements = uniqueElements(matched);
     if (elements.length === 0) {
-      return { error: failure("scroll selector matched 0 elements.", "browser_locator_not_found") };
-    }
-    if (elements.length > 1) {
-      const candidates = firstCandidateObjects(elements);
+      if (kind === "selector") {
+        return { error: failure("scroll selector matched 0 elements.", "browser_locator_not_found") };
+      }
+      const candidates = nearbyLocatorCandidates(parsed.spec.role);
       return {
         error: failure(
-          "scroll selector matched " + elements.length + " elements; pass a unique selector. Candidates: " + JSON.stringify(candidates),
-          "browser_locator_ambiguous",
+          "locator matched 0 elements. Candidates: " + JSON.stringify(candidates),
+          "browser_locator_not_found",
           false,
-          { candidates },
+          { candidates: candidates },
         ),
       };
     }
-    const element = elements[0];
+    let chosen = elements;
+    if (parsed.spec.nth !== undefined) {
+      if (parsed.spec.nth >= elements.length) {
+        const candidates = firstCandidateObjects(elements);
+        return {
+          error: failure(
+            "locator.nth " + parsed.spec.nth + " is out of range (" + elements.length + " matches); add name to disambiguate or pass a valid nth. Candidates: " + JSON.stringify(candidates),
+            "browser_locator_ambiguous",
+            false,
+            { candidates: candidates },
+          ),
+        };
+      }
+      chosen = [elements[parsed.spec.nth]];
+    } else if (elements.length > 1) {
+      const candidates = firstCandidateObjects(elements);
+      const message = kind === "selector"
+        ? "scroll selector matched " + elements.length + " elements; pass a unique selector. Candidates: " + JSON.stringify(candidates)
+        : "locator matched " + elements.length + " elements; add name to disambiguate or pass nth. Candidates: " + JSON.stringify(candidates);
+      return {
+        error: failure(message, "browser_locator_ambiguous", false, { candidates }),
+      };
+    }
+    const element = chosen[0];
     // Scroll targets are often disabled or non-interactive regions (e.g.
     // aria-disabled="true" lists): scrolling stays allowed, only connected/
     // rendered visibility is required. Click/input keep their stricter checks.
@@ -1516,6 +1539,14 @@
       return { error: failure("The requested scroll target is hidden.", "browser_target_not_actionable") };
     }
     return { entry: entryFromElement(element) };
+  }
+
+  function resolveScrollSelector(selector) {
+    return resolveVisibleScrollMatch({ css: selector }, "selector");
+  }
+
+  function resolveScrollLocator(locator) {
+    return resolveVisibleScrollMatch(locator, "locator");
   }
 
   function formFieldLocator(field) {
@@ -2206,10 +2237,21 @@
     const scrollSelector = action === "scroll" && typeof params.selector === "string" && params.selector.trim().length > 0
       ? params.selector
       : null;
+    const scrollLocator = action === "scroll" && hasLocatorParam(params) ? params.locator : null;
+    if (action === "scroll") {
+      const hasIndex = Number.isInteger(params.element_index);
+      const hasToken = typeof params.element_token === "string" && params.element_token.length > 0;
+      const hasSnapshot = typeof params.snapshot_id === "string" && params.snapshot_id.length > 0;
+      const kinds = [Boolean(scrollSelector), Boolean(scrollLocator), Boolean(hasIndex || hasToken || hasSnapshot)].filter(Boolean).length;
+      if (kinds > 1) {
+        return failure("Provide exactly one of selector, locator, or a snapshot element target.", "invalid_browser_target");
+      }
+    }
     const targeted = ["click", "input", "select"].includes(action)
       || (action === "scroll" && (Number.isInteger(params.element_index) || typeof params.element_token === "string"));
     let resolved = targeted ? resolveTarget(params) : null;
     if (!resolved && scrollSelector) resolved = resolveScrollSelector(scrollSelector);
+    if (!resolved && scrollLocator) resolved = resolveScrollLocator(scrollLocator);
     if (resolved?.error) return resolved.error;
     const entry = resolved?.entry || null;
     const element = entry?.element || null;

@@ -1600,6 +1600,78 @@ describe('browser debug actions', () => {
     }
   })
 
+  it('bounds a hung wait_check by the public wait deadline instead of the bridge timeout', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    const realExecute = contents.executeJavaScript
+    // A navigation/render commit can leave the wait_check evaluation pending far
+    // past a short public timeout; the wait must still settle as a structured result.
+    contents.executeJavaScript = vi.fn(async (code: string) => {
+      if (code.includes('"action":"wait_check"')) return new Promise(() => {})
+      return realExecute(code)
+    })
+    vi.useFakeTimers()
+    try {
+      const pending = host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.1 }, { reveal: false })
+      await vi.advanceTimersByTimeAsync(100)
+      const failed = await pending
+      expect(failed).toMatchObject({ ok: false, code: 'timeout', error: 'browser wait timed out' })
+      expect(failed.elapsedMs).toBeLessThanOrEqual(100)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('bounds a hung first post-ready observation by the remaining wait budget', async () => {
+    const { host, runtime } = await liveBrowser()
+    const realEvaluate = runtime.evaluate.bind(runtime)
+    let observeCalls = 0
+    runtime.evaluate = (code: string) => {
+      if (code.includes('"action":"observe"')) {
+        observeCalls += 1
+        // The first post-ready observation hangs: the renderer never answers.
+        return new Promise(() => {})
+      }
+      return realEvaluate(code)
+    }
+    vi.useFakeTimers()
+    try {
+      const pending = host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.2 }, { reveal: false })
+      await vi.advanceTimersByTimeAsync(200)
+      const failed = await pending
+      expect(failed).toMatchObject({ ok: false, code: 'observe_failed', waitReady: true })
+      expect(String(failed.error)).toContain('exceeded the remaining 200ms wait budget')
+      expect(failed.elapsedMs).toBeLessThanOrEqual(200)
+      // No retry: the budget is gone.
+      expect(observeCalls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('observes a readiness transition inside a 0.1s budget instead of sleeping past it', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    contents.waitReady = false
+    vi.useFakeTimers()
+    try {
+      const pending = host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.1 }, { reveal: false })
+      // The first adaptive poll fires well before the old fixed 80ms sleep would.
+      await vi.advanceTimersByTimeAsync(30)
+      contents.waitReady = true
+      await vi.advanceTimersByTimeAsync(30)
+      const result = await pending
+      expect(result).toMatchObject({ ok: true, ready: true })
+      expect(result.elapsedMs).toBeLessThanOrEqual(100)
+      const waitChecks = contents.executeJavaScript.mock.calls
+        .map(([code]) => String(code))
+        .filter(code => code.includes('"action":"wait_check"'))
+      expect(waitChecks.length).toBeGreaterThanOrEqual(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('isolates console buffers per virtual tab and supports cursor/clear/caps', async () => {
     const { host, contents } = browserHarness()
     await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
@@ -2685,6 +2757,131 @@ describe('browser selector-targeted scroll', () => {
     expect(result.ok).toBe(true)
     expect(result.action).toMatchObject({ kind: 'scroll', target: 'page' })
     expect(pageScrollBy).toHaveBeenCalled()
+  })
+
+  it('scrolls a unique locator-matched container without converting the locator to CSS', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          {
+            tag: 'div',
+            attrs: { id: 'scroll-container', role: 'region', 'aria-label': 'Feed' },
+            children: [
+              { tag: 'p', attrs: { id: 'inner-row' }, text: 'row one' },
+              { tag: 'p', text: 'row two' },
+            ],
+          },
+          { tag: 'button', text: 'Checkout' },
+        ],
+      },
+    ])
+    const container = walkElements(runtime.document.body).find(el => el.id === 'scroll-container')!
+    const containerScrollBy = makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({
+      action: 'scroll',
+      locator: { role: 'region', name: 'Feed' },
+      direction: 'down',
+      amount: 0.8,
+    }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', direction: 'down', target: 'element' })
+    expect(containerScrollBy).toHaveBeenCalledTimes(1)
+    expect(containerScrollBy).toHaveBeenCalledWith(expect.objectContaining({ left: 0, top: 320 }))
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('climbs from a locator-matched child to the scrollable ancestor', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          {
+            tag: 'div',
+            attrs: { id: 'scroll-container', role: 'region', 'aria-label': 'Feed' },
+            children: [{ tag: 'p', attrs: { id: 'inner-row' }, text: 'row one' }],
+          },
+        ],
+      },
+    ])
+    const container = walkElements(runtime.document.body).find(el => el.id === 'scroll-container')!
+    const containerScrollBy = makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({
+      action: 'scroll',
+      locator: { css: '#inner-row' },
+      direction: 'up',
+      amount: 1,
+    }))
+
+    expect(result.ok).toBe(true)
+    expect(result.action).toMatchObject({ kind: 'scroll', target: 'ancestor' })
+    expect(containerScrollBy).toHaveBeenCalledWith(expect.objectContaining({ top: -400 }))
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('fails a zero-match scroll locator instead of scrolling the page', async () => {
+    const { host, runtime } = await liveBrowser(scrollContainerTree())
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({
+      action: 'scroll',
+      locator: { role: 'region', name: 'NoSuch' },
+    }))
+
+    expect(result).toMatchObject({ ok: false, code: 'browser_locator_not_found' })
+    expect(String(result.error)).toMatch(/0 elements/)
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('fails an ambiguous scroll locator instead of scrolling the page', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          { tag: 'div', attrs: { role: 'region', 'aria-label': 'One' }, text: 'one' },
+          { tag: 'div', attrs: { role: 'region', 'aria-label': 'Two' }, text: 'two' },
+        ],
+      },
+    ])
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({ action: 'scroll', locator: { role: 'region' } }))
+
+    expect(result).toMatchObject({ ok: false, code: 'browser_locator_ambiguous' })
+    expect(String(result.error)).toMatch(/name|nth/i)
+    expect(pageScrollBy).not.toHaveBeenCalled()
+  })
+
+  it('fails a hidden scroll locator instead of scrolling the page', async () => {
+    const { host, runtime } = await liveBrowser([
+      {
+        tag: 'main',
+        children: [
+          {
+            tag: 'div',
+            attrs: { id: 'hidden-scroll', hidden: '', role: 'region', 'aria-label': 'HiddenFeed' },
+            children: [{ tag: 'p', text: 'row' }],
+          },
+        ],
+      },
+    ])
+    const container = walkElements(runtime.document.body).find(el => el.id === 'hidden-scroll')!
+    makeScrollable(container, 2400, 400)
+    const { scrollBy: pageScrollBy } = guardPageScroll(runtime)
+
+    const result = await host.toolAction(asRequest({
+      action: 'scroll',
+      locator: { role: 'region', name: 'HiddenFeed' },
+    }))
+
+    expect(result).toMatchObject({ ok: false, code: 'browser_target_not_actionable' })
+    expect(String(result.error)).toMatch(/hidden/i)
+    expect(pageScrollBy).not.toHaveBeenCalled()
   })
 })
 
