@@ -316,6 +316,12 @@ export function listDocumentRenderers(): readonly RegisteredDocumentRenderer[] {
   return registeredDocumentRenderers()
 }
 
+/** Registered document renderers in precedence order; re-renders on registry changes. */
+export function useDocumentRenderers(): readonly RegisteredDocumentRenderer[] {
+  useRegistrySnapshot(documentRendererRegistry)
+  return registeredDocumentRenderers()
+}
+
 function documentRendererMatches(contribution: DocumentRendererContribution, query: DocumentMatchQuery): boolean {
   const kind = query.documentKind?.trim()
   if (kind && contribution.kinds?.includes(kind)) return true
