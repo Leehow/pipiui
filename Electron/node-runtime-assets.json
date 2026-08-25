@@ -1,26 +1,26 @@
 {
-  "version": "22.19.0",
-  "baseUrl": "https://nodejs.org/dist/v22.19.0",
+  "version": "22.23.2",
+  "baseUrl": "https://nodejs.org/dist/v22.23.2",
   "assets": {
     "darwin-x64": {
-      "archive": "node-v22.19.0-darwin-x64.tar.gz",
-      "sha256": "3cfed4795cd97277559763c5f56e711852d2cc2420bda1cea30c8aa9ac77ce0c",
-      "nodePath": "node-v22.19.0-darwin-x64/bin/node"
+      "archive": "node-v22.23.2-darwin-x64.tar.gz",
+      "sha256": "58e99022c2ff89395576cc7fd4d98cea24bb68081475d5f88b801ee8729fb026",
+      "nodePath": "node-v22.23.2-darwin-x64/bin/node"
     },
     "darwin-arm64": {
-      "archive": "node-v22.19.0-darwin-arm64.tar.gz",
-      "sha256": "c59006db713c770d6ec63ae16cb3edc11f49ee093b5c415d667bb4f436c6526d",
-      "nodePath": "node-v22.19.0-darwin-arm64/bin/node"
+      "archive": "node-v22.23.2-darwin-arm64.tar.gz",
+      "sha256": "61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6",
+      "nodePath": "node-v22.23.2-darwin-arm64/bin/node"
     },
     "win32-x64": {
-      "archive": "node-v22.19.0-win-x64.zip",
-      "sha256": "ea3fad0e67a991d8477d8c01344b56e69c676ccb733f065b22436994b1253f86",
-      "nodePath": "node-v22.19.0-win-x64/node.exe"
+      "archive": "node-v22.23.2-win-x64.zip",
+      "sha256": "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97",
+      "nodePath": "node-v22.23.2-win-x64/node.exe"
     },
     "linux-x64": {
-      "archive": "node-v22.19.0-linux-x64.tar.gz",
-      "sha256": "d36e56998220085782c0ca965f9d51b7726335aed2f5fc7321c6c0ad233aa96d",
-      "nodePath": "node-v22.19.0-linux-x64/bin/node"
+      "archive": "node-v22.23.2-linux-x64.tar.gz",
+      "sha256": "b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a",
+      "nodePath": "node-v22.23.2-linux-x64/bin/node"
     }
   }
 }

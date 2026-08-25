@@ -292,7 +292,9 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     }
     if (command.message === "__fail_turn__") {
       // Provider failure: the assistant message ends with stopReason "error",
-      // an errorMessage, and no content — the host must forward it to the UI.
+      // an errorMessage, and no content. Real Pi can omit agent_settled here;
+      // message_end itself must release the host turn instead of waiting for the watchdog.
+      send({ type: "agent_start" });
       send({
         type: "message_end",
         message: {
@@ -303,7 +305,6 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
           errorMessage: "Codex error: Invalid schema for function 'subagent': ...",
         },
       });
-      send({ type: "agent_settled" });
       return;
     }
     if (command.message === "__compaction_end_only__") {
