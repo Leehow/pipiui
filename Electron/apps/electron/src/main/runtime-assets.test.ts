@@ -57,7 +57,7 @@ describe('resolveRuntimeAssets', () => {
       schemaVersion: 1,
       platform,
       arch,
-      nodeVersion: '22.23.2',
+      nodeVersion: '24.19.0',
       nodeExecutable: platform === 'win32' ? 'node/bin/node.exe' : 'node/bin/node',
       piCli: 'pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
       piLauncher: platform === 'win32' ? 'pi/bin/pi.cmd' : 'pi/bin/pi',

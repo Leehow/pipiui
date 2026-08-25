@@ -2,7 +2,7 @@ import type { HostBackend, UpdateCenterItem, UpdateCenterItemCategory, UpdateCen
 
 /** Build-time tools are not shipped as runtime dependencies, so keep their resolved versions explicit and test them against the lockfile. */
 export const UPDATE_CENTER_FRAMEWORK_VERSIONS = {
-  electron: '43.4.0',
+  electron: '44.0.0',
   vite: '7.3.6',
   'electron-vite': '5.0.0'
 } as const
@@ -74,6 +74,7 @@ export function latestNodeVersion(payload: unknown): string | undefined {
   if (!Array.isArray(payload)) return undefined
   const versions = payload.flatMap(release => {
     if (!release || typeof release !== 'object') return []
+    if (!(release as { lts?: unknown }).lts) return []
     const version = (release as { version?: unknown }).version
     return typeof version === 'string' && parseSemver(version) ? [version.replace(/^v/, '')] : []
   })

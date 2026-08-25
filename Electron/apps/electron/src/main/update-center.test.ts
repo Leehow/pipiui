@@ -29,8 +29,12 @@ describe('update center version discovery', () => {
     ])).toBe('0.19.3')
   })
 
-  it('selects the highest semver from the official Node distribution index', () => {
-    expect(latestNodeVersion([{ version: 'v22.19.0' }, { version: 'v24.8.0', security: true }, { version: 'nightly' }])).toBe('24.8.0')
+  it('selects the highest LTS semver from the official Node distribution index', () => {
+    expect(latestNodeVersion([
+      { version: 'v24.19.0', lts: 'Krypton' },
+      { version: 'v26.7.0', lts: false },
+      { version: 'nightly', lts: 'Krypton' }
+    ])).toBe('24.19.0')
   })
 
   it('keeps explicit framework versions aligned with the resolved Electron app lockfile', () => {
@@ -75,11 +79,15 @@ describe('update center version discovery', () => {
   })
 
   it('checks embedded Node against the official distribution index and preserves hierarchy metadata', async () => {
-    const fetch = vi.fn(async () => response([{ version: 'v24.8.0' }, { version: 'v22.19.0' }]))
+    const fetch = vi.fn(async () => response([
+      { version: 'v26.7.0', lts: false },
+      { version: 'v24.19.0', lts: 'Krypton' },
+      { version: 'v22.23.2', lts: 'Jod' }
+    ]))
     const snapshot = await createUpdateCenterService({ fetch, catalog: [
       { id: 'node', name: 'Node.js 内置 Pi 运行时', category: 'runtime', currentVersion: '22.19.0', source: { type: 'nodeDist' } }
     ] })()
-    expect(snapshot.items[0]).toMatchObject({ category: 'runtime', latestVersion: '24.8.0', status: 'updateAvailable' })
+    expect(snapshot.items[0]).toMatchObject({ category: 'runtime', latestVersion: '24.19.0', status: 'updateAvailable' })
     expect(fetch.mock.calls[0][0]).toBe('https://nodejs.org/dist/index.json')
   })
 
