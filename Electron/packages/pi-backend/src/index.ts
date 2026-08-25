@@ -4506,6 +4506,11 @@ export class PiHostBackend implements HostBackend {
             ? message.errorMessage
             : undefined;
         if (content) this.stream({ type: "error", sessionId: id, content: redactText(content, secrets) });
+        // message_end is the durable terminal boundary even when Pi omits the
+        // subsequent agent_settled event after a provider transport failure.
+        // Release the queue/composer immediately; the epoch fence makes a late
+        // agent_settled idempotent.
+        this.projectTurnTerminal(live, "stopped");
       }
       if (
         message.role === "assistant"

@@ -15,6 +15,7 @@ import {
 import { BrowserSessionHost, installBrowserNativeTrace, mountBrowserShellView, routeBrowserView, withBrowserTabsHost } from './browser-host.js'
 import { BrowserMobileWindowController } from './browser-mobile-window.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
+import { resolveSystemProxyEnvironment } from './system-proxy.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
@@ -188,6 +189,7 @@ if (app) {
     const primary = screen.getPrimaryDisplay()
     const display = { displayID: primary.id, width: primary.size.width, height: primary.size.height }
     const userData = app.getPath('userData')
+    const piProcessEnv = await resolveSystemProxyEnvironment(url => app.resolveProxy(url), process.env)
     const assets = resolveRuntimeAssets({
       packaged: app.isPackaged,
       resourcesPath: process.resourcesPath,
@@ -234,6 +236,7 @@ if (app) {
     const quotaStore = new QuotaStore(process.env, { agentDir: piProfile.agentDir, readCookie: createQuotaCookieReader(userData), persistCookie: createQuotaCookiePersister(userData), readCursorAuth: readCursorAccessToken })
     const piBackend = createPiHostBackend({
       piCommand: assets.piCommand,
+      env: piProcessEnv,
       managedNodeModulesRoot: assets.managedNodeModulesRoot,
       browserAction: (request, sessionId) => browser.toolAction(sessionId, request as any),
       browserWatch: (request, sessionId) => handleBrowserWatchEvent(request, sessionId, browser, watchCallbacks),
