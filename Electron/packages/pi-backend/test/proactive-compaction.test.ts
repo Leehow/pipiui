@@ -4,6 +4,7 @@ import {
   ProactiveCompactionScheduler,
   STANDARD_PROACTIVE_COMPACTION,
   contextUsageFraction,
+  type ProactiveCompactionObserverEvent,
 } from "../src/proactive-compaction.js";
 
 /**
@@ -109,7 +110,12 @@ describe("ProactiveCompactionPolicy", () => {
 });
 
 /** Manual timer/clock so the scheduler's quiet period never costs wall-clock time. */
-function harness(options: { idle?: boolean; liveAgents?: boolean; compact?: () => Promise<unknown> } = {}) {
+function harness(options: {
+  idle?: boolean;
+  liveAgents?: boolean;
+  compact?: () => Promise<unknown>;
+  observer?: (event: ProactiveCompactionObserverEvent) => void;
+} = {}) {
   const timers = new Map<number, { fn: () => void; at: number }>();
   let nextHandle = 1;
   let clock = 0;
@@ -121,6 +127,7 @@ function harness(options: { idle?: boolean; liveAgents?: boolean; compact?: () =
       state.compactCalls += 1;
       return options.compact ? options.compact() : Promise.resolve();
     },
+    ...(options.observer ? { observer: options.observer } : {}),
     setTimer: (fn, ms) => {
       const handle = nextHandle++;
       timers.set(handle, { fn, at: clock + ms });
@@ -403,6 +410,137 @@ describe("ProactiveCompactionScheduler", () => {
       h.advance(1);
       await flush();
       expect(h.state.compactCalls).toBe(2);
+    });
+  });
+
+  describe("decision observer", () => {
+    it("reports below_threshold with the usage sample and a coarse skip reason", () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ observer: (event) => events.push(event) });
+      h.scheduler.liveAgentStateChanged();
+      h.scheduler.observeUsage(BELOW_LINE, h.scheduler.beginUsageRequest());
+      expect(events.map((e) => e.decision)).toEqual([
+        "below_threshold",
+        "below_threshold",
+      ]);
+      expect(events[0]!.skipReason).toBe("no_usage_sample");
+      expect(events[1]!.usage).toEqual(BELOW_LINE);
+      expect(events[1]!.skipReason).toBe("usage_below_watermark");
+    });
+
+    it("reports not_idle while the host gates say busy or a compaction runs", () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ idle: false, observer: (event) => events.push(event) });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      expect(events).toEqual([
+        { decision: "not_idle", usage: HIGH, skipReason: "busy" },
+      ]);
+      expect(h.pending).toBe(0);
+    });
+
+    it("reports timer_armed → timer_fired → rpc_succeeded and disarms afterwards", async () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ observer: (event) => events.push(event) });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      expect(events.map((e) => e.decision)).toEqual(["timer_armed"]);
+      expect(events[0]!.requiredIdleMs).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      expect(events[0]!.usage).toEqual(HIGH);
+
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
+      // requestCompleted → compactionFinished → reconsider also reports the post-success disarm.
+      expect(events.map((e) => e.decision)).toEqual([
+        "timer_armed",
+        "timer_fired",
+        "rpc_succeeded",
+        "below_threshold",
+      ]);
+      expect(events[0]!.requiredIdleMs).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      expect(events[0]!.remainingIdleMs).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      expect(events[0]!.usage).toEqual(HIGH);
+      expect(events[1]!.requiredIdleMs).toBe(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      expect(events[1]!.remainingIdleMs).toBe(0);
+      expect(events[3]!.skipReason).toBe("disarmed_until_low_report");
+    });
+
+    it("reports rpc_failed with the error kind as skip reason", async () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({
+        observer: (event) => events.push(event),
+        compact: () => Promise.reject(new Error("pi refused")),
+      });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      await flush();
+      expect(events.map((e) => e.decision)).toEqual([
+        "timer_armed",
+        "timer_fired",
+        "rpc_failed",
+        "timer_armed",
+      ]);
+      expect(events[2]!.skipReason).toBe("Error");
+    });
+
+    it("reports gate_failed when the quiet timer fires into a busy session", async () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ observer: (event) => events.push(event) });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      // Go busy without telling the scheduler: the timer is only a hint.
+      h.state.idle = false;
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(0);
+      expect(events.map((e) => e.decision)).toEqual(["timer_armed", "gate_failed"]);
+      expect(events.at(-1)!.skipReason).toBe("busy");
+    });
+
+    it("bounds identical below_threshold/not_idle repeats without changing gates", () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ observer: (event) => events.push(event) });
+      for (let i = 0; i < 40; i++) {
+        h.scheduler.observeUsage(BELOW_LINE, h.scheduler.beginUsageRequest());
+      }
+      expect(events.filter((e) => e.decision === "below_threshold")).toHaveLength(1);
+      expect(h.pending).toBe(0);
+      expect(h.state.compactCalls).toBe(0);
+
+      h.state.idle = false;
+      for (let i = 0; i < 40; i++) {
+        h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      }
+      const notIdle = events.filter((e) => e.decision === "not_idle");
+      expect(notIdle).toHaveLength(1);
+      expect(notIdle[0]!.skipReason).toBe("busy");
+      expect(h.pending).toBe(0);
+      expect(h.state.compactCalls).toBe(0);
+
+      // A usage/skipReason change must still be recorded.
+      h.scheduler.observeUsage({ tokens: 10, contextWindow: 100 }, h.scheduler.beginUsageRequest());
+      expect(events.filter((e) => e.decision === "not_idle")).toHaveLength(2);
+    });
+
+    it("never dedupes timer_armed, timer_fired, or RPC outcomes", async () => {
+      const events: ProactiveCompactionObserverEvent[] = [];
+      const h = harness({ observer: (event) => events.push(event) });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      await flush();
+      expect(events.map((e) => e.decision)).toEqual([
+        "timer_armed",
+        "timer_fired",
+        "rpc_succeeded",
+        "below_threshold",
+      ]);
+    });
+
+    it("swallows a throwing observer and changes no scheduling behavior", async () => {
+      const h = harness({ observer: () => { throw new Error("observer bug"); } });
+      h.scheduler.observeUsage(HIGH, h.scheduler.beginUsageRequest());
+      expect(h.pending).toBe(1);
+      h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+      await flush();
+      expect(h.state.compactCalls).toBe(1);
     });
   });
 });

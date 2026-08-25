@@ -148,8 +148,13 @@ import {
 } from "./token-ledger.js";
 import {
   ProactiveCompactionScheduler,
+  STANDARD_PROACTIVE_COMPACTION,
   type ProactiveCompactionConfiguration,
 } from "./proactive-compaction.js";
+import {
+  createCompactionDiagnostics,
+  type CompactionDiagnostics,
+} from "./compaction-diagnostics.js";
 import {
   generateModelSessionTitle,
   isPlaceholderSessionTitle,
@@ -596,6 +601,7 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
+  /** Injectable compaction diagnostics log; defaults to agentDir JSONL. */ compactionDiagnostics?: CompactionDiagnostics;
   /** Test/host-injected Chat with Files uploader. Production loads the grok host entry. */ inputFilesRemote?: InputFilesRemote;
   /** Test-injected Structured Outputs validator. Production loads the grok host entry. */ structuredOutputNormalize?: StructuredOutputNormalize;
   structuredOutputsEnabled?: StructuredOutputsEnabled;
@@ -675,6 +681,10 @@ type Live = {
   compactionIntent?: "manual" | "proactive_idle";
   /** Classification of the in-flight compaction, kept so `compaction_end` can repeat it. */
   activeCompaction?: { operation: "context_compaction" | "context_fold"; trigger?: CompactionTrigger };
+  /** Diagnostics identity of the in-flight compaction: stable operationId, start time, pre-compaction sample. */
+  activeCompactionDiagnostics?: { operationId: string; startedAt: number; beforeTokens?: number };
+  /** Settle already wrote a fallback end for the last start; a late real end must not repeat it. */
+  compactionDiagnosticsClosedBySettle?: boolean;
   /** toolCallId → toolName, recorded from `tool_execution_start` so a later
    *  `tool_execution_end` can prove which tool produced a result. Consumed on
    *  end and cleared per turn. */
@@ -1876,6 +1886,9 @@ export class PiHostBackend implements HostBackend {
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
   private toolBatchTelemetry: ToolBatchTelemetry;
+  private compactionDiagnostics: CompactionDiagnostics;
+  /** Monotonic per-host counter giving each compaction lifecycle a stable operationId. */
+  private compactionOperationSeq = 0;
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
   /** Steer payloads pi acknowledged but never echoed back as a user message.
@@ -1924,6 +1937,7 @@ export class PiHostBackend implements HostBackend {
       void this.modelsWrite.enqueue(() => this.profileInitialization);
     }
     this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
+    this.compactionDiagnostics = options.compactionDiagnostics ?? createCompactionDiagnostics({ agentDir: this.agentDir });
     this.thinkingControl = new ThinkingControlReporter(this.agentDir);
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
     this.piCommand = options.piCommand
@@ -2259,6 +2273,8 @@ export class PiHostBackend implements HostBackend {
     await this.agentsWrite;
     // Bounded wait for already-queued stats lines; a hung append must not block exit.
     await this.toolBatchTelemetry.close();
+    // Same contract for the compaction diagnostics probe.
+    await this.compactionDiagnostics.close();
     this.leases.clear();
     this.documentWatcher.stop();
     this.listeners.clear();
@@ -3997,6 +4013,33 @@ export class PiHostBackend implements HostBackend {
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
         hasLiveAgents: () => this.sessionHasLiveAgents(id),
+        observer: (event) => {
+          // Same JSONL as the lifecycle events, always tagged proactive_idle.
+          const usage = event.usage;
+          const usagePercent =
+            typeof usage?.percent === "number"
+              ? usage.percent
+              : typeof usage?.tokens === "number" && typeof usage?.contextWindow === "number" && usage.contextWindow > 0
+                ? (usage.tokens / usage.contextWindow) * 100
+                : undefined;
+          const config = this.compactionConfiguration ?? STANDARD_PROACTIVE_COMPACTION;
+          this.compactionDiagnostics.record({
+            sessionId: id,
+            event: "scheduler_decision",
+            operation: "context_compaction",
+            trigger: "proactive_idle",
+            operationId: null,
+            decision: event.decision,
+            skipReason: event.skipReason,
+            ...(typeof usage?.tokens === "number" ? { contextTokens: usage.tokens } : {}),
+            ...(typeof usage?.contextWindow === "number" ? { contextWindow: usage.contextWindow } : {}),
+            ...(usagePercent !== undefined ? { usagePercent } : {}),
+            ...(event.requiredIdleMs !== undefined ? { requiredIdleMs: event.requiredIdleMs } : {}),
+            ...(event.remainingIdleMs !== undefined ? { remainingIdleMs: event.remainingIdleMs } : {}),
+            highWatermark: config.highWatermark,
+            lowWatermark: config.lowWatermark,
+          });
+        },
         compact: () => {
           // pi reports the scheduler's compact RPC as `reason: "manual"`; this
           // intent is what lets compaction_start attribute it to proactive idle.
@@ -4184,6 +4227,29 @@ export class PiHostBackend implements HostBackend {
       });
       live.activeCompaction = { operation: "context_compaction", trigger };
       live.compactionIntent = undefined;
+      const diagnosticsId = `${id}:${++this.compactionOperationSeq}`;
+      const knownContext = this.sessionContextLastKnown.get(id);
+      live.compactionDiagnosticsClosedBySettle = undefined;
+      live.activeCompactionDiagnostics = {
+        operationId: diagnosticsId,
+        startedAt: Date.now(),
+        ...(knownContext ? { beforeTokens: knownContext.tokens } : {}),
+      };
+      this.compactionDiagnostics.record({
+        sessionId: id,
+        event: "compaction_start",
+        operation: "context_compaction",
+        trigger: trigger ?? "unclassified",
+        operationId: diagnosticsId,
+        ...(typeof e.reason === "string" ? { reason: e.reason } : {}),
+        ...(knownContext
+          ? {
+              contextTokens: knownContext.tokens,
+              contextWindow: knownContext.contextWindow,
+              ...(knownContext.percent !== null ? { usagePercent: knownContext.percent } : {}),
+            }
+          : {}),
+      });
       this.stream({
         type: "compaction",
         sessionId: id,
@@ -4208,6 +4274,39 @@ export class PiHostBackend implements HostBackend {
               busy: this.queue.isTurnActive(id),
             });
       live.activeCompaction = undefined;
+      const diagnostics = live.activeCompactionDiagnostics;
+      live.activeCompactionDiagnostics = undefined;
+      if (live.compactionDiagnosticsClosedBySettle) {
+        live.compactionDiagnosticsClosedBySettle = undefined;
+      } else {
+        this.compactionDiagnostics.record({
+          sessionId: id,
+          event: "compaction_end",
+          operation: "context_compaction",
+          trigger: trigger ?? "unclassified",
+          success: !aborted && !error,
+          ...(aborted ? { aborted: true } : {}),
+          ...(error
+            ? {
+                error: redactText(error.slice(0, 200), this.sessionSecrets(id)),
+                errorKind: aborted ? "aborted" : "pi_compaction_error",
+              }
+            : {}),
+          ...(diagnostics
+            ? {
+                operationId: diagnostics.operationId,
+                durationMs: Date.now() - diagnostics.startedAt,
+                ...(diagnostics.beforeTokens !== undefined
+                  ? { beforeTokens: diagnostics.beforeTokens }
+                  : {}),
+              }
+            : {
+                decision: "missing_start",
+                skipReason: "missing_start",
+                errorKind: "missing_start",
+              }),
+        });
+      }
       live.compaction.compactionFinished(!aborted && !error);
       this.queue.clearCompacting(id);
       if (live.compactionHoldsQueue) {
@@ -4542,6 +4641,25 @@ export class PiHostBackend implements HostBackend {
     void this.queueIdle(live.session.id, epoch);
     // A compact lifecycle that omitted its end event must not wedge the
     // scheduler; terminal projection is the final authority for this turn.
+    if (live.activeCompactionDiagnostics) {
+      const diagnostics = live.activeCompactionDiagnostics;
+      live.activeCompactionDiagnostics = undefined;
+      live.compactionDiagnosticsClosedBySettle = true;
+      this.compactionDiagnostics.record({
+        sessionId: live.session.id,
+        event: "compaction_end",
+        operation: "context_compaction",
+        trigger: live.activeCompaction?.trigger ?? "unclassified",
+        operationId: diagnostics.operationId,
+        durationMs: Date.now() - diagnostics.startedAt,
+        ...(diagnostics.beforeTokens !== undefined
+          ? { beforeTokens: diagnostics.beforeTokens }
+          : {}),
+        decision: "settled_without_end",
+        skipReason: "settled_without_end",
+        errorKind: "settled_without_end",
+      });
+    }
     live.compaction.settleTurn();
     if (pushStats) void this.pushSessionStats(live.session.id);
     return true;

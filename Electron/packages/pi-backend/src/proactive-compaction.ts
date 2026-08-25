@@ -62,6 +62,31 @@ interface ProactiveCompactionSchedulingPlan {
   delayMs: number;
 }
 
+/** Scheduling decisions the scheduler can report to a host-side observer. */
+export type ProactiveCompactionDecision =
+  | "below_threshold"
+  | "not_idle"
+  | "timer_armed"
+  | "timer_fired"
+  | "gate_failed"
+  | "rpc_succeeded"
+  | "rpc_failed";
+
+/** Read-only notification about one scheduling decision. Pure observation. */
+export interface ProactiveCompactionObserverEvent {
+  decision: ProactiveCompactionDecision;
+  /** The policy's freshest usage sample at decision time, when one exists. */
+  usage?: ContextUsageLike;
+  /** Configured quiet window (ms) this arm/fire is enforcing. */
+  requiredIdleMs?: number;
+  /** Remaining delay of the current timer, or 0 once it has fired. */
+  remainingIdleMs?: number;
+  /** Coarse why for the negative decisions; short metadata tokens only. */
+  skipReason?: string;
+}
+
+export type ProactiveCompactionObserver = (event: ProactiveCompactionObserverEvent) => void;
+
 /** A single fresh context report. `percent` keeps pi/UI's 0…100 convention. */
 export interface ContextUsageLike {
   tokens?: number | null;
@@ -98,6 +123,11 @@ export function contextUsageFraction(
     return percent / 100;
   }
   return undefined;
+}
+
+function usageFingerprint(usage?: ContextUsageLike): string {
+  if (!usage) return "";
+  return `${usage.tokens ?? ""}|${usage.contextWindow ?? ""}|${usage.percent ?? ""}`;
 }
 
 export class ProactiveCompactionPolicy {
@@ -206,6 +236,9 @@ export interface ProactiveCompactionSchedulerOptions {
   setTimer?: (fn: () => void, ms: number) => unknown;
   clearTimer?: (handle: unknown) => void;
   now?: () => number;
+  /** Optional decision observer. Diagnostics-only: never consulted by any
+   * gate/timer/threshold path, and its failures are swallowed. */
+  observer?: ProactiveCompactionObserver;
 }
 
 /**
@@ -236,6 +269,10 @@ export class ProactiveCompactionScheduler {
   /** A successful wait compact is allowed once per continuous live-agent wave. */
   private waitCompactedInWave = false;
   private disposed = false;
+  /** Quiet window captured when the current timer was armed. */
+  private armedRequiredIdleMs?: number;
+  /** Last emitted negative decision; identical repeats are dropped. */
+  private lastNegativeKey?: string;
 
   constructor(options: ProactiveCompactionSchedulerOptions) {
     this.options = options;
@@ -282,6 +319,11 @@ export class ProactiveCompactionScheduler {
     const hasLiveAgents = this.syncLiveAgentWave();
     if (this.isCompacting || !this.options.isIdle()) {
       this.cancel();
+      this.notify({
+        decision: "not_idle",
+        usage: this.policy.latestUsage,
+        skipReason: this.isCompacting ? "compacting" : "busy",
+      });
       return;
     }
     const plan = this.policy.nextSchedulingPlan(
@@ -290,6 +332,15 @@ export class ProactiveCompactionScheduler {
     );
     if (!plan) {
       this.cancel();
+      this.notify({
+        decision: "below_threshold",
+        usage: this.policy.latestUsage,
+        skipReason: !this.policy.isArmed
+          ? "disarmed_until_low_report"
+          : contextUsageFraction(this.policy.latestUsage) === undefined
+            ? "no_usage_sample"
+            : "usage_below_watermark",
+      });
       return;
     }
     const wave = plan.mode === "wait-for-subagents" ? this.liveAgentWave : undefined;
@@ -299,6 +350,8 @@ export class ProactiveCompactionScheduler {
     const token = this.token;
     this.timerMode = plan.mode;
     this.timerWave = wave;
+    const requiredIdleMs = this.quietWindowMs(plan.mode);
+    this.armedRequiredIdleMs = requiredIdleMs;
     this.timer = this.setTimer(() => {
       if (this.disposed || token !== this.token) return;
       this.timer = undefined;
@@ -306,6 +359,12 @@ export class ProactiveCompactionScheduler {
       this.timerWave = undefined;
       this.fire(plan.mode, wave);
     }, plan.delayMs);
+    this.notify({
+      decision: "timer_armed",
+      usage: this.policy.latestUsage,
+      requiredIdleMs,
+      remainingIdleMs: plan.delayMs,
+    });
   }
 
   cancel(): void {
@@ -314,6 +373,7 @@ export class ProactiveCompactionScheduler {
     this.timer = undefined;
     this.timerMode = undefined;
     this.timerWave = undefined;
+    this.armedRequiredIdleMs = undefined;
   }
 
   /** `compaction_start` from pi — manual, overflow, threshold, or ours. */
@@ -361,21 +421,68 @@ export class ProactiveCompactionScheduler {
     this.cancel();
   }
 
+  /** Diagnostics-only notification; a throwing observer must never break scheduling. */
+  private notify(event: ProactiveCompactionObserverEvent): void {
+    if (event.decision === "below_threshold" || event.decision === "not_idle") {
+      const key = `${event.decision}\0${event.skipReason ?? ""}\0${usageFingerprint(event.usage)}`;
+      if (this.lastNegativeKey === key) return;
+      this.lastNegativeKey = key;
+    } else {
+      this.lastNegativeKey = undefined;
+    }
+    const observer = this.options.observer;
+    if (!observer) return;
+    try {
+      observer(event);
+    } catch {
+      /* swallow: observation is best-effort */
+    }
+  }
+
+  private quietWindowMs(mode: ProactiveCompactionMode): number {
+    return mode === "wait-for-subagents"
+      ? this.policy.configuration.waitQuietDelayMs
+      : this.policy.configuration.quietDelayMs;
+  }
+
   private fire(mode: ProactiveCompactionMode, wave?: number): void {
-    if (this.isCompacting || !this.options.isIdle()) return;
+    if (this.isCompacting || !this.options.isIdle()) {
+      this.notify({
+        decision: "gate_failed",
+        usage: this.policy.latestUsage,
+        skipReason: this.isCompacting ? "compacting" : "busy",
+      });
+      return;
+    }
     const hasLiveAgents = this.syncLiveAgentWave();
     const plan = this.policy.nextSchedulingPlan(
       this.now(),
       hasLiveAgents && !this.waitCompactedInWave,
     );
     if (!plan || plan.mode !== mode) {
+      this.notify({
+        decision: "gate_failed",
+        usage: this.policy.latestUsage,
+        skipReason: plan ? "mode_changed" : "usage_below_watermark",
+      });
       this.reconsider();
       return;
     }
     if (mode === "wait-for-subagents" && wave !== this.liveAgentWave) {
+      this.notify({
+        decision: "gate_failed",
+        usage: this.policy.latestUsage,
+        skipReason: "subagent_wave_changed",
+      });
       this.reconsider();
       return;
     }
+    this.notify({
+      decision: "timer_fired",
+      usage: this.policy.latestUsage,
+      requiredIdleMs: this.armedRequiredIdleMs ?? this.quietWindowMs(mode),
+      remainingIdleMs: 0,
+    });
     this.rpcInFlight = true;
     this.requestMode = mode;
     this.requestWave = wave;
@@ -383,18 +490,24 @@ export class ProactiveCompactionScheduler {
       .then(() => this.options.compact())
       .then(
         () => this.requestCompleted(),
-        () => this.requestFailed(),
+        (error) => this.requestFailed(error),
       );
   }
 
   /** pi answers only after the compaction finished; the events normally settle first. */
   private requestCompleted(): void {
     if (!this.rpcInFlight) return;
+    this.notify({ decision: "rpc_succeeded", usage: this.policy.latestUsage });
     this.compactionFinished(true);
   }
 
-  private requestFailed(): void {
+  private requestFailed(error?: unknown): void {
     if (!this.rpcInFlight) return;
+    this.notify({
+      decision: "rpc_failed",
+      usage: this.policy.latestUsage,
+      skipReason: error instanceof Error ? error.name || "Error" : typeof error,
+    });
     this.compactionFinished(false);
   }
 

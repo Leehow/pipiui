@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -359,5 +359,99 @@ describe("context compaction", () => {
     const backend = await fixture();
     expect(await backend.handle("capabilities", [])).toMatchObject({ compact: true });
     await backend.close();
+  });
+
+  it("logs compaction diagnostics with a stable operationId, trigger, and duration", async () => {
+    const backend = await fixture();
+    await backend.handle("sendPrompt", ["session-1", "go"]);
+    await settle();
+    await backend.handle("compact", ["session-1"]);
+    await settle();
+    // close() drains the diagnostics writer's queue.
+    await backend.close();
+
+    const text = await readFile(join(root, "agent", "pipiui-compaction-diagnostics.jsonl"), "utf8");
+    const lines = text.trim().split("\n").map((line) => JSON.parse(line) as Record<string, any>);
+    const start = lines.find((l) => l.event === "compaction_start");
+    const end = lines.find((l) => l.event === "compaction_end");
+    expect(start).toMatchObject({
+      schemaVersion: 1,
+      sessionId: "session-1",
+      operation: "context_compaction",
+      trigger: "manual",
+      reason: "manual",
+    });
+    expect(typeof start.operationId).toBe("string");
+    expect(end.operationId).toBe(start.operationId);
+    expect(end.trigger).toBe("manual");
+    expect(end.success).toBe(true);
+    expect(typeof end.durationMs).toBe("number");
+    expect(end.durationMs).toBeGreaterThanOrEqual(0);
+
+    // Scheduler decisions share the same file, tagged proactive_idle, with the
+    // fixture's watermarks and no operation yet (operationId null).
+    const decisions = lines.filter((l) => l.event === "scheduler_decision");
+    expect(decisions.length).toBeGreaterThan(0);
+    for (const line of decisions) {
+      expect(line).toMatchObject({
+        trigger: "proactive_idle",
+        operation: "context_compaction",
+        operationId: null,
+        highWatermark: 0.8,
+        lowWatermark: 0.6,
+      });
+      expect(typeof line.decision).toBe("string");
+    }
+
+    // Only allowlisted metadata keys ever appear — no content-bearing fields.
+    const allowed = new Set([
+      "schemaVersion", "timestamp", "sessionId", "event", "operation", "trigger",
+      "operationId", "reason", "decision", "skipReason", "executed", "contextTokens",
+      "contextWindow", "usagePercent", "idleMs", "requiredIdleMs", "remainingIdleMs",
+      "highWatermark", "lowWatermark", "beforeTokens", "afterTokens", "durationMs",
+      "success", "aborted", "error", "errorKind",
+    ]);
+    for (const line of lines) {
+      for (const key of Object.keys(line)) expect(allowed.has(key)).toBe(true);
+    }
+  });
+
+  it("does not invent an operationId when end arrives without a retained start", async () => {
+    const backend = await fixture();
+    await backend.handle("sendPrompt", ["session-1", "__compaction_end_only__"]);
+    await settle();
+    await backend.close();
+
+    const text = await readFile(join(root, "agent", "pipiui-compaction-diagnostics.jsonl"), "utf8");
+    const ends = text.trim().split("\n")
+      .map((line) => JSON.parse(line) as Record<string, any>)
+      .filter((line) => line.event === "compaction_end");
+    expect(ends.length).toBeGreaterThanOrEqual(1);
+    for (const end of ends) {
+      expect(end).not.toHaveProperty("operationId");
+      expect(end.skipReason).toBe("missing_start");
+      expect(end.errorKind).toBe("missing_start");
+      expect(end.decision).toBe("missing_start");
+    }
+  });
+
+  it("records settle fallback without fabricating success, and a late end does not repeat", async () => {
+    const backend = await fixture();
+    await backend.handle("sendPrompt", ["session-1", "__compaction_start_no_end__"]);
+    await settle();
+    await backend.close();
+
+    const lines = (await readFile(join(root, "agent", "pipiui-compaction-diagnostics.jsonl"), "utf8"))
+      .trim().split("\n")
+      .map((line) => JSON.parse(line) as Record<string, any>);
+    const starts = lines.filter((line) => line.event === "compaction_start");
+    const ends = lines.filter((line) => line.event === "compaction_end");
+    expect(starts).toHaveLength(1);
+    expect(ends).toHaveLength(1);
+    expect(ends[0]!.operationId).toBe(starts[0]!.operationId);
+    expect(ends[0]!.skipReason).toBe("settled_without_end");
+    expect(ends[0]!.errorKind).toBe("settled_without_end");
+    expect(ends[0]!.decision).toBe("settled_without_end");
+    expect(ends[0]!).not.toHaveProperty("success");
   });
 });

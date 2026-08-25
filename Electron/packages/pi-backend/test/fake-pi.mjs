@@ -306,6 +306,23 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__compaction_end_only__") {
+      // Orphan end: no matching start. Host must not invent an operationId.
+      ok();
+      send({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false });
+      send({ type: "agent_start" });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__compaction_start_no_end__") {
+      // Start without end, then settle; a late end must not pair-duplicate.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "compaction_start", reason: "manual" });
+      send({ type: "agent_settled" });
+      send({ type: "compaction_end", reason: "manual", aborted: false, willRetry: false });
+      return;
+    }
     if (command.message === "__overflow_compact__") {
       // pi's own provider-overflow recovery: compaction before the turn continues.
       ok();
