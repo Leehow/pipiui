@@ -385,7 +385,13 @@ export type AgentSummary = { agentId: string; runId: string; name: string; task:
   /** Runtime/host stall probe. Metadata only. */
   diagnostics?: AgentDiagnostics };
 export type WorktreeLifecycle = "none" | "active" | "pendingReview" | "merged" | "mergedCleanupPending" | "discarded";
-export type WorktreeStatus = { agentId: string; branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
+export type WorktreeStatus = {
+  agentId: string;
+  /** Owning episode session — required: every worktree row belongs to exactly one episode. */
+  sessionId: string;
+  /** Owning episode run — required: a badge/operation on this status binds to this run alone. */
+  runId: string;
+  branch?: string; path?: string; error?: string; lifecycle: WorktreeLifecycle; merge: "ready" | "merged" | "conflict" | "unavailable"; discard: "ready" | "discarded" | "unavailable" };
 export type HostCapabilities = { computerUse: boolean; revealInFinder: boolean; terminal: boolean; plan: boolean; retainedWorktreeDisposition: boolean; [capability: string]: boolean };
 export type ComputerUsePermissionKind = "screenRecording" | "accessibility";
 export type ComputerUseState = { enabled: boolean; screenRecording?: boolean; accessibility?: boolean };
@@ -658,11 +664,28 @@ export type BrowserMobileOverlay = {
   userAgent?: string;
 };
 export type BrowserViewBounds = { x: number; y: number; width: number; height: number; visible?: boolean; mode?: BrowserViewMode; slots?: { desktop?: BrowserViewSlot; mobile?: BrowserViewSlot }; mobileOverlay?: BrowserMobileOverlay };
+/** One page console line surfaced to the panel; main filters to error/warn before emitting. */
+export type BrowserConsoleEntry = { timestamp: number; level: string; message: string; sourceId?: string; line?: number; url?: string; tabId?: string };
+/** Watch condition as shown in the panel; mirrors the main-side registry contract. */
+export type BrowserWatchCondition =
+  | { type: "selector"; selector: string; snapshotId?: string; elementIndex?: number; elementToken?: string }
+  | { type: "idle"; idleMs?: number }
+  | { type: "url_matches"; pattern: string }
+  | { type: "expression"; expression: string }
+  | { type: "timer" };
+/** Active one-shot page watch. `timeoutAt` null means no deadline (the registry's Infinity is not JSON-safe). */
+export type BrowserWatchInfo = { watchId: string; condition: BrowserWatchCondition; createdAt: number; timeoutAt: number | null; intervalMs: number; status: "active" | "checking" };
+/** Last fired watch, for the panel's trigger banner. */
+export type BrowserWatchTrigger = { watchId: string; reason: "matched" | "timeout" | "disposed" | "navigating-lost"; waitedMs: number; url: string; title: string; firedAt: number };
 export type BrowserEvent = (
   | { type: "tabs"; snapshot: BrowserTabsSnapshot }
   | { type: "reveal" }
   | { type: "error"; message: string }
   | { type: "mobile-window"; open: boolean; deviceId?: BrowserMobileDeviceId | string }
+  | { type: "console"; entry: BrowserConsoleEntry }
+  | { type: "certificate-error"; url: string; reason: string }
+  | { type: "js-dialog"; kind: "alert" | "confirm" | "prompt"; message: string; url?: string }
+  | { type: "watch"; watches: BrowserWatchInfo[]; trigger?: BrowserWatchTrigger }
 ) & { sessionId: string };
 
 /**
@@ -687,6 +710,8 @@ export interface BrowserHostAPI {
   setViewBounds(sessionId: string, bounds: BrowserViewBounds): Promise<void>;
   /** Page zoom for the visible desktop WebContents (not the mobile device-frame scale). */
   setZoomFactor(sessionId: string, factor: number, tabId?: string): Promise<number>;
+  /** Active one-shot page watches for the panel's watch strip. Optional: older hosts omit it. */
+  listActiveWatches?(sessionId: string): Promise<BrowserWatchInfo[]>;
   subscribe(listener: (event: BrowserEvent) => void): Unsubscribe;
 }
 
@@ -1135,7 +1160,17 @@ export interface PipiHostAPI {
    */
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
-  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe; abortAgent(agentId: string): Promise<void>; resolveAgent(agentId: string): Promise<void>; checkAgent(agentId: string): Promise<AgentSummary>; getWorktreeStatus(agentId: string): Promise<WorktreeStatus>; mergeWorktree(agentId: string): Promise<WorktreeStatus>; discardWorktree(agentId: string): Promise<WorktreeStatus>;
+  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe;
+  /**
+   * Exact episode identity for agent/worktree control: every operation binds
+   * the exact {sessionId, agentId, runId}. Hosts must resolve that composite key
+   * exactly — a stale run or another session's same-slug worker is rejected,
+   * never routed to the globally newest row carrying that agentId. There is
+   * deliberately no agentId-only overload: a shorter call would resolve to an
+   * undefined episode at runtime, which is exactly the misbinding this contract
+   * removed.
+   */
+  abortAgent(sessionId: string, agentId: string, runId: string): Promise<void>; resolveAgent(sessionId: string, agentId: string, runId: string): Promise<void>; checkAgent(sessionId: string, agentId: string, runId: string): Promise<AgentSummary>; getWorktreeStatus(sessionId: string, agentId: string, runId: string): Promise<WorktreeStatus>; mergeWorktree(sessionId: string, agentId: string, runId: string): Promise<WorktreeStatus>; discardWorktree(sessionId: string, agentId: string, runId: string): Promise<WorktreeStatus>;
   /**
    * Plans the session's runtime published through the plan tools, newest
    * activity first. Optional: hosts that mount no plan runtime advertise
@@ -1207,7 +1242,7 @@ export interface PipiHostAPI {
 
 type BaseHostMethod = Exclude<keyof Omit<PipiHostAPI, "protocolVersion" | "subscribeStream" | "subscribeAllStreams" | "subscribeAgents" | "subscribeAgentLog" | "subscribeSessionStats" | "subscribeDocuments" | "subscribePlans" | "subscribeExt" | "subscribeExtUi" | "subscribeModelCatalog" | "browser" | "terminal">, "browser" | "terminal">;
 export type TerminalHostMethod = "terminalOpen" | "terminalWrite" | "terminalResize" | "terminalClear" | "terminalPrivate" | "terminalSnapshot" | "terminalClose";
-export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor";
+export type BrowserHostMethod = "browserSelectSession" | "browserListTabs" | "browserGetActiveTab" | "browserNewTab" | "browserSwitchTab" | "browserCloseTab" | "browserLoadURL" | "browserGoBack" | "browserGoForward" | "browserReload" | "browserSnapshot" | "browserSetViewBounds" | "browserSetZoomFactor" | "browserListWatches";
 export type HostMethod = BaseHostMethod | TerminalHostMethod | BrowserHostMethod;
 export type HostRequest = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "request"; method: HostMethod; params: unknown[] };
 export type HostResponse = { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: true; result: unknown } | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; id: string; type: "response"; ok: false; error: string; errorCode?: string };
@@ -1325,12 +1360,12 @@ function apiFrom(
     getAgentLogs: (agentId, sessionId, runId, scope) => scope ? invoke("getAgentLogs", agentId, sessionId, runId, scope) : invoke("getAgentLogs", agentId, sessionId, runId),
     subscribeAgents: listener => subscribe("agents", event => event.channel === "agents", event => listener((event as Extract<HostEvent, { channel: "agents" }>).event)),
     subscribeAgentLog: (agentId, listener, sessionId, runId) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId && event.event.sessionId === sessionId && event.event.runId === runId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),
-    abortAgent: agentId => invoke("abortAgent", agentId),
-    resolveAgent: agentId => invoke("resolveAgent", agentId),
-    checkAgent: agentId => invoke("checkAgent", agentId),
-    getWorktreeStatus: agentId => invoke("getWorktreeStatus", agentId),
-    mergeWorktree: agentId => invoke("mergeWorktree", agentId),
-    discardWorktree: agentId => invoke("discardWorktree", agentId),
+    abortAgent: (sessionId, agentId, runId) => invoke("abortAgent", sessionId, agentId, runId),
+    resolveAgent: (sessionId, agentId, runId) => invoke("resolveAgent", sessionId, agentId, runId),
+    checkAgent: (sessionId, agentId, runId) => invoke("checkAgent", sessionId, agentId, runId),
+    getWorktreeStatus: (sessionId, agentId, runId) => invoke("getWorktreeStatus", sessionId, agentId, runId),
+    mergeWorktree: (sessionId, agentId, runId) => invoke("mergeWorktree", sessionId, agentId, runId),
+    discardWorktree: (sessionId, agentId, runId) => invoke("discardWorktree", sessionId, agentId, runId),
     getPlans: sessionId => sessionId === undefined ? invoke("getPlans") : invoke("getPlans", sessionId),
     subscribePlans: listener => subscribe("plan", event => event.channel === "plan", event => listener((event as Extract<HostEvent, { channel: "plan" }>).event)),
     capabilities: () => invoke("capabilities"),
@@ -1393,6 +1428,7 @@ function apiFrom(
       snapshot: (sessionId, tabId) => invoke("browserSnapshot", sessionId, tabId),
       setViewBounds: (sessionId, bounds) => invoke("browserSetViewBounds", sessionId, bounds),
       setZoomFactor: (sessionId, factor, tabId) => invoke("browserSetZoomFactor", sessionId, factor, tabId),
+      listActiveWatches: sessionId => invoke("browserListWatches", sessionId),
       subscribe: listener => subscribe("browser", event => event.channel === "browser", event => listener((event as Extract<HostEvent, { channel: "browser" }>).event))
     },
     terminal: {

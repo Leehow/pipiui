@@ -151,11 +151,19 @@ function createContractMockBackend(): HostBackend {
   const loginOwners = new Map<string, string>()
   // session-1 carries full usage; sessions created by newSession have no usage data yet.
   const fullStats = (sessionId: string) => ({ sessionId, tokens: { input: 100, output: 50, cacheRead: 200, cacheWrite: 10, total: 360 }, cost: 0.0123, contextUsage: { tokens: 9000, contextWindow: 262144, percent: 3.4 }, model: { provider: 'mock', id: 'model-1', name: 'Mock Model' } })
-  const agent: any = { agentId: 'agent-1', runId: 'run-1', name: 'builder', role: 'general-purpose', title: 'Mock build', task: 'Mock task', state: 'running', depth: 1, createdAt: 1, cost: 0, turns: 1, outputCount: 0 }
+  const agent: any = { agentId: 'agent-1', runId: 'run-1', sessionId: 'session-1', name: 'builder', role: 'general-purpose', title: 'Mock build', task: 'Mock task', state: 'running', depth: 1, createdAt: 1, cost: 0, turns: 1, outputCount: 0 }
   const agentLogs: any[] = []
-  let worktree: any = { agentId: agent.agentId, branch: 'pipiui/mock', path: '/tmp/pipiui-mock', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' }
+  let worktree: any = { agentId: agent.agentId, sessionId: agent.sessionId, runId: agent.runId, branch: 'pipiui/mock', path: '/tmp/pipiui-mock', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' }
   const terminals = new Map<string, { cwd: string; input: string }>()
   const requireSession = (id: string) => { if (!history.has(id)) throw new Error(`unknown session ${id}`) }
+  // Exact control contract: every agent/worktree control call must match the
+  // exact {sessionId, agentId, runId} or the host rejects it. There is no
+  // agentId-only resolution — that was the cross-session misrouting this
+  // contract removed.
+  const resolveEpisode = (params: readonly unknown[]): void => {
+    const [sessionId, agentId, runId] = params as [string, string, string]
+    if (sessionId !== agent.sessionId || agentId !== agent.agentId || runId !== agent.runId) throw new Error(`unknown episode ${sessionId}/${agentId}/${runId}`)
+  }
 
   return {
     subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
@@ -288,6 +296,10 @@ function createContractMockBackend(): HostBackend {
           : state.model.provider === 'deepseek'
             ? { provider: 'deepseek', accountLabel: '账户余额', balance: { amount: 88, currency: 'CNY' }, windows: [] }
             : null
+        case 'listAgentDefinitions': return [
+          { name: 'explore', description: 'Research agent', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
+          { name: 'secretary', description: 'Closeout secretary', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'secretary', available: true, availability: 'available' },
+        ]
         case 'listAgents': return [agent]
         case 'getAgentLogs': {
           const [agentId, sessionId, runId] = params as [string, string, string]
@@ -295,12 +307,12 @@ function createContractMockBackend(): HostBackend {
             .filter(log => log.agentId === agentId && log.sessionId === sessionId && log.runId === runId)
             .map(({ type: _type, sessionId: _sessionId, agentId: _agentId, runId: _runId, ...entry }) => entry)
         }
-        case 'abortAgent': agent.state = 'aborted'; emit('agents', { type: 'agent', agent: { ...agent } }); return
-        case 'resolveAgent': agent.state = 'ok'; emit('agents', { type: 'agent', agent: { ...agent } }); return
-        case 'checkAgent': return agent
-        case 'getWorktreeStatus': return worktree
-        case 'mergeWorktree': worktree = { ...worktree, lifecycle: 'merged', merge: 'merged', discard: 'unavailable' }; emit('agents', { type: 'worktree', status: worktree }); return worktree
-        case 'discardWorktree': worktree = { ...worktree, lifecycle: 'discarded', merge: 'unavailable', discard: 'discarded' }; emit('agents', { type: 'worktree', status: worktree }); return worktree
+        case 'abortAgent': resolveEpisode(params); agent.state = 'aborted'; emit('agents', { type: 'agent', agent: { ...agent } }); return
+        case 'resolveAgent': resolveEpisode(params); agent.state = 'ok'; emit('agents', { type: 'agent', agent: { ...agent } }); return
+        case 'checkAgent': resolveEpisode(params); return agent
+        case 'getWorktreeStatus': resolveEpisode(params); return worktree
+        case 'mergeWorktree': resolveEpisode(params); worktree = { ...worktree, lifecycle: 'merged', merge: 'merged', discard: 'unavailable' }; emit('agents', { type: 'worktree', status: worktree }); return worktree
+        case 'discardWorktree': resolveEpisode(params); worktree = { ...worktree, lifecycle: 'discarded', merge: 'unavailable', discard: 'discarded' }; emit('agents', { type: 'worktree', status: worktree }); return worktree
         case 'terminalOpen': {
           const options = (params[0] ?? {}) as { cwd?: string }; const id = `terminal-${++sequence}`; const cwd = options.cwd ?? project.path
           terminals.set(id, { cwd, input: '' }); return { id, title: '终端', cwd, initialOutput: `pipiui_e mock terminal\r\n${cwd}\r\n$ ` }
@@ -372,14 +384,26 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       expect(await host.setSidebarSessionPreferences?.({ pinnedSessionIds: ['session-a', 'session-b'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
       expect(await host.getSidebarSessionPreferences?.()).toEqual({ pinnedSessionIds: ['session-a'], archivedSessionIds: ['session-b'], orderedSessionIds: ['session-b', 'session-a'], sessionOrderVersion: 2 })
       expect(await host.listAgents()).toEqual([expect.objectContaining({ agentId: 'agent-1', depth: 1, title: 'Mock build', role: 'general-purpose', createdAt: 1 })])
-      expect((await host.checkAgent('agent-1')).state).toBe('running')
-      expect(await host.getWorktreeStatus('agent-1')).toMatchObject({ lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' })
-      expect(await host.mergeWorktree('agent-1')).toMatchObject({ lifecycle: 'merged', merge: 'merged' })
-      await host.abortAgent('agent-1')
-      expect((await host.checkAgent('agent-1')).state).toBe('aborted')
-      await host.resolveAgent('agent-1')
-      expect((await host.checkAgent('agent-1')).state).toBe('ok')
-      expect(await host.discardWorktree('agent-1')).toMatchObject({ lifecycle: 'discarded', discard: 'discarded' })
+      const catalog = await host.listAgentDefinitions?.()
+      expect(catalog).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: 'explore', description: 'Research agent' }),
+        expect.objectContaining({ name: 'secretary', canonicalRole: 'secretary' }),
+      ]))
+      expect(catalog?.every(agent => typeof agent.name === 'string' && typeof agent.description === 'string')).toBe(true)
+      expect((await host.checkAgent('session-1', 'agent-1', 'run-1')).state).toBe('running')
+      expect(await host.getWorktreeStatus('session-1', 'agent-1', 'run-1')).toMatchObject({ lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' })
+      expect(await host.mergeWorktree('session-1', 'agent-1', 'run-1')).toMatchObject({ lifecycle: 'merged', merge: 'merged' })
+      await host.abortAgent('session-1', 'agent-1', 'run-1')
+      expect((await host.checkAgent('session-1', 'agent-1', 'run-1')).state).toBe('aborted')
+      await host.resolveAgent('session-1', 'agent-1', 'run-1')
+      expect((await host.checkAgent('session-1', 'agent-1', 'run-1')).state).toBe('ok')
+      expect(await host.discardWorktree('session-1', 'agent-1', 'run-1')).toMatchObject({ lifecycle: 'discarded', discard: 'discarded' })
+      // Exact episode identity: another session's same-slug worker and a stale run
+      // are both rejected instead of routing to the globally newest row.
+      await expect(host.checkAgent('session-2', 'agent-1', 'run-1')).rejects.toThrow(/unknown episode session-2\/agent-1\/run-1/)
+      await expect(host.abortAgent('session-1', 'agent-1', 'run-stale')).rejects.toThrow(/unknown episode session-1\/agent-1\/run-stale/)
+      await expect(host.resolveAgent('session-1', 'agent-1', 'run-stale')).rejects.toThrow(/unknown episode/)
+      await expect(host.mergeWorktree('session-2', 'agent-1', 'run-1')).rejects.toThrow(/unknown episode/)
       await host.deleteSession(session.id)
       expect((await host.listSessions(project.id)).map(item => item.id)).not.toContain(session.id)
     })
@@ -452,7 +476,7 @@ function contract(name: string, factory: Factory, expectedCapabilities: Record<s
       ]
       await host.queueFollowUp(session.id, 'later')
       await host.sendPrompt(session.id, 'hello')
-      await host.abortAgent('agent-1')
+      await host.abortAgent('session-1', 'agent-1', 'run-1')
       await new Promise(resolve => setTimeout(resolve, 10))
       off.forEach(stop => stop())
       expect(stream.map(event => event.type)).toEqual(expect.arrayContaining(['status', 'thinking', 'text', 'tool_call', 'tool_result']))
@@ -558,6 +582,38 @@ async function wsFactory(): Promise<{ host: PipiHostAPI; close(): Promise<void> 
 
 contract('IPC transport', ipcFactory)
 contract('WebSocket transport', wsFactory, { computerUse: false, revealInFinder: false, terminal: true, browser: false })
+
+describe('agent control call-shape', () => {
+  it('always sends the exact composite wire form {sessionId, agentId, runId}', async () => {
+    const requests: { method: string; params: unknown[] }[] = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request: any) => {
+        requests.push({ method: request.method, params: request.params })
+        return { protocolVersion: request.protocolVersion, id: request.id, type: 'response', ok: true, result: null }
+      },
+      on: () => {},
+      removeListener: () => {}
+    }
+    const host = createIpcHost(ipc)
+    // Composite shape (exact episode identity): {sessionId, agentId, runId}. There
+    // is deliberately no agentId-only wire form: a shorter call would resolve to an
+    // undefined episode at runtime — the misbinding this contract removes.
+    await host.abortAgent('session-1', 'agent-1', 'run-1')
+    await host.resolveAgent('session-1', 'agent-1', 'run-1')
+    await host.checkAgent('session-1', 'agent-1', 'run-1')
+    await host.getWorktreeStatus('session-1', 'agent-1', 'run-1')
+    await host.mergeWorktree('session-1', 'agent-1', 'run-1')
+    await host.discardWorktree('session-1', 'agent-1', 'run-1')
+    expect(requests.map(({ method, params }) => [method, params])).toEqual([
+      ['abortAgent', ['session-1', 'agent-1', 'run-1']],
+      ['resolveAgent', ['session-1', 'agent-1', 'run-1']],
+      ['checkAgent', ['session-1', 'agent-1', 'run-1']],
+      ['getWorktreeStatus', ['session-1', 'agent-1', 'run-1']],
+      ['mergeWorktree', ['session-1', 'agent-1', 'run-1']],
+      ['discardWorktree', ['session-1', 'agent-1', 'run-1']]
+    ])
+  })
+})
 
 class MemorySocket implements WebSocketLike {
   readyState = 1
