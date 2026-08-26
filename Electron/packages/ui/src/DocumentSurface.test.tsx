@@ -1,18 +1,31 @@
 // @vitest-environment jsdom
+import {
+  resetDefaultFileViewerAssetBaseUrl,
+  resolveFileViewerPdfAssetUrls,
+  setDefaultFileViewerAssetBaseUrl,
+} from '@file-viewer/core'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { DocumentRendererProps } from '@pipiui/extension-api'
+import OfficeRenderer from '../../pipiui-office-extension/app/src/office-renderer'
 import { DocumentPanel } from './DocumentPanel'
-import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
-import { BUILTIN_OFFICE_COMPAT_ID, BUILTIN_OFFICE_COMPAT_PRIORITY, ensureBuiltinOfficeCompat } from './builtin-office-compat'
-import { disposeDocumentRenderers, listDocumentRenderers, registerDocumentRenderer } from './ui-registries'
+import { corePdfAssetBaseUrl } from './DocumentSurface'
+import { disposeDocumentRenderers, registerDocumentRenderer } from './ui-registries'
 
+vi.mock('@file-viewer/preset-office', () => ({ default: { id: 'office' } }))
 vi.mock('@file-viewer/react', async () => {
   const React = await import('react')
   type ViewerStateSink = (state: { error?: unknown }) => void
   const sinksByName = new Map<string, Set<ViewerStateSink>>()
-  const MockViewer = ({ buffer, name, type, className, onStateChange }: { buffer: ArrayBuffer; name: string; type: string; className?: string; onStateChange?: ViewerStateSink }) => {
+  const MockViewer = ({ buffer, name, type, className, onStateChange, options }: {
+    buffer: ArrayBuffer
+    name: string
+    type: string
+    className?: string
+    onStateChange?: ViewerStateSink
+    options?: { pdf?: { assetBaseUrl?: string; workerUrl?: string } }
+  }) => {
     React.useEffect(() => {
       if (!onStateChange) return
       let sinks = sinksByName.get(name)
@@ -23,7 +36,9 @@ vi.mock('@file-viewer/react', async () => {
       sinks.add(onStateChange)
       return () => { sinks!.delete(onStateChange) }
     }, [name, onStateChange])
-    return <div className={className} data-testid="office-viewer" data-name={name} data-type={type} data-size={buffer.byteLength} />
+    const assetBase = options?.pdf?.assetBaseUrl ?? ''
+    const workerUrl = options?.pdf?.workerUrl ?? ''
+    return <div className={className} data-testid="office-viewer" data-name={name} data-type={type} data-size={buffer.byteLength} data-pdf-asset-base={assetBase} data-pdf-worker={workerUrl} />
   }
   return {
     default: MockViewer,
@@ -35,7 +50,7 @@ vi.mock('@file-viewer/react', async () => {
     },
   }
 })
-vi.mock('@file-viewer/preset-office', () => ({ default: { id: 'office' } }))
+vi.mock('@file-viewer/renderer-pdf', () => ({ pdfRenderer: { id: 'pdf' } }))
 
 const TEST_EXT = 'document-surface-test'
 let lastProps: DocumentRendererProps | null = null
@@ -68,6 +83,8 @@ afterEach(() => {
   cleanup()
   disposeDocumentRenderers(TEST_EXT)
   lastProps = null
+  resetDefaultFileViewerAssetBaseUrl()
+  document.getElementById('pipiui-office-extension-style')?.remove()
 })
 
 describe('DocumentSurface registry renderers', () => {
@@ -92,7 +109,7 @@ describe('DocumentSurface registry renderers', () => {
     expect(screen.queryByTestId('office-viewer')).toBeNull()
   })
 
-  it('orders competing renderers by priority above the builtin office compat', async () => {
+  it('orders competing renderers by priority descending', async () => {
     const Low = probeRenderer('low')
     const High = probeRenderer('high')
     registerDocumentRenderer(TEST_EXT, { id: 'office-low', kinds: ['word'], priority: 1, render: props => <Low {...props} /> })
@@ -327,61 +344,32 @@ describe('DocumentSurface registry renderers', () => {
   })
 })
 
-describe('builtin office compatibility registration (T3 temporary; T4 delete)', () => {
-  it('registers the office compat renderer through the same registry at lowest priority', () => {
-    const entry = listDocumentRenderers().find(item => item.contribution.id === BUILTIN_OFFICE_COMPAT_ID)
-    expect(entry?.extId).toBe(BUILTIN_EXTENSION_ID)
-    expect(entry?.contribution.priority).toBe(BUILTIN_OFFICE_COMPAT_PRIORITY)
-    expect(entry?.contribution.priority).toBe(-Number.MAX_VALUE)
-    expect([...(entry?.contribution.kinds ?? [])]).toEqual(['word', 'spreadsheet', 'presentation'])
-  })
-
-  it('ensureBuiltinOfficeCompat is idempotent and keeps a single lowest-priority entry', () => {
-    expect(listDocumentRenderers().filter(item => item.contribution.id === BUILTIN_OFFICE_COMPAT_ID)).toHaveLength(1)
-    expect(() => {
-      ensureBuiltinOfficeCompat()
-      ensureBuiltinOfficeCompat()
-    }).not.toThrow()
-    const entries = listDocumentRenderers().filter(item => item.contribution.id === BUILTIN_OFFICE_COMPAT_ID)
-    expect(entries).toHaveLength(1)
-    expect(entries[0]?.contribution.priority).toBe(-Number.MAX_VALUE)
-    expect(entries[0]?.extId).toBe(BUILTIN_EXTENSION_ID)
-  })
-
-  it('lets a lower-than-minus-100 extension renderer beat the office compat', async () => {
-    const Low = probeRenderer('below-compat')
-    registerDocumentRenderer(TEST_EXT, {
-      id: 'office-below-compat',
-      kinds: ['word'],
-      priority: -101,
-      render: props => <Low {...props} />,
-    })
+describe('generic anydoc fallback (host-owned, path-free renderer)', () => {
+  it('converts through the host when a renderer asks for generic fallback and never leaks the path', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], priority: 50, render: props => {
+      const Probe = probeRenderer('word')
+      return <Probe {...props} />
+    } })
     const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]) }))
-    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/form.docx" />)
-    expect(await screen.findByTestId('probe-below-compat')).toBeTruthy()
-    expect(screen.queryByTestId('office-viewer')).toBeNull()
-  })
-
-  it('renders office documents through the registry compat renderer and its error sink', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
-    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
-    const convertDocumentToMarkdown = vi.fn(async () => '# 兼容渲染器回退')
+    const convertDocumentToMarkdown = vi.fn(async () => '# 通用回退')
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
-    const viewer = await screen.findByTestId('office-viewer')
-    expect(viewer.getAttribute('data-name')).toBe('form.docx')
-    expect(viewer.getAttribute('data-type')).toBe('docx')
-    viewerModule.__emitViewerState({ error: new Error('engine failed') })
-    expect(await screen.findByRole('heading', { name: '兼容渲染器回退' })).toBeTruthy()
+    const probe = await screen.findByTestId('probe-word')
+    expect(JSON.stringify(lastProps)).not.toContain('/tmp/form.docx')
+    expect(probe.getAttribute('data-actions')).toBe('openExternally,reload,useGenericFallback')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
+    expect(await screen.findByRole('heading', { name: '通用回退' })).toBeTruthy()
     expect(screen.getByTestId('document-fallback')).toBeTruthy()
     expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/form.docx')
+    expect(convertDocumentToMarkdown).toHaveBeenCalledTimes(1)
+    expect(JSON.stringify(lastProps)).not.toContain('/tmp/form.docx')
   })
 
-  it('ignores office viewer errors that belong to another surface', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as {
-      __emitViewerStateFor: (name: string, state: { error?: unknown }) => void
-    }
+  it('isolates generic fallback to the requesting surface', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], priority: 50, render: props => {
+      const Probe = probeRenderer(props.document.name)
+      return <Probe {...props} />
+    } })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const readA = vi.fn(async (path: string) => ({ id: path, name: 'alpha.docx', path, kind: 'word' as const, size: bytes.byteLength, bytes }))
     const readB = vi.fn(async (path: string) => ({ id: path, name: 'beta.docx', path, kind: 'word' as const, size: bytes.byteLength, bytes }))
@@ -391,12 +379,88 @@ describe('builtin office compatibility registration (T3 temporary; T4 delete)', 
       <DocumentPanel host={{ ...documentHost(readA), convertDocumentToMarkdown: convertA } as unknown as PipiHostAPI} documentPath="/tmp/alpha.docx" />
       <DocumentPanel host={{ ...documentHost(readB), convertDocumentToMarkdown: convertB } as unknown as PipiHostAPI} documentPath="/tmp/beta.docx" />
     </>)
-    await waitFor(() => expect(screen.getAllByTestId('office-viewer')).toHaveLength(2))
-    viewerModule.__emitViewerStateFor('alpha.docx', { error: new Error('alpha engine failed') })
+    await waitFor(() => expect(screen.getAllByTestId(/probe-/)).toHaveLength(2))
+    fireEvent.click(screen.getAllByRole('button', { name: 'probe fallback' })[0]!)
     expect(await screen.findByRole('heading', { name: 'alpha fallback' })).toBeTruthy()
     expect(convertA).toHaveBeenCalledTimes(1)
     expect(convertB).not.toHaveBeenCalled()
     expect(screen.queryByRole('heading', { name: 'beta fallback' })).toBeNull()
-    expect(screen.getByTestId('office-viewer').getAttribute('data-name')).toBe('beta.docx')
+    expect(screen.getByTestId('probe-beta.docx')).toBeTruthy()
+  })
+
+  it('does not apply a stale anydoc conversion after the document path switches', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], priority: 50, render: props => {
+      const Probe = probeRenderer(props.document.name)
+      return <Probe {...props} />
+    } })
+    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
+    let releaseOld: ((value: string) => void) | undefined
+    const convertOld = vi.fn(() => new Promise<string>(resolve => { releaseOld = resolve }))
+    const convertNew = vi.fn(async () => '# new fallback')
+    const readOld = vi.fn(async (path: string) => ({ id: path, name: 'old.docx', path, kind: 'word' as const, size: bytes.byteLength, bytes }))
+    const readNew = vi.fn(async (path: string) => ({ id: path, name: 'new.docx', path, kind: 'word' as const, size: bytes.byteLength, bytes }))
+    const { rerender } = render(
+      <DocumentPanel host={{ ...documentHost(readOld), convertDocumentToMarkdown: convertOld } as unknown as PipiHostAPI} documentPath="/tmp/old.docx" />,
+    )
+    await screen.findByTestId('probe-old.docx')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
+    await waitFor(() => expect(convertOld).toHaveBeenCalledTimes(1))
+    rerender(
+      <DocumentPanel host={{ ...documentHost(readNew), convertDocumentToMarkdown: convertNew } as unknown as PipiHostAPI} documentPath="/tmp/new.docx" />,
+    )
+    await screen.findByTestId('probe-new.docx')
+    releaseOld?.('# stale old markdown')
+    await waitFor(() => expect(screen.getByTestId('probe-new.docx')).toBeTruthy())
+    expect(screen.queryByRole('heading', { name: 'stale old markdown' })).toBeNull()
+    expect(screen.queryByTestId('document-fallback')).toBeNull()
+    expect(convertNew).not.toHaveBeenCalled()
+  })
+})
+
+describe('core PDF asset base vs Office global lease', () => {
+  it('keeps PDF instance assetBaseUrl stable while an Office renderer holds the global lease', async () => {
+    const readPdf = vi.fn(async (path: string) => ({
+      id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]),
+    }))
+    const officeProps: DocumentRendererProps = {
+      document: {
+        documentId: 'office-1',
+        name: 'form.docx',
+        extension: '.docx',
+        documentKind: 'word',
+        size: 4,
+        revision: 1,
+      },
+      bytes: new Uint8Array([1, 2, 3, 4]),
+      actions: {
+        reload: async () => undefined,
+        openExternally: async () => undefined,
+        useGenericFallback: async () => undefined,
+      },
+    }
+    const tree = <>
+      <DocumentPanel host={documentHost(readPdf)} documentPath="/work/report.pdf" />
+      <OfficeRenderer {...officeProps} />
+    </>
+    const view = render(tree)
+    await screen.findByTestId('office-renderer')
+    const pdfNode = await waitFor(() => {
+      const node = document.querySelector('[data-type="pdf"]')
+      if (!(node instanceof HTMLElement)) throw new Error('pdf viewer missing')
+      return node
+    })
+    const expected = corePdfAssetBaseUrl()
+    expect(pdfNode.getAttribute('data-pdf-asset-base')).toBe(expected)
+    expect(pdfNode.getAttribute('data-pdf-worker')).toContain('file-viewer')
+    expect(expected).toMatch(/file-viewer\/?$/)
+    setDefaultFileViewerAssetBaseUrl('https://office-lease.test/file-viewer/')
+    view.rerender(tree)
+    const pdfAfter = document.querySelector('[data-type="pdf"]')
+    expect(pdfAfter).toBeTruthy()
+    expect(pdfAfter!.getAttribute('data-pdf-asset-base')).toBe(expected)
+    expect(pdfAfter!.getAttribute('data-pdf-asset-base')).not.toContain('office-lease.test')
+    expect(pdfAfter!.getAttribute('data-pdf-worker')).toContain('vendor/pdf')
+    expect(pdfAfter!.getAttribute('data-pdf-worker')).not.toContain('office-lease.test')
+    expect(resolveFileViewerPdfAssetUrls().workerUrl).toContain('office-lease.test')
   })
 })

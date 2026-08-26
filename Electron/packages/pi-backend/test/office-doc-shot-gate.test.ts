@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
-  OFFICECLI_MCP_TOOL,
+  DIRECT_OFFICECLI_TOOL,
   OFFICE_DOCUMENT_EXTENSIONS,
   OFFICE_DOC_SHOT_GATE_FAILED_MESSAGE,
   OFFICE_DOC_SHOT_GATE_FOLLOW_UP_LIMIT,
@@ -19,7 +19,7 @@ import {
 } from "../../../resources/runtime/extensions/office-doc-shot-gate.ts";
 import officeDocShotGateExtension from "../../../resources/runtime/extensions/pipiui-office-doc-shot-gate.ts";
 
-const TOOL = OFFICECLI_MCP_TOOL;
+const TOOL = DIRECT_OFFICECLI_TOOL;
 const CWD = "/workspace/docs";
 
 function existing(files: string[]) {
@@ -254,9 +254,9 @@ describe("OfficeDocShotLedger", () => {
 });
 
 describe("office gate baseline freeze (office-extension-refactor-v1 T1)", () => {
-  it("binds the gate to the officecli MCP tool name family and leaves other tools ungated", () => {
-    expect(OFFICECLI_MCP_TOOL).toBe("mcp_officecli_officecli");
-    expect(isOfficecliToolName("mcp_officecli_officecli")).toBe(true);
+  it("binds the gate to the officecli tool name family and leaves other tools ungated", () => {
+    expect(DIRECT_OFFICECLI_TOOL).toBe("pipiui_officecli");
+    expect(isOfficecliToolName(DIRECT_OFFICECLI_TOOL)).toBe(true);
     expect(isOfficecliToolName("officecli")).toBe(true);
     expect(isOfficecliToolName("OfficeCLI")).toBe(true);
     expect(isOfficecliToolName("mcp_other_officecli")).toBe(true);
@@ -265,6 +265,12 @@ describe("office gate baseline freeze (office-extension-refactor-v1 T1)", () => 
     expect(isOfficecliToolName("mcp_xofficecli")).toBe(false);
 
     const gate = ledger();
+    expect(gate.beginCall({
+      toolCallId: "w8",
+      toolName: DIRECT_OFFICECLI_TOOL,
+      input: { command: set() },
+      cwd: CWD,
+    }).action).toBe("block");
     expect(gate.beginCall({
       toolCallId: "w9",
       toolName: "mcp_something_else",

@@ -1,9 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { documentKindForName, type DocumentContent, type DocumentKind, type PipiHostAPI } from '@pipi/host-api'
 import type { DocumentRendererActions, DocumentRendererDescriptor } from '@pipiui/extension-api'
-import { DocumentSurface, isOfficeKind } from './DocumentSurface'
-// T4 删除点：subscribeOfficeViewerErrors 是临时 built-in Office 兼容渲染器的内部接线（见 builtin-office-compat.tsx 头注记）。
-import { subscribeOfficeViewerErrors } from './builtin-office-compat'
+import { DocumentSurface } from './DocumentSurface'
 import './document-panel.css'
 
 function errorMessage(error: unknown): string {
@@ -75,7 +73,12 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
   const onDismissError = useCallback(() => {
     setResolved(previous => previous ? { ...previous, error: null } : previous)
   }, [])
-  const onDismissViewerError = useCallback(() => setViewerError(null), [])
+  const onDismissViewerError = useCallback(() => {
+    setViewerError(null)
+    setGenericFallback(false)
+    setFallbackMarkdown(null)
+    setFallbackPending(false)
+  }, [])
 
   // Restricted, host-mediated renderer actions (contract v1). No paths, no host API.
   const actions = useMemo<DocumentRendererActions>(() => ({
@@ -156,19 +159,11 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
     })
   }, [host, documentPath, load])
 
-  // Office FileViewer errors arrive through the builtin compat module's sink.
-  // T4 删除点：随 builtin-office-compat 一起删除。
-  useEffect(() => subscribeOfficeViewerErrors(event => {
-    if (!documentId || event.documentId !== documentId) return
-    onViewerError(event.error)
-  }), [documentId, onViewerError])
-
-  // When the Office viewer fails (missing runtime asset, engine error, …), keep the
-  // user reading the document: convert it locally with the bundled anydoc engine
-  // and show markdown instead of a bare error. PDF/markdown/plain stay unchanged.
-  // T4 删除点：office 回退策略随 Office 扩展接管后删除（anydoc 引擎本身留在宿主）。
+  // Generic fallback is requested by a path-free renderer action. Core owns the
+  // only anydoc engine and the document path; the renderer never sees either.
   useEffect(() => {
-    if (!viewerError || !document || !isOfficeKind(document) || !documentPath) return
+    if (!genericFallback || !documentPath || !document) return
+    if (document.kind === 'markdown' || document.kind === 'plain') return
     if (!host.convertDocumentToMarkdown || fallbackAttemptedRef.current) return
     fallbackAttemptedRef.current = true
     let cancelled = false
@@ -178,7 +173,7 @@ export const DocumentPanel = memo(function DocumentPanel({ host, documentPath }:
       .catch(() => { if (!cancelled) setFallbackMarkdown('') })
       .finally(() => { if (!cancelled) setFallbackPending(false) })
     return () => { cancelled = true }
-  }, [viewerError, document, host, documentPath])
+  }, [genericFallback, document, host, documentPath])
 
   return <section className="document-panel" aria-label="文档面板">
     {!documentPath ? <div className="document-empty" data-testid="document-empty">

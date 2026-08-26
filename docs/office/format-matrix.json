@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "frozenForPlan": "office-extension-refactor-v1/T1",
+  "frozenForPlan": "office-extension-refactor-v1/T1 (historical freeze; T8 direct cutover shipped 2026-08)",
   "frozenAt": "2026-08-25",
-  "purpose": "Machine-readable Office format contract frozen in T1. T4/T6 use this as the compatibility corpus input. Any change to DOCUMENT_KIND_BY_EXTENSION (packages/host-api) or OFFICE_DOCUMENT_EXTENSIONS (resources/runtime/extensions/office-doc-shot-gate.ts) must be reflected here or office-format-baseline.test.ts fails.",
+  "purpose": "Machine-readable Office format contract. Tier/preview/edit/fallback/macro promises are unchanged and still enforced by office-format-baseline.test.ts. Since the T8 direct cutover the guaranteed edit transport is the direct pipiui_officecli tool (no MCP). Any change to DOCUMENT_KIND_BY_EXTENSION (packages/host-api) or OFFICE_DOCUMENT_EXTENSIONS (resources/runtime/extensions/office-doc-shot-gate.ts) must be reflected here or office-format-baseline.test.ts fails.",
   "uniformPolicies": {
     "macroExecutionPolicy": "PipiUI never executes VBA/macro code in any Office file. Macro-enabled and legacy containers are previewed and preserved only.",
     "readLimits": "text kinds 2MB, binary kinds 50MB, absolute path + regular file + extension allowlist required (readLocalDocument).",

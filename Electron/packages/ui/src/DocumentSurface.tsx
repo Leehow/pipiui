@@ -1,30 +1,71 @@
 import { Component, useMemo, type ReactNode } from 'react'
+import {
+  DEFAULT_FILE_VIEWER_PDF_CMAP_PATH,
+  DEFAULT_FILE_VIEWER_PDF_STANDARD_FONT_PATH,
+  DEFAULT_FILE_VIEWER_PDF_WASM_PATH,
+  DEFAULT_FILE_VIEWER_PDF_WORKER_PATH,
+} from '@file-viewer/core'
 import FileViewer, { type ViewerState } from '@file-viewer/react'
-import officePreset from '@file-viewer/preset-office'
-import type { BinaryDocumentContent, DocumentContent, DocumentKind } from '@pipi/host-api'
+import { pdfRenderer } from '@file-viewer/renderer-pdf'
+import type { BinaryDocumentContent, DocumentContent } from '@pipi/host-api'
 import type { DocumentRendererActions, DocumentRendererDescriptor, DocumentRendererProps } from '@pipiui/extension-api'
 import { TranscriptMarkdown } from './AssistantTranscriptContent'
 import { matchDocumentRenderers, useDocumentRenderers } from './ui-registries'
-// T4 删除点：下一行 side-effect import 注册临时 built-in Office 兼容渲染器（见该文件头注记）。
-import './builtin-office-compat'
 
-// T4 删除点：OFFICE_DOCUMENT_KINDS 是 core 内最后的 Office 格式策略。T4 由 Office
-// 扩展接管 word/spreadsheet/presentation 后，本常量与 isOfficeKind、以及本文件里
-// office 回退分支一并删除；pdf/markdown/plain 的 builtin 分支保留。
-export const OFFICE_DOCUMENT_KINDS: readonly DocumentKind[] = ['word', 'spreadsheet', 'presentation']
+/** Matches `fileViewerAssetOptions.copyAssets.baseDir` in vite.browser.config.ts. */
+const CORE_PDF_ASSET_DIR = 'file-viewer/'
 
-/** Office kinds the bundled anydoc engine can convert to readable markdown (PDF is out of scope). */
-export function isOfficeKind(document: DocumentContent): boolean {
-  return OFFICE_DOCUMENT_KINDS.includes(document.kind)
+/**
+ * Instance-level PDF asset base. Do not call `resolveFileViewerRuntimeAssetBaseUrl`
+ * here: that helper returns the process default when Office holds a global lease
+ * (`@file-viewer/core` assets.js). `document.baseURI` is the same document fallback
+ * the helper uses, combined with the Vite copyAssets directory — never a worktree path.
+ */
+export function corePdfAssetBaseUrl(
+  documentRef: { baseURI?: string; URL?: string } | null | undefined = typeof document === 'undefined' ? undefined : document,
+): string | undefined {
+  if (!documentRef) return undefined
+  try {
+    const documentBaseUrl = documentRef.baseURI || documentRef.URL || 'file:///'
+    return new URL(CORE_PDF_ASSET_DIR, documentBaseUrl).href
+  } catch {
+    return undefined
+  }
 }
 
-/** Builtin binary viewer config (pdf now; office no-match fallback until T4). */
-const BUILTIN_VIEWER_OPTIONS = {
-  preset: officePreset,
+/** Builtin PDF-only viewer config. Office preset/format policy lives in office-extension. */
+const PDF_VIEWER_OPTIONS = {
+  preset: {
+    id: 'file-viewer-preset-pdf',
+    label: 'PDF',
+    renderers: [pdfRenderer],
+  },
   rendererMode: 'replace' as const,
   locale: 'zh-CN' as const,
   ui: { density: 'compact' as const },
   toolbar: { download: false, print: false, exportHtml: false, theme: false, position: 'top' as const },
+}
+
+function pdfAssetUrl(base: string, path: string): string {
+  return new URL(path, base.endsWith('/') ? base : `${base}/`).href
+}
+
+function pdfViewerOptions() {
+  const assetBaseUrl = corePdfAssetBaseUrl()
+  if (!assetBaseUrl) return PDF_VIEWER_OPTIONS
+  // FileViewer still prefers the process default when workerUrl/cMapUrl are omitted,
+  // so instance isolation requires the explicit PDF asset URLs, not only assetBaseUrl.
+  return {
+    ...PDF_VIEWER_OPTIONS,
+    pdf: {
+      assetBaseUrl,
+      workerUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_WORKER_PATH),
+      cMapUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_CMAP_PATH),
+      wasmUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_WASM_PATH),
+      standardFontDataUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_STANDARD_FONT_PATH),
+      cjkFontFallbackPath: pdfAssetUrl(assetBaseUrl, 'vendor/pdf/fonts/'),
+    },
+  }
 }
 
 function isBinaryDocument(document: DocumentContent): document is BinaryDocumentContent {
@@ -53,11 +94,11 @@ export type DocumentSurfaceProps = {
   error: string | null
   onRetry: () => void
   onDismissError: () => void
-  /** Office viewer error message (host-owned state); suppresses the viewer until dismissed. */
+  /** Builtin PDF viewer error (host-owned). Office errors stay inside the extension. */
   viewerError: string | null
   onViewerError: (error: unknown) => void
   onDismissViewerError: () => void
-  /** Host-converted anydoc markdown for the office fallback view. */
+  /** Host-converted anydoc markdown after a renderer asked for generic fallback. */
   fallbackMarkdown: string | null
   fallbackPending: boolean
   /** A registry renderer asked the host shell for the generic builtin view. */
@@ -85,7 +126,7 @@ function RegisteredRenderer({
 
 /**
  * Reusable document rendering surface: registry renderer first (deterministic
- * precedence), builtin views (markdown / plain / pdf / office no-match) after.
+ * precedence), builtin views (markdown / plain / pdf) after.
  * Host-owned concerns (path, read/watch/reload, size, anydoc) stay upstream.
  */
 export function DocumentSurface({
@@ -94,7 +135,7 @@ export function DocumentSurface({
 }: DocumentSurfaceProps) {
   useDocumentRenderers() // re-render when renderer registrations change
   const builtinBuffer = useMemo(() => {
-    if (!document || !isBinaryDocument(document)) return null
+    if (!document || !isBinaryDocument(document) || document.kind !== 'pdf') return null
     return binaryBuffer(document)
   }, [document])
   const matched = document && descriptor
@@ -109,19 +150,21 @@ export function DocumentSurface({
     if (document.kind === 'plain') {
       return <pre className="document-plain-text" aria-label={`文档内容 ${document.name}`}>{document.content}</pre>
     }
-    if (!isBinaryDocument(document) || !builtinBuffer) return null
-    return <div className="document-office-preview" aria-label={`文档内容 ${document.name}`}>
-      <FileViewer
-        className="document-file-viewer"
-        key={`${document.path}:${document.updatedAt ?? document.size ?? 0}`}
-        buffer={builtinBuffer}
-        name={document.name}
-        type={document.name.split('.').at(-1)}
-        size={document.size}
-        options={BUILTIN_VIEWER_OPTIONS}
-        onStateChange={(state: ViewerState) => { if (state.error) onViewerError(state.error) }}
-      />
-    </div>
+    if (document.kind === 'pdf' && isBinaryDocument(document) && builtinBuffer) {
+      return <div className="document-pdf-preview" aria-label={`文档内容 ${document.name}`}>
+        <FileViewer
+          className="document-file-viewer"
+          key={`${document.path}:${document.updatedAt ?? document.size ?? 0}`}
+          buffer={builtinBuffer}
+          name={document.name}
+          type="pdf"
+          size={document.size}
+          options={pdfViewerOptions()}
+          onStateChange={(state: ViewerState) => { if (state.error) onViewerError(state.error) }}
+        />
+      </div>
+    }
+    return <div className="document-empty" role="status">没有可用的预览器</div>
   }
 
   const viewerErrorAlert = viewerError !== null
@@ -132,21 +175,26 @@ export function DocumentSurface({
     ? { document: descriptor, bytes: isBinaryDocument(document) ? document.bytes : undefined, text: textOf(document), actions }
     : null
 
+  const genericFallbackView = (): ReactNode => {
+    if (!document) return null
+    if (fallbackMarkdown) {
+      return <div className="document-fallback" data-testid="document-fallback">
+        <div className="document-fallback-bar" role="status">原始版式预览失败，已显示本地转换的文本。<span className="document-error-actions"><button onClick={onRetry}>重试</button><button aria-label="关闭文档错误" onClick={onDismissViewerError}>×</button></span></div>
+        <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={fallbackMarkdown} /></article>
+      </div>
+    }
+    if (fallbackPending) return <div className="document-loading" role="status">正在转换文档为可读文本…</div>
+    return <div className="document-error" role="alert"><span>无法将文档转换为可读文本</span><span className="document-error-actions"><button onClick={onRetry}>重试</button><button aria-label="关闭文档错误" onClick={onDismissViewerError}>×</button></span></div>
+  }
+
   return <div className="document-reader">
     {loading ? <div className="document-loading" role="status">正在读取文档…</div>
       : error ? <div className="document-error" role="alert"><span>{error}</span><span className="document-error-actions"><button onClick={onRetry}>重试</button><button aria-label="关闭文档错误" onClick={onDismissError}>×</button></span></div>
-        // T4 删除点：office viewer 失败 → anydoc 回退分支（isOfficeKind + fallbackMarkdown）。
-        : document && viewerError && isOfficeKind(document)
-          ? (fallbackMarkdown
-            ? <div className="document-fallback" data-testid="document-fallback">
-              <div className="document-fallback-bar" role="status">原始版式预览失败，已显示本地转换的文本。<span className="document-error-actions"><button onClick={onRetry}>重试</button><button aria-label="关闭文档错误" onClick={onDismissViewerError}>×</button></span></div>
-              <article className="document-markdown" aria-label={`文档内容 ${document.name}`}><TranscriptMarkdown content={fallbackMarkdown} /></article>
-            </div>
-            : fallbackPending ? <div className="document-loading" role="status">正在转换文档为可读文本…</div>
-              : viewerErrorAlert)
+        : document && genericFallback
+          ? (isBinaryDocument(document) ? genericFallbackView() : builtinView())
           : viewerError
             ? viewerErrorAlert
-            : matched && rendererProps && !genericFallback
+            : matched && rendererProps
               ? <RendererErrorBoundary
                 key={`${matched.extId}:${matched.contribution.id}:${descriptor!.documentId}:${descriptor!.revision}`}
                 fallbackRender={builtinView}

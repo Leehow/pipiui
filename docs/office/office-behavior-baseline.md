@@ -1,8 +1,10 @@
 # Office 行为与格式基线（office-extension-refactor-v1 · T1 冻结）
 
-状态：**冻结基线**（2026-08-25，T1 交付）。本文件与 `docs/office/format-matrix.json` 共同构成 T4/T6
-重构的兼容性判据：重构后的 Office 扩展必须逐条保持本文列出的可观察行为，除非计划任务显式修改承诺。
-本文只描述现状并冻结承诺，**未改动任何 production 代码**。
+状态：**历史基线**（2026-08-25 T1 冻结；2026-08 T8 direct 收口后仅作重构前行为证据保留）。
+本文与 `docs/office/format-matrix.json` 曾作为 T4/T6 重构的兼容性判据；重构已完成，当前架构见
+`docs/office/README.md`（extension-owned 预览 + 直连 `pipiui_officecli`，无 MCP）。
+文中关于 `mcp_officecli_officecli` 等 MCP 工具名的描述是**重构前现状的记录**，不是当前产品行为。
+除本状态说明外，原文证据未改写。
 
 ## 一、三层格式承诺
 

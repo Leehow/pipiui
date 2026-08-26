@@ -4,7 +4,9 @@ import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { DocumentContent, PipiHostAPI } from '@pipi/host-api'
+import type { DocumentRendererProps } from '@pipiui/extension-api'
 import { DocumentPanel } from './DocumentPanel'
+import { disposeDocumentRenderers, registerDocumentRenderer } from './ui-registries'
 
 vi.mock('@file-viewer/react', async () => {
   const React = await import('react')
@@ -26,9 +28,26 @@ vi.mock('@file-viewer/react', async () => {
     __emitViewerState: (state: { error?: unknown }) => { for (const sink of [...sinks]) sink(state) }
   }
 })
-vi.mock('@file-viewer/preset-office', () => ({ default: { id: 'office' } }))
+vi.mock('@file-viewer/renderer-pdf', () => ({ pdfRenderer: { id: 'pdf' } }))
 
-afterEach(cleanup)
+const TEST_EXT = 'document-panel-office-removed'
+
+afterEach(() => {
+  cleanup()
+  disposeDocumentRenderers(TEST_EXT)
+})
+
+function officeProbe(id: string) {
+  return function Probe(props: DocumentRendererProps) {
+    return <div data-testid={`probe-${id}`}
+      data-name={props.document.name}
+      data-kind={props.document.documentKind}
+      data-extension={props.document.extension}
+      data-actions={Object.keys(props.actions ?? {}).sort().join(',')}>
+      <button onClick={() => void props.actions.useGenericFallback()}>probe fallback</button>
+    </div>
+  }
+}
 
 function documentHost(readDocument: NonNullable<PipiHostAPI['readDocument']> = vi.fn(async (path: string) => ({ id: path, name: 'README.md', path, kind: 'markdown' as const, size: 42, content: '# Project README\n\n**Rendered** from the host.' }))): PipiHostAPI {
   return { protocolVersion: 2, readDocument } as unknown as PipiHostAPI
@@ -51,7 +70,7 @@ describe('DocumentPanel', () => {
     expect(text.textContent).toBe('line one\nline two')
   })
 
-  it('routes PDF and Office bytes to the mature file viewer', async () => {
+  it('routes PDF bytes to the builtin file viewer', async () => {
     const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]) }))
     render(<DocumentPanel host={documentHost(readDocument)} documentPath="/work/report.pdf" />)
     const viewer = await screen.findByTestId('office-viewer')
@@ -61,26 +80,18 @@ describe('DocumentPanel', () => {
     expect(viewer.getAttribute('data-size')).toBe('4')
   })
 
-  it('renders a .docx word document in the FileViewer without throwing', async () => {
-    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x05, 0x06])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: '托班幼儿基本情况调查表.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
-    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/托班幼儿基本情况调查表.docx" />)
-    const viewer = await screen.findByTestId('office-viewer')
-    expect(viewer.getAttribute('data-name')).toBe('托班幼儿基本情况调查表.docx')
-    expect(viewer.getAttribute('data-type')).toBe('docx')
-    expect(viewer.getAttribute('data-size')).toBe(String(bytes.byteLength))
-    expect(screen.queryByRole('alert')).toBeNull()
-  })
-
-  it('falls back to locally converted markdown when the office viewer fails', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+  it('starts host anydoc conversion when a renderer asks for generic fallback', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], render: props => {
+      const Probe = officeProbe('word')
+      return <Probe {...props} />
+    } })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
     const convertDocumentToMarkdown = vi.fn(async () => '# 转换后的标题\n\n本地转换的正文内容。')
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
-    await screen.findByTestId('office-viewer')
-    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    await screen.findByTestId('probe-word')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     expect(await screen.findByRole('heading', { name: '转换后的标题' })).toBeTruthy()
     expect(screen.getByTestId('document-fallback')).toBeTruthy()
     expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/form.docx')
@@ -88,24 +99,27 @@ describe('DocumentPanel', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('keeps a closable viewer error when no markdown conversion is available', async () => {
+  it('keeps a closable PDF viewer error and never calls anydoc', async () => {
     const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
-    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'slides.pptx', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
-    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/slides.pptx" />)
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]) }))
+    const convertDocumentToMarkdown = vi.fn(async () => '# should never render')
+    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
+    render(<DocumentPanel host={host} documentPath="/tmp/report.pdf" />)
     await screen.findByTestId('office-viewer')
     viewerModule.__emitViewerState({ error: new Error('wasm load failed') })
     expect((await screen.findByRole('alert')).textContent).toContain('wasm load failed')
+    expect(convertDocumentToMarkdown).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: '关闭文档错误' }))
     await screen.findByTestId('office-viewer')
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('keeps the office search toolbar inside the tools pane instead of the window width', () => {
+  it('keeps the PDF search toolbar inside the tools pane instead of the window width', () => {
     const css = readFileSync(join(import.meta.dirname, 'document-panel.css'), 'utf8')
     expect(css).toMatch(/\.document-file-viewer::part\(toolbar\)\{[^}]*max-width:100%/)
     expect(css).toMatch(/\.document-file-viewer::part\(toolbar\)\{[^}]*flex-wrap:wrap/)
     expect(css).toMatch(/\.document-file-viewer::part\(input\)\{[^}]*max-width:100%/)
+    expect(css).not.toContain('document-office-preview')
   })
 
   it('can fall back to the OS default app and surfaces a closable shell error', async () => {
@@ -174,14 +188,14 @@ describe('DocumentPanel', () => {
     expect((await screen.findByRole('alert')).textContent).toContain('文件已不存在')
   })
 
-  it('does not reload an Office preview when the parent re-renders with the same document', async () => {
+  it('does not reload a PDF preview when the parent re-renders with the same document', async () => {
     const bytes = new Uint8Array([1, 2, 3, 4])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.doc', path, kind: 'word' as const, size: 4, bytes }))
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, bytes }))
     const host = documentHost(readDocument)
     function Harness({ tick }: { tick: number }) {
       return <>
         <span data-testid="parent-tick">{tick}</span>
-        <DocumentPanel host={host} documentPath="/tmp/form.doc" />
+        <DocumentPanel host={host} documentPath="/tmp/report.pdf" />
       </>
     }
     const { rerender } = render(<Harness tick={1} />)
@@ -196,82 +210,70 @@ describe('DocumentPanel', () => {
   })
 })
 
-describe('DocumentPanel office behavior baseline (frozen for office-extension-refactor-v1 T1)', () => {
-  it('routes spreadsheet and legacy presentation binaries to the office viewer', async () => {
+describe('DocumentPanel generic fallback (T1 anydoc contract, T4 host-owned)', () => {
+  it('converts spreadsheet and presentation binaries through host anydoc after useGenericFallback', async () => {
+    registerDocumentRenderer(TEST_EXT, {
+      id: 'office-probe',
+      kinds: ['spreadsheet', 'presentation'],
+      render: props => {
+        const Probe = officeProbe(props.document.documentKind)
+        return <Probe {...props} />
+      },
+    })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const readDocument = vi.fn(async (path: string) =>
-      path.endsWith('.ppt')
-        ? { id: path, name: '旧版幻灯.ppt', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }
+      path.endsWith('.pptx')
+        ? { id: path, name: 'deck.pptx', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }
         : { id: path, name: '台账.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes })
-    const host = documentHost(readDocument)
-    const { rerender } = render(<DocumentPanel host={host} documentPath="/work/台账.xlsx" />)
-    const xlsxViewer = await screen.findByTestId('office-viewer')
-    expect(xlsxViewer.getAttribute('data-name')).toBe('台账.xlsx')
-    expect(xlsxViewer.getAttribute('data-type')).toBe('xlsx')
-    expect(screen.queryByRole('alert')).toBeNull()
-
-    rerender(<DocumentPanel host={host} documentPath="/work/旧版幻灯.ppt" />)
-    const pptViewer = await screen.findByTestId('office-viewer')
-    expect(pptViewer.getAttribute('data-name')).toBe('旧版幻灯.ppt')
-    expect(pptViewer.getAttribute('data-type')).toBe('ppt')
-    expect(screen.queryByRole('alert')).toBeNull()
-  })
-
-  it('falls back to anydoc markdown when the spreadsheet viewer fails', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
-    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: '台账.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
-    const convertDocumentToMarkdown = vi.fn(async () => '# 表格回退\n\nA1 单元格内容。')
+    const convertDocumentToMarkdown = vi.fn(async (path: string) => path.endsWith('.pptx') ? '# 幻灯回退' : '# 表格回退')
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
-    render(<DocumentPanel host={host} documentPath="/tmp/台账.xlsx" />)
-    await screen.findByTestId('office-viewer')
-    viewerModule.__emitViewerState({ error: new Error('xlsx engine failed') })
+    const { rerender } = render(<DocumentPanel host={host} documentPath="/tmp/台账.xlsx" />)
+    await screen.findByTestId('probe-spreadsheet')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     expect(await screen.findByRole('heading', { name: '表格回退' })).toBeTruthy()
-    expect(screen.getByTestId('document-fallback')).toBeTruthy()
     expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/台账.xlsx')
-  })
 
-  it('falls back to anydoc markdown when the presentation viewer fails', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
-    const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
-    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'deck.pptx', path, kind: 'presentation' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
-    const convertDocumentToMarkdown = vi.fn(async () => '# 幻灯回退')
-    const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
-    render(<DocumentPanel host={host} documentPath="/tmp/deck.pptx" />)
-    await screen.findByTestId('office-viewer')
-    viewerModule.__emitViewerState({ error: new Error('pptx engine failed') })
+    rerender(<DocumentPanel host={host} documentPath="/tmp/deck.pptx" />)
+    await screen.findByTestId('probe-presentation')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     expect(await screen.findByRole('heading', { name: '幻灯回退' })).toBeTruthy()
     expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/tmp/deck.pptx')
   })
 
-  it('keeps a closable error when the anydoc conversion itself fails', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+  it('keeps a closable generic error when the anydoc conversion itself fails', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], render: props => {
+      const Probe = officeProbe('word')
+      return <Probe {...props} />
+    } })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
     const convertDocumentToMarkdown = vi.fn(async () => { throw new Error('anydoc engine missing') })
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
-    await screen.findByTestId('office-viewer')
-    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    await screen.findByTestId('probe-word')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('renderer engine failed')
+    expect(alert.textContent).toContain('无法将文档转换为可读文本')
     expect(screen.queryByTestId('document-fallback')).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '关闭文档错误' }))
-    await screen.findByTestId('office-viewer')
+    await screen.findByTestId('probe-word')
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('keeps a closable error when the conversion yields empty markdown', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+  it('keeps a closable generic error when the conversion yields empty markdown', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], render: props => {
+      const Probe = officeProbe('word')
+      return <Probe {...props} />
+    } })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'form.docx', path, kind: 'word' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
     const convertDocumentToMarkdown = vi.fn(async () => '')
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
-    await screen.findByTestId('office-viewer')
-    viewerModule.__emitViewerState({ error: new Error('renderer engine failed') })
+    await screen.findByTestId('probe-word')
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     const alert = await screen.findByRole('alert')
-    expect(alert.textContent).toContain('renderer engine failed')
+    expect(alert.textContent).toContain('无法将文档转换为可读文本')
     expect(convertDocumentToMarkdown).toHaveBeenCalledTimes(1)
   })
 
@@ -300,23 +302,31 @@ describe('DocumentPanel office behavior baseline (frozen for office-extension-re
     expect(screen.queryByTestId('office-viewer')).toBeNull()
   })
 
-  it('preserves Chinese and space-containing names through viewer and fallback', async () => {
-    const viewerModule = await import('@file-viewer/react') as unknown as { __emitViewerState: (state: { error?: unknown }) => void }
+  it('preserves Chinese and space-containing names through generic fallback without leaking the path to the renderer', async () => {
+    let seen: DocumentRendererProps | null = null
+    registerDocumentRenderer(TEST_EXT, { id: 'sheet-probe', kinds: ['spreadsheet'], render: props => {
+      seen = props
+      const Probe = officeProbe('sheet')
+      return <Probe {...props} />
+    } })
     const bytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04])
     const path = '/工作 目录/2026 报告 表格.xlsx'
     const readDocument = vi.fn(async () => ({ id: path, name: '2026 报告 表格.xlsx', path, kind: 'spreadsheet' as const, size: bytes.byteLength, updatedAt: 1, bytes }))
     const convertDocumentToMarkdown = vi.fn(async () => '# 空格路径回退成功')
     const host = { ...documentHost(readDocument), convertDocumentToMarkdown } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath={path} />)
-    const viewer = await screen.findByTestId('office-viewer')
-    expect(viewer.getAttribute('data-name')).toBe('2026 报告 表格.xlsx')
-    expect(viewer.getAttribute('data-type')).toBe('xlsx')
-    viewerModule.__emitViewerState({ error: new Error('engine failed') })
+    await screen.findByTestId('probe-sheet')
+    expect(JSON.stringify(seen)).not.toContain(path)
+    fireEvent.click(screen.getByRole('button', { name: 'probe fallback' }))
     expect(await screen.findByRole('heading', { name: '空格路径回退成功' })).toBeTruthy()
-    expect(convertDocumentToMarkdown).toHaveBeenCalledWith('/工作 目录/2026 报告 表格.xlsx')
+    expect(convertDocumentToMarkdown).toHaveBeenCalledWith(path)
+    expect(JSON.stringify(seen)).not.toContain(path)
   })
 
-  it('reloads office bytes only for a matching documentChanged event', async () => {
+  it('reloads binary bytes only for a matching documentChanged event', async () => {
+    registerDocumentRenderer(TEST_EXT, { id: 'word-probe', kinds: ['word'], render: props => (
+      <div data-testid="probe-word" data-size={String(props.bytes?.length ?? -1)} data-revision={String(props.document.revision)} />
+    ) })
     const listeners = new Set<(event: { type: 'documentChanged'; path: string }) => void>()
     let generation = 0
     const readDocument = vi.fn(async (path: string) => {
@@ -334,11 +344,11 @@ describe('DocumentPanel office behavior baseline (frozen for office-extension-re
       }
     } as unknown as PipiHostAPI
     render(<DocumentPanel host={host} documentPath="/tmp/form.docx" />)
-    const first = await screen.findByTestId('office-viewer')
+    const first = await screen.findByTestId('probe-word')
     await waitFor(() => expect(first.getAttribute('data-size')).toBe('4'))
     for (const listener of [...listeners]) listener({ type: 'documentChanged', path: '/tmp/form.docx' })
     await waitFor(() => expect(readDocument).toHaveBeenCalledTimes(2))
-    await waitFor(() => expect(screen.getByTestId('office-viewer').getAttribute('data-size')).toBe('8'))
+    await waitFor(() => expect(screen.getByTestId('probe-word').getAttribute('data-size')).toBe('8'))
     for (const listener of [...listeners]) listener({ type: 'documentChanged', path: '/tmp/other.docx' })
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(readDocument).toHaveBeenCalledTimes(2)

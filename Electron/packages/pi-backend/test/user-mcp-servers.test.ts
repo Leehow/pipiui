@@ -11,18 +11,18 @@ describe("summarizeMcpServers", () => {
     expect(summarizeMcpServers({ mcpServers: {} })).toEqual([]);
   });
 
-  it("summarizes stdio officecli without env", () => {
+  it("summarizes a stdio server without leaking env", () => {
     const rows = summarizeMcpServers({
       mcpServers: {
-        officecli: {
+        "sample-server": {
           transport: "stdio",
-          command: "/Users/haoli/.local/bin/officecli",
-          args: ["mcp"],
-          env: { OFFICECLI_TOKEN: "secret" },
+          command: "/opt/tools/sample-server",
+          args: ["serve"],
+          env: { SAMPLE_TOKEN: "secret" },
         },
       },
     });
-    expect(rows).toEqual([{ name: "officecli", transport: "stdio", summary: "officecli mcp" }]);
+    expect(rows).toEqual([{ name: "sample-server", transport: "stdio", summary: "sample-server serve" }]);
     expect(JSON.stringify(rows)).not.toContain("secret");
   });
 });
@@ -37,10 +37,10 @@ describe("readUserMcpServers", () => {
     const path = join(dir, "mcp.json");
     await writeFile(
       path,
-      JSON.stringify({ mcpServers: { officecli: { transport: "stdio", command: "officecli", args: ["mcp"] } } }),
+      JSON.stringify({ mcpServers: { "sample-mcp": { transport: "stdio", command: "sample-mcp", args: ["serve"] } } }),
     );
     expect(await readUserMcpServers(path)).toEqual([
-      { name: "officecli", transport: "stdio", summary: "officecli mcp" },
+      { name: "sample-mcp", transport: "stdio", summary: "sample-mcp serve" },
     ]);
   });
 });

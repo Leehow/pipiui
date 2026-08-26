@@ -1,7 +1,8 @@
 import { existsSync } from "node:fs";
 import { extname, isAbsolute, normalize, resolve } from "node:path";
 
-export const OFFICECLI_MCP_TOOL = "mcp_officecli_officecli";
+/** The direct OfficeCLI tool registered by the office extension. */
+export const DIRECT_OFFICECLI_TOOL = "pipiui_officecli";
 export const OFFICE_DOC_SHOT_GATE_CUSTOM_TYPE = "pipiui-office-doc-shot-gate";
 export const OFFICE_DOC_SHOT_GATE_FOLLOW_UP_LIMIT = 3;
 export const OFFICE_DOC_SHOT_GATE_FAILED_MESSAGE = "未通过截图闸门";
@@ -55,7 +56,7 @@ export function workerOfficeDocShotGateArgs(
 
 export function isOfficecliToolName(name: string): boolean {
 	const normalized = name.trim().toLowerCase();
-	return normalized === OFFICECLI_MCP_TOOL
+	return normalized === DIRECT_OFFICECLI_TOOL
 		|| normalized === "officecli"
 		|| /(^|_)officecli$/.test(normalized);
 }
@@ -327,7 +328,7 @@ export class OfficeDocShotLedger {
 				return {
 					action: "block",
 					kind: "other",
-					reason: "Office document screenshot gate: blocked bash invocation of officecli. Use the OfficeCLI MCP tool (mcp_officecli_officecli). Direct shell officecli bypass is not allowed.",
+					reason: "Office document screenshot gate: blocked bash invocation of officecli. Use the OfficeCLI tool (pipiui_officecli). Direct shell officecli bypass is not allowed.",
 				};
 			}
 			return { action: "allow", kind: "other" };

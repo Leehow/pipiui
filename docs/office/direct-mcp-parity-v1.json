@@ -1,0 +1,1601 @@
+{
+  "schema": "pipiui-office-parity-v1",
+  "go": true,
+  "generatedBy": "PIPIUI_OFFICECLI_E2E=1 (Electron/packages/pipiui-office-extension/test/direct-mcp-parity.e2e.test.ts)",
+  "toolNames": {
+    "directPrimary": "pipiui_officecli",
+    "legacyRollback": "mcp_officecli_officecli"
+  },
+  "versions": {
+    "cli": "1.0.144",
+    "officecliSdk": "0.1.2",
+    "mcpSdk": "1.30.0",
+    "mcpServer": "1.0.144"
+  },
+  "binary": {
+    "sha256": "04757163428c5bde8d91e8f838517818e74722157722ca5f3877b6716b77bd45",
+    "target": "darwin-arm64",
+    "source": "host cache Electron/.officecli (git-ignored); copied to a neutral-name temp executable for the run"
+  },
+  "transports": {
+    "direct": "DirectOfficeAdapter + @officecli/sdk resident pipe (explicit binary, own project root, no MCP config/PATH)",
+    "legacy": "officecli mcp stdio server via @modelcontextprotocol/sdk (independent process, equivalent project root)"
+  },
+  "toolsList": {
+    "toolName": "officecli",
+    "commandTypes": [
+      "array",
+      "string"
+    ],
+    "required": [
+      "command"
+    ]
+  },
+  "summary": {
+    "cases": 42,
+    "matches": 27,
+    "allowedDifferences": 15,
+    "byFormat": {
+      "common": 8,
+      "docx": 10,
+      "xlsx": 7,
+      "pptx": 10,
+      "docx-zh": 7
+    }
+  },
+  "cases": [
+    {
+      "id": "tools-list",
+      "format": "common",
+      "kind": "tools-list",
+      "command": "(transport capability)",
+      "direct": null,
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "server officecli 1.0.144; tool officecli; command array|string; required command",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": []
+      },
+      "agree": "allowed-difference",
+      "difference": "tools/list is an MCP-protocol capability; the direct transport is an in-process adapter and has no tool registry. Not a Tier-1 document semantic."
+    },
+    {
+      "id": "help-verbs",
+      "format": "common",
+      "kind": "help",
+      "command": "help",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"verb\":\"help\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Description:\n  officecli: AI-friendly CLI for Office documents (.docx, .xlsx, .pptx)\n  \n  Run 'officecli help' for the schema-driven capability reference (formats, elements, properties).\n  See the Commands section below for the full list of subcommands.\n\nUsage:\n  host-oc [command] [options]\n\nOptions:\n  --json          Output as JSON (AI-friendly)\n  -?, -h, --help  Show help and usage information\n  --version       Show version information\n\nCommands:\n  open <file>                                Start a resident process to keep the document in memory for faster subsequent commands\n  close <file> ",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct `help` is a client-side stub ({success:true,verb:\"help\"}); the CLI grammar reference is served by the legacy transport. Vocabulary parity is asserted separately (legacy help lists every adapter verb); help does not mutate documents."
+    },
+    {
+      "id": "help-docx-p",
+      "format": "common",
+      "kind": "help",
+      "command": "help docx p",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"verb\":\"help\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "docx paragraph\n--------------\nPaths: /body/p[@paraId=*]  /body/p[N]\nOperations: add set get query remove\n\nUsage:\n  officecli add <file> /body --type paragraph [--prop key=val ...]\n  officecli set <file> /body/p[N] --prop key=val ...\n  officecli get <file> /body/p[N]\n  officecli query <file> paragraph\n  officecli remove <file> /body/p[N]\n\nProperties:\n  lineRule   enum   [add/set/get]   aliases: linerule\n    description: line spacing rule paired with lineSpacing (Word-only: w:spacing@w:lineRule). 'auto' = multiplier (default for 1.5x/150%), 'exact' = exact fixed height (default for Npt), 'atLeas",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct `help <topic>` is a client-side stub; grammar discovery goes through the legacy transport. No document mutation involved."
+    },
+    {
+      "id": "help-xlsx-cell",
+      "format": "common",
+      "kind": "help",
+      "command": "help xlsx cell",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"verb\":\"help\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "xlsx cell\n--------------\nParent: sheet\nPaths: /<sheetName>/<A1Ref>  /Sheet1/A1  /Sheet1/B2:C3\nOperations: add set get query remove\n\nUsage:\n  officecli add <file> /Sheet1 --type cell [--prop key=val ...]\n  officecli set <file> /Sheet1/A1 --prop key=val ...\n  officecli get <file> /Sheet1/A1\n  officecli query <file> cell\n  officecli remove <file> /Sheet1/A1\n\nProperties:\n  value   string   [add/set/get]\n    description: literal cell value — string, number, or date. Numeric strings stored as numbers unless cell has text format (@) or explicit type=string. Readback in DocumentNode.Text.\n    example:",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct `help <topic>` is a client-side stub; grammar discovery goes through the legacy transport. No document mutation involved."
+    },
+    {
+      "id": "help-pptx-slide",
+      "format": "common",
+      "kind": "help",
+      "command": "help pptx slide",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"verb\":\"help\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "pptx slide\n--------------\nParent: presentation\nPaths: /slide[N]\nOperations: add set get query remove\n\nUsage:\n  officecli add <file> / --type slide [--prop key=val ...]\n  officecli set <file> /slide[N] --prop key=val ...\n  officecli get <file> /slide[N]\n  officecli query <file> slide\n  officecli remove <file> /slide[N]\n\nProperties:\n  layout   string   [add/set/get]\n    description: slide layout name (e.g. 'Title Slide', 'Title and Content'). Resolved against the presentation's slide masters. The `layout` property is metadata only — placeholder slots defined in the layout are NOT auto-materializ",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct `help <topic>` is a client-side stub; grammar discovery goes through the legacy transport. No document mutation involved."
+    },
+    {
+      "id": "help-pptx-shape",
+      "format": "common",
+      "kind": "help",
+      "command": "help pptx shape",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"verb\":\"help\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "pptx shape\n--------------\nPaths: /slide[N]/shape[@id=*]  /slide[N]/shape[N]\nOperations: add set get query remove\n\nUsage:\n  officecli add <file> /slide[N] --type shape [--prop key=val ...]\n  officecli set <file> /slide[N]/shape[N] --prop key=val ...\n  officecli get <file> /slide[N]/shape[N]\n  officecli query <file> shape\n  officecli remove <file> /slide[N]/shape[N]\n\nProperties:\n  size   font-size   [add/set/get]   aliases: fontSize, fontsize, font.size\n    description: font size — Add/Set forwards to the first run; Get returns the bare size when every run shares the same explicit FontSize (non-",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct `help <topic>` is a client-side stub; grammar discovery goes through the legacy transport. No document mutation involved."
+    },
+    {
+      "id": "docx-create",
+      "format": "docx",
+      "kind": "create",
+      "command": "create report.docx",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"path\":\"<ROOT>/report.docx\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": true,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Created: report.docx",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-baseline-shot",
+      "format": "docx",
+      "kind": "screenshot",
+      "command": "view \"report.docx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1378,
+          "height": 1920
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-edit-add-paragraph",
+      "format": "docx",
+      "kind": "edit",
+      "command": "add report.docx /body --type paragraph --prop \"text=parity-hello\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Added paragraph at /body/p[@paraId=*]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Added paragraph at /body/p[@paraId=*]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-validate",
+      "format": "docx",
+      "kind": "validate",
+      "command": "validate \"report.docx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-flush",
+      "format": "docx",
+      "kind": "flush",
+      "command": "save \"report.docx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Closing resident.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "report.docx is already saved to disk.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "flush wrapper wording/timing differs (direct closes the resident handle; legacy may auto-flush first). Persistence is proven by the persisted-view case below."
+    },
+    {
+      "id": "docx-persisted-view",
+      "format": "docx",
+      "kind": "persisted-view",
+      "command": "view \"report.docx\" text",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "[/body/p[@paraId=*]] parity-hello",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "[/body/p[@paraId=*]] parity-hello",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-final-shot",
+      "format": "docx",
+      "kind": "screenshot",
+      "command": "view \"report.docx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1378,
+          "height": 1920
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-create",
+      "format": "xlsx",
+      "kind": "create",
+      "command": "create book.xlsx",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"path\":\"<ROOT>/book.xlsx\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": true,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Created: book.xlsx",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-baseline-shot",
+      "format": "xlsx",
+      "kind": "screenshot",
+      "command": "view \"book.xlsx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-edit-set-cell",
+      "format": "xlsx",
+      "kind": "edit",
+      "command": "set book.xlsx /Sheet1/A1 --prop value=42",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Updated /Sheet1/A1: value=42",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Updated /Sheet1/A1: value=42",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-validate",
+      "format": "xlsx",
+      "kind": "validate",
+      "command": "validate \"book.xlsx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-flush",
+      "format": "xlsx",
+      "kind": "flush",
+      "command": "save \"book.xlsx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Closing resident.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "book.xlsx is already saved to disk.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "flush wrapper wording/timing differs (direct closes the resident handle; legacy may auto-flush first). Persistence is proven by the persisted-view case below."
+    },
+    {
+      "id": "xlsx-persisted-view",
+      "format": "xlsx",
+      "kind": "persisted-view",
+      "command": "view \"book.xlsx\" text",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "=== Sheet: Sheet1 ===\n[/Sheet1/row[1]] A1=42",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "=== Sheet: Sheet1 ===\n[/Sheet1/row[1]] A1=42",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "xlsx-final-shot",
+      "format": "xlsx",
+      "kind": "screenshot",
+      "command": "view \"book.xlsx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "book.xlsx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-create",
+      "format": "pptx",
+      "kind": "create",
+      "command": "create deck.pptx",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"path\":\"<ROOT>/deck.pptx\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": true,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Created: deck.pptx\n  totalSlides: 0\n  slideWidth: 960pt\n  slideHeight: 540pt",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-edit-add-slide",
+      "format": "pptx",
+      "kind": "edit",
+      "command": "add deck.pptx / --type slide",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Added slide at /slide[1]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Added slide at /slide[1]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-baseline-shot",
+      "format": "pptx",
+      "kind": "screenshot",
+      "command": "view \"deck.pptx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1280,
+          "height": 720
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-edit-add-shape",
+      "format": "pptx",
+      "kind": "edit",
+      "command": "add deck.pptx /slide[1] --type shape --prop \"text=Hi\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Added shape at /slide[1]/shape[@id=*]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Added shape at /slide[1]/shape[@id=*]\n  x: 0cm  y: 0cm  width: 10cm  height: 5cm",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-validate",
+      "format": "pptx",
+      "kind": "validate",
+      "command": "validate \"deck.pptx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-flush",
+      "format": "pptx",
+      "kind": "flush",
+      "command": "save \"deck.pptx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Closing resident.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "deck.pptx is already saved to disk.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "flush wrapper wording/timing differs (direct closes the resident handle; legacy may auto-flush first). Persistence is proven by the persisted-view case below."
+    },
+    {
+      "id": "pptx-persisted-view",
+      "format": "pptx",
+      "kind": "persisted-view",
+      "command": "view \"deck.pptx\" text",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "=== /slide[1] ===\nHi",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "=== /slide[1] ===\nHi",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-final-shot",
+      "format": "pptx",
+      "kind": "screenshot",
+      "command": "view \"deck.pptx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH>",
+        "screenshot": {
+          "png": true,
+          "width": 1280,
+          "height": 720
+        },
+        "targets": [
+          "deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-empty-deck-create",
+      "format": "pptx",
+      "kind": "create",
+      "command": "create empty-deck.pptx",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"path\":\"<ROOT>/empty-deck.pptx\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "empty-deck.pptx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": true,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Created: empty-deck.pptx\n  totalSlides: 0\n  slideWidth: 960pt\n  slideHeight: 540pt",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "pptx-empty-deck-shot",
+      "format": "pptx",
+      "kind": "screenshot",
+      "command": "view empty-deck.pptx screenshot --grid auto",
+      "direct": {
+        "ok": false,
+        "code": "command_failed",
+        "text": "officecli command failed",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "empty-deck.pptx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "0-slide pptx screenshot: resident pipe rejects grid rendering with no pages ('--page 1 out of range (total slides: 0)') while the CLI one-shot path the MCP tool uses renders a blank grid. Tier-1 semantics unaffected: no gate-mandated flow screenshots a 0-slide deck (create is baseline-exempt; final screenshots follow writes), validation/persistence/edits all agree, and non-empty deck screenshots agree (pptx-baseline-shot / pptx-final-shot). An existing 0-slide .pptx is a degenerate artifact not producible by PowerPoint."
+    },
+    {
+      "id": "docx-zh-create",
+      "format": "docx-zh",
+      "kind": "create",
+      "command": "create 报告 文档.docx",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "{\"success\":true,\"path\":\"<ROOT>/报告 文档.docx\"}",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": true,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Created: 报告 文档.docx",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-zh-baseline-shot",
+      "format": "docx-zh",
+      "kind": "screenshot",
+      "command": "view \"报告 文档.docx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH> <SCREENSHOT.png>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1378,
+          "height": 1920
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-zh-edit-add-paragraph",
+      "format": "docx-zh",
+      "kind": "edit",
+      "command": "add \"报告 文档.docx\" /body --type paragraph --prop \"text=中文 内容\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Added paragraph at /body/p[@paraId=*]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": true,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Added paragraph at /body/p[@paraId=*]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-zh-validate",
+      "format": "docx-zh",
+      "kind": "validate",
+      "command": "validate \"报告 文档.docx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Validation passed: no errors found.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-zh-flush",
+      "format": "docx-zh",
+      "kind": "flush",
+      "command": "save \"报告 文档.docx\"",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "Closing resident.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "报告 文档.docx is already saved to disk.",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "flush wrapper wording/timing differs (direct closes the resident handle; legacy may auto-flush first). Persistence is proven by the persisted-view case below."
+    },
+    {
+      "id": "docx-zh-persisted-view",
+      "format": "docx-zh",
+      "kind": "persisted-view",
+      "command": "view \"报告 文档.docx\" text",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "[/body/p[@paraId=*]] 中文 内容",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "[/body/p[@paraId=*]] 中文 内容",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-zh-final-shot",
+      "format": "docx-zh",
+      "kind": "screenshot",
+      "command": "view \"报告 文档.docx\" screenshot --grid auto",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "<TMP-PATH> <SCREENSHOT.png>",
+        "screenshot": {
+          "png": true,
+          "width": 1600,
+          "height": 1200
+        },
+        "targets": [
+          "报告 文档.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": true
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "Screenshot rendered (returned inline).",
+        "screenshot": {
+          "png": true,
+          "width": 1378,
+          "height": 1920
+        },
+        "contentTypes": [
+          "text",
+          "image"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "docx-error-invalid-selector",
+      "format": "docx",
+      "kind": "error",
+      "command": "set report.docx /body/p[999] --prop text=x",
+      "direct": {
+        "ok": false,
+        "code": "command_failed",
+        "text": "officecli command failed",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": true,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": false,
+        "isError": true,
+        "text": "Error: Path not found: /body/p[999]. Available at /body: p[1]..p[1]",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "error wrapper differs by transport (direct: adapter `command_failed` envelope; legacy: CLI `Error: Path not found…` text). Same semantic category: CLI rejected the selector; no document mutation (verified below)."
+    },
+    {
+      "id": "docx-error-unchanged-view",
+      "format": "docx",
+      "kind": "persisted-view",
+      "command": "view report.docx text",
+      "direct": {
+        "ok": true,
+        "code": "ok",
+        "text": "[/body/p[@paraId=*]] parity-hello",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [
+          "report.docx"
+        ],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": true,
+        "isError": false,
+        "text": "[/body/p[@paraId=*]] parity-hello",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "match"
+    },
+    {
+      "id": "common-error-missing-file",
+      "format": "common",
+      "kind": "error",
+      "command": "view missing.docx text",
+      "direct": {
+        "ok": false,
+        "code": "path_rejected",
+        "text": "path component does not exist",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": false,
+        "isError": true,
+        "text": "Error: File not found: <ROOT>/missing.docx",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct rejects a missing path client-side (PipiUI containment, code path_rejected); legacy defers to the CLI (File not found). Same semantic category: missing-file rejection, no document touched."
+    },
+    {
+      "id": "common-error-unknown-verb",
+      "format": "common",
+      "kind": "error",
+      "command": "frobnicate report.docx",
+      "direct": {
+        "ok": false,
+        "code": "unknown_verb",
+        "text": "unknown officecli verb: frobnicate",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": {
+        "ok": false,
+        "isError": true,
+        "text": "Description:\n  officecli: AI-friendly CLI for Office documents (.docx, .xlsx, .pptx)\n  \n  Run 'officecli help' for the schema-driven capability reference (formats, elements, properties).\n  See the Commands section below for the full list of subcommands.\n\nUsage:\n  host-oc [command] [options]\n\nOptions:\n  --json          Output as JSON (AI-friendly)\n  -?, -h, --help  Show help and usage information\n  --version       Show version information\n\nCommands:\n  open <file>                                Start a resident process to keep the document in memory for faster subsequent commands\n  close <file> ",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "contentTypes": [
+          "text"
+        ]
+      },
+      "agree": "allowed-difference",
+      "difference": "direct enforces the frozen verb vocabulary client-side (unknown_verb); legacy prints CLI help with isError=true. Same semantic category: unknown verb never reaches a document."
+    },
+    {
+      "id": "policy-only-malformed-quote",
+      "format": "docx",
+      "kind": "policy-only",
+      "command": "set report.docx \"/body/p[1] --prop text=x",
+      "direct": {
+        "ok": false,
+        "code": "invalid_command",
+        "text": "unterminated quote",
+        "screenshot": {
+          "png": false,
+          "width": null,
+          "height": null
+        },
+        "targets": [],
+        "persisted": null,
+        "isWrite": false,
+        "isCreate": false,
+        "isQualifyingScreenshot": false
+      },
+      "mcp": null,
+      "agree": "allowed-difference",
+      "difference": "PipiUI client-side lexer policy (unterminated quote) — frozen in command-gate-parity/direct-adapter tests; the raw MCP server is not required to duplicate PipiUI policy."
+    }
+  ],
+  "allowedDifferences": [
+    "tools/list is an MCP-protocol capability; the direct transport is an in-process adapter and has no tool registry. Not a Tier-1 document semantic.",
+    "direct `help` is a client-side stub ({success:true,verb:\"help\"}); the CLI grammar reference is served by the legacy transport. Vocabulary parity is asserted separately (legacy help lists every adapter verb); help does not mutate documents.",
+    "direct `help <topic>` is a client-side stub; grammar discovery goes through the legacy transport. No document mutation involved.",
+    "flush wrapper wording/timing differs (direct closes the resident handle; legacy may auto-flush first). Persistence is proven by the persisted-view case below.",
+    "0-slide pptx screenshot: resident pipe rejects grid rendering with no pages ('--page 1 out of range (total slides: 0)') while the CLI one-shot path the MCP tool uses renders a blank grid. Tier-1 semantics unaffected: no gate-mandated flow screenshots a 0-slide deck (create is baseline-exempt; final screenshots follow writes), validation/persistence/edits all agree, and non-empty deck screenshots agree (pptx-baseline-shot / pptx-final-shot). An existing 0-slide .pptx is a degenerate artifact not producible by PowerPoint.",
+    "error wrapper differs by transport (direct: adapter `command_failed` envelope; legacy: CLI `Error: Path not found…` text). Same semantic category: CLI rejected the selector; no document mutation (verified below).",
+    "direct rejects a missing path client-side (PipiUI containment, code path_rejected); legacy defers to the CLI (File not found). Same semantic category: missing-file rejection, no document touched.",
+    "direct enforces the frozen verb vocabulary client-side (unknown_verb); legacy prints CLI help with isError=true. Same semantic category: unknown verb never reaches a document.",
+    "PipiUI client-side lexer policy (unterminated quote) — frozen in command-gate-parity/direct-adapter tests; the raw MCP server is not required to duplicate PipiUI policy."
+  ],
+  "fixes": [
+    "adapter toBatchItem: add/add-part now map the parent positional to `parent` (was `path`; the resident defaults a missing parent to /body, which made pptx slide/shape adds impossible and silently retargeted docx adds)",
+    "adapter runSdk: view screenshot mode now requests the JSON envelope (the resident returns the rendered PNG path only in JSON mode for pptx; text mode returned an empty Stdout)"
+  ],
+  "notes": [
+    "Screenshot comparison: qualification + successful valid-PNG render on both transports (never bytes). Dimensions are recorded per transport as delivery metadata: direct writes the native grid contact sheet to a temp PNG; legacy MCP inlines a downscaled render.",
+    "Persistence: explicit flush (save/close) then re-open `view <file> text` through each transport plus on-disk zip checks in both roots.",
+    "Raw wrapper text, process/PIDs, timing and absolute temp roots are allowed differences; roots are scrubbed to <ROOT> in this evidence.",
+    "Edit echo: transports agree on the mutation-outcome line; the CLI one-shot may append decoration lines (e.g. default geometry for an added shape) that the resident envelope omits. Persisted content is compared exactly via persisted-view."
+  ]
+}

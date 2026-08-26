@@ -1,0 +1,46 @@
+{
+  "name": "@pipiui/pipiui-office-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PipiUI Office extension: app document preview plus the direct OfficeCLI agent/host (pipiui_officecli via @officecli/sdk resident process; direct-only, no MCP setup).",
+  "exports": {
+    "./package.json": "./package.json",
+    "./agent/host": "./agent/dist/host.js"
+  },
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json && node scripts/copy-officecli-sdk.mjs && vite build --config app/vite.config.ts",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs pipiui-office-extension",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "clean": "rm -rf app/dist agent/dist"
+  },
+  "dependencies": {
+    "@file-viewer/core": "^2.2.8",
+    "@file-viewer/preset-office": "^2.2.8",
+    "@file-viewer/react": "^2.2.8",
+    "@officecli/officecli": "file:vendor/officecli-cli-stub",
+    "@officecli/sdk": "0.1.2",
+    "@pipiui/extension-api": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@file-viewer/vite-plugin": "^2.2.8",
+    "@testing-library/react": "^16.3.2",
+    "@types/react": "^18.3.12",
+    "@vitejs/plugin-react": "^4.3.3",
+    "jsdom": "^29.1.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3",
+    "vite": "7.3.6",
+    "vitest": "^4.1.10"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0"
+  },
+  "overrides": {
+    "@officecli/officecli": "file:vendor/officecli-cli-stub"
+  }
+}

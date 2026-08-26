@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "extensionId": "office-extension",
+  "manifestVersion": "0.1.0",
+  "hostEntry": "agent/dist/host.js",
+  "sha256": "8bc912dd8f3ad8826ae6dd21144fa526e5ad4439991ffb79dc32b52b0bd626aa",
+  "bytes": 982,
+  "contentHash": "a13a73f85ad385fbc068fada1d73fb02aae3323c13405ebb917a1939fba142d2",
+  "generatedAt": "2026-08-26T16:36:07.791Z"
+}

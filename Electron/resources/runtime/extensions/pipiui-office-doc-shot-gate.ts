@@ -11,7 +11,7 @@ const SYSTEM_HINT = [
 	"OfficeCLI document edits are gated: for an existing Office file, take a whole-document baseline screenshot before the first write in this human task, then take another after the last write.",
 	"Qualifying command only: officecli view <file> screenshot --grid auto",
 	"--page, missing --grid auto, or a failed view do not count. create of a new file may skip the baseline but still needs the final screenshot.",
-	"Use the OfficeCLI MCP tool. Do not call officecli from bash.",
+	"Use the OfficeCLI tool (pipiui_officecli). Do not call officecli from bash.",
 ].join(" ");
 
 export default function (pi: ExtensionAPI) {
