@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -55,6 +55,8 @@ async function makeFixture(): Promise<Fixture> {
   await write(packageDir, 'pipiui-extension.json', manifestJson())
   await write(packageDir, 'package.json', JSON.stringify({ name: 'fixture-ext', private: true }, null, 2))
   await write(packageDir, 'README.md', '# fixture-ext\n')
+  await write(packageDir, 'LICENSE', 'fixture license\n')
+  await write(packageDir, 'NOTICE', 'fixture notice\n')
   await write(packageDir, 'agent/dist/index.js', 'export function activate() { return 1 }\n')
   await write(packageDir, 'agent/dist/host.js', 'export const hostLibrary = "v1"\n')
   await write(packageDir, 'app/dist/panel.js', 'export const panel = "v1"\n')
@@ -139,6 +141,8 @@ describe('bundled extension receipt reproducibility', () => {
     expect(receiptAfter.hostEntry).toBe('agent/dist/host.js')
     expect(receiptAfter.extensionId).toBe('fixture-ext')
     expect(receiptAfter.manifestVersion).toBe('1.2.3')
+    expect(await readFile(join(fx.dest, 'LICENSE'), 'utf8')).toBe('fixture license\n')
+    expect(await readFile(join(fx.dest, 'NOTICE'), 'utf8')).toBe('fixture notice\n')
   })
 
   it('content changes move generatedAt and the pinned hashes', async () => {
@@ -211,5 +215,179 @@ describe('bundled extension receipt reproducibility', () => {
     const fx = await makeFixture()
     await rm(join(fx.packageDir, 'agent', 'dist', 'index.js'))
     await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('copies a declared documentRenderers entry into the runtime tree', async () => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        ...(manifest.app?.ui ?? {}),
+        documentRenderers: [{ id: 'office', entry: 'app/dist/office-renderer.js', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await write(fx.packageDir, 'app/dist/office-renderer.js', 'export default function Office() { return null }\n')
+    await runSync(fx)
+    const destFile = join(fx.dest, 'app', 'dist', 'office-renderer.js')
+    expect(await readFile(destFile, 'utf8')).toContain('export default function Office')
+  })
+
+  it('refuses a document renderer entry that escapes the package with ..', async () => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        documentRenderers: [{ id: 'evil', entry: '../secret.js', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('refuses a POSIX absolute document renderer entry', async () => {
+    const fx = await makeFixture()
+    const outside = join(fx.root, 'outside-absolute.js')
+    await writeFile(outside, 'export default 1\n')
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        documentRenderers: [{ id: 'evil', entry: outside, kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('refuses a document renderer entry that is a symlink to an outside file', async () => {
+    const fx = await makeFixture()
+    const outside = join(fx.root, 'stolen.js')
+    await writeFile(outside, 'export const stolen = 1\n')
+    await symlink(outside, join(fx.packageDir, 'app', 'dist', 'office-renderer.js'))
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        ...(manifest.app?.ui ?? {}),
+        documentRenderers: [{ id: 'office', entry: 'app/dist/office-renderer.js', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('refuses a nested dist asset symlink that escapes the package', async () => {
+    const fx = await makeFixture()
+    const outside = join(fx.root, 'escape.wasm')
+    await writeFile(outside, 'wasm')
+    await mkdir(join(fx.packageDir, 'app', 'dist', 'file-viewer', 'vendor'), { recursive: true })
+    await symlink(outside, join(fx.packageDir, 'app', 'dist', 'file-viewer', 'vendor', 'escape.wasm'))
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('copies hashed renderer chunks and vendor assets beside the entry', async () => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        ...(manifest.app?.ui ?? {}),
+        documentRenderers: [{ id: 'office', entry: 'app/dist/office-renderer.js', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await write(fx.packageDir, 'app/dist/office-renderer.js', 'export { O as default } from "./office-renderer-DS5--c0p.js"\n')
+    await write(fx.packageDir, 'app/dist/office-renderer-DS5--c0p.js', 'export const O = function Office() { return null }\n')
+    await write(fx.packageDir, 'app/dist/office-renderer.css', '.office { color: navy }')
+    await write(fx.packageDir, 'app/dist/file-viewer/vendor/ppt/ppt-native.wasm', 'wasm-bytes')
+    await runSync(fx)
+    expect(await readFile(join(fx.dest, 'app', 'dist', 'office-renderer.js'), 'utf8')).toContain('office-renderer-DS5--c0p')
+    expect(await readFile(join(fx.dest, 'app', 'dist', 'office-renderer-DS5--c0p.js'), 'utf8')).toContain('function Office')
+    expect(await readFile(join(fx.dest, 'app', 'dist', 'office-renderer.css'), 'utf8')).toContain('.office')
+    expect(await readFile(join(fx.dest, 'app', 'dist', 'file-viewer', 'vendor', 'ppt', 'ppt-native.wasm'), 'utf8')).toBe('wasm-bytes')
+  })
+
+  it('accepts a declared entry whose filename contains .. as characters, not a path segment', async () => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        ...(manifest.app?.ui ?? {}),
+        documentRenderers: [{ id: 'office', entry: 'app/dist/chunk..js', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await write(fx.packageDir, 'app/dist/chunk..js', 'export default function Chunk() { return null }\n')
+    await runSync(fx)
+    expect(await readFile(join(fx.dest, 'app', 'dist', 'chunk..js'), 'utf8')).toContain('function Chunk')
+  })
+
+  it.each([
+    'C:\\Windows\\evil.js',
+    'C:/Windows/evil.js',
+    '\\\\server\\share\\evil.js',
+    '//server/share/evil.js',
+  ])('refuses Windows/UNC absolute document renderer entry %s', async (entry) => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        documentRenderers: [{ id: 'evil', entry, kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('refuses a directory as a declared entry', async () => {
+    const fx = await makeFixture()
+    const manifest = JSON.parse(await readFile(fx.manifestPath, 'utf8')) as {
+      app?: { ui?: Record<string, unknown> }
+    }
+    manifest.app = {
+      ui: {
+        documentRenderers: [{ id: 'evil', entry: 'app/dist', kinds: ['word'] }],
+      },
+    }
+    await writeFile(fx.manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+  })
+
+  it('refuses a final destination that is a symlink and leaves the external sentinel untouched', async () => {
+    const fx = await makeFixture()
+    const outside = join(fx.root, 'stolen-dest')
+    await mkdir(outside, { recursive: true })
+    const sentinel = join(outside, 'SENTINEL')
+    await writeFile(sentinel, 'untouched\n')
+    await mkdir(join(fx.electron, 'resources', 'runtime', 'extensions'), { recursive: true })
+    await symlink(outside, fx.dest)
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+    expect(await readFile(sentinel, 'utf8')).toBe('untouched\n')
+    expect(await readdir(outside)).toEqual(['SENTINEL'])
+  })
+
+  it('refuses a symlinked extensions parent and leaves the external sentinel untouched', async () => {
+    const fx = await makeFixture()
+    const outside = join(fx.root, 'stolen-extensions')
+    await mkdir(outside, { recursive: true })
+    const sentinel = join(outside, 'SENTINEL')
+    await writeFile(sentinel, 'untouched\n')
+    await mkdir(join(fx.electron, 'resources', 'runtime'), { recursive: true })
+    await symlink(outside, join(fx.electron, 'resources', 'runtime', 'extensions'))
+    await expect(runSync(fx)).rejects.toMatchObject({ code: 1 })
+    expect(await readFile(sentinel, 'utf8')).toBe('untouched\n')
+    expect(await readdir(outside)).toEqual(['SENTINEL'])
   })
 })

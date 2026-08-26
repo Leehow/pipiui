@@ -17,9 +17,9 @@
  * Usage: node scripts/sync-bundled-extension.mjs [packageDirName]
  *   packageDirName defaults to grok-build-oauth-extension (id from its manifest).
  */
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, posix, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const RECEIPT_NAME = "pipiui-host-receipt.json";
@@ -92,23 +92,119 @@ if (typeof id !== "string" || !/^[a-z][a-z0-9-]*$/.test(id)) {
   process.exit(1);
 }
 
-const dest = join(electronRoot, "resources", "runtime", "extensions", id);
+const runtimeRoot = join(electronRoot, "resources", "runtime");
+const extensionsRoot = join(runtimeRoot, "extensions");
+const dest = join(extensionsRoot, id);
 const agentEntry = manifest.agent?.extension;
 const hostEntry = typeof manifest.host?.entry === "string" ? manifest.host.entry : undefined;
 const appEntries = [
   ...(manifest.app?.ui?.panels ?? []).map((p) => p.entry),
   ...(manifest.app?.ui?.toolRenderers ?? []).map((r) => r.entry),
+  ...(manifest.app?.ui?.documentRenderers ?? []).map((r) => r.entry),
   ...(manifest.app?.ui?.settingsSections ?? []).map((s) => s.entry),
 ].filter((entry) => typeof entry === "string" && entry.length > 0);
 
-// Every declared entry must be built before the runtime copy is refreshed.
-for (const entry of [agentEntry, hostEntry, ...appEntries]) {
-  if (!entry) continue;
-  if (!existsSync(join(packageDir, entry))) {
-    console.error(`sync-bundled-extension: missing build artifact ${entry}; run the package build first`);
-    process.exit(1);
+function fail(message) {
+  console.error(`sync-bundled-extension: ${message}`);
+  process.exit(1);
+}
+
+function containedBy(root, target) {
+  const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+  return target.startsWith(prefix);
+}
+
+function isPortableAbsolute(entry) {
+  return posix.isAbsolute(entry) || win32.isAbsolute(entry);
+}
+
+function hasDotDotSegment(entry) {
+  return entry.split(/[\\/]+/).includes("..");
+}
+
+function assertDeclaredEntry(root, entry, label, missingMessage) {
+  if (isPortableAbsolute(entry)) fail(`${label} must not be an absolute path: ${entry}`);
+  if (hasDotDotSegment(entry)) fail(`${label} must not contain ..: ${entry}`);
+  const resolved = resolve(root, entry);
+  if (!containedBy(resolve(root), resolved)) fail(`${label} escapes package: ${entry}`);
+  if (!existsSync(resolved)) fail(missingMessage ?? `missing build artifact ${entry}; run the package build first`);
+  const st = lstatSync(resolved);
+  if (st.isSymbolicLink()) fail(`${label} must not be a symlink: ${entry}`);
+  if (!st.isFile()) fail(`${label} must be a regular file: ${entry}`);
+  const realRoot = realpathSync(root);
+  const realEntry = realpathSync(resolved);
+  if (!containedBy(realRoot, realEntry)) fail(`${label} realpath escapes package: ${entry}`);
+}
+
+/** Reject symlink components from electronRoot down to target. Do not inspect ancestors above electronRoot (/var → /private/var). */
+function assertNoSymlinkComponentsFrom(root, target, label) {
+  const rootAbs = resolve(root);
+  const targetAbs = resolve(target);
+  if (targetAbs !== rootAbs && !containedBy(rootAbs, targetAbs)) fail(`${label} escapes ${rootAbs}`);
+  const remainder = targetAbs === rootAbs ? [] : targetAbs.slice(rootAbs.length).split(sep).filter(Boolean);
+  let acc = rootAbs;
+  for (const seg of remainder) {
+    acc = join(acc, seg);
+    if (!existsSync(acc)) break;
+    if (lstatSync(acc).isSymbolicLink()) fail(`${label} must not contain symlink: ${acc}`);
   }
 }
+
+function assertDestinationSafe() {
+  const expectedRuntime = resolve(runtimeRoot);
+  const expectedExtensions = resolve(extensionsRoot);
+  const expectedDest = resolve(dest);
+  if (!containedBy(expectedRuntime, expectedExtensions)) fail("extensions root escapes runtime root");
+  if (!containedBy(expectedExtensions, expectedDest)) fail(`destination escapes extensions root: ${dest}`);
+  assertNoSymlinkComponentsFrom(electronRoot, expectedRuntime, "runtime root");
+  assertNoSymlinkComponentsFrom(electronRoot, expectedExtensions, "extensions root");
+  assertNoSymlinkComponentsFrom(electronRoot, expectedDest, "destination");
+  if (existsSync(extensionsRoot) && lstatSync(extensionsRoot).isSymbolicLink()) {
+    fail(`extensions root must not be a symlink: ${extensionsRoot}`);
+  }
+  if (existsSync(dest) && lstatSync(dest).isSymbolicLink()) {
+    fail(`destination must not be a symlink: ${dest}`);
+  }
+  if (existsSync(runtimeRoot)) {
+    const realElectron = realpathSync(electronRoot);
+    const realRuntime = realpathSync(runtimeRoot);
+    if (realRuntime !== realElectron && !containedBy(realElectron, realRuntime)) {
+      fail("runtime root realpath escapes electron root");
+    }
+  }
+}
+
+function assertTreeSafe(treeRoot, containerReal, label) {
+  if (!existsSync(treeRoot)) return;
+  if (lstatSync(treeRoot).isSymbolicLink()) fail(`${label} must not be a symlink: ${treeRoot}`);
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isSymbolicLink()) fail(`${label} must not contain symlink: ${full}`);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const realFile = realpathSync(full);
+      if (!containedBy(containerReal, realFile)) fail(`${label} file escapes package: ${full}`);
+    }
+  };
+  walk(treeRoot);
+}
+
+// Every declared entry must be built before the runtime copy is refreshed.
+const packageReal = realpathSync(packageDir);
+for (const entry of [agentEntry, hostEntry, ...appEntries]) {
+  if (!entry) continue;
+  assertDeclaredEntry(packageDir, entry, "entry");
+}
+for (const half of ["agent", "app"]) {
+  assertTreeSafe(join(packageDir, half, "dist"), packageReal, `${half}/dist`);
+}
+
+// Canonicalize destination before any destructive write. Never rm then verify.
+assertDestinationSafe();
 
 // Snapshot the previous receipt (exact bytes + parsed) before the tree is
 // rebuilt, so an unchanged rebuild can rewrite it byte-for-byte.
@@ -126,20 +222,36 @@ if (existsSync(receiptPath)) {
 
 rmSync(dest, { recursive: true, force: true });
 mkdirSync(dest, { recursive: true });
-for (const file of ["pipiui-extension.json", "package.json", "README.md"]) {
+for (const file of [
+  "pipiui-extension.json",
+  "package.json",
+  "README.md",
+  "LICENSE",
+  "NOTICE",
+  "THIRD-PARTY-NOTICES-OFFICECLI.md",
+  "LICENSE-OFFICECLI",
+]) {
   if (existsSync(join(packageDir, file))) cpSync(join(packageDir, file), join(dest, file));
+}
+for (const dir of ["bin", "licenses"]) {
+  const srcDir = join(packageDir, dir);
+  if (existsSync(srcDir)) cpSync(srcDir, join(dest, dir), { recursive: true });
 }
 for (const half of ["agent", "app"]) {
   const distDir = join(packageDir, half, "dist");
   if (existsSync(distDir)) cpSync(distDir, join(dest, half, "dist"), { recursive: true });
 }
 
+const destReal = realpathSync(dest);
+for (const half of ["agent", "app"]) {
+  assertTreeSafe(join(dest, half, "dist"), destReal, `runtime ${half}/dist`);
+}
+for (const dir of ["bin", "licenses"]) {
+  if (existsSync(join(dest, dir))) assertTreeSafe(join(dest, dir), destReal, `runtime ${dir}`);
+}
 for (const entry of [agentEntry, hostEntry, ...appEntries]) {
   if (!entry) continue;
-  if (!existsSync(join(dest, entry))) {
-    console.error(`sync-bundled-extension: runtime copy is missing ${entry}`);
-    process.exit(1);
-  }
+  assertDeclaredEntry(dest, entry, "runtime entry", `runtime copy is missing ${entry}`);
 }
 
 // Host receipt: pin the declared host library entry's content hash so a

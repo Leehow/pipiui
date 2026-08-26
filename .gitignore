@@ -45,6 +45,12 @@ Electron/**/dist/
 !Electron/resources/runtime/extensions/grok-build-oauth/**
 !Electron/resources/runtime/extensions/deepseek/
 !Electron/resources/runtime/extensions/deepseek/**
+# Bundled manifest extension runtime bundles (compiled halves synced from the
+# workspace packages by scripts/sync-bundled-extension.mjs)
+!Electron/resources/runtime/extensions/office-extension/
+!Electron/resources/runtime/extensions/office-extension/**
+!Electron/resources/runtime/extensions/pipiui-headroom/
+!Electron/resources/runtime/extensions/pipiui-headroom/**
 Electron/**/out/
 
 # file-viewer vite-plugin copies (regenerated on build; manifest has machine paths)

@@ -81,7 +81,7 @@ describe('persistent embedded Pi runtime CLI', () => {
   function run(args: string[], path = process.env.PATH) {
     return spawnSync(process.execPath, [script, ...args], {
       encoding: 'utf8',
-      env: { ...process.env, PATH: path, PIPIUI_EMBEDDED_RUNTIMES_ROOT: root }
+      env: { ...process.env, PATH: path, PIPIUI_EMBEDDED_RUNTIMES_ROOT: root, PIPIUI_SKIP_OFFICECLI: '1' }
     })
   }
 

@@ -80,6 +80,28 @@ describe("extension lifecycle state machine", () => {
     expect(registry.get("pi-ext")?.state).toBe("disabled");
   });
 
+  it("unloads a builtin from error so a later ingest can rediscover it", () => {
+    const registry = createExtensionRegistry([]);
+    registry.ingest({
+      id: "office-extension",
+      name: "PipiUI Office",
+      version: "0.1.0",
+      origin: "builtin",
+    });
+    registry.enterError("office-extension", "agent.extension does not exist: agent/dist/index.js");
+    expect(registry.get("office-extension")?.state).toBe("error");
+    expect(() => registry.unload("office-extension")).not.toThrow();
+    expect(registry.get("office-extension")).toBeUndefined();
+    const again = registry.ingest({
+      id: "office-extension",
+      name: "PipiUI Office",
+      version: "0.1.0",
+      origin: "builtin",
+    });
+    expect(again.state).toBe("enabled");
+    expect(again.error).toBeUndefined();
+  });
+
   it("enters error on invalid descriptors without enabling", () => {
     const registry = createExtensionRegistry([]);
     const bad = registry.ingest({

@@ -3,12 +3,11 @@ import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import { fileViewerRenderers, type FileViewerRenderersPluginOptions } from '@file-viewer/vite-plugin'
-import { fileViewerPptVendorAssetPlugin } from './file-viewer-ppt-vendor-assets'
 
-// Default chunkStrategy:'renderer' splits word/ofd into circular chunks
-// that TDZ-crash the web bundle before React mounts. Match Electron.
+// PDF-only after T4: Office preset/assets live in pipiui-office-extension.
+// chunkStrategy:'none' still avoids renderer-chunk TDZ if more formats return.
 export const fileViewerAssetOptions = {
-  preset: 'office',
+  formats: ['pdf'],
   copyAssets: { baseDir: 'file-viewer' },
   chunkStrategy: 'none'
 } satisfies FileViewerRenderersPluginOptions
@@ -16,7 +15,7 @@ export const fileViewerAssetOptions = {
 const here = dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig({
-  plugins: [fileViewerPptVendorAssetPlugin(), fileViewerRenderers(fileViewerAssetOptions), react()],
+  plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
   resolve: {
     alias: {
       '@pipiui/extension-api': resolve(here, '../extension-api/src/index.ts'),

@@ -409,7 +409,11 @@ function descriptorFrom(
 
 function unloadSafe(registry: ExtensionRegistry, id: string): void {
   const rec = registry.get(id);
-  if (!rec || rec.origin === "builtin") return;
+  if (!rec) return;
+  if (rec.origin === "builtin") {
+    if (rec.state === "error") registry.unload(id);
+    return;
+  }
   if (rec.state === "error") {
     registry.unload(id);
     return;
@@ -599,8 +603,8 @@ export class ExtensionLoader {
     if (pkg.origin !== "builtin" && this.reservedBuiltinIds.has(descriptor.id)) {
       if (existing) return existing;
     }
-    if (existing && this.directories.get(descriptor.id) === pkg.directory) {
-      if (!validation.ok && existing.state !== "error") {
+    if (existing && this.directories.get(descriptor.id) === pkg.directory && existing.state !== "error") {
+      if (!validation.ok) {
         this.rememberAgent(descriptor.id, pkg.directory, undefined);
         return this.registry.enterError(descriptor.id, validation.errors.join("; "));
       }
@@ -609,7 +613,7 @@ export class ExtensionLoader {
       if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
       else this.auth.delete(descriptor.id);
       const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
-      if (missingAgent && existing.state !== "error") {
+      if (missingAgent) {
         return this.registry.enterError(descriptor.id, missingAgent);
       }
       return existing;

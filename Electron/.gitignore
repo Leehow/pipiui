@@ -9,6 +9,7 @@ node_modules/
 !resources/runtime/anydoc/node_modules/**
 .cua-driver/
 .cua-driver-cache/
+.officecli/
 .embedded-runtime/
 .embedded-runtime-staging-*/
 .embedded-runtimes/
@@ -20,5 +21,10 @@ dist/
 !resources/runtime/extensions/qoder/**
 !resources/runtime/extensions/deepseek/
 !resources/runtime/extensions/deepseek/**
+# Bundled manifest extension runtime bundles (synced from the workspace packages)
+!resources/runtime/extensions/office-extension/
+!resources/runtime/extensions/office-extension/**
+!resources/runtime/extensions/pipiui-headroom/
+!resources/runtime/extensions/pipiui-headroom/**
 out/
 packages/pi-backend/src/runtime-agents.bundle.mjs

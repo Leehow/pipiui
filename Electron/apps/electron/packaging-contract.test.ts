@@ -55,6 +55,8 @@ describe('macOS packaging contract', () => {
     const embedded = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-embedded')
     expect(runtimeSource?.filter).toContain('!**/node_modules/**')
     expect(runtimeSource?.filter).toContain('!**/target/**')
+    expect(runtimeSource?.filter).toContain('!extensions/office-extension/bin/**/officecli')
+    expect(runtimeSource?.filter).toContain('!extensions/office-extension/bin/**/officecli.exe')
     const codeRetrieval = packageJSON.build.extraResources.find(entry => entry.to === 'pipiui-runtime/extensions/code-retrieval')
     expect(codeRetrieval?.filter).toContain('!**/target/**')
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
@@ -66,6 +68,24 @@ describe('macOS packaging contract', () => {
       from: '../../resources/runtime/extensions/qoder',
       to: 'pipiui-runtime/extensions/qoder',
       filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/pipiui-headroom',
+      to: 'pipiui-runtime/extensions/pipiui-headroom',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/office-extension',
+      to: 'pipiui-runtime/extensions/office-extension',
+      filter: [
+        '**/*',
+        '!**/node_modules/**',
+        '!**/.git/**',
+        '!**/*.tsbuildinfo',
+        '!bin/**/officecli',
+        '!bin/**/officecli.exe',
+        '!bin/**/receipt.json'
+      ]
     }))
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/pdf-inspector/node_modules',
@@ -185,6 +205,33 @@ describe('macOS packaging contract', () => {
     expect(packageJSON.scripts['package:win']).not.toContain('CUA_TARGET_PLATFORM=')
   })
 
+  it('ships one OfficeCLI native binary per target from the ignored cache, prepared by the same fetch-pi-runtime key', () => {
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../.officecli/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}',
+      to: 'pipiui-runtime'
+    }))
+    const officeFrom = packageJSON.build.extraResources.filter(entry => String(entry.from).includes('.officecli'))
+    expect(officeFrom).toHaveLength(1)
+    expect(officeFrom[0]?.to).toBe('pipiui-runtime')
+    expect(officeFrom[0]?.to).not.toContain('${env')
+    expect(officeFrom[0]?.from).not.toContain('darwin-arm64')
+    expect(officeFrom[0]?.from).not.toContain('darwin-x64')
+    expect(runtimePreparer).toContain('fetch-officecli-binary.mjs')
+    expect(runtimePreparer).toContain("'--platform', platform")
+    expect(runtimePreparer).toContain("'--arch', arch")
+    expect(runtimePreparer).toContain("process.env.PIPIUI_SKIP_OFFICECLI !== '1'")
+    expect(targetPackager).toContain('fetch-pi-runtime.mjs')
+    expect(targetPackager).not.toContain('PIPIUI_SKIP_OFFICECLI')
+    expect(wrapper).not.toContain('PIPIUI_SKIP_OFFICECLI')
+    expect(targetPackager).toContain("'--check'")
+    const gitignore = readFileSync(resolve(import.meta.dirname, '../../.gitignore'), 'utf8')
+    expect(gitignore).toMatch(/^\.officecli\/$/m)
+    const officeFetch = readFileSync(resolve(import.meta.dirname, '../../scripts/fetch-officecli-binary.mjs'), 'utf8')
+    expect(officeFetch).not.toContain('https://d.officecli.ai')
+    expect(officeFetch).not.toContain('/releases/latest/download')
+    expect(officeFetch).toContain('Refusing mutable OfficeCLI URL')
+  })
+
   it('checks and selects exactly one persistent target without preparing during release', () => {
     expect(packageJSON.scripts['package:win']).toContain('package-electron-target.mjs --platform win32 --arch x64')
     expect(packageJSON.scripts['package:linux']).toContain('package-electron-target.mjs --platform linux --arch x64')
@@ -222,7 +269,14 @@ describe('macOS packaging contract', () => {
   })
 
   it('reseals and strictly verifies each settled architecture with the stable identity', () => {
-    expect(wrapper).toMatch(/package_mac_arch x64 "\$ROOT\/build\/mac"[\s\S]*package_mac_arch arm64 "\$ROOT\/build\/mac-arm64"/)
+    expect(wrapper).toMatch(/package_mac_arch x64 "\$run_root\/x64"[\s\S]*package_mac_arch arm64 "\$run_root\/arm64"/)
+    // Each release builds into one unique owned run root handed to
+    // electron-builder via --config.directories.output; the fixed shared
+    // build/mac* trees are never used or cleaned up.
+    expect(wrapper).toContain('--config.directories.output="$out_dir"')
+    expect(wrapper).toMatch(/run_root="\$\(mktemp -d "\$ROOT\/build\/.release-run\.XXXXXX"\)"/)
+    expect(wrapper).not.toMatch(/rm -rf "\$ROOT\/build\/mac/)
+    expect(wrapper).not.toMatch(/"\$ROOT\/build\/mac"|"\$ROOT\/build\/mac-arm64"/)
     expect(wrapper).not.toMatch(/codesign --sign[^\n]*--deep/)
     expect(wrapper).toContain('discover_macho_candidates "$app"')
     expect(wrapper).toMatch(/find "\$app\/Contents" -type f \\\([\s\S]*-perm -111[\s\S]*-name '\*\.node'[\s\S]*-name '\*\.dylib'[\s\S]*-name '\*\.so'/)
@@ -338,9 +392,15 @@ describe('macOS packaging contract', () => {
     const output = execFileSync('/bin/bash', ['-c', [
       'set -euo pipefail',
       `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
-      'PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST=1 package_mac_arch arm64 "/tmp/mac-arm64"'
+      'arm64_app="$(PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST=1 package_mac_arch arm64 "/tmp/rel-arm64")"',
+      'x64_app="$(PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST=1 package_mac_arch x64 "/tmp/rel-x64")"',
+      'printf \'%s\\n%s\\n\' "$arm64_app" "$x64_app"'
     ].join('\n')], { encoding: 'utf8' })
-    expect(output.trim()).toBe('/tmp/mac-arm64/PipiUI Electron.app')
+    // Pins the electron-builder unpacked-dir naming the run-root layout
+    // depends on: <out>/mac for x64, <out>/mac-arm64 for arm64.
+    const [arm64App, x64App] = output.trim().split('\n')
+    expect(arm64App).toBe('/tmp/rel-arm64/mac-arm64/PipiUI Electron.app')
+    expect(x64App).toBe('/tmp/rel-x64/mac/PipiUI Electron.app')
   })
 
   it('matches only the exact canonical Electron executable and guards before mac build work', () => {

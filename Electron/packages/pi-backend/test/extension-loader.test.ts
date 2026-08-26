@@ -863,4 +863,29 @@ describe("extension loader agent contributions snapshot", () => {
     expect(JSON.stringify(a?.contributionDiagnostics)).not.toMatch(/\/[^`]+\/agent\/dist/);
     expect(JSON.stringify(b?.contributionDiagnostics)).not.toContain(appRoot);
   });
+
+  it("rediscovers a builtin after agent.extension appears on a later scan", async () => {
+    await tempRoot("pipi-ext-builtin-recover-");
+    const builtinRoot = join(root, "runtime", "extensions");
+    const dest = await writeContribPackage(join(builtinRoot, "office-extension"), {
+      id: "office-extension",
+      extension: "agent/dist/index.js",
+    });
+    await rm(join(dest, "agent/dist/index.js"));
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot,
+      appRoot: join(root, "agent", "extensions"),
+    });
+    loader.scan();
+    expect(registry.get("office-extension")?.state).toBe("error");
+    expect(registry.get("office-extension")?.error).toMatch(/agent\.extension does not exist/);
+    await writeFile(join(dest, "agent/dist/index.js"), "export default function () {}\n");
+    loader.scan();
+    expect(registry.get("office-extension")?.state).not.toBe("error");
+    expect(registry.get("office-extension")?.error).toBeUndefined();
+    const spawned = loader.spawnPackages({ "office-extension": true }).find((pkg) => pkg.id === "office-extension");
+    expect(spawned?.extensionPath).toMatch(/office-extension\/agent\/dist\/index\.js$/);
+  });
 });

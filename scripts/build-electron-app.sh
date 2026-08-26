@@ -1,7 +1,10 @@
 #!/bin/bash
 # Build PipiUI Electron packages.
-# Usage: scripts/build-electron-app.sh [mac|win|linux|--check-signing]   (default: mac)
+# Usage: scripts/build-electron-app.sh [mac|mac --stage-only|win|linux|--check-signing]   (default: mac)
 #   mac   → dmg + zip (x64 + arm64) + canonical single artifact build/PipiUI Electron.app
+#   mac --stage-only → stage the container build/PipiUI Electron.release-staged/
+#                      (verified arm64 PipiUI Electron.app + receipt.json) without
+#                      touching the canonical App; see publish_release_staged below.
 #   win   → NSIS installer (x64) — cross-built on any host (no .app produced)
 #   linux → AppImage + deb (x64) — cross-built on any host (no .app produced)
 # The macOS .app packaging guard from AGENTS.md stays: only the primary
@@ -11,6 +14,14 @@ set -euo pipefail
 DEFAULT_MAC_SIGNING_IDENTITY="108232C5A713C15A869FC4C267E18D2E35CD276C"
 
 prepare_mac_signing_identity() {
+  # Test-only seam: route tests exercise the top-level release flow without a
+  # keychain. Never active unless PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST=1.
+  if [[ "${PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST:-0}" == "1" ]]; then
+    CSC_NAME="PIPIUI-TEST-IDENTITY"
+    export CSC_NAME
+    export CSC_IDENTITY_AUTO_DISCOVERY=false
+    return 0
+  fi
   local requested="${PIPIUI_ELECTRON_SIGNING_IDENTITY:-$DEFAULT_MAC_SIGNING_IDENTITY}"
   local identities matches match_count fingerprint certificate_name
 
@@ -101,9 +112,18 @@ process_list_contains_exact_executable() {
   return "$found"
 }
 
+process_listing() {
+  # Test-only seam: never active unless PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST=1.
+  if [[ "${PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST:-0}" == "1" && -n "${PIPIUI_PS_SEAM_FILE:-}" ]]; then
+    /bin/cat "${PIPIUI_PS_SEAM_FILE}"
+  else
+    /bin/ps -axo pid=,comm=
+  fi
+}
+
 canonical_electron_app_is_running() {
   local executable="$1"
-  process_list_contains_exact_executable "$executable" < <(/bin/ps -axo pid=,comm=)
+  process_list_contains_exact_executable "$executable" < <(process_listing)
 }
 
 verify_embedded_node_shim() {
@@ -279,15 +299,42 @@ finalize_mac_bundle() {
 
 package_mac_arch() {
   local arch="$1"
-  local app_dir="$2"
-  local app="$app_dir/PipiUI Electron.app"
-  local log status
+  # Each invocation owns an output directory under this run's unique run root
+  # (passed to electron-builder via --config.directories.output), so nothing
+  # reads or writes the fixed shared build/mac* trees.
+  local out_dir="$2"
+  local app_subdir app log status
+  case "$arch" in
+    x64) app_subdir="mac" ;;
+    arm64) app_subdir="mac-arm64" ;;
+    *) echo "ERROR: unsupported mac architecture: $arch" >&2; return 1 ;;
+  esac
+  app="$out_dir/$app_subdir/PipiUI Electron.app"
   if [[ "${PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST:-0}" == "1" ]]; then
+    # Function-test seam: optionally materialize a complete fake candidate and
+    # fake arch-tagged artifacts from a fixture, so the top-level release route
+    # can execute end-to-end without electron-builder. Filenames here only need
+    # the <version> and <arch> tokens the artifact contract classifies on.
+    if [[ -n "${PIPIUI_PACKAGING_TEST_FIXTURE:-}" ]]; then
+      local version="${PIPIUI_PACKAGING_TEST_VERSION:-0.0.0}"
+      local skip="${PIPIUI_PACKAGING_TEST_SKIP:-}" extra
+      mkdir -p "$(dirname "$app")"
+      cp -R "$PIPIUI_PACKAGING_TEST_FIXTURE" "$app"
+      [[ "$skip" == *"$arch-dmg"* ]] || printf 'fake %s dmg %s\n' "$arch" "$version" > "$out_dir/PipiUI Electron-$version-$arch.dmg"
+      [[ "$skip" == *"$arch-zip"* ]] || printf 'fake %s zip %s\n' "$arch" "$version" > "$out_dir/PipiUI Electron-$version-$arch.zip"
+      if [[ "$arch" == "arm64" && -n "${PIPIUI_PACKAGING_TEST_EXTRA_ARM64:-}" ]]; then
+        for extra in ${PIPIUI_PACKAGING_TEST_EXTRA_ARM64}; do
+          printf 'extra %s\n' "$extra" > "$out_dir/$extra"
+        done
+      fi
+    fi
     printf '%s\n' "$app"
     return 0
   fi
-  log="$(mktemp "${TMPDIR:-/tmp}/pipiui-electron-builder-${arch}.XXXXXX.log")"
-  local version_args=()
+  # BSD mktemp only randomizes a trailing XXXXXX; characters after it become a
+  # literal pathname (so the second arch would collide on the same .log file).
+  log="$(mktemp "${TMPDIR:-/tmp}/pipiui-electron-builder-${arch}.log.XXXXXX")"
+  local -a version_args=()
   if [[ -n "${PIPIUI_ELECTRON_BUILD_VERSION:-}" ]]; then
     version_args+=(--config.extraMetadata.version="$PIPIUI_ELECTRON_BUILD_VERSION")
   fi
@@ -297,7 +344,7 @@ package_mac_arch() {
     CUA_TARGET_PLATFORM=darwin node ../../scripts/fetch-cua-driver.mjs \
       && PIPIUI_EMBEDDED_RUNTIMES_ROOT="$ROOT/Electron/.embedded-runtimes" node ../../scripts/fetch-pi-runtime.mjs --platform darwin --arch "$arch" --check \
       && PIPIUI_EMBEDDED_RUNTIME_TARGET="darwin-$arch" ../../node_modules/.bin/electron-builder --mac --"$arch" \
-           "${version_args[@]}"
+           --config.directories.output="$out_dir" ${version_args[@]+"${version_args[@]}"}
   ) 2>&1 | tee "$log"
   status=${PIPESTATUS[0]}
   set -e
@@ -314,22 +361,327 @@ package_mac_arch() {
   finalize_mac_bundle "$app"
 }
 
+json_quote() {
+  # Escape the characters that can appear in paths and plist-derived strings;
+  # reject remaining control characters instead of emitting invalid JSON.
+  local value="${1//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  if printf '%s' "$value" | LC_ALL=C grep -q $'[^ -~]'; then
+    echo "ERROR: refusing to embed control characters in the staged receipt" >&2
+    return 1
+  fi
+  printf '"%s"' "$value"
+}
+
+sha256_file() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+# Root CodeDirectory hash. CDHash is computed by codesign over the sealed
+# bundle resources, so it binds the whole signed App, not just one file.
+extract_codesign_cdhash() {
+  local app="$1" line
+  line="$(codesign -d --verbose=4 "$app" 2>&1 | /usr/bin/awk -F= '/^CDHash=/ {print $2; exit}')"
+  [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$line"
+}
+
+RELEASE_STAGED_SCHEMA="pipiui-electron-release-staged/2"
+BUILD_ELECTRON_APP_VERSION="2"
+stage_cleanup_paths=()
+
+stage_sibling_path() {
+  local dest="$1" suffix="$2"
+  printf '%s/.%s.%s\n' "$(dirname "$dest")" "$(basename "$dest")" "$suffix"
+}
+
+stage_cleanup_temps() {
+  local path
+  for path in "${stage_cleanup_paths[@]:-}"; do
+    [[ -n "$path" ]] && rm -rf "$path"
+  done
+  stage_cleanup_paths=()
+}
+
+stage_forget_path() {
+  # Drop one exact path from the cleanup array. Element-exact string matching
+  # only — never word-split — so paths containing spaces stay intact.
+  local drop="$1" path
+  local -a keep=()
+  for path in ${stage_cleanup_paths[@]+"${stage_cleanup_paths[@]}"}; do
+    [[ "$path" == "$drop" ]] || keep+=("$path")
+  done
+  stage_cleanup_paths=(${keep[@]+"${keep[@]}"})
+}
+
+# Replace dest with src without ever exposing a partial dest: park src in a
+# sibling .next, park any previous dest in .prev, then complete with one mv.
+# The EXIT trap (stage_cleanup_temps) discards parked paths on a crash; every
+# early return forgets exactly the paths it parked, preserving the rest of the
+# cleanup array (paths may contain spaces and are never word-split).
+atomic_publish_dir() {
+  local src="$1" dest="$2" next prev
+  [[ -d "$src" ]] || return 1
+  mkdir -p "$(dirname "$dest")" || return 1
+  next="$(stage_sibling_path "$dest" next)"
+  prev="$(stage_sibling_path "$dest" prev)"
+  rm -rf "$next" "$prev"
+  stage_cleanup_paths+=("$next" "$prev")
+  if ! mv "$src" "$next"; then
+    stage_forget_path "$next"
+    stage_forget_path "$prev"
+    return 1
+  fi
+  if [[ -e "$dest" ]]; then
+    if ! mv "$dest" "$prev"; then
+      mv "$next" "$src" 2>/dev/null || true
+      stage_forget_path "$next"
+      stage_forget_path "$prev"
+      return 1
+    fi
+  fi
+  if ! mv "$next" "$dest"; then
+    # Best-effort restore of the previous pair. If a restore itself fails the
+    # stable dest is simply absent — never a mismatched pair.
+    if [[ -e "$prev" ]]; then mv "$prev" "$dest" 2>/dev/null || true; fi
+    if [[ -e "$next" ]]; then mv "$next" "$src" 2>/dev/null || true; fi
+    stage_forget_path "$next"
+    stage_forget_path "$prev"
+    return 1
+  fi
+  rm -rf "$prev"
+  stage_forget_path "$next"
+  stage_forget_path "$prev"
+  return 0
+}
+
+publish_release_artifacts() {
+  # Validate exactly this run's four expected artifacts (x64+arm64 dmg+zip),
+  # each tagged with this release's version, all unique, then - and only after
+  # the full matrix validated - move them into build/ with same-filesystem
+  # atomic renames. Files arrive per arch in the arch-owned run-root subdir, so
+  # classification never depends on parsing artifact basenames. A validation
+  # failure leaves build/ and any prior artifacts completely untouched.
+  # Prints the JSON object entries (comma-joined) for the receipt inventory.
+  local root="$1" run_root="$2" version="$3" arch file base kind bytes sha entry
+  local -a entries=() found=() moves=()
+  for arch in x64 arm64; do
+    for file in "$run_root/$arch"/*.dmg "$run_root/$arch"/*.zip; do
+      [[ -f "$file" ]] || continue
+      base="$(basename "$file")"
+      case "$base" in
+        *.dmg) kind="dmg" ;;
+        *.zip) kind="zip" ;;
+        *) continue ;;
+      esac
+      if printf '%s\n' ${found[@]+"${found[@]}"} | /usr/bin/grep -qx "$kind-$arch"; then
+        echo "ERROR: release: duplicate $arch $kind artifact in the run root: $base" >&2
+        return 1
+      fi
+      if [[ -n "$version" && "$base" != *"$version"* ]]; then
+        echo "ERROR: release: artifact $base is not tagged with the release version $version" >&2
+        return 1
+      fi
+      found+=("$kind-$arch")
+      moves+=("$file")
+      bytes="$(stat -f %z "$file")"
+      sha="$(sha256_file "$file")"
+      entries+=("{\"kind\":\"$kind\",\"arch\":\"$arch\",\"path\":$(json_quote "$root/build/$base"),\"bytes\":$bytes,\"sha256\":\"$sha\"}")
+    done
+  done
+  if [[ "${#found[@]}" -ne 4 ]]; then
+    echo "ERROR: release: expected exactly 4 artifacts (x64+arm64 dmg+zip) for version ${version:-unknown}, found ${#found[@]}: ${found[*]:-none}" >&2
+    return 1
+  fi
+  for file in ${moves[@]+"${moves[@]}"}; do
+    if ! mv "$file" "$root/build/"; then
+      echo "ERROR: release: failed to publish artifact $(basename "$file") into build/" >&2
+      return 1
+    fi
+  done
+  (IFS=,; printf '%s' "${entries[*]}")
+}
+
+extension_manifests_aggregate() {
+  # Deterministic identity of the bundled extension manifest set: every
+  # pipiui-extension.json under Resources/pipiui-runtime/extensions, sorted by
+  # relative path, folded as "<relpath>  <sha256>" lines and hashed. Prints
+  # "<aggregateSha256> <count>". The installer recomputes this to bind the
+  # staged App to its receipt without hashing the whole multi-GB bundle.
+  local app="$1" manifest rel sha count
+  local -a lines=()
+  while IFS= read -r manifest; do
+    rel="${manifest#"$app"/}"
+    sha="$(sha256_file "$manifest")"
+    lines+=("$rel  $sha")
+  done < <(find "$app/Contents/Resources/pipiui-runtime/extensions" -name pipiui-extension.json -print | LC_ALL=C sort)
+  count="${#lines[@]}"
+  if [[ "$count" -eq 0 ]]; then
+    echo "ERROR: staged App has no pipiui-extension.json manifests under Resources/pipiui-runtime/extensions" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$(printf '%s\n' "${lines[@]}" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')" "$count"
+}
+
+# Stage-only step: verify the finished arm64 candidate strictly, gather its
+# cryptographic identity, publish this run's four validated artifacts into
+# build/, and publish candidate+receipt together as one atomic container swap
+# to build/PipiUI Electron.release-staged/ (App + receipt.json). The canonical
+# App (running or not) is never touched, and a failed run leaves the previous
+# complete container pair intact - a mismatched candidate/receipt pair is
+# never exposed.
+publish_release_staged() {
+  local run_root="$1"
+  local app_src="$run_root/arm64/mac-arm64/PipiUI Electron.app"
+  local container_dst="$ROOT/build/PipiUI Electron.release-staged"
+  local main_exe office_bin office_receipt_dir office_receipt office_target office_sha office_bytes office_version office_receipt_sha
+  local cdhash exe_sha exe_bytes plist_sha bundle_version archs epoch staged_at tmp_container tmp_receipt inventory
+  local manifest_identity manifest_agg manifest_count
+
+  [[ -d "$app_src" ]] || { echo "ERROR: stage-only: expected the arm64 App at $app_src" >&2; return 1; }
+  expected_mac_bundle_is_complete "$app_src" || { echo "ERROR: stage-only: refusing to stage an incomplete Electron bundle: $app_src" >&2; return 1; }
+  main_exe="$app_src/Contents/MacOS/PipiUI Electron"
+  if ! codesign --verify --deep --strict --verbose=2 "$app_src"; then
+    echo "ERROR: stage-only: strict codesign verification failed for $app_src" >&2
+    return 1
+  fi
+  if ! cdhash="$(extract_codesign_cdhash "$app_src")"; then
+    echo "ERROR: stage-only: could not read a valid CDHash for $app_src" >&2
+    return 1
+  fi
+  archs="$(lipo -archs "$main_exe" 2>/dev/null || true)"
+  [[ "$archs" == *"arm64"* ]] || { echo "ERROR: stage-only: staged main executable is not arm64 (${archs:-unknown})" >&2; return 1; }
+  bundle_version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$app_src/Contents/Info.plist" 2>/dev/null || true)"
+  [[ -n "$bundle_version" ]] || { echo "ERROR: stage-only: staged App has no CFBundleShortVersionString" >&2; return 1; }
+  exe_sha="$(sha256_file "$main_exe")"
+  exe_bytes="$(stat -f %z "$main_exe")"
+  plist_sha="$(sha256_file "$app_src/Contents/Info.plist")"
+  if ! manifest_identity="$(extension_manifests_aggregate "$app_src")"; then
+    return 1
+  fi
+  read -r manifest_agg manifest_count <<< "$manifest_identity"
+
+  # The packaging contract ships exactly one OfficeCLI slice per target; a
+  # staged candidate without a hash-valid darwin-arm64 slice is not installable.
+  office_receipt_dir="$app_src/Contents/Resources/pipiui-runtime/extensions/office-extension/bin/darwin-arm64"
+  office_bin="$office_receipt_dir/officecli"
+  office_receipt="$office_receipt_dir/receipt.json"
+  [[ -x "$office_bin" && -f "$office_receipt" ]] || { echo "ERROR: stage-only: staged App lacks the bundled darwin-arm64 OfficeCLI binary/receipt" >&2; return 1; }
+  office_target="$(/usr/bin/plutil -extract target raw -o - "$office_receipt" 2>/dev/null || true)"
+  office_sha="$(/usr/bin/plutil -extract sha256 raw -o - "$office_receipt" 2>/dev/null || true)"
+  office_bytes="$(/usr/bin/plutil -extract bytes raw -o - "$office_receipt" 2>/dev/null || true)"
+  office_version="$(/usr/bin/plutil -extract version raw -o - "$office_receipt" 2>/dev/null || true)"
+  office_receipt_sha="$(sha256_file "$office_receipt")"
+  [[ "$office_target" == "darwin-arm64" ]] || { echo "ERROR: stage-only: bundled OfficeCLI receipt target is ${office_target:-missing}, expected darwin-arm64" >&2; return 1; }
+  [[ "$office_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: stage-only: bundled OfficeCLI receipt has no valid sha256" >&2; return 1; }
+  [[ "$office_bytes" =~ ^[0-9]+$ ]] || office_bytes=0
+  [[ "$(sha256_file "$office_bin")" == "$office_sha" ]] || { echo "ERROR: stage-only: bundled OfficeCLI hash does not match its receipt" >&2; return 1; }
+
+  if ! inventory="$(publish_release_artifacts "$ROOT" "$run_root" "$bundle_version")"; then
+    return 1
+  fi
+
+  # Build the complete replacement container (App + receipt) in a unique temp
+  # directory, then swap the stable container in one atomic rename chain: a
+  # crash leaves either the previous complete pair or the new complete pair,
+  # never a candidate/receipt mismatch.
+  tmp_container="$(mktemp -d "$ROOT/build/.release-staged-container.XXXXXX")"
+  stage_cleanup_paths+=("$tmp_container")
+  if ! mv "$app_src" "$tmp_container/PipiUI Electron.app"; then
+    echo "ERROR: stage-only: failed to assemble the staged container" >&2
+    return 1
+  fi
+  epoch="$(date +%s)"
+  staged_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  tmp_receipt="$(mktemp "$ROOT/build/.release-staged.receipt.XXXXXX")"
+  stage_cleanup_paths+=("$tmp_receipt")
+  {
+    printf '{\n'
+    printf '  "schema": %s,\n' "$(json_quote "$RELEASE_STAGED_SCHEMA")"
+    printf '  "sourceScriptVersion": %s,\n' "$(json_quote "$BUILD_ELECTRON_APP_VERSION")"
+    printf '  "version": %s,\n' "$(json_quote "$bundle_version")"
+    printf '  "containerPath": %s,\n' "$(json_quote "$container_dst")"
+    printf '  "stagedPath": %s,\n' "$(json_quote "$container_dst/PipiUI Electron.app")"
+    printf '  "mainArch": "arm64",\n'
+    printf '  "stagedAt": %s,\n' "$(json_quote "$staged_at")"
+    printf '  "stagedAtEpoch": %s,\n' "$epoch"
+    printf '  "app": {\n'
+    printf '    "cdhash": %s,\n' "$(json_quote "$cdhash")"
+    printf '    "mainExecutable": {"path": %s, "sha256": %s, "bytes": %s},\n' "$(json_quote "Contents/MacOS/PipiUI Electron")" "$(json_quote "$exe_sha")" "$exe_bytes"
+    printf '    "infoPlist": {"path": %s, "sha256": %s},\n' "$(json_quote "Contents/Info.plist")" "$(json_quote "$plist_sha")"
+    printf '    "extensionManifests": {"count": %s, "aggregateSha256": %s}\n' "$manifest_count" "$(json_quote "$manifest_agg")"
+    printf '  },\n'
+    printf '  "officecli": {\n'
+    printf '    "target": %s,\n' "$(json_quote "$office_target")"
+    printf '    "sha256": %s,\n' "$(json_quote "$office_sha")"
+    printf '    "bytes": %s,\n' "$office_bytes"
+    printf '    "version": %s,\n' "$(json_quote "$office_version")"
+    printf '    "receiptPath": %s,\n' "$(json_quote "Contents/Resources/pipiui-runtime/extensions/office-extension/bin/darwin-arm64/receipt.json")"
+    printf '    "receiptSha256": %s\n' "$(json_quote "$office_receipt_sha")"
+    printf '  },\n'
+    printf '  "codesign": {"verified": true, "mode": "deep-strict", "cdhash": %s},\n' "$(json_quote "$cdhash")"
+    printf '  "artifacts": [%s]\n' "$inventory"
+    printf '}\n'
+  } > "$tmp_receipt"
+  if ! mv "$tmp_receipt" "$tmp_container/receipt.json"; then
+    echo "ERROR: stage-only: failed to seal the receipt into the staged container" >&2
+    return 1
+  fi
+  stage_forget_path "$tmp_receipt"
+
+  if ! atomic_publish_dir "$tmp_container" "$container_dst"; then
+    echo "ERROR: stage-only: failed to publish the staged container atomically; any previous staged container was kept" >&2
+    return 1
+  fi
+  stage_forget_path "$tmp_container"
+
+  echo "Staged release container: $container_dst"
+  echo "Staged receipt: $container_dst/receipt.json"
+}
+
 PLATFORM="${1:-mac}"
+# mac --stage-only: full dual-architecture DMG/ZIP release build that never
+# touches, moves, or quits build/PipiUI Electron.app. The verified arm64
+# candidate and its receipt are published as one atomic container to
+# build/PipiUI Electron.release-staged/ (PipiUI Electron.app + receipt.json),
+# for scripts/install-electron-release-staged.sh.
+STAGE_ONLY=0
+USAGE_LINE="usage: $0 [mac [--stage-only]|win|linux|--check-signing]"
 case "$PLATFORM" in
-  mac|win|linux) ;;
+  mac)
+    if [[ "${2:-}" == "--stage-only" ]]; then
+      STAGE_ONLY=1
+    elif [[ -n "${2:-}" ]]; then
+      echo "$USAGE_LINE" >&2
+      exit 2
+    fi
+    ;;
+  win|linux)
+    if [[ -n "${2:-}" ]]; then
+      echo "$USAGE_LINE" >&2
+      exit 2
+    fi
+    ;;
   --check-signing)
     prepare_mac_signing_identity
     exit 0
     ;;
   -h|--help)
-    echo "usage: $0 [mac|win|linux|--check-signing]"
+    echo "$USAGE_LINE"
     echo "mac signing defaults to persistent identity PipiUI Dev ($DEFAULT_MAC_SIGNING_IDENTITY)."
     echo "Override intentionally with PIPIUI_ELECTRON_SIGNING_IDENTITY=<exact SHA-1>."
     echo "Prepare release runtimes first: npm --prefix Electron run runtime:prepare:mac"
+    echo "mac --stage-only keeps a running PipiUI alive: it publishes the verified arm64"
+    echo "candidate plus receipt as one atomic container, build/PipiUI Electron.release-staged/"
+    echo "(PipiUI Electron.app + receipt.json), and never touches the canonical App."
+    echo "Install it later with install-electron-release-staged.sh."
     echo "Note: electron-vite dev runs the framework Electron binary and does not share the packaged App's TCC signing identity."
     exit 0
     ;;
-  *) echo "usage: $0 [mac|win|linux|--check-signing]" >&2; exit 2 ;;
+  *) echo "$USAGE_LINE" >&2; exit 2 ;;
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
@@ -353,11 +705,12 @@ if [[ "$CURRENT_ROOT" != "$PRIMARY_ROOT" ]]; then
   fi
 fi
 
-if [[ "$PLATFORM" == "mac" ]]; then
+if [[ "$PLATFORM" == "mac" && "$STAGE_ONLY" != "1" ]]; then
   CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"
   if canonical_electron_app_is_running "$CANONICAL_ELECTRON_EXECUTABLE"; then
     echo "ERROR: refusing to build or replace the canonical Electron App while it is running." >&2
     echo "Quit PipiUI Electron manually, then rerun this command. The running process was not terminated." >&2
+    echo "For a full release while PipiUI stays open, rerun with: $0 mac --stage-only" >&2
     exit 1
   fi
 fi
@@ -368,27 +721,50 @@ fi
 
 # build/ is gitignored, so the .icns may be absent on fresh checkouts; the
 # mac icon is generated from the tracked brand png (tolerant: skips if the
-# macOS toolchain is missing).
-if [[ "$PLATFORM" == "mac" ]]; then
+# macOS toolchain is missing). Route tests skip repo-mutating preparation.
+if [[ "$PLATFORM" == "mac" && "${PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST:-0}" != "1" ]]; then
   scripts/make-icon.sh assets/brand/app-icon.png Electron/apps/electron/build/icon.icns
 fi
 
 case "$PLATFORM" in
   mac)
-    npm --prefix Electron run build
-    package_mac_arch x64 "$ROOT/build/mac"
-    package_mac_arch arm64 "$ROOT/build/mac-arm64"
+    if [[ "${PIPIUI_ELECTRON_RELEASE_FUNCTION_TEST:-0}" != "1" ]]; then
+      npm --prefix Electron run build
+    fi
+    # Every release run builds into one unique owned run root under build/,
+    # passed to electron-builder via --config.directories.output. Nothing reads
+    # or deletes the fixed shared build/mac* trees, and cleanup touches only
+    # this run's own root (via the EXIT trap on failure, explicitly on success).
+    run_root="$(mktemp -d "$ROOT/build/.release-run.XXXXXX")"
+    trap stage_cleanup_temps EXIT
+    stage_cleanup_paths+=("$run_root")
+    echo "Release run root: $run_root"
+    package_mac_arch x64 "$run_root/x64"
+    package_mac_arch arm64 "$run_root/arm64"
 
+    if [[ "$STAGE_ONLY" == "1" ]]; then
+      # Two-phase release, step 1. DMG/ZIP artifacts for both architectures
+      # are validated and published into build/; the verified arm64 candidate
+      # and its receipt are published as one atomic container swap to
+      # build/PipiUI Electron.release-staged/. The canonical App — running or
+      # not — is never touched, moved, or quit, and nothing is installed.
+      publish_release_staged "$run_root"
+    else
     # Canonical single artifact: build/PipiUI Electron.app
-    APP_SRC="$ROOT/build/mac-arm64/PipiUI Electron.app"
+    APP_SRC="$run_root/arm64/mac-arm64/PipiUI Electron.app"
     APP_DST="$ROOT/build/PipiUI Electron.app"
     if [[ -d "$APP_SRC" ]]; then
+      APP_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP_SRC/Contents/Info.plist" 2>/dev/null || true)"
+      publish_release_artifacts "$ROOT" "$run_root" "$APP_VERSION" >/dev/null
       rm -rf "$APP_DST"
       mv "$APP_SRC" "$APP_DST"
       codesign --verify --deep --strict --verbose=2 "$APP_DST"
       echo "Packaged: $APP_DST"
     fi
-    rm -rf "$ROOT/build/mac-arm64" "$ROOT/build/mac"
+    fi
+    # Owned run-root cleanup only — never the fixed shared build/mac* trees.
+    rm -rf "$run_root"
+    stage_forget_path "$run_root"
     ;;
   win)
     npm --prefix Electron run package:win

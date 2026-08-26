@@ -300,7 +300,7 @@ export class ExtensionRegistry {
   transition(id: string, to: ExtensionLifecycleState): ExtensionRecord {
     const entry = this.require(id);
     assertLegalTransition(entry.state, to);
-    if (to === "unloaded" && !entry.uninstallable) {
+    if (to === "unloaded" && !entry.uninstallable && entry.state !== "error") {
       throw new ExtensionLifecycleError(`builtin extensions cannot be unloaded: ${id}`);
     }
     if (to === "disabled" || to === "unloaded") this.disposeAll(id);

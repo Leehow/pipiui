@@ -74,7 +74,10 @@
           "!**/dist/**",
           "!**/release/**",
           "!**/target/**",
-          "!**/.cua-driver-cache/**"
+          "!**/.cua-driver-cache/**",
+          "!extensions/office-extension/bin/**/officecli",
+          "!extensions/office-extension/bin/**/officecli.exe",
+          "!extensions/office-extension/bin/**/receipt.json"
         ]
       },
       {
@@ -126,6 +129,33 @@
           "!**/.git/**",
           "!**/*.tsbuildinfo"
         ]
+      },
+      {
+        "from": "../../resources/runtime/extensions/pipiui-headroom",
+        "to": "pipiui-runtime/extensions/pipiui-headroom",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
+        "from": "../../resources/runtime/extensions/office-extension",
+        "to": "pipiui-runtime/extensions/office-extension",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo",
+          "!bin/**/officecli",
+          "!bin/**/officecli.exe",
+          "!bin/**/receipt.json"
+        ]
+      },
+      {
+        "from": "../../.officecli/${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}",
+        "to": "pipiui-runtime"
       },
       {
         "from": "../../resources/runtime/anydoc/node_modules",

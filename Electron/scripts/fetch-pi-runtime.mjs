@@ -541,6 +541,17 @@ async function main() {
   const key = `${platform}-${arch}`
   const asset = metadata.assets[key]
   if (!asset) throw new Error(`No pinned Node runtime asset for ${key}`)
+  // Same target as extraResources `${env.PIPIUI_EMBEDDED_RUNTIME_TARGET}`.
+  // fast-app and package-electron-target both enter here; do not skip in production.
+  if (process.env.PIPIUI_SKIP_OFFICECLI !== '1') {
+    const officeCliArgs = [
+      join(electronRoot, 'scripts', 'fetch-officecli-binary.mjs'),
+      '--platform', platform,
+      '--arch', arch
+    ]
+    if (options.check) officeCliArgs.push('--check')
+    run(process.execPath, officeCliArgs)
+  }
   for (const [name, version] of Object.entries(requiredPackages)) {
     if (!exactVersion(version)) throw new Error(`${name} must be an exact production dependency, got ${version ?? 'missing'}`)
   }

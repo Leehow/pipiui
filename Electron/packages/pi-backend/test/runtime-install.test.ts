@@ -114,6 +114,7 @@ describe("installRuntimeTree", () => {
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("grok-build-oauth");
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("qoder");
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("pipiui-headroom");
+      expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("office-extension");
       const grokDir = join(root, "extensions", "grok-build-oauth");
       const grokManifest = JSON.parse(await readFile(join(grokDir, "pipiui-extension.json"), "utf8")) as {
         agent?: { extension?: string };
@@ -127,6 +128,39 @@ describe("installRuntimeTree", () => {
       ].filter(Boolean) as string[];
       expect(grokEntries.length).toBeGreaterThan(0);
       for (const entry of grokEntries) expect(existsSync(join(grokDir, entry))).toBe(true);
+      // A dist-backed builtin (office-extension) must survive the generic strip.
+      // Missing this keepDist pass is exactly `agent.extension does not exist: agent/dist/index.js`.
+      const officeDir = join(root, "extensions", "office-extension");
+      const officeManifest = JSON.parse(await readFile(join(officeDir, "pipiui-extension.json"), "utf8")) as {
+        agent?: { extension?: string };
+        host?: { entry?: string };
+        app?: { ui?: { documentRenderers?: { entry?: string }[] } };
+      };
+      expect(officeManifest.agent?.extension).toBe("agent/dist/index.js");
+      expect(existsSync(join(officeDir, officeManifest.agent!.extension!))).toBe(true);
+      expect(officeManifest.host?.entry).toBeTruthy();
+      expect(existsSync(join(officeDir, officeManifest.host!.entry!))).toBe(true);
+      for (const renderer of officeManifest.app?.ui?.documentRenderers ?? []) {
+        if (renderer.entry) expect(existsSync(join(officeDir, renderer.entry))).toBe(true);
+      }
+      const shipped = await readdir(join(runtimeSource, "extensions"), { withFileTypes: true });
+      for (const entry of shipped) {
+        if (!entry.isDirectory()) continue;
+        const manifestPath = join(runtimeSource, "extensions", entry.name, "pipiui-extension.json");
+        if (!existsSync(manifestPath)) continue;
+        const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+          agent?: { extension?: string };
+          host?: { entry?: string };
+        };
+        const declared = [manifest.agent?.extension, manifest.host?.entry].filter(
+          (rel): rel is string => typeof rel === "string" && rel.length > 0,
+        );
+        if (!declared.some((rel) => rel.split(/[/\\]/).includes("dist"))) continue;
+        expect(BUNDLED_MANIFEST_EXTENSIONS, `${entry.name} ships dist-backed agent/host`).toContain(entry.name);
+        for (const rel of declared) {
+          expect(existsSync(join(root, "extensions", entry.name, rel)), `${entry.name} ${rel}`).toBe(true);
+        }
+      }
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
@@ -135,6 +169,45 @@ describe("installRuntimeTree", () => {
     try {
       const report = installRuntimeTree({}, root);
       expect(report.failures).toEqual(["runtime source root: no source path resolved"]);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
+  it("installs keepDist builtins before the first listExtensions scan", async () => {
+    const { createPiHostBackend } = await import("../src/index.js");
+    const root = await temp();
+    try {
+      const source = join(root, "src");
+      const dest = join(root, "runtime");
+      const officeSrc = join(source, "extensions", "office-extension");
+      const officeDest = join(dest, "extensions", "office-extension");
+      await mkdir(join(officeSrc, "agent", "dist"), { recursive: true });
+      await mkdir(officeDest, { recursive: true });
+      const manifest = {
+        id: "office-extension",
+        name: "PipiUI Office",
+        version: "0.1.0",
+        capabilities: [],
+        agent: { extension: "agent/dist/index.js" },
+      };
+      await writeFile(join(officeSrc, "pipiui-extension.json"), `${JSON.stringify(manifest)}\n`);
+      await writeFile(join(officeSrc, "agent", "dist", "index.js"), "export default function () {}\n");
+      await writeFile(join(officeDest, "pipiui-extension.json"), `${JSON.stringify(manifest)}\n`);
+      const backend = createPiHostBackend({
+        agentDir: join(root, "agent"),
+        sessionsRoot: join(root, "sessions"),
+        runtimeRoot: dest,
+        runtimeAssets: { sourceRoot: source },
+        canonicalProjectPaths: async () => undefined,
+      });
+      const listed = (await backend.handle("listExtensions" as never, [])) as Array<{
+        id: string;
+        state: string;
+        error?: string;
+      }>;
+      const office = listed.find((row) => row.id === "office-extension");
+      expect(office?.state).not.toBe("error");
+      expect(office?.error).toBeUndefined();
+      expect(existsSync(join(officeDest, "agent", "dist", "index.js"))).toBe(true);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 });
