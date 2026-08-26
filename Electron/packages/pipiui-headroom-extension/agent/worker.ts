@@ -1,0 +1,216 @@
+import { validateCompression } from "./client.js";
+import type { PreparedCache } from "./cache.js";
+import type { Candidate, PreparedEntry, WorkerStats } from "./types.js";
+
+export interface WorkerClient {
+  health(signal?: AbortSignal): Promise<boolean>;
+  compress(candidate: Candidate, modelId: string, signal?: AbortSignal): Promise<unknown>;
+  retrieve(hash: string, signal?: AbortSignal): Promise<string | undefined>;
+}
+
+export interface WorkerOptions {
+  client: WorkerClient;
+  cache: PreparedCache;
+  maxQueue?: number;
+  concurrency?: number;
+  onAccepted?: (entry: PreparedEntry) => void;
+  onRejected?: (candidate: Candidate, reason: string) => void;
+  onFault?: (reason: string) => void;
+  onStateChange?: (state: WorkerStats["state"]) => void;
+}
+
+interface QueueItem { candidate: Candidate; modelId: string }
+
+const FATAL_REJECTION_REASONS = new Set([
+  "invalid_response",
+  "empty_output",
+  "zero_tokens",
+  "hash_missing",
+  "retrieval_failed",
+  "retrieval_miss",
+]);
+
+export class CompressionWorker {
+  readonly #client: WorkerClient;
+  readonly #cache: PreparedCache;
+  readonly #maxQueue: number;
+  readonly #concurrency: number;
+  readonly #onAccepted?: WorkerOptions["onAccepted"];
+  readonly #onRejected?: WorkerOptions["onRejected"];
+  readonly #onFault?: WorkerOptions["onFault"];
+  readonly #onStateChange?: WorkerOptions["onStateChange"];
+  readonly #queue: QueueItem[] = [];
+  readonly #knownKeys = new Set<string>();
+  readonly #active = new Map<string, AbortController>();
+  #state: WorkerStats["state"] = "warming";
+  #candidates = 0;
+  #accepted = 0;
+  #rejected = 0;
+  #skipped = 0;
+  #dropped = 0;
+  #lastError: string | undefined;
+  #drainScheduled = false;
+  #stopped = false;
+  #faulted = false;
+
+  constructor(options: WorkerOptions) {
+    this.#client = options.client;
+    this.#cache = options.cache;
+    this.#maxQueue = options.maxQueue ?? 32;
+    this.#concurrency = options.concurrency ?? 2;
+    if (!Number.isInteger(this.#maxQueue) || this.#maxQueue <= 0) throw new Error("maxQueue must be positive");
+    if (!Number.isInteger(this.#concurrency) || this.#concurrency <= 0) throw new Error("concurrency must be positive");
+    this.#onAccepted = options.onAccepted;
+    this.#onRejected = options.onRejected;
+    this.#onFault = options.onFault;
+    this.#onStateChange = options.onStateChange;
+  }
+
+  async checkHealth(options: { faultOnFailure?: boolean } = {}): Promise<boolean> {
+    if (this.#stopped || this.#faulted) return false;
+    const faultOnFailure = options.faultOnFailure !== false;
+    this.#setState("warming");
+    const controller = new AbortController();
+    try {
+      const healthy = await this.#client.health(controller.signal);
+      if (!healthy) {
+        if (faultOnFailure) this.#fault("health check failed");
+        else this.#lastError = "health check failed";
+        return false;
+      }
+      this.#lastError = undefined;
+      this.#setState("online");
+      this.#scheduleDrain();
+      return true;
+    } catch {
+      if (faultOnFailure) this.#fault("health check failed");
+      else this.#lastError = "health check failed";
+      return false;
+    }
+  }
+
+  enqueue(candidate: Candidate, modelId: string): boolean {
+    if (this.#stopped || this.#faulted || this.#knownKeys.has(candidate.key) || this.#cache.get(candidate.key)) return false;
+    this.#candidates += 1;
+    if (this.#queue.length >= this.#maxQueue) {
+      const dropped = this.#queue.shift();
+      if (dropped) {
+        this.#knownKeys.delete(dropped.candidate.key);
+        this.#dropped += 1;
+      }
+    }
+    this.#queue.push({ candidate, modelId });
+    this.#knownKeys.add(candidate.key);
+    this.#scheduleDrain();
+    return true;
+  }
+
+  stop(): void {
+    if (this.#stopped) return;
+    this.#stopped = true;
+    this.#queue.length = 0;
+    this.#knownKeys.clear();
+    for (const controller of this.#active.values()) controller.abort();
+    this.#setState("stopped");
+  }
+
+  stats(): WorkerStats {
+    return {
+      candidates: this.#candidates,
+      queued: this.#queue.length,
+      active: this.#active.size,
+      accepted: this.#accepted,
+      rejected: this.#rejected,
+      skipped: this.#skipped,
+      dropped: this.#dropped,
+      state: this.#state,
+      ...(this.#lastError ? { lastError: this.#lastError } : {}),
+    };
+  }
+
+  #scheduleDrain(): void {
+    if (this.#drainScheduled || this.#stopped || this.#faulted || this.#state !== "online") return;
+    this.#drainScheduled = true;
+    queueMicrotask(() => {
+      this.#drainScheduled = false;
+      this.#drain();
+    });
+  }
+
+  #drain(): void {
+    while (!this.#stopped && !this.#faulted && this.#active.size < this.#concurrency && this.#queue.length > 0) {
+      const item = this.#queue.shift();
+      if (!item) break;
+      const controller = new AbortController();
+      this.#active.set(item.candidate.key, controller);
+      void this.#process(item, controller).finally(() => {
+        this.#active.delete(item.candidate.key);
+        this.#knownKeys.delete(item.candidate.key);
+        this.#scheduleDrain();
+      });
+    }
+  }
+
+  async #process(item: QueueItem, controller: AbortController): Promise<void> {
+    try {
+      const response = await this.#client.compress(item.candidate, item.modelId, controller.signal);
+      const outcome = await validateCompression(item.candidate, response, hash => this.#client.retrieve(hash, controller.signal));
+      if (this.#stopped || this.#faulted) return;
+      if ("status" in outcome) {
+        if (outcome.status === "skipped") {
+          this.#skipped += 1;
+          return;
+        }
+        this.#rejected += 1;
+        this.#onRejected?.(item.candidate, outcome.reason);
+        if (FATAL_REJECTION_REASONS.has(outcome.reason)) {
+          this.#fault(`compression rejected: ${outcome.reason}`);
+        }
+        return;
+      }
+      if (!this.#cache.set(outcome)) {
+        this.#rejected += 1;
+        this.#onRejected?.(item.candidate, "cache_rejected");
+        return;
+      }
+      this.#accepted += 1;
+      this.#lastError = undefined;
+      this.#onAccepted?.(outcome);
+    } catch {
+      if (this.#stopped && controller.signal.aborted) return;
+      this.#rejected += 1;
+      this.#onRejected?.(item.candidate, "request_failed");
+      // Compression is candidate-local and Headroom deliberately fails open
+      // when a compressor exceeds its time budget. Do not permanently hand
+      // the session to context-fold for one slow or malformed candidate when
+      // the service is still healthy. A failed health probe remains a real
+      // service fault and activates the deterministic fallback.
+      try {
+        if (await this.#client.health(controller.signal)) {
+          if (!this.#stopped && !this.#faulted) this.#lastError = "compression request failed";
+          return;
+        }
+      } catch {
+        // The common fault path below owns the stable status and callback.
+      }
+      if (!this.#stopped && !this.#faulted) this.#fault("compression request failed");
+    }
+  }
+
+  #fault(reason: string): void {
+    if (this.#faulted || this.#stopped) return;
+    this.#faulted = true;
+    this.#lastError = reason;
+    this.#dropped += this.#queue.length;
+    this.#queue.length = 0;
+    this.#knownKeys.clear();
+    this.#setState("offline");
+    this.#onFault?.(reason);
+  }
+
+  #setState(state: WorkerStats["state"]): void {
+    if (this.#state === state) return;
+    this.#state = state;
+    this.#onStateChange?.(state);
+  }
+}

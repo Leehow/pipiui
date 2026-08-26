@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createPiHostBackend } from "../src/index.js";
+import { HEADROOM_MANAGED_SETTINGS, type HeadroomManagedRuntimeLike } from "../src/headroom-managed-runtime.js";
 import { extensionSettingsEnvName } from "../src/spawn-assembly.js";
 
 let root = "";
@@ -59,6 +60,7 @@ function backendFor(dirs: {
   env?: Record<string, string>;
   timeoutMs?: number;
   capture?: { args?: string[]; env?: NodeJS.ProcessEnv };
+  headroomRuntime?: HeadroomManagedRuntimeLike;
 }) {
   return createPiHostBackend({
     agentDir: dirs.agent,
@@ -67,6 +69,7 @@ function backendFor(dirs: {
     canonicalProjectPaths: async () => undefined,
     piPath: "node",
     extensionInvokeTimeoutMs: dirs.timeoutMs,
+    headroomRuntime: dirs.headroomRuntime,
     spawn: (_bin, args, options) => {
       const argv = args as string[];
       if (dirs.capture && argv.includes("--mode") && argv.includes("rpc") && !argv.includes("--no-session")) {
@@ -193,5 +196,70 @@ describe("invokeExtension and spawn settings snapshot", () => {
     expect(settingsText).toContain("ext.settings_changed");
     expect(settingsText).toContain("invoke-agent");
     await backend.close();
+  });
+
+  it("injects the host-managed Headroom endpoint without persisting it as user settings", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-ext-headroom-managed-"));
+    const agent = join(root, "app-profile", "pi-agent");
+    const cwd = join(root, "project");
+    const sessions = join(root, "sessions");
+    const runtime = join(root, "runtime");
+    const pkg = join(runtime, "extensions", "pipiui-headroom");
+    await writeManifest(pkg, {
+      id: "pipiui-headroom",
+      name: "PipiUI Headroom",
+      version: "0.1.0",
+      capabilities: ["settings.read", "settings.write"],
+      agent: { extension: "agent/index.js" },
+      app: {
+        settings: {
+          scope: "project",
+          schema: { type: "object", properties: { "ext.pipiui-headroom.minResultChars": { type: "integer" } } },
+        },
+      },
+      settingsVersion: 1,
+    });
+    await mkdir(join(pkg, "agent"), { recursive: true });
+    await writeFile(join(pkg, "agent", "index.js"), "export default () => {};\n");
+    await seedSession(cwd, sessions);
+    const capture: { args?: string[]; env?: NodeJS.ProcessEnv } = {};
+    const statePath = join(cwd, ".pi", "agent", "headroom", "service.json");
+    const headroomRuntime: HeadroomManagedRuntimeLike = {
+      settingsForProject: vi.fn(async () => ({
+        [HEADROOM_MANAGED_SETTINGS.baseUrl]: "http://127.0.0.1:43126",
+        [HEADROOM_MANAGED_SETTINGS.managed]: true,
+        [HEADROOM_MANAGED_SETTINGS.state]: "ready",
+        [HEADROOM_MANAGED_SETTINGS.statePath]: statePath,
+        [HEADROOM_MANAGED_SETTINGS.engineVersion]: "0.36.5",
+      })),
+      prepare: vi.fn(async () => ({
+        schemaVersion: 1,
+        state: "ready",
+        engineVersion: "0.36.5",
+        baseUrl: "http://127.0.0.1:43126",
+        statePath,
+        updatedAt: new Date().toISOString(),
+      })),
+      stopProject: vi.fn(async () => undefined),
+      stopAll: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+    };
+    const backend = backendFor({ agent, sessions, runtime, capture, headroomRuntime });
+    await backend.handle("listExtensions" as never, []);
+    await backend.handle("addProject", [cwd]);
+    await backend.handle("sendPrompt", ["session-1", "go"]);
+    await vi.waitFor(() => expect(capture.env?.[extensionSettingsEnvName("pipiui-headroom")]).toBeTruthy());
+
+    const injected = JSON.parse(capture.env![extensionSettingsEnvName("pipiui-headroom")]!);
+    expect(injected).toMatchObject({
+      [HEADROOM_MANAGED_SETTINGS.baseUrl]: "http://127.0.0.1:43126",
+      [HEADROOM_MANAGED_SETTINGS.managed]: true,
+      [HEADROOM_MANAGED_SETTINGS.statePath]: statePath,
+    });
+    expect(headroomRuntime.settingsForProject).toHaveBeenCalledWith(cwd);
+    const projectSettings = await readFile(join(cwd, ".pi", "agent", "ext-settings", "pipiui-headroom.json"), "utf8").catch(() => "");
+    expect(projectSettings).not.toContain("43126");
+    await backend.close();
+    expect(headroomRuntime.close).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,0 +1,55 @@
+{
+  "id": "pipiui-headroom",
+  "name": "PipiUI Headroom",
+  "version": "0.1.0",
+  "description": "PipiUI 自动托管的 Headroom 主优化器；不可用或校验失败时回退 context-fold。",
+  "capabilities": [
+    "settings.read",
+    "settings.write"
+  ],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.pipiui-headroom.minContextTokens": {
+            "type": "integer",
+            "default": 20000,
+            "title": "最小模型上下文"
+          },
+          "ext.pipiui-headroom.minResultChars": {
+            "type": "integer",
+            "default": 4000,
+            "title": "最小工具结果字符数"
+          },
+          "ext.pipiui-headroom.protectRecentToolResults": {
+            "type": "integer",
+            "default": 2,
+            "title": "保护最近工具结果数"
+          },
+          "ext.pipiui-headroom.maxCacheBytes": {
+            "type": "integer",
+            "default": 67108864,
+            "title": "准备缓存上限（字节）"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [],
+      "settingsSections": [
+        { "id": "pipiui-headroom", "title": "PipiUI Headroom" }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

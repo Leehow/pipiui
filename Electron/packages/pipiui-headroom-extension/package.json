@@ -1,0 +1,20 @@
+{
+  "name": "@pipiui/pipiui-headroom",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Thin PipiUI adapter with an auto-managed upstream Headroom runtime",
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs pipiui-headroom-extension",
+    "test": "vitest run",
+    "clean": "rm -rf agent/dist"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}
