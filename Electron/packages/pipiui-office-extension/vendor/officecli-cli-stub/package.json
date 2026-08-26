@@ -1,0 +1,12 @@
+{
+  "name": "@officecli/officecli",
+  "version": "1.0.144",
+  "private": true,
+  "description": "PipiUI T5 stub: satisfies @officecli/sdk's @officecli/officecli ^1.0.0 without postinstall binary download. T7 ships architecture-specific OfficeCLI binaries.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js"
+  }
+}

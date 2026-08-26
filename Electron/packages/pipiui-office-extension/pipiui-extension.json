@@ -1,0 +1,47 @@
+{
+  "id": "office-extension",
+  "name": "PipiUI Office",
+  "version": "0.1.0",
+  "description": "Office document preview for word, spreadsheet, and presentation files, plus the direct OfficeCLI agent tool pipiui_officecli.",
+  "capabilities": [],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "host": {
+    "entry": "agent/dist/host.js",
+    "description": "Stable host library for the direct OfficeCLI tool contract (DirectOfficeAdapter). Direct-only; not MCP."
+  },
+  "app": {
+    "ui": {
+      "documentRenderers": [
+        {
+          "id": "office",
+          "entry": "app/dist/office-renderer.js",
+          "kinds": ["word", "spreadsheet", "presentation"],
+          "extensions": [
+            ".doc",
+            ".docx",
+            ".docm",
+            ".rtf",
+            ".odt",
+            ".epub",
+            ".xls",
+            ".xlsx",
+            ".xlsm",
+            ".xlsb",
+            ".ods",
+            ".ppt",
+            ".pptx",
+            ".pptm",
+            ".pps",
+            ".ppsx",
+            ".ppsm",
+            ".pot",
+            ".odp"
+          ],
+          "priority": 100
+        }
+      ]
+    }
+  }
+}
