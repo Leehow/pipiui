@@ -1,7 +1,7 @@
 ---
 id: fanout
 name: 瀑布流哲学
-summary: 无依赖的活一次全派出去；宽 wave 用清晰 brief 与分组管；异步信号自己收，不回头看原始产物。
+summary: 无依赖的活一次全派出去；写冲突先拆文件再并行而不是串行；宽 wave 用清晰 brief 与分组管；异步信号自己收，不回头看原始产物。
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]
@@ -71,7 +71,8 @@ whether two pieces are independent, dispatching both is the cheaper mistake.
   now dispatchable and send it, rather than returning to the user to wait. Idle boss time while
   nameable work sits unstarted is the most expensive thing in this system.
 - Serialize only for a real dependency or a genuine write conflict in the same small code region
-  (the same function or neighboring hunk), not merely the same file. Read-only work always parallelizes.
+  (the same function or neighboring hunk), not merely the same file — and before you accept that
+  conflict, ask whether the region can simply be cut out (below). Read-only work always parallelizes.
 - Writable workers run in isolated git worktrees and the runtime auto-merges them, so Git handles
   file-level overlap; different regions of one file are not a reason to serialize.
 - When workers write in parallel, their briefs must name the code regions they touch so the boss
@@ -101,8 +102,42 @@ spent.
 Named anti-patterns: dispatching A and then "B after A is done" when they have no real
 dependency or shared code-region conflict; one worker told to cover several independent sub-items; idling on a single worker
 while dispatchable work is queued; sitting out a long review or other read-only worker while
-the acceptance check only you can run goes unperformed; waiting for the user to say "in
+the acceptance check only you can run goes unperformed; accepting a same-region collision
+between two separable concerns as a reason to serialize when one extraction would have made
+both independent; waiting for the user to say "in
 parallel" before doing what this layer already requires.
+
+## Cut the file instead of serializing the wave
+
+The one remaining excuse for serializing — two tasks that really would collide in the same
+small region — is usually a statement about the code, not about the work. Two separable
+concerns living in one file is a cohesion defect that predates this wave. You own the code's
+structure, so the move is to remove the collision, not to queue behind it.
+
+When two tasks look like they collide, ask in this order:
+
+1. **Is it a real collision?** Different regions of one file are not one. Git merges those,
+   and serializing on file identity alone is the mistake named above.
+2. **Does the contested block stand on its own?** The test is whether you can name it in one
+   noun phrase with its own reason to change. If you can, cut it into its own module and the
+   two tasks stop overlapping. If you cannot — it shares state, control flow, or a single
+   reason to change with what surrounds it — the coupling is real: put both on one worker.
+3. **Is the cut smaller than what it unblocks?** An extraction that costs more than the
+   serialization it saves is not worth making. Serialize and move on.
+
+Dispatch the cut as the head of the wave, never as its own turn: extraction and both
+dependents go out in **one** call, the dependents carrying `blockedBy` on it. The extraction
+is a pure move — same behavior, same exported names, imports updated, no design decision
+taken inside it. A "while I'm in here" rewrite stops being preparation and becomes work
+competing with the tasks it was supposed to unblock.
+
+Afterwards the new file appears in exactly one `scope`: the worker whose concern moved owns
+it, the other imports it. If both dependents still need to write it, the block was not
+separable and question 2 was answered wrong.
+
+This is a decomposition tool, not a habit. Cutting a cohesive file to manufacture width you
+did not need is worse than the serialization it replaced, and an extraction with exactly one
+dependent is a serialization wearing a wave's costume.
 
 ## Wide waves stay under the boss
 

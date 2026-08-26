@@ -275,6 +275,21 @@ describe("vendored philosophy: delivery", () => {
     );
   });
 
+  it("treats a same-region write conflict as a cut to make, not a reason to serialize", () => {
+    // The boss kept single-threading separable work because two tasks named the same file.
+    // File identity was already ruled out as a reason; this closes the last excuse — a real
+    // same-region collision between two concerns is a cohesion defect the boss can remove.
+    const fanout = layers.find((l) => l.id === "fanout")!.body;
+    expect(fanout).toMatch(/Cut the file instead of serializing the wave/);
+    expect(fanout).toMatch(/name it in one\s+noun phrase with its own reason to change/);
+    // The cut must not cost a turn, and must not smuggle in design work.
+    expect(fanout).toMatch(/Dispatch the cut as the head of the wave, never as its own turn/);
+    expect(fanout).toMatch(/pure move — same behavior, same exported names/);
+    // ...and must not become a habit of carving up cohesive files for fake width.
+    expect(fanout).toMatch(/serialization wearing a wave's costume/);
+    expect(fanout).toMatch(/accepting a same-region collision/);
+  });
+
   it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
     expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
     expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
@@ -385,8 +400,13 @@ describe("vendored philosophy: delivery", () => {
     // workers assembling `cd X && grep` chains the tools could already answer, so the
     // layer now maps each chain shape to the parameter that absorbs it. The section pays
     // for itself the first time it replaces a five-grep bash script with one call.
+    // Raised to 18100 for fanout's "cut the file" section: file identity had already been
+    // ruled out as a reason to serialize, but a same-region collision was still accepted as
+    // one, so separable work kept running single-threaded behind a cohesion defect the boss
+    // could have removed in one extraction. The section buys back wall-clock on every wave
+    // that would otherwise have queued.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(17500);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(18100);
   });
 
   it("permits worker skill_search/load and memory_query without automatic bootstrap", () => {
