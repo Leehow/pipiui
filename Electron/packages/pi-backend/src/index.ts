@@ -608,9 +608,10 @@ export type PiBackendOptions = {
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
   /**
-   * Legacy host summary compaction at the 45% + quiet threshold. Defaults off:
-   * Headroom/context-fold own that non-urgent epoch, while pi still owns its
-   * near-overflow and real-overflow safety compactions.
+   * Always-on host summary compaction at the 45% + quiet threshold.
+   * Defaults off so Headroom/context-fold own the first pass; the scheduler
+   * still falls back to a host `compact` when that rewrite leaves usage at
+   * or above the high watermark. Pi keeps near-overflow / overflow safety.
    */
   proactiveSummaryCompaction?: boolean;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
@@ -4049,6 +4050,7 @@ export class PiHostBackend implements HostBackend {
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
         hasLiveAgents: () => this.sessionHasLiveAgents(id),
+        shouldCompact: () => this.proactiveSummaryCompaction,
         observer: (event) => {
           // Same JSONL as the lifecycle events, always tagged proactive_idle.
           const usage = event.usage;

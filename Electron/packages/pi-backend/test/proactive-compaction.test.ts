@@ -114,6 +114,7 @@ function harness(options: {
   idle?: boolean;
   liveAgents?: boolean;
   compact?: () => Promise<unknown>;
+  shouldCompact?: () => boolean;
   observer?: (event: ProactiveCompactionObserverEvent) => void;
 } = {}) {
   const timers = new Map<number, { fn: () => void; at: number }>();
@@ -127,6 +128,7 @@ function harness(options: {
       state.compactCalls += 1;
       return options.compact ? options.compact() : Promise.resolve();
     },
+    ...(options.shouldCompact ? { shouldCompact: options.shouldCompact } : {}),
     ...(options.observer ? { observer: options.observer } : {}),
     setTimer: (fn, ms) => {
       const handle = nextHandle++;
@@ -193,6 +195,23 @@ describe("ProactiveCompactionScheduler", () => {
     h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
     await flush();
     expect(h.state.compactCalls).toBe(1);
+  });
+
+  it("falls back to host summary compaction when lossless rewrite leaves usage at or above 45%", async () => {
+    // Production closes the legacy summary gate so Headroom/context-fold can
+    // own the epoch. If their rewrite never drops the sample, the quiet timer
+    // must still issue the compact RPC — otherwise 585k/1m sits forever.
+    const events: ProactiveCompactionObserverEvent[] = [];
+    const h = harness({
+      shouldCompact: () => false,
+      observer: (event) => events.push(event),
+    });
+    h.scheduler.observeUsage({ tokens: 584_556, contextWindow: 1_000_000 }, h.scheduler.beginUsageRequest());
+    h.advance(STANDARD_PROACTIVE_COMPACTION.quietDelayMs);
+    await flush();
+    expect(h.state.compactCalls).toBe(1);
+    expect(events.map((e) => e.decision)).toContain("timer_fired");
+    expect(events.some((e) => e.skipReason === "lossless_optimizer_primary")).toBe(false);
   });
 
   it("never fires while the session is busy, and rearms a fresh full window when it goes quiet", async () => {

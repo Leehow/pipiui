@@ -231,6 +231,14 @@ export interface ProactiveCompactionSchedulerOptions {
   hasLiveAgents?: () => boolean;
   /** Issues the `compact` RPC. Must reject when pi refuses the request. */
   compact: () => Promise<unknown>;
+  /**
+   * Final synchronous authority for the non-urgent summary compaction.
+   * Returning false asks the scheduler to defer to a lossless optimizer
+   * (Headroom/context-fold). If that rewrite has not brought the fresh
+   * usage sample below the high watermark, the quiet epoch still falls
+   * back to the host `compact` RPC. Near-overflow / overflow stay at pi.
+   */
+  shouldCompact?: () => boolean;
   configuration?: ProactiveCompactionConfiguration;
   /** Timer/clock seams; tests drive these instead of waiting on wall clock. */
   setTimer?: (fn: () => void, ms: number) => unknown;
@@ -476,6 +484,25 @@ export class ProactiveCompactionScheduler {
       });
       this.reconsider();
       return;
+    }
+    if (this.options.shouldCompact?.() === false) {
+      const fraction = contextUsageFraction(this.policy.latestUsage);
+      const stillHigh =
+        fraction !== undefined && fraction >= this.policy.configuration.highWatermark;
+      if (!stillHigh) {
+        this.notify({
+          decision: "gate_failed",
+          usage: this.policy.latestUsage,
+          skipReason: "lossless_optimizer_primary",
+        });
+        // No summary RPC: lossless rewrite already relieved the watermark, or
+        // there is no usable sample. Re-arm only if a later high report arrives.
+        this.reconsider();
+        return;
+      }
+      // Fallback: Headroom/context-fold own the epoch, but the quiet sample is
+      // still at/above 45%. Issue the host summary compact so the session does
+      // not sit at 585k/1m with no visible compression.
     }
     this.notify({
       decision: "timer_fired",

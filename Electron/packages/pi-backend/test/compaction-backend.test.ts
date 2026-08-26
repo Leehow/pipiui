@@ -21,7 +21,7 @@ async function fixture(compaction?: {
   quietDelayMs?: number;
   waitWatermark?: number;
   waitQuietDelayMs?: number;
-}) {
+}, proactiveSummaryCompaction = true) {
   root = await mkdtemp(join(tmpdir(), "pipi-compact-"));
   const cwd = join(root, "project");
   const dir = join(root, "sessions", "project");
@@ -45,6 +45,9 @@ async function fixture(compaction?: {
       waitWatermark: compaction?.waitWatermark,
       waitQuietDelayMs: compaction?.waitQuietDelayMs,
     },
+    // Production default is false (Headroom/context-fold try first). The
+    // scheduler still falls back to a host compact when usage stays high.
+    proactiveSummaryCompaction,
     spawn: (_bin, _args, options) =>
       spawn("/usr/local/bin/node", [new URL("./fake-pi.mjs", import.meta.url).pathname], {
         ...options,
@@ -170,6 +173,23 @@ describe("context compaction", () => {
     // proactive idle — not 手动.
     expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["proactive_idle", "proactive_idle"]);
     expect(compactionEvents(events).every((e: any) => e.operation === "context_compaction" && e.executed === true)).toBe(true);
+    expect((await backend.handle("getSessionStats", ["session-1"])) as any).toMatchObject({
+      contextUsage: { tokens: 12000 },
+    });
+    await backend.close();
+  });
+
+  it("production default falls back to host summary compaction when lossless rewrite leaves usage high", async () => {
+    const backend = await fixture(undefined, false);
+    const events: any[] = [];
+    const off = backend.subscribe((e) => events.push(e));
+
+    await backend.handle("sendPrompt", ["session-1", "fill-context"]);
+    await waitFor(() => compactionEvents(events).length >= 2);
+    off();
+
+    expect(compactionEvents(events).map((e) => e.phase)).toEqual(["start", "end"]);
+    expect(compactionEvents(events).map((e: any) => e.trigger)).toEqual(["proactive_idle", "proactive_idle"]);
     expect((await backend.handle("getSessionStats", ["session-1"])) as any).toMatchObject({
       contextUsage: { tokens: 12000 },
     });
