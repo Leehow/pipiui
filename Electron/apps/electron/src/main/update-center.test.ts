@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { compareSemver, createUpdateCenterService, latestCuaDriverVersion, latestNodeVersion, npmLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS } from './update-center.js'
+import { compareSemver, createUpdateCenterService, latestCuaDriverVersion, latestNodeVersion, npmLatestVersion, pypiLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS } from './update-center.js'
 
 const response = (payload: unknown, ok = true, status = 200) => ({ ok, status, json: async () => payload })
 
@@ -17,6 +17,12 @@ describe('update center version discovery', () => {
     expect(npmLatestVersion({ 'dist-tags': { latest: '0.84.2', next: '0.85.0-beta.1' } })).toBe('0.84.2')
     expect(npmLatestVersion({ version: '0.84.2' })).toBeUndefined()
     expect(npmLatestVersion({ 'dist-tags': { latest: 'latest' } })).toBeUndefined()
+  })
+
+  it('uses the official PyPI info.version field and rejects malformed project data', () => {
+    expect(pypiLatestVersion({ info: { name: 'headroom-ai', version: '0.36.5' } })).toBe('0.36.5')
+    expect(pypiLatestVersion({ version: '0.36.5' })).toBeUndefined()
+    expect(pypiLatestVersion({ info: { version: 'latest' } })).toBeUndefined()
   })
 
   it('filters mixed Cua monorepo releases by driver prefix and includes non-draft prerelease-marked releases', () => {
@@ -41,7 +47,7 @@ describe('update center version discovery', () => {
     const lock = JSON.parse(readFileSync(new URL('../../../../package-lock.json', import.meta.url), 'utf8')) as { packages: Record<string, { version?: string }> }
     expect(UPDATE_CENTER_FRAMEWORK_VERSIONS).toEqual({
       electron: lock.packages['node_modules/electron'].version,
-      vite: lock.packages['apps/electron/node_modules/vite'].version,
+      vite: (lock.packages['apps/electron/node_modules/vite'] ?? lock.packages['node_modules/vite']).version,
       'electron-vite': lock.packages['apps/electron/node_modules/electron-vite'].version
     })
   })
@@ -76,6 +82,15 @@ describe('update center version discovery', () => {
     ] })()
     expect(snapshot.items[0]).toMatchObject({ latestVersion: '0.19.3', status: 'updateAvailable' })
     expect(fetch.mock.calls[0][0]).toBe('https://api.github.com/repos/trycua/cua/releases?per_page=100')
+  })
+
+  it('checks Headroom against the official PyPI project endpoint', async () => {
+    const fetch = vi.fn(async () => response({ info: { name: 'headroom-ai', version: '0.37.0' } }))
+    const snapshot = await createUpdateCenterService({ fetch, catalog: [
+      { id: 'headroom-ai', name: 'Headroom', category: 'extension', currentVersion: '0.36.5', source: { type: 'pypi', packageName: 'headroom-ai' } }
+    ] })()
+    expect(snapshot.items[0]).toMatchObject({ packageName: 'headroom-ai', latestVersion: '0.37.0', status: 'updateAvailable' })
+    expect(fetch.mock.calls[0][0]).toBe('https://pypi.org/pypi/headroom-ai/json')
   })
 
   it('checks embedded Node against the official distribution index and preserves hierarchy metadata', async () => {

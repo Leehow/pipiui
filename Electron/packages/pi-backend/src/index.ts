@@ -214,6 +214,12 @@ import {
   type ExtensionGrantRecord,
 } from "./extension-grants.js";
 import { removeExtensionPackageDirectory } from "./extension-uninstall.js";
+import {
+  HEADROOM_EXTENSION_ID,
+  HEADROOM_MANAGED_SETTINGS,
+  HeadroomManagedRuntime,
+  type HeadroomManagedRuntimeLike,
+} from "./headroom-managed-runtime.js";
 import { readWebSearchApiKeys, writeWebSearchApiKeys } from "./web-search-keys.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
@@ -608,6 +614,12 @@ export type PiBackendOptions = {
   /** In-memory vault namespace key. Never used as a disk path. */ vaultDir?: string;
   /** Watermarks/delays for idle-time compaction; defaults to the Swift app's. */
   compaction?: ProactiveCompactionConfiguration;
+  /**
+   * Legacy host summary compaction at the 45% + quiet threshold. Defaults off:
+   * Headroom/context-fold own that non-urgent epoch, while pi still owns its
+   * near-overflow and real-overflow safety compactions.
+   */
+  proactiveSummaryCompaction?: boolean;
   /** Testable canonical Swift project source; undefined preserves existing host state. */
   canonicalProjectPaths?: () => Promise<string[] | undefined>;
   /** Injectable abort-unresponsive kill ladder (tests). */
@@ -626,6 +638,8 @@ export type PiBackendOptions = {
   externalSessionRoots?: ExternalSessionRoots;
   /** Injectable registry for tests; defaults to bundled builtins. */
   extensionRegistry?: ExtensionRegistry;
+  /** Injectable project-scoped Headroom sidecar owner; defaults to the App-managed runtime. */
+  headroomRuntime?: HeadroomManagedRuntimeLike;
   /** Minimum gap between durable agent-index snapshots (default 2000ms; tests shorten it). */
   agentPersistMinIntervalMs?: number;
   /** Debounce + minimum gap between durable agent-log snapshots (default 2000ms). */
@@ -1748,7 +1762,9 @@ export class PiHostBackend implements HostBackend {
   });
   private readonly planStore = new PlanStore();
   private readonly extensions: ExtensionRegistry;
-  private readonly extensionLoader: ExtensionLoader;  private planRuntimeMounted: boolean | undefined;
+  private readonly extensionLoader: ExtensionLoader;
+  private readonly headroomRuntime: HeadroomManagedRuntimeLike;
+  private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
   /**
    * Per-session in-flight spawn (ensure) promises. Concurrent ensure() calls for
@@ -1906,6 +1922,7 @@ export class PiHostBackend implements HostBackend {
    * conversations; this small index only lets the UI rebuild its tree after host restart. */
   private agentsWrite: Promise<void> = Promise.resolve();
   private compactionConfiguration?: ProactiveCompactionConfiguration;
+  private proactiveSummaryCompaction: boolean;
   private canonicalProjectPaths: () => Promise<string[] | undefined>;
   private terminalSessionDeleted?: (sessionId: string) => void;
   private externalSessionRoots: ExternalSessionRoots;
@@ -1920,6 +1937,7 @@ export class PiHostBackend implements HostBackend {
   constructor(options: PiBackendOptions = {}) {
     this.terminalSessionDeleted = options.terminalSessionDeleted;
     this.compactionConfiguration = options.compaction;
+    this.proactiveSummaryCompaction = options.proactiveSummaryCompaction ?? false;
     this.computerDescriptor = options.computerDescriptor;
     this.computerUsable = options.computerUsable ?? (() => false);
     this.agentDir = options.agentDir ?? join(homedir(), ".pi", "agent");
@@ -1959,6 +1977,11 @@ export class PiHostBackend implements HostBackend {
     this.resourceMode = options.resourceMode ?? "default";
     this.proc = options.spawn ?? (spawn as ProcFactory);
     this.env = options.env ?? process.env;
+    this.headroomRuntime = options.headroomRuntime ?? new HeadroomManagedRuntime({
+      agentDir: this.agentDir,
+      nodeExecutable: this.piCommand.executable,
+      env: this.env,
+    });
     this.canonicalProjectPaths = options.canonicalProjectPaths ?? (() => swiftCanonicalProjectPaths(this.env));
     this.revealPath = options.revealPath ?? defaultRevealPath;
     this.externalSessionRoots = options.externalSessionRoots ?? {};
@@ -2256,6 +2279,7 @@ export class PiHostBackend implements HostBackend {
       item.pending.clear();
     }
     await Promise.all(live.map((item) => this.stopLiveProcess(item)));
+    await this.headroomRuntime.close();
     await Promise.allSettled([...this.backgroundStatsRefreshes]);
     await Promise.all(
       [...this.leases.values()].map((lease) =>
@@ -3303,18 +3327,30 @@ export class PiHostBackend implements HostBackend {
         }
         return this.agentLogCache.get(this.agentLogKey(sessionId, agentId, runId)) ?? [];
       }
-      case "abortAgent":
-        return this.agentCommand(params[0] as string, "abort");
-      case "resolveAgent":
-        return this.agentCommand(params[0] as string, "resolve");
-      case "checkAgent":
-        return this.getAgent(params[0] as string);
-      case "getWorktreeStatus":
-        return this.getWorktree(params[0] as string);
-      case "mergeWorktree":
-        return this.worktreeCommand(params[0] as string, "merge");
-      case "discardWorktree":
-        return this.worktreeCommand(params[0] as string, "discard");
+      case "abortAgent": {
+        const [aSession, aAgentId, aRunId] = this.episodeWire("abortAgent", params);
+        return this.agentCommand(aSession, aAgentId, aRunId, "abort");
+      }
+      case "resolveAgent": {
+        const [resolveSession, resolveAgentId, resolveRunId] = this.episodeWire("resolveAgent", params);
+        return this.agentCommand(resolveSession, resolveAgentId, resolveRunId, "resolve");
+      }
+      case "checkAgent": {
+        const [checkSession, checkAgentId, checkRunId] = this.episodeWire("checkAgent", params);
+        return this.getAgentExact(checkSession, checkAgentId, checkRunId);
+      }
+      case "getWorktreeStatus": {
+        const [wtSession, wtAgentId, wtRunId] = this.episodeWire("getWorktreeStatus", params);
+        return this.getWorktree(wtSession, wtAgentId, wtRunId);
+      }
+      case "mergeWorktree": {
+        const [mSession, mAgentId, mRunId] = this.episodeWire("mergeWorktree", params);
+        return this.worktreeCommand(mSession, mAgentId, mRunId, "merge");
+      }
+      case "discardWorktree": {
+        const [dSession, dAgentId, dRunId] = this.episodeWire("discardWorktree", params);
+        return this.worktreeCommand(dSession, dAgentId, dRunId, "discard");
+      }
       case "gitStatus":
         return probeGit(await this.projectPath(params[0] as string));
       case "gitCheckout":
@@ -4013,6 +4049,7 @@ export class PiHostBackend implements HostBackend {
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
         hasLiveAgents: () => this.sessionHasLiveAgents(id),
+        shouldCompact: () => this.proactiveSummaryCompaction,
         observer: (event) => {
           // Same JSONL as the lifecycle events, always tagged proactive_idle.
           const usage = event.usage;
@@ -5577,6 +5614,15 @@ export class PiHostBackend implements HostBackend {
       const record = this.extensions.list(overlay).find((item) => item.id === id);
       if (!record) throw new Error(`unknown extension ${id}`);
       await this.refreshCatalogAfterExtensionChange(id);
+      if (id === HEADROOM_EXTENSION_ID) {
+        if (!enabledValue) await this.headroomRuntime.stopAll();
+        else if (typeof projectIdValue === "string" && projectIdValue.trim()) {
+          const root = await this.projectPath(projectIdValue);
+          void this.headroomRuntime.prepare(root).catch((error) => {
+            console.warn(`[pipiui-headroom] managed runtime prepare failed: ${error instanceof Error ? error.message : String(error)}`);
+          });
+        }
+      }
       return record;
     }
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
@@ -5587,6 +5633,15 @@ export class PiHostBackend implements HostBackend {
     const record = this.extensions.list(overlay).find((item) => item.id === id);
     if (!record) throw new Error(`unknown extension ${id}`);
     await this.refreshCatalogAfterExtensionChange(id);
+    if (id === HEADROOM_EXTENSION_ID) {
+      if (enabledValue) {
+        void this.headroomRuntime.prepare(root).catch((error) => {
+          console.warn(`[pipiui-headroom] managed runtime prepare failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      } else {
+        await this.headroomRuntime.stopProject(root);
+      }
+    }
     return record;
   }
   private async refreshCatalogAfterExtensionChange(id: string): Promise<void> {
@@ -5852,6 +5907,18 @@ export class PiHostBackend implements HostBackend {
         settings = await this.readExtensionSettingsSnapshot(pkg.id, projectRoot);
       } catch {
         settings = {};
+      }
+      if (pkg.id === HEADROOM_EXTENSION_ID) {
+        try {
+          settings = { ...settings, ...(await this.headroomRuntime.settingsForProject(projectRoot)) };
+        } catch (error) {
+          settings = {
+            ...settings,
+            [HEADROOM_MANAGED_SETTINGS.managed]: true,
+            [HEADROOM_MANAGED_SETTINGS.state]: "failed",
+          };
+          console.warn(`[pipiui-headroom] managed runtime unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       out.push({ ...pkg, settings });
     }
@@ -7563,7 +7630,13 @@ export class PiHostBackend implements HostBackend {
         this.projectionDebugProvenance.set(key, "durable_load");
       }
       if (Array.isArray(value.worktrees)) for (const raw of value.worktrees) {
-        if (isRecord(raw) && typeof raw.agentId === "string") this.worktrees.set(raw.agentId, raw as unknown as WorktreeStatus);
+        // Composite identity only: an entry without a sessionId cannot be attributed
+        // to one episode, and attributing it by agentId alone would recreate the
+        // cross-session same-slug collision this projection removed. Legacy
+        // session-less entries are dropped; a still-live worker re-establishes its
+        // worktree row from its next event.
+        if (isRecord(raw) && typeof raw.agentId === "string" && typeof raw.sessionId === "string" && typeof raw.runId === "string")
+          this.worktrees.set(this.agentKey(raw.agentId, raw.sessionId, raw.runId), raw as unknown as WorktreeStatus);
       }
       // Shrink a bloated projection once at load so the first snapshot is already
       // bounded; a 15MB index costs a full parse + stringify cycle otherwise.
@@ -7752,42 +7825,52 @@ export class PiHostBackend implements HostBackend {
     const drop = new Set<string>(
       terminal.slice(this.agentRetentionMaxTerminal).map(([key]) => key),
     );
-    const droppedAgentIds = new Set<string>();
     for (const key of drop) {
       const agent = this.agents.get(key);
       if (!agent) continue;
       this.agents.delete(key);
       this.agentLogCache.delete(this.agentLogKey(agent.sessionId ?? "", agent.agentId, agent.runId));
       this.projectionDebugProvenance.delete(key);
-      droppedAgentIds.add(agent.agentId);
-    }
-    for (const agentId of droppedAgentIds) {
-      // An agentId may be reused across sessions; only touch the worktree when
-      // no retained row still references it.
-      const stillReferenced = [...this.agents.values()].some(agent => agent.agentId === agentId);
-      if (stillReferenced) continue;
-      const worktree = this.worktrees.get(agentId);
-      // Actionable worktrees survive retention: pendingReview still offers
-      // manual merge/discard and active belongs to a live worker.
-      if (!worktree || worktree.lifecycle === "active" || worktree.lifecycle === "pendingReview") continue;
-      this.worktrees.delete(agentId);
+      // The worktree projection is keyed by the same exact episode key, so it retires
+      // with its row. Actionable worktrees survive retention: pendingReview still
+      // offers manual merge/discard and active belongs to a live worker.
+      const worktree = this.worktrees.get(key);
+      if (worktree && worktree.lifecycle !== "active" && worktree.lifecycle !== "pendingReview") this.worktrees.delete(key);
     }
     return drop.size > 0;
   }
-  private async getAgent(id: string) {
-    // Commands predate session-qualified ids. Prefer an active matching row, then the newest;
-    // listAgents itself remains exactly session-scoped even when two projects reuse `builder`.
-    const a = [...this.agents.values()]
-      .filter(agent => agent.agentId === id)
-      .sort((left, right) => Number(right.state === "running") - Number(left.state === "running") || (right.createdAt ?? 0) - (left.createdAt ?? 0))[0];
-    if (!a) throw new Error(`unknown agent ${id}`);
-    return a;
+  /**
+   * Exact episode lookup for control commands (abort/resolve/check). The previous
+   * fuzzy lookup — any row with this agentId, preferring running then newest — let
+   * one session's stop/resolve land on another session's same-slug worker, or on a
+   * newer run that replaced the one the caller was looking at. Both are now
+   * rejected instead of silently routed.
+   */
+  private async getAgentExact(sessionId: string, agentId: string, runId: string) {
+    const agent = this.agents.get(this.agentKey(agentId, sessionId, runId));
+    if (!agent) throw new Error(`unknown agent ${agentId} (session ${sessionId || "?"}, run ${runId || "?"}); it may have been replaced by a newer run`);
+    return agent;
   }
-  private async getWorktree(id: string) {
+  /**
+   * Strict episode wire for agent/worktree control: the only accepted form is
+   * the exact [sessionId, agentId, runId] triple. There is deliberately no
+   * agentId-only or partial form - a fuzzy route would pick a running/newest
+   * same-slug episode, which is precisely the cross-session misbinding this
+   * contract removed. Any other arity fails loud instead of guessing which
+   * episode was meant.
+   */
+  private episodeWire(method: string, params: unknown[]): [string, string, string] {
+    if (params.length === 3 && typeof params[0] === "string" && typeof params[1] === "string" && typeof params[2] === "string")
+      return [params[0], params[1], params[2]];
+    throw new Error(`${method} expects exactly [sessionId, agentId, runId] (exact episode), got ${params.length} argument(s)`);
+  }
+  private getWorktree(sessionId: string, agentId: string, runId: string) {
     return (
-      this.worktrees.get(id) ??
+      this.worktrees.get(this.agentKey(agentId, sessionId, runId)) ??
       ({
-        agentId: id,
+        agentId,
+        sessionId,
+        runId,
         lifecycle: "none",
         merge: "unavailable",
         discard: "unavailable",
@@ -7838,8 +7921,9 @@ export class PiHostBackend implements HostBackend {
     );
     this.orphanReconcileTimer.unref?.();
   }
-  private retainOrphanWorktree(agentId: string): void {
-    const current = this.worktrees.get(agentId);
+  private retainOrphanWorktree(agent: AgentSummary): void {
+    const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
+    const current = this.worktrees.get(key);
     if (!current?.path || current.lifecycle !== "active") return;
     const status: WorktreeStatus = {
       ...current,
@@ -7847,7 +7931,7 @@ export class PiHostBackend implements HostBackend {
       merge: "ready",
       discard: "ready",
     };
-    this.worktrees.set(agentId, status);
+    this.worktrees.set(key, status);
     this.agent({ type: "worktree", status });
   }
   /**
@@ -7881,7 +7965,7 @@ export class PiHostBackend implements HostBackend {
       this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), next);
       this.agentProjectionChanged(next.sessionId);
       this.agent({ type: "agent", agent: next });
-      this.retainOrphanWorktree(agent.agentId);
+      this.retainOrphanWorktree(next);
       changed = true;
     }
     if (changed) this.persistAgents();
@@ -7956,10 +8040,14 @@ export class PiHostBackend implements HostBackend {
     }
   }
 
-  private async agentCommand(id: string, operation: "abort" | "resolve") {
-    const a = await this.getAgent(id);
+  private async agentCommand(sessionId: string, id: string, runId: string, operation: "abort" | "resolve") {
+    // Exact episode binding: the composite key names the row the caller is looking
+    // at. A stale run or another session's same-slug worker is rejected here; the
+    // runtime applies the same exact-run rule again for the live process.
+    const a = await this.getAgentExact(sessionId, id, runId);
 		if (operation === "abort") {
-			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id)) throw new Error("agent abort requires a live session and bounded agent id");
+			if (!a.sessionId || !/^[A-Za-z0-9_-]{2,160}$/.test(id) || !a.runId) throw new Error("agent abort requires a live session and bounded agent id");
+			if (!this.isLiveAgentState(a.state)) throw new Error(`agent ${id} run ${a.runId} already finished (${a.state}); nothing to abort`);
 			const abortsOwningTurn = a.name === "computer-use-leader" && !a.parentId;
 			const live = this.closed ? undefined : this.liveSessionProcess(a.sessionId);
 			if (live) {
@@ -7968,7 +8056,9 @@ export class PiHostBackend implements HostBackend {
 				// owning process is wedged, already gone, or the host is closing.
 				try {
 					await this.withAgentCommandTimeout(
-						this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id}`, streamingBehavior: "followUp" }),
+						// The runId makes the abort exact at the runtime too: a stale panel row
+						// must never kill a NEWER run reusing the same semantic slug.
+						this.command(a.sessionId, { type: "prompt", message: `/subagent_abort ${id} ${a.runId}`, streamingBehavior: "followUp" }),
 						5_000,
 						"停止请求在 5 秒内未被主 Agent 接收",
 					);
@@ -7995,8 +8085,32 @@ export class PiHostBackend implements HostBackend {
 			}
 			return;
 		} else {
+      // Bind the resolve to the exact episode: the runtime's /subagent_resolve owns the
+      // interrupted-reminder cancellation and the worktree closeout re-entry, and it
+      // rejects a stale runId itself.
+      //
+      // Live-process rule: when the owning session has a live process, the runtime
+      // forward is authoritative — a send failure or timeout propagates to the caller
+      // and NOTHING is marked handled (a silent local marking would cancel no reminder
+      // and skip the closeout re-entry while the UI shows success). Only when there is
+      // NO live process — an interrupted episode whose owner died, exactly the offline
+      // case — is the host-local handled marking the correct terminal disposition.
+      const hasLiveOwner = Boolean(a.sessionId && a.runId && !this.closed && this.liveSessionProcess(a.sessionId));
+      if (hasLiveOwner) {
+        await this.withAgentCommandTimeout(
+          this.command(a.sessionId!, {
+            type: "prompt",
+            message: `/subagent_resolve ${a.agentId} ${a.runId}`,
+            streamingBehavior: "followUp",
+          }),
+          5_000,
+          "标记已处理请求在 5 秒内未被主 Agent 接收",
+        );
+      }
+      if (!hasLiveOwner) {
+        a.closeout = a.closeout ?? "归属会话已无主进程，仅在本地标记已处理";
+      }
       a.handled = true;
-      a.closeout = a.closeout ?? "Boss marked this episode handled";
     }
     this.agent({ type: "agent", agent: { ...a } });
     this.persistAgents();
@@ -8010,8 +8124,22 @@ export class PiHostBackend implements HostBackend {
    * no Git at all — telling a user their work was merged when the branch was untouched is worse
    * than having no button. Until this routes through a real host-api operation, it fails loudly.
    */
-  private async worktreeCommand(id: string, operation: "merge" | "discard") {
-    const current = await this.getWorktree(id);
+  private async worktreeCommand(sessionId: string, id: string, runId: string, operation: "merge" | "discard") {
+    // Exact episode binding: a stale run's retained badge must never dispose the
+    // worktree a newer LIVE run of the same slug in the same session now owns —
+    // the physical worktree/branch is shared across runs of that (session, agentId).
+    const newerLiveRun = [...this.agents.values()].some(
+      (agent) =>
+        agent.agentId === id &&
+        (agent.sessionId ?? "") === (sessionId ?? "") &&
+        agent.runId !== runId &&
+        this.isLiveAgentState(agent.state),
+    );
+    if (newerLiveRun)
+      throw new Error(`worktree ${operation} refused: a newer run of ${id} is live in this session and owns the worktree`);
+    const current = await this.getWorktree(sessionId, id, runId);
+    if (current.lifecycle === "none")
+      throw new Error(`no worktree recorded for ${id} run ${runId || "?"} in session ${sessionId || "?"}`);
     if (operation === "merge" && current.merge !== "ready")
       throw new Error("worktree cannot be merged");
     if (operation === "discard" && current.discard !== "ready")
@@ -8123,8 +8251,30 @@ export class PiHostBackend implements HostBackend {
 			);
 		});
 	}
-  private projectWorktreeFromEvent(raw: any, state: AgentSummary["state"]): void {
-    const previous = this.worktrees.get(raw.agentId);
+  private projectWorktreeFromEvent(raw: any, sessionId: string | undefined, state: AgentSummary["state"]): void {
+    // Exact composite key (session, agent, run): the same semantic slug in another
+    // session/project — or a later run of this session — projects its own entry, so
+    // none of them can overwrite another. The Git branch stays pipiui/<agentId>;
+    // this key is the projection identity, not the branch name.
+    const key = this.agentKey(raw.agentId, sessionId, typeof raw.runId === "string" ? raw.runId : "");
+    // Identity is required on the current wire: a runtime agent event always
+    // carries its session and runId. An identity-less event cannot be attributed
+    // to one episode, and attributing it by agentId alone would recreate the
+    // cross-session same-slug collision this projection removed — drop it.
+    if (!sessionId || typeof raw.runId !== "string") return;
+    const previous = this.worktrees.get(key);
+    // Physical-worktree ownership: runs of one (session, agentId) share the same
+    // worktree path/branch. Once a NEWER run is live, a late event from a retired
+    // run must not re-describe that shared resource — its entry is frozen.
+    const newerLiveRun = [...this.agents.values()].some(
+      (agent) =>
+        agent.agentId === raw.agentId &&
+        (agent.sessionId ?? "") === (sessionId ?? "") &&
+        typeof raw.runId === "string" &&
+        agent.runId !== raw.runId &&
+        this.isLiveAgentState(agent.state),
+    );
+    if (newerLiveRun) return;
     const explicit = parseWorktreeLifecycle(raw.worktreeLifecycle);
     const settled =
       previous &&
@@ -8143,6 +8293,8 @@ export class PiHostBackend implements HostBackend {
     if (!lifecycle) return;
     const status: WorktreeStatus = {
       agentId: raw.agentId,
+      sessionId,
+      runId: raw.runId,
       path: raw.worktreePath ?? previous?.path,
       branch: raw.worktreeBranch ?? previous?.branch,
       error: raw.worktreeError ?? previous?.error,
@@ -8160,7 +8312,7 @@ export class PiHostBackend implements HostBackend {
             ? "discarded"
             : "unavailable",
     };
-    this.worktrees.set(raw.agentId, status);
+    this.worktrees.set(key, status);
     this.agent({ type: "worktree", status });
   }
   private mergeAgentDiagnostics(raw: any, current: AgentSummary | undefined, receivedAt = Date.now()) {
@@ -8247,7 +8399,7 @@ export class PiHostBackend implements HostBackend {
         listeners: this.listeners.size,
       });
       this.agent({ type: "agent", agent });
-      this.projectWorktreeFromEvent(raw, agent.state);
+      this.projectWorktreeFromEvent(raw, agent.sessionId ?? sessionId, agent.state);
       this.persistAgents();
       return;
     }
@@ -8387,7 +8539,7 @@ export class PiHostBackend implements HostBackend {
       before: current?.state ?? "missing",
       after: agent.state,
     });
-    if (raw.kind !== "log_delta") this.projectWorktreeFromEvent(raw, state);
+    if (raw.kind !== "log_delta") this.projectWorktreeFromEvent(raw, agent.sessionId ?? sessionId, state);
     const logSessionId = agent.sessionId;
     if (raw.kind === "log_delta" && logSessionId) {
       // Runtime log_delta pushes cumulative full text keyed by contentIndex; carry
@@ -8463,3 +8615,4 @@ export {
   type VaultDiagKind,
 } from "./secret-vault.js";
 export { FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from "./freeze-probe.js";
+export { HEADROOM_ENGINE_VERSION } from "./headroom-managed-runtime.js";

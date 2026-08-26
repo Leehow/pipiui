@@ -9,6 +9,8 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *   through the app's own browser panel instead of direct HTTP (JS rendering, session login
  *   state). It complements pi-web-access's `web_search`, never replaces it. It also intercepts
  *   that plugin's curator `open`/Glimpse so the review page lands in the same panel.
+ * - `browserMemory` adds browser_flow (save/list/show/delete/run of taught flows, replayed
+ *   step-by-step over the same bridge; values are parameterized, never stored).
  * - Isolated `webSearch` defaults to Exa MCP keyless with `workflow: "none"` (search and
  *   return). A 429/`quota` error falls through `searchRouting` to SearXNG → OpenAI →
  *   Firecrawl → the rest of the auto chain. TUN/fake-IP proxies get
@@ -26,4 +28,4 @@ import type { SpawnFeatures } from "./spawn-assembly.js";
  *
  * Everything else is verified to load: pi boots with all 13 mounts and a clean stderr.
  */
-export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:true,goal:true,subagent:true,memoryBroker:true,contextFold:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,deepseekServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});
+export const DEFAULT_FEATURES:SpawnFeatures=Object.freeze({philosophy:true,plan:true,goal:true,subagent:true,memoryBroker:true,contextFold:true,git:true,generateImage:true,reload:true,webSearch:true,browserSearch:true,browserMemory:true,arxivFetch:true,mcp:true,skillLoader:true,searchScope:false,codexServerTools:true,claudeServerTools:true,openaiServerTools:true,geminiServerTools:true,xaiServerTools:true,deepseekServerTools:true,glmSearchMcp:true,glmVisionMcp:true,browser:true,terminal:true,computerUse:true,bossReadOnly:true});

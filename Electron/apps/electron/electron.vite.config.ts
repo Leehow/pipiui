@@ -3,10 +3,6 @@ import { fileURLToPath } from 'node:url'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
 import { fileViewerRenderers, type FileViewerRenderersPluginOptions } from '@file-viewer/vite-plugin'
-import {
-  fileViewerPptVendorAssetPlugin,
-  rewriteFileViewerPptDefaultAssetUrls
-} from '../../packages/ui/file-viewer-ppt-vendor-assets'
 
 // Workspace packages must be bundled into the main/preload output so the
 // packaged app.asar never resolves @pipi/* through node_modules at runtime.
@@ -17,6 +13,7 @@ const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const uiPackageRoot = resolve(workspaceRoot, 'packages/ui')
 const piBackendSourceEntry = resolve(workspaceRoot, 'packages/pi-backend/src/index.ts')
 const hostApiSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/index.ts')
+const hostApiBrowserSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/browser.ts')
 const serverSourceEntry = resolve(workspaceRoot, 'apps/server/src/index.ts')
 // Resolve @pipiui/ui straight to the UI package source (not its prebuilt
 // dist): electron-vite's dev watcher then tracks packages/ui/src edits for
@@ -37,12 +34,10 @@ export function rendererAssetFileNames(assetInfo: { name?: string }): string {
 }
 
 export const fileViewerAssetOptions = {
-  preset: 'office',
+  formats: ['pdf'],
   copyAssets: { baseDir: 'file-viewer' },
   chunkStrategy: 'none'
 } satisfies FileViewerRenderersPluginOptions
-
-export { fileViewerPptVendorAssetPlugin, rewriteFileViewerPptDefaultAssetUrls }
 
 // A parallel workspace build/package rewrites these generated paths. Rollup's
 // main-process watcher otherwise treats those writes as source edits and
@@ -60,6 +55,8 @@ const devWatch = process.env.NODE_ENV_ELECTRON_VITE === 'development'
   : undefined
 
 const hostSourceAliases = [
+  // Subpath before the bare package: alias matching is prefix-based.
+  { find: '@pipi/host-api/browser', replacement: hostApiBrowserSourceEntry },
   { find: '@pipi/pi-backend', replacement: piBackendSourceEntry },
   { find: '@pipi/host-api', replacement: hostApiSourceEntry },
   { find: '@pipiui/server', replacement: serverSourceEntry }
@@ -83,8 +80,7 @@ export default defineConfig({
     build: { watch: devWatch }
   },
   renderer: {
-    plugins: [fileViewerPptVendorAssetPlugin(), fileViewerRenderers(fileViewerAssetOptions), react()],
-    optimizeDeps: { exclude: ['@file-viewer/ppt'] },
+    plugins: [fileViewerRenderers(fileViewerAssetOptions), react()],
     build: {
       rollupOptions: {
         output: { assetFileNames: rendererAssetFileNames }

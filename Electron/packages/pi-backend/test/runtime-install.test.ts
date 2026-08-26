@@ -93,7 +93,9 @@ describe("installRuntimeTree", () => {
       expect(await readFile(join(root, "extensions", "pipiui-runtime-info.ts"), "utf8")).toContain("pipiui_runtime_info");
       expect(await readFile(join(root, "extensions", "pipiui-coding-tools.ts"), "utf8")).toContain("readPathIfDirectory");
       expect(await readFile(join(root, "extensions", "pipiui-office-doc-shot-gate.ts"), "utf8")).toContain("triggerTurn: true");
-      expect(await readFile(join(root, "extensions", "office-doc-shot-gate.ts"), "utf8")).toContain("mcp_officecli_officecli");
+      expect(await readFile(join(root, "extensions", "office-doc-shot-gate.ts"), "utf8")).toContain("pipiui_officecli");
+      expect(await readFile(join(root, "extensions", "office-doc-shot-gate.ts"), "utf8")).toContain("DIRECT_OFFICECLI_TOOL");
+      expect(await readFile(join(root, "extensions", "pipiui-office-doc-shot-gate.ts"), "utf8")).toContain("pipiui_officecli");
       expect(await readFile(join(root, "extensions", "pipiui-update-center.ts"), "utf8")).toContain('pi.on("input"');
       expect(await readFile(join(root, "extensions", "pipiui-electron-webview.ts"), "utf8")).toContain("sessionCapability: CAPABILITY");
       expect(await readdir(join(root, "built-in-skills"))).toEqual(expect.arrayContaining(["create-subagent", "add-extension", "pipiui-research"]));
@@ -111,6 +113,7 @@ describe("installRuntimeTree", () => {
       // the generic extensions sync strips `dist`.
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("grok-build-oauth");
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("qoder");
+      expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("pipiui-headroom");
       const grokDir = join(root, "extensions", "grok-build-oauth");
       const grokManifest = JSON.parse(await readFile(join(grokDir, "pipiui-extension.json"), "utf8")) as {
         agent?: { extension?: string };

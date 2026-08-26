@@ -614,4 +614,44 @@ describe('pipiui-electron-webview tool execute (behavioral)', () => {
     })
     expect(textOf(failed)).toContain('browser_locator_not_found')
   })
+
+  it('serves the watches list through the dedicated browser_watch bridge, not the DOM host dispatcher', async () => {
+    const { calls } = installBridgeMock([
+      { ok: true, watches: [{ watchId: 'bw-1', condition: { type: 'selector', selector: '.ready' }, status: 'active', createdAt: 1, timeoutAt: 61_000, intervalMs: 2_000 }] },
+    ])
+    const result = await executeBrowserTool({ action: 'watches' }, undefined)
+    expect(result.isError).toBeUndefined()
+    // The list rides the browser_watch RPC with op=list — never the DOM host
+    // dispatcher, which would answer unknown_action for watches.
+    expect(calls).toEqual([{
+      rpcAction: 'browser_watch',
+      action: 'watches',
+      event: expect.objectContaining({ action: 'watches', op: 'list' }),
+    }])
+    expect(textOf(result)).toContain('bw-1')
+    expect(textOf(result)).toContain('"selector":".ready"')
+    expect(textOf(result)).toContain('status=active')
+    expect(result.details.watches).toHaveLength(1)
+
+    installBridgeMock([{ ok: false, error: 'browser watch limit reached for this session (8 active watches); unwatch one before registering another', code: 'browser_watch_limit_exceeded', limit: 8 }])
+    const failed = await executeBrowserTool({ action: 'watches' }, undefined)
+    expect(failed.isError).toBe(true)
+    expect(textOf(failed)).toContain('browser_watch_limit_exceeded')
+  })
+
+  it('registers and cancels watches through the browser_watch bridge with structured failures', async () => {
+    const { calls } = installBridgeMock([
+      { ok: true, watchId: 'bw-9', condition: { type: 'idle' }, conditionSummary: 'idle', timeoutAt: 61_000, intervalMs: 2_000, watch: { watchId: 'bw-9', createdAt: 1_000, timeoutAt: 61_000 } },
+      { ok: true },
+    ])
+    const registered = await executeBrowserTool({ action: 'watch', timeoutSecs: 60, idle: true }, undefined)
+    expect(registered.isError).toBeUndefined()
+    expect(calls[0]).toMatchObject({ rpcAction: 'browser_watch', action: 'watch' })
+    expect(calls[0].event).toMatchObject({ op: 'register', timeoutSecs: 60, idle: true })
+    expect(textOf(registered)).toContain('Registered watch bw-9')
+    const cancelled = await executeBrowserTool({ action: 'unwatch', watchId: 'bw-9' }, undefined)
+    expect(cancelled.isError).toBeUndefined()
+    expect(calls[1]).toMatchObject({ rpcAction: 'browser_watch', action: 'unwatch' })
+    expect(calls[1].event).toMatchObject({ op: 'unwatch', watchId: 'bw-9' })
+  })
 })

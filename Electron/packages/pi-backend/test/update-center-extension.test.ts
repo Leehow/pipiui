@@ -72,6 +72,11 @@ describe("pipiui update center extension seam", () => {
         source: "interactive",
         checks: ["memory-broker、自动召回、角色化记忆策略和 Hermes 复核模型设置", "recall 行为、role 策略、数据库格式/迁移", "Hermes adapter", "临时副本或 fixture", "主 Agent 自动召回、显式 memory_query、subagent 召回", "canonical Electron App"],
       },
+      {
+        fields: { id: "headroom-ai", name: "Headroom", packageName: "headroom-ai", currentVersion: "0.36.5", latestVersion: "0.37.0" },
+        source: "interactive",
+        checks: ["PyPI 的 headroom-ai", "proxy CLI", "/v1/compress CCR 协议", "macOS arm64/x86_64 wheel", "托管 uv/Python 安装", "项目级 .pi/agent 数据隔离", "context-fold 继续工作", "真实冷启动/readyz/compress/关闭清理"],
+      },
     ];
     for (const testCase of cases) {
       const images = [{ type: "image", data: "image-data", mimeType: "image/png" }];

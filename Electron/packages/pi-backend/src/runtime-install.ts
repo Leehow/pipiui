@@ -16,7 +16,7 @@ const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist"
  * re-synced with `keepDist` after the generic `extensions` pass so their build
  * artifacts survive both the signature and the copy.
  */
-export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "deepseek", "qoder"];
+export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "deepseek", "qoder", "pipiui-headroom"];
 const SIGNATURE_FILE = ".pipiui-install.json";
 let stagingSeq = 0;
 

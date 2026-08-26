@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { createPortal } from 'react-dom'
 import type { BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, PipiHostAPI } from '@pipi/host-api'
 import { BROWSER_MOBILE_DEVICES, browserMobileDeviceById } from '@pipi/host-api'
+import type { BrowserConsoleEntry, BrowserSurfaceHostAPI, BrowserWatchCondition, BrowserWatchInfo, BrowserWatchTrigger } from '@pipi/host-api/browser'
 import { DismissibleError } from './DismissibleError'
 import './browser-panel.css'
 
@@ -11,6 +12,10 @@ type SessionChrome = { tabs: BrowserTabsSnapshot; address: string; deviceId: str
 const BROWSER_ZOOM_MIN = 0.25
 const BROWSER_ZOOM_MAX = 5
 const BROWSER_ZOOM_STEP = 0.1
+/** Bounded page-output buffer: newest entries survive, old ones drop. */
+const BROWSER_CONSOLE_BUFFER_LIMIT = 200
+/** DOM stays bounded even at the buffer cap; the header keeps the true count. */
+const BROWSER_CONSOLE_RENDER_LIMIT = 50
 
 function clampZoom(factor: number): number {
   const next = Number.isFinite(factor) ? factor : 1
@@ -33,6 +38,23 @@ function activeTab(snapshot: BrowserTabsSnapshot): BrowserTab | undefined {
   return snapshot.tabs.find(tab => tab.id === snapshot.activeTabId) ?? snapshot.tabs[0]
 }
 
+function watchConditionLabel(condition: BrowserWatchCondition): string {
+  switch (condition.type) {
+    case 'url_matches': return `URL 匹配 /${condition.pattern}/`
+    case 'selector': return `选择器 ${condition.selector}`
+    case 'expression': return `表达式 ${condition.expression}`
+    case 'idle': return condition.idleMs == null ? '页面空闲' : `页面空闲 ${condition.idleMs}ms`
+    case 'timer': return '定时器'
+  }
+}
+
+function formatWatchRemaining(timeoutAt: number | null | undefined, now: number): string {
+  if (timeoutAt == null || !Number.isFinite(timeoutAt)) return '无超时'
+  const seconds = Math.max(0, Math.ceil((timeoutAt - now) / 1000))
+  if (seconds >= 90) return `剩 ${Math.round(seconds / 60)} 分钟`
+  return `剩 ${seconds}s`
+}
+
 export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: {
   host: PipiHostAPI
   sessionId?: string
@@ -41,7 +63,10 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   workspaceFullscreen?: boolean
   onToggleWorkspaceFullscreen?: () => void
 }) {
-  const browser = host.browser
+  // Surface lens over the root browser API: the same object, typed for the
+  // wider event union this subpath owns (method bivariance makes the root
+  // host structurally compatible; the cast only widens the view).
+  const browser = host.browser as BrowserSurfaceHostAPI | undefined
   const [tabs, setTabs] = useState<BrowserTabsSnapshot>(emptyTabs)
   const [address, setAddress] = useState('')
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -49,6 +74,12 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   const [zoomFactor, setZoomFactor] = useState(1)
   const zoomFactorRef = useRef(1)
   const [error, setError] = useState<string>()
+  const [consoleEntries, setConsoleEntries] = useState<BrowserConsoleEntry[]>([])
+  const [certificateError, setCertificateError] = useState<{ url: string; reason: string }>()
+  const [jsDialog, setJsDialog] = useState<{ kind: string; message: string; url?: string; count: number }>()
+  const [watches, setWatches] = useState<BrowserWatchInfo[]>([])
+  const [lastWatchTrigger, setLastWatchTrigger] = useState<BrowserWatchTrigger>()
+  const [watchNow, setWatchNow] = useState(() => Date.now())
   const [surface, setSurface] = useState<HTMLDivElement | null>(null)
   const sessionKey = sessionId ?? ''
   const mobileOpenRef = useRef(mobileOpen)
@@ -59,6 +90,12 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   const [chromeKey, setChromeKey] = useState(sessionKey)
   if (sessionKey !== chromeKey) {
     if (chromeKey) chromeBySession.current.set(chromeKey, { tabs, address, deviceId, zoomFactor })
+    // Page-level notices are live-only (not worth caching across switches).
+    setConsoleEntries([])
+    setCertificateError(undefined)
+    setJsDialog(undefined)
+    setWatches([])
+    setLastWatchTrigger(undefined)
     const cached = sessionKey ? chromeBySession.current.get(sessionKey) : undefined
     if (cached) {
       setTabs(cached.tabs)
@@ -84,6 +121,17 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
     setTabs(await browser.listTabs(sessionKey))
   }, [browser, sessionKey])
 
+  // Watch hydration rides selectSession: main re-emits the active watch list
+  // as a `watch` event on every (re)select, so the panel never needs a
+  // dedicated list RPC and a panel opened after the first select still hydrates.
+  // That emission is synchronous on the main side, so the event subscription
+  // must already be live when this runs (see the effect below: subscribe first,
+  // then announce).
+  const announceSession = useCallback(() => {
+    if (!browser || !sessionKey) return
+    void browser.selectSession(sessionKey).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
+  }, [browser, sessionKey])
+
   const setBounds = useCallback((visible: boolean, nextMobileOpen = mobileOpenRef.current, nextDeviceId = deviceIdRef.current): boolean => {
     if (!browser || !sessionKey) return false
     const container = readRect(surface)
@@ -107,19 +155,48 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
   useEffect(() => {
     if (!browser || !sessionKey) return
     let alive = true
-    void sync().catch(reason => { if (alive) setError(reason instanceof Error ? reason.message : String(reason)) })
+    // Subscribe BEFORE announcing: main emits the watch hydration snapshot
+    // synchronously inside selectSession, so a listener registered after the
+    // announce would drop the initial/session-switch snapshot. An empty
+    // snapshot still arrives as a `watch` event and clears stale chips.
     const unsubscribe = browser.subscribe(event => {
       if (event.sessionId !== sessionKey || !alive) return
       if (event.type === 'tabs') setTabs(event.snapshot)
       if (event.type === 'error') setError(event.message)
       if (event.type === 'reveal') setBounds(!occluded)
+      if (event.type === 'console' && (event.entry.level === 'error' || event.entry.level === 'warn')) {
+        setConsoleEntries(previous => {
+          // Bounded ring: cap total memory no matter how chatty the page is.
+          const overflow = previous.length - BROWSER_CONSOLE_BUFFER_LIMIT + 1
+          const kept = overflow > 0 ? previous.slice(overflow) : previous.slice()
+          kept.push(event.entry)
+          return kept
+        })
+      }
+      if (event.type === 'certificate-error') setCertificateError({ url: event.url, reason: event.reason })
+      if (event.type === 'js-dialog') setJsDialog(previous => previous && previous.kind === event.kind && previous.message === event.message
+        ? { ...previous, count: previous.count + 1 }
+        : { kind: event.kind, message: event.message, url: event.url, count: 1 })
+      if (event.type === 'watch') {
+        setWatches(event.watches)
+        if (event.trigger) setLastWatchTrigger(event.trigger)
+      }
       if (event.type === 'mobile-window' && !event.open) {
         mobileOpenRef.current = false
         setMobileOpen(false)
       }
     })
+    void sync().catch(reason => { if (alive) setError(reason instanceof Error ? reason.message : String(reason)) })
+    announceSession()
     return () => { alive = false; unsubscribe() }
-  }, [browser, sync, sessionKey, setBounds, occluded])
+  }, [browser, sync, announceSession, sessionKey, setBounds, occluded])
+
+  // Countdown freshness for the watch strip; only ticks while watches exist.
+  useEffect(() => {
+    if (watches.length === 0) return
+    const timer = window.setInterval(() => setWatchNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [watches.length])
 
   useEffect(() => { setAddress(active?.url ?? '') }, [active?.id, active?.url])
 
@@ -208,6 +285,40 @@ export function BrowserPanel({ host, sessionId, occluded = false, headerSlot, wo
     <div id={active ? `browser-tab-${active.id}` : undefined} className="browser-webcontents-surface" ref={setSurface} role="tabpanel" aria-label={active ? `浏览器内容：${displayTitle(active)}` : '浏览器内容'}>
       {(!active?.url || active.url === 'about:blank') && !active?.isLoading ? <div className="browser-surface-fallback" aria-hidden="true">桌面宿主将在此显示网页内容</div> : null}
     </div>
+    {(certificateError || jsDialog || watches.length > 0 || lastWatchTrigger || consoleEntries.length > 0) && <div className="browser-page-status" data-testid="browser-page-status" role="region" aria-label="页面状态与输出">
+      {certificateError && <div className="browser-banner browser-certificate-banner" role="status" data-testid="browser-certificate-error">
+        <span className="browser-banner-title">证书错误：{certificateError.reason || '未指明原因'}{certificateError.url ? ` ${certificateError.url}` : ''}</span>
+        <span className="browser-banner-note">工具侧已按默认策略拒绝加载该页（未放行证书）</span>
+        <button type="button" aria-label="关闭证书错误提示" title="关闭" onClick={() => setCertificateError(undefined)}>×</button>
+      </div>}
+      {jsDialog && <div className="browser-banner browser-dialog-banner" role="status" data-testid="browser-js-dialog">
+        <span className="browser-banner-title">页面调用了 {jsDialog.kind}()：{jsDialog.message || '（无文案）'}{jsDialog.count > 1 ? ` ×${jsDialog.count}` : ''}</span>
+        <span className="browser-banner-note">原生对话框可能已弹出；agent 工具不会代答，需人工处理</span>
+        <button type="button" aria-label="关闭对话框提示" title="关闭" onClick={() => setJsDialog(undefined)}>×</button>
+      </div>}
+      {watches.length > 0 && <div className="browser-watch-strip" data-testid="browser-watches" aria-label={`页面监听 ${watches.length} 项`}>
+        <span className="browser-watch-title">监听中 {watches.length}</span>
+        {watches.map(watch => <span className="browser-watch-chip" key={watch.watchId} title={watchConditionLabel(watch.condition)}>{watchConditionLabel(watch.condition)} · {formatWatchRemaining(watch.timeoutAt, watchNow)}</span>)}
+      </div>}
+      {lastWatchTrigger && <div className="browser-banner browser-watch-trigger" role="status" data-testid="browser-watch-trigger">
+        <span className="browser-banner-title">监听触发（{lastWatchTrigger.reason}）：{(lastWatchTrigger.title || lastWatchTrigger.url || lastWatchTrigger.watchId)}，等待 {(lastWatchTrigger.waitedMs / 1000).toFixed(1)}s</span>
+        <button type="button" aria-label="关闭监听触发提示" title="关闭" onClick={() => setLastWatchTrigger(undefined)}>×</button>
+      </div>}
+      {consoleEntries.length > 0 && <div className="browser-console" data-testid="browser-console" aria-label="页面输出">
+        <div className="browser-console-header">
+          <span>页面输出 · {consoleEntries.filter(entry => entry.level === 'error').length} 错误 / {consoleEntries.filter(entry => entry.level === 'warn').length} 警告（最近 {consoleEntries.length} 条）</span>
+          <button type="button" aria-label="清空页面输出" onClick={() => setConsoleEntries([])}>清空</button>
+        </div>
+        <ul className="browser-console-list">
+          {consoleEntries.slice(-BROWSER_CONSOLE_RENDER_LIMIT).map((entry, index) => <li
+            key={`${entry.timestamp}-${index}`}
+            className={entry.level === 'error' ? 'browser-console-entry error' : 'browser-console-entry warn'}
+            data-level={entry.level}
+            title={entry.url ? `${entry.url}${entry.line != null ? `:${entry.line}` : ''}` : undefined}
+          >{entry.message}</li>)}
+        </ul>
+      </div>}
+    </div>}
     {error && <DismissibleError className="browser-error" message={error} onDismiss={() => setError(undefined)} />}
   </section>
 }

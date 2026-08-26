@@ -89,6 +89,28 @@ describe('BrowserMobileWindowController', () => {
     expect(window.destroy).not.toHaveBeenCalled()
   })
 
+  it('allows native close during an application-wide quit', () => {
+    const window = new FakeMobileWindow()
+    const view = fakeView()
+    const onClosed = vi.fn()
+    const controller = new BrowserMobileWindowController(
+      {} as any,
+      () => window,
+      vi.fn(),
+      onClosed,
+      () => true
+    )
+    controller.present('session-a', view, true, iphone)
+    const preventDefault = vi.fn()
+
+    window.emit('close', { preventDefault })
+
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(window.hide).not.toHaveBeenCalled()
+    expect(view.setVisible).not.toHaveBeenLastCalledWith(false)
+    expect(onClosed).not.toHaveBeenCalled()
+  })
+
   it('lays out only the mobile view on resize and destroys every child window on shutdown', () => {
     const windows: FakeMobileWindow[] = []
     const views = [fakeView(), fakeView()]

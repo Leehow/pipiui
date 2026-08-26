@@ -58,7 +58,8 @@ export class BrowserMobileWindowController {
     private readonly parent: unknown,
     private readonly createWindow: (options: BrowserMobileWindowOptions) => BrowserMobileWindowLike,
     private readonly onResize: (sessionId: string, size: { width: number; height: number }) => void,
-    private readonly onUserClosed: (sessionId: string) => void
+    private readonly onUserClosed: (sessionId: string) => void,
+    private readonly isAppQuitting: () => boolean = () => false
   ) {}
 
   present(
@@ -127,6 +128,10 @@ export class BrowserMobileWindowController {
     const close = (event: { preventDefault?(): void }) => {
       const current = this.records.get(sessionId)
       if (!current || current.closing) return
+      if (this.isAppQuitting()) {
+        current.closing = true
+        return
+      }
       event.preventDefault?.()
       view.setVisible?.(false)
       window.hide()

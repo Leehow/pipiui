@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  WATCHER_MAX_WATCHES_PER_SESSION,
   WatcherRegistry,
   type WatchPageSummary,
   type WatchRecord,
@@ -216,6 +217,31 @@ describe('WatcherRegistry', () => {
     expect(handle.register({ sessionKey: 's', condition: { type: 'selector', selector: '' } }).ok).toBe(false)
     expect(handle.register({ sessionKey: 's', condition: { type: 'url_matches', pattern: '(' } }).ok).toBe(false)
     expect(handle.register({ sessionKey: 's', condition: { type: 'expression', expression: '  ' } }).ok).toBe(false)
+  })
+
+  it('caps active watches per session with a structured error and frees the slot on unwatch', () => {
+    const handle = tracked(mockPage(), [], { value: 1_000 })
+    for (let i = 0; i < WATCHER_MAX_WATCHES_PER_SESSION; i++) {
+      expect(handle.register({ sessionKey: 'sess-a', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: `a-${i}` }).ok).toBe(true)
+    }
+    const exceeded = handle.register({ sessionKey: 'sess-a', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: 'a-extra' })
+    expect(exceeded).toEqual({
+      ok: false,
+      error: expect.stringContaining(`watch limit reached for this session (${WATCHER_MAX_WATCHES_PER_SESSION} active watches)`),
+      code: 'browser_watch_limit_exceeded',
+      limit: WATCHER_MAX_WATCHES_PER_SESSION,
+    })
+    // The ceiling is per session: another session is unaffected.
+    expect(handle.register({ sessionKey: 'sess-b', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: 'b-0' }).ok).toBe(true)
+    // Unwatching frees the slot for the same session.
+    handle.unwatch('a-0')
+    expect(handle.register({ sessionKey: 'sess-a', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: 'a-after' }).ok).toBe(true)
+    expect(handle.list('sess-a')).toHaveLength(WATCHER_MAX_WATCHES_PER_SESSION)
+    // A fired watch also frees its slot.
+    const fired = handle.register({ sessionKey: 'sess-c', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: 'c-0' })
+    expect(fired.ok).toBe(true)
+    handle.notifyDisposed('sess-c')
+    expect(handle.register({ sessionKey: 'sess-c', condition: { type: 'timer' }, timeoutMs: 60_000, watchId: 'c-1' }).ok).toBe(true)
   })
 
   it('clears checking after a hung evaluate so a later tick can fire timeout', async () => {

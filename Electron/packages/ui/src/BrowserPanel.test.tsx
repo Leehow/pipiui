@@ -5,6 +5,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BrowserEvent } from '@pipi/host-api'
+import type { BrowserSurfaceEvent, BrowserWatchInfo } from '@pipi/host-api/browser'
 import { createMockHost } from './App'
 import { BrowserPanel } from './BrowserPanel'
 
@@ -199,12 +200,13 @@ describe('BrowserPanel', () => {
   it('hides the empty-tab hint once a real URL is present and shows host load errors', async () => {
     const host = createMockHost()
     const original = host.browser!.subscribe.bind(host.browser)
-    const extra = new Set<(event: BrowserEvent) => void>()
+    const extra = new Set<(event: BrowserSurfaceEvent) => void>()
     host.browser!.subscribe = listener => {
-      extra.add(listener)
+      const surfaceListener = asSurfaceListener(listener)
+      extra.add(surfaceListener)
       const unsubscribe = original(listener)
       return () => {
-        extra.delete(listener)
+        extra.delete(surfaceListener)
         unsubscribe()
       }
     }
@@ -224,9 +226,9 @@ describe('BrowserPanel', () => {
     const host = createMockHost()
     const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
     const original = host.browser!.subscribe.bind(host.browser)
-    let panelListener: ((event: BrowserEvent) => void) | undefined
+    let panelListener: ((event: BrowserSurfaceEvent) => void) | undefined
     host.browser!.subscribe = listener => {
-      panelListener = listener
+      panelListener = asSurfaceListener(listener)
       return original(listener)
     }
     renderPanel(host)
@@ -290,9 +292,9 @@ describe('BrowserPanel', () => {
     const host = createMockHost()
     const setViewBounds = vi.spyOn(host.browser!, 'setViewBounds')
     const original = host.browser!.subscribe.bind(host.browser)
-    let listener: ((event: BrowserEvent) => void) | undefined
+    let listener: ((event: BrowserSurfaceEvent) => void) | undefined
     host.browser!.subscribe = next => {
-      listener = next
+      listener = asSurfaceListener(next)
       return original(next)
     }
     renderPanel(host)
@@ -353,5 +355,184 @@ describe('BrowserPanel', () => {
       deviceId: 'iphone-15-pro-max', viewport: { width: 430, height: 932 }, deviceScaleFactor: 3
     }))
     expect((select as HTMLSelectElement).value).toBe('iphone-15-pro-max')
+  })
+})
+
+/** Grabs the listener BrowserPanel registered, so tests can push host events. */
+function interceptPanelListener(host: ReturnType<typeof createMockHost>) {
+  const original = host.browser!.subscribe.bind(host.browser)
+  let listener: ((event: BrowserSurfaceEvent) => void) | undefined
+  host.browser!.subscribe = next => {
+    listener = asSurfaceListener(next)
+    return original(next)
+  }
+  return () => listener
+}
+
+/**
+ * Narrow seam cast at the root-subscribe boundary: the root contract types the
+ * handler parameter as the stable `BrowserEvent` union, while the panel (and
+ * these tests) receive the wider `BrowserSurfaceEvent` union this subpath
+ * owns. Only the handler's parameter type is widened; nothing else is cast.
+ */
+function asSurfaceListener(listener: (event: BrowserEvent) => void): (event: BrowserSurfaceEvent) => void {
+  return listener as (event: BrowserSurfaceEvent) => void
+}
+
+function pageConsoleEvent(index: number, level: 'error' | 'warn' | 'log'): BrowserSurfaceEvent {
+  return { type: 'console', sessionId: 'welcome', entry: { timestamp: 1700000000000 + index, level, message: `page-${index}`, sourceId: `s${index}.js`, line: index, url: 'https://page.example/app', tabId: 't1' } }
+}
+
+describe('BrowserPanel page visibility', () => {
+  it('hydrates the watch strip from the synchronous selectSession snapshot without any list RPC', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    // Main-side contract (session-host.ts): selectSession re-emits the active
+    // watch list as one `watch` event, synchronously, to already-registered
+    // listeners. The panel must subscribe BEFORE announcing, otherwise this
+    // emission is dropped and hydration never happens — so the test emits
+    // strictly through the listener the panel registered, never a test-side
+    // push; if the listener is not up yet, the mock throws and this test fails.
+    // Mount re-runs the effect (surface attach), so the registry content — not
+    // a call counter — decides what each announcement emits, exactly like main.
+    let currentWatches: BrowserWatchInfo[] = [
+      { watchId: 'w1', condition: { type: 'url_matches', pattern: 'done' }, createdAt: 1, timeoutAt: Date.now() + 30_000, intervalMs: 500, status: 'active' },
+      { watchId: 'w2', condition: { type: 'expression', expression: 'window.ready === true' }, createdAt: 1, timeoutAt: null, intervalMs: 500, status: 'checking' }
+    ]
+    const selectSession = vi.spyOn(host.browser!, 'selectSession').mockImplementation(async () => {
+      const listener = getListener()
+      if (!listener) throw new Error('selectSession emitted its snapshot before the panel subscribed to browser events')
+      listener({ type: 'watch', sessionId: 'welcome', watches: currentWatches })
+    })
+    const { view, slot } = renderPanel(host)
+
+    const strip = await screen.findByTestId('browser-watches')
+    expect(strip.textContent).toContain('监听中 2')
+    expect(strip.textContent).toContain('URL 匹配 /done/')
+    // Live countdown may tick past the boundary mid-render; assert the band.
+    expect(strip.textContent).toMatch(/剩 3[01]s/)
+    expect(strip.textContent).toContain('表达式 window.ready === true')
+    expect(strip.textContent).toContain('无超时')
+    // Hydration contract: mount announces ownership via selectSession; there is
+    // no listActiveWatches call because the method is not on the host contract.
+    expect(selectSession).toHaveBeenCalledWith('welcome')
+    expect((host.browser as { listActiveWatches?: unknown }).listActiveWatches).toBeUndefined()
+
+    // Effect re-run (occlusion flip) re-announces ownership; once the registry
+    // drains, the empty snapshot from that re-select must clear the old chips.
+    currentWatches = []
+    view.rerender(<BrowserPanel host={host} sessionId="welcome" headerSlot={slot} occluded />)
+    await waitFor(() => expect(screen.queryByTestId('browser-watches')).toBeNull())
+  })
+
+  it('shows the latest watch trigger banner and dismisses it without dropping the strip', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    renderPanel(host)
+    await screen.findByRole('tab', { name: '新标签页' })
+    getListener()?.({
+      type: 'watch',
+      sessionId: 'welcome',
+      watches: [{ watchId: 'w1', condition: { type: 'url_matches', pattern: 'done' }, createdAt: 1, timeoutAt: Date.now() + 60_000, intervalMs: 500, status: 'active' }] satisfies BrowserWatchInfo[],
+      trigger: { watchId: 'w1', reason: 'matched', waitedMs: 4200, url: 'https://page.example/done', title: '任务完成', firedAt: Date.now() }
+    } satisfies BrowserSurfaceEvent)
+    const banner = await screen.findByTestId('browser-watch-trigger')
+    expect(banner.textContent).toContain('matched')
+    expect(banner.textContent).toContain('任务完成')
+    expect(banner.textContent).toContain('4.2s')
+    expect(screen.getByTestId('browser-watches').textContent).toContain('URL 匹配 /done/')
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭监听触发提示' }))
+    await waitFor(() => expect(screen.queryByTestId('browser-watch-trigger')).toBeNull())
+    expect(screen.getByTestId('browser-watches')).toBeTruthy()
+  })
+
+  it('buffers page console output at 200 entries, filters to error/warn, and clears', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    renderPanel(host)
+    await screen.findByRole('tab', { name: '新标签页' })
+    getListener()?.(pageConsoleEvent(1, 'error'))
+    getListener()?.(pageConsoleEvent(2, 'warn'))
+    getListener()?.(pageConsoleEvent(3, 'log'))
+    getListener()?.({ type: 'console', sessionId: 'welcome', entry: { timestamp: 1, level: 'error', message: 'boom from page', tabId: 't1' } })
+    let consoleBox = await screen.findByTestId('browser-console')
+    expect(consoleBox.textContent).toContain('page-1')
+    expect(consoleBox.textContent).toContain('page-2')
+    expect(consoleBox.textContent).not.toContain('page-3')
+    expect(consoleBox.textContent).toContain('1 警告')
+    expect(consoleBox.textContent).toContain('boom from page')
+
+    for (let index = 10; index < 260; index += 1) getListener()?.(pageConsoleEvent(index, 'error'))
+    await waitFor(() => expect(screen.getByTestId('browser-console').textContent).toContain('最近 200 条'))
+    consoleBox = screen.getByTestId('browser-console')
+    expect(consoleBox.querySelectorAll('li')).toHaveLength(50)
+    expect(consoleBox.textContent).toContain('page-259')
+
+    fireEvent.click(screen.getByRole('button', { name: '清空页面输出' }))
+    await waitFor(() => expect(screen.queryByTestId('browser-console')).toBeNull())
+  })
+
+  it('surfaces certificate errors with the tool-side handling note and dismisses them', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    renderPanel(host)
+    await screen.findByRole('tab', { name: '新标签页' })
+    getListener()?.({ type: 'certificate-error', sessionId: 'welcome', url: 'https://self-signed.example', reason: 'ERR_CERT_AUTHORITY_INVALID' })
+    const banner = await screen.findByTestId('browser-certificate-error')
+    expect(banner.textContent).toContain('ERR_CERT_AUTHORITY_INVALID')
+    expect(banner.textContent).toContain('https://self-signed.example')
+    expect(banner.textContent).toContain('拒绝加载')
+
+    fireEvent.click(screen.getByRole('button', { name: '关闭证书错误提示' }))
+    await waitFor(() => expect(screen.queryByTestId('browser-certificate-error')).toBeNull())
+  })
+
+  it('surfaces JS dialog calls with a repeat count', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    renderPanel(host)
+    await screen.findByRole('tab', { name: '新标签页' })
+    getListener()?.({ type: 'js-dialog', sessionId: 'welcome', kind: 'alert', message: '操作完成', url: 'https://page.example/app' })
+    const banner = await screen.findByTestId('browser-js-dialog')
+    expect(banner.textContent).toContain('alert()')
+    expect(banner.textContent).toContain('操作完成')
+    expect(banner.textContent).toContain('不会代答')
+
+    getListener()?.({ type: 'js-dialog', sessionId: 'welcome', kind: 'alert', message: '操作完成', url: 'https://page.example/app' })
+    await waitFor(() => expect(screen.getByTestId('browser-js-dialog').textContent).toContain('×2'))
+
+    getListener()?.({ type: 'js-dialog', sessionId: 'welcome', kind: 'confirm', message: '确认删除？' })
+    await waitFor(() => expect(screen.getByTestId('browser-js-dialog').textContent).toContain('confirm()'))
+    fireEvent.click(screen.getByRole('button', { name: '关闭对话框提示' }))
+    await waitFor(() => expect(screen.queryByTestId('browser-js-dialog')).toBeNull())
+  })
+
+  it('keeps projecting navigation failures and timeouts through the error alert', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    renderPanel(host)
+    await screen.findByRole('tab', { name: '新标签页' })
+    getListener()?.({ type: 'error', sessionId: 'welcome', message: 'ERR_TIMED_OUT https://slow.example' })
+    expect((await screen.findByRole('alert')).textContent).toContain('ERR_TIMED_OUT')
+    getListener()?.({ type: 'error', sessionId: 'welcome', message: '导航超时：did-fail-load (-7)' })
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('导航超时'))
+  })
+
+  it('resets page notices when switching to another session browser space', async () => {
+    const host = createMockHost()
+    const getListener = interceptPanelListener(host)
+    const { rerender } = render(<BrowserPanel host={host} sessionId="welcome" />)
+    await screen.findByLabelText('浏览器地址')
+    getListener()?.({ type: 'certificate-error', sessionId: 'welcome', url: 'https://self-signed.example', reason: 'ERR_CERT_AUTHORITY_INVALID' })
+    getListener()?.(pageConsoleEvent(1, 'error'))
+    await screen.findByTestId('browser-certificate-error')
+
+    rerender(<BrowserPanel host={host} sessionId="layout" />)
+    await waitFor(() => {
+      expect(screen.queryByTestId('browser-certificate-error')).toBeNull()
+      expect(screen.queryByTestId('browser-console')).toBeNull()
+      expect(screen.queryByTestId('browser-page-status')).toBeNull()
+    })
   })
 })

@@ -1,7 +1,7 @@
 import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX } from '@pipi/pi-backend'
+import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -80,7 +80,12 @@ export function registerPipiHostIpc(
   })
 }
 
-function createWindow(browser: BrowserSessionHost, onClosed: () => void, freezeProbeFile?: string): void {
+function createWindow(
+  browser: BrowserSessionHost,
+  onClosed: () => void,
+  freezeProbeFile?: string,
+  isAppQuitting: () => boolean = () => false
+): void {
   const window = new BaseWindow({
     width: 1280,
     height: 800,
@@ -117,7 +122,8 @@ function createWindow(browser: BrowserSessionHost, onClosed: () => void, freezeP
     window,
     options => new BaseWindow(options as any) as any,
     (sessionId, size) => browser.mobileWindowResized(sessionId, size),
-    sessionId => browser.mobileWindowClosed(sessionId)
+    sessionId => browser.mobileWindowClosed(sessionId),
+    isAppQuitting
   )
   browser.attachToWindow((sessionId, rawView, placement, kind, device) => {
     if (kind === 'mobile') return mobileWindows.present(sessionId, rawView, placement, device)
@@ -175,7 +181,7 @@ if (app) {
         view.webContents.getUserAgent().replace(/\s*[\w ]*Electron\/[\d.]+/g, '')
       )
       return view
-    })
+    }, { certificateErrorApp: app })
     const watchCallbacks = new BrowserWatchCallbackRegistry()
     browser.setWatchTrigger((watch, reason, pageSummary) => {
       void watchCallbacks.deliver(watch.sessionKey, {
@@ -280,6 +286,7 @@ if (app) {
         currentVersion,
         source: { type: 'npm' as const, packageName }
       })),
+      { id: 'headroom-ai', name: 'Headroom', category: 'extension', currentVersion: HEADROOM_ENGINE_VERSION, source: { type: 'pypi', packageName: 'headroom-ai' } },
       { id: 'cua-driver', name: 'Cua Driver', category: 'runtime', currentVersion: CUA_DRIVER_VERSION, source: { type: 'cuaGitHub' } },
       { id: 'vite', name: 'Vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS.vite, source: { type: 'npm', packageName: 'vite' } },
       { id: 'electron-vite', name: 'electron-vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS['electron-vite'], source: { type: 'npm', packageName: 'electron-vite' } }
@@ -313,14 +320,20 @@ if (app) {
       remoteDebug
     )
     void remoteControl.restore()
-    app.on('before-quit', () => { void remoteDebug.close() })
-    createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE))
+    let appQuitting = false
+    app.on('before-quit', () => {
+      appQuitting = true
+      void remoteDebug.close()
+    })
+    createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE), () => appQuitting)
     // Capability is the first models-write job. Isolated backend init then migrates
     // project catalogs and refreshes the model catalog; do not refresh here or the
     // UI can observe pre-migration canonical state.
     installOwnedRuntimeShutdown(app, terminalHost, computer, piBackend)
     app.on('activate', () => {
-      if (BaseWindow.getAllWindows().length === 0) createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE))
+      if (BaseWindow.getAllWindows().length === 0) {
+        createWindow(browser, () => terminalHost.closeAll(), join(piProfile.agentDir, FREEZE_PROBE_FILE), () => appQuitting)
+      }
     })
   })
 

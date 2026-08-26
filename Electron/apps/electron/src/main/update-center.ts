@@ -12,7 +12,7 @@ export type UpdateCatalogItem = {
   name: string
   category: UpdateCenterItemCategory
   currentVersion: string
-  source: { type: 'npm'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' }
+  source: { type: 'npm'; packageName: string } | { type: 'pypi'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' }
 }
 
 export type UpdateCenterFetch = (input: string, init?: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'json'>>
@@ -58,6 +58,14 @@ export function npmLatestVersion(payload: unknown): string | undefined {
   return typeof latest === 'string' && parseSemver(latest) ? latest : undefined
 }
 
+export function pypiLatestVersion(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined
+  const info = (payload as { info?: unknown }).info
+  if (!info || typeof info !== 'object') return undefined
+  const version = (info as { version?: unknown }).version
+  return typeof version === 'string' && parseSemver(version) ? version : undefined
+}
+
 export function latestCuaDriverVersion(payload: unknown): string | undefined {
   if (!Array.isArray(payload)) return undefined
   const candidates = payload.flatMap(release => {
@@ -83,11 +91,12 @@ export function latestNodeVersion(payload: unknown): string | undefined {
 
 function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCenterItem {
   const precedence = compareSemver(latestVersion, item.currentVersion)
+  const packageName = item.source.type === 'npm' || item.source.type === 'pypi' ? item.source.packageName : undefined
   if (precedence === undefined) return {
     id: item.id,
     name: item.name,
     category: item.category,
-    ...(item.source.type === 'npm' ? { packageName: item.source.packageName } : {}),
+    ...(packageName ? { packageName } : {}),
     currentVersion: item.currentVersion,
     status: 'notCheckable',
     error: '本机版本不是可识别的 SemVer'
@@ -96,7 +105,7 @@ function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCent
     id: item.id,
     name: item.name,
     category: item.category,
-    ...(item.source.type === 'npm' ? { packageName: item.source.packageName } : {}),
+    ...(packageName ? { packageName } : {}),
     currentVersion: item.currentVersion,
     latestVersion,
     status: precedence > 0 ? 'updateAvailable' : 'upToDate'
@@ -104,10 +113,11 @@ function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCent
 }
 
 function failedItem(item: UpdateCatalogItem, error: unknown): UpdateCenterItem {
+  const packageName = item.source.type === 'npm' || item.source.type === 'pypi' ? item.source.packageName : undefined
   return {
     id: item.id,
     name: item.name,
-    ...(item.source.type === 'npm' ? { packageName: item.source.packageName } : {}),
+    ...(packageName ? { packageName } : {}),
     currentVersion: item.currentVersion,
     status: 'checkFailed',
     error: error instanceof Error ? error.message : String(error)
@@ -131,9 +141,11 @@ export function createUpdateCenterService(options: {
       try {
         const url = item.source.type === 'npm'
           ? `https://registry.npmjs.org/${encodeURIComponent(item.source.packageName)}`
-          : item.source.type === 'cuaGitHub'
-            ? 'https://api.github.com/repos/trycua/cua/releases?per_page=100'
-            : 'https://nodejs.org/dist/index.json'
+          : item.source.type === 'pypi'
+            ? `https://pypi.org/pypi/${encodeURIComponent(item.source.packageName)}/json`
+            : item.source.type === 'cuaGitHub'
+              ? 'https://api.github.com/repos/trycua/cua/releases?per_page=100'
+              : 'https://nodejs.org/dist/index.json'
         const response = await fetcher(url, {
           signal: controller.signal,
           headers: item.source.type === 'cuaGitHub'
@@ -144,9 +156,11 @@ export function createUpdateCenterService(options: {
         const payload = await response.json()
         const latest = item.source.type === 'npm'
           ? npmLatestVersion(payload)
-          : item.source.type === 'cuaGitHub'
-            ? latestCuaDriverVersion(payload)
-            : latestNodeVersion(payload)
+          : item.source.type === 'pypi'
+            ? pypiLatestVersion(payload)
+            : item.source.type === 'cuaGitHub'
+              ? latestCuaDriverVersion(payload)
+              : latestNodeVersion(payload)
         if (!latest) throw new Error('版本服务返回了无法识别的数据')
         return checkedItem(item, latest)
       } catch (error) {

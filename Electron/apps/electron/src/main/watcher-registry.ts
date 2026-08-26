@@ -14,6 +14,15 @@ export const WATCHER_DEFAULT_INTERVAL_MS = 2_000
 /** Hard cap for one in-flight evaluate/waitCheck so a hung renderer cannot pin `checking`. */
 export const WATCHER_CHECK_TIMEOUT_MS = 10_000
 
+/**
+ * Per-session watch ceiling. Watches are one-shot but long-lived (up to 30min),
+ * each polls the live WebView off one shared timer, and nothing else bounded the
+ * registry: a runaway loop registering per-iteration watches could accumulate
+ * unbounded Map entries and evaluates. 8 keeps a healthy multi-watch session
+ * working while bounding the resource cost per session.
+ */
+export const WATCHER_MAX_WATCHES_PER_SESSION = 8
+
 /** Why a one-shot watch fired. The record is unregistered before the callback. */
 export type WatchTriggerReason = 'matched' | 'timeout' | 'disposed' | 'navigating-lost'
 
@@ -74,7 +83,7 @@ export type WatchRegisterInput = {
 
 export type WatchRegisterResult =
   | { ok: true; watch: WatchRecord }
-  | { ok: false; error: string }
+  | { ok: false; error: string; code?: string; limit?: number }
 
 export type WatchUnwatchResult = { ok: true }
 
@@ -118,6 +127,8 @@ export type WatcherRegistryOptions = {
   intervalMs?: number
   /** Per-check hard timeout. Default 10000ms. */
   checkTimeoutMs?: number
+  /** Per-session watch ceiling. Default WATCHER_MAX_WATCHES_PER_SESSION. */
+  maxWatchesPerSession?: number
   setTimeout?: (handler: () => void, ms: number) => ReturnType<typeof setTimeout>
   clearTimeout?: (id: ReturnType<typeof setTimeout>) => void
   watchId?: () => string
@@ -142,6 +153,7 @@ export class WatcherRegistry {
   private readonly clearIntervalFn: (id: ReturnType<typeof setInterval>) => void
   private readonly intervalMs: number
   private readonly checkTimeoutMs: number
+  private readonly maxWatchesPerSession: number
   private readonly setTimeoutFn: (handler: () => void, ms: number) => ReturnType<typeof setTimeout>
   private readonly clearTimeoutFn: (id: ReturnType<typeof setTimeout>) => void
   private readonly nextWatchId: () => string
@@ -158,6 +170,7 @@ export class WatcherRegistry {
     this.clearIntervalFn = options.clearInterval ?? clearInterval
     this.intervalMs = Math.max(50, options.intervalMs ?? WATCHER_DEFAULT_INTERVAL_MS)
     this.checkTimeoutMs = Math.max(1, options.checkTimeoutMs ?? WATCHER_CHECK_TIMEOUT_MS)
+    this.maxWatchesPerSession = Math.max(1, Math.floor(options.maxWatchesPerSession ?? WATCHER_MAX_WATCHES_PER_SESSION))
     this.setTimeoutFn = options.setTimeout ?? setTimeout
     this.clearTimeoutFn = options.clearTimeout ?? clearTimeout
     this.nextWatchId = options.watchId ?? (() => `bw-${++this.sequence}-${this.now().toString(36)}`)
@@ -186,6 +199,18 @@ export class WatcherRegistry {
     const intervalMs = Math.max(this.intervalMs, Math.floor(input.intervalMs ?? this.intervalMs))
     const watchId = (typeof input.watchId === 'string' && input.watchId.trim()) || this.nextWatchId()
     if (this.watches.has(watchId)) return { ok: false, error: `watch already exists: ${watchId}` }
+    // The registry is long-lived and watches are one-shot; without a per-session
+    // ceiling a runaway loop could register unbounded records. The cap frees up
+    // again as watches fire or are unwatched.
+    const sessionWatchCount = [...this.watches.values()].reduce((count, watch) => watch.sessionKey === sessionKey ? count + 1 : count, 0)
+    if (sessionWatchCount >= this.maxWatchesPerSession) {
+      return {
+        ok: false,
+        error: `browser watch limit reached for this session (${this.maxWatchesPerSession} active watches); unwatch one before registering another`,
+        code: 'browser_watch_limit_exceeded',
+        limit: this.maxWatchesPerSession,
+      }
+    }
     const record: InternalWatch = {
       watchId,
       sessionKey,

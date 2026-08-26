@@ -4,9 +4,9 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:pa
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
-export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
+export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 /** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
 export type SpawnRegisteredExtension = {
@@ -104,6 +104,8 @@ if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PI
 // Built-in-browser search/fetch share the webview's bridge; mounted beside it, independently
 // gated so the Settings browser toggle and this search route stay separate switches.
 if(enabled(f,"browserSearch"))ext(args,p.browserSearch);
+// Browser flow memory replays over the same bridge; bridge-gated like browserSearch.
+if(enabled(f,"browserMemory"))ext(args,p.browserMemory);
 if(enabled(f,"terminal"))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
 // pi-web-access resolves optional `glimpseui` from this NODE_PATH before falling
 // back to `open`. The shim lives beside the other host extensions.
@@ -119,7 +121,7 @@ if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse
 // the subagent extension. Export the reviewed strategy for explicitly granted
 // bounded operator children; never register mutating computer/open_application
 // tools directly in the main session.
-env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.20.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
+env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.22.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
@@ -378,6 +380,7 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     computerUse:fileIfPresent(extensions,"pipiui-computer-use.ts"),
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
     browserSearch:fileIfPresent(extensions,"pipiui-browser-search.ts"),
+    browserMemory:fileIfPresent(extensions,"pipiui-browser-memory.ts"),
     terminal:fileIfPresent(extensions,"pipiui-electron-terminal.ts"),
     updateCenter:fileIfPresent(extensions,"pipiui-update-center.ts"),
     runtimeInfo:fileIfPresent(extensions,"pipiui-runtime-info.ts"),

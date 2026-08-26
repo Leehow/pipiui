@@ -431,6 +431,46 @@ describe('BrowserTabsHost', () => {
     await expect(host.toolAction({ action: 'eval' })).resolves.toMatchObject({ ok: false })
   })
 
+  it('waits for the reload navigation lifecycle to settle before returning the tab', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('settle.example')
+    contents.deferCommit = true
+    let settled = false
+    const reloading = host.reload().then(tab => { settled = true; return tab })
+    await Promise.resolve()
+    // The reload navigation has started but not committed: the caller must not
+    // be handed a tab that claims the old document state is final.
+    expect(settled).toBe(false)
+    contents.commitNavigation()
+    const tab = await reloading
+    expect(settled).toBe(true)
+    expect(tab.isLoading).toBe(false)
+    expect(tab.url).toBe('https://settle.example')
+  })
+
+  it('bounds the reload settle wait when the commit never lands', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('hung.example')
+    contents.deferCommit = true
+    vi.useFakeTimers()
+    try {
+      const reloading = host.reload()
+      await vi.advanceTimersByTimeAsync(10_000)
+      const tab = await reloading
+      // A hung commit resolves the settle wait at the bound and still returns
+      // the tab (loading state keeps flowing through events).
+      expect(tab.isLoading).toBe(true)
+      expect(contents.reload).toHaveBeenCalledTimes(1)
+      contents.commitNavigation()
+      contents.deferCommit = false
+      await expect(host.reload()).resolves.toMatchObject({ isLoading: false })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('reveals and embeds the physical browser for a Pi action from another tool tab', async () => {
     const { host, contents, view, createView, attach } = browserHarness()
     contents.pageText = '无需人工打开面板'
@@ -1067,6 +1107,27 @@ describe('BrowserTabsHost dual viewport',
       expect(created.every(item => item.contents.loadURL.mock.calls.some(([url]) => url === 'https://state.example'))).toBe(true)
     })
 
+    it('keeps document ownership per viewport when one pane load fails mid-flight', async () => {
+      const { host, created } = multiViewHarness()
+      await host.setViewBounds(asBounds({
+        x: 10, y: 20, width: 700, height: 500, visible: true, mode: 'desktop',
+        mobileOverlay: { visible: true, applyDeviceEmulation: true }
+      }))
+      const desktop = created[0].contents
+      const mobile = created[1].contents
+      // Desktop commit is deferred while the mobile load fails immediately: the
+      // failing pane must only clear its own pending ownership, never the
+      // desktop pane's, or the later desktop commit loses its console owner.
+      desktop.deferCommit = true
+      mobile.loadURLRejects = 'ERR_FAILED'
+      await expect(host.loadURL('flaky.example')).rejects.toThrow('ERR_FAILED')
+      desktop.commitNavigation('https://flaky.example')
+      desktop.emit('console-message', { level: 'error', message: 'desktop-owner', lineNumber: 1, sourceId: 'a.js' })
+      const consoleResult = await host.toolAction({ action: 'console' })
+      expect(consoleResult).toMatchObject({ ok: true })
+      expect(String(consoleResult.logs)).toContain('desktop-owner')
+    })
+
     it('keeps desktop bounds, zoom, visibility, URL, and scroll unchanged by mobile tools', async () => {
       const { host, created } = multiViewHarness()
       await host.setViewBounds(asBounds({ x: 40, y: 60, width: 720, height: 540, visible: true, mode: 'desktop', mobileOverlay: { visible: false, applyDeviceEmulation: true, viewport: { width: 390, height: 844 }, userAgent: 'MobileUA', deviceScaleFactor: 2 } }))
@@ -1420,7 +1481,19 @@ describe('browser debug actions', () => {
     const advertised = BROWSER_TOOL_DECLARED_ACTIONS.filter(action => action !== 'help')
     expect([...advertised].sort()).toEqual([...BROWSER_HOST_TOOL_ACTIONS].sort())
     const descriptionMatch = webviewSource.match(/actions: ([^.]+)\./)
-    expect(descriptionMatch?.[1].split(/,\s*/).map(item => item.trim()).filter(item => item && item !== 'help').sort()).toEqual([...BROWSER_HOST_TOOL_ACTIONS].sort())
+    // The tool description must list every action the tool actually handles —
+    // host-dispatched DOM actions plus the extension-layer watch actions — so a
+    // reader of the description never misses an available action.
+    const watchActions = ['watch', 'unwatch', 'watches']
+    const describedActions = descriptionMatch?.[1].split(/,\s*/).map(item => item.trim()).filter(Boolean) ?? []
+    expect([...describedActions].sort()).toEqual([...BROWSER_TOOL_DECLARED_ACTIONS, ...watchActions].sort())
+    expect([...describedActions.filter(item => item !== 'help' && !watchActions.includes(item))].sort()).toEqual([...BROWSER_HOST_TOOL_ACTIONS].sort())
+    // The parameter schema descriptions list the same full action set (single + batch).
+    const schemaActionDescriptions = [...webviewSource.matchAll(/description: "navigate \| observe \| wait \| ([^"]+)"/g)].map(match => `navigate | observe | wait | ${match[1]}`)
+    expect(schemaActionDescriptions.length).toBeGreaterThanOrEqual(2)
+    for (const schemaDescription of schemaActionDescriptions) {
+      expect(schemaDescription.split(/ \| /).sort()).toEqual([...BROWSER_TOOL_DECLARED_ACTIONS, ...watchActions].sort())
+    }
     expect(webviewSource).toMatch(/script \{js\}/)
     expect(webviewSource).toMatch(/region\?,role\?,name\?,cursor\?/)
     expect(webviewSource).toContain('region: Type.Optional')
@@ -1620,6 +1693,139 @@ describe('browser debug actions', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('neutralizes a late wait_check success that resolves after the deadline', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    const realExecute = contents.executeJavaScript.getMockImplementation()!
+    let waitCheckEvaluates = 0
+    contents.executeJavaScript.mockImplementation(async (code: string) => {
+      if (code.includes('"action":"wait_check"')) {
+        waitCheckEvaluates += 1
+        // The underlying evaluate cannot be cancelled: it lands far past the
+        // public deadline claiming ready — a late lie that must change nothing.
+        await new Promise(resolve => setTimeout(resolve, 300))
+        return { ok: true, ready: true }
+      }
+      return realExecute(code)
+    })
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const startedAt = Date.now()
+      const failed = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.05 }, { reveal: false })
+      expect(failed).toMatchObject({ ok: false, code: 'timeout', error: 'browser wait timed out' })
+      expect(Date.now() - startedAt).toBeLessThan(250)
+      await new Promise(resolve => setTimeout(resolve, 350))
+      // Exactly one dispatched evaluate, no follow-up dispatch from the late result.
+      expect(waitCheckEvaluates).toBe(1)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('neutralizes a late wait_check rejection after the deadline without unhandled rejection', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    const realExecute = contents.executeJavaScript.getMockImplementation()!
+    contents.executeJavaScript.mockImplementation(async (code: string) => {
+      if (code.includes('"action":"wait_check"')) {
+        await new Promise(resolve => setTimeout(resolve, 300))
+        throw new Error('late renderer failure')
+      }
+      return realExecute(code)
+    })
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      const failed = await host.toolAction({ action: 'wait', mode: 'idle', timeout: 0.05 }, { reveal: false })
+      expect(failed).toMatchObject({ ok: false, code: 'timeout', error: 'browser wait timed out' })
+      await new Promise(resolve => setTimeout(resolve, 350))
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+  })
+
+  it('fails fast with a structured browser_navigating error while a main-frame commit is in flight', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('nav.example')
+    contents.deferCommit = true
+    await host.loadURL('nav.example/next')
+    const before = contents.executeJavaScript.mock.calls.length
+    await expect(host.toolAction({ action: 'observe' }, { reveal: false })).resolves.toMatchObject({
+      ok: false,
+      code: 'browser_navigating',
+      retryable: true,
+      viewportTarget: 'desktop',
+    })
+    // Fast fail means no page dispatch happened at all.
+    expect(contents.executeJavaScript.mock.calls.length).toBe(before)
+    // The host-side console buffer stays readable mid-navigation.
+    await expect(host.toolAction({ action: 'console' }, { reveal: false })).resolves.toMatchObject({ ok: true })
+    contents.commitNavigation()
+    await expect(host.toolAction({ action: 'observe' }, { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'desktop' })
+  })
+
+  it('fails fast only against the pane whose sibling sync is still committing', async () => {
+    const { host, created } = multiViewHarness()
+    await host.setViewBounds(asBounds({
+      x: 10, y: 20, width: 700, height: 500, visible: true, mode: 'desktop',
+      mobileOverlay: { visible: true, applyDeviceEmulation: true }
+    }))
+    await host.loadURL('sync.example')
+    // Organic desktop navigation triggers the fire-and-forget sibling sync; the
+    // mobile pane's commit is held back while the desktop document is settled.
+    created[1].contents.deferCommit = true
+    created[0].contents.emit('did-navigate', {}, 'https://clicked.example')
+    // Per-pane guard: only the mobile pane is mid-commit, so only mobile-targeted
+    // actions fail fast; the committed desktop page stays actionable.
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'desktop' }), { reveal: false })).resolves.toMatchObject({
+      ok: true, viewportTarget: 'desktop'
+    })
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'mobile' }), { reveal: false })).resolves.toMatchObject({
+      ok: false, code: 'browser_navigating'
+    })
+    created[1].contents.commitNavigation('https://clicked.example')
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'mobile' }), { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'mobile' })
+  })
+
+  it('keeps the navigation guard per pane across the dual viewport matrix', async () => {
+    const { host, created } = multiViewHarness()
+    await host.setViewBounds(asBounds({
+      x: 10, y: 20, width: 700, height: 500, visible: true, mode: 'desktop',
+      mobileOverlay: { visible: true, applyDeviceEmulation: true }
+    }))
+    await host.loadURL('matrix.example')
+    const desktop = created[0].contents
+    const mobile = created[1].contents
+    // Desktop-only navigation window: organic mobile navigation triggers the
+    // sibling sync onto the desktop pane.
+    desktop.deferCommit = true
+    mobile.emit('did-navigate', {}, 'https://clicked.example')
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'desktop' }), { reveal: false })).resolves.toMatchObject({ ok: false, code: 'browser_navigating' })
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'mobile' }), { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'mobile' })
+    desktop.commitNavigation('https://clicked.example')
+
+    // Desktop mid organic load (no pane.pending — the guard's loading clause):
+    // the sibling pane loading and stopping first zeroes the shared tab-level
+    // isLoading flag; the desktop pane's own window must survive that.
+    desktop.emit('did-start-loading')
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'desktop' }), { reveal: false })).resolves.toMatchObject({ ok: false, code: 'browser_navigating' })
+    // Actions against the settled sibling pane stay allowed while desktop loads.
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'mobile' }), { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'mobile' })
+    mobile.emit('did-start-loading')
+    mobile.emit('did-stop-loading')
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'desktop' }), { reveal: false })).resolves.toMatchObject({ ok: false, code: 'browser_navigating' })
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'mobile' }), { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'mobile' })
+    desktop.emit('did-navigate', {}, 'https://organic.example')
+    desktop.emit('did-stop-loading')
+    await expect(host.toolAction(asRequest({ action: 'observe', target: 'desktop' }), { reveal: false })).resolves.toMatchObject({ ok: true, viewportTarget: 'desktop' })
   })
 
   it('bounds a hung first post-ready observation by the remaining wait budget', async () => {
@@ -3518,3 +3724,207 @@ describe('BrowserSessionHost WatcherRegistry hooks', () => {
     host.watchers.dispose()
   })
 })
+
+/** Extracts the live per-commit nonce the host baked into the newest dialog hook install. */
+function extractDialogNonce(contents: FakeWebContents): string {
+  const sources = contents.executeJavaScript.mock.calls.map(([code]) => String(code)).filter(code => code.includes('__pipiuiDialogHook'))
+  const match = sources.at(-1)?.match(/__pipiui_js_dialog__ ([0-9a-f]+)/)
+  if (!match) throw new Error('dialog hook nonce not found in installed hook source')
+  return match[1]!
+}
+
+/** Harness with the app-level certificate-error source Electron really emits from. */
+function certificateErrorAppHarness() {
+  const listeners = new Map<string, Array<(...args: any[]) => void>>()
+  const app = {
+    on(event: string, listener: (...args: any[]) => void) {
+      listeners.set(event, [...(listeners.get(event) ?? []), listener])
+    },
+    off(event: string, listener: (...args: any[]) => void) {
+      listeners.set(event, (listeners.get(event) ?? []).filter(item => item !== listener))
+    },
+    emit(event: string, ...args: any[]) {
+      listeners.get(event)?.forEach(listener => listener(...args))
+    },
+    listenerCount(event: string) {
+      return listeners.get(event)?.length ?? 0
+    }
+  }
+  const contents = new FakeWebContents()
+  const view: BrowserViewLike = {
+    webContents: contents,
+    setBounds: vi.fn(),
+    setVisible: vi.fn(),
+    getVisible: () => false
+  }
+  const host = new BrowserTabsHost(vi.fn(() => view), undefined, app)
+  host.attachToWindow(vi.fn())
+  return { host, contents, app }
+}
+
+describe('BrowserTabsHost page visibility notices', () => {
+  it('emits console events for error/warn page output but not info', async () => {
+    const { host, contents } = browserHarness()
+    const events: Array<{ type: string; entry?: { level: string; message: string } }> = []
+    host.subscribe(event => events.push(event))
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('console.example')
+    contents.emit('console-message', { level: 3, message: 'boom', lineNumber: 1, sourceId: 'a.js' })
+    contents.emit('console-message', { level: 2, message: 'careful', lineNumber: 2, sourceId: 'b.js' })
+    contents.emit('console-message', { level: 1, message: 'quiet', lineNumber: 3, sourceId: 'c.js' })
+    const consoleEvents = events.filter(event => event.type === 'console')
+    expect(consoleEvents).toHaveLength(2)
+    expect(consoleEvents[0]!.entry).toMatchObject({ level: 'error', message: 'boom', tabId: expect.any(String) })
+    expect(consoleEvents[1]!.entry).toMatchObject({ level: 'warn', message: 'careful' })
+  })
+
+  it('re-emits the nonce-carrying dialog marker as a js-dialog event instead of buffering it', async () => {
+    const { host, contents } = browserHarness()
+    const events: Array<{ type: string; kind?: string; message?: string }> = []
+    host.subscribe(event => events.push(event))
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('dialog.example')
+    contents.emit('console-message', { level: 3, message: `__pipiui_js_dialog__ ${extractDialogNonce(contents)} confirm 确认删除？` })
+    expect(events).toContainEqual(expect.objectContaining({ type: 'js-dialog', kind: 'confirm', message: '确认删除？' }))
+    expect(events.filter(event => event.type === 'console')).toEqual([])
+  })
+
+  it('drops forged dialog markers: static text, guessed nonces, and stale nonces never emit js-dialog events', async () => {
+    const { host, contents } = browserHarness()
+    const events: Array<{ type: string; kind?: string }> = []
+    host.subscribe(event => events.push(event))
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('forged.example')
+    const staleNonce = extractDialogNonce(contents)
+    // A fresh commit rotates the nonce; the page cannot guess the new value.
+    contents.commitNavigation('https://forged.example/next')
+    const freshNonce = extractDialogNonce(contents)
+    expect(freshNonce).not.toBe(staleNonce)
+    contents.emit('console-message', { level: 3, message: '__pipiui_js_dialog__ alert static forgery' })
+    contents.emit('console-message', { level: 3, message: `__pipiui_js_dialog__ ${staleNonce} prompt stale forgery` })
+    contents.emit('console-message', { level: 3, message: '__pipiui_js_dialog__ 00000000000000000000000000000000 alert guessed nonce' })
+    expect(events.filter(event => event.type === 'js-dialog')).toEqual([])
+    // Forged lines degrade to ordinary console output, not dialog notices.
+    expect(events.some(event => event.type === 'console')).toBe(true)
+    // A real hook report carrying the live nonce still lands.
+    contents.emit('console-message', { level: 3, message: `__pipiui_js_dialog__ ${freshNonce} alert 真实弹窗` })
+    expect(events.filter(event => event.type === 'js-dialog')).toEqual([
+      expect.objectContaining({ type: 'js-dialog', kind: 'alert', message: '真实弹窗' })
+    ])
+  })
+
+  it('installs the dialog reporter script after every document commit', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('hook.example')
+    const installs = contents.executeJavaScript.mock.calls.filter(([code]) => String(code).includes('__pipiuiDialogHook'))
+    expect(installs.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('routes app-level certificate-error events to the owning pane with consecutive dedupe and commit reset', async () => {
+    const { host, contents, app } = certificateErrorAppHarness()
+    const events: Array<{ type: string; url?: string; reason?: string }> = []
+    host.subscribe(event => events.push(event))
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('cert.example')
+    const preventDefault = vi.fn()
+    // Electron emits certificate-error from `app` with the failing webContents.
+    app.emit('certificate-error', { preventDefault }, contents, 'https://self-signed.example', 'ERR_CERT_AUTHORITY_INVALID', {}, vi.fn())
+    app.emit('certificate-error', { preventDefault: vi.fn() }, contents, 'https://self-signed.example', 'ERR_CERT_AUTHORITY_INVALID', {}, vi.fn())
+    expect(events.filter(event => event.type === 'certificate-error')).toEqual([
+      { type: 'certificate-error', url: 'https://self-signed.example', reason: 'ERR_CERT_AUTHORITY_INVALID' }
+    ])
+    // Observability only: never preventDefault, so the default reject stays in force.
+    expect(preventDefault).not.toHaveBeenCalled()
+    // The listener must live on `app`; a webContents-level hook never fires in Electron.
+    expect(contents.listeners.get('certificate-error')).toBeUndefined()
+    contents.commitNavigation('https://ok.example')
+    app.emit('certificate-error', { preventDefault: vi.fn() }, contents, 'https://self-signed.example', 'ERR_CERT_AUTHORITY_INVALID', {}, vi.fn())
+    expect(events.filter(event => event.type === 'certificate-error')).toHaveLength(2)
+    // webContents from another window or session never reach this pane's notices.
+    app.emit('certificate-error', { preventDefault: vi.fn() }, new FakeWebContents(), 'https://other.example', 'ERR_CERT_DATE_INVALID', {}, vi.fn())
+    expect(events.filter(event => event.type === 'certificate-error')).toHaveLength(2)
+  })
+
+  it('unregisters the app-level certificate-error listener on dispose', async () => {
+    const { host, contents, app } = certificateErrorAppHarness()
+    const events: Array<{ type: string }> = []
+    host.subscribe(event => events.push(event))
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('cert.example')
+    expect(app.listenerCount('certificate-error')).toBe(1)
+    await host.dispose()
+    expect(app.listenerCount('certificate-error')).toBe(0)
+    app.emit('certificate-error', { preventDefault: vi.fn() }, contents, 'https://self-signed.example', 'ERR_CERT_AUTHORITY_INVALID', {}, vi.fn())
+    expect(events.filter(event => event.type === 'certificate-error')).toEqual([])
+  })
+})
+
+describe('BrowserSessionHost watch visibility events', () => {
+  it('emits watch list events on register/unwatch and a trigger event with the reason', async () => {
+    let fakeNow = 1000
+    const bridgeTrigger = vi.fn()
+    const host = new BrowserSessionHost(createViewForSessionHarness(), { now: () => fakeNow, watchIntervalMs: 50, onWatchTrigger: bridgeTrigger })
+    const events: Array<{ type: string; sessionId?: string; watches?: unknown[]; trigger?: { reason: string } }> = []
+    host.subscribe(event => events.push(event))
+
+    const registered = host.registerWatch({ sessionKey: 's1', condition: { type: 'url_matches', pattern: 'done' }, timeoutMs: 5000 })
+    expect(registered.ok).toBe(true)
+    expect(host.listWatches('s1')).toHaveLength(1)
+    expect(events.filter(event => event.type === 'watch')).toHaveLength(1)
+    expect(events[0]!.watches?.[0]).toMatchObject({ condition: { type: 'url_matches', pattern: 'done' } })
+
+    host.unwatch((registered as { watch: { watchId: string } }).watch.watchId)
+    expect(events.filter(event => event.type === 'watch')).toHaveLength(2)
+    expect(events[1]!.watches).toEqual([])
+
+    const timer = host.registerWatch({ sessionKey: 's1', condition: { type: 'timer' }, timeoutMs: 100 })
+    expect(timer.ok).toBe(true)
+    fakeNow = 5000
+    await host.watchers.tick()
+    const fired = events.filter(event => event.type === 'watch' && event.trigger)
+    expect(fired).toHaveLength(1)
+    expect(fired[0]!.sessionId).toBe('s1')
+    expect(fired[0]!.trigger).toMatchObject({ reason: 'timeout' })
+    expect(fired[0]!.watches).toEqual([])
+    expect(bridgeTrigger).toHaveBeenCalledTimes(1)
+    host.watchers.dispose()
+  })
+
+  it('re-emits the active watch list as a hydration snapshot on every selectSession', async () => {
+    const host = new BrowserSessionHost(createViewForSessionHarness(), { now: () => 1000, watchIntervalMs: 50 })
+    const events: Array<{ type: string; sessionId?: string; watches?: unknown[] }> = []
+    host.subscribe(event => events.push(event))
+
+    // No dedicated list RPC exists on the host contract; the panel hydrates
+    // purely from this snapshot event (mounted before or after the select).
+    await host.selectSession('s1')
+    expect(events).toEqual([{ type: 'watch', sessionId: 's1', watches: [] }])
+
+    const registered = host.registerWatch({ sessionKey: 's1', condition: { type: 'timer' }, timeoutMs: 5000 })
+    expect(registered.ok).toBe(true)
+    const watchId = (registered as { watch: { watchId: string } }).watch.watchId
+
+    await host.selectSession('s1')
+    const snapshots = events.filter(event => event.type === 'watch')
+    expect(snapshots.at(-1)!.watches).toEqual([
+      expect.objectContaining({ watchId, condition: { type: 'timer' }, timeoutAt: 6000 })
+    ])
+
+    // Session switching scopes the snapshot: the other space sees an empty strip.
+    await host.selectSession('s2')
+    expect(events.at(-1)).toEqual({ type: 'watch', sessionId: 's2', watches: [] })
+    host.watchers.dispose()
+  })
+})
+
+function createViewForSessionHarness() {
+  const contents = new FakeWebContents()
+  const view: BrowserViewLike = {
+    webContents: contents,
+    setBounds: vi.fn(),
+    setVisible: vi.fn(),
+    getVisible: () => false
+  }
+  return vi.fn(() => view)
+}

@@ -7,7 +7,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { createInterface, type Interface } from "node:readline";
 import { resolveCuaDriverLaunchPath } from "./runtime-assets.js";
 
-export const CUA_DRIVER_VERSION = "0.20.0";
+export const CUA_DRIVER_VERSION = "0.22.0";
 export type DisplayDescriptor = {
   displayID: number;
   width: number;

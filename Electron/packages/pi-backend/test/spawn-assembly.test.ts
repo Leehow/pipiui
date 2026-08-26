@@ -307,7 +307,7 @@ describe("Computer Agent host contract", () => {
     });
     expect(env.PIPIUI_ACTIVE_PROJECT_PI_HOME).toBe("/tmp/project/.pi/agent");
     expect(env.PIPIUI_COMPUTER_PROCEDURE_STORE).toBeUndefined();
-    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.20.0");
+    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.22.0");
   });
 
   it("exports the enabled browser route for the single Computer Use Agent child", () => {

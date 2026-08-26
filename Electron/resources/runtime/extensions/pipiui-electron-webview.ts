@@ -23,7 +23,14 @@ export const BROWSER_TOOL_DECLARED_ACTIONS = [
   "content", "eval", "script", "console", "screenshot", "back", "forward", "reload", "help",
 ] as const;
 
-/** Watch actions ride a dedicated browser_watch RPC, not the DOM host dispatcher. */
+/**
+ * Watch actions ride a dedicated browser_watch RPC, not the DOM host dispatcher.
+ * `watches` lists session watch-registry state (hosted on BrowserSessionHost, not
+ * the per-viewport DOM host), and `help` is static text — both are fully served at
+ * this extension layer and never forwarded to the DOM host, whose dispatcher
+ * would answer `unknown_action`. The tool schema lists them truthfully as actions
+ * of this tool; see the HELP/schema alignment test for the pinned contract.
+ */
 export const BROWSER_WATCH_TOOL_ACTIONS = ["watch", "unwatch", "watches"] as const;
 
 const WATCH_MAX_TIMEOUT_SECS = 1800;
@@ -653,7 +660,7 @@ export default function (pi: ExtensionAPI) {
     label: "Browser",
     description:
       "Drive the built-in WebView with structured observations and typed DOM actions. " +
-      "actions: navigate, observe, wait, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
+      "actions: navigate, observe, wait, watch, unwatch, watches, click, input, type, select, fill_form, scroll, content, eval, script, console, screenshot, back, forward, reload, help. " +
       "Prefer packing consecutive actions that do not need an intermediate observation into one actions[] call (1..8 items), e.g. fill_form then submit click, click then wait, type then Enter. Pass exactly one of action or actions. Stop and observe after navigate, after submitting a form, and when a dialog, captcha, or login wall may appear. " +
       "observe/screenshot are best as the final step of a batch (later items cannot consume an earlier item's observation), and watch in a batch only registers its non-blocking listener without waiting. " +
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
@@ -667,11 +674,11 @@ export default function (pi: ExtensionAPI) {
       'Call with action:"help" for full parameter docs.',
     parameters: Type.Object({
       action: Type.Optional(Type.String({
-        description: "navigate | observe | wait | watch | unwatch | watches | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+        description: "navigate | observe | wait | watch | unwatch | watches | click | input | type | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
       })),
       actions: Type.Optional(Type.Array(Type.Object({
         action: Type.String({
-          description: "navigate | observe | wait | watch | unwatch | watches | click | input | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
+          description: "navigate | observe | wait | watch | unwatch | watches | click | input | type | select | fill_form | scroll | content | eval | script | console | screenshot | back | forward | reload | help",
         }),
         url: Type.Optional(Type.String()),
         js: Type.Optional(Type.String()),

@@ -78,6 +78,7 @@ function componentChecks(intent: Intent): string {
   const cua = intent.name === "Cua Driver" || intent.id === "cua-driver" || intent.id === "cua";
   const electron = intent.id === "electron" || intent.packageName === "electron";
   const node = intent.id === "node";
+  const headroom = intent.id === "headroom-ai" || intent.packageName === "headroom-ai";
   const toolchain = intent.id === "vite" || intent.id === "electron-vite" || intent.packageName === "vite" || intent.packageName === "electron-vite";
   if (hermes) return `Hermes 专属检查：
 - 保留现有 memory-broker、自动召回、角色化记忆策略和 Hermes 复核模型设置；核对 recall 行为、role 策略、数据库格式/迁移、Hermes adapter 内部 API 与配置兼容性。
@@ -95,6 +96,10 @@ function componentChecks(intent: Intent): string {
   if (node) return `内置 Node.js 专属检查：
 - 这是 PipiUI 固定打包给 Pi 的独立 Node 运行时，不得与 Electron 自带 Node 混为一谈；核对 Pi 支持范围、原生模块 ABI、launcher、双架构 embedded runtime、manifest 与离线首次运行。
 - 最新大版本只代表上游最新版，不代表建议跨大版本升级；必须先给出 LTS/支持周期和依赖兼容结论，再决定目标版本。`;
+  if (headroom) return `Headroom 专属检查：
+- 以 PyPI 的 headroom-ai 发布和上游源码为准；核对 Python 版本要求、proxy CLI、/v1/compress CCR 协议与 macOS arm64/x86_64 wheel 可用性。
+- 核对 PipiUI 托管 uv/Python 安装、版本校验、项目级 .pi/agent 数据隔离、进程退出清理，以及 Headroom 准备中或异常时 context-fold 继续工作的回退合同。
+- 更新必须同时覆盖托管引擎版本、更新中心当前版本和适配器运行时身份；验收包括双架构静态合同、真实冷启动/readyz/compress/关闭清理，以及 canonical Electron App。`;
   if (toolchain) return `Electron 构建工具专属检查：
 - 核对 Vite 与 electron-vite 的相互兼容范围、Node 要求、插件 API、配置格式、main/preload/renderer 构建产物和开发服务器行为。
 - 这是构建链更新，不是运行时扩展更新；验收必须覆盖 workspace build/test、preload 校验、canonical Electron App 打包和启动冒烟，跨大版本不得只改版本号。`;
