@@ -1,11 +1,16 @@
 import { execFileSync } from "node:child_process";
 
 export type StopEscalationDelays = {
-  /** After abort is sent: SIGTERM each descendant of pi (not pi itself). */
+  /**
+   * Legacy descendant windows. A turn abort/cut-in must never signal pi's
+   * descendants — background subagent workers are descendants of the same pi
+   * process and must keep running — so this and `killDescendantsMs` now only
+   * contribute to the total bound before the pi process itself is escalated.
+   */
   termDescendantsMs: number;
-  /** After T1: SIGKILL those descendants. */
+  /** After `termDescendantsMs`: legacy SIGKILL-descendants window. See above. */
   killDescendantsMs: number;
-  /** After T2: SIGKILL the pi process itself. */
+  /** After the full window: SIGKILL the pi process itself. */
   killPiMs: number;
 };
 
@@ -39,8 +44,6 @@ type EscalationRun = {
   cancelled: boolean;
   timers: unknown[];
   snapshot: StopEscalationSnapshot;
-  descendants?: ProcessIdentity[];
-  enumerated: Promise<void>;
 };
 
 /** Recursively list child PIDs of `pid` via `pgrep -P`. Never returns `pid` itself. */
@@ -131,8 +134,12 @@ export function defaultStopEscalationHooks(): StopEscalationHooks {
 
 /**
  * Abort-unresponsive turn ladder (Swift scheduleStopEscalation parity).
- * Never signals a process group (`kill(-pid)`); only enumerated descendant PIDs
- * and, last, the snapshotted pi pid itself.
+ * Never signals a process group (`kill(-pid)`) and never signals pi's
+ * descendants: background subagent workers live under the same pi process and
+ * must survive a turn abort/cut-in (close()/session teardown owns their
+ * explicit cleanup). The only escalation target is the snapshotted pi pid
+ * itself, bounded by termDescendantsMs + killDescendantsMs + killPiMs, so a
+ * hung abort can never block forever.
  */
 export class StopEscalationScheduler {
   private readonly runs = new Map<string, EscalationRun>();
@@ -152,7 +159,6 @@ export class StopEscalationScheduler {
       cancelled: false,
       timers: [],
       snapshot: { piPid: snapshot.piPid, piIdentity: snapshot.piIdentity },
-      enumerated: Promise.resolve(),
     };
     this.runs.set(sessionId, run);
 
@@ -162,72 +168,6 @@ export class StopEscalationScheduler {
         fn();
       }, ms);
       run.timers.push(id);
-    };
-
-    const piLiveMatchesSnapshot = async (): Promise<boolean> => {
-      const expected = run.snapshot.piIdentity;
-      if (!isCompleteIdentity(expected)) {
-        return false;
-      }
-      const live = await this.hooks.identify(run.snapshot.piPid);
-      if (run.cancelled) return false;
-      return identitiesMatch(live, expected);
-    };
-
-    const enumerate = async (): Promise<void> => {
-      if (!(await piLiveMatchesSnapshot())) {
-        if (!run.cancelled) {
-          console.warn(
-            `[stop-escalation] skip descendant enumerate of pid=${run.snapshot.piPid}: identity mismatch or incomplete`,
-          );
-        }
-        return;
-      }
-      const kids = await this.hooks.listDescendants(run.snapshot.piPid);
-      if (run.cancelled) return;
-      const identities: ProcessIdentity[] = [];
-      for (const child of kids) {
-        if (run.cancelled) return;
-        if (child === run.snapshot.piPid) continue;
-        const identity = await this.hooks.identify(child);
-        if (run.cancelled) return;
-        if (isCompleteIdentity(identity)) identities.push(identity);
-      }
-      if (!run.cancelled) run.descendants = identities;
-    };
-    run.enumerated = enumerate();
-
-    const signalDescendants = async (signal: NodeJS.Signals) => {
-      await run.enumerated;
-      if (run.cancelled) return;
-      if (!isCompleteIdentity(run.snapshot.piIdentity)) {
-        console.warn(
-          `[stop-escalation] skip ${signal} descendants of pid=${run.snapshot.piPid}: incomplete abort snapshot`,
-        );
-        return;
-      }
-      if (!(await piLiveMatchesSnapshot())) {
-        if (!run.cancelled) {
-          console.warn(
-            `[stop-escalation] skip ${signal} descendants of pid=${run.snapshot.piPid}: identity mismatch or incomplete`,
-          );
-        }
-        return;
-      }
-      const targets = run.descendants;
-      if (!targets) return;
-      for (const expected of targets) {
-        if (run.cancelled) return;
-        const actual = await this.hooks.identify(expected.pid);
-        if (run.cancelled) return;
-        if (!identitiesMatch(expected, actual)) {
-          console.warn(
-            `[stop-escalation] skip ${signal} pid=${expected.pid}: identity mismatch or incomplete`,
-          );
-          continue;
-        }
-        this.hooks.kill(expected.pid, signal);
-      }
     };
 
     const signalPi = async () => {
@@ -250,12 +190,6 @@ export class StopEscalationScheduler {
       this.hooks.kill(run.snapshot.piPid, "SIGKILL");
     };
 
-    arm(this.delays.termDescendantsMs, () => {
-      void signalDescendants("SIGTERM");
-    });
-    arm(this.delays.termDescendantsMs + this.delays.killDescendantsMs, () => {
-      void signalDescendants("SIGKILL");
-    });
     arm(
       this.delays.termDescendantsMs + this.delays.killDescendantsMs + this.delays.killPiMs,
       () => {
