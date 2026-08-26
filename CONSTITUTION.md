@@ -81,6 +81,18 @@ Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不
 - chatrpgv4 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
 - 禁止使用或写入全局 `~/.pi`。禁止从 `~/.pi` 导入 packages。
 
+## 7. 模型可操作稳定 ID 必须是语义 slug（强制）
+
+**Any stable identifier an LLM must read, repeat, resume, or reference across tool calls must be a short, unique, human-readable semantic slug — never a UUID, random hex, or `agent-<random>`. Opaque randomness is reserved for machine-internal ids no model ever names.**
+
+按来源分三类，要求不同：
+
+- **A. Caller-chosen 身份（模型显式提供）**：worker `agentId`、`plan.id` 及其 task id、`computer_task` `sessionId` 等由模型命名并按名续接的身份。必须由模型显式提供短、唯一、可读、可复制的 slug（如 `quota-pill`）；运行时不得为这类身份静默回退到随机生成。
+- **B. Runtime-allocated 模型可见身份**：如 pi-goal 的 `goal_id`（`<slug>.<generation>`）。可由运行时生成，但必须同样短、可读、语义化且唯一（如 `fix-login-race.2`），永不以 UUID / 随机 hex / opaque randomness 代替。
+- **C. 机器内部一次性 ID（模型无需命名）**：单次 runId/eventId/waveId/requestId、安全/capability token、浏览器 snapshot/element token、临时文件与锁 —— 随机/不透明是正确选择。
+
+A 与 B 都禁止 opaque randomness，区别只在提供方；暴露 A/B 类 ID 的工具契约（schema 与 description）必须写明对应要求。bundled philosophy 的 orchestration 层同步承载该规则，并由 philosophy runtime 测试钉住。
+
 ---
 
 **权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`（唯一可运行包）

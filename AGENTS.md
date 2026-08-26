@@ -109,6 +109,17 @@ each holds a slimming invariant that an innocuous-looking edit silently undoes.
 数百条 ESTABLISHED socket。**registry 全程可达（3-4 秒），所以连通性测试查不出来**
 —— 要看 CPU 时间和写入量，别看能不能 ping 通。
 
+### 稳定 ID 必须是语义 slug（binding）
+
+凡 LLM 需要读取、复述、续接、跨调用引用的稳定 ID，必须是短、唯一、可读的语义
+slug；禁止 UUID / 随机 hex / `agent-<random>`。分两类：caller-chosen 身份
+（worker `agentId`、`plan.id`/task id、computer `sessionId`）由模型显式提供；
+runtime-allocated 模型可见身份（如 pi-goal `goal_id`）可由运行时生成，但必须同样
+短、可读、语义、唯一。随机/不透明 ID 只能用于模型无需命名的单次
+runId/eventId/waveId/requestId、安全 token、浏览器 snapshot/element token、
+临时文件和锁。详见 [`CONSTITUTION.md`](./CONSTITUTION.md) §7 与 bundled
+philosophy 的 orchestration 层（有 runtime 测试钉住）。
+
 ### 快速打包（快速迭代）
 
 ```bash
@@ -132,6 +143,7 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Need | Where |
 |------|--------|
 | Project rules | `CONSTITUTION.md` |
+| 稳定 ID 规则（语义 slug） | `CONSTITUTION.md` §7 · philosophy `orchestration` 层 |
 | Build / run docs | `README.md` → 构建运行 |
 | Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI Electron.app` |
 | Electron release (dual arch + DMG/ZIP) | `pipiui-electron-build` skill → `release`；never `electron-builder` by hand |
