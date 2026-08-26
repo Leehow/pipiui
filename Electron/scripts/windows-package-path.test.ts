@@ -170,13 +170,19 @@ describe('Windows package and CI path', () => {
   it('writes Spectre-only node-pty props and never sets LibraryPath', () => {
     const root = mkdtempSync(join(tmpdir(), 'pipiui-win-props-'))
     try {
-      const written = writeWindowsPtyBuildProps(root)
+      const delayimp = 'C:\\MSVC\\14.44.35207\\lib\\x64'
+      const written = writeWindowsPtyBuildProps(root, delayimp)
       expect(written.length).toBe(3)
       for (const dir of written) {
         const text = readFileSync(join(dir, 'Directory.Build.props'), 'utf8')
         expect(text).toContain('<SpectreMitigation>false</SpectreMitigation>')
+        expect(text).toContain(`<AdditionalLibraryDirectories>${delayimp};%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>`)
         expect(text).not.toContain('LibraryPath')
       }
+      expect(writeWindowsPtyBuildProps(root).every((dir) => {
+        const text = readFileSync(join(dir, 'Directory.Build.props'), 'utf8')
+        return text.includes('<SpectreMitigation>false</SpectreMitigation>') && !text.includes('AdditionalLibraryDirectories')
+      })).toBe(true)
       expect(packager).not.toMatch(/LibraryPath\}?\$\{/)
       expect(packager).not.toContain('findWindowsSdkLibDirs')
     } finally {

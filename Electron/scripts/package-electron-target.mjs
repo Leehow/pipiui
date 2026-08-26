@@ -116,13 +116,20 @@ export function appendWindowsLibDir(env, libDir) {
   return next
 }
 
-/** Spectre only. Never set LibraryPath here — that drops the SDK/UCRT dirs vcvars already provided. */
-export function writeWindowsPtyBuildProps(root) {
+/** Spectre off, plus delayimp search path. Never set LibraryPath here — that drops the SDK/UCRT dirs vcvars already provided. */
+export function writeWindowsPtyBuildProps(root, delayimpDir) {
+  const extraLink = delayimpDir
+    ? `\n    <AdditionalLibraryDirectories>${delayimpDir};%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>`
+    : ''
   const props = `<?xml version="1.0" encoding="utf-8"?>
 <Project>
   <PropertyGroup>
     <SpectreMitigation>false</SpectreMitigation>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <Link>${extraLink}
+    </Link>
+  </ItemDefinitionGroup>
 </Project>
 `
   const dirs = [
@@ -162,7 +169,7 @@ async function main() {
   if (options.platform === 'win32') {
     const delayimpDir = findDelayimpLibDir(releaseEnv)
     Object.assign(releaseEnv, appendWindowsLibDir(releaseEnv, delayimpDir))
-    const written = writeWindowsPtyBuildProps(electronRoot)
+    const written = writeWindowsPtyBuildProps(electronRoot, delayimpDir)
     if (delayimpDir) console.log(`Windows native rebuild append delayimp LIB ${delayimpDir} spectre-props=${written.length}`)
   }
   const packageStartedAt = Date.now()
