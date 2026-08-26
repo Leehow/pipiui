@@ -115,7 +115,7 @@ describe("idle nudge → context_manage → spool/recall", () => {
 		});
 
 		idle.arm("session-e2e", "worker-a");
-		clock.advance(299_999);
+			clock.advance(239_999);
 		expect(nudges).toHaveLength(0);
 		clock.advance(1);
 		expect(nudges).toHaveLength(1);

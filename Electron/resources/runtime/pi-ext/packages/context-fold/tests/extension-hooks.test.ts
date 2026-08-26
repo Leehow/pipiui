@@ -9,12 +9,21 @@
  * Skipped when the Pi CLI is not installed alongside (the adapter imports `typebox`, which Pi
  * injects at runtime — see vitest.config.ts).
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { user, assistantText, assistantWithCalls, bigResult, toolResult } from "./helpers";
 import type { AgentMessage } from "../src/core/block";
+import {
+	beginContextOptimizerSession,
+	armContextRewrite,
+	beginContextRewriteTurn,
+	configureContextRewriteGate,
+	CONTEXT_FOLD_FALLBACK_KEY,
+	CONTEXT_OPTIMIZER_STATE_KEY,
+	contextOptimizerState,
+} from "../src/adapters/pi/optimizer-coordinator";
 
 const PI_PRESENT = existsSync(resolve(__dirname, "../node_modules/@earendil-works/pi-coding-agent/node_modules/typebox"));
 
@@ -65,6 +74,8 @@ beforeEach(() => {
 });
 afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
+	delete (globalThis as Record<string | symbol, unknown>)[CONTEXT_OPTIMIZER_STATE_KEY];
+	delete (globalThis as Record<string | symbol, unknown>)[CONTEXT_FOLD_FALLBACK_KEY];
 	for (const k of ENV_KEYS) {
 		if (savedEnv[k] === undefined) delete process.env[k];
 		else process.env[k] = savedEnv[k];
@@ -72,7 +83,13 @@ afterEach(() => {
 });
 
 /** A ctx shaped like Pi's, backed by a real on-disk session dir. */
-function ctxFor(opts: { sessionId?: string; entries?: unknown[]; usage?: { contextWindow: number; tokens: number | null } | null } = {}) {
+function ctxFor(opts: {
+	sessionId?: string;
+	entries?: unknown[];
+	usage?: { contextWindow: number; tokens: number | null; percent?: number | null } | null;
+	idle?: boolean;
+	pending?: boolean;
+} = {}) {
 	const notices: string[] = [];
 	const statuses: Record<string, string | undefined> = {};
 	return {
@@ -86,6 +103,8 @@ function ctxFor(opts: { sessionId?: string; entries?: unknown[]; usage?: { conte
 				getEntries: () => opts.entries ?? [],
 			},
 			getContextUsage: () => opts.usage ?? { contextWindow: 200_000, tokens: null },
+			isIdle: () => opts.idle ?? true,
+			hasPendingMessages: () => opts.pending ?? false,
 			ui: {
 				notify: (m: string) => notices.push(m),
 				setStatus: (key: string, text: string | undefined) => {
@@ -96,10 +115,18 @@ function ctxFor(opts: { sessionId?: string; entries?: unknown[]; usage?: { conte
 	};
 }
 
-async function load() {
+function openRewriteGate(sessionId = "s1") {
+	beginContextOptimizerSession(sessionId);
+	configureContextRewriteGate(sessionId, 0.45, 240_000);
+	armContextRewrite(sessionId);
+	beginContextRewriteTurn(sessionId);
+}
+
+async function load(options: { rewriteAllowed?: boolean } = {}) {
 	const { default: contextFold } = await import("../src/adapters/pi/index");
 	const s = stubPi();
 	contextFold(s.api);
+	if (options.rewriteAllowed !== false) openRewriteGate();
 	return s;
 }
 
@@ -115,6 +142,54 @@ function heavySession(): AgentMessage[] {
 }
 
 describe.skipIf(!PI_PRESENT)("context hook", () => {
+	it("requires 45% and a fresh four-minute quiet window before a new fold event", async () => {
+		vi.useFakeTimers();
+		try {
+			const s = await load({ rewriteAllowed: false });
+			const { ctx } = ctxFor({ usage: { contextWindow: 80_000, tokens: 36_000, percent: 45 } });
+			const messages = heavySession();
+			await s.hooks.get("session_start")!({}, ctx);
+
+			await vi.advanceTimersByTimeAsync(180_000);
+			await s.hooks.get("before_agent_start")!({}, ctx); // activity cancels the partial quiet window
+			const early = (await s.hooks.get("context")!({ messages }, ctx)) as { messages: AgentMessage[] };
+			expect(early.messages).toBe(messages);
+			expect(contextOptimizerState("s1")?.rewriteGate?.armed).toBe(false);
+
+			await s.hooks.get("agent_settled")!({}, ctx);
+			await vi.advanceTimersByTimeAsync(239_999);
+			expect(contextOptimizerState("s1")?.rewriteGate?.armed).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+			expect(contextOptimizerState("s1")?.rewriteGate?.armed).toBe(true);
+
+			await s.hooks.get("before_agent_start")!({}, ctx);
+			const allowed = (await s.hooks.get("context")!({ messages }, ctx)) as { messages: AgentMessage[] };
+			expect(JSON.stringify(allowed.messages)).toContain("FOLDED");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("stays mounted in standby for a healthy Headroom primary and can fold in the same-turn fallback", async () => {
+		const s = await load();
+		const { ctx, statuses } = ctxFor({ usage: { contextWindow: 80_000, tokens: null } });
+		const state = beginContextOptimizerSession("s1");
+		state.primaryOwner = "pipiui-headroom";
+		const messages = heavySession();
+
+		const sleeping = await s.hooks.get("context")!({ messages }, ctx);
+		expect(sleeping).toBeUndefined();
+		expect(statuses["context-fold"]).toContain("standby");
+		expect(s.entries).toEqual([]);
+
+		const fallback = (globalThis as Record<string | symbol, unknown>)[CONTEXT_FOLD_FALLBACK_KEY] as
+			(event: unknown, context: unknown) => { messages: AgentMessage[] };
+		const out = await fallback({ messages }, ctx);
+		expect(JSON.stringify(out.messages)).toContain("FOLDED");
+		expect(state.primaryOwner).toBeUndefined();
+		expect(state.fallbackOwner).toBe("context-fold");
+	});
+
 	it("ignores obsolete L0 settings and delivers a large fresh result unchanged", async () => {
 		// CONTEXTFOLD_L0* configured the arrival-time ingestion gate removed in 0.3.0 (see
 		// CHANGELOG.md). Stale settings from an older install must stay inert, never resurrect it.
@@ -210,6 +285,7 @@ describe.skipIf(!PI_PRESENT)("session_start hook", () => {
 		const s = await load();
 		const firstCtx = ctxFor({ sessionId: "s1", usage: { contextWindow: 80_000, tokens: null } }).ctx;
 		await s.hooks.get("session_start")!({}, firstCtx);
+		openRewriteGate("s1");
 		await s.hooks.get("context")!({ messages: heavySession() }, firstCtx);
 		const spoolRecord = s.entries.find((entry) => (entry.data as { kind?: string }).kind === "spool")!;
 		const code = (spoolRecord.data as { entry: { code: string } }).entry.code;
@@ -498,6 +574,7 @@ describe.skipIf(!PI_PRESENT)("footer status line", () => {
 		await s.hooks.get("session_start")!({}, ctx);
 		expect(statuses["context-fold"]).toContain("idle");
 
+		openRewriteGate("s1");
 		await s.hooks.get("context")!({ messages: heavySession() }, ctx);
 		expect(statuses["context-fold"]).toContain("×1");
 		expect(statuses["context-fold"]).toContain("tok masked");

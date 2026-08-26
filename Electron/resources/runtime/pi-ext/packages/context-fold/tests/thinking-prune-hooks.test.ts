@@ -5,6 +5,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import contextFold from "../src/adapters/pi/index";
 import type { AgentMessage } from "../src/core/block";
 import { bigResult, user } from "./helpers";
+import {
+	armContextRewrite,
+	beginContextOptimizerSession,
+	beginContextRewriteTurn,
+	clearContextOptimizerState,
+	configureContextRewriteGate,
+} from "../src/adapters/pi/optimizer-coordinator";
 
 type Hook = (event: any, ctx: any) => unknown;
 
@@ -59,6 +66,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
+	clearContextOptimizerState();
 	for (const key of ENV_KEYS) {
 		if (savedEnv[key] === undefined) delete process.env[key];
 		else process.env[key] = savedEnv[key];
@@ -88,12 +96,20 @@ function harness(model = { provider: "generic", api: "custom-chat", id: "m1" }) 
 		},
 		ui: { setStatus: () => {} },
 	};
+	const openGate = () => {
+		beginContextOptimizerSession(sessionId);
+		configureContextRewriteGate(sessionId, 0.45, 240_000);
+		armContextRewrite(sessionId);
+		beginContextRewriteTurn(sessionId);
+	};
+	openGate();
 	return {
 		...stub,
 		ctx,
 		setIdle: (value: boolean) => { idle = value; },
 		setPending: (value: boolean) => { pending = value; },
 		setSessionId: (value: string) => { sessionId = value; },
+		openGate,
 		compactCalls: () => compactCalls,
 	};
 }
@@ -192,17 +208,20 @@ describe("strict-island native compaction fallback", () => {
 		process.env.CONTEXTFOLD_THINKING_KEEP_TURNS = "0";
 		const h = harness({ provider: "openai", api: "openai-responses", id: "gpt-5" });
 		await h.hooks.get("session_start")!({}, h.ctx);
+		h.openGate();
 		await h.hooks.get("context")!({ messages: strictMessages() }, h.ctx);
 		await h.hooks.get("agent_settled")!({}, h.ctx);
 		expect(h.compactCalls()).toBe(1);
 
 		await h.hooks.get("session_compact")!({}, h.ctx);
+		h.openGate();
 		await h.hooks.get("context")!({ messages: strictMessages() }, h.ctx);
 		await h.hooks.get("agent_settled")!({}, h.ctx);
 		expect(h.compactCalls()).toBe(1);
 
 		h.setSessionId("s2");
 		await h.hooks.get("session_start")!({}, h.ctx);
+		h.openGate();
 		await h.hooks.get("context")!({ messages: strictMessages() }, h.ctx);
 		await h.hooks.get("agent_settled")!({}, h.ctx);
 		expect(h.compactCalls()).toBe(2);

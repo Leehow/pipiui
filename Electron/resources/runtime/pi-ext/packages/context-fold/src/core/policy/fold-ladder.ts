@@ -82,6 +82,8 @@ export class FoldLadderPolicy implements FoldPolicy {
 	private host: PolicyHost | null = null;
 	/** No live cache read observed yet (adapter feeds this from measured telemetry each turn). */
 	private cold = false;
+	/** Shared 45% + quiet gate controls new fold events; frozen layers still render while closed. */
+	private enabled = true;
 
 	constructor(private readonly cfg: LadderConfig = LADDER_DEFAULTS) {}
 
@@ -93,12 +95,20 @@ export class FoldLadderPolicy implements FoldPolicy {
 		this.cold = cold;
 	}
 
+	setEnabled(enabled: boolean): void {
+		this.enabled = enabled;
+	}
+
 	conduct(view: PolicyView): FoldCommand[] {
 		const cw = view.contextWindow ?? 0;
 		// Provider-anchored usage when Pi has it; the chars÷4 estimator otherwise.
 		const used = view.reportedTokens ?? view.liveTokens;
 		const fraction = cw > 0 ? used / cw : 0;
 		const foldAt = this.cold ? Math.min(this.cfg.coldFoldAt, this.cfg.foldAt) : this.cfg.foldAt;
+		if (!this.enabled) {
+			this.publishIdle(view, fraction, foldAt, 0, 0);
+			return [];
+		}
 
 		const blocks = annotateExternalized(view.blocks, this.cfg.findingsExists ?? defaultFindingsExists);
 		const annotated: PolicyView = blocks === view.blocks ? view : { ...view, blocks };

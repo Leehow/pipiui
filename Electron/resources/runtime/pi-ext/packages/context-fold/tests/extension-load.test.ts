@@ -59,12 +59,11 @@ describe.skipIf(!PI_PRESENT)("extension entry point", () => {
 			else process.env.CONTEXTFOLD_COMPACT = prev;
 		}
 
-		expect(s.hooks).toEqual(
-			expect.arrayContaining(["session_start", "message_end", "agent_settled", "context"]),
-		);
+			expect(s.hooks).toEqual(
+				expect.arrayContaining(["session_start", "before_agent_start", "message_end", "agent_settled", "context"]),
+			);
 		expect(s.hooks).not.toContain("session_before_compact");
 		expect(s.hooks).not.toContain("tool_result");
-		expect(s.hooks).not.toContain("before_agent_start");
 		expect(s.tools).toEqual(expect.arrayContaining(["recall_folded", "unfold"]));
 		expect(s.commands).toEqual(expect.arrayContaining(["context-fold", "fold-handoff"]));
 	});

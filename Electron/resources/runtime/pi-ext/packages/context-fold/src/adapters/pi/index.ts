@@ -13,7 +13,7 @@
  */
 import { writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ContextEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentMessage as CoreAgentMessage } from "../../core/block";
 import { FoldLadderPolicy } from "../../core/policy/fold-ladder";
 import { ContextFoldEngine } from "./store";
@@ -32,7 +32,26 @@ import { pruneHistoricalThinking, thinkingPruneConfigFromEnv } from "./thinking-
 
 import { adapterConfigFromEnv, configFromEnv } from "./config";
 import { registerLiveContextFoldEngine } from "./live-engine";
+import {
+	armContextRewrite,
+	beginContextRewriteTurn,
+	beginContextOptimizerSession,
+	clearContextOptimizerState,
+	configureContextRewriteGate,
+	contextFoldShouldStandby,
+	contextOptimizerState,
+	contextRewriteIsAllowed,
+	disarmContextRewrite,
+	finishContextRewriteTurn,
+	latchContextFoldFallback,
+	observeContextRewriteFraction,
+	registerContextFoldFallback,
+} from "./optimizer-coordinator";
 export { adapterConfigFromEnv, configFromEnv };
+
+/** One product-wide gate for every non-urgent model-visible context rewrite. */
+export const CONTEXT_REWRITE_USAGE_FRACTION = 0.45;
+export const CONTEXT_REWRITE_QUIET_MS = 4 * 60 * 1000;
 
 export default function contextFold(pi: ExtensionAPI): void {
 	// MASTER kill switch: CONTEXTFOLD=0/off/false disables the whole extension — no hooks, no
@@ -46,6 +65,9 @@ export default function contextFold(pi: ExtensionAPI): void {
 	const foldCfg = configFromEnv();
 	const thinkingCfg = thinkingPruneConfigFromEnv();
 	const ladderPolicy = new FoldLadderPolicy(acfg.ladder);
+	// One Pi process owns one extension instance. Reset any stale global left by a test harness or
+	// extension reload before later-mounted primaries (for example pipiui-headroom) can claim it.
+	clearContextOptimizerState();
 
 	// Exact originals for ladder folds, shared by fold-index emission and recall.
 	const registry = new MapSpoolRegistry();
@@ -135,18 +157,83 @@ export default function contextFold(pi: ExtensionAPI): void {
 	// Persistent footer status: one keyed line in Pi's footer (TUI renders it below the stats
 	// line; headless modes stub setStatus to a no-op). Updated per turn rather than flashed per
 	// event — the numbers ticking up ARE the fold notification, with no transcript pollution.
-	const updateFooter = (hctx: { ui?: { setStatus?: (key: string, text: string | undefined) => void } }) => {
+	const updateFooter = (hctx: {
+		ui?: { setStatus?: (key: string, text: string | undefined) => void };
+		sessionManager?: { getSessionId?: () => string };
+	}) => {
 		const setStatus = hctx.ui?.setStatus?.bind(hctx.ui);
 		if (!setStatus) return;
+		const sessionId = hctx.sessionManager?.getSessionId?.();
+		const optimizer = sessionId ? contextOptimizerState(sessionId) : undefined;
+		if (optimizer?.primaryOwner && !optimizer.fallbackOwner) {
+			setStatus("context-fold", `⧉ context-fold standby · ${optimizer.primaryOwner} primary`);
+			return;
+		}
 		const s = telemetry.snapshot();
 		const parts = [
 			s.foldEvents === 0 ? "⧉ context-fold idle" : `⧉ context-fold ×${s.foldEvents} · ~${k(s.foldSavedTokens)} tok masked`,
 		];
+		if (optimizer?.rewriteGate) {
+			parts.push(
+				optimizer.rewriteGate.activeTurn
+					? "rewrite gate active"
+					: optimizer.rewriteGate.armed
+						? "rewrite gate armed"
+						: "rewrite gate waiting (45% + 4m quiet)",
+			);
+		}
 		const gauge = foldGauge(engine.status?.metrics ?? {});
 		if (gauge) parts.push(gauge);
 		if (s.hitRatio !== null) parts.push(`cache avg ${Math.round(s.hitRatio * 100)}%`);
 		if (s.wireDeferredFolds > 0) parts.push("⚠ folds not on wire");
 		setStatus("context-fold", parts.join(" · "));
+	};
+
+	let rewriteGateTimer: ReturnType<typeof setTimeout> | null = null;
+	let rewriteGateGeneration = 0;
+	const cancelRewriteGateTimer = () => {
+		rewriteGateGeneration += 1;
+		if (rewriteGateTimer) clearTimeout(rewriteGateTimer);
+		rewriteGateTimer = null;
+	};
+	const usageFraction = (ctx: ExtensionContext): number | undefined => {
+		const usage = ctx.getContextUsage();
+		if (!usage || typeof usage.contextWindow !== "number" || usage.contextWindow <= 0) return undefined;
+		if (typeof usage.tokens === "number" && Number.isFinite(usage.tokens) && usage.tokens >= 0) {
+			return usage.tokens / usage.contextWindow;
+		}
+		if (typeof usage.percent === "number" && Number.isFinite(usage.percent) && usage.percent >= 0) {
+			return usage.percent / 100;
+		}
+		return undefined;
+	};
+	const scheduleRewriteGate = (ctx: ExtensionContext) => {
+		cancelRewriteGateTimer();
+		const sessionId = ctx.sessionManager.getSessionId();
+		beginContextOptimizerSession(sessionId);
+		configureContextRewriteGate(sessionId, CONTEXT_REWRITE_USAGE_FRACTION, CONTEXT_REWRITE_QUIET_MS);
+		const fraction = usageFraction(ctx);
+		observeContextRewriteFraction(sessionId, fraction);
+		if (
+			fraction === undefined ||
+			fraction < CONTEXT_REWRITE_USAGE_FRACTION ||
+			!ctx.isIdle() ||
+			ctx.hasPendingMessages()
+		) return;
+
+		const generation = rewriteGateGeneration;
+		rewriteGateTimer = setTimeout(() => {
+			rewriteGateTimer = null;
+			if (generation !== rewriteGateGeneration) return;
+			if (ctx.sessionManager.getSessionId() !== sessionId || !ctx.isIdle() || ctx.hasPendingMessages()) return;
+			const freshFraction = usageFraction(ctx);
+			observeContextRewriteFraction(sessionId, freshFraction);
+			if (freshFraction === undefined || freshFraction < CONTEXT_REWRITE_USAGE_FRACTION) return;
+			armContextRewrite(sessionId);
+			updateFooter(ctx);
+		}, CONTEXT_REWRITE_QUIET_MS);
+		// A quiet session must not keep a headless Pi process alive solely for this optimization.
+		(rewriteGateTimer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
 	};
 
 	let spool: SpoolStore | null = null;
@@ -177,6 +264,10 @@ export default function contextFold(pi: ExtensionAPI): void {
 	let restoredFor = "";
 	pi.on("session_start", (_event, ctx) => {
 		const sid = ctx.sessionManager.getSessionId();
+		beginContextOptimizerSession(sid);
+		configureContextRewriteGate(sid, CONTEXT_REWRITE_USAGE_FRACTION, CONTEXT_REWRITE_QUIET_MS);
+		disarmContextRewrite(sid);
+		scheduleRewriteGate(ctx);
 		resetThinkingCompactionForSession(sid);
 		if (restoredFor === sid) return;
 		const isSwitch = restoredFor !== "";
@@ -248,12 +339,25 @@ export default function contextFold(pi: ExtensionAPI): void {
 		}
 	});
 
+	pi.on("before_agent_start", (_event, ctx) => {
+		cancelRewriteGateTimer();
+		const sessionId = ctx.sessionManager.getSessionId();
+		beginContextOptimizerSession(sessionId);
+		configureContextRewriteGate(sessionId, CONTEXT_REWRITE_USAGE_FRACTION, CONTEXT_REWRITE_QUIET_MS);
+		beginContextRewriteTurn(sessionId);
+		updateFooter(ctx);
+	});
+
 	// Observe completion only; never register a native-mode `session_before_compact` handler.
 	// Keeping the completed fingerprint suppresses a repeat if the same strict island remains in
 	// the first post-compaction view, while a later view without it clears the cooldown below.
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (_event, ctx) => {
 		pendingThinkingCompaction = null;
 		thinkingCompactionInFlight = false;
+		cancelRewriteGateTimer();
+		const sessionId = ctx.sessionManager.getSessionId();
+		disarmContextRewrite(sessionId);
+		scheduleRewriteGate(ctx);
 	});
 
 	// OBSERVE-ONLY cache telemetry: every finalized assistant message carries real provider
@@ -295,6 +399,9 @@ export default function contextFold(pi: ExtensionAPI): void {
 	// recommendation: evaluate it only once Pi says retries, compaction and queued continuations
 	// have all settled. This also lets a transient cache miss recover later in the same agent run.
 	pi.on("agent_settled", (_event, ctx) => {
+		const settledSessionId = ctx.sessionManager.getSessionId();
+		finishContextRewriteTurn(settledSessionId);
+		scheduleRewriteGate(ctx);
 		const t = telemetry.snapshot();
 		const adv = buildAdvisory();
 		if (adv.coldNow && !wasCold) {
@@ -309,6 +416,9 @@ export default function contextFold(pi: ExtensionAPI): void {
 		// otherwise a genuinely cold streak would reset here and warn again on its next response.
 		if (!t.lastTurnAfterFold) wasCold = adv.coldNow;
 
+		const sessionId = settledSessionId;
+		beginContextOptimizerSession(sessionId);
+		if (contextFoldShouldStandby(sessionId)) return;
 		const strictIsland = pendingThinkingCompaction;
 		if (
 			!thinkingCfg.enabled ||
@@ -342,16 +452,20 @@ export default function contextFold(pi: ExtensionAPI): void {
 		}
 	});
 
-	// The make-or-break hook: rewrite the outgoing context before each model call.
-	pi.on("context", (event, ctx) => {
+	// The make-or-break pass. It is also exposed through a private well-known Symbol so a later
+	// primary can invoke the exact durable path in the same turn if its own synchronous transform
+	// fails after context-fold already yielded.
+	const applyContextFold = (event: ContextEvent, ctx: ExtensionContext): { messages: ContextEvent["messages"] } => {
 		try {
 			// Liveness for the GC sweep: mark this session's spool as belonging to a running session,
 			// so a quiet-but-live session is not reaped by a sibling's session_start sweep. Throttled
 			// internally to once an hour and inert until this session has actually spooled something.
-			const sessionId = ctx.sessionManager.getSessionId();
-			resetThinkingCompactionForSession(sessionId);
-			touchHeartbeat(join(ctx.sessionManager.getSessionDir(), "spool", sessionId));
-			lastContextWindow = ctx.getContextUsage()?.contextWindow ?? lastContextWindow;
+				const sessionId = ctx.sessionManager.getSessionId();
+				resetThinkingCompactionForSession(sessionId);
+				touchHeartbeat(join(ctx.sessionManager.getSessionDir(), "spool", sessionId));
+				lastContextWindow = ctx.getContextUsage()?.contextWindow ?? lastContextWindow;
+				const allowNewRewrite = contextRewriteIsAllowed(sessionId);
+				ladderPolicy.setEnabled(allowNewRewrite);
 			// Ladder cold branch: no live cache read observed after a few turns ⇒ there is no warm
 			// prefix to protect, so the ladder folds earlier and more freely (measured, not assumed).
 			const t = telemetry.snapshot();
@@ -381,11 +495,17 @@ export default function contextFold(pi: ExtensionAPI): void {
 					return false;
 				}
 			};
-			const pruned = pruneHistoricalThinking(
-				event.messages as unknown as CoreAgentMessage[],
-				ctx.model ? { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id } : undefined,
-				thinkingCfg,
-			);
+				const pruned = allowNewRewrite
+					? pruneHistoricalThinking(
+						event.messages as unknown as CoreAgentMessage[],
+						ctx.model ? { provider: ctx.model.provider, api: ctx.model.api, id: ctx.model.id } : undefined,
+						thinkingCfg,
+					)
+					: {
+						messages: event.messages as unknown as CoreAgentMessage[],
+						compactionFingerprint: null,
+						prunedThinkingBlocks: 0,
+					};
 			if (!pruned.compactionFingerprint) {
 				pendingThinkingCompaction = null;
 				completedThinkingCompaction = null;
@@ -418,6 +538,35 @@ export default function contextFold(pi: ExtensionAPI): void {
 			process.stderr.write(`[context-fold] fold pass failed (context sent raw): ${err instanceof Error ? err.message : String(err)}\n`);
 			return { messages: event.messages };
 		}
+	};
+
+	const unregisterFallback = registerContextFoldFallback((event, ctx) => {
+		const typedCtx = ctx as ExtensionContext;
+		const sessionId = typedCtx.sessionManager.getSessionId();
+		beginContextOptimizerSession(sessionId);
+		latchContextFoldFallback(sessionId, "primary transform failed");
+		return applyContextFold(event as ContextEvent, typedCtx);
+	});
+
+	// The normal hook sleeps while a healthy primary owns the session. It remains registered so
+	// ownership can fall back without remounting extensions or restarting Pi.
+	pi.on("context", (event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		beginContextOptimizerSession(sessionId);
+		if (contextFoldShouldStandby(sessionId)) {
+			updateFooter(ctx);
+			return;
+		}
+		const result = applyContextFold(event, ctx);
+		if (result.messages !== event.messages) {
+			latchContextFoldFallback(sessionId, "context-fold committed an outgoing rewrite");
+		}
+		return result;
+	});
+
+	pi.on("session_shutdown", () => {
+		cancelRewriteGateTimer();
+		unregisterFallback();
 	});
 
 	// HARD COMPACTION (the hard floor): the automatic path NEVER summarizes with a model. With
@@ -429,6 +578,9 @@ export default function contextFold(pi: ExtensionAPI): void {
 	// compaction owner. Explicit `det` opt-in is therefore the only mode that registers this hook.
 	if (acfg.compact === "det")
 		pi.on("session_before_compact", (event, ctx) => {
+			const sessionId = ctx.sessionManager.getSessionId();
+			beginContextOptimizerSession(sessionId);
+			if (contextFoldShouldStandby(sessionId)) return;
 			compactions++;
 			try {
 			const prep = (event as { preparation: { messagesToSummarize: unknown[]; turnPrefixMessages: unknown[]; tokensBefore: number; firstKeptEntryId: string; previousSummary?: string } }).preparation;
