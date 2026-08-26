@@ -167,6 +167,8 @@ describe('SubagentModelModal', () => {
 	expect(screen.getByRole('heading', { name: 'Computer Use Agent' })).toBeTruthy()
 	expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
 	const generalHeading = screen.getByRole('heading', { name: '通用 Subagents' })
+	expect(screen.getByText('PipiUI 内置与用户安装')).toBeTruthy()
+	expect(screen.queryByTestId('project-subagent-group')).toBeNull()
 	const computerHeading = screen.getByRole('heading', { name: 'Computer Use Agent' })
 	expect(generalHeading.compareDocumentPosition(computerHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 	const computerHierarchy = screen.getByTestId('computer-use-model-hierarchy')
@@ -312,7 +314,7 @@ function catalogHost(agents: AgentDefinition[], settings: Record<string, Subagen
 }
 
 describe('SubagentModelModal dynamic catalog', () => {
-  it('groups Computer Use by canonicalRole metadata and shows extension agents in general', async () => {
+  it('groups Computer Use by canonicalRole and keeps project-specific agents folded away from general', async () => {
     const host = catalogHost([
       { name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' },
       { name: 'operator', description: 'Desktop escape hatch', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'operator' },
@@ -327,17 +329,32 @@ describe('SubagentModelModal dynamic catalog', () => {
         availability: 'available',
         permissionSummary: 'mode:read-only, filesystem:read-only',
       },
+      { name: 'steward-init', description: 'COC 模组建卡最小包 L0 解析管家', origin: 'project', source: 'project' },
     ])
     render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} projectId="proj-1" />)
-    await screen.findByTestId('subagent-agent-ext-researcher')
+    await screen.findByTestId('subagent-agent-explore')
     expect(host.listAgentDefinitions).toHaveBeenCalledWith('proj-1')
     expect(screen.getByTestId('computer-use-model-hierarchy').textContent).toContain('computer-use')
     expect(within(screen.getByTestId('computer-use-model-hierarchy')).queryByTestId('subagent-agent-operator')).toBeNull()
     expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
-    expect(screen.getByTestId('subagent-source-ext-researcher').textContent).toContain('扩展 ext-research')
-    expect(screen.getByTestId('subagent-permissions-ext-researcher').textContent).toContain('filesystem:read-only')
     expect(within(screen.getByTestId('subagent-agent-computer-use')).getByText(/需要查看截图/)).toBeTruthy()
     expect(within(screen.getByTestId('subagent-agent-operator')).queryByText(/需要查看截图/)).toBeNull()
+
+    const projectGroup = screen.getByTestId('project-subagent-group')
+    const toggle = screen.getByTestId('project-subagent-toggle')
+    expect(within(projectGroup).getByRole('heading', { name: '项目专用 Subagents' })).toBeTruthy()
+    expect(toggle.textContent).toContain('2 个')
+    expect(toggle.textContent).toContain('当前项目自带，不是 PipiUI 内置')
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByTestId('subagent-agent-ext-researcher')).toBeNull()
+    expect(screen.queryByTestId('subagent-agent-steward-init')).toBeNull()
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByTestId('subagent-source-ext-researcher').textContent).toContain('扩展 ext-research')
+    expect(screen.getByTestId('subagent-permissions-ext-researcher').textContent).toContain('filesystem:read-only')
+    expect(screen.getByTestId('subagent-agent-steward-init')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-source-steward-init')).toBeNull()
   })
 
   it('falls back to name/description rows when the host omits catalog metadata', async () => {

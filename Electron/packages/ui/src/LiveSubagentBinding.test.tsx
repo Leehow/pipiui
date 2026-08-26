@@ -20,10 +20,13 @@ describe('live subagent binding', () => {
     const host = { listAgents: vi.fn(async () => [root]), subscribeAgents: vi.fn((next: (event: AgentEvent) => void) => { listener = next; return () => undefined }) } as unknown as PipiHostAPI
     const tool: TranscriptTool = { id: 'call-1', name: 'subagent', input: '{}', result: 'Started background agent(s) (1).\n- agentId=root', startedAt: 1, finishedAt: 2, finished: true, dispatched: true }
     render(<LiveSubagentBindingProvider host={host} sessionId="A"><AssistantTranscriptContent message={{ content: '', tools: [tool] }} /></LiveSubagentBindingProvider>)
+    const steps = await screen.findByRole('button', { name: /1 个步骤/ })
+    expect(steps.getAttribute('aria-expanded')).toBe('false')
+    act(() => steps.click())
     expect((await screen.findByTestId('subagent-tool-card')).textContent).toContain('运行 1')
     act(() => listener?.({ type: 'agent', agent: { ...root, state: 'ok', turns: 3 } }))
-    await screen.findByRole('button', { name: /1 个步骤/ })
-    act(() => screen.getByRole('button', { name: /1 个步骤/ }).click())
+    const settled = await screen.findByRole('button', { name: /1 个步骤/ })
+    if (settled.getAttribute('aria-expanded') === 'false') act(() => settled.click())
     expect((await screen.findByTestId('subagent-tool-card')).textContent).toContain('运行 0')
     expect(screen.getByTestId('subagent-tool-card').textContent).toContain('3 turns')
   })

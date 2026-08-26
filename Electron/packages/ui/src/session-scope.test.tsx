@@ -38,7 +38,7 @@ describe('right panel session scoping', () => {
     render(<SubagentPanel host={host} sessionId="session-a" />)
     await screen.findByTestId('agent-row-mine')
     // Neither event names an agent in this tree, so neither may create or mutate a row.
-    push?.({ type: 'worktree', status: { agentId: 'theirs', lifecycle: 'active', merge: 'unavailable', discard: 'unavailable' } })
+    push?.({ type: 'worktree', status: { agentId: 'theirs', sessionId: 'session-z', runId: 'r-theirs', lifecycle: 'active', merge: 'unavailable', discard: 'unavailable' } })
     push?.({ type: 'agent_log', agentId: 'theirs', itemType: 'text', text: 'leaked' })
     await waitFor(() => expect(screen.queryByText('leaked')).toBeNull())
     expect(screen.queryByTestId('agent-row-theirs')).toBeNull()

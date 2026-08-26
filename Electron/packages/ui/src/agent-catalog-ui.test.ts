@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import { formatDiagnostic, redactDiagnosticMessage } from './agent-catalog-ui'
+import {
+  agentSourceLabel,
+  formatDiagnostic,
+  isBlockingCatalogDiagnostic,
+  partitionCatalog,
+  redactDiagnosticMessage,
+} from './agent-catalog-ui'
 
 describe('agent catalog diagnostic formatting', () => {
   it('formats structured shadowed-name text without path fragments', () => {
@@ -19,5 +25,45 @@ describe('agent catalog diagnostic formatting', () => {
       code: 'shadowed-name',
       message: leaked,
     })).toBe('shadowed-name: overrides definition at <path>; kept')
+  })
+
+  it('keeps catalog error banners for failures, not ignored optional fields', () => {
+    expect(isBlockingCatalogDiagnostic({
+      severity: 'warning',
+      code: 'unknown-field',
+      message: 'Unknown frontmatter field `thinking`; ignored by legacy compatibility mode.',
+    })).toBe(false)
+    expect(isBlockingCatalogDiagnostic({
+      severity: 'error',
+      code: 'catalog-discovery-failed',
+      message: 'overlay scan failed',
+    })).toBe(true)
+  })
+})
+
+describe('agent catalog grouping', () => {
+  it('keeps bundled and user agents in general, folds project agents, and prefers computer role', () => {
+    const explore = { name: 'explore', description: 'Research', origin: 'bundled' as const, source: 'bundled' as const }
+    const userWorker = { name: 'openai-user', description: 'User install', origin: 'user' as const, source: 'user' as const }
+    const steward = { name: 'steward-init', description: 'COC L0', origin: 'project' as const, source: 'project' as const }
+    const ext = { name: 'ext-researcher', description: 'Project ext', origin: 'project' as const, source: 'project' as const, extensionId: 'ext-research' }
+    const computer = { name: 'computer-use', description: 'Desktop', origin: 'project' as const, source: 'project' as const, canonicalRole: 'computer' as const }
+    const grouped = partitionCatalog([explore, userWorker, steward, ext, computer])
+    expect(grouped.general.map(agent => agent.name)).toEqual(['explore', 'openai-user'])
+    expect(grouped.project.map(agent => agent.name)).toEqual(['steward-init', 'ext-researcher'])
+    expect(grouped.computer.map(agent => agent.name)).toEqual(['computer-use'])
+  })
+
+  it('labels project agents as project-specific instead of a bare 项目 badge', () => {
+    expect(agentSourceLabel({ name: 'steward-init', description: 'COC L0', origin: 'project', source: 'project' })).toBe('项目专用')
+    expect(agentSourceLabel({ name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' })).toBe('内置')
+    expect(agentSourceLabel({
+      name: 'ext-researcher',
+      description: 'Project ext',
+      origin: 'project',
+      source: 'project',
+      extensionId: 'ext-research',
+    })).toBe('扩展 ext-research')
+    expect(agentSourceLabel({ name: 'steward-init', description: 'COC L0', origin: 'project', source: 'project' }, { skipProject: true })).toBeUndefined()
   })
 })

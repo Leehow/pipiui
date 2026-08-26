@@ -9,6 +9,7 @@ import {
   diagnosticsForExtension,
   formatDiagnostic,
   formatPatchOperations,
+  isBlockingCatalogDiagnostic,
   isRequestedPatch,
   patchesForExtension,
   redactDiagnosticMessage,
@@ -302,7 +303,9 @@ function ExtensionContributionSummary({
   const patches = patchesForExtension(agents, ext.id)
   const acceptedPatches = patches.filter(({ patch }) => !isRequestedPatch(patch))
   const requestedPatches = patches.filter(({ patch }) => isRequestedPatch(patch))
-  const related = diagnosticsForExtension(ext.id, agents, catalogDiagnostics).filter(entry => !dismissed.has(diagnosticKey(entry)))
+  const related = diagnosticsForExtension(ext.id, agents, catalogDiagnostics).filter(entry => (
+    isBlockingCatalogDiagnostic(entry) && !dismissed.has(diagnosticKey(entry))
+  ))
   if (contributed.length === 0 && acceptedPatches.length === 0 && requestedPatches.length === 0 && related.length === 0) return null
   return (
     <div className="extensions-pkg-contrib" data-testid={`extensions-pkg-contrib-${ext.id}`}>
@@ -497,6 +500,7 @@ function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; proj
   const resolvedProjectId = projectId || lastProjectId()
   const catalogDiagnostics = useMemo(() => collectCatalogDiagnostics(agents), [agents])
   const visibleCatalogDiagnostics = [...loadDiagnostics, ...catalogDiagnostics].filter(entry => {
+    if (!isBlockingCatalogDiagnostic(entry)) return false
     if (dismissedDiagnostics.has(diagnosticKey(entry))) return false
     return !items.some(ext => diagnosticsForExtension(ext.id, agents, [entry]).length > 0)
   })

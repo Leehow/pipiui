@@ -610,9 +610,11 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 
   useEffect(() => {
     if (!selected) return
-    const agentId = selected.agentId
-    const sessionId = selected.sessionId ?? ''
-    const runId = selected.runId ?? ''
+    const identity = episodeIdentity(selected)
+    // No exact episode identity → no subscription. A blank-keyed subscription
+    // would receive every run of the slug and paint them under this row.
+    if (!identity) return
+    const { agentId, sessionId: logSessionId, runId: logRunId } = identity
     let timer: number | undefined
     let pending: Extract<AgentEvent, { type: 'agent_log' }>[] = []
     const flush = () => {
@@ -622,10 +624,12 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       const batch = pending
       pending = []
       setAgents(current => current.map(agent => {
-        if (agent.agentId !== agentId) return agent
-        const matching = batch.filter(event =>
-          (!event.runId || !agent.runId || event.runId === agent.runId)
-          && (!event.sessionId || !agent.sessionId || event.sessionId === agent.sessionId))
+        // Strict triple match: only the row that owns the subscribed episode
+        // receives the batch, and only events carrying that exact identity land.
+        // Identity-less rows never receive streamed logs; identity-less events
+        // are dropped instead of falling back to the agentId.
+        if (!sameEpisode(agent, identity)) return agent
+        const matching = batch.filter(event => sameEpisode(event, identity))
         if (!matching.length) return agent
         const logs = matching.reduce((next, event) => applyLogDelta(next, event), agent.logs)
         return logs === agent.logs ? agent : { ...agent, logs }
@@ -637,36 +641,63 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
         timer = window.setTimeout(flush, AGENT_LOG_RENDER_INTERVAL_MS)
         logRenderTimers.current.add(timer)
       }
-    }, sessionId, runId)
+    }, logSessionId, logRunId)
     return () => {
       off()
       // Keep an already queued batch alive across a same-agent run switch. The
-      // event identity check in flush rejects stale old-run frames, while a
-      // legacy identity-less host retains its pre-batching behavior.
+      // exact-identity check in flush rejects stale old-run frames.
     }
   }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
 
   // Fetch cached logs for the selected agent so completed subagents show their
   // full transcript (live subscription only delivers events while running).
-  // `scope: 'agent'` concatenates every run of this agentId — Computer Use
-  // Leader reuses the id across plan / recovery / final-report runs.
+  // Default scope is the exact run: a semantic agentId is deliberately reused
+  // across runs, and concatenating older runs under the current run's header
+  // misattributes their tool logs. The full history stays reachable through the
+  // explicit per-agent history view (see showHistory below).
   useEffect(() => {
-    if (!selected?.agentId || !host.getAgentLogs) return
+    const identity = selected ? episodeIdentity(selected) : undefined
+    // Only an exact-episode row fetches its cached transcript: a blank-keyed
+    // read would return some other run's logs under this row's header.
+    if (!identity || !host.getAgentLogs) return
     let cancelled = false
-    const agentId = selected.agentId
-    const session = selected.sessionId ?? ''
-    const runId = selected.runId ?? ''
-    void host.getAgentLogs(agentId, session, runId, 'agent').then(entries => {
+    void host.getAgentLogs(identity.agentId, identity.sessionId, identity.runId).then(entries => {
       if (cancelled || !entries.length) return
       setAgents(current => current.map(agent => {
-        if (agent.agentId !== agentId || agent.logs.length > 0) return agent
+        if (!sameEpisode(agent, identity) || agent.logs.length > 0) return agent
         let logs: Log[] = []
-        for (const entry of entries) logs = applyLogDelta(logs, { type: 'agent_log', agentId, ...entry })
+        for (const entry of entries) logs = applyLogDelta(logs, { type: 'agent_log', agentId: identity.agentId, ...entry })
         return { ...agent, logs }
       }))
     })
     return () => { cancelled = true }
   }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
+
+  // Explicit agent-history view (scope: 'agent' concatenates every run of this
+  // agentId). Distinct from the default current-run transcript and clearly
+  // labeled in the detail pane, so a cross-run transcript is never mistaken for
+  // the current run's output.
+  const [historyLogs, setHistoryLogs] = useState<Log[] | undefined>()
+  const [historyError, setHistoryError] = useState('')
+  useEffect(() => {
+    setHistoryLogs(undefined)
+    setHistoryError('')
+  }, [selected?.agentId, selected?.sessionId, selected?.runId])
+  const showHistory = async (agent: Agent) => {
+    if (!host.getAgentLogs) return
+    const identity = episodeIdentity(agent)
+    // Explicit history stays an exact-episode read too: no blank-keyed scopes.
+    if (!identity) return
+    setHistoryError('')
+    try {
+      const entries = await host.getAgentLogs(identity.agentId, identity.sessionId, identity.runId, 'agent')
+      let logs: Log[] = []
+      for (const entry of entries) logs = applyLogDelta(logs, { type: 'agent_log', agentId: identity.agentId, ...entry })
+      setHistoryLogs(logs)
+    } catch (error) {
+      setHistoryError(error instanceof Error ? error.message : '无法加载运行历史')
+    }
+  }
 
   useEffect(() => {
     if (follow && agents.length) setPage(0)
@@ -722,20 +753,36 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     onManualStatusCheck?.(agentIDs)
   }
   const check = async (agent: Agent) => {
+    const identity = episodeIdentity(agent)
+    // Inert without exact identity: no host probe with synthesized blanks.
+    if (!identity) return
     requestManualStatusCheck([agent.agentId])
     // Capture the session this probe belongs to. The user may switch chats while the
     // host read is pending; a response for the old session must never write into the
     // new session's list, and an unmounted panel must not setState at all.
     const session = sessionId
     const generation = loadGeneration.current
-    const update = await host.checkAgent(agent.agentId)
+    // Exact episode identity: the probe describes the run this row shows, never
+    // the host's globally newest row reusing the same semantic slug.
+    const update = await host.checkAgent(identity.sessionId, identity.agentId, identity.runId)
     if (generation !== loadGeneration.current || session !== sessionId) return
     // A probe response is an async host read: it may describe a run the live feed
     // already replaced, so it merges with snapshot precedence, never live trust.
+    // The merge itself is exact-triple guarded (applyAgentEvent never lets a stale
+    // run rewrite a row that a newer run already owns).
     setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }, 'snapshot', session))
   }
-  const worktree = async (agentId: string, action: 'merge' | 'discard') => {
-    const status = action === 'merge' ? await host.mergeWorktree(agentId) : await host.discardWorktree(agentId)
+  const worktree = async (agent: Agent, action: 'merge' | 'discard') => {
+    const identity = episodeIdentity(agent)
+    // Inert without exact identity: no disposition request with synthesized blanks.
+    if (!identity) return
+    // Exact episode identity for worktree disposition: the request and the returned
+    // status both bind to the selected row's session+run. The returned status carries
+    // its own identity; a row that has since switched runs ignores it (own-run guard),
+    // so a slow response for a retired run cannot repaint the current run's badge.
+    const status = action === 'merge'
+      ? await host.mergeWorktree(identity.sessionId, identity.agentId, identity.runId)
+      : await host.discardWorktree(identity.sessionId, identity.agentId, identity.runId)
     setAgents(current => applyAgentEvent(current, { type: 'worktree', status }))
   }
   const openWorktreeTerminal = async (wtPath: string) => {
@@ -747,11 +794,15 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     }
   }
 	const abort = async (agent: Agent) => {
-		if (abortingIds.has(agent.agentId)) return
+		const identity = episodeIdentity(agent)
+		// Inert without exact identity: no stop request with synthesized blanks —
+		// the host would reject the episode, and a slug-only stop could kill a
+		// newer run reusing the same semantic id.
+		if (!identity || abortingIds.has(agent.agentId)) return
 		setAbortError('')
 		setAbortingIds(current => new Set(current).add(agent.agentId))
 		try {
-			await host.abortAgent(agent.agentId)
+			await host.abortAgent(identity.sessionId, identity.agentId, identity.runId)
 		} catch (error) {
 			setAbortError(`无法停止 ${agentDisplayName(agent)}：${error instanceof Error ? error.message : '停止请求失败'}`)
 		} finally {
@@ -762,6 +813,23 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 			})
 		}
 	}
+  const resolve = async (agent: Agent) => {
+    const identity = episodeIdentity(agent)
+    // Inert without exact identity: no resolve request with synthesized blanks.
+    if (!identity) return
+    // Exact episode identity: mark the run this row shows. The completion handler
+    // re-reads the CURRENT row state and matches the exact triple, so a newer run
+    // that arrived while the request was in flight is never marked handled.
+    try {
+      await host.resolveAgent(identity.sessionId, identity.agentId, identity.runId)
+      setAgents(current => current.map(item =>
+        sameEpisode(item, identity)
+          ? { ...item, handled: true }
+          : item))
+    } catch (error) {
+      setAbortError(`无法标记 ${agentDisplayName(agent)} 已处理：${error instanceof Error ? error.message : '请求失败'}`)
+    }
+  }
   const clearFinished = () => {
     setAgents(current => current.filter(isActive))
     setPage(0)
@@ -805,7 +873,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 				now={now}
                 onSelect={() => setSelectedId(agent.agentId)}
 				onAbort={() => void abort(agent)}
-                onResolve={() => void host.resolveAgent(agent.agentId).then(() => setAgents(current => current.map(item => item.agentId === agent.agentId ? { ...item, handled: true } : item)))}
+                onResolve={() => void resolve(agent)}
               />)}
               {ordered.length > pageSize && <div className="agent-pager">
                 <button disabled={activePage === 0} onClick={() => setPage(value => value - 1)}>较新</button>
@@ -814,26 +882,75 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
               </div>}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} />
+			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />
           </div>}
   </section>
 }
 
 /**
- * Keep another session's agents out of this panel.
+ * Keep another session's agents out of this panel, and identity-less events
+ * out of the tree entirely.
  *
- * Only `agent` events carry a sessionId; `agent_log` and `worktree` are addressed by agentId, so
- * they belong to us exactly when the agent they name is already in this tree. A host that omits
- * sessionId entirely (aggregating hosts, or an unscoped panel) is trusted as before.
+ * Every live event must carry a non-empty {sessionId, agentId, runId}: an
+ * event without that triple names no episode, and matching it by agentId
+ * alone would let it repaint whichever same-slug row happens to be displayed —
+ * the exact cross-run/cross-session misbinding this contract removes. An
+ * unscoped panel (no sessionId prop, aggregating hosts) still admits
+ * identity-carrying agent events; worktree/log events must additionally name
+ * a row already in this tree by the exact triple.
  */
 function sessionScopedEvent(current: Agent[], event: AgentEvent, sessionId?: string): boolean {
-  if (!sessionId) return true
   if (event.type === 'agent') {
-    if (event.agent.sessionId) return event.agent.sessionId === sessionId
-    return current.some(agent => agent.agentId === event.agent.agentId)
+    if (!episodeIdentity(event.agent)) return false
+    if (!sessionId) return true
+    return event.agent.sessionId === sessionId
   }
-  const agentId = event.type === 'worktree' ? event.status.agentId : event.agentId
-  return current.some(agent => agent.agentId === agentId)
+  if (event.type === 'worktree') {
+    const identity = episodeIdentity(event.status)
+    if (!identity) return false
+    if (sessionId && event.status.sessionId !== sessionId) return false
+    return current.some(agent => sameEpisode(agent, identity))
+  }
+  const identity = episodeIdentity(event)
+  if (!identity) return false
+  if (sessionId && event.sessionId !== sessionId) return false
+  return current.some(agent => sameEpisode(agent, identity))
+}
+
+/**
+ * Exact episode identity of an agent row, a worktree status, or a log event:
+ * all three fields must be non-empty strings. A carrier without this identity
+ * names no episode — it may still be displayed (host snapshot rows) but its
+ * controls are inert, it issues no subscriptions or host reads, and events
+ * carrying it are ignored. Blank strings are NOT identity: `''` is the absent
+ * value a synthesized call would send, and the host would reject the episode.
+ */
+type EpisodeIdentity = { sessionId: string; agentId: string; runId: string }
+
+function episodeIdentity(carrier: { sessionId?: string; agentId: string; runId?: string }): EpisodeIdentity | undefined {
+  const { sessionId, agentId, runId } = carrier
+  if (!sessionId || !agentId || !runId) return undefined
+  return { sessionId, agentId, runId }
+}
+
+/** Strict same-episode test: non-empty identity on both sides, equal on all three fields. */
+function sameEpisode(carrier: { sessionId?: string; agentId: string; runId?: string }, identity: EpisodeIdentity): boolean {
+  const own = episodeIdentity(carrier)
+  if (!own) return false
+  return own.sessionId === identity.sessionId && own.agentId === identity.agentId && own.runId === identity.runId
+}
+
+/**
+ * Exact-episode guard for worktree badges. A status belongs to its own run
+ * alone: a late closeout from a retired run must not repaint the current run's
+ * badge, and a status without non-empty identity cannot be attributed to any
+ * episode — an agentId fallback would repaint whichever same-slug row happens
+ * to be displayed, so it is ignored instead.
+ */
+function worktreeStatusOwnsRow(agent: Agent, status: WorktreeStatus): boolean {
+  const identity = episodeIdentity(status)
+  if (!identity) return false
+  return sameEpisode(agent, identity)
 }
 
 const TERMINAL_AGENT_STATES: readonly AgentState[] = ['ok', 'failed', 'aborted', 'interrupted']
@@ -935,7 +1052,7 @@ export function agentEventSupersedes(
 }
 
 function applyAgentEvent(current: Agent[], event: AgentEvent, source: AgentEventSource = 'live', sessionId?: string): Agent[] {
-  if (event.type === 'worktree') return current.map(agent => agent.agentId === event.status.agentId ? { ...agent, worktree: event.status } : agent)
+  if (event.type === 'worktree') return current.map(agent => agent.agentId === event.status.agentId && worktreeStatusOwnsRow(agent, event.status) ? { ...agent, worktree: event.status } : agent)
   if (event.type !== 'agent') return current
   const incoming = event.agent
   const index = current.findIndex(agent => agent.agentId === incoming.agentId)
@@ -951,14 +1068,12 @@ function applyAgentEvent(current: Agent[], event: AgentEvent, source: AgentEvent
   if (previous && !agentEventSupersedes(previous, incoming, source)) return current
   const active = incoming.state === 'running'
   const switchedRun = Boolean(previous?.runId && incoming.runId && previous.runId !== incoming.runId)
-  // A new run restarts contentIndex at 0; forget the previous run's slot keys so its
-  // rows are never rewritten by the next run's first deltas (Swift clears its stream
-  // slots on `start` for the same reason).
-  const logs = previous?.logs
-    ? switchedRun
-      ? previous.logs.map(log => log.contentIndex === undefined ? log : { ...log, contentIndex: undefined })
-      : previous.logs
-    : []
+  // A new run owns a fresh transcript: the previous run's cached/streamed logs are
+  // cleared outright (not just unkeyed), because they belong to the retired run —
+  // they are only ever re-shown through the explicit agent-history view
+  // (scope: 'agent'), never silently concatenated under the new run's header.
+  // contentIndex slot-keying alone would keep the old rows visible as plain rows.
+  const logs = switchedRun ? [] : previous?.logs ?? []
   const startedCandidates = [incoming.createdAt, switchedRun ? undefined : previous?.startedAt]
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
   if (switchedRun && previous.runId) retireAgentRun(sessionId ?? incoming.sessionId, incoming.agentId, previous.runId)
@@ -1054,6 +1169,11 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
   const active = isActive(agent)
   const worktree = worktreeBadge(agent.worktree, active)
   const subtitle = agentListSubtitle(agent)
+  // No non-empty {sessionId, runId} → no exact episode identity: this row can
+  // be displayed but never issues controls. Buttons stay rendered (layout) yet
+  // disabled, and the handlers are additionally inert as a defense in depth.
+  const identity = episodeIdentity(agent)
+  const controlsInert = !identity
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
   const stalled = agent.stalled || agent.state === 'stalled'
   const closing = liveRunningProgressLine({
@@ -1092,12 +1212,12 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
 		{live && <small className={`agent-live-state ${live.severity}`}>{live.text}</small>}
       </span>
     </button>
-    {active && <button aria-label={`${aborting ? '正在中止' : '中止'} ${agent.name}`} title={aborting ? '正在中止 agent' : '中止 agent'} className="agent-control abort" disabled={aborting} onClick={onAbort}>{aborting ? <span className="agent-spinner" aria-hidden="true" /> : '■'}</button>}
-    {handled && <button aria-label={`标记 ${agent.name} 已处理`} title="标记已处理" className="agent-control resolve" onClick={onResolve}>标记已处理</button>}
+    {active && <button aria-label={`${aborting ? '正在中止' : '中止'} ${agent.name}`} title={controlsInert ? '缺少会话/运行标识，无法精确停止' : aborting ? '正在中止 agent' : '中止 agent'} className="agent-control abort" disabled={aborting || controlsInert} onClick={onAbort}>{aborting ? <span className="agent-spinner" aria-hidden="true" /> : '■'}</button>}
+    {handled && <button aria-label={`标记 ${agent.name} 已处理`} title={controlsInert ? '缺少会话/运行标识，无法精确标记' : '标记已处理'} className="agent-control resolve" disabled={controlsInert} onClick={onResolve}>标记已处理</button>}
   </article>
 }
 
-function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, terminalAvailable, onCheck, onWorktree, onOpenWorktreeTerminal, onAbort }: {
+function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable, terminalAvailable, onCheck, onWorktree, onOpenWorktreeTerminal, onAbort, historyLogs, historyError, canShowHistory, onShowHistory, onHideHistory }: {
   agent?: Agent
 	activeChildCount: number
 	aborting: boolean
@@ -1107,9 +1227,15 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   retainedWorktreeDispositionAvailable: boolean
   terminalAvailable: boolean
   onCheck: (agent: Agent) => void
-  onWorktree: (agentId: string, action: 'merge' | 'discard') => void
+  onWorktree: (agent: Agent, action: 'merge' | 'discard') => void
   onOpenWorktreeTerminal: (path: string) => void
   onAbort: (agent: Agent) => void
+  /** Explicit agent-history view (scope: 'agent'): when set, the transcript renders these cross-run logs instead of the current run's. */
+  historyLogs?: Log[]
+  historyError: string
+  canShowHistory: boolean
+  onShowHistory: (agent: Agent) => void
+  onHideHistory: () => void
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const followRef = useRef(true)
@@ -1121,10 +1247,12 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   const latestLog = agent?.logs.at(-1)
   // Summary/usage events arrive independently from logs. Reuse the expensive
   // unified transcript (and its memoized Markdown subtree) until one of the
-  // fields that actually changes transcript output changes.
+  // fields that actually changes transcript output changes. The explicit history
+  // view substitutes its own cross-run logs for the current run's.
+  const sourceLogs = historyLogs ?? agent?.logs
   const transcript = useMemo(
-    () => agent ? agentTranscript(agent, output) : [],
-    [agent?.logs, agent?.startedAt, agent?.state, agent?.worktreeError, output],
+    () => agent && sourceLogs ? agentTranscript({ ...agent, logs: sourceLogs }, output) : [],
+    [sourceLogs, agent?.startedAt, agent?.state, agent?.worktreeError, output],
   )
 
   useEffect(() => {
@@ -1147,6 +1275,10 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
 
   if (!agent) return <div className="agent-detail empty">选择一个 agent 查看详情</div>
   const reviewable = agent.worktree?.lifecycle === 'pendingReview'
+  // Same inert rule as the row: no non-empty {sessionId, runId} → every
+  // episode-scoped control in the detail pane is disabled.
+  const identity = episodeIdentity(agent)
+  const controlsInert = !identity
   const model = agent.model || `${providerLabel(agent)}/${agent.name}`
   const resolvedModel = modelLabel(agent)
   const modelFamilyLabel = modelFamily(agent).family
@@ -1180,9 +1312,20 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
       followRef.current = atBottom
       setAtBottom(atBottom)
     }}>
-      {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
+      {isActive(agent) && <div className={`agent-running-activity ${live?.severity ?? 'active'}`} role="status" aria-live="polite"><span className="agent-spinner" aria-hidden="true" /><span>{live?.text ?? `正在执行 · ${activity}`}</span><button disabled={aborting || controlsInert} title={controlsInert ? '缺少会话/运行标识，无法精确停止' : undefined} onClick={() => onAbort(agent)}>{aborting ? '正在停止' : '停止'}</button></div>}
       <div className="agent-transcript" data-testid="subagent-transcript">
-        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></article>)}
+        {/* Run-scope label + explicit history toggle. The current run is the default
+            view; the cross-run history is a separate, clearly labeled view and is
+            only offered for finished agents so it never freezes a live follow. */}
+        {canShowHistory && !controlsInert && !isActive(agent) && (
+          historyLogs
+            ? <div className="agent-log-scope" data-testid="agent-log-scope"><span>全部运行历史（跨 run 拼接）</span><button type="button" onClick={onHideHistory}>仅看当前运行</button></div>
+            : <div className="agent-log-scope" data-testid="agent-log-scope"><span>当前运行记录</span><button type="button" onClick={() => onShowHistory(agent)}>查看全部运行历史</button></div>
+        )}
+        {historyError && <div className="agent-log-scope agent-log-scope-error" data-testid="agent-log-scope-error" role="alert">{historyError}</div>}
+        {/* Step groups default collapsed here — explicit false also suppresses the
+            streaming auto-expand — so the boss expands each group manually. */}
+        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></article>)}
       </div>
       <details className="agent-technical-details">
       <summary>技术详情</summary>
@@ -1194,7 +1337,7 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         <DetailMetrics agent={agent} now={now} pricing={pricingFor([agent])} />
         {agent.activityEndedAt && agent.activityActive === false && <span>上一工具已结束于 {completedAt(agent.activityEndedAt)}</span>}
         <AgentStallDiagnostics agent={agent} now={now} />
-        <button type="button" data-testid="subagent-detail-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" onClick={() => void onCheck(agent)}>手动检查</button>
+        <button type="button" data-testid="subagent-detail-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" disabled={controlsInert} onClick={() => void onCheck(agent)}>手动检查</button>
       </div>
       <p className="agent-task">{visibleAgentText(agent.task)}</p>
       {agent.closeout && <p className="agent-closeout">收尾 · {agent.closeout}</p>}
@@ -1203,8 +1346,8 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         {agent.worktree.branch && <code>{agent.worktree.branch}</code>}
         {agent.worktree.error && <small>{agent.worktree.error}</small>}
         {agent.worktree.path && terminalAvailable && <button className="worktree-terminal-btn" title={`在终端中打开 ${agent.worktree.path}`} onClick={() => onOpenWorktreeTerminal(agent.worktree!.path!)}>⌘ 终端</button>}
-        {reviewable && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'merge')}>合并到主分支</button><button onClick={() => void onWorktree(agent.agentId, 'discard')}>丢弃 worktree</button></span>}
-        {agent.worktree.lifecycle === 'active' && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button onClick={() => void onWorktree(agent.agentId, 'discard')}>关闭 worktree</button></span>}
+        {reviewable && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button disabled={controlsInert} onClick={() => void onWorktree(agent, 'merge')}>合并到主分支</button><button disabled={controlsInert} onClick={() => void onWorktree(agent, 'discard')}>丢弃 worktree</button></span>}
+        {agent.worktree.lifecycle === 'active' && retainedWorktreeDispositionAvailable && <span className="worktree-actions"><button disabled={controlsInert} onClick={() => void onWorktree(agent, 'discard')}>关闭 worktree</button></span>}
       </div>}
       {!isActive(agent) && <span className="agent-finished-at">结束于 {completedAt(agent.endedAt)} · {duration(agent, now)}</span>}
       </details>

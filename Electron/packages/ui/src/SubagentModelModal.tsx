@@ -9,6 +9,7 @@ import {
   formatDiagnostic,
   formatPatchOperations,
   isAgentUnavailable,
+  isBlockingCatalogDiagnostic,
   needsVisualModelHint,
   partitionCatalog,
 } from './agent-catalog-ui'
@@ -41,9 +42,11 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
-  const { general: generalAgents, computer: computerAgents } = useMemo(() => partitionCatalog(agents), [agents])
+  const { general: generalAgents, project: projectAgents, computer: computerAgents } = useMemo(() => partitionCatalog(agents), [agents])
   const catalogDiagnostics = useMemo(() => collectCatalogDiagnostics(agents), [agents])
-  const visibleCatalogDiagnostics = catalogDiagnostics.filter(entry => !dismissedDiagnostics.has(diagnosticKey(entry)))
+  const visibleCatalogDiagnostics = catalogDiagnostics.filter(entry => (
+    isBlockingCatalogDiagnostic(entry) && !dismissedDiagnostics.has(diagnosticKey(entry))
+  ))
   const supervisorModel = settings.supervisor?.[0]?.model ?? ''
 
   useEffect(() => {
@@ -159,10 +162,11 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
                 />
               ))}
             </div>}
-            <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
-              <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
+            {generalAgents.length > 0 && <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
+              <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3><span>PipiUI 内置与用户安装</span></div>
               {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
-            </section>
+            </section>}
+            <ProjectSubagentGroup agents={projectAgents} settings={settings} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
             {computerAgents.length > 0 && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
               <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agent</h3><span>单个 Agent 完成规划、操作、恢复与验证</span></div>
               <div className="subagent-computer-use-tree">
@@ -177,7 +181,50 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   )
 }
 
-function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hierarchy }: {
+function ProjectSubagentGroup({
+  agents,
+  settings,
+  models,
+  saving,
+  dismissed,
+  onDismiss,
+  onSave,
+}: {
+  agents: AgentDefinition[]
+  settings: Record<string, SubagentModelSetting[]>
+  models: Model[]
+  saving: string | null
+  dismissed: Set<string>
+  onDismiss: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
+  onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
+}) {
+  const [open, setOpen] = useState(false)
+  if (agents.length === 0) return null
+  return (
+    <section className="subagent-agent-group subagent-project-group" aria-labelledby="project-subagent-models-heading" data-testid="project-subagent-group">
+      <button
+        type="button"
+        className="subagent-agent-group-toggle"
+        aria-expanded={open}
+        aria-controls="project-subagent-models"
+        aria-label={open ? '收起项目专用 Subagents' : '展开项目专用 Subagents'}
+        data-testid="project-subagent-toggle"
+        onClick={() => setOpen(value => !value)}
+      >
+        <span className="subagent-agent-group-heading">
+          <h3 id="project-subagent-models-heading">项目专用 Subagents</h3>
+          <span>{agents.length} 个 · 当前项目自带，不是 PipiUI 内置</span>
+        </span>
+        <b aria-hidden="true">{open ? '⌃' : '⌄'}</b>
+      </button>
+      {open && <div id="project-subagent-models">
+        {agents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={models} saving={saving === agent.name} dismissed={dismissed} onDismiss={onDismiss} onSave={onSave} hideProjectSource />)}
+      </div>}
+    </section>
+  )
+}
+
+function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hierarchy, hideProjectSource }: {
   agent: AgentDefinition
   chain: SubagentModelSetting[]
   models: Model[]
@@ -186,11 +233,14 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
   onDismiss: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
   hierarchy?: 'leader' | 'worker'
+  hideProjectSource?: boolean
 }) {
-  const sourceLabel = agentSourceLabel(agent)
+  const sourceLabel = agentSourceLabel(agent, { skipProject: hideProjectSource })
   const availabilityLabel = agentAvailabilityLabel(agent)
   const unavailable = isAgentUnavailable(agent)
-  const ownDiagnostics = (agent.diagnostics ?? []).filter(entry => !dismissed.has(diagnosticKey(entry)))
+  const ownDiagnostics = (agent.diagnostics ?? []).filter(entry => (
+    isBlockingCatalogDiagnostic(entry) && !dismissed.has(diagnosticKey(entry))
+  ))
   // Persisted selections are provider-qualified. A historical bare id must not
   // masquerade as the first matching provider in the current catalog.
   const findModel = (ref: string) => models.find(candidate => modelRef(candidate) === ref)

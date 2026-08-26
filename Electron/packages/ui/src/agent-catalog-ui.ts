@@ -19,13 +19,21 @@ export function agentAvailabilityLabel(agent: AgentDefinition): string | undefin
   return undefined
 }
 
-export function agentSourceLabel(agent: AgentDefinition): string | undefined {
+export function agentSourceLabel(
+  agent: AgentDefinition,
+  options?: { skipProject?: boolean },
+): string | undefined {
   if (agent.extensionId) return `扩展 ${agent.extensionId}`
   const origin = agent.source ?? agent.origin
   if (origin === 'bundled') return '内置'
-  if (origin === 'project') return '项目'
+  if (origin === 'project') return options?.skipProject ? undefined : '项目专用'
   if (origin === 'user') return '用户'
   return undefined
+}
+
+export function isProjectScopedAgent(agent: AgentDefinition): boolean {
+  if (isComputerRole(agent)) return false
+  return (agent.source ?? agent.origin) === 'project'
 }
 
 export function diagnosticKey(entry: AgentCatalogDiagnostic): string {
@@ -48,6 +56,11 @@ export function formatDiagnostic(entry: AgentCatalogDiagnostic): string {
   return `${entry.code}: ${redactDiagnosticMessage(entry.message)}`
 }
 
+/** Catalog banners are for load/contribution failures, not ignored optional fields. */
+export function isBlockingCatalogDiagnostic(entry: AgentCatalogDiagnostic): boolean {
+  return entry.severity === 'error'
+}
+
 export function collectCatalogDiagnostics(agents: AgentDefinition[]): AgentCatalogDiagnostic[] {
   const seen = new Set<string>()
   const out: AgentCatalogDiagnostic[] = []
@@ -64,15 +77,18 @@ export function collectCatalogDiagnostics(agents: AgentDefinition[]): AgentCatal
 
 export function partitionCatalog(agents: AgentDefinition[]): {
   general: AgentDefinition[]
+  project: AgentDefinition[]
   computer: AgentDefinition[]
 } {
   const general: AgentDefinition[] = []
+  const project: AgentDefinition[] = []
   const computer: AgentDefinition[] = []
   for (const agent of agents) {
     if (isComputerRole(agent)) computer.push(agent)
+    else if (isProjectScopedAgent(agent)) project.push(agent)
     else general.push(agent)
   }
-  return { general, computer }
+  return { general, project, computer }
 }
 
 export function contributedAgentsFor(agents: AgentDefinition[], extensionId: string): AgentDefinition[] {
