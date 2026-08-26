@@ -526,6 +526,9 @@ test("prompt is a bounded compact S1 packet with no transcript fields", async ()
 	assert.match(system, /JSON object/);
 	assert.match(system, /transcript/);
 	assert.match(system, /no shell, filesystem, web/i);
+	assert.match(system, /Successful worker completions default to forward/);
+	assert.match(system, /Use wait on a successful completion only when/);
+	assert.match(system, /Never wait on a failed, interrupted, or verify-failed completion/);
 	assert.match(system, /resume and retry are not self-service production actions/i);
 	assert.match(system, /failure cause, safe management actions attempted.*next action the Boss should take/i);
 	assert.doesNotMatch(system, /prefer .*resume|bounded retry/i);

@@ -169,12 +169,16 @@ const silentBoss: BossRequestSink = {
 	send() {},
 };
 
+export function isSuccessfulSupervisorCompletion(request: SupervisorDeliveryRequest): boolean {
+	if (request.kind !== "completion") return false;
+	if (request.job.status === "failed" || request.job.status === "interrupted") return false;
+	if (request.job.verify === "failed") return false;
+	return request.job.status === "completed";
+}
+
 export function isTerminalWaveRequest(request: SupervisorDeliveryRequest, activeWorkerCount: number): boolean {
 	if (activeWorkerCount > 0) return false;
-	if (request.kind === "wave") return true;
-	if (request.kind !== "completion") return false;
-	if (request.wave) return request.wave.running === 0;
-	return true;
+	return request.kind === "wave";
 }
 
 export function coalesceTerminalWaveRequest(
@@ -236,6 +240,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 	}>();
 	const inFlight = new Map<string, Promise<SupervisorDeliveryResult>>();
 	const results: SupervisorDeliveryResult[] = [];
+	const heldByWave = new Map<string, SupervisorTerminalReport[]>();
 	let bossWakeCount = 0;
 	let bossRequestCount = 0;
 	let fallbackCount = 0;
@@ -353,7 +358,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			await persistAction(event, { kind: "escalate", reason: SUPERVISOR_FAILURE_FALLBACK_REASON });
 		} else if (outcome === "boss_direct" || outcome === "escalated") {
 			await persistAction(event, {
-				kind: "escalate",
+				kind: decisionAction === "forward" ? "forward" : "escalate",
 				reason: envelope?.reason ?? event.summary,
 			});
 		}
@@ -396,6 +401,58 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		return Buffer.from(clean, "utf8").subarray(0, Math.max(0, maxBytes - 3)).toString("utf8").replace(/\uFFFD$/u, "") + "...";
 	}
 
+	function waveIdOf(request: SupervisorDeliveryRequest): string | undefined {
+		return request.waveId ?? request.wave?.waveId;
+	}
+
+	function rememberHeldCompletion(request: SupervisorDeliveryRequest): void {
+		const waveId = waveIdOf(request);
+		if (!waveId || request.kind !== "completion") return;
+		const statusRef = request.evidenceRefs?.find((ref) => ref.startsWith("artifact://status/"))
+			?? `artifact://status/${request.agentId}/${request.runId}`;
+		const report: SupervisorTerminalReport = {
+			agentId: request.agentId,
+			runId: request.runId,
+			status: request.job.status,
+			findings: request.publicText || request.summary,
+			statusRef,
+		};
+		const existing = heldByWave.get(waveId) ?? [];
+		if (existing.some((item) => item.agentId === report.agentId && item.runId === report.runId)) return;
+		heldByWave.set(waveId, [...existing, report]);
+	}
+
+	function heldKeysFromStore(waveId: string): Set<string> {
+		if (!deps.store) return new Set();
+		const waveRef = `artifact://wave/${waveId}`;
+		try {
+			return new Set(
+				Object.values(deps.store.load().receipts)
+					.filter((claim) =>
+						claim.kind === "completion"
+						&& claim.action === "wait"
+						&& (claim.evidenceRefs ?? []).includes(waveRef))
+					.map((claim) => `${claim.agentId}\0${claim.runId}`),
+			);
+		} catch {
+			return new Set();
+		}
+	}
+
+	function takeHeldReports(request: SupervisorDeliveryRequest): SupervisorTerminalReport[] {
+		const waveId = waveIdOf(request);
+		if (!waveId) return [];
+		const held = heldByWave.get(waveId) ?? [];
+		heldByWave.delete(waveId);
+		const heldKeys = new Set([
+			...held.map((item) => `${item.agentId}\0${item.runId}`),
+			...heldKeysFromStore(waveId),
+		]);
+		if (heldKeys.size === 0) return [];
+		const fromHost = (request.terminalReports ?? []).filter((item) => heldKeys.has(`${item.agentId}\0${item.runId}`));
+		return fromHost.length > 0 ? fromHost : held.filter((item) => heldKeys.has(`${item.agentId}\0${item.runId}`));
+	}
+
 	function terminalReport(request: SupervisorDeliveryRequest): string {
 		const summary = truncateUtf8(request.summary, 600);
 		const reports = request.terminalReports ?? [];
@@ -430,6 +487,65 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		const serialized = serializeBossEscalation(envelope);
 		if (serialized.ok === false) return undefined;
 		return formatSupervisorEscalationText(envelope);
+	}
+
+	async function flushHeldCompletions(source: SupervisorDeliveryRequest): Promise<void> {
+		const reports = takeHeldReports(source);
+		const waveId = waveIdOf(source);
+		if (reports.length === 0 || !waveId) return;
+		const identity = waveReceiptIdentity(waveId);
+		const coords = identity.ok
+			? identity.value
+			: { kind: "wave" as const, agentId: SUPERVISOR_WAVE_AGENT_ID, runId: waveId, sequence: 1, waveId };
+		const waveRequest: SupervisorDeliveryRequest = {
+			...source,
+			kind: "wave",
+			agentId: coords.agentId,
+			runId: coords.runId,
+			sequence: coords.sequence,
+			waveId,
+			summary: `held completions flushed count=${reports.length}`,
+			publicText: `[subagent-wave] ${waveId} held=${reports.length}`,
+			job: { agentId: coords.agentId, runId: coords.runId, status: "completed" },
+			terminalReports: reports,
+			activeJobs: [],
+			evidenceRefs: [...reports.map((item) => item.statusRef), `artifact://wave/${waveId}`],
+			wave: source.wave ?? {
+				waveId,
+				running: 0,
+				completed: reports.filter((item) => item.status === "completed").length,
+				failed: reports.filter((item) => item.status !== "completed").length,
+				agentIds: reports.map((item) => item.agentId),
+			},
+		};
+		const built = createSupervisorEvent({
+			kind: "wave",
+			agentId: coords.agentId,
+			runId: coords.runId,
+			sequence: coords.sequence,
+			occurredAt: Date.now(),
+			job: waveRequest.job,
+			summary: terminalReport(waveRequest),
+			waveId,
+			wave: waveRequest.wave,
+			evidenceRefs: waveRequest.evidenceRefs,
+		});
+		if (built.ok === false) return;
+		const envelope = boundedEnvelope(built.value, terminalReport(waveRequest), waveRequest.evidenceRefs);
+		if (!envelope) return;
+		const text = boundedText(envelope);
+		if (!text) return;
+		await acceptBossWake(
+			waveRequest,
+			built.value,
+			built.value.identity.eventId,
+			text,
+			envelope,
+			0,
+			"boss_direct",
+			undefined,
+			"wave_summary",
+		);
 	}
 
 	async function fallback(
@@ -511,6 +627,11 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		const active = Math.max(0, deps.activeWorkerCount());
 		const request = coalesceTerminalWaveRequest(raw, active);
 		const eventSummary = isTerminalWaveRequest(request, active) ? terminalReport(request) : request.summary;
+		const waveId = waveIdOf(request);
+		const evidenceRefs = [
+			...(request.evidenceRefs ?? []),
+			...(request.kind === "completion" && waveId ? [`artifact://wave/${waveId}`] : []),
+		].filter((value, index, all) => all.indexOf(value) === index);
 		const built = createSupervisorEvent({
 			kind: request.kind,
 			agentId: request.agentId,
@@ -522,7 +643,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			waveId: request.waveId,
 			task: request.task,
 			wave: request.wave,
-			evidenceRefs: request.evidenceRefs,
+			evidenceRefs,
 		});
 		if (built.ok === false) {
 			return fallback(request, undefined, "", 0, built.error);
@@ -566,6 +687,21 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		});
 
 		if (active <= 0 && packetActive <= 0 && !abnormalTerminal) {
+			if (isSuccessfulSupervisorCompletion(request)) {
+				const delivered = await acceptBossWake(
+					request,
+					event,
+					receiptId,
+					request.publicText,
+					undefined,
+					0,
+					"boss_direct",
+					undefined,
+					"forward",
+				);
+				await flushHeldCompletions(request);
+				return delivered;
+			}
 			if (isTerminalWaveRequest(request, active)) {
 				const envelope = boundedEnvelope(event, terminalReport(request), event.evidenceRefs);
 				if (!envelope) {
@@ -646,6 +782,9 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 					error instanceof Error ? error.message : String(error),
 				);
 			}
+			if (action.kind === "wait" && isSuccessfulSupervisorCompletion(request)) {
+				rememberHeldCompletion(request);
+			}
 		}
 		if (applied?.outcome === "duplicate") {
 			remember(receiptId);
@@ -661,6 +800,34 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			};
 			results.push(result);
 			return result;
+		}
+
+		if (!abnormalTerminal && request.kind === "completion" && action.kind === "wait" && !isSuccessfulSupervisorCompletion(request)) {
+			return acceptBossWake(
+				request,
+				event,
+				receiptId,
+				request.publicText,
+				undefined,
+				routed.supervisorPrompts,
+				"boss_direct",
+				undefined,
+				"forward",
+			);
+		}
+
+		if (!abnormalTerminal && isSuccessfulSupervisorCompletion(request) && action.kind !== "wait" && action.kind !== "escalate") {
+			return acceptBossWake(
+				request,
+				event,
+				receiptId,
+				request.publicText,
+				undefined,
+				routed.supervisorPrompts,
+				"boss_direct",
+				undefined,
+				action.kind === "forward" ? "forward" : action.kind,
+			);
 		}
 
 		if (abnormalTerminal || routed.outcome === "escalated" || applied?.outcome === "escalation_required" || requiresBossDelivery({

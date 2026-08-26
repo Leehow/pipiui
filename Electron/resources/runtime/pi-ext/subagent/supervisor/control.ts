@@ -417,6 +417,14 @@ export function createSupervisorControl(deps: SupervisorControlDeps): Supervisor
 			return resultOf(liveEvent, action.kind, "escalation_required", action.reason ?? "escalate");
 		}
 
+		if (action.kind === "forward") {
+			const claim = claimInProgress(state, liveEvent, action.kind, now(), evidenceFor(liveEvent));
+			persist(deps.store, state);
+			completeClaim(state, claim, "applied", now(), evidenceFor(liveEvent));
+			persist(deps.store, state);
+			return resultOf(liveEvent, action.kind, "applied", action.reason ?? "forward");
+		}
+
 		if (RUN_MUTATIONS.has(action.kind)) {
 			const identity = exactRunIdentity(liveEvent, action);
 			if (identity.ok === false) return resultOf(liveEvent, action.kind, "rejected", identity.error);

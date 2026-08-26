@@ -132,14 +132,12 @@ import {
 	queueCompletionAfterCutIn,
 } from "./completion-notification.ts";
 import {
-	SUPERVISOR_WAVE_AGENT_ID,
 	createFileSupervisorStateStore,
 	createHostSupervisorDelivery,
 	createPiSupervisorSessionFactory,
 	serializeBossEscalation,
 	supervisorResourceLoaderFlags,
 	supervisorSessionStatePath,
-	waveReceiptIdentity,
 	type HostSupervisorDelivery,
 	type SupervisorDeliveryRequest,
 	type SupervisorJobSnapshot,
@@ -5084,33 +5082,7 @@ function supervisorRequestFromStall(text: string): SupervisorDeliveryRequest | u
 
 function supervisorRequestFromCompletion(agentId: string, runId: string, text: string): SupervisorDeliveryRequest {
 	const wave = supervisorWaveFromRuntime();
-	if (wave.running === 0) {
-		const terminalReports = supervisorTerminalReports(wave);
-		const identity = waveReceiptIdentity(wave.waveId);
-		const coords = identity.ok
-			? identity.value
-			: { kind: "wave" as const, agentId: SUPERVISOR_WAVE_AGENT_ID, runId: wave.waveId, sequence: 1, waveId: wave.waveId };
-		return {
-			kind: "wave",
-			agentId: coords.agentId,
-			runId: coords.runId,
-			sequence: coords.sequence,
-			waveId: wave.waveId,
-			publicText: terminalReports.length > 0
-				? `[subagent-wave] ${wave.waveId} completed=${wave.completed} failed=${wave.failed}`
-				: text,
-			job: { agentId: coords.agentId, runId: coords.runId, status: "completed" },
-			summary: `wave closed completed=${wave.completed} failed=${wave.failed}`,
-			wave,
-			evidenceRefs: [
-				...terminalReports.map((report) => report.statusRef),
-				`artifact://wave/${wave.waveId}`,
-			],
-			terminalReports,
-			activeJobs: [],
-		};
-	}
-	return {
+	const request: SupervisorDeliveryRequest = {
 		kind: "completion",
 		agentId,
 		runId,
@@ -5120,8 +5092,13 @@ function supervisorRequestFromCompletion(agentId: string, runId: string, text: s
 		job: supervisorJobSnapshot(agentId, runId, "completed"),
 		summary: text.split("\n")[0]?.slice(0, 400) || "completion",
 		wave,
-		evidenceRefs: [`artifact://status/${agentId}/${runId}`],
+		evidenceRefs: [`artifact://status/${agentId}/${runId}`, `artifact://wave/${wave.waveId}`],
 	};
+	if (wave.running === 0) {
+		request.terminalReports = supervisorTerminalReports(wave);
+		request.activeJobs = [];
+	}
+	return request;
 }
 
 function currentSupervisorManifest(): SupervisorTaskManifest {

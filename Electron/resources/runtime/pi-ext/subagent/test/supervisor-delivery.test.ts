@@ -105,7 +105,7 @@ interface DeliveryHarness {
 
 function harness(options: {
 	decide?: (packet: unknown) => SupervisorDecision;
-	active?: number;
+	active?: number | (() => number);
 	fail?: Error;
 	lifecycle?: SupervisorLifecyclePort;
 	acceptCurrent?: boolean | (() => boolean);
@@ -154,7 +154,7 @@ function harness(options: {
 			if (typeof accept === "function") return accept();
 			return accept !== false;
 		},
-		activeWorkerCount: () => options.active ?? 1,
+		activeWorkerCount: () => typeof options.active === "function" ? options.active() : (options.active ?? 1),
 		store,
 		control: () => createSupervisorControl({
 			lifecycle: lifecycle.port,
@@ -188,17 +188,17 @@ test("normal heartbeat causes one Supervisor prompt and zero Boss provider reque
 	assert.equal(h.delivery.bossWakeCount, 0);
 });
 
-test("intermediate completion receives a durable Supervisor receipt with zero Boss wake", async () => {
+test("supervisor wait holds a successful completion instead of waking Boss", async () => {
 	const h = harness({
-		decide: () => ({ action: "wait" }),
+		decide: () => ({ action: "wait", reason: "must compare both designs" }),
 		active: 2,
 	});
 	const event = request({
 		kind: "completion",
 		job: job("completed"),
-		wave: { waveId: "wave-9", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
-		waveId: "wave-9",
-		publicText: "[subagent-done] agentId=worker-a intermediate",
+		wave: { waveId: "wave-hold", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-hold",
+		publicText: "[subagent-done] agentId=worker-a compare-design-a",
 	});
 
 	const result = await h.delivery.handle(event);
@@ -207,12 +207,263 @@ test("intermediate completion receives a durable Supervisor receipt with zero Bo
 	assert.equal(result.bossWakes, 0);
 	assert.equal(h.current.length, 0);
 	assert.equal(h.boss.requestCount, 0);
+	const claim = h.store.load().receipts[result.receiptId];
+	assert.ok(claim);
+	assert.equal(claim?.action, "wait");
+	assert.equal(claim?.kind, "completion");
+});
+
+test("successful completion defaults to forwarding even when Supervisor says status", async () => {
+	const h = harness({
+		decide: () => ({ action: "status" }),
+		active: 2,
+	});
+	const publicText = "[subagent-done] agentId=worker-a independent follow-up is ready";
+	const result = await h.delivery.handle(request({
+		kind: "completion",
+		job: job("completed"),
+		wave: { waveId: "wave-default", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-default",
+		publicText,
+	}));
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.equal(h.boss.requestCount, 0);
+});
+
+test("failed completion cannot be held by wait", async () => {
+	const h = harness({
+		decide: () => ({ action: "wait", reason: "observe longer" }),
+		active: 2,
+	});
+	const publicText = "[subagent-done] agentId=worker-a ok=false verify failed";
+	const result = await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({
+			agentId: "worker-a",
+			runId: "run-1",
+			status: "failed",
+			verify: "failed",
+		}), "failed-job"),
+		wave: { waveId: "wave-fail", running: 1, completed: 0, failed: 1, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-fail",
+		publicText,
+	}));
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(h.current.length, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+});
+
+test("Supervisor failure on a completion fail-opens to the original done text", async () => {
+	const h = harness({
+		fail: new Error("provider 429"),
+		active: 2,
+	});
+	const publicText = "[subagent-done] agentId=worker-a still usable after supervisor timeout";
+	const result = await h.delivery.handle(request({
+		kind: "completion",
+		job: job("completed"),
+		wave: { waveId: "wave-open", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-open",
+		publicText,
+	}));
+	assert.equal(result.outcome, "fallback");
+	assert.equal(result.bossWakes, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.doesNotMatch(h.current[0]?.publicText ?? "", /\[subagent-supervisor\]/);
+});
+
+test("successful intermediate completion forwards the original done text to Boss", async () => {
+	const h = harness({
+		decide: () => ({ action: "forward", reason: "boss can start follow-up" }),
+		active: 2,
+	});
+	const publicText = [
+		"[subagent-done] agentId=worker-a runId=run-1 ok=true",
+		"Title: scan workspace",
+		"Result: auth module is ready",
+	].join("\n");
+	const event = request({
+		kind: "completion",
+		job: job("completed"),
+		wave: { waveId: "wave-9", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-9",
+		publicText,
+	});
+
+	const result = await h.delivery.handle(event);
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(result.createBossObligation, true);
+	assert.equal(result.bossWakes, 1);
+	assert.equal(result.decisionAction, "forward");
+	assert.equal(result.supervisorPrompts, 1);
+	assert.equal(h.delivery.fallbackCount, 0);
+	assert.equal(h.current.length, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.doesNotMatch(h.current[0]?.publicText ?? "", /\[subagent-supervisor\]/);
+	assert.equal(h.boss.requestCount, 0);
 
 	const claim = h.store.load().receipts[result.receiptId];
 	assert.ok(claim, "Supervisor receipt must be durable");
 	assert.equal(claim?.status, "completed");
 	assert.equal(claim?.kind, "completion");
-	assert.notEqual(claim?.outcome, undefined);
+	assert.equal(claim?.action, "forward");
+});
+
+test("last successful completion delivers the original done instead of a sibling wave dump", async () => {
+	const h = harness({ active: 0 });
+	const publicText = "[subagent-done] agentId=worker-a result sentinel: frontend is ready; Wave: 0 other workers still running";
+	const event = request({
+		kind: "completion",
+		job: job("completed"),
+		wave: { waveId: "wave-9", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-9",
+		publicText,
+		evidenceRefs: ["artifact://status/worker-a/run-1", "artifact://status/worker-b/run-2"],
+		activeJobs: [job("completed")],
+		terminalReports: [
+			{ agentId: "worker-a", runId: "run-1", status: "completed", findings: "frontend is ready", statusRef: "artifact://status/worker-a/run-1" },
+			{ agentId: "worker-b", runId: "run-2", status: "completed", findings: "backend is ready", statusRef: "artifact://status/worker-b/run-2" },
+		],
+	});
+
+	const result = await h.delivery.handle(event);
+	assert.equal(isTerminalWaveRequest(event, 0), false);
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(result.supervisorPrompts, 0);
+	assert.equal(h.supervisor.promptCount, 0);
+	assert.equal(h.current.length, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.doesNotMatch(h.current[0]?.publicText ?? "", /\[subagent-supervisor\]/);
+	assert.doesNotMatch(h.current[0]?.publicText ?? "", /backend is ready/);
+	assert.equal(h.current[0]?.agentId, "worker-a");
+});
+
+test("held completions flush after a delivery restart from durable wait receipts", async () => {
+	const store = memorySupervisorStore();
+	const make = (active: number) => createSupervisorDelivery({
+		supervisor: createFakeSupervisorSession({
+			decide: () => ({ action: "wait", reason: "must compare designs" }),
+		}),
+		boss: createRecordingBossSink(),
+		deliverCurrent: (input) => {
+			current.push(input.publicText);
+			return true;
+		},
+		activeWorkerCount: () => active,
+		store,
+		control: () => createSupervisorControl({
+			lifecycle: {
+				status(id) { return { ...id, status: "running" }; },
+				resume() {},
+				retry() {},
+				abort() {},
+				resolve() {},
+				startDeclared() {},
+			},
+			store,
+			manifest: { tasks: [] },
+		}),
+	});
+	const current: string[] = [];
+	const first = make(2);
+	const hold = await first.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-a", runId: "run-1", status: "completed" }), "held-job"),
+		wave: { waveId: "wave-restart", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-restart",
+		publicText: "[subagent-done] agentId=worker-a UNIQUE-RESTART-HELD",
+		evidenceRefs: ["artifact://status/worker-a/run-1", "artifact://wave/wave-restart"],
+		activeJobs: [unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "running" }), "running-b")],
+	}));
+	assert.equal(hold.outcome, "supervisor");
+	assert.equal(current.length, 0);
+
+	const restarted = createSupervisorDelivery({
+		supervisor: createFakeSupervisorSession({ decide: () => ({ action: "forward" }) }),
+		boss: createRecordingBossSink(),
+		deliverCurrent: (input) => {
+			current.push(input.publicText);
+			return true;
+		},
+		activeWorkerCount: () => 0,
+		store,
+		control: () => createSupervisorControl({
+			lifecycle: {
+				status(id) { return { ...id, status: "running" }; },
+				resume() {},
+				retry() {},
+				abort() {},
+				resolve() {},
+				startDeclared() {},
+			},
+			store,
+			manifest: { tasks: [] },
+		}),
+	});
+	await restarted.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "completed" }), "last-job"),
+		agentId: "worker-b",
+		runId: "run-2",
+		wave: { waveId: "wave-restart", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-restart",
+		publicText: "[subagent-done] agentId=worker-b UNIQUE-RESTART-LAST",
+		activeJobs: [],
+		terminalReports: [
+			{ agentId: "worker-a", runId: "run-1", status: "completed", findings: "UNIQUE-RESTART-HELD-findings", statusRef: "artifact://status/worker-a/run-1" },
+			{ agentId: "worker-b", runId: "run-2", status: "completed", findings: "UNIQUE-RESTART-LAST-findings", statusRef: "artifact://status/worker-b/run-2" },
+		],
+	}));
+	assert.equal(current.length, 2);
+	assert.equal(current[0], "[subagent-done] agentId=worker-b UNIQUE-RESTART-LAST");
+	assert.match(current[1] ?? "", /UNIQUE-RESTART-HELD-findings/);
+	assert.doesNotMatch(current[1] ?? "", /UNIQUE-RESTART-LAST-findings/);
+});
+
+test("wave close flushes only held completions and does not resend forwarded ones", async () => {
+	let active = 2;
+	const h = harness({
+		active: () => active,
+		decide: (packet) => {
+			const agentId = (packet as { event: { identity: { agentId: string } } }).event.identity.agentId;
+			return agentId === "worker-a"
+				? { action: "wait", reason: "must compare designs" }
+				: { action: "forward", reason: "independent follow-up" };
+		},
+	});
+	const hold = await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-a", runId: "run-1", status: "completed" }), "held-job"),
+		wave: { waveId: "wave-mix", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-mix",
+		publicText: "[subagent-done] agentId=worker-a UNIQUE-HELD",
+		activeJobs: [unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "running" }), "running-b")],
+	}));
+	assert.equal(hold.outcome, "supervisor");
+	assert.equal(h.current.length, 0);
+
+	active = 0;
+	const last = await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "completed" }), "fwd-job"),
+		agentId: "worker-b",
+		runId: "run-2",
+		wave: { waveId: "wave-mix", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-mix",
+		publicText: "[subagent-done] agentId=worker-b UNIQUE-FORWARDED; Wave: 0 other workers still running",
+		activeJobs: [],
+		terminalReports: [
+			{ agentId: "worker-a", runId: "run-1", status: "completed", findings: "UNIQUE-HELD-findings", statusRef: "artifact://status/worker-a/run-1" },
+			{ agentId: "worker-b", runId: "run-2", status: "completed", findings: "UNIQUE-FORWARDED-findings", statusRef: "artifact://status/worker-b/run-2" },
+		],
+	}));
+	assert.equal(last.outcome, "boss_direct");
+	assert.equal(h.current.length, 2, "last done plus held flush");
+	assert.equal(h.current[0]?.publicText, "[subagent-done] agentId=worker-b UNIQUE-FORWARDED; Wave: 0 other workers still running");
+	assert.match(h.current[1]?.publicText ?? "", /\[subagent-supervisor\]/);
+	assert.match(h.current[1]?.publicText ?? "", /UNIQUE-HELD-findings/);
+	assert.doesNotMatch(h.current[1]?.publicText ?? "", /UNIQUE-FORWARDED-findings/);
 });
 
 test("escalation yields exactly one bounded Boss request", async () => {
@@ -334,14 +585,15 @@ test("no active workers yields zero Supervisor requests", async () => {
 	assert.equal(h.current.length, 0);
 });
 
-test("terminal wave summary still reaches Boss once", async () => {
+test("last successful completion reaches Boss once as the original done text", async () => {
 	const h = harness({ active: 0 });
+	const publicText = "[subagent-done] worker-a result sentinel: frontend and backend are ready; Wave: 0 other workers still running";
 	const event = request({
 		kind: "completion",
 		job: job("completed"),
 		wave: { waveId: "wave-9", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] },
 		waveId: "wave-9",
-		publicText: "[subagent-done] worker-a result sentinel: frontend and backend are ready; Wave: 0 other workers still running",
+		publicText,
 		evidenceRefs: ["artifact://status/worker-a/run-1", "artifact://status/worker-b/run-2"],
 		activeJobs: [job("completed")],
 	});
@@ -349,22 +601,16 @@ test("terminal wave summary still reaches Boss once", async () => {
 	const first = await h.delivery.handle(event);
 	const second = await h.delivery.handle(event);
 
-	assert.equal(isTerminalWaveRequest(event, 0), true);
+	assert.equal(isTerminalWaveRequest(event, 0), false);
 	assert.equal(first.outcome, "boss_direct");
 	assert.equal(first.supervisorPrompts, 0);
 	assert.equal(first.bossWakes, 1);
 	assert.equal(first.createBossObligation, true);
 	assert.equal(h.supervisor.promptCount, 0);
 	assert.equal(h.current.length, 1);
-	assert.match(h.current[0]?.publicText ?? "", /\[subagent-supervisor\]/);
-	assert.match(h.current[0]?.publicText ?? "", /result sentinel: frontend and backend are ready/);
-	assert.ok(utf8ByteLength(h.current[0]?.publicText ?? "") <= BOSS_ESCALATION_MAX_UTF8_BYTES + 32);
-	assert.equal(h.current[0]?.agentId, SUPERVISOR_WAVE_AGENT_ID);
-	assert.deepEqual(h.boss.envelopes[0]?.evidenceRefs, [
-		"artifact://status/worker-a/run-1",
-		"artifact://status/worker-b/run-2",
-		"artifact://wave/wave-9",
-	]);
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.doesNotMatch(h.current[0]?.publicText ?? "", /\[subagent-supervisor\]/);
+	assert.equal(h.current[0]?.agentId, "worker-a");
 	assert.equal(second.outcome, "duplicate");
 	assert.equal(h.current.length, 1);
 });
@@ -674,7 +920,7 @@ test("false Boss delivery is not acknowledged and redelivers exactly once withou
 	assert.equal(h.supervisor.promptCount, 1);
 });
 
-test("two concurrent terminal completions coalesce into one bounded wave delivery", async () => {
+test("two concurrent last completions each forward their own done text", async () => {
 	const h = harness({ active: 0 });
 	const wave = { waveId: "wave-9", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] };
 	const first = request({
@@ -682,7 +928,7 @@ test("two concurrent terminal completions coalesce into one bounded wave deliver
 		job: job("completed"),
 		wave,
 		waveId: "wave-9",
-		publicText: `[subagent-done] worker-a ${"x".repeat(40_000)}`,
+		publicText: "[subagent-done] worker-a UNIQUE-A; Wave: 0 other workers still running",
 		activeJobs: [job("completed")],
 	});
 	const secondJob = unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "completed" }), "job-b");
@@ -693,30 +939,35 @@ test("two concurrent terminal completions coalesce into one bounded wave deliver
 		runId: "run-2",
 		wave,
 		waveId: "wave-9",
-		publicText: `[subagent-done] worker-b ${"y".repeat(40_000)}`,
+		publicText: "[subagent-done] worker-b UNIQUE-B; Wave: 0 other workers still running",
 		activeJobs: [secondJob],
 	});
 
 	const [a, b] = await Promise.all([h.delivery.handle(first), h.delivery.handle(second)]);
-	assert.equal(h.current.length, 1, "concurrent terminals must share one Boss obligation");
-	assert.ok(a.outcome === "boss_direct" || b.outcome === "boss_direct");
-	assert.ok(utf8ByteLength(h.current[0]?.publicText ?? "") <= BOSS_ESCALATION_MAX_UTF8_BYTES + 32);
-	assert.doesNotMatch(h.current[0]?.publicText ?? "", /xxxx|yyyy/);
-	assert.equal(h.current[0]?.agentId, SUPERVISOR_WAVE_AGENT_ID);
+	assert.equal(h.current.length, 2, "independent last completions must not wait for each other");
+	assert.equal(a.outcome, "boss_direct");
+	assert.equal(b.outcome, "boss_direct");
+	const texts = h.current.map((item) => item.publicText).sort();
+	assert.deepEqual(texts, [
+		"[subagent-done] worker-a UNIQUE-A; Wave: 0 other workers still running",
+		"[subagent-done] worker-b UNIQUE-B; Wave: 0 other workers still running",
+	]);
 });
 
-test("oversized terminal input is delivered as an 8 KiB envelope, never a raw dump", async () => {
+test("explicit wave summaries stay inside the 8 KiB envelope and never dump raw transcripts", async () => {
 	const h = harness({ active: 0 });
 	const huge = "raw-transcript-dump ".repeat(3000);
 	assert.ok(utf8ByteLength(huge) > BOSS_ESCALATION_MAX_UTF8_BYTES);
 	const result = await h.delivery.handle(request({
-		kind: "completion",
-		job: job("completed"),
-		wave: { waveId: "wave-8k", running: 0, completed: 1, failed: 0, agentIds: ["worker-a"] },
+		kind: "wave",
+		agentId: SUPERVISOR_WAVE_AGENT_ID,
+		runId: "wave-8k",
 		waveId: "wave-8k",
+		job: unwrap(createJobSnapshot({ agentId: SUPERVISOR_WAVE_AGENT_ID, runId: "wave-8k", status: "completed" }), "wave-job"),
+		wave: { waveId: "wave-8k", running: 0, completed: 1, failed: 0, agentIds: ["worker-a"] },
 		publicText: huge,
 		summary: "wave closed",
-		activeJobs: [job("completed")],
+		activeJobs: [],
 	}));
 	assert.equal(result.outcome, "boss_direct");
 	assert.equal(h.current.length, 1);
@@ -743,11 +994,12 @@ test("taskId reaches control and a declared task starts from the immutable spec"
 		decide: () => ({ action: "start_declared", taskId: "scan" }),
 	});
 	const result = await h.delivery.handle(request({ kind: "completion", job: job("completed"), active: undefined }));
-	assert.equal(result.outcome, "supervisor");
+	assert.equal(result.outcome, "boss_direct");
 	assert.deepEqual(h.lifecycle.calls, [{
 		method: "startDeclared",
 		args: { taskId: "scan", agentId: "worker-a", role: "explore", title: "scan workspace" },
 	}]);
+	assert.equal(h.current.length, 1);
 });
 
 test("unresolved Supervisor model fails closed and never creates a default-model session", async () => {

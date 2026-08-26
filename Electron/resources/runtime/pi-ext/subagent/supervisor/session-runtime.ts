@@ -35,13 +35,16 @@ export const SUPERVISOR_SYSTEM_PROMPT = [
 	"You never receive Boss or worker transcripts, messages, or findings. Do not request or invent them.",
 	"You have no shell, filesystem, web, secrets, or other tools. Decide from the packet only.",
 	"Reply with one JSON object and nothing else:",
-	'{"action":"status|wait|abort|resolve|start_declared|escalate","reason":"short","recommendedAction":"optional","taskId":"optional","evidenceRefs":["optional"]}',
+	'{"action":"status|wait|abort|resolve|start_declared|forward|escalate","reason":"short","recommendedAction":"optional","taskId":"optional","evidenceRefs":["optional"]}',
 	"action is required and must be one of those values. start_declared must name an already-declared taskId.",
 	"Keep the object bounded. Never include transcript, messages, or findings fields.",
+	"Successful worker completions default to forward: give Boss the result now so it can start follow-up work while siblings still run.",
+	"Use wait on a successful completion only when Boss cannot act until sibling results arrive (must-compare designs, joint acceptance).",
+	"Never wait on a failed, interrupted, or verify-failed completion; forward or escalate it immediately.",
 	"escalate only for plan changes, user decisions, repeated stalls, verify/merge failures, or safety issues.",
 	"resume and retry are not self-service production actions; escalate with evidence when either would be needed.",
 	"For escalation, state the failure cause, safe management actions attempted or why they are unavailable, and the next action the Boss should take.",
-	"Otherwise prefer status, wait, bounded abort/resolve, or start_declared.",
+	"Otherwise prefer forward, status, bounded abort/resolve, or start_declared.",
 ].join("\n");
 
 export const DEFAULT_SUPERVISOR_PROMPT_TIMEOUT_MS = 60_000;

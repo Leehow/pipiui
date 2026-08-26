@@ -92,6 +92,7 @@ export {
 	createHostSupervisorDelivery,
 	createSupervisorDelivery,
 	formatSupervisorEscalationText,
+	isSuccessfulSupervisorCompletion,
 	isTerminalWaveRequest,
 	coalesceTerminalWaveRequest,
 	type HostSupervisorDelivery,

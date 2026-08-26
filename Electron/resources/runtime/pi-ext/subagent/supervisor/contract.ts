@@ -25,6 +25,7 @@ export const SUPERVISOR_ACTION_KINDS = [
 	"abort",
 	"resolve",
 	"start_declared",
+	"forward",
 	"escalate",
 ] as const;
 

@@ -8,6 +8,7 @@ import {
 	createJobSnapshot,
 	createReceiptIdentity,
 	createRecordingBossSink,
+	createSupervisorDecision,
 	createSupervisorEvent,
 	createSupervisorRouter,
 	serializeBossEscalation,
@@ -77,6 +78,18 @@ test("receipt identity is durable and stable for the same event coordinates", ()
 		waveId: "wave-9",
 		sequence: 3,
 	}), "other-run").eventId);
+});
+
+test("forward is a valid Supervisor decision and does not require a Boss escalation envelope", () => {
+	const decision = createSupervisorDecision({
+		action: "forward",
+		reason: "boss can start follow-up",
+	});
+	assert.equal(decision.ok, true);
+	if (decision.ok) {
+		assert.equal(decision.value.action, "forward");
+		assert.equal(decision.value.reason, "boss can start follow-up");
+	}
 });
 
 test("normal heartbeat is handled by Supervisor with zero Boss provider turns", async () => {
