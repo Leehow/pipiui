@@ -153,8 +153,9 @@ describe("explicit sidebar project persistence", () => {
     expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "computer-use" }),
     ]));
-    const listed = await first.handle("listAgentDefinitions", []) as Array<{ name: string }>;
-    expect(listed.map((a) => a.name)).toEqual(["explore", "general-purpose", "reviewer", "computer-use", "secretary"]);
+    const listed = await first.handle("listAgentDefinitions", []) as Array<{ name: string; description?: string }>;
+    expect(listed.map((a) => a.name)).toEqual(expect.arrayContaining(["explore", "general-purpose", "reviewer", "computer-use", "secretary"]));
+    expect(listed.every((a) => typeof a.name === "string" && typeof a.description === "string")).toBe(true);
     const fresh = backend(fixture.agent, fixture.sessions);
     expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });
     expect(await fresh.handle("getSubagentModels", [])).toEqual({

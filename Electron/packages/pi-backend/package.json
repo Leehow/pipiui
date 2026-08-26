@@ -10,9 +10,10 @@
     }
   },
   "scripts": {
-    "prebuild": "npm run build -w @pipi/account-usage-core",
+    "bundle:runtime-agents": "node scripts/bundle-runtime-agents.mjs",
+    "prebuild": "npm run build -w @pipi/account-usage-core && node scripts/bundle-runtime-agents.mjs",
     "build": "tsc -p tsconfig.json",
-    "pretest": "npm run build -w @pipi/account-usage-core",
+    "pretest": "npm run build -w @pipi/account-usage-core && node scripts/bundle-runtime-agents.mjs",
     "test": "vitest run"
   },
   "dependencies": {

@@ -253,8 +253,70 @@ export type SidebarSessionPreferences = {
   /** Absent / 2 are pre-v3 prefs whose orderedSessionIds must be discarded. Current writers persist 3. */
   sessionOrderVersion?: 2 | 3;
 };
-/** Built-in subagent role metadata used by the settings UI. */
-export type AgentDefinition = { name: string; description: string };
+/** Effective catalog origin. Bundled roles are App-shipped; extension contributions keep their runtime origin. */
+export type AgentCatalogOrigin = "user" | "project" | "bundled";
+export type AgentCatalogSource = "user" | "project" | "bundled";
+export type AgentCatalogMode = "read-only" | "worker";
+/** Canonical privileged bundled roles identified by metadata, not a UI name list. */
+export type AgentCanonicalRole = "computer" | "secretary" | "operator";
+export type AgentCatalogAvailability = "available" | "degraded" | "unavailable";
+/** Catalog/merge diagnostic. Never carries prompt bodies. */
+export type AgentCatalogDiagnostic = {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  extensionId?: string;
+  agentName?: string;
+  filePath?: string;
+};
+/** Patch operations an extension applied; kinds only, never prompt text. */
+export type AgentPatchOperation = "appendPrompt" | "replacePrompt" | "addTools" | "removeTools";
+/** `requested` is a provisional custom addTools pending Pi's unique winner; omit/`accepted` is actually applied. */
+export type AgentPatchProvenanceStatus = "accepted" | "requested";
+/** Read-only provenance of one extension patch on a catalog agent. Never includes prompt bodies or filesystem paths. */
+export type AgentPatchProvenance = {
+  extensionId: string;
+  origin?: "builtin" | "app" | "project";
+  operations: AgentPatchOperation[];
+  addTools?: string[];
+  removeTools?: string[];
+  /** Absent on legacy hosts (treat as accepted). Static catalog uses `requested` for unverified custom addTools. */
+  status?: AgentPatchProvenanceStatus;
+};
+/** Permission summary for the settings UI. Tools/capabilities only — never prompt text. */
+export type AgentPermissionSummary = {
+  filesystem: "none" | "read-only" | "workspace-write";
+  shell: boolean;
+  web: boolean;
+  desktop: "none" | "requestable";
+  delegation: boolean;
+  mcpTools: string[];
+};
+/**
+ * Subagent catalog row. `{name, description}` remains the compatibility core;
+ * extra fields are optional so older hosts and mock catalogs keep working.
+ * Prompt bodies are never part of this contract.
+ */
+export type AgentDefinition = {
+  name: string;
+  description: string;
+  origin?: AgentCatalogOrigin;
+  source?: AgentCatalogSource;
+  extensionId?: string;
+  mode?: AgentCatalogMode;
+  worktree?: "none" | "isolated";
+  capabilities?: AgentPermissionSummary;
+  permissionSummary?: string;
+  available?: boolean;
+  availability?: AgentCatalogAvailability;
+  diagnostics?: AgentCatalogDiagnostic[];
+  /** Catalog-wide issues (missing patch targets, snapshot failures) repeated so JSON array transports cannot drop them. */
+  catalogDiagnostics?: AgentCatalogDiagnostic[];
+  /** Successful extension patches on this agent. Absent on legacy hosts and unpatched rows. */
+  patches?: AgentPatchProvenance[];
+  canonical?: boolean;
+  canonicalRole?: AgentCanonicalRole;
+};
 export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "interrupted";
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
@@ -1028,7 +1090,8 @@ export interface PipiHostAPI {
     retryable: boolean;
     platform: string;
   }>;
-  listAgentDefinitions?(): Promise<AgentDefinition[]>;
+  /** Effective agent catalog for the active project. Optional `projectId` selects project/extension overlay; omit for bundled + app enablement. */
+  listAgentDefinitions?(projectId?: string): Promise<AgentDefinition[]>;
   /**
    * Provider credentials and login — backed by pi's ModelRuntime
    * (getProviders / login / logout / AuthStorage) over IPC and WSS.
@@ -1254,7 +1317,7 @@ function apiFrom(
     unmountSecretVault: (sessionId, secret) => invoke("unmountSecretVault", sessionId, secret),
     deleteSecretVault: secret => invoke("deleteSecretVault", secret),
     diagnoseSecretVault: () => invoke("diagnoseSecretVault"),
-    listAgentDefinitions: () => invoke("listAgentDefinitions"),
+    listAgentDefinitions: projectId => projectId === undefined ? invoke("listAgentDefinitions") : invoke("listAgentDefinitions", projectId),
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
     subscribeSessionStats: listener => subscribe("session_stats", event => event.channel === "session_stats", event => listener((event as Extract<HostEvent, { channel: "session_stats" }>).event)),

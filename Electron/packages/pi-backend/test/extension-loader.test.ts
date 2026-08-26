@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync } from "node:fs";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
+import { cp, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -421,5 +421,446 @@ describe("bundled grok-build-oauth package (M5)", () => {
     // Disabled overlay keeps the package out of the mounted set (media stays the owner).
     const disabled = loader.spawnPackages({ "grok-build-oauth": false }).find((pkg) => pkg.id === "grok-build-oauth");
     expect(disabled?.enabled).toBe(false);
+  });
+});
+
+async function writeContribPackage(
+  dest: string,
+  spec: {
+    id: string;
+    name?: string;
+    capabilities?: string[];
+    extension?: string;
+    skills?: string[];
+    agents?: Array<{ rel: string; body?: string }>;
+    patches?: Array<{
+      target: string;
+      appendPrompt?: { rel: string; body?: string };
+      replacePrompt?: { rel: string; body?: string };
+      addTools?: string[];
+      removeTools?: string[];
+    }>;
+  },
+): Promise<string> {
+  await mkdir(dest, { recursive: true });
+  const agent: Record<string, unknown> = {};
+  if (spec.extension) {
+    agent.extension = spec.extension;
+    const entry = join(dest, spec.extension);
+    await mkdir(dirname(entry), { recursive: true });
+    await writeFile(entry, "export default function () {}\n");
+  }
+  if (spec.skills?.length) agent.skills = spec.skills;
+  if (spec.agents?.length) {
+    agent.agents = spec.agents.map((item) => item.rel);
+    for (const item of spec.agents) {
+      const path = join(dest, item.rel);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, item.body ?? "---\nschema: 1\n---\n# agent\n");
+    }
+  }
+  if (spec.patches?.length) {
+    agent.agentPatches = [];
+    for (const patch of spec.patches) {
+      const declared: Record<string, unknown> = { target: patch.target };
+      if (patch.appendPrompt) {
+        declared.appendPrompt = patch.appendPrompt.rel;
+        const path = join(dest, patch.appendPrompt.rel);
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, patch.appendPrompt.body ?? "append\n");
+      }
+      if (patch.replacePrompt) {
+        declared.replacePrompt = patch.replacePrompt.rel;
+        const path = join(dest, patch.replacePrompt.rel);
+        await mkdir(dirname(path), { recursive: true });
+        await writeFile(path, patch.replacePrompt.body ?? "replace\n");
+      }
+      if (patch.addTools) declared.addTools = patch.addTools;
+      if (patch.removeTools) declared.removeTools = patch.removeTools;
+      (agent.agentPatches as Record<string, unknown>[]).push(declared);
+    }
+  }
+  await writeManifest(dest, {
+    id: spec.id,
+    name: spec.name ?? spec.id,
+    version: "1.0.0",
+    capabilities: spec.capabilities ?? [],
+    ...(Object.keys(agent).length ? { agent } : {}),
+  });
+  return dest;
+}
+
+describe("extension loader agent contributions snapshot", () => {
+  it("keeps legacy agent.extension/skills when the manifest has no agents or patches", async () => {
+    await tempRoot("pipi-ext-contrib-legacy-");
+    const appRoot = join(root, "agent", "extensions");
+    await writeContribPackage(join(appRoot, "quota"), {
+      id: "quota",
+      extension: "agent/dist/index.js",
+      skills: ["skills/hello"],
+    });
+    await mkdir(join(appRoot, "quota", "skills", "hello"), { recursive: true });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const spawned = loader.spawnPackages({ quota: true }).find((pkg) => pkg.id === "quota");
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toMatch(/quota\/agent\/dist\/index\.js$/);
+    expect(spawned?.skillRoots?.some((path) => path.endsWith("skills/hello"))).toBe(true);
+    expect(spawned?.agentContribution).toBeUndefined();
+  });
+
+  it("resolves confined agent and patch paths from the validated manifest, not raw JSON", async () => {
+    await tempRoot("pipi-ext-contrib-resolve-");
+    const appRoot = join(root, "agent", "extensions");
+    const dest = await writeContribPackage(join(appRoot, "reviewer-kit"), {
+      id: "reviewer-kit",
+      extension: "agent/dist/index.js",
+      agents: [{ rel: "agents/reviewer-lite/AGENT.md" }],
+      patches: [{
+        target: "explore",
+        appendPrompt: { rel: "prompts/explore-extra.md", body: "SECRET_PROMPT_BODY_SHOULD_NOT_LEAK\n" },
+        addTools: ["code_search"],
+        removeTools: ["bash"],
+      }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const spawned = loader.spawnPackages({ "reviewer-kit": true }).find((pkg) => pkg.id === "reviewer-kit");
+    const rootReal = realpathSync(dest);
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toBeTruthy();
+    expect(spawned?.agentContribution).toEqual({
+      id: "reviewer-kit",
+      origin: "app",
+      root: rootReal,
+      agents: [realpathSync(join(dest, "agents/reviewer-lite/AGENT.md"))],
+      patches: [{
+        target: "explore",
+        appendPrompt: realpathSync(join(dest, "prompts/explore-extra.md")),
+        addTools: ["code_search"],
+        removeTools: ["bash"],
+      }],
+    });
+    expect(JSON.stringify(spawned?.agentContribution)).not.toContain("SECRET_PROMPT_BODY_SHOULD_NOT_LEAK");
+  });
+
+  it("drops contributions whose realpath escapes the extension root", async () => {
+    await tempRoot("pipi-ext-contrib-escape-");
+    const appRoot = join(root, "agent", "extensions");
+    const dest = await writeContribPackage(join(appRoot, "escaped"), {
+      id: "escaped",
+      extension: "agent/dist/index.js",
+      skills: ["skills/hello"],
+      agents: [{ rel: "agents/ok/AGENT.md" }],
+    });
+    await mkdir(join(dest, "skills", "hello"), { recursive: true });
+    const outside = join(root, "outside", "AGENT.md");
+    await mkdir(dirname(outside), { recursive: true });
+    await writeFile(outside, "---\nschema: 1\n---\n# outside SECRET_PROMPT_BODY_SHOULD_NOT_LEAK\n");
+    await rm(join(dest, "agents/ok/AGENT.md"));
+    await symlink(outside, join(dest, "agents/ok/AGENT.md"));
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    const rec = loader.scan().find((item) => item.id === "escaped");
+    expect(rec?.state).not.toBe("error");
+    const spawned = loader.spawnPackages({ escaped: true }).find((pkg) => pkg.id === "escaped");
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toBeTruthy();
+    expect(spawned?.skillRoots?.some((path) => path.endsWith("skills/hello"))).toBe(true);
+    expect(spawned?.agentContribution).toBeUndefined();
+    expect(spawned?.contributionDiagnostics?.some((entry) => entry.code === "contribution-path-escape")).toBe(true);
+    expect(JSON.stringify(spawned?.contributionDiagnostics)).not.toContain("SECRET_PROMPT_BODY_SHOULD_NOT_LEAK");
+    expect(JSON.stringify(spawned?.contributionDiagnostics)).not.toContain(outside);
+  });
+
+  it("keeps valid contributions when one patch path is missing and reports the failure", async () => {
+    await tempRoot("pipi-ext-contrib-partial-");
+    const appRoot = join(root, "agent", "extensions");
+    const dest = await writeContribPackage(join(appRoot, "partial"), {
+      id: "partial",
+      agents: [
+        { rel: "agents/reviewer-lite/AGENT.md" },
+        { rel: "agents/gone/AGENT.md" },
+      ],
+      patches: [{
+        target: "explore",
+        addTools: ["grep"],
+      }, {
+        target: "reviewer",
+        appendPrompt: { rel: "prompts/missing.md" },
+      }],
+    });
+    await rm(join(dest, "agents/gone/AGENT.md"));
+    await rm(join(dest, "prompts/missing.md"));
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    const rec = loader.scan().find((item) => item.id === "partial");
+    expect(rec?.state).not.toBe("error");
+    const spawned = loader.spawnPackages({ partial: true }).find((pkg) => pkg.id === "partial");
+    expect(spawned?.agentContribution?.agents).toEqual([
+      expect.stringMatching(/agents\/reviewer-lite\/AGENT\.md$/),
+    ]);
+    expect(spawned?.agentContribution?.patches).toEqual([{ target: "explore", addTools: ["grep"] }]);
+    expect(spawned?.contributionDiagnostics?.some((entry) => entry.code === "contribution-missing-file")).toBe(true);
+    expect(JSON.stringify(spawned?.contributionDiagnostics)).not.toContain(dest);
+  });
+
+  it("drops oversized prompt files with a diagnostic and keeps the extension usable", async () => {
+    await tempRoot("pipi-ext-contrib-oversize-");
+    const appRoot = join(root, "agent", "extensions");
+    const dest = await writeContribPackage(join(appRoot, "bulky"), {
+      id: "bulky",
+      extension: "agent/dist/index.js",
+      patches: [{
+        target: "explore",
+        appendPrompt: { rel: "prompts/huge.md", body: `${"x".repeat(64 * 1024 + 1)}\n` },
+      }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    const rec = loader.scan().find((item) => item.id === "bulky");
+    expect(rec?.state).not.toBe("error");
+    const spawned = loader.spawnPackages({ bulky: true }).find((pkg) => pkg.id === "bulky");
+    expect(spawned?.enabled).toBe(true);
+    expect(spawned?.extensionPath).toBeTruthy();
+    expect(spawned?.agentContribution).toBeUndefined();
+    expect(spawned?.contributionDiagnostics?.some((entry) => entry.code === "contribution-prompt-invalid")).toBe(true);
+    expect(JSON.stringify(spawned?.contributionDiagnostics)).not.toContain("x".repeat(32));
+    expect(JSON.stringify(spawned?.contributionDiagnostics)).not.toContain(dest);
+  });
+
+  it("does not contribute when overlay-disabled, even if paths resolve", async () => {
+    await tempRoot("pipi-ext-contrib-disable-");
+    const appRoot = join(root, "agent", "extensions");
+    await writeContribPackage(join(appRoot, "quota"), {
+      id: "quota",
+      agents: [{ rel: "agents/reviewer-lite/AGENT.md" }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const disabled = loader.spawnPackages().find((pkg) => pkg.id === "quota");
+    expect(disabled?.enabled).toBe(false);
+    expect(disabled?.agentContribution).toBeUndefined();
+    const enabled = loader.spawnPackages({ quota: true }).find((pkg) => pkg.id === "quota");
+    expect(enabled?.enabled).toBe(true);
+    expect(enabled?.agentContribution?.agents).toHaveLength(1);
+  });
+
+  it("uses the project instance overlay, not the shadowed app package", async () => {
+    await tempRoot("pipi-ext-contrib-overlay-");
+    const appRoot = join(root, "agent", "extensions");
+    const project = join(root, "repo");
+    await writeContribPackage(join(appRoot, "quota"), {
+      id: "quota",
+      agents: [{ rel: "agents/app-only/AGENT.md", body: "app\n" }],
+    });
+    const projectDir = await writeContribPackage(join(projectPiAgentDir(project), "extensions", "quota"), {
+      id: "quota",
+      agents: [{ rel: "agents/project-only/AGENT.md", body: "project\n" }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan(project);
+    const spawned = loader.spawnPackages({ quota: true }).find((pkg) => pkg.id === "quota");
+    expect(spawned?.agentContribution?.origin).toBe("project");
+    expect(spawned?.agentContribution?.root).toBe(realpathSync(projectDir));
+    expect(spawned?.agentContribution?.agents).toEqual([
+      realpathSync(join(projectDir, "agents/project-only/AGENT.md")),
+    ]);
+  });
+
+  it("preserves per-extension manifest order; registry list stays id-sorted until spawn serializes", async () => {
+    await tempRoot("pipi-ext-contrib-sort-");
+    const builtinRoot = join(root, "runtime", "extensions");
+    const appRoot = join(root, "agent", "extensions");
+    const project = join(root, "repo");
+    await writeContribPackage(join(builtinRoot, "zeta"), {
+      id: "zeta",
+      agents: [
+        { rel: "agents/first/AGENT.md" },
+        { rel: "agents/second/AGENT.md" },
+      ],
+    });
+    await writeContribPackage(join(appRoot, "alpha"), {
+      id: "alpha",
+      agents: [{ rel: "agents/alpha/AGENT.md" }],
+    });
+    await writeContribPackage(join(appRoot, "mu"), {
+      id: "mu",
+      agents: [{ rel: "agents/mu/AGENT.md" }],
+    });
+    await writeContribPackage(join(projectPiAgentDir(project), "extensions", "beta"), {
+      id: "beta",
+      agents: [{ rel: "agents/beta/AGENT.md" }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({ registry, builtinRoot, appRoot });
+    loader.scan(project);
+    const spawned = loader.spawnPackages({ alpha: true, mu: true, beta: true });
+    const contribs = spawned.filter((pkg) => pkg.agentContribution).map((pkg) => pkg.agentContribution!);
+    // Loader attaches in registry id order; spawn-assembly re-sorts by origin then id.
+    expect(contribs.map((item) => [item.origin, item.id])).toEqual([
+      ["app", "alpha"],
+      ["project", "beta"],
+      ["app", "mu"],
+      ["builtin", "zeta"],
+    ]);
+    const zetaAgents = contribs.find((item) => item.id === "zeta")!.agents;
+    expect(zetaAgents[0]).toMatch(/agents\/first\/AGENT\.md$/);
+    expect(zetaAgents[1]).toMatch(/agents\/second\/AGENT\.md$/);
+  });
+
+  it("gives invalid and L2-refused extensions no contributions", async () => {
+    await tempRoot("pipi-ext-contrib-refused-");
+    const appRoot = join(root, "agent", "extensions");
+    await writeManifest(join(appRoot, "broken"), {
+      name: "Broken",
+      version: "1.0.0",
+      capabilities: [],
+    });
+    await writeContribPackage(join(appRoot, "evil"), {
+      id: "evil",
+      capabilities: ["host.main"],
+      agents: [{ rel: "agents/evil/AGENT.md" }],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const brokenRec = registry.list().find((item) => item.state === "error");
+    expect(brokenRec?.state).toBe("error");
+    const brokenSpawn = loader.spawnPackages({ [brokenRec!.id]: true, evil: true }).find((pkg) => pkg.id === brokenRec!.id);
+    expect(brokenSpawn?.enabled).toBe(false);
+    expect(brokenSpawn?.agentContribution).toBeUndefined();
+    const evil = loader.spawnPackages({ evil: true }).find((pkg) => pkg.id === "evil");
+    expect(evil?.enabled).toBe(true);
+    expect(evil?.agentContribution).toBeUndefined();
+  });
+
+  it("refuses a symlink agent.extension, keeps skills, and does not error the package", async () => {
+    await tempRoot("pipi-ext-agent-symlink-");
+    const appRoot = join(root, "agent", "extensions");
+    const hostEntry = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "../../../resources/runtime/pi-ext/subagent/index.ts",
+    );
+    await writeContribPackage(join(appRoot, "ext-a"), {
+      id: "ext-a",
+      extension: "agent/dist/index.js",
+      skills: ["skills/a"],
+    });
+    await mkdir(join(appRoot, "ext-a", "skills", "a"), { recursive: true });
+    await writeContribPackage(join(appRoot, "ext-b"), {
+      id: "ext-b",
+      extension: "agent/dist/index.js",
+      skills: ["skills/b"],
+    });
+    await mkdir(join(appRoot, "ext-b", "skills", "b"), { recursive: true });
+    await writeContribPackage(join(appRoot, "ext-host"), {
+      id: "ext-host",
+      extension: "agent/dist/index.js",
+      skills: ["skills/host"],
+    });
+    await mkdir(join(appRoot, "ext-host", "skills", "host"), { recursive: true });
+    await rm(join(appRoot, "ext-b", "agent/dist/index.js"));
+    await symlink(join(appRoot, "ext-a", "agent/dist/index.js"), join(appRoot, "ext-b", "agent/dist/index.js"));
+    await rm(join(appRoot, "ext-host", "agent/dist/index.js"));
+    await symlink(hostEntry, join(appRoot, "ext-host", "agent/dist/index.js"));
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const spawned = loader.spawnPackages({ "ext-a": true, "ext-b": true, "ext-host": true });
+    const a = spawned.find((pkg) => pkg.id === "ext-a");
+    const b = spawned.find((pkg) => pkg.id === "ext-b");
+    const host = spawned.find((pkg) => pkg.id === "ext-host");
+    expect(a?.enabled).toBe(true);
+    expect(a?.extensionPath).toBeTruthy();
+    expect(b?.enabled).toBe(true);
+    expect(b?.extensionPath).toBeUndefined();
+    expect(b?.skillRoots?.some((path) => path.endsWith("skills/b"))).toBe(true);
+    expect(b?.contributionDiagnostics?.some((entry) => entry.code === "agent-extension-symlink")).toBe(true);
+    expect(JSON.stringify(b?.contributionDiagnostics)).not.toContain(join(appRoot, "ext-a"));
+    expect(host?.enabled).toBe(true);
+    expect(host?.extensionPath).toBeUndefined();
+    expect(host?.skillRoots?.some((path) => path.endsWith("skills/host"))).toBe(true);
+    expect(host?.contributionDiagnostics?.some((entry) => entry.code === "agent-extension-symlink")).toBe(true);
+    expect(JSON.stringify(host?.contributionDiagnostics)).not.toContain("pi-ext/subagent");
+  });
+
+  it("invalidates every colliding canonical agent.extension identity and keeps skills", async () => {
+    await tempRoot("pipi-ext-agent-alias-");
+    const appRoot = join(root, "agent", "extensions");
+    await writeContribPackage(join(appRoot, "ext-a"), {
+      id: "ext-a",
+      extension: "agent/dist/index.js",
+      skills: ["skills/a"],
+    });
+    await mkdir(join(appRoot, "ext-a", "skills", "a"), { recursive: true });
+    await writeContribPackage(join(appRoot, "ext-b"), {
+      id: "ext-b",
+      extension: "agent/dist/index.js",
+      skills: ["skills/b"],
+    });
+    await mkdir(join(appRoot, "ext-b", "skills", "b"), { recursive: true });
+    await rm(join(appRoot, "ext-b", "agent/dist/index.js"));
+    await link(join(appRoot, "ext-a", "agent/dist/index.js"), join(appRoot, "ext-b", "agent/dist/index.js"));
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot,
+    });
+    loader.scan();
+    const spawned = loader.spawnPackages({ "ext-a": true, "ext-b": true });
+    const a = spawned.find((pkg) => pkg.id === "ext-a");
+    const b = spawned.find((pkg) => pkg.id === "ext-b");
+    expect(a?.enabled).toBe(true);
+    expect(b?.enabled).toBe(true);
+    expect(a?.extensionPath).toBeUndefined();
+    expect(b?.extensionPath).toBeUndefined();
+    expect(a?.skillRoots?.some((path) => path.endsWith("skills/a"))).toBe(true);
+    expect(b?.skillRoots?.some((path) => path.endsWith("skills/b"))).toBe(true);
+    expect(a?.contributionDiagnostics?.some((entry) => entry.code === "agent-extension-alias-conflict")).toBe(true);
+    expect(b?.contributionDiagnostics?.some((entry) => entry.code === "agent-extension-alias-conflict")).toBe(true);
+    expect(JSON.stringify(a?.contributionDiagnostics)).not.toMatch(/\/[^`]+\/agent\/dist/);
+    expect(JSON.stringify(b?.contributionDiagnostics)).not.toContain(appRoot);
   });
 });

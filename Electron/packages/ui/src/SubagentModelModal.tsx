@@ -1,16 +1,31 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { thinkingLevelsForModel } from '@pipi/host-api'
 import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
+import {
+  agentAvailabilityLabel,
+  agentSourceLabel,
+  collectCatalogDiagnostics,
+  diagnosticKey,
+  formatDiagnostic,
+  formatPatchOperations,
+  isAgentUnavailable,
+  needsVisualModelHint,
+  partitionCatalog,
+} from './agent-catalog-ui'
+import { DismissibleError } from './DismissibleError'
 import { modelRef } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
 import type { ModelVisibilityController } from './useModelVisibility'
 import './subagent-models.css'
 
-const COMPUTER_USE_AGENT_NAMES = new Set(['computer-use', 'computer-use-leader', 'operator', 'computer-verifier', 'computer-terminal'])
-const VISUAL_COMPUTER_USE_AGENT_NAMES = new Set(['computer-use'])
-
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
-export function SubagentModelModal({ host, current, visibility, onClose }: { host: PipiHostAPI; current: Model | null; visibility: ModelVisibilityController; onClose: () => void }) {
+export function SubagentModelModal({ host, current, visibility, onClose, projectId }: {
+  host: PipiHostAPI
+  current: Model | null
+  visibility: ModelVisibilityController
+  onClose: () => void
+  projectId?: string
+}) {
   const hostMethodsPresent = typeof host.getSubagentModels === 'function' && typeof host.setSubagentModel === 'function' && typeof host.listAgentDefinitions === 'function'
   const memoryMethodsPresent = typeof host.getMemoryReviewModel === 'function' && typeof host.setMemoryReviewModel === 'function'
   const [available, setAvailable] = useState(hostMethodsPresent)
@@ -21,21 +36,25 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   const [loading, setLoading] = useState(hostMethodsPresent)
   const [saving, setSaving] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [dismissedDiagnostics, setDismissedDiagnostics] = useState<Set<string>>(() => new Set())
   // Use the same candidate stream as the composer quick picker, then remove
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
-  const computerUseAgent = agents.find(agent => agent.name === 'computer-use')
-  const generalAgents = agents.filter(agent => !COMPUTER_USE_AGENT_NAMES.has(agent.name))
+  const { general: generalAgents, computer: computerAgents } = useMemo(() => partitionCatalog(agents), [agents])
+  const catalogDiagnostics = useMemo(() => collectCatalogDiagnostics(agents), [agents])
+  const visibleCatalogDiagnostics = catalogDiagnostics.filter(entry => !dismissedDiagnostics.has(diagnosticKey(entry)))
   const supervisorModel = settings.supervisor?.[0]?.model ?? ''
 
   useEffect(() => {
     if (!host.getSubagentModels || !host.listAgentDefinitions) return
     let active = true
-    void Promise.all([host.getSubagentModels(), host.listAgentDefinitions()]).then(([nextSettings, nextAgents]) => {
+    const catalogProjectId = projectId?.trim() || undefined
+    void Promise.all([host.getSubagentModels(), host.listAgentDefinitions(catalogProjectId)]).then(([nextSettings, nextAgents]) => {
       if (!active) return
       setSettings(nextSettings)
       setAgents(nextAgents)
+      setDismissedDiagnostics(new Set())
     }).catch((err) => {
       // `apiFrom` cannot know whether an older IPC backend implements these
       // optional methods until it receives its unknown-method response.
@@ -44,7 +63,7 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
       setError(`无法加载 Subagent 模型设置：${err instanceof Error ? err.message : String(err)}`)
     }).finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [host])
+  }, [host, projectId])
 
   useEffect(() => {
     if (!host.getMemoryReviewModel || !host.setMemoryReviewModel) return
@@ -131,14 +150,23 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
                 {memoryReviewModel && !candidateModels.some(model => modelRef(model) === memoryReviewModel) && <div className="subagent-model-warning" role="alert">历史设置「{memoryReviewModel}」当前不可见，请重新选择已启用的 provider/model。</div>}
               </article>}
             </section>
+            {visibleCatalogDiagnostics.length > 0 && <div className="subagent-catalog-diagnostics" data-testid="subagent-catalog-diagnostics">
+              {visibleCatalogDiagnostics.map(entry => (
+                <DismissibleError
+                  key={diagnosticKey(entry)}
+                  message={formatDiagnostic(entry)}
+                  onDismiss={() => setDismissedDiagnostics(current => new Set(current).add(diagnosticKey(entry)))}
+                />
+              ))}
+            </div>}
             <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
               <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3></div>
-              {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} onSave={save} />)}
+              {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
             </section>
-            {computerUseAgent && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
+            {computerAgents.length > 0 && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
               <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agent</h3><span>单个 Agent 完成规划、操作、恢复与验证</span></div>
               <div className="subagent-computer-use-tree">
-                <AgentRow agent={computerUseAgent} chain={settings[computerUseAgent.name] ?? []} models={candidateModels} saving={saving === computerUseAgent.name} onSave={save} />
+                {computerAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
               </div>
             </section>}
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
@@ -149,14 +177,20 @@ export function SubagentModelModal({ host, current, visibility, onClose }: { hos
   )
 }
 
-function AgentRow({ agent, chain, models, saving, onSave, hierarchy }: {
+function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hierarchy }: {
   agent: AgentDefinition
   chain: SubagentModelSetting[]
   models: Model[]
   saving: boolean
+  dismissed: Set<string>
+  onDismiss: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
   hierarchy?: 'leader' | 'worker'
 }) {
+  const sourceLabel = agentSourceLabel(agent)
+  const availabilityLabel = agentAvailabilityLabel(agent)
+  const unavailable = isAgentUnavailable(agent)
+  const ownDiagnostics = (agent.diagnostics ?? []).filter(entry => !dismissed.has(diagnosticKey(entry)))
   // Persisted selections are provider-qualified. A historical bare id must not
   // masquerade as the first matching provider in the current catalog.
   const findModel = (ref: string) => models.find(candidate => modelRef(candidate) === ref)
@@ -195,10 +229,21 @@ function AgentRow({ agent, chain, models, saving, onSave, hierarchy }: {
   const remove = (index: number) => void onSave(agent.name, chain.filter((_, itemIndex) => itemIndex !== index))
 
   return (
-    <article className={`subagent-agent-row${hierarchy ? ` subagent-agent-${hierarchy}` : ''}`} data-testid={`subagent-agent-${agent.name}`}>
-      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{hierarchy && <span className="subagent-agent-hierarchy-badge">{hierarchy === 'leader' ? '主管' : '子 Agent'}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
+    <article className={`subagent-agent-row${hierarchy ? ` subagent-agent-${hierarchy}` : ''}${unavailable ? ' subagent-agent-unavailable' : ''}`} data-testid={`subagent-agent-${agent.name}`}>
+      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{sourceLabel && <span data-testid={`subagent-source-${agent.name}`}>{sourceLabel}</span>}{availabilityLabel && <span className="subagent-agent-status" data-testid={`subagent-status-${agent.name}`}>{availabilityLabel}</span>}{hierarchy && <span className="subagent-agent-hierarchy-badge">{hierarchy === 'leader' ? '主管' : '子 Agent'}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
       <p>{agent.description}</p>
-      {VISUAL_COMPUTER_USE_AGENT_NAMES.has(agent.name) && <p className="subagent-visual-model-hint">需要查看截图，建议选择支持图像输入的模型（如 Grok）。这只是建议，不会自动选择或覆盖你的设置。</p>}
+      {agent.permissionSummary && <p className="subagent-agent-permissions" data-testid={`subagent-permissions-${agent.name}`}>{agent.permissionSummary}</p>}
+      {agent.patches && agent.patches.length > 0 && <p className="subagent-agent-patches" data-testid={`subagent-patches-${agent.name}`}>{agent.patches.map(patch => `${patch.extensionId} · ${formatPatchOperations(patch)}`).join('; ')}</p>}
+      {ownDiagnostics.length > 0 && <div className="subagent-agent-diagnostics" data-testid={`subagent-diagnostics-${agent.name}`}>
+        {ownDiagnostics.map(entry => (
+          <DismissibleError
+            key={diagnosticKey(entry)}
+            message={formatDiagnostic(entry)}
+            onDismiss={() => onDismiss(current => new Set(current).add(diagnosticKey(entry)))}
+          />
+        ))}
+      </div>}
+      {needsVisualModelHint(agent) && <p className="subagent-visual-model-hint">需要查看截图，建议选择支持图像输入的模型（如 Grok）。这只是建议，不会自动选择或覆盖你的设置。</p>}
       {rows.map((entry, index) => {
         const selected = findModel(entry.model)
         const thinkingLevels = selected ? thinkingLevelsForModel(selected) : []

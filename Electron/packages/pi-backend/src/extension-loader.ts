@@ -1,9 +1,11 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
+  EXTENSION_L2_CAPABILITIES,
   EXTENSION_MANIFEST_FILENAME,
   originPrecedence,
   parseExtensionManifestJson,
+  type ExtensionAgentPatch,
   type ExtensionUiSummary,
   type ManifestValidation,
   type ValidatedExtensionManifest,
@@ -22,7 +24,12 @@ import {
   type ExtensionSettingsManifest,
 } from "./extension-registry.js";
 import { projectPiAgentDir } from "./project-pi-home.js";
-import type { SpawnRegisteredExtension } from "./spawn-assembly.js";
+import type {
+  SpawnAgentContribution,
+  SpawnAgentContributionPatch,
+  SpawnContributionDiagnostic,
+  SpawnRegisteredExtension,
+} from "./spawn-assembly.js";
 
 export const EXTENSIONS_DIRNAME = "extensions";
 
@@ -75,6 +82,197 @@ function confinedRealpath(path: string, jail: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** Matches runtime prompt-file cap so oversized prompts never enter the snapshot. */
+const EXTENSION_CONTRIB_PROMPT_MAX_BYTES = 64 * 1024;
+
+function contribDiagnostic(
+  extensionId: string,
+  code: string,
+  message: string,
+  agentName?: string,
+): SpawnContributionDiagnostic {
+  return {
+    severity: "error",
+    code,
+    message,
+    extensionId,
+    ...(agentName ? { agentName } : {}),
+  };
+}
+
+function resolveConfinedContributionFile(
+  jail: string,
+  rel: string,
+  kind: "agent" | "prompt",
+): { path?: string; code?: string; message?: string } {
+  const joined = confinedJoin(jail, rel);
+  if (!joined) {
+    return { code: "contribution-path-escape", message: `Contribution ${kind} path escaped the extension root: ${rel}` };
+  }
+  if (!existsSync(joined)) {
+    return { code: "contribution-missing-file", message: `Contribution ${kind} path is missing: ${rel}` };
+  }
+  const real = confinedRealpath(joined, jail);
+  if (!real) {
+    return { code: "contribution-path-escape", message: `Contribution ${kind} path escaped the extension root: ${rel}` };
+  }
+  try {
+    const stat = lstatSync(real);
+    if (!stat.isFile()) {
+      return { code: "contribution-missing-file", message: `Contribution ${kind} path is not a file: ${rel}` };
+    }
+    if (kind === "prompt" && stat.size > EXTENSION_CONTRIB_PROMPT_MAX_BYTES) {
+      return {
+        code: "contribution-prompt-invalid",
+        message: `Contribution prompt file exceeds ${EXTENSION_CONTRIB_PROMPT_MAX_BYTES} bytes: ${rel}`,
+      };
+    }
+  } catch {
+    return { code: "contribution-missing-file", message: `Contribution ${kind} path is missing: ${rel}` };
+  }
+  return { path: real };
+}
+
+function isL2RefusedOrigin(origin: ExtensionOrigin, capabilities: readonly string[]): boolean {
+  if (origin === "builtin") return false;
+  return capabilities.some((cap) => (EXTENSION_L2_CAPABILITIES as readonly string[]).includes(cap));
+}
+
+type RememberedAgentContribution = {
+  agents: string[];
+  patches: SpawnAgentContributionPatch[];
+};
+
+type RememberedAgent = {
+  extensionPath?: string;
+  extensionIdentity?: string;
+  skillRoots: string[];
+  root: string;
+  contribution?: RememberedAgentContribution;
+  contributionDiagnostics?: SpawnContributionDiagnostic[];
+  mountDiagnostics?: SpawnContributionDiagnostic[];
+};
+
+function agentExtensionIdentity(stat: { dev: number; ino: number }): string {
+  return `${stat.dev}:${stat.ino}`;
+}
+
+/**
+ * `agent.extension` must be a regular file inside the canonical extension root.
+ * The entry itself and every root→entry path component must not be a symlink.
+ */
+function resolveUnaliasedAgentExtension(
+  root: string,
+  rel: string,
+): { path?: string; identity?: string; missing?: boolean; code?: string; message?: string } {
+  const joined = confinedJoin(root, rel);
+  if (!joined) {
+    return { missing: true, code: "agent-extension-escape", message: `agent.extension does not exist: ${rel}` };
+  }
+  const rootResolved = resolve(root);
+  const relFromRoot = relative(rootResolved, joined);
+  if (!relFromRoot || relFromRoot.startsWith("..") || isAbsolute(relFromRoot)) {
+    return { missing: true, code: "agent-extension-escape", message: `agent.extension does not exist: ${rel}` };
+  }
+  let current = rootResolved;
+  const parts = relFromRoot.split(/[/\\]/).filter(Boolean);
+  for (let index = 0; index < parts.length; index++) {
+    current = join(current, parts[index]!);
+    let stat;
+    try {
+      stat = lstatSync(current);
+    } catch {
+      return { missing: true, code: "agent-extension-missing", message: `agent.extension does not exist: ${rel}` };
+    }
+    if (stat.isSymbolicLink()) {
+      return { code: "agent-extension-symlink", message: "agent.extension is not a regular unaliased file" };
+    }
+    const last = index === parts.length - 1;
+    if (last) {
+      if (!stat.isFile()) {
+        return { code: "agent-extension-symlink", message: "agent.extension is not a regular unaliased file" };
+      }
+      return { path: current, identity: agentExtensionIdentity(stat) };
+    }
+    if (!stat.isDirectory()) {
+      return { missing: true, code: "agent-extension-missing", message: `agent.extension does not exist: ${rel}` };
+    }
+  }
+  return { missing: true, code: "agent-extension-missing", message: `agent.extension does not exist: ${rel}` };
+}
+
+/** Resolve validated relative contribution paths. Invalid items are dropped with diagnostics; valid items are kept. */
+function resolveRememberedContribution(
+  root: string,
+  manifest: ValidatedExtensionManifest,
+  extensionId: string,
+): { contribution?: RememberedAgentContribution; diagnostics: SpawnContributionDiagnostic[] } {
+  const declaredAgents = manifest.agents ?? [];
+  const declaredPatches = manifest.agentPatches ?? [];
+  if (!declaredAgents.length && !declaredPatches.length) return { diagnostics: [] };
+
+  const diagnostics: SpawnContributionDiagnostic[] = [];
+  const agents: string[] = [];
+  for (const rel of declaredAgents) {
+    const resolved = resolveConfinedContributionFile(root, rel, "agent");
+    if (resolved.path) {
+      agents.push(resolved.path);
+      continue;
+    }
+    diagnostics.push(contribDiagnostic(
+      extensionId,
+      resolved.code ?? "contribution-missing-file",
+      `Extension \`${extensionId}\` ${resolved.message ?? `contribution agent path is invalid: ${rel}`}`,
+    ));
+  }
+
+  const patches: SpawnAgentContributionPatch[] = [];
+  for (const patch of declaredPatches) {
+    const resolved = resolveRememberedPatch(root, patch, extensionId);
+    if (resolved.patch) patches.push(resolved.patch);
+    if (resolved.diagnostic) diagnostics.push(resolved.diagnostic);
+  }
+  const contribution = agents.length || patches.length ? { agents, patches } : undefined;
+  return { contribution, diagnostics };
+}
+
+function resolveRememberedPatch(
+  root: string,
+  patch: ExtensionAgentPatch,
+  extensionId: string,
+): { patch?: SpawnAgentContributionPatch; diagnostic?: SpawnContributionDiagnostic } {
+  const resolved: SpawnAgentContributionPatch = { target: patch.target };
+  if (patch.appendPrompt) {
+    const file = resolveConfinedContributionFile(root, patch.appendPrompt, "prompt");
+    if (!file.path) {
+      return {
+        diagnostic: contribDiagnostic(
+          extensionId,
+          file.code ?? "contribution-missing-file",
+          `Extension \`${extensionId}\` ${file.message ?? `contribution appendPrompt is invalid: ${patch.appendPrompt}`}`,
+        ),
+      };
+    }
+    resolved.appendPrompt = file.path;
+  }
+  if (patch.replacePrompt) {
+    const file = resolveConfinedContributionFile(root, patch.replacePrompt, "prompt");
+    if (!file.path) {
+      return {
+        diagnostic: contribDiagnostic(
+          extensionId,
+          file.code ?? "contribution-missing-file",
+          `Extension \`${extensionId}\` ${file.message ?? `contribution replacePrompt is invalid: ${patch.replacePrompt}`}`,
+        ),
+      };
+    }
+    resolved.replacePrompt = file.path;
+  }
+  if (patch.addTools?.length) resolved.addTools = [...patch.addTools];
+  if (patch.removeTools?.length) resolved.removeTools = [...patch.removeTools];
+  return { patch: resolved };
 }
 
 function readDirSafe(path: string): string[] {
@@ -228,6 +426,34 @@ function packageId(pkg: DiscoveredExtensionPackage): string {
   return (validation.ok ? validation.manifest.id : validation.fallbackId) ?? pkg.directoryName;
 }
 
+function invalidateConflictingAgentExtensions(
+  packages: SpawnRegisteredExtension[],
+  remembered: ReadonlyMap<string, RememberedAgent>,
+): void {
+  const groups = new Map<string, SpawnRegisteredExtension[]>();
+  for (const pkg of packages) {
+    if (!pkg.enabled || !pkg.extensionPath) continue;
+    const identity = remembered.get(pkg.id)?.extensionIdentity ?? `path:${resolve(pkg.extensionPath)}`;
+    const list = groups.get(identity) ?? [];
+    list.push(pkg);
+    groups.set(identity, list);
+  }
+  for (const items of groups.values()) {
+    if (items.length < 2) continue;
+    const ids = [...new Set(items.map((item) => item.id))].sort();
+    const label = ids.map((id) => "`" + id + "`").join(", ");
+    for (const item of items) {
+      item.extensionPath = undefined;
+      const diagnostic = contribDiagnostic(
+        item.id,
+        "agent-extension-alias-conflict",
+        `Extension \`${item.id}\` agent.extension identity collides with ${label}; agent-half ownership is disabled.`,
+      );
+      item.contributionDiagnostics = [...(item.contributionDiagnostics ?? []), diagnostic];
+    }
+  }
+}
+
 export type ExtensionLoaderOptions = {
   registry: ExtensionRegistry;
   builtinRoot: string;
@@ -242,7 +468,7 @@ export class ExtensionLoader {
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly auth = new Map<string, ExtensionAuthContribution>();
   private readonly directories = new Map<string, string>();
-  private readonly agent = new Map<string, { extensionPath?: string; skillRoots: string[] }>();
+  private readonly agent = new Map<string, RememberedAgent>();
   private readonly reservedBuiltinIds: Set<string>;
   private loadedProjectRoot?: string;
 
@@ -294,16 +520,41 @@ export class ExtensionLoader {
       return undefined;
     }
     const declared = manifest.agentExtension;
-    const extensionPath = declared ? confinedJoin(directory, declared) : undefined;
     const skillRoots = (manifest.agentSkills ?? [])
       .map((rel) => confinedJoin(directory, rel))
       .filter((path): path is string => Boolean(path));
-    if (declared && (!extensionPath || !existsSync(extensionPath))) {
-      this.agent.set(id, { skillRoots });
-      return `agent.extension does not exist: ${declared}`;
+    const root = confinedRealpath(directory, directory) ?? directory;
+    const remembered: RememberedAgent = { skillRoots, root };
+    if (declared) {
+      const resolvedEntry = resolveUnaliasedAgentExtension(root, declared);
+      if (resolvedEntry.missing) {
+        this.agent.set(id, remembered);
+        return resolvedEntry.message ?? `agent.extension does not exist: ${declared}`;
+      }
+      if (resolvedEntry.path && resolvedEntry.identity) {
+        remembered.extensionPath = resolvedEntry.path;
+        remembered.extensionIdentity = resolvedEntry.identity;
+      } else {
+        remembered.mountDiagnostics = [contribDiagnostic(
+          id,
+          resolvedEntry.code ?? "agent-extension-symlink",
+          `Extension \`${id}\` agent.extension is not a regular unaliased file.`,
+        )];
+      }
     }
-    this.agent.set(id, extensionPath ? { extensionPath, skillRoots } : { skillRoots });
+    const resolved = resolveRememberedContribution(root, manifest, id);
+    if (resolved.contribution) remembered.contribution = resolved.contribution;
+    if (resolved.diagnostics.length) remembered.contributionDiagnostics = resolved.diagnostics;
+    this.agent.set(id, remembered);
     return undefined;
+  }
+
+  private contributionRefused(record: ExtensionRecord): boolean {
+    try {
+      return isL2RefusedOrigin(record.origin, this.registry.capabilities(record.id));
+    } catch {
+      return true;
+    }
   }
 
   /** Overlay-aware agent-half mounts for a new session spawn (D3 / D9: not hot-mounted). */
@@ -314,8 +565,28 @@ export class ExtensionLoader {
       const item: SpawnRegisteredExtension = { id: record.id, enabled: record.state === "enabled" };
       if (info?.extensionPath) item.extensionPath = info.extensionPath;
       if (info?.skillRoots.length) item.skillRoots = info.skillRoots;
+      if (item.enabled && info && !this.contributionRefused(record)) {
+        if (info.contribution) {
+          const agentContribution: SpawnAgentContribution = {
+            id: record.id,
+            origin: record.origin,
+            root: info.root,
+            agents: info.contribution.agents,
+            patches: info.contribution.patches,
+          };
+          item.agentContribution = agentContribution;
+        }
+        const mountAndContribution = [
+          ...(info.mountDiagnostics ?? []),
+          ...(info.contributionDiagnostics ?? []),
+        ];
+        if (mountAndContribution.length) item.contributionDiagnostics = mountAndContribution;
+      } else if (info?.mountDiagnostics?.length) {
+        item.contributionDiagnostics = info.mountDiagnostics;
+      }
       out.push(item);
     }
+    invalidateConflictingAgentExtensions(out, this.agent);
     return out;
   }
 

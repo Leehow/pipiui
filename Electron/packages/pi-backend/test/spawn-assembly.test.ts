@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, statSync, symlinkSync, chmodSync, linkSync, lstatSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { assemblePiSpawn, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, resolveSpawnPaths, sanitizeEnvironment, userExtensionMounts, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
+import { AGENT_CONTRIBUTIONS_ENV, AGENT_CONTRIBUTIONS_ENV_MAX_BYTES, AGENT_CONTRIBUTIONS_FILE_ENV, AGENT_CONTRIBUTIONS_HOST_MAX_BYTES, AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV, assemblePiSpawn, buildVersionedAgentContributionSnapshot, contributionSidecarName, contributionSidecarTempPattern, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, removeContributionSnapshotSidecar, resolveContributionSnapshotFile, resolveSpawnPaths, sanitizeEnvironment, serializeAgentContributions, userExtensionMounts, workerAgentContributionsSnapshot, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
@@ -689,18 +689,43 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
     expect(workerRegisteredExtensionArgs(env, { computerWorker: true })).toEqual([]);
   });
 
+  it("keeps skills when agent-half is absent and drops colliding mount paths", () => {
+    const skillOnly = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [{ id: "quota", enabled: true, skillRoots: [skillRoot] }],
+    });
+    expect(skillOnly.env.PIPIUI_SKILL_ROOTS?.split(delimiter)).toContain(skillRoot);
+    expect(skillOnly.env[REGISTERED_EXTENSION_PATHS_ENV]).toBeUndefined();
+    expect(skillOnly.env[MOUNTED_EXTENSIONS_ENV]).toBeUndefined();
+
+    const colliding = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        { id: "ext-a", enabled: true, extensionPath: quotaAgent },
+        { id: "ext-b", enabled: true, extensionPath: quotaAgent },
+      ],
+    });
+    expect(colliding.args).not.toContain(quotaAgent);
+    expect(colliding.env[REGISTERED_EXTENSION_PATHS_ENV]).toBeUndefined();
+  });
+
   it("does not leak inherited extension settings env into a spawn without mounts", () => {
     expect(sanitizeEnvironment({
       PIPIUI_EXT_SETTINGS_QUOTA: "{\"stale\":true}",
       PIPIUI_SKILL_ROOTS: "/stale",
       [REGISTERED_EXTENSION_PATHS_ENV]: "/stale/agent.js",
+      [AGENT_CONTRIBUTIONS_ENV]: "[{\"id\":\"stale\"}]",
       PATH: "/usr/bin",
     })).toEqual({ PATH: "/usr/bin" });
     const { env } = assemblePiSpawn({ cwd: "/tmp/project", paths: { updateCenter, runtimeInfo } });
     expect(env.PIPIUI_EXT_SETTINGS_QUOTA).toBeUndefined();
     expect(env.PIPIUI_SKILL_ROOTS).toBeUndefined();
     expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBeUndefined();
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
     expect(workerRegisteredExtensionArgs(env)).toEqual([]);
+    expect(workerAgentContributionsSnapshot(env)).toBeUndefined();
   });
 
   it("snapshots enabled mounts so a later enable cannot rewrite a live spawn", () => {
@@ -750,6 +775,503 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
     const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
     expect(source).toContain("process.env.PIPIUI_PHILOSOPHY_EXT");
     expect(source).toContain("args.push(\"-e\", PIPIUI_PHILOSOPHY_EXT)");
+  });
+});
+
+describe("PIPIUI_EXT_AGENT_CONTRIBUTIONS spawn snapshot", () => {
+  const updateCenter = "/runtime/update.ts";
+  const runtimeInfo = "/runtime/info.ts";
+  const promptMarker = "SECRET_PROMPT_BODY_MUST_NOT_ENTER_ENV";
+  const contribZeta = {
+    id: "zeta",
+    origin: "builtin" as const,
+    root: "/runtime/extensions/zeta",
+    agents: ["/runtime/extensions/zeta/agents/first/AGENT.md", "/runtime/extensions/zeta/agents/second/AGENT.md"],
+    patches: [],
+  };
+  const contribAlpha = {
+    id: "alpha",
+    origin: "app" as const,
+    root: "/agent/extensions/alpha",
+    agents: ["/agent/extensions/alpha/agents/alpha/AGENT.md"],
+    patches: [{
+      target: "explore",
+      appendPrompt: "/agent/extensions/alpha/prompts/explore-extra.md",
+      addTools: ["code_search"],
+      removeTools: ["bash"],
+    }],
+  };
+  const contribBeta = {
+    id: "beta",
+    origin: "project" as const,
+    root: "/repo/.pi/agent/extensions/beta",
+    agents: ["/repo/.pi/agent/extensions/beta/agents/beta/AGENT.md"],
+    patches: [],
+  };
+
+  it("writes bounded metadata in origin-then-id order and never prompt bodies", () => {
+    const registeredExtensions = [
+      { id: "beta", enabled: true, agentContribution: contribBeta },
+      { id: "zeta", enabled: true, extensionPath: "/runtime/extensions/zeta/agent.js", agentContribution: contribZeta },
+      { id: "alpha", enabled: true, agentContribution: { ...contribAlpha, prompt: promptMarker } as typeof contribAlpha },
+      { id: "off", enabled: false, agentContribution: contribAlpha },
+    ];
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions,
+    });
+    const expected = serializeAgentContributions(registeredExtensions);
+    expect(expected).toBe(JSON.stringify({
+      version: 1,
+      extensions: [
+        {
+          id: "zeta",
+          origin: "builtin",
+          root: contribZeta.root,
+          agents: contribZeta.agents,
+          patches: [],
+        },
+        {
+          id: "alpha",
+          origin: "app",
+          root: contribAlpha.root,
+          agents: contribAlpha.agents,
+          patches: [{
+            target: "explore",
+            appendPrompt: contribAlpha.patches[0].appendPrompt,
+            addTools: ["code_search"],
+            removeTools: ["bash"],
+          }],
+        },
+        {
+          id: "beta",
+          origin: "project",
+          root: contribBeta.root,
+          agents: contribBeta.agents,
+          patches: [],
+        },
+      ],
+    }));
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBe(expected);
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).not.toContain(promptMarker);
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).not.toContain("SECRET");
+  });
+
+  it("gives main session and workers the exact same snapshot string", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        { id: "alpha", enabled: true, agentContribution: contribAlpha },
+        { id: "beta", enabled: true, agentContribution: contribBeta },
+      ],
+    });
+    expect(workerAgentContributionsSnapshot(env)).toBe(env[AGENT_CONTRIBUTIONS_ENV]);
+    expect(workerAgentContributionsSnapshot({ ...env })).toBe(env[AGENT_CONTRIBUTIONS_ENV]);
+    const bridged = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 9,
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        { id: "alpha", enabled: true, agentContribution: contribAlpha },
+        { id: "beta", enabled: true, agentContribution: contribBeta },
+      ],
+    });
+    expect(bridged.env[AGENT_CONTRIBUTIONS_ENV]).toBe(env[AGENT_CONTRIBUTIONS_ENV]);
+    expect(workerAgentContributionsSnapshot(bridged.env)).toBe(env[AGENT_CONTRIBUTIONS_ENV]);
+  });
+
+  it("clears stale inherited contributions when the spawn has none", () => {
+    const stale = { [AGENT_CONTRIBUTIONS_ENV]: JSON.stringify([contribAlpha]) };
+    expect(sanitizeEnvironment(stale)[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        { id: "alpha", enabled: false, agentContribution: contribAlpha },
+        { id: "legacy", enabled: true, extensionPath: "/pkg/legacy/agent.js" },
+      ],
+    });
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+    expect(workerAgentContributionsSnapshot(env)).toBeUndefined();
+    const merged = mergedSpawnEnvironment(
+      { [AGENT_CONTRIBUTIONS_ENV]: JSON.stringify({ version: 1, extensions: [contribAlpha] }), [AGENT_CONTRIBUTIONS_FILE_ENV]: "/tmp/stale.json", PATH: "/usr/bin" },
+      { [AGENT_CONTRIBUTIONS_ENV]: "stale-dotenv", [AGENT_CONTRIBUTIONS_FILE_ENV]: "/tmp/stale-dotenv.json" },
+      env,
+    );
+    expect(merged[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    expect(merged[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+  });
+
+  it("keeps old manifests without contributions compatible", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: [
+        { id: "quota", enabled: true, extensionPath: "/pkg/quota/agent.js", skillRoots: ["/pkg/quota/skills"] },
+      ],
+    });
+    expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBe("/pkg/quota/agent.js");
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    expect(serializeAgentContributions([
+      { id: "quota", enabled: true, extensionPath: "/pkg/quota/agent.js" },
+    ])).toBeUndefined();
+  });
+
+  function bulkyContribution(id: string, toolWidth: number, patchCount: number, toolsPerPatch: number) {
+    const token = "n".repeat(toolWidth);
+    return {
+      id,
+      origin: "project" as const,
+      root: `/repo/.pi/agent/extensions/${id}`,
+      agents: [`/repo/.pi/agent/extensions/${id}/agents/${id}/AGENT.md`],
+      patches: Array.from({ length: patchCount }, (_, patchIndex) => ({
+        target: `explore-${patchIndex}`,
+        addTools: Array.from({ length: toolsPerPatch }, (_, toolIndex) => `${token}_${patchIndex}_${toolIndex}`),
+      })),
+    };
+  }
+
+  it("disables contributions over the host byte cap and keeps extension/skills mounts", () => {
+    const huge = bulkyContribution("huge", 220, 32, 32);
+    const packages = [
+      { id: "huge", enabled: true, extensionPath: "/pkg/huge/agent.js", skillRoots: ["/pkg/huge/skills"], agentContribution: huge },
+    ];
+    const built = buildVersionedAgentContributionSnapshot(packages);
+    expect(built.byteLength).toBeGreaterThan(AGENT_CONTRIBUTIONS_HOST_MAX_BYTES);
+    expect(built.json).toBeUndefined();
+    expect(built.extensions).toEqual([]);
+    expect(built.diagnostics.some((entry) => entry.code === "contribution-snapshot-oversize")).toBe(true);
+    expect(serializeAgentContributions(packages)).toBeUndefined();
+    const { env, args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: packages,
+    });
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+    expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBe("/pkg/huge/agent.js");
+    expect(env.PIPIUI_SKILL_ROOTS).toBe("/pkg/huge/skills");
+    expect(args).toContain("/pkg/huge/agent.js");
+  });
+
+  it("writes a session-owned snapshot file when the versioned JSON exceeds the env budget", async () => {
+    const mid = bulkyContribution("mid", 80, 16, 32);
+    const packages = [
+      { id: "mid", enabled: true, extensionPath: "/pkg/mid/agent.js", agentContribution: mid },
+    ];
+    const built = buildVersionedAgentContributionSnapshot(packages);
+    expect(built.json).toBeDefined();
+    expect(built.byteLength).toBeGreaterThan(AGENT_CONTRIBUTIONS_ENV_MAX_BYTES);
+    expect(built.byteLength).toBeLessThanOrEqual(AGENT_CONTRIBUTIONS_HOST_MAX_BYTES);
+    const sessionRoot = await mkdtemp(join(tmpdir(), "pipi-contrib-snap-"));
+    try {
+      const sessionsRoot = join(sessionRoot, "sessions");
+      const sessionPath = join(sessionsRoot, "chat-1.jsonl");
+      await mkdir(sessionsRoot, { recursive: true });
+      const { env } = assemblePiSpawn({
+        cwd: sessionRoot,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: packages,
+      });
+      const expectedFile = resolveContributionSnapshotFile({ sessionPath, sessionsRoot });
+      expect(expectedFile).toBe(join(realpathSync(sessionsRoot), "chat-1.ext-agent-contributions.json"));
+      expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+      expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBe(expectedFile);
+      expect(existsSync(expectedFile!)).toBe(true);
+      expect(await readFile(expectedFile!, "utf8")).toBe(built.json);
+      expect(workerAgentContributionsSnapshot(env)).toBe(built.json);
+      const worker = assemblePiSpawn({
+        cwd: sessionRoot,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: packages,
+      });
+      expect(worker.env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBe(env[AGENT_CONTRIBUTIONS_FILE_ENV]);
+      expect(workerAgentContributionsSnapshot(worker.env)).toBe(built.json);
+    } finally {
+      await rm(sessionRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("refuses a snapshot file outside agentDir/sessionsRoot jail", () => {
+    const mid = bulkyContribution("jail", 80, 16, 32);
+    const packages = [
+      { id: "jail", enabled: true, extensionPath: "/pkg/jail/agent.js", agentContribution: mid },
+    ];
+    expect(resolveContributionSnapshotFile({
+      sessionPath: "/etc/passwd.jsonl",
+      sessionsRoot: "/tmp/pipi-sessions",
+    })).toBeUndefined();
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      sessionPath: "/etc/passwd.jsonl",
+      sessionsRoot: "/tmp/pipi-sessions",
+      paths: { updateCenter, runtimeInfo },
+      registeredExtensions: packages,
+    });
+    expect(env[AGENT_CONTRIBUTIONS_ENV]).toBeUndefined();
+    expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+    expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBe("/pkg/jail/agent.js");
+  });
+});
+
+describe("agent contribution sidecar hardening (slice C)", () => {
+  const updateCenter = "/runtime/update.ts";
+  const runtimeInfo = "/runtime/info.ts";
+
+  function heavyPackages(id = "heavy") {
+    const token = "n".repeat(80);
+    return [{
+      id,
+      enabled: true,
+      extensionPath: `/pkg/${id}/agent.js`,
+      agentContribution: {
+        id,
+        origin: "project" as const,
+        root: `/repo/.pi/agent/extensions/${id}`,
+        agents: [`/repo/.pi/agent/extensions/${id}/agents/${id}/AGENT.md`],
+        patches: Array.from({ length: 16 }, (_, patchIndex) => ({
+          target: `explore-${patchIndex}`,
+          addTools: Array.from({ length: 32 }, (_, toolIndex) => `${token}_${patchIndex}_${toolIndex}`),
+        })),
+      },
+    }];
+  }
+
+  /** Fresh session jail: sessionsRoot/<project>/<ts>.jsonl with the session file present. */
+  async function freshSession(root: string) {
+    const sessionsRoot = join(root, "sessions");
+    const dir = join(sessionsRoot, encodeURIComponent("/tmp/project"));
+    await mkdir(dir, { recursive: true });
+    const sessionPath = join(dir, "chat-1.jsonl");
+    await writeFile(sessionPath, "{\"type\":\"session\",\"version\":3}\n");
+    return { sessionsRoot, dir, sessionPath };
+  }
+
+  it("writes an owner-only regular sidecar and leaves no temp files behind", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-hard-"));
+    try {
+      const { sessionsRoot, sessionPath } = await freshSession(root);
+      const { env } = assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: heavyPackages("perm"),
+      });
+      const file = env[AGENT_CONTRIBUTIONS_FILE_ENV]!;
+      expect(file).toBeDefined();
+      expect(env[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]).toBe(dirname(file));
+      const stat = lstatSync(file);
+      expect(stat.isFile()).toBe(true);
+      expect(stat.mode & 0o777).toBe(0o600);
+      expect(stat.nlink).toBe(1);
+      const temps = readdirSync(dirname(file)).filter((name) => name.includes("ext-agent-contributions") && name.endsWith(".tmp"));
+      expect(temps).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("replaces the sidecar atomically and keeps the mode", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-atomic-"));
+    try {
+      const { sessionsRoot, sessionPath } = await freshSession(root);
+      const spawn = () => assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: heavyPackages("atomic"),
+      });
+      const first = spawn();
+      const file = first.env[AGENT_CONTRIBUTIONS_FILE_ENV]!;
+      const firstBody = await readFile(file, "utf8");
+      expect(firstBody).toContain("atomic");
+      const second = spawn();
+      expect(second.env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBe(file);
+      const secondBody = await readFile(file, "utf8");
+      expect(secondBody).toBe(firstBody);
+      expect(lstatSync(file).mode & 0o777).toBe(0o600);
+      expect(readdirSync(dirname(file)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("refuses a prepositioned symlink at the sidecar path and never writes through it", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-symlink-"));
+    try {
+      const { sessionsRoot, sessionPath, dir } = await freshSession(root);
+      const victim = join(root, "victim.json");
+      await writeFile(victim, "SECRET", { mode: 0o600 });
+      const sidecar = join(realpathSync(dir), contributionSidecarName(sessionPath));
+      symlinkSync(victim, sidecar);
+      const { env } = assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: heavyPackages("sl"),
+      });
+      expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+      expect(env[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]).toBeUndefined();
+      expect(await readFile(victim, "utf8")).toBe("SECRET");
+      expect(lstatSync(sidecar).isSymbolicLink()).toBe(true);
+      expect(readdirSync(realpathSync(dir)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("refuses a hard-linked sidecar target", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-hardlink-"));
+    try {
+      const { sessionsRoot, sessionPath, dir } = await freshSession(root);
+      const realDir = realpathSync(dir);
+      const original = join(root, "original.json");
+      await writeFile(original, JSON.stringify({ version: 1, extensions: [] }), { mode: 0o600 });
+      linkSync(original, join(realDir, contributionSidecarName(sessionPath)));
+      const { env } = assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: heavyPackages("hl"),
+      });
+      expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+      expect(await readFile(original, "utf8")).toBe(JSON.stringify({ version: 1, extensions: [] }));
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("rejects a realpath-escaped session directory and a missing jail", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-escape-"));
+    try {
+      const sessionsRoot = join(root, "sessions");
+      await mkdir(sessionsRoot, { recursive: true });
+      const outside = join(root, "outside");
+      await mkdir(outside, { recursive: true });
+      await writeFile(join(outside, "stolen.jsonl"), "x\n");
+      symlinkSync(outside, join(sessionsRoot, "link-project"));
+      expect(resolveContributionSnapshotFile({
+        sessionPath: join(sessionsRoot, "link-project", "stolen.jsonl"),
+        sessionsRoot,
+      })).toBeUndefined();
+      expect(resolveContributionSnapshotFile({
+        sessionPath: join(sessionsRoot, "no-such-dir", "chat.jsonl"),
+        sessionsRoot,
+      })).toBeUndefined();
+      const packages = heavyPackages("esc");
+      const { env } = assemblePiSpawn({
+        cwd: root,
+        sessionPath: join(sessionsRoot, "link-project", "stolen.jsonl"),
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: packages,
+      });
+      expect(env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+      expect(existsSync(join(outside, "stolen.ext-agent-contributions.json"))).toBe(false);
+      expect(env[REGISTERED_EXTENSION_PATHS_ENV]).toBe("/pkg/esc/agent.js");
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("strips stale inherited session-root values like the other host contract keys", () => {
+    const sanitized = sanitizeEnvironment({
+      [AGENT_CONTRIBUTIONS_FILE_ENV]: "/tmp/stale.json",
+      [AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]: "/tmp",
+      PATH: "/usr/bin",
+    });
+    expect(sanitized[AGENT_CONTRIBUTIONS_FILE_ENV]).toBeUndefined();
+    expect(sanitized[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]).toBeUndefined();
+  });
+
+  it("main and worker share the same read-only sidecar reference", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-parity-"));
+    try {
+      const { sessionsRoot, sessionPath } = await freshSession(root);
+      const packages = heavyPackages("parity");
+      const spawn = () => assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: packages,
+      });
+      const main = spawn();
+      const worker = spawn();
+      const file = main.env[AGENT_CONTRIBUTIONS_FILE_ENV]!;
+      expect(worker.env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBe(file);
+      expect(worker.env[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]).toBe(main.env[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV]);
+      expect(workerAgentContributionsSnapshot(worker.env)).toBe(await readFile(file, "utf8"));
+      // rename/move never relocate the session file, so the derived sidecar stays valid.
+      const moved = assemblePiSpawn({
+        cwd: join(root, "other-project"),
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: packages,
+      });
+      expect(moved.env[AGENT_CONTRIBUTIONS_FILE_ENV]).toBe(file);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("session delete removes the owned sidecar and orphaned temps, never foreign files", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-delete-"));
+    try {
+      const { sessionsRoot, sessionPath, dir } = await freshSession(root);
+      const realDir = realpathSync(dir);
+      const { env } = assemblePiSpawn({
+        cwd: root,
+        sessionPath,
+        sessionsRoot,
+        paths: { updateCenter, runtimeInfo },
+        registeredExtensions: heavyPackages("del"),
+      });
+      const sidecar = env[AGENT_CONTRIBUTIONS_FILE_ENV]!;
+      expect(existsSync(sidecar)).toBe(true);
+      // Crash leftover temp for this sidecar, a foreign sidecar for another session,
+      // and a decoy JSON that is not a versioned snapshot.
+      const temp = join(realDir, `.${contributionSidecarName(sessionPath)}.999999.deadbeef.tmp`);
+      await writeFile(temp, "garbage", { mode: 0o600 });
+      const foreignSidecar = join(realDir, contributionSidecarName("chat-2.jsonl"));
+      await writeFile(foreignSidecar, JSON.stringify({ version: 1, extensions: [] }), { mode: 0o600 });
+      const decoy = join(realDir, "notes.json");
+      await writeFile(decoy, "{\"hello\":\"world\"}", { mode: 0o600 });
+      removeContributionSnapshotSidecar({ sessionPath, sessionsRoot });
+      expect(existsSync(sidecar)).toBe(false);
+      expect(existsSync(temp)).toBe(false);
+      expect(existsSync(foreignSidecar)).toBe(true);
+      expect(existsSync(decoy)).toBe(true);
+      expect(existsSync(sessionPath)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
+  });
+
+  it("session delete never removes an unowned file at the canonical path", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-contrib-delete2-"));
+    try {
+      const { sessionsRoot, sessionPath, dir } = await freshSession(root);
+      const realDir = realpathSync(dir);
+      const impostor = join(realDir, contributionSidecarName(sessionPath));
+      await writeFile(impostor, "{\"not\":\"ours\"}", { mode: 0o600 });
+      removeContributionSnapshotSidecar({ sessionPath, sessionsRoot });
+      expect(existsSync(impostor)).toBe(true);
+    } finally {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    }
   });
 });
 

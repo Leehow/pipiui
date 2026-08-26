@@ -60,6 +60,7 @@ import {
   defaultRuntimeRoot,
   MEDIA_COMPAT_FALLBACK_ENV,
   mergedSpawnEnvironment,
+  removeContributionSnapshotSidecar,
   resolvePiExecutable,
   resolveSpawnPaths,
   withToolPath,
@@ -68,6 +69,7 @@ import {
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
+import { attachCatalogDiagnostics, buildAgentCatalog } from "./agent-catalog.js";
 import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
@@ -474,15 +476,6 @@ type Rpc = Record<string, any>;
 
 /** Spec D5 invokeExtension timeout (host → agent RPC). Tests may override via options. */
 export const EXT_INVOKE_TIMEOUT_MS = 15_000;
-
-/** Mirrors the bundled runtime agent registry for the Electron settings surface. */
-const BUILT_IN_AGENT_DEFINITIONS: AgentDefinition[] = [
-  { name: "explore", description: "Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files." },
-  { name: "general-purpose", description: "Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason." },
-  { name: "reviewer", description: "Read-only code review specialist for quality and security." },
-  { name: "computer-use", description: "Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation." },
-  { name: "secretary", description: "Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree." },
-];
 
 type ProcFactory = (
   bin: string,
@@ -3029,6 +3022,14 @@ export class PiHostBackend implements HostBackend {
         this.queueLoads.delete(s.header.id);
         this.unconfirmedSteers.delete(s.header.id);
         await fs.rm(s.path);
+        // The extension-contribution sidecar is session-owned: it must not outlive the
+        // session. The helper only removes files this system itself wrote (canonical name,
+        // versioned snapshot shape) and never touches anything else in the directory.
+        removeContributionSnapshotSidecar({
+          sessionPath: s.path,
+          sessionsRoot: this.root,
+          agentDir: this.agentDir,
+        });
         this.historyCache.delete(s.path);
         this.indexCache.delete(s.path);
         this.sessionById.delete(s.header.id);
@@ -3257,7 +3258,7 @@ export class PiHostBackend implements HostBackend {
         return { deleted };
       }
       case "listAgentDefinitions":
-        return BUILT_IN_AGENT_DEFINITIONS.map((agent) => ({ ...agent }));
+        return this.listAgentDefinitions(params[0]);
       case "listModels":
         await this.loadModelCatalog();
         return this.models;
@@ -3897,6 +3898,13 @@ export class PiHostBackend implements HostBackend {
       throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
     try {
       await rewriteSessionCwd(session.path, targetPath);
+      // Old-project contribution/path snapshot must not outlive a successful cwd change.
+      // Same helper as deleteSession: only versioned owned sidecars and our temps, never neighbors.
+      removeContributionSnapshotSidecar({
+        sessionPath: session.path,
+        sessionsRoot: this.root,
+        agentDir: this.agentDir,
+      });
       this.indexCache.delete(session.path);
       const moved = await readSessionMeta(session.path);
       const stat = await fs.stat(session.path);
@@ -4049,7 +4057,6 @@ export class PiHostBackend implements HostBackend {
         configuration: this.compactionConfiguration,
         isIdle: () => this.isSessionQuiet(id),
         hasLiveAgents: () => this.sessionHasLiveAgents(id),
-        shouldCompact: () => this.proactiveSummaryCompaction,
         observer: (event) => {
           // Same JSONL as the lifecycle events, always tagged proactive_idle.
           const usage = event.usage;
@@ -5494,6 +5501,49 @@ export class PiHostBackend implements HostBackend {
     else next[displayPath] = trimmed;
     await this.saveProjectNames(next);
     return this.project(displayPath, next);
+  }
+  private async listAgentDefinitions(projectId?: unknown): Promise<AgentDefinition[]> {
+    const extra: NonNullable<AgentDefinition["catalogDiagnostics"]> = [];
+    let projectRoot: string | undefined;
+    if (typeof projectId === "string" && projectId.trim()) {
+      try {
+        projectRoot = await this.projectPath(projectId);
+      } catch (error) {
+        extra.push({
+          severity: "error",
+          code: "catalog-project-unavailable",
+          message: `Catalog project is unavailable: ${error instanceof Error ? error.message : String(error)}.`,
+        });
+      }
+    }
+    const list = async (packages: readonly SpawnRegisteredExtension[]) => {
+      const agentHome = this.profileMode === "isolated" && projectRoot
+        ? projectPiAgentDir(projectRoot)
+        : this.agentDir;
+      return buildAgentCatalog({
+        runtimeRoot: this.runtimeRoot,
+        userDir: join(agentHome, "agents"),
+        projectRoot,
+        packages,
+      });
+    };
+    try {
+      this.extensionLoader.scan(projectRoot);
+      const overlay = await this.mergedExtensionOverlay(projectRoot);
+      const catalog = await list(this.extensionLoader.spawnPackages(overlay));
+      return attachCatalogDiagnostics(catalog.agents, [...extra, ...catalog.diagnostics]);
+    } catch (error) {
+      const fallback = await list([]);
+      return attachCatalogDiagnostics(fallback.agents, [
+        ...extra,
+        {
+          severity: "error",
+          code: "catalog-discovery-failed",
+          message: `Agent catalog discovery failed: ${error instanceof Error ? error.message : String(error)}.`,
+        },
+        ...fallback.diagnostics,
+      ]);
+    }
   }
   private async listExtensions(projectId: unknown): Promise<ExtensionListItem[]> {
     const projectRoot =

@@ -1,8 +1,10 @@
+import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
 const here = dirname(fileURLToPath(import.meta.url))
+spawnSync(process.execPath, [resolve(here, 'scripts/bundle-runtime-agents.mjs')], { stdio: 'inherit' })
 
 // These integration tests spawn a real fake-pi child per sendPrompt (node
 // interpreter startup each time). On a busy machine a single test legitimately

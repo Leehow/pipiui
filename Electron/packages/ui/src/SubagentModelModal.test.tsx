@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Model, PipiHostAPI, SubagentModelSetting } from '@pipi/host-api'
+import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting } from '@pipi/host-api'
 import { createMockHost } from './App'
 import { SubagentModelModal } from './SubagentModelModal'
 import type { ModelVisibilityController } from './useModelVisibility'
@@ -293,5 +293,202 @@ describe('SubagentModelModal', () => {
     }))
     expect(screen.queryByLabelText('explore 0 思考强度')).toBeNull()
     expect(within(screen.getByTestId('subagent-agent-explore')).getByText('思考强度由模型决定')).toBeTruthy()
+  })
+})
+
+function catalogHost(agents: AgentDefinition[], settings: Record<string, SubagentModelSetting[]> = {}) {
+  const host = createMockHost()
+  const stored: Record<string, SubagentModelSetting[]> = Object.fromEntries(
+    Object.entries(settings).map(([name, chain]) => [name, chain.map((entry: SubagentModelSetting) => ({ ...entry }))]),
+  )
+  host.listAgentDefinitions = vi.fn(async (_projectId?: string) => agents.map(agent => ({ ...agent })))
+  host.getSubagentModels = vi.fn(async () => Object.fromEntries(Object.entries(stored).map(([name, chain]) => [name, chain.map((entry: SubagentModelSetting) => ({ ...entry }))])))
+  host.setSubagentModel = vi.fn(async (agentName, chain) => {
+    if (chain.length) stored[agentName] = chain.map((entry: SubagentModelSetting) => ({ ...entry }))
+    else delete stored[agentName]
+    return Object.fromEntries(Object.entries(stored).map(([name, saved]) => [name, saved.map((entry: SubagentModelSetting) => ({ ...entry }))]))
+  })
+  return host
+}
+
+describe('SubagentModelModal dynamic catalog', () => {
+  it('groups Computer Use by canonicalRole metadata and shows extension agents in general', async () => {
+    const host = catalogHost([
+      { name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' },
+      { name: 'operator', description: 'Desktop escape hatch', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'operator' },
+      { name: 'computer-use', description: 'Desktop goal', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'computer' },
+      {
+        name: 'ext-researcher',
+        description: 'Extension researcher',
+        extensionId: 'ext-research',
+        origin: 'project',
+        source: 'project',
+        available: true,
+        availability: 'available',
+        permissionSummary: 'mode:read-only, filesystem:read-only',
+      },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} projectId="proj-1" />)
+    await screen.findByTestId('subagent-agent-ext-researcher')
+    expect(host.listAgentDefinitions).toHaveBeenCalledWith('proj-1')
+    expect(screen.getByTestId('computer-use-model-hierarchy').textContent).toContain('computer-use')
+    expect(within(screen.getByTestId('computer-use-model-hierarchy')).queryByTestId('subagent-agent-operator')).toBeNull()
+    expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
+    expect(screen.getByTestId('subagent-source-ext-researcher').textContent).toContain('扩展 ext-research')
+    expect(screen.getByTestId('subagent-permissions-ext-researcher').textContent).toContain('filesystem:read-only')
+    expect(within(screen.getByTestId('subagent-agent-computer-use')).getByText(/需要查看截图/)).toBeTruthy()
+    expect(within(screen.getByTestId('subagent-agent-operator')).queryByText(/需要查看截图/)).toBeNull()
+  })
+
+  it('falls back to name/description rows when the host omits catalog metadata', async () => {
+    const host = catalogHost([
+      { name: 'explore', description: 'Research' },
+      { name: 'computer-use', description: 'Desktop' },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-agent-explore')
+    expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
+    expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Computer Use Agent' })).toBeNull()
+    expect(screen.queryByTestId('subagent-source-explore')).toBeNull()
+    expect(within(screen.getByTestId('subagent-agent-computer-use')).queryByText(/需要查看截图/)).toBeNull()
+  })
+
+  it('shows requested custom addTools as pending verification, not as applied', async () => {
+    const host = catalogHost([
+      {
+        name: 'explore',
+        description: 'Research',
+        origin: 'bundled',
+        patches: [{
+          extensionId: 'ext-ghost',
+          origin: 'project',
+          operations: ['addTools'],
+          addTools: ['ghost_tool'],
+          status: 'requested',
+        }],
+        diagnostics: [{
+          severity: 'error',
+          code: 'contribution-add-tool-unregistered',
+          message: 'Tool `ghost_tool` has no extension owner in Pi\'s effective registry.',
+          extensionId: 'ext-ghost',
+        }],
+      },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-patches-explore')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('请求添加工具 ghost_tool（待运行验证）')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).not.toMatch(/(?<!请求)添加工具 ghost_tool/)
+    expect(screen.getByTestId('subagent-diagnostics-explore').textContent).toContain('contribution-add-tool-unregistered')
+  })
+
+  it('shows accepted patch provenance and rejected operations as diagnostics', async () => {
+    const host = catalogHost([
+      {
+        name: 'explore',
+        description: 'Research',
+        origin: 'bundled',
+        patches: [{
+          extensionId: 'ext-research',
+          origin: 'project',
+          operations: ['appendPrompt', 'addTools'],
+          addTools: ['code_search'],
+        }],
+        diagnostics: [{
+          severity: 'error',
+          code: 'contribution-reserved-tool',
+          message: 'Extension `ext-research` cannot add host-issued or reserved tool `computer` to `explore`.',
+          extensionId: 'ext-research',
+        }],
+        catalogDiagnostics: [{
+          severity: 'error',
+          code: 'contribution-replace-forbidden',
+          message: 'Extension `ext-research` cannot replacePrompt on canonical privileged bundled role `secretary`.',
+          extensionId: 'ext-research',
+          agentName: 'secretary',
+        }],
+      },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-patches-explore')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('追加 Prompt')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('code_search')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).not.toContain('替换 Prompt')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).not.toContain('computer')
+    expect(screen.getByTestId('subagent-diagnostics-explore').textContent).toContain('contribution-reserved-tool')
+    expect(screen.getByTestId('subagent-catalog-diagnostics').textContent).toContain('contribution-replace-forbidden')
+    expect(screen.queryByText(/SECRET_PROMPT|\/tmp\/|systemPrompt/)).toBeNull()
+  })
+
+  it('shows patch provenance on catalog rows and hides it for legacy name/description hosts', async () => {
+    const host = catalogHost([
+      {
+        name: 'explore',
+        description: 'Research',
+        origin: 'bundled',
+        patches: [{
+          extensionId: 'ext-research',
+          origin: 'project',
+          operations: ['appendPrompt', 'addTools'],
+          addTools: ['code_search'],
+        }],
+      },
+      { name: 'reviewer', description: 'Review' },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-patches-explore')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('ext-research')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('追加 Prompt')
+    expect(screen.getByTestId('subagent-patches-explore').textContent).toContain('code_search')
+    expect(screen.queryByTestId('subagent-patches-reviewer')).toBeNull()
+    expect(screen.queryByText(/SECRET_PROMPT|systemPrompt/i)).toBeNull()
+  })
+
+  it('shows dismissable diagnostics for unavailable agents without blocking other roles', async () => {
+    const host = catalogHost([
+      { name: 'explore', description: 'Research' },
+      {
+        name: 'broken-ext',
+        description: 'Broken contribution',
+        extensionId: 'ext-broken',
+        available: false,
+        availability: 'unavailable',
+        diagnostics: [{ severity: 'error', code: 'contribution-path-escape', message: 'prompt file escaped the extension root' }],
+        catalogDiagnostics: [{ severity: 'error', code: 'catalog-discovery-failed', message: 'overlay scan failed' }],
+      },
+    ])
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-agent-broken-ext')
+    expect(screen.getByTestId('subagent-status-broken-ext').textContent).toContain('不可用')
+    expect(screen.getByTestId('subagent-catalog-diagnostics').textContent).toContain('catalog-discovery-failed')
+    expect(screen.getByTestId('subagent-diagnostics-broken-ext').textContent).toContain('contribution-path-escape')
+    fireEvent.click(within(screen.getByTestId('subagent-diagnostics-broken-ext')).getByRole('button', { name: '关闭错误提示' }))
+    expect(screen.queryByTestId('subagent-diagnostics-broken-ext')).toBeNull()
+    fireEvent.click(within(screen.getByTestId('subagent-catalog-diagnostics')).getByRole('button', { name: '关闭错误提示' }))
+    expect(screen.queryByTestId('subagent-catalog-diagnostics')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
+    fireEvent.click(screen.getByTestId('subagent-model-option-explore-0-openai-gpt-5'))
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'openai/gpt-5' }],
+    }))
+  })
+
+  it('hides stale model settings for missing catalog agents without deleting them', async () => {
+    const host = catalogHost(
+      [{ name: 'explore', description: 'Research' }],
+      {
+        explore: [{ model: 'openai/gpt-5' }],
+        'gone-ext-agent': [{ model: 'xai/grok-4.5' }],
+      },
+    )
+    const save = vi.spyOn(host, 'setSubagentModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    await screen.findByTestId('subagent-agent-explore')
+    expect(screen.queryByTestId('subagent-agent-gone-ext-agent')).toBeNull()
+    expect(await host.getSubagentModels?.()).toMatchObject({
+      explore: [{ model: 'openai/gpt-5' }],
+      'gone-ext-agent': [{ model: 'xai/grok-4.5' }],
+    })
+    expect(save).not.toHaveBeenCalled()
   })
 })

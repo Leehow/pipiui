@@ -20,8 +20,10 @@ describe('Computer Agent role model settings', () => {
   it('advertises the unified computer-use agent and materializes its independent setting', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))
     const backend = createPiHostBackend({ agentDir: join(root, 'agent'), env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
-    const roles = await backend.handle('listAgentDefinitions', []) as Array<{ name: string }>
-    expect(roles.map(role => role.name)).toEqual(['explore', 'general-purpose', 'reviewer', 'computer-use', 'secretary'])
+    const roles = await backend.handle('listAgentDefinitions', []) as Array<{ name: string; description?: string; canonicalRole?: string }>
+    expect(roles.map(role => role.name)).toEqual(expect.arrayContaining(['explore', 'general-purpose', 'reviewer', 'computer-use', 'secretary']))
+    expect(roles.every(role => typeof role.name === 'string' && typeof role.description === 'string')).toBe(true)
+    expect(roles.find(role => role.name === 'computer-use')).toMatchObject({ canonicalRole: 'computer' })
     await backend.handle('setSubagentModel', ['computer-use', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
     expect(await backend.handle('getSubagentModels', [])).toMatchObject({ 'computer-use': [{ model: 'xai/grok-4.5', thinking: 'high' }] })
     const runtime = JSON.parse(await readFile(join(root, 'agent/pipiui-subagent-models-runtime.json'), 'utf8'))

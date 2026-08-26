@@ -680,11 +680,11 @@ export function createMockHost(): PipiHostAPI {
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
   let memoryReviewModel: string | null = null
   const agentDefinitions: AgentDefinition[] = [
-    { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.' },
-    { name: 'general-purpose', description: 'Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason.' },
-    { name: 'reviewer', description: 'Read-only code review specialist for quality and security.' },
-    { name: 'computer-use', description: 'Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation.' },
-    { name: 'secretary', description: 'Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.' },
+    { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
+    { name: 'general-purpose', description: 'Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason.', origin: 'bundled', source: 'bundled', mode: 'worker', worktree: 'isolated', available: true, availability: 'available' },
+    { name: 'reviewer', description: 'Read-only code review specialist for quality and security.', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
+    { name: 'computer-use', description: 'Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation.', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'computer', available: true, availability: 'available' },
+    { name: 'secretary', description: 'Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'secretary', available: true, availability: 'available' },
   ]
   const emit = (sessionId: string, event: StreamEvent) => {
     listeners.get(sessionId)?.forEach(listener => listener(event))
@@ -858,7 +858,7 @@ export function createMockHost(): PipiHostAPI {
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
     getMemoryReviewModel: async () => memoryReviewModel,
     setMemoryReviewModel: async model => { memoryReviewModel = model; return memoryReviewModel },
-    listAgentDefinitions: async () => agentDefinitions.map(agent => ({ ...agent })),
+    listAgentDefinitions: async (_projectId?: string) => agentDefinitions.map(agent => ({ ...agent })),
     getSessionStats: async sessionId => {
       const id = sessionId ?? sessions[0]?.id ?? 'mock-session'
       const fixture = sessionContextFixtures[id] ?? { tokens: 0, window: 200_000 }
@@ -3140,7 +3140,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (!selectedSession || !host.browser) return
       void host.browser.newTab(selectedSession, { url }).then(() => navigateTool('Browser')).catch(() => undefined)
     }} />}
-    {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} />}
+    {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} projectId={selectedProject} />}
     <ExtensionUiHost host={host} sessionId={selectedSession || undefined} />
   </main>
 }

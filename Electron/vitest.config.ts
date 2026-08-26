@@ -1,8 +1,12 @@
+import { spawnSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
 const here = dirname(fileURLToPath(import.meta.url))
+spawnSync(process.execPath, [resolve(here, 'packages/pi-backend/scripts/bundle-runtime-agents.mjs')], {
+  stdio: 'inherit',
+})
 
 // The pi-backend integration tests spawn a real fake-pi child (a node process)
 // per sendPrompt; on a busy machine a single test legitimately runs 3-5s. The
@@ -16,6 +20,7 @@ export default defineConfig({
       // '@pipi/host-api' entry below would otherwise capture it.
       '@pipi/host-api/browser': resolve(here, 'packages/host-api/src/browser.ts'),
       '@pipi/host-api': resolve(here, 'packages/host-api/src/index.ts'),
+      '@pipi/pi-backend': resolve(here, 'packages/pi-backend/src/index.ts'),
       '@pipiui/extension-api': resolve(here, 'packages/extension-api/src/index.ts'),
     },
   },

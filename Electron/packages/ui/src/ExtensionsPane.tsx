@@ -1,5 +1,19 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
-import type { ExtensionDescriptor, PipiHostAPI, UserMcpServer } from '@pipi/host-api'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionDescriptor, PipiHostAPI, UserMcpServer } from '@pipi/host-api'
+import {
+  agentAvailabilityLabel,
+  agentSourceLabel,
+  collectCatalogDiagnostics,
+  contributedAgentsFor,
+  diagnosticKey,
+  diagnosticsForExtension,
+  formatDiagnostic,
+  formatPatchOperations,
+  isRequestedPatch,
+  patchesForExtension,
+  redactDiagnosticMessage,
+} from './agent-catalog-ui'
+import { DismissibleError } from './DismissibleError'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
 import {
   blocksEnableForL2,
@@ -271,16 +285,107 @@ function ConfirmDialog({
   )
 }
 
+function ExtensionContributionSummary({
+  ext,
+  agents,
+  catalogDiagnostics,
+  dismissed,
+  onDismiss,
+}: {
+  ext: ExtensionDescriptor
+  agents: AgentDefinition[]
+  catalogDiagnostics: AgentCatalogDiagnostic[]
+  dismissed: Set<string>
+  onDismiss: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
+}) {
+  const contributed = contributedAgentsFor(agents, ext.id)
+  const patches = patchesForExtension(agents, ext.id)
+  const acceptedPatches = patches.filter(({ patch }) => !isRequestedPatch(patch))
+  const requestedPatches = patches.filter(({ patch }) => isRequestedPatch(patch))
+  const related = diagnosticsForExtension(ext.id, agents, catalogDiagnostics).filter(entry => !dismissed.has(diagnosticKey(entry)))
+  if (contributed.length === 0 && acceptedPatches.length === 0 && requestedPatches.length === 0 && related.length === 0) return null
+  return (
+    <div className="extensions-pkg-contrib" data-testid={`extensions-pkg-contrib-${ext.id}`}>
+      {contributed.length > 0 && (
+        <>
+          <div className="extensions-pkg-contrib-heading">贡献的 Agent</div>
+          <ul className="extensions-pkg-agents" data-testid={`extensions-pkg-agents-${ext.id}`}>
+            {contributed.map(agent => {
+              const sourceLabel = agentSourceLabel(agent)
+              const availabilityLabel = agentAvailabilityLabel(agent)
+              return (
+                <li key={agent.name} data-testid={`extensions-pkg-agent-${ext.id}-${agent.name}`}>
+                  <strong>{agent.name}</strong>
+                  <span className="extensions-pkg-agent-meta">
+                    {sourceLabel}{availabilityLabel ? ` · ${availabilityLabel}` : ''}{agent.permissionSummary ? ` · ${agent.permissionSummary}` : ''}
+                  </span>
+                  {agent.description && <span className="extensions-pkg-agent-desc">{agent.description}</span>}
+                </li>
+              )
+            })}
+          </ul>
+        </>
+      )}
+      {acceptedPatches.length > 0 && (
+        <>
+          <div className="extensions-pkg-contrib-heading">应用的补丁</div>
+          <ul className="extensions-pkg-patches" data-testid={`extensions-pkg-patches-${ext.id}`}>
+            {acceptedPatches.map(({ agentName, patch }, index) => (
+              <li key={`${agentName}-${patch.operations.join('-')}-${index}`} data-testid={`extensions-pkg-patch-${ext.id}-${agentName}`}>
+                <strong>{agentName}</strong>
+                <span className="extensions-pkg-agent-meta">{formatPatchOperations(patch)}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {requestedPatches.length > 0 && (
+        <>
+          <div className="extensions-pkg-contrib-heading">请求的补丁</div>
+          <ul className="extensions-pkg-requested" data-testid={`extensions-pkg-requested-${ext.id}`}>
+            {requestedPatches.map(({ agentName, patch }, index) => (
+              <li key={`${agentName}-${patch.operations.join('-')}-requested-${index}`} data-testid={`extensions-pkg-requested-${ext.id}-${agentName}`}>
+                <strong>{agentName}</strong>
+                <span className="extensions-pkg-agent-meta">{formatPatchOperations(patch)}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {related.length > 0 && (
+        <div className="extensions-pkg-contrib-diagnostics" data-testid={`extensions-pkg-contrib-diag-${ext.id}`}>
+          <div className="extensions-pkg-contrib-heading">贡献诊断</div>
+          {related.map(entry => (
+            <DismissibleError
+              key={diagnosticKey(entry)}
+              message={formatDiagnostic(entry)}
+              onDismiss={() => onDismiss(current => new Set(current).add(diagnosticKey(entry)))}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ExtensionPackageRow({
   ext,
   host,
   busy,
+  agents,
+  catalogDiagnostics,
+  dismissedDiagnostics,
+  onDismissDiagnostics,
   onToggle,
   onUninstall,
 }: {
   ext: ExtensionDescriptor
   host: PipiHostAPI
   busy: boolean
+  agents: AgentDefinition[]
+  catalogDiagnostics: AgentCatalogDiagnostic[]
+  dismissedDiagnostics: Set<string>
+  onDismissDiagnostics: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
   onToggle: (ext: ExtensionDescriptor) => void
   onUninstall: (ext: ExtensionDescriptor) => void
 }) {
@@ -370,27 +475,68 @@ function ExtensionPackageRow({
       {errorText && (
         <p className="model-modal-error" role="alert" data-testid={`extensions-pkg-error-${ext.id}`}>{errorText}</p>
       )}
+      <ExtensionContributionSummary
+        ext={ext}
+        agents={agents}
+        catalogDiagnostics={catalogDiagnostics}
+        dismissed={dismissedDiagnostics}
+        onDismiss={onDismissDiagnostics}
+      />
     </div>
   )
 }
 
 function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; projectId?: string }) {
   const [items, setItems] = useState<ExtensionDescriptor[]>([])
+  const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
   const [grantTarget, setGrantTarget] = useState<ExtensionDescriptor | null>(null)
   const [uninstallTarget, setUninstallTarget] = useState<ExtensionDescriptor | null>(null)
+  const [dismissedDiagnostics, setDismissedDiagnostics] = useState<Set<string>>(() => new Set())
+  const [loadDiagnostics, setLoadDiagnostics] = useState<AgentCatalogDiagnostic[]>([])
   const resolvedProjectId = projectId || lastProjectId()
+  const catalogDiagnostics = useMemo(() => collectCatalogDiagnostics(agents), [agents])
+  const visibleCatalogDiagnostics = [...loadDiagnostics, ...catalogDiagnostics].filter(entry => {
+    if (dismissedDiagnostics.has(diagnosticKey(entry))) return false
+    return !items.some(ext => diagnosticsForExtension(ext.id, agents, [entry]).length > 0)
+  })
 
   const refresh = useCallback(async () => {
+    const nextLoad: AgentCatalogDiagnostic[] = []
     if (!host.listExtensions) {
       setItems([])
+      setAgents([])
+      setLoadDiagnostics([])
       return
     }
     try {
-      setItems(await (resolvedProjectId ? host.listExtensions(resolvedProjectId) : host.listExtensions()))
-    } catch {
+      const listed = await (resolvedProjectId ? host.listExtensions(resolvedProjectId) : host.listExtensions())
+      setItems(listed)
+    } catch (error) {
       setItems([])
+      nextLoad.push({
+        severity: 'error',
+        code: 'extensions-load-failed',
+        message: redactDiagnosticMessage(`无法加载扩展列表：${error instanceof Error ? error.message : String(error)}`),
+      })
     }
+    if (!host.listAgentDefinitions) {
+      setAgents([])
+      setLoadDiagnostics(nextLoad)
+      return
+    }
+    try {
+      setAgents(await host.listAgentDefinitions(resolvedProjectId || undefined))
+      setDismissedDiagnostics(new Set())
+    } catch (error) {
+      setAgents([])
+      nextLoad.push({
+        severity: 'error',
+        code: 'agent-catalog-load-failed',
+        message: redactDiagnosticMessage(`无法加载 Agent 目录：${error instanceof Error ? error.message : String(error)}`),
+      })
+    }
+    setLoadDiagnostics(nextLoad)
   }, [host, resolvedProjectId])
 
   useEffect(() => { void refresh() }, [refresh])
@@ -467,6 +613,17 @@ function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; proj
         </div>
         {items.length > 0 && <span>{items.length} 项</span>}
       </header>
+      {visibleCatalogDiagnostics.length > 0 && (
+        <div className="extensions-catalog-diagnostics" data-testid="extensions-catalog-diagnostics">
+          {visibleCatalogDiagnostics.map(entry => (
+            <DismissibleError
+              key={diagnosticKey(entry)}
+              message={formatDiagnostic(entry)}
+              onDismiss={() => setDismissedDiagnostics(current => new Set(current).add(diagnosticKey(entry)))}
+            />
+          ))}
+        </div>
+      )}
       {items.length === 0
         ? <div className="model-modal-state" data-testid="extensions-packages-empty">还没有扫描到扩展包。</div>
         : (
@@ -477,6 +634,10 @@ function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; proj
                 ext={ext}
                 host={host}
                 busy={busyId === ext.id}
+                agents={agents}
+                catalogDiagnostics={catalogDiagnostics}
+                dismissedDiagnostics={dismissedDiagnostics}
+                onDismissDiagnostics={setDismissedDiagnostics}
                 onToggle={ext => { void onToggle(ext) }}
                 onUninstall={setUninstallTarget}
               />

@@ -14,6 +14,13 @@
   ],
   "agent": {
     "extension": "agent/dist/index.js"
+    // Optional: contribute schema:1 AGENT.md packages (paths relative to this package).
+    // Leave these commented until the files exist — missing files fail at load, not at scaffold.
+    // "agents": ["agents/example/AGENT.md"],
+    // Optional: patch an existing agent. appendPrompt and replacePrompt are mutually exclusive.
+    // "agentPatches": [
+    //   { "target": "explore", "appendPrompt": "prompts/explore-extra.md", "addTools": ["code_search"] }
+    // ]
   },
   "app": {
     "settings": {

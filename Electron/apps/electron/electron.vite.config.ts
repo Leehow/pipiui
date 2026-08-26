@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process'
+import { existsSync, statSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
@@ -10,6 +12,22 @@ const workspacePkgs = ['@pipi/pi-backend', '@pipi/host-api', '@pipiui/ui', '@pip
 
 // This file lives at apps/electron/electron.vite.config.ts.
 const workspaceRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+
+function ensurePiBackendRuntimeAgentsBundle(): void {
+  const script = resolve(workspaceRoot, 'packages/pi-backend/scripts/bundle-runtime-agents.mjs')
+  const bundle = resolve(workspaceRoot, 'packages/pi-backend/src/runtime-agents.bundle.mjs')
+  const source = resolve(workspaceRoot, 'resources/runtime/pi-ext/subagent/agents.ts')
+  const stale =
+    !existsSync(bundle) ||
+    (existsSync(source) && existsSync(bundle) && statSync(source).mtimeMs > statSync(bundle).mtimeMs)
+  if (!stale) return
+  const result = spawnSync(process.execPath, [script], { stdio: 'inherit' })
+  if (result.status !== 0) {
+    throw new Error('Failed to bundle pi-backend runtime agents core')
+  }
+}
+ensurePiBackendRuntimeAgentsBundle()
+
 const uiPackageRoot = resolve(workspaceRoot, 'packages/ui')
 const piBackendSourceEntry = resolve(workspaceRoot, 'packages/pi-backend/src/index.ts')
 const hostApiSourceEntry = resolve(workspaceRoot, 'packages/host-api/src/index.ts')
@@ -48,7 +66,8 @@ export const generatedWatchExcludes = [
   '**/build/**',
   '**/*.tsbuildinfo',
   '**/.cua-driver/**',
-  '**/.cua-driver-cache/**'
+  '**/.cua-driver-cache/**',
+  '**/runtime-agents.bundle.mjs'
 ]
 const devWatch = process.env.NODE_ENV_ELECTRON_VITE === 'development'
   ? { exclude: generatedWatchExcludes }

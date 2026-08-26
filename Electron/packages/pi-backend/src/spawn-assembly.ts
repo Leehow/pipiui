@@ -1,6 +1,7 @@
-import { accessSync, closeSync, constants, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, readSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
@@ -8,6 +9,32 @@ export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
 export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
+/** Origin of the resolved extension instance that produced a contribution snapshot. */
+export type SpawnExtensionOrigin = "builtin" | "app" | "project";
+/** Incremental patch metadata in the spawn snapshot. Prompt fields are canonical absolute paths, never bodies. */
+export type SpawnAgentContributionPatch = {
+  target: string;
+  appendPrompt?: string;
+  replacePrompt?: string;
+  addTools?: readonly string[];
+  removeTools?: readonly string[];
+};
+/** Bounded agent-contribution snapshot item shared by main session and workers. */
+export type SpawnAgentContribution = {
+  id: string;
+  origin: SpawnExtensionOrigin;
+  root: string;
+  agents: readonly string[];
+  patches: readonly SpawnAgentContributionPatch[];
+};
+/** Loader-side contribution validation issues. Never prompt bodies or absolute paths. Not part of the spawn snapshot JSON. */
+export type SpawnContributionDiagnostic = {
+  severity: "error" | "warning";
+  code: string;
+  message: string;
+  extensionId?: string;
+  agentName?: string;
+};
 /** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
 export type SpawnRegisteredExtension = {
   id: string;
@@ -15,6 +42,10 @@ export type SpawnRegisteredExtension = {
   extensionPath?: string;
   skillRoots?: readonly string[];
   settings?: unknown;
+  /** Validated, path-confined contribution metadata. Omitted when disabled/invalid/refused/empty. */
+  agentContribution?: SpawnAgentContribution;
+  /** Contribution path/size issues for an otherwise usable extension. Omitted when disabled/refused. */
+  contributionDiagnostics?: readonly SpawnContributionDiagnostic[];
 };
 export type SpawnInput = { sessionPath?: string; /** Host session id. Scopes per-session runtime state (plan store) to one conversation. */ sessionId?: string; cwd: string; runtimeRoot?: string; agentDir?: string; sessionsRoot?: string; resourceMode?: "default"|"explicit"; features?: SpawnFeatures; paths: SpawnPaths; bridgePort?: number; bridgeRoutingKey?: string; /** Canonical v1 bridge credential. Its presence is what selects PIPIUI_HOST_PROTOCOL=1. */ sessionCapability?: string; computerCapability?: string; computerDescriptor?: ComputerDescriptor; grantSessionKey?: string; mainModelId?: string; /** Optional full provider/model reference for Hermes background review. */ memoryReviewModelId?: string; subagentModelsFile?: string; /** Compact provider/id → nativeSearch map for worker tool-list filtering. */ subagentNativeSearchFile?: string; /** Selected session model; used to hide generic web_search when native web_search is effective. */ model?: { provider?: string; id?: string; capabilities?: import("@pipi/host-api").ModelCapabilities }; /** The user's Settings → 工具开关 denylist. Merged with the Boss read-only policy; never passed to workers. */ disabledToolNames?: readonly string[]; /** Unused disk path kept only so callers do not infer a project vault. */ vaultDir?: string; /** Enabled PipiUI extension agent halves; assembled into `-e` like user-extensions. */ registeredExtensions?: readonly SpawnRegisteredExtension[]; /** Extra internal env merged last (never sanitized): host→legacy-extension contracts such as the media compat fallback flag. */ internalEnv?: Record<string,string> };
 export type SpawnOutput = { args: string[]; env: Record<string,string> };
@@ -97,7 +128,7 @@ if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
 if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}if(enabled(f,"contextFold")){ext(args,p.contextFold)}
-if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env};}
+if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions,input);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
 if(enabled(f,"memoryBroker")){ext(args,p.memoryBroker);if(p.memoryBroker){env.PIPIUI_MEMORY_BROKER_MODE="main";env.PIPIUI_MEMORY_PROJECT_ROOT=input.cwd;if(input.memoryReviewModelId)env.PIPIUI_MEMORY_REVIEW_MODEL=input.memoryReviewModelId;if(p.hermesMemory){env.PIPIUI_HERMES_PACKAGE_ROOT=p.hermesMemory;env.PIPIUI_HERMES_NODE_MODULES_ROOT=dirname(p.hermesMemory)}}}if(enabled(f,"browser")){ext(args,p.webview);if(p.webview)env.PIPIUI_WEBVIEW_EXT=p.webview}
@@ -125,7 +156,7 @@ env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.compu
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
-appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env}; }
+appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions,input);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env}; }
 export const USER_EXTENSIONS_DIR="user-extensions";
 const USER_EXTENSION_FILE=/\.(?:[cm]?js|ts)$/;
 /**
@@ -171,26 +202,381 @@ export const MOUNTED_EXTENSIONS_ENV = "PIPIUI_MOUNTED_EXTENSIONS";
  */
 export const REGISTERED_EXTENSION_PATHS_ENV = "PIPIUI_EXT_REGISTERED_PATHS";
 /**
+ * Bounded JSON snapshot of enabled extension agent contributions.
+ * Value is metadata only (ids, origins, canonical roots, absolute AGENT.md / prompt-file paths, tool names).
+ * Never contains prompt bodies. Name uses `PIPIUI_EXT_` so sanitizeEnvironment strips inherited/stale values.
+ * Main session and workers share this exact string; omit it when there are no active contributions.
+ */
+export const AGENT_CONTRIBUTIONS_ENV = "PIPIUI_EXT_AGENT_CONTRIBUTIONS";
+export const AGENT_CONTRIBUTIONS_FILE_ENV = "PIPIUI_EXT_AGENT_CONTRIBUTIONS_FILE";
+/**
+ * Canonical session-owned jail directory for the sidecar named by
+ * AGENT_CONTRIBUTIONS_FILE_ENV. Set by the host beside the file env so the
+ * runtime can verify the sidecar never left the session directory (realpath
+ * confinement, not a lexical prefix). `PIPIUI_EXT_` prefix so stale inherited
+ * values are stripped like the file env.
+ */
+export const AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV = "PIPIUI_EXT_AGENT_CONTRIBUTIONS_SESSION_ROOT";
+/** Runtime parser rejects snapshots above this. Host stays strictly below. */
+export const AGENT_CONTRIBUTIONS_RUNTIME_MAX_BYTES = 256 * 1024;
+/** Host refuses to emit at or above this, leaving margin under the runtime cap. */
+export const AGENT_CONTRIBUTIONS_HOST_MAX_BYTES = 192 * 1024;
+/** Inline env budget so a legal snapshot cannot blow ARG_MAX. Larger snapshots use a session-owned file. */
+export const AGENT_CONTRIBUTIONS_ENV_MAX_BYTES = 32 * 1024;
+export const AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION = 1;
+export type ContributionSnapshotDiagnostic = {
+  severity: "error";
+  code: "contribution-snapshot-oversize" | "contribution-snapshot-file";
+  message: string;
+};
+export type VersionedAgentContributionSnapshot = {
+  version: typeof AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION;
+  extensions: Record<string, unknown>[];
+  json?: string;
+  byteLength: number;
+  diagnostics: ContributionSnapshotDiagnostic[];
+};
+const CONTRIBUTION_ORIGIN_RANK: Record<SpawnExtensionOrigin, number> = { builtin: 0, app: 1, project: 2 };
+function isSpawnExtensionOrigin(value: unknown): value is SpawnExtensionOrigin {
+  return value === "builtin" || value === "app" || value === "project";
+}
+function snapshotAgentContributionPatch(patch: SpawnAgentContributionPatch): Record<string, unknown> {
+  const item: Record<string, unknown> = { target: patch.target };
+  if (patch.appendPrompt) item.appendPrompt = patch.appendPrompt;
+  if (patch.replacePrompt) item.replacePrompt = patch.replacePrompt;
+  if (patch.addTools?.length) item.addTools = [...patch.addTools];
+  if (patch.removeTools?.length) item.removeTools = [...patch.removeTools];
+  return item;
+}
+function snapshotAgentContribution(pkgId: string, contribution: SpawnAgentContribution): Record<string, unknown> | undefined {
+  if (!isSpawnExtensionOrigin(contribution.origin) || typeof contribution.root !== "string" || !contribution.root) return undefined;
+  return {
+    id: contribution.id || pkgId,
+    origin: contribution.origin,
+    root: contribution.root,
+    agents: [...(contribution.agents ?? [])],
+    patches: (contribution.patches ?? []).map(snapshotAgentContributionPatch),
+  };
+}
+function compareAgentContributions(a: { origin: string; id: string }, b: { origin: string; id: string }): number {
+  const origin = (CONTRIBUTION_ORIGIN_RANK[a.origin as SpawnExtensionOrigin] ?? 99) - (CONTRIBUTION_ORIGIN_RANK[b.origin as SpawnExtensionOrigin] ?? 99);
+  if (origin !== 0) return origin;
+  return a.id.localeCompare(b.id);
+}
+/** Build the versioned `{version:1, extensions}` snapshot shared with the runtime parser. */
+export function buildVersionedAgentContributionSnapshot(
+  packages?: readonly SpawnRegisteredExtension[],
+): VersionedAgentContributionSnapshot {
+  const items: Record<string, unknown>[] = [];
+  for (const pkg of packages ?? []) {
+    if (!pkg.enabled || !pkg.agentContribution) continue;
+    const item = snapshotAgentContribution(pkg.id, pkg.agentContribution);
+    if (item) items.push(item);
+  }
+  items.sort((a, b) => compareAgentContributions(
+    { origin: String(a.origin), id: String(a.id) },
+    { origin: String(b.origin), id: String(b.id) },
+  ));
+  if (!items.length) {
+    return { version: AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION, extensions: [], byteLength: 0, diagnostics: [] };
+  }
+  const json = JSON.stringify({ version: AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION, extensions: items });
+  const byteLength = Buffer.byteLength(json, "utf8");
+  if (byteLength > AGENT_CONTRIBUTIONS_HOST_MAX_BYTES) {
+    return {
+      version: AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION,
+      extensions: [],
+      byteLength,
+      diagnostics: [{
+        severity: "error",
+        code: "contribution-snapshot-oversize",
+        message: `Extension agent contributions snapshot is ${byteLength} bytes; host limit is ${AGENT_CONTRIBUTIONS_HOST_MAX_BYTES} (runtime accepts ${AGENT_CONTRIBUTIONS_RUNTIME_MAX_BYTES}). Contributions were disabled; extension/skills mounts are unchanged.`,
+      }],
+    };
+  }
+  return { version: AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION, extensions: items, json, byteLength, diagnostics: [] };
+}
+/** Serialize enabled contributions as versioned JSON. Undefined when empty or over the host byte cap. */
+export function serializeAgentContributions(packages?: readonly SpawnRegisteredExtension[]): string | undefined {
+  return buildVersionedAgentContributionSnapshot(packages).json;
+}
+/** Canonical sidecar suffix shared with the runtime parser's basename check. */
+export const CONTRIBUTION_SIDECAR_SUFFIX = ".ext-agent-contributions.json";
+const CONTRIBUTION_SIDECAR_SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+/** Sidecar name for one session file: `chat.jsonl` → `chat.ext-agent-contributions.json`. */
+export function contributionSidecarName(sessionFile: string): string {
+  return basename(sessionFile).replace(/(\.jsonl|\.json)?$/i, "") + CONTRIBUTION_SIDECAR_SUFFIX;
+}
+/** Temp-file pattern for one sidecar name; crash leftovers are matched for session cleanup. */
+export function contributionSidecarTempPattern(sidecarName: string): RegExp {
+  return new RegExp(`^\\.${sidecarName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.[0-9A-Fa-f-]+\\.tmp$`);
+}
+/**
+ * Session-owned sidecar path, verified with realpath — never a lexical prefix guess.
+ *
+ * The jail is the session file's own (realpath-resolved) directory; the sidecar name is
+ * the canonical derivation of the session file name. A directory that does not exist, a
+ * jail outside every realpath-resolved agentDir/sessionsRoot root, or a session id that
+ * is not a flat slug all refuse (undefined), so a prepositioned symlink on any path
+ * component can only make the resolution fail, never relocate the sidecar.
+ */
+export function resolveContributionSnapshotFile(input: {
+  sessionPath?: string;
+  sessionId?: string;
+  agentDir?: string;
+  sessionsRoot?: string;
+}): string | undefined {
+  let jail: string | undefined;
+  let name: string;
+  if (input.sessionPath) {
+    jail = dirname(input.sessionPath);
+    name = contributionSidecarName(input.sessionPath);
+  } else if (input.agentDir && input.sessionId) {
+    if (!CONTRIBUTION_SIDECAR_SESSION_ID.test(input.sessionId)) return undefined;
+    jail = join(resolve(input.agentDir), "sessions", input.sessionId);
+    name = "ext-agent-contributions" + CONTRIBUTION_SIDECAR_SUFFIX;
+  } else {
+    return undefined;
+  }
+  if (name === CONTRIBUTION_SIDECAR_SUFFIX) return undefined; // empty session stem
+  let realJail: string;
+  try {
+    realJail = realpathSync(jail);
+    if (!lstatSync(realJail).isDirectory()) return undefined;
+  } catch {
+    return undefined;
+  }
+  const roots = [input.agentDir, input.sessionsRoot]
+    .filter((root): root is string => Boolean(root))
+    .map((root) => {
+      try {
+        return realpathSync(resolve(root));
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((root): root is string => Boolean(root));
+  if (!roots.length) return undefined;
+  const confined = roots.some((root) => {
+    const rel = relative(root, realJail);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  });
+  if (!confined) return undefined;
+  return join(realJail, name);
+}
+/**
+ * Atomic, no-follow sidecar replacement. The temp file is created with O_EXCL
+ * (0600), written+fsynced, then renamed over the target; a pre-existing symlink,
+ * non-regular file, or multi-link inode at the canonical path is refused instead
+ * of replaced. Any failure returns false — the caller drops contributions only.
+ */
+function isPublishedSidecarStat(stat: { isFile(): boolean; mode: number; nlink: number }): boolean {
+  return stat.isFile() && (stat.mode & 0o777) === 0o600 && stat.nlink === 1;
+}
+function writeContributionSnapshotFile(file: string, json: string): boolean {
+  const dir = dirname(file);
+  try {
+    if (!lstatSync(dir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  try {
+    const existing = lstatSync(file);
+    if (!existing.isFile() || existing.nlink !== 1) return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+  const tmp = join(dir, `.${basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  let fd: number | undefined;
+  let published = false;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    const buffer = Buffer.from(json, "utf8");
+    let offset = 0;
+    while (offset < buffer.length) offset += writeSync(fd, buffer, offset, buffer.length - offset);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(tmp, file);
+    published = true;
+    const noFollow = (constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+    const verifyFd = openSync(file, constants.O_RDONLY | (noFollow ?? 0));
+    try {
+      if (!isPublishedSidecarStat(fstatSync(verifyFd))) throw new Error("sidecar verify");
+    } finally {
+      closeSync(verifyFd);
+    }
+    return true;
+  } catch {
+    if (published) {
+      try { unlinkSync(file); } catch { /* best-effort rollback of a failed publish */ }
+    }
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* already closed */ }
+    }
+    try { unlinkSync(tmp); } catch { /* renamed away or never created */ }
+  }
+}
+/**
+ * Delete the session's sidecar plus this system's orphaned temp files.
+ * Only files at the exact canonical path (realpath-resolved, plus the pre-realpath
+ * lexical location older versions wrote) are considered, and only when they look
+ * like ours: regular file, within the byte cap, and parsing as a versioned
+ * snapshot. Anything else is left untouched — never delete a file this system
+ * does not own.
+ */
+export function removeContributionSnapshotSidecar(input: {
+  sessionPath: string;
+  agentDir?: string;
+  sessionsRoot?: string;
+}): void {
+  const candidates = new Set<string>();
+  const resolved = resolveContributionSnapshotFile(input);
+  if (resolved) candidates.add(resolved);
+  if (input.sessionPath) {
+    candidates.add(resolve(input.sessionPath.replace(/(\.jsonl|\.json)?$/i, "") + CONTRIBUTION_SIDECAR_SUFFIX));
+  }
+  if (!candidates.size) return;
+  const names = new Set([...candidates].map((candidate) => basename(candidate)));
+  const noFollow = (constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+  for (const candidate of candidates) {
+    let fd: number | undefined;
+    try {
+      const pre = lstatSync(candidate);
+      if (!pre.isFile() || pre.size > AGENT_CONTRIBUTIONS_RUNTIME_MAX_BYTES) continue;
+      fd = openSync(candidate, constants.O_RDONLY | (noFollow ?? 0));
+      const opened = fstatSync(fd);
+      if (
+        !opened.isFile()
+        || opened.size > AGENT_CONTRIBUTIONS_RUNTIME_MAX_BYTES
+        || opened.dev !== pre.dev
+        || opened.ino !== pre.ino
+      ) continue;
+      const buffer = Buffer.alloc(opened.size);
+      let offset = 0;
+      while (offset < buffer.length) {
+        const read = readSync(fd, buffer, offset, buffer.length - offset, offset);
+        if (read <= 0) break;
+        offset += read;
+      }
+      closeSync(fd);
+      fd = undefined;
+      const parsed: unknown = JSON.parse(buffer.toString("utf8", 0, offset));
+      if (
+        !parsed || typeof parsed !== "object"
+        || (parsed as { version?: unknown }).version !== AGENT_CONTRIBUTIONS_SNAPSHOT_VERSION
+        || !Array.isArray((parsed as { extensions?: unknown }).extensions)
+      ) continue;
+      unlinkSync(candidate);
+    } catch {
+      /* not ours, unreadable, or already gone — leave it alone */
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* already closed */ }
+      }
+    }
+  }
+  try {
+    const dir = dirname([...candidates][0]!);
+    const patterns = [...names].map(contributionSidecarTempPattern);
+    for (const entry of readdirSync(dir, { withFileTypes: true, encoding: "utf8" })) {
+      if (!entry.isFile() || !patterns.some((pattern) => pattern.test(entry.name))) continue;
+      try { unlinkSync(join(dir, entry.name)); } catch { /* raced away */ }
+    }
+  } catch {
+    /* directory already gone */
+  }
+}
+/** Worker remount: exact inline JSON, or the same session-owned file contents. Never a rescan. */
+export function workerAgentContributionsSnapshot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const value = env[AGENT_CONTRIBUTIONS_ENV];
+  if (typeof value === "string" && value) return value;
+  const file = env[AGENT_CONTRIBUTIONS_FILE_ENV];
+  if (typeof file !== "string" || !file) return undefined;
+  try {
+    return readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+/**
  * Deprecated compat fallback gate for the legacy `pipiui-media` Grok transport
  * (loopback relay / raw xAI API key). Set to "1" only when the user explicitly
  * enables `ext.grok-build-oauth.compatFallback`; default off (spec D6 / US-27).
  */
 export const MEDIA_COMPAT_FALLBACK_ENV = "PIPIUI_MEDIA_COMPAT_FALLBACK";
-function appendRegisteredExtensions(args:string[], env:Record<string,string>, packages?:readonly SpawnRegisteredExtension[]) {
+function applyAgentContributionEnv(
+  env: Record<string, string>,
+  packages: readonly SpawnRegisteredExtension[] | undefined,
+  input?: SpawnInput,
+): void {
+  const built = buildVersionedAgentContributionSnapshot(packages);
+  if (!built.json) return;
+  if (built.byteLength <= AGENT_CONTRIBUTIONS_ENV_MAX_BYTES) {
+    env[AGENT_CONTRIBUTIONS_ENV] = built.json;
+    return;
+  }
+  const file = input ? resolveContributionSnapshotFile(input) : undefined;
+  if (!file || !writeContributionSnapshotFile(file, built.json)) return;
+  env[AGENT_CONTRIBUTIONS_FILE_ENV] = file;
+  env[AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV] = dirname(file);
+}
+function isHostBundledSubagentPath(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  const marker = "/pi-ext/subagent/";
+  const index = normalized.indexOf(marker);
+  if (index < 0) return normalized.endsWith("/pi-ext/subagent");
+  const rest = normalized.slice(index + marker.length);
+  if (!rest) return true;
+  const top = rest.split("/")[0] ?? "";
+  return top !== "test" && top !== "tests";
+}
+
+/** Refuse symlink/host/aliased mounts. Missing test fixtures stay keyed by resolved path. */
+function classifyExtensionMount(filePath: string): { key: string } | undefined {
+  if (isHostBundledSubagentPath(filePath)) return undefined;
+  try {
+    const stat = lstatSync(filePath);
+    if (stat.isSymbolicLink() || !stat.isFile()) return undefined;
+    try {
+      if (isHostBundledSubagentPath(realpathSync(filePath))) return undefined;
+    } catch {
+      /* inode identity is enough */
+    }
+    return { key: `${stat.dev}:${stat.ino}` };
+  } catch {
+    return { key: `path:${resolve(filePath)}` };
+  }
+}
+
+function appendRegisteredExtensions(args:string[], env:Record<string,string>, packages?:readonly SpawnRegisteredExtension[], input?:SpawnInput) {
   const skillRoots:string[]=[];
   const mountedIds:string[]=[];
   const mountedPaths:string[]=[];
+  const classified:{ pkg:SpawnRegisteredExtension; key:string }[]=[];
+  const keyCount=new Map<string, number>();
   for (const pkg of packages ?? []) {
-    if (!pkg.enabled || !pkg.extensionPath) continue;
+    if (!pkg.enabled) continue;
+    if (pkg.skillRoots) for (const root of pkg.skillRoots) if (root) skillRoots.push(root);
+    if (pkg.settings !== undefined) env[extensionSettingsEnvName(pkg.id)] = JSON.stringify(pkg.settings);
+    if (!pkg.extensionPath) continue;
+    const mount = classifyExtensionMount(pkg.extensionPath);
+    if (!mount) continue;
+    classified.push({ pkg, key: mount.key });
+    keyCount.set(mount.key, (keyCount.get(mount.key) ?? 0) + 1);
+  }
+  for (const { pkg, key } of classified) {
+    if ((keyCount.get(key) ?? 0) > 1 || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
     mountedIds.push(pkg.id);
     mountedPaths.push(pkg.extensionPath);
-    if (pkg.skillRoots) for (const root of pkg.skillRoots) if (root) skillRoots.push(root);
-    if (pkg.settings !== undefined) env[extensionSettingsEnvName(pkg.id)] = JSON.stringify(pkg.settings);
   }
   if (mountedIds.length) env[MOUNTED_EXTENSIONS_ENV] = mountedIds.join(",");
   if (mountedPaths.length) env[REGISTERED_EXTENSION_PATHS_ENV] = mountedPaths.join(delimiter);
   if (skillRoots.length) env.PIPIUI_SKILL_ROOTS = skillRoots.join(delimiter);
+  applyAgentContributionEnv(env, packages, input);
 }
 /**
  * Worker `-e` remount of the main-session registered-extension snapshot.

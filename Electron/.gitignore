@@ -21,3 +21,4 @@ dist/
 !resources/runtime/extensions/deepseek/
 !resources/runtime/extensions/deepseek/**
 out/
+packages/pi-backend/src/runtime-agents.bundle.mjs

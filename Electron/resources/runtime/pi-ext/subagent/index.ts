@@ -70,7 +70,11 @@ import {
 	type AgentScope,
 	discoverAgents,
 	discoverBundledAgentsFromDirectory,
+	dispatchToolPatch,
+	extensionToolOwnership,
 	formatAgentDiagnostics,
+	installExtensionToolOwnershipCapture,
+	mountedExtensionIdsFromEnv,
 } from "./agents.ts";
 import { registerMainSessionCompactionHook } from "./main-compaction.ts";
 import { registerMidTurnCompactionGuard } from "./mid-turn-compaction.ts";
@@ -5928,14 +5932,23 @@ async function runSingleAgent(
 		memoryOmissionReason,
 	});
 	const workerReadToolOmissionText = formatWorkerReadToolOmissions(workerReadToolOmissions);
+	const mountedExtensionIds = mountedExtensionIdsFromEnv();
+	const toolPatch = dispatchToolPatch(
+		agent,
+		mountedExtensionIds,
+		extensionToolOwnership(),
+	);
 	const normalToolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
 		// Depth-gated: a child at/above PIPIUI_MAX_DEPTH must not even see the tools.
-		declaredTools: options?.computerAgent ? undefined : agent.tools?.filter(
+		// Extension extras stay provenance-tagged until this mount filter; runtime
+		// suffixes (placement/isolation/desktop/closeout/findings) are appended after
+		// the (already patched) definition prompt below.
+		declaredTools: options?.computerAgent ? undefined : toolPatch.declaredTools?.filter(
 			(t) => allowRecursiveDelegation || !isDelegationTool(t),
 		),
-		disabledTools: loadDisabledTools(),
+		disabledTools: [...loadDisabledTools(), ...toolPatch.extraDisabledTools],
 		hasDesktopCapability: desktopGrant.granted,
 		hasMemoryBrokerCapability: !!terminalMemoryBrokerEnvironment,
 		// The subagent extension that registers session_recall is mounted below
@@ -8066,6 +8079,7 @@ export default function (pi: ExtensionAPI) {
 	registerMidTurnCompactionGuard(AgentSession);
 	registerFollowUpCompactionGuard(AgentSession);
 	registerFatalHookPropagation(ExtensionRunner);
+	installExtensionToolOwnershipCapture(ExtensionRunner);
 	pi.on("session_start", (_event, ctx) => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();

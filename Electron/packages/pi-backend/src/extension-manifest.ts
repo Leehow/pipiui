@@ -69,7 +69,50 @@ export type ExtensionUiSummary = {
   slashCommands?: ExtensionUiSlashCommand[];
 };
 
-export type ValidatedExtensionManifest = {
+/** Max contributed AGENT.md paths in one manifest. */
+export const EXTENSION_AGENT_CONTRIBUTION_MAX = 32;
+/** Max agent patches in one manifest. */
+export const EXTENSION_AGENT_PATCH_MAX = 32;
+/** Max addTools/removeTools names on one patch. */
+export const EXTENSION_AGENT_PATCH_TOOLS_MAX = 32;
+/** Max characters for a retained relative path. */
+export const EXTENSION_AGENT_PATH_MAX = 256;
+/** Semantic agent / patch-target name. */
+export const EXTENSION_AGENT_NAME_RE = /^[A-Za-z][A-Za-z0-9._-]{0,62}$/;
+/** Tool names requested by a patch (host or extension-supplied). */
+export const EXTENSION_AGENT_TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/;
+
+const AGENT_MANIFEST_KEYS = new Set(["extension", "skills", "agents", "agentPatches"]);
+const AGENT_PATCH_KEYS = new Set([
+  "target",
+  "appendPrompt",
+  "replacePrompt",
+  "addTools",
+  "removeTools",
+]);
+const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
+
+/**
+ * Incremental patch against an already-discovered agent.
+ * Prompt fields are extension-relative file paths (not inline bodies).
+ * `appendPrompt` and `replacePrompt` are mutually exclusive.
+ */
+export type ExtensionAgentPatch = {
+  target: string;
+  appendPrompt?: string;
+  replacePrompt?: string;
+  addTools?: string[];
+  removeTools?: string[];
+};
+
+/** Validated agent-half contribution snapshot — transport must not re-parse raw JSON. */
+export type ExtensionAgentContributions = {
+  /** Extension-relative schema:1 `AGENT.md` paths. Existence/realpath is the loader's job. */
+  agents?: string[];
+  agentPatches?: ExtensionAgentPatch[];
+};
+
+export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   id: string;
   name: string;
   version: string;
@@ -132,6 +175,178 @@ function collectDocumentExtensions(value: unknown, label: string, errors: string
     out.push(normalized);
   }
   return out.length ? out : undefined;
+}
+
+function rejectUnknownKeys(
+  record: Record<string, unknown>,
+  allowed: Set<string>,
+  label: string,
+  errors: string[],
+): void {
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) errors.push(`unknown field '${key}' in ${label}`);
+  }
+}
+
+/** Manifest-layer relative path: keep the string; loader owns realpath / existence. */
+function collectRelativePath(
+  value: unknown,
+  label: string,
+  errors: string[],
+  options?: { requireAgentMd?: boolean },
+): string | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    errors.push(`${label} must be a non-empty path string`);
+    return undefined;
+  }
+  const path = value.trim();
+  if (CONTROL_CHAR_RE.test(path)) {
+    errors.push(`${label} must not contain control characters`);
+    return undefined;
+  }
+  if (path.length > EXTENSION_AGENT_PATH_MAX) {
+    errors.push(`${label} must be at most ${EXTENSION_AGENT_PATH_MAX} characters`);
+    return undefined;
+  }
+  if (path.startsWith("/") || path.startsWith("\\") || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("~")) {
+    errors.push(`${label} must be a relative path`);
+    return undefined;
+  }
+  if (path.includes("\\")) {
+    errors.push(`${label} must use forward slashes`);
+    return undefined;
+  }
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
+    errors.push(`${label} must not contain empty, '.', or '..' segments`);
+    return undefined;
+  }
+  if (options?.requireAgentMd && segments[segments.length - 1] !== "AGENT.md") {
+    errors.push(`${label} must be a schema:1 AGENT.md relative path`);
+    return undefined;
+  }
+  return path;
+}
+
+function collectToolNames(value: unknown, label: string, errors: string[]): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
+    errors.push(`${label} must be an array of non-empty strings`);
+    return undefined;
+  }
+  if (value.length > EXTENSION_AGENT_PATCH_TOOLS_MAX) {
+    errors.push(`${label} must have at most ${EXTENSION_AGENT_PATCH_TOOLS_MAX} entries`);
+    return undefined;
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value as string[]) {
+    const name = item.trim();
+    if (!EXTENSION_AGENT_TOOL_NAME_RE.test(name)) {
+      errors.push(`${label} contains invalid tool name '${name}'`);
+      continue;
+    }
+    if (seen.has(name)) {
+      errors.push(`${label} contains duplicate tool name '${name}'`);
+      continue;
+    }
+    seen.add(name);
+    out.push(name);
+  }
+  return out.length ? out : undefined;
+}
+
+function collectAgentPaths(value: unknown, errors: string[]): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    errors.push("agent.agents must be an array of AGENT.md relative paths");
+    return undefined;
+  }
+  if (value.length > EXTENSION_AGENT_CONTRIBUTION_MAX) {
+    errors.push(`agent.agents must have at most ${EXTENSION_AGENT_CONTRIBUTION_MAX} entries`);
+    return undefined;
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const path = collectRelativePath(item, `agent.agents[${index}]`, errors, { requireAgentMd: true });
+    if (!path) continue;
+    if (seen.has(path)) {
+      errors.push(`duplicate agent path '${path}'`);
+      continue;
+    }
+    seen.add(path);
+    out.push(path);
+  }
+  return out.length ? out : undefined;
+}
+
+function collectAgentPatches(value: unknown, errors: string[]): ExtensionAgentPatch[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    errors.push("agent.agentPatches must be an array");
+    return undefined;
+  }
+  if (value.length > EXTENSION_AGENT_PATCH_MAX) {
+    errors.push(`agent.agentPatches must have at most ${EXTENSION_AGENT_PATCH_MAX} entries`);
+    return undefined;
+  }
+  const patches: ExtensionAgentPatch[] = [];
+  const seenTargets = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const label = `agent.agentPatches[${index}]`;
+    if (!isRecord(item)) {
+      errors.push(`${label} must be an object`);
+      continue;
+    }
+    rejectUnknownKeys(item, AGENT_PATCH_KEYS, label, errors);
+    const target = asNonEmptyString(item.target);
+    if (!target) {
+      errors.push(`${label}.target must be a non-empty agent name`);
+      continue;
+    }
+    if (!EXTENSION_AGENT_NAME_RE.test(target)) {
+      errors.push(`${label}.target is not a valid agent name`);
+      continue;
+    }
+    if (seenTargets.has(target)) {
+      errors.push(`duplicate agent patch target '${target}'`);
+    } else {
+      seenTargets.add(target);
+    }
+
+    const hasAppend = Object.prototype.hasOwnProperty.call(item, "appendPrompt");
+    const hasReplace = Object.prototype.hasOwnProperty.call(item, "replacePrompt");
+    if (hasAppend && hasReplace) {
+      errors.push(`${label} cannot declare both appendPrompt and replacePrompt`);
+    }
+    const appendPrompt = hasAppend
+      ? collectRelativePath(item.appendPrompt, `${label}.appendPrompt`, errors)
+      : undefined;
+    const replacePrompt = hasReplace
+      ? collectRelativePath(item.replacePrompt, `${label}.replacePrompt`, errors)
+      : undefined;
+    const addTools = collectToolNames(item.addTools, `${label}.addTools`, errors);
+    const removeTools = collectToolNames(item.removeTools, `${label}.removeTools`, errors);
+    if (addTools && removeTools) {
+      const overlap = addTools.filter((name) => removeTools.includes(name));
+      if (overlap.length) {
+        errors.push(`${label} cannot add and remove the same tool (${overlap.join(", ")})`);
+      }
+    }
+    if (!appendPrompt && !replacePrompt && !addTools?.length && !removeTools?.length) {
+      errors.push(
+        `${label} must declare at least one of appendPrompt, replacePrompt, addTools, removeTools`,
+      );
+    }
+    const patch: ExtensionAgentPatch = { target };
+    if (appendPrompt) patch.appendPrompt = appendPrompt;
+    if (replacePrompt) patch.replacePrompt = replacePrompt;
+    if (addTools?.length) patch.addTools = addTools;
+    if (removeTools?.length) patch.removeTools = removeTools;
+    patches.push(patch);
+  }
+  return patches.length ? patches : undefined;
 }
 
 function settingsPrefix(id: string): string {
@@ -421,10 +636,13 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
 
   let agentExtension: string | undefined;
   let agentSkills: string[] | undefined;
+  let agents: string[] | undefined;
+  let agentPatches: ExtensionAgentPatch[] | undefined;
   if (value.agent !== undefined && value.agent !== null) {
     if (!isRecord(value.agent)) {
       errors.push("agent must be an object");
     } else {
+      rejectUnknownKeys(value.agent, AGENT_MANIFEST_KEYS, "agent", errors);
       if (value.agent.extension !== undefined) {
         const path = asNonEmptyString(value.agent.extension);
         if (!path) errors.push("agent.extension must be a path string");
@@ -437,6 +655,8 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
           agentSkills = value.agent.skills.map((item) => String(item));
         }
       }
+      agents = collectAgentPaths(value.agent.agents, errors);
+      agentPatches = collectAgentPatches(value.agent.agentPatches, errors);
     }
   }
 
@@ -477,6 +697,8 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (ui) manifest.ui = ui;
   if (agentExtension) manifest.agentExtension = agentExtension;
   if (agentSkills) manifest.agentSkills = agentSkills;
+  if (agents) manifest.agents = agents;
+  if (agentPatches) manifest.agentPatches = agentPatches;
   if (hostEntry) manifest.hostEntry = hostEntry;
   if (auth) manifest.auth = auth;
   return { ok: true, manifest };

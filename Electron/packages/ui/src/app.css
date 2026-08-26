@@ -151,6 +151,13 @@ body{overscroll-behavior:none}
 .extensions-pkg-actions{display:flex;align-items:center;gap:8px;flex:none}
 .extensions-badges{display:flex;flex-wrap:wrap;gap:4px}
 .extensions-pkg-desc{margin:0;color:var(--muted);font-size:12px;line-height:1.4}
+.extensions-pkg-contrib{display:flex;flex-direction:column;gap:6px;padding-top:8px;border-top:1px dashed var(--border)}
+.extensions-pkg-contrib-heading{color:var(--muted);font-size:10px}
+.extensions-pkg-agents,.extensions-pkg-patches{margin:0;padding-left:16px;color:var(--text);font-size:11px;line-height:1.45}
+.extensions-pkg-agents li,.extensions-pkg-patches li{margin:3px 0;display:flex;flex-direction:column;gap:2px}
+.extensions-pkg-agent-meta,.extensions-pkg-agent-desc{color:var(--muted);font-size:10px}
+.extensions-pkg-contrib-diagnostics{display:flex;flex-direction:column;gap:6px}
+.extensions-catalog-diagnostics{display:flex;flex-direction:column;gap:6px;padding:8px 12px;border-bottom:1px solid var(--border)}
 .extensions-pkg-settings{display:flex;flex-direction:column;gap:8px;border-top:1px dashed var(--border);padding-top:8px}
 .extensions-pkg-settings>.model-modal-refresh{align-self:flex-start}
 .extensions-pkg-auth{display:flex;flex-direction:column;gap:8px;border-top:1px dashed var(--border);padding-top:8px}
