@@ -400,6 +400,9 @@ describe("vendored philosophy: delivery", () => {
     // workers assembling `cd X && grep` chains the tools could already answer, so the
     // layer now maps each chain shape to the parameter that absorbs it. The section pays
     // for itself the first time it replaces a five-grep bash script with one call.
+    // The semantic-slug identity section rode in under the same cap: it compresses the
+    // agentId brief bullet it supersedes, so the rule pays for its own prose instead of
+    // adding an entry to this ledger.
     // Raised to 18100 for fanout's "cut the file" section: file identity had already been
     // ruled out as a reason to serialize, but a same-region collision was still accepted as
     // one, so separable work kept running single-threaded behind a cohesion defect the boss
@@ -407,6 +410,47 @@ describe("vendored philosophy: delivery", () => {
     // that would otherwise have queued.
     const result = compose({ model: SCOPED_MODEL });
     expect(Math.round(result.text.length / 4)).toBeLessThan(18100);
+  });
+
+  it("delivers the semantic-slug identity rule into the composed boss prompt", () => {
+    // The shipped defect: stable worker identity fell back to `agent-<random>` — an id no
+    // model can read, repeat, or retype to continue, abort, or resolve. The contract now
+    // lives in the orchestration layer and splits by who mints the id: caller-chosen
+    // identities (agentId, plan id, computer sessionId) the model supplies explicitly;
+    // runtime-allocated model-visible identities (a goal id) the runtime may mint but must
+    // keep readable and semantic; randomness only for ids no model ever names. The first
+    // wording overreached — "every stable id the model must generate" — and contradicted
+    // the runtime-allocated goal ids, so the negative pin below keeps that regression out.
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(orchestration).toMatch(/## Stable identity is a semantic slug/);
+    // Tier A: caller-chosen identities are the model's to mint, as readable slugs.
+    expect(orchestration).toMatch(/Every stable id you name/);
+    expect(orchestration).toMatch(/`quota-pill`, not a UUID, random hex, or `agent-<random>`/);
+    // The over-broad first wording is gone: not every model-visible id is model-minted.
+    expect(orchestration).not.toMatch(/Every stable id you must generate/);
+    // Tier B: runtime-allocated ids stay readable and semantic, just not caller-supplied.
+    expect(orchestration).toMatch(/Runtime-allocated ids \(a goal id\) stay\s+readable and semantic, not yours to mint/);
+    // Tier C: randomness belongs only where no model names the id.
+    expect(orchestration).toMatch(/Randomness belongs only where no model names it/);
+    expect(orchestration).toMatch(/one-shot\s+runId\/eventId\/waveId\/requestId/);
+    // The browser token stays capability-addressed; a bare tool name would fail the scan.
+    expect(orchestration).toMatch(/\{\{browser\}\} snapshot\/element\s+tokens/);
+    for (const role of ["main", "lead"] as const) {
+      const result = compose({ role });
+      expect(result.included.map((l) => l.id)).toContain("orchestration");
+      // The composed prompt — what the session actually loads — carries all three tiers
+      // verbatim, with the capability placeholder resolved to the live tool name.
+      expect(result.text).toMatch(/Stable identity is a semantic slug/);
+      expect(result.text).toMatch(/Every stable id you name/);
+      expect(result.text).toMatch(/`quota-pill`, not a UUID, random hex, or `agent-<random>`/);
+      expect(result.text).toMatch(/Runtime-allocated ids \(a goal id\) stay\s+readable and semantic/);
+      expect(result.text).toMatch(/runId\/eventId\/waveId\/requestId/);
+      expect(result.text).toMatch(/browser snapshot\/element\s+tokens/);
+    }
+    // The rule rides the orchestration layer only; a dispatched worker never pays for it.
+    const worker = compose({ role: "worker", agent: "general-purpose" });
+    expect(worker.included.map((l) => l.id)).not.toContain("orchestration");
+    expect(worker.text).not.toMatch(/Stable identity is a semantic slug/);
   });
 
   it("permits worker skill_search/load and memory_query without automatic bootstrap", () => {

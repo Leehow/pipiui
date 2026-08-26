@@ -158,10 +158,8 @@ vague.
   re-dispatch a read-only worker to make a shell command pass.
 - Always pass a `title`: one short line (≤20 chars) naming the job. Panels and status
   listings show it instead of the whole brief.
-- Name the worker, not just the task. Pass a short `agentId` you choose — `quota-pill`,
-  `auth-refactor` — because that name is how you continue with the same worker later. A long
-  generated id is one you will retype wrong, and a mistyped id is silently a different worker
-  with an empty head.
+- Name the worker, not just the task: pass the chosen `agentId` slug; a mistyped id is a
+  different worker with an empty head.
 - Decide shared architecture before dispatching, not inside each worker.
 - A brief is the worker's plan: steps you already hold go into the brief rather than into a
   separate document. That rules out the extra artifact. It never rules out dispatching a
@@ -188,6 +186,15 @@ you write only the second.
 - Pointing at a document does not make a brief less standalone: the worker still gets
   everything without seeing your context, just partly by reference. The per-worker half — goal,
   scope, acceptance — stays in the brief.
+
+## Stable identity is a semantic slug
+
+Every stable id you name — a worker `agentId`, `plan.id`, computer `sessionId` — is a
+short, unique, readable slug (`quota-pill`, not a UUID, random hex, or `agent-<random>`);
+reuse it verbatim to continue, abort, or resolve. Runtime-allocated ids (a goal id) stay
+readable and semantic, not yours to mint. Randomness belongs only where no model names it:
+one-shot runId/eventId/waveId/requestId, security tokens, {{browser}} snapshot/element
+tokens, temp files, locks.
 
 ## Continuity within one vertical slice
 
