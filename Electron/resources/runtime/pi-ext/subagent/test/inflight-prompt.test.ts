@@ -21,6 +21,7 @@ function queued(partial: Partial<QueuedDispatchV1> & Pick<QueuedDispatchV1, "age
 		task: "look around",
 		blockedBy: [],
 		queuedAt: 0,
+		runId: `run-${partial.agentId}`,
 		run: async () => {},
 		...partial,
 	};

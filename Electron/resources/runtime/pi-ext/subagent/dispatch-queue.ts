@@ -22,6 +22,8 @@ export type DependencyState = "ok" | "failed" | "running" | "unknown";
 
 export interface QueuedDispatchV1 {
 	agentId: string;
+	/** One-shot run identity assigned at acceptance, not at start. Exact-abort binding. */
+	runId: string;
 	role: string;
 	title?: string;
 	task: string;
@@ -96,9 +98,13 @@ export class DispatchQueueV1 {
 		return true;
 	}
 
-	/** Drop a queued item that has not started. Returns false when it is unknown or already running. */
-	cancel(agentId: string): boolean {
-		const index = this.queued.findIndex((item) => item.agentId === agentId);
+	/**
+	 * Drop a queued item that has not started, bound to the exact accepted run.
+	 * A stale runId (the agentId was re-queued or already runs a newer run) must not drop the
+	 * newer item. Returns false when no queued item matches the {agentId, runId} pair.
+	 */
+	cancel(agentId: string, runId: string): boolean {
+		const index = this.queued.findIndex((item) => item.agentId === agentId && item.runId === runId);
 		if (index === -1) return false;
 		this.queued.splice(index, 1);
 		this.pump();
@@ -152,7 +158,8 @@ export class DispatchQueueV1 {
 					this.options.notify(
 						`[subagent-blocked] agentId=${item.agentId} title=${item.title ?? item.role} is held: ${admission.reason}. ` +
 							"It has NOT run and will NOT run on its own. Re-dispatch that dependency — this task starts automatically when the dependency succeeds — " +
-							`or drop it with subagent_abort({agentId:"${item.agentId}"}) if it is no longer wanted.`,
+							`or drop it with subagent_abort({agentId:"${item.agentId}", runId:"${item.runId}"}) if it is no longer wanted. ` +
+							"Before any wait or final closeout after this event, run the fan-out refill scan.",
 					);
 				}
 				continue;
@@ -224,7 +231,7 @@ export function formatQueuedPromptSections(
 				const title = item.title?.trim() || item.agentId;
 				return `- \`${item.agentId}\` (${title}) — ${item.heldReason}`;
 			}),
-			"Each is waiting on a dependency that did not succeed. Re-dispatch that dependency and the held task resumes automatically, or drop it with subagent_abort({agentId}) . Do not declare the goal finished while anything above is held.",
+			"Each is waiting on a dependency that did not succeed. Re-dispatch that dependency and the held task resumes automatically, or drop it with subagent_abort({agentId, runId}). Do not declare the goal finished while anything above is held.",
 		);
 	}
 	return lines;
@@ -243,6 +250,6 @@ export function formatQueuedDispatches(
 				? `waiting for ${item.blockedBy.join(", ")}`
 				: "waiting for a slot";
 		const title = item.title ? ` title=${item.title}` : "";
-		return `agentId=${item.agentId} role=${item.role}${title} state=queued: ${state} queued=${waited}s`;
+		return `agentId=${item.agentId} runId=${item.runId} role=${item.role}${title} state=queued: ${state} queued=${waited}s`;
 	});
 }

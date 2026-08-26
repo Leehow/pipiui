@@ -6,7 +6,6 @@ export const RESERVED_DESKTOP_TOOL_NAMES = Object.freeze([
 /** Tools that exist only to dispatch or control workers. Nested roles lose the whole set. */
 export const DELEGATION_TOOL_NAMES = Object.freeze([
 	"subagent",
-	"subagent_parallel",
 	"subagent_chain",
 	"subagent_abort",
 	"subagent_resolve",

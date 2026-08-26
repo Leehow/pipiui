@@ -41,7 +41,10 @@ it("preserves every run of one agent as durable, independently queryable history
   await report({ kind: "end", agentId: "operator-1", runId: "run-old", name: "operator", ok: false, output: "old failure", at: "2026-08-16T15:00:00.000Z" });
   await report({ kind: "start", agentId: "operator-1", runId: "run-new", name: "operator", task: "second attempt", createdAt: 200 });
   await report({ kind: "log_delta", agentId: "operator-1", runId: "run-new", itemType: "text", text: "new evidence", contentIndex: 0 });
-  await expect(backend.handle("checkAgent", ["operator-1"])).resolves.toMatchObject({ runId: "run-new", state: "running" });
+  // Exact episode lookup: the probe names the run it is inspecting.
+  await expect(backend.handle("checkAgent", ["session-1", "operator-1", "run-new"])).resolves.toMatchObject({ runId: "run-new", state: "running" });
+  // A stale run row stays queryable by its exact triple and never falls through to the newest run.
+  await expect(backend.handle("checkAgent", ["session-1", "operator-1", "run-old"])).resolves.toMatchObject({ runId: "run-old", state: "failed" });
   await report({ kind: "end", agentId: "operator-1", runId: "run-new", name: "operator", ok: true, output: JSON.stringify({ outcome: "completed" }), at: "2026-08-16T15:01:00.000Z" });
   await report({ kind: "update", agentId: "operator-1", runId: "run-old", output: "late old update", activity: "stale" });
 
@@ -61,5 +64,5 @@ it("preserves every run of one agent as durable, independently queryable history
     { text: "old evidence" },
     { text: "new evidence" },
   ]);
-  await expect(backend.handle("checkAgent", ["operator-1"])).resolves.toMatchObject({ runId: "run-new" });
+  await expect(backend.handle("checkAgent", ["session-1", "operator-1", "run-new"])).resolves.toMatchObject({ runId: "run-new" });
 });

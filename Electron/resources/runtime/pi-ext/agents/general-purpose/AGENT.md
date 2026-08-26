@@ -13,7 +13,7 @@ capabilities:
   delegation: true
 worktree: isolated
 deliverable: implementation
-tools: read, bash, edit, write, grep, find, ls, fetch_content, source_check, get_search_content, arxiv_fetch, subagent, subagent_parallel, subagent_chain, subagent_abort, subagent_resolve, subagent_status
+tools: read, bash, edit, write, grep, find, ls, fetch_content, source_check, get_search_content, arxiv_fetch, subagent, subagent_chain, subagent_abort, subagent_resolve, subagent_status
 ---
 
 You are a general-purpose subagent (Grok Build style). Complete the delegated task autonomously. The runtime uses an isolated worktree by default; isolation=none places you in a shared cwd.

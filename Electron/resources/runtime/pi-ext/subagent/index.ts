@@ -7,7 +7,7 @@
  * Public tools:
  *   - subagent: { prompt, description, subagent_type?, isolation? }
  *   - subagent_chain: { chain: [{ prompt, description }, ...] }
- *   - subagent_abort: { agentId }
+ *   - subagent_abort: { agentId, runId }
  *   - subagent_resolve: { agentId, runId }
  *
  * Uses JSON mode to capture structured output from subagents.
@@ -46,7 +46,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
-import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments, remapUnknownSubagentType } from "./strict-json-schema.ts";
+import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
 import {
 	cleanScope,
 	clearRunningDispatchScope,
@@ -168,6 +168,7 @@ import {
 	type IdleFoldUsage,
 } from "./idle-fold-timer.ts";
 import {
+	contextFoldIsStandby,
 	contextManageTool,
 	handleIdleFoldNudge,
 	restoreNudgeThinking,
@@ -2395,6 +2396,7 @@ function noteIdleFoldContext(event: { messages?: unknown }, ctx: {
 }
 
 function runProductionIdleFold(): void {
+	if (contextFoldIsStandby()) return;
 	const usage = lastIdleFoldUsage;
 	if (!contextAboveIdleFoldWatermark(usage, idleFoldConfig.lowWatermark)) return;
 	const messages = lastIdleFoldMessages;
@@ -2661,23 +2663,39 @@ function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle,
 }
 
 /**
- * 中止运行中的后台 job：触发其 AbortController → killProc（SIGTERM，5s 后未退出则 SIGKILL）。
+ * 中止一个后台 job：触发其 AbortController → killProc（SIGTERM，5s 后未退出则 SIGKILL）。
  * job 以 aborted 结束；精确单任务中止由 Supervisor 接收终态，stop sweep 保持静默。
- * agentId 不存在/已结束返回明确错误。
+ * runId 必填：queued 与 running 都按 {agentId, runId} 精确匹配，stale runId 拒绝而不是
+ * 误杀同名 agentId 的新队列/新 run；成功取消 queued 项时同步释放 localAgentReservations。
  */
 function abortRunningAgent(
 	agentId: string,
-	options?: { reportTerminalToSupervisor?: boolean },
+	options: { reportTerminalToSupervisor?: boolean; runId: string },
 ): { ok: boolean; message: string } {
+	const runId = options.runId.trim();
+	if (!runId) {
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: runId is required. Pass the exact runId from the dispatch receipt or subagent_status so a stale holder cannot abort a newer run under the same agentId.`,
+		};
+	}
 	// A queued task has no process to signal, so abort means "drop it before it starts". This is
 	// also the escape hatch offered by the [subagent-blocked] signal for a task no longer wanted.
-	if (dispatchQueue.cancel(agentId)) {
+	if (dispatchQueue.cancel(agentId, runId)) {
+		// Accepted-but-unstarted work owns an id reservation; dropping it must give the id back.
+		localAgentReservations.delete(agentId);
 		return {
 			ok: true,
-			message: `Dropped queued agentId=${agentId} before it started; no process ran and no [subagent-done] will arrive for it.`,
+			message: `Dropped queued agentId=${agentId} runId=${runId} before it started; no process ran and no [subagent-done] will arrive for it.`,
 		};
 	}
 	const job = jobRegistry.get(agentId);
+	if (job && job.runId !== runId) {
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: stale runId=${runId}${job.runId ? `; currentRunId=${job.runId}` : ""}. Re-check with subagent_status and abort the current run's exact runId.`,
+		};
+	}
 	if (job && job.state !== "running") {
 		return {
 			ok: false,
@@ -2689,12 +2707,18 @@ function abortRunningAgent(
 		if (!job) {
 			return {
 				ok: false,
-				message: `Cannot abort agentId=${agentId}: unknown agentId (no such job in this session process).`,
+				message: `Cannot abort agentId=${agentId} runId=${runId}: no queued item, run, or job matches that exact pair (no such job in this session process).`,
 			};
 		}
 		return {
 			ok: false,
 			message: `Cannot abort agentId=${agentId}: job is running but has no abort handle (already finishing?).`,
+		};
+	}
+	if (handle.runId !== runId) {
+		return {
+			ok: false,
+			message: `Cannot abort agentId=${agentId}: stale runId=${runId}; currentRunId=${handle.runId}. Re-check with subagent_status and abort the current run's exact runId.`,
 		};
 	}
 	if (handle.finalizing) {
@@ -2703,9 +2727,9 @@ function abortRunningAgent(
 			message: `Cannot abort agentId=${agentId}: child process already exited and is already finalizing closeout.`,
 		};
 	}
-	noteDiagnosticsAbort(handle.diagnostics, options?.reportTerminalToSupervisor ? "stall" : "user");
+	noteDiagnosticsAbort(handle.diagnostics, options.reportTerminalToSupervisor ? "stall" : "user");
 	const abortExactRun = () => handle.controller.abort();
-	if (options?.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
+	if (options.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
 		supervisorAbortTerminalCloseout.requestExternal(
 			{ agentId, runId: handle.runId },
 			abortExactRun,
@@ -2715,7 +2739,7 @@ function abortRunningAgent(
 	}
 	return {
 		ok: true,
-		message: `Abort requested for agentId=${agentId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
+		message: `Abort requested for agentId=${agentId} runId=${runId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
 	};
 }
 
@@ -2726,13 +2750,12 @@ function abortRunningAgent(
  * cannot restart turns by itself.
  */
 function abortAllRunningAgents(): { aborted: string[] } {
-	const ids = new Set<string>([
-		...dispatchQueue.snapshot().map((item) => item.agentId),
-		...runningAgents.keys(),
-	]);
+	const targets = new Map<string, string>();
+	for (const item of dispatchQueue.snapshot()) targets.set(item.agentId, item.runId);
+	for (const [agentId, handle] of runningAgents) targets.set(agentId, handle.runId);
 	const aborted: string[] = [];
-	for (const id of ids) {
-		if (abortRunningAgent(id).ok) aborted.push(id);
+	for (const [agentId, runId] of targets) {
+		if (abortRunningAgent(agentId, { runId }).ok) aborted.push(agentId);
 	}
 	return { aborted };
 }
@@ -2784,7 +2807,7 @@ function resolveSubagentEpisode(
 	if (job.state === "running") {
 		return {
 			ok: false,
-			message: `Cannot resolve agentId=${agentId} runId=${runId}: job is still running. Use subagent_abort({agentId}) or wait for it to finish.`,
+			message: `Cannot resolve agentId=${agentId} runId=${runId}: job is still running. Use subagent_abort({agentId, runId}) or wait for it to finish.`,
 		};
 	}
 	if (job.state === "ok") {
@@ -3674,26 +3697,6 @@ function formatQueuedSection(now: number): string[] {
 	return ["", `Queued (not started, ${queued.length}):`, ...formatQueuedDispatches(queued, now).map((l) => `  ${l}`)];
 }
 
-function generatePipiuiAgentId(
-	reserved: Set<string> = new Set(),
-	options: { reserveGlobally?: boolean } = {},
-): string {
-	// 64 random bits keeps generated ids collision-resistant while staying inside the 24-char
-	// semantic-id contract. The loop turns probabilistic uniqueness into a checked invariant.
-	for (let attempt = 0; attempt < 100; attempt++) {
-		const candidate = `agent-${randomBytes(8).toString("hex")}`;
-		const active =
-			localAgentReservations.has(candidate) ||
-			runningAgents.has(candidate) ||
-			jobRegistry.get(candidate)?.state === "running";
-		if (reserved.has(candidate) || active) continue;
-		reserved.add(candidate);
-		if (options.reserveGlobally !== false) localAgentReservations.add(candidate);
-		return candidate;
-	}
-	throw new Error("Unable to allocate a unique subagent id after 100 attempts.");
-}
-
 /**
  * A worker's id is what the boss has to type back to continue with the same worker, so it is
  * chosen by the boss and kept short and meaningful: `quota-pill`, not `agent-ms1mo5dx-pn6o1l`.
@@ -3702,10 +3705,22 @@ function generatePipiuiAgentId(
  *
  * Also lands verbatim in a git branch (`pipiui/<id>`) and a session filename, so the character
  * set is the intersection of "safe there" and "hard to mistype".
+ *
+ * Identity contract: nothing here ever generates an agentId. Every dispatch — single,
+ * tasks/parallel, chain, read-only or writable — must carry an explicit caller-chosen id;
+ * runSingleAgent rejects a missing one instead of inventing `agent-<random>`. Randomness
+ * stays correct only for the one-shot runId (DeliveryObligationStore.runId).
  */
 // PIPIUI_PURE_AGENT_ID_BEGIN
 const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
 const RESERVED_AGENT_IDS = new Set(["root", "main", "head", "master"]);
+/** Shape of the retired generator ("agent-" + 16 lowercase hex chars): banned for new dispatch. */
+const LEGACY_GENERATED_AGENT_ID_PATTERN = /^agent-[0-9a-f]{16}$/;
+
+/** True only for the exact retired random-generator shape. Historical ids stay operable via abort/resolve/status. */
+export function isLegacyGeneratedAgentId(id: string): boolean {
+	return LEGACY_GENERATED_AGENT_ID_PATTERN.test(id);
+}
 
 /** Returns an error addressed to the model, or null when the id is usable. */
 function validateAgentId(id: string): string | null {
@@ -3727,7 +3742,7 @@ interface CallerAgentIdSelection {
 }
 
 /** Pure request gate: validates, de-duplicates, and excludes every currently active id. */
-function selectCallerAgentIds(
+export function selectCallerAgentIds(
 	candidates: readonly (string | undefined)[],
 	activeIds: ReadonlySet<string>,
 ): CallerAgentIdSelection {
@@ -3758,8 +3773,9 @@ function selectCallerAgentIds(
 
 /**
  * A worker that gets a worktree also gets `pipiui/<agentId>` as a real branch, so an unnamed
- * writable worker stamps a random id onto the repository forever. Read-only roles never create
- * a worktree, so a generated id for a one-shot report is invisible and stays allowed.
+ * writable worker stamps an unidentified id onto the repository forever. The dispatch gate
+ * already rejects a missing agentId for every form; this pure helper keeps the writable-role
+ * specific wording available (and tested) for callers that want it.
  *
  * Pure: `createsWorktree` is injected so this stays testable without an agent catalog.
  */
@@ -3771,6 +3787,72 @@ export function unnamedWritableDispatchProblem(
 	if (unnamed.length === 0) return null;
 	const names = [...new Set(unnamed.map((target) => `"${target.agent}"`))].join(", ");
 	return `Missing agentId for ${names}. A worker that writes code gets its own git branch named pipiui/<agentId>, so it needs a short semantic id naming the slice — e.g. "quota-pill", "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_"). Re-dispatch with one agentId per writable task. Read-only roles may still omit it.`;
+}
+
+/**
+ * Pure identity gate shared by every dispatch form (single / tasks / chain) before any
+ * reservation: rejects a missing id, an agentId/resume_from conflict, and the retired
+ * random-generator shape when no historical worker with that id actually exists.
+ * `isResumable` is injected so this stays testable without the job registry.
+ */
+export function dispatchIdentityGateProblem(input: {
+	targets: ReadonlyArray<{ agentId?: string; fresh?: boolean; agentName?: string; label: string }>;
+	agentId?: string;
+	resumeFrom?: string;
+	/** Per-dispatch fresh flag (single form). Chain/task items carry their own. */
+	fresh?: boolean;
+	/**
+	 * Actual resumability for one id under the ROLE it is being dispatched as: a retained
+	 * session file exists AND this dispatch's runner would actually open it. Read-only
+	 * roles force `--no-session` (their one-shot reports are ephemeral by design), so a
+	 * stray file named after the id is not context that run will reuse.
+	 */
+	isResumable: (agentId: string, agentName: string | undefined) => boolean;
+}): string | null {
+	if (
+		input.agentId?.trim() &&
+		input.resumeFrom?.trim() &&
+		input.agentId.trim() !== input.resumeFrom.trim()
+	) {
+		return `Conflicting identity: agentId ${JSON.stringify(input.agentId.trim())} and resume_from ${JSON.stringify(input.resumeFrom!.trim())} differ. To resume that worker, pass agentId ${JSON.stringify(input.resumeFrom!.trim())} (drop resume_from); for new work pick a fresh short semantic agentId.`;
+	}
+	for (const target of input.targets) {
+		const id = target.agentId?.trim();
+		if (!id) {
+			return `Missing agentId for ${target.label}. Every dispatched worker needs a short semantic id you choose — e.g. "quota-pill", "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_"). Re-dispatch with one agentId per worker; reusing an agentId resumes that worker (add fresh:true to start it cold).`;
+		}
+		if (isLegacyGeneratedAgentId(id)) {
+			// Continuation-only: the retired generated shape may be used solely to resume a
+			// worker that actually exists, with its stored context. fresh:true (cold start) or a
+			// brand-new worker under this shape would recreate exactly the opaque identity this
+			// contract retired — reject both. abort/resolve/status never pass through this gate.
+			const fresh = target.fresh ?? input.fresh;
+			if (fresh === true) {
+				return `agentId ${JSON.stringify(id)} has the retired auto-generated shape and cannot be started cold. If you meant a new worker, pick a fresh short semantic id you choose — e.g. "quota-pill"; if you meant to discard that worker's context, resolve/abandon the episode and re-dispatch new work under a new semantic id.`;
+			}
+			if (!input.isResumable(id, target.agentName)) {
+				return `agentId ${JSON.stringify(id)} has the retired auto-generated shape (agent-<random hex>) and is not resumable here: continuation requires a retained session this dispatch's role will actually reopen (writable/context-retaining workers only). Pick a fresh short semantic id you choose — e.g. "quota-pill". Historical ids of that shape remain operable with subagent_status / subagent_resolve / exact-run abort.`;
+			}
+		}
+	}
+	return null;
+}
+
+/**
+ * Chain bookkeeping: ids of steps never handed to runSingleAgent. Each handed-over step
+ * releases its own reservation in runSingleAgent's finally, so only the tail leaks when a
+ * chain stops early — release exactly that tail.
+ */
+export function unstartedChainReservationIds(
+	steps: ReadonlyArray<{ agentId?: string }>,
+	dispatchedCount: number,
+): string[] {
+	const ids: string[] = [];
+	for (let i = Math.max(0, dispatchedCount); i < steps.length; i++) {
+		const id = steps[i]?.agentId?.trim();
+		if (id) ids.push(id);
+	}
+	return ids;
 }
 
 /** Selector + synchronous reservation is one operation from the event loop's perspective. */
@@ -5177,7 +5259,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 			mutate(id) {
 				const job = jobRegistry.get(id.agentId);
 				if (!job || job.runId !== id.runId) throw new Error("abort run identity mismatch");
-				const result = abortRunningAgent(id.agentId);
+				const result = abortRunningAgent(id.agentId, { runId: id.runId });
 				if (!result.ok) throw new Error(result.message);
 			},
 		});
@@ -5492,12 +5574,17 @@ async function runSingleAgent(
 	options: RunSingleAgentOptions,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
-	// A worker that gets a worktree also gets a branch named `pipiui/<agentId>` verbatim, so an
-	// unnamed writable worker permanently stamps a random id onto the repository — the exact
-	// drift this id contract exists to prevent. Read-only roles never create a worktree or a
-	// branch, so a generated id for a one-shot report costs nothing and stays allowed.
-	const callerAgentId = options?.agentId?.trim() || undefined;
-	const pipiuiAgentId = callerAgentId ?? generatePipiuiAgentId();
+	// Identity is caller-chosen, full stop. Every dispatch path (single, tasks/parallel,
+	// chain, runtime recovery) must pass a short semantic agentId; the public gates reject a
+	// missing one with a named error before we ever get here, and no `agent-<random>` name is
+	// ever generated for a worker identity. Randomness belongs to the one-shot runId only.
+	const callerAgentId = options?.agentId?.trim() || "";
+	if (!callerAgentId) {
+		throw new Error(
+			"runSingleAgent requires an explicit short semantic agentId (e.g. \"quota-pill\"): the dispatch contract rejects a missing id instead of generating one.",
+		);
+	}
+	const pipiuiAgentId = callerAgentId;
 	// Capture this invocation's generation before any early failure path can return a result.
 	const runId = options?.runId ?? DeliveryObligationStore.runId();
 	const isBackground = options?.background === true;
@@ -5547,14 +5634,12 @@ async function runSingleAgent(
 			stopReason: "error",
 		};
 	}
-	const identityProblem = callerAgentId
-		? agentResumeIdentityProblem({
-			agentId: pipiuiAgentId,
-			requestedName: agentName,
-			historicalName: readAgentSliceMetadata().find((item) => item.agentId === pipiuiAgentId)?.name,
-			fresh: options?.fresh,
-		})
-		: null;
+	const identityProblem = agentResumeIdentityProblem({
+		agentId: pipiuiAgentId,
+		requestedName: agentName,
+		historicalName: readAgentSliceMetadata().find((item) => item.agentId === pipiuiAgentId)?.name,
+		fresh: options?.fresh,
+	});
 	if (identityProblem) {
 		localAgentReservations.delete(pipiuiAgentId);
 		return {
@@ -6329,7 +6414,7 @@ async function runSingleAgent(
 										`[subagent-timeout] agentId=${pipiuiAgentId} runId=${runId} title=${title}`,
 										`  ${runtimeBudgetDiagnostic(now)}`,
 										`The ${budgetSec}s runtime budget expired while this worker made no progress. It has been re-armed once for another ${budgetSec}s instead of being killed.`,
-										`Before the new budget expires, query subagent_status({agentId:"${pipiuiAgentId}"}), then choose exactly one: keep waiting and say why / subagent_abort({agentId:"${pipiuiAgentId}"}) and re-dispatch by a materially different route / ask the user.`,
+										`Before the new budget expires, query subagent_status({agentId:"${pipiuiAgentId}"}), then choose exactly one: keep waiting and say why / subagent_abort({agentId:"${pipiuiAgentId}", runId:"${runId}"}) and re-dispatch by a materially different route / ask the user.`,
 										`If the re-armed budget also expires with no progress the worker is aborted automatically and its result carries this same diagnostic. Do not treat this message as a new user request.`,
 									].join("\n"),
 								);
@@ -7455,7 +7540,7 @@ const VERIFY_PARAM_DESCRIPTION =
 	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
 
 const AGENT_ID_DESCRIPTION =
-	"Short semantic name for the worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\". Re-dispatching the same agentId continues a writable worker with its previous conversation, worktree and branch — use it for one vertical slice (implement, verify, debug, fix, re-verify). Read-only roles are one-shot and do not create a worktree. Required for any role that writes code: it becomes the git branch pipiui/<agentId>. Read-only one-shot roles may omit it and a name is generated. Also the target id for action=\"abort\" or action=\"resolve\".";
+	"Short semantic name you choose for this worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\", starting with a letter or digit. Required on every dispatch — no id is generated for you. Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch pipiui/<agentId>: use one agentId per vertical slice (implement, verify, debug, fix, re-verify), and pass fresh:true only to start the same id cold. Also the target id for action=\"abort\" or action=\"resolve\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 const DESKTOP_PARAM_DESCRIPTION =
@@ -7532,7 +7617,7 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
@@ -7561,11 +7646,12 @@ const ChainItem = Type.Object({
 			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
 		}),
 	),
-	agentId: Type.Optional(Type.String({ description: AGENT_ID_DESCRIPTION })),
+	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
 	isolation: IsolationParam,
+	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	desktop: Type.Optional(
@@ -7596,6 +7682,10 @@ const SharedDispatchParams = {
 
 // Each public tool is one intent. The shared execute still accepts the internal
 // union (single / chain / tasks / abort / resolve) so wrappers can delegate.
+// The single schema speaks the same field set the execution layer actually reads for a
+// single dispatch (title, fresh, verify, thinking, blockedBy, desktop, heartbeatSecs,
+// timeoutSecs, agentScope): anything declared here survives the strict sanitizer, so a
+// field the runner supports must not be silently dropped at the provider boundary.
 const SubagentParams = Type.Object({
 	prompt: Type.String({
 		minLength: 1,
@@ -7611,6 +7701,7 @@ const SubagentParams = Type.Object({
 			default: "general-purpose",
 		}),
 	),
+	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	run_in_background: Type.Optional(
 		Type.Boolean({
 			default: true,
@@ -7621,10 +7712,27 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process." })),
 	resume_from: Type.Optional(
 		Type.String({
-			description: "Resume a previous subagent. Pass the agent id returned by a prior call.",
+			description: "Deprecated alias for agentId: resume a previous worker by passing its agentId. New dispatches pass agentId directly; nothing is generated.",
 		}),
 	),
+	title: Type.Optional(
+		Type.String({
+			description: "Alias for description (3-5 word label); description wins when both are set.",
+		}),
+	),
+	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
+	thinking: ThinkingParam,
+	blockedBy: BlockedByParam,
+	desktop: Type.Optional(
+		StringEnum(["user-requested", "ui-verify"] as const, {
+			description: DESKTOP_PARAM_DESCRIPTION,
+		}),
+	),
+	heartbeatSecs: HeartbeatSecsParam,
+	timeoutSecs: TimeoutSecsParam,
 	scope: ScopeParam,
+	...SharedDispatchParams,
 }, { additionalProperties: false });
 const SubagentChainParams = Type.Object({
 	chain: Type.Array(ChainItem, {
@@ -7634,7 +7742,12 @@ const SubagentChainParams = Type.Object({
 	...SharedDispatchParams,
 }, { additionalProperties: false });
 const SubagentAbortParams = Type.Object({
-	agentId: Type.String({ description: "Running job to abort." }),
+	agentId: Type.String({ description: "Running or queued job to abort." }),
+	runId: Type.String({
+		minLength: 1,
+		description:
+			"Exact run to abort, from the dispatch receipt or subagent_status (queued jobs carry their runId from acceptance). A stale runId — this agentId already moved to a newer run — is rejected instead of aborting the newer run.",
+	}),
 }, { additionalProperties: false });
 const SubagentResolveParams = Type.Object({
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
@@ -7677,6 +7790,7 @@ type SubagentExecuteParams = {
 		subagent_type?: string;
 		isolation?: "worktree" | "none";
 		agentId?: string;
+		fresh?: boolean;
 		title?: string;
 		cwd?: string;
 		verify?: string;
@@ -7705,23 +7819,6 @@ type SubagentExecuteParams = {
 	confirmProjectAgents?: boolean;
 	background?: boolean;
 };
-const ParallelSubagentParams = Type.Object({
-	tasks: Type.Array(
-		Type.Object({
-			// Keep the provider-facing object deliberately tiny and put task first. Grok 4.6
-			// repeatedly emitted optional metadata while omitting this required field when the
-			// parallel shape lived inside subagent's large anyOf schema.
-			task: Type.String({ minLength: 1, description: "Complete non-empty task body for this worker" }),
-			agent: Type.String({ minLength: 1, description: "Name of the agent to invoke" }),
-		}, { additionalProperties: false }),
-		{
-			description:
-				'Independent tasks to dispatch together. Every item must contain exactly task and agent. Example: [{"task":"map auth","agent":"explore"},{"task":"map billing","agent":"explore"}].',
-			minItems: 1,
-			maxItems: MAX_PARALLEL_TASKS,
-		},
-	),
-}, { additionalProperties: false });
 const SecretaryCommitParams = Type.Object({
 	closeout: StringEnum(["pass", "needs-action", "blocked"] as const),
 	integrationVerify: StringEnum(["pass", "fail", "none"] as const),
@@ -7890,7 +7987,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 			Type.Literal("user-requested"),
 			Type.Literal("ui-verify"),
 		], { description: "Per-task desktop grant required to open a Boss-driven session." })),
-		sessionId: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Existing Boss-driven desktop session." })),
+		sessionId: Type.String({ minLength: 1, maxLength: 24, description: "Short semantic session id you choose, e.g. \"textedit-install\" (2-24 chars: lowercase letters, digits, \"-\", \"_\", starting with a letter or digit). Required on every call — nothing is generated for you. Opening a session (action \"session\" or a desktop grant) creates/reuses it; observe/act/open_application/close reuse the same sessionId." }),
 		action: Type.Optional(Type.Union([
 			Type.Literal("session"),
 			Type.Literal("observe"),
@@ -7909,7 +8006,7 @@ function registerComputerTaskTool(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "computer_task",
 		label: "Computer Task",
-		description: "Drive external macOS apps and OS-level UI (native dialogs, window management, apps other than the in-app browser). For the built-in browser panel, use the browser tool instead. Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) to open a session, then call again with sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
+		description: "Drive external macOS apps and OS-level UI (native dialogs, window management, apps other than the in-app browser). For the built-in browser panel, use the browser tool instead. Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) AND a short semantic sessionId you choose, e.g. \"textedit-install\" (2-24 chars: lowercase letters, digits, \"-\", \"_\") — nothing is generated for you; then call again with the same sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
 		parameters: computerTaskParameters,
 		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
 		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
@@ -8023,7 +8120,7 @@ function registerContextManageTool(pi: ExtensionAPI): void {
 export default function (pi: ExtensionAPI) {
 	bindIdleFoldRegistry(createIdleFoldRegistry({
 		...idleFoldConfig,
-		isContextAboveWatermark: () => contextAboveIdleFoldWatermark(lastIdleFoldUsage, idleFoldConfig.lowWatermark),
+		isContextAboveWatermark: () => !contextFoldIsStandby() && contextAboveIdleFoldWatermark(lastIdleFoldUsage, idleFoldConfig.lowWatermark),
 		onNudge: () => handleIdleFoldNudge(pi, { watermark: idleFoldConfig.lowWatermark }),
 		onFold: () => runProductionIdleFold(),
 	}));
@@ -8443,7 +8540,7 @@ export default function (pi: ExtensionAPI) {
 			const activityRaw = job?.activity?.trim() || "";
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			if (action === "abort") {
-				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true });
+				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId: handle.runId });
 				if (!aborted.ok) continue;
 				logStallProbe("abort", {
 					agent: agentId,
@@ -8472,6 +8569,7 @@ export default function (pi: ExtensionAPI) {
 				pi,
 				formatStallMessage({
 					agentId,
+					runId: handle.runId,
 					title,
 					idleSec,
 					lastLine,
@@ -8567,14 +8665,16 @@ export default function (pi: ExtensionAPI) {
 
 	// ---- RPC commands: GUI uses these same Node control paths instead of mutating Swift-only state. ----
 	pi.registerCommand("subagent_abort", {
-		description: "Abort a running background subagent: /subagent_abort <agentId> (PipiUI)",
+		description: "Abort a background subagent (running or queued): /subagent_abort <agentId> <runId> — runId must be the exact accepted run (PipiUI)",
 		handler: async (args, ctx) => {
-			const agentId = (args ?? "").trim();
-			if (!agentId) {
-				ctx.ui.notify("Usage: /subagent_abort <agentId>", "error");
+			const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const agentId = parts.shift();
+			const runId = parts.shift();
+			if (!agentId || !runId) {
+				ctx.ui.notify("Usage: /subagent_abort <agentId> <runId>", "error");
 				return;
 			}
-			const result = abortRunningAgent(agentId, { reportTerminalToSupervisor: true });
+			const result = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId });
 			ctx.ui.notify(result.message, result.ok ? "info" : "error");
 		},
 	});
@@ -8680,9 +8780,10 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Dispatch one worker. Required: prompt (the full brief) and description (3-5 word label). Optional: subagent_type (default general-purpose), isolation (worktree|none), cwd, resume_from, run_in_background.",
+			"Dispatch one worker. Required: prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, blockedBy, desktop, heartbeatSecs, timeoutSecs, scope, run_in_background. resume_from is a deprecated alias of agentId.",
 			"Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
-			"Ordered steps use subagent_chain. Stop a job with subagent_abort. Close a failed episode with subagent_resolve. Inspect with subagent_status before re-dispatching.",
+			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
 		parameters: subagentParameters,
 		// pi validates arguments before execute() runs; models that emit
@@ -8716,7 +8817,6 @@ export default function (pi: ExtensionAPI) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
-			params = remapUnknownSubagentType(params, new Set(agents.map((agent) => agent.name)));
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
@@ -8738,7 +8838,6 @@ export default function (pi: ExtensionAPI) {
 						: {}),
 				});
 
-			const requestAgentIds = new Set<string>();
 			// Default background at boss depth for single/parallel; multi-step chain stays
 			// sync so `{previous}` can be substituted. Fan-out also forces a one-step chain
 			// into the background — that is not ordered work, and waiting on it deadlocks
@@ -8775,19 +8874,27 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// action=abort：中止运行中的后台 job（不占 single/parallel/chain 的 mode 名额）
+			// action=abort：中止一个后台 job（不占 single/parallel/chain 的 mode 名额）。runId 必填：
+			// queued 与 running 都按 {agentId, runId} 精确匹配，stale runId 拒绝而不是误杀新 run。
 			if (params.action === "abort") {
 				const target = params.agentId?.trim();
-				if (!target) {
+				const runId = params.runId?.trim();
+				if (!target || !runId) {
 					return {
 						content: [
-							{ type: "text", text: 'action="abort" requires agentId of a running background job.' },
+							{
+								type: "text",
+								text: 'action="abort" requires both agentId and the exact runId (from the dispatch receipt or subagent_status; queued jobs carry their runId from acceptance). A stale runId is rejected instead of aborting a newer run.',
+							},
 						],
 						details: makeDetails("single")([]),
 						isError: true,
 					};
 				}
-				const abortResult = abortRunningAgent(target, { reportTerminalToSupervisor: true });
+				const abortResult = abortRunningAgent(target, {
+					reportTerminalToSupervisor: true,
+					runId,
+				});
 				return {
 					content: [{ type: "text", text: abortResult.message }],
 					details: makeDetails("single")([]),
@@ -8800,6 +8907,7 @@ export default function (pi: ExtensionAPI) {
 				task: string,
 				cwd: string | undefined,
 				agentId: string,
+				runId: string,
 				mode: "single" | "parallel",
 				title: string | undefined,
 				verify: string | undefined,
@@ -8824,7 +8932,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -8855,7 +8963,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			const formatStartedMessage = (
-				items: { agentId: string; name: string; task: string; title?: string; fresh?: boolean }[],
+				items: { agentId: string; runId: string; name: string; task: string; title?: string; fresh?: boolean }[],
 			): string => {
 				const lines = items.map((it) => {
 					// 派工回执的「将续跑」提示：parent 侧的 resumingSession 判定（会话文件存在、非 fresh）
@@ -8885,12 +8993,12 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 					return (
-						`- agentId=${it.agentId} name=${it.name}${it.title ? ` title=${it.title}` : ""} task=${it.task.length > 120 ? `${it.task.slice(0, 120)}...` : it.task}` +
+						`- agentId=${it.agentId} runId=${it.runId} name=${it.name}${it.title ? ` title=${it.title}` : ""} task=${it.task.length > 120 ? `${it.task.slice(0, 120)}...` : it.task}` +
 						(resumeNote ? `\n  ${resumeNote}` : "")
 					);
 				});
 				return (
-					`${bgIgnoredWarning}Started background agent(s) (${items.length}). ` +
+					`${bgIgnoredWarning}Started background agent(s) (${items.length}). Each line carries the exact runId for subagent_abort({agentId, runId}); queued jobs keep the runId from acceptance. ` +
 					"You will receive a completion signal per agent when each finishes. " +
 					"Do not busy-loop poll; use subagent_status before re-dispatch. " +
 					"Continue other work or dispatch more independent agents.\n\n" +
@@ -9098,6 +9206,48 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Identity contract, one pure gate for every dispatch form. agentId is caller-chosen and
+			// required on every worker — single, tasks/parallel and chain steps alike; nothing is
+			// generated. The retired random-generator shape (agent-<16hex>) is refused for new work
+			// and may only resume when the role being dispatched would actually reopen a retained
+			// session for that id (read-only roles never do); abort/resolve/status never pass
+			// through this gate, so historical ids stay operable.
+			const dispatchIdTargets: Array<{ agentId: string | undefined; fresh?: boolean; agentName?: string; label: string }> = hasChain
+				? (params.chain ?? []).map((step, index) => ({ agentId: step.agentId, fresh: step.fresh, agentName: step.agent, label: `chain step ${index + 1}` }))
+				: hasTasks
+					? (params.tasks ?? []).map((task, index) => ({ agentId: task.agentId, fresh: task.fresh, agentName: task.agent, label: `task ${index + 1}` }))
+					: [{ agentId: params.agentId, fresh: params.fresh, agentName: params.agent, label: "this dispatch" }];
+			const identityProblem = dispatchIdentityGateProblem({
+				targets: dispatchIdTargets,
+				agentId: params.agentId,
+				resumeFrom: params.resume_from,
+				// Continuation-only gate for retired `agent-<16hex>` ids: actual resumability,
+				// not bookkeeping — and resumability under the ROLE being dispatched. The runner
+				// only opens a session for context-retaining (writable) roles: read-only roles force
+				// --no-session (runSingleAgent: sessionDir === undefined), so even a stray session
+				// file named after the id is not context this dispatch would reuse. Job/slice
+				// metadata alone proves nothing. Active ids never reach this check: the reservation
+				// selector below already rejects them as "already running", and abort/resolve/status
+				// do not pass through this gate at all.
+				isResumable: (agentId, agentName) => {
+					const config = agentName ? agents.find((agent) => agent.name === agentName) : undefined;
+					if (!config || config.traits.readOnly) return false;
+					const dir = agentSessionDir();
+					return dir !== undefined && agentSessionExists(dir, `pipiui-${agentId}`);
+				},
+			});
+			if (identityProblem) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: identityProblem,
+						},
+					],
+					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+					isError: true,
+				};
+			}
 			// This is deliberately after the final await/validation and immediately before
 			// dispatch. Add to the module reservation set synchronously so a concurrent tool call
 			// cannot pass the same selector during any later async setup.
@@ -9109,11 +9259,7 @@ export default function (pi: ExtensionAPI) {
 					.map((job) => job.agentId),
 			]);
 			const callerSelection = selectAndReserveCallerAgentIds(
-				hasTasks
-					? (params.tasks ?? []).map((task) => task.agentId)
-					: hasSingle
-						? [params.agentId]
-						: [],
+				dispatchIdTargets.map((target) => target.agentId),
 				activeAgentIds,
 				localAgentReservations,
 			);
@@ -9144,10 +9290,6 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			for (const id of callerSelection.ids) {
-				requestAgentIds.add(id);
-			}
-
 			recordSubagentDispatchStats(
 				dispatchMode,
 				dispatchStatsTasks,
@@ -9174,17 +9316,19 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const agentId = step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
+					const agentId = step.agentId!.trim();
+					const stepRunId = DeliveryObligationStore.runId();
 					startBackgroundAgent(
 						agentName,
 						task,
 						step.cwd,
 						agentId,
+						stepRunId,
 						"single",
 						step.title,
 						step.verify,
 						step.thinking,
-						undefined,
+						step.fresh,
 						step.desktop,
 						undefined,
 						step.worktree,
@@ -9195,6 +9339,7 @@ export default function (pi: ExtensionAPI) {
 					const placeholder: SingleResult = {
 						agent: agentName,
 						agentId,
+						runId: stepRunId,
 						agentSource: agentCfg.source,
 						task,
 						title: step.title,
@@ -9212,7 +9357,7 @@ export default function (pi: ExtensionAPI) {
 									dispatchNudgePrefix +
 									bgIgnoredWarning +
 									formatStartedMessage([
-										{ agentId, name: agentName, task, title: step.title },
+										{ agentId, runId: stepRunId, name: agentName, task, title: step.title, fresh: step.fresh },
 									]),
 							},
 						],
@@ -9221,86 +9366,103 @@ export default function (pi: ExtensionAPI) {
 				}
 				const results: SingleResult[] = [];
 				let previousOutput = "";
+				// Reservation bookkeeping: the gate reserved every step id up front; each step
+				// handed to runSingleAgent releases its own id in runSingleAgent's finally. This
+				// finally releases the ids of steps that never started — early stop, an abort
+				// throw, or any exit path — so those ids are immediately re-dispatchable.
+				let chainDispatchedCount = 0;
+				try {
 
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = (step.task ?? step.prompt ?? "").replace(/\{previous\}/g, previousOutput);
+					for (let i = 0; i < params.chain.length; i++) {
+						const step = params.chain[i];
+						const taskWithContext = (step.task ?? step.prompt ?? "").replace(/\{previous\}/g, previousOutput);
 
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
+						// Create update callback that includes all previous results
+						const chainUpdate: OnUpdateCallback | undefined = onUpdate
+							? (partial) => {
+									// Combine completed results with current streaming result
+									const currentResult = partial.details?.results[0];
+									if (currentResult) {
+										const allResults = [...results, currentResult];
+										onUpdate({
+											content: partial.content,
+											details: makeDetails("chain")(allResults),
+										});
+									}
 								}
-							}
-						: undefined;
+							: undefined;
 
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
+						// Ownership transfers at hand-over, not completion: runSingleAgent releases
+						// its own id in its finally from this point on.
+						chainDispatchedCount = i + 1;
+						const result = await runSingleAgent(
+							ctx.cwd,
+							agents,
+							step.agent,
+							taskWithContext,
+							step.cwd,
+							i + 1,
+							signal,
+							chainUpdate,
+							makeDetails("chain"),
 
-						{
-							toolCallId,
-							title: step.title,
-							sessionModel,
-							contextWindow,
-							verify: step.verify,
-							thinking: step.thinking,
-							agentId: step.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
-							desktop: step.desktop,
-							worktree: step.worktree,
-							noWorktreeReason: step.noWorktreeReason,
-							heartbeatSecs: step.heartbeatSecs,
-							timeoutSecs: step.timeoutSecs,
-						},
-					);
-					results.push(result);
+							{
+								toolCallId,
+								title: step.title,
+								sessionModel,
+								contextWindow,
+								verify: step.verify,
+								thinking: step.thinking,
+								agentId: step.agentId!.trim(),
+								fresh: step.fresh,
+								desktop: step.desktop,
+								worktree: step.worktree,
+								noWorktreeReason: step.noWorktreeReason,
+								heartbeatSecs: step.heartbeatSecs,
+								timeoutSecs: step.timeoutSecs,
+							},
+						);
+						results.push(result);
 
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [
-								{
+						const isError = isFailedResult(result);
+						if (isError) {
+							const errorMsg = getResultOutput(result);
+							return {
+								content: [
+									{
+										type: "text",
+										text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
+									},
+								],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						const integrationProblem = dependentStepIntegrationProblem({
+							workerState: "ok",
+							integrationState: result.integrationState,
+							worktreePath: result.worktreePath,
+							worktreeBranch: result.worktreeBranch,
+							finalizationSummary: result.worktreeFinalization,
+						});
+						if (integrationProblem) {
+							return {
+								content: [{
 									type: "text",
-									text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}`,
-								},
-							],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
+									text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${integrationProblem}`,
+								}],
+								details: makeDetails("chain")(results),
+								isError: true,
+							};
+						}
+						previousOutput = getFinalOutput(result.messages);
 					}
-					const integrationProblem = dependentStepIntegrationProblem({
-						workerState: "ok",
-						integrationState: result.integrationState,
-						worktreePath: result.worktreePath,
-						worktreeBranch: result.worktreeBranch,
-						finalizationSummary: result.worktreeFinalization,
-					});
-					if (integrationProblem) {
-						return {
-							content: [{
-								type: "text",
-								text: `${bgIgnoredWarning}${formatChainVerifyPrefix(results)}Chain stopped at step ${i + 1} (${step.agent}): ${integrationProblem}`,
-							}],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
+				} finally {
+					// Steps never handed over keep reservations only until this exit; stale
+					// reservations would block re-dispatching those ids forever.
+					for (const idleId of unstartedChainReservationIds(params.chain, chainDispatchedCount)) {
+						localAgentReservations.delete(idleId);
 					}
-					previousOutput = getFinalOutput(result.messages);
 				}
 				const lastChainResult = results[results.length - 1];
 				// Chain aggregated output = final step output; capped by that agent's done
@@ -9349,18 +9511,25 @@ export default function (pi: ExtensionAPI) {
 						};
 					}
 
-					const startedItems: { agentId: string; name: string; task: string; title?: string; fresh?: boolean }[] = [];
+					// One-shot run ids are assigned at acceptance, before queueing: a queued
+					// job is exactly abortable from its receipt, and the id survives into the
+					// eventual runSingleAgent call so status/abort never see two runIds.
+					const startedItems: { agentId: string; runId: string; name: string; task: string; title?: string; fresh?: boolean }[] = [];
 					const placeholders: SingleResult[] = [];
 					const agentIds: string[] = [];
+					const runIds: string[] = [];
 
 					for (const t of params.tasks) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
-						const agentId = t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
+						const agentId = t.agentId!.trim();
+						const acceptedRunId = DeliveryObligationStore.runId();
 						agentIds.push(agentId);
-						startedItems.push({ agentId, name: t.agent, task: t.task, title: t.title, fresh: t.fresh });
+						runIds.push(acceptedRunId);
+						startedItems.push({ agentId, runId: acceptedRunId, name: t.agent, task: t.task, title: t.title, fresh: t.fresh });
 						placeholders.push({
 							agent: t.agent,
 							agentId,
+							runId: acceptedRunId,
 							agentSource: agentCfg.source,
 							task: t.task,
 							title: t.title,
@@ -9379,6 +9548,7 @@ export default function (pi: ExtensionAPI) {
 						index: number,
 					) => {
 						const agentId = agentIds[index];
+						const acceptedRunId = runIds[index]!;
 						recordRunningDispatchScope(agentId, t.scope);
 						try {
 							const result = await runSingleAgent(
@@ -9391,7 +9561,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -9401,6 +9571,7 @@ export default function (pi: ExtensionAPI) {
 							const failResult: SingleResult = {
 								agent: t.agent,
 								agentId,
+								runId: acceptedRunId,
 								agentSource: agents.find((a) => a.name === t.agent)?.source ?? "unknown",
 								task: t.task,
 								title: t.title,
@@ -9432,6 +9603,7 @@ export default function (pi: ExtensionAPI) {
 					dispatchQueue.enqueueBatch(
 						params.tasks.map((t, index) => ({
 							agentId: agentIds[index],
+							runId: runIds[index]!,
 							role: t.agent,
 							title: t.title,
 							task: t.task,
@@ -9511,7 +9683,7 @@ export default function (pi: ExtensionAPI) {
 							contextWindow,
 							verify: t.verify,
 							thinking: t.thinking,
-							agentId: t.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+							agentId: t.agentId!.trim(),
 							fresh: t.fresh,
 							desktop: t.desktop,
 							blockedBy: t.blockedBy,
@@ -9564,15 +9736,79 @@ export default function (pi: ExtensionAPI) {
 							isError: true,
 						};
 					}
-					const agentId = params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds);
+					const agentId = params.agentId!.trim();
+					// Assigned here, not inside runSingleAgent, so the receipt names the exact
+					// abortable run from the moment dispatch is accepted.
+					const runId = DeliveryObligationStore.runId();
 					const scopeOverlapNotice = formatDispatchScopeWarning(
 						[{ agentId, scope: cleanScope(params.scope) }],
 						dispatchQueue.snapshot(),
 					);
-					startBackgroundAgent(params.agent, params.task, params.cwd, agentId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.scope);
+					if (params.blockedBy && params.blockedBy.length > 0) {
+						// blockedBy is declared on the single schema with queue semantics ("held until every
+						// named agent succeeds"), so a single background dispatch with dependencies goes
+						// through the same queue as parallel batches: accepted runId, exact-run cancel,
+						// reservation released on drop — never a silently ungated immediate spawn.
+						dispatchQueue.enqueueBatch([
+							{
+								agentId,
+								runId,
+								role: params.agent,
+								title: params.title,
+								task: params.task,
+								blockedBy: params.blockedBy,
+								scope: cleanScope(params.scope),
+								queuedAt: Date.now(),
+								run: () =>
+									new Promise<void>((resolveRun) => {
+										recordRunningDispatchScope(agentId, params.scope);
+										void runSingleAgent(
+											ctx.cwd,
+											agents,
+											params.agent!,
+											params.task!,
+											params.cwd,
+											undefined,
+											undefined,
+											undefined,
+											makeDetails("single", { background: true, agentIds: [agentId] }),
+											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs },
+										)
+											.then((result) => {
+												clearRunningDispatchScope(agentId);
+												notifySubagentDone(pi, result);
+												resolveRun();
+											})
+											.catch((err) => {
+												clearRunningDispatchScope(agentId);
+												const msg = err instanceof Error ? err.message : String(err);
+												console.error("[pipiui-subagent] background queued agent error:", agentId, msg);
+												notifySubagentDone(pi, {
+													agent: params.agent!,
+													agentId,
+													runId,
+													agentSource: agentCfg.source,
+													task: params.task!,
+													title: params.title,
+													exitCode: 1,
+													messages: [],
+													stderr: msg,
+													errorMessage: msg,
+													usage: emptyUsage(),
+													stopReason: /abort/i.test(msg) ? "aborted" : "error",
+												});
+												resolveRun();
+											});
+									}),
+							},
+						]);
+					} else {
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.scope);
+					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
 						agentId,
+						runId,
 						agentSource: agentCfg.source,
 						task: params.task,
 						title: params.title,
@@ -9590,7 +9826,7 @@ export default function (pi: ExtensionAPI) {
 									(scopeOverlapNotice ? `${scopeOverlapNotice}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage([
-										{ agentId, name: params.agent, task: params.task, title: params.title, fresh: params.fresh },
+										{ agentId, runId, name: params.agent, task: params.task, title: params.title, fresh: params.fresh },
 									]),
 							},
 						],
@@ -9618,7 +9854,7 @@ export default function (pi: ExtensionAPI) {
 						contextWindow,
 						verify: params.verify,
 						thinking: params.thinking,
-						agentId: params.agentId?.trim() || generatePipiuiAgentId(requestAgentIds),
+						agentId: params.agentId!.trim(),
 						fresh: params.fresh,
 						desktop: params.desktop,
 						blockedBy: params.blockedBy,
@@ -10016,7 +10252,8 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_chain",
 		label: "Subagent Chain",
-		description: "Run ordered worker steps. Each chain item needs prompt (the full brief) and description (3-5 word label). A step may reference the prior step's output as {previous}.",
+		description:
+			"Run ordered worker steps. Each chain item needs prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose, unique within the chain (2-24 chars: lowercase letters, digits, \"-\", \"_\"). A step may reference the prior step's output as {previous}.",
 		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
 		promptGuidelines: [
 			"Use subagent_chain only for genuinely ordered multi-step work; a one-step chain is dispatched in the background while fan-out is on.",
@@ -10053,13 +10290,18 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_abort",
 		label: "Subagent Abort",
-		description: "Abort one running background worker. Required: agentId.",
+		description:
+			"Abort one background worker (running or queued). Required: agentId and the exact runId from the dispatch receipt or subagent_status. A stale runId is rejected instead of aborting a newer run under the same agentId.",
 		parameters: SubagentAbortParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentAbortParams),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			return subagentTool.execute(
 				toolCallId,
-				{ action: "abort", agentId: params.agentId } as SubagentExecuteParams,
+				{
+					action: "abort",
+					agentId: params.agentId,
+					runId: params.runId,
+				} as SubagentExecuteParams,
 				signal,
 				onUpdate,
 				ctx,
@@ -10067,7 +10309,9 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderCall(args, theme) {
 			return new Text(
-				theme.fg("toolTitle", theme.bold("subagent_abort ")) + theme.fg("accent", args.agentId || "?"),
+				theme.fg("toolTitle", theme.bold("subagent_abort ")) +
+					theme.fg("accent", args.agentId || "?") +
+					(args.runId ? theme.fg("muted", ` ${args.runId}`) : ""),
 				0,
 				0,
 			);

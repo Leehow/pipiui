@@ -33,7 +33,7 @@ test("watchdog stall abort keeps Supervisor terminal closeout wiring", () => {
 	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 	assert.match(source, /isQuietToolStalled\(/);
 	assert.match(source, /if \(stallInfo\.inTool && !stallInfo\.stalled\) continue;/);
-	assert.match(source, /abortRunningAgent\(agentId, \{ reportTerminalToSupervisor: true \}\)/);
+	assert.match(source, /abortRunningAgent\(agentId, \{ reportTerminalToSupervisor: true, runId: handle\.runId \}\)/);
 	assert.match(source, /createSupervisorOwnedTerminalCloseout/);
 	assert.match(source, /LIVENESS_SAMPLE_AFTER_MS/);
 });

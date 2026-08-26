@@ -232,10 +232,24 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
 	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
 	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
+	// Identity contract (2026-08): the single public schema declares the full field set the
+	// execution layer actually reads for one dispatch — including agentId — so the strict
+	// sanitizer cannot drop a supported field. Internal old names stay out of the public shape.
 	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
-	assert.doesNotMatch(singleSchema, /heartbeatSecs|timeoutSecs|agentScope|confirmProjectAgents|desktop:/);
-	const parallelSchema = source.slice(source.indexOf("const ParallelSubagentParams"), source.indexOf("const SecretaryCommitParams"));
-	assert.doesNotMatch(parallelSchema, /worktree|heartbeatSecs|timeoutSecs/);
+	for (const declared of ["agentId:", "title:", "fresh:", "verify:", "thinking: ThinkingParam", "blockedBy:", "desktop:", "heartbeatSecs:", "timeoutSecs:"]) {
+		assert.match(singleSchema, new RegExp(declared.replace(":", "\\s*:")), `single schema must declare ${declared}`);
+	}
+	// Scope knobs arrive via the same shared block the chain wrapper spreads.
+	assert.match(singleSchema, /\.\.\.SharedDispatchParams,/);
+	const sharedBlock = source.slice(source.indexOf("const SharedDispatchParams = {"), source.indexOf("// Each public tool is one intent."));
+	assert.match(sharedBlock, /agentScope:/);
+	assert.match(sharedBlock, /confirmProjectAgents:/);
+	assert.doesNotMatch(singleSchema, /worktree:|noWorktreeReason|\btasks:|\bchain:|action:/);
+	// No worker identity is ever generated: the random fallback is gone from the runtime, and
+	// the dead parallel schema (items without agentId) is not re-introduced.
+	assert.doesNotMatch(source, /generatePipiuiAgentId/);
+	assert.doesNotMatch(source, /agent-\$\{randomBytes/);
+	assert.doesNotMatch(source, /const ParallelSubagentParams/);
 });
 
 test("runtime budget expiry is progress-aware, notifies the boss once, and retries terminal reports", () => {

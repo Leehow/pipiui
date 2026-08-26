@@ -153,6 +153,17 @@ const STANDARD_FIELDS = new Set([
 	"read-only",
 	"delegates",
 	"block-skill-reads",
+	// Optional execution-policy keys used by project agents (COC stewards).
+	// Declaring them here keeps catalog discovery from treating a valid
+	// project agent as a broken extension. Dispatch still applies its own
+	// depth/skill/turn gates; these fields do not widen capabilities.
+	"thinking",
+	"systemPromptMode",
+	"inheritProjectContext",
+	"inheritSkills",
+	"async",
+	"turnBudget",
+	"maxSubagentDepth",
 ]);
 const CAPABILITY_FIELDS = new Set([
 	"filesystem",
@@ -503,7 +514,6 @@ function capabilityToolNames(capabilities: AgentCapabilities, trustedSecretary: 
 	if (capabilities.delegation) {
 		names.push(
 			"subagent",
-			"subagent_parallel",
 			"subagent_chain",
 			"subagent_abort",
 			"subagent_resolve",

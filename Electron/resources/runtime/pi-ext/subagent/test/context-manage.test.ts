@@ -7,6 +7,7 @@ import {
 	CONTEXT_MANAGE_NUDGE_CUSTOM_TYPE,
 	CONTEXT_MANAGE_NUDGE_TEXT,
 	CONTEXT_MANAGE_PARAMS,
+	CONTEXT_OPTIMIZER_STATE_KEY,
 	PLAN_TOOL_NAMES,
 	WORKER_TOOL_NAMES,
 	buildBoundedManifest,
@@ -212,6 +213,29 @@ test("fold executes only safe ids and refuses unknown / user / plan ids", () => 
 	assert.ok(result.skipped.some((row) => row.id === "r:missing" && row.reason === "not_in_session"));
 	assert.match(String(manage.viewFor([]).blocks.find((item) => item.id === "r:ok")?.text), /FOLDED/);
 	assert.equal(manage.originals.get("r:ok"), "original file body");
+});
+
+test("fold refuses every id while a primary context optimizer owns the session", () => {
+	const globals = globalThis as Record<string | symbol, unknown>;
+	const previous = globals[CONTEXT_OPTIMIZER_STATE_KEY];
+	globals[CONTEXT_OPTIMIZER_STATE_KEY] = {
+		version: 1,
+		sessionId: "session-1",
+		primaryOwner: "pipiui-headroom",
+	};
+	try {
+		const manage = memoryManage(view([
+			block({ id: "r:ok", kind: "tool_result", tokens: 400, toolName: "read", text: "original file body" }),
+		]));
+		const result = foldContextByIds({ getMessages: () => [{ role: "toolResult" }], manage }, ["r:ok"]);
+		assert.deepEqual(result.foldedIds, []);
+		assert.equal(result.skipped[0]?.reason, "primary_optimizer_active");
+		assert.match(result.problem ?? "", /standby/);
+		assert.equal(manage.viewFor([]).blocks[0]?.text, "original file body");
+	} finally {
+		if (previous === undefined) delete globals[CONTEXT_OPTIMIZER_STATE_KEY];
+		else globals[CONTEXT_OPTIMIZER_STATE_KEY] = previous;
+	}
 });
 
 test("fold via the live manage API is recallable from the stored original", async () => {

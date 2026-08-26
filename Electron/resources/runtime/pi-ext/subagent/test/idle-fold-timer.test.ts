@@ -307,6 +307,8 @@ test("index.ts arms, cancels, and disposes the idle-fold timer off the 30s watch
 	assert.match(source, /noteIdleFoldCompleted/);
 	assert.match(source, /disposeAllIdleFoldTimers/);
 	assert.match(source, /runDeterministicIdleFold/);
+	assert.match(source, /!contextFoldIsStandby\(\).*contextAboveIdleFoldWatermark/);
+	assert.match(source, /function runProductionIdleFold\(\): void \{\s*if \(contextFoldIsStandby\(\)\) return;/);
 	assert.match(source, /registerContextManageTool/);
 	assert.match(source, /handleIdleFoldNudge/);
 	assert.match(source, /onNudge/);

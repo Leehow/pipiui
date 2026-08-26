@@ -179,6 +179,8 @@ export function planHeldSignalFlush<K extends string>(input: HeldSignalFlushInpu
 
 export interface StallMessageInput {
 	agentId: string;
+	/** Exact run identity: abort is {agentId, runId}-bound, so the signal must carry it. */
+	runId: string;
 	title: string;
 	idleSec: number;
 	lastLine: string;
@@ -201,7 +203,7 @@ export function formatStallMessage(input: StallMessageInput): string {
 		`[subagent-stalled] agentId=${input.agentId} title=${input.title} idle=${input.idleSec}s${inTool} last=${input.lastLine}`,
 		`Liveness: ${input.liveness ?? "no CPU measurement available for this worker"}.`,
 		`Query it first with subagent_status({agentId:"${input.agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
-		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId}) (or /subagent_abort) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId, runId}) (or /subagent_resolve). A text-only reply does not stop this message.`,
+		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_resolve ${input.agentId} ${input.runId}). A text-only reply does not stop this message.`,
 	].join("\n");
 }
 

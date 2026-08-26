@@ -259,16 +259,6 @@ function mapWorktreeToIsolation(value: unknown): "worktree" | "none" | undefined
 	return undefined;
 }
 
-function slugAgentId(value: string): string | undefined {
-	const slug = value
-		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, "-")
-		.replace(/^-+|-+$/g, "")
-		.slice(0, 24)
-		.replace(/-+$/g, "");
-	return AGENT_ID_PATTERN.test(slug) ? slug : undefined;
-}
-
 function inferredAgentType(value: JsonSchema): "explore" | "general-purpose" {
 	if (
 		value.isolation != null && value.isolation !== ""
@@ -317,6 +307,11 @@ function applyAliasesToRecord(value: JsonSchema): JsonSchema {
 	}
 	if (out.run_in_background == null && typeof out.background === "boolean") out.run_in_background = out.background;
 	if (out.background == null && typeof out.run_in_background === "boolean") out.background = out.run_in_background;
+	// Identity is caller-chosen only: resume_from fills agentId when the caller used the
+	// deprecated name, but nothing is ever derived from the description. An inferred slug
+	// would silently turn a same-shaped new dispatch into a resume of that worker — the
+	// exact drift the explicit-id contract exists to prevent. A missing agentId is rejected
+	// at execute() with a named error instead of being papered over here.
 	if (!hasNonEmptyString(out.resume_from) && hasNonEmptyString(out.agentId)) out.resume_from = out.agentId;
 	if (!hasNonEmptyString(out.agentId) && hasNonEmptyString(out.resume_from)) out.agentId = out.resume_from;
 
@@ -339,18 +334,6 @@ function applyAliasesToRecord(value: JsonSchema): JsonSchema {
 		const generated = shortLabel(out.prompt);
 		out.description = generated;
 		out.title = generated;
-	}
-
-	if (
-		(out.agent === "general-purpose" || out.subagent_type === "general-purpose")
-		&& !hasNonEmptyString(out.agentId)
-		&& hasNonEmptyString(out.description)
-	) {
-		const slug = slugAgentId(out.description);
-		if (slug) {
-			out.agentId = slug;
-			if (!hasNonEmptyString(out.resume_from)) out.resume_from = slug;
-		}
 	}
 
 	if (!hasNonEmptyString(out.agent) && hasNonEmptyString(out.subagent_type)) out.agent = out.subagent_type;
@@ -418,34 +401,6 @@ export function adoptGrokBuildDispatch<T>(value: T): T {
 	}
 	if (Array.isArray(out.chain)) {
 		out.chain = out.chain.map((item) => (isRecord(item) ? applyAliasesToRecord(item) : item));
-	}
-	return out as T;
-}
-
-function remapUnknownTypeName(value: JsonSchema, knownNames: ReadonlySet<string>): JsonSchema {
-	const typeName = hasNonEmptyString(value.subagent_type) ? value.subagent_type : value.agent;
-	if (!hasNonEmptyString(typeName) || knownNames.has(typeName) || KNOWN_AGENT_TYPES.has(typeName)) {
-		return value;
-	}
-	if (!AGENT_ID_PATTERN.test(typeName)) return value;
-	const out: JsonSchema = { ...value };
-	if (!hasNonEmptyString(out.agentId)) out.agentId = typeName;
-	if (!hasNonEmptyString(out.resume_from)) out.resume_from = typeName;
-	const inferred = inferredAgentType(out);
-	out.subagent_type = inferred;
-	out.agent = inferred;
-	return out;
-}
-
-/** After agent discovery: treat an unknown type that looks like an id as resume_from. */
-export function remapUnknownSubagentType<T>(value: T, knownNames: ReadonlySet<string>): T {
-	if (!isRecord(value)) return value;
-	const out = remapUnknownTypeName(value, knownNames);
-	if (Array.isArray(out.tasks)) {
-		out.tasks = out.tasks.map((item) => (isRecord(item) ? remapUnknownTypeName(item, knownNames) : item));
-	}
-	if (Array.isArray(out.chain)) {
-		out.chain = out.chain.map((item) => (isRecord(item) ? remapUnknownTypeName(item, knownNames) : item));
 	}
 	return out as T;
 }

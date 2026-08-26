@@ -18,6 +18,7 @@ export const CONTEXT_MANAGE_MAX_CANDIDATES_DEFAULT = 20;
 export const CONTEXT_MANAGE_MAX_FOLD_IDS_DEFAULT = 20;
 export const CONTEXT_MANAGE_SUMMARY_CHARS_DEFAULT = 160;
 export const CONTEXT_FOLD_MANAGE_KEY = Symbol.for("pipiui.contextFold.manage");
+export const CONTEXT_OPTIMIZER_STATE_KEY = Symbol.for("pipiui.contextOptimizer.state.v1");
 export const CONTEXT_MANAGE_NUDGE_CUSTOM_TYPE = "pipiui-context-manage-nudge";
 
 /** Authoritative plan tools from extensions/pipiui-plan.ts (plan_publish / _task_update / _approve / _cancel). */
@@ -142,6 +143,14 @@ export function getLiveContextFoldManage(): ContextFoldManageApi | undefined {
 	const api = registered as Partial<ContextFoldManageApi>;
 	if (typeof api.viewFor !== "function" || typeof api.foldByIds !== "function") return undefined;
 	return api as ContextFoldManageApi;
+}
+
+/** Process-local lease check shared with context-fold and pipiui-headroom. */
+export function contextFoldIsStandby(): boolean {
+	const value = (globalThis as Record<string | symbol, unknown>)[CONTEXT_OPTIMIZER_STATE_KEY];
+	if (typeof value !== "object" || value === null || (value as { version?: unknown }).version !== 1) return false;
+	const state = value as { primaryOwner?: unknown; fallbackOwner?: unknown };
+	return typeof state.primaryOwner === "string" && state.primaryOwner.length > 0 && !state.fallbackOwner;
 }
 
 export function isPlanToolName(toolName: string | undefined): boolean {
@@ -303,6 +312,13 @@ export function foldContextByIds(deps: ContextManageDeps, ids: readonly string[]
 	const maxIds = deps.maxFoldIds ?? cfg.maxFoldIds;
 	const requested = [...new Set(ids.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim()))];
 	if (requested.length === 0) return { foldedIds: [], skipped: [], problem: "fold requires a non-empty ids list." };
+	if (contextFoldIsStandby()) {
+		return {
+			foldedIds: [],
+			skipped: requested.map((id) => ({ id, reason: "primary_optimizer_active" })),
+			problem: "context-fold is in standby while the primary context optimizer is active.",
+		};
+	}
 	if (requested.length > maxIds) {
 		return { foldedIds: [], skipped: requested.map((id) => ({ id, reason: "too_many_ids" })), problem: `fold accepts at most ${maxIds} ids.` };
 	}

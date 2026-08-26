@@ -256,6 +256,7 @@ test("the wake waits for the cut-in hold before sending", async () => {
 
 test("the stall message carries identity, liveness, and the one-of-three instruction", () => {
 	const text = formatStallMessage({
+		runId: "run-1",
 		agentId: "research-one",
 		title: "recon",
 		idleSec: 120,
@@ -267,7 +268,8 @@ test("the stall message carries identity, liveness, and the one-of-three instruc
 	assert.equal(lines[0], "[subagent-stalled] agentId=research-one title=recon idle=120s in=read+grep for=45s last=grep src");
 	assert.equal(lines[1], "Liveness: 12% cpu over 30s.");
 	assert.match(text, /choose exactly one/);
-	assert.match(text, /subagent_resolve\(\{agentId, runId\}\)/);
+	assert.match(text, /subagent_resolve\(\{agentId:"[^"]+", runId:"[^"]+"\}\)/);
+	assert.match(text, /subagent_abort\(\{agentId:"[^"]+", runId:"[^"]+"\}\)/);
 });
 
 test("a stall with no tool and no CPU measurement says so rather than omitting the line", () => {

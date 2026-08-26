@@ -76,9 +76,9 @@ describe("subagent lifecycle → AgentSummary", () => {
 		(backend as any).live.set("session-1", fakeLive());
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
-		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
-		await vi.waitFor(() => expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" }));
-		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
+		const aborting = backend.handle("abortAgent", ["session-1", "agent-safe_1", "r1"]);
+		await vi.waitFor(() => expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1 r1", streamingBehavior: "followUp" }));
+		expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1 r1", streamingBehavior: "followUp" });
 		expect(latest().state).toBe("running");
 		deliver({ ...END, agentId: "agent-safe_1", ok: false, aborted: true, output: "aborted" });
 		await expect(aborting).resolves.toBeUndefined();
@@ -93,9 +93,9 @@ describe("subagent lifecycle → AgentSummary", () => {
 			(backend as any).live.set("session-1", fakeLive());
 			const command = vi.fn(() => new Promise<never>(() => undefined));
 			(backend as any).command = command;
-			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+			const aborting = backend.handle("abortAgent", ["session-1", "agent-safe_1", "r1"]);
 			await vi.advanceTimersByTimeAsync(0);
-			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1 r1", streamingBehavior: "followUp" });
 			await vi.advanceTimersByTimeAsync(5_000);
 			await expect(aborting).resolves.toBeUndefined();
 			expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
@@ -113,7 +113,7 @@ describe("subagent lifecycle → AgentSummary", () => {
 		(backend as any).live.set("session-1", fakeLive());
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
-		const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+		const aborting = backend.handle("abortAgent", ["session-1", "agent-safe_1", "r1"]);
 		await vi.waitFor(() => expect(command).toHaveBeenCalled());
 		expect(latest().state).toBe("running");
 		await backend.close();
@@ -129,7 +129,7 @@ describe("subagent lifecycle → AgentSummary", () => {
 		deliver({ ...START, agentId: "agent-safe_1" });
 		const command = vi.fn(async () => ({}));
 		(backend as any).command = command;
-		await expect(backend.handle("abortAgent", ["agent-safe_1"])).resolves.toBeUndefined();
+		await expect(backend.handle("abortAgent", ["session-1", "agent-safe_1", "r1"])).resolves.toBeUndefined();
 		expect(command).not.toHaveBeenCalled();
 		expect(latest()).toMatchObject({ agentId: "agent-safe_1", state: "aborted" });
 	});
@@ -142,9 +142,9 @@ describe("subagent lifecycle → AgentSummary", () => {
 			(backend as any).live.set("session-1", fakeLive());
 			const command = vi.fn(async () => ({}));
 			(backend as any).command = command;
-			const aborting = backend.handle("abortAgent", ["agent-safe_1"]);
+			const aborting = backend.handle("abortAgent", ["session-1", "agent-safe_1", "r1"]);
 			await vi.advanceTimersByTimeAsync(0);
-			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1", streamingBehavior: "followUp" });
+			expect(command).toHaveBeenCalledWith("session-1", { type: "prompt", message: "/subagent_abort agent-safe_1 r1", streamingBehavior: "followUp" });
 			expect(latest().state).toBe("running");
 			await vi.advanceTimersByTimeAsync(15_000);
 			await expect(aborting).resolves.toBeUndefined();
@@ -798,7 +798,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     });
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
     expect(worktree?.status).toMatchObject({ lifecycle: "merged", merge: "merged", discard: "unavailable" });
-    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({ lifecycle: "merged", merge: "merged" });
+    await expect(backend.handle("getWorktreeStatus", ["session-1", "a1", "r1"])).resolves.toMatchObject({ lifecycle: "merged", merge: "merged" });
   });
 
   it("keeps pendingReview for retained/needs-fixer and accepts legacy path-only ends", async () => {
@@ -811,7 +811,7 @@ describe("subagent lifecycle → AgentSummary", () => {
       worktreeLifecycle: "pendingReview",
       worktreeFinalization: "disposition=needs-fixer merge=not-attempted cleanup=not-attempted phase=recovery",
     });
-    await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
+    await expect(backend.handle("getWorktreeStatus", ["session-1", "a1", "r1"])).resolves.toMatchObject({
       lifecycle: "pendingReview",
       merge: "ready",
       discard: "ready",
@@ -831,7 +831,7 @@ describe("subagent lifecycle → AgentSummary", () => {
       output: "ok",
       worktreePath: "/tmp/legacy",
     });
-    await expect(backend.handle("getWorktreeStatus", ["legacy"])).resolves.toMatchObject({
+    await expect(backend.handle("getWorktreeStatus", ["session-1", "legacy", "r-legacy"])).resolves.toMatchObject({
       lifecycle: "pendingReview",
       merge: "ready",
     });
@@ -1210,7 +1210,7 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver({ ...USAGE, agentId: "leader", runId: "plan-1" });
     deliver({ ...UPDATE, agentId: "leader", runId: "plan-1" });
     deliver({ ...END, agentId: "leader", runId: "plan-1", output: "old plan" });
-    await backend.handle("resolveAgent", ["leader"]);
+    await backend.handle("resolveAgent", ["session-1", "leader", "plan-1"]);
     expect(latest()).toMatchObject({ state: "ok", finalResult: "old plan", handled: true, model: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: 0.55, turns: 4, outputCount: 1, inputTokens: 12_400, outputTokens: 2_130, cacheTokens: 8_900, contextTokens: 153_000, activityActive: false });
     expect(latest().listSubtitle).toBeUndefined();
     expect(latest().endedAt).toBeGreaterThan(0);
@@ -1347,8 +1347,13 @@ describe("subagent lifecycle → AgentSummary", () => {
 
     const restarted = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
     backends.push(restarted);
+    // The first backend closed cleanly, so its close() sweep force-aborted the
+    // live row ("宿主停止时无主…") before persisting. Restart normalization only
+    // remaps crash-persisted running/stalled rows to interrupted — that path is
+    // covered by "persists restart normalization once…"; this test pins the
+    // load-race: the live START's row survived next to the seeded history.
     await expect(restarted.handle("listAgents", [])).resolves.toEqual(expect.arrayContaining([
-      expect.objectContaining({ agentId: "same", runId: "new-run", state: "interrupted", task: "当前新任务" }),
+      expect.objectContaining({ agentId: "same", runId: "new-run", state: "aborted", task: "当前新任务" }),
       expect.objectContaining({ agentId: "old", runId: "old-run", task: "历史无关任务" })
     ]));
   });
@@ -1385,8 +1390,8 @@ describe("subagent lifecycle → AgentSummary", () => {
     deliver(START);
     deliver({ kind: "end", agentId: "a1", runId: "r1", ok: false, output: "boom" });
 
-    await backend.handle("resolveAgent", ["a1"]);
-    await expect(backend.handle("checkAgent", ["a1"])).resolves.toMatchObject({ state: "failed", handled: true });
+    await backend.handle("resolveAgent", ["session-1", "a1", "r1"]);
+    await expect(backend.handle("checkAgent", ["session-1", "a1", "r1"])).resolves.toMatchObject({ state: "failed", handled: true });
   });
 });
 
@@ -1464,7 +1469,7 @@ describe("dead-session orphan reconcile", () => {
     ]);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
       expect(worktree?.status).toMatchObject({ agentId: "a1", lifecycle: "pendingReview", merge: "ready", discard: "ready" });
-      await expect(backend.handle("getWorktreeStatus", ["a1"])).resolves.toMatchObject({
+      await expect(backend.handle("getWorktreeStatus", ["session-1", "a1", "r1"])).resolves.toMatchObject({
         lifecycle: "pendingReview",
       });
     } finally {
@@ -1547,8 +1552,10 @@ describe("durable projection retention", () => {
       version: 1,
       agents: rows,
       worktrees: [
-        { agentId: "old2", path: "/tmp/wt-old2", lifecycle: "merged", merge: "done", discard: "done" },
-        { agentId: "fresh", path: "/tmp/wt-fresh", lifecycle: "pendingReview", merge: "ready", discard: "ready" },
+        // Composite-identity persisted entries: a session-less entry can no longer
+        // be attributed to one episode and is dropped at load.
+        { agentId: "old2", sessionId: "session-r", runId: "run-old2", path: "/tmp/wt-old2", lifecycle: "merged", merge: "done", discard: "done" },
+        { agentId: "fresh", sessionId: "session-r", runId: "run-fresh", path: "/tmp/wt-fresh", lifecycle: "pendingReview", merge: "ready", discard: "ready" },
       ],
     }, null, 2) + "\n");
     await writeFile(join(agentDir, "pipiui-agent-logs.json"), JSON.stringify({
@@ -1574,9 +1581,9 @@ describe("durable projection retention", () => {
     const persisted = JSON.parse(await readFile(join(agentDir, "pipiui-agent-index.json"), "utf8"));
     expect(persisted.agents.map((agent: { agentId: string }) => agent.agentId).sort()).toEqual(["fresh", "older"]);
     // The merged worktree of a pruned agent goes with it; an actionable
-    // pendingReview worktree must survive retention.
+    // pendingReview worktree must survive retention — keyed to its exact episode.
     expect(persisted.worktrees).toEqual([
-      expect.objectContaining({ agentId: "fresh", lifecycle: "pendingReview" }),
+      expect.objectContaining({ agentId: "fresh", sessionId: "session-r", runId: "run-fresh", lifecycle: "pendingReview" }),
     ]);
 
     const restarted = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions"), agentRetentionMaxTerminal: 2 });
