@@ -20,6 +20,7 @@ import {
 	serializeGoalState,
 } from "./persistence.js";
 import { buildContinuePrompt, type GoalStatus } from "./prompts.js";
+import { GoalIdSequence, MAX_GOAL_ID_LENGTH } from "./goal-id.js";
 import { nextToolFreeRepeatState, resetGoalSafetyEpoch } from "./safety.js";
 
 export { queueGoalSafetyReset, resetGoalSafetyEpoch } from "./safety.js";
@@ -117,7 +118,7 @@ export interface StatusContext {
 
 export const STATUS_KEY = "goal";
 export const GOAL_STATE_ENTRY_TYPE = "goal-state";
-export const MAX_GOAL_ID_LENGTH = 128;
+export { MAX_GOAL_ID_LENGTH };
 
 /** Canonical Goal state passed to the in-process managed-run publisher. */
 export type GoalStateSnapshotStatus = GoalStatus | "cleared";
@@ -229,6 +230,8 @@ export class GoalRuntime {
 	agentRunToolAttempted = false;
 	guardAbortGoalId?: string;
 	staleGoalToolCallsBlocked = false;
+	/** Allocates readable `<slug>.<generation>` goal ids; see ./goal-id.ts. */
+	readonly goalIds = new GoalIdSequence();
 	readonly toolPolicy: GoalToolPolicy;
 	pendingGoalPromptMarkers = new Map<string, PendingGoalPrompt>();
 	claimedGoalPromptMarkers = new Map<string, string>();
@@ -1094,14 +1097,17 @@ export class GoalRuntime {
 		if (!isTerminalGoalStatus(goal.status) || this.terminalDetails?.goalId !== goal.id) {
 			this.clearTerminalDetails();
 		}
-		this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(goal));
+		this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(goal, this.goalIds.snapshot()));
 		this.publishGoalState(
 			buildGoalStateSnapshot(goal, this.terminalDetails?.summary, this.terminalDetails?.reason),
 		);
 	}
 
 	clearPersistedGoal(cwd: string, clearedGoal?: ActiveGoal, reason = "goal cleared") {
-		this.pi.appendEntry(GOAL_STATE_ENTRY_TYPE, serializeGoalState(undefined));
+		this.pi.appendEntry(
+			GOAL_STATE_ENTRY_TYPE,
+			serializeGoalState(undefined, this.goalIds.snapshot()),
+		);
 		if (clearedGoal) {
 			this.publishGoalState({
 				goalId: clearedGoal.id,
@@ -1277,10 +1283,11 @@ export function createGoal(
 	text: string,
 	tokenBudget: number | undefined,
 	baselineTokens: number,
+	goalIds: GoalIdSequence,
 ): ActiveGoal {
 	const now = Date.now();
 	return {
-		id: randomUUID(),
+		id: goalIds.allocate(text),
 		text,
 		status: "active",
 		startedAt: now,
@@ -1314,8 +1321,17 @@ export function transitionGoal(goal: ActiveGoal, requestedStatus: GoalStatus): A
 	return next;
 }
 
-export function nextGoalInstance(goal: ActiveGoal): ActiveGoal {
-	return { ...goal, id: randomUUID(), updatedAt: Date.now() };
+export function nextGoalInstance(
+	goal: ActiveGoal,
+	goalIds: GoalIdSequence,
+	nextText: string = goal.text,
+): ActiveGoal {
+	return {
+		...goal,
+		id: goalIds.allocate(nextText, goal.id),
+		text: nextText,
+		updatedAt: Date.now(),
+	};
 }
 
 export function editedGoalStatus(status: GoalStatus): GoalStatus {

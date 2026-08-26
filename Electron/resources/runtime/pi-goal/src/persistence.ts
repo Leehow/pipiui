@@ -37,6 +37,8 @@ export interface ActiveGoal {
 
 export interface GoalStateEntryData {
 	goal: ActiveGoal | null;
+	/** Slug → highest allocated generation; keeps goal ids unique across reloads. */
+	goalIdSequence?: Record<string, number>;
 }
 
 export interface LegacyQueueState {
@@ -47,6 +49,7 @@ export interface LegacyQueueState {
 export interface LoadedGoalState {
 	goal: ActiveGoal | undefined;
 	legacyQueueState: LegacyQueueState | undefined;
+	goalIdSequence: Record<string, number> | undefined;
 	source: "none" | "canonical" | "legacy-goals";
 }
 
@@ -63,8 +66,11 @@ interface SessionContext {
 	};
 }
 
-export function serializeGoalState(goal: ActiveGoal | undefined): GoalStateEntryData {
-	return { goal: goal ?? null };
+export function serializeGoalState(
+	goal: ActiveGoal | undefined,
+	goalIdSequence?: Record<string, number>,
+): GoalStateEntryData {
+	return { goal: goal ?? null, ...(goalIdSequence ? { goalIdSequence } : {}) };
 }
 
 export function loadGoalStateFromSession(ctx: SessionContext): LoadedGoalState {
@@ -110,7 +116,12 @@ function loadCanonicalGoalState(data: unknown): LoadedGoalState {
 
 	let goal = rawGoal === null ? undefined : normalizeLoadedGoal(rawGoal);
 	if (goal?.status === "complete") goal = undefined;
-	return { goal, legacyQueueState: undefined, source: "canonical" };
+	return {
+		goal,
+		legacyQueueState: undefined,
+		goalIdSequence: normalizeGoalIdSequence(data.goalIdSequence),
+		source: "canonical",
+	};
 }
 
 function countCanonicalLegacyGoals(
@@ -155,6 +166,7 @@ function loadLegacyGoalsState(data: unknown): LoadedGoalState {
 		return {
 			goal: normalizeLoadedGoal(rawGoals[0]),
 			legacyQueueState: undefined,
+			goalIdSequence: undefined,
 			source: "legacy-goals",
 		};
 	}
@@ -267,6 +279,7 @@ function emptyGoalState(source: LoadedGoalState["source"]): LoadedGoalState {
 	return {
 		goal: undefined,
 		legacyQueueState: undefined,
+		goalIdSequence: undefined,
 		source,
 	};
 }
@@ -278,6 +291,23 @@ function legacyQueueState(
 	return {
 		goal: undefined,
 		legacyQueueState: legacyQueue,
+		goalIdSequence: undefined,
 		source,
 	};
+}
+
+/** Accepts only well-formed persisted sequences; anything else is dropped safely. */
+function normalizeGoalIdSequence(value: unknown): Record<string, number> | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const entries = Object.entries(value).filter(
+		([slug, generation]) =>
+			typeof slug === "string" &&
+			slug.length > 0 &&
+			!slug.includes(".") &&
+			typeof generation === "number" &&
+			Number.isSafeInteger(generation) &&
+			generation >= 1,
+	);
+	if (entries.length === 0) return undefined;
+	return Object.fromEntries(entries);
 }

@@ -73,7 +73,7 @@ function goalObjectiveBlock(goal: GoalPromptContext) {
 }
 
 function goalCompletionGuardBlock(goal: GoalPromptContext) {
-	return `<goal_id>\n${escapeXmlText(goal.id)}\n</goal_id>\nThis goal_id is only the goal_complete tool stale-turn guard, not part of the objective. If and only if the goal is fully complete, pass this exact goal_id to goal_complete with the completion summary.`;
+	return `<goal_id>\n${escapeXmlText(goal.id)}\n</goal_id>\nThis goal_id is a short, readable id for the current goal instance (objective slug + instance number, e.g. ${escapeXmlText(goal.id)}). It is only the stale-turn guard for goal_complete, goal_blocked, and goal_wait — not part of the objective. Copy it exactly, including the instance number; a goal_id from an older, stopped, replaced, or cleared goal turn is rejected.`;
 }
 
 function goalModeRules(goalLabel: string) {

@@ -82,6 +82,10 @@ export function registerGoalLifecycle(
 		const loaded = loadGoalStateFromSession(ctx);
 		runtime.activeGoal = loaded.goal;
 		runtime.legacyQueueState = loaded.legacyQueueState;
+		// Seed the semantic-id sequence before any new goal can be created: restored
+		// generations (active goal id + persisted sequence) must never be reissued.
+		runtime.goalIds.restore(loaded.goalIdSequence);
+		if (loaded.goal) runtime.goalIds.seed(loaded.goal.id);
 		runController.bindSession(ctx);
 		if (runtime.legacyQueueState) {
 			runtime.toolPolicy.reconcileRestoredState(runtime.settings.toolVisibility, false);

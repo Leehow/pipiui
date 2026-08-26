@@ -94,7 +94,12 @@ export class GoalCommandController {
 		this.runtime.clearBudgetWrapUp();
 		this.runtime.clearStaleGoalToolCallBlock();
 		if (!legacyQueueBeforeActivation) this.runtime.legacyQueueState = undefined;
-		this.runtime.activeGoal = createGoal(objective, tokenBudget, currentTokenTotal(ctx));
+		this.runtime.activeGoal = createGoal(
+			objective,
+			tokenBudget,
+			currentTokenTotal(ctx),
+			this.runtime.goalIds,
+		);
 		const startedGoal = this.runtime.activeGoal;
 		onActivated?.(startedGoal);
 		if (!legacyQueueBeforeActivation) this.runtime.persistGoal(startedGoal);
@@ -252,7 +257,10 @@ export class GoalCommandController {
 		this.runtime.clearBudgetWrapUp();
 		this.runtime.clearStaleGoalToolCallBlock();
 		this.runtime.activeGoal = queueGoalSafetyReset(
-			transitionGoal(nextGoalInstance(this.runtime.activeGoal), "active"),
+			transitionGoal(
+				nextGoalInstance(this.runtime.activeGoal, this.runtime.goalIds),
+				"active",
+			),
 		);
 		this.runtime.persistGoal(this.runtime.activeGoal);
 		this.runtime.updateStatus(ctx, this.runtime.activeGoal);
@@ -367,11 +375,10 @@ export class GoalCommandController {
 		this.runtime.clearGoalRecovery();
 		this.runtime.clearBudgetWrapUp();
 		const previousStatus = this.runtime.activeGoal.status;
-		const rotatedGoal = nextGoalInstance(this.runtime.activeGoal);
+		const rotatedGoal = nextGoalInstance(this.runtime.activeGoal, this.runtime.goalIds, objective);
 		const transitionedGoal = transitionGoal(
 			{
 				...rotatedGoal,
-				text: objective,
 				tokenBudget: tokenBudget ?? this.runtime.activeGoal.tokenBudget,
 				waiting: undefined,
 			},
