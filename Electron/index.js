@@ -3388,7 +3388,7 @@ function withBrowserTabsHost(backend, browser) {
     }
   };
 }
-const CUA_DRIVER_VERSION = "0.19.2";
+const CUA_DRIVER_VERSION = "0.22.0";
 function cuaSocketPath(temporaryDirectory = os.tmpdir(), pid = process.pid, nonce = crypto$1.randomUUID(), platform = process.platform) {
   const root = platform === "win32" ? temporaryDirectory : "/tmp";
   const compactNonce = nonce.replace(/[^A-Za-z0-9]/g, "").slice(0, 32);

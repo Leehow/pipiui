@@ -17,8 +17,22 @@ export const DIRECT_DRIVE_ERROR = {
   grantInvalid: "desktop_grant_invalid",
   sessionRequired: "desktop_session_required",
   sessionUnknown: "desktop_session_unknown",
+  sessionIdRequired: "desktop_session_id_required",
+  sessionIdInvalid: "desktop_session_id_invalid",
   unsupportedAction: "unsupported_direct_drive_action",
 } as const;
+
+/**
+ * Boss-driven desktop session ids are model-visible stable identities the caller must
+ * read, repeat, and reuse across observe/act/close — the same short semantic slug contract
+ * as subagent agentId. Random/opaque strings are forbidden here; the one-shot runId below
+ * is the only identifier that stays random.
+ */
+const DESKTOP_SESSION_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{1,23}$/;
+
+export function isSemanticDesktopSessionId(value: string): boolean {
+  return DESKTOP_SESSION_ID_PATTERN.test(value);
+}
 
 export type DirectDriveBroker = {
   issue(input: {
@@ -202,7 +216,12 @@ export function createBossDesktopDirectDrive(input: {
     },
     async execute(params, options) {
       const expectedEffect = params.expectedEffect;
-      const requestedAction = parseActionName(params.action, nonempty(params.sessionId) ? "observe" : "session");
+      // A desktop grant only ever accompanies opening a session, so `desktop` + no action means
+      // "session"; a bare sessionId with no action is the observe continuation.
+      const requestedAction = parseActionName(
+        params.action,
+        nonempty(params.sessionId) && !nonempty(params.desktop) ? "observe" : "session",
+      );
       if (!requestedAction) {
         return fail(
           { type: String(params.action ?? "") },
@@ -214,8 +233,23 @@ export function createBossDesktopDirectDrive(input: {
       if (requestedAction === "session") {
         const grant = resolveBossDesktopGrant({ desktop: params.desktop, hostAvailable: options.hostAvailable });
         if (!grant.granted) return fail({ type: "session" }, grant.code, grant.error);
+        const requestedSessionId = nonempty(params.sessionId) ? params.sessionId.trim() : "";
+        if (!requestedSessionId) {
+          return fail(
+            { type: "session" },
+            DIRECT_DRIVE_ERROR.sessionIdRequired,
+            'desktop_session_id_required: pass a short semantic sessionId you choose (2-24 chars: lowercase letters, digits, "-", "_"), e.g. "textedit-install". Nothing is generated for you; reuse the same sessionId for observe/act/open_application/close.',
+          );
+        }
+        if (!isSemanticDesktopSessionId(requestedSessionId)) {
+          return fail(
+            { type: "session" },
+            DIRECT_DRIVE_ERROR.sessionIdInvalid,
+            `desktop_session_id_invalid: sessionId must be 2-24 chars of lowercase letters, digits, "-" or "_", starting with a letter or digit; got ${JSON.stringify(requestedSessionId)}.`,
+          );
+        }
+        const sessionId = requestedSessionId;
         const handle = await brokerOrThrow();
-        const sessionId = nonempty(params.sessionId) ? params.sessionId.trim() : `desktop-${randomId()}`;
         const existing = sessions.get(sessionId);
         if (existing) {
           return resultEnvelope({

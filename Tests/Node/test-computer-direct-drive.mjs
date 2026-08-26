@@ -80,6 +80,38 @@ test("opening a session without a grant is rejected and does not issue a broker 
   assert.equal(issued, 0);
 });
 
+test("opening a session requires a caller-chosen semantic sessionId; nothing is generated", async () => {
+  let issued = 0;
+  const drive = createBossDesktopDirectDrive({
+    acquireBroker: async () => {
+      issued += 1;
+      return fakeBroker(async () => ({ ok: true }));
+    },
+    randomId: () => "should-never-become-a-session-id",
+  });
+
+  const missing = await drive.execute(
+    { action: "session", desktop: "user-requested", goal: "drive TextEdit" },
+    { hostAvailable: true },
+  );
+  assert.equal(missing.code, DIRECT_DRIVE_ERROR.sessionIdRequired);
+  assert.match(missing.error, /desktop_session_id_required/);
+  assert.equal(missing.sessionId, "");
+  assert.equal(issued, 0, "no broker token may be issued before the session id is valid");
+
+  // Charset/shape violations only: a caller-provided id that merely LOOKS generated (hex
+  // slug) is shape-legal — the contract forbids the runtime generating ids, not hex shapes.
+  for (const bad of ["TextEdit Drive", "x", "way-too-long-semantic-session-id", "-leading-dash"]) {
+    const invalidId = await drive.execute(
+      { action: "session", desktop: "user-requested", sessionId: bad },
+      { hostAvailable: true },
+    );
+    assert.equal(invalidId.code, DIRECT_DRIVE_ERROR.sessionIdInvalid, `sessionId=${bad} must be rejected`);
+    assert.match(invalidId.error, /desktop_session_id_invalid/);
+    assert.equal(issued, 0);
+  }
+});
+
 test("Boss-direct screenshot/action loop reuses the broker and never marks a Leader spawn", async () => {
   const calls = [];
   const drive = createBossDesktopDirectDrive({
@@ -100,15 +132,24 @@ test("Boss-direct screenshot/action loop reuses the broker and never marks a Lea
   });
 
   const opened = await drive.execute(
-    { desktop: "user-requested", goal: "drive TextEdit" },
+    { desktop: "user-requested", sessionId: "textedit-drive", goal: "drive TextEdit" },
     { hostAvailable: true },
   );
   assert.equal(opened.spawnedLeader, false);
-  assert.equal(opened.sessionId, "desktop-fixed-id");
+  assert.equal(opened.sessionId, "textedit-drive");
   assert.deepEqual(opened.action, { type: "session", desktop: "user-requested" });
   assert.equal(opened.error, null);
   assert.equal(opened.screenChanged, null);
   assert.equal("expectedEffect" in opened, false);
+  assert.equal(calls.length, 0);
+
+  // Re-opening with the same semantic id resumes the same session instead of issuing a new one.
+  const resumed = await drive.execute(
+    { desktop: "user-requested", sessionId: "textedit-drive" },
+    { hostAvailable: true },
+  );
+  assert.deepEqual(resumed.action, { type: "session", desktop: "user-requested", resumed: true });
+  assert.equal(resumed.sessionId, "textedit-drive");
   assert.equal(calls.length, 0);
 
   const observed = await drive.execute(
