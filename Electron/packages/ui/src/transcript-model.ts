@@ -274,6 +274,32 @@ export function transcriptFingerprint(messages: readonly ChatMessage[]): string 
   })))
 }
 
+/** Keep live user follow-ups (prompts and [subagent-*] confirmations) that a
+ *  same-branch history snapshot has not persisted yet. A snapshot that does not
+ *  share any message with live is a branch/retry and replaces the transcript. */
+export function retainLiveUserTail(snapshot: ChatMessage[], live?: readonly ChatMessage[]): ChatMessage[] {
+  if (!live?.length || !snapshot.length) return snapshot
+  const seenIds = new Set(snapshot.map(message => message.id))
+  const seenUsers = new Set(snapshot.filter(message => message.role === 'user').map(message => message.content))
+  let shared = false
+  let cut = live.length
+  for (let index = live.length - 1; index >= 0; index -= 1) {
+    const message = live[index]
+    if (seenIds.has(message.id) || (message.role === 'user' && seenUsers.has(message.content))) {
+      shared = true
+      cut = index + 1
+      break
+    }
+  }
+  if (!shared) return snapshot
+  const extraUsers = live.slice(cut).filter(message => (
+    message.role === 'user'
+    && !seenIds.has(message.id)
+    && !seenUsers.has(message.content)
+  ))
+  return extraUsers.length ? [...snapshot, ...extraUsers] : snapshot
+}
+
 export function reconcileHistorySnapshot(
   entries: HistoryEntry[],
   requestLiveRevision: number,
@@ -294,7 +320,12 @@ export function reconcileHistorySnapshot(
       fingerprint: previousFingerprint ?? transcriptFingerprint(liveMessages),
     }
   }
-  return { status: 'accepted', messages, fingerprint }
+  const retained = retainLiveUserTail(messages, liveMessages)
+  return {
+    status: 'accepted',
+    messages: retained,
+    fingerprint: retained === messages ? fingerprint : transcriptFingerprint(retained),
+  }
 }
 
 export type SecretRedactPatch = {

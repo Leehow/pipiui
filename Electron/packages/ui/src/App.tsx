@@ -72,9 +72,26 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
   return lease.holder?.holder || '另一客户端'
 }
 
+export const PANE_HANDLE_TRACKS = 12
+export const CHAT_MIN_WIDTH = 360
+export const BROWSER_TOOLS_MIN = 320
+export const BROWSER_TOOLS_PREFERRED_MIN = 520
+export const BROWSER_TOOLS_MAX = 920
+
+/** Shrink a remembered/preferred browser pane so the chat column stays usable.
+ *  An overflowing --tools-w is clipped by CSS, but the native WebContentsView
+ *  still paints the unclipped rect and covers the transcript. */
+export function fitBrowserToolsWidth(viewportWidth: number, sidebar: number, requested: number): number {
+  const maxFit = viewportWidth - sidebar - PANE_HANDLE_TRACKS - CHAT_MIN_WIDTH
+  const ceiling = Math.min(BROWSER_TOOLS_MAX, Math.max(BROWSER_TOOLS_MIN, maxFit))
+  const floor = Math.min(BROWSER_TOOLS_PREFERRED_MIN, ceiling)
+  return clamp(requested, floor, ceiling)
+}
+
 function initialBrowserToolsWidth(sidebar = 258): number {
   const viewportWidth = typeof window === 'undefined' ? 1280 : window.innerWidth
-  return Math.min(920, Math.max(520, Math.round((viewportWidth - sidebar - 12) * 0.58)))
+  const preferred = Math.round((viewportWidth - sidebar - PANE_HANDLE_TRACKS) * 0.58)
+  return fitBrowserToolsWidth(viewportWidth, sidebar, preferred)
 }
 const defaultWidths: PaneWidths = { sidebar: 258, tools: 368, browserTools: initialBrowserToolsWidth(), sidebarCollapsed: false, toolsCollapsed: false }
 const storageKey = 'pipiui:eui-pane-widths'
@@ -343,7 +360,7 @@ function readWidths(): PaneWidths {
     return {
       sidebar: clamp(parsed.sidebar ?? defaultWidths.sidebar, 190, 440),
       tools: clamp(parsed.tools ?? defaultWidths.tools, 270, 620),
-      browserTools: clamp(parsed.browserTools ?? initialBrowserToolsWidth(parsed.sidebar ?? defaultWidths.sidebar), 520, 920),
+      browserTools: clamp(parsed.browserTools ?? initialBrowserToolsWidth(parsed.sidebar ?? defaultWidths.sidebar), BROWSER_TOOLS_PREFERRED_MIN, BROWSER_TOOLS_MAX),
       sidebarCollapsed: parsed.sidebarCollapsed === true,
       toolsCollapsed: parsed.toolsCollapsed === true
     }
@@ -910,11 +927,11 @@ export function createMockHost(): PipiHostAPI {
       stream(2, 'toolResult', undefined, ['已读取主界面实现', '，确认流式更新逻辑位于 SubagentPanel。'])
       return () => timers.forEach(window.clearTimeout)
     },
-    abortAgent: async () => undefined, resolveAgent: async () => undefined,
-    checkAgent: async agentId => ({ agentId, runId: 'mock', name: 'Mock agent', task: '', state: 'ok' }),
-    getWorktreeStatus: async agentId => ({ agentId, lifecycle: 'none', merge: 'unavailable', discard: 'unavailable' }),
-    mergeWorktree: async agentId => ({ agentId, lifecycle: 'merged', merge: 'merged', discard: 'unavailable' }),
-    discardWorktree: async agentId => ({ agentId, lifecycle: 'discarded', merge: 'unavailable', discard: 'discarded' }),
+    abortAgent: async (_sessionId: string, _agentId: string, _runId: string) => undefined, resolveAgent: async (_sessionId: string, _agentId: string, _runId: string) => undefined,
+    checkAgent: async (sessionId: string, agentId: string, runId: string) => ({ sessionId, agentId, runId, name: 'Mock agent', task: '', state: 'ok' }),
+    getWorktreeStatus: async (sessionId: string, agentId: string, runId: string) => ({ sessionId, agentId, runId, lifecycle: 'none', merge: 'unavailable', discard: 'unavailable' }),
+    mergeWorktree: async (sessionId: string, agentId: string, runId: string) => ({ sessionId, agentId, runId, lifecycle: 'merged', merge: 'merged', discard: 'unavailable' }),
+    discardWorktree: async (sessionId: string, agentId: string, runId: string) => ({ sessionId, agentId, runId, lifecycle: 'discarded', merge: 'unavailable', discard: 'discarded' }),
     getPlans: async sessionId => sessionId ? mockPlans() : [],
     subscribePlans: () => () => undefined,
     capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: false, documents: true, browser: true, git: true, plan: true, retainedWorktreeDisposition: false }),
@@ -967,6 +984,16 @@ function useNarrowViewport(): boolean {
     return () => media.removeEventListener?.('change', update)
   }, [])
   return narrow
+}
+
+function useViewportWidth(): number {
+  const [width, setWidth] = useState(() => typeof window === 'undefined' ? 1280 : window.innerWidth)
+  useEffect(() => {
+    const update = () => setWidth(window.innerWidth)
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [])
+  return width
 }
 
 /** Keep the in-flight cut-in optimistic user across a JSONL snapshot that has not persisted it yet. Match the current receipt id only. */
@@ -1072,6 +1099,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [announcedTerminals, setAnnouncedTerminals] = useState<Record<string, TerminalSession>>({})
   const [revealedTerminalIds, setRevealedTerminalIds] = useState<Record<string, string>>({})
   const [widths, setWidths] = useState<PaneWidths>(readWidths)
+  const viewportWidth = useViewportWidth()
   const narrowViewport = useNarrowViewport()
   // Narrow-viewport override (not persisted): both panes start collapsed and the
   // header toggles / quick rail flip these to show the panes as overlays.
@@ -2980,7 +3008,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const browser = activeTab === 'Browser'
     const key: 'tools' | 'browserTools' = browser ? 'browserTools' : 'tools'
     const start = widths[key]
-    const onMove = (move: PointerEvent) => setWidths(current => ({ ...current, [key]: clamp(start + origin - move.clientX, browser ? 520 : 270, browser ? 920 : 620) }))
+    const onMove = (move: PointerEvent) => setWidths(current => {
+      const sidebar = current.sidebarCollapsed ? 0 : current.sidebar
+      const fittedMax = browser ? fitBrowserToolsWidth(window.innerWidth, sidebar, BROWSER_TOOLS_MAX) : 620
+      const fittedMin = browser ? Math.min(BROWSER_TOOLS_PREFERRED_MIN, fittedMax) : 270
+      return { ...current, [key]: clamp(start + origin - move.clientX, fittedMin, fittedMax) }
+    })
     const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', done)
@@ -3082,7 +3115,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       ? { id: selectedExternalSession.id, projectId: selectedExternalSession.projectId, name: selectedExternalSession.title, updatedAt: selectedExternalSession.updatedAt }
       : undefined)
   const dismissNarrowOverlays = () => setNarrowPanes({ sidebar: false, tools: false })
-  return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${browserWorkspaceActive ? widths.browserTools : widths.tools}px` } as React.CSSProperties}>
+  const toolsTrack = browserWorkspaceActive
+    ? fitBrowserToolsWidth(viewportWidth, sidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
+    : widths.tools
+  return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
     {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
     <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
     <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
@@ -3107,6 +3143,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           {selectedSession ? (
             <div key={selectedSession} className="session-transcript-slot" data-session-transcript={selectedSession}>
               <Transcript
+                stateKey={selectedSession}
                 messages={messages}
                 onLoadOlder={loadOlderHistory}
                 documentBasePath={selectedProjectPath}

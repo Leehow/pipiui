@@ -223,7 +223,7 @@ describe('external session aggregation', () => {
       listExternalSessions: async () => { throw new Error('cursor scanner exploded') },
     })
     render(<App host={host} />)
-    await screen.findByText('Pi 会话')
+    await screen.findByText('Pi 会话', { selector: '.sb-session-title' })
     expect(screen.queryByText('Claude 新')).toBeNull()
     expect(screen.queryByText(/加载会话列表失败/)).toBeNull()
     expect(document.querySelector('[data-session-id="pi-mid"]')).toBeTruthy()

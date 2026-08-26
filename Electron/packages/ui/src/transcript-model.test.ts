@@ -41,6 +41,39 @@ describe('transcript model', () => {
     expect(result.messages.map(message => message.id)).toEqual(['u2', 'a2'])
   })
 
+  it('keeps a live user follow-up that the history snapshot has not persisted yet', () => {
+    const live = [
+      { id: 'u1', role: 'user' as const, content: '先派发', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: '已派发', timestamp: 2 },
+      { id: 'done-1', role: 'user' as const, content: '[subagent-done] agentId=a1 name=explore ok=true\nTitle: 修合流', timestamp: 3 },
+      { id: 'steer-1', role: 'user' as const, content: '先停一下，改验证标准', timestamp: 4 },
+    ]
+    const result = reconcileHistorySnapshot([
+      { id: 'u1', role: 'user', content: '先派发', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '已派发', timestamp: 2 },
+    ], 4, 4, undefined, live)
+    expect(result.status).toBe('accepted')
+    expect(result.messages.map(message => message.id)).toEqual(['u1', 'a1', 'done-1', 'steer-1'])
+  })
+
+  it('keeps a later live confirmation after history replaced the streaming assistant', () => {
+    const live = [
+      { id: 'u1', role: 'user' as const, content: '继续', timestamp: 1 },
+      { id: 'a-live', role: 'assistant' as const, content: 'partial', timestamp: 2, streaming: true },
+      { id: 'done-1', role: 'user' as const, content: '[subagent-done] agentId=a1 name=explore ok=true', timestamp: 3 },
+    ]
+    const result = reconcileHistorySnapshot([
+      { id: 'u1', role: 'user', content: '继续', timestamp: 1 },
+      { id: 'a-done', role: 'assistant', content: 'done', timestamp: 2 },
+    ], 4, 4, undefined, live)
+    expect(result.status).toBe('accepted')
+    expect(result.messages.map(message => ({ id: message.id, role: message.role }))).toEqual([
+      { id: 'u1', role: 'user' },
+      { id: 'a-done', role: 'assistant' },
+      { id: 'done-1', role: 'user' },
+    ])
+  })
+
   it('does not let an empty history snapshot wipe a non-empty live transcript', () => {
     const live = [
       { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },

@@ -2,7 +2,7 @@
 import { createRef } from 'react'
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { VirtuosoHandle } from 'react-virtuoso'
+import type { StateSnapshot, VirtuosoHandle } from 'react-virtuoso'
 import { findPreviousUserMessageIndex, Transcript } from './Transcript'
 import type { ChatMessage } from './transcript-model'
 import { TRANSCRIPT_FIRST_ITEM_BASE, transcriptTailVirtualIndex } from './transcript-scroll'
@@ -10,6 +10,7 @@ import { TRANSCRIPT_FIRST_ITEM_BASE, transcriptTailVirtualIndex } from './transc
 type VirtuosoCapture = {
   firstItemIndex?: number
   initialTopMostItemIndex?: unknown
+  restoreStateFrom?: StateSnapshot
   followOutput?: (atBottom: boolean) => unknown
   atBottomStateChange?: (value: boolean) => void
   computeItemKey?: (index: number, item: ChatMessage) => React.Key
@@ -27,6 +28,7 @@ vi.mock('react-virtuoso', async () => {
     data: unknown[]
     itemContent: (index: number, item: never) => JSX.Element
     initialTopMostItemIndex?: unknown
+    restoreStateFrom?: StateSnapshot
     firstItemIndex?: number
     followOutput?: (atBottom: boolean) => unknown
     atBottomStateChange?: (value: boolean) => void
@@ -36,11 +38,14 @@ vi.mock('react-virtuoso', async () => {
     const rec = React.useRef<VirtuosoCapture>()
     if (!rec.current) {
       const scrollToIndex = vi.fn()
-      rec.current = { scrollToIndex, handle: { scrollToIndex } as unknown as VirtuosoHandle, data: props.data }
+      const snapshot: StateSnapshot = { ranges: [{ startIndex: 0, endIndex: 1, size: 72 }], scrollTop: 240 }
+      const getState = vi.fn((callback: (state: StateSnapshot) => void) => callback(snapshot))
+      rec.current = { scrollToIndex, handle: { scrollToIndex, getState } as unknown as VirtuosoHandle, data: props.data }
       virtuosoInstances.push(rec.current)
     }
     rec.current.firstItemIndex = props.firstItemIndex
     rec.current.initialTopMostItemIndex = props.initialTopMostItemIndex
+    rec.current.restoreStateFrom = props.restoreStateFrom
     rec.current.followOutput = props.followOutput
     rec.current.atBottomStateChange = props.atBottomStateChange
     rec.current.computeItemKey = props.computeItemKey
@@ -156,6 +161,25 @@ describe('Transcript waiting layout', () => {
 })
 
 describe('Transcript prepend and follow', () => {
+  it('restores a remounted session from its measured Virtuoso snapshot', () => {
+    const newest = makeMessages(3, 3)
+    const firstView = render(<Transcript stateKey="restore-session" messages={newest} {...handlers} />)
+    const firstIndex = virtuosoInstances[0]!.firstItemIndex!
+    const full = [...makeMessages(3, 0), ...newest]
+    firstView.rerender(<Transcript stateKey="restore-session" messages={full} {...handlers} />)
+    expect(virtuosoInstances[0]!.firstItemIndex).toBe(firstIndex - 3)
+
+    firstView.unmount()
+    virtuosoInstances.length = 0
+    render(<Transcript stateKey="restore-session" messages={full} {...handlers} />)
+
+    expect(virtuosoInstances[0]!.restoreStateFrom).toEqual({
+      ranges: [{ startIndex: 0, endIndex: 1, size: 72 }],
+      scrollTop: 240,
+    })
+    expect(virtuosoInstances[0]!.firstItemIndex).toBe(firstIndex - 3)
+  })
+
   it('holds firstItemIndex still for a tail append and lowers it on an older-page prepend', () => {
     const transcriptRef = createRef<VirtuosoHandle>()
     const newest = makeMessages(4, 4)

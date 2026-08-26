@@ -89,7 +89,7 @@ vi.mock('@xterm/xterm', () => {
 
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
-import { App, createMockHost, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY } from './App'
+import { App, createMockHost, fitBrowserToolsWidth, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, CHAT_MIN_WIDTH, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY, PANE_HANDLE_TRACKS } from './App'
 
 describe('PipiUI Electron main layout', () => {
   it('keeps archive timestamps stable, grants legacy archives a fresh window, and expires at 24 hours', () => {
@@ -523,6 +523,44 @@ describe('PipiUI Electron main layout', () => {
     expect(screen.queryByText('older durable row')).toBeNull()
   })
 
+  it('does not let a late history snapshot swallow a live user follow-up or subagent confirmation', async () => {
+    const base = createMockHost()
+    let listener: ((event: StreamEvent) => void) | undefined
+    let welcomeReads = 0
+    const durable: HistoryEntry[] = [
+      { id: 'u1', role: 'user', content: '先派发子任务', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '已派发', timestamp: 2 },
+    ]
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async sessionId => {
+        if (sessionId !== 'welcome') return []
+        welcomeReads += 1
+        return durable
+      },
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === 'welcome') listener = callback
+        return () => { if (listener === callback) listener = undefined }
+      },
+    }
+    render(<App host={host} />)
+    expect(await screen.findByText('先派发子任务')).toBeTruthy()
+    await waitFor(() => expect(listener).toBeDefined())
+    const readsAfterLoad = welcomeReads
+
+    act(() => {
+      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'done-1', content: '[subagent-done] agentId=a1 name=explore ok=true\nTitle: 修合流' })
+      listener?.({ type: 'user_message', sessionId: 'welcome', id: 'steer-1', content: '先停一下，改验证标准' })
+    })
+    expect(await screen.findByText('先停一下，改验证标准')).toBeTruthy()
+    expect(screen.getByTestId('subagent-signal-card').textContent).toContain('修合流')
+
+    act(() => listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }))
+    await waitFor(() => expect(welcomeReads).toBeGreaterThan(readsAfterLoad))
+    expect(screen.getByText('先停一下，改验证标准')).toBeTruthy()
+    expect(screen.getByTestId('subagent-signal-card').textContent).toContain('修合流')
+  })
+
   it('coalesces rapid terminal events into one immediate and one delayed read', async () => {
     const base = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined
@@ -574,7 +612,7 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(container.querySelector('[data-session-id="welcome"]')!)
     await waitFor(() => expect(container.querySelector('[data-session-id="welcome"]')?.getAttribute('aria-current')).toBe('true'))
 
-    act(() => background?.({ type: 'status', sessionId: 'tool-burst', status: 'started' }))
+    await act(async () => { background?.({ type: 'status', sessionId: 'tool-burst', status: 'started' }) })
     expect(container.querySelector('[data-session-id="tool-burst"]')?.getAttribute('data-status')).not.toBe('running')
   })
 
@@ -802,6 +840,14 @@ describe('PipiUI Electron main layout', () => {
     expect(css).toContain('.electron-chrome .sb-topbar{padding-left:88px}')
   })
 
+  it('fits a remembered browser pane so the chat column keeps 360px', () => {
+    expect(fitBrowserToolsWidth(1280, 258, 586)).toBe(586)
+    expect(fitBrowserToolsWidth(1024, 258, 520)).toBe(394)
+    expect(fitBrowserToolsWidth(1600, 258, 920)).toBe(920)
+    expect(fitBrowserToolsWidth(800, 0, 920)).toBe(428)
+    expect(fitBrowserToolsWidth(2000, 258, 400)).toBe(520)
+  })
+
   it('opens Browser as a wide adjustable IDE split while keeping chat visible', async () => {
     const { container } = render(<App host={createMockHost()} />)
     await screen.findAllByText('Electron 三栏界面')
@@ -813,8 +859,10 @@ describe('PipiUI Electron main layout', () => {
     expect(container.querySelector('.chat-column')).toBeTruthy()
     expect(container.querySelector('.resize-handle-right')).toBeTruthy()
     const browserWidth = Number.parseInt(shell.style.getPropertyValue('--tools-w'), 10)
-    expect(browserWidth).toBeGreaterThanOrEqual(520)
-    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ browserTools: browserWidth })
+    const sidebarWidth = Number.parseInt(shell.style.getPropertyValue('--sidebar-w'), 10)
+    expect(browserWidth).toBeGreaterThanOrEqual(320)
+    expect(sidebarWidth + PANE_HANDLE_TRACKS + browserWidth + CHAT_MIN_WIDTH).toBeLessThanOrEqual(window.innerWidth)
+    expect(JSON.parse(localStorage.getItem('pipiui:eui-pane-widths')!)).toMatchObject({ browserTools: expect.any(Number) })
   })
 
   it('browser fullscreen hides sidebar and chat then restores without changing expanded tools', async () => {
@@ -872,7 +920,9 @@ describe('PipiUI Electron main layout', () => {
     expect(rail).toBeTruthy()
     expect(container.querySelector('.tool-panel-header')!.contains(rail)).toBe(true)
     expect(container.querySelector('.chat-viewport')!.contains(rail)).toBe(false)
-    expect(rail.querySelectorAll('button')).toHaveLength(5)
+    // The Plan rail button appears once the session's async getPlans resolves —
+    // the unscoped rail ships only 4 buttons until then.
+    await waitFor(() => expect(rail.querySelectorAll('button')).toHaveLength(5))
     const browser = screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement
     await waitFor(() => expect(browser.disabled).toBe(false))
     // switching via the rail opens that tool and highlights it
@@ -971,9 +1021,13 @@ describe('PipiUI Electron main layout', () => {
     const narrow899 = css.match(/@media \(max-width:899px\)\{[^\n]*\}/)?.[0] ?? ''
     expect(narrow899).toMatch(/\.composer-stats\{[^}]*margin-left:auto/)
     expect(narrow899).not.toMatch(/\.composer-stats\{[^}]*margin-left:0/)
-    // 720px breakpoint: auto-collapse hides panes, re-expanded panes become overlays
+    expect(css).toMatch(/@media \(max-width:899px\)\{[^\n]*\.pipiui-shell\.browser-workspace\{[^}]*--tools-col:var\(--tools-w/)
+    // 720px breakpoint: auto-collapse hides panes, re-expanded panes become overlays.
+    // The five pane tracks must stay in place — a 3-column template would put the
+    // left handle in the 1fr track and crush chat whenever both overlays are open.
     const narrow = css.match(/@media \(max-width:720px\)\{[^\n]*\}/)?.[0] ?? ''
-    expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed\.tools-collapsed\{[^}]*grid-template-columns:0 minmax\(0,1fr\) 0/)
+    expect(narrow).toMatch(/grid-template-columns:0 0 minmax\(0,1fr\) 0 0/)
+    expect(narrow).not.toMatch(/grid-template-columns:0 minmax\(0,1fr\) 0[;}]/)
     expect(narrow).toContain('position:fixed')
     expect(narrow).toContain('z-index:31')
     expect(narrow).toMatch(/\.pane-overlay-backdrop\{[^}]*z-index:25/)
@@ -1008,6 +1062,13 @@ describe('PipiUI Electron main layout', () => {
     expect(desktop).toMatch(/\.pipiui-shell\.sidebar-collapsed\{[^}]*grid-template-columns:0 0 minmax\(0,1fr\)/)
     expect(desktop).toMatch(/\.pipiui-shell\.tools-collapsed\{[^}]*grid-template-columns:var\(--sidebar-col\) 6px minmax\(0,1fr\) 0 0/)
     expect(desktop).toMatch(/\.pipiui-shell\.sidebar-collapsed\.tools-collapsed\{grid-template-columns:0 0 minmax\(0,1fr\) 0 0\}/)
+    // Extra siblings (narrow backdrop, modals) must not steal auto-placement tracks.
+    expect(desktop).toMatch(/\.pipiui-shell>\.sb-root\{grid-column:1;grid-row:1\}/)
+    expect(desktop).toMatch(/\.pipiui-shell>\.resize-handle-left\{grid-column:2;grid-row:1\}/)
+    expect(desktop).toMatch(/\.pipiui-shell>\.chat-column\{grid-column:3;grid-row:1\}/)
+    expect(desktop).toMatch(/\.pipiui-shell>\.resize-handle-right\{grid-column:4;grid-row:1\}/)
+    expect(desktop).toMatch(/\.pipiui-shell>\.tool-panel\{grid-column:5;grid-row:1\}/)
+    expect(css).toMatch(/\.pane-overlay-backdrop\{[^}]*grid-column:1\/-1/)
   })
 
   it('shares one outer content track across every main chat row', () => {
@@ -1294,8 +1355,12 @@ describe('PipiUI Electron main layout', () => {
     expect(within(subagentTranscript).queryByText(/已读取主界面实现/)).toBeNull()
     // Logs stream in via subscribeAgentLog; wait for the unified step card
     // (thinking + read combined, like the main agent transcript).
-    await within(subagentTranscript).findByRole('button', { name: /个步骤/ })
-    // expandSteps opens the latest outer card; nested ordinary tools stay folded.
+    // Subagent transcript step groups default collapsed; the boss expands them manually.
+    const stepsDetail = await within(subagentTranscript).findByRole('button', { name: /个步骤/ })
+    expect(stepsDetail.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(stepsDetail)
+    expect(stepsDetail.getAttribute('aria-expanded')).toBe('true')
+    // Nested ordinary tools stay folded after the outer card opens.
     const readDetail = await within(subagentTranscript).findByRole('button', { name: /^read/ })
     expect(readDetail.getAttribute('aria-expanded')).toBe('false')
     expect(within(subagentTranscript).queryByText(/已读取主界面实现/)).toBeNull()
@@ -1517,8 +1582,9 @@ describe('PipiUI Electron main layout', () => {
     const host: PipiHostAPI = { ...createMockHost(), getSessionLease: async sessionId => ({ sessionId, writable: false, holder: { protocolVersion: 1, holder: 'pipiui-swift', pid: 1, hostname: 'mac', acquiredAt: '', heartbeatAt: '', expiresAt: '' } }), forceTakeoverSessionLease }
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(true)
-    expect(screen.getByText(/由 pipiui-swift 运行中/)).toBeTruthy()
+    // The lease read is async: wait for read-only to land before asserting it.
+    await waitFor(() => expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(true))
+    await waitFor(() => expect(screen.getByText(/由 pipiui-swift 运行中/)).toBeTruthy())
     fireEvent.click(screen.getByTestId('lease-takeover-header'))
     await waitFor(() => expect(forceTakeoverSessionLease).toHaveBeenCalled())
     await waitFor(() => expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(false))
@@ -1537,8 +1603,10 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     const stack = screen.getByTestId('chat-composer-stack')
     const textarea = within(stack).getByLabelText('消息输入框') as HTMLTextAreaElement
-    expect(textarea.disabled).toBe(true)
-    expect(screen.getByText(/由 pipiui-electron 运行中/)).toBeTruthy()
+    // The lease read (getSessionLease) is async: wait for the read-only state to
+    // land before asserting the composer it gates.
+    await waitFor(() => expect(textarea.disabled).toBe(true))
+    await waitFor(() => expect(screen.getByText(/由 pipiui-electron 运行中/)).toBeTruthy())
     expect(within(stack).getByTestId('composer-read-only').textContent).toContain('pipiui-electron')
     expect(within(stack).getByTestId('composer-lease-takeover')).toBeTruthy()
     expect(await within(stack).findByTestId('composer-session-stats')).toBeTruthy()
@@ -3702,7 +3770,8 @@ describe('extensions settings tab', () => {
     await screen.findAllByText('Electron 三栏界面')
     await waitFor(() => expect(host.listExtensions).toHaveBeenCalled())
     const rail = container.querySelector('.tool-quick-rail')!
-    expect(rail.querySelectorAll('button')).toHaveLength(5)
+    // Plan joins the rail after the async plans fetch settles.
+    await waitFor(() => expect(rail.querySelectorAll('button')).toHaveLength(5))
     expect(screen.queryByRole('button', { name: 'Grok Build' })).toBeNull()
     expect(screen.queryByRole('button', { name: 'grok-build-status' })).toBeNull()
     expect(screen.queryByRole('button', { name: /grok-build/i })).toBeNull()

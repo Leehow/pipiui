@@ -1,5 +1,5 @@
 import { forwardRef, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
+import { Virtuoso, type StateSnapshot, type VirtuosoHandle } from 'react-virtuoso'
 import { ActivityCard as CollapsibleActivityCard } from './ActivityCard'
 import { AssistantTranscriptContent } from './AssistantTranscriptContent'
 import { MessageActionBar } from './MessageActionBar'
@@ -17,6 +17,39 @@ import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PI
 export type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
 type DocumentOpenProps = { documentBasePath?: string; onOpenDocument?: (path: string) => void }
 type SubagentOpenProps = { onOpenSubagents?: (agentId?: string) => void }
+type TranscriptStateRecord = { messageIds: readonly string[]; firstItemIndex: number; snapshot: StateSnapshot }
+
+const TRANSCRIPT_STATE_CACHE_LIMIT = 12
+const transcriptStateCache = new Map<string, TranscriptStateRecord>()
+
+function matchingTranscriptState(stateKey: string | undefined, messageIds: readonly string[]): TranscriptStateRecord | undefined {
+  if (!stateKey) return undefined
+  const cached = transcriptStateCache.get(stateKey)
+  if (!cached) return undefined
+  const matches = cached.messageIds.length === messageIds.length && cached.messageIds.every((id, index) => id === messageIds[index])
+  if (!matches) {
+    transcriptStateCache.delete(stateKey)
+    return undefined
+  }
+  transcriptStateCache.delete(stateKey)
+  transcriptStateCache.set(stateKey, cached)
+  return cached
+}
+
+function rememberTranscriptState(stateKey: string, state: TranscriptStateRecord) {
+  transcriptStateCache.delete(stateKey)
+  transcriptStateCache.set(stateKey, state)
+  while (transcriptStateCache.size > TRANSCRIPT_STATE_CACHE_LIMIT) {
+    const oldest = transcriptStateCache.keys().next().value as string | undefined
+    if (!oldest) break
+    transcriptStateCache.delete(oldest)
+  }
+}
+
+function assignForwardedVirtuosoRef(ref: React.ForwardedRef<VirtuosoHandle>, value: VirtuosoHandle | null) {
+  if (typeof ref === 'function') ref(value)
+  else if (ref) ref.current = value
+}
 
 function transcriptItemKey(index: number, message: ChatMessage) {
   return `${index}:${message.id}`
@@ -35,7 +68,9 @@ function assignVirtuosoRef(ref: React.RefObject<VirtuosoHandle> | undefined, val
   if (ref) (ref as React.MutableRefObject<VirtuosoHandle | null>).current = value
 }
 
-export function Transcript({ messages, transcriptRef, waiting, active = true, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
+export function Transcript({ stateKey, messages, transcriptRef, waiting, active = true, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
+  /** Stable session identity used to restore Virtuoso measurements after remounting. */
+  stateKey?: string
   messages: ChatMessage[]
   /** Optional bridge used by the active transcript to expose its handle. */
   transcriptRef?: React.RefObject<VirtuosoHandle>
@@ -201,25 +236,49 @@ export function Transcript({ messages, transcriptRef, waiting, active = true, on
   }
   return <div className={waiting ? 'transcript-area is-waiting' : 'transcript-area'} ref={containerRef} onWheelCapture={handleWheel} onTouchStartCapture={handleTouchStart} onTouchMoveCapture={handleTouchMove}>
     <PromptRail prompts={prompts} activeId={activeId} onJump={jump} />
-    <MessageList ref={setVirtuosoHandle} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} onLoadOlder={onLoadOlder} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} onJump={jump} />
+    <MessageList ref={setVirtuosoHandle} stateKey={stateKey} messages={messages} active={active} shouldFollow={() => followIntentRef.current} onAtBottom={handleAtBottom} onListHeightChanged={requestPin} onLoadOlder={onLoadOlder} documentBasePath={documentBasePath} onOpenDocument={onOpenDocument} onOpenSubagents={onOpenSubagents} onCopy={onCopy} onResend={onResend} resendDisabled={resendDisabled} copiedId={copiedId} onJump={jump} />
     {waiting && <WaitingPlaceholder phase={waiting.phase} startedAt={waiting.startedAt} detail={waiting.detail} onStop={waiting.onStop} />}
     {active && !atBottom && messages.length > 0 && <button className="return-latest" aria-label="回到最新" title="回到最新" onClick={returnLatest}><svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" /></svg></button>}
   </div>
 }
 
-export const MessageList = memo(forwardRef<VirtuosoHandle, { messages: ChatMessage[]; active?: boolean; shouldFollow: () => boolean; onAtBottom: (value: boolean) => void; onListHeightChanged: () => void; onLoadOlder?: () => void; onJump: (index: number, id: string) => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ messages, active = true, shouldFollow, onAtBottom, onListHeightChanged, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId, onJump }, ref) {
+export const MessageList = memo(forwardRef<VirtuosoHandle, { stateKey?: string; messages: ChatMessage[]; active?: boolean; shouldFollow: () => boolean; onAtBottom: (value: boolean) => void; onListHeightChanged: () => void; onLoadOlder?: () => void; onJump: (index: number, id: string) => void } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers>(function MessageList({ stateKey, messages, active = true, shouldFollow, onAtBottom, onListHeightChanged, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId, onJump }, ref) {
   const ids = useMemo(() => messages.map(transcriptMessageIdentity), [messages])
-  const previousIdsRef = useRef<readonly string[]>([])
-  const firstItemIndexRef = useRef(TRANSCRIPT_FIRST_ITEM_BASE)
+  const restoredStateRef = useRef<TranscriptStateRecord | undefined>(undefined)
+  const restoredStateCheckedRef = useRef(false)
+  if (!restoredStateCheckedRef.current) {
+    restoredStateRef.current = matchingTranscriptState(stateKey, ids)
+    restoredStateCheckedRef.current = true
+  }
+  const previousIdsRef = useRef<readonly string[]>(restoredStateRef.current?.messageIds ?? [])
+  const firstItemIndexRef = useRef(restoredStateRef.current?.firstItemIndex ?? TRANSCRIPT_FIRST_ITEM_BASE)
   const firstItemIndex = nextTranscriptFirstItemIndex(firstItemIndexRef.current, previousIdsRef.current, ids)
   firstItemIndexRef.current = firstItemIndex
   previousIdsRef.current = ids
+  const idsRef = useRef(ids)
+  idsRef.current = ids
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null)
+  const setVirtuosoHandle = useCallback((handle: VirtuosoHandle | null) => {
+    const previous = virtuosoRef.current
+    if (!handle && previous && stateKey && typeof previous.getState === 'function') {
+      const capturedIds = [...idsRef.current]
+      const capturedFirstItemIndex = firstItemIndexRef.current
+      previous.getState(snapshot => rememberTranscriptState(stateKey, {
+        messageIds: capturedIds,
+        firstItemIndex: capturedFirstItemIndex,
+        snapshot,
+      }))
+    }
+    virtuosoRef.current = handle
+    assignForwardedVirtuosoRef(ref, handle)
+  }, [ref, stateKey])
   return <div className="message-list" data-testid="message-scroll"><Virtuoso
-    ref={ref}
+    ref={setVirtuosoHandle}
     data={messages}
     firstItemIndex={firstItemIndex}
     computeItemKey={transcriptItemKey}
-    initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
+    initialTopMostItemIndex={restoredStateRef.current ? undefined : { index: 'LAST', align: 'end' }}
+    restoreStateFrom={restoredStateRef.current?.snapshot}
     followOutput={() => active && shouldFollow() ? 'auto' : false}
     atBottomStateChange={onAtBottom}
     startReached={onLoadOlder}

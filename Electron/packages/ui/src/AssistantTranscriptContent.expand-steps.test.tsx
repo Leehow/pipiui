@@ -43,4 +43,30 @@ describe('expandSteps accordion', () => {
     expect(screen.queryByRole('button', { name: /read · A\.tsx/ })).toBeNull()
     expect(screen.getByTestId('active-tool').querySelector('b')?.textContent).toBe('bash · ls')
   })
+
+  it('keeps a dispatched subagent folded on the main transcript even while the turn is still live', () => {
+    const dispatched = {
+      id: 'sub-1',
+      name: 'subagent',
+      input: '{"agentId":"confluence-core","description":"修合流冲突ID碰撞","isolation":"none"}',
+      result: 'Started background agent(s) (1).\n- agentId=confluence-core',
+      startedAt: 1,
+      finishedAt: 2,
+      finished: true,
+      dispatched: true,
+    } as const
+    const activities: TranscriptActivity[] = [
+      { type: 'thinking', id: 't1', contentIndex: 0, content: '先派发' },
+      { type: 'tool', contentIndex: 1, tool: { ...dispatched } },
+    ]
+    const { rerender } = render(<AssistantTranscriptContent message={{ content: '', streaming: true, activities, tools: [{ ...dispatched }] }} />)
+    const steps = screen.getByRole('button', { name: /个步骤/ })
+    expect(steps.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('button', { name: /子任务/ })).toBeNull()
+    expect(screen.queryByText(/confluence-core/)).toBeNull()
+
+    rerender(<AssistantTranscriptContent message={{ content: '', streaming: false, activities, tools: [{ ...dispatched }] }} />)
+    expect(screen.getByRole('button', { name: /个步骤/ }).getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(/confluence-core/)).toBeNull()
+  })
 })

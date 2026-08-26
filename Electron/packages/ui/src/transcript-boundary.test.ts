@@ -23,7 +23,7 @@ describe('transcript architecture boundary', () => {
     const transcript = transcriptSource()
     expect(transcript).toMatch(/firstItemIndex=\{firstItemIndex\}/)
     expect(transcript).toMatch(/computeItemKey=\{transcriptItemKey\}/)
-    expect(transcript).toMatch(/initialTopMostItemIndex=\{\{ index: 'LAST', align: 'end' \}\}/)
+    expect(transcript).toMatch(/initialTopMostItemIndex=\{restoredStateRef\.current \? undefined : \{ index: 'LAST', align: 'end' \}\}/)
     expect(transcript).toMatch(/const virtuosoRef = useRef<VirtuosoHandle \| null>\(null\)/)
     expect(transcript).toMatch(/totalListHeightChanged=\{onListHeightChanged\}/)
     expect(transcript).toMatch(/TRANSCRIPT_PIN_MAX_ATTEMPTS/)

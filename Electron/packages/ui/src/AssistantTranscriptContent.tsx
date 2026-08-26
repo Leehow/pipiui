@@ -49,7 +49,7 @@ function toolRunSummary(steps: number, thinking: string | null, tools: { name: s
   return `${steps} 个步骤 · ${[thinking, label].filter((part): part is string => Boolean(part)).join(' · ')}`
 }
 
-const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }: { tool: TranscriptTool; streaming?: boolean }) {
+const TranscriptToolCard = memo(function TranscriptToolCard({ tool }: { tool: TranscriptTool; streaming?: boolean }) {
   const argsSummary = toolArgsSummary(tool.name, tool.input)
   const subagentNotice = tool.name === 'subagent' && tool.finished && tool.result && !tool.error ? parseSubagentNotice(tool.result) : null
   const summary = tool.name === 'subagent'
@@ -63,7 +63,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool, streaming }:
   const meta: ReactNode = delta
     ? <span>{baseMeta} · <span className="tok-add tok-del-wrap">{delta.split(' ').map((part, i) => <span key={i} className={part.startsWith('+') ? 'tok-add' : 'tok-del'}>{i ? ` ${part}` : part}</span>)}</span></span>
     : live ? `${baseMeta} · ${live}` : baseMeta
-  return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={tool.name === 'subagent' ? (Boolean(streaming) || !tool.finished || Boolean(tool.dispatched)) : false}>
+  return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={false}>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
     {tool.input && <div className="tool-io"><div className="tool-io-label">输入</div><pre>{formatToolInput(tool.name, tool.input)}</pre></div>}
     {tool.result && <div className="tool-io"><div className="tool-io-label">输出</div><div className="tool-result"><TruncatedText text={tool.result} /></div></div>}
@@ -111,7 +111,10 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   const linkedFailed = subagentProjections.some(projection => projection.failedCount > 0)
   const failed = tools.some(tool => Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)) || linkedFailed
   const running = Boolean(message.streaming && !activeTool && !textAfterUnfinishedTool) || linkedRunning || pendingDispatch
-  const stepsExpanded = expandSteps ?? (Boolean(message.streaming) || pendingDispatch || linkedRunning)
+  // Main transcript: expand only while this turn is still producing local
+  // steps. A dispatched/linked subagent is finished work in the transcript —
+  // progress lives on the waiting placeholder and the Subagents pane.
+  const stepsExpanded = expandSteps ?? (Boolean(message.streaming) && !pendingDispatch && !linkedRunning)
   const lastStepsIndex = segments.reduce((last, segment, index) => segment.type === 'steps' ? index : last, -1)
   const stepGroupCount = segments.filter(segment => segment.type === 'steps').length
   const stepsKey = (index: number) => {

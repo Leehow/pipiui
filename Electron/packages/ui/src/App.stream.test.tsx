@@ -334,6 +334,7 @@ describe('subagent tool card stays live while linked workers run', () => {
     // Durable tool completion is independent from live child presentation.
     expect(running[0].tools?.[0]).toMatchObject({ name: 'subagent', finished: true })
     renderWithAgents(<MessageView message={running[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />, [agent()])
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
     const liveCard = screen.getByTestId('subagent-tool-card')
     expect(liveCard.textContent).toContain('共 1 · 运行 1 · 完成 0 · 失败 0')
     expect(liveCard.querySelector('.agent-spinner')).toBeTruthy()
@@ -359,12 +360,16 @@ describe('subagent tool card stays live while linked workers run', () => {
     messages = finishStreamingMessage(messages)
     expect(messages[0].tools?.[0]).toMatchObject({ finished: true, dispatched: true })
     renderWithAgents(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />, [])
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
     const pending = screen.getByRole('button', { name: /子任务/ })
     expect(pending.textContent).toContain('已派发')
     expect(pending.textContent).not.toContain('完成')
+    expect(pending.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByText(/general-purpose/)).toBeNull()
     cleanup()
 
     renderWithAgents(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />, [agent()])
+    fireEvent.click(screen.getByRole('button', { name: /1 个步骤/ }))
     expect(screen.getByTestId('subagent-tool-card').textContent).toContain('运行 1')
   })
 
