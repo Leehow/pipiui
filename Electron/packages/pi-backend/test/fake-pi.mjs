@@ -290,6 +290,57 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__silent_think__") {
+      // kimi k3 silent thinking: not one thinking_delta streams, yet message_end
+      // persists the full reasoning block — the host must surface it live.
+      send({ type: "agent_start" });
+      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "hello" } });
+      send({
+        type: "message_end",
+        message: {
+          id: "silent-think-1",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "hidden reasoning", thinkingSignature: "sig" }, { type: "text", text: "hello" }],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__partial_think__") {
+      // Only the first thinking_delta made it through before the stream dropped;
+      // the final block completes "think more" — message_end must backfill " more".
+      send({ type: "agent_start" });
+      send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "think" } });
+      send({
+        type: "message_end",
+        message: {
+          id: "partial-think-1",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "think more", thinkingSignature: "sig" }, { type: "text", text: "answer" }],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
+    if (command.message === "__healthy_think__") {
+      // Everything streamed and persisted intact — message_end must not duplicate it.
+      send({ type: "agent_start" });
+      send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "all good" } });
+      send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "done" } });
+      send({
+        type: "message_end",
+        message: {
+          id: "healthy-think-1",
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "all good", thinkingSignature: "sig" }, { type: "text", text: "done" }],
+          stopReason: "stop",
+        },
+      });
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__fail_turn__") {
       // Provider failure: the assistant message ends with stopReason "error",
       // an errorMessage, and no content. Real Pi can omit agent_settled here;

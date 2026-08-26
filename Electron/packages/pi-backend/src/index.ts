@@ -717,6 +717,8 @@ type Live = {
   turnEpoch?: number;
   /** Concatenated `text_delta` for the in-flight assistant message. */
   streamedAssistantText?: string;
+  /** Concatenated redacted `thinking_delta` for the in-flight assistant message; diffed against the final blocks at message_end. */
+  streamedAssistantThinking?: string;
   streamRedactors?: { text: Map<number, StreamRedactor>; thinking: Map<number, StreamRedactor>; tool: Map<number, StreamRedactor> };
   /** Turn already projected terminal to renderers; suppresses late duplicate settle evidence. */
   terminalEpoch?: number;
@@ -2011,6 +2013,7 @@ export class PiHostBackend implements HostBackend {
       },
     });
     this.extensions = options.extensionRegistry ?? createExtensionRegistry();
+    this.refreshRuntimeTree();
     this.extensionLoader = new ExtensionLoader({
       registry: this.extensions,
       builtinRoot: join(this.runtimeRoot, "extensions"),
@@ -2680,6 +2683,7 @@ export class PiHostBackend implements HostBackend {
       for (const redactor of bag.values()) redactor.replaceSecrets(secrets);
     }
     if (live.streamedAssistantText) live.streamedAssistantText = redactText(live.streamedAssistantText, secrets);
+    if (live.streamedAssistantThinking) live.streamedAssistantThinking = redactText(live.streamedAssistantThinking, secrets);
   }
   private publishSessionSecretRedact(sessionId: string, path: string): void {
     if (!existsSync(path)) return;
@@ -4227,6 +4231,7 @@ export class PiHostBackend implements HostBackend {
           : [];
       live.pendingDrainPrompt = undefined;
       live.streamedAssistantText = "";
+      live.streamedAssistantThinking = "";
       this.stream({
         type: "status",
         sessionId: id,
@@ -4396,6 +4401,7 @@ export class PiHostBackend implements HostBackend {
       }
       if (d.type === "thinking_delta") {
         const delta = redactor("thinking", d.contentIndex ?? 0).push(d.delta ?? "");
+        live.streamedAssistantThinking = (live.streamedAssistantThinking ?? "") + delta;
         // Thinking arriving is the only evidence that the dial was ever consulted. A route
         // whose selected level maps to no provider value reasons at the upstream default
         // and reports nothing, so this is where that gets noticed rather than inferred.
@@ -4487,9 +4493,14 @@ export class PiHostBackend implements HostBackend {
         void this.persistAssistantUsage(id, endedMessage);
         const flushed = [...(live.streamRedactors?.text.values() ?? [])].map((item) => item.flush()).join("");
         live.streamRedactors?.text.clear();
+        // Tails count as already-streamed thinking so the catch-up below never re-emits them.
+        let thinkingFlushed = "";
         live.streamRedactors?.thinking.forEach((item) => {
           const tail = item.flush();
-          if (tail) this.stream({ type: "thinking", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: tail });
+          if (tail) {
+            thinkingFlushed += tail;
+            this.stream({ type: "thinking", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: tail });
+          }
         });
         live.streamRedactors?.thinking.clear();
         const fullText = redactText(assistantVisibleText(endedMessage.content), secrets);
@@ -4506,6 +4517,35 @@ export class PiHostBackend implements HostBackend {
           this.stream({ type: "text", sessionId: id, contentIndex: 0, segment: endingEpoch, delta: flushed });
         }
         live.streamedAssistantText = "";
+        // Thinking suffers the same dropped-delta failure mode as text but had no
+        // repair: a route that persists reasoning while streaming few or no
+        // thinking_delta (kimi k3 silent thinking) left the live turn without its
+        // thinking card until a history reload. Diff the final blocks the same way;
+        // redacted blocks read "[Reasoning redacted]", matching history rendering.
+        const thinkingBlocks = (Array.isArray(endedMessage.content) ? (endedMessage.content as { type?: string; thinking?: string; index?: number }[]) : [])
+          .map((part, contentIndex) =>
+            part?.type === "thinking"
+              ? { index: typeof part.index === "number" ? part.index : contentIndex, text: part.thinking ?? "" }
+              : undefined,
+          )
+          .filter((block): block is { index: number; text: string } => block != null);
+        const fullThinking = redactText(thinkingBlocks.map((block) => block.text).join(""), secrets);
+        const alreadyThinking = (live.streamedAssistantThinking ?? "") + thinkingFlushed;
+        if (fullThinking && fullThinking.startsWith(alreadyThinking) && fullThinking.length > alreadyThinking.length) {
+          // Interleaved turns carry several thinking blocks; per-block attribution
+          // for mid-turn losses is not attempted. The dominant failure is
+          // whole-turn loss, and the missing suffix is keyed to the last block so
+          // the reasoning still lands on a live card.
+          const target = thinkingBlocks[thinkingBlocks.length - 1];
+          this.stream({
+            type: "thinking",
+            sessionId: id,
+            contentIndex: target.index,
+            segment: endingEpoch,
+            delta: fullThinking.slice(alreadyThinking.length),
+          });
+        }
+        live.streamedAssistantThinking = "";
         const citations = extractHistoryCitations(endedMessage, fullText);
         if (citations.length) this.stream({ type: "citations", sessionId: id, citations });
         const fileSources = extractHistoryFileSources(endedMessage);
