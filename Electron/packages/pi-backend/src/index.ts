@@ -3422,14 +3422,6 @@ export class PiHostBackend implements HostBackend {
       return;
     }
     const id = sessionId.trim();
-    if (this.queue.isBusy(id) && this.live.has(id)) {
-      try {
-        await this.command(id, { type: "steer", message: injection });
-        return;
-      } catch (error) {
-        console.warn("[document-drop]", error);
-      }
-    }
     this.documentInjections.setPending(id, injection, supported);
   }
   private async notifyComposerDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {

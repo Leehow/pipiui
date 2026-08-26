@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -114,6 +114,29 @@ describe("explicit local document reads", () => {
     (backend as { queue: { markBusy(sessionId: string): number } }).queue.markBusy("s1");
     await backend.handle("notifyDocumentsDropped", ["s1", [path]]);
     expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+    await backend.close();
+  });
+
+  it("does not steer a busy live session; the injection stays pending for the next user prompt", async () => {
+    const backend = await fixture();
+    const path = join(root, "notes.md");
+    await writeFile(path, "# Busy panel document\n\n幼儿姓名：回归。\n");
+    (backend as { queue: { markBusy(sessionId: string): number } }).queue.markBusy("s1");
+    (backend as { live: Map<string, unknown> }).live.set("s1", {});
+    const commandSpy = vi
+      .spyOn(backend as { command(id: string, body: unknown): Promise<unknown> }, "command")
+      .mockResolvedValue(undefined);
+
+    await backend.handle("notifyDocumentsDropped", ["s1", [path]]);
+
+    expect(commandSpy).not.toHaveBeenCalled();
+    const injections = (backend as { documentInjections: { takePending(sessionId: string): string | undefined } })
+      .documentInjections;
+    const pending = injections.takePending("s1");
+    expect(pending).toContain(path);
+    expect(pending).toContain("Busy panel document");
+    expect(injections.takePending("s1")).toBeUndefined();
+    (backend as { live: Map<string, unknown> }).live.delete("s1");
     await backend.close();
   });
 });
