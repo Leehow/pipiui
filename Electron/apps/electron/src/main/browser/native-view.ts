@@ -6,7 +6,9 @@
  */
 import type { BrowserToolRequest } from '@pipi/host-api'
 import { requestIdOf } from '../browser-debug.js'
-import type { BrowserViewLike, BrowserViewNativeHostLike, BrowserViewPlacement, BrowserShellWindowLike } from './types.js'
+import type { BrowserShellLayoutEvent, BrowserViewLike, BrowserViewNativeHostLike, BrowserViewPlacement, BrowserShellWindowLike } from './types.js'
+
+const SHELL_LAYOUT_EVENTS: BrowserShellLayoutEvent[] = ['resize', 'maximize', 'unmaximize', 'restore', 'enter-full-screen', 'leave-full-screen', 'show']
 
 
 /** BaseWindow composition: mount the renderer shell first and keep it full-size. */
@@ -18,8 +20,8 @@ export function mountBrowserShellView(window: BrowserShellWindowLike, shellView:
   }
   window.contentView.addChildView(shellView)
   layout()
-  window.on('resize', layout)
-  return () => window.off('resize', layout)
+  for (const event of SHELL_LAYOUT_EVENTS) window.on(event, layout)
+  return () => { for (const event of SHELL_LAYOUT_EVENTS) window.off(event, layout) }
 }
 
 const browserViewParent = new WeakMap<BrowserViewLike, BrowserViewNativeHostLike>()

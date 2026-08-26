@@ -147,7 +147,7 @@ describe('BrowserTabsHost', () => {
   it('mounts the renderer shell before browser children and tracks BaseWindow content size', () => {
     const calls: string[] = []
     let size = { width: 1280, height: 800 }
-    let resize: (() => void) | undefined
+    const listeners = new Map<string, () => void>()
     const shell = browserHarness().view
     const browser = browserHarness().view
     const window = {
@@ -156,20 +156,24 @@ describe('BrowserTabsHost', () => {
         removeChildView: () => undefined
       },
       getContentBounds: () => size,
-      on: (_event: 'resize', listener: () => void) => { resize = listener },
-      off: (_event: 'resize', listener: () => void) => { if (resize === listener) resize = undefined }
+      on: (event: string, listener: () => void) => { listeners.set(event, listener) },
+      off: (event: string, listener: () => void) => { if (listeners.get(event) === listener) listeners.delete(event) }
     }
 
     const unmount = mountBrowserShellView(window, shell)
     routeBrowserView(browser, true, window)
     expect(calls).toEqual(['shell:add', 'browser:add'])
     expect(shell.setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1280, height: 800 })
+    expect([...listeners.keys()]).toEqual(expect.arrayContaining(['resize', 'show', 'maximize', 'enter-full-screen']))
 
     size = { width: 900, height: 600 }
-    resize?.()
+    listeners.get('resize')?.()
     expect(shell.setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 900, height: 600 })
+    size = { width: 1100, height: 700 }
+    listeners.get('show')?.()
+    expect(shell.setBounds).toHaveBeenLastCalledWith({ x: 0, y: 0, width: 1100, height: 700 })
     unmount()
-    expect(resize).toBeUndefined()
+    expect(listeners.size).toBe(0)
   })
 
   it('pins hidden and visible states to one main-window native owner', () => {

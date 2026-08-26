@@ -64,10 +64,12 @@ export interface BrowserViewNativeHostLike {
   contentView: { children?: BrowserViewLike[]; addChildView(view: BrowserViewLike): void; removeChildView(view: BrowserViewLike): void }
 }
 
+export type BrowserShellLayoutEvent = 'resize' | 'maximize' | 'unmaximize' | 'restore' | 'enter-full-screen' | 'leave-full-screen' | 'show'
+
 export interface BrowserShellWindowLike extends BrowserViewNativeHostLike {
   getContentBounds(): { width: number; height: number }
-  on(event: 'resize', listener: () => void): unknown
-  off(event: 'resize', listener: () => void): unknown
+  on(event: BrowserShellLayoutEvent, listener: () => void): unknown
+  off(event: BrowserShellLayoutEvent, listener: () => void): unknown
 }
 
 export type BrowserTabRecord = BrowserTab & { history: string[]; historyIndex: number }
