@@ -3,6 +3,7 @@
  * Never records prompt, tool args, stdout/stderr, final text, or secrets.
  */
 
+import { recordCloseoutTimeline } from "./closeout-timeline.ts";
 import { logStallProbe } from "./stall-diagnostics.ts";
 
 export const DEFAULT_READONLY_CHILD_EXIT_GRACE_MS = 5_000;
@@ -17,7 +18,9 @@ export type CloseoutProbeState =
 	| "terminate"
 	| "exit"
 	| "late-ok"
-	| "late-error";
+	| "late-error"
+	/** Hold interval closed without a release (entry forgotten/replaced). */
+	| "skip";
 
 export type CloseoutProbeFields = {
 	agent?: string;
@@ -401,6 +404,19 @@ export function logCloseoutProbe(event: string, fields: CloseoutProbeFields): vo
 		elapsedMs: fields.elapsedMs,
 		error: fields.error,
 		pid: fields.pid,
+		attempt: fields.attempt,
+	});
+	// Durable twin of the stderr probe line: same allowlisted metadata, JSONL on disk.
+	// No pid here: the timeline sink stamps the RECORDING process's own pid on every
+	// record, so a caller-supplied one would be an excess property by contract.
+	recordCloseoutTimeline(event, {
+		agent: fields.agent,
+		run: fields.run,
+		role: fields.role,
+		phase: fields.phase,
+		status: fields.state,
+		elapsedMs: fields.elapsedMs,
+		error: fields.error,
 		attempt: fields.attempt,
 	});
 }

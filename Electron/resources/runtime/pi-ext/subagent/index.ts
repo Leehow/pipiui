@@ -329,6 +329,7 @@ import {
 	noteFinalizationDetails,
 	resetFinalizationFields,
 } from "./finalization-phase.ts";
+import { setCloseoutTimelineDir } from "./closeout-timeline.ts";
 import {
 	DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS,
 	awaitTerminalCandidate,
@@ -755,6 +756,9 @@ const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
 // App-owned authoritative session root. Nested agents inherit it even when their own
 // process cwd is an isolated worktree.
 const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
+// Closeout timeline lives next to this project's own pi state, never the global ~/.pi.
+// Disabled until here: workers without a main cwd stay silent by default.
+setCloseoutTimelineDir(PIPIUI_MAIN_CWD ? path.join(PIPIUI_MAIN_CWD, ".pi", "agent") : undefined);
 const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 // 多层护栏：depth >= 上限的进程不允许再派 subagent（终端裸跑同样生效）
 const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
@@ -4670,10 +4674,44 @@ interface PendingDoneEntry {
 	firstFailedAt: number;
 	inFlight: boolean;
 	recoveredAmbiguous: boolean;
+	/** Wall clock when a Boss-turn/host-quiet hold first captured this delivery. */
+	holdSince?: number;
 }
 const pendingDone = new Map<string, PendingDoneEntry>();
 let pendingDoneSettledRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let doneDeliveryStore: DeliveryObligationStore | undefined;
+
+/**
+ * An entry leaving the map while its delivery is still held must not leave a dangling
+ * done-hold enter. One metadata-only skip state closes the interval.
+ */
+function clearDoneHoldOnForget(entry: PendingDoneEntry | undefined): void {
+	if (!entry || entry.holdSince === undefined) return;
+	logCloseoutProbe("done-hold", {
+		agent: entry.obligation.agentId,
+		run: entry.obligation.runId,
+		phase: "done-await-host",
+		state: "skip",
+		elapsedMs: Math.max(0, Date.now() - entry.holdSince),
+	});
+	entry.holdSince = undefined;
+}
+
+/**
+ * Test seam: expose the EXACT production lifecycle transitions so suites can execute
+ * the delivery/hold state machines behaviorally (paired probes) instead of matching
+ * source text. Aliases only — no semantic change to any closeout path.
+ */
+export const __doneLifecycleForTests = {
+	forgetHold: clearDoneHoldOnForget,
+	/** Full boss-delivery entry: obligation creation, store, probing included. */
+	deliverToBoss: deliverConfirmedDoneToBossAsync,
+};
+/** Default-off injection point letting behavior tests exercise the rejection closure. */
+let doneDeliverCutInOverride: (() => Promise<void>) | undefined;
+export function setDoneDeliverCutInOverrideForTests(fn?: () => Promise<void>): void {
+	doneDeliverCutInOverride = fn;
+}
 let hostSupervisor: HostSupervisorDelivery | undefined;
 let supervisorAbortTerminalCloseout: ReturnType<typeof createSupervisorOwnedTerminalCloseout> | undefined;
 let supervisorWaveIdentity: SupervisorWaveIdentityTracker | undefined;
@@ -4692,6 +4730,7 @@ function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
 		const now = Date.now();
 		for (const [obligationId, entry] of [...pendingDone]) {
 			if (entry.obligation.state === "fulfilled") {
+				clearDoneHoldOnForget(entry);
 				pendingDone.delete(obligationId);
 				continue;
 			}
@@ -4862,7 +4901,30 @@ function sendDoneWithConfirmation(
 	// Host-stop quiet always holds. A live Boss turn also holds, except the
 	// just-idle settle flush which must send every sibling before the first
 	// receipt flips bossTurnBusy and would otherwise stall the rest.
-	if (holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options)) return Promise.resolve(false);
+	const held = holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options);
+	if (held) {
+		if (entry.holdSince === undefined) {
+			entry.holdSince = Date.now();
+			logCloseoutProbe("done-hold", {
+				agent: obligation.agentId,
+				run: obligation.runId,
+				phase: "done-await-host",
+				state: "enter",
+				elapsedMs: 0,
+			});
+		}
+		return Promise.resolve(false);
+	}
+	if (entry.holdSince !== undefined) {
+		logCloseoutProbe("done-hold", {
+			agent: obligation.agentId,
+			run: obligation.runId,
+			phase: "done-await-host",
+			state: "ok",
+			elapsedMs: Math.max(0, Date.now() - entry.holdSince),
+		});
+		entry.holdSince = undefined;
+	}
 	if (!entry.sessionId || entry.sessionId !== doneDeliveryPiSessionId) return Promise.resolve(false);
 	const now = Date.now();
 	if (doneDeliveryStore && !obligation.id.startsWith("volatile-")) {
@@ -4872,6 +4934,7 @@ function sendDoneWithConfirmation(
 				obligation = persisted;
 			} else if (doneDeliveryStore.read(obligation.id)) {
 				// Another live process/extension instance owns this exact obligation.
+				// No done-deliver enter was emitted yet, so nothing can dangle here.
 				return Promise.resolve(true);
 			} else {
 				// The row vanished/corrupted after create: do not suppress the actual completion.
@@ -4897,6 +4960,17 @@ function sendDoneWithConfirmation(
 	}
 	entry.obligation = obligation;
 	entry.inFlight = true;
+	// The delivery clock starts HERE — after every early return above, so each
+	// `done-deliver` enter is guaranteed exactly one matching terminal record and
+	// its duration covers only the actual send.
+	const deliverStartedAt = Date.now();
+	logCloseoutProbe("done-deliver", {
+		agent: obligation.agentId,
+		run: obligation.runId,
+		phase: "done-deliver",
+		state: "enter",
+		elapsedMs: 0,
+	});
 	const prefix = entry.recoveredAmbiguous
 		? `(recovered delivery: this completion may already have been queued or persisted before restart; obligationId=${obligation.id}; treat it as the same event.)`
 		: isRetry
@@ -4910,9 +4984,33 @@ function sendDoneWithConfirmation(
 		obligationId: obligation.id,
 		text: outText,
 	}, {
-		waitForCutIn: awaitCutInHoldRelease,
+		waitForCutIn: doneDeliverCutInOverride ?? awaitCutInHoldRelease,
 		currentSessionId: () => doneDeliveryPiSessionId,
+	}).catch((err: unknown) => {
+		// A rejected send still closes the enter it opened — then propagates unchanged.
+		logCloseoutProbe("done-deliver", {
+			agent: obligation.agentId,
+			run: obligation.runId,
+			phase: "done-deliver",
+			state: "error",
+			elapsedMs: Math.max(0, Date.now() - deliverStartedAt),
+			attempt: obligation.attempts,
+			error: "done-deliver-error",
+		});
+		throw err;
 	}).then((queued) => {
+		// Terminal record first, even when the pending map moved on (retry/recovery
+		// replaced the entry mid-flight): every enter gets exactly one exit state.
+		logCloseoutProbe("done-deliver", {
+			agent: obligation.agentId,
+			run: obligation.runId,
+			phase: "done-deliver",
+			// "ok" means accepted for post-cut-in queueing, not yet Boss-consumed.
+			state: queued ? "ok" : "error",
+			elapsedMs: Math.max(0, Date.now() - deliverStartedAt),
+			attempt: obligation.attempts,
+			...(queued ? {} : { error: "done-not-queued" }),
+		});
 		if (pendingDone.get(obligation.id) !== entry) return queued;
 		entry.inFlight = false;
 		let settled: DeliveryObligation = { ...entry.obligation, state: queued ? "queued" : "failed" };
@@ -4928,6 +5026,7 @@ function sendDoneWithConfirmation(
 			entry.firstFailedAt = now;
 		}
 		if (!queued && settled.attempts >= DONE_MAX_ATTEMPTS) {
+			clearDoneHoldOnForget(entry);
 			pendingDone.delete(obligation.id);
 			console.error(
 				`[pipiui-subagent] giving up done delivery after ${settled.attempts} attempts: ${settled.agentId}`,
@@ -5015,6 +5114,7 @@ function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[])
 						: doneDeliveryStore.markObserved(record.id);
 				if (!settled) continue;
 				if (settled.state === "failed" && settled.attempts < DONE_MAX_ATTEMPTS) {
+					clearDoneHoldOnForget(pendingDone.get(record.id));
 					pendingDone.set(record.id, {
 						obligation: settled,
 						sessionId: piSessionId,
@@ -5023,6 +5123,7 @@ function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[])
 						recoveredAmbiguous: false,
 					});
 				} else {
+					clearDoneHoldOnForget(pendingDone.get(record.id));
 					pendingDone.delete(record.id);
 				}
 			} catch (err) {
@@ -5041,7 +5142,9 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 	}
 	if (doneDeliveryPiSessionId && doneDeliveryPiSessionId !== piSessionId) {
 		// A runtime session switch must not retry the previous session's messages here.
-		// Their durable rows remain for that Pi session's next startup.
+		// Their durable rows remain for that Pi session's next startup. Every active
+		// done-hold ends with an explicit skip first — no dangling enter may survive.
+		for (const entry of pendingDone.values()) clearDoneHoldOnForget(entry);
 		pendingDone.clear();
 		doneDeliveryStore = undefined;
 		supervisorWaveIdentity = undefined;
@@ -5060,6 +5163,7 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 		);
 		reconcilePersistedDone(piSessionId, activeBranch);
 		for (const recovered of doneDeliveryStore.recoverable()) {
+			clearDoneHoldOnForget(pendingDone.get(recovered.record.id));
 			const entry: PendingDoneEntry = {
 				obligation: recovered.record,
 				sessionId: piSessionId,
@@ -5456,6 +5560,14 @@ function notifySubagentDone(
 	// Persist the full report next to the ledger BEFORE formatting, so the done message can
 	// hand the next worker a path instead of making it rediscover this worker's ground.
 	// A failed write only costs the handoff line; it never blocks the completion.
+	logCloseoutProbe("findings", {
+		agent: result.agentId,
+		run: runId,
+		phase: "findings",
+		state: "enter",
+		elapsedMs: 0,
+	});
+	const findingsStartedAt = Date.now();
 	const findings = writeFindingsArtifact({
 		mainCwd: PIPIUI_MAIN_CWD,
 		agentId: result.agentId,
@@ -5466,6 +5578,14 @@ function notifySubagentDone(
 		// An error is not a finding. A worker that died without a report leaves no artifact;
 		// continuing it by agentId is what recovers its work, per the continuity rule.
 		text: extra?.error ? "" : getResultOutput(result),
+	});
+	logCloseoutProbe("findings", {
+		agent: result.agentId,
+		run: runId,
+		phase: "findings",
+		state: findings.ok ? "ok" : "error",
+		elapsedMs: Date.now() - findingsStartedAt,
+		...(findings.ok ? {} : { error: "findings-error" }),
 	});
 	const extraWithWave = {
 		...extra,
@@ -8582,7 +8702,7 @@ export default function (pi: ExtensionAPI) {
 
 		// (1) done 重投
 		for (const [obligationId, entry] of [...pendingDone]) {
-			if (entry.obligation.state === "fulfilled") { pendingDone.delete(obligationId); continue; }
+			if (entry.obligation.state === "fulfilled") { clearDoneHoldOnForget(entry); pendingDone.delete(obligationId); continue; }
 			if (!deliveryRetryDue(entry.obligation, now, DONE_RETRY_MIN_INTERVAL_MS, DONE_MAX_ATTEMPTS)) continue;
 			sendDoneWithConfirmation(pi, entry, true);
 		}
