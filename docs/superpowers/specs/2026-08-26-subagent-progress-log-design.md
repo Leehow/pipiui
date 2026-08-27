@@ -5,7 +5,7 @@
 
 ## 一句话
 
-Bundled `general-purpose` 的 dispatch 可带 `progressLog`。Watchdog / 运行预算除 worker JSONL 外，把该文件的体积或 mtime 变化算作进展。Supervisor 按固定节奏把新增日志片段转给 Boss。chatrpgv4 的 Boss skill 教何时填、填哪、brief 怎么写。
+Bundled `general-purpose` 的 dispatch 可带 `progressLog`。Watchdog / 运行预算除 worker JSONL 外，把该文件的体积或 mtime 变化算作进展。Supervisor 按固定节奏把新增日志片段转给 Boss。Bundled skill `chatrpg-test-dispatch` 教何时填、填哪、brief 怎么写。
 
 ## 行为
 
@@ -19,6 +19,6 @@ Bundled `general-purpose` 的 dispatch 可带 `progressLog`。Watchdog / 运行�
 
 ## Boss skill
 
-- 提交位置：`chatrpgv4/skills/chatrpg-test-dispatch/SKILL.md`（仓库内，可发现副本在项目 `.pi/agent/skills`）。
+- 位置：PipiUI bundled skill `Electron/resources/runtime/built-in-skills/chatrpg-test-dispatch/SKILL.md`，经 PIPIUI_BUILT_IN_SKILL_ROOT 在所有项目会话可发现，不依赖任何特定项目文件夹。
 - 给主会话 Boss：测 pytest / playtest 时 `skill_load`，再派 worker。
 - 规定：`progressLog=".pi/progress/<agentId>.log"`，长测提高 `timeoutSecs`，`heartbeatSecs=60`，brief 命令 `tee -a` 到该路径。Supervisor 会定期把该文件新增片段回给 Boss；当作测试输出，不当新用户请求。

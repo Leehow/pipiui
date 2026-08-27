@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BUNDLED_MANIFEST_EXTENSIONS, installRuntimeTree, syncTree, treeSignature } from "../src/runtime-install.js";
+import { assemblePiSpawn, resolveSpawnPaths } from "../src/spawn-assembly.js";
 
 const runtimeSource = new URL("../../../resources/runtime", import.meta.url).pathname;
 const temp = () => mkdtemp(join(tmpdir(), "runtime-install-"));
@@ -161,6 +162,31 @@ describe("installRuntimeTree", () => {
           expect(existsSync(join(root, "extensions", entry.name, rel)), `${entry.name} ${rel}`).toBe(true);
         }
       }
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
+  // Standalone proof for the chatrpg-test-dispatch bundled skill: it must hold even in
+  // environments where unrelated prebuilt dist artifacts (e.g. code-retrieval) are absent.
+  it("ships chatrpg-test-dispatch as a built-in skill", async () => {
+    const root = await temp();
+    try {
+      // Same sync mechanism the runtime install uses, scoped to just the skills subtree.
+      const runtimeRoot = join(root, "runtime");
+      const installed = [join(runtimeRoot, "built-in-skills")];
+      expect(syncTree(join(runtimeSource, "built-in-skills"), installed[0]).installed).toEqual(installed);
+      const dispatchSkill = await readFile(join(runtimeRoot, "built-in-skills", "chatrpg-test-dispatch", "SKILL.md"), "utf8");
+      expect(dispatchSkill).toContain("progressLog");
+      expect(dispatchSkill).toContain("tee -a");
+      // Spawn/runtime path contract: the synced runtime exposes the root as builtInSkills,
+      // and a ready skill loader publishes it as PIPIUI_BUILT_IN_SKILL_ROOT.
+      const paths = resolveSpawnPaths(runtimeRoot);
+      expect(paths.builtInSkills).toBe(join(runtimeRoot, "built-in-skills"));
+      const spawn = assemblePiSpawn({
+        cwd: root,
+        features: { skillLoader: true },
+        paths: { ...paths, skillLoader: join(runtimeSource, "extensions", "pipiui-skillloader.ts") },
+      });
+      expect(spawn.env.PIPIUI_BUILT_IN_SKILL_ROOT).toBe(paths.builtInSkills);
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
