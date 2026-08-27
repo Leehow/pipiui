@@ -5,7 +5,7 @@ summary: 参数已知且互不依赖的探查与派工同一轮发出；依赖�
 order: 31
 requires: []
 requires-capabilities: [delegate]
-scope: [main, lead]
+scope: [main, general-purpose]
 ---
 # Same-turn independent calls
 

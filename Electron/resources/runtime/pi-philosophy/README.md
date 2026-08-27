@@ -42,22 +42,23 @@ to someone who cannot perform it is prompt weight and nothing else.
 
 | id | 中文名 | What it governs | Delivered to |
 |---|---|---|---|
-| `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + lead + worker |
-| `method` | 工作方式哲学 | Process weight matches the work; research-only requests are terminal | main + lead |
-| `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + lead + every code-reading agent |
-| `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + lead + `explore` |
-| `planning` | 规划哲学 | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + lead + `plan` |
-| `craft` | 编码手艺哲学 | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + lead + `general-purpose` |
-| `debugloop` | 调试回路哲学 | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main + lead |
-| `domain` | 领域记忆哲学 | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main + lead |
-| `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main + lead |
-| `same-turn` | 同轮调用纪律 | Every call whose arguments you already know goes out in the same message | main + lead |
-| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly; worker state arrives as signals; keep the wave's raw output out of your context | main + lead |
+| `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + worker |
+| `method` | 工作方式哲学 | Process weight matches the work; research-only requests are terminal | main |
+| `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
+| `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
+| `planning` | 规划哲学 | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |
+| `craft` | 编码手艺哲学 | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + `general-purpose` |
+| `debugloop` | 调试回路哲学 | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main |
+| `domain` | 领域记忆哲学 | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main |
+| `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main |
+| `same-turn` | 同轮调用纪律 | Every call whose arguments you already know goes out in the same message | main + `general-purpose` |
+| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly; worker state arrives as signals; keep the wave's raw output out of your context | main |
+| `nested-dispatch` | 下级派工哲学 | For a worker that may itself delegate: dispatches are synchronous, concurrency exists only inside one call, children cannot delegate, and recon returns file:line evidence rather than prose | `general-purpose` |
 | `toolcall` | 工具调用纪律 | Calling the tool *is* the work; act on the first turn; "I can't" has to name something | one model family (see below) |
 | `thinking` | 思考纪律 | Decide, act, verify — once each; resolve an unknown with the cheapest sufficient probe | every family measured to sprawl |
 
-`fanout` requires `orchestration`. `orchestration`, `same-turn` and `fanout` require a dispatch
-tool and are skipped entirely in a session that has none; `retrieval` requires a code-search
+`fanout` requires `orchestration`. `orchestration`, `same-turn`, `fanout` and `nested-dispatch`
+require a dispatch tool and are skipped entirely in a session that has none; `retrieval` requires a code-search
 tool and is skipped in a project that mounts none — the judgement layers keep working either
 way.
 
@@ -110,7 +111,7 @@ summary: shown by /philosophy
 order: 10
 requires: []
 requires-capabilities: []
-scope: [main, lead, worker]
+scope: [main, worker]
 ---
 Your text.
 ```
@@ -177,7 +178,7 @@ after a pi upgrade and you will see immediately whether anything came unstuck.
 ## Known limitations
 
 - **Worker detection outside PipiUI.** Scope filtering needs to know whether this process is a
-  dispatched worker. It reads `PIPI_PHILOSOPHY_ROLE` (`main` | `lead` | `worker`) first, then
+  dispatched worker. It reads `PIPI_PHILOSOPHY_ROLE` (`main` | `worker`) first, then
   falls back to `PIPIUI_AGENT_DEPTH > 0`. A dispatch runtime that sets neither has its workers
   treated as main sessions — they will carry the orchestration layer they do not need. Set
   `PIPI_PHILOSOPHY_ROLE=worker` in your dispatch environment to fix that.

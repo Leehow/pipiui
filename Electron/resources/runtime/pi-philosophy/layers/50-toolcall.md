@@ -5,7 +5,7 @@ summary: 该调工具时调工具：首轮就动手、不用 shell 复刻已有�
 order: 50
 requires: []
 requires-capabilities: []
-scope: [main, lead, worker, explore, plan, general-purpose, reviewer]
+scope: [main, worker, explore, plan, general-purpose, reviewer]
 ---
 # Tool discipline
 

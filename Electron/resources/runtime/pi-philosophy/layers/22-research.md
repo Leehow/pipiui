@@ -5,7 +5,7 @@ summary: 先自己形成判断，再对外交叉验证；证据高于权威。
 order: 22
 requires: []
 requires-capabilities: []
-scope: [main, lead, explore]
+scope: [main, explore]
 ---
 # Research
 

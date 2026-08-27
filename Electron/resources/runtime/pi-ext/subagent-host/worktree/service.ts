@@ -23,7 +23,6 @@ import type {
 import {
 	DEFAULT_GIT_TIMEOUT_MS,
 	DEFAULT_SPAWN_TERMINATION_GRACE_MS,
-	DEFAULT_VERIFY_TIMEOUT_MS,
 	NodeGitWorktreeAdapter,
 	runSpawnV1,
 } from "./adapter.ts";
@@ -32,6 +31,7 @@ import {
 	DEFAULT_ON_MERGED_TIMEOUT_MS,
 	DEFAULT_QUEUE_HEAD_TIMEOUT_MS,
 	DEFAULT_QUEUE_WAIT_TIMEOUT_MS,
+	resolveVerifyTimeoutMs,
 } from "./deadlines.ts";
 import type { MainRepoSerialQueueV1, SerialQueueGuardV1 } from "./queue.ts";
 import {
@@ -270,7 +270,7 @@ export class WorktreeFinalizationServiceV1 {
 	private readonly finalizationDeadlineMs: number;
 
 	constructor(options: WorktreeFinalizationServiceOptionsV1 = {}) {
-		this.verifyTimeoutMs = options.verifyTimeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+		this.verifyTimeoutMs = options.verifyTimeoutMs ?? resolveVerifyTimeoutMs();
 		this.abortSignal = options.abortSignal;
 		this.terminationGraceMs = options.terminationGraceMs ?? DEFAULT_SPAWN_TERMINATION_GRACE_MS;
 		this.queueWaitTimeoutMs = options.queueWaitTimeoutMs ?? DEFAULT_QUEUE_WAIT_TIMEOUT_MS;

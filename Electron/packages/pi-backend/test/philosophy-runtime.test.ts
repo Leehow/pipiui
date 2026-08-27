@@ -63,6 +63,7 @@ describe("vendored philosophy: structure", () => {
       "orchestration",
       "same-turn",
       "fanout",
+      "nested-dispatch",
       "toolcall",
       "thinking",
     ]);
@@ -98,7 +99,7 @@ describe("vendored philosophy: delivery", () => {
     // whoever searches, not gated on a model allowlist.
     expect(workerIds("explore")).toEqual(["retrieval", "research", "toolcall", "thinking"]);
     expect(workerIds("plan")).toEqual(["retrieval", "planning", "toolcall", "thinking"]);
-    expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
+    expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "same-turn", "nested-dispatch", "toolcall", "thinking"]);
   });
 
   it("gives an unaddressed worker the corrections that name an audience while bulk distribution is off", () => {
@@ -116,7 +117,7 @@ describe("vendored philosophy: delivery", () => {
     // role-only scopes — cannot withhold it. The old deepseek allowlist was removed after
     // session-log measurement showed the drift on every model family, grok included.
     const result = compose({ role: "worker", agent: "general-purpose", model: SCOPED_MODEL });
-    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
+    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "same-turn", "nested-dispatch", "toolcall", "thinking"]);
     const grok = compose({ role: "worker", agent: "general-purpose", model: "xai/grok-4.6" });
     expect(grok.included.map((l) => l.id)).toContain("toolcall");
   });
@@ -297,7 +298,7 @@ describe("vendored philosophy: delivery", () => {
     );
   });
 
-  it("delivers same-turn independent-call discipline to boss and lead on every model", () => {
+  it("delivers same-turn independent-call discipline to the boss and the worker that dispatches", () => {
     const sameTurn = layers.find((l) => l.id === "same-turn");
     expect(sameTurn, "Electron-only same-turn layer must exist").toBeTruthy();
     expect(sameTurn!.body).toMatch(/Issue every tool call whose arguments you already know/);
@@ -307,18 +308,22 @@ describe("vendored philosophy: delivery", () => {
       /Issue every tool call whose arguments you already know/,
     );
 
-    for (const role of ["main", "lead"] as const) {
+    for (const target of [
+      { role: "main" as const },
+      { role: "worker" as const, agent: "general-purpose" },
+    ]) {
       for (const model of ["openai/gpt-5", SCOPED_MODEL]) {
-        const result = compose({ role, model });
+        const result = compose({ ...target, model });
         expect(result.included.map((l) => l.id)).toContain("same-turn");
         expect(result.text).toMatch(/Issue every tool call whose arguments you already know/);
         expect(result.text).toMatch(/Cross a turn only when the next call/);
         expect(result.text).toMatch(/Do not batch desktop \/ computer actions/);
       }
     }
-    expect(
-      compose({ role: "worker", agent: "general-purpose" }).included.map((l) => l.id),
-    ).not.toContain("same-turn");
+    // A dispatched agent that cannot delegate has no wave to batch, so the discipline
+    // that governs firing several dispatches at once is not addressed to it.
+    expect(workerIds("explore")).not.toContain("same-turn");
+    expect(workerIds("plan")).not.toContain("same-turn");
   });
 
   it("delivers thinking discipline to the routes that actually drift", () => {
@@ -360,7 +365,7 @@ describe("vendored philosophy: delivery", () => {
     // Same bypass `requires-models` layers get: the bulk switch declines to buy judgement
     // prefix, not a correction that keeps the worker's own model from misbehaving.
     const result = compose({ role: "worker", agent: "general-purpose", model: "kimi-coding/k3-256k" });
-    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "toolcall", "thinking"]);
+    expect(result.included.map((l) => l.id)).toEqual(["retrieval", "craft", "same-turn", "nested-dispatch", "toolcall", "thinking"]);
   });
 
   it("keeps the boss's whole prefix inside budget", () => {
@@ -435,7 +440,7 @@ describe("vendored philosophy: delivery", () => {
     expect(orchestration).toMatch(/one-shot\s+runId\/eventId\/waveId\/requestId/);
     // The browser token stays capability-addressed; a bare tool name would fail the scan.
     expect(orchestration).toMatch(/\{\{browser\}\} snapshot\/element\s+tokens/);
-    for (const role of ["main", "lead"] as const) {
+    for (const role of ["main"] as const) {
       const result = compose({ role });
       expect(result.included.map((l) => l.id)).toContain("orchestration");
       // The composed prompt — what the session actually loads — carries all three tiers
@@ -483,7 +488,7 @@ describe("vendored philosophy: model-capability gating",
           "name: Hosted Grok",
           "summary: only when the model declares hosted features",
           "order: 90",
-          "scope: [main, lead, worker]",
+          "scope: [main, worker]",
           "requires-model-capabilities: [hostedTools.code_interpreter, structuredOutputs]",
           "---",
           "Use hosted code and structured output only when the model declares them.",

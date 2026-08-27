@@ -5,7 +5,7 @@ summary: 会话会蒸发，词汇表和 ADR 不会：术语解决的当下落进
 order: 28
 requires: []
 requires-capabilities: []
-scope: [main, lead]
+scope: [main]
 ---
 # Domain memory
 

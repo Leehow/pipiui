@@ -1,5 +1,6 @@
 import type { AgentConfig } from "./agents.ts";
 import { sanitizeProgressLogInput } from "./progress-log.ts";
+import type { LivenessVerdict } from "./worker-liveness.ts";
 
 export const PRIVATE_COMPUTER_AGENT_NAMES = ["operator", "computer-verifier", "computer-terminal"] as const;
 export const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
@@ -249,6 +250,22 @@ export function createRunScopedTimeout(options: {
  * producing gets its budget silently re-armed; a stalled one earns the boss one
  * diagnostic notification plus one final grace budget; only a second expiry with
  * no progress aborts. Never aborts a producing worker just for being slow.
+ *
+ * `idleMs` alone cannot see a worker that is busy *through a child*. A nested
+ * dispatch is silent on the parent's own stream by construction — the parent is
+ * blocked in its `subagent` tool while the grandchild burns the CPU — so a
+ * delegating worker looked exactly like a wedged one here and paid for
+ * delegating with its own life. The stall watchdog already resolved that
+ * question with subtree CPU evidence (`isQuietToolStalled`); this decision now
+ * reads the same evidence rather than a second, blinder measure of the same
+ * thing.
+ *
+ * Measured progress is checked before `syncWait` on purpose. That branch exists
+ * because a boss turn blocked on a sync wait cannot receive the diagnostic
+ * letter, which is a reason to skip the notification — not a reason to kill a
+ * worker whose subtree is demonstrably working. A grandchild is always a sync
+ * wait, so without this order nested delegation would stay unaffordable exactly
+ * where it is most useful.
  */
 export type RuntimeBudgetExpiryDecision = "extend-silent" | "notify-extend" | "abort";
 export function decideRuntimeBudgetExpiry(input: {
@@ -256,8 +273,11 @@ export function decideRuntimeBudgetExpiry(input: {
 	progressGraceMs: number;
 	notified: boolean;
 	syncWait?: boolean;
+	/** Subtree CPU evidence, when the watchdog has a sample pair. Absent = unknown, never assumed. */
+	verdict?: LivenessVerdict;
 }): RuntimeBudgetExpiryDecision {
 	if (input.idleMs <= input.progressGraceMs) return "extend-silent";
+	if (input.verdict === "working") return "extend-silent";
 	if (input.syncWait) return "abort";
 	return input.notified ? "abort" : "notify-extend";
 }

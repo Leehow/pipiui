@@ -155,6 +155,28 @@ test("runtime budget expiry extends producing workers and aborts only after a no
 	assert.equal(decideRuntimeBudgetExpiry({ idleMs: 0, progressGraceMs: grace, notified: false, syncWait: true }), "extend-silent");
 });
 
+test("runtime budget expiry reads subtree CPU evidence so a delegating worker survives its child's silence", () => {
+	const grace = 120_000;
+	const stalled = { idleMs: grace + 1, progressGraceMs: grace };
+	// The regression this pins: a worker blocked in a nested dispatch is silent on its own
+	// stream by construction — the grandchild is burning the CPU — so idleMs alone read it
+	// as wedged and the budget killed it for delegating. The stall watchdog already settled
+	// this question with subtree CPU; the budget now reads the same evidence.
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: false, verdict: "working" }), "extend-silent");
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: true, verdict: "working" }), "extend-silent");
+	// A grandchild is always a sync wait, so that branch must not outrank measured progress:
+	// skipping an undeliverable notification is not a reason to kill a working subtree.
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: true, syncWait: true, verdict: "working" }), "extend-silent");
+	// Evidence of no work, a dead subtree, or no evidence at all leaves the policy untouched.
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: false, verdict: "no-progress" }), "notify-extend");
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: true, verdict: "no-progress" }), "abort");
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: false, syncWait: true, verdict: "gone" }), "abort");
+	assert.equal(decideRuntimeBudgetExpiry({ ...stalled, notified: true, verdict: "unknown" }), "abort");
+	// And the decision is actually wired to the watchdog's sample, not left to a default.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.match(source, /const budgetVerdict = stalledInfoFor\(pipiuiAgentId, now\)\.verdict;/);
+});
+
 test("fan-out treats a one-step chain as background and keeps multi-step chain synchronous", () => {
 	assert.deepEqual(
 		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 1, fanoutActive: true }),
@@ -284,8 +306,6 @@ test("runtime budget expiry is progress-aware, notifies the boss once, and retri
 	assert.match(source, /runtimeBudgetNotify = \(text\) => \{/);
 	assert.match(source, /re-armed once for another \$\{budgetSec\}s instead of being killed/);
 	// Terminal bridge reports survive a dropped POST instead of stranding a running row.
-	// postTerminalPipiuiReport enqueues the retrying poster as `flight`, then the bounded
-	// closeout awaits it and seals/abandons per outcome.
 	assert.match(source, /const TERMINAL_REPORT_RETRY_DELAYS_MS = \[1_000, 3_000\] as const;/);
 	assert.match(source, /function postPipiuiReportWithRetry/);
 	assert.match(source, /const flight = enqueuePipiuiReport\(payload, postPipiuiReportWithRetry\);/);

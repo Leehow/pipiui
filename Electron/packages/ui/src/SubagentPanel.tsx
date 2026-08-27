@@ -52,6 +52,27 @@ function isActive(agent: Pick<Agent, 'state'>) {
   return agent.state === 'running'
 }
 
+/** Seam-test fixture workers announce themselves with a `[seam:` marker in prompt or result. */
+const SEAM_FIXTURE_MARK = '[seam:'
+/** Terminal rows settled this long ago are history material, not active list content. */
+const AGENT_STALE_TERMINAL_AFTER_MS = 24 * 60 * 60 * 1000
+
+function isSeamFixtureAgent(agent: Pick<AgentSummary, 'task' | 'finalResult'>) {
+  return agent.task.includes(SEAM_FIXTURE_MARK) || Boolean(agent.finalResult?.includes(SEAM_FIXTURE_MARK))
+}
+
+/**
+ * Running/stalled rows always stay actionable in the main list; terminal rows
+ * whose end time lies far in the past collapse into the 历史 group. A missing
+ * end timestamp means undated, not ancient: those stay visible.
+ */
+function isStaleTerminalRow(agent: Pick<Agent, 'state' | 'endedAt'>, now: number) {
+  if (isActive(agent) || agent.state === 'stalled') return false
+  return typeof agent.endedAt === 'number'
+    && Number.isFinite(agent.endedAt)
+    && now - agent.endedAt > AGENT_STALE_TERMINAL_AFTER_MS
+}
+
 function stateText(agent: Agent) {
   const closing = formatFinalizationLine(agent.diagnostics)
   if (closing && (agent.state === 'running' || agent.state === 'stalled')) return closing
@@ -512,6 +533,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const [agents, setAgents] = useState<Agent[]>([])
   const [selectedId, setSelectedId] = useState<string>()
   const [page, setPage] = useState(0)
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [ratio, setRatio] = useState(initialRatio)
   const [follow, setFollow] = useState(true)
   const [loading, setLoading] = useState(true)
@@ -731,7 +753,14 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     onRunningChange?.(false)
   }, [onRunningChange, onRunningCountChange])
 
-  const ordered = treeOrder(agents)
+  // View layering only: seam-test fixture noise and long-settled terminal rows
+  // fold into the collapsed 历史 group; the main list keeps active/recent rows.
+  const currentAgents: Agent[] = []
+  const historyAgents: Agent[] = []
+  for (const agent of agents)
+    ((isSeamFixtureAgent(agent) || isStaleTerminalRow(agent, now)) ? historyAgents : currentAgents).push(agent)
+  const ordered = treeOrder(currentAgents)
+  const archiveOrdered = treeOrder(historyAgents)
   const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
   const activePage = Math.min(page, pageCount - 1)
   const visibleAgents = ordered.slice(Math.max(0, ordered.length - (activePage + 1) * pageSize), ordered.length - activePage * pageSize)
@@ -880,6 +909,25 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
                 <span>最新第 {activePage + 1}/{pageCount} 页</span>
                 <button disabled={(activePage + 1) * pageSize >= ordered.length} onClick={() => setPage(value => value + 1)}>较早</button>
               </div>}
+              {archiveOrdered.length > 0 && (
+                <div className="agent-archive" data-testid="subagent-archive">
+                  <button type="button" className="agent-archive-toggle" data-testid="subagent-archive-toggle" aria-expanded={historyOpen} onClick={() => setHistoryOpen(value => !value)}>
+                    {historyOpen ? '▾' : '▸'} 历史（{archiveOrdered.length}）
+                  </button>
+                  {historyOpen && archiveOrdered.map(agent => <AgentRow
+                    key={agent.agentId}
+                    agent={agent}
+                    childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
+                    activeChildCount={agents.filter(candidate => candidate.parentId === agent.agentId && isActive(candidate)).length}
+                    selected={agent.agentId === selectedId}
+                    aborting={abortingIds.has(agent.agentId)}
+                    now={now}
+                    onSelect={() => setSelectedId(agent.agentId)}
+                    onAbort={() => void abort(agent)}
+                    onResolve={() => void resolve(agent)}
+                  />)}
+                </div>
+              )}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
 			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />

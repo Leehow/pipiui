@@ -5,7 +5,7 @@ summary: 先定成功判据；只写必要的代码；只改该改的。
 order: 26
 requires: []
 requires-capabilities: []
-scope: [main, lead, general-purpose]
+scope: [main, general-purpose]
 ---
 # Craft
 

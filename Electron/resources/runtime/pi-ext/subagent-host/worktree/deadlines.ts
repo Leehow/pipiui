@@ -7,6 +7,21 @@
 export const DEFAULT_GIT_TIMEOUT_MS = 30_000;
 /** Swift's post-merge runner uses a 120-second verify deadline. */
 export const DEFAULT_VERIFY_TIMEOUT_MS = 120_000;
+
+/**
+ * Per-call verify budget: PIPIUI_VERIFY_TIMEOUT_MS overrides the conservative
+ * default for long test suites. Invalid or <1000ms values fall back silently.
+ * Post-merge verify additionally remains bounded by the queue-head envelope
+ * (DEFAULT_QUEUE_HEAD_TIMEOUT_MS); a larger value cannot extend past that.
+ */
+export function resolveVerifyTimeoutMs(): number {
+	const raw = process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+	if (typeof raw === "string" && /^[0-9]+$/.test(raw.trim())) {
+		const parsed = Number.parseInt(raw, 10);
+		if (Number.isSafeInteger(parsed) && parsed >= 1000) return parsed;
+	}
+	return DEFAULT_VERIFY_TIMEOUT_MS;
+}
 export const DEFAULT_SPAWN_TERMINATION_GRACE_MS = 1_000;
 /** Extra slack after a predecessor's own head budget so same-tick timeout cannot skip the waiter. */
 export const DEFAULT_QUEUE_WAIT_TIMEOUT_MS = 30 * 60_000;

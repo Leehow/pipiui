@@ -269,6 +269,7 @@ import {
 } from "./worktree-recovery.ts";
 import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
 import type { WorktreeMergedEventV1 } from "../subagent-host/worktree/service.ts";
+import { resolveVerifyTimeoutMs } from "../subagent-host/worktree/deadlines.ts";
 import {
 	BaseAdvanceDeduper,
 	createTipPreflightTracker,
@@ -1857,11 +1858,10 @@ const JOB_RESULT_DISPLAY_CAP = 8000;
 const MAX_TERMINAL_JOB_RECORDS = 1000;
 
 // ---- Attested verify (system testimony): the runtime runs `verify` in the agent's cwd ----
-const VERIFY_TIMEOUT_MS = 120_000;
 const VERIFY_TAIL_CHARS = 2000;
 const VERIFY_TAIL_LINES = 20;
 /** Rolling collection cap while verify runs: retain only this tail so a chatty
- * command cannot buffer unbounded output for up to VERIFY_TIMEOUT_MS. */
+ * command cannot buffer unbounded output for up to the configured verify timeout. */
 const VERIFY_COLLECT_TAIL_CHARS = 64 * 1024;
 
 
@@ -1881,6 +1881,7 @@ function runVerifyCommand(
 	cwd: string,
 	hooks?: { onSpawn?: (pid: number | undefined) => void },
 ): Promise<VerifyAttestation> {
+	const timeoutMs = resolveVerifyTimeoutMs();
 	return new Promise((resolve) => {
 		let proc: ReturnType<typeof spawn>;
 		try {
@@ -1933,7 +1934,7 @@ function runVerifyCommand(
 			} catch {
 				/* ignore */
 			}
-		}, VERIFY_TIMEOUT_MS);
+		}, timeoutMs);
 		proc.stdout?.on("data", (d) => {
 			appendChunk(d.toString());
 		});
@@ -1952,7 +1953,7 @@ function runVerifyCommand(
 		});
 		proc.on("close", (code) => {
 			clearTimeout(killTimer);
-			const timeoutNote = `[verify timed out after ${VERIFY_TIMEOUT_MS / 1000}s]`;
+			const timeoutNote = `[verify timed out after ${timeoutMs / 1000}s]`;
 			let tail = tailText(combined, VERIFY_TAIL_CHARS, VERIFY_TAIL_LINES);
 			if (timedOut) tail = tail ? `${tail}\n${timeoutNote}` : timeoutNote;
 			resolve({ command, exitCode: timedOut ? null : code, timedOut, tail });
@@ -6478,13 +6479,19 @@ async function runSingleAgent(
 					...(options?.computerWorker?.environment ?? {}),
 					...(options?.computerAgent?.environment ?? {}),
 					...(options?.computerAgent ? { PIPIUI_AGENT_NO_DELEGATION: "1" } : {}),
-					// Scope marker read by the philosophy package. An agent that delegates needs the
-					// orchestration layers; every other dispatched agent must not get them — depth
-					// alone cannot tell the two apart, and a worker taught to fan out would fight
-					// PIPIUI_AGENT_MAX_DEPTH. Declared by the agent (`delegates: true`), which is
-					// consistent with `tools` already deciding whether it can dispatch at all.
-					PIPI_PHILOSOPHY_ROLE:
-						agent.traits.delegates && allowRecursiveDelegation ? "lead" : "worker",
+					// Scope marker read by the philosophy package. Every dispatched agent is a
+					// worker, whatever it may itself dispatch. There used to be a third role
+					// here — `lead`, for an agent that delegates — but the roster it was
+					// invented for is gone, and the condition below could only ever select
+					// `general-purpose`. A one-member role is not an abstraction, and this one
+					// actively misdelivered: `lead` carried the boss layers, so the one agent
+					// whose job is to hand back an implementation was told it does not work the
+					// floor, and was handed a fan-out contract that is false at its depth.
+					// Layers that genuinely belong to a delegating worker now address it by
+					// name (`scope: [general-purpose]`), which also survives the
+					// `scopes.worker` bulk switch — a layer that names its audience is not
+					// untargeted bulk.
+					PIPI_PHILOSOPHY_ROLE: "worker",
 					// The agent's own name, so a philosophy layer can address one kind of worker:
 					// craft rules to whoever writes code, research rules to whoever investigates.
 					// Without it every dispatched agent looks alike and only role-wide layers land.
@@ -6540,11 +6547,16 @@ async function runSingleAgent(
 							const now = Date.now();
 							const handle = handleForRun(pipiuiAgentId, runId);
 							const idleMs = handle ? progressIdleMs(now, handle) : Number.POSITIVE_INFINITY;
+							// Same subtree-CPU evidence the stall watchdog uses. A worker that
+							// delegated is silent on its own stream while the grandchild works,
+							// and without this it was killed for its child's silence.
+							const budgetVerdict = stalledInfoFor(pipiuiAgentId, now).verdict;
 							const expiry = decideRuntimeBudgetExpiry({
 								idleMs,
 								progressGraceMs: STALL_THRESHOLD_MS,
 								notified: runtimeTimeoutNotified,
 								syncWait: handle?.syncWait === true,
+								...(budgetVerdict ? { verdict: budgetVerdict } : {}),
 							});
 							if (expiry === "abort") {
 								runtimeTimedOut = true;
@@ -7309,7 +7321,7 @@ async function runSingleAgent(
 
 		// Attested verify: runs AFTER the agent process exits and BEFORE the "end" report,
 		// because Swift auto-merges and removes the worktree on "end". Skipped on abort
-		// (user interrupted; don't block up to VERIFY_TIMEOUT_MS on a dead task).
+		// (user interrupted; don't block up to the configured verify timeout on a dead task).
 		// A read-only role delivers a report, not a file: running a verify against it can
 		// only ever fail, which used to burn the two-attempts budget on a re-dispatch that
 		// was structurally incapable of passing. `verifyDropped` tells the boss why.

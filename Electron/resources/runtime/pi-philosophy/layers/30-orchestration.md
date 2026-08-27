@@ -5,7 +5,7 @@ summary: 不下基层：拆解、派工、验收、整合、汇报；上下文�
 order: 30
 requires: []
 requires-capabilities: [delegate]
-scope: [main, lead]
+scope: [main]
 ---
 # Orchestration
 

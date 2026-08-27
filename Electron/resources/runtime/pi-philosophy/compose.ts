@@ -5,9 +5,16 @@
  * that touches the runtime, so every rule that matters can be tested with plain `node`.
  */
 
-export type Role = "main" | "lead" | "worker";
+/**
+ * `lead` was retired. It named "a dispatched agent that may itself delegate", but the
+ * dispatch runtime could only ever award it to `general-purpose`, and carrying the boss
+ * layers under that name told the one agent that must return an implementation that it
+ * does not work the floor. A worker that delegates is still a worker; layers meant for it
+ * address it by agent name instead.
+ */
+export type Role = "main" | "worker";
 
-export const ROLES: readonly Role[] = ["main", "lead", "worker"];
+export const ROLES: readonly Role[] = ["main", "worker"];
 
 export interface Capability {
   /** The pi tool name this capability currently maps to. */
@@ -62,7 +69,7 @@ export interface Layer {
    * the layer — never guessed as supported.
    */
   requiresModelCapabilities: string[];
-  /** Roles (`main`/`lead`/`worker`) and/or agent names (`explore`, `plan`, …). */
+  /** Roles (`main`/`worker`) and/or agent names (`explore`, `plan`, …). */
   scope: string[];
   body: string;
   /** Where it came from; user layers shadow bundled ones with the same id. */
@@ -295,7 +302,7 @@ export function placeholdersIn(body: string): string[] {
 }
 
 /**
- * A bare name list left the boss guessing what `plan` and `lead` were for, and a guess about
+ * A bare name list left the boss guessing what `plan` and `reviewer` were for, and a guess about
  * an unfamiliar name resolves as "do it myself". One line each, so the roster answers "who
  * takes this?" without a lookup the boss has no way to perform.
  */

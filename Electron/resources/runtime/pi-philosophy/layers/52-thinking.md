@@ -6,7 +6,7 @@ order: 52
 requires: []
 requires-capabilities: []
 excludes-models: openai-codex/*, xai/*
-scope: [main, lead, worker]
+scope: [main, worker]
 ---
 # Thinking discipline
 

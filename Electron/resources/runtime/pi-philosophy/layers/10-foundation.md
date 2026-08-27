@@ -5,7 +5,7 @@ summary: 交往公理：你有什么授权、什么算证据、什么时候能�
 order: 10
 requires: []
 requires-capabilities: []
-scope: [main, lead, worker]
+scope: [main, worker]
 ---
 # Foundation
 

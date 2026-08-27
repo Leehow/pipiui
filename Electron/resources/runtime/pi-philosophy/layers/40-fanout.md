@@ -5,7 +5,7 @@ summary: 无依赖的活一次全派出去；写冲突先拆文件再并行而�
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]
-scope: [main, lead]
+scope: [main]
 ---
 # Fan-out: many workers, running in the background
 

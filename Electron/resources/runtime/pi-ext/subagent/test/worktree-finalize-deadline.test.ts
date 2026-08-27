@@ -13,6 +13,7 @@ import {
 	DEFAULT_QUEUE_HEAD_TIMEOUT_MS,
 	DEFAULT_QUEUE_WAIT_TIMEOUT_MS,
 	DEFAULT_VERIFY_TIMEOUT_MS,
+	resolveVerifyTimeoutMs,
 } from "../../subagent-host/worktree/deadlines.ts";
 import {
 	PerMainRepoSerialQueueV1,
@@ -178,6 +179,40 @@ test("production closeout deadlines stay conservative and centralized", () => {
 	assert.equal(DEFAULT_QUEUE_HEAD_TIMEOUT_MS, 15 * 60_000);
 	assert.equal(DEFAULT_FINALIZATION_DEADLINE_MS, DEFAULT_QUEUE_HEAD_TIMEOUT_MS);
 	assert.ok(DEFAULT_FINALIZATION_DEADLINE_MS > DEFAULT_VERIFY_TIMEOUT_MS);
+});
+
+test("PIPIUI_VERIFY_TIMEOUT_MS unset or invalid resolves to the conservative default", () => {
+	const previous = process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+	try {
+		delete process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+		assert.equal(resolveVerifyTimeoutMs(), DEFAULT_VERIFY_TIMEOUT_MS);
+		for (const raw of ["abc", "", "12s", "-5", "999"]) {
+			process.env.PIPIUI_VERIFY_TIMEOUT_MS = raw;
+			assert.equal(
+				resolveVerifyTimeoutMs(),
+				DEFAULT_VERIFY_TIMEOUT_MS,
+				`invalid value ${JSON.stringify(raw)} must fall back silently`,
+			);
+		}
+	} finally {
+		if (previous === undefined) delete process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+		else process.env.PIPIUI_VERIFY_TIMEOUT_MS = previous;
+	}
+});
+
+test("PIPIUI_VERIFY_TIMEOUT_MS valid override is accepted at the 1000ms floor and re-read per call", () => {
+	const previous = process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+	try {
+		process.env.PIPIUI_VERIFY_TIMEOUT_MS = "300000";
+		assert.equal(resolveVerifyTimeoutMs(), 300_000);
+		process.env.PIPIUI_VERIFY_TIMEOUT_MS = "1000";
+		assert.equal(resolveVerifyTimeoutMs(), 1000);
+		delete process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+		assert.equal(resolveVerifyTimeoutMs(), DEFAULT_VERIFY_TIMEOUT_MS);
+	} finally {
+		if (previous === undefined) delete process.env.PIPIUI_VERIFY_TIMEOUT_MS;
+		else process.env.PIPIUI_VERIFY_TIMEOUT_MS = previous;
+	}
 });
 
 test("never-resolving queue head times out, advances FIFO, and consumes late rejection", async () => {

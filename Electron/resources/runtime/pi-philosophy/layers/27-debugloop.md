@@ -5,7 +5,7 @@ summary: 看得见的验收归你：终端起长驻服务、浏览器复现、�
 order: 27
 requires: []
 requires-capabilities: []
-scope: [main, lead]
+scope: [main]
 ---
 # The debug loop
 

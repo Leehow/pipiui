@@ -199,8 +199,8 @@ describe('SubagentPanel', () => {
   it('links a selected agent to details, renders duration/cost, and marks a failed agent handled', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [
-      { agentId: 'runner', runId: 'r-runner', sessionId: 'session-1', name: 'runner', task: 'keep working', state: 'running', createdAt: 1 },
-      { agentId: 'failed', runId: 'r-failed', sessionId: 'session-1', name: 'failed', title: 'Failed detail', listSubtitle: 'failed row subtitle', task: 'inspect this failure', state: 'failed', createdAt: 0, endedAt: 61_000, cost: 1, costUnit: 'CNY', exchangeRate: 7.2, finalResult: 'failed-only result' }
+      { agentId: 'runner', runId: 'r-runner', sessionId: 'session-1', name: 'runner', task: 'keep working', state: 'running', createdAt: Date.now() },
+      { agentId: 'failed', runId: 'r-failed', sessionId: 'session-1', name: 'failed', title: 'Failed detail', listSubtitle: 'failed row subtitle', task: 'inspect this failure', state: 'failed', createdAt: Date.now() - 120_000, endedAt: Date.now() - 59_000, cost: 1, costUnit: 'CNY', exchangeRate: 7.2, finalResult: 'failed-only result' }
     ]
     render(<SubagentPanel host={harness.host} />)
 
@@ -235,7 +235,7 @@ describe('SubagentPanel', () => {
     harness.emitAgent({
       type: 'agent',
       agent: {
-        agentId: 'iso', runId: 'r-iso', name: 'builder', task: '改布局', state: 'failed', createdAt: 0, endedAt: 1_000,
+        agentId: 'iso', runId: 'r-iso', name: 'builder', task: '改布局', state: 'failed', createdAt: Date.now() - 60_000, endedAt: Date.now(),
         finalResult: `Writable subagent isolation failed before spawn: ${reason}`, worktreeError: reason
       }
     })
@@ -490,6 +490,43 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(harness.abortAgent).toHaveBeenCalledWith('session-1', 'run', 'r1'))
   })
 
+  it('hides [seam: fixture workers from the default list behind the collapsed 历史 group', async () => {
+    const harness = hostHarness()
+    const dayAgo = Date.now() - 36 * 60 * 60 * 1000
+    harness.host.listAgents = async () => [
+      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: '[seam: cone-hold] keep blocker busy', state: 'ok', createdAt: dayAgo, endedAt: dayAgo },
+      { agentId: 'fresh', runId: 'r-fresh', sessionId: 'session-1', name: 'explore', task: '审计 fallback 路径', state: 'running', createdAt: Date.now() }
+    ]
+    renderSubagentPanel({ host: harness.host })
+
+    expect(await screen.findByTestId('agent-row-fresh')).toBeTruthy()
+    expect(screen.queryByTestId('agent-row-blocker')).toBeNull()
+    expect(screen.getByTestId('subagent-archive-toggle').textContent).toContain('历史')
+    expect(screen.getByTestId('subagent-archive-toggle').textContent).toContain('1')
+  })
+
+  it('reveals seam fixtures and stale terminal rows after expanding 历史, keeping row controls', async () => {
+    const harness = hostHarness()
+    const dayAgo = Date.now() - 36 * 60 * 60 * 1000
+    harness.host.listAgents = async () => [
+      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: '[seam: cone-hold] keep blocker busy', state: 'aborted', createdAt: dayAgo, endedAt: dayAgo },
+      { agentId: 'qfix', runId: 'r-qfix', sessionId: 'session-1', name: 'fixer', task: '修复 quota 徽标样式', state: 'failed', createdAt: dayAgo, endedAt: dayAgo },
+      { agentId: 'cutoff-ok', runId: 'r-edge', sessionId: 'session-1', name: 'explore', task: '24 小时内完成', state: 'ok', createdAt: Date.now() - 20 * 60 * 60 * 1000, endedAt: Date.now() - 20 * 60 * 60 * 1000 }
+    ]
+    renderSubagentPanel({ host: harness.host })
+
+    const toggle = await screen.findByTestId('subagent-archive-toggle')
+    expect(toggle.textContent).toContain('2')
+    fireEvent.click(toggle)
+
+    expect(screen.getByTestId('agent-row-blocker')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-qfix')).toBeTruthy()
+    // A settled-but-recent row stays inline; only long-settled rows fold away.
+    expect(screen.getByTestId('agent-row-cutoff-ok')).toBeTruthy()
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByLabelText('标记 fixer 已处理')).toBeTruthy()
+  })
+
   it('shows live tokens on a running row and totals them on the header badge', async () => {
     const harness = hostHarness()
     renderSubagentPanel({ host: harness.host })
@@ -732,7 +769,7 @@ describe('SubagentPanel', () => {
     harness.emitAgent({
       type: 'agent',
       agent: {
-        agentId: 'done', runId: 'r-done', sessionId: 'session-1', name: 'reviewer', task: '审核变更', state: 'failed', createdAt: 1, endedAt: 61_000,
+        agentId: 'done', runId: 'r-done', sessionId: 'session-1', name: 'reviewer', task: '审核变更', state: 'failed', createdAt: Date.now() - 30_000, endedAt: Date.now(),
         provider: 'openai', model: 'openai/gpt-5', cost: .5, costUnit: 'CNY', exchangeRate: 7.2
       }
     })
@@ -755,7 +792,7 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [{
       agentId: 'narrow', runId: 'r1', name: 'reviewer', title: '中文任务简介', task: 'RAW_PROMPT /tmp/exact path',
-      state: 'ok', createdAt: 1, endedAt: 2, provider: 'jellytoken', model: 'volcengine/deepseek-v4-flash',
+      state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(), provider: 'jellytoken', model: 'volcengine/deepseek-v4-flash',
       sessionId: 'session-raw-exact', contextTokens: 120, inputTokens: 80, outputTokens: 40, cacheTokens: 20,
       finalResult: '中文 TLDR：验证完成', worktree: { agentId: 'narrow', lifecycle: 'mergedCleanupPending', merge: 'unavailable', discard: 'unavailable', error: 'FULL_RAW_ERROR exact' }
     }]
@@ -818,7 +855,7 @@ describe('SubagentPanel', () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [{
       agentId: 'fa0238aa', runId: 'r1', name: 'computer-use-leader', task: 'Computer Use Leader {"goal":"raw english goal"}',
-      title: '整理桌面交付结果', state: 'ok', createdAt: 1, endedAt: 2, finalResult: '中文最终结论',
+      title: '整理桌面交付结果', state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(), finalResult: '中文最终结论',
       provider: 'openai', model: 'openai/gpt-5', sessionId: 'session-exact'
     }]
     render(<SubagentPanel host={harness.host} />)
@@ -1076,7 +1113,7 @@ describe('SubagentPanel', () => {
     harness.host.listAgents = async () => [
       {
         agentId: 'cua-lead-1', runId: 'report-1', sessionId: 's1', name: 'computer-use-leader',
-        task: 'Computer Use Leader', title: '电脑操作主管', state: 'ok', createdAt: 2, endedAt: 3,
+        task: 'Computer Use Leader', title: '电脑操作主管', state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(),
         finalResult: conclusion,
       },
     ]
@@ -1122,7 +1159,7 @@ describe('SubagentPanel', () => {
       type: 'agent',
       agent: {
         agentId: 'op-1', runId: 'op-run', name: 'operator', title: 'Operate Computer Task',
-        task: 'Operate Computer Task', state: 'ok', createdAt: 1, endedAt: 2, finalResult: verdict,
+        task: 'Operate Computer Task', state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(), finalResult: verdict,
       },
     })
     const card = await screen.findByTestId('computer-worker-result-card')
@@ -1696,7 +1733,7 @@ describe('SubagentPanel', () => {
     render(<SubagentPanel host={harness.host} />)
 
     // The terminal event lands through the live subscription while listAgents() is in flight.
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'ok', createdAt: 1_000, endedAt: 2_000, finalResult: '全部通过' } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'ok', createdAt: Date.now() - 9_000, endedAt: Date.now() - 8_000, finalResult: '全部通过' } as AgentSummary })
 
     // The snapshot was captured before the end event: same run, still running.
     await act(async () => resolveSnapshot([{ agentId: 'smoke', runId: 'r1', name: 'general-purpose', task: '真跑模型smoke', state: 'running', createdAt: 1_000, updatedAt: 1_500 } as AgentSummary]))
@@ -1935,7 +1972,7 @@ describe('SubagentPanel', () => {
     // reaches failed and would disappear only if run-2 itself got marked.
     await act(async () => { releaseResolve() })
     await act(async () => {
-      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'failed', createdAt: 2, endedAt: 3 } })
+      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'failed', createdAt: 2, endedAt: Date.now() } })
     })
     // run-2 stays unhandled: its resolve button is still offered.
     expect(await screen.findByLabelText('标记 fixer 已处理')).toBeTruthy()

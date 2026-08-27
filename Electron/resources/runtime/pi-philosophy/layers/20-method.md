@@ -5,7 +5,7 @@ summary: 流程的重量必须配得上工作量。
 order: 20
 requires: []
 requires-capabilities: []
-scope: [main, lead]
+scope: [main]
 ---
 # Working method
 

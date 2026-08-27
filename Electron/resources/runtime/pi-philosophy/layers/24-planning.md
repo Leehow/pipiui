@@ -5,7 +5,7 @@ summary: 计划是可执行的列表不是文档；正式规划覆盖完整 spec
 order: 24
 requires: []
 requires-capabilities: []
-scope: [main, lead, plan]
+scope: [main, plan]
 ---
 # Planning
 

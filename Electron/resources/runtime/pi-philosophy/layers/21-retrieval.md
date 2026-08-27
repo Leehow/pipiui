@@ -5,7 +5,7 @@ summary: 点得出 token 就精确搜，只描述得出就交给加权检索；�
 order: 21
 requires: []
 requires-capabilities: [code_search]
-scope: [main, lead, explore, plan, general-purpose, reviewer]
+scope: [main, explore, plan, general-purpose, reviewer]
 ---
 # Finding code
 
