@@ -1400,18 +1400,101 @@ describe("dead-session orphan reconcile", () => {
   const staleAt = new Date(base).toISOString();
   const staleNow = base + 10 * 60 * 1000;
 
-  it("sweeps a stale running worker to interrupted even while the session process is still alive", async () => {
+  it("keeps an inconclusive stale worker running while the session process is still alive", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(staleNow));
     try {
       const { backend, deliver, events } = await harness();
       deliver({ ...START, at: staleAt });
       (backend as any).live.set("session-1", fakeLive());
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+      expect(events.some(e => e.type === "agent" && (e as any).agent.state === "interrupted")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses same-run diagnostics reception as liveness without rewriting business updatedAt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver, latest } = await harness();
+      deliver({ ...START, at: staleAt });
+      const businessUpdatedAt = latest().updatedAt;
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 7,
+          cpuVerdict: "working",
+          watchdogDecision: "cpu-progress",
+        },
+      });
+      (backend as any).live.set("session-1", fakeLive());
+      expect(latest().updatedAt).toBe(businessUpdatedAt);
+      expect(latest().diagnostics?.hostReceivedAt).toBe(staleNow);
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a stale row running when its recorded child PID survives the session process", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(base));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: staleAt });
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 7,
+          childPid: process.pid,
+          cpuVerdict: "unknown",
+          watchdogDecision: "tool-quiet-alive",
+        },
+      });
+      vi.setSystemTime(new Date(staleNow));
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("interrupts a stale worker when diagnostics positively confirm its process is gone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: staleAt });
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 8,
+          cpuVerdict: "gone",
+          watchdogDecision: "process-exited",
+          exitReason: "child-close:1",
+        },
+      });
+      (backend as any).live.set("session-1", fakeLive());
       expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
       await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
-        { agentId: "a1", state: "interrupted" },
+        { agentId: "a1", state: "interrupted", closeout: "执行进程已确认退出；按中断成果保留" },
       ]);
-      expect(events.some(e => e.type === "agent" && (e as any).agent.state === "interrupted")).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -1435,7 +1518,7 @@ describe("dead-session orphan reconcile", () => {
     }
   });
 
-  it("reconciles on listAgents so a reconnect immediately corrects a stale running row", async () => {
+  it("keeps an inconclusive stale row running when listAgents reconnects to a live session", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(staleNow));
     try {
@@ -1444,7 +1527,7 @@ describe("dead-session orphan reconcile", () => {
       (backend as any).live.set("session-1", fakeLive());
       (backend as any).reconcileOrphanedNow("session-1", staleNow);
       await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
-        { agentId: "a1", state: "interrupted", endedAt: staleNow },
+        { agentId: "a1", state: "running", endedAt: undefined },
       ]);
     } finally {
       vi.useRealTimers();
@@ -1464,7 +1547,7 @@ describe("dead-session orphan reconcile", () => {
         state: "interrupted",
         endedAt: staleNow,
         listSubtitle: "",
-        closeout: "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留",
+        closeout: "运行宿主不可用且超过 10 分钟无状态观察；按中断成果保留",
       },
     ]);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);

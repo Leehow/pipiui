@@ -785,8 +785,10 @@ const AGENT_PERSIST_MIN_INTERVAL_MS = 2_000;
 const AGENT_LOG_PERSIST_DEBOUNCE_MS = 10_000;
 /** Retention for terminal agent rows: keep live rows plus the newest N terminal rows. */
 const AGENT_RETENTION_MAX_TERMINAL = 400;
-const ORPHAN_CLOSEOUT =
-  "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留";
+const ORPHAN_HOST_UNAVAILABLE_CLOSEOUT =
+  "运行宿主不可用且超过 10 分钟无状态观察；按中断成果保留";
+const ORPHAN_PROCESS_GONE_CLOSEOUT =
+  "执行进程已确认退出；按中断成果保留";
 class PiExitedError extends Error {
   constructor(
     readonly code: number | null,
@@ -8130,8 +8132,34 @@ export class PiHostBackend implements HostBackend {
     if (!live || !this.liveProcessUsable(live)) return undefined;
     return live;
   }
+  private diagnosticsConfirmProcessGone(agent: AgentSummary): boolean {
+    const diagnostics = agent.diagnostics;
+    return Boolean(
+      diagnostics?.cpuVerdict === "gone" ||
+      diagnostics?.watchdogDecision === "no-process" ||
+      diagnostics?.watchdogDecision === "process-exited" ||
+      diagnostics?.exitReason,
+    );
+  }
+  private diagnosticChildProcessAlive(agent: AgentSummary): boolean {
+    const pid = agent.diagnostics?.childPid;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || this.diagnosticsConfirmProcessGone(agent)) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error: any) {
+      // EPERM still proves that the PID exists; only ESRCH positively proves it is gone.
+      return error?.code !== "ESRCH";
+    }
+  }
   private lastObservedAt(agent: AgentSummary): number | undefined {
-    return agent.updatedAt ?? agent.createdAt;
+    const businessObservation = agent.updatedAt ?? agent.createdAt;
+    const diagnosticsObservation = this.diagnosticsConfirmProcessGone(agent)
+      ? undefined
+      : agent.diagnostics?.hostReceivedAt;
+    if (businessObservation === undefined) return diagnosticsObservation;
+    if (diagnosticsObservation === undefined) return businessObservation;
+    return Math.max(businessObservation, diagnosticsObservation);
   }
   private isLiveAgentState(state: AgentSummary["state"]): boolean {
     return state === "running" || state === "stalled";
@@ -8183,21 +8211,20 @@ export class PiHostBackend implements HostBackend {
     this.agent({ type: "worktree", status });
   }
   /**
-   * Orphan sweep: running/stalled rows whose last observation is older than
-   * the 10-minute watchdog window are marked interrupted. Previously this
-   * only swept dead sessions (liveSessionProcess guard); that treated a
-   * long-lived main Pi process as proof the worker was still alive and let
-   * a lost terminal event leave the panel stuck on running forever.
-   * Now staleness is judged purely on worker liveness evidence (updatedAt/
-   * createdAt age / stream freshness via lastObservedAt); main process
-   * liveness no longer exempts the row.
+   * Orphan sweep: silence is not terminal evidence. A stale projection stays
+   * live while either its owning Pi session or its recorded child PID still
+   * exists. Same-run diagnostics reception is an independent heartbeat; only
+   * a missing host/child or a positive process-gone diagnosis can close it.
    */
   private reconcileOrphanedNow(sessionId: string, now = Date.now()): boolean {
     let changed = false;
+    const liveSession = this.liveSessionProcess(sessionId);
     for (const agent of [...this.agents.values()]) {
       if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
       const observed = this.lastObservedAt(agent);
       if (observed === undefined || now - observed < ORPHAN_STALE_MS) continue;
+      const processGone = this.diagnosticsConfirmProcessGone(agent);
+      if (!processGone && (liveSession || this.diagnosticChildProcessAlive(agent))) continue;
       const next: AgentSummary = {
         ...agent,
         state: "interrupted",
@@ -8208,7 +8235,7 @@ export class PiHostBackend implements HostBackend {
         activityToolCallId: undefined,
         activityEndedAt: agent.activityEndedAt ?? now,
         endedAt: agent.endedAt ?? now,
-        closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
+        closeout: agent.closeout ?? (processGone ? ORPHAN_PROCESS_GONE_CLOSEOUT : ORPHAN_HOST_UNAVAILABLE_CLOSEOUT),
       };
       this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), next);
       this.agentProjectionChanged(next.sessionId);
