@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { listSecretMeta, putSecret, type VaultSecretMeta } from "./secret-vault.js";
+import { deleteSecret, isSafeEnvName, listSecretMeta, loadVault, putSecret, type VaultSecretMeta } from "./secret-vault.js";
 import type { ExtInvokeErrorCode, ExtensionSettingsManifest } from "./extension-registry.js";
 
 export type ExtInvokeResult<T = unknown> =
@@ -54,9 +54,10 @@ export function validateExtensionSettingsPatch(
   id: string,
   schema: ExtensionSettingsManifest["schema"] | undefined,
   patch: Record<string, unknown>,
-): { ok: true; values: Record<string, unknown>; secrets: Record<string, string> } | { ok: false; code: ExtInvokeErrorCode; message: string } {
+): { ok: true; values: Record<string, unknown>; secrets: Record<string, string>; cleared: string[] } | { ok: false; code: ExtInvokeErrorCode; message: string } {
   const properties = isRecord(schema?.properties) ? schema!.properties! : undefined;
   const secrets: Record<string, string> = {};
+  const cleared: string[] = [];
   const values: Record<string, unknown> = {};
   const prefix = `ext.${id}.`;
   for (const [key, value] of Object.entries(patch)) {
@@ -68,8 +69,12 @@ export function validateExtensionSettingsPatch(
     }
     const spec = propertySpec(schema, key) ?? {};
     if (spec.format === "secret") {
+      if (value === null) {
+        cleared.push(key);
+        continue;
+      }
       if (typeof value !== "string") {
-        return { ok: false, code: "capability_denied", message: `secret field ${key} must be a string` };
+        return { ok: false, code: "capability_denied", message: `secret field ${key} must be a string or null to clear` };
       }
       secrets[key] = value;
       continue;
@@ -79,7 +84,7 @@ export function validateExtensionSettingsPatch(
     }
     values[key] = value;
   }
-  return { ok: true, values, secrets };
+  return { ok: true, values, secrets, cleared };
 }
 
 export type ExtensionSettingsDocument = {
@@ -207,6 +212,33 @@ export async function putExtensionSecrets(
     written.push(await putSecret(vaultDir, { name: key, envName: secretEnvName(key), value }));
   }
   return written;
+}
+
+/** Delete vault entries for secret settings keys the user explicitly cleared. Idempotent. */
+export async function clearExtensionSecrets(vaultDir: string, keys: readonly string[]): Promise<boolean[]> {
+  const removed: boolean[] = [];
+  for (const key of keys) removed.push(await deleteSecret(vaultDir, key));
+  return removed;
+}
+
+/**
+ * Secret values for one extension's enabled spawn package, keyed by env var name.
+ *
+ * Reads only the given in-memory vault namespace; never returns values for any other
+ * namespace, so project-scoped settings stay project-isolated. The result goes straight
+ * into the child process environment via `SpawnRegisteredExtension.secretEnv` and must
+ * never be echoed into settings snapshots or IPC payloads.
+ */
+export function extensionSecretEnvs(vaultNamespace: string, keys: ReadonlySet<string>): Record<string, string> {
+  if (keys.size === 0) return {};
+  const wanted = new Set(keys);
+  const out: Record<string, string> = {};
+  for (const secret of loadVault(vaultNamespace).secrets) {
+    if (!wanted.has(secret.name)) continue;
+    if (!isSafeEnvName(secret.envName)) continue;
+    out[secret.envName] = secret.value;
+  }
+  return out;
 }
 
 /** Extension id of the canonical Grok Build OAuth package. */

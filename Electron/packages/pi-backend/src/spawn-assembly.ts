@@ -7,7 +7,7 @@ import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
 export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlPdf"|"pdfInspector"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 /** Origin of the resolved extension instance that produced a contribution snapshot. */
 export type SpawnExtensionOrigin = "builtin" | "app" | "project";
@@ -42,6 +42,11 @@ export type SpawnRegisteredExtension = {
   extensionPath?: string;
   skillRoots?: readonly string[];
   settings?: unknown;
+  /** Vault-backed secret values for this package's settings schema, keyed by env var
+   * name (`secretEnvName(settingsKey)`). Applied to the child environment only when the
+   * agent half is actually mounted, and never serialized into settings snapshots,
+   * IPC payloads or transcript redaction sources. */
+  secretEnv?: Record<string, string>;
   /** Validated, path-confined contribution metadata. Omitted when disabled/invalid/refused/empty. */
   agentContribution?: SpawnAgentContribution;
   /** Contribution path/size issues for an otherwise usable extension. Omitted when disabled/refused. */
@@ -110,7 +115,7 @@ export function mergedSpawnEnvironment(
   });
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlPdf)ext(args,p.firecrawlPdf);if(p.pdfInspector){env.PIPIUI_PDF_INSPECTOR_ROOT=p.pdfInspector;const inspectorModules=join(p.pdfInspector,"node_modules");env.NODE_PATH=env.NODE_PATH?inspectorModules+delimiter+env.NODE_PATH:inspectorModules}if(p.firecrawlAnydoc)ext(args,p.firecrawlAnydoc);if(p.anydoc){env.PIPIUI_ANYDOC_ROOT=p.anydoc;const anydocModules=join(p.anydoc,"node_modules");env.NODE_PATH=env.NODE_PATH?anydocModules+delimiter+env.NODE_PATH:anydocModules}if(enabled(f,"philosophy")){ext(args,p.philosophy);if(p.philosophy)env.PIPIUI_PHILOSOPHY_EXT=p.philosophy}if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader)env.PIPIUI_SKILLLOADER_EXT=p.skillLoader;if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"deepseekServerTools"))ext(args,p.deepseekServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames,model:input.model}));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlAnydoc)ext(args,p.firecrawlAnydoc);if(p.anydoc){env.PIPIUI_ANYDOC_ROOT=p.anydoc;const anydocModules=join(p.anydoc,"node_modules");env.NODE_PATH=env.NODE_PATH?anydocModules+delimiter+env.NODE_PATH:anydocModules}if(enabled(f,"philosophy")){ext(args,p.philosophy);if(p.philosophy)env.PIPIUI_PHILOSOPHY_EXT=p.philosophy}if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader)env.PIPIUI_SKILLLOADER_EXT=p.skillLoader;if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"deepseekServerTools"))ext(args,p.deepseekServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({bossReadOnly:enabled(f,"bossReadOnly"),disabledToolNames:input.disabledToolNames,model:input.model}));
 /*
  * Subagent orchestration, deliberately mounted before the bridge gate.
  *
@@ -571,6 +576,7 @@ function appendRegisteredExtensions(args:string[], env:Record<string,string>, pa
   for (const { pkg, key } of classified) {
     if ((keyCount.get(key) ?? 0) > 1 || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
+    if (pkg.secretEnv) Object.assign(env, pkg.secretEnv);
     mountedIds.push(pkg.id);
     mountedPaths.push(pkg.extensionPath);
   }
@@ -774,8 +780,6 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     secretVault:fileIfPresent(extensions,"pipiui-secret-vault.ts"),
     codingTools:fileIfPresent(extensions,"pipiui-coding-tools.ts"),
     officeDocShotGate:fileIfPresent(extensions,"pipiui-office-doc-shot-gate.ts"),
-    firecrawlPdf:fileIfPresent(extensions,"pipiui-firecrawl-pdf.ts"),
-    pdfInspector:packageIfPresent(runtimeRoot,"pdf-inspector"),
     firecrawlAnydoc:fileIfPresent(extensions,"pipiui-firecrawl-anydoc.ts"),
     anydoc:packageIfPresent(runtimeRoot,"anydoc"),
     subagentDir:fileIfPresent(ext,"subagent"),

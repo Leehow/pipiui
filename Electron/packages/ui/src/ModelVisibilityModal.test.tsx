@@ -67,8 +67,6 @@ function hostStub(overrides: Partial<PipiHostAPI> = {}): PipiHostAPI {
     setVisionEnabled: async () => false,
     getVisionModel: async () => null,
     setVisionModel: async () => null,
-    getPaddleOcrStatus: async () => ({ hasKey: false }),
-    setPaddleOcrAccessToken: async () => ({ hasKey: true }),
     openExternal: async () => undefined,
     ...overrides,
   } as PipiHostAPI

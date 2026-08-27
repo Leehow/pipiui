@@ -82,9 +82,10 @@ describe("installRuntimeTree", () => {
       expect(entries).toContain("pi-philosophy");
       expect(entries).toContain("extensions");
       expect(entries).toContain("built-in-skills");
-      expect(entries).toContain("pdf-inspector");
       expect(entries).toContain("anydoc");
-      expect(await readdir(join(root, "pdf-inspector", "node_modules", "@firecrawl"))).toEqual(expect.arrayContaining(["pdf-inspector", "pdf-inspector-wasm"]));
+      // The pdf parser ships as a bundled manifest extension with its owned vendored deps.
+      expect(await readdir(join(root, "extensions", "pdf-extension"))).toEqual(expect.arrayContaining(["agent", "pipiui-extension.json", "vendor"]));
+      expect(existsSync(join(root, "extensions", "pdf-extension", "vendor", "pdf-inspector", "node_modules", "@firecrawl"))).toBe(true);
       expect(await readdir(join(root, "anydoc", "node_modules", "@firecrawl"))).toEqual(expect.arrayContaining(["anydoc", "anydoc-wasm"]));
       expect(await readdir(join(root, "pi-ext"))).toEqual(expect.arrayContaining(["agents", "packages", "subagent"]));
       expect(existsSync(join(root, "pi-ext", "packages", "context-fold", "index.ts"))).toBe(true);

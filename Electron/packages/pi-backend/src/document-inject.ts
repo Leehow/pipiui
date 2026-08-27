@@ -56,6 +56,8 @@ export async function buildDocumentsOpenedInjection(
     source?: DocumentInjectionSource;
     convertBinary?: BinaryMarkdownConverter;
     anydocRoot?: string;
+    /** Whether new sessions mount the pdf-extension parser; forwards to documentsOpenedInjection. */
+    pdfParser?: boolean;
   } = {},
 ): Promise<string> {
   const source = options.source === "composer" ? "composer" : "panel";
@@ -95,5 +97,5 @@ export async function buildDocumentsOpenedInjection(
       entries.push({ path, kind, binary: true });
     }
   }
-  return documentsOpenedInjection(entries, { source });
+  return documentsOpenedInjection(entries, { source, pdfParser: options.pdfParser });
 }

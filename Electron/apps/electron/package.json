@@ -81,15 +81,6 @@
         ]
       },
       {
-        "from": "../../resources/runtime/pdf-inspector/node_modules",
-        "to": "pipiui-runtime/pdf-inspector/node_modules",
-        "filter": [
-          "**/*",
-          "!**/.bin",
-          "!**/.bin/**"
-        ]
-      },
-      {
         "from": "../../resources/runtime/extensions/grok-build-oauth",
         "to": "pipiui-runtime/extensions/grok-build-oauth",
         "filter": [
@@ -151,6 +142,17 @@
           "!bin/**/officecli",
           "!bin/**/officecli.exe",
           "!bin/**/receipt.json"
+        ]
+      },
+      {
+        "from": "../../resources/runtime/extensions/pdf-extension",
+        "to": "pipiui-runtime/extensions/pdf-extension",
+        "filter": [
+          "**/*",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo",
+          "!vendor/pdf-inspector/node_modules/.bin",
+          "!vendor/pdf-inspector/node_modules/.bin/**"
         ]
       },
       {

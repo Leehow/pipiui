@@ -203,6 +203,22 @@ for (const half of ["agent", "app"]) {
   assertTreeSafe(join(packageDir, half, "dist"), packageReal, `${half}/dist`);
 }
 
+// Optional manifest-declared dependency trees owned by this package
+// (`runtimeAssets`, e.g. a vendored native/WASM inspector tree). Copied
+// verbatim into the mirror, including any node_modules they legitimately
+// contain. Packages that declare none are untouched, byte for byte.
+const runtimeAssets = Array.isArray(manifest.runtimeAssets) ? manifest.runtimeAssets : [];
+for (const rel of runtimeAssets) {
+  if (typeof rel !== "string" || !rel.trim()) fail(`runtimeAssets entries must be non-empty strings: ${JSON.stringify(rel)}`);
+  if (isPortableAbsolute(rel)) fail(`runtimeAsset must not be an absolute path: ${rel}`);
+  if (hasDotDotSegment(rel)) fail(`runtimeAsset must not contain ..: ${rel}`);
+  const srcTree = join(packageDir, rel);
+  if (!containedBy(resolve(packageDir), resolve(packageDir, rel))) fail(`runtimeAsset escapes package: ${rel}`);
+  if (!existsSync(srcTree) || !lstatSync(srcTree).isDirectory()) fail(`missing runtimeAsset directory ${rel}; run the package install first`);
+  assertNoSymlinkComponentsFrom(packageDir, srcTree, `runtimeAsset ${rel}`);
+  assertTreeSafe(srcTree, packageReal, `runtimeAsset ${rel}`);
+}
+
 // Canonicalize destination before any destructive write. Never rm then verify.
 assertDestinationSafe();
 
@@ -237,12 +253,18 @@ for (const dir of ["bin", "licenses"]) {
   const srcDir = join(packageDir, dir);
   if (existsSync(srcDir)) cpSync(srcDir, join(dest, dir), { recursive: true });
 }
+for (const rel of runtimeAssets) {
+  cpSync(join(packageDir, rel), join(dest, rel), { recursive: true });
+}
 for (const half of ["agent", "app"]) {
   const distDir = join(packageDir, half, "dist");
   if (existsSync(distDir)) cpSync(distDir, join(dest, half, "dist"), { recursive: true });
 }
 
 const destReal = realpathSync(dest);
+for (const rel of runtimeAssets) {
+  assertTreeSafe(join(dest, rel), destReal, `runtime ${rel}`);
+}
 for (const half of ["agent", "app"]) {
   assertTreeSafe(join(dest, half, "dist"), destReal, `runtime ${half}/dist`);
 }

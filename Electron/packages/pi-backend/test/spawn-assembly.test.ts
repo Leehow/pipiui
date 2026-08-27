@@ -60,37 +60,61 @@ describe("runtime info extension mount", () => {
   });
 });
 
-describe("firecrawl pdf extension mount", () => {
-  const firecrawlPdf = "/runtime/extensions/pipiui-firecrawl-pdf.ts";
+describe("pdf-extension registry mount", () => {
+  const pdfExtensionPath = "/runtime/extensions/pdf-extension/agent/dist/index.js";
 
-  it("always mounts the bundled PDF parser when the runtime file exists", () => {
-    const input = { cwd: "/tmp/project", paths: { firecrawlPdf } };
-    expect(assemblePiSpawn(input).args).toEqual(["-e", firecrawlPdf]);
-    expect(assemblePiSpawn({ ...input, resourceMode: "explicit" as const }).args).toEqual(["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "-e", firecrawlPdf]);
+  it("mounts the parser only through the enabled registry package, never a spawn path", () => {
+    const registered = [{ id: "pdf-extension", enabled: true, extensionPath: pdfExtensionPath }];
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {}, registeredExtensions: registered }).args).toEqual(["-e", pdfExtensionPath]);
+    // Disabled packages must not mount even when a stale path is present.
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: {}, registeredExtensions: [{ id: "pdf-extension", enabled: false, extensionPath: pdfExtensionPath }] }).args).toEqual([]);
   });
 
-  it("resolves the shipped extension from the source runtime tree", () => {
+  it("resolves no PDF spawn paths and no inspector root from the runtime tree", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
-    expect(resolveSpawnPaths(root).firecrawlPdf).toBe(join(root, "extensions", "pipiui-firecrawl-pdf.ts"));
-    expect(resolveSpawnPaths(root).pdfInspector).toBe(join(root, "pdf-inspector"));
+    expect(resolveSpawnPaths(root)).not.toHaveProperty("firecrawlPdf");
+    expect(resolveSpawnPaths(root)).not.toHaveProperty("pdfInspector");
     expect(resolveSpawnPaths(root).firecrawlAnydoc).toBe(join(root, "extensions", "pipiui-firecrawl-anydoc.ts"));
     expect(resolveSpawnPaths(root).anydoc).toBe(join(root, "anydoc"));
-    expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector", "package.json"))).toBe(true);
-    expect(existsSync(join(root, "pdf-inspector", "node_modules", "@firecrawl", "pdf-inspector-wasm", "pdf_inspector_wasm_bg.wasm"))).toBe(true);
-    expect(existsSync(join(root, "anydoc", "node_modules", "@firecrawl", "anydoc-wasm", "anydoc_wasm_bg.wasm"))).toBe(true);
+    expect(existsSync(join(root, "extensions", "pipiui-firecrawl-pdf.ts"))).toBe(false);
   });
 
-  it("exports the inspector root and NODE_PATH so the Pi child can resolve official packages", () => {
-    const firecrawlPdf = "/runtime/extensions/pipiui-firecrawl-pdf.ts";
-    const pdfInspector = "/runtime/pdf-inspector";
+  it("delivers vault-backed secrets only for uniquely-mounted enabled extensions", () => {
     const firecrawlAnydoc = "/runtime/extensions/pipiui-firecrawl-anydoc.ts";
     const anydoc = "/runtime/anydoc";
-    const { env, args } = assemblePiSpawn({ cwd: "/tmp/project", paths: { firecrawlPdf, pdfInspector, firecrawlAnydoc, anydoc } });
-    expect(args).toEqual(["-e", firecrawlPdf, "-e", firecrawlAnydoc]);
-    expect(env.PIPIUI_PDF_INSPECTOR_ROOT).toBe(pdfInspector);
+    const secretEnv = { EXT_PDF_EXTENSION_AISTUDIOACCESSTOKEN: "ast-secret" };
+    const { env, args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: { firecrawlAnydoc, anydoc },
+      registeredExtensions: [
+        { id: "other-ext", enabled: true, extensionPath: "/runtime/extensions/other.js" },
+        { id: "pdf-extension", enabled: true, extensionPath: pdfExtensionPath, secretEnv },
+      ],
+    });
+    expect(args).toContain("-e", "/runtime/extensions/other.js");
+    expect(args).toContain("-e", pdfExtensionPath);
+    expect(args).toContain("-e", firecrawlAnydoc);
+    expect(env.EXT_PDF_EXTENSION_AISTUDIOACCESSTOKEN).toBe("ast-secret");
     expect(env.PIPIUI_ANYDOC_ROOT).toBe(anydoc);
-    expect(env.NODE_PATH?.split(delimiter)).toContain(join(pdfInspector, "node_modules"));
-    expect(env.NODE_PATH?.split(delimiter)).toContain(join(anydoc, "node_modules"));
+    const disabledEnv = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: {},
+      registeredExtensions: [{ id: "pdf-extension", enabled: false, extensionPath: pdfExtensionPath, secretEnv }],
+    }).env;
+    expect(disabledEnv.EXT_PDF_EXTENSION_AISTUDIOACCESSTOKEN).toBeUndefined();
+    // Same inode mounted twice: ownership is ambiguous, so neither the mount nor its secrets ship.
+    const conflictExtensions = [
+      { id: "a-copy", enabled: true, extensionPath: pdfExtensionPath, secretEnv },
+      { id: "b-copy", enabled: true, extensionPath: pdfExtensionPath, secretEnv },
+    ];
+    const conflicted = assemblePiSpawn({ cwd: "/tmp/project", paths: {}, registeredExtensions: conflictExtensions });
+    expect(conflicted.args).not.toContain(pdfExtensionPath);
+    expect(conflicted.env.EXT_PDF_EXTENSION_AISTUDIOACCESSTOKEN).toBeUndefined();
+  });
+
+  it("strips stale inherited PDF inspector roots from parent and .env layers", () => {
+    // The var no longer has any live contract; the denylist only stops stale ambient
+    // values (old installed apps, leftover .env lines) from reaching new sessions.
     expect(sanitizeEnvironment({ PIPIUI_PDF_INSPECTOR_ROOT: "/stale", PIPIUI_ANYDOC_ROOT: "/stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 });

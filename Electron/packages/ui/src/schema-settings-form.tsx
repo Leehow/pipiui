@@ -8,6 +8,8 @@ export type SchemaSettingsFormProps = {
   onChange?: (key: string, value: unknown) => void
   host?: PipiHostAPI
   extensionId?: string
+  /** Project-scoped manifests resolve settings against this project. */
+  projectId?: string
   disabled?: boolean
 }
 
@@ -38,17 +40,27 @@ function SchemaField({
   let control: ReactNode
   if (isSecret) {
     control = (
-      <input
-        className="ext-schema-control"
-        type="password"
-        autoComplete="off"
-        spellCheck={false}
-        disabled={disabled}
-        data-testid={testId}
-        placeholder={configuredSecret ? '已配置（输入新密钥以替换）' : ''}
-        defaultValue=""
-        onChange={event => onCommit(event.target.value)}
-      />
+      <span className="ext-schema-secret-row">
+        <input
+          className="ext-schema-control"
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          disabled={disabled}
+          data-testid={testId}
+          placeholder={configuredSecret ? '已配置（输入新密钥以替换）' : ''}
+          defaultValue=""
+          onChange={event => onCommit(event.target.value)}
+        />
+        {configuredSecret && !disabled && (
+          <button
+            type="button"
+            className="ext-schema-secret-clear"
+            data-testid={`${testId}-clear`}
+            onClick={() => onCommit(null)}
+          >清除</button>
+        )}
+      </span>
     )
   } else if (prop.enum && prop.enum.length > 0) {
     const current = value == null ? '' : String(value)
@@ -128,16 +140,24 @@ export function SchemaSettingsForm({
   onChange,
   host,
   extensionId,
+  projectId,
   disabled,
 }: SchemaSettingsFormProps) {
   const [loaded, setLoaded] = useState<Record<string, unknown>>({})
   const [error, setError] = useState<string | null>(null)
   const controlled = valuesProp !== undefined
 
+  const fetchSettings = () => {
+    if (!host?.getExtensionSettings || !extensionId) return undefined
+    return projectId === undefined
+      ? host.getExtensionSettings(extensionId)
+      : host.getExtensionSettings(extensionId, projectId)
+  }
+
   useEffect(() => {
     if (controlled || !host?.getExtensionSettings || !extensionId) return
     let cancelled = false
-    void host.getExtensionSettings(extensionId).then((next: Record<string, unknown>) => {
+    void fetchSettings()?.then((next: Record<string, unknown>) => {
       if (!cancelled) {
         setLoaded(next ?? {})
         setError(null)
@@ -146,7 +166,7 @@ export function SchemaSettingsForm({
       if (!cancelled) setError(err instanceof Error ? err.message : String(err))
     })
     return () => { cancelled = true }
-  }, [controlled, host, extensionId])
+  }, [controlled, host, extensionId, projectId])
 
   const values = controlled ? valuesProp : loaded
   const properties = schema?.properties ?? {}
@@ -155,8 +175,24 @@ export function SchemaSettingsForm({
   const commit = (key: string, value: unknown) => {
     onChange?.(key, value)
     if (!controlled) setLoaded(prev => ({ ...prev, [key]: value }))
-    if (host?.updateExtensionSettings && extensionId) {
-      void host.updateExtensionSettings(extensionId, { [key]: value }).catch((err: unknown) => {
+    const { updateExtensionSettings } = host ?? {}
+    if (updateExtensionSettings && extensionId) {
+      const save = () => (projectId === undefined
+        ? updateExtensionSettings(extensionId, { [key]: value })
+        : updateExtensionSettings(extensionId, { [key]: value }, projectId))
+      void save().then((result) => {
+        // A resolved {ok:false} denial must not leave the optimistic local value behind.
+        if (result && result.ok === false) {
+          setError(result.error?.message || '设置保存失败')
+          if (!controlled && extensionId) {
+            void fetchSettings()
+              ?.then((next: Record<string, unknown>) => setLoaded(next ?? {}))
+              .catch(() => undefined)
+          }
+        } else {
+          setError(null)
+        }
+      }).catch((err: unknown) => {
         setError(err instanceof Error ? err.message : String(err))
       })
     }

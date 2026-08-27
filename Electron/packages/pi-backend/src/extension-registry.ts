@@ -405,10 +405,14 @@ export class ExtensionRegistry {
     return this.require(id).settings;
   }
 
+  /**
+   * Record one session's authoritative mount snapshot for its current child
+   * process. Replacement, never union: every spawn registration describes a new
+   * child's full extension set, so a same-ID respawn under changed enablement
+   * must not inherit mounts from the dead child. An empty list clears.
+   */
   mountSession(sessionId: string, extensionIds: readonly string[]): void {
-    const set = this.sessionMounts.get(sessionId) ?? new Set<string>();
-    for (const extensionId of extensionIds) set.add(extensionId);
-    this.sessionMounts.set(sessionId, set);
+    this.sessionMounts.set(sessionId, new Set(extensionIds));
   }
 
   unmountSession(sessionId: string): void {

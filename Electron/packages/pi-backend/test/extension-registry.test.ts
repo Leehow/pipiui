@@ -160,6 +160,35 @@ describe("extension lifecycle state machine", () => {
   });
 });
 
+describe("session mount snapshots", () => {
+  it("replaces a session snapshot on each spawn registration instead of unioning", () => {
+    const registry = createExtensionRegistry([]);
+    // First spawn mounts two extensions.
+    registry.mountSession("sess-1", ["a", "b"]);
+    expect(registry.isMounted("sess-1", "a")).toBe(true);
+    expect(registry.isMounted("sess-1", "b")).toBe(true);
+    // Same-ID respawn under changed enablement replaces the whole set.
+    registry.mountSession("sess-1", ["b", "c"]);
+    expect(registry.isMounted("sess-1", "a")).toBe(false);
+    expect(registry.isMounted("sess-1", "b")).toBe(true);
+    expect(registry.isMounted("sess-1", "c")).toBe(true);
+  });
+
+  it("clears the snapshot when the new spawn mounts nothing", () => {
+    const registry = createExtensionRegistry([]);
+    registry.mountSession("sess-1", ["pdf-extension"]);
+    expect(registry.isMounted("sess-1", "pdf-extension")).toBe(true);
+    // Dead child respawns with pdf disabled: no residual mount may survive.
+    registry.mountSession("sess-1", []);
+    expect(registry.isMounted("sess-1", "pdf-extension")).toBe(false);
+    // Explicit cleanup stays per-session.
+    registry.mountSession("sess-2", ["other"]);
+    registry.unmountSession("sess-1");
+    expect(registry.isMounted("sess-1", "other")).toBe(false);
+    expect(registry.isMounted("sess-2", "other")).toBe(true);
+  });
+});
+
 describe("extension enable persistence", () => {
   it("round-trips App-level enablement through pipiui-settings.json extensions slot", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-ext-app-"));

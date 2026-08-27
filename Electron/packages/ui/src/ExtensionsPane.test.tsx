@@ -24,7 +24,10 @@ describe('ExtensionsPane', () => {
     render(<ExtensionsPane addOpen={false} onCloseAdd={() => undefined} />)
     expect(screen.getByTestId('extensions-pane')).toBeTruthy()
     expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
-    expect(screen.getByTestId('extensions-item-paddleocr').textContent).toContain('PaddleOCR-VL-1.6')
+    // The bespoke PaddleOCR row is gone; its settings render generically via the
+    // pdf-extension manifest in ExtensionPackagesSection.
+    expect(screen.queryByTestId('extensions-item-paddleocr')).toBeNull()
+    expect(screen.getByTestId('extensions-builtin').textContent).toContain('1 项')
     expect(screen.getByTestId('extensions-user-empty').textContent).toContain('还没有额外添加')
     expect(screen.queryByTestId('extensions-add-dialog')).toBeNull()
   })
@@ -59,26 +62,42 @@ describe('ExtensionsPane', () => {
     expect(onCloseAdd).toHaveBeenCalledTimes(1)
   })
 
-  it('saves a project-scoped PaddleOCR token without echoing it and opens the apply URL', async () => {
-    const getPaddleOcrStatus = vi.fn(async () => ({ hasKey: false }))
-    const setPaddleOcrAccessToken = vi.fn(async (_projectId: string, token: string | null) => ({ hasKey: Boolean(token) }))
-    const openExternal = vi.fn(async () => undefined)
+  it('renders the pdf-extension token through the generic schema settings form', async () => {
+    const getExtensionSettings = vi.fn(async (_id: string) => ({ 'ext.pdf-extension.aistudioAccessToken': true }))
+    const updateExtensionSettings = vi.fn(async (id: string, patch: Record<string, unknown>) => ({ ok: true, data: patch }))
+    const listExtensions = vi.fn(async (): Promise<ExtensionDescriptor[]> => [{
+      id: 'pdf-extension',
+      name: 'PipiUI PDF',
+      version: '0.1.0',
+      source: 'builtin',
+      state: 'enabled',
+      capabilities: [],
+      contributions: {
+        settings: {
+          scope: 'project',
+          schema: { type: 'object', properties: { 'ext.pdf-extension.aistudioAccessToken': { type: 'string', format: 'secret', title: 'PaddleOCR AI Studio Access Token' } } },
+        },
+      },
+    }])
     const host = {
-      getPaddleOcrStatus,
-      setPaddleOcrAccessToken,
-      openExternal,
+      listExtensions,
+      getExtensionSettings,
+      updateExtensionSettings,
       listUserMcpServers: async () => [],
       listProjects: async () => [{ id: 'project-1', name: 'demo', path: '/tmp/demo' }],
     } as unknown as PipiHostAPI
     render(<ExtensionsPane host={host} projectId="project-1" addOpen={false} onCloseAdd={() => undefined} />)
-    expect(await screen.findByTestId('paddleocr-status')).toBeTruthy()
-    fireEvent.change(screen.getByTestId('paddleocr-token-input'), { target: { value: 'ast-secret-should-not-echo' } })
-    fireEvent.click(screen.getByTestId('paddleocr-save'))
-    await waitFor(() => expect(setPaddleOcrAccessToken).toHaveBeenCalledWith('project-1', 'ast-secret-should-not-echo'))
-    expect(screen.queryByText('ast-secret-should-not-echo')).toBeNull()
-    expect(screen.getByTestId('paddleocr-status').textContent).toContain('已配置')
-    fireEvent.click(screen.getByTestId('paddleocr-apply'))
-    expect(openExternal).toHaveBeenCalledWith('https://aistudio.baidu.com/account/accessToken')
+    fireEvent.click(await screen.findByTestId('extensions-pkg-settings-toggle-pdf-extension'))
+    expect(screen.getByTestId('ext-schema-form')).toBeTruthy()
+    const input = screen.getByTestId('ext-schema-field-ext.pdf-extension.aistudioAccessToken')
+    expect(input.getAttribute('type')).toBe('password')
+    // Configured secret shows presence, not the value, plus a generic clear affordance.
+    expect((input as HTMLInputElement).value).toBe('')
+    // Defect-1 routing: the selected project id rides along to the backend.
+    expect(getExtensionSettings).toHaveBeenCalledWith('pdf-extension', 'project-1')
+    expect(await screen.findByTestId('ext-schema-field-ext.pdf-extension.aistudioAccessToken-clear')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('ext-schema-field-ext.pdf-extension.aistudioAccessToken-clear'))
+    await waitFor(() => expect(updateExtensionSettings).toHaveBeenCalledWith('pdf-extension', { 'ext.pdf-extension.aistudioAccessToken': null }, 'project-1'))
   })
 
   it('closes the add dialog on Escape without bubbling to the settings modal', () => {

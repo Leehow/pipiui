@@ -15,8 +15,15 @@ const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist"
  * (spec D10: builtins live in the Bundled runtime extensions tree). They are
  * re-synced with `keepDist` after the generic `extensions` pass so their build
  * artifacts survive both the signature and the copy.
+ *
+ * `pdf-extension` additionally keeps its owned vendored dependency tree
+ * (`vendor/pdf-inspector/node_modules`, see BUNDLED_KEEP_NODE_MODULES) so its
+ * compiled agent resolves the pdf-inspector native/WASM engine relative to
+ * itself instead of through a host path contract.
  */
-export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "deepseek", "qoder", "pipiui-headroom", "office-extension"];
+export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "deepseek", "qoder", "pipiui-headroom", "office-extension", "pdf-extension"];
+/** Bundled manifest extensions that ship an owned `node_modules` inside their mirrored tree. */
+const BUNDLED_KEEP_NODE_MODULES: ReadonlySet<string> = new Set(["pdf-extension"]);
 const SIGNATURE_FILE = ".pipiui-install.json";
 let stagingSeq = 0;
 
@@ -110,8 +117,8 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
   // generic extensions sync strips. Re-sync each one over its stripped copy; a missing
   // source directory is a reported failure like any other missing asset.
   for (const id of BUNDLED_MANIFEST_EXTENSIONS)
-    syncTree(join(assets.sourceRoot, "extensions", id), join(runtimeRoot, "extensions", id), report, { keepDist: true });
-  syncTree(join(assets.sourceRoot, "pdf-inspector"), join(runtimeRoot, "pdf-inspector"), report, { keepNodeModules: true });
+    syncTree(join(assets.sourceRoot, "extensions", id), join(runtimeRoot, "extensions", id), report,
+      { keepDist: true, ...(BUNDLED_KEEP_NODE_MODULES.has(id) ? { keepNodeModules: true } : {}) });
   syncTree(join(assets.sourceRoot, "anydoc"), join(runtimeRoot, "anydoc"), report, { keepNodeModules: true });
   return report;
 }

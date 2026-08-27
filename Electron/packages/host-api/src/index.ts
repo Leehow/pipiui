@@ -132,12 +132,18 @@ function formatDocumentSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
-function binaryParseHint(kind: DocumentKind | null | undefined, size: string, source: DocumentInjectionSource): string {
-  if (kind === "pdf") {
+function binaryParseHint(kind: DocumentKind | null | undefined, size: string, source: DocumentInjectionSource, pdfParser = true): string {
+  if (kind === "pdf" && pdfParser) {
     const tool = "请用 pipiui_firecrawl_pdf 工具本地解析该绝对路径（不要用 read）。默认本地提取文字，不会上传；仅当页面需要 OCR 且已配置可选 OCR Key 时才会上传。";
     return source === "composer"
       ? `。${tool}`
       : `。文件已在右侧面板打开（${kind}${size}）；${tool}打开预览本身不会解析。`;
+  }
+  if (kind === "pdf") {
+    const hint = "当前未启用 PDF 解析扩展（PipiUI PDF），无法本地提取该文件文字；可在 设置 → 扩展 中启用后重新发送。";
+    return source === "composer"
+      ? `。${hint}`
+      : `。文件已在右侧面板打开（${kind}${size}）；${hint}打开预览本身不会解析。`;
   }
   const tool = "请用 pipiui_firecrawl_anydoc 工具本地解析该绝对路径（不要用 read）。转换在本地完成，不会上传。";
   return source === "composer"
@@ -147,7 +153,7 @@ function binaryParseHint(kind: DocumentKind | null | undefined, size: string, so
 /** Path + readable excerpt (or a local parse hint) so the model can see an opened document. */
 export function documentsOpenedInjection(
   entries: readonly DocumentInjectionEntry[],
-  options?: { source?: DocumentInjectionSource },
+  options?: { source?: DocumentInjectionSource; /** False when the host knows the pdf-extension parser is not mounted for this session's project; omits the parser-tool recommendation. */ pdfParser?: boolean },
 ): string {
   const source = options?.source === "composer" ? "composer" : "panel";
   const opened = source === "composer" ? "[输入框] 用户附上了文档：" : "[文档面板] 用户打开了文档：";
@@ -163,7 +169,7 @@ export function documentsOpenedInjection(
     }
     const size = typeof entry.size === "number" ? `，约 ${formatDocumentSize(entry.size)}` : "";
     const hint = entry.binary
-      ? binaryParseHint(kind, size, source)
+      ? binaryParseHint(kind, size, source, options?.pdfParser)
       : source === "composer"
         ? "。文件在磁盘上，可读取。"
         : "。文件在磁盘上，可读取与编辑；面板会自动刷新。";
@@ -1083,10 +1089,6 @@ export interface PipiHostAPI {
    */
   getScanExternalSessions?(): Promise<boolean>;
   setScanExternalSessions?(enabled: boolean): Promise<boolean>;
-  /** Project-scoped PaddleOCR AI Studio token. Renderer only receives hasKey, never the secret. */
-  getPaddleOcrStatus?(projectId: string): Promise<{ hasKey: boolean }>;
-  /** Pass a new token or null to clear. Never returned back to the renderer. */
-  setPaddleOcrAccessToken?(projectId: string, token: string | null): Promise<{ hasKey: boolean }>;
   /**
    * Project-scoped web search provider API keys.
    * Returns which non-empty `*ApiKey` fields are configured; values never cross this boundary.
@@ -1212,8 +1214,9 @@ export interface PipiHostAPI {
   /** Official pi `extension_ui_*` channel (spec D12). Older hosts may omit it. */
   subscribeExtUi?(listener: (event: ExtUiEvent) => void): Unsubscribe;
   extensionUiResponse?(sessionId: string, requestId: string, response: ExtUiResponse): Promise<void>;
-  getExtensionSettings?(id: string): Promise<Record<string, unknown>>;
-  updateExtensionSettings?(id: string, patch: Record<string, unknown>): Promise<ExtInvokeResult<Record<string, unknown>>>;
+  /** Project-scoped manifests resolve settings against the given project; omitted = app scope / current project default. */
+  getExtensionSettings?(id: string, projectId?: string): Promise<Record<string, unknown>>;
+  updateExtensionSettings?(id: string, patch: Record<string, unknown>, projectId?: string): Promise<ExtInvokeResult<Record<string, unknown>>>;
   /** Reserved: M2 wires this to the session's pi RPC. */
   invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
   listExtensions?(projectId?: string): Promise<ExtensionDescriptor[]>;
@@ -1342,8 +1345,6 @@ function apiFrom(
     setVisionEnabled: enabled => invoke("setVisionEnabled", enabled),
     getScanExternalSessions: () => invoke("getScanExternalSessions"),
     setScanExternalSessions: enabled => invoke("setScanExternalSessions", enabled),
-    getPaddleOcrStatus: projectId => invoke("getPaddleOcrStatus", projectId),
-    setPaddleOcrAccessToken: (projectId, token) => invoke("setPaddleOcrAccessToken", projectId, token),
     getWebSearchKeys: projectId => invoke("getWebSearchKeys", projectId),
     setWebSearchKeys: (projectId, keys) => invoke("setWebSearchKeys", projectId, keys),
     listSecretVault: sessionId => invoke("listSecretVault", sessionId),
@@ -1391,8 +1392,8 @@ function apiFrom(
       event => listener((event as Extract<HostEvent, { channel: "extui" }>).event),
     ),
     extensionUiResponse: (sessionId, requestId, response) => invoke("extensionUiResponse", sessionId, requestId, response),
-    getExtensionSettings: id => invoke("getExtensionSettings", id),
-    updateExtensionSettings: (id, patch) => invoke("updateExtensionSettings", id, patch),
+    getExtensionSettings: (id, projectId) => projectId === undefined ? invoke("getExtensionSettings", id) : invoke("getExtensionSettings", id, projectId),
+    updateExtensionSettings: (id, patch, projectId) => projectId === undefined ? invoke("updateExtensionSettings", id, patch) : invoke("updateExtensionSettings", id, patch, projectId),
     invokeExtension: (id, method, params, opts) => opts === undefined
       ? invoke("invokeExtension", id, method, params)
       : invoke("invokeExtension", id, method, params, opts),

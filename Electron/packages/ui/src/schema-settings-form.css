@@ -10,3 +10,7 @@
 .ext-schema-control:focus{border-color:var(--accent)}
 .ext-schema-check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text)}
 .ext-schema-check input{margin:0}
+.ext-schema-secret-row{display:flex;align-items:center;gap:6px}
+.ext-schema-secret-row .ext-schema-control{flex:1;min-width:0}
+.ext-schema-secret-clear{border:1px solid var(--border-strong);background:transparent;color:var(--muted);border-radius:5px;padding:3px 8px;font-size:11px;cursor:pointer}
+.ext-schema-secret-clear:hover{color:var(--danger);border-color:var(--danger)}

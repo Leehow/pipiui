@@ -1,0 +1,19 @@
+{
+  "name": "@pipiui/pipiui-pdf-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "PipiUI PDF extension: local PDF validation/download, vendored @firecrawl/pdf-inspector native/WASM adapter, auto/fast/ocr routing, and the PaddleOCR NDJSON MCP client behind pipiui_firecrawl_pdf.",
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs pipiui-pdf-extension",
+    "pretest": "npm run build",
+    "test": "vitest run",
+    "clean": "rm -rf agent/dist"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

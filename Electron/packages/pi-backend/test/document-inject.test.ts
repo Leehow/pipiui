@@ -61,4 +61,16 @@ describe("document injection", () => {
     expect(text).toContain("默认本地提取文字");
     expect(text).not.toContain("请用 read 工具");
   });
+
+  it("stops recommending the parser tool when the pdf-extension is disabled", async () => {
+    root = await mkdtemp(join(tmpdir(), "doc-inject-pdf-off-"));
+    const pdf = join(root, "scan.pdf");
+    await writeFile(pdf, Buffer.from("%PDF-1.4\n"));
+    for (const source of ["panel", "composer"] as const) {
+      const text = await buildDocumentsOpenedInjection([pdf], { source, pdfParser: false });
+      expect(text).toContain(pdf);
+      expect(text).not.toContain("pipiui_firecrawl_pdf");
+      expect(text).toContain("未启用 PDF 解析扩展");
+    }
+  });
 });

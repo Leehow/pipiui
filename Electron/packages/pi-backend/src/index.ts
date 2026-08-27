@@ -1,5 +1,5 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
-import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, watch, writeSync, promises as fs } from "node:fs";
+import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -128,6 +128,7 @@ import {
   listSessionMounts,
   loadVault,
   memoryVaultDiagnosis,
+  MIN_SECRET_LEN,
   mountSecret,
   putSecret,
   createSessionRedactionGate,
@@ -166,7 +167,7 @@ import {
 import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-telemetry.js";
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
-import { paddleocrHasKey, writePaddleocrAccessToken } from "./paddleocr-key.js";
+import { readPaddleocrAccessToken, writePaddleocrAccessToken } from "./paddleocr-key.js";
 import {
   createExtensionRegistry,
   readAppExtensionEnabled,
@@ -191,8 +192,11 @@ import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
 import {
+  clearExtensionSecrets,
+  extensionSecretEnvs,
   mediaCompatFallbackEnvFromSettings,
   putExtensionSecrets,
+  secretEnvName,
   readAppExtensionSettingsDocument,
   readAppExtensionSettingsValues,
   readProjectExtensionSettingsDocument,
@@ -205,6 +209,10 @@ import {
   writeProjectExtensionSettingsValues,
 } from "./extension-settings.js";
 import { migrateExtensionSettings } from "./extension-migrations.js";
+/** Bundled PDF parser extension (registry-owned `pipiui_firecrawl_pdf`). */
+const PDF_EXTENSION_ID = "pdf-extension";
+/** Namespaced project-scoped secret settings key for the PaddleOCR AI Studio token. */
+const PDF_EXTENSION_SECRET_KEY = "ext.pdf-extension.aistudioAccessToken";
 import {
   evaluateCapabilityGrant,
   grantFromConfirmation,
@@ -3254,10 +3262,6 @@ export class PiHostBackend implements HostBackend {
         return this.loadScanExternalSessions();
       case "setScanExternalSessions":
         return this.saveScanExternalSessions(params[0]);
-      case "getPaddleOcrStatus":
-        return this.loadPaddleOcrStatus(params[0]);
-      case "setPaddleOcrAccessToken":
-        return this.savePaddleOcrAccessToken(params[0], params[1]);
       case "getWebSearchKeys":
         return this.loadWebSearchKeys(params[0]);
       case "setWebSearchKeys":
@@ -3457,12 +3461,40 @@ export class PiHostBackend implements HostBackend {
   private documentInjectionOptions(source: "panel" | "composer") {
     return { source, anydocRoot: join(this.runtimeRoot, "anydoc") };
   }
+  /**
+   * Whether new spawns of this session's project mount the pdf-extension parser.
+   * Mirrors `registeredExtensionsForSpawn` enablement so document-open injection can
+   * stop recommending `pipiui_firecrawl_pdf` when it would be unavailable.
+   */
+  private async pdfParserMounted(sessionId?: string): Promise<boolean> {
+    try {
+      const id = sessionId?.trim();
+      // A live session speaks with the mount snapshot it was spawned under
+      // (PIPIUI_MOUNTED_EXTENSIONS / registry mountSession), not today's overlay:
+      // mid-session enablement must not advertise a tool the running child lacks,
+      // and mid-session disablement must not suppress one that stays mounted.
+      if (id && this.live.has(id)) {
+        return this.extensions.isMounted(id, PDF_EXTENSION_ID);
+      }
+      // No live child (or unknown session): the next send respawns, so the current
+      // overlay is exactly what a new session would mount.
+      const projectRoot = sessionId && this.live.get(sessionId)?.cwd
+        ? this.verifiedProjectRoot(this.live.get(sessionId)!.cwd)
+        : this.extensionLoader.loadedProject();
+      this.extensionLoader.scan(projectRoot);
+      const overlay = await this.mergedExtensionOverlay(projectRoot);
+      return this.extensions.list(overlay).find((item) => item.id === PDF_EXTENSION_ID)?.state === "enabled";
+    } catch {
+      return false;
+    }
+  }
   private async notifyDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
     const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
     this.rememberOpenedDocuments(list);
     const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
     if (!supported.length) return;
-    const injection = await buildDocumentsOpenedInjection(supported, this.documentInjectionOptions("panel"));
+    const parserMounted = await this.pdfParserMounted(typeof sessionId === "string" ? sessionId.trim() : undefined);
+    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("panel"), pdfParser: parserMounted });
     if (!injection) return;
     if (typeof sessionId !== "string" || !sessionId.trim()) {
       console.warn("[document-drop] no active session; skip announce");
@@ -3475,7 +3507,8 @@ export class PiHostBackend implements HostBackend {
     const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
     const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
     if (!supported.length) return;
-    const injection = await buildDocumentsOpenedInjection(supported, this.documentInjectionOptions("composer"));
+    const parserMounted = await this.pdfParserMounted(typeof sessionId === "string" ? sessionId.trim() : undefined);
+    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("composer"), pdfParser: parserMounted });
     if (!injection) return;
     if (typeof sessionId !== "string" || !sessionId.trim()) {
       console.warn("[composer-docs] no active session; skip announce");
@@ -5806,22 +5839,71 @@ export class PiHostBackend implements HostBackend {
     const paths = await this.loadProjectPaths();
     return paths[0];
   }
+  /**
+   * Opaque in-memory vault namespace for extension secret settings. Vault namespaces are
+   * keys, never disk paths; project-scoped secrets must not collide across projects.
+   */
+  private extensionVaultNamespace(scope: string | undefined, projectRoot?: string): string {
+    if (scope !== "project" || !projectRoot) return this.vaultDir;
+    // Canonicalize like verifiedProjectRoot so every caller — settings IPC and spawn
+    // registration alike — lands on the same namespace even across macOS /var↔/private/var.
+    let canonical = resolve(projectRoot);
+    try {
+      canonical = realpathSync(canonical);
+    } catch {
+      /* keep the lexical resolution */
+    }
+    return `${this.vaultDir}?extension-project=${canonical}`;
+  }
+  /** Env contract between host secret delivery and the pdf-extension agent half. */
+  private pdfExtensionSecretEnvName(): string {
+    return secretEnvName(PDF_EXTENSION_SECRET_KEY);
+  }
   private async getExtensionSettings(idValue: unknown, projectId?: unknown): Promise<Record<string, unknown>> {
     if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
     const id = idValue.trim();
     if (!this.extensions.get(id)) throw new Error(`unknown extension ${id}`);
     const manifest = this.extensions.settingsManifest(id);
     const secretKeys = secretPropertyKeys(manifest?.schema);
-    const presence = secretPresence(this.vaultDir, secretKeys);
     const scope = manifest?.scope ?? "app";
     if (scope === "project") {
       const root = await this.resolveExtensionSettingsProject(projectId);
-      if (!root) return { ...presence };
+      if (!root) return { ...secretPresence(this.vaultDir, secretKeys) };
+      // Derived legacy migration: paddleocr.json counts as configured until superseded
+      // through this channel. Presence only — never echoes the token itself.
+      const legacyConfigured = id === PDF_EXTENSION_ID && secretKeys.has(PDF_EXTENSION_SECRET_KEY)
+        ? Boolean(await this.legacyPaddleOcrToken(root))
+        : false;
+      const presence = {
+        ...(legacyConfigured ? { [PDF_EXTENSION_SECRET_KEY]: true as const } : {}),
+        ...secretPresence(this.extensionVaultNamespace(scope, root), secretKeys),
+      };
       const values = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
       return { ...values, ...presence };
     }
     const values = readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
-    return { ...values, ...presence };
+    return { ...values, ...secretPresence(this.vaultDir, secretKeys) };
+  }
+  /**
+   * TEMPORARY pdf-extension adapter: project the generic-settings value into its one
+   * canonical DURABLE store ({projectAgentHome}/paddleocr.json, atomic 0600) BEFORE
+   * the per-run vault cache, so replacement and clear survive backend/App restart
+   * with a single canonical value and no legacy fallback resurrection. The file is
+   * never read for any other settings key and Firecrawl/web-search data is untouched.
+   */
+  private async projectPdfLegacyStore(
+    extensionId: string,
+    projectRoot: string,
+    mutation: { saved?: Record<string, string>; cleared?: readonly string[] },
+  ): Promise<void> {
+    if (extensionId !== PDF_EXTENSION_ID || !projectRoot) return;
+    const agentHome = await this.legacyPaddleOcrAgentDir(projectRoot);
+    if (mutation.saved && typeof mutation.saved[PDF_EXTENSION_SECRET_KEY] === "string") {
+      await writePaddleocrAccessToken(agentHome, mutation.saved[PDF_EXTENSION_SECRET_KEY]);
+    }
+    if (mutation.cleared?.includes(PDF_EXTENSION_SECRET_KEY)) {
+      await writePaddleocrAccessToken(agentHome, null);
+    }
   }
   private async updateExtensionSettings(
     idValue: unknown,
@@ -5839,6 +5921,40 @@ export class PiHostBackend implements HostBackend {
     const manifest = this.extensions.settingsManifest(id);
     const validated = validateExtensionSettingsPatch(id, manifest?.schema, patchValue);
     if (!validated.ok) return settingsDenied(validated.code, validated.message);
+    // Reject sub-vault-minimum secrets BEFORE any durable projection: the pdf-extension
+    // canonical store writes project-side first, so a late vault failure would otherwise
+    // half-apply a value the renderer was told was denied.
+    const shortSecret = Object.entries(validated.secrets).find(([, value]) => value.length < MIN_SECRET_LEN);
+    if (shortSecret) {
+      return settingsDenied("capability_denied", `secret values must be at least ${MIN_SECRET_LEN} characters`);
+    }
+    const scope = manifest?.scope ?? "app";
+    if (scope === "project") {
+      const root = await this.resolveExtensionSettingsProject(projectId);
+      if (!root) return settingsDenied("no_session", "project-scoped settings require a project");
+      const namespace = this.extensionVaultNamespace(scope, root);
+      // Durable projection first: paddleocr.json is authoritative across restarts.
+      await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
+      if (Object.keys(validated.secrets).length > 0) {
+        try {
+          await putExtensionSecrets(namespace, validated.secrets);
+        } catch (error) {
+          return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+        }
+      }
+      if (validated.cleared.length > 0) {
+        try {
+          await clearExtensionSecrets(namespace, validated.cleared);
+        } catch (error) {
+          return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+        }
+      }
+      const secretKeys = secretPropertyKeys(manifest?.schema);
+      const existing = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
+      const next = { ...existing, ...validated.values };
+      await writeProjectExtensionSettingsValues(projectPiAgentDir(root), id, next, manifest?.settingsVersion);
+      this.notifyExtensionSettingsChanged(id, next);      return { ok: true, data: next };
+    }
     if (Object.keys(validated.secrets).length > 0) {
       try {
         await putExtensionSecrets(this.vaultDir, validated.secrets);
@@ -5846,16 +5962,14 @@ export class PiHostBackend implements HostBackend {
         return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
       }
     }
-    const secretKeys = secretPropertyKeys(manifest?.schema);
-    const scope = manifest?.scope ?? "app";
-    if (scope === "project") {
-      const root = await this.resolveExtensionSettingsProject(projectId);
-      if (!root) return settingsDenied("no_session", "project-scoped settings require a project");
-      const existing = await readProjectExtensionSettingsValues(projectPiAgentDir(root), id, secretKeys);
-      const next = { ...existing, ...validated.values };
-      await writeProjectExtensionSettingsValues(projectPiAgentDir(root), id, next, manifest?.settingsVersion);
-      this.notifyExtensionSettingsChanged(id, next);      return { ok: true, data: next };
+    if (validated.cleared.length > 0) {
+      try {
+        await clearExtensionSecrets(this.vaultDir, validated.cleared);
+      } catch (error) {
+        return settingsDenied("agent_error", error instanceof Error ? error.message : String(error));
+      }
     }
+    const secretKeys = secretPropertyKeys(manifest?.schema);
     const next = await this.updateSettings((settings) => {
       const existing = readAppExtensionSettingsValues(settings, id, secretKeys);
       const merged = { ...existing, ...validated.values };
@@ -6034,6 +6148,27 @@ export class PiHostBackend implements HostBackend {
     }
     return readAppExtensionSettingsValues(await this.readSettings(), id, secretKeys);
   }
+  /**
+   * Spawn-time secret delivery for one enabled extension: manifest secret keys are read
+   * from the extension vault namespace (a per-run cache mirroring each key's durable
+   * store) and returned keyed by env var name. Values never enter settings snapshots,
+   * IPC payloads, or redaction/transcript surfaces. For pdf-extension the durable
+   * store is `{projectAgentHome}/paddleocr.json`, kept in lockstep by the generic
+   * channel, so post-restart spawns resolve the identical value here.
+   */
+  private async spawnSecretEnvFor(extensionId: string, projectRoot: string): Promise<Record<string, string>> {
+    const manifest = this.extensions.settingsManifest(extensionId);
+    const keys = secretPropertyKeys(manifest?.schema);
+    if (!keys.size) return {};
+    const namespace = this.extensionVaultNamespace(manifest?.scope, projectRoot);
+    const env = extensionSecretEnvs(namespace, keys);
+    const missing = [...keys].filter((key) => !(secretEnvName(key) in env));
+    if (extensionId === PDF_EXTENSION_ID && missing.includes(PDF_EXTENSION_SECRET_KEY)) {
+      const token = await this.legacyPaddleOcrToken(projectRoot);
+      if (token) env[this.pdfExtensionSecretEnvName()] = token;
+    }
+    return env;
+  }
   private async registeredExtensionsForSpawn(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
     this.extensionLoader.scan(projectRoot);
     const overlay = await this.mergedExtensionOverlay(projectRoot);
@@ -6062,7 +6197,13 @@ export class PiHostBackend implements HostBackend {
           console.warn(`[pipiui-headroom] managed runtime unavailable: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
-      out.push({ ...pkg, settings });
+      let secretEnv: Record<string, string> = {};
+      try {
+        secretEnv = await this.spawnSecretEnvFor(pkg.id, projectRoot);
+      } catch (error) {
+        console.warn(`[${pkg.id}] spawn secret resolution failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}) });
     }
     return out;
   }
@@ -6324,25 +6465,27 @@ export class PiHostBackend implements HostBackend {
     this.scanExternalSessionsLoaded = Promise.resolve();
     return value;
   }
-  private async paddleOcrAgentDir(projectId: unknown): Promise<string> {
-    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");
-    const path = await this.projectPath(projectId);
+  private async legacyPaddleOcrAgentDir(projectRoot: string): Promise<string> {
     if (this.profileMode === "isolated") {
-      const home = await this.ensureIsolatedProjectHome(path);
-      if (!home) throw new Error("isolated project home is unavailable");
-      return home.agentDir;
+      const home = await this.ensureIsolatedProjectHome(projectRoot);
+      if (home) return home.agentDir;
     }
     return this.agentDir;
   }
-  private async loadPaddleOcrStatus(projectId: unknown): Promise<{ hasKey: boolean }> {
-    const agentDir = await this.paddleOcrAgentDir(projectId);
-    return { hasKey: await paddleocrHasKey(agentDir) };
-  }
-  private async savePaddleOcrAccessToken(projectId: unknown, token: unknown): Promise<{ hasKey: boolean }> {
-    if (token !== null && typeof token !== "string") throw new Error("token 必须是 string 或 null");
-    const agentDir = await this.paddleOcrAgentDir(projectId);
-    const hasKey = await writePaddleocrAccessToken(agentDir, token);
-    return { hasKey };
+  /**
+   * Legacy durable PaddleOCR token (`{projectAgentHome}/paddleocr.json`). Read-only:
+   * it feeds derived settings presence and the spawn secret env when the vault has no
+   * value yet. Never rewritten or deleted here — the file stays the migration source
+   * until a durable generic secret store exists (the in-memory vault does not survive
+   * App restarts).
+   */
+  private async legacyPaddleOcrToken(projectRoot?: string): Promise<string | undefined> {
+    if (!projectRoot) return undefined;
+    try {
+      return await readPaddleocrAccessToken(await this.legacyPaddleOcrAgentDir(projectRoot));
+    } catch {
+      return undefined;
+    }
   }
   private async webSearchAgentDir(projectId: unknown): Promise<string> {
     if (typeof projectId !== "string" || !projectId.trim()) throw new Error("projectId 必须是 string");

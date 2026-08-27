@@ -88,9 +88,13 @@ describe('macOS packaging contract', () => {
       ]
     }))
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
-      from: '../../resources/runtime/pdf-inspector/node_modules',
-      to: 'pipiui-runtime/pdf-inspector/node_modules',
-      filter: ['**/*', '!**/.bin', '!**/.bin/**']
+      from: '../../resources/runtime/extensions/pdf-extension',
+      to: 'pipiui-runtime/extensions/pdf-extension',
+      filter: expect.arrayContaining([
+        '**/*',
+        '!vendor/pdf-inspector/node_modules/.bin',
+        '!vendor/pdf-inspector/node_modules/.bin/**'
+      ])
     }))
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/anydoc/node_modules',

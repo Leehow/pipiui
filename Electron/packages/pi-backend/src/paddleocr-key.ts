@@ -1,6 +1,19 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+/**
+ * TEMPORARY pdf-extension legacy-token adapter (`{projectAgentHome}/paddleocr.json`).
+ *
+ * The PDF parser lives in the bundled `pdf-extension` package; its secret is managed
+ * through project-scoped extension settings (`ext.pdf-extension.aistudioAccessToken`).
+ * Because the in-memory vault does not survive backend/App restart, this file is the
+ * one canonical DURABLE projection for that single key: the generic channel writes
+ * replacements here first (atomic 0600), then mirrors them into the per-run vault
+ * cache, and clearing removes the field here plus the vault entry — so neither a
+ * replacement nor a clear can revert or resurrect after restart. Read helpers also
+ * seed presence/spawn delivery for values saved before this contract existed.
+ * `web-search.json` (including its legacy `firecrawlApiKey`) is never read.
+ */
 export const PADDLEOCR_CONFIG_NAME = "paddleocr.json";
 export const PADDLEOCR_TOKEN_FIELD = "aistudioAccessToken";
 
@@ -53,7 +66,16 @@ async function writePaddleocrConfigAtomic(agentDir: string, next: JsonObject): P
   }
 }
 
-/** Persist or clear the AI Studio token. Never writes into web-search.json. */
+/**
+ * Durable write/clear of the AI Studio token — the TEMPORARY pdf-extension migration
+ * adapter. After the cutover the generic extension-settings channel is the only UI,
+ * and this file is its one canonical durable projection for `pdf-extension`:
+ * saving routes here FIRST (atomic 0600 replace), then into the project vault
+ * namespace as a per-run spawn cache; clearing removes the field here AND the vault
+ * entry, so neither replacement nor clear can revert when the memory-only vault
+ * resets on backend/App restart. Other documents (notably web-search.json with its
+ * legacy firecrawlApiKey) are never read or written.
+ */
 export async function writePaddleocrAccessToken(agentDir: string, token: string | null): Promise<boolean> {
   const current = await readPaddleocrConfig(agentDir);
   const next = { ...current };
@@ -63,15 +85,3 @@ export async function writePaddleocrAccessToken(agentDir: string, token: string 
   await writePaddleocrConfigAtomic(agentDir, next);
   return Boolean(trimmed);
 }
-
-export function paddleocrMcpEnv(token?: string): Record<string, string> {
-  const env: Record<string, string> = {
-    PADDLEOCR_MCP_MODEL: "PaddleOCR-VL-1.6",
-    PADDLEOCR_MCP_PPOCR_SOURCE: "aistudio",
-  };
-  if (token) env.PADDLEOCR_MCP_AISTUDIO_ACCESS_TOKEN = token;
-  return env;
-}
-
-export const PADDLEOCR_MCP_COMMAND = "uvx";
-export const PADDLEOCR_MCP_ARGS = ["--from", "paddleocr-mcp", "paddleocr_mcp"] as const;

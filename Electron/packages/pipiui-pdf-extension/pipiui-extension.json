@@ -1,0 +1,28 @@
+{
+  "id": "pdf-extension",
+  "name": "PipiUI PDF",
+  "version": "0.1.0",
+  "description": "Local PDF parsing and OCR for the pipiui_firecrawl_pdf agent tool: pdf-inspector native/WASM adapter, auto/fast/ocr routing, and PaddleOCR-VL MCP. Text PDFs never leave the machine.",
+  "capabilities": [],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "settingsVersion": 1,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.pdf-extension.aistudioAccessToken": {
+            "type": "string",
+            "format": "secret",
+            "title": "PaddleOCR AI Studio Access Token",
+            "description": "可选：用于扫描/图片页的 PaddleOCR-VL-1.6 在线识别。只保存在项目密钥库，不会回显。文字型 PDF 始终本地解析，不需要此 Token。"
+          }
+        }
+      }
+    }
+  },
+  "runtimeAssets": ["vendor/pdf-inspector"]
+}

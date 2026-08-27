@@ -73,4 +73,33 @@ describe('SchemaSettingsForm', () => {
     await waitFor(() => expect(updateExtensionSettings).toHaveBeenCalledWith('quota', { 'ext.quota.apiKey': 'sk-new' }))
     expect(listSecretVault).not.toHaveBeenCalled()
   })
+
+  it('project-scoped forms fetch/save/clear against the explicit project and revert on a resolved denial', async () => {
+    const updateExtensionSettings = vi
+      .fn<(patch: Record<string, unknown>) => Promise<{ ok: boolean; error?: { code: string; message: string } }>>()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({ ok: false, error: { code: 'capability_denied', message: 'denied-by-test' } })
+    const getExtensionSettings = vi.fn(async (_id: string, _projectId?: string) => ({ 'ext.quota.apiKey': true }))
+    const host = { getExtensionSettings, updateExtensionSettings } as unknown as PipiHostAPI
+
+    render(<SchemaSettingsForm schema={schema} host={host} extensionId="quota" projectId="proj-b" />)
+    // Fetch routes through the selected project, not the first-project default.
+    await waitFor(() => expect(getExtensionSettings).toHaveBeenCalledWith('quota', 'proj-b'))
+    const secret = await screen.findByTestId('ext-schema-field-ext.quota.apiKey') as HTMLInputElement
+    await waitFor(() => expect(secret.placeholder).toContain('已配置'))
+
+    // A replacement save carries the same explicit project id.
+    fireEvent.change(secret, { target: { value: 'tok-b-value' } })
+    await waitFor(() => expect(updateExtensionSettings).toHaveBeenCalledWith('quota', { 'ext.quota.apiKey': 'tok-b-value' }, 'proj-b'))
+    expect(await screen.queryByRole('alert')).toBeNull()
+
+    // A resolved (non-rejected) {ok:false} must surface the error and refetch,
+    // leaving no optimistic local state behind.
+    const clearButton = await screen.findByTestId('ext-schema-field-ext.quota.apiKey-clear')
+    fireEvent.click(clearButton)
+    await waitFor(() => expect(updateExtensionSettings).toHaveBeenCalledWith('quota', { 'ext.quota.apiKey': null }, 'proj-b'))
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('denied-by-test'))
+    await waitFor(() => expect(getExtensionSettings).toHaveBeenCalledTimes(2))
+    expect(getExtensionSettings).toHaveBeenLastCalledWith('quota', 'proj-b')
+  })
 })
