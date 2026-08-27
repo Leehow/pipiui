@@ -49,12 +49,28 @@ describe("generic web_search filter — shared predicates", () => {
     expect(hidesGenericWebSearch(undeclaredXai)).toBe(false);
     expect(hidesGenericWebSearch(codeOnly)).toBe(false);
     expect(hidesGenericWebSearch(fullHosted)).toBe(true);
-    expect(extraExcludedGenericSearchTools(nativeWeb)).toEqual(["web_search"]);
-    expect(extraExcludedGenericSearchTools(hostedWeb)).toEqual(["web_search"]);
+    expect(extraExcludedGenericSearchTools(nativeWeb)).toEqual(["web_search", "browser_search", "browser_fetch"]);
+    expect(extraExcludedGenericSearchTools(hostedWeb)).toEqual(["web_search", "browser_search", "browser_fetch"]);
     expect(extraExcludedGenericSearchTools(xOnly)).toEqual([]);
     expect(extraExcludedGenericSearchTools(codeOnly)).toEqual([]);
     expect(extraExcludedGenericSearchTools(ordinary)).toEqual([]);
     expect(extraExcludedGenericSearchTools(undeclaredXai)).toEqual([]);
+    // DeepSeek Extended suppresses the local browser-search route alongside generic web_search.
+    const deepseekExtended = {
+      provider: "deepseek-extended",
+      id: "deepseek-v4-flash",
+      capabilities: {
+        hostedTools: { tools: ["web_search"] as const },
+        structuredOutputs: true as const,
+        nativeSearch: { tools: ["web_search"] as const },
+      },
+    };
+    expect(hidesGenericWebSearch(deepseekExtended)).toBe(true);
+    expect(extraExcludedGenericSearchTools(deepseekExtended)).toEqual([
+      "web_search",
+      "browser_search",
+      "browser_fetch",
+    ]);
   });
 
   it("stamps effective nativeSearch into the worker catalog without provider branches at lookup", () => {

@@ -74,7 +74,7 @@ describe("native-search capability contract", () => {
     expect(effectiveNativeSearchOf({ provider: "xai" })).toBeUndefined();
     expect(effectiveModelHidesGenericWebSearch({ provider: "xai" })).toBe(false);
     expect(effectiveModelHidesGenericWebSearch({ provider: "xai", capabilities: { nativeSearch: { tools: ["x_search"] } } })).toBe(false);
-    expect(extraExcludedToolsForNativeSearch(web)).toEqual(["web_search"]);
+    expect(extraExcludedToolsForNativeSearch(web)).toEqual(["web_search", "browser_search", "browser_fetch"]);
     expect(extraExcludedToolsForNativeSearch(xOnly)).toEqual([]);
     expect(extraExcludedToolsForNativeSearch({ provider: "xai" })).toEqual([]);
   });
@@ -169,7 +169,7 @@ describe("native-search capability contract", () => {
       expect(extraExcludedToolsForNativeSearch(codeOnly)).toEqual([]);
       expect(extraExcludedToolsForNativeSearch({
         capabilities: { hostedTools: { tools: ["web_search"] } },
-      })).toEqual(["web_search"]);
+      })).toEqual(["web_search", "browser_search", "browser_fetch"]);
     });
 
   it("gates structuredOutputs and inputFiles only when explicitly declared",

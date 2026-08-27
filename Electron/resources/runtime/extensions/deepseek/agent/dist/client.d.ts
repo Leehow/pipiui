@@ -33,6 +33,19 @@ export declare function chatCompletionsUrl(baseUrl: string): string;
 export declare function responsesUrl(baseUrl: string): string;
 /** Drop stateful Responses fields so every request is a full replay. */
 export declare function withoutStatefulFields<T extends Record<string, unknown>>(body: T): T;
+/** Official DeepSeek Responses built-in tool: server-executed web search. */
+export declare const DEEPSEEK_WEB_SEARCH_BUILTIN: Readonly<{
+    type: "web_search";
+}>;
+/**
+ * Capability-gated enablement of DeepSeek server-native search on the Responses
+ * path: inject the official built-in `{type:"web_search"}` exactly once, strip
+ * every local search function tool (`web_search`, `browser_search`,
+ * `browser_fetch`) so a stale spawn's tool list can never leak them to the
+ * wire, and preserve every other tool. Unsupported models are returned
+ * untouched — search support is never pretended.
+ */
+export declare function mergeHostedWebSearchTool<T>(payload: T, supported: boolean): T;
 export declare function rewriteDeepSeekPayload<T>(payload: T): T;
 export declare function rewriteDeepSeekPayloadAsync<T>(payload: T, options?: FilesRewriteOptions & {
     apiKey?: string;

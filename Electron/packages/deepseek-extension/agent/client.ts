@@ -62,6 +62,74 @@ export function withoutStatefulFields<T extends Record<string, unknown>>(body: T
   return next;
 }
 
+/** Official DeepSeek Responses built-in tool: server-executed web search. */
+export const DEEPSEEK_WEB_SEARCH_BUILTIN = Object.freeze({ type: "web_search" });
+
+/**
+ * Local tools whose job is taken over by the hosted built-in: the PipiUI
+ * generic web search plus the browser-search route. Mirrors host-api's
+ * `NATIVE_SEARCH_EXCLUDED_LOCAL_TOOLS` (kept there for spawn argv / UI
+ * catalogs); enforced here so the outbound payload is clean even when a
+ * session was spawned before those tools were hidden.
+ */
+const LOCAL_SEARCH_FUNCTION_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "web_search",
+  "browser_search",
+  "browser_fetch",
+]);
+
+function isBuiltinWebSearchTool(tool: unknown): boolean {
+  return isRecord(tool) && tool.type === "web_search" && !isRecord(tool.function);
+}
+
+/**
+ * True only for function tools whose exact name is a local search tool, in
+ * either Responses shape (`{type:"function", name}`) or Chat Completions
+ * shape (`{type:"function", function:{name}}`). Anything that is not a
+ * function tool — built-ins (`type` only) and other typed tools such as
+ * `{type:"custom", name:"web_search"}` — is never matched, however its name
+ * reads; merely similar names (e.g. `web_search_preview`) never match either.
+ */
+function isLocalSearchFunctionTool(tool: unknown): boolean {
+  if (!isRecord(tool) || tool.type !== "function") return false;
+  if (typeof tool.name === "string") return LOCAL_SEARCH_FUNCTION_TOOL_NAMES.has(tool.name);
+  if (isRecord(tool.function)) {
+    const { name } = tool.function;
+    return typeof name === "string" && LOCAL_SEARCH_FUNCTION_TOOL_NAMES.has(name);
+  }
+  return false;
+}
+
+/**
+ * Capability-gated enablement of DeepSeek server-native search on the Responses
+ * path: inject the official built-in `{type:"web_search"}` exactly once, strip
+ * every local search function tool (`web_search`, `browser_search`,
+ * `browser_fetch`) so a stale spawn's tool list can never leak them to the
+ * wire, and preserve every other tool. Unsupported models are returned
+ * untouched — search support is never pretended.
+ */
+export function mergeHostedWebSearchTool<T>(payload: T, supported: boolean): T {
+  if (!supported || !isRecord(payload)) return payload;
+  if (!Array.isArray(payload.tools)) {
+    return { ...payload, tools: [{ ...DEEPSEEK_WEB_SEARCH_BUILTIN }] };
+  }
+  const tools: unknown[] = [];
+  let hasBuiltin = false;
+  for (const tool of payload.tools) {
+    if (isLocalSearchFunctionTool(tool)) continue;
+    if (isBuiltinWebSearchTool(tool)) {
+      if (!hasBuiltin) {
+        tools.push({ ...DEEPSEEK_WEB_SEARCH_BUILTIN });
+        hasBuiltin = true;
+      }
+      continue;
+    }
+    tools.push(tool);
+  }
+  if (!hasBuiltin) tools.push({ ...DEEPSEEK_WEB_SEARCH_BUILTIN });
+  return { ...payload, tools };
+}
+
 export function rewriteDeepSeekPayload<T>(payload: T): T {
   const withImages = rewritePayloadImages(payload);
   const withJson = rewriteJsonOutput(withImages);

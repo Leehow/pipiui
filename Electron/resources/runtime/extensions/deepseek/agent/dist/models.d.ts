@@ -56,6 +56,12 @@ export declare const DEEPSEEK_CAPABILITIES: DeepSeekModelCapabilities;
  */
 export declare const DEEPSEEK_CONVERSATION_MODELS: readonly DeepSeekConversationModel[];
 export declare const DEEPSEEK_CONVERSATION_MODEL_IDS: readonly string[];
+/**
+ * Capability evidence from the canonical catalog: does this DeepSeek Extended
+ * model declare hosted `web_search`? Unknown ids never qualify — search support
+ * comes from declared model capabilities, never from prompts or provider names.
+ */
+export declare function modelSupportsHostedWebSearch(modelId: unknown): boolean;
 /** Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
 export declare function deepseekManifestModels(): Array<{
     id: string;

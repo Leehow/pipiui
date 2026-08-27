@@ -355,10 +355,26 @@ export function effectiveModelHidesGenericWebSearch(
 
 export const GENERIC_WEB_SEARCH_TOOL_NAME = "web_search";
 
+/**
+ * Local browser-search route registered by the built-in browser extension
+ * (`pipiui-browser-search.ts`): `browser_search` + `browser_fetch`. When the
+ * selected model executes search server-side (effective native `web_search`),
+ * these local search surfaces are redundant and leave the tool list with the
+ * generic client `web_search` — same capability predicate, never a provider
+ * branch.
+ */
+export const BROWSER_SEARCH_TOOL_NAMES = ["browser_search", "browser_fetch"] as const;
+
+/** Local search tools suppressed when the model has effective native `web_search`. */
+export const NATIVE_SEARCH_EXCLUDED_LOCAL_TOOLS: readonly string[] = [
+  GENERIC_WEB_SEARCH_TOOL_NAME,
+  ...BROWSER_SEARCH_TOOL_NAMES,
+];
+
 export function extraExcludedToolsForNativeSearch(
   model: { provider?: string; capabilities?: ModelCapabilities } | undefined,
 ): string[] {
-  return effectiveModelHidesGenericWebSearch(model) ? [GENERIC_WEB_SEARCH_TOOL_NAME] : [];
+  return effectiveModelHidesGenericWebSearch(model) ? [...NATIVE_SEARCH_EXCLUDED_LOCAL_TOOLS] : [];
 }
 
 export function nativeSearchDomainPolicyOf(

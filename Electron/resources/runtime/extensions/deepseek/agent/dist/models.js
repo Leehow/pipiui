@@ -73,6 +73,21 @@ export const DEEPSEEK_CONVERSATION_MODELS = [
     },
 ];
 export const DEEPSEEK_CONVERSATION_MODEL_IDS = DEEPSEEK_CONVERSATION_MODELS.map((model) => model.id);
+/**
+ * Capability evidence from the canonical catalog: does this DeepSeek Extended
+ * model declare hosted `web_search`? Unknown ids never qualify — search support
+ * comes from declared model capabilities, never from prompts or provider names.
+ */
+export function modelSupportsHostedWebSearch(modelId) {
+    const id = typeof modelId === "string" ? modelId.trim() : "";
+    if (!id)
+        return false;
+    const model = DEEPSEEK_CONVERSATION_MODELS.find((candidate) => candidate.id === id);
+    const tools = model?.capabilities?.hostedTools.tools.length
+        ? model.capabilities.hostedTools.tools
+        : (model?.capabilities?.nativeSearch.tools ?? []);
+    return tools.includes("web_search");
+}
 /** Pi-shaped contribution used by `pipiui-extension.json` `auth.provider.models`. */
 export function deepseekManifestModels() {
     return DEEPSEEK_CONVERSATION_MODELS.map((model) => ({

@@ -13,6 +13,7 @@ import {
   rewriteChatCompletionsUrlToResponses,
   rewriteDeepSeekRequest,
 } from "../../../resources/runtime/extensions/pipiui-deepseek-server-tools.ts";
+import { processResponsesStream } from "../../../node_modules/@earendil-works/pi-ai/dist/api/openai-responses-shared.js";
 
 const EXTENSION = pathToFileURL(
   join(dirname(fileURLToPath(import.meta.url)), "../../../resources/runtime/extensions/pipiui-deepseek-server-tools.ts"),
@@ -103,6 +104,107 @@ describe("pipiui-deepseek-server-tools", () => {
     expect(tools).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ type: "function", name: "web_search" })]),
     );
+  });
+
+  it("collapses duplicate hosted web_search entries when both extension layers ran", () => {
+    const tools = mergeHostedWebSearch([
+      { type: "web_search" },
+      { type: "function", name: "web_search", parameters: { type: "object" } },
+      { type: "function", function: { name: "bash", parameters: { type: "object" } } },
+      { type: "web_search" },
+    ]);
+    expect(tools).toEqual([
+      { type: "web_search" },
+      { type: "function", name: "bash", parameters: { type: "object" } },
+    ]);
+  });
+
+  it("keeps native web_search_call items off the local tool path in the shared Responses streamer", async () => {
+    const events = [
+      { type: "response.created", response: { id: "resp_ws" } },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { type: "web_search_call", id: "ws_1", status: "in_progress" },
+      },
+      {
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "web_search_call",
+          id: "ws_1",
+          status: "completed",
+          action: { type: "search", query: "pipiui", sources: [{ url: "https://docs.example/a", title: "Docs A" }] },
+        },
+      },
+      { type: "response.output_item.added", output_index: 1, item: { type: "message", role: "assistant" } },
+      { type: "response.output_text.delta", output_index: 1, delta: "Answer with citation." },
+      {
+        type: "response.output_item.done",
+        output_index: 1,
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "Answer with citation." }],
+        },
+      },
+      {
+        type: "response.completed",
+        response: {
+          id: "resp_ws",
+          status: "completed",
+          usage: { input_tokens: 3, output_tokens: 5, total_tokens: 8 },
+        },
+      },
+    ] as unknown[];
+    const output = {
+      role: "assistant",
+      content: [] as Array<{ type?: string; text?: string }>,
+      api: "openai-responses",
+      provider: "deepseek-extended",
+      model: "deepseek-v4-flash",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "pending",
+      timestamp: Date.now(),
+    } as never;
+    const pushed: Array<{ type?: string }> = [];
+    const stream = { push: (event: { type?: string }) => { pushed.push(event); } } as never;
+    const dummyModel = {
+      id: "deepseek-v4-flash",
+      provider: "deepseek-extended",
+      api: "openai-responses",
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    } as never;
+    await processResponsesStream(events as never, output, stream, dummyModel);
+    const message = output as unknown as { content: Array<{ type?: string; text?: string }>; stopReason: string };
+    // Server-side search never becomes a local tool call or a tool-call prompt.
+    expect(message.content.some((block) => block.type === "toolCall")).toBe(false);
+    expect(pushed.some((event) => event.type === "toolcall_start" || event.type === "toolcall_delta")).toBe(false);
+    expect(message.content).toEqual([expect.objectContaining({ type: "text", text: "Answer with citation." })]);
+    expect(message.stopReason).toBe("stop");
+  });
+
+  it("maps native web_search_call output to citations without creating local tool calls", () => {
+    const mapped = mapResponsesToChatCompletions({
+      id: "resp_3",
+      object: "response",
+      output: [
+        {
+          type: "web_search_call",
+          id: "ws_9",
+          status: "completed",
+          action: { type: "search", query: "pipiui", sources: [{ url: "https://docs.example/d", title: "Docs D" }] },
+        },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Done." }] },
+      ],
+    });
+    const message = (mapped?.choices?.[0]?.message ?? {}) as {
+      tool_calls?: unknown;
+      citations?: Array<Record<string, unknown>>;
+    };
+    expect(message.tool_calls ?? []).toEqual([]);
+    expect(mapped?.choices?.[0]?.finish_reason).toBe("stop");
+    expect(message.citations).toEqual([{ url: "https://docs.example/d", title: "Docs D" }]);
   });
 
   it("maps Chat Completions history onto stateless Responses input items", () => {

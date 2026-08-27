@@ -31,6 +31,28 @@ describe("deepseek extension entry", () => {
     expect(hooks.some((hook) => hook.event === "before_provider_request")).toBe(true);
   });
 
+  it("registers every provider model with the capability bag that hides generic web_search", () => {
+    const providers = new Map<string, unknown>();
+    const pi = {
+      registerProvider: (id: string, config: unknown) => {
+        providers.set(id, config);
+      },
+      on: () => undefined,
+    };
+    agent(pi as never);
+    const registered = providers.get(DEEPSEEK_PROVIDER_ID) as ReturnType<typeof createDeepSeekProvider>;
+    for (const model of registered.models) {
+      // DeepSeek's own hosted search stays declared — this exact declaration is
+      // what the host reads to keep the generic PipiUI web_search client tool
+      // out of these models' tool lists (nativeSearch, or the hostedTools
+      // search slice as fallback).
+      expect(model.capabilities?.hostedTools?.tools).toEqual(["web_search"]);
+      expect(model.capabilities?.nativeSearch?.tools).toEqual(["web_search"]);
+      // Sibling capabilities survive untouched.
+      expect(model.capabilities?.structuredOutputs).toBe(true);
+    }
+  });
+
   it("keeps the manifest catalog aligned with deepseekManifestModels", () => {
     const manifest = JSON.parse(
       readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "pipiui-extension.json"), "utf8"),
@@ -41,6 +63,40 @@ describe("deepseek extension entry", () => {
     expect(manifest.auth.provider.models.map((model) => model.id)).toEqual(deepseekManifestModels().map((model) => model.id));
     expect(manifest.auth.provider.models.every((model) => model.api === "openai-responses")).toBe(true);
     expect(manifest.auth.provider.models.every((model) => model.capabilities?.hostedTools?.tools?.includes("web_search"))).toBe(true);
+  });
+
+  it("declares exactly hosted web_search and nothing else in the manifest capabilities", () => {
+    const manifest = JSON.parse(
+      readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "pipiui-extension.json"), "utf8"),
+    ) as {
+      auth: {
+        provider: {
+          models: Array<{
+            id: string;
+            capabilities?: {
+              hostedTools?: { tools?: string[] };
+              structuredOutputs?: unknown;
+              nativeSearch?: { tools?: string[] };
+            };
+          }>;
+        };
+      };
+    };
+    for (const model of manifest.auth.provider.models) {
+      // The bags name only DeepSeek's own hosted web_search — code_interpreter
+      // / x_search are phase 2 and must not creep into the manifest.
+      expect(model.capabilities?.hostedTools?.tools).toEqual(["web_search"]);
+      expect(model.capabilities?.nativeSearch?.tools).toEqual(["web_search"]);
+      expect(model.capabilities?.structuredOutputs).toBe(true);
+    }
+  });
+
+  it("propagates the hide-generic-search capabilities through deepseekManifestModels", () => {
+    for (const model of deepseekManifestModels()) {
+      expect(model.capabilities.hostedTools.tools).toEqual(["web_search"]);
+      expect(model.capabilities.nativeSearch.tools).toEqual(["web_search"]);
+      expect(model.capabilities.structuredOutputs).toBe(true);
+    }
   });
 
   it("rewrites deepseek requests and ignores other providers", async () => {
