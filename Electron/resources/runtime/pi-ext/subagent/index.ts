@@ -46,6 +46,15 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import {
+	DEFAULT_PROGRESS_LOG_REPORT_MS,
+	formatProgressLogReport,
+	progressIdleMs,
+	readProgressLogExcerpt,
+	resolveProgressLogPath,
+	sampleProgressLog,
+	type ProgressLogSample,
+} from "./progress-log.ts";
 import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
 import {
 	cleanScope,
@@ -2326,6 +2335,20 @@ interface RunningAgentHandle {
 	startedAt: number;
 	/** Boss-selected regular check-in interval for this run; absent preserves stepped defaults. */
 	heartbeatMs?: number;
+	/** Boss-tailed live progress log (bundled GP only); samples/forwarding state below stay unset otherwise. */
+	progressLogPath?: string;
+	/** Last watchdog stat() of the progress log; the size/mtime delta pair decides "progressed". */
+	progressLogSample?: ProgressLogSample;
+	/** Forward offset into the progress log: bytes up to here were already consumed for Boss delivery. */
+	progressLogOffset?: number;
+	/** Last time the progress log itself changed (size/mtime); merged with lastActivityAt for idle math. */
+	lastProgressLogAt?: number;
+	/** Forward cadence for progress excerpts: heartbeatSecs when set, else 60s default. */
+	progressLogIntervalMs?: number;
+	/** Progress-forward bookkeeping: last claimed send slot, monotonically growing sequence, one in-flight guard. */
+	lastProgressReportAt?: number;
+	progressReportCount?: number;
+	progressReportInFlight?: boolean;
 	/** Absolute runtime deadline for this exact generation, computed at first child spawn. */
 	deadlineAt?: number;
 	/**
@@ -2585,7 +2608,7 @@ function stalledInfoFor(agentId: string, now: number): {
 } {
 	const handle = runningAgents.get(agentId);
 	if (!handle || handle.finalizing) return { stalled: false, idleSec: 0 };
-	const idleMs = now - handle.lastActivityAt;
+	const idleMs = progressIdleMs(now, handle);
 	const idleSec = Math.max(0, Math.floor(idleMs / 1000));
 	const quiet = idleMs >= STALL_THRESHOLD_MS;
 	const verdict = handle.cpuSample
@@ -3346,7 +3369,7 @@ function inFlightWorkerTitle(handle: RunningAgentHandle): string {
 function inFlightWorkerKind(handle: RunningAgentHandle, now: number): InFlightWorkerView["kind"] {
 	if (handle.finalizing) return "finalizing";
 	if (isHandleVanished(handle, now)) return "vanished";
-	if (now - handle.lastActivityAt >= STALL_THRESHOLD_MS) return "stalled";
+	if (progressIdleMs(now, handle) >= STALL_THRESHOLD_MS) return "stalled";
 	return "running";
 }
 
@@ -5162,6 +5185,59 @@ function supervisorRequestFromStall(text: string): SupervisorDeliveryRequest | u
 	};
 }
 
+/** One watchdog pass over a worker's live progress log: stat(), compare against the last
+ *  sample, and record lastProgressLogAt on any size/mtime change. Metadata only — contents
+ *  are never read here; a missing file is not an error. Exported for tests.
+ */
+export function applyProgressLogSampleTick(
+	handle: Pick<RunningAgentHandle, "progressLogPath" | "progressLogSample" | "lastProgressLogAt">,
+	now: number,
+): void {
+	if (!handle.progressLogPath) return;
+	const sample = sampleProgressLog({ path: handle.progressLogPath, previous: handle.progressLogSample, now });
+	handle.progressLogSample = sample;
+	if (sample.progressed && sample.at !== undefined) handle.lastProgressLogAt = sample.at;
+}
+
+/** Forward newly appended progress-log bytes to Boss, bypassing the Supervisor LLM.
+ *  Reads from the stored offset (≤4KB cap), then consumes those bytes regardless of delivery
+ *  outcome so one failed send cannot loop the same excerpt forever. Never touches
+ *  noteAgentActivity / toolWaitSince: log progress must not masquerade as JSONL activity.
+ */
+async function deliverProgressLogReport(pi: ExtensionAPI, agentId: string, handle: RunningAgentHandle): Promise<void> {
+	const excerpt = readProgressLogExcerpt({ path: handle.progressLogPath!, offset: handle.progressLogOffset ?? 0 });
+	handle.progressLogOffset = excerpt.nextOffset;
+	if (!excerpt.grew) return;
+	const now = Date.now();
+	const text = formatProgressLogReport({
+		agentId,
+		title: inFlightWorkerTitle(handle),
+		elapsed: formatElapsedMs(now - handle.startedAt),
+		idleSec: Math.max(0, Math.floor(progressIdleMs(now, handle) / 1000)),
+		state: formatHeartbeatWorkerState(agentId, handle, now),
+		excerpt: excerpt.excerpt,
+		addedBytes: excerpt.addedBytes,
+	});
+	const sequence = (handle.progressReportCount ?? 0) + 1;
+	handle.progressReportCount = sequence;
+	const request: SupervisorDeliveryRequest = {
+		kind: "heartbeat",
+		agentId,
+		runId: handle.runId,
+		sequence,
+		forceForward: true,
+		publicText: text,
+		job: supervisorJobSnapshot(agentId, handle.runId, "running"),
+		summary: `[subagent-progress] +${excerpt.addedBytes} bytes`,
+	};
+	await awaitCutInHoldRelease();
+	const routed = await routeSupervisorDelivery(request);
+	// accepted → Supervisor delivered; pending → receipt retained, retry next cadence;
+	// unhandled → no Supervisor host bound this session, send straight to Boss.
+	if (routed !== "unhandled") return;
+	await sendUserMessageAfterCutIn(pi, text);
+}
+
 function supervisorRequestFromCompletion(agentId: string, runId: string, text: string): SupervisorDeliveryRequest {
 	const wave = supervisorWaveFromRuntime();
 	const request: SupervisorDeliveryRequest = {
@@ -5914,6 +5990,70 @@ async function runSingleAgent(
 	}
 	const spawnCwd = placement.cwd;
 
+	// progressLog 路径闸门（与 timeoutSecs 同门：仅 bundled general-purpose 会带值走到这里）。
+	// 相对 spawnCwd 或绝对；realpath 归一后必须落在打开的项目、spawnCwd 或本 worker worktree
+	// 内，越界/控制字符/空串一律拒发，错误信息点名 progressLog。文件此时不必存在。
+	let progressLogSpec: { path: string } | undefined;
+	if (executionPolicy?.progressLog) {
+		const resolvedProgressLog = resolveProgressLogPath({
+			progressLog: executionPolicy.progressLog,
+			spawnCwd,
+			allowedRoots: [PIPIUI_MAIN_CWD, spawnCwd, placement.worktreePath],
+		});
+		if ("problem" in resolvedProgressLog) {
+			const message = resolvedProgressLog.problem;
+			const fail: SingleResult = {
+				agent: agentName,
+				agentSource: agent.source,
+				task,
+				title: options?.title,
+				exitCode: 1,
+				messages: [],
+				stderr: message,
+				errorMessage: message,
+				usage: emptyUsage(),
+				model: resolvedModel,
+				step,
+				agentId: pipiuiAgentId,
+				runId,
+				stopReason: "error",
+			};
+			pipiuiReportQueue.beginRun(pipiuiAgentId, runId);
+			await postPipiuiReport({
+				kind: "start",
+				agentId: pipiuiAgentId,
+				runId,
+				parentId: options?.parentAgentId === undefined ? PIPIUI_PARENT : options.parentAgentId,
+				toolCallId: options.toolCallId,
+				name: agentName,
+				task,
+				depth: options?.depth ?? PIPIUI_DEPTH + 1,
+				model: resolvedModel ?? null,
+				...(options?.title ? { title: options.title } : {}),
+				...(options?.background ? { background: true } : {}),
+			});
+			jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
+			jobFinalize(pipiuiAgentId, runId, {
+				name: agentName,
+				task,
+				state: "failed",
+				resultText: message,
+			});
+			await postTerminalPipiuiReport({
+				kind: "end",
+				agentId: pipiuiAgentId,
+				runId,
+				ok: false,
+				activity: null,
+				activityActive: false,
+				activityEndedAt: Date.now(),
+				output: message,
+			});
+			return fail;
+		}
+		progressLogSpec = resolvedProgressLog;
+	}
+
 	// A worker keeps its conversation across re-dispatches so a vertical slice — implement,
 	// verify, debug, fix, re-verify — is done by someone who remembers writing the code, rather
 	// than by a stranger who re-reads the files and re-derives the same wrong assumption every
@@ -6168,6 +6308,18 @@ async function runSingleAgent(
 	// Both foreground Computer Workers and background jobs need a separately
 	// addressable abort handle; the parent tool signal is composed at spawn.
 	const dispatchAbort = new AbortController();
+	// Prime the progress-log baseline at spawn time so watchdog deltas measure only THIS run's
+	// appends (leftover bytes from a resumed agentId are never re-reported or credited as progress).
+	let progressLogFields: Partial<RunningAgentHandle> = {};
+	if (progressLogSpec) {
+		const baseline = sampleProgressLog({ path: progressLogSpec.path, now: Date.now() });
+		progressLogFields = {
+			progressLogPath: progressLogSpec.path,
+			progressLogSample: baseline,
+			progressLogOffset: baseline.size,
+			...(executionPolicy?.heartbeatMs ? { progressLogIntervalMs: executionPolicy.heartbeatMs } : { progressLogIntervalMs: DEFAULT_PROGRESS_LOG_REPORT_MS }),
+		};
+	}
 		runningAgents.set(pipiuiAgentId, {
 			runId,
 			controller: dispatchAbort,
@@ -6181,6 +6333,7 @@ async function runSingleAgent(
 			checkinInFlight: false,
 			startedAt: Date.now(),
 			...(executionPolicy?.heartbeatMs ? { heartbeatMs: executionPolicy.heartbeatMs } : {}),
+			...progressLogFields,
 			finalizing: false,
 			...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 			...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
@@ -6240,7 +6393,7 @@ async function runSingleAgent(
 	 *  notification and the terminal receipt so neither is a bare "exceeded Ns" again. */
 	const runtimeBudgetDiagnostic = (now: number): string => {
 		const handle = handleForRun(pipiuiAgentId, runId);
-		const idleSec = handle ? Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000)) : -1;
+		const idleSec = handle ? Math.max(0, Math.floor(progressIdleMs(now, handle) / 1000)) : -1;
 		const phase =
 			runtimeProviderPhase === "awaiting-model"
 				? `awaiting model response (${currentResult.model || resolvedModel || agentName})`
@@ -6386,7 +6539,7 @@ async function runSingleAgent(
 							// because the boss turn cannot receive that diagnostic.
 							const now = Date.now();
 							const handle = handleForRun(pipiuiAgentId, runId);
-							const idleMs = handle ? Math.max(0, now - handle.lastActivityAt) : Number.POSITIVE_INFINITY;
+							const idleMs = handle ? progressIdleMs(now, handle) : Number.POSITIVE_INFINITY;
 							const expiry = decideRuntimeBudgetExpiry({
 								idleMs,
 								progressGraceMs: STALL_THRESHOLD_MS,
@@ -7602,6 +7755,12 @@ const HeartbeatSecsParam = Type.Optional(
 const TimeoutSecsParam = Type.Optional(
 	Type.Integer({ minimum: 30, maximum: 604800, description: "Bundled general-purpose only. Absolute wall-clock hard timeout in seconds from actual child spawn." }),
 );
+const ProgressLogParam = Type.Optional(
+	Type.String({
+		description:
+			'Bundled general-purpose only. Path of a live log this run appends to (e.g. `tee -a .pi/progress/<agentId>.log`). Relative to the worker cwd or absolute; after resolution it must stay inside the opened project, the spawn cwd, or this worker\'s worktree, else the dispatch fails. Watchdog counts file size/mtime changes as progress; appended bytes are forwarded to Boss every 60s (or heartbeatSecs).',
+	}),
+);
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
@@ -7654,6 +7813,7 @@ const ChainItem = Type.Object({
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
+	progressLog: ProgressLogParam,
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
 			description: DESKTOP_PARAM_DESCRIPTION,
@@ -7731,6 +7891,7 @@ const SubagentParams = Type.Object({
 	),
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
+	progressLog: ProgressLogParam,
 	scope: ScopeParam,
 	...SharedDispatchParams,
 }, { additionalProperties: false });
@@ -7772,6 +7933,7 @@ type SubagentExecuteParams = {
 	noWorktreeReason?: string;
 	heartbeatSecs?: number;
 	timeoutSecs?: number;
+	progressLog?: string;
 	agentId?: string;
 	runId?: string;
 	reason?: string;
@@ -7799,6 +7961,7 @@ type SubagentExecuteParams = {
 		noWorktreeReason?: string;
 		heartbeatSecs?: number;
 		timeoutSecs?: number;
+		progressLog?: string;
 		desktop?: "user-requested" | "ui-verify";
 		scope?: string[];
 	}>;
@@ -8455,18 +8618,41 @@ export default function (pi: ExtensionAPI) {
 		const quietWorkers = [...runningAgents.values()].filter(
 			(handle) => !handle.finalizing
 				&& handle.pid !== undefined
-				&& now - handle.lastActivityAt >= LIVENESS_SAMPLE_AFTER_MS,
+				&& progressIdleMs(now, handle) >= LIVENESS_SAMPLE_AFTER_MS,
 		);
 		if (quietWorkers.length > 0) {
 			const rows = readProcessTable();
 			if (rows.length > 0) for (const handle of quietWorkers) sampleWorkerCpu(handle, rows, now);
 		}
 
+		// (2b+) progressLog 采样：Boss 指定的持续日志每拍 stat 一次（30s 节奏）。体积或 mtime
+		// 变新即视为进展（更新 lastProgressLogAt）；只读元数据不读内容；文件不存在不算失败。
+		// 先于 stall 判定执行，让同一拍的 idle 判定用上新样本。
+		for (const handle of runningAgents.values()) {
+			applyProgressLogSampleTick(handle, now);
+		}
+		// (2b++) progressLog 回传：独立于墙钟检查点。默认每 60s（设了 heartbeatSecs 用该间隔）
+		// 读取自上次偏移的新增字节（≤4KB），经 Supervisor force-forward 直达 Boss；无新字节不打扰。
+		for (const [progressAgentId, progressHandle] of runningAgents) {
+			if (!progressHandle.progressLogPath || progressHandle.finalizing) continue;
+			const intervalMs = progressHandle.progressLogIntervalMs ?? DEFAULT_PROGRESS_LOG_REPORT_MS;
+			if (now - (progressHandle.lastProgressReportAt ?? progressHandle.startedAt) < intervalMs) continue;
+			progressHandle.lastProgressReportAt = now;
+			progressHandle.progressReportInFlight = true;
+			void deliverProgressLogReport(pi, progressAgentId, progressHandle)
+				.catch((err) => {
+					console.error("[pipiui-subagent] progress-log delivery failed:", progressAgentId, err instanceof Error ? err.message : err);
+				})
+				.finally(() => {
+					progressHandle.progressReportInFlight = false;
+				});
+		}
+
 		// (2c) Metadata-only stall probe. Logs only on decision change; never changes abort policy.
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing) continue;
 			const stallInfo = stalledInfoFor(agentId, now);
-			const idleMs = now - handle.lastActivityAt;
+			const idleMs = progressIdleMs(now, handle);
 			const action = decideStallWatchdogAction({
 				idleMs,
 				stallThresholdMs: STALL_THRESHOLD_MS,
@@ -8521,7 +8707,7 @@ export default function (pi: ExtensionAPI) {
 			// is what taught the Boss to discount the signal in the first place.
 			const stallInfo = stalledInfoFor(agentId, now);
 			if (stallInfo.inTool && !stallInfo.stalled) continue;
-			const idleMs = now - handle.lastActivityAt;
+			const idleMs = progressIdleMs(now, handle);
 			const action = decideStallWatchdogAction({
 				idleMs,
 				stallThresholdMs: STALL_THRESHOLD_MS,
@@ -8610,7 +8796,7 @@ export default function (pi: ExtensionAPI) {
 				const title =
 					handle.title?.trim() || (handle.task.split("\n")[0] ?? "").trim().slice(0, 60) || "(untitled)";
 				const elapsed = formatElapsedMs(now - handle.startedAt);
-				const idle = Math.max(0, Math.floor((now - handle.lastActivityAt) / 1000));
+				const idle = Math.max(0, Math.floor(progressIdleMs(now, handle) / 1000));
 				const state = formatHeartbeatWorkerState(agentId, handle, now);
 				lines.push(`  ${agentId} (${title}) — running ${elapsed}, idle ${idle}s, state=${state}`);
 				const job = jobRegistry.get(agentId);
@@ -8781,7 +8967,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Dispatch one worker. Required: prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
-			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, blockedBy, desktop, heartbeatSecs, timeoutSecs, scope, run_in_background. resume_from is a deprecated alias of agentId.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, run_in_background. resume_from is a deprecated alias of agentId.",
 			"Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
 			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
@@ -8919,6 +9105,7 @@ export default function (pi: ExtensionAPI) {
 				noWorktreeReason?: string,
 				heartbeatSecs?: number,
 				timeoutSecs?: number,
+				progressLog?: string,
 				scope?: string[],
 			): void => {
 				recordRunningDispatchScope(agentId, scope);
@@ -8932,7 +9119,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -9335,6 +9522,7 @@ export default function (pi: ExtensionAPI) {
 						step.noWorktreeReason,
 						step.heartbeatSecs,
 						step.timeoutSecs,
+						step.progressLog,
 					);
 					const placeholder: SingleResult = {
 						agent: agentName,
@@ -9420,6 +9608,7 @@ export default function (pi: ExtensionAPI) {
 								noWorktreeReason: step.noWorktreeReason,
 								heartbeatSecs: step.heartbeatSecs,
 								timeoutSecs: step.timeoutSecs,
+								progressLog: step.progressLog,
 							},
 						);
 						results.push(result);
@@ -9772,7 +9961,7 @@ export default function (pi: ExtensionAPI) {
 											undefined,
 											undefined,
 											makeDetails("single", { background: true, agentIds: [agentId] }),
-											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs },
+											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
 										)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -9803,7 +9992,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						]);
 					} else {
-						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.scope);
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope);
 					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -9862,6 +10051,7 @@ export default function (pi: ExtensionAPI) {
 						noWorktreeReason: params.noWorktreeReason,
 						heartbeatSecs: params.heartbeatSecs,
 						timeoutSecs: params.timeoutSecs,
+						progressLog: params.progressLog,
 					},
 				);
 				const isError = isFailedResult(result);

@@ -91,6 +91,7 @@ function request(overrides: Partial<SupervisorDeliveryRequest> = {}): Supervisor
 		tasks: overrides.tasks,
 		priorAction: overrides.priorAction,
 		terminalReports: overrides.terminalReports,
+		forceForward: overrides.forceForward,
 	};
 }
 
@@ -171,6 +172,23 @@ function harness(options: {
 	});
 	return { delivery, supervisor, boss, current, lifecycle, store };
 }
+
+test("force-forward heartbeat wakes Boss without a Supervisor prompt", async () => {
+	const h = harness({ decide: () => ({ action: "wait" }) });
+	const result = await h.delivery.handle(request({
+		kind: "heartbeat",
+		forceForward: true,
+		publicText: "[subagent-heartbeat] outstanding=1\n[subagent-progress] agentId=worker-a +12 bytes\nhello log",
+	}));
+
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(result.decisionAction, "forward");
+	assert.equal(result.supervisorPrompts, 0);
+	assert.equal(result.bossWakes, 1);
+	assert.equal(h.supervisor.promptCount, 0);
+	assert.equal(h.current.length, 1);
+	assert.match(h.current[0]!.publicText, /\[subagent-progress\]/);
+});
 
 test("normal heartbeat causes one Supervisor prompt and zero Boss provider requests", async () => {
 	const h = harness({ decide: () => ({ action: "wait" }) });

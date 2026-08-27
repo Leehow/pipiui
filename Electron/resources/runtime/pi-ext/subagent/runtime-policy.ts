@@ -1,4 +1,5 @@
 import type { AgentConfig } from "./agents.ts";
+import { sanitizeProgressLogInput } from "./progress-log.ts";
 
 export const PRIVATE_COMPUTER_AGENT_NAMES = ["operator", "computer-verifier", "computer-terminal"] as const;
 export const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
@@ -62,6 +63,7 @@ export interface GeneralPurposeExecutionOverrides {
 	noWorktreeReason?: string;
 	heartbeatSecs?: number;
 	timeoutSecs?: number;
+	progressLog?: string;
 }
 
 export interface GeneralPurposeExecutionPolicy {
@@ -69,6 +71,7 @@ export interface GeneralPurposeExecutionPolicy {
 	noWorktreeReason?: string;
 	heartbeatMs?: number;
 	timeoutMs?: number;
+	progressLog?: string;
 }
 
 /** Default GP budget: producing workers extend silently; a stalled one can be aborted. */
@@ -180,6 +183,8 @@ export function normalizeGeneralPurposeExecutionPolicy(
 	if (overrides.heartbeatSecs !== undefined && overrides.heartbeatSecs >= effectiveTimeoutSecs) {
 		return { problem: "heartbeatSecs must be less than timeoutSecs when both are provided." };
 	}
+	const progressLog = sanitizeProgressLogInput(overrides.progressLog);
+	if (progressLog && "problem" in progressLog) return { problem: progressLog.problem };
 
 	return {
 		policy: {
@@ -190,6 +195,7 @@ export function normalizeGeneralPurposeExecutionPolicy(
 				overrides.timeoutSecs !== undefined
 					? overrides.timeoutSecs * 1000
 					: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS,
+			...(progressLog && "value" in progressLog ? { progressLog: progressLog.value } : {}),
 		},
 	};
 }

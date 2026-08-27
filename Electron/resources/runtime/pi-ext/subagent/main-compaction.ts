@@ -178,6 +178,22 @@ export function boundedSerializeConversation(
 	return `${head}\n\n[…上下文过大，已截断 ${dropped.toLocaleString()} 字符（中间部分）…]\n\n${tail}`;
 }
 
+/**
+ * Injected housekeeping text — git status snapshots, background-worker panels,
+ * subagent lifecycle events, `Ran N commands` wrappers — arrives inside
+ * `[User]:` records but is never the user's actual task.
+ */
+export function isNonTaskUserText(text: string): boolean {
+	const line = typeof text === "string" ? text.trimStart() : "";
+	if (!line) return false;
+	return (
+		/^## Git \(/.test(line) ||
+		/^## Background workers in flight\b/.test(line) ||
+		/^\[subagent-[a-z-]+\]/i.test(line) ||
+		/^Ran \d+ commands?\b/.test(line)
+	);
+}
+
 /** First `[User]: …` line from the serialized conversation (goal heuristic). */
 export function extractSerializedGoal(
 	serialized: string,
@@ -189,8 +205,9 @@ export function extractSerializedGoal(
 	for (const line of serialized.split("\n")) {
 		const m = /^\[User\]:\s*(.*)$/.exec(line);
 		if (m?.[1]?.trim()) {
-			const text = m[1].trim();
-			return clipDeterministicText(text, maxChars);
+			// Git snapshots / command wrappers / worker panels are not the Goal.
+			if (isNonTaskUserText(m[1])) continue;
+			return clipDeterministicText(m[1].trim(), maxChars);
 		}
 	}
 	return "（未能从历史中提取目标，见 Recent Messages）";
@@ -426,9 +443,12 @@ export function buildDeterministicSummary(input: DeterministicSummaryInput): str
 		typeof previousSummary === "string" && previousSummary.trim()
 			? clipDeterministicText(previousSummary, COMPACTION_DETERMINISTIC_PREVIOUS_CHARS)
 			: "";
-	const firstUser = records.find((record) => record.tag === "User" && record.text);
+	const firstUser = records.find(
+		(record) => record.tag === "User" && record.text && !isNonTaskUserText(record.text),
+	);
+	const prevGoalLine = extractSectionLine(prev, "Goal");
 	const goal =
-		extractSectionLine(prev, "Goal") ??
+		(prevGoalLine && !isNonTaskUserText(prevGoalLine) ? prevGoalLine : undefined) ??
 		(firstUser ? transcriptOneLine(firstUser, COMPACTION_DETERMINISTIC_HEAD_CHARS) : undefined) ??
 		extractSerializedGoal(serialized);
 	const corrections = formatTranscriptFacts(
@@ -618,6 +638,17 @@ export function listPresentCheckpointHeadings(markdown: string): string[] {
 	return COMPACTION_CHECKPOINT_HEADINGS.filter((heading) => CHECKPOINT_HEADING_RE(heading).test(text));
 }
 
+/** Remove one `## <heading>` section (through the next top-level heading). */
+function removeMarkdownSection(markdown: string, heading: string): string {
+	if (typeof markdown !== "string" || !markdown) return markdown;
+	const match = CHECKPOINT_HEADING_RE(heading).exec(markdown);
+	if (!match) return markdown;
+	const rest = markdown.slice(match.index + match[0].length);
+	const next = /^##\s+/m.exec(rest);
+	const end = next ? match.index + match[0].length + next.index : markdown.length;
+	return `${markdown.slice(0, match.index)}${markdown.slice(end)}`.replace(/\n{3,}/g, "\n\n");
+}
+
 function extractMappedDeterministicSection(deterministic: string, heading: string): string {
 	switch (heading) {
 		case "Goal":
@@ -654,13 +685,20 @@ export interface CompactionLlmQuality {
 	missing: string[];
 }
 
-/** Minimal quality gate: never adopt empty, tiny, or unstructured prose. */
+/** Minimal quality gate: never adopt empty, tiny, or unstructured prose. A
+ *  present-but-injected Goal (git snapshot / command wrapper) counts as missing
+ *  so the merge path re-derives the real task; the structural key check still
+ *  uses raw heading presence. */
 export function evaluateCompactionLlmSummary(text: string): CompactionLlmQuality {
 	const summary = typeof text === "string" ? text.trim() : "";
-	const present = listPresentCheckpointHeadings(summary);
+	const rawPresent = listPresentCheckpointHeadings(summary);
+	let present = rawPresent;
+	if (present.includes("Goal") && isNonTaskUserText(extractMarkdownSection(summary, "Goal"))) {
+		present = present.filter((h) => h !== "Goal");
+	}
 	const missing = COMPACTION_CHECKPOINT_HEADINGS.filter((h) => !present.includes(h));
 	const hasKey =
-		present.includes("Goal") && present.includes("Progress") && present.includes("Next Steps");
+		rawPresent.includes("Goal") && rawPresent.includes("Progress") && rawPresent.includes("Next Steps");
 	if (!summary || summary.length < COMPACTION_LLM_MIN_SUMMARY_CHARS) {
 		return { accept: false, merge: false, present, missing };
 	}
@@ -677,14 +715,19 @@ export function evaluateCompactionLlmSummary(text: string): CompactionLlmQuality
 }
 
 export function mergeCheckpointSummary(llmSummary: string, deterministic: string): string {
-	const present = listPresentCheckpointHeadings(llmSummary);
+	// A Goal that is just injected noise/tool-output must not survive the merge:
+	// excise it so the appended deterministic checkpoint supplies the real task.
+	const cleaned = isNonTaskUserText(extractMarkdownSection(llmSummary, "Goal"))
+		? removeMarkdownSection(llmSummary, "Goal")
+		: llmSummary;
+	const present = listPresentCheckpointHeadings(cleaned);
 	const extras = COMPACTION_CHECKPOINT_HEADINGS.filter((h) => !present.includes(h)).map((heading) => {
 		const mapped =
 			extractMarkdownSection(deterministic, heading) ||
 			extractMappedDeterministicSection(deterministic, heading);
 		return `## ${heading}\n${mapped || "（见 deterministic fallback）"}`;
 	});
-	return `${llmSummary.trim()}\n\n${extras.join("\n\n")}`.trim();
+	return `${cleaned.trim()}\n\n${extras.join("\n\n")}`.trim();
 }
 
 export function newCompactionLlmSessionId(): string {
@@ -739,7 +782,8 @@ Preserve verbatim (do not paraphrase or invent):
 - Error strings
 - Test evidence and its credibility (pass/fail, command, exit code)
 - Worker agentId / worktree / status
-Do not treat a plan as completed work. Keep it under 4000 tokens.
+Do not treat a plan as completed work. The Goal is the user's actual task — never git status snapshots, background-worker panels, subagent lifecycle events, or "Ran N commands" wrappers.
+Keep it under 4000 tokens.
 ${updateRules}
 Trigger: ${reason}
 

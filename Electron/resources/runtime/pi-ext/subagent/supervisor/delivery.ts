@@ -81,6 +81,8 @@ export interface SupervisorDeliveryRequest {
 	priorAction?: SupervisorAction;
 	/** Structured terminal batch rows; delivery allocates findings bytes fairly across every row. */
 	terminalReports?: SupervisorTerminalReport[];
+	/** Progress-log excerpts skip the Supervisor LLM and wake Boss immediately. */
+	forceForward?: boolean;
 }
 
 export interface SupervisorTerminalReport {
@@ -675,6 +677,20 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			if (!publicText) return fallback(request, event, receiptId, 0, "escalation envelope rejected");
 			const outcome = pending?.outcome ?? (request.kind === "wave" ? "boss_direct" : "escalated");
 			return acceptBossWake(request, event, receiptId, publicText, envelope, 0, outcome, undefined, pending?.decisionAction);
+		}
+
+		if (request.forceForward) {
+			return acceptBossWake(
+				request,
+				event,
+				receiptId,
+				request.publicText,
+				undefined,
+				0,
+				"boss_direct",
+				undefined,
+				"forward",
+			);
 		}
 
 		const packetJobs = request.activeJobs ?? [event.job];

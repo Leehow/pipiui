@@ -55,7 +55,7 @@ test("execution overrides on other roles are ignored", () => {
 		{ name: "general-purpose", origin: "project" as const },
 	]) {
 		assert.deepEqual(
-			normalizeGeneralPurposeExecutionPolicy(agent, { heartbeatSecs: 60, worktree: "isolated" }),
+			normalizeGeneralPurposeExecutionPolicy(agent, { heartbeatSecs: 60, worktree: "isolated", progressLog: ".pi/progress/x.log" }),
 			{},
 		);
 	}
@@ -75,6 +75,14 @@ test("heartbeat and timeout bounds are enforced and normalized per dispatch", ()
 	assert.deepEqual(
 		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { heartbeatSecs: 45, timeoutSecs: 90 }),
 		{ policy: { worktree: "isolated", heartbeatMs: 45_000, timeoutMs: 90_000 } },
+	);
+	assert.deepEqual(
+		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { progressLog: "  .pi/progress/player-thomas.log  " }),
+		{ policy: { worktree: "isolated", timeoutMs: DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS, progressLog: ".pi/progress/player-thomas.log" } },
+	);
+	assert.match(
+		normalizeGeneralPurposeExecutionPolicy(bundledGeneralPurpose, { progressLog: "" }).problem ?? "",
+		/progressLog/,
 	);
 	assert.equal(configuredHeartbeatAt(1_000, 0, 45_000), 46_000);
 	assert.equal(configuredHeartbeatAt(1_000, 2, 45_000), 136_000);
@@ -230,13 +238,13 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /aborted: externallyAborted,/);
 	assert.match(source, /if \(runtimeTimedOut && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
 	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
-	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,/);
+	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,[\s\S]*?progressLog: ProgressLogParam,/);
 	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
 	// Identity contract (2026-08): the single public schema declares the full field set the
 	// execution layer actually reads for one dispatch — including agentId — so the strict
 	// sanitizer cannot drop a supported field. Internal old names stay out of the public shape.
 	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
-	for (const declared of ["agentId:", "title:", "fresh:", "verify:", "thinking: ThinkingParam", "blockedBy:", "desktop:", "heartbeatSecs:", "timeoutSecs:"]) {
+	for (const declared of ["agentId:", "title:", "fresh:", "verify:", "thinking: ThinkingParam", "blockedBy:", "desktop:", "heartbeatSecs:", "timeoutSecs:", "progressLog:"]) {
 		assert.match(singleSchema, new RegExp(declared.replace(":", "\\s*:")), `single schema must declare ${declared}`);
 	}
 	// Scope knobs arrive via the same shared block the chain wrapper spreads.
@@ -276,9 +284,11 @@ test("runtime budget expiry is progress-aware, notifies the boss once, and retri
 	assert.match(source, /runtimeBudgetNotify = \(text\) => \{/);
 	assert.match(source, /re-armed once for another \$\{budgetSec\}s instead of being killed/);
 	// Terminal bridge reports survive a dropped POST instead of stranding a running row.
+	// postTerminalPipiuiReport enqueues the retrying poster as `flight`, then the bounded
+	// closeout awaits it and seals/abandons per outcome.
 	assert.match(source, /const TERMINAL_REPORT_RETRY_DELAYS_MS = \[1_000, 3_000\] as const;/);
 	assert.match(source, /function postPipiuiReportWithRetry/);
-	assert.match(source, /return enqueuePipiuiReport\(payload, postPipiuiReportWithRetry\);/);
+	assert.match(source, /const flight = enqueuePipiuiReport\(payload, postPipiuiReportWithRetry\);/);
 });
 
 test("provider wait deadline covers initial wait and mid-stream silence, never tool runs", () => {
