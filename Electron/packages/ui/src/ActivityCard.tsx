@@ -28,7 +28,7 @@ export function ActivityCard({
   const open = userExpanded ?? (defaultExpanded || (running && kind === 'thinking'))
   const failed = error && !running
   const caution = warning && !running && !failed
-  const indicator = running ? '◌' : failed ? '×' : caution ? '!' : kind === 'thinking' ? '◌' : '✓'
+  const indicator = running ? <span className="activity-spinner" /> : failed ? '×' : caution ? '!' : kind === 'thinking' ? '◌' : '✓'
   const defaultMeta = running ? '运行中' : failed ? '失败' : caution ? '注意' : '已完成'
 
   return <section className={`activity-card activity-card-${kind}${failed ? ' activity-card-error' : caution ? ' activity-card-warning' : ''}`} data-activity-card={kind} data-activity-status={running ? 'running' : failed ? 'error' : caution ? 'warning' : 'ok'}>

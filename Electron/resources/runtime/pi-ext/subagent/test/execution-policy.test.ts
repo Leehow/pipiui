@@ -261,7 +261,9 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.match(source, /if \(runtimeTimedOut && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
 	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
 	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,[\s\S]*?progressLog: ProgressLogParam,/);
-	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
+	// Prompt is Optional at the SCHEMA level only so the parallel tasks[] mode can share this
+	// strict schema; single-mode calls still must provide both fields (runtime exact-one-mode gate).
+	assert.match(source, /const SubagentParams = Type\.Object\(\{[\s\S]*?prompt: Type\.Optional\(Type\.String\(\{[\s\S]*?isolation: IsolationParam,/);
 	// Identity contract (2026-08): the single public schema declares the full field set the
 	// execution layer actually reads for one dispatch — including agentId — so the strict
 	// sanitizer cannot drop a supported field. Internal old names stay out of the public shape.
@@ -274,9 +276,9 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	const sharedBlock = source.slice(source.indexOf("const SharedDispatchParams = {"), source.indexOf("// Each public tool is one intent."));
 	assert.match(sharedBlock, /agentScope:/);
 	assert.match(sharedBlock, /confirmProjectAgents:/);
-	assert.doesNotMatch(singleSchema, /worktree:|noWorktreeReason|\btasks:|\bchain:|action:/);
-	// No worker identity is ever generated: the random fallback is gone from the runtime, and
-	// the dead parallel schema (items without agentId) is not re-introduced.
+	assert.doesNotMatch(singleSchema, /worktree:|noWorktreeReason|\bchain:|action:/);
+	// No worker identity is ever generated: the random fallback is gone from the runtime.
+	// The declared tasks[] items DO carry required agentId (same identity contract as single).
 	assert.doesNotMatch(source, /generatePipiuiAgentId/);
 	assert.doesNotMatch(source, /agent-\$\{randomBytes/);
 	assert.doesNotMatch(source, /const ParallelSubagentParams/);
@@ -439,7 +441,10 @@ test("provider stall recovery spends a clustered budget before giving up", () =>
 		source.indexOf('if (providerRecovery === "resume") {'),
 		source.indexOf("resumeAgentHandle(pipiuiAgentId, runId);", source.indexOf('if (providerRecovery === "resume") {')),
 	);
-	assert.match(resumeBranch, /resolveAgentModelChainEntry\(agentName, modelChainIndex \+ 1\)/);
+	// Unpinned: advance the persisted chain exactly as before. Pinned: the Boss chose one
+	// exact model for this run — no silent chain switch onto another model.
+	assert.match(resumeBranch, /chainAdvanceEntryFor\(modelPin, agentName, modelChainIndex \+ 1\)/);
+	assert.doesNotMatch(resumeBranch, /= resolveAgentModelChainEntry\(agentName, modelChainIndex \+ 1\)/);
 	assert.match(resumeBranch, /rewriteSpawnModelArgs\(args, stallChainEntry\.model, stallThinking\)/);
 	assert.match(resumeBranch, /\(provider stall\)/);
 });

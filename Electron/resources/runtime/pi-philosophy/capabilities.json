@@ -39,6 +39,11 @@
       "required": false,
       "absent": "your runtime's resolve command"
     },
+    "delegate_progress": {
+      "tool": "subagent_progress",
+      "required": false,
+      "absent": "your runtime's progress-log channel"
+    },
     "search": {
       "tool": "web_search",
       "required": false,

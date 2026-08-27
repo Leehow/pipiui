@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
@@ -136,46 +136,20 @@ describe('agentEventSupersedes', () => {
     expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1', createdAt: 2_000 })).toBe(true)
   })
 
-  it('orders different runs strictly by createdAt: older loses, equal never supersedes', () => {
-    const newRun = { state: 'running' as const, runId: 'r2', createdAt: 5_000 }
-    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 1_000 })).toBe(false)
-    expect(agentEventSupersedes(newRun, { state: 'stalled', runId: 'r1', createdAt: 1_000 })).toBe(false)
-    expect(agentEventSupersedes(newRun, { state: 'ok', runId: 'r1', createdAt: 1_000 })).toBe(false)
-    // Equal timestamps cannot order two runs, so they follow the missing-time rule:
-    // a live first-sight start is accepted once; retirement then blocks the reverse.
-    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 5_000 })).toBe(true)
-    expect(agentEventSupersedes(newRun, { state: 'ok', runId: 'r1', createdAt: 5_000 })).toBe(false)
-    expect(agentEventSupersedes(newRun, { state: 'running', runId: 'r1', createdAt: 5_000 }, 'snapshot')).toBe(false)
-
-    const oldTerminal = { state: 'ok' as const, runId: 'r1', createdAt: 1_000 }
-    expect(agentEventSupersedes(oldTerminal, { state: 'running', runId: 'r2', createdAt: 5_000 })).toBe(true)
-    expect(agentEventSupersedes(oldTerminal, { state: 'ok', runId: 'r2', createdAt: 5_000 }, 'snapshot')).toBe(true)
-  })
-
-  it('without usable createdAt trusts only a live first-sight start', () => {
-    const live = { state: 'running' as const, runId: 'r2' }
-    // An unseen run's first live event is its start (the backend keys runs separately), so it is trusted — but only as running.
-    expect(agentEventSupersedes(live, { state: 'running', runId: 'r9' })).toBe(true)
-    // A stall/end for an unknown run, or any snapshot row, can never prove it is the newer run.
-    expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1' })).toBe(false)
-    expect(agentEventSupersedes(live, { state: 'stalled', runId: 'r1' })).toBe(false)
-    expect(agentEventSupersedes(live, { state: 'running', runId: 'r1' }, 'snapshot')).toBe(false)
-    expect(agentEventSupersedes(live, { state: 'ok', runId: 'r1' }, 'snapshot')).toBe(false)
-
-    const dead = { state: 'ok' as const, runId: 'r1' }
-    expect(agentEventSupersedes(dead, { state: 'running', runId: 'r2' })).toBe(true)
-    expect(agentEventSupersedes(dead, { state: 'failed', runId: 'r2' })).toBe(false)
-    expect(agentEventSupersedes(dead, { state: 'stalled', runId: 'r2' })).toBe(false)
-  })
-
-  it('permanently rejects a retired run regardless of state, source, or timestamps', () => {
-    const previous = { state: 'running' as const, runId: 'r2', createdAt: 5_000 }
-    const retired = new Set(['r1'])
-    expect(agentEventSupersedes(previous, { state: 'running', runId: 'r1', createdAt: 9_000 }, 'live', retired)).toBe(false)
-    expect(agentEventSupersedes(previous, { state: 'ok', runId: 'r1', createdAt: 9_000 }, 'snapshot', retired)).toBe(false)
-    expect(agentEventSupersedes(previous, { state: 'stalled', runId: 'r1' }, 'live', retired)).toBe(false)
-    // A run that was never displayed stays free to start.
-    expect(agentEventSupersedes(previous, { state: 'running', runId: 'r3', createdAt: 9_000 })).toBe(true)
+  it('merges different runs never: rows are per-episode, ordering is display-only', () => {
+    const displayed = { state: 'ok' as const, runId: 'r1', createdAt: 1_000 }
+    // A different run is simply another row — it never merges into this one,
+    // regardless of which timestamp is newer or which source delivers it.
+    for (const incoming of [
+      { state: 'running' as const, runId: 'r2', createdAt: 5_000 },
+      { state: 'running' as const, runId: 'r0', createdAt: 500 },
+      { state: 'ok' as const, runId: 'r2' },
+    ]) {
+      expect(agentEventSupersedes(displayed, incoming)).toBe(false)
+      expect(agentEventSupersedes(incoming, displayed)).toBe(false)
+    }
+    // Same run id but no timestamps still follows the terminal-stickiness rule.
+    expect(agentEventSupersedes({ ...displayed }, { state: 'ok', runId: 'r1' })).toBe(true)
   })
 })
 
@@ -310,7 +284,7 @@ describe('SubagentPanel', () => {
     const view = render(<Fixture host={harness.host} sessionId="selected-other" />)
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull()
-    expect(listAgents).toHaveBeenLastCalledWith('selected-other')
+    expect(listAgents).toHaveBeenLastCalledWith('selected-other', 'history')
 
     view.rerender(<Fixture host={harness.host} sessionId="owner-session" />)
     const row = await screen.findByTestId('agent-row-electron-ui-acceptance')
@@ -322,13 +296,13 @@ describe('SubagentPanel', () => {
     fireEvent.click(row.querySelector('.agent-select')!)
     expect(document.querySelector('.agent-technical-details')?.textContent).toContain('通用')
     expect(document.querySelector('.agent-technical-details')?.textContent).toContain('owner-session')
-    expect(listAgents).toHaveBeenLastCalledWith('owner-session')
+    expect(listAgents).toHaveBeenLastCalledWith('owner-session', 'history')
 
     view.rerender(<Fixture host={harness.host} sessionId="another-current-session" />)
     await waitFor(() => expect(screen.queryByTestId('agent-row-electron-ui-acceptance')).toBeNull())
     expect(await screen.findByText('还没有 subagent')).toBeTruthy()
     expect(screen.getByText('0 个')).toBeTruthy()
-    expect(listAgents).toHaveBeenLastCalledWith('another-current-session')
+    expect(listAgents).toHaveBeenLastCalledWith('another-current-session', 'history')
   })
 
   it('ignores a stale snapshot and streamed events from the previous session', async () => {
@@ -448,6 +422,10 @@ describe('SubagentPanel', () => {
       const startedAt = Date.now() - 12_000
       harness.host.listAgents = async () => [{
         agentId: 'run', runId: 'r1', name: 'explore', title: '查 Electron GLM 鉴权与 MCP 链路',
+        // Canonical hosts scope every row to a session (episode triple): without
+        // it the stamped incoming event below would adopt a NEW identity mid-flight
+        // and remount the row instead of updating it in place.
+        sessionId: 'session-1',
         task: 'research', state: 'running', createdAt: startedAt, updatedAt: Date.now(),
         listSubtitle: 'tool', activityActive: true,
       }]
@@ -490,11 +468,11 @@ describe('SubagentPanel', () => {
     await waitFor(() => expect(harness.abortAgent).toHaveBeenCalledWith('session-1', 'run', 'r1'))
   })
 
-  it('hides [seam: fixture workers from the default list behind the collapsed 历史 group', async () => {
+  it('hides rows explicitly marked as test fixtures behind the collapsed 历史 group', async () => {
     const harness = hostHarness()
     const dayAgo = Date.now() - 36 * 60 * 60 * 1000
     harness.host.listAgents = async () => [
-      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: '[seam: cone-hold] keep blocker busy', state: 'ok', createdAt: dayAgo, endedAt: dayAgo },
+      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: 'keep blocker busy', state: 'ok', testFixture: true, createdAt: dayAgo, endedAt: dayAgo },
       { agentId: 'fresh', runId: 'r-fresh', sessionId: 'session-1', name: 'explore', task: '审计 fallback 路径', state: 'running', createdAt: Date.now() }
     ]
     renderSubagentPanel({ host: harness.host })
@@ -505,11 +483,50 @@ describe('SubagentPanel', () => {
     expect(screen.getByTestId('subagent-archive-toggle').textContent).toContain('1')
   })
 
-  it('reveals seam fixtures and stale terminal rows after expanding 历史, keeping row controls', async () => {
+  it('never folds a running worker into 历史 even when its snapshot carries an old endedAt', async () => {
+    const harness = hostHarness()
+    const twoDaysAgo = Date.now() - 48 * 60 * 60 * 1000
+    // Screenshot repro: 历史（2）held a live general-purpose row (“0 秒前有新进展”)
+    // and an explore that finished 398s ago. Neither may fold.
+    harness.host.listAgents = async () => [
+      { agentId: 'live-runner', runId: 'r-live', sessionId: 'session-1', name: 'worker', task: '持续修复徽标样式', state: 'running', role: 'general-purpose', createdAt: twoDaysAgo, endedAt: twoDaysAgo },
+      { agentId: 'just-done', runId: 'r-done', sessionId: 'session-1', name: 'explore', task: '调查记录消失根因', state: 'ok', createdAt: Date.now() - 400_000, endedAt: Date.now() - 398_000 }
+    ]
+    renderSubagentPanel({ host: harness.host })
+
+    expect(await screen.findByTestId('agent-row-live-runner')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-just-done')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-archive')).toBeNull()
+  })
+
+  it('keeps a terminal row without a timestamp visible instead of folding it into 历史', async () => {
+    const harness = hostHarness()
+    // Undated means unknown, not ancient: missing endedAt must stay inline.
+    harness.host.listAgents = async () => [
+      { agentId: 'undated', runId: 'r-undated', sessionId: 'session-1', name: 'explore', task: '无结束时间的完成行', state: 'ok', createdAt: Date.now() - 60_000 }
+    ]
+    renderSubagentPanel({ host: harness.host })
+
+    expect(await screen.findByTestId('agent-row-undated')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-archive')).toBeNull()
+  })
+
+  it('never hides a real episode just because its task text contains the old [seam: marker', async () => {
+    const harness = hostHarness()
+    renderSubagentPanel({ host: harness.host })
+    // Production text heuristics are gone: only the explicit testFixture flag folds a row.
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'real-task', runId: 'r-real', sessionId: 'session-1', name: 'explore', task: '[seam: cone-hold] 记录真实任务的说明', state: 'running', createdAt: Date.now() } })
+
+    const row = await screen.findByTestId('agent-row-real-task')
+    expect(row.textContent).toContain('记录真实任务的说明')
+    expect(screen.queryByTestId('subagent-archive-toggle')).toBeNull()
+  })
+
+  it('reveals flagged fixtures and stale terminal rows after expanding 历史, keeping row controls', async () => {
     const harness = hostHarness()
     const dayAgo = Date.now() - 36 * 60 * 60 * 1000
     harness.host.listAgents = async () => [
-      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: '[seam: cone-hold] keep blocker busy', state: 'aborted', createdAt: dayAgo, endedAt: dayAgo },
+      { agentId: 'blocker', runId: 'r-blocker', sessionId: 'session-1', name: 'blocker', task: 'keep blocker busy', state: 'aborted', testFixture: true, createdAt: dayAgo, endedAt: dayAgo },
       { agentId: 'qfix', runId: 'r-qfix', sessionId: 'session-1', name: 'fixer', task: '修复 quota 徽标样式', state: 'failed', createdAt: dayAgo, endedAt: dayAgo },
       { agentId: 'cutoff-ok', runId: 'r-edge', sessionId: 'session-1', name: 'explore', task: '24 小时内完成', state: 'ok', createdAt: Date.now() - 20 * 60 * 60 * 1000, endedAt: Date.now() - 20 * 60 * 60 * 1000 }
     ]
@@ -1261,6 +1278,76 @@ describe('SubagentPanel', () => {
     expect([...document.querySelectorAll('[data-activity-card="tool"]')].filter(card => card.textContent?.includes('A.ts')).every(card => !card.textContent?.includes('ONLY_B'))).toBe(true)
   })
 
+  it('renders an orphan toolResult as a result card, never as markdown prose', async () => {
+    const harness = hostHarness()
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'orphan', runId: 'r1', name: 'reviewer', task: 'review', state: 'running' } })
+    await screen.findByTestId('agent-row-orphan')
+    await waitFor(() => expect(harness.hasLogSubscriber('orphan')).toBe(true))
+    // The tool row was lost (mid-run reload/stream gap); only its result arrives.
+    harness.emitLog('orphan', { type: 'agent_log', agentId: 'orphan', itemType: 'toolResult', name: 'read', text: 'def _loop_warnings(envelope):\n    return []\n\n\ndef test_third_call():\n    assert True' })
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    expandTranscriptCards()
+    // The raw output stays inside a tool/result card (pre-wrap monospace), and no
+    // markdown text segment picks it up — collapsed newlines turned it into a wall of prose.
+    const card = screen.getByText(/def _loop_warnings/).closest('[data-activity-card="tool"]')
+    expect(card).toBeTruthy()
+    for (const segment of document.querySelectorAll('[data-transcript-segment="text"]')) {
+      expect(segment.textContent).not.toContain('def _loop_warnings')
+    }
+  })
+
+  it('backfills a lost tool row from the cache so its result pairs instead of staying orphaned', async () => {
+    const harness = hostHarness()
+    // Reproduce the mid-run reload hole: the live stream already has the result
+    // (its tool row was lost — the runtime never re-sends already-streamed tool
+    // calls), and the cache snapshot resolves only AFTER those live rows landed.
+    let resolveLogs: (entries: { itemType: 'tool'; name: string; text: string; toolCallId: string }[]) => void = () => {}
+    harness.host.getAgentLogs = () => new Promise(resolve => { resolveLogs = resolve })
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'backfill', runId: 'r1', name: 'reviewer', task: 'review', state: 'running' } })
+    await screen.findByTestId('agent-row-backfill')
+    await waitFor(() => expect(harness.hasLogSubscriber('backfill')).toBe(true))
+    harness.emitLog('backfill', { type: 'agent_log', agentId: 'backfill', itemType: 'toolResult', name: 'read', text: 'LOST_RESULT_BODY', toolCallId: 'tc-lost' })
+    // The batched flush lands the owner-less result as a finished result card in
+    // the steps group (never as markdown prose).
+    await waitFor(() => expect(screen.getAllByTestId('assistant-transcript-content')).toHaveLength(1))
+    resolveLogs([{ itemType: 'tool', name: 'read', text: '{"path":"lost.md"}', toolCallId: 'tc-lost' }])
+    // The backfilled tool row absorbs its result into one paired card (input +
+    // output together). Expansion repeats inside the wait because the group's
+    // expansion state resets when the transcript restructures around the pairing.
+    await waitFor(() => {
+      expandTranscriptCards()
+      expect(screen.getByText('LOST_RESULT_BODY').closest('[data-activity-card="tool"]')?.textContent).toContain('lost.md')
+    })
+    expect(document.querySelectorAll('[data-activity-card="tool"]').length).toBe(1)
+  })
+
+  it('merges the cache backfill idempotently: snapshot rows dedup against live rows', async () => {
+    const harness = hostHarness()
+    harness.host.getAgentLogs = async () => [
+      { itemType: 'thinking', text: 'PLAN_AHEAD' },
+      { itemType: 'tool', name: 'read', text: '{"path":"a.md"}', toolCallId: 'tc1' },
+      { itemType: 'toolResult', name: 'read', text: 'A_MD_BODY', toolCallId: 'tc1' },
+    ]
+    render(<SubagentPanel host={harness.host} />)
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'dedup', runId: 'r1', name: 'reviewer', task: 'review', state: 'running' } })
+    await screen.findByTestId('agent-row-dedup')
+    await waitFor(() => expect(harness.hasLogSubscriber('dedup')).toBe(true))
+    // The live stream already delivered the same rows the snapshot contains, plus
+    // a newer text row the snapshot predates.
+    harness.emitLog('dedup', { type: 'agent_log', agentId: 'dedup', itemType: 'thinking', text: 'PLAN_AHEAD' })
+    harness.emitLog('dedup', { type: 'agent_log', agentId: 'dedup', itemType: 'tool', name: 'read', text: '{"path":"a.md"}', toolCallId: 'tc1' })
+    harness.emitLog('dedup', { type: 'agent_log', agentId: 'dedup', itemType: 'toolResult', name: 'read', text: 'A_MD_BODY', toolCallId: 'tc1' })
+    harness.emitLog('dedup', { type: 'agent_log', agentId: 'dedup', itemType: 'text', text: 'AFTER_SNAPSHOT_LINE' })
+    // The live flush batches at 200ms: wait for the post-snapshot row, then expand.
+    await waitFor(() => expect(screen.getByText('AFTER_SNAPSHOT_LINE')).toBeTruthy())
+    expandTranscriptCards()
+    expect(screen.getAllByText('PLAN_AHEAD')).toHaveLength(1)
+    expect(screen.getAllByText('A_MD_BODY')).toHaveLength(1)
+    expect(document.querySelectorAll('[data-activity-card="tool"]').length).toBe(1)
+  })
+
   it('keeps a running tool card collapsed so execution details stay folded', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
@@ -1434,26 +1521,35 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('first second')).toBeTruthy()
   })
 
-  it('starts a fresh log row for a new run instead of rewriting the previous run row', async () => {
+  it('keeps each sibling run its own streamed transcript instead of clearing the finished one', async () => {
     const harness = hostHarness()
     render(<SubagentPanel host={harness.host} />)
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r1', name: 'explore', task: 'research', state: 'running' } })
+    const base = { agentId: 'run', name: 'explore', task: 'research' }
+    const now = Date.now()
+    harness.emitAgent({ type: 'agent', agent: { ...base, sessionId: 'session-1', runId: 'r1', state: 'running', createdAt: now - 4_000 } })
+    // A lone run shows under the bare slug; the --runId suffix appears once a
+    // sibling run of the same slug coexists.
     await screen.findByTestId('agent-row-run')
     await waitFor(() => expect(harness.hasLogSubscriber('run')).toBe(true))
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: 'run one', contentIndex: 0 })
-    await screen.findByText('run one')
 
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'run', runId: 'r2', name: 'explore', task: 'research', state: 'running' } })
-    // Let the row switch re-register the log subscription for the new run before
-    // its first log event arrives (the host delivers logs after the start event).
+    harness.emitAgent({ type: 'agent', agent: { ...base, sessionId: 'session-1', runId: 'r2', state: 'running', createdAt: now } })
+    expect(await screen.findByTestId('agent-row-run--r2')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-run--r1')).toBeTruthy()
+
+    // Selecting r2 re-binds the exact-episode log subscription; let effects flush,
+    // then its first streamed log paints under r2 only.
+    fireEvent.click(screen.getByTestId('agent-row-run--r2').querySelector('.agent-select')!)
     await act(async () => { await Promise.resolve() })
     harness.emitLog('run', { type: 'agent_log', agentId: 'run', itemType: 'text', text: 'run two', contentIndex: 0 })
-    await screen.findByText('run two')
-    // A new run owns a fresh transcript: the previous run's rows are cleared, not
-    // merely unkeyed — run one's contentIndex-0 row must not linger where run
-    // two's first row could rewrite it. History stays the explicit cross-run view.
+    expect(await screen.findByText('run two')).toBeTruthy()
     expect(screen.queryByText('run one')).toBeNull()
-    expect(screen.getByText('run two')).toBeTruthy()
+
+    // Switching back shows r1's own stream untouched: per-episode rows own their
+    // transcripts; a sibling run starting never clears another run's record.
+    fireEvent.click(screen.getByTestId('agent-row-run--r1').querySelector('.agent-select')!)
+    expect(await screen.findByText('run one')).toBeTruthy()
+    expect(screen.queryByText('run two')).toBeNull()
   })
 
   it('keeps the newest fixed page and persists the dragged list/detail split', async () => {
@@ -1747,165 +1843,123 @@ describe('SubagentPanel', () => {
     expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
   })
 
-  it('keeps a displayed new run when the previous run\u2019s late events and snapshot rows arrive', async () => {
+  it('shows both runs of a re-dispatched agentId side by side and never drops the finished one', async () => {
     const harness = hostHarness()
-    let resolveSnapshot!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
     render(<SubagentPanel host={harness.host} />)
+    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'session-1' }
 
-    // Old run ends, then the same agentId is re-dispatched as a genuinely newer run.
-    const base = { agentId: 'smoke', name: 'general-purpose' }
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', createdAt: 1_000, endedAt: 2_000 } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running', createdAt: 5_000 } as AgentSummary })
+    const now = Date.now()
+    // First run finishes; the same semantic id is re-dispatched as a second run.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', createdAt: now - 6_000, endedAt: now - 5_000 } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running', createdAt: now } as AgentSummary })
 
-    // A slower listAgents snapshot captured during the old run merges after the new start.
-    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true, createdAt: 1_000, updatedAt: 1_500 } as AgentSummary]))
-    expect(await screen.findByTitle('运行中')).toBeTruthy()
+    // Two rows: the completed r1 keeps its record while r2 runs beside it.
+    expect(await screen.findByTestId('agent-row-smoke--r1')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-smoke--r1').textContent).toContain('第一轮任务')
+    expect(screen.getByTitle('已完成')).toBeTruthy()
+    const r2 = screen.getByTestId('agent-row-smoke--r2')
+    expect(r2.textContent).toContain('第二轮任务')
     expect(screen.getByLabelText('中止 general-purpose')).toBeTruthy()
-    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
-    expect(screen.queryByTitle('已完成')).toBeNull()
 
-    // Late old-run live events are equally rejected: the new run keeps the row.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running', createdAt: 1_200 } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', createdAt: 2_000 } as AgentSummary })
-    expect(screen.getByTitle('运行中')).toBeTruthy()
-    expect(screen.getByLabelText('中止 general-purpose')).toBeTruthy()
-    const row = screen.getByTestId('agent-row-smoke')
-    expect(row.textContent).toContain('第二轮任务')
+    // A late running/stalled event for r1 lands on r1's own row and cannot reopen it.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true, createdAt: now - 5_000 } as AgentSummary })
+    expect(screen.getByTestId('agent-row-smoke--r1').textContent).not.toContain('卡住')
+    expect(screen.getByTitle('已完成')).toBeTruthy()
+
+    // When r2 completes too, BOTH records stay visible side by side.
+    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'ok', createdAt: now, endedAt: now + 1_000 } as AgentSummary })
+    await waitFor(() => expect(within(screen.getByTestId('agent-row-smoke--r2')).getByTitle('已完成')).toBeTruthy())
+    expect(screen.getByTestId('agent-row-smoke--r1')).toBeTruthy()
+    expect(screen.queryByLabelText('中止 general-purpose')).toBeNull()
   })
 
-  it('retires a run once a new run starts, rejecting its late events and snapshots without createdAt', async () => {
-    const harness = hostHarness()
-    let resolveSnapshot!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
-    render(<SubagentPanel host={harness.host} />)
-    const base = { agentId: 'smoke', name: 'general-purpose' }
+  it('restores every retained run after a restart without collapsing fresh completions', async () => {
+    const now = Date.now()
+    let requestedScope: string | undefined
+    const historyHost = hostHarness()
+    historyHost.host.listAgents = vi.fn(async (_sessionId?: string, scope?: 'current' | 'history') => {
+      requestedScope = scope
+      return [
+        { agentId: 'duo', runId: 'run-a', sessionId: 'session-1', name: 'explore', task: '早一轮任务', state: 'ok', createdAt: now - 6_000, endedAt: now - 5_000 },
+        { agentId: 'duo', runId: 'run-b', sessionId: 'session-1', name: 'explore', task: '晚一轮任务', state: 'ok', createdAt: now - 2_000, endedAt: now - 1_000 },
+        { agentId: 'solo', runId: 'run-c', sessionId: 'session-1', name: 'reviewer', task: '刚完成', state: 'ok', createdAt: now - 100, endedAt: now - 50 },
+      ] as AgentSummary[]
+    })
+    renderSubagentPanel({ host: historyHost.host, sessionId: 'session-1' })
 
-    // While listAgents() is still in flight, the live feed shows r1's verdict and then
-    // a never-seen r2 start (no createdAt anywhere): the start is trusted.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    // The retired r1 can no longer rewrite the row: running, stalled, and ok are all rejected.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    // A slower snapshot captured during r1 merges after the r2 start and is rejected too.
-    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary]))
-    expect(screen.getByTitle('运行中')).toBeTruthy()
-    expect(screen.queryByTitle('已完成')).toBeNull()
-    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
-
-    // A genuinely newer run can still take over the row.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
-    expect(screen.getByTitle('运行中')).toBeTruthy()
+    // The panel hydrates from the durable full-run history, not one summary per slug.
+    await waitFor(() => expect(requestedScope).toBe('history'))
+    expect(await screen.findByTestId('agent-row-duo--run-a')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-duo--run-b').textContent).toContain('晚一轮任务')
+    // Freshly settled rows stay inline right after load; nothing hides behind 历史.
+    expect(screen.getByTestId('agent-row-solo')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-archive-toggle')).toBeNull()
   })
 
-  it('never lets an equal createdAt resurrect the run a live start already replaced', async () => {
+  it('清空 hides only plain terminal rows in the current view: stalled and pendingReview stay', async () => {
     const harness = hostHarness()
-    const at = Date.now() - 5_000
-    let resolveSnapshot!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })
-    render(<SubagentPanel host={harness.host} />)
-    const base = { agentId: 'smoke', name: 'general-purpose', createdAt: at }
+    harness.host.listAgents = async () => []
+    renderSubagentPanel({ host: harness.host, sessionId: 'session-1' })
+    const now = Date.now()
+    // A stalled live row and a terminal row whose worktree still owes the user a
+    // merge/discard decision stay; a settled failed row with nothing pending hides.
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'stall-row', runId: 'r-s', sessionId: 'session-1', name: 'fixer', task: '卡住的任务', state: 'stalled', stalled: true, createdAt: now } as AgentSummary })
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'pr-row', runId: 'r-pr', sessionId: 'session-1', name: 'builder', task: '待善后任务', state: 'aborted', createdAt: now - 5_000, endedAt: now - 4_000 } as AgentSummary })
+    harness.emitAgent({ type: 'worktree', status: { agentId: 'pr-row', runId: 'r-pr', sessionId: 'session-1', path: '/tmp/wt-pr', lifecycle: 'pendingReview', merge: 'ready', discard: 'ready' } })
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'done-row', runId: 'r-d', sessionId: 'session-1', name: 'explore', task: '已完成的记录', state: 'failed', createdAt: now - 9_000, endedAt: now - 8_000 } as AgentSummary })
+    await screen.findByTestId('agent-row-stall-row')
 
-    // r1 ends and a new r2 starts with the very same createdAt: equal times cannot
-    // order the runs, so the live first-sight start wins and retires r1.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok', endedAt: at } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    // The same timestamp for r1 proves nothing anymore: a snapshot cannot switch runs…
-    await act(async () => resolveSnapshot([{ ...base, runId: 'r1', task: '第一轮任务', state: 'ok', endedAt: at } as AgentSummary]))
-    expect(screen.getByTitle('运行中')).toBeTruthy()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
-
-    // …and neither may a live stall/end for the retired run claim the row.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'stalled', stalled: true } as AgentSummary })
-    expect(screen.getByTitle('运行中')).toBeTruthy()
-    expect(screen.queryByText('卡住', { selector: '.stalled-badge' })).toBeNull()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
+    fireEvent.click(screen.getByText('清空'))
+    expect(screen.getByTestId('agent-row-stall-row')).toBeTruthy()
+    expect(screen.getByTestId('agent-row-pr-row')).toBeTruthy()
+    expect(screen.queryByTestId('agent-row-done-row')).toBeNull()
   })
 
-  it('keeps r1 retired across a session A→B→A round trip, even when its live event beats the snapshot', async () => {
+  it('清空 is view-only: switching sessions away and back restores the hidden rows', async () => {
     const harness = hostHarness()
-    let resolveA!: (agents: AgentSummary[]) => void
-    let resolveB!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = vi.fn((id?: string) => id === 'B'
-      ? new Promise<AgentSummary[]>(resolve => { resolveB = resolve })
-      : new Promise<AgentSummary[]>(resolve => { resolveA = resolve }))
-    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
-    const view = render(<Fixture host={harness.host} sessionId="A" />)
+    const now = Date.now()
+    harness.host.listAgents = vi.fn(async (sid?: string): Promise<AgentSummary[]> =>
+      sid === 'session-1'
+        ? [
+          { agentId: 'smoke', runId: 'r1', sessionId: 'session-1', name: 'general-purpose', task: '第一轮任务', state: 'ok', createdAt: now - 6_000, endedAt: now - 5_000 },
+          { agentId: 'smoke', runId: 'r2', sessionId: 'session-1', name: 'general-purpose', task: '第二轮任务', state: 'running', createdAt: now },
+        ]
+        : [])
+    const view = renderSubagentPanel({ host: harness.host, sessionId: 'session-1' })
+    await screen.findByTestId('agent-row-smoke--r1')
 
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    await act(async () => resolveA([]))
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
+    fireEvent.click(screen.getByText('清空'))
+    expect(screen.queryByTestId('agent-row-smoke--r1')).toBeNull()
+    expect(screen.getByTestId('agent-row-smoke--r2')).toBeTruthy() // running r2 stays
 
-    // Leaving and re-entering session A clears the row list but not the run lineage.
-    view.rerender(<Fixture host={harness.host} sessionId="B" />)
-    await act(async () => resolveB([]))
-    view.rerender(<Fixture host={harness.host} sessionId="A" />)
-
-    // The retired r1's late live running arrives before any snapshot: it must not reinsert.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
-    // The legitimate r2 snapshot lands afterwards and owns the row.
-    await act(async () => resolveA([{ ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary]))
-    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
-
-    // A genuinely new r3 live start still takes over and retires r2; r2 then stays rejected.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务')
+    // Nothing was deleted remotely: another session away and back reloads the
+    // history scope and the cleared row is visible again.
+    view.rerender(<Fixture host={harness.host} sessionId="session-2" />)
+    await screen.findByText('还没有 subagent')
+    view.rerender(<Fixture host={harness.host} sessionId="session-1" />)
+    expect(await screen.findByTestId('agent-row-smoke--r1')).toBeTruthy()
   })
 
-  it('keeps r1 retired across a full panel unmount/remount', async () => {
+  it('keeps same agentId+runId episodes of DIFFERENT sessions apart in aggregate mode', async () => {
     const harness = hostHarness()
-    let resolveA!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = () => new Promise<AgentSummary[]>(resolve => { resolveA = resolve })
-    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
-    const first = render(<Fixture host={harness.host} sessionId="A" />)
-
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    await act(async () => resolveA([]))
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
-    first.unmount()
-
-    // A remounted panel starts with an empty list: the retired r1 live event arrives first.
-    render(<Fixture host={harness.host} sessionId="A" />)
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'running' } as AgentSummary })
-    await act(async () => resolveA([{ ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary]))
-    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务')
-    expect(screen.getByTitle('运行中')).toBeTruthy()
-  })
-
-  it('keeps another session\u2019s ledger independent even for the same agentId and runId', async () => {
-    const harness = hostHarness()
-    let resolveA!: (agents: AgentSummary[]) => void
-    let resolveB!: (agents: AgentSummary[]) => void
-    harness.host.listAgents = vi.fn((id?: string) => id === 'B'
-      ? new Promise<AgentSummary[]>(resolve => { resolveB = resolve })
-      : new Promise<AgentSummary[]>(resolve => { resolveA = resolve }))
-    const base = { agentId: 'smoke', name: 'general-purpose', sessionId: 'A' }
-    const view = render(<Fixture host={harness.host} sessionId="A" />)
-
-    // Retire r1 for agent 'smoke' in session A.
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r1', task: '第一轮任务', state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    await act(async () => resolveA([]))
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
-
-    // Session B reuses both the agentId and the runId: its r1 must display untouched.
-    view.rerender(<Fixture host={harness.host} sessionId="B" />)
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', name: 'general-purpose', sessionId: 'B', runId: 'r1', task: 'B 的独立任务', state: 'running' } as AgentSummary })
-    await act(async () => resolveB([]))
-    expect(await screen.findByTestId('agent-row-smoke')).toBeTruthy()
-    expect(screen.getByTestId('agent-row-smoke').textContent).toContain('B 的独立任务')
-    expect(screen.getByTitle('运行中')).toBeTruthy()
+    const now = Date.now()
+    harness.host.listAgents = vi.fn(async (): Promise<AgentSummary[]> => [
+      { agentId: 'w', runId: 'r1', sessionId: 's-a', name: 'explore', task: '甲会话任务', state: 'failed', createdAt: now - 30_000, endedAt: now - 29_000 },
+      { agentId: 'w', runId: 'r1', sessionId: 's-b', name: 'explore', task: '乙会话任务', state: 'running', createdAt: now },
+    ])
+    renderSubagentPanel({ host: harness.host })
+    const rowWith = (text: string) => screen.getAllByTestId('agent-row-w--r1').find(row => row.textContent?.includes(text))
+    await screen.findByText('乙会话任务')
+    // Full episode identity means two DISTINCT rows — the old (agentId, runId)
+    // upsert merged these two sessions into one row / collided their keys.
+    expect(screen.getAllByTestId('agent-row-w--r1')).toHaveLength(2)
+    const beforeA = rowWith('甲会话任务')!.textContent!
+    const beforeB = rowWith('乙会话任务')!.textContent!
+    // Updating s-b's episode must not repaint s-a's identical triple.
+    harness.emitRawAgent({ type: 'agent', agent: { agentId: 'w', runId: 'r1', sessionId: 's-b', name: 'explore', task: '乙会话任务', state: 'aborted', createdAt: now } })
+    await waitFor(() => expect(rowWith('乙会话任务')!.textContent).not.toBe(beforeB))
+    expect(rowWith('甲会话任务')!.textContent).toBe(beforeA)
+    expect(screen.getAllByTestId('agent-row-w--r1')).toHaveLength(2)
   })
 
   it('carries the exact episode identity on abort, resolve and manual check', async () => {
@@ -1960,44 +2014,49 @@ describe('SubagentPanel', () => {
     fireEvent.click(screen.getByLabelText('标记 fixer 已处理'))
     await waitFor(() => expect(harness.resolveAgent).toHaveBeenCalledWith('session-9', 'fix-pill', 'run-1'))
     await act(async () => {
-      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'running', createdAt: 2 } })
+      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'running', createdAt: Date.now() - 1_000 } })
     })
-    // The row switched to run-2: it is live again (abort offered, no resolve button).
-    expect(await screen.findByLabelText('中止 fixer')).toBeTruthy()
-    expect(screen.queryByLabelText('标记 fixer 已处理')).toBeNull()
+
+    // Two rows now: run-2 keeps streaming live beside the failed run-1 record.
+    const r2Row = await screen.findByTestId('agent-row-fix-pill--run-2')
+    const r1Row = screen.getByTestId('agent-row-fix-pill--run-1')
+    expect(r2Row.querySelector('[aria-label="中止 fixer"]')).toBeTruthy()
+    expect(r2Row.querySelector('[aria-label="标记 fixer 已处理"]')).toBeNull()
 
     // The old request completes: only the exact (session, agent, run) triple it
-    // named may be marked handled — the new run must stay unmarked. The resolve
-    // button on the row is the un-marked indicator: it reappears when run-2
-    // reaches failed and would disappear only if run-2 itself got marked.
+    // named may be marked handled — the new run must stay unmarked.
     await act(async () => { releaseResolve() })
     await act(async () => {
-      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'failed', createdAt: 2, endedAt: Date.now() } })
+      harness.emitAgent({ type: 'agent', agent: { agentId: 'fix-pill', runId: 'run-2', sessionId: 'session-9', name: 'fixer', title: 'Retry slice', task: 'second attempt', state: 'failed', createdAt: Date.now() - 1_000, endedAt: Date.now() } })
     })
-    // run-2 stays unhandled: its resolve button is still offered.
-    expect(await screen.findByLabelText('标记 fixer 已处理')).toBeTruthy()
+    // run-1 resolves handled; run-2 reaches failed UNMARKED: its resolve button
+    // is offered while run-1's is not.
+    await waitFor(() => expect(within(r1Row).queryByLabelText('标记 fixer 已处理')).toBeNull())
+    expect(within(r2Row).getByLabelText('标记 fixer 已处理')).toBeTruthy()
     expect(harness.resolveAgent).toHaveBeenCalledTimes(1)
   })
 
-  it('clears the current run transcript when the runId switches, keeping history explicit', async () => {
+  it("drops a sibling-run log frame instead of painting it on the selected run", async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => []
+    const now = Date.now()
     render(<SubagentPanel host={harness.host} sessionId="session-9" />)
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', sessionId: 'session-9', name: 'explore', task: '第一轮', state: 'running', createdAt: 1 } })
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r1', sessionId: 'session-9', name: 'explore', task: '第一轮', state: 'running', createdAt: now - 4_000 } })
     await screen.findByTestId('agent-row-smoke')
+    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r2', sessionId: 'session-9', name: 'explore', task: '第二轮', state: 'running', createdAt: now } })
+    await screen.findByTestId('agent-row-smoke--r2')
+    fireEvent.click(screen.getByTestId('agent-row-smoke--r2').querySelector('.agent-select')!)
     await waitFor(() => expect(harness.hasLogSubscriber('smoke')).toBe(true))
-    harness.emitLog('smoke', { type: 'agent_log', sessionId: 'session-9', agentId: 'smoke', runId: 'r1', itemType: 'text', text: 'OLD-RUN-STREAM', contentIndex: 0 })
-    expect(await screen.findByText(/OLD-RUN-STREAM/)).toBeTruthy()
 
-    // The same slug starts a new run: the row switches and its transcript starts empty.
-    harness.emitAgent({ type: 'agent', agent: { agentId: 'smoke', runId: 'r2', sessionId: 'session-9', name: 'explore', task: '第二轮', state: 'running', createdAt: 2 } })
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮'))
-    expect(screen.queryByText(/OLD-RUN-STREAM/)).toBeNull()
-
-    // New-run logs render; the old run's rows never reappear under the new header.
+    // The selected row is r2; a frame still tagged r1 belongs to its own episode
+    // and must never land in r2's transcript.
+    harness.emitLog('smoke', { type: 'agent_log', sessionId: 'session-9', agentId: 'smoke', runId: 'r1', itemType: 'text', text: 'OLD-RUN-FRAME', contentIndex: 0 })
+    await act(async () => { await Promise.resolve() })
+    expect(screen.queryByText(/OLD-RUN-FRAME/)).toBeNull()
+    // r2's own frame lands.
     harness.emitLog('smoke', { type: 'agent_log', sessionId: 'session-9', agentId: 'smoke', runId: 'r2', itemType: 'text', text: 'NEW-RUN-STREAM', contentIndex: 0 })
     expect(await screen.findByText(/NEW-RUN-STREAM/)).toBeTruthy()
-    expect(screen.queryByText(/OLD-RUN-STREAM/)).toBeNull()
+    expect(screen.queryByText(/OLD-RUN-FRAME/)).toBeNull()
   })
 
   it('never repaints the current run\u2019s worktree badge from a retired run\u2019s event', async () => {
@@ -2114,30 +2173,6 @@ describe('SubagentPanel', () => {
     fireEvent.click(screen.getByText('仅看当前运行'))
     await waitFor(() => expect(screen.queryByText('OLD-RUN-EVIDENCE')).toBeNull())
     expect(screen.getByText('CURRENT-RUN-EVIDENCE')).toBeTruthy()
-  })
-
-  it('records each retired run exactly once regardless of how often its late events repeat', async () => {
-    const harness = hostHarness()
-    harness.host.listAgents = async () => []
-    render(<SubagentPanel host={harness.host} />)
-    const base = { agentId: 'smoke', name: 'general-purpose', runId: 'r1', task: '第一轮任务' }
-
-    harness.emitAgent({ type: 'agent', agent: { ...base, state: 'ok' } as AgentSummary })
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r2', task: '第二轮任务', state: 'running' } as AgentSummary })
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第二轮任务'))
-    expect(agentRunLineageSizeForTest()).toBe(1)
-
-    // Repeated late traffic for the retired run never duplicates ledger entries.
-    for (let repeat = 0; repeat < 10; repeat += 1) {
-      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'running' } as AgentSummary })
-      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'stalled', stalled: true } as AgentSummary })
-      harness.emitAgent({ type: 'agent', agent: { ...base, state: 'ok' } as AgentSummary })
-    }
-    expect(agentRunLineageSizeForTest()).toBe(1)
-
-    harness.emitAgent({ type: 'agent', agent: { ...base, runId: 'r3', task: '第三轮任务', state: 'running' } as AgentSummary })
-    await waitFor(() => expect(screen.getByTestId('agent-row-smoke').textContent).toContain('第三轮任务'))
-    expect(agentRunLineageSizeForTest()).toBe(2)
   })
 
   it('discards a manual-check response that resolves after the session switched away', async () => {

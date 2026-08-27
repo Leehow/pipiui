@@ -1284,6 +1284,62 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(await readFile(indexPath, "utf8")).toBe(persistedOnce);
   });
 
+  it("migrates legacy dispatch-seam fixture rows to testFixture on load and writes the flag back", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-agent-events-seam-legacy-"));
+    const agentDir = join(root, "agent");
+    const indexPath = join(agentDir, "pipiui-agent-index.json");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(indexPath, JSON.stringify({
+      version: 1,
+      agents: [
+        // Exact legacy signatures: allowlisted slug + its own marker.
+        { agentId: "blocker", runId: "mt93-run-1", name: "explore", task: "Block the slot. [seam:blocker].", state: "failed", sessionId: "session-1", createdAt: 1, endedAt: 2 },
+        { agentId: "qfix", runId: "mt93-run-2", name: "explore", task: "Fresh dispatch on freed id. [seam:qfix].", state: "ok", finalResult: "fake-ok:qfix", sessionId: "session-1", createdAt: 3, endedAt: 4 },
+        // Mode suffix ([seam:<id>:<mode>]) is part of the same legacy family.
+        { agentId: "cone", runId: "mt93-run-3", name: "explore", task: "Step one. [seam:cone:fail].", state: "failed", sessionId: "session-1", createdAt: 5, endedAt: 6 },
+        // Real episode quoting old fixture copy: never flagged, stays visible.
+        { agentId: "real-task", runId: "r-real", name: "explore", task: "[seam:qfix] 引用旧夹具文案的真实任务", state: "ok", sessionId: "session-1", createdAt: 7, endedAt: 8 },
+        // Allowlisted slug but someone else's marker text: no own-marker match.
+        { agentId: "blocker", runId: "mt93-run-6", name: "explore", task: "真实任务说明里引用 [seam:qfix]", state: "ok", sessionId: "session-2", createdAt: 9, endedAt: 10 },
+        // Longer slug sharing the prefix ([seam:blockers]) must not match blocker.
+        { agentId: "blocker", runId: "mt93-run-7", name: "explore", task: "名字更长的旧夹具 [seam:blockers] 与本行无关", state: "ok", sessionId: "session-3", createdAt: 11, endedAt: 12 },
+        // Already-flagged row stays exactly as persisted.
+        { agentId: "hworker", runId: "mt93-run-5", name: "explore", task: "Hang forever. [seam:hworker].", state: "aborted", testFixture: true, sessionId: "session-1", createdAt: 13, endedAt: 14 },
+      ],
+      worktrees: [],
+    }, null, 2) + "\n");
+
+    const backend = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(backend);
+    const session1 = await backend.handle("listAgents", ["session-1"]) as AgentSummary[];
+    const byKey = new Map(session1.map(row => [`${row.agentId}@${row.runId}`, row] as const));
+    expect(byKey.get("blocker@mt93-run-1")?.testFixture).toBe(true);
+    expect(byKey.get("qfix@mt93-run-2")?.testFixture).toBe(true);
+    expect(byKey.get("cone@mt93-run-3")?.testFixture).toBe(true);
+    expect(byKey.get("real-task@r-real")?.testFixture).toBeUndefined();
+    expect(byKey.get("hworker@mt93-run-5")?.testFixture).toBe(true);
+    const crossQuoted = await backend.handle("listAgents", ["session-2"]) as AgentSummary[];
+    const prefixMiss = await backend.handle("listAgents", ["session-3"]) as AgentSummary[];
+    expect(crossQuoted.map(row => [row.agentId, row.testFixture])).toEqual([["blocker", undefined]]);
+    expect(prefixMiss.map(row => [row.agentId, row.testFixture])).toEqual([["blocker", undefined]]);
+    await closeTracked(backend);
+
+    // The migration writes the flag back into the durable index.
+    const persisted = JSON.parse(await readFile(indexPath, "utf8"));
+    expect(persisted.agents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "qfix", testFixture: true }),
+      expect.objectContaining({ agentId: "cone", testFixture: true }),
+    ]));
+    expect(persisted.agents.find((agent: { runId: string }) => agent.runId === "r-real")?.testFixture).toBeUndefined();
+
+    // A second restart loads the written-back flag directly; no re-normalization needed.
+    const restarted = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions") });
+    backends.push(restarted);
+    const again = await restarted.handle("listAgents", ["session-1"]) as AgentSummary[];
+    expect(again.find(row => row.agentId === "qfix")?.testFixture).toBe(true);
+    await closeTracked(restarted);
+  });
+
   it("rehydrates the session-scoped tree after restart without faking a running process", async () => {
     const { backend, deliver } = await harness();
     deliver(START);
@@ -1400,18 +1456,101 @@ describe("dead-session orphan reconcile", () => {
   const staleAt = new Date(base).toISOString();
   const staleNow = base + 10 * 60 * 1000;
 
-  it("sweeps a stale running worker to interrupted even while the session process is still alive", async () => {
+  it("keeps an inconclusive stale worker running while the session process is still alive", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(staleNow));
     try {
       const { backend, deliver, events } = await harness();
       deliver({ ...START, at: staleAt });
       (backend as any).live.set("session-1", fakeLive());
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+      expect(events.some(e => e.type === "agent" && (e as any).agent.state === "interrupted")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses same-run diagnostics reception as liveness without rewriting business updatedAt", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver, latest } = await harness();
+      deliver({ ...START, at: staleAt });
+      const businessUpdatedAt = latest().updatedAt;
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 7,
+          cpuVerdict: "working",
+          watchdogDecision: "cpu-progress",
+        },
+      });
+      (backend as any).live.set("session-1", fakeLive());
+      expect(latest().updatedAt).toBe(businessUpdatedAt);
+      expect(latest().diagnostics?.hostReceivedAt).toBe(staleNow);
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a stale row running when its recorded child PID survives the session process", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(base));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: staleAt });
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 7,
+          childPid: process.pid,
+          cpuVerdict: "unknown",
+          watchdogDecision: "tool-quiet-alive",
+        },
+      });
+      vi.setSystemTime(new Date(staleNow));
+      expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(false);
+      await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
+        { agentId: "a1", state: "running" },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("interrupts a stale worker when diagnostics positively confirm its process is gone", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(staleNow));
+    try {
+      const { backend, deliver } = await harness();
+      deliver({ ...START, at: staleAt });
+      deliver({
+        kind: "diagnostics",
+        agentId: "a1",
+        runId: "r1",
+        diagnostics: {
+          eventSeq: 8,
+          cpuVerdict: "gone",
+          watchdogDecision: "process-exited",
+          exitReason: "child-close:1",
+        },
+      });
+      (backend as any).live.set("session-1", fakeLive());
       expect((backend as any).reconcileOrphanedNow("session-1", staleNow)).toBe(true);
       await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
-        { agentId: "a1", state: "interrupted" },
+        { agentId: "a1", state: "interrupted", closeout: "执行进程已确认退出；按中断成果保留" },
       ]);
-      expect(events.some(e => e.type === "agent" && (e as any).agent.state === "interrupted")).toBe(true);
     } finally {
       vi.useRealTimers();
     }
@@ -1435,7 +1574,7 @@ describe("dead-session orphan reconcile", () => {
     }
   });
 
-  it("reconciles on listAgents so a reconnect immediately corrects a stale running row", async () => {
+  it("keeps an inconclusive stale row running when listAgents reconnects to a live session", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(staleNow));
     try {
@@ -1444,7 +1583,7 @@ describe("dead-session orphan reconcile", () => {
       (backend as any).live.set("session-1", fakeLive());
       (backend as any).reconcileOrphanedNow("session-1", staleNow);
       await expect(backend.handle("listAgents", ["session-1"])).resolves.toMatchObject([
-        { agentId: "a1", state: "interrupted", endedAt: staleNow },
+        { agentId: "a1", state: "running", endedAt: undefined },
       ]);
     } finally {
       vi.useRealTimers();
@@ -1464,7 +1603,7 @@ describe("dead-session orphan reconcile", () => {
         state: "interrupted",
         endedAt: staleNow,
         listSubtitle: "",
-        closeout: "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留",
+        closeout: "运行宿主不可用且超过 10 分钟无状态观察；按中断成果保留",
       },
     ]);
     const worktree = events.filter((event): event is Extract<AgentEvent, { type: "worktree" }> => event.type === "worktree").at(-1);
@@ -1537,6 +1676,9 @@ describe("durable projection retention", () => {
     const agentDir = join(root, "agent");
     await mkdir(agentDir, { recursive: true });
     const now = Date.now();
+    // Retention only competes among rows outside the 24h protection window, so
+    // age every row just past it before exercising the cap.
+    const hourMs = 60 * 60_000;
     const rows = ["old2", "old1", "older", "fresh"].map((agentId, index) => ({
       agentId,
       runId: `run-${agentId}`,
@@ -1544,9 +1686,9 @@ describe("durable projection retention", () => {
       task: `task ${agentId}`,
       state: "ok",
       sessionId: "session-r",
-      createdAt: now - (10 - index) * 60_000,
-      endedAt: now - (10 - index) * 60_000 + 1_000,
-      updatedAt: now - (10 - index) * 60_000 + 1_000,
+      createdAt: now - 26 * hourMs - (10 - index) * 60_000,
+      endedAt: now - 26 * hourMs - (10 - index) * 60_000 + 1_000,
+      updatedAt: now - 26 * hourMs - (10 - index) * 60_000 + 1_000,
     }));
     await writeFile(join(agentDir, "pipiui-agent-index.json"), JSON.stringify({
       version: 1,
@@ -1592,4 +1734,65 @@ describe("durable projection retention", () => {
     expect(reloaded.map(agent => agent.agentId).sort()).toEqual(["fresh", "older"]);
     await closeTracked(restarted);
   });
+
+  it("never prunes terminal rows ended inside the 24h protection window, and keeps undated rows", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-agent-recent-protect-"));
+    const agentDir = join(root, "agent");
+    await mkdir(agentDir, { recursive: true });
+    const now = Date.now();
+    const hourMs = 60 * 60_000;
+    const row = (agentId: string, endedAt: number | undefined) => ({
+      agentId,
+      runId: `run-${agentId}`,
+      name: "general-purpose",
+      task: `task ${agentId}`,
+      state: "ok",
+      sessionId: "session-r",
+      ...(endedAt === undefined
+        ? { createdAt: now - 40 * hourMs }
+        : { createdAt: endedAt - 5 * 60_000, endedAt, updatedAt: endedAt }),
+    });
+    // Five terminal rows against a cap of two: only the two rows outside the
+    // window are prunable; the recent ones and the undated one must survive —
+    // even though that leaves the projection over the cap.
+    const rows = [
+      row("ancient", now - 30 * hourMs),
+      row("yesterday", now - 26 * hourMs),
+      row("recentA", now - 20 * hourMs),
+      row("recentB", now - 1 * hourMs),
+      row("nodate", undefined),
+    ];
+    await writeFile(join(agentDir, "pipiui-agent-index.json"), JSON.stringify({
+      version: 1,
+      agents: rows,
+      worktrees: [
+        { agentId: "ancient", sessionId: "session-r", runId: "run-ancient", path: "/tmp/wt-ancient", lifecycle: "merged", merge: "done", discard: "done" },
+        { agentId: "recentA", sessionId: "session-r", runId: "run-recentA", path: "/tmp/wt-recentA", lifecycle: "merged", merge: "done", discard: "done" },
+      ],
+    }, null, 2) + "\n");
+    await writeFile(join(agentDir, "pipiui-agent-logs.json"), JSON.stringify({
+      version: 1,
+      logs: Object.fromEntries(rows.map(agent => [
+        `session-r\u0000${agent.agentId}\u0000run-${agent.agentId}`,
+        [{ itemType: "text", text: `transcript ${agent.agentId}` }],
+      ])),
+    }) + "\n");
+
+    const protectBackend = createPiHostBackend({ agentDir, sessionsRoot: join(root, "sessions"), agentRetentionMaxTerminal: 2 });
+    backends.push(protectBackend);
+    const history = await protectBackend.handle("listAgents", ["session-r", "history"]) as AgentSummary[];
+    expect(history.map(agent => agent.agentId).sort()).toEqual(["nodate", "recentA", "recentB"]);
+    // Only provably old rows lose their cached logs.
+    await expect(protectBackend.handle("getAgentLogs", ["ancient", "session-r", "run-ancient"])).resolves.toEqual([]);
+    await expect(protectBackend.handle("getAgentLogs", ["recentA", "session-r", "run-recentA"])).resolves.toMatchObject([{ text: "transcript recentA" }]);
+    await closeTracked(protectBackend);
+
+    const persisted = JSON.parse(await readFile(join(agentDir, "pipiui-agent-index.json"), "utf8"));
+    expect(persisted.agents.map((agent: { agentId: string }) => agent.agentId).sort()).toEqual(["nodate", "recentA", "recentB"]);
+    // The pruned old row's worktree retires with it; the protected row's stays.
+    expect(persisted.worktrees).toEqual([
+      expect.objectContaining({ agentId: "recentA", sessionId: "session-r", runId: "run-recentA", lifecycle: "merged" }),
+    ]);
+  });
+
 });

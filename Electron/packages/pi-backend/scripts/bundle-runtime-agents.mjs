@@ -18,6 +18,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const packageRoot = join(here, "..");
 const electronRoot = join(packageRoot, "../..");
 const agentsEntry = join(electronRoot, "resources/runtime/pi-ext/subagent/agents.ts");
+const subagentEntry = join(electronRoot, "resources/runtime/pi-ext/subagent/index.ts");
 const srcOut = join(packageRoot, "src/runtime-agents.bundle.mjs");
 const distOut = join(packageRoot, "dist/runtime-agents.bundle.mjs");
 const scriptPath = fileURLToPath(import.meta.url);
@@ -51,7 +52,21 @@ try {
 }
 
 if (!existsSync(agentsEntry)) fail(`missing source of truth: ${agentsEntry}`);
+if (!existsSync(subagentEntry)) fail(`missing subagent extension entry: ${subagentEntry}`);
 if (!existsSync(frontmatterJs)) fail(`missing parseFrontmatter implementation: ${frontmatterJs}`);
+
+// The extension entry is shipped as TypeScript and parsed only when Pi starts.
+// Parse it during every backend prebuild so packaging cannot successfully ship
+// a runtime that immediately fails extension loading.
+try {
+  await esbuild.transform(readFileSync(subagentEntry, "utf8"), {
+    loader: "ts",
+    sourcefile: subagentEntry,
+    target: "node22",
+  });
+} catch (error) {
+  fail(`subagent extension entry does not parse: ${error instanceof Error ? error.message : String(error)}`);
+}
 
 const yamlRequire = createRequire(frontmatterJs);
 let yamlBrowser;

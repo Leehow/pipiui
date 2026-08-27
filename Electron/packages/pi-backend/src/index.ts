@@ -77,7 +77,7 @@ import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
 import { LeaseManager } from "./lease.js";
 import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
-import { HostBridge } from "./bridge.js";
+import { HostBridge, type ModelPinValidateDecisionV1, type ModelPinValidateRequestV1 } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { DocumentFileWatcher } from "./document-watch.js";
 import {
@@ -292,6 +292,9 @@ export {
   HostBridge,
   type BridgeAgentEvent,
   type BridgeHandlers,
+  type ModelPinValidateDecisionV1,
+  type ModelPinValidateDenyCodeV1,
+  type ModelPinValidateRequestV1,
 } from "./bridge.js";
 export {
   BROWSER_WATCH_ACTION,
@@ -647,7 +650,7 @@ export type PiBackendOptions = {
   agentPersistMinIntervalMs?: number;
   /** Debounce + minimum gap between durable agent-log snapshots (default 2000ms). */
   agentLogPersistDebounceMs?: number;
-  /** How many newest terminal agent rows the durable projection retains (default 400). */
+  /** How many newest terminal agent rows the durable projection retains (default 5000). */
   agentRetentionMaxTerminal?: number;
 };
 
@@ -792,9 +795,21 @@ const AGENT_PERSIST_MIN_INTERVAL_MS = 2_000;
 // Turn boundaries still schedule a checkpoint and graceful close flushes it.
 const AGENT_LOG_PERSIST_DEBOUNCE_MS = 10_000;
 /** Retention for terminal agent rows: keep live rows plus the newest N terminal rows. */
-const AGENT_RETENTION_MAX_TERMINAL = 400;
-const ORPHAN_CLOSEOUT =
-  "会话进程已退出且超过 10 分钟无观察事件；按中断成果保留";
+const AGENT_RETENTION_MAX_TERMINAL = 5000;
+/**
+ * Recency floor for that retention: a terminal row ended inside the window is
+ * exempt from pruning no matter how far over the cap the projection is — a
+ * record the user watched finish must not vanish behind housekeeping (and must
+ * still be recoverable from the durable index after a restart). Rows without a
+ * usable end timestamp are never pruned either; only strictly older rows
+ * compete for retention slots, so the projection may temporarily hold more
+ * than the cap rather than delete recent completions.
+ */
+const AGENT_RETENTION_PROTECT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const ORPHAN_HOST_UNAVAILABLE_CLOSEOUT =
+  "运行宿主不可用且超过 10 分钟无状态观察；按中断成果保留";
+const ORPHAN_PROCESS_GONE_CLOSEOUT =
+  "执行进程已确认退出；按中断成果保留";
 class PiExitedError extends Error {
   constructor(
     readonly code: number | null,
@@ -834,6 +849,37 @@ const assistantVisibleText = (content: any) =>
     : Array.isArray(content)
       ? content.map((part) => part?.type === "text" ? part.text ?? "" : "").join("")
       : "";
+/**
+ * Legacy dispatch-seam fixture slugs. Before the explicit `testFixture` flag
+ * existed, dispatch-seam runtime tests persisted rows whose agentId was one of
+ * these slugs. Migration requires BOTH the allowlisted slug AND that row's own
+ * exact `[seam:<agentId>]` (or `[seam:<agentId>:mode]`) marker in the task —
+ * a real episode merely quoting `[seam:` text is never flagged.
+ */
+const LEGACY_SEAM_FIXTURE_IDS = new Set([
+  "blocker", "qfix", "cone", "ctwo", "cthree", "fworker", "fprobe",
+  "hworker", "hang-worker", "queued-fix", "chain-one", "chain-two", "chain-three",
+]);
+/** True when `task` carries this agent's own `[seam:<agentId>` marker with a
+ * valid boundary (`]` or `:mode`); `[seam:<id>extra` never matches. */
+function hasOwnSeamMarker(agentId: string, task: string): boolean {
+  const prefix = `[seam:${agentId}`;
+  let at = task.indexOf(prefix);
+  while (at >= 0) {
+    const next = task[at + prefix.length];
+    if (next === "]" || next === ":") return true;
+    at = task.indexOf(prefix, at + 1);
+  }
+  return false;
+}
+/** Narrow legacy migration for pre-flag persisted rows; explicit flags stay as-is. */
+function migrateLegacySeamFixture(agent: AgentSummary): boolean {
+  if (agent.testFixture) return false;
+  if (!LEGACY_SEAM_FIXTURE_IDS.has(agent.agentId)) return false;
+  if (!hasOwnSeamMarker(agent.agentId, agent.task)) return false;
+  agent.testFixture = true;
+  return true;
+}
 const SUBAGENT_COMPLETION_CUSTOM_TYPE = "pipiui-subagent-complete-v1";
 function isSubagentCompletion(value: any): boolean {
   if (!value || typeof value !== "object") return false;
@@ -1611,6 +1657,43 @@ function capabilitiesForHostModel(raw: any, inherited: any): ModelCapabilities |
     normalizeModelCapabilities(raw?.capabilities),
   );
 }
+/** Display-snapshot contract read by the subagent runtime (`PIPIUI_SUBAGENT_MODEL_CATALOG_FILE`).
+ * v3 snapshots are a PRESENTATION CACHE ONLY: the Boss prompt renders this list, but the ONLY
+ * acceptance decision for an explicit dispatch pin is the synchronous `model_pin_validate`
+ * bridge RPC answered from this process's PinCatalogAuthority. A stale, torn, misaligned or
+ * failed display write can therefore never widen or narrow what is pinnable. */
+export const SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION = 3;
+export type SubagentModelCatalogEntry = { id: string; name?: string };
+export type SubagentModelCatalogContent = { version: number; models: SubagentModelCatalogEntry[] };
+/** Best-effort DISPLAY marker published while the authoritative catalog is not usable.
+ * Reason is a stable sanitized code (never provider/runtime error text); detailed messages
+ * stay in logs and RPC callers only. Not a gate — decisions live in the authority. */
+export type SubagentModelCatalogTombstone = { version: number; available: false; reason: string; models: [] };
+/**
+ * Pure builder for the Boss-VISIBLE available-model list (display cache input). The input is
+ * the SAME final merged catalog the renderer's picker shows (configured models.json +
+ * auth-aware runtime + extension contributions) minus the user's `hiddenModelIds`; the output
+ * carries ONLY `{ id: "provider/modelId", name? }` metadata — never API keys, base URLs,
+ * headers or credential state. Authorization itself lives in PinCatalogAuthority, not here.
+ */
+export function buildSubagentModelCatalogSnapshot(
+  models: readonly Model[],
+  hiddenModelIds: readonly string[],
+): SubagentModelCatalogContent {
+  const hidden = new Set(hiddenModelIds.map(id => id.trim()).filter(Boolean));
+  const entries = new Map<string, SubagentModelCatalogEntry>();
+  for (const model of models) {
+    if (!model || typeof model.provider !== "string" || !model.provider || typeof model.id !== "string" || !model.id) continue;
+    const id = `${model.provider}/${model.id}`;
+    if (hidden.has(id) || entries.has(id)) continue; // exact provider/id identity, first wins
+    const name = typeof model.name === "string" ? model.name.replace(/\s+/g, " ").trim().slice(0, 120) : "";
+    entries.set(id, { id, ...(name && name !== model.id ? { name } : {}) });
+  }
+  return {
+    version: SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION,
+    models: [...entries.values()].sort((a, b) => a.id.localeCompare(b.id)),
+  };
+}
 /** Reduce Pi's provider-shaped model into the small capability contract renderers need. */
 function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {}): Model {
   const provider = raw?.provider ?? fallbackProvider ?? inherited?.provider ?? "unknown";
@@ -2076,6 +2159,10 @@ export class PiHostBackend implements HostBackend {
         return result
       },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
+      onModelPinValidate: (input) =>
+        // Authorization is proven by the capability→sessionId map; the request body carries
+        // nothing but refs. The synchronous return IS the shared linearization point.
+        this.validateSubagentModelPins(input),
       onStructuredOutput: async (event, sessionId) => {
         const op = event.op;
         if (op !== "take") throw new Error("unsupported structured_output op");
@@ -2106,13 +2193,22 @@ export class PiHostBackend implements HostBackend {
       runtime: {
         getProviders: async () => (await this.modelRuntime()).getProviders(),
         getAvailable: async () => (await this.modelRuntime()).getAvailable(),
-        login: async (p, t, i) => (await this.modelRuntime()).login(p, t, i),
+        login: async (p, t, i) => {
+          // A login attempt may mutate credentials at ANY point before its terminal event
+          // (success, failure or cancellation). Fail closed for the whole attempt: the pin
+          // authority flips shut right here and only a settled canonical rebuild reopens it
+          // (ProviderAuthBackend awaits refreshModelsAfterAuthChange BEFORE 'completed').
+          this.invalidateModelCatalog();
+          return (await this.modelRuntime()).login(p, t, i);
+        },
         logout: async (p) => (await this.modelRuntime()).logout(p),
       },
       authPath: join(this.agentDir, "auth.json"),
-      onLoginCompleted: () => {
-        void this.refreshModelsAfterAuthChange();
-      },
+      onLoginCompleted: () =>
+        // Awaited by ProviderAuthBackend.runLogin BEFORE the terminal 'completed' event:
+        // the model catalog (load + invalidate/publish/tombstone) must settle while the
+        // login is still in flight. A rejection becomes that login's explicit failure.
+        this.refreshModelsAfterAuthChange().then(() => undefined),
     });
     // The bridge callback is synchronous, so finish the small durable-index read before this
     // backend can receive any live event. An async constructor load could otherwise overwrite a
@@ -4072,6 +4168,7 @@ export class PiHostBackend implements HostBackend {
       memoryReviewModelId: (await this.loadMemoryReviewModel()) ?? undefined,
       subagentModelsFile: this.subagentModelsRuntimeFile(),
       subagentNativeSearchFile: this.nativeSearchRuntimeFile(),
+      subagentModelCatalogFile: this.subagentModelCatalogFile(),
       model: desired.model,
       bridgePort,
       bridgeRoutingKey: id,
@@ -5435,6 +5532,167 @@ export class PiHostBackend implements HostBackend {
   private nativeSearchRuntimeFile(): string {
     return join(this.agentDir, "pipiui-native-search-runtime.json");
   }
+  /** Read-only available-model catalog snapshot handed to the main Pi session (and hot-read per dispatch). */
+  private subagentModelCatalogFile(): string {
+    return join(this.agentDir, "pipiui-subagent-model-catalog-runtime.json");
+  }
+  /** Serializes DISPLAY-cache publications so temp/rename pairs never interleave. Presentation-only. */
+  private subagentCatalogQueue: Promise<void> = Promise.resolve();
+  /** JSON content of the last successfully published display snapshot (skip-churn baseline). */
+  private subagentCatalogLastPublished?: string;
+
+  // ── PinCatalogAuthority: the single cross-process gate for explicit dispatch pins ──────
+  //
+  // Availability IS decided here, synchronously inside this backend process. Three
+  // linearization points share one Node run-to-completion total order:
+  //   • Invalidate LP  — markSubagentPinsUnavailable() swaps the WHOLE authority object,
+  //     synchronously, before any await/queue/disk work of the transition begins.
+  //   • Canonical LP   — commitReadyPinCatalog() installs ONE immutable ready view in the
+  //     same synchronous segment that marks the canonical rebuild committed.
+  //   • Validation LP  — validateSubagentModelPins() captures the object exactly once per
+  //     batch (the bridge calls it without awaiting).
+  // Concurrent invalidate/validate/commit therefore serialize into a deterministic total
+  // order: validate<invalidate allows with the old revision; invalidate<validate denies;
+  // commit<validate judges against exactly the new refs. Disk artifacts (snapshot file,
+  // tombstone) are presentation caches strictly downstream of these points and are never
+  // consulted to accept or refuse a pin.
+  private pinCatalogRevision = 0;
+  private pinCatalogAuthority:
+    | { state: "unavailable"; revision: number; code: "bootstrapping" | "refreshing" | "catalog-error" }
+    | { state: "ready"; revision: number; refs: ReadonlySet<string> } = {
+    state: "unavailable",
+    revision: 0,
+    code: "bootstrapping",
+  };
+
+  /** Invalidate LP helper: swap in an unavailable view WITHOUT disk/queue work — safe inside
+   * any synchronous continuation. Recovery always routes through a full canonical rebuild. */
+  private markSubagentPinsUnavailable(code: "refreshing" | "catalog-error"): void {
+    this.pinCatalogRevision += 1;
+    this.pinCatalogAuthority = { state: "unavailable", revision: this.pinCatalogRevision, code };
+  }
+
+  /** Canonical ready LP: derive the exact `provider/id` set from last-committed models ∖ hidden.
+   * Callers MUST run this in the same synchronous segment that installs those inputs; it never
+   * fabricates readiness while the canonical load has not committed (`modelCatalogReady`). */
+  private commitReadyPinCatalog(): void {
+    if (!this.modelCatalogReady) {
+      this.markSubagentPinsUnavailable("refreshing");
+      return;
+    }
+    const hidden = new Set(this.hiddenIds.map((id) => id.trim()).filter(Boolean));
+    const refs = new Set<string>();
+    for (const model of this.models) {
+      if (!model || typeof model.provider !== "string" || !model.provider || typeof model.id !== "string" || !model.id) continue;
+      const id = `${model.provider}/${model.id}`;
+      if (hidden.has(id)) continue;
+      refs.add(id);
+    }
+    this.pinCatalogRevision += 1;
+    this.pinCatalogAuthority = { state: "ready", revision: this.pinCatalogRevision, refs };
+  }
+
+  /**
+   * THE validation LP for `model_pin_validate`. Synchronous BY CONTRACT (the bridge must not
+   * await it): one capture of the immutable view decides the entire batch. Deny codes are
+   * stable sanitized tokens — provider/runtime internals never reach the wire.
+   */
+  private validateSubagentModelPins(input: ModelPinValidateRequestV1): ModelPinValidateDecisionV1 {
+    const view = this.pinCatalogAuthority; // ── Validation LP ──
+    if (view.state !== "ready") {
+      return {
+        schemaVersion: 1,
+        decision: "deny",
+        code: "catalog_unavailable",
+        authorityRevision: view.revision,
+        retryable: true,
+      };
+    }
+    const refs = input?.refs;
+    if (!Array.isArray(refs) || refs.length === 0 || !refs.every((ref) => typeof ref === "string")) {
+      // Only our own runtime produces batches; a malformed one still fails closed without
+      // echoing internals. Not retryable as-is because retrying identical bytes cannot help.
+      return {
+        schemaVersion: 1,
+        decision: "deny",
+        code: "catalog_unavailable",
+        authorityRevision: view.revision,
+        retryable: false,
+      };
+    }
+    for (let index = 0; index < refs.length; index += 1) {
+      const ref = (refs[index] as string).trim();
+      if (!ref || ref.length > 300 || !view.refs.has(ref)) {
+        return {
+          schemaVersion: 1,
+          decision: "deny",
+          code: "model_unavailable",
+          invalidIndex: index,
+          authorityRevision: view.revision,
+          retryable: false,
+        };
+      }
+    }
+    return { schemaVersion: 1, decision: "allow", authorityRevision: view.revision };
+  }
+
+  /** Atomic write of one DISPLAY cache file (snapshot or tombstone). Failures are logged and
+   * propagate only to the publication caller; nothing gates spawn/dispatch/auth on them. */
+  private async writeSubagentModelState(
+    snapshot: SubagentModelCatalogContent | SubagentModelCatalogTombstone,
+  ): Promise<void> {
+    const target = this.subagentModelCatalogFile();
+    const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
+    try {
+      await fs.mkdir(dirname(target), { recursive: true });
+      await fs.writeFile(tmp, JSON.stringify(snapshot, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+      await fs.rename(tmp, target);
+    } catch (error) {
+      console.warn(`[pipiui] subagent model catalog display write failed: ${error instanceof Error ? error.message : String(error)}`);
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * One serialized DISPLAY publication unit built from LAST-COMMITTED canonical state. Never
+   * a gate: stale/corrupt/absent files degrade prompt cosmetics only, every pin decision goes
+   * through validateSubagentModelPins. While the authority cannot prove readiness (bootstrap,
+   * refresh window, failed visibility/load), an explicit tombstone keeps human inspection
+   * honest instead of leaving a stale model list on disk.
+   */
+  private async publishSubagentModelCatalog(): Promise<void> {
+    let payload: SubagentModelCatalogContent | SubagentModelCatalogTombstone;
+    if (this.modelCatalogReady && this.pinCatalogAuthority.state === "ready") {
+      payload = buildSubagentModelCatalogSnapshot(this.models, this.hiddenIds);
+    } else {
+      payload = {
+        version: SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION,
+        available: false,
+        reason: "unavailable",
+        models: [],
+      };
+    }
+    const json = JSON.stringify(payload, null, 2) + "\n";
+    // Steady-state zero churn: unchanged content writes nothing at all.
+    if (json === this.subagentCatalogLastPublished) return;
+    await this.writeSubagentModelState(payload);
+    this.subagentCatalogLastPublished = json;
+  }
+
+  /** Enqueue one display publication unit onto the serialized queue; resolves only when settled. */
+  private materializeSubagentModelCatalog(): Promise<void> {
+    const run = this.subagentCatalogQueue.then(() => this.publishSubagentModelCatalog());
+    this.subagentCatalogQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** Fire-and-forget scheduler for display convergence hooks; a failure never breaks its caller. */
+  private scheduleSubagentModelCatalogRefresh(): void {
+    this.materializeSubagentModelCatalog().catch(error => {
+      console.warn(`[pipiui] subagent model catalog refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }
   private async materializeNativeSearchCatalog(): Promise<void> {
     const fromModels = nativeSearchRuntimeCatalog(this.models);
     const fromClaims = nativeSearchRuntimeCatalog(
@@ -5464,6 +5722,10 @@ export class PiHostBackend implements HostBackend {
     const value = await this.loadSubagentModels(waitForCatalog);
     await this.materializeSubagentModels(value);
     await this.materializeNativeSearchCatalog();
+    // NO dispatch gate here anymore: pin acceptance is decided in-memory by
+    // PinCatalogAuthority (validateSubagentModelPins). The display cache converges via the
+    // rebuild hook and never blocks spawn — a slow or failed write is cosmetic only.
+    this.scheduleSubagentModelCatalogRefresh();
     return value;
   }
   private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
@@ -5786,6 +6048,10 @@ export class PiHostBackend implements HostBackend {
       });
       if (enabledValue) this.extensions.enable(id);
       else this.extensions.disable(id);
+      // Contribution enablement changes model availability: flip the authority shut in THIS
+      // synchronous continuation, before any further await. A provider-less extension leaves
+      // it untouched (nothing pinnable can change); the refresh below reopens it for real.
+      if (this.extensionLoader.authContribution(id)) this.markSubagentPinsUnavailable("refreshing");
       const record = this.extensions.list(overlay).find((item) => item.id === id);
       if (!record) throw new Error(`unknown extension ${id}`);
       await this.refreshCatalogAfterExtensionChange(id);
@@ -6113,6 +6379,11 @@ export class PiHostBackend implements HostBackend {
     } else if (current.state === "discovered") {
       this.extensions.enterError(id, "uninstalled");
     }
+    // Same synchronous transition rule as setExtensionEnabled: an auth-contributing
+    // extension disappearing closes the authority before the awaits below.
+    if ((current.state === "enabled" || current.state === "loaded") && this.extensionLoader.authContribution(id)) {
+      this.markSubagentPinsUnavailable("refreshing");
+    }
     const directory = this.extensionLoader.directoryOf(id);
     if (!directory) throw new Error(`unknown extension package directory ${id}`);
     const projectRoot = await this.resolveGrantProjectRoot(projectId);
@@ -6341,7 +6612,7 @@ export class PiHostBackend implements HostBackend {
   /** Atomic opt-out visibility store, mirroring Swift ModelVisibility(UserDefaults). */
   private async loadHiddenModelIds(): Promise<string[]> {
     if (!this.hiddenIdsLoaded) {
-      this.hiddenIdsLoaded = (async () => {
+      const attempt = (async () => {
         const raw = await this.readSettings();
         const value = raw.hiddenModelIds;
         if (value === undefined) {
@@ -6355,6 +6626,12 @@ export class PiHostBackend implements HostBackend {
           throw new Error("hiddenModelIds 必须是 string[]");
         this.hiddenIds = [...new Set(value)].sort();
       })();
+      // A failed visibility read must not poison every future read: drop the memo so the
+      // next publication retries from disk and recovery needs no restart.
+      attempt.catch(() => {
+        if (this.hiddenIdsLoaded === attempt) this.hiddenIdsLoaded = undefined;
+      });
+      this.hiddenIdsLoaded = attempt;
     }
     await this.hiddenIdsLoaded;
     return [...this.hiddenIds];
@@ -6368,6 +6645,12 @@ export class PiHostBackend implements HostBackend {
     });
     this.hiddenIds = [...sorted];
     this.hiddenIdsLoaded = Promise.resolve();
+    // Authority close-out is SYNCHRONOUS and in-memory: from THIS statement the newly hidden
+    // model is rejected by model_pin_validate even while its name lingers in a display file.
+    // No acceptance window exists, so saveHiddenModelIds no longer waits on disk writes.
+    this.commitReadyPinCatalog();
+    // The cosmetic snapshot converges asynchronously; failures are display-only.
+    this.scheduleSubagentModelCatalogRefresh();
     return [...sorted];
   }
   /**
@@ -6878,6 +7161,24 @@ export class PiHostBackend implements HostBackend {
     if (generation !== this.modelCatalogGeneration) return;
     this.applyManualThinkingLevel(await this.loadManualThinkingLevel());
     if (generation !== this.modelCatalogGeneration) return;
+    // Visibility belongs to the AUTHORITY inputs: a fresh ready view may never be built from
+    // un-proven hidden state. Memoized read; failure throws (fail closed) out of the whole
+    // load so the canonical commit below never lands on guessed visibility.
+    await this.loadHiddenModelIds();
+    if (generation !== this.modelCatalogGeneration) return;
+    // ═══ Canonical commit LP: NO await anywhere between these statements ═══
+    // From this synchronous segment on, model_pin_validate accepts exactly these refs.
+    this.modelCatalogReady = true;
+    this.modelCatalogIncludeCurrent = includeCurrent || this.modelCatalogIncludeCurrent;
+    this.commitReadyPinCatalog();
+    // Keep the Boss-VISIBLE display snapshot convergent with every catalog rebuild path
+    // (listModels, auth refresh, hidden-id changes, spawn). Presentation-only: failures are
+    // logged downstream and never block dispatch or auth.
+    this.scheduleSubagentModelCatalogRefresh();
+    this.scheduleCompatContextBackfill();
+    // Cosmetic session alignment below MAY await (per-session set_thinking persistence). It
+    // cannot retro-actively change the committed view above: a supersede landing inside these
+    // awaits flips the authority shut synchronously and forces its own fresh rebuild.
     for (const [sessionId, state] of this.sessionModelStates) {
       const catalog = this.models.find(model =>
         model.provider === state.model.provider && model.id === state.model.id,
@@ -6912,18 +7213,22 @@ export class PiHostBackend implements HostBackend {
         }
       }
     }
-    if (generation !== this.modelCatalogGeneration) return;
-    this.modelCatalogReady = true;
-    this.modelCatalogIncludeCurrent = includeCurrent || this.modelCatalogIncludeCurrent;
-    this.scheduleCompatContextBackfill();
   }
   private invalidateModelCatalog(): void {
+    // ═══ Invalidate LP: FIRST statement, strictly synchronous. ═══
+    // From this instant no model_pin_validate can accept any previous canonical ref — no
+    // matter how long the reload or its disk work takes. Run-to-completion orders this
+    // before any validation that has not already captured the ready view.
+    this.markSubagentPinsUnavailable("refreshing");
     this.modelsLoaded = undefined;
     this.runtimeModelsPromise = undefined;
     this.modelCatalogReady = false;
     this.modelCatalogLoad = undefined;
     this.modelCatalogIncludeCurrent = false;
     this.modelCatalogGeneration += 1;
+    // Display-only convergence: the publisher tombstones the cache while unavailability
+    // holds and republishes after the next committed rebuild. Never a gate.
+    this.scheduleSubagentModelCatalogRefresh();
   }
   /** Rebuild after pi login/logout while preserving still-configured literal/env-key models. */
   private async refreshModelsAfterAuthChange(
@@ -6932,9 +7237,24 @@ export class PiHostBackend implements HostBackend {
   ): Promise<Model[]> {
     this.invalidateModelCatalog();
     await this.loadModelCatalog(includeCurrent);
+    // Display-cache close-out only: the authoritative decision for this transition already
+    // happened in memory (invalidate LP → commit LP). A failed display write must neither
+    // fail the auth lifecycle nor dangle; the cache reconverges on a later rebuild.
+    await this.materializeSubagentModelCatalog().catch((error) => {
+      console.warn(`[pipiui] subagent model catalog display settlement failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     this.emitModelCatalogChanged(reason);
     return this.models;
   }
+  /**
+   * Unsafe twin used from inside `modelsWrite` jobs (custom-provider writes, compat
+   * backfill). It must NOT blockingly settle the catalog queue: publication re-reads
+   * canonical state via loadModelCatalog, which awaits modelsWrite-idle — awaiting that
+   * here would enqueue behind ourselves and deadlock. The load-end converge hook
+   * (scheduleSubagentModelCatalogRefresh) settles it right after the job finishes;
+   * these paths only ever ADD providers, so a briefly older snapshot fails closed on
+   * unknown pins instead of accepting revoked ones.
+   */
   private async refreshModelsAfterAuthChangeUnsafe(
     includeCurrent = true,
   ): Promise<Model[]> {
@@ -6955,6 +7275,11 @@ export class PiHostBackend implements HostBackend {
   async refreshModelCatalog(): Promise<Model[]> {
     this.invalidateModelCatalog();
     await this.loadModelCatalog(true);
+    // Same demotion as the auth path: refresh returns once the load committed; the DISPLAY
+    // cache settles best-effort and can no longer fail the API call.
+    await this.materializeSubagentModelCatalog().catch((error) => {
+      console.warn(`[pipiui] subagent model catalog display settlement failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
     return this.models;
   }
   private async refreshModelCatalogUnsafe(): Promise<Model[]> {
@@ -7020,7 +7345,10 @@ export class PiHostBackend implements HostBackend {
     if (contextWindow === undefined) {
       contextWindow = await probeCompatContextWindow(baseUrl, apiKey, modelId);
     }
-    return this.modelsWrite.enqueue(async () => {
+    // Persistence runs on modelsWrite; the catalog lifecycle settles OUTSIDE that queue so
+    // awaiting it here can never enqueue behind ourselves and deadlock. The RPC caller still
+    // observes a fully settled catalog (or an explicit failure) when THIS method returns.
+    const providerIdCommitted = await this.modelsWrite.enqueue(async () => {
       const modelsPath = join(this.agentDir, "models.json");
       let catalog: any = { providers: {} };
       try {
@@ -7057,9 +7385,14 @@ export class PiHostBackend implements HostBackend {
       };
       catalog.providers = providers;
       await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
-      await this.refreshModelsAfterAuthChangeUnsafe(false);
-      return { providerId: uniqueId };
+      return uniqueId;
     });
+    try {
+      await this.refreshModelsAfterAuthChange(false);
+    } catch (error) {
+      throw new Error(`自定义 provider 已保存，但模型目录刷新失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    return { providerId: providerIdCommitted };
   }
 
   private scheduleCompatContextBackfill(): void {
@@ -7175,7 +7508,45 @@ export class PiHostBackend implements HostBackend {
     providerId: string,
   ): Promise<ModelState> {
     const rt = await this.modelRuntime();
-    await rt.logout(providerId);
+    try {
+      await rt.logout(providerId);
+    } catch (error) {
+      // A logout may still have changed credentials partially before failing. Close the
+      // authoritative window NOW and keep it closed until a later canonical rebuild; then
+      // surface the original error to the caller.
+      this.invalidateModelCatalog();
+      this.scheduleSubagentModelCatalogRefresh();
+      throw error;
+    }
+    // pi 的 logout 只清 auth.json，从不修改 models.json；apiKey 内联在 models.json 里的
+    // 自定义 provider（如 openai-completions 镜像）会原样留在目录中，删除后模型依旧可用，
+    // 用户看到“删不掉”。这里把带 api/apiKey 字段的 provider 定义从 canonical models.json
+    // 一并删除；仅含 modelOverrides 的内置能力覆盖（如 xai）不属于凭证，跳过不动。
+    try {
+      await this.modelsWrite.enqueue(async () => {
+        const modelsPath = join(this.agentDir, "models.json");
+        let catalog: any;
+        try {
+          catalog = JSON.parse(await fs.readFile(modelsPath, "utf8"));
+        } catch (error: any) {
+          if (error?.code !== "ENOENT") throw error;
+          return; // 无 models.json = 无自定义定义可删，不写文件。
+        }
+        const providers = catalog?.providers;
+        if (!providers || typeof providers !== "object") return;
+        const entry = providers[providerId];
+        if (!entry || typeof entry !== "object") return;
+        if (typeof entry.api !== "string" && typeof entry.apiKey !== "string") return;
+        delete providers[providerId];
+        await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
+      });
+    } catch (error) {
+      // Same authoritative-window semantics as a failed logout: surface the error with the
+      // catalog closed so no stale "still configured" view survives.
+      this.invalidateModelCatalog();
+      this.scheduleSubagentModelCatalogRefresh();
+      throw error;
+    }
     const models = await this.refreshModelsAfterAuthChange(false);
     if (this.modelState.model.provider === providerId) {
       const next = models[0] ?? {
@@ -8016,6 +8387,10 @@ export class PiHostBackend implements HostBackend {
           });
           normalized = true;
         }
+        // One-time migration of pre-flag-era dispatch-seam fixture rows so the
+        // UI keeps them behind the 历史 group after restart; the next persist
+        // writes the flag back into the durable index.
+        if (migrateLegacySeamFixture(agent)) normalized = true;
         const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
         this.agents.set(key, agent);
         this.projectionDebugProvenance.set(key, "durable_load");
@@ -8111,7 +8486,6 @@ export class PiHostBackend implements HostBackend {
       if (known.size > 0 && !known.has(key)) continue;
       logs[key] = entries;
     }
-    const target = this.agentLogsFile();
     const stringifyStarted = Date.now();
     const snapshot = JSON.stringify({ version: 1, logs }) + "\n";
     this.agentLogsPersistLastEnd = Date.now();
@@ -8121,10 +8495,10 @@ export class PiHostBackend implements HostBackend {
       keys: Object.keys(logs).length,
     });
     this.agentsWrite = this.agentsWrite.then(async () => {
-      await fs.mkdir(dirname(target), { recursive: true });
-      const tmp = `${target}.tmp-${process.pid}`;
+      await fs.mkdir(dirname(this.agentLogsFile()), { recursive: true });
+      const tmp = `${this.agentLogsFile()}.tmp-${process.pid}`;
       await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
-      await fs.rename(tmp, target);
+      await fs.rename(tmp, this.agentLogsFile());
     }).catch(error => console.warn(`[pipi-agents] unable to persist durable logs: ${error?.message ?? error}`));
   }
   private persistAgents(): void {
@@ -8159,7 +8533,6 @@ export class PiHostBackend implements HostBackend {
         while (this.agentsPersistDirty) {
           this.agentsPersistDirty = false;
           this.pruneAgentProjection(Date.now());
-          const target = this.agentsFile();
           const stringifyStarted = Date.now();
           const snapshot = JSON.stringify({ version: 1, agents: [...this.agents.values()], worktrees: [...this.worktrees.values()] }, null, 2) + "\n";
           freezeProbe("persist_agents", {
@@ -8168,6 +8541,7 @@ export class PiHostBackend implements HostBackend {
             agents: this.agents.size,
             worktrees: this.worktrees.size,
           });
+          const target = this.agentsFile();
           await fs.mkdir(dirname(target), { recursive: true });
           const tmp = `${target}.tmp-${process.pid}`;
           await fs.writeFile(tmp, snapshot, { encoding: "utf8", mode: 0o600 });
@@ -8203,7 +8577,10 @@ export class PiHostBackend implements HostBackend {
    * 3128 log keys → 15MB index + 40MB log file) until every event-driven
    * snapshot stringify pinned the Electron main thread at ~100% CPU
    * (2026-08-23 freeze). Keep live rows plus the newest N terminal rows and
-   * drop the cached logs and settled worktrees of everything else. Pi still
+   * drop the cached logs and settled worktrees of everything else. Rows ended
+   * inside AGENT_RETENTION_PROTECT_WINDOW_MS (and rows without an end
+   * timestamp) are exempt: when few old rows exist the projection temporarily
+   * holds more than the cap rather than delete recent completions. Pi still
    * owns the worker transcripts; this projection only rebuilds the UI tree.
    */
   private pruneAgentProjection(now: number): boolean {
@@ -8211,11 +8588,19 @@ export class PiHostBackend implements HostBackend {
     for (const [key, agent] of this.agents) {
       if (!this.isLiveAgentState(agent.state)) terminal.push([key, agent]);
     }
-    if (terminal.length <= this.agentRetentionMaxTerminal) return false;
+    const excess = terminal.length - this.agentRetentionMaxTerminal;
+    if (excess <= 0) return false;
     terminal.sort((a, b) => (this.lastObservedAt(b[1]) ?? 0) - (this.lastObservedAt(a[1]) ?? 0));
-    const drop = new Set<string>(
-      terminal.slice(this.agentRetentionMaxTerminal).map(([key]) => key),
-    );
+    // Walk oldest → newest and stop once the cap is met again, skipping any row
+    // that is not provably old (endedAt missing or inside the protection
+    // window). Recency beats retention: a completed record the panel can still
+    // show after a restart must not be pruned the moment its page reloads.
+    const drop = new Set<string>();
+    for (let i = terminal.length - 1; i >= 0 && drop.size < excess; i--) {
+      const agent = terminal[i][1];
+      if (agent.endedAt === undefined || now - agent.endedAt < AGENT_RETENTION_PROTECT_WINDOW_MS) continue;
+      drop.add(terminal[i][0]);
+    }
     for (const key of drop) {
       const agent = this.agents.get(key);
       if (!agent) continue;
@@ -8273,8 +8658,34 @@ export class PiHostBackend implements HostBackend {
     if (!live || !this.liveProcessUsable(live)) return undefined;
     return live;
   }
+  private diagnosticsConfirmProcessGone(agent: AgentSummary): boolean {
+    const diagnostics = agent.diagnostics;
+    return Boolean(
+      diagnostics?.cpuVerdict === "gone" ||
+      diagnostics?.watchdogDecision === "no-process" ||
+      diagnostics?.watchdogDecision === "process-exited" ||
+      diagnostics?.exitReason,
+    );
+  }
+  private diagnosticChildProcessAlive(agent: AgentSummary): boolean {
+    const pid = agent.diagnostics?.childPid;
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || this.diagnosticsConfirmProcessGone(agent)) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error: any) {
+      // EPERM still proves that the PID exists; only ESRCH positively proves it is gone.
+      return error?.code !== "ESRCH";
+    }
+  }
   private lastObservedAt(agent: AgentSummary): number | undefined {
-    return agent.updatedAt ?? agent.createdAt;
+    const businessObservation = agent.updatedAt ?? agent.createdAt;
+    const diagnosticsObservation = this.diagnosticsConfirmProcessGone(agent)
+      ? undefined
+      : agent.diagnostics?.hostReceivedAt;
+    if (businessObservation === undefined) return diagnosticsObservation;
+    if (diagnosticsObservation === undefined) return businessObservation;
+    return Math.max(businessObservation, diagnosticsObservation);
   }
   private isLiveAgentState(state: AgentSummary["state"]): boolean {
     return state === "running" || state === "stalled";
@@ -8326,21 +8737,20 @@ export class PiHostBackend implements HostBackend {
     this.agent({ type: "worktree", status });
   }
   /**
-   * Orphan sweep: running/stalled rows whose last observation is older than
-   * the 10-minute watchdog window are marked interrupted. Previously this
-   * only swept dead sessions (liveSessionProcess guard); that treated a
-   * long-lived main Pi process as proof the worker was still alive and let
-   * a lost terminal event leave the panel stuck on running forever.
-   * Now staleness is judged purely on worker liveness evidence (updatedAt/
-   * createdAt age / stream freshness via lastObservedAt); main process
-   * liveness no longer exempts the row.
+   * Orphan sweep: silence is not terminal evidence. A stale projection stays
+   * live while either its owning Pi session or its recorded child PID still
+   * exists. Same-run diagnostics reception is an independent heartbeat; only
+   * a missing host/child or a positive process-gone diagnosis can close it.
    */
   private reconcileOrphanedNow(sessionId: string, now = Date.now()): boolean {
     let changed = false;
+    const liveSession = this.liveSessionProcess(sessionId);
     for (const agent of [...this.agents.values()]) {
       if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
       const observed = this.lastObservedAt(agent);
       if (observed === undefined || now - observed < ORPHAN_STALE_MS) continue;
+      const processGone = this.diagnosticsConfirmProcessGone(agent);
+      if (!processGone && (liveSession || this.diagnosticChildProcessAlive(agent))) continue;
       const next: AgentSummary = {
         ...agent,
         state: "interrupted",
@@ -8351,7 +8761,7 @@ export class PiHostBackend implements HostBackend {
         activityToolCallId: undefined,
         activityEndedAt: agent.activityEndedAt ?? now,
         endedAt: agent.endedAt ?? now,
-        closeout: agent.closeout ?? ORPHAN_CLOSEOUT,
+        closeout: agent.closeout ?? (processGone ? ORPHAN_PROCESS_GONE_CLOSEOUT : ORPHAN_HOST_UNAVAILABLE_CLOSEOUT),
       };
       this.agents.set(this.agentKey(agent.agentId, agent.sessionId, agent.runId), next);
       this.agentProjectionChanged(next.sessionId);

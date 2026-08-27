@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "source": "https://models.dev/api.json + hand-curated entries",
-  "retrievedAt": "2026-08-13T03:11:00Z",
+  "retrievedAt": "2026-08-27T15:25:00Z",
   "providers": {
     "xai": {
       "models": {
@@ -60,6 +60,46 @@
             "acceptedValues": ["low", "medium", "high"],
             "rejectedValues": ["off", "minimal", "xhigh", "max"],
             "result": "Effort vocabulary is documented, not probed: the relay is user-configured, so values are taken from the official API contract."
+          }
+        },
+        "kimi-k3": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max"
+          },
+          "compat": { "supportsReasoningEffort": true },
+          "verification": {
+            "method": "探测 + 官方契约：经 jellytoken 中转实测 reasoning_effort low/medium/high/max 均返回 HTTP 200 且推理发生，并对照 Moonshot Kimi K3 官方契约（reasoning_effort 接受 low | high | max，默认 max；模型始终推理，无 thinking 开关）。实测 medium 被上游软接受，但官方词汇不含 medium，故按 deepseek 条目同法保守映射到 high；off: null 保持未设置级别时不发送参数，走上游默认（始终思考）。",
+            "verifiedAt": "2026-08-27T15:25:00Z",
+            "acceptedValues": ["low", "high", "max"],
+            "rejectedValues": ["minimal", "medium", "xhigh"],
+            "result": "探测：21 个 (model, effort) 组合均返回 HTTP 200 且推理确实发生；官方契约：kimi-k3 接受 reasoning_effort low/high/max（默认 max）且始终思考。medium 实测被中转软接受，但官方词汇无 medium，保守映射到 high。"
+          }
+        },
+        "qwen3.8-max": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "compat": { "supportsReasoningEffort": true },
+          "verification": {
+            "method": "探测 + 官方契约：经 jellytoken 中转实测 reasoning_effort low/medium/high/xhigh/none 均返回 HTTP 200 且推理发生，并对照 Qwen 3.8 Max 官方契约（enable_thinking + reasoning_effort 接受 low | medium | xhigh，默认 xhigh；none 显式禁用思考）。off 映射到 none 而非省略参数，否则 off 会保持默认 xhigh 思考不关；max 上游无此值，映射到 xhigh。",
+            "verifiedAt": "2026-08-27T15:25:00Z",
+            "acceptedValues": ["low", "medium", "xhigh", "none"],
+            "rejectedValues": [],
+            "result": "探测：21 个 (model, effort) 组合均返回 HTTP 200 且推理确实发生；官方契约：qwen3.8-max 使用 enable_thinking + reasoning_effort low/medium/xhigh（默认 xhigh），none 禁用思考。上游无 max，映射到 xhigh。"
           }
         },
         "deepseek-v4-pro": {

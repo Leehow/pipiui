@@ -118,18 +118,6 @@ function prepared(tool: RegisteredTool, args: unknown): Record<string, unknown> 
 	return out as Record<string, unknown>;
 }
 
-/** Minimal schema-side required check mirroring pi's validation of TypeBox objects. */
-function schemaRequiredProperties(tool: RegisteredTool): string[] {
-	const schema = tool.parameters as { required?: string[]; properties?: Record<string, unknown> };
-	if (Array.isArray(schema.required)) return schema.required;
-	return Object.entries(schema.properties ?? {})
-		.filter(([, value]) => {
-			const v = value as { anyOf?: unknown[] };
-			return !Array.isArray(v.anyOf) || !v.anyOf.some((entry) => (entry as { type?: string }).type === "null");
-		})
-		.map(([key]) => key);
-}
-
 const agentsDir = fileURLToPath(new URL("../../agents", import.meta.url));
 
 /**
@@ -166,8 +154,13 @@ test("registered tool seam: provider schema + prepare rejects missing IDs; expli
 	const chain = tools.get("subagent_chain")!;
 	assert.ok(chain, "subagent_chain tool must be registered");
 
-	// Provider schema: agentId is required, not optional-with-runtime-rejection.
-	assert.ok(schemaRequiredProperties(subagent).includes("agentId"), "single schema must require agentId");
+	// Provider schema: root agentId is declared but NOT required — the parallel tasks[] mode
+	// omits it (each item carries its own). Single-mode enforcement lives at the execute()
+	// identity gate, asserted right below with its named error. TypeBox omits `required`
+	// when nothing is required, so assert against the declared array directly.
+	assert.ok(Boolean((subagent.parameters as { properties?: Record<string, unknown> }).properties?.agentId), "single schema must still DECLARE agentId");
+	const rootRequired = (subagent.parameters as { required?: string[] }).required ?? [];
+	assert.equal(rootRequired.includes("agentId"), false, "root agentId must be schema-optional so bare tasks[] waves validate; identity is enforced at execute()");
 	const chainItemSchema = (chain.parameters as { properties?: { chain?: { items?: { properties?: Record<string, unknown> } } } })
 		.properties?.chain?.items?.properties ?? {};
 	assert.ok(chainItemSchema.agentId, "chain item schema must declare agentId");

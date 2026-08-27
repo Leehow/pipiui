@@ -557,11 +557,29 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     }
   }
   if (event.type !== 'text' && event.type !== 'thinking' && event.type !== 'tool_call' && event.type !== 'tool_result' && event.type !== 'hosted_search' && event.type !== 'hosted_code_interpreter' && event.type !== 'citations' && event.type !== 'input_file_sources' && event.type !== 'server_side_usage') return previous
-  const index = previous.findLastIndex(item => item.role === 'assistant')
+  const eventToolId = event.type === 'tool_call' || event.type === 'tool_result'
+    ? event.toolCallId
+    : event.type === 'hosted_search' || event.type === 'hosted_code_interpreter'
+      ? event.callId
+      : undefined
+  // A cut-in user message is a hard chronology boundary. Updates for an
+  // already-rendered tool still belong on that earlier card, but a new model
+  // activity after the cut-in must open a new assistant row after the user.
+  const matchingToolAssistantIndex = eventToolId
+    ? previous.findLastIndex(item => item.role === 'assistant' && item.tools?.some(tool => tool.id === eventToolId))
+    : -1
+  const lastAssistantIndex = previous.findLastIndex(item => item.role === 'assistant')
+  const index = matchingToolAssistantIndex >= 0 ? matchingToolAssistantIndex : lastAssistantIndex
+  const mayCrossUserBoundary = matchingToolAssistantIndex >= 0
+    || event.type === 'citations'
+    || event.type === 'input_file_sources'
+    || event.type === 'server_side_usage'
   // Late hosted code-interpreter events after settle still update the last
   // assistant in place so the virtual card appears immediately.
   const reuseSettled = (event.type === 'hosted_code_interpreter' || event.type === 'input_file_sources') && index >= 0
-  const canUpdate = index >= 0 && (previous[index].streaming || reuseSettled)
+  const canUpdate = index >= 0
+    && (index === previous.length - 1 || mayCrossUserBoundary)
+    && (previous[index].streaming || reuseSettled)
   const current = canUpdate ? previous[index] : { id: `stream-${Date.now()}`, role: 'assistant' as const, content: '', thinking: '', tools: [], streaming: true, timestamp: Date.now() }
   // Copy-on-write working containers: a streaming text/thinking delta only
   // rewrites the one activity it appends to, so the previous message's tools
@@ -864,7 +882,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
   // Keep insertion order. Sorting by contentIndex is wrong: Pi restarts the
   // index every assistant message, and text/thinking often share index 0.
   const next = canUpdate ? [...previous] : [...previous, current]
-  next[next.length - 1] = updated
+  next[canUpdate ? index : next.length - 1] = updated
   return next
 }
 

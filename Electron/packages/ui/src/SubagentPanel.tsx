@@ -52,14 +52,12 @@ function isActive(agent: Pick<Agent, 'state'>) {
   return agent.state === 'running'
 }
 
-/** Seam-test fixture workers announce themselves with a `[seam:` marker in prompt or result. */
-const SEAM_FIXTURE_MARK = '[seam:'
-/** Terminal rows settled this long ago are history material, not active list content. */
+/**
+ * Terminal rows settled this long ago are history material, not active list
+ * content. Freshly-completed rows never match, so a record the user just
+ * watched finish always stays in the default list.
+ */
 const AGENT_STALE_TERMINAL_AFTER_MS = 24 * 60 * 60 * 1000
-
-function isSeamFixtureAgent(agent: Pick<AgentSummary, 'task' | 'finalResult'>) {
-  return agent.task.includes(SEAM_FIXTURE_MARK) || Boolean(agent.finalResult?.includes(SEAM_FIXTURE_MARK))
-}
 
 /**
  * Running/stalled rows always stay actionable in the main list; terminal rows
@@ -405,7 +403,6 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
   // card containing all thinking + tools, followed by the text content.
   const activities: TranscriptActivity[] = []
   const tools: TranscriptTool[] = []
-  const contentParts: string[] = []
   let nextIndex = 0
   const activityIndex = (log: Log) => log.contentIndex ?? nextIndex
   const consumed = new Set<number>()
@@ -457,26 +454,36 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
       activities.push({ type: 'tool', contentIndex, tool })
       nextIndex = Math.max(nextIndex, contentIndex + 1)
     } else if (log.itemType === 'toolResult') {
-      if (!consumed.has(index) && text) contentParts.push(text)
+      // Orphan result: its tool row never reached this panel (mid-run reload or a
+      // lost stream frame — the runtime never re-sends already-streamed tool calls).
+      // Raw tool output must never become message content: the markdown renderer
+      // collapses newlines and turns a 1500-char file slice into a prose wall.
+      // Keep it inspectable as a finished result card inside the steps group.
+      if (!consumed.has(index) && text) {
+        const contentIndex = activityIndex(log)
+        const tool: TranscriptTool = { id: `subagent-result-${log.id}`, name: nameOf(log) || 'tool', input: '', result: text, error: log.isError, startedAt: agent.startedAt, finished: true }
+        tools.push(tool)
+        activities.push({ type: 'tool', contentIndex, tool })
+        nextIndex = Math.max(nextIndex, contentIndex + 1)
+      }
     } else if (text) {
       const contentIndex = activityIndex(log)
       activities.push({ type: 'text', id: `text:${log.id}`, contentIndex, content: text })
       nextIndex = Math.max(nextIndex, contentIndex + 1)
     }
   }
-  const content = contentParts.join('\n\n')
   const messages: AssistantTranscriptMessage[] = []
   const hasSteps = activities.length > 0
-  if (hasSteps || content) {
+  if (hasSteps) {
     messages.push({
-      content,
+      content: '',
       thinking: activities.find((activity): activity is Extract<TranscriptActivity, { type: 'thinking' }> => activity.type === 'thinking')?.content,
       tools: tools.length > 0 ? tools : undefined,
       activities: hasSteps ? activities : undefined,
       streaming: isActive(agent)
     })
   }
-  if (finalResult && finalResult.trim() && !content.includes(finalResult.trim()) && !activities.some(activity => activity.type === 'text' && activity.content.includes(finalResult.trim()))) {
+  if (finalResult && finalResult.trim() && !activities.some(activity => activity.type === 'text' && activity.content.includes(finalResult.trim()))) {
     messages.push({ content: finalResult })
   }
   if (!messages.length && !isActive(agent)) messages.push({ content: agent.state === 'ok' ? '任务已完成' : agent.state === 'failed' ? '任务失败。请查看技术详情中的完整错误。' : `任务${stateText(agent)}，尚无返回内容。` })
@@ -531,7 +538,9 @@ function treeOrder(agents: Agent[]) {
 export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, headerSlot, onRunningChange, onRunningCountChange, onAgentStarted, onManualStatusCheck }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; headerSlot?: HTMLElement | null; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void; onManualStatusCheck?: (agentIDs: string[]) => void }) {
   const terminalAvailable = Boolean(host.terminal?.open)
   const [agents, setAgents] = useState<Agent[]>([])
-  const [selectedId, setSelectedId] = useState<string>()
+  // Selection is a ROW key (agentId+runId), never the bare agentId: two runs of
+  // one slug are distinct rows, and selecting one must select exactly that run.
+  const [selectedKey, setSelectedKey] = useState<string>()
   const [page, setPage] = useState(0)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [ratio, setRatio] = useState(initialRatio)
@@ -540,6 +549,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   const [loadError, setLoadError] = useState('')
 	const [abortError, setAbortError] = useState('')
 	const [abortingIds, setAbortingIds] = useState<Set<string>>(() => new Set())
+  const [hiddenClearedKeys, setHiddenClearedKeys] = useState<Set<string>>(() => new Set())
   const [now, setNow] = useState(() => Date.now())
   const listRef = useRef<HTMLDivElement>(null)
   const loadGeneration = useRef(0)
@@ -550,7 +560,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   // viewport) collapsed. Only running-count increases after hydration reveal.
   const hydratedRef = useRef(false)
   const previousRunningRef = useRef(0)
-  const selected = agents.find(agent => agent.agentId === selectedId)
+  const selected = agents.find(agent => agentRowKey(agent) === selectedKey)
 
   useEffect(() => () => {
     for (const timer of logRenderTimers.current) window.clearTimeout(timer)
@@ -565,8 +575,11 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     try {
       // The durable host index survives restarts, but the visible tree belongs to the
       // selected chat. Replacing (rather than accumulating) the snapshot keeps agents
-      // from another session out of the panel.
-      const snapshot = await host.listAgents(sessionId)
+      // from another session out of the panel. The 'history' scope returns every
+      // retained run of this session — including an older completed run of the same
+      // agentId — so records restored after a restart stay visible instead of being
+      // collapsed into one current summary per agentId.
+      const snapshot = await host.listAgents(sessionId, 'history')
       if (generation !== loadGeneration.current) return
       if (!hydratedRef.current) {
         previousRunningRef.current = snapshot.filter(isActive).length
@@ -575,7 +588,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       // The session-change effect already cleared the previous chat. Merge the
       // snapshot into any events that arrived while this request was in flight,
       // otherwise a fast START can be erased by a slower empty snapshot.
-      setAgents(current => snapshot.reduce((next, agent) => applyAgentEvent(next, { type: 'agent', agent }, 'snapshot', sessionId), current))
+      setAgents(current => snapshot.reduce((next, agent) => applyAgentEvent(next, { type: 'agent', agent }, sessionId), current))
     } catch (error) {
       if (generation !== loadGeneration.current) return
       setLoadError(error instanceof Error ? error.message : '无法加载 subagents')
@@ -592,13 +605,14 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     hydratedRef.current = false
     previousRunningRef.current = 0
     setAgents([])
-    setSelectedId(undefined)
+    setSelectedKey(undefined)
+    setHiddenClearedKeys(new Set())
     setPage(0)
 		setAbortError('')
 		setAbortingIds(new Set())
     void load()
     const off = host.subscribeAgents(event => setAgents(current => sessionScopedEvent(current, event, sessionId)
-      ? applyAgentEvent(current, event, 'live', sessionId)
+      ? applyAgentEvent(current, event, sessionId)
       : current))
     return () => {
       loadGeneration.current += 1
@@ -607,13 +621,13 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   }, [host, load, sessionId])
 
   useEffect(() => {
-    // Auto-select the newest agent; if the current selection no longer exists
-    // in this session's tree (e.g. a session switch reloaded a different set),
-    // fall back to the newest agent or clear the stale id.
-    const exists = agents.some(agent => agent.agentId === selectedId)
+    // Auto-select the newest row; if the current selection no longer exists in
+    // this session's tree (e.g. a session switch reloaded a different set),
+    // fall back to the newest row or clear the stale key.
+    const exists = agents.some(agent => agentRowKey(agent) === selectedKey)
     if (exists) return
-    setSelectedId(agents.length ? treeOrder(agents).at(-1)?.agentId : undefined)
-  }, [agents, selectedId])
+    setSelectedKey(agents.length ? agentRowKey(treeOrder(agents).at(-1)!) : undefined)
+  }, [agents, selectedKey])
 
   useEffect(() => {
     localStorage.setItem(splitKey, String(ratio))
@@ -671,12 +685,14 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     }
   }, [host, selected?.agentId, selected?.sessionId, selected?.runId])
 
-  // Fetch cached logs for the selected agent so completed subagents show their
-  // full transcript (live subscription only delivers events while running).
-  // Default scope is the exact run: a semantic agentId is deliberately reused
-  // across runs, and concatenating older runs under the current run's header
-  // misattributes their tool logs. The full history stays reachable through the
-  // explicit per-agent history view (see showHistory below).
+  // Backfill the selected row's transcript from the host's log cache. The live
+  // subscription only delivers events from subscribe-time on, so a row selected
+  // (or a renderer reloaded) mid-run starts with a partial transcript — and the
+  // runtime never re-sends already-streamed tool calls, so those rows would be
+  // lost forever, leaving their toolResults orphaned. The host updates its cache
+  // synchronously before relaying each event, so the snapshot is a superset of
+  // everything this panel could have received live: merge it in (never skip
+  // just because rows exist) instead of the old fill-only-when-empty.
   useEffect(() => {
     const identity = selected ? episodeIdentity(selected) : undefined
     // Only an exact-episode row fetches its cached transcript: a blank-keyed
@@ -686,10 +702,9 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     void host.getAgentLogs(identity.agentId, identity.sessionId, identity.runId).then(entries => {
       if (cancelled || !entries.length) return
       setAgents(current => current.map(agent => {
-        if (!sameEpisode(agent, identity) || agent.logs.length > 0) return agent
-        let logs: Log[] = []
-        for (const entry of entries) logs = applyLogDelta(logs, { type: 'agent_log', agentId: identity.agentId, ...entry })
-        return { ...agent, logs }
+        if (!sameEpisode(agent, identity)) return agent
+        const logs = mergeAgentLogBackfill(agent.logs, entries, identity.agentId)
+        return logs === agent.logs ? agent : { ...agent, logs }
       }))
     })
     return () => { cancelled = true }
@@ -753,18 +768,28 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     onRunningChange?.(false)
   }, [onRunningChange, onRunningCountChange])
 
-  // View layering only: seam-test fixture noise and long-settled terminal rows
-  // fold into the collapsed 历史 group; the main list keeps active/recent rows.
+  // View layering only: rows explicitly marked as test fixtures and
+  // long-settled terminal rows fold into the collapsed 历史 group; the main list
+  // keeps active/recent rows. A just-finished real worker never matches either
+  // rule, so a record the user watched complete always stays visible.
+  // 仅当前视图隐藏（清空）的行在分区前整体过滤；不触碰持久化数据，重载即恢复。
+  const presented = agents.filter(agent => !hiddenClearedKeys.has(agentRowKey(agent)))
   const currentAgents: Agent[] = []
   const historyAgents: Agent[] = []
-  for (const agent of agents)
-    ((isSeamFixtureAgent(agent) || isStaleTerminalRow(agent, now)) ? historyAgents : currentAgents).push(agent)
+  for (const agent of presented)
+    ((agent.testFixture === true || isStaleTerminalRow(agent, now)) ? historyAgents : currentAgents).push(agent)
   const ordered = treeOrder(currentAgents)
   const archiveOrdered = treeOrder(historyAgents)
   const pageCount = Math.max(1, Math.ceil(ordered.length / pageSize))
   const activePage = Math.min(page, pageCount - 1)
   const visibleAgents = ordered.slice(Math.max(0, ordered.length - (activePage + 1) * pageSize), ordered.length - activePage * pageSize)
-  const newestId = ordered.at(-1)?.agentId
+  const newestKey = ordered.length ? agentRowKey(ordered.at(-1)!) : undefined
+  // Rows are episodes: when one semantic agentId owns two displayed runs, its
+  // per-row testid must disambiguate them instead of colliding.
+  const idOccurrences = new Map<string, number>()
+  for (const agent of agents) idOccurrences.set(agent.agentId, (idOccurrences.get(agent.agentId) ?? 0) + 1)
+  const rowTestId = (agent: Agent) =>
+    (idOccurrences.get(agent.agentId) ?? 0) > 1 ? `${agent.agentId}--${agent.runId ?? 'legacy'}` : agent.agentId
 
   useEffect(() => {
     if (page !== activePage) setPage(activePage)
@@ -774,7 +799,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     const el = listRef.current
     if (!el || !follow || !paneVisible) return
     el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight)
-  }, [follow, newestId, paneVisible, visibleAgents.length])
+  }, [follow, newestKey, paneVisible, visibleAgents.length])
 
   const staleAgentIDs = staleRunningAgentIDs(agents, now)
   const requestManualStatusCheck = (agentIDs: string[]) => {
@@ -799,7 +824,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
     // already replaced, so it merges with snapshot precedence, never live trust.
     // The merge itself is exact-triple guarded (applyAgentEvent never lets a stale
     // run rewrite a row that a newer run already owns).
-    setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }, 'snapshot', session))
+    setAgents(current => applyAgentEvent(current, { type: 'agent', agent: update }, session))
   }
   const worktree = async (agent: Agent, action: 'merge' | 'discard') => {
     const identity = episodeIdentity(agent)
@@ -827,9 +852,9 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 		// Inert without exact identity: no stop request with synthesized blanks —
 		// the host would reject the episode, and a slug-only stop could kill a
 		// newer run reusing the same semantic id.
-		if (!identity || abortingIds.has(agent.agentId)) return
+		if (!identity || abortingIds.has(agentRowKey(agent))) return
 		setAbortError('')
-		setAbortingIds(current => new Set(current).add(agent.agentId))
+		setAbortingIds(current => new Set(current).add(agentRowKey(agent)))
 		try {
 			await host.abortAgent(identity.sessionId, identity.agentId, identity.runId)
 		} catch (error) {
@@ -837,7 +862,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
 		} finally {
 			setAbortingIds(current => {
 				const next = new Set(current)
-				next.delete(agent.agentId)
+				next.delete(agentRowKey(agent))
 				return next
 			})
 		}
@@ -859,9 +884,21 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
       setAbortError(`无法标记 ${agentDisplayName(agent)} 已处理：${error instanceof Error ? error.message : '请求失败'}`)
     }
   }
+  // 「清空」只隐藏当前视图里本会话的终态行（不改任何持久化数据）:running/stalled
+  // 行与仍待用户处理（pendingReview 工作树）的行保留；切换会话或重新加载后隐藏即失效。
   const clearFinished = () => {
-    setAgents(current => current.filter(isActive))
+    if (!sessionId) return
     setPage(0)
+    setHiddenClearedKeys(current => {
+      const next = new Set(current)
+      for (const agent of agents) {
+        if (agent.sessionId && agent.sessionId !== sessionId) continue
+        if (isActive(agent) || agent.state === 'stalled') continue
+        if (agent.worktree?.lifecycle === 'pendingReview') continue
+        next.add(agentRowKey(agent))
+      }
+      return next
+    })
   }
   const startDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
     const startY = event.clientY
@@ -878,7 +915,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   }
 
   return <section className="subagents" data-testid="subagent-panel">
-    {headerSlot && paneVisible && createPortal(<SubagentHeader total={agents.length} {...summary} onClear={clearFinished} />, headerSlot)}
+    {headerSlot && paneVisible && createPortal(<SubagentHeader total={agents.length} {...summary} clearDisabled={!sessionId} onClear={clearFinished} />, headerSlot)}
     {staleAgentIDs.length > 0 && <div className="subagent-status-channel-warning" data-testid="subagent-status-channel-warning" role="status">
       <p>{statusChannelWarningText(staleAgentIDs)}</p>
       <button type="button" data-testid="subagent-manual-status-check" title="向主会话发出用户主动的状态查询；不会自动重新派发 agent" onClick={() => requestManualStatusCheck(staleAgentIDs)}>手动检查</button>
@@ -893,14 +930,15 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
           : <div className="subagent-split" style={{ gridTemplateRows: `${ratio}fr 6px ${1 - ratio}fr` }}>
             <div ref={listRef} className="agent-list compact" data-density="compact" onScroll={event => setFollow(event.currentTarget.scrollHeight - event.currentTarget.scrollTop - event.currentTarget.clientHeight < 24)}>
               {visibleAgents.map(agent => <AgentRow
-                key={agent.agentId}
+                key={agentRowKey(agent)}
+                testId={rowTestId(agent)}
                 agent={agent}
 				childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
 				activeChildCount={agents.filter(candidate => candidate.parentId === agent.agentId && isActive(candidate)).length}
-                selected={agent.agentId === selectedId}
-				aborting={abortingIds.has(agent.agentId)}
+                selected={agentRowKey(agent) === selectedKey}
+				aborting={abortingIds.has(agentRowKey(agent))}
 				now={now}
-                onSelect={() => setSelectedId(agent.agentId)}
+                onSelect={() => setSelectedKey(agentRowKey(agent))}
 				onAbort={() => void abort(agent)}
                 onResolve={() => void resolve(agent)}
               />)}
@@ -915,14 +953,15 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
                     {historyOpen ? '▾' : '▸'} 历史（{archiveOrdered.length}）
                   </button>
                   {historyOpen && archiveOrdered.map(agent => <AgentRow
-                    key={agent.agentId}
+                    key={agentRowKey(agent)}
+                    testId={rowTestId(agent)}
                     agent={agent}
                     childCount={agents.filter(candidate => candidate.parentId === agent.agentId).length}
                     activeChildCount={agents.filter(candidate => candidate.parentId === agent.agentId && isActive(candidate)).length}
-                    selected={agent.agentId === selectedId}
-                    aborting={abortingIds.has(agent.agentId)}
+                    selected={agentRowKey(agent) === selectedKey}
+                    aborting={abortingIds.has(agentRowKey(agent))}
                     now={now}
-                    onSelect={() => setSelectedId(agent.agentId)}
+                    onSelect={() => setSelectedKey(agentRowKey(agent))}
                     onAbort={() => void abort(agent)}
                     onResolve={() => void resolve(agent)}
                   />)}
@@ -930,7 +969,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
               )}
             </div>
             <div className="subagent-divider" aria-label="调整 agent 列表高度" role="separator" onPointerDown={startDrag} />
-			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(selected.agentId))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />
+			<AgentDetail agent={selected} activeChildCount={selected ? agents.filter(candidate => candidate.parentId === selected.agentId && isActive(candidate)).length : 0} aborting={Boolean(selected && abortingIds.has(agentRowKey(selected)))} now={now} projectPath={projectPath} onOpenDocument={onOpenDocument} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} terminalAvailable={terminalAvailable} onCheck={check} onWorktree={worktree} onOpenWorktreeTerminal={path => void openWorktreeTerminal(path)} onAbort={agent => void abort(agent)} historyLogs={historyLogs} historyError={historyError} canShowHistory={Boolean(host.getAgentLogs)} onShowHistory={agent => void showHistory(agent)} onHideHistory={() => { setHistoryLogs(undefined); setHistoryError('') }} />
           </div>}
   </section>
 }
@@ -981,6 +1020,16 @@ function episodeIdentity(carrier: { sessionId?: string; agentId: string; runId?:
   return { sessionId, agentId, runId }
 }
 
+/**
+ * Stable list/React key for one displayed run. Rows are episodes — two runs of
+ * the same semantic agentId are two rows, and in aggregate mode the same
+ * (agentId, runId) can exist in TWO sessions — so the key is the exact episode
+ * triple; legacy identity-less rows fall back to the bare agentId alone.
+ */
+function agentRowKey(agent: Pick<AgentSummary, 'sessionId' | 'agentId' | 'runId'>): string {
+  return agent.runId ? `${agent.sessionId ?? ''}\u0000${agent.agentId}\u0000${agent.runId}` : agent.agentId
+}
+
 /** Strict same-episode test: non-empty identity on both sides, equal on all three fields. */
 function sameEpisode(carrier: { sessionId?: string; agentId: string; runId?: string }, identity: EpisodeIdentity): boolean {
   const own = episodeIdentity(carrier)
@@ -1016,37 +1065,28 @@ export function resolveAgentStalled(state: AgentState, stalled: boolean): boolea
 }
 
 /**
- * Timing guard for merging one agent event/snapshot row into a displayed row.
+ * Timing guard for merging one agent event/snapshot row into ITS OWN displayed row.
  *
- * The live subscription and the async `listAgents()`/`checkAgent()` reads land in whatever
- * order the host delivers them, so `applyAgentEvent` must not blindly spread by agentId:
- *
- * - Same run: once a row reached a terminal verdict, a late running/stalled event for
- *   that same run (or an older snapshot row captured before the verdict) must never
- *   downgrade it back to live. Terminal→terminal refresh is still allowed.
- * - Different run with comparable, unequal `createdAt`: only a strictly newer time
- *   replaces the displayed run; an equal time can never supersede in either direction.
- * - Different run with missing/equal `createdAt`: the backend keys each run separately
- *   (its own mapper never reopens a terminal run), so the first live event for a
- *   never-before-seen runId is that run's start and is trusted — but only as `running`.
- *   Everything else (a snapshot, a stall/end, or any event for a run the panel has
- *   already displayed and replaced) is conservatively rejected: a retired run can
- *   never come back.
+ * Rows are episodes: an event routes by exact {agentId, runId} to the run's own
+ * row, and a different run becomes its own row instead of replacing anything —
+ * so no cross-run ordering rule is needed anymore (an old run's record stays
+ * visible next to its newer sibling). The only precedence left is within one
+ * run: once a row reached a terminal verdict, a late running/stalled event for
+ * that same run (or an older snapshot row captured before the verdict) must
+ * never downgrade it back to live. Terminal→terminal refresh is still allowed.
  */
-export type AgentEventSource = 'live' | 'snapshot'
 
 /**
- * Renderer-lifetime ledger of runs the panel has already displayed and replaced,
- * keyed `${sessionId}\u0000${agentId}` so different chats never pollute each other.
+ * Renderer-lifetime ledger of runs this renderer has explicitly forgotten —
+ * cleared by the user via 清空 or retired by a run replacement in an earlier
+ * panel generation — keyed `${sessionId}\u0000${agentId}` so chats never
+ * pollute each other.
  *
- * It deliberately lives OUTSIDE React state: session switches and remounts clear the
- * row list (`setAgents([])`), but retiring a run is permanent — after the panel comes
- * back, a late event for a run a newer run already replaced must still be rejected,
- * even before any row exists for that agent again. It is never cleared on a session
- * switch. The host emits no reliable "forget this run" signal, so entries are kept for
- * the renderer's life; each actual runId is stored exactly once (Set dedupes) and O(1)
- * lookup replaces per-row array copies. Correctness outranks memory here: no
- * capacity-based eviction that could resurrect an old run.
+ * It lives OUTSIDE React state because session switches and remounts clear the
+ * row list (`setAgents([])`): after that, a stale late event for a cleared run
+ * must not reinsert it as a fresh row. A run currently DISPLAYED still accepts
+ * its own events (routing is per-episode), so retirement only blocks first-sight
+ * reinsertion. Entries are kept for the renderer's life; Set dedupes.
  */
 const agentRunLineages = new Map<string, Set<string>>()
 
@@ -1077,58 +1117,46 @@ export function agentRunLineageSizeForTest(): number {
 export function agentEventSupersedes(
   previous: Pick<AgentSummary, 'state' | 'runId' | 'createdAt'>,
   incoming: Pick<AgentSummary, 'state' | 'runId' | 'createdAt'>,
-  source: AgentEventSource = 'live',
-  retiredRunIds?: ReadonlySet<string>,
 ): boolean {
+  // Different runIds are different episodes entirely: the caller inserts a
+  // sibling row instead of merging, whatever the timestamps say.
+  if (previous.runId && incoming.runId && previous.runId !== incoming.runId) return false
   const previousTerminal = TERMINAL_AGENT_STATES.includes(previous.state)
   const incomingTerminal = TERMINAL_AGENT_STATES.includes(incoming.state)
-  if (!previous.runId || !incoming.runId || previous.runId === incoming.runId) {
-    return !(previousTerminal && !incomingTerminal)
-  }
-  // A run the panel already displayed and then replaced is permanently retired:
-  // no late live event or snapshot for it may ever rewrite the row again.
-  if (retiredRunIds?.has(incoming.runId)) return false
-  const before = previous.createdAt
-  const at = incoming.createdAt
-  if (typeof before === 'number' && Number.isFinite(before) && typeof at === 'number' && Number.isFinite(at) && before !== at) {
-    return at > before
-  }
-  // Missing or equal timestamps cannot order the runs: accept only a live first
-  // sight of a brand-new run (its start, per backend run isolation). Snapshots and
-  // non-running events are rejected — they can never prove they are the newer run.
-  return source === 'live' && incoming.state === 'running'
+  return !(previousTerminal && !incomingTerminal)
 }
 
-function applyAgentEvent(current: Agent[], event: AgentEvent, source: AgentEventSource = 'live', sessionId?: string): Agent[] {
+function applyAgentEvent(current: Agent[], event: AgentEvent, sessionId?: string): Agent[] {
   if (event.type === 'worktree') return current.map(agent => agent.agentId === event.status.agentId && worktreeStatusOwnsRow(agent, event.status) ? { ...agent, worktree: event.status } : agent)
   if (event.type !== 'agent') return current
   const incoming = event.agent
-  const index = current.findIndex(agent => agent.agentId === incoming.agentId)
-  const previous = current[index]
-  // The lineage ledger is checked even when no row exists yet: after a session switch or
-  // remount the list is empty, and a retired run's late live event must not reinsert it
-  // ahead of the current run's snapshot. Survives list clears; see agentRunLineages.
+  // Episode routing: match by exact session + run identity, so a second run of
+  // one agentId ADDS a row while the older completed run keeps showing beside
+  // it, and the same (agentId, runId) in a DIFFERENT session gets its own row
+  // too instead of repainting this one. Only legacy identity-less events fall
+  // back to a bare-agentId legacy row.
+  const index = current.findIndex(agent =>
+    agent.agentId === incoming.agentId
+    && (incoming.runId ? agent.runId === incoming.runId : !agent.runId)
+    && (!incoming.sessionId || !agent.sessionId || agent.sessionId === incoming.sessionId))
+  const previous = index < 0 ? undefined : current[index]
+  // The forget-ledger is checked only for runs with no displayed row: 清空-deleted
+  // or already-replaced runs must not come back from a stale event/snapshot replay.
   const retiredRunIds = agentRunLineages.get(agentRunLineageKey(sessionId ?? incoming.sessionId, incoming.agentId))
-  if (incoming.runId && retiredRunIds?.has(incoming.runId)) return current
-  // A row that already reached a verdict — or already shows a newer run — must not
-  // be rewritten by a late event or a slower listAgents() snapshot taken before
-  // that verdict/new run existed. See agentEventSupersedes for the precedence rules.
-  if (previous && !agentEventSupersedes(previous, incoming, source)) return current
+  if (!previous && incoming.runId && retiredRunIds?.has(incoming.runId)) return current
+  // Within ONE run, a reached verdict must not be reopened by a late running/stalled
+  // event or a slower listAgents() snapshot taken before it. See agentEventSupersedes.
+  if (previous && !agentEventSupersedes(previous, incoming)) return current
   const active = incoming.state === 'running'
-  const switchedRun = Boolean(previous?.runId && incoming.runId && previous.runId !== incoming.runId)
-  // A new run owns a fresh transcript: the previous run's cached/streamed logs are
-  // cleared outright (not just unkeyed), because they belong to the retired run —
-  // they are only ever re-shown through the explicit agent-history view
-  // (scope: 'agent'), never silently concatenated under the new run's header.
-  // contentIndex slot-keying alone would keep the old rows visible as plain rows.
-  const logs = switchedRun ? [] : previous?.logs ?? []
-  const startedCandidates = [incoming.createdAt, switchedRun ? undefined : previous?.startedAt]
+  // Logs belong to THIS episode and stream across its own updates; a sibling run
+  // has its own row with its own transcript (loaded via getAgentLogs when shown).
+  const logs = previous?.logs ?? []
+  const startedCandidates = [incoming.createdAt, previous?.startedAt]
     .filter((value): value is number => typeof value === 'number' && Number.isFinite(value))
-  if (switchedRun && previous.runId) retireAgentRun(sessionId ?? incoming.sessionId, incoming.agentId, previous.runId)
   const next: Agent = {
     ...previous,
     ...incoming,
-    // Shallow-merge alone would inherit the previous run's stalled flag when the
+    // Shallow-merge alone would inherit a previous stalled flag when the
     // incoming event omits it; resolve it per event instead (see resolveAgentStalled).
     stalled: resolveAgentStalled(incoming.state, incoming.stalled === true),
     startedAt: startedCandidates.length ? Math.min(...startedCandidates) : Date.now(),
@@ -1165,7 +1193,7 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
     // Skip empty placeholders (delta before the first real chunk) so the panel
     // doesn't flash a blank row.
     if (!text && itemType !== 'tool') return logs
-    return [...logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex, charCount, ...(toolCallId ? { toolCallId } : {}) }]
+    return appendAgentLogRow(logs, { id: logs.length + 1, itemType, text, name, isError, contentIndex: event.contentIndex, charCount, ...(toolCallId ? { toolCallId } : {}) })
   }
   if (event.resetStreamSlots && !text && itemType !== 'tool') return logs
   // A no-index `kind:"log"` item is a turn boundary: forget live slots so the
@@ -1175,15 +1203,66 @@ function applyLogDelta(logs: Log[], event: Extract<AgentEvent, { type: 'agent_lo
   if (last && last.itemType === itemType && text.length > last.text.length && text.startsWith(last.text)) {
     return logs.map(log => log.id === last.id ? { ...log, text, charCount: charCount ?? log.charCount } : log)
   }
-  return [...logs, { id: logs.length + 1, itemType, text, name, isError, charCount, ...(toolCallId ? { toolCallId } : {}) }]
+  return appendAgentLogRow(logs, { id: logs.length + 1, itemType, text, name, isError, charCount, ...(toolCallId ? { toolCallId } : {}) })
 }
 
-function SubagentHeader({ total, running, runningTokens, succeeded, failed, onClear }: {
+/**
+ * Identity keys under which one log row can be recognized across the live
+ * stream and the host cache. A row may carry overlapping identities: the
+ * contentIndex slot key (streamed deltas), the itemType+toolCallId key (call
+ * pairing; a missed reset event leaves one copy sealed and the other not), and
+ * — for terminal batch rows carrying neither — the exact text. Any shared key
+ * means "same row".
+ */
+function agentLogIdentityKeys(log: Log): string[] {
+  const keys: string[] = []
+  if (log.contentIndex !== undefined) keys.push(`ci:${log.contentIndex}`)
+  if (log.toolCallId) keys.push(`${log.itemType}:${log.toolCallId}`)
+  if (log.contentIndex === undefined && !log.toolCallId) keys.push(`x:${log.itemType}:${log.text}`)
+  return keys
+}
+
+/**
+ * Append with cross-channel dedup. The host-cache backfill and the live stream
+ * are two writers over one list: a row whose identity key already exists is the
+ * same logical row arriving from the other channel (replayed batch, refetch
+ * racing a flush), not new content. Whichever writer lands second is a no-op.
+ */
+function appendAgentLogRow(logs: Log[], row: Log): Log[] {
+  const keys = new Set<string>()
+  for (const log of logs) for (const key of agentLogIdentityKeys(log)) keys.add(key)
+  if (agentLogIdentityKeys(row).some(key => keys.has(key))) return logs
+  return [...logs, row]
+}
+
+type CachedAgentLogEntry = Awaited<ReturnType<PipiHostAPI['getAgentLogs']>>[number]
+
+/**
+ * Merge a getAgentLogs snapshot into the row's live logs. The cache is
+ * canonical — complete, order-faithful, sealed exactly as the host relayed —
+ * so the result is the replayed snapshot followed by any live rows the
+ * snapshot predates. Dedup makes the merge idempotent: re-running it over an
+ * already merged list is a no-op, and a refill racing a live flush composes
+ * cleanly instead of duplicating or clobbering rows.
+ */
+function mergeAgentLogBackfill(live: Log[], entries: readonly CachedAgentLogEntry[], agentId: string): Log[] {
+  let cached: Log[] = []
+  for (const entry of entries) cached = applyLogDelta(cached, { type: 'agent_log', agentId, ...entry })
+  if (!cached.length) return live
+  const cachedKeys = new Set<string>()
+  for (const log of cached) for (const key of agentLogIdentityKeys(log)) cachedKeys.add(key)
+  const extras = live.filter(log => !agentLogIdentityKeys(log).some(key => cachedKeys.has(key)))
+  return extras.length ? [...cached, ...extras] : cached
+}
+
+function SubagentHeader({ total, running, runningTokens, succeeded, failed, clearDisabled, onClear }: {
   total: number
   running: number
   runningTokens: number
   succeeded: number
   failed: number
+  /** No session scope (or a delete already in flight): a durable 清空 cannot be issued. */
+  clearDisabled?: boolean
   onClear: () => void
 }) {
   const finished = Math.max(0, total - running)
@@ -1198,13 +1277,15 @@ function SubagentHeader({ total, running, runningTokens, succeeded, failed, onCl
     </div>
     <div className="subagent-header-right">
       <i className={`running-badge${running ? '' : ' is-zero'}`} data-testid="subagent-running-badge">{runningLabel}</i>
-      <button onClick={onClear} disabled={finished === 0}>清空</button>
+      <button onClick={onClear} disabled={finished === 0 || clearDisabled} title="仅隐藏当前视图的已完成记录（切换会话或刷新后恢复）">清空</button>
     </div>
   </header>
 }
 
-function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now, onSelect, onAbort, onResolve }: {
+function AgentRow({ agent, testId, childCount, activeChildCount, selected, aborting, now, onSelect, onAbort, onResolve }: {
   agent: Agent
+  /** Per-row testid: the bare agentId when unique in this tree, `agentId--runId` when one slug owns several displayed runs. */
+  testId?: string
 	childCount: number
 	activeChildCount: number
   selected: boolean
@@ -1238,7 +1319,7 @@ function AgentRow({ agent, childCount, activeChildCount, selected, aborting, now
       : undefined
   const liveTokens = active ? formatTokens(agentTokenTotal(agent)) : ''
 
-  return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${agent.agentId}`}>
+  return <article className={`agent-row ${agent.parentId ? 'agent-child' : 'agent-root'} ${selected ? 'selected' : ''}`} data-testid={`agent-row-${testId ?? agent.agentId}`}>
     <button className="agent-select" onClick={onSelect} aria-pressed={selected}>
       <span className="agent-indent" style={{ width: Math.max(0, (agent.depth ?? 1) - 1) * 10 }} />
 	  {agent.parentId && <span className="agent-parent" aria-label="Leader 的子 agent">└</span>}

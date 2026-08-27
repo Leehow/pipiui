@@ -322,6 +322,19 @@ describe('transcript model', () => {
     expect(afterAssistant[2]).toMatchObject({ id: 'done-3', role: 'user' })
   })
 
+  it('keeps a cut-in user message between separate live assistant activity groups', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'first', name: 'bash', delta: '{}' })
+    messages = appendLiveUserMessage(messages, { id: 'cut-in', content: '中途插入的信息' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'first', content: 'ok' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'second', name: 'read', delta: '{}' })
+
+    expect(messages.map(message => message.role)).toEqual(['assistant', 'user', 'assistant'])
+    expect(messages[0].tools).toEqual([expect.objectContaining({ id: 'first', result: 'ok', finished: true })])
+    expect(messages[1]).toMatchObject({ id: 'cut-in', role: 'user', content: '中途插入的信息' })
+    expect(messages[2].tools?.map(tool => tool.id)).toEqual(['second'])
+  })
+
   it('replaces the optimistic image send with the annotated server echo instead of a second bubble', () => {
     const note = '(Images are also embedded multimodally; prefer viewing them directly. If you use the read tool, use the paths above — do not invent paths like /home/workdir/attachments/.)'
     const optimistic: ChatMessage[] = [{

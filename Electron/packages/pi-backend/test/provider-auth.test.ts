@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createPiHostBackend } from "../src/index.js";
+import { createPiHostBackend, SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION } from "../src/index.js";
+import { ProviderAuthBackend } from "../src/provider-auth.js";
 import type { AuthEventLike, AuthInteractionLike, AuthPromptLike, AuthRuntimeLike } from "../src/provider-auth.js";
 
 /** In-memory pi auth runtime with scripted login flows. Credential values never logged. */
@@ -159,6 +160,87 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(models.map(model => `${model.provider}/${model.id}`)).toContain("my-proxy/gpt-4o-mini");
   });
 
+  it("custom provider RPC returns only after catalog publication settles — disk pair aligned on return without follow-up calls", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Settle Prov",
+      baseUrl: "https://settle.example/v1",
+      apiKey: "sk-settle",
+      modelId: "m1",
+    }]);
+    // NO polling / no second RPC: when the call above returned, the subagent model display
+    // cache must already be settled and include the new provider. (v3 is a presentation
+    // cache; AUTHORITY acceptance was committed in memory before this line.)
+    const file = join(root, "pipiui-subagent-model-catalog-runtime.json");
+    const snap = JSON.parse(await readFile(file, "utf8"));
+    expect(snap.version).toBe(SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION);
+    expect(snap.available).not.toBe(false);
+    expect(snap.models.map((m: { id: string }) => m.id)).toContain("settle-prov/m1");
+    await vi.waitFor(async () => {
+      const raw = await readFile(`${file}.epoch`, "utf8").catch(() => null);
+      expect(raw).toBeNull(); // retired v2 sidecar is never written again
+    }, { timeout: 2000 });
+  });
+
+  it("custom provider RPC waits behind a busy modelsWrite job and still settles without deadlock", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    const order: string[] = [];
+    let releaseBlocker!: () => void;
+    const blocker = new Promise<void>((resolve) => { releaseBlocker = resolve; });
+    void backend.modelsWrite.enqueue(async () => {
+      order.push("blocker-start");
+      await blocker;
+      order.push("blocker-end");
+    }).catch(() => undefined);
+    const rpc = (backend.handle("addOpenAICompatibleProvider", [{
+      name: "Queued Prov",
+      baseUrl: "https://queued.example/v1",
+      apiKey: "sk-q",
+      modelId: "qm1",
+    }]) as Promise<{ providerId: string }>).then(
+      (v) => { order.push("rpc-resolved"); return v; },
+      (e) => { order.push("rpc-rejected"); throw e; },
+    );
+    // Let the RPC reach the queue; it must be WAITING, not completed out of order.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual(["blocker-start"]);
+    releaseBlocker();
+    const saved = await rpc;
+    expect(saved.providerId).toBe("queued-prov");
+    // FIFO completion AND settled catalog visible immediately after resolution.
+    expect(order).toEqual(["blocker-start", "blocker-end", "rpc-resolved"]);
+    const snap = JSON.parse(await readFile(join(root, "pipiui-subagent-model-catalog-runtime.json"), "utf8"));
+    expect(snap.models.map((m: { id: string }) => m.id)).toContain("queued-prov/qm1");
+  });
+
+  it("custom provider RPC propagates persistence failure loudly and leaves the catalog untouched", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    await writeFile(join(root, "models.json"), "{corrupt-json", "utf8");
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    // Prime one healthy publication so "unchanged" is observable against a real baseline.
+    // The backend tolerates unparsable models.json (treated as empty) for catalog reads;
+    // materialize directly so the settle happens inside this test's control, not via a
+    // fire-and-forget converge hook.
+    await backend.handle("listModels", []);
+    await (backend as unknown as { materializeSubagentModelCatalog(): Promise<void> }).materializeSubagentModelCatalog();
+    const file = join(root, "pipiui-subagent-model-catalog-runtime.json");
+    const failingCall = () => backend.handle("addOpenAICompatibleProvider", [{
+      name: "Broken",
+      baseUrl: "https://broken.example/v1",
+      apiKey: "sk-b",
+      modelId: "bm1",
+    }]);
+    await expect(failingCall()).rejects.toThrow(/models\.json/);
+    const beforeSnap = await readFile(file, "utf8");
+    await expect(failingCall()).rejects.toThrow(/models\.json/);
+    expect(await readFile(file, "utf8")).toBe(beforeSnap);
+  });
+
   it("persists probed context_length as contextWindow", async () => {
     root = await tempAgent();
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
@@ -218,17 +300,54 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(disk.providers.jelly.models[0].contextWindow).toBe(131072);
   });
 
-  it("keeps an env-configured model available when its provider credentials are removed", async () => {
+  it("removing credentials deletes the models.json provider definition; the referenced .env key itself is untouched", async () => {
     root = await tempAgent();
     await writeFile(join(root, "models.json"), JSON.stringify({ providers: { openai: { apiKey: "$OPENAI_KEY", models: [{ id: "o1", name: "O1", reasoning: true }] } } }));
     await writeFile(join(root, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "o1" }));
     const runtime = fakeAuthRuntime();
     const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime, env: { OPENAI_KEY: "ok" } });
-    // Pi logout only removes auth.json credentials; an explicit env API key remains usable.
+    // Before deletion the env-resolved provider definition is a first-class catalog entry.
+    expect((await backend.handle("listModels", []) as any[]).map(model => `${model.provider}/${model.id}`)).toContain("openai/o1");
     const state = await backend.handle("removeProviderCredentials", ["openai"]) as any;
     expect(runtime.logouts).toEqual(["openai"]);
-    expect(state).toMatchObject({ model: { provider: "openai", id: "o1" } });
-    expect((await backend.handle("getModelState", []))).toMatchObject({ model: { provider: "openai", id: "o1" } });
+    // New semantics: the definition (including its $ENV apiKey reference) is removed from
+    // models.json; the environment / .env file itself is never written by the host.
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.openai).toBeUndefined();
+    expect((await backend.handle("listModels", []) as any[]).map(model => `${model.provider}/${model.id}`)).not.toContain("openai/o1");
+    expect(state).toMatchObject({ model: { provider: "unknown", id: "unknown" } });
+  });
+
+  it("deleting an inline-key custom provider (jellytoken) removes its models.json definition and logs out", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        jellytoken: {
+          api: "openai-completions",
+          baseUrl: "https://jelly.example/v1",
+          apiKey: "sk-inline",
+          models: [{ id: "m1", name: "m1", reasoning: true }],
+        },
+      },
+    }));
+    await writeFile(join(root, "settings.json"), JSON.stringify({ defaultProvider: "jellytoken", defaultModel: "m1" }));
+    await writeFile(join(root, "auth.json"), JSON.stringify({ jellytoken: { type: "api_key", key: "sk-inline" } }));
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    const runtime = fakeAuthRuntime(["jellytoken"]);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
+    // The inline-key mirror provider is usable before deletion (the reported bug: logout
+    // alone left it usable because pi never touches models.json).
+    expect((await backend.handle("listModels", []) as any[]).map(model => `${model.provider}/${model.id}`)).toContain("jellytoken/m1");
+    const state = await backend.handle("removeProviderCredentials", ["jellytoken"]) as any;
+    // (a) auth.json credentials were logged out via the pi runtime.
+    expect(runtime.logouts).toEqual(["jellytoken"]);
+    // (b) models.json was rewritten without the jellytoken definition (verified on disk).
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jellytoken).toBeUndefined();
+    // (c) the model is gone from the catalog.
+    expect((await backend.handle("listModels", []) as any[]).map(model => `${model.provider}/${model.id}`)).not.toContain("jellytoken/m1");
+    // (d) the active model fell back away from jellytoken.
+    expect(state).toMatchObject({ model: { provider: "unknown", id: "unknown" } });
   });
 
   it("backfills missing contextWindow on existing openai-completions providers after catalog load", async () => {
@@ -335,5 +454,86 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
     expect(disk.providers.jellytoken.models.find((m: any) => m.id === "keep").contextWindow).toBe(64000);
     expect(disk.providers.jellytoken.models.find((m: any) => m.id === "fill").contextWindow).toBe(131072);
+  });
+
+  it("login completes only AFTER the catalog refresh promise settles; refresh failure is an explicit failed terminal, never an unhandled rejection", async () => {
+    const marks: string[] = [];
+    let doResolve!: () => void;
+    let doReject!: (e: Error) => void;
+    let gate: Promise<void> = new Promise<void>((res) => { doResolve = res; });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => { unhandled.push(e); };
+    process.on("unhandledRejection", onUnhandled);
+    const makeBackend = () => new ProviderAuthBackend({
+      runtime: {
+        getProviders: async () => [],
+        getAvailable: async () => [],
+        login: async (_p: unknown, _t: unknown, interaction: AuthInteractionLike) => {
+          // Realistic api_key handshake: the prompt blocks until the answer arrives.
+          await interaction.prompt({ type: "secret", message: "API key" });
+          marks.push("login-resolved");
+        },
+        logout: async () => undefined,
+      },
+      authPath: join(root, "auth.json"),
+      onLoginCompleted: async () => {
+        marks.push("refresh-start");
+        await gate;
+        marks.push("refresh-end");
+      },
+    });
+    try {
+      // Success path: completed strictly after refresh-end.
+      const be = makeBackend();
+      const loginId = be.beginLogin("deepseek", "api_key");
+      expect(await be.continueLogin(loginId)).toMatchObject({ kind: "prompt" });
+      const finalAnswered = be.continueLogin(loginId, "sk-ordering");
+      await new Promise((r) => setTimeout(r, 10));
+      expect(marks).toEqual(["login-resolved", "refresh-start"]);
+      let completedSeen = false;
+      void finalAnswered.then(() => { completedSeen = true; });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(completedSeen).toBe(false);
+      doResolve();
+      const event = await finalAnswered;
+      expect(event).toEqual({ kind: "completed", providerId: "deepseek" });
+      expect(marks).toEqual(["login-resolved", "refresh-start", "refresh-end"]);
+
+      // Failure path: the refresh rejection becomes the login's terminal failure.
+      marks.length = 0;
+      gate = new Promise<void>((_res, rej) => { doReject = rej as (e: Error) => void; });
+      const be2 = makeBackend();
+      const loginId2 = be2.beginLogin("deepseek", "api_key");
+      await be2.continueLogin(loginId2);
+      const failingFinal = be2.continueLogin(loginId2, "sk-ordering-2");
+      await new Promise((r) => setTimeout(r, 10));
+      doReject(new Error("catalog blew up"));
+      const failedEvent = await failingFinal;
+      expect(failedEvent.kind).toBe("failed");
+      expect(String((failedEvent as { error?: string }).error)).toMatch(/模型目录刷新失败/);
+      expect(marks).toEqual(["login-resolved", "refresh-start"]);
+      await new Promise((r) => setTimeout(r, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("production wiring: completed login observes a settled, aligned catalog pair immediately", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline"); }));
+    const runtime = fakeAuthRuntime();
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
+    const { loginId } = await backend.handle("beginProviderLogin", ["deepseek", "api_key"]) as any;
+    await backend.handle("continueProviderLogin", [loginId]);
+    const completed = await backend.handle("continueProviderLogin", [loginId, "sk-wiring"]) as any;
+    expect(completed).toEqual({ kind: "completed", providerId: "deepseek" });
+    // When 'completed' was observable, the settled display cache already listed the newly
+    // authenticated provider (v3 presentation cache; authority committed in memory first).
+    const file = join(root, "pipiui-subagent-model-catalog-runtime.json");
+    const snap = JSON.parse(await readFile(file, "utf8"));
+    expect(snap.version).toBe(SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION);
+    expect(snap.available).not.toBe(false);
+    expect(snap.models.map((m: { id: string }) => m.id)).toContain("deepseek/d1");
   });
 });

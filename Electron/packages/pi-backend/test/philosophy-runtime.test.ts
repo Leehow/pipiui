@@ -414,6 +414,11 @@ describe("vendored philosophy: delivery", () => {
     // one, so separable work kept running single-threaded behind a cohesion defect the boss
     // could have removed in one extraction. The section buys back wall-clock on every wave
     // that would otherwise have queued.
+    // Raised to 18600 for orchestration's "silence is a measurement" section: a worker
+    // blocked in a long test run is silent by construction, the stall report on that
+    // silence is correct, and the boss was reading the pair as a verdict and aborting
+    // healthy runs. The section names the cheap correction — move where the runtime
+    // looks — and fences it, so it cannot become a way to keep a wedged worker alive.
     // Raised to 18800 for orchestration's [subagent-recovery] routing bullet: one reviewer
     // run replayed four resumed episodes (~384 calls / 212 reads) into the same provider/
     // context death because nothing at the boundary told the boss that continuing that
@@ -463,6 +468,45 @@ describe("vendored philosophy: delivery", () => {
     const worker = compose({ role: "worker", agent: "general-purpose" });
     expect(worker.included.map((l) => l.id)).not.toContain("orchestration");
     expect(worker.text).not.toMatch(/Stable identity is a semantic slug/);
+  });
+
+  it("delivers the stall-is-a-measurement rule with a live progress-channel tool name", () => {
+    // The shipped defect: a worker blocked in a long test run is silent on its own stream by
+    // construction, so the runtime reported a stall on silence that carried no information
+    // about the work — and the boss read that pair as a verdict and aborted healthy runs.
+    // The correction is capability-addressed, so a rename of the progress tool stays a
+    // one-line edit in capabilities.json rather than a stale tool name in prose.
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(orchestration).toMatch(/## Silence is a measurement, not a verdict/);
+    expect(orchestration).toMatch(/silent on its own\s+stream by construction/);
+    expect(orchestration).toMatch(/\{\{delegate_progress\}\}/);
+    // Both fences ride with the rule: aborting is the expensive mistake, and re-pointing a
+    // wedged worker is the dishonest one.
+    expect(orchestration).toMatch(/pays for the same run twice/);
+    expect(orchestration).toMatch(/no CPU and no\s+growing log is genuinely wedged/);
+
+    const result = compose({ role: "main" });
+    expect(result.included.map((l) => l.id)).toContain("orchestration");
+    expect(result.text).toMatch(/Silence is a measurement, not a verdict/);
+    // The placeholder resolves to the tool the session really has; no dead name survives.
+    expect(result.text).toMatch(
+      new RegExp(`move where\\s+the runtime is looking with ${capabilities.capabilities.delegate_progress.tool}\\b`),
+    );
+    expect(result.text).not.toMatch(/\{\{delegate_progress\}\}/);
+
+    // A session whose runtime lacks the tool degrades to prose instead of naming a dead one.
+    const withoutProgress = compose({
+      role: "main",
+      activeTools: ALL_TOOLS.filter((t) => t !== capabilities.capabilities.delegate_progress.tool),
+    });
+    expect(withoutProgress.text).toMatch(/Silence is a measurement, not a verdict/);
+    expect(withoutProgress.text).not.toMatch(
+      new RegExp(`\\b${capabilities.capabilities.delegate_progress.tool}\\b`),
+    );
+
+    // Supervision is the boss's job; a worker never pays for this prose.
+    const worker = compose({ role: "worker", agent: "general-purpose" });
+    expect(worker.text).not.toMatch(/Silence is a measurement, not a verdict/);
   });
 
   it("permits worker skill_search/load and memory_query without automatic bootstrap", () => {

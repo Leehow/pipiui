@@ -53,10 +53,15 @@ import { Type } from "typebox";
 import {
 	DEFAULT_PROGRESS_LOG_REPORT_MS,
 	formatProgressLogReport,
+	formatProgressLogRetargetReceipt,
+	describeProgressChannelForStall,
 	progressIdleMs,
+	readProgressLogTail,
 	readProgressLogExcerpt,
 	resolveProgressLogPath,
+	retargetProgressLog,
 	sampleProgressLog,
+	sanitizeProgressReportSecs,
 	type ProgressLogSample,
 } from "./progress-log.ts";
 import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
@@ -306,7 +311,11 @@ import {
 import { registerSubagentManagementTool } from "./agent-management.ts";
 import {
 	encodeAgentEventBridgeRequestV1,
+	encodeModelPinValidateBridgeRequestV1,
+	parseModelPinValidateDecisionV1,
+	PIPIUI_HOST_PROTOCOL_V1,
 	type AgentBridgeEventPayloadV1,
+	type ModelPinValidateDecisionV1,
 } from "./host-bridge.ts";
 import { applyCappedStreamText } from "./stream-part-text.ts";
 import {
@@ -1422,6 +1431,15 @@ interface RunSingleAgentOptions {
 	contextWindow?: number;
 	/** Optional Boss-selected thinking for this dispatch; never inherited from the Boss session. */
 	thinking?: string;
+	/** Raw per-dispatch model pin (`provider/id`) as supplied by the Boss; overrides role/session/frontmatter for this one run. */
+	model?: string;
+	/**
+	 * Host-authoritative validation result for `model` (the batched model_pin_validate RPC).
+	 * REQUIRED whenever `model` is set: runSingleAgent refuses a raw pin so no internal path
+	 * can ever fall back to the long-demoted display snapshot. Omit both fields for the
+	 * default resolution.
+	 */
+	modelPin?: ValidatedModelPin;
 	/** Shell command the runtime runs in the agent's cwd after the process ends (attested verify). */
 	verify?: string;
 	/** Discard this worker's stored conversation and start it cold. */
@@ -1641,6 +1659,194 @@ function capabilityForSubagentModel(
 	return catalog[stripModelThinkingSuffix(model.trim())];
 }
 
+/** Env carrying the host-written available-model catalog; only the host sets it (never the child). */
+const SUBAGENT_MODEL_CATALOG_FILE_ENV = "PIPIUI_SUBAGENT_MODEL_CATALOG_FILE";
+/** Must match pi-backend's SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION. */
+const SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION = 3;
+type SubagentModelCatalog = { available: boolean; refs: string[] };
+/**
+ * Hot-read the host-written available-model DISPLAY cache. PRESENTATION ONLY: the Boss
+ * prompt renders these refs as guidance, but NO dispatch acceptance ever consults this
+ * file. An explicit pin is validated authoritatively over the host bridge
+ * (`model_pin_validate`), answered from the backend's in-memory PinCatalogAuthority — so a
+ * stale, torn, misaligned or failed cache write merely trims the advertised list while the
+ * authority keeps deciding. Tombstones (`available:false`), unknown versions and unreadable
+ * files render as "nothing advertised", never as permission to accept anything.
+ */
+export function loadSubagentModelCatalog(file: string | undefined = process.env[SUBAGENT_MODEL_CATALOG_FILE_ENV]): SubagentModelCatalog {
+	if (!file) return { available: false, refs: [] };
+	try {
+		const parsed = JSON.parse(fs.readFileSync(file, "utf-8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { available: false, refs: [] };
+		const root = parsed as { version?: unknown; available?: unknown; models?: unknown };
+		// A tombstone or a shape the host never wrote in this protocol generation means the
+		// authoritative catalog is mid-refresh/unusable RIGHT NOW; advertise nothing rather
+		// than showing models that may already be hidden or revoked.
+		if (root.available === false) return { available: false, refs: [] };
+		const version = typeof root.version === "number" ? root.version : undefined;
+		if (version !== SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION) return { available: false, refs: [] };
+		const models = root.models;
+		if (!Array.isArray(models)) return { available: false, refs: [] };
+		const refs: string[] = [];
+		for (const entry of models) {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+			const id = typeof (entry as { id?: unknown }).id === "string" ? (entry as { id: string }).id.trim() : "";
+			if (id && !refs.includes(id)) refs.push(id);
+		}
+		return { available: true, refs };
+	} catch {
+		// Unreadable cache is a stale/transient host state — advertise nothing.
+		return { available: false, refs: [] };
+	}
+}
+
+export type DispatchModelPinVerdict = { ok: true; model: string } | { ok: false; problem: string };
+/**
+ * Pure syntax contract for ONE Boss-supplied per-dispatch model pin — no host consultation,
+ * no I/O, synchronous. A pin must be a well-formed provider-qualified ref WITHOUT Pi's
+ * `model:level` shorthand (thinking goes through the separate `thinking` field).
+ * Availability/authorization is decided exclusively by the host authority RPC below.
+ */
+export function dispatchModelPinSyntaxProblem(value: unknown): string | undefined {
+	const label = 'model="provider/modelId"';
+	if (typeof value !== "string") return `dispatch ${label} 必须是字符串，收到 ${typeof value}`;
+	const ref = value.trim();
+	if (!ref) return `dispatch ${label} 不能为空；省略该字段即可沿用用户当前模型选择。`;
+	if (ref.length > 300) return `dispatch model 引用过长（${ref.length} > 300）`;
+	if (/[\u0000-\u001f\u007f\s]/u.test(ref)) return `dispatch model 含空白或控制字符：“${JSON.stringify(value)}”`;
+	const slash = ref.indexOf("/");
+	if (slash <= 0 || slash === ref.length - 1) return `dispatch model 必须使用精确的 provider/modelId 完整标识（缺少 provider）：${ref}`;
+	// Pi 的 `model:level` 缩写不是另一个模型；thinking 走独立的 `thinking` 字段，保持 pin 精确。
+	if (stripModelThinkingSuffix(ref) !== ref) {
+		return `dispatch model 不能携带 thinking 后缀：“${ref}”。请使用纯 provider/modelId 并通过独立的 thinking 字段指定强度。`;
+	}
+	return undefined;
+}
+
+/** A pin that passed BOTH syntax checks and one named authoritative host validation. */
+export type ValidatedModelPin = { ref: string; authorityRevision: number };
+
+/**
+ * Branded-pin resolution for runSingleAgent: undefined when no pin was supplied; otherwise
+ * the exact validated ref. Refuses a RAW pin loudly so no internal caller can bypass the
+ * batched host RPC or fall back to the long-demoted display snapshot.
+ */
+export function requireValidatedModelPin(
+	model: unknown,
+	modelPin: ValidatedModelPin | undefined,
+): string | undefined {
+	if (model === undefined || model === null) return undefined;
+	const raw = typeof model === "string" ? model.trim() : "";
+	if (!raw || !modelPin || modelPin.ref !== raw) {
+		throw new Error(
+			`internal: dispatch model “${String(model)}” 缺少 Host 权威校验结果（modelPin）；已拒绝执行以防旧目录回退。请通过 subagent 工具发起派发（其会先做一次批量权威校验）。`,
+		);
+	}
+	return modelPin.ref;
+}
+export type DispatchPinBatchResult =
+	| { ok: true; pins: Map<string, ValidatedModelPin> }
+	| { ok: false; problem: string };
+
+/** Loopback hard timeout for one pin-validation RPC; never retried (deny ≠ flap). */
+const MODEL_PIN_VALIDATE_TIMEOUT_MS = 1500;
+/** Matches the bridge/backend batch bound. */
+const MAX_MODEL_PIN_REFS_PER_BATCH = 1000;
+
+/**
+ * One batched `/rpc model_pin_validate` round trip. Returns the parsed decision, or a
+ * transport-shaped failure for EVERY non-decision outcome (missing env/capability, encoder
+ * refusal, timeout, connection refused, HTTP error, malformed body). Canonical v1 only:
+ * legacy bridges get no fallback and no disk read.
+ */
+async function requestModelPinValidation(
+	refs: readonly string[],
+): Promise<{ kind: "decision"; decision: ModelPinValidateDecisionV1 } | { kind: "transport" }> {
+	const body = encodeModelPinValidateBridgeRequestV1(refs, {
+		PIPIUI_HOST_PROTOCOL,
+		PIPIUI_SESSION_KEY: PIPIUI_SESSION,
+		PIPIUI_SESSION_CAPABILITY,
+	});
+	if (!body || !PIPIUI_PORT) return { kind: "transport" };
+	const timeout = createTimeoutAbort(MODEL_PIN_VALIDATE_TIMEOUT_MS);
+	try {
+		const response = await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+			signal: timeout.signal,
+		});
+		if (!response.ok) return { kind: "transport" };
+		const decision = parseModelPinValidateDecisionV1(JSON.parse(await response.text()));
+		return decision ? { kind: "decision", decision } : { kind: "transport" };
+	} catch {
+		return { kind: "transport" };
+	} finally {
+		timeout.dispose();
+	}
+}
+
+/**
+ * Validate every present pin of ONE tool call against the host authority in a SINGLE batched
+ * RPC — all pins share one linearization point and one authority revision. Zero pins ⇒ zero
+ * network activity and zero added latency. Any transport failure, host absence, timeout or
+ * logical deny fails the WHOLE wave closed before reservations/worktrees/spawns — a pinned
+ * run is never silently re-routed onto the default model, and the long-demoted display
+ * snapshot is never consulted for acceptance.
+ */
+export async function validateDispatchModelPinsViaHost(
+	items: ReadonlyArray<{ label: string; model?: unknown }>,
+): Promise<DispatchPinBatchResult> {
+	const present: Array<{ label: string; ref: string }> = [];
+	for (const item of items) {
+		if (item.model === undefined || item.model === null) continue;
+		const problem = dispatchModelPinSyntaxProblem(item.model);
+		if (problem) return { ok: false, problem: `${item.label}: ${problem}` };
+		present.push({ label: item.label, ref: (item.model as string).trim() });
+	}
+	if (present.length === 0) return { ok: true, pins: new Map() };
+	if (present.length > MAX_MODEL_PIN_REFS_PER_BATCH) {
+		return { ok: false, problem: `[model_pin_batch_too_large] 一次 dispatch 最多校验 ${MAX_MODEL_PIN_REFS_PER_BATCH} 个 model pin（收到 ${present.length}）；整批未启动。` };
+	}
+	const refs = [...new Set(present.map((item) => item.ref))];
+	const result = await requestModelPinValidation(refs);
+	if (result.kind === "transport") {
+		return {
+			ok: false,
+			problem: [
+				"[model_pin_host_unavailable] 无法通过 Host 权威校验 dispatch model（bridge 不可达、超时、协议不符或响应无效）。",
+				"显式 pin 绝不回退默认模型，也未启动任何任务 —— 请稍后重试、恢复 Host 连接后重试，或省略 model 沿用当前解析。",
+			].join("\n"),
+		};
+	}
+	const decision = result.decision;
+	if (decision.decision === "deny") {
+		if (decision.code === "catalog_unavailable") {
+			return {
+				ok: false,
+				problem: decision.retryable
+					? `[model_catalog_unavailable] 暂无法校验 ${present.length} 个 dispatch model pin：Host 权威模型目录正在刷新或暂时不可用。可等待目录恢复后重试，或省略 model 沿用默认解析；本次任务未启动。`
+					: `[model_catalog_unavailable] dispatch model 校验请求无效，已拒绝；请省略 model 或修正后重试。`,
+			};
+		}
+		const badRef = decision.invalidIndex !== undefined ? refs[decision.invalidIndex] : undefined;
+		const offenders = present.filter((item) => item.ref !== undefined && item.ref === badRef);
+		const targetRef = badRef ?? "(未知引用)";
+		const offenderLabels = offenders.map((item) => item.label).filter(Boolean).join(", ");
+		return {
+			ok: false,
+			problem: [
+				`[model_unavailable] ${offenderLabels ? `${offenderLabels}: ` : ""}dispatch model “${targetRef}” 不在 Host 权威可用模型目录中（不可用、已被用户隐藏或已注销）。`,
+				"整批任务均未启动；请从系统提示的 Available models 列表中选择精确 provider/id，修正后重试，或省略 model 沿用默认选择。",
+			].join("\n"),
+		};
+	}
+	const pins = new Map<string, ValidatedModelPin>(
+		refs.map((ref) => [ref, { ref, authorityRevision: decision.authorityRevision }]),
+	);
+	return { ok: true, pins };
+}
+
 /** Host-written `provider/id` → effective nativeSearch map. Invalid/missing is empty. */
 function loadNativeSearchCatalog(): Record<string, { tools?: unknown }> {
 	const file = process.env.PIPIUI_SUBAGENT_NATIVE_SEARCH_FILE;
@@ -1726,15 +1932,22 @@ function loadDisabledTools(): Set<string> {
 
 /**
  * Resolve model for a subagent type:
+ * 0. Explicit per-dispatch pin from the Boss tool call (already catalog-validated upstream)
  * 1. Explicit override in settings JSON
  * 2. Follow main (composer/bottom-bar): depth0 ctx.model → main-model.txt → PIPIUI_MAIN_MODEL
  * 3. agent.md frontmatter model
+ *
+ * The optional pin short-circuits every persisted/user resolution for exactly one dispatch;
+ * callers validate it against the host model catalog before reaching here.
  */
-function resolveAgentModel(
+export function resolveAgentModel(
 	agentName: string,
 	frontmatterModel: string | undefined,
 	sessionModel: string | undefined,
+	modelPin?: string,
 ): string | undefined {
+	const pin = modelPin?.trim();
+	if (pin) return pin;
 	const overrides = loadSubagentModelOverrides();
 	const explicit = overrides[agentName]?.models[0];
 	if (explicit?.model) {
@@ -1782,6 +1995,17 @@ function resolveAgentModelChainEntry(
 ): SubagentModelOverride | undefined {
 	const entry = loadSubagentModelOverrides()[agentName]?.models[index];
 	return entry ? { ...entry, model: checkedSubagentOverrideModel(agentName, entry.model) } : undefined;
+}
+
+/**
+ * Pure dispatch-policy seam for the retry loop's model-switch step. A dispatch WITHOUT a
+ * pin advances the user's persisted fallback chain exactly as before. A PINNED dispatch is
+ * the Boss choosing one exact model for this run: when it fails the runtime retries that
+ * same pinned model within the existing resume budgets and then fails loudly — it never
+ * silently lands on another (user-default) model.
+ */
+export function chainAdvanceEntryFor(modelPin: string | undefined, agentName: string, nextIndex: number): SubagentModelOverride | undefined {
+	return modelPin ? undefined : resolveAgentModelChainEntry(agentName, nextIndex);
 }
 
 /** Main-agent model to stamp onto child env so nested agents still「跟随主」. */
@@ -1851,10 +2075,23 @@ function formatSubagentModelRoutingBlock(): string | null {
 			: "unresolved";
 		return `- ${name}${configured ? "" : " (follow-main)"}: ${chain}`;
 	});
+	// Boss-visible model pins must come from the one canonical host catalog (already filtered
+	// by the user's hidden-model choices). Bounded so the per-turn prompt stays affordable.
+	const modelCatalog = loadSubagentModelCatalog();
+	const CATALOG_PROMPT_CAP = 50;
+	const modelLines = modelCatalog.available
+		? [
+			"Available models (exact `model:\"provider/id\"` values for a single dispatch):",
+			...modelCatalog.refs.slice(0, CATALOG_PROMPT_CAP).map((ref) => `- ${ref}`),
+			...(modelCatalog.refs.length > CATALOG_PROMPT_CAP ? [`- ... +${modelCatalog.refs.length - CATALOG_PROMPT_CAP} more`] : []),
+		]
+		: [];
 	return [
 		"[Subagent model routing — hot-read]",
-		"Optional task `thinking` is available on single, tasks[], and chain; v1 has no per-task model. Never inherit Boss thinking.",
-		"Priority: task thinking > current candidate set thinking > omit --thinking. On fallback, carry task thinking only when catalog explicitly allows it; otherwise use that fallback set thinking/default. `allow=?` or a trailing `?` means capability unknown.",
+		"Optional task `thinking` is available on single, tasks[], and chain. Optional per-dispatch `model` overrides only that ONE dispatch and never changes user/role settings; omit `model` to follow the normal resolution above. A pinned model is checked against the Host's authoritative catalog at dispatch time — unavailable models are rejected loudly, never silently replaced. This list is a display cache and may briefly lag that authority.",
+		"Priority without `model`: role settings primary/fallback chain → current session/main model → agent frontmatter. Never inherit Boss thinking.",
+		...modelLines,
+		"Priority for task thinking > current candidate set thinking > omit --thinking. On fallback, carry task thinking only when catalog explicitly allows it; otherwise use that fallback set thinking/default. `allow=?` or a trailing `?` means capability unknown.",
 		...routes,
 	].join("\n");
 }
@@ -2002,6 +2239,8 @@ interface JobRecord {
 	activity?: string;
 	cost?: number;
 	turns?: number;
+	/** Model this run actually started on (pin or resolved); updated only on a real model switch. */
+	model?: string;
 	/** Full-ish result text for status-by-id (capped) */
 	resultText?: string;
 	/** Runtime-attested verify (when the brief carried `verify`). */
@@ -2361,6 +2600,12 @@ interface RunningAgentHandle {
 	lastProgressLogAt?: number;
 	/** Forward cadence for progress excerpts: heartbeatSecs when set, else 60s default. */
 	progressLogIntervalMs?: number;
+	/** When this path became the watched one; a never-written log is judged against this, not startedAt. */
+	progressLogSetAt?: number;
+	/** Spawn cwd, retained so a mid-run progressLog retarget is judged against this run's own roots. */
+	spawnCwd?: string;
+	/** True only for the exact bundled general-purpose dispatch, the same gate `progressLog` passes at dispatch. */
+	progressLogEligible?: boolean;
 	/** Progress-forward bookkeeping: last claimed send slot, monotonically growing sequence, one in-flight guard. */
 	lastProgressReportAt?: number;
 	progressReportCount?: number;
@@ -2701,6 +2946,95 @@ function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle,
 	return job.state;
 }
 
+/** The progress-channel line a stall report carries, or nothing when none is configured. */
+function progressEvidenceFor(handle: RunningAgentHandle, now: number): string | undefined {
+	if (!handle.progressLogPath) return undefined;
+	return describeProgressChannelForStall({
+		path: handle.progressLogPath,
+		now,
+		...(handle.lastProgressLogAt !== undefined ? { lastProgressLogAt: handle.lastProgressLogAt } : {}),
+		setAt: handle.progressLogSetAt ?? handle.startedAt,
+		tail: readProgressLogTail({ path: handle.progressLogPath }),
+	});
+}
+
+/**
+ * Re-aim one live worker's progress channel at a different log file.
+ *
+ * The dispatch-time `progressLog` could only ever be a guess: Boss names the path before the
+ * worker exists, and a test harness that turns out to write somewhere else leaves the watchdog
+ * measuring silence on a file nobody appends to. The only remedy on offer was abort and
+ * re-dispatch, which spends the run to fix the observation of it. Same gate, same containment
+ * rule and same run-identity check as the dispatch field — this corrects where the runtime
+ * looks, it does not grant a new reach.
+ */
+function retargetRunningProgressLog(input: {
+	agentId: string;
+	runId: string;
+	progressLog: string;
+	reportSecs?: number;
+}): { ok: boolean; message: string } {
+	const agentId = input.agentId.trim();
+	const runId = input.runId.trim();
+	if (!agentId || !runId) {
+		return {
+			ok: false,
+			message: "subagent_progress requires both agentId and the exact runId from the dispatch receipt or subagent_status.",
+		};
+	}
+	const handle = runningAgents.get(agentId);
+	if (!handle) {
+		const job = jobRegistry.get(agentId);
+		return {
+			ok: false,
+			message: `Cannot re-point progressLog for agentId=${agentId}: no live run here (${job ? `job state "${job.state}"` : "no such job in this session process"}). A queued or finished run has no progress channel to aim; dispatch the next run with the corrected progressLog instead.`,
+		};
+	}
+	if (handle.runId !== runId) {
+		return {
+			ok: false,
+			message: `Cannot re-point progressLog for agentId=${agentId}: stale runId=${runId}; currentRunId=${handle.runId}. Re-check with subagent_status and pass the current run's exact runId.`,
+		};
+	}
+	if (handle.finalizing) {
+		return {
+			ok: false,
+			message: `Cannot re-point progressLog for agentId=${agentId} runId=${runId}: the worker already reported and is closing out. Read its result with subagent_status.`,
+		};
+	}
+	if (!handle.progressLogEligible) {
+		return {
+			ok: false,
+			message: `progressLog is only available for the bundled general-purpose worker, and agentId=${agentId} runs "${handle.name}". Dispatch long test runs as general-purpose if you need the progress channel.`,
+		};
+	}
+	const interval = sanitizeProgressReportSecs(input.reportSecs);
+	if (interval && "problem" in interval) return { ok: false, message: interval.problem };
+	const resolved = resolveProgressLogPath({
+		progressLog: input.progressLog,
+		spawnCwd: handle.spawnCwd ?? PIPIUI_MAIN_CWD,
+		allowedRoots: [PIPIUI_MAIN_CWD, handle.spawnCwd ?? "", handle.worktreePath ?? ""],
+	});
+	if ("problem" in resolved) return { ok: false, message: resolved.problem };
+	const result = retargetProgressLog(handle, {
+		path: resolved.path,
+		now: Date.now(),
+		...(interval && "ms" in interval ? { intervalMs: interval.ms } : {}),
+	});
+	logStallProbe("progress_retarget", {
+		agent: agentId,
+		run: runId,
+		seq: handle.diagnostics.eventSeq,
+		baselineBytes: result.baselineBytes,
+		intervalMs: result.intervalMs,
+		childPid: handle.pid,
+	});
+	return {
+		ok: true,
+		message: formatProgressLogRetargetReceipt({ agentId, runId, path: resolved.path, result }),
+	};
+}
+
 /**
  * 中止一个后台 job：触发其 AbortController → killProc（SIGTERM，5s 后未退出则 SIGKILL）。
  * job 以 aborted 结束；精确单任务中止由 Supervisor 接收终态，stop sweep 保持静默。
@@ -2970,6 +3304,7 @@ function jobUpsertRunning(
 	title?: string,
 	blockedBy?: string[],
 	runId?: string,
+	model?: string,
 ): string {
 	// Every dispatch is a fresh episode, including a same-agentId continuation. A late old
 	// close/finalize callback is therefore unable to mutate the new row or its reminders.
@@ -2982,6 +3317,7 @@ function jobUpsertRunning(
 		task: taskSummary(task),
 		title,
 		...(blockedBy && blockedBy.length > 0 ? { blockedBy } : {}),
+		...(model ? { model } : {}),
 		state: "running",
 		startedAt: Date.now(),
 	});
@@ -3029,6 +3365,13 @@ function jobPatchRunning(
 	if (patch.activity !== undefined) job.activity = patch.activity;
 	if (patch.cost !== undefined) job.cost = patch.cost;
 	if (patch.turns !== undefined) job.turns = patch.turns;
+}
+
+/** Model-switch bookkeeping: the status card must show the model this run ACTUALLY uses now. */
+function jobPatchModel(agentId: string, runId: string, model: string): void {
+	const job = jobRegistry.get(agentId);
+	if (!job || job.runId !== runId || job.state !== "running" || !model) return;
+	if (job.model !== model) job.model = model;
 }
 
 type JobFinalizeFields = {
@@ -3105,6 +3448,7 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		activity: fields.activity ?? existing?.activity,
 		cost: fields.cost ?? existing?.cost,
 		turns: fields.turns ?? existing?.turns,
+		...(existing?.model ? { model: existing.model } : {}),
 		resultText:
 			fields.resultText !== undefined
 				? truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP)
@@ -3623,6 +3967,7 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 				? [`blocked-by: ${job.blockedBy.join(", ")}`]
 				: []),
 			`state: ${formatJobStateWithStall(job, now)}`,
+			...(job.model ? [`model: ${job.model}`] : []),
 			...formatSubagentIntegrationStatus({
 				workerState: job.state,
 				integrationState: job.integrationState,
@@ -3656,6 +4001,23 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 			// The measurement the Boss otherwise has to go improvise in a terminal.
 			const evidence = cpuEvidenceFor(job.agentId);
 			if (evidence) lines.push(`liveness: ${evidence}`);
+			// Which file the idle clock is actually reading. Without this the Boss cannot tell a
+			// wedged worker from a correct one whose output lands somewhere nobody is watching,
+			// and `subagent_progress` would be a guess at what it is replacing.
+			const live = handleForRun(job.agentId, job.runId);
+			if (live?.progressLogPath) {
+				lines.push(
+					`progress log: ${live.progressLogPath} — ${
+						live.lastProgressLogAt
+							? `last grew ${formatElapsedMs(now - live.lastProgressLogAt)} ago`
+							: "no growth seen yet"
+					}`,
+				);
+			} else if (live?.progressLogEligible) {
+				lines.push(
+					`progress log: none — if this worker's real output is appended to a log file, point the idle clock at it with subagent_progress({agentId:"${job.agentId}", runId:"${job.runId}", progressLog:"<path>"})`,
+				);
+			}
 		} else {
 			const stored = job.resultText || "(no result stored)";
 			// Head-keep like the done message: the report's structured sections come first.
@@ -6075,11 +6437,16 @@ async function runSingleAgent(
 		policy: placementPolicy,
 		allowEnvironmentOptOut: executionPolicy?.worktree === "isolated" ? false : undefined,
 	});
-	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel);
+	// ── Branded-pin contract ─────────────────────────────────────────────────────────
+	// Only a host-validated pin may pass this point (see requireValidatedModelPin).
+	const modelPin = requireValidatedModelPin(options?.model, options?.modelPin);
+	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel, modelPin);
 	// Tool-selected thinking belongs to this one dispatch only; it never reads the Boss's
-	// current thinking level. The initial candidate may use it directly by priority.
+	// current thinking level. The initial candidate may use it directly by priority. With a
+	// pinned model the persisted role-thinking no longer describes the actual candidate, so
+	// only an explicit task thinking (or Pi default) applies.
 	const taskThinking = normalizeTaskThinking(options?.thinking);
-	const resolvedThinking = resolveAgentThinking(agentName, taskThinking);
+	const resolvedThinking = modelPin ? taskThinking : resolveAgentThinking(agentName, taskThinking);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 	if (placement.worktreeError) {
 		const message = `Writable subagent isolation failed before spawn: ${placement.worktreeError}`;
@@ -6114,7 +6481,7 @@ async function runSingleAgent(
 			...(options?.background ? { background: true } : {}),
 			worktreeError: placement.worktreeError,
 		});
-		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
 		jobFinalize(pipiuiAgentId, runId, {
 			name: agentName,
 			task,
@@ -6178,7 +6545,7 @@ async function runSingleAgent(
 				...(options?.title ? { title: options.title } : {}),
 				...(options?.background ? { background: true } : {}),
 			});
-			jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
+			jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
 			jobFinalize(pipiuiAgentId, runId, {
 				name: agentName,
 				task,
@@ -6450,7 +6817,7 @@ async function runSingleAgent(
 			lastActivityAt: Date.now(),
 		}),
 	});
-	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId);
+	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
 	// Both foreground Computer Workers and background jobs need a separately
 	// addressable abort handle; the parent tool signal is composed at spawn.
 	const dispatchAbort = new AbortController();
@@ -6463,6 +6830,7 @@ async function runSingleAgent(
 			progressLogPath: progressLogSpec.path,
 			progressLogSample: baseline,
 			progressLogOffset: baseline.size,
+			progressLogSetAt: Date.now(),
 			...(executionPolicy?.heartbeatMs ? { progressLogIntervalMs: executionPolicy.heartbeatMs } : { progressLogIntervalMs: DEFAULT_PROGRESS_LOG_REPORT_MS }),
 		};
 	}
@@ -6478,6 +6846,8 @@ async function runSingleAgent(
 			checkinCount: 0,
 			checkinInFlight: false,
 			startedAt: Date.now(),
+			spawnCwd,
+			...(executionPolicy ? { progressLogEligible: true } : {}),
 			...(executionPolicy?.heartbeatMs ? { heartbeatMs: executionPolicy.heartbeatMs } : {}),
 			...progressLogFields,
 			finalizing: false,
@@ -7302,7 +7672,7 @@ async function runSingleAgent(
 				currentResult.errorMessage = undefined;
 				// A provider that just went silent tends to stay silent, so a stall resume
 				// advances the chain when one exists rather than re-dialling the same model.
-				const stallChainEntry = resolveAgentModelChainEntry(agentName, modelChainIndex + 1);
+				const stallChainEntry = chainAdvanceEntryFor(modelPin, agentName, modelChainIndex + 1);
 				const stallProgress = `provider stall auto-resume ${providerStallResumeCount}/${PROVIDER_WAIT_AUTO_RESUME_MAX}`;
 				if (stallChainEntry) {
 					const stalledModel = resolveAgentModelChainEntry(agentName, modelChainIndex)?.model ?? "?";
@@ -7312,6 +7682,7 @@ async function runSingleAgent(
 					currentResult.model = stallThinking
 						? stripModelThinkingSuffix(stallChainEntry.model)
 						: stallChainEntry.model;
+					jobPatchModel(pipiuiAgentId, runId, currentResult.model);
 					autoResumeCount = 0; // the new model gets its own same-model resume budget
 					const stallNote = `model fallback: ${stalledModel} -> ${stallChainEntry.model} (provider stall)`;
 					modelFallbackNotes.push(`\n[pipiui] ${stallNote}`);
@@ -7363,7 +7734,7 @@ async function runSingleAgent(
 			//    next entry (the new model resets its own resume budget);
 			// c) any other non-retryable (auth 401/403, unknown agent, …) → never switch;
 			//    fall through to the existing failed path.
-			const nextChainEntry = resolveAgentModelChainEntry(agentName, modelChainIndex + 1);
+			const nextChainEntry = chainAdvanceEntryFor(modelPin, agentName, modelChainIndex + 1);
 			let fallbackReason: string | undefined;
 			if (isQuotaLikeWorkerError(currentResult.errorMessage ?? "")) {
 				if (!nextChainEntry) break;
@@ -7397,6 +7768,7 @@ async function runSingleAgent(
 				currentResult.model = fallbackThinking
 					? stripModelThinkingSuffix(nextChainEntry.model)
 					: nextChainEntry.model;
+				jobPatchModel(pipiuiAgentId, runId, currentResult.model);
 				autoResumeCount = 0; // the new model gets its own same-model resume budget
 				const fallbackNote = `model fallback: ${oldModel} -> ${nextChainEntry.model} (${fallbackReason})`;
 				modelFallbackNotes.push(`\n[pipiui] ${fallbackNote}`);
@@ -7898,6 +8270,8 @@ const AGENT_ID_DESCRIPTION =
 	"Short semantic name you choose for this worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\", starting with a letter or digit. Required on every dispatch — no id is generated for you. Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch pipiui/<agentId>: use one agentId per vertical slice (implement, verify, debug, fix, re-verify), and pass fresh:true only to start the same id cold. Also the target id for action=\"abort\" or action=\"resolve\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
+const MODEL_PARAM_DESCRIPTION =
+	'Optional exact model for THIS dispatch only, as a stable `provider/modelId` string (e.g. "openai/gpt-5", never a bare model id). It must exactly match one entry of the Available models list in your system prompt — unavailable or user-hidden models are rejected with an error, never silently replaced by a default. Omit it to follow the normal resolution (user role settings → current session/main model → agent frontmatter). A pin is never persisted and does not affect any later dispatch.';
 const DESKTOP_PARAM_DESCRIPTION =
 	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed a UI that the built-in browser tool CANNOT open — a native macOS app or an OS dialog — and genuinely needs a visual acceptance check). If the changed screen loads in the built-in browser tool, ui-verify does NOT apply: check it there yourself and grant nothing. Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
@@ -7905,7 +8279,7 @@ const BLOCKED_BY_DESCRIPTION =
 const SCOPE_DESCRIPTION =
 	'Optional advisory path prefixes this worker expects to touch, e.g. ["Electron/packages/ui/src/session/", "Electron/packages/ui/src/session/store.ts"]. A trailing slash means that directory and everything under it. Concurrent dispatches whose scopes overlap get a [subagent-overlap] warning but still start. Omit when the task is read-only or has no predicted write set.';
 const THINKING_PARAM_DESCRIPTION =
-	"Optional per-task thinking for this dispatch only: off|minimal|low|medium|high|xhigh|max. It never inherits the Boss current thinking and does not select a model (v1 has no per-task model). It overrides the current candidate's configured thinking; if a fallback is needed, it carries only when the Swift capability catalog explicitly allows that fallback level, otherwise that fallback uses its configured thinking/default.";
+	"Optional per-task thinking for this dispatch only: off|minimal|low|medium|high|xhigh|max. It never inherits the Boss current thinking and does not select a model (pass `model` for that). It overrides the current candidate's configured thinking; if a fallback is needed, it carries only when the Swift capability catalog explicitly allows that fallback level, otherwise that fallback uses its configured thinking/default.";
 
 /** Runtime shape check for blockedBy: array of strings, max 10, each ≤ 40 chars. */
 function validateBlockedBy(value: unknown, label: string): string | null {
@@ -7978,6 +8352,7 @@ const TaskItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
+	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	desktop: Type.Optional(
@@ -8011,6 +8386,7 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
+	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	isolation: IsolationParam,
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	heartbeatSecs: HeartbeatSecsParam,
@@ -8049,21 +8425,28 @@ const SharedDispatchParams = {
 // timeoutSecs, agentScope): anything declared here survives the strict sanitizer, so a
 // field the runner supports must not be silently dropped at the provider boundary.
 const SubagentParams = Type.Object({
-	prompt: Type.String({
+	// prompt/description/agentId are OPTIONAL at the schema level ONLY so the parallel
+	// `tasks[]` mode fits this one strict schema — a legal wave carries per-item agentIds and
+	// no root identity at all. Single-mode required-ness stays enforced at runtime: the
+	// exactly-one-mode gate rejects empty/mixed calls with named errors, and the identity
+	// gate rejects an id-less single dispatch before any worker spawns.
+	prompt: Type.Optional(Type.String({
 		minLength: 1,
-		description: "The full task prompt for the subagent to execute.",
-	}),
-	description: Type.String({
+		description: "The full task prompt for the subagent to execute. Required for a single dispatch; omit only when using tasks[].",
+	})),
+	description: Type.Optional(Type.String({
 		minLength: 1,
-		description: "Short description of the task (3-5 words).",
-	}),
+		description: "Short description of the task (3-5 words). Required for a single dispatch; omit only when using tasks[].",
+	})),
 	subagent_type: Type.Optional(
 		Type.String({
 			description: "Subagent type. Defaults to general-purpose. Built-in: general-purpose, explore, plan, reviewer.",
 			default: "general-purpose",
 		}),
 	),
-	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
+	agentId: Type.Optional(Type.String({
+		description: `${AGENT_ID_DESCRIPTION} Required for a single dispatch; a parallel tasks[] call omits this root field and gives each item its own agentId instead.`,
+	})),
 	run_in_background: Type.Optional(
 		Type.Boolean({
 			default: true,
@@ -8085,6 +8468,7 @@ const SubagentParams = Type.Object({
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
+	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	blockedBy: BlockedByParam,
 	desktop: Type.Optional(
 		StringEnum(["user-requested", "ui-verify"] as const, {
@@ -8095,6 +8479,12 @@ const SubagentParams = Type.Object({
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
 	scope: ScopeParam,
+	tasks: Type.Optional(Type.Array(TaskItem, {
+		minItems: 1,
+		maxItems: MAX_PARALLEL_TASKS,
+		description:
+			"Parallel fan-out in THIS one call: independent tasks (several subagent calls in one message remain preferable for ordinary independent work). Exactly one mode per call — do not combine tasks[] with the single prompt/description fields or chain[].",
+	})),
 	...SharedDispatchParams,
 }, { additionalProperties: false });
 const SubagentChainParams = Type.Object({
@@ -8112,13 +8502,30 @@ const SubagentAbortParams = Type.Object({
 			"Exact run to abort, from the dispatch receipt or subagent_status (queued jobs carry their runId from acceptance). A stale runId — this agentId already moved to a newer run — is rejected instead of aborting the newer run.",
 	}),
 }, { additionalProperties: false });
+const SubagentProgressParams = Type.Object({
+	agentId: Type.String({ description: "Running worker whose progress channel should be re-aimed." }),
+	runId: Type.String({
+		minLength: 1,
+		description: "Exact run to re-point, from the dispatch receipt, [subagent-stalled], or subagent_status. A stale runId is rejected.",
+	}),
+	progressLog: Type.String({
+		minLength: 1,
+		description:
+			"Path to the file this worker actually appends its output to (relative to its spawn cwd, or absolute). Must resolve inside the opened project, that worker's spawn cwd, or its worktree. The file need not exist yet.",
+	}),
+	reportSecs: Type.Optional(Type.Integer({
+		minimum: 30,
+		maximum: 3600,
+		description: "How often new bytes are forwarded to you as [subagent-progress]. Default: this run's existing cadence, else 60s.",
+	})),
+}, { additionalProperties: false });
 const SubagentResolveParams = Type.Object({
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	runId: Type.String({ minLength: 1, description: "Exact runId from [subagent-done] or subagent_status. Stale runIds are rejected." }),
 	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
 }, { additionalProperties: false });
 type SubagentExecuteParams = {
-	action?: "abort" | "resolve";
+	action?: "abort" | "resolve" | "progress";
 	prompt?: string;
 	description?: string;
 	subagent_type?: string;
@@ -8131,11 +8538,15 @@ type SubagentExecuteParams = {
 	blockedBy?: string[];
 	scope?: string[];
 	thinking?: string;
+	/** Optional per-dispatch model pin: exact `provider/modelId`, catalog-validated at the gate. */
+	model?: string;
 	worktree?: "isolated" | "none";
 	noWorktreeReason?: string;
 	heartbeatSecs?: number;
 	timeoutSecs?: number;
 	progressLog?: string;
+	/** action="progress" only: forwarding cadence for the re-pointed log. */
+	reportSecs?: number;
 	agentId?: string;
 	runId?: string;
 	reason?: string;
@@ -8159,6 +8570,8 @@ type SubagentExecuteParams = {
 		cwd?: string;
 		verify?: string;
 		thinking?: string;
+		/** Optional per-dispatch model pin; catalog-validated before any step spawns. */
+		model?: string;
 		worktree?: "isolated" | "none";
 		noWorktreeReason?: string;
 		heartbeatSecs?: number;
@@ -8175,6 +8588,8 @@ type SubagentExecuteParams = {
 		cwd?: string;
 		verify?: string;
 		thinking?: string;
+		/** Optional per-dispatch model pin; catalog-validated before any task spawns. */
+		model?: string;
 		agentId?: string;
 		fresh?: boolean;
 		desktop?: "user-requested" | "ui-verify";
@@ -8964,6 +9379,9 @@ export default function (pi: ExtensionAPI) {
 				continue;
 			}
 			if (!claimStallNotification(handle, now, STALL_RENOTIFY_MAX, STALL_RENOTIFY_INTERVAL_MS)) continue;
+			// One read of the log per report; the tail is the diagnosis, so it is built only
+			// once the notification is actually claimed.
+			const progressEvidence = progressEvidenceFor(handle, now);
 			void deliverStallWake(
 				pi,
 				formatStallMessage({
@@ -8974,6 +9392,7 @@ export default function (pi: ExtensionAPI) {
 					lastLine,
 					...(stallInfo.inTool ? { inTool: stallInfo.inTool } : {}),
 					...(cpuEvidenceFor(agentId) ? { liveness: cpuEvidenceFor(agentId) as string } : {}),
+					...(progressEvidence ? { progress: progressEvidence } : {}),
 				}),
 			).then((ok) => confirmStallNotification(handle, ok));
 			pipiuiReport(attachDiagnostics({
@@ -9179,9 +9598,9 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description: [
-			"Dispatch one worker. Required: prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
-			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, run_in_background. resume_from is a deprecated alias of agentId.",
-			"Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
+			"Dispatch one worker. A single dispatch requires prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, run_in_background. resume_from is a deprecated alias of agentId.",
+			"Parallel mode: pass tasks[] (each item: task, agentId, and the same optional fields including its own model) instead of prompt/description. Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
 			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
 		parameters: subagentParameters,
@@ -9273,6 +9692,22 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// action=progress: re-aim one live worker's progress log. Observation only — no state,
+			// verify, or lifecycle change — so it does not consume a single/parallel/chain mode slot.
+			if (params.action === "progress") {
+				const progressResult = retargetRunningProgressLog({
+					agentId: params.agentId ?? "",
+					runId: params.runId ?? "",
+					progressLog: params.progressLog ?? "",
+					...(params.reportSecs !== undefined ? { reportSecs: params.reportSecs } : {}),
+				});
+				return {
+					content: [{ type: "text", text: progressResult.message }],
+					details: makeDetails("single")([]),
+					isError: !progressResult.ok,
+				};
+			}
+
 			// action=abort：中止一个后台 job（不占 single/parallel/chain 的 mode 名额）。runId 必填：
 			// queued 与 running 都按 {agentId, runId} 精确匹配，stale runId 拒绝而不是误杀新 run。
 			if (params.action === "abort") {
@@ -9320,6 +9755,8 @@ export default function (pi: ExtensionAPI) {
 				timeoutSecs?: number,
 				progressLog?: string,
 				scope?: string[],
+				model?: string,
+				modelPin?: ValidatedModelPin,
 			): void => {
 				recordRunningDispatchScope(agentId, scope);
 				void runSingleAgent(
@@ -9332,7 +9769,7 @@ export default function (pi: ExtensionAPI) {
 					undefined, // do not bind parent abort — turn abort must not kill background workers
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -9408,14 +9845,23 @@ export default function (pi: ExtensionAPI) {
 
 			if (modeCount !== 1) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+				const detectedModes = [
+					hasSingle ? "single (prompt/description/agentId)" : "",
+					hasTasks ? `tasks[${params.tasks?.length ?? 0}]` : "",
+					hasChain ? `chain[${params.chain?.length ?? 0}]` : "",
+				].filter(Boolean).join(" + ") || "none";
+				const guidance = modeCount === 0
+					? "Pick ONE mode: a single dispatch requires prompt + description + agentId together; otherwise pass tasks[] (each item: task, agentId) or chain[]."
+					: "Exactly one mode per call: single (prompt/description/agentId) OR tasks[] OR chain[] — never combined.";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
+							text: `Invalid parameters. Provide exactly one mode.\nDetected modes: ${detectedModes}. ${guidance}\nAvailable agents: ${available}`,
 						},
 					],
-					details: makeDetails("single")([]),
+					details: makeDetails(hasTasks ? "parallel" : hasChain ? "chain" : "single")([]),
+					isError: true,
 				};
 			}
 
@@ -9606,6 +10052,33 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Per-dispatch model pins: ONE batched authoritative RPC before anything reserves or
+			// spawns. A pin names exactly one usable provider/modelId for one dispatch; any
+			// transport/host failure or logical deny fails the WHOLE wave loudly at acceptance
+			// time — never a silent substitution with the user's default model, never a disk read.
+			const modelPinItems = [
+				...(hasSingle ? [{ label: "model", model: params.model }] : []),
+				...(hasTasks ? (params.tasks ?? []).map((t, i) => ({ label: `tasks[${i}].model`, model: t.model })) : []),
+				...(hasChain ? (params.chain ?? []).map((s, i) => ({ label: `chain[${i}].model`, model: s.model })) : []),
+			];
+			let validatedModelPins = new Map<string, ValidatedModelPin>();
+			if (modelPinItems.some((item) => item.model !== undefined && item.model !== null)) {
+				const pinResult = await validateDispatchModelPinsViaHost(modelPinItems);
+				if (!pinResult.ok) {
+					return {
+						content: [{ type: "text", text: pinResult.problem }],
+						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				validatedModelPins = pinResult.pins;
+			}
+			/** Branded pin lookup for downstream spawn options; undefined when the item carries no model. */
+			const validatedPinOf = (model: unknown): ValidatedModelPin | undefined => {
+				if (model === undefined || model === null) return undefined;
+				return validatedModelPins.get(String(model).trim());
+			};
+
 			// Identity contract, one pure gate for every dispatch form. agentId is caller-chosen and
 			// required on every worker — single, tasks/parallel and chain steps alike; nothing is
 			// generated. The retired random-generator shape (agent-<16hex>) is refused for new work
@@ -9736,6 +10209,9 @@ export default function (pi: ExtensionAPI) {
 						step.heartbeatSecs,
 						step.timeoutSecs,
 						step.progressLog,
+						undefined,
+						step.model,
+						validatedPinOf(step.model),
 					);
 					const placeholder: SingleResult = {
 						agent: agentName,
@@ -9748,7 +10224,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: emptyUsage(),
-						model: resolveAgentModel(agentName, agentCfg.model, sessionModel),
+						model: step.model ?? resolveAgentModel(agentName, agentCfg.model, sessionModel),
 					};
 					return {
 						content: [
@@ -9814,6 +10290,8 @@ export default function (pi: ExtensionAPI) {
 								contextWindow,
 								verify: step.verify,
 								thinking: step.thinking,
+								model: step.model,
+								modelPin: validatedPinOf(step.model),
 								agentId: step.agentId!.trim(),
 								fresh: step.fresh,
 								desktop: step.desktop,
@@ -9939,7 +10417,7 @@ export default function (pi: ExtensionAPI) {
 							messages: [],
 							stderr: "",
 							usage: emptyUsage(),
-							model: resolveAgentModel(t.agent, agentCfg.model, sessionModel),
+							model: t.model ?? resolveAgentModel(t.agent, agentCfg.model, sessionModel),
 						});
 					}
 
@@ -9963,7 +10441,7 @@ export default function (pi: ExtensionAPI) {
 								undefined, // no parent abort binding
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -10085,6 +10563,8 @@ export default function (pi: ExtensionAPI) {
 							contextWindow,
 							verify: t.verify,
 							thinking: t.thinking,
+							model: t.model,
+							modelPin: validatedPinOf(t.model),
 							agentId: t.agentId!.trim(),
 							fresh: t.fresh,
 							desktop: t.desktop,
@@ -10163,7 +10643,46 @@ export default function (pi: ExtensionAPI) {
 								queuedAt: Date.now(),
 								run: () =>
 									new Promise<void>((resolveRun) => {
-										recordRunningDispatchScope(agentId, params.scope);
+										releaseBlockedQueuedSingle().catch((setupError) => {
+											console.error("[pipiui-subagent] background queued agent setup error:", agentId, setupError instanceof Error ? setupError.message : String(setupError));
+											resolveRun();
+										});
+
+										// A saved pin is one linearization point at acceptance; a blockedBy item may
+										// be released much later, after the authority invalidated or re-committed.
+										// The stale grant must not authorize this later spawn: present the saved
+										// model to the authority again right before its spawn through the same
+										// batched RPC seam. Transport failure or deny fails THIS agent closed without
+										// spawning — an honest terminal, never a default-model substitution.
+										async function releaseBlockedQueuedSingle(): Promise<void> {
+											let releasedModelPin = validatedPinOf(params.model);
+											if (releasedModelPin) {
+												const revalidated = await validateDispatchModelPinsViaHost([{ label: "model", model: params.model }]);
+												if (!revalidated.ok) {
+													const msg = `[subagent-pin-stale] ${revalidated.problem}`;
+													console.error("[pipiui-subagent] background queued agent refused before spawn:", agentId, msg);
+													const refusedResult: SingleResult = {
+														agent: params.agent!,
+														agentId,
+														runId,
+														agentSource: agentCfg.source,
+														task: params.task!,
+														title: params.title,
+														exitCode: 1,
+														messages: [],
+														stderr: msg,
+														errorMessage: msg,
+														usage: emptyUsage(),
+														stopReason: "error",
+													};
+												notifySubagentDone(pi, refusedResult);
+												resolveRun();
+												return;
+											}
+											releasedModelPin = revalidated.pins.get(String(params.model).trim())!;
+										}
+									}
+									recordRunningDispatchScope(agentId, params.scope);
 										void runSingleAgent(
 											ctx.cwd,
 											agents,
@@ -10174,7 +10693,7 @@ export default function (pi: ExtensionAPI) {
 											undefined,
 											undefined,
 											makeDetails("single", { background: true, agentIds: [agentId] }),
-											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
 										)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -10205,7 +10724,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						]);
 					} else {
-						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope);
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model));
 					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -10218,7 +10737,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: emptyUsage(),
-						model: resolveAgentModel(params.agent, agentCfg.model, sessionModel),
+						model: params.model ?? resolveAgentModel(params.agent, agentCfg.model, sessionModel),
 					};
 					return {
 						content: [
@@ -10256,6 +10775,8 @@ export default function (pi: ExtensionAPI) {
 						contextWindow,
 						verify: params.verify,
 						thinking: params.thinking,
+						model: params.model,
+						modelPin: validatedPinOf(params.model),
 						agentId: params.agentId!.trim(),
 						fresh: params.fresh,
 						desktop: params.desktop,
@@ -10715,6 +11236,41 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("toolTitle", theme.bold("subagent_abort ")) +
 					theme.fg("accent", args.agentId || "?") +
 					(args.runId ? theme.fg("muted", ` ${args.runId}`) : ""),
+				0,
+				0,
+			);
+		},
+	});
+	pi.registerTool({
+		name: "subagent_progress",
+		label: "Subagent Progress",
+		description: [
+			"Re-point one running worker's live progress log at the file it actually writes to. Required: agentId, runId (exact, from the dispatch receipt / [subagent-stalled] / subagent_status) and progressLog.",
+			"Use it when a worker looks stalled but is really running something that reports through its own log — a pytest run, a playtest driver, a build — and the dispatch either named the wrong path or named none. Progress is then measured by that file growing, not by the worker's own stream, and its new bytes are forwarded to you as [subagent-progress].",
+			"This corrects an observation, not the work: it resets the idle clock and this run's stall-notification budget, and it never touches the worker, its prompt, or its files. Only the bundled general-purpose worker has a progress channel. If the worker never appends to the path you name, it will be reported stalled again — so name a path its brief actually tees output to, and abort instead when it is genuinely wedged.",
+		].join(" "),
+		parameters: SubagentProgressParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentProgressParams),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			return subagentTool.execute(
+				toolCallId,
+				{
+					action: "progress",
+					agentId: params.agentId,
+					runId: params.runId,
+					progressLog: params.progressLog,
+					reportSecs: params.reportSecs,
+				} as SubagentExecuteParams,
+				signal,
+				onUpdate,
+				ctx,
+			);
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent_progress ")) +
+					theme.fg("accent", args.agentId || "?") +
+					theme.fg("muted", ` → ${args.progressLog || "?"}`),
 				0,
 				0,
 			);

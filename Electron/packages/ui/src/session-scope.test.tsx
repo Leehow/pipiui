@@ -24,7 +24,7 @@ describe('right panel session scoping', () => {
 
     render(<SubagentPanel host={host} sessionId="session-a" />)
     await screen.findByTestId('agent-row-mine')
-    expect(listAgents).toHaveBeenCalledWith('session-a')
+    expect(listAgents).toHaveBeenCalledWith('session-a', 'history')
 
     push?.({ type: 'agent', agent: agent('theirs', 'session-b') })
     push?.({ type: 'agent', agent: agent('also-mine', 'session-a') })

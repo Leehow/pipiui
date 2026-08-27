@@ -186,6 +186,89 @@ describe("HostBridge", () => {
   });
 });
 
+describe("HostBridge model_pin_validate", () => {
+  const ALLOW = { schemaVersion: 1, decision: "allow", authorityRevision: 17 };
+  async function pinBridge(handler?: ConstructorParameters<typeof HostBridge>[0]["onModelPinValidate"]) {
+    bridge = new HostBridge({
+      onAgentEvent: () => {},
+      ...(handler ? { onModelPinValidate: handler } : {}),
+    });
+    const port = await bridge.listen();
+    return { port, capability: bridge.register("session-1") };
+  }
+  const postPins = (port: number, capability: unknown, refs: string[], action = "model_pin_validate") =>
+    post(port, { schemaVersion: 1, sessionCapability: capability, action, event: { schemaVersion: 1, refs } });
+
+  it("returns the handler decision verbatim; the batch shares one synchronous read", async () => {
+    let calls = 0;
+    const { port, capability } = await pinBridge((input) => {
+      calls += 1;
+      expect(Object.keys(input).sort()).toEqual(["refs"]);
+      if (input.refs.includes("prov/gone")) {
+        return { schemaVersion: 1, decision: "deny", code: "model_unavailable", invalidIndex: input.refs.indexOf("prov/gone"), authorityRevision: 42, retryable: false };
+      }
+      return { schemaVersion: 1, decision: "allow", authorityRevision: 42 };
+    });
+    const allowed = await postPins(port, capability, ["prov/a", "prov/b"]);
+    expect(allowed.status).toBe(200);
+    expect(await allowed.json()).toEqual({ schemaVersion: 1, decision: "allow", authorityRevision: 42 });
+    const denied = await postPins(port, capability, ["prov/a", "prov/gone"]);
+    expect(await denied.json()).toMatchObject({ decision: "deny", code: "model_unavailable", invalidIndex: 1 });
+    expect(calls).toBe(2);
+  });
+
+  it("denies fail-closed when the host has no pin surface at all", async () => {
+    const { port, capability } = await pinBridge();
+    const response = await postPins(port, capability, ["prov/a"]);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ decision: "deny", code: "catalog_unavailable", retryable: true });
+  });
+
+  it("never authorizes pins through a forged/rotated capability and rejects malformed batches with 400", async () => {
+    const { port, capability } = await pinBridge(() => {
+      throw new Error("must not be called for unauthorized callers");
+    });
+    // Forged, missing, rotated (re-register invalidates the old one) — identical 403.
+    await expect(postPins(port, "forged", ["prov/a"])).resolves.toMatchObject({ status: 403 });
+    const bare = await fetch(`http://127.0.0.1:${port}/rpc`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ schemaVersion: 1, action: "model_pin_validate", event: { schemaVersion: 1, refs: ["prov/a"] } }) });
+    expect(bare.status).toBe(403);
+    bridge!.register("session-1");
+    expect((await postPins(port, capability, ["prov/a"])).status).toBe(403);
+
+    // Re-arm a valid capability for malformed-body checks against a permissive handler.
+    bridge = new HostBridge({ onAgentEvent: () => {}, onModelPinValidate: () => ALLOW });
+    const port2 = await bridge.listen();
+    const cap2 = bridge.register("session-1");
+    for (const badEvent of [
+      {}, // no refs key at all
+      { refs: "prov/a" },
+      { refs: [42] },
+      { refs: [Array(1001).fill("prov/x")].flat() },
+      { refs: [`prov/${"x".repeat(301)}`] },
+    ]) {
+      const response = await post(port2, { schemaVersion: 1, sessionCapability: cap2, action: "model_pin_validate", event: badEvent });
+      expect(response.status).toBe(400);
+    }
+    // Over-limit batch is refused BEFORE the handler sees it.
+    const huge = Array.from({ length: 1001 }, (_, i) => `prov/m${i}`);
+    expect((await postPins(port2, cap2, huge)).status).toBe(400);
+    // Exactly at the limit passes.
+    expect((await postPins(port2, cap2, huge.slice(0, 1000))).status).toBe(200);
+  });
+
+  it("sanitizes handler faults into the same stable catalog_unavailable deny", async () => {
+    const { port, capability } = await pinBridge(() => {
+      throw new Error("apiKey=SECRET baseUrl=https://internal.example expires=soon");
+    });
+    const response = await postPins(port, capability, ["prov/a"]);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toEqual({ schemaVersion: 1, decision: "deny", code: "catalog_unavailable", authorityRevision: -1, retryable: true });
+    expect(JSON.stringify(body)).not.toContain("SECRET");
+    expect(JSON.stringify(body)).not.toContain("internal.example");
+  });
+});
+
 describe("canonical v1 spawn credentials", () => {
   it("sets the protocol marker only together with a real capability", () => {
     const base = { cwd: "/tmp/project", paths: { subagentDir: "/ext/subagent" }, features: { subagent: true } };

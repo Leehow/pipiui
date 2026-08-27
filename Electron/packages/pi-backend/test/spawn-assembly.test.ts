@@ -512,6 +512,18 @@ describe("bridge-free subagent orchestration", () => {
     expect(env.PIPIUI_SUBAGENT_MODELS_FILE).toBe("/electron/agent/subagent-models.json");
   });
 
+  it("binds the Boss-visible model catalog file only when the host provides one", () => {
+    const without = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true }, paths });
+    expect(without.env.PIPIUI_SUBAGENT_MODEL_CATALOG_FILE).toBeUndefined();
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { subagent: true },
+      paths,
+      subagentModelCatalogFile: "/electron/agent/pipiui-subagent-model-catalog-runtime.json",
+    });
+    expect(env.PIPIUI_SUBAGENT_MODEL_CATALOG_FILE).toBe("/electron/agent/pipiui-subagent-model-catalog-runtime.json");
+  });
+
   it("binds the native-search catalog file for worker tool-list filtering", () => {
     const { env } = assemblePiSpawn({
       cwd: "/tmp/project",

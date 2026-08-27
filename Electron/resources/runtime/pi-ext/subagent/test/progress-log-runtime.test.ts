@@ -7,7 +7,7 @@ import { join } from "node:path";
 import {
 	applyProgressLogSampleTick,
 } from "../index.ts";
-import { progressIdleMs, sampleProgressLog } from "../progress-log.ts";
+import { progressIdleMs, retargetProgressLog, sampleProgressLog } from "../progress-log.ts";
 
 /** Mirrors STALL_THRESHOLD_MS (120s); the constant itself is not exported. */
 const STALL_THRESHOLD_MS = 120_000;
@@ -116,4 +116,80 @@ test("runtime wiring: schemas, containment gate, watchdog order, and idle call s
 	assert.ok(noteIdx > 0 && forwardIdx > noteIdx);
 	const fnBody = src.slice(noteIdx, src.indexOf("\n}", src.indexOf("sendUserMessageAfterCutIn(pi, text)", noteIdx)));
 	assert.ok(!fnBody.includes("noteAgentActivity"));
+});
+
+test("a mid-run retarget makes the corrected log the live progress signal", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-log-retarget-runtime-"));
+	const named = join(dir, "guessed.log");
+	const real = join(dir, "driver.log");
+	writeFileSync(named, "");
+	writeFileSync(real, "already 40 minutes of playtest output\n");
+
+	// A worker blocked in a driver that reports through `real`: its JSONL has been silent for
+	// 50 minutes and the file the dispatch named never gets a byte, so the watchdog is right
+	// about the silence and wrong about the worker.
+	const t0 = 7_000_000;
+	const handle = {
+		progressLogPath: named,
+		progressLogSample: sampleProgressLog({ path: named, now: t0 }),
+		progressLogOffset: 0,
+		lastActivityAt: t0 - 50 * 60_000,
+		lastStallNotifyAt: t0 - 60_000,
+		stallNotifyCount: 2,
+	};
+	applyProgressLogSampleTick(handle, t0);
+	assert.ok(progressIdleMs(t0, handle) > STALL_THRESHOLD_MS);
+
+	retargetProgressLog(handle, { path: real, now: t0 });
+	assert.ok(progressIdleMs(t0, handle) < STALL_THRESHOLD_MS);
+	// The backlog is a baseline, not progress: a tick with no new bytes must not credit it.
+	applyProgressLogSampleTick(handle, t0 + 30_000);
+	assert.equal(handle.lastProgressLogAt, t0);
+
+	// From here the corrected file drives the same watchdog credit the dispatch field would have.
+	writeFileSync(real, `${readFileSync(real, "utf8")}turn 41 resolved\n`);
+	applyProgressLogSampleTick(handle, t0 + 60_000);
+	assert.equal(handle.lastProgressLogAt, t0 + 60_000);
+	assert.ok(progressIdleMs(t0 + 65_000, handle) < STALL_THRESHOLD_MS);
+	// JSONL activity is untouched: log bytes never masquerade as the worker's own stream.
+	assert.equal(handle.lastActivityAt, t0 - 50 * 60_000);
+});
+
+test("runtime wiring: the retarget is Boss-side, run-bound, and fenced exactly like dispatch", () => {
+	const src = source();
+
+	// One public tool, strict-sanitized like its abort/resolve siblings, delegating to the
+	// shared execute rather than reaching into runningAgents from a second place.
+	assert.match(src, /name: "subagent_progress",/);
+	assert.match(src, /parameters: SubagentProgressParams,\n\t\tprepareArguments: bindSanitizeStrictToolArguments\(SubagentProgressParams\),/);
+	assert.match(src, /action: "progress",/);
+	const progressSchema = src.slice(src.indexOf("const SubagentProgressParams"), src.indexOf("const SubagentResolveParams"));
+	for (const field of ["agentId", "runId", "progressLog"]) {
+		assert.match(progressSchema, new RegExp(`\\n\\t${field}: Type\\.String\\(`), `${field} must be required on the retarget`);
+	}
+	assert.match(progressSchema, /reportSecs: Type\.Optional\(Type\.Integer\(\{\n\t\tminimum: 30,\n\t\tmaximum: 3600,/);
+
+	// The gates, in order: live run, exact runId, not finalizing, and the same bundled
+	// general-purpose gate the dispatch field passes.
+	const fn = src.slice(src.indexOf("function retargetRunningProgressLog"), src.indexOf("function abortRunningAgent"));
+	const order = ["runningAgents.get(agentId)", "handle.runId !== runId", "handle.finalizing", "handle.progressLogEligible"];
+	let cursor = -1;
+	for (const needle of order) {
+		const at = fn.indexOf(needle);
+		assert.ok(at > cursor, `retarget gate out of order or missing: ${needle}`);
+		cursor = at;
+	}
+	// Containment is judged against THIS run's own roots, not the Boss's cwd alone.
+	assert.match(fn, /spawnCwd: handle\.spawnCwd \?\? PIPIUI_MAIN_CWD,\n\t\tallowedRoots: \[PIPIUI_MAIN_CWD, handle\.spawnCwd \?\? "", handle\.worktreePath \?\? ""\],/);
+	// Those roots only exist because the dispatch records them on the handle.
+	assert.match(src, /\t\t\tspawnCwd,\n\t\t\t\.\.\.\(executionPolicy \? \{ progressLogEligible: true \} : \{\}\),/);
+
+	// The detail view names the file the idle clock actually reads, so the correction is aimed
+	// at a known target rather than guessed at.
+	assert.match(src, /progress log: \$\{live\.progressLogPath\}/);
+	assert.match(src, /} else if \(live\?\.progressLogEligible\) \{/);
+
+	// A stall signal must offer the correction, or the Boss aborts a healthy test run instead.
+	const stall = readFileSync(new URL("../stall-notification.ts", import.meta.url), "utf8");
+	assert.match(stall, /subagent_progress\(\{agentId:"\$\{input\.agentId\}", runId:"\$\{input\.runId\}"/);
 });

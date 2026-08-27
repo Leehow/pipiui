@@ -89,9 +89,12 @@ The skill is the only path that carries the packaging invariants: it requires
 allows the agent to supply it whenever packaging or live acceptance was requested), cleans its own staging tree (leaked
 `.electron-fast-*` directories previously grew `build/` past 9GB), exports the
 `PIPIUI_EMBEDDED_RUNTIME_TARGET` that selects the per-architecture Cua driver
-slice, and checks the result against a size budget. A single-architecture App is
-~610MB; it was 1.2GB before the packaging was slimmed, so a bundle near that size
-is a regression to report, not a heavier build to ship. Read the skill's
+slice, and checks the result against a size budget. The budget applies to the
+core App with bundled plugins (`pipiui-runtime/extensions`, e.g. office 75MB,
+code-retrieval) metered separately: a single-architecture core is ~750MB after
+the Electron/Node LTS upgrade (was ~610MB before, 1.2GB before the original
+slimming), so a core number near or past that is a regression to report, not a
+heavier build to ship. Read the skill's
 `SKILL.md` before changing anything under `Electron/apps/electron/package.json`
 `build`, `scripts/fetch-pi-runtime.mjs`, or `scripts/fetch-cua-driver.mjs` —
 each holds a slimming invariant that an innocuous-looking edit silently undoes.

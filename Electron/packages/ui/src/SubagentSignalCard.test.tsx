@@ -12,6 +12,15 @@ afterEach(cleanup)
 const handlers = { onCopy: vi.fn(() => Promise.resolve()), onResend: vi.fn(), resendDisabled: false, copied: false }
 
 describe('SubagentSignalCard MessageView integration', () => {
+  it('renders a heartbeat as an animated running indicator instead of a static glyph', () => {
+    const message: ChatMessage = { id: 'heartbeat', role: 'user', content: '[subagent-heartbeat] outstanding=1 vanished=0 stalled=0\n  a1 (测试) — running 2m, idle 4s, state=running', timestamp: 1 }
+    const { container } = render(<MessageView message={message} {...handlers} />)
+    const disclosure = screen.getByRole('button', { name: /运行中/ })
+    expect(container.querySelector('[data-activity-status="running"]')).toBeTruthy()
+    expect(disclosure.querySelector('.activity-spinner')).toBeTruthy()
+    expect(disclosure.querySelector('.activity-status')?.textContent).not.toBe('◌')
+  })
+
   it('renders one compact collapsed done card without human bubble, prompt marker or resend action', () => {
     const message: ChatMessage = { id: 'done', role: 'user', content: '[subagent-done] agentId=a1 name=general-purpose ok=true verified=fail cost=0.1659 turns=9\nTitle: 修复列表\nResult:\n完成 report.md', timestamp: 1 }
     const { container } = render(<MessageView message={message} showFooter documentBasePath="/tmp/project" {...handlers} />)

@@ -382,6 +382,8 @@ export type AgentDiagnostics = {
 };
 /** Metadata is optional for v1 producers; v2 producers populate it on snapshots and updates. */
 export type AgentSummary = { agentId: string; runId: string; name: string; task: string; state: AgentState; stalled?: boolean; stalledIdleSec?: number; handled?: boolean; cost?: number; costUnit?: CostUnit; exchangeRate?: number; turns?: number; outputCount?: number; sessionId?: string; parentId?: string | null; /** The main-chat tool_call this agent was dispatched from (subagent tool), if any. Lets the transcript card link a tool_call to its live worker. */ toolCallId?: string; depth?: number; role?: string; createdAt?: number; updatedAt?: number; deadlineAt?: number; endedAt?: number; title?: string; model?: string; provider?: string; listSubtitle?: string; /** True only while a tool is in-flight. Missing means the field was not provided. */ activityActive?: boolean; /** In-flight tool id when the runtime supplied one. */ activityToolCallId?: string; /** Set when the last in-flight tool ended/failed/aborted. */ activityEndedAt?: number; closeout?: string; contextTokens?: number; contextWindowTokens?: number; inputTokens?: number; outputTokens?: number; cacheTokens?: number; finalResult?: string;
+  /** Explicit test-fixture marker: only synthetic test data sets this. Production hosts never do, and no prose heuristic may substitute for it. */
+  testFixture?: true;
   /**
    * Writable isolation failed on an existing git repo (worktree add / unborn HEAD).
    * Non-git folders do not isolate and do not set this field — workers run in
@@ -1162,7 +1164,9 @@ export interface PipiHostAPI {
    */
   getQuotaSnapshot?(sessionId?: string): Promise<QuotaSnapshot | null>;
   /** Current snapshot; omit sessionId only for hosts that intentionally aggregate all sessions. */
-  listAgents(sessionId?: string): Promise<AgentSummary[]>; getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe;
+  /** `"history"` returns every retained run of the session instead of one current summary per agentId. */
+  listAgents(sessionId?: string, scope?: "current" | "history"): Promise<AgentSummary[]>;
+  getAgentLogs(agentId: string, sessionId: string, runId: string, scope?: "run" | "agent"): Promise<{ itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number }[]>; subscribeAgents(listener: (event: AgentEvent) => void): Unsubscribe; subscribeAgentLog(agentId: string, listener: (event: Extract<AgentEvent, { type: "agent_log" }>) => void, sessionId: string, runId: string): Unsubscribe;
   /**
    * Exact episode identity for agent/worktree control: every operation binds
    * the exact {sessionId, agentId, runId}. Hosts must resolve that composite key
@@ -1357,7 +1361,7 @@ function apiFrom(
     getSessionStats: sessionId => invoke("getSessionStats", sessionId),
     getQuotaSnapshot: sessionId => sessionId === undefined ? invoke("getQuotaSnapshot") : invoke("getQuotaSnapshot", sessionId),
     subscribeSessionStats: listener => subscribe("session_stats", event => event.channel === "session_stats", event => listener((event as Extract<HostEvent, { channel: "session_stats" }>).event)),
-    listAgents: sessionId => invoke("listAgents", sessionId),
+    listAgents: (sessionId, scope) => scope ? invoke("listAgents", sessionId, scope) : invoke("listAgents", sessionId),
     getAgentLogs: (agentId, sessionId, runId, scope) => scope ? invoke("getAgentLogs", agentId, sessionId, runId, scope) : invoke("getAgentLogs", agentId, sessionId, runId),
     subscribeAgents: listener => subscribe("agents", event => event.channel === "agents", event => listener((event as Extract<HostEvent, { channel: "agents" }>).event)),
     subscribeAgentLog: (agentId, listener, sessionId, runId) => subscribe("agents", event => event.channel === "agents" && event.event.type === "agent_log" && event.event.agentId === agentId && event.event.sessionId === sessionId && event.event.runId === runId, event => listener((event as Extract<HostEvent, { channel: "agents" }>).event as Extract<AgentEvent, { type: "agent_log" }>)),

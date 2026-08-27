@@ -61,6 +61,7 @@ export const TOOL_GROUPS = {
     "subagent_abort",
     "subagent_chain",
     "subagent_manage",
+    "subagent_progress",
     "subagent_resolve",
     "subagent_status",
   ],

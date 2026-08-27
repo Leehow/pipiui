@@ -338,6 +338,20 @@ describe('Electron Pi profile', () => {
             input: ['text'],
             contextWindow: 200000,
             maxTokens: 16384
+          }, {
+            id: 'kimi-k3',
+            name: 'Kimi K3',
+            reasoning: false,
+            input: ['text'],
+            contextWindow: 200000,
+            maxTokens: 16384
+          }, {
+            id: 'qwen3.8-max',
+            name: 'Qwen 3.8 Max',
+            reasoning: false,
+            input: ['text'],
+            contextWindow: 200000,
+            maxTokens: 16384
           }]
         }
       }
@@ -381,6 +395,36 @@ describe('Electron Pi profile', () => {
     })
     expect(qwen?.thinkingLevelMap?.off).toBeUndefined()
     expect(qwen?.compat).not.toHaveProperty('thinkingFormat')
+
+    const kimi3 = runtime.getModel('jellytoken', 'kimi-k3')
+    expect(kimi3).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        off: null,
+        minimal: 'low',
+        low: 'low',
+        medium: 'high',
+        high: 'high',
+        xhigh: 'max',
+        max: 'max'
+      },
+      compat: { supportsReasoningEffort: true }
+    })
+
+    const qwen38 = runtime.getModel('jellytoken', 'qwen3.8-max')
+    expect(qwen38).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        off: 'none',
+        minimal: 'low',
+        low: 'low',
+        medium: 'medium',
+        high: 'xhigh',
+        xhigh: 'xhigh',
+        max: 'xhigh'
+      },
+      compat: { supportsReasoningEffort: true }
+    })
 
     const { streamSimple } = await import('@earendil-works/pi-ai/api/openai-completions')
     const capture = async (reasoning?: string) => {

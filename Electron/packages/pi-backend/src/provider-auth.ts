@@ -197,8 +197,14 @@ export async function readAuthMetadataEntries(authPath: string): Promise<Map<str
 export interface ProviderAuthOptions {
   runtime: AuthRuntimeLike;
   authPath: string;
-  /** Called after a successful login so the model catalog can be refreshed. */
-  onLoginCompleted?: () => void;
+  /**
+   * Awaited AFTER runtime login succeeds but BEFORE the terminal 'completed' event is
+   * published: the model catalog must finish load + invalidate/publish/tombstone settle so
+   * no caller can observe success while revoked/added providers are still stale on disk.
+   * A rejection becomes the login's explicit terminal failure (never an unhandled
+   * rejection, never a silent fire-and-forget).
+   */
+  onLoginCompleted?: () => void | Promise<void>;
 }
 
 /** Owns interactive login sessions and the provider catalog listing. */
@@ -308,8 +314,16 @@ export class ProviderAuthBackend {
     try {
       await this.options.runtime.login(providerId, authType, session.interaction());
       if (!session.cancelled) {
-        session.push({ kind: "completed", providerId });
-        this.options.onLoginCompleted?.();
+        try {
+          // Completion ordering contract: catalog refresh + publication SETTLE before any
+          // consumer can observe 'completed'. Failures surface as an explicit failed login.
+          await this.options.onLoginCompleted?.();
+          session.push({ kind: "completed", providerId });
+        } catch (refreshError) {
+          const message = refreshError instanceof Error ? refreshError.message : String(refreshError);
+          console.warn(`[pipi-auth] post-login model catalog refresh failed for ${providerId}: ${message}`);
+          session.push({ kind: "failed", error: `登录已成功，但登录后模型目录刷新失败：${message}` });
+        }
       }
     } catch (err) {
       session.push(session.cancelled ? { kind: "cancelled" } : { kind: "failed", error: err instanceof Error ? err.message : String(err) });

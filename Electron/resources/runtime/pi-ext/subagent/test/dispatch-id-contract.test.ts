@@ -189,11 +189,17 @@ test("wiring: abort is exact-run everywhere and the runtime never generates a wo
 	// ChainItem declares fresh and the sync loop passes it.
 	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?fresh: Type\.Optional\(Type\.Boolean\(\{ description: FRESH_DESCRIPTION \}\)\),/);
 	assert.match(source, /fresh: step\.fresh,/);
-	// Provider schemas require the semantic id instead of promising a runtime rejection.
-	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
-	assert.match(singleSchema, /\tagentId: Type\.String\(\{ description: AGENT_ID_DESCRIPTION \}\),/);
+	// Identity is caller-chosen everywhere. tasks[] items and chain steps keep agentId
+	// REQUIRED in their item schemas; the single schema declares it Optional ONLY so the
+	// parallel tasks[] wave (no root identity) clears real provider validation — single-mode
+	// enforcement stays at the execute() identity gate, which names "Missing agentId for this
+	// dispatch" instead of ever generating an id.
+	const taskItem = source.slice(source.indexOf("const TaskItem"), source.indexOf("const ChainItem"));
+	assert.match(taskItem, /\tagentId: Type\.String\(\{ description: AGENT_ID_DESCRIPTION \}\),/);
 	const chainItem = source.slice(source.indexOf("const ChainItem"), source.indexOf("const AgentScopeSchema"));
 	assert.match(chainItem, /\tagentId: Type\.String\(\{ description: AGENT_ID_DESCRIPTION \}\),/);
+	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
+	assert.match(singleSchema, /\tagentId: Type\.Optional\(Type\.String\(\{[\s\S]*?tasks\[\] call omits this root field/, "root agentId must be schema-optional for the parallel tasks[] mode");
 	// computer_task sessionId is required, not optional-plus-runtime-error.
 	assert.match(source, /\tsessionId: Type\.String\(\{ minLength: 1, maxLength: 24,/);
 	assert.doesNotMatch(source, /sessionId: Type\.Optional/);

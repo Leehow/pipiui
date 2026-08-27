@@ -14,6 +14,26 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
  * environment — otherwise any local process could inject agent events into a session.
  */
 export type BridgeAgentEvent = Record<string, unknown> & { kind?: string; agentId?: string; runId?: string };
+
+/** Wire contract for `model_pin_validate`: explicit subagent dispatch pins only. */
+export type ModelPinValidateRequestV1 = { schemaVersion?: unknown; refs?: unknown };
+export type ModelPinValidateDenyCodeV1 = "catalog_unavailable" | "model_unavailable";
+/**
+ * Decision envelope. Logical denies travel over HTTP 200; only transport-level problems
+ * (bad capability, malformed body) use 4xx so a worker cannot confuse its own bug with
+ * "the pinned model is unavailable".
+ */
+export type ModelPinValidateDecisionV1 =
+  | { schemaVersion: 1; decision: "allow"; authorityRevision: number }
+  | {
+      schemaVersion: 1;
+      decision: "deny";
+      code: ModelPinValidateDenyCodeV1;
+      /** Index into the request refs of the first refused pin (`model_unavailable` only). */
+      invalidIndex?: number;
+      authorityRevision: number;
+      retryable: boolean;
+    };
 export type BridgeHandlers = {
   onAgentEvent(event: BridgeAgentEvent, sessionId: string): void;
   /** Plan tools POST here; a host with no plan surface still has to answer. */
@@ -27,6 +47,13 @@ export type BridgeHandlers = {
   onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
   /** One-shot Structured Outputs take. Session id comes from the capability, never the body. */
   onStructuredOutput?(event: Record<string, unknown>, sessionId: string): Promise<unknown> | unknown;
+  /**
+   * Authoritative validation of explicit dispatch pins against this process's canonical
+   * catalog. MUST be synchronous and side-effect-free: capturing the current immutable
+   * authority view once is the linearization point the whole batch shares. Omitting the
+   * handler denies everything (fail closed) — there is no legacy fallback.
+   */
+  onModelPinValidate?(input: ModelPinValidateRequestV1, sessionId: string): ModelPinValidateDecisionV1;
   /** Spec D4 `ext.emit`. Fail closed when omitted. */
   onExtEmit?(
     input: { extensionId: string; event: string; payload?: unknown },
@@ -36,6 +63,33 @@ export type BridgeHandlers = {
 
 /** Agent logs are the largest payload; anything past this is refused, not buffered. */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+/** Upper bound of pins accepted per `model_pin_validate` batch. */
+const MAX_MODEL_PIN_REFS = 1000;
+/** Matches the runtime-side length cap for one `provider/modelId` ref. */
+const MAX_MODEL_PIN_REF_LENGTH = 300;
+
+/** Structural pre-parse only; semantic checks belong to the backend authority handler. */
+function parseModelPinValidateEvent(event: unknown): { ok: true; refs: string[] } | { ok: false; error: string } {
+  if (!event || typeof event !== "object" || Array.isArray(event)) {
+    return { ok: false, error: "invalid model_pin_validate event" };
+  }
+  const refs = (event as { refs?: unknown }).refs;
+  if (!Array.isArray(refs)) return { ok: false, error: "refs must be an array of strings" };
+  if (refs.length > MAX_MODEL_PIN_REFS) return { ok: false, error: `too many refs (${refs.length} > ${MAX_MODEL_PIN_REFS})` };
+  for (const ref of refs) {
+    if (typeof ref !== "string") return { ok: false, error: "refs must be an array of strings" };
+    if (ref.length > MAX_MODEL_PIN_REF_LENGTH) return { ok: false, error: "ref too long" };
+  }
+  return { ok: true, refs: [...refs] };
+}
+
+const MODEL_PIN_DENY_CATALOG_UNAVAILABLE: ModelPinValidateDecisionV1 = {
+  schemaVersion: 1,
+  decision: "deny",
+  code: "catalog_unavailable",
+  authorityRevision: -1,
+  retryable: true,
+};
 
 function safeEqual(a: string, b: string): boolean {
   const left = Buffer.from(a), right = Buffer.from(b);
@@ -190,6 +244,23 @@ export class HostBridge {
     }
     const event = body.event;
     if (!event || typeof event !== "object") return this.reply(response, 400, { ok: false, error: "missing event" });
+    if (body.action === "model_pin_validate") {
+      const handler = this.handlers.onModelPinValidate;
+      // An absent host surface still denies every pin — never a silent allow, never a
+      // legacy fallback. A handler fault is sanitized into the same stable deny: raw
+      // provider/runtime errors never reach the worker.
+      if (!handler) return this.reply(response, 200, MODEL_PIN_DENY_CATALOG_UNAVAILABLE);
+      const parsed = parseModelPinValidateEvent(event);
+      if (!parsed.ok) return this.reply(response, 400, { ok: false, error: parsed.error });
+      try {
+        // Deliberately NOT awaited: run-to-completion makes this single synchronous read of
+        // the backend authority THE linearization point shared by every ref in the batch.
+        return this.reply(response, 200, handler({ refs: parsed.refs }, sessionId));
+      } catch (error) {
+        console.warn(`[pipi-bridge] model_pin_validate handler error: ${error instanceof Error ? error.message : String(error)}`);
+        return this.reply(response, 200, MODEL_PIN_DENY_CATALOG_UNAVAILABLE);
+      }
+    }
     try {
       if (body.action === "agent_event") this.handlers.onAgentEvent(event as BridgeAgentEvent, sessionId);
       else if (body.action === "plan_event") this.handlers.onPlanEvent?.(event as Record<string, unknown>, sessionId);
