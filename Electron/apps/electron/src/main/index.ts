@@ -125,10 +125,13 @@ function createWindow(
     sessionId => browser.mobileWindowClosed(sessionId),
     isAppQuitting
   )
-  browser.attachToWindow((sessionId, rawView, placement, kind, device) => {
-    if (kind === 'mobile') return mobileWindows.present(sessionId, rawView, placement, device)
-    routeBrowserView(rawView, placement, window as any)
-  })
+  browser.attachToWindow(
+    (sessionId, rawView, placement, kind, device) => {
+      if (kind === 'mobile') return mobileWindows.present(sessionId, rawView, placement, device)
+      routeBrowserView(rawView, placement, window as any)
+    },
+    () => shellView.webContents.getZoomFactor()
+  )
   window.on('close', () => {
     browser.detachWindow()
     mobileWindows.dispose()

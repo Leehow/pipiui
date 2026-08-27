@@ -512,7 +512,10 @@ describe('BrowserTabsHost', () => {
 })
 
 describe('BrowserSessionHost', () => {
-  function sessionsHarness(attach: (view: BrowserViewLike, placement: boolean | 'detach') => void = vi.fn()) {
+  function sessionsHarness(
+    attach: (view: BrowserViewLike, placement: boolean | 'detach') => void = vi.fn(),
+    boundsScale: () => number = () => 1
+  ) {
     const created: Array<{ partition?: string; contents: FakeWebContents; view: BrowserViewLike }> = []
     const createView = vi.fn((options: { webPreferences: { partition?: string } }) => {
       const contents = new FakeWebContents()
@@ -527,7 +530,7 @@ describe('BrowserSessionHost', () => {
       return view
     })
     const host = new BrowserSessionHost(createView)
-    host.attachToWindow((_sessionId, view, placement) => attach(view, placement))
+    host.attachToWindow((_sessionId, view, placement) => attach(view, placement), boundsScale)
     return { host, created, createView, attach }
   }
 
@@ -645,6 +648,14 @@ describe('BrowserSessionHost', () => {
 
     releaseNavigation()
     await slowNavigation
+  })
+
+  it('converts zoomed shell CSS bounds into native window coordinates', async () => {
+    const { host, created } = sessionsHarness(vi.fn(), () => 1.2)
+
+    await host.setViewBounds('session-a', { x: 400, y: 80, width: 500, height: 300, visible: true })
+
+    expect(created[0].view.setBounds).toHaveBeenLastCalledWith({ x: 480, y: 96, width: 600, height: 360 })
   })
 
   it('destroys only the deleted session view and clears its storage ownership', async () => {

@@ -37,6 +37,34 @@ type BrowserSessionRecord = {
   disposing: boolean
 }
 
+type BrowserBoundsScaleProvider = () => number
+
+function readBoundsScale(provider: BrowserBoundsScaleProvider): number {
+  try {
+    const scale = provider()
+    return Number.isFinite(scale) && scale > 0 ? scale : 1
+  } catch {
+    return 1
+  }
+}
+
+function scaleBrowserViewBounds(bounds: BrowserViewBounds, scale: number): BrowserViewBounds {
+  if (scale === 1) return bounds
+  const scaleRect = (rect: { x: number; y: number; width: number; height: number }) => ({
+    x: rect.x * scale,
+    y: rect.y * scale,
+    width: rect.width * scale,
+    height: rect.height * scale,
+  })
+  const slots = bounds.slots
+    ? {
+        ...(bounds.slots.desktop ? { desktop: scaleRect(bounds.slots.desktop) } : {}),
+        ...(bounds.slots.mobile ? { mobile: scaleRect(bounds.slots.mobile) } : {}),
+      }
+    : undefined
+  return { ...bounds, ...scaleRect(bounds), ...(slots ? { slots } : {}) }
+}
+
 function toBrowserWatchInfo(watch: WatchRecord): BrowserWatchInfo {
   return {
     watchId: watch.watchId,
@@ -69,6 +97,7 @@ export class BrowserSessionHost implements BrowserHostAPI {
   private readonly disposedSessionIds = new Set<string>()
   private readonly listeners = new Set<(event: BrowserSurfaceEvent) => void>()
   private attach?: BrowserSessionViewAttach
+  private boundsScale: BrowserBoundsScaleProvider = () => 1
   private readonly certificateErrorApp?: BrowserCertificateErrorAppLike
   private selectedSessionId?: string
   private visibleSessionId?: string
@@ -134,8 +163,9 @@ export class BrowserSessionHost implements BrowserHostAPI {
     this.listeners.forEach(listener => listener(event))
   }
 
-  attachToWindow(attach: BrowserSessionViewAttach): void {
+  attachToWindow(attach: BrowserSessionViewAttach, boundsScale: BrowserBoundsScaleProvider = () => 1): void {
     this.attach = attach
+    this.boundsScale = boundsScale
     for (const [sessionId, record] of this.records) {
       record.host.attachToWindow((view, placement, kind, device) => attach(sessionId, view, placement, kind, device))
     }
@@ -144,6 +174,7 @@ export class BrowserSessionHost implements BrowserHostAPI {
   detachWindow(): void {
     for (const record of this.records.values()) record.host.detachWindow()
     this.attach = undefined
+    this.boundsScale = () => 1
     this.visibleSessionId = undefined
   }
 
@@ -177,7 +208,8 @@ export class BrowserSessionHost implements BrowserHostAPI {
       if (old && !old.disposing) await old.host.setViewBounds(hiddenBounds, false)
       if (!this.recordIsCurrent(id, record)) return
     }
-    const needsRestore = await record.host.setViewBounds(bounds, false)
+    const nativeBounds = scaleBrowserViewBounds(bounds, readBoundsScale(this.boundsScale))
+    const needsRestore = await record.host.setViewBounds(nativeBounds, false)
     if (!this.recordIsCurrent(id, record)) return
     if (visible) this.visibleSessionId = id
     else if (this.visibleSessionId === id) this.visibleSessionId = undefined
