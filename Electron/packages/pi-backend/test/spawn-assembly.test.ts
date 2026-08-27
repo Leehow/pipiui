@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { dirname, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AGENT_CONTRIBUTIONS_ENV, AGENT_CONTRIBUTIONS_ENV_MAX_BYTES, AGENT_CONTRIBUTIONS_FILE_ENV, AGENT_CONTRIBUTIONS_HOST_MAX_BYTES, AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV, assemblePiSpawn, buildVersionedAgentContributionSnapshot, contributionSidecarName, contributionSidecarTempPattern, extensionSettingsEnvName, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, removeContributionSnapshotSidecar, resolveContributionSnapshotFile, resolveSpawnPaths, sanitizeEnvironment, serializeAgentContributions, userExtensionMounts, workerAgentContributionsSnapshot, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
+import { AGENT_CONTRIBUTIONS_ENV, AGENT_CONTRIBUTIONS_ENV_MAX_BYTES, AGENT_CONTRIBUTIONS_FILE_ENV, AGENT_CONTRIBUTIONS_HOST_MAX_BYTES, AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV, assemblePiSpawn, buildVersionedAgentContributionSnapshot, contributionSidecarName, contributionSidecarTempPattern, extensionSettingsEnvName, GOAL_AUTO_RESUME_ENV, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, removeContributionSnapshotSidecar, resolveContributionSnapshotFile, resolveSpawnPaths, sanitizeEnvironment, serializeAgentContributions, userExtensionMounts, workerAgentContributionsSnapshot, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 
@@ -1319,6 +1319,26 @@ describe("grok-build delegation marker and media compat gate (M5)", () => {
     // A stale parent value can never turn the deprecated path back on.
     expect(sanitizeEnvironment({ [MEDIA_COMPAT_FALLBACK_ENV]: "1", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
     expect(sanitizeEnvironment({ [MOUNTED_EXTENSIONS_ENV]: "stale", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
+  });
+
+  it("propagates goal auto-resume suppression only when requested and strips stale markers", () => {
+    const blocked = assemblePiSpawn({
+      sessionId: "s-archived",
+      goalAutoResume: "blocked",
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+    });
+    expect(blocked.env[GOAL_AUTO_RESUME_ENV]).toBe("blocked");
+
+    const running = assemblePiSpawn({
+      sessionId: "s-live",
+      cwd: "/tmp/project",
+      paths: { updateCenter, runtimeInfo },
+    });
+    expect(running.env[GOAL_AUTO_RESUME_ENV]).toBeUndefined();
+
+    // A stale inherited marker must not leak into worker children.
+    expect(sanitizeEnvironment({ [GOAL_AUTO_RESUME_ENV]: "blocked", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 });
 

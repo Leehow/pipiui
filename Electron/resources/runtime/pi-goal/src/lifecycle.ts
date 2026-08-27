@@ -213,6 +213,9 @@ export function registerGoalLifecycle(
 			runtime.clearGoalRecovery();
 			return;
 		}
+		// Any genuine user keystroke re-opens goal flow after an auto-revival block;
+		// only extension-sourced (goal-generated) traffic must stay gated.
+		runtime.noteUserInput();
 		if (/^\/goal(?:\s|$)/u.test(event.text.trimStart())) return;
 		if (runtime.activeGoal?.waiting) runtime.clearGoalWait(ctx, runtime.activeGoal.id);
 		if (event.streamingBehavior === "followUp") {

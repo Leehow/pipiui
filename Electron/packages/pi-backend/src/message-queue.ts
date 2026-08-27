@@ -77,6 +77,13 @@ export type SessionMessageQueueOptions = {
   drainBehavior?: DispatchBehavior;
   /** Called with immutable queue snapshots after every visible item change. */
   onChange?: QueueChangeListener;
+  /**
+   * Returns true while automatic FIFO delivery must stay inert for the session
+   * (user manual stop / archived revival guard). Checked before every drain;
+   * user-initiated sends lift it on the host side, so only automatic revival
+   * is blocked. Restore paths can never clear it.
+   */
+  isDrainSuppressed?: (sessionId: string) => boolean;
 };
 
 type SessionState = {
@@ -111,6 +118,7 @@ export class SessionMessageQueue {
   private readonly now: () => number;
   private readonly drainBehavior: DispatchBehavior;
   private readonly onChange?: QueueChangeListener;
+  private readonly isDrainSuppressed?: (sessionId: string) => boolean;
   private readonly sessions = new Map<string, SessionState>();
 
   constructor(options: SessionMessageQueueOptions) {
@@ -118,6 +126,7 @@ export class SessionMessageQueue {
     this.now = options.now ?? Date.now;
     this.drainBehavior = options.drainBehavior ?? "prompt";
     this.onChange = options.onChange;
+    this.isDrainSuppressed = options.isDrainSuppressed;
   }
 
   private state(sessionId: string): SessionState {
@@ -515,6 +524,10 @@ export class SessionMessageQueue {
   async drain(sessionId: string): Promise<void> {
     const session = this.state(sessionId);
     if (session.dispatching || session.turnActive || session.compactionActive) return;
+    // Manual-stop/archived revival gate: a suppressed session never re-sends
+    // queued items from an idle/watchdog/compaction drain. Explicit user
+    // sends clear the suppression host-side, then reach their own delivery.
+    if (this.isDrainSuppressed?.(sessionId)) return;
     const index = session.items.findIndex((item) => item.state === "queued");
     if (index < 0) return;
     const deliveryEpoch = session.deliveryEpoch;

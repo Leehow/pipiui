@@ -20,6 +20,7 @@ import {
 	serializeGoalState,
 } from "./persistence.js";
 import { buildContinuePrompt, type GoalStatus } from "./prompts.js";
+import { initialGoalAutoResume, type GoalAutoResumeState } from "./auto-resume.js";
 import { GoalIdSequence, MAX_GOAL_ID_LENGTH } from "./goal-id.js";
 import { nextToolFreeRepeatState, resetGoalSafetyEpoch } from "./safety.js";
 
@@ -244,9 +245,25 @@ export class GoalRuntime {
 
 	readonly pi: ExtensionAPI;
 
+	/**
+	 * Set by the host at spawn for manually stopped / archived sessions; blocks
+	 * every automatic revival path until genuine user input lifts it.
+	 */
+	private autoResume: GoalAutoResumeState;
+
 	constructor(pi: ExtensionAPI) {
 		this.pi = pi;
+		this.autoResume = initialGoalAutoResume();
 		this.toolPolicy = new GoalToolPolicy(pi);
+	}
+
+	blocksAutoResume() {
+		return this.autoResume === "blocked";
+	}
+
+	/** Real user input re-enables goal flow; only automatic revival stays gated. */
+	noteUserInput() {
+		this.autoResume = "run";
 	}
 
 	hasLegacyQueueInterface() {
@@ -302,7 +319,7 @@ export class GoalRuntime {
 	}
 
 	beginRecoveryRunIfNeeded() {
-		if (this.agentRunGoalId !== undefined || !this.activeGoal) return;
+		if (this.blocksAutoResume() || this.agentRunGoalId !== undefined || !this.activeGoal) return;
 		const recovery = this.goalRecovery;
 		if (!recovery || recovery.goalId !== this.activeGoal.id) return;
 		this.beginAgentRun(recovery.goalId, recovery.automaticOwner ? "automatic" : "manual");
@@ -347,6 +364,7 @@ export class GoalRuntime {
 	}
 
 	requestContinuation(goal: ActiveGoal) {
+		if (this.blocksAutoResume()) return false;
 		if (goal.waiting || this.hasContinuationWorkForGoal(goal.id)) return false;
 		const marker = continuationMarker(goal);
 		this.continuationIntent = {
@@ -359,6 +377,7 @@ export class GoalRuntime {
 	}
 
 	dispatchContinuationIfSettled(ctx: StatusContext) {
+		if (this.blocksAutoResume()) return false;
 		const intent = this.continuationIntent;
 		if (!intent) return false;
 		if (this.activeGoal?.status === "active" && !this.toolPolicy.toolsAvailable()) {
@@ -437,6 +456,7 @@ export class GoalRuntime {
 	}
 
 	restoreGoalWaitTimer(ctx: StatusContext) {
+		if (this.blocksAutoResume()) return false;
 		this.clearGoalWaitTimer();
 		const goal = this.activeGoal;
 		const resumeAt = goal?.status === "active" ? goal.waiting?.resumeAt : undefined;
@@ -446,6 +466,7 @@ export class GoalRuntime {
 	}
 
 	dispatchDueGoalWait(ctx: StatusContext) {
+		if (this.blocksAutoResume()) return false;
 		const goal = this.activeGoal;
 		const waiting = goal?.status === "active" ? goal.waiting : undefined;
 		const resumeAt = waiting?.resumeAt;

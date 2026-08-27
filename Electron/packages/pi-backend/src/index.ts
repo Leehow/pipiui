@@ -58,6 +58,7 @@ import { readUserMcpServers } from "./user-mcp-servers.js";
 import {
   assemblePiSpawn,
   defaultRuntimeRoot,
+  GOAL_AUTO_RESUME_ENV,
   MEDIA_COMPAT_FALLBACK_ENV,
   mergedSpawnEnvironment,
   removeContributionSnapshotSidecar,
@@ -1903,6 +1904,16 @@ export class PiHostBackend implements HostBackend {
   private compactionOperationSeq = 0;
   private queueLoads = new Map<string, Promise<void>>();
   private queueWrites = new Map<string, Promise<void>>();
+  /** Sessions the user stopped manually; persisted under `sessionManualStopIds` so it survives restarts and queue restores. */
+  private manualStopIds: Set<string>;
+  /** Resolves once the initial manual-stop read from settings has settled. */
+  private manualStopsLoaded: Promise<void>;
+  /** Cached `archivedSessionIds` for synchronous revival checks at spawn/drain time. */
+  private sidebarArchivedCache: Set<string>;
+  /** Resolves once the first archived-id refresh has settled. */
+  private sidebarPrefsLoaded: Promise<void>;
+  /** Sessions where an explicit user send re-enabled automatic delivery despite being archived. */
+  private autoRevivalUserLifts: Set<string>;
   /** Steer payloads pi acknowledged but never echoed back as a user message.
    * pi's ack only proves the text entered its in-memory steering queue, which
    * an aborted/compacted turn can drop; settle recycles them to the FIFO head. */
@@ -1987,10 +1998,21 @@ export class PiHostBackend implements HostBackend {
         : join(this.root, ".pipiui-queues");
     this.queueStore = options.queueStore ?? new FileQueueStore(queueRoot);
     this.quotaStore = options.quotaStore ?? new QuotaStore(this.env, { agentDir: this.agentDir });
+    this.manualStopIds = new Set<string>();
+    this.sidebarArchivedCache = new Set<string>();
+    this.autoRevivalUserLifts = new Set<string>();
+    // Manual-stop markers and the archived-id cache must be durable across
+    // restarts; both feeds are preloaded eagerly and awaited wherever an
+    // automatic revival decision is made.
+    this.manualStopsLoaded = this.readManualStopsFromSettings().catch(() => undefined);
+    this.sidebarPrefsLoaded = this.refreshSidebarArchivedCache().then(() => undefined).catch(() => undefined);
     this.queue = new SessionMessageQueue({
       dispatch: (id, payload, behavior) =>
         this.dispatchQueuedMessage(id, payload, behavior),
       onChange: (id, items) => this.queueChanged(id, items),
+      // User Stop (and archival) must outlive queue restores: neither
+      // restoreQueue nor a watchdog idle may deliver queued items again.
+      isDrainSuppressed: (id) => this.autoRevivalSuppressed(id),
     });
     const stopHooks = options.stopEscalationHooks ?? defaultStopEscalationHooks();
     this.stopEscalation = options.stopEscalation
@@ -2365,15 +2387,21 @@ export class PiHostBackend implements HostBackend {
   private async loadQueue(id: string): Promise<void> {
     let task = this.queueLoads.get(id);
     if (!task) {
-      task = this.queueStore
-        .load(id)
-        .then((items) => this.queue.restoreQueue(id, items))
-        .catch((error) => {
+      task = (async () => {
+        // Revival gates (manual stop / archived) must be resident before any
+        // restored item can reach a drain.
+        if (this.manualStopsLoaded) await this.manualStopsLoaded.catch(() => undefined);
+        let items: QueuedMessage[];
+        try {
+          items = await this.queueStore.load(id);
+        } catch (error) {
           console.warn(
             `[pipi-backend] queue restore failed for ${id}: ${error instanceof Error ? error.message : String(error)}`,
           );
-          this.queue.restoreQueue(id, []);
-        });
+          items = [];
+        }
+        this.queue.restoreQueue(id, items);
+      })();
       this.queueLoads.set(id, task);
     }
     await task;
@@ -2424,6 +2452,10 @@ export class PiHostBackend implements HostBackend {
       this.queue.noteAbort(sessionId);
       this.rejectPendingCommands(sessionId, new Error("session stopped"));
       if (live) live.pendingDrainPrompt = undefined;
+      // Persist the manual-stop intent: queue restores and pi-goal's
+      // session_start/continuation revival must not resurrect the turn until
+      // the user explicitly sends again.
+      void this.markManualStop(sessionId);
     } else if (!this.queue.hasPendingCutIn(sessionId)) {
       this.queue.suppressIdleDrain(sessionId);
     }
@@ -2476,6 +2508,10 @@ export class PiHostBackend implements HostBackend {
   ): Promise<QueueEnqueueResult> {
     if (isExternalSessionId(id)) throw new Error("external session is read-only");
     this.structuredOutputs?.assertReadyToSend(id);
+    // Archived sessions stay dead: refuse instead of reviving; unarchive first.
+    this.assertNotArchived(id);
+    // Explicit user input lifts manual-stop revival suppression.
+    this.noteExplicitUserSend(id);
     await this.loadQueue(id);
     const result = this.queue.enqueue(id, { text, attachments });
     if (result.outcome === "dispatched") await this.queue.waitForDispatch(id);
@@ -3133,18 +3169,24 @@ export class PiHostBackend implements HostBackend {
         );
       case "steerQueuedMessage":
         await this.loadQueue(params[0] as string);
+        this.assertNotArchived(params[0] as string);
+        this.noteExplicitUserSend(params[0] as string);
         return this.queue.steerMessage(
           params[0] as string,
           params[1] as string,
         );
       case "cutInQueuedMessage":
         await this.loadQueue(params[0] as string);
+        this.assertNotArchived(params[0] as string);
+        this.noteExplicitUserSend(params[0] as string);
         return this.cutInQueuedMessage(
           params[0] as string,
           params[1] as string,
         );
       case "retryQueuedMessage":
         await this.loadQueue(params[0] as string);
+        this.assertNotArchived(params[0] as string);
+        this.noteExplicitUserSend(params[0] as string);
         return this.queue.retryMessage(
           params[0] as string,
           params[1] as string,
@@ -3922,18 +3964,27 @@ export class PiHostBackend implements HostBackend {
       return {};
     }
   }
-  private ensure(id: string): Promise<Live> {
+  private async ensure(id: string): Promise<Live> {
     const live = this.live.get(id);
-    if (live && this.liveProcessUsable(live)) return Promise.resolve(live);
+    if (live && this.liveProcessUsable(live)) return live;
     if (live && !this.liveProcessUsable(live)) {
-      return (live.exit ?? Promise.resolve()).then(() => {
-        if (this.live.get(id) === live) this.live.delete(id);
-        return this.ensure(id);
-      });
+      await (live.exit ?? Promise.resolve());
+      if (this.live.get(id) === live) this.live.delete(id);
+      return this.ensure(id);
     }
     const inFlight = this.ensureInFlight.get(id);
     if (inFlight) return inFlight;
     this.stopEscalation.cancel(id);
+    // Archive = total death: transcript/detail reads use findSession/index
+    // paths and never reach here; anything that would implicitly respawn pi
+    // for an archived session is refused until the user unarchives it.
+    if (this.sidebarArchivedCache.has(id)) {
+      if (this.manualStopsLoaded) await this.manualStopsLoaded.catch(() => undefined);
+      if (this.sidebarPrefsLoaded) await this.sidebarPrefsLoaded.catch(() => undefined);
+      if (this.sidebarArchivedCache.has(id)) {
+        throw new Error("会话已归档：请先在侧栏取消归档，再继续该会话");
+      }
+    }
     const attempt = this.spawnLive(id).finally(() => {
       this.ensureInFlight.delete(id);
     });
@@ -3970,6 +4021,9 @@ export class PiHostBackend implements HostBackend {
       : undefined;
     const spawnCwd = isolated?.realProjectRoot ?? found.header.cwd;
     const registeredExtensions = await this.registeredExtensionsForSpawn(spawnCwd);
+    // Computed once with both durable feeds resident; drives the in-child
+    // pi-goal auto-revival suppression.
+    const goalAutoResume = await this.goalAutoResumeForSpawn(id);
     const output = assemblePiSpawn({
       sessionPath: found.path,
       sessionId: id,
@@ -3995,7 +4049,11 @@ export class PiHostBackend implements HostBackend {
         : undefined,
       vaultDir: this.vaultDir,
       registeredExtensions,
-      internalEnv: await this.mediaCompatFallbackEnv(),
+      internalEnv: {
+        ...(await this.mediaCompatFallbackEnv()),
+        ...(goalAutoResume ? { [GOAL_AUTO_RESUME_ENV]: "blocked" } : {}),
+      },
+      goalAutoResume,
     });
     this.extensions.mountSession(
       id,
@@ -6344,16 +6402,118 @@ export class PiHostBackend implements HostBackend {
   }
   private async loadSidebarSessionPreferences(): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 }> {
     const value = (await this.readSettings()).sidebarSessionPreferences;
-    return value === undefined
+    const prefs = value === undefined
       ? { pinnedSessionIds: [], archivedSessionIds: [], orderedSessionIds: [] }
       : this.checkedSidebarSessionPreferences(value);
+    this.sidebarArchivedCache = new Set(prefs.archivedSessionIds);
+    return prefs;
   }
   private async saveSidebarSessionPreferences(value: unknown): Promise<{ pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 }> {
     const checked = this.checkedSidebarSessionPreferences(value);
-    return this.updateSettings(settings => {
+    const previouslyArchived = new Set(this.sidebarArchivedCache);
+    const saved = await this.updateSettings(settings => {
       settings.sidebarSessionPreferences = checked;
       return { pinnedSessionIds: [...checked.pinnedSessionIds], archivedSessionIds: [...checked.archivedSessionIds], ...(checked.archivedSessionTimestamps === undefined ? {} : { archivedSessionTimestamps: { ...checked.archivedSessionTimestamps } }), orderedSessionIds: [...checked.orderedSessionIds], ...(checked.sessionOrderVersion === 2 || checked.sessionOrderVersion === 3 ? { sessionOrderVersion: checked.sessionOrderVersion } : {}) };
     });
+    this.sidebarArchivedCache = new Set(checked.archivedSessionIds);
+    // Archive = total death (UI unarchive rewrites the full set through this
+    // same channel, so the cache diff is authoritative both ways). Newly
+    // archived sessions lose every revival lift, their queues go inert, and
+    // any running pi child plus its subagents are torn down immediately.
+    const newlyArchived = checked.archivedSessionIds.filter(id => !previouslyArchived.has(id));
+    if (newlyArchived.length) {
+      for (const id of newlyArchived) this.autoRevivalUserLifts.delete(id);
+      await Promise.allSettled(newlyArchived.map(id => this.teardownArchivedSession(id)));
+    }
+    return saved;
+  }
+
+  /** Archive teardown: freeze the FIFO, reject pending RPCs, kill the live child and its subagents. */
+  private async teardownArchivedSession(sessionId: string): Promise<void> {
+    try {
+      if (this.manualStopsLoaded) await this.manualStopsLoaded.catch(() => undefined);
+      const live = this.live.get(sessionId);
+      this.queue.noteAbort(sessionId);
+      this.rejectPendingCommands(sessionId, new Error("session archived"));
+      if (live) live.pendingDrainPrompt = undefined;
+      void this.sweepSessionAgents(sessionId).catch(() => undefined);
+      if (live && this.liveProcessUsable(live)) await this.stopLiveProcess(live);
+      this.stream({ type: "status", sessionId, status: "stopped", pendingFollowUps: [] });
+    } catch (error) {
+      console.warn(`[pipi-backend] archive teardown failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  /** Refresh the archived-id cache; resolves with it so spawn paths never gate on stale data. */
+  private async refreshSidebarArchivedCache(): Promise<Set<string>> {
+    await this.loadSidebarSessionPreferences();
+    return this.sidebarArchivedCache;
+  }
+
+  /**
+   * Manual-stop persistence. Stored as `sessionManualStopIds` inside the same
+   * pipiui-settings.json the frontend owns, so a user Stop outlives restarts
+   * and is never cleared by restoreQueue or watchdog idle paths.
+   */
+  private async readManualStopsFromSettings(): Promise<void> {
+    const value = (await this.readSettings()).sessionManualStopIds;
+    if (Array.isArray(value)) {
+      for (const id of value) if (typeof id === "string" && id.length > 0) this.manualStopIds.add(id);
+    }
+  }
+
+  private async markManualStop(sessionId: string): Promise<void> {
+    try {
+      if (this.manualStopsLoaded) await this.manualStopsLoaded;
+      // A fresh Stop always wins over an earlier explicit send's revival lift.
+      this.autoRevivalUserLifts.delete(sessionId);
+      if (this.manualStopIds.has(sessionId)) return;
+      this.manualStopIds.add(sessionId);
+      await this.updateSettings(settings => {
+        settings.sessionManualStopIds = [...this.manualStopIds];
+      });
+    } catch (error) {
+      console.warn(`[pipi-backend] persisting manual stop failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private clearManualStop(sessionId: string): Promise<void> {
+    this.autoRevivalUserLifts.add(sessionId);
+    if (!this.manualStopIds.has(sessionId)) return Promise.resolve();
+    this.manualStopIds.delete(sessionId);
+    return this.updateSettings(settings => {
+      settings.sessionManualStopIds = [...this.manualStopIds];
+    }).catch((error) =>
+      console.warn(`[pipi-backend] clearing manual stop failed for ${sessionId}: ${error instanceof Error ? error.message : String(error)}`),
+    );
+  }
+
+  /** Any explicit user send re-enables automatic delivery after a manual stop. */
+  private noteExplicitUserSend(sessionId: string): void {
+    void this.clearManualStop(sessionId);
+  }
+
+  /** Conversing with an archived session requires an explicit unarchive first. */
+  private assertNotArchived(sessionId: string): void {
+    if (!this.sidebarArchivedCache.has(sessionId)) return;
+    throw new Error("会话已归档：请先在侧栏取消归档，再继续该会话");
+  }
+
+  /**
+   * True while automatic FIFO delivery must stay inert: user-stopped sessions,
+   * and archived sessions that have not seen an explicit user send since the
+   * host started. Restore paths can never lift this — only a user send does.
+   */
+  private autoRevivalSuppressed(sessionId: string): boolean {
+    if (this.autoRevivalUserLifts.has(sessionId)) return false;
+    if (this.manualStopIds.has(sessionId)) return true;
+    return this.sidebarArchivedCache.has(sessionId);
+  }
+
+  /** Which goal auto-resume suppression a freshly spawned child must carry. */
+  private async goalAutoResumeForSpawn(sessionId: string): Promise<"blocked" | undefined> {
+    if (this.manualStopsLoaded) await this.manualStopsLoaded;
+    if (this.sidebarPrefsLoaded) await this.sidebarPrefsLoaded;
+    return this.autoRevivalSuppressed(sessionId) ? "blocked" : undefined;
   }
   private async modelRuntime(): Promise<AuthRuntimeLike> {
     if (!this.authRuntimePromise) {
@@ -7194,6 +7354,10 @@ export class PiHostBackend implements HostBackend {
       await this.enqueueMessage(id, prompt, attachments);
       return;
     }
+    // Archived sessions stay dead: refuse instead of reviving; unarchive first.
+    this.assertNotArchived(id);
+    // Explicit user input lifts manual-stop revival suppression.
+    this.noteExplicitUserSend(id);
     await this.dispatchQueuedMessage(
       id,
       { text: prompt, attachments: [] },

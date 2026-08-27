@@ -651,4 +651,37 @@ describe("SessionMessageQueue", () => {
     host.pending[0].resolve(undefined);
     await flush();
   });
+
+  it("manual-stop suppression keeps restored items undelivered until the host lifts it", async () => {
+    // Mirrors the backend contract: a user Stop persists suppression;
+    // restoreQueue may resurrect items as queued but can never re-arm the
+    // idle/watchdog/compaction drain past this gate. Only an explicit user
+    // send (host clears the flag) unlocks delivery again.
+    let suppressed = true;
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({
+      dispatch: host.dispatch,
+      isDrainSuppressed: () => suppressed,
+    });
+    // A persisted `sending` item restored conservatively to `queued`.
+    queue.restoreQueue("s1", [
+      { id: "q1", sessionId: "s1", text: "stopped mid-send", attachments: [], createdAt: 1, state: "sending" },
+    ]);
+
+    await queue.notifyIdle("s1");
+    expect(queue.listQueue("s1").map((item) => ({ text: item.text, state: item.state })))
+      .toEqual([{ text: "stopped mid-send", state: "queued" }]);
+    expect(host.calls).toHaveLength(0);
+
+    // Watchdog orphan-busy recovery also funnels notifyIdle → drain.
+    await queue.notifyIdle("s1", 0);
+    expect(host.calls).toHaveLength(0);
+
+    // Explicit user send lifts suppression; next idle delivers FIFO head once.
+    suppressed = false;
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["stopped mid-send"]);
+    host.pending[0].resolve(undefined);
+    await idle;
+  });
 });

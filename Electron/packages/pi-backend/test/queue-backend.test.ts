@@ -85,8 +85,11 @@ describe("PiHostBackend message queue integration", () => {
       expect.objectContaining({ text: "first" }),
       expect.objectContaining({ text: "second" }),
     ]);
-    (backend as any).queue.markBusy("s1");
-    await (backend as any).queue.notifyIdle("s1");
+    // Post-Stop nothing automatic redelivers; items are held, not lost.
+    await eventually(() => (backend as any).queue.isBusy("s1") === false);
+    expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["first", "second"]);
+    // A deliberate user cut-in re-engages delivery and resumes the FIFO.
+    await backend.handle("cutInQueuedMessage", ["s1", first.message.id]);
     await eventually(() => (backend as any).queue?.listQueue("s1").length === 0);
     off();
     const snapshots = events.map(event => event.queue.map((item: any) => item.text).join(","));
@@ -118,8 +121,11 @@ describe("PiHostBackend message queue integration", () => {
     await backend.handle("stop", ["s1"]);
     await eventually(() => (backend as any).queue.isBusy("s1") === false);
     expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["B edited", "__queue_fail__"]);
-    (backend as any).queue.markBusy("s1");
-    await (backend as any).queue.notifyIdle("s1");
+    // User Stop must freeze automatic redelivery; an explicit user cut-in of
+    // the recycled head re-engages the FIFO chain through the same drain path.
+    // Recycled payloads mint fresh ids, so address the head by position.
+    const recycledHead = (await backend.handle("listQueue", ["s1"]) as any[])[0];
+    await backend.handle("cutInQueuedMessage", ["s1", recycledHead.id]);
     await eventually(() => ((backend as any).queue.listQueue("s1")[0]?.state) === "failed");
     const failedItem = (await backend.handle("listQueue", ["s1"]) as any[])[0];
     expect(failedItem).toMatchObject({ text: "__queue_fail__", state: "failed", error: "queue dispatch failed" });
@@ -148,9 +154,10 @@ describe("PiHostBackend message queue integration", () => {
       expect.objectContaining({ text: "interrupt lost", state: "queued" }),
     ]);
 
-    // The next turn delivers it as a normal prompt.
-    (backend as any).queue.markBusy("s1");
-    await (backend as any).queue.notifyIdle("s1");
+    // The next deliberate user action delivers it as a normal prompt. The
+    // recycled payload carries a fresh id, so address the head by position.
+    const recycledHead = (await backend.handle("listQueue", ["s1"]) as any[])[0];
+    await backend.handle("cutInQueuedMessage", ["s1", recycledHead.id]);
     await eventually(() => (backend as any).queue.listQueue("s1").length === 0);
     await backend.close();
   });
@@ -166,9 +173,19 @@ describe("PiHostBackend message queue integration", () => {
     expect(steered.state).toBe("sending");
     await eventually(() => userEchoes.some(event => event.content === "__steer_echo__ hello"));
 
-    // The echo is the delivery receipt: settle recycles nothing.
+    // The echo is the delivery receipt: settle recycles nothing when it lands
+    // first. If stop beat a very late ack/recycle path, the payload is instead
+    // preserved queued and suppression must hold it until an explicit user
+    // resend — either way nothing is lost and nothing is redelivered twice.
     await backend.handle("stop", ["s1"]);
     await eventually(() => (backend as any).queue.isBusy("s1") === false);
+    const remain = await backend.handle("listQueue", ["s1"]) as any[];
+    if (remain.length > 0) {
+      expect(remain).toEqual([
+        expect.objectContaining({ text: "__steer_echo__ hello", state: "queued" }),
+      ]);
+      await backend.handle("cutInQueuedMessage", ["s1", remain[0].id]);
+    }
     expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
     off();
     await backend.close();
@@ -216,8 +233,9 @@ describe("PiHostBackend message queue integration", () => {
     const queued = await backend.handle("enqueueMessage", ["s1", "继续"]) as any;
     expect(queued).toMatchObject({ outcome: "queued", message: { text: "继续" } });
     await backend.handle("stop", ["s1"]);
-    (backend as any).queue.markBusy("s1");
-    await (backend as any).queue.notifyIdle("s1");
+    // Only a user-driven resend may start the next turn: a cut-in announces
+    // the delivery on `started` exactly like an idle drain used to.
+    await backend.handle("cutInQueuedMessage", ["s1", queued.message.id]);
     await eventually(() => events.some(event =>
       event.status === "started" && event.pendingFollowUps?.includes("继续"),
     ));
