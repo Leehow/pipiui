@@ -226,7 +226,10 @@ export function runSecretaryCommit(
 	if (verificationBlock) return blocked(verificationBlock, cwd);
 	if (!dispositionsAreFinal(input)) return blocked("dispositions-not-final", cwd);
 
-	const preStaged = git(cwd, ["diff", "--cached", "--name-only", "-z", "--"]);
+	// `--no-renames` keeps this an exact name enumeration: with rename detection on,
+	// a deleted blob plus an identical blob added elsewhere collapses into one rename
+	// entry and the deleted path disappears from `--name-only`.
+	const preStaged = git(cwd, ["diff", "--cached", "--no-renames", "--name-only", "-z", "--"]);
 	if (!preStaged.ok) return blocked("cannot-inspect-index", cwd);
 	const preStagedQuiet = git(cwd, ["diff-index", "--cached", "--quiet", "HEAD", "--"]);
 	if (preStagedQuiet.status === null || preStagedQuiet.status > 1) {
@@ -262,7 +265,10 @@ export function runSecretaryCommit(
 		return blocked("stage-failed", cwd);
 	}
 
-	const cached = git(cwd, ["diff", "--cached", "--name-only", "-z", "--"]);
+	// See `preStaged`: without `--no-renames`, a manifest that legitimately contains both
+	// sides of an identical-content move (delete old path, add new path) would never
+	// equal the staged name set and every such closeout would block.
+	const cached = git(cwd, ["diff", "--cached", "--no-renames", "--name-only", "-z", "--"]);
 	if (!cached.ok || !exactPathSet(nulPaths(cached.stdout), manifest.paths)) {
 		clearHelperIndex(cwd);
 		return blocked("staged-set-does-not-match-manifest", cwd);
