@@ -1,7 +1,7 @@
 ---
 id: retrieval
 name: 代码检索哲学
-summary: 点得出 token 就精确搜，只描述得出就交给加权检索；先读 ref 再取正文；陌生仓库先要地图。
+summary: 点得出 token 就精确搜，只描述得出就交给加权检索；先读 ref 再取正文；陌生仓库先要地图；覆盖满即收敛。
 order: 21
 requires: []
 requires-capabilities: [code_search]
@@ -29,10 +29,9 @@ mind, and this build carries no semantic index. If the answer is written in voca
 not use, it comes back empty — and that emptiness is worth more than a miss, because it tells
 you your words are wrong rather than that the code is absent. Change vocabulary, not tool.
 
-The drift runs one way only: taking a describable question to the exact matcher, then
-compensating with a dozen greps. Your own second keyword is the tell — if the first pattern
-missed and you are reaching for a synonym, you are hand-rolling the weighing that one
-{{code_search}} call does properly. Hand it the sentence instead of guessing again.
+If the exact matcher missed and you are reaching for a synonym, your own second keyword is the tell:
+you are hand-rolling the weighing that one {{code_search}} call does properly. Hand it the sentence
+instead.
 
 **Relationships are their own question**: where a symbol is defined, who calls it, what
 implements it. Text search flattens the definition, every call, and every mention in a comment
@@ -59,14 +58,21 @@ in the first place.
 
 ## A note about the route is not a verdict on the answer
 
-These tools narrate what they did, and the two kinds of narration mean different things.
-*"Ranked by term match, not by meaning"* describes how an answer was produced — it is not a
-warning that the answer is wrong. A real degradation is stated separately and in its own
-words: the index is down, the symbol layer is vacant, nothing matched at all. Reading the
-first as the second is how a correct set of spans gets thrown away and re-derived by hand.
+*"Ranked by term match, not by meaning"* says how an answer was produced, not that it is
+wrong; a real degradation states itself separately and plainly — the index is down, the
+symbol layer is vacant, nothing matched. Reading the first as the second is how a correct
+set of spans gets thrown away. These tools fall back on their own when they degrade, so a
+degraded answer is still the one you would have gotten; trying costs nothing over the search
+you were about to run, and the call is how you find out.
 
-They also fall back on their own — to text search when the index is not up, to a plain report
-when the symbol layer is vacant. So a degraded answer is still the answer you would have
-gotten anyway, and trying costs nothing over the search you were about to run regardless.
-"The index might not be ready" is never a reason to skip the call; the call is how you find
-out.
+## Coverage decides when searching ends
+
+Retrieval has its own stopping rule, and it is coverage, not stamina. Name the evidence
+dimensions the task actually rests on — usually three to seven claims the deliverable needs
+anchored — and let one reliable file:line anchor carry each. Later retrieval must name the
+question it answers or the finding it would falsify; once every required dimension holds an
+anchor, stop and report. That is completion, not early stopping: extra strategies are owed
+only while a material question stays unresolved, never as ritual after coverage is done,
+and no call-count cap stands in for an uncovered dimension. None of this retires exact
+matching for a string you already know, and nothing makes a map or a weighted search a
+prerequisite for starting.

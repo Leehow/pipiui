@@ -4,13 +4,17 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
+  ATTRIBUTION_RESULT_KIND,
   ATTRIBUTION_TURN_KIND,
   AVAILABLE_TOOL_BOUND,
+  READ_PATH_BOUND,
   RETRIEVAL_ATTRIBUTION_FILENAME,
   RETRIEVAL_ATTRIBUTION_KIND,
   RETRIEVAL_ATTRIBUTION_VERSION,
+  RETRIEVAL_ATTRIBUTION_V1,
   boundRetrievalInput,
   buildAttributionRecord,
+  buildAttributionResult,
   classifyGrepPattern,
   createRetrievalAttribution,
   formatAttributionSummary,
@@ -19,6 +23,7 @@ import {
   isProjectLocalAgentHome,
   normalizeAvailableTools,
   serializeAttributionRecord,
+  summarizeAttributionFile,
   summarizeAttributionRecords,
   type RetrievalAttributionRecord,
 } from "../../../resources/runtime/pi-philosophy/retrieval-attribution.ts";
@@ -391,6 +396,296 @@ describe("all-tool recording and secret omission", () => {
   });
 });
 
+describe("read target normalization", () => {
+  it("records project-relative read paths, offset, and limit without content", async () => {
+    const agentDir = await dir();
+    const projectRoot = join(agentDir, "..", "..");
+    const tel = createRetrievalAttribution({ agentDir });
+    tel.observeToolCall({
+      toolName: "read",
+      toolCallId: "r1",
+      sessionId: "s1",
+      input: { path: join(projectRoot, "src", "app.ts"), offset: 120, limit: 40 },
+    });
+    tel.observeToolCall({
+      toolName: "read",
+      toolCallId: "r2",
+      sessionId: "s1",
+      input: { paths: ["./src/a.ts", "src/a.ts", "docs/b.md"], offset: 0 },
+    });
+    await tel.pending();
+    const rows = lines(await readFile(join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME), "utf8"));
+    const first = rows.find((row) => row.toolCallId === "r1");
+    expect(first?.retrieval?.paths).toEqual(["src/app.ts"]);
+    expect(first?.retrieval?.offset).toBe(120);
+    expect(first?.retrieval?.limit).toBe(40);
+    expect(first?.v).toBe(RETRIEVAL_ATTRIBUTION_VERSION);
+    expect(JSON.stringify(first)).not.toContain("\.\.");
+    const second = rows.find((row) => row.toolCallId === "r2");
+    // Deduplicated in order; leading ./ stripped.
+    expect(second?.retrieval?.paths).toEqual(["src/a.ts", "docs/b.md"]);
+    expect(second?.retrieval?.offset).toBe(0);
+  });
+
+  it("collapses outside-project and home read targets without leaking locations", () => {
+    const retrieval = boundRetrievalInput("read", {
+      paths: [join(homedir(), "secrets", "auth.json"), "~/notes.txt", "/etc/hosts"],
+    }, "/somewhere/else/projectroot") as NonNullable<ReturnType<typeof boundRetrievalInput>>;
+    expect(retrieval.paths?.every((path) => path === "[outside-project]")).toBe(true);
+    expect(retrieval.redacted).toContain("paths");
+    expect(JSON.stringify(retrieval)).not.toContain(homedir());
+    expect(JSON.stringify(retrieval)).not.toContain("/etc/hosts");
+  });
+
+  it("drops secret-bearing, oversized, and malformed read arguments", () => {
+    const retrieval = boundRetrievalInput(
+      "read",
+      {
+        path: "token=sk-abcdefghijklmnopqrstuvwxyz.ts",
+        offset: -5,
+        limit: Number.NaN,
+        paths: [`${"x".repeat(300)}.ts`],
+      },
+      "/proj",
+    ) as NonNullable<ReturnType<typeof boundRetrievalInput>>;
+    // Secret path vanishes; its field is flagged redacted, not stored.
+    expect(JSON.stringify(retrieval)).not.toMatch(/sk-/);
+    expect(retrieval.paths?.join("")).not.toContain("sk-");
+    expect(retrieval.redacted?.length ?? 0).toBeGreaterThan(0);
+    expect(retrieval.offset).toBeUndefined();
+    expect(retrieval.limit).toBeUndefined();
+    for (const path of retrieval.paths ?? []) expect(path.length).toBeLessThanOrEqual(200);
+  });
+
+  it("caps stored read paths at the documented bound", () => {
+    const many = Array.from({ length: READ_PATH_BOUND + 6 }, (_, i) => `f${i}.ts`);
+    const retrieval = boundRetrievalInput("read", { paths: many }, "/proj") as NonNullable<
+      ReturnType<typeof boundRetrievalInput>
+    >;
+    expect(retrieval.paths).toHaveLength(READ_PATH_BOUND);
+    expect(retrieval.truncated).toContain("paths");
+  });
+
+  it("never stores page content fields passed to read", () => {
+    const retrieval = boundRetrievalInput("read", { path: "a.ts", content: "SECRET BODY", text: "more" }, "/proj");
+    expect(JSON.stringify(retrieval)).not.toContain("SECRET BODY");
+  });
+});
+
+describe("post-result metadata", () => {
+  it("extracts structured retrieval funnel fields and nothing else", () => {
+    const result = buildAttributionResult(false, {
+      schemaVersion: 1,
+      kind: "code-retrieval.search",
+      hits: [
+        { ref: "R1", path: "src/a.ts", startLine: 1, endLine: 9 },
+        { ref: "R2", path: "src/b.ts", startLine: 10, endLine: 20, alreadyRead: true },
+        { ref: "R3", path: "src/c.ts", startLine: 21, endLine: 30 },
+      ],
+      resultsPath: ".pi/agent/code-retrieval/results/abc.jsonl",
+      degraded: false,
+      query: "internal state that must not leak",
+      content: [{ type: "text", text: "SOURCE BODY THAT MUST NOT LEAK" }],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.resultKind).toBe("code-retrieval.search");
+    expect(result.degraded).toBe(false);
+    expect(result.hitCount).toBe(3);
+    expect(result.alreadyReadCount).toBe(1);
+    expect(result.resultsPath).toBe(".pi/agent/code-retrieval/results/abc.jsonl");
+    expect(result.refs).toEqual(["R1", "R2", "R3"]);
+    expect(JSON.stringify(result)).not.toContain("internal state");
+    expect(JSON.stringify(result)).not.toContain("SOURCE BODY");
+  });
+
+  it("marks explicitly errored calls and omits duration when no call was observed", () => {
+    const errored = buildAttributionResult(true, { kind: "code-retrieval.spans", degraded: true, hits: [] });
+    expect(errored.ok).toBe(false);
+    expect(errored.degraded).toBe(true);
+    expect(errored.durationMs).toBeUndefined();
+    const unknownFlag = buildAttributionResult(undefined, undefined);
+    expect(unknownFlag.ok).toBe(true);
+    expect(Object.keys(unknownFlag)).toEqual(["ok"]);
+  });
+
+  it("correlates a tool_result event with its call id and measures bounded latency", async () => {
+    const agentDir = await dir();
+    let tick = 0;
+    const clock = () => new Date(Date.UTC(2026, 7, 23, 12, 0, tick++));
+    const tel = createRetrievalAttribution({ agentDir, now: clock });
+    tel.observeToolCall({
+      toolName: "code_search",
+      toolCallId: "cs9",
+      sessionId: "s1",
+      input: { query: "where the session token gets refreshed" },
+    });
+    tel.observeToolResult({
+      toolName: "code_search",
+      toolCallId: "cs9",
+      sessionId: "s1",
+      isError: false,
+      details: { kind: "code-retrieval.search", degraded: true, hitCountHint: 99, hits: [{ ref: "R1", alreadyRead: true }] },
+    });
+    // Unknown result (no observed call): recorded, but latency stays absent.
+    tick += 4;
+    tel.observeToolResult({
+      toolName: "read_spans",
+      toolCallId: "sp1",
+      sessionId: "s1",
+      isError: false,
+      details: { kind: "code-retrieval.spans", hits: [] },
+    });
+    await tel.pending();
+    const raw = await readFile(join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME), "utf8");
+    const rows = lines(raw);
+    const correlated = rows.find((row) => row.kind === ATTRIBUTION_RESULT_KIND && row.toolCallId === "cs9");
+    expect(correlated?.tool).toBe("code_search");
+    expect(correlated?.sessionId).toBe("s1");
+    expect(correlated?.result?.ok).toBe(true);
+    expect(correlated?.result?.degraded).toBe(true);
+    expect(correlated?.result?.hitCount).toBe(1);
+    expect(correlated?.result?.alreadyReadCount).toBe(1);
+    expect(correlated?.result?.durationMs).toBe(1000);
+    // Fields absent at the seam stay absent: no invented provider, no leaked hint.
+    expect(correlated?.result?.refs).toEqual(["R1"]);
+    expect(JSON.stringify(correlated)).not.toContain("hitCountHint");
+    const orphan = rows.find((row) => row.kind === ATTRIBUTION_RESULT_KIND && row.toolCallId === "sp1");
+    expect(orphan?.result?.durationMs).toBeUndefined();
+  });
+
+  it("stamps the last noted runtime index on calls, honoring explicit overrides", async () => {
+    const agentDir = await dir();
+    const tel = createRetrievalAttribution({ agentDir });
+    expect(tel.noteTurnIndex(3)).toBe(3);
+    tel.observeToolCall({ toolName: "grep", toolCallId: "g1", input: { pattern: "x" } });
+    tel.observeToolCall({ toolName: "grep", toolCallId: "g2", input: { pattern: "y" }, turnIndex: 7 });
+    // Invalid values never clobber the last real index.
+    expect(tel.noteTurnIndex(-1)).toBe(3);
+    expect(tel.noteTurnIndex(Number.NaN)).toBe(3);
+    tel.observeToolCall({ toolName: "grep", toolCallId: "g3", input: { pattern: "z" } });
+    await tel.pending();
+    const rows = lines(await readFile(join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME), "utf8"));
+    expect(rows.find((row) => row.toolCallId === "g1")?.turnIndex).toBe(3);
+    expect(rows.find((row) => row.toolCallId === "g2")?.turnIndex).toBe(7);
+    expect(rows.find((row) => row.toolCallId === "g3")?.turnIndex).toBe(3);
+  });
+
+  it("absent indices stay absent rather than invented", () => {
+    expect(buildAttributionRecord({ toolName: "grep", turnIndex: -2 })?.turnIndex).toBeUndefined();
+    expect(buildAttributionRecord({ toolName: "grep" })?.turnIndex).toBeUndefined();
+  });
+});
+
+describe("versioned compatibility", () => {
+  it("still summarizes v1 attribution files without new fields", async () => {
+    const agentDir = await dir();
+    const file = join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME);
+    const v1Lines = [
+      JSON.stringify({
+        v: 1,
+        kind: ATTRIBUTION_TURN_KIND,
+        ts: "2026-08-01T00:00:00.000Z",
+        role: "worker",
+        agent: "explore",
+        model: "x/y",
+        availableToolIds: ["grep", "read"],
+        availableToolCount: 2,
+        toolsetHash: "hash-v1",
+      }),
+      JSON.stringify({
+        v: 1,
+        kind: RETRIEVAL_ATTRIBUTION_KIND,
+        ts: "2026-08-01T00:00:01.000Z",
+        role: "worker",
+        agent: "explore",
+        tool: "read",
+        toolsetHash: "hash-v1",
+      }),
+    ];
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(file, v1Lines.join("\n") + "\n", "utf8");
+    const summary = await summarizeAttributionFile(file);
+    expect(summary.turns).toBe(1);
+    expect(summary.calls).toBe(1);
+    // A v1 read has no targets: denominator counts it, numerator stays zero.
+    expect(summary.coverage.readCalls).toBe(1);
+    expect(summary.coverage.readCallsWithTarget).toBe(0);
+    expect(formatAttributionSummary(summary)).toContain("worker\texplore\tread\t1");
+  });
+
+  it("rejects records from a future schema version instead of misreading them", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const agentDir = await dir();
+    const file = join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME);
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      file,
+      `${JSON.stringify({ v: RETRIEVAL_ATTRIBUTION_VERSION + 1, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", tool: "grep" })}\n`,
+      "utf8",
+    );
+    const summary = await summarizeAttributionFile(file);
+    expect(summary.calls).toBe(0);
+    expect(summary.total).toBe(0);
+  });
+
+  it("keeps serializer allowlisting strict for new containers", () => {
+    const line = serializeAttributionRecord({
+      v: RETRIEVAL_ATTRIBUTION_VERSION,
+      kind: RETRIEVAL_ATTRIBUTION_KIND,
+      ts: "t",
+      tool: "grep",
+      result: "junk-not-an-object" as unknown as RetrievalAttributionRecord["result"],
+      retrieval: "junk" as unknown as RetrievalAttributionRecord["retrieval"],
+      provider: "made-up",
+    } as RetrievalAttributionRecord);
+    expect(line).not.toContain("provider");
+    expect(line).not.toContain("junk");
+    const roundTrip = JSON.parse(line) as RetrievalAttributionRecord;
+    expect(roundTrip.result).toBeUndefined();
+    expect(roundTrip.retrieval).toBeUndefined();
+  });
+});
+
+describe("summarizer coverage and retrieval funnel", () => {
+  function searchDetails(hitCount: number, opts: { degraded?: boolean; durationMs?: number } = {}) {
+    return {
+      ok: true,
+      resultKind: "code-retrieval.search",
+      degraded: opts.degraded === true,
+      hitCount,
+      refs: Array.from({ length: Math.min(hitCount, 12) }, (_, i) => `R${i + 1}`),
+      ...(opts.durationMs !== undefined ? { durationMs: opts.durationMs } : {}),
+    };
+  }
+
+  it("reports coverage denominators plus outcome, degradation, hit, and latency funnels", () => {
+    const toolset = normalizeAvailableTools(["grep", "read", "code_search", "read_spans"]);
+    const records: RetrievalAttributionRecord[] = [
+      { v: 1, kind: ATTRIBUTION_TURN_KIND, ts: "t", role: "main", agent: "main", availableToolIds: toolset.availableToolIds, availableToolCount: 4, toolsetHash: "h" },
+      { v: 2, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", role: "main", agent: "main", tool: "read", toolCallId: "r1", retrieval: { paths: ["src/a.ts"] } },
+      { v: 2, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", role: "main", agent: "main", tool: "read", toolCallId: "r2" },
+      { v: 2, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolCallId: "cs1" },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolCallId: "cs1", result: searchDetails(8, { degraded: true, durationMs: 100 }) },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolCallId: "cs2", result: { ...searchDetails(2), ok: false, durationMs: 300 } },
+    ];
+    const summary = summarizeAttributionRecords(records);
+    expect(summary.calls).toBe(3);
+    expect(summary.coverage).toMatchObject({ turns: 1, calls: 3, results: 2, readCalls: 2, readCallsWithTarget: 1, indexedSearchCalls: 1 });
+    const okRow = summary.results.find((row) => row.outcome === "ok");
+    expect(okRow).toMatchObject({ tool: "code_search", count: 1, degraded: 1, hitsSum: 8, maxHits: 8 });
+    const errorRow = summary.results.find((row) => row.outcome === "error");
+    expect(errorRow).toMatchObject({ tool: "code_search", count: 1, degraded: 0, hitsSum: 2 });
+    expect(okRow?.durationsMs).toEqual([100]);
+    const formatted = formatAttributionSummary(summary);
+    expect(formatted).toContain("coverage=turns:1\tcalls:3\tresults:2\treadCalls:2\treadCallsWithTarget:1\tindexedSearchCalls:1");
+    expect(formatted).toContain("main\tmain\tcode_search\tcode-retrieval.search\tok\t1\t1\t8\t8\t100\t100\t100");
+    // Legacy sections survive next to the new ones.
+    expect(formatted).toContain("role\tagent\ttool\tcount");
+    expect(formatted).toContain("role\tagent\tmodel\tunusedTools");
+  });
+});
+
 describe("available-but-unused summary", () => {
   it("exposes unused tools and treats durable zero-use as eligibility, not a defect", () => {
     const tools = ["bash", "code_search", "grep", "memory_query", "read", "session_recall"];
@@ -436,5 +731,256 @@ describe("available-but-unused summary", () => {
     expect(formatted).not.toMatch(/\tdefect\b/);
     expect(formatted).toContain("filesystem\t3\t1\t2\t1");
     expect(formatted).toContain("retrieval\t1\t0\t1\t0");
+  });
+});
+
+describe("telemetry path normalization across path-bearing tools", () => {
+  it("redacts relative .. escapes without logging destinations", () => {
+    const grepEscape = boundRetrievalInput("grep", { pattern: "token", path: "../../etc/shadow" }, "/proj");
+    expect(grepEscape?.path).toBe("[outside-project]");
+    expect(grepEscape?.redacted).toContain("path");
+    expect(JSON.stringify(grepEscape)).not.toMatch(/\.\.|etc|shadow/);
+
+    // An interior escape hidden behind a benign prefix is caught too.
+    const navEscape = boundRetrievalInput(
+      "code_nav",
+      { operation: "definition", symbol: "S", path: "src/../../../../outside/secret.ts" },
+      "/somewhere/projectroot",
+    );
+    expect(navEscape?.path).toBe("[outside-project]");
+    expect(JSON.stringify(navEscape)).not.toContain("outside/secret.ts");
+
+    const readInterior = boundRetrievalInput("read", { paths: ["docs/../../../*.env"] }, "/proj");
+    expect(readInterior?.paths?.join(",")).toBe("[outside-project]");
+  });
+
+  it("normalizes absolute paths for grep, find, code_search, and code_nav alike", () => {
+    const projectRoot = "/fake-checkout-that-does-not-exist";
+    const outsidePath = join(homedir(), "elsewhere", "notes.md");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["grep", { pattern: "composePhilosophy" }],
+      ["find", { pattern: "*.test.ts" }],
+      ["code_search", { query: "where login state is invalidated" }],
+      ["code_nav", { operation: "references", symbol: "observeToolCall" }],
+    ];
+    for (const [toolName, base] of cases) {
+      const inside = boundRetrievalInput(toolName, { ...base, path: join(projectRoot, "src", "app.ts") }, projectRoot);
+      expect(inside?.path, `${toolName} inside`).toBe("src/app.ts");
+      const outside = boundRetrievalInput(toolName, { ...base, path: outsidePath }, projectRoot);
+      expect(outside?.path, `${toolName} outside`).toBe("[outside-project]");
+      expect(JSON.stringify(outside)).not.toContain(homedir());
+    }
+  });
+
+  it("keeps tilde targets as markers for non-read tools too", () => {
+    const retrieval = boundRetrievalInput("grep", { pattern: "x", path: "~/secrets.txt" }, "/proj");
+    expect(retrieval?.path).toBe("[outside-project]");
+    expect(JSON.stringify(retrieval)).not.toContain("~/");
+  });
+
+  it("bounds and redacts paths[] arrays for grep/find while preserving safe entries", () => {
+    const mixed = boundRetrievalInput(
+      "grep",
+      {
+        pattern: "x",
+        ignoreCase: true,
+        paths: ["src/a.ts", join(homedir(), "outside.ts"), "~/b.md", "lib/../../gone.rs"],
+      },
+      "/proj",
+    );
+    expect(mixed?.paths).toEqual(["src/a.ts", "[outside-project]"]);
+    expect(mixed?.redacted).toContain("paths");
+    expect(JSON.stringify(mixed)).not.toContain(homedir());
+    expect(JSON.stringify(mixed)).not.toContain("outside.ts");
+
+    const overflow = boundRetrievalInput(
+      "find",
+      { pattern: "*", paths: Array.from({ length: READ_PATH_BOUND + 4 }, (_, i) => `f${i}.ts`) },
+      "/proj",
+    );
+    expect(overflow?.paths).toHaveLength(READ_PATH_BOUND);
+    expect(overflow?.truncated).toContain("paths");
+
+    // Array inputs never disturb scalar field extraction.
+    expect(mixed?.patternKind).toBe("exact");
+  });
+
+  it("canonicalizes safe paths (./ prefixes collapse) instead of dropping them", () => {
+    const search = boundRetrievalInput("code_search", { query: "q", mode: "auto", path: "./packages/ui/src" }, "/repo");
+    expect(search?.path).toBe("packages/ui/src");
+  });
+
+  it("redacts symlink escapes and keeps genuinely in-project symlinks readable-relative", async () => {
+    const { mkdir, mkdtemp, symlink, writeFile } = await import("node:fs/promises");
+    const projectRoot = await mkdtemp(join(tmpdir(), "attr-sym-root-"));
+    await mkdir(join(projectRoot, "src"), { recursive: true });
+    await writeFile(join(projectRoot, "src", "safe.ts"), "export const ok = true;\n");
+    const outside = await mkdtemp(join(tmpdir(), "attr-sym-out-"));
+    await writeFile(join(outside, "secret.env"), "LEAK=1\n");
+    // Escape: symlink inside the checkout pointing at an outside directory.
+    await symlink(outside, join(projectRoot, "leak"));
+    // Safe: in-project symlink whose target stays inside.
+    await symlink("safe.ts", join(projectRoot, "src", "alias.ts"));
+
+    const retrieval = boundRetrievalInput(
+      "read",
+      { paths: ["leak/secret.env", "src/safe.ts", "src/alias.ts"] },
+      projectRoot,
+    ) as NonNullable<ReturnType<typeof boundRetrievalInput>>;
+
+    expect(retrieval.paths).toEqual(["[outside-project]", "src/safe.ts", "src/alias.ts"]);
+    expect(retrieval.redacted).toContain("paths");
+    expect(JSON.stringify(retrieval)).not.toContain(outside);
+    expect(JSON.stringify(retrieval)).not.toContain("LEAK");
+  });
+
+  it("still applies symlink containment when writing via create-before-read leaves", async () => {
+    // Leaf does not exist, parent inside a symlinked directory chain: closest resolvable ancestor decides.
+    const { mkdir, mkdtemp, symlink } = await import("node:fs/promises");
+    const projectRoot = await mkdtemp(join(tmpdir(), "attr-sym2-root-"));
+    await mkdir(join(projectRoot, "gen"), { recursive: true });
+    const outside = await mkdtemp(join(tmpdir(), "attr-sym2-out-"));
+    await symlink(outside, join(projectRoot, "gen", "out"));
+    const retrieval = boundRetrievalInput("read", { paths: ["gen/out/new-file.txt"] }, projectRoot);
+    expect(retrieval?.paths).toEqual(["[outside-project]"]);
+    expect(JSON.stringify(retrieval)).not.toContain(outside);
+  });
+
+  it("redacts escapes through nonexistent descendants of an outside-pointing symlink", async () => {
+    // link-out exists and points outside; every path beneath it is missing, so both
+    // the target realpath and the immediate-parent fallback used to bail out and
+    // skip containment. The deepest existing ancestor must decide instead.
+    const { mkdir, mkdtemp, symlink } = await import("node:fs/promises");
+    const projectRoot = await mkdtemp(join(tmpdir(), "attr-sym3-root-"));
+    await mkdir(join(projectRoot, "project"), { recursive: true });
+    const outside = await mkdtemp(join(tmpdir(), "attr-sym3-out-"));
+    await symlink(outside, join(projectRoot, "project", "link-out"));
+    const missingUnderEscape = join("project", "link-out", "missing", "deeper.ts");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["read", { paths: [missingUnderEscape] }],
+      ["grep", { pattern: "x", path: missingUnderEscape }],
+      ["find", { pattern: "*.ts", paths: [missingUnderEscape] }],
+      ["code_search", { query: "q", path: missingUnderEscape }],
+      ["code_nav", { operation: "definition", symbol: "S", path: missingUnderEscape }],
+    ];
+    for (const [toolName, input] of cases) {
+      const bounded = boundRetrievalInput(toolName, input, projectRoot);
+      expect(bounded?.path ?? bounded?.paths?.[0], `${toolName} escape`).toBe("[outside-project]");
+      expect(JSON.stringify(bounded), `${toolName} leak`).not.toContain(outside);
+      expect(JSON.stringify(bounded), `${toolName} leak deeper.ts`).not.toContain("deeper.ts");
+    }
+  });
+
+  it("keeps not-yet-created descendants under an in-project ancestor recorded normally", async () => {
+    // Missing nested dirs under a real in-project ancestor (macOS tmpdir is itself
+    // an alias) still resolve against the deepest existing ancestor and stay inside.
+    const { mkdir, mkdtemp } = await import("node:fs/promises");
+    const projectRoot = await mkdtemp(join(tmpdir(), "attr-sym4-root-"));
+    await mkdir(join(projectRoot, "project", "src"), { recursive: true });
+    const safeNested = join("project", "src", "new-dir", "generated.ts");
+    const read = boundRetrievalInput("read", { paths: [safeNested] }, projectRoot);
+    expect(read?.paths).toEqual([safeNested]);
+    expect(read?.redacted).toBeUndefined();
+    const nav = boundRetrievalInput(
+      "code_nav",
+      { operation: "references", symbol: "X", path: safeNested },
+      projectRoot,
+    );
+    expect(nav?.path).toBe(safeNested);
+    expect(nav?.redacted).toBeUndefined();
+  });
+});
+
+describe("provider provenance ingestion and coverage", () => {
+  it("records the executor provider reported in structured details only", () => {
+    const result = buildAttributionResult(false, {
+      kind: "code-retrieval.search",
+      provider: "tantivy",
+      degraded: false,
+      hits: [{ ref: "R1", path: "src/a.ts" }, { ref: "R2", path: "src/b.ts" }],
+      content: [{ type: "text", text: "BODY MUST NOT LEAK" }],
+    });
+    expect(result.provider).toBe("tantivy");
+    expect(result.hitCount).toBe(2);
+    expect(JSON.stringify(result)).not.toContain("BODY MUST NOT LEAK");
+
+    const absentProvider = buildAttributionResult(false, { kind: "read.note" });
+    expect(absentProvider.provider).toBeUndefined();
+
+    // Untrusted-looking provider strings are screened like every other value.
+    const secretish = buildAttributionResult(false, { kind: "k", provider: "token=sk-abcdefghijklmnopqrstuvwxyz" });
+    expect(secretish.provider).toBeUndefined();
+    expect(secretish.redacted).toContain("provider");
+    expect(JSON.stringify(secretish)).not.toMatch(/sk-/);
+  });
+
+  it("flows provider through a correlated tool_result record within the serializer allowlist", async () => {
+    const agentDir = await dir();
+    const tel = createRetrievalAttribution({ agentDir });
+    tel.observeToolCall({
+      toolName: "code_search",
+      toolCallId: "pv1",
+      sessionId: "s1",
+      input: { query: "where the session token gets refreshed" },
+    });
+    tel.observeToolResult({
+      toolName: "code_search",
+      toolCallId: "pv1",
+      isError: false,
+      details: {
+        kind: "code-retrieval.search",
+        degraded: false,
+        provider: "tantivy",
+        hits: [{ ref: "R1" }, { ref: "R2", alreadyRead: true }],
+      },
+    });
+    await tel.pending();
+    const row = lines(await readFile(join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME), "utf8")).find(
+      (item) => item.kind === ATTRIBUTION_RESULT_KIND && item.toolCallId === "pv1",
+    );
+    expect(row?.result?.provider).toBe("tantivy");
+    expect(row?.result?.hitCount).toBe(2);
+    expect(row?.result?.alreadyReadCount).toBe(1);
+    expect(JSON.stringify(row)).not.toContain("where the session token gets refreshed");
+  });
+
+  it("aggregates provider coverage metrics without storing any result content", () => {
+    const records: RetrievalAttributionRecord[] = [
+      { v: 2, kind: ATTRIBUTION_TURN_KIND, ts: "t", role: "main", agent: "main", availableToolIds: ["code_search"], availableToolCount: 1, toolsetHash: "h" },
+      { v: 2, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolsetHash: "h" },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolCallId: "c1", result: { ok: true, resultKind: "code-retrieval.search", provider: "tantivy", hitCount: 5 } },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "main", agent: "main", tool: "code_search", toolCallId: "c2", result: { ok: false, resultKind: "code-retrieval.search", provider: "tantivy", degraded: true } },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "worker", agent: "explore", model: "m", tool: "grep", toolCallId: "g1", result: { ok: true, resultKind: "native.grep", provider: "rg" } },
+      { v: 2, kind: ATTRIBUTION_RESULT_KIND, ts: "t", role: "main", agent: "main", tool: "read", toolCallId: "r9", result: { ok: true, resultKind: "read.note" } },
+    ];
+    const summary = summarizeAttributionRecords(records);
+    expect(summary.coverage.results).toBe(4);
+    expect(summary.coverage.resultsWithProvider).toBe(3);
+    expect(summary.providers).toEqual([
+      { role: "main", agent: "main", tool: "code_search", provider: "tantivy", count: 2, degraded: 1 },
+      { role: "worker", agent: "explore", tool: "grep", provider: "rg", count: 1, degraded: 0 },
+    ]);
+    const formatted = formatAttributionSummary(summary);
+    expect(formatted).toContain("role\tagent\ttool\tprovider\tcount\tdegraded");
+    expect(formatted).toContain("main\tmain\tcode_search\ttantivy\t2\t1");
+    expect(formatted).toContain("resultsWithProvider:3");
+    // Legacy sections stay intact beside the new one.
+    expect(formatted).toContain("role\tagent\ttool\tresultKind\toutcome\tcount\tdegraded\thitsSum\tmaxHits\tp50Ms\tp95Ms\tmaxMs");
+  });
+
+  it("v1-era files summarize cleanly with zero provider coverage", async () => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const agentDir = await dir();
+    const file = join(agentDir, RETRIEVAL_ATTRIBUTION_FILENAME);
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(
+      file,
+      `${JSON.stringify({ v: 1, kind: RETRIEVAL_ATTRIBUTION_KIND, ts: "t", role: "worker", agent: "explore", tool: "grep" })}\n`,
+      "utf8",
+    );
+    const summary = await summarizeAttributionFile(file);
+    expect(summary.calls).toBe(1);
+    expect(summary.coverage.resultsWithProvider).toBe(0);
+    expect(summary.providers).toEqual([]);
   });
 });

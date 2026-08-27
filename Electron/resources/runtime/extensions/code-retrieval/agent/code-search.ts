@@ -1,5 +1,7 @@
 import { exactSearch } from "./grep-exact.js";
 import { getSymbolLayer } from "./hooks.js";
+import type { SeenRangeLedger } from "./ledger.js";
+import { buildInlinePreviews } from "./previews.js";
 import { buildToolResult, emptyDegraded, formatCompressedContent, type RefRegistry } from "./protocol.js";
 import {
   extractLexicalTerms,
@@ -23,6 +25,12 @@ export type CodeSearchArgs = {
   excludeGlobs: string[];
   sidecar: SidecarConnection | undefined;
   signal?: AbortSignal;
+  /** Provider honesty: what was selected vs what actually serves indexed hits. */
+  providerInfo?: { requested?: string; actual?: string };
+  /** ext.code-retrieval.tokenBudget; caps inline previews under it. */
+  tokenBudget?: number;
+  /** Session seen-range ledger; inline previews mark their exact shown window. */
+  ledger?: SeenRangeLedger;
 };
 
 const DEFAULT_TOP_K = 20;
@@ -35,6 +43,18 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
 
   try {
     const routed = routeQuery(query, args.mode);
+    // Provider honesty: report the layer that ACTUALLY serves the returned
+    // hits (sidecar identity or "rg" for the local path), never a stale
+    // advertised one. A "tantivy" request that ends up on another layer must say so.
+    const requestedProvider = args.providerInfo?.requested;
+    // Set from whichever runExact batch produced hits first; local fallback always sets "rg".
+    let servingProvider: string | undefined;
+    const providerNote = () =>
+      requestedProvider === "tantivy" &&
+      servingProvider !== undefined &&
+      servingProvider !== "tantivy"
+        ? `Requested exact provider tantivy is not available; these results were served by ${servingProvider}.`
+        : undefined;
     const notes: string[] = [];
     let degraded = false;
     let hits: UnassignedHit[] = [];
@@ -57,6 +77,9 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       const lexical = await runLexicalSymbol(args, terms);
       hits = lexical.hits;
       degraded = degraded || lexical.degraded;
+      if (lexical.hits.length > 0 && lexical.provider && servingProvider === undefined) {
+        servingProvider = lexical.provider;
+      }
       for (const note of lexical.notes) {
         if (!notes.includes(note)) notes.push(note);
       }
@@ -74,6 +97,9 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       if (routed === "exact" || hits.length === 0) {
         const exact = await runExact(args, query);
         hits = mergeHits(hits, exact.hits);
+        if (exact.hits.length > 0 && exact.provider && servingProvider === undefined) {
+          servingProvider = exact.provider;
+        }
         if (exact.degraded) {
           degraded = true;
           notes.push(
@@ -106,6 +132,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
         content: message,
         query,
         degradeReason: notes[0],
+        // No hits were served by any layer, so no serving-provider claim exists.
       });
     }
 
@@ -114,7 +141,19 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       ...record,
       ...(hits[i]?.text ? { text: hits[i]!.text } : {}),
     }));
-    const content = [formatCompressedContent(resultHits), ...notes].filter(Boolean).join("\n");
+    const previews = await buildInlinePreviews(resultHits, {
+      projectRoot: args.projectRoot,
+      ledger: args.ledger,
+      budgetTokens: args.tokenBudget,
+    });
+    const note = providerNote();
+    const content = [
+      formatCompressedContent(resultHits, previews.note, previews.previews),
+      ...notes,
+      ...(note ? [note] : []),
+    ]
+      .filter(Boolean)
+      .join("\n");
     return buildToolResult({
       projectRoot: args.projectRoot,
       kind: "code-retrieval.search",
@@ -123,6 +162,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       content,
       query,
       degradeReason: notes[0],
+      ...(servingProvider ? { provider: servingProvider } : {}),
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -137,17 +177,25 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
         signal: args.signal,
       });
       const assigned = args.registry.assignAll(fallback);
+      // Degraded rg/node paths carry the same previews: a fallback that only names
+      // files would undo exactly the friction this feature removes.
+      const previews = await buildInlinePreviews(assigned, {
+        projectRoot: args.projectRoot,
+        ledger: args.ledger,
+        budgetTokens: args.tokenBudget,
+      });
       return buildToolResult({
         projectRoot: args.projectRoot,
         kind: "code-retrieval.search",
         hits: assigned,
         degraded: true,
         content: [
-          formatCompressedContent(assigned),
+          formatCompressedContent(assigned, previews.note, previews.previews),
           `code_search recovered via grep after error: ${message} (details.degraded=true).`,
         ].join("\n"),
         query,
         degradeReason: message,
+        provider: "rg",
       });
     } catch {
       return emptyDegraded(
@@ -161,7 +209,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
 async function runLexicalSymbol(
   args: CodeSearchArgs,
   terms: string[],
-): Promise<{ hits: UnassignedHit[]; notes: string[]; degraded: boolean }> {
+): Promise<{ hits: UnassignedHit[]; notes: string[]; degraded: boolean; provider?: string }> {
   const notes: string[] = [];
   let degraded = false;
   const identTerms = terms.filter(isIdentifierLike);
@@ -208,12 +256,16 @@ async function runLexicalSymbol(
   };
 
   for (const batch of symbolBatches) addHits(batch.hits ?? undefined, batch.term);
+  let servingProvider: string | undefined;
   for (const batch of exactBatches) {
     if (batch.result.degraded) {
       degraded = true;
       if (batch.result.reason && !notes.includes(batch.result.reason)) {
         notes.push(batch.result.reason);
       }
+    }
+    if (batch.result.hits.length > 0 && batch.result.provider && servingProvider === undefined) {
+      servingProvider = batch.result.provider;
     }
     addHits(batch.result.hits, batch.term);
   }
@@ -248,7 +300,7 @@ async function runLexicalSymbol(
     .slice(0, topK);
 
   notes.push(`Used lexical+symbol fallback (terms: ${terms.join(", ")}).`);
-  return { hits: ranked, notes, degraded };
+  return { hits: ranked, notes, degraded, ...(servingProvider ? { provider: servingProvider } : {}) };
 }
 
 function scoreHit(
@@ -301,10 +353,19 @@ async function trySymbolSearch(args: CodeSearchArgs, queries: string[]): Promise
   return any ? mergeHits([], merged) : undefined;
 }
 
-async function runExact(
-  args: CodeSearchArgs,
-  query: string,
-): Promise<{ hits: UnassignedHit[]; degraded: boolean; reason?: string }> {
+export type ExactOutcome = {
+  hits: UnassignedHit[];
+  degraded: boolean;
+  reason?: string;
+  /**
+   * Provider that actually served these hits: sidecar identity or "rg" for the
+   * local path. Omitted when the serving sidecar's identity is unknown — it is
+   * never inferred from the requested mode.
+   */
+  provider?: string;
+};
+
+async function runExact(args: CodeSearchArgs, query: string): Promise<ExactOutcome> {
   if (args.sidecar) {
     const remote = await sidecarSearch(args.sidecar, {
       query,
@@ -314,9 +375,37 @@ async function runExact(
       excludeGlobs: args.excludeGlobs,
     });
     if (remote) {
+      // Provider honesty: report only the identity the sidecar itself declares.
+      // A legacy sidecar predating provider reporting stays UNKNOWN — never
+      // inferred from the requested mode — and unverified identity degrades,
+      // mirroring sidecarStatus's providerDegraded rule.
+      const actual = args.sidecar.provider;
+      const requested = args.providerInfo?.requested ?? args.sidecar.requestedProvider;
+      if (actual === undefined) {
+        return {
+          hits: coerceHits(remote.hits),
+          degraded: true,
+          reason:
+            args.sidecar.providerFallback?.reason ??
+            `Running sidecar does not report a provider; identity unknown and not trusted as ${requested ?? "auto"}, so these hits carry no verified provider.`,
+        };
+      }
+      // A known-identity sidecar serving an explicit different selection is a
+      // real fallback (e.g. tantivy requested, rg sidecar spawned): say so AND
+      // mark degraded, matching the manifest's 回退 rg 并标注降级 contract.
+      const selectionMismatch =
+        requested !== undefined && requested !== "auto" && requested !== actual;
       return {
         hits: coerceHits(remote.hits),
-        degraded: remote.degraded,
+        degraded: remote.degraded || selectionMismatch,
+        ...(selectionMismatch
+          ? {
+              reason:
+                args.sidecar.providerFallback?.reason ??
+                `Requested exact provider ${requested} is unavailable here; these results were served by ${actual}.`,
+            }
+          : {}),
+        provider: actual,
       };
     }
     const local = await exactSearch({
@@ -331,7 +420,10 @@ async function runExact(
     return {
       hits: local,
       degraded: true,
-      reason: "Sidecar was listed but did not answer; used grep fallback (details.degraded=true).",
+      // The local rg path served the results: details.provider must name it
+      // even when the listed sidecar advertised a different provider.
+      provider: "rg",
+      reason: "Sidecar was listed but did not answer; used local rg fallback (details.provider=rg, details.degraded=true).",
     };
   }
 
@@ -347,7 +439,8 @@ async function runExact(
   return {
     hits: local,
     degraded: true,
-    reason: "Index sidecar is not ready; used grep fallback (details.degraded=true).",
+    provider: "rg",
+    reason: "Index sidecar is not ready; used rg fallback (details.provider=rg, details.degraded=true).",
   };
 }
 

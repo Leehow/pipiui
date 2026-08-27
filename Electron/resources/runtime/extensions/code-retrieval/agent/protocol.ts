@@ -76,8 +76,18 @@ function formatScore(score: number): string {
   return text.replace(/0+$/, "").replace(/\.$/, "");
 }
 
-export function formatCompressedContent(hits: Array<Parameters<typeof formatRefLine>[0]>, extraNote?: string): string {
-  const lines = hits.slice(0, TOP_INLINE).map(formatRefLine);
+export function formatCompressedContent(
+  hits: Array<Parameters<typeof formatRefLine>[0]>,
+  extraNote?: string,
+  /** ref → bounded inline source preview rendered directly under that ref line. */
+  previews?: ReadonlyMap<string, string>,
+): string {
+  const lines: string[] = [];
+  for (const hit of hits.slice(0, TOP_INLINE)) {
+    lines.push(formatRefLine(hit));
+    const preview = previews?.get(hit.ref);
+    if (preview) lines.push(preview);
+  }
   if (hits.length > TOP_INLINE) {
     lines.push(`…（至多 12 条内联；其余见 results 落盘）`);
   }
@@ -140,6 +150,8 @@ export async function buildToolResult(args: {
   content: string;
   query?: string;
   degradeReason?: string;
+  /** Actual serving provider for indexed results; omitted for non-index kinds. */
+  provider?: string;
 }): Promise<ToolResult> {
   const persisted = await persistResults(args.projectRoot, {
     kind: args.kind,
@@ -165,6 +177,7 @@ export async function buildToolResult(args: {
     hits: args.hits.map(({ text: _text, ...rest }) => rest),
     resultsPath: persisted.resultsPath,
     degraded: args.degraded,
+    ...(args.provider ? { provider: args.provider } : {}),
   };
   return {
     content: [{ type: "text", text: body }],

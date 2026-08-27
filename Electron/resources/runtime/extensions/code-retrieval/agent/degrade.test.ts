@@ -88,3 +88,46 @@ test("semantic queries degrade honestly instead of pretending success", async ()
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a tantivy request served by rg says so and details.provider names the actual layer", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cr-provider-note-"));
+  try {
+    await mkdir(join(root, "src"), { recursive: true });
+    await writeFile(join(root, "src", "auth.ts"), "export function signToken() { return 1; }\n", "utf8");
+    // Live-pid / closed-port connection forces the in-process grep path while
+    // still presenting a sidecar whose advertised layer is rg.
+    const conn = { pid: process.pid, port: 9, token: "not-a-real-token", provider: "rg" };
+    const result = await executeCodeSearch({
+      query: "signToken",
+      mode: "exact",
+      projectRoot: root,
+      registry: new RefRegistry(),
+      excludeGlobs: [],
+      sidecar: conn,
+      providerInfo: { requested: "tantivy", actual: conn.provider },
+    });
+    assert.ok(result.details.hits.length > 0, "grep keeps results flowing");
+    assert.equal(result.details.provider, "rg");
+    assert.match(
+      result.content[0]!.text,
+      /Requested exact provider tantivy[\s\S]*served by rg/,
+      "the denial must be visible to the model",
+    );
+
+    const quiet = await executeCodeSearch({
+      query: "signToken",
+      mode: "exact",
+      projectRoot: root,
+      registry: new RefRegistry(),
+      excludeGlobs: [],
+      sidecar: undefined,
+    });
+    assert.doesNotMatch(
+      quiet.content[0]!.text,
+      /Requested exact provider/,
+      "no tantivy denial may be claimed without a tantivy request",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -3,9 +3,10 @@
  *
  * Installed as a pi package, so a bare TUI session, a GUI frontend, and every dispatched
  * worker load the same four layers from the same config. The only pi surfaces this file
- * touches are `before_agent_start` (+ `getActiveTools` for capability truth) and a
- * best-effort `tool_call` observer that never blocks or mutates. Composition lives in
- * `compose.ts`; attribution lives in `retrieval-attribution.ts`.
+ * touches are `before_agent_start` (+ `getActiveTools` for capability truth), a real-turn
+ * id from `turn_start`, and best-effort `tool_call` / `tool_result` observers that never
+ * block or mutate. Composition lives in `compose.ts`; attribution lives in
+ * `retrieval-attribution.ts`.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -304,6 +305,15 @@ export default function (pi: ExtensionAPI) {
     if (injected) return { systemPrompt: nextPrompt };
   });
 
+  // Real turn correlation id: pi already numbers turns per agent run via `turn_start`.
+  pi.on("turn_start", (event) => {
+    try {
+      attribution?.noteTurnIndex((event as { turnIndex?: unknown }).turnIndex);
+    } catch {
+      // Best-effort.
+    }
+  });
+
   pi.on("tool_call", (event, ctx) => {
     try {
       const prompt = typeof ctx.getSystemPrompt === "function" ? ctx.getSystemPrompt() : undefined;
@@ -319,6 +329,26 @@ export default function (pi: ExtensionAPI) {
       });
     } catch {
       // Best-effort: never block or mutate a tool call.
+    }
+  });
+
+  // Post-result observer: returns nothing, mutates nothing. Reads only structured
+  // details fields (kind / degraded / hits / resultsPath), never result bodies or
+  // messages; fields the runtime does not expose stay absent from the record.
+  pi.on("tool_result", (event, ctx) => {
+    try {
+      attribution?.observeToolResult({
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        isError: event.isError,
+        details: event.details,
+        sessionId: ctx.sessionManager?.getSessionId?.(),
+        role: resolveRole(process.env),
+        agent: resolveAgent(process.env),
+        model: formatModel(ctx.model),
+      });
+    } catch {
+      // Best-effort: observing a result must never change one.
     }
   });
 

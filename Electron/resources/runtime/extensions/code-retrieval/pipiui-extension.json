@@ -13,9 +13,10 @@
         "properties": {
           "ext.code-retrieval.exactProvider": {
             "type": "string",
-            "enum": ["auto", "rg", "zoekt", "tantivy"],
+            "enum": ["auto", "rg", "tantivy"],
             "default": "auto",
-            "title": "精确索引"
+            "title": "精确索引",
+            "description": "auto=优先 Tantivy、不可用时诚实回退 rg；rg=强制 rg；tantivy=请求 Tantivy，失败回退 rg 并标注降级"
           },
           "ext.code-retrieval.tokenBudget": {
             "type": "number",
@@ -27,11 +28,6 @@
             "items": { "type": "string" },
             "default": [],
             "title": "排除 glob"
-          },
-          "ext.code-retrieval.semanticApiKey": {
-            "type": "string",
-            "format": "secret",
-            "title": "语义检索 API Key"
           }
         }
       }

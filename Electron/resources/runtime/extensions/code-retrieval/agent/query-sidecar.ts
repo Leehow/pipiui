@@ -116,7 +116,7 @@ async function writeSnapshot(port: number): Promise<void> {
   const dest = sidecarJsonPath(projectRoot);
   await mkdir(dirname(dest), { recursive: true });
   const tmp = `${dest}.${process.pid}.tmp`;
-  const body = JSON.stringify({ pid: process.pid, port, token, startedAt: Date.now() });
+const body = JSON.stringify({ pid: process.pid, port, token, startedAt: Date.now(), provider: "rg" });
   await writeFile(tmp, body, "utf8");
   await rename(tmp, dest);
 }
@@ -165,6 +165,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
         sessionTtlMs,
         oldestExpiresAt,
         sessions: live,
+        provider: "rg",
       });
       return;
     }
@@ -264,7 +265,7 @@ process.on("SIGINT", () => {
 server.listen({ host: "127.0.0.1", port: 0, exclusive: true }, () => {
   const port = listenPort();
   void writeSnapshot(port).then(() => {
-    process.stdout.write(JSON.stringify({ ok: true, pid: process.pid, port, token }) + "\n");
+    process.stdout.write(JSON.stringify({ ok: true, pid: process.pid, port, token, provider: "rg" }) + "\n");
     scheduleIdle();
   });
 });

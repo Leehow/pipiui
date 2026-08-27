@@ -46,6 +46,7 @@ to someone who cannot perform it is prompt weight and nothing else.
 | `method` | 工作方式哲学 | Process weight matches the work; research-only requests are terminal | main |
 | `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
 | `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
+| `recon-stopping` | 侦察收敛纪律 | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
 | `planning` | 规划哲学 | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |
 | `craft` | 编码手艺哲学 | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + `general-purpose` |
 | `debugloop` | 调试回路哲学 | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main |

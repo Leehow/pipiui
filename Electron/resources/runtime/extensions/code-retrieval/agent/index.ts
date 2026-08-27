@@ -13,10 +13,12 @@
 import { executeCodeSearch } from "./code-search.js";
 import { getSymbolLayer, normalizeCodeNavResult, setSymbolLayer } from "./hooks.js";
 import { SeenRangeLedger } from "./ledger.js";
+import { executeRepoMap } from "./map-tool.js";
 import { EXTENSION_ID } from "./paths.js";
+import { buildInlinePreviews } from "./previews.js";
 import { buildToolResult, emptyDegraded, formatCompressedContent, RefRegistry } from "./protocol.js";
 import { executeReadSpans } from "./read-spans.js";
-import { loadRetrievalSettings } from "./settings.js";
+import { loadRetrievalSettings, type ExactProvider } from "./settings.js";
 import {
   attachSidecar,
   detachSidecar,
@@ -25,14 +27,15 @@ import {
   startSidecarHeartbeat,
   type HeartbeatHandle,
 } from "./sidecar-lifecycle.js";
-import { extractProjectCached } from "./symbol/cache.js";
-import { installSymbolLayer } from "./symbol/hooks-adapter.js";
-import { initTreeSitter, isTreeSitterReady } from "./symbol/treesitter.js";
 import type { SidecarConnection, ToolResult } from "./types.js";
+import { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
+import { installSymbolLayer } from "./symbol/hooks-adapter.js";
 
 export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
 export { RefRegistry, formatRefLine, buildToolResult } from "./protocol.js";
 export { SeenRangeLedger } from "./ledger.js";
+export { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
+export { executeRepoMap } from "./map-tool.js";
 
 type ExtensionAPI = {
   registerTool(tool: {
@@ -71,6 +74,8 @@ export class SessionRuntime {
   readonly ledger = new SeenRangeLedger();
   sidecar: SidecarConnection | undefined;
   started = false;
+  /** Provider selection in force for the current attach; reported honestly by sidecarStatus(). */
+  requestedProvider: ExactProvider = "auto";
   /** Bumped first in `shutdown` so an in-flight `ensure` cannot start a zombie heartbeat. */
   generation = 0;
   /** Test seam: delay or wrap attach to reproduce ensure/shutdown interleaving. */
@@ -115,9 +120,12 @@ export class SessionRuntime {
     this.started = true;
     let sidecar: SidecarConnection | undefined;
     try {
+      const settings = await loadRetrievalSettings(root);
+      this.requestedProvider = settings.exactProvider;
       sidecar = await this.attachSidecarFn({
         projectRoot: root,
         sessionId: this.sessionId,
+        provider: settings.exactProvider,
       });
     } catch {
       sidecar = undefined;
@@ -166,6 +174,39 @@ export class SessionRuntime {
   async sidecarStatus(): Promise<Record<string, unknown>> {
     const snap = this.projectRoot ? await readSidecarSnapshot(this.projectRoot) : undefined;
     const live = snap ? await pingSidecar(snap) : undefined;
+    const actualProvider = live?.provider ?? snap?.provider;
+    const requested = this.requestedProvider;
+    const attached = this.sidecar !== undefined;
+    const knownActual = actualProvider !== undefined;
+    // Refused foreign-provider slot: selection is rg/tantivy, the running
+    // sidecar reports something else, and this session therefore did not attach.
+    const refusedForeign =
+      !attached && knownActual && requested !== "auto" && actualProvider !== requested;
+    // Unknown identity (legacy provider-less sidecar) is degraded under any
+    // explicit selection: never silently trusted as the requested provider.
+    const providerDegraded =
+      (requested === "tantivy" && knownActual && actualProvider !== "tantivy") ||
+      (attached && !knownActual) ||
+      refusedForeign;
+    const fallbackReasons = new Set<string>();
+    if (live?.providerFallback) fallbackReasons.add(live.providerFallback.reason);
+    if (this.sidecar?.providerFallback) fallbackReasons.add(this.sidecar.providerFallback.reason);
+    const providerNotes = [
+      ...fallbackReasons,
+      ...(requested === "tantivy" && knownActual && actualProvider !== "tantivy"
+        ? [`Selection requested tantivy but exact search is served by ${actualProvider}.`]
+        : []),
+      ...(attached && knownActual && requested !== "auto" && actualProvider !== requested
+        ? [`Running sidecar reports ${actualProvider}; the ${requested} selection applies after it exits.`]
+        : []),
+      // Provider-correct refusal: the rg/tantivy selection neither borrows nor
+      // stops a foreign-provider sidecar another session owns.
+      ...(refusedForeign
+        ? [
+            `A ${actualProvider} sidecar from another session is running; the ${requested} selection does not borrow or stop it, so exact search stays on local rg.`,
+          ]
+        : []),
+    ];
     return {
       state: live ? "ready" : "degraded",
       ready: Boolean(live),
@@ -173,45 +214,17 @@ export class SessionRuntime {
       pid: live?.pid ?? snap?.pid,
       port: live?.port ?? snap?.port,
       refcount: live?.refcount,
-      reason: live ? "sidecar reachable" : "sidecar not reachable; tools fall back to grep",
+      provider: actualProvider,
+      requestedProvider: requested,
+      providerDegraded,
+      // Bearer token deliberately never surfaced here.
+      reason: [
+        live
+          ? "sidecar reachable"
+          : "sidecar not reachable; tools fall back to grep",
+        ...providerNotes,
+      ].join("; "),
     };
-  }
-}
-
-let tsInitPromise: Promise<void> | null = null;
-let warmupRoot = "";
-let warmupPromise: Promise<void> | null = null;
-
-/** Shared in-flight tree-sitter init. Concurrent callers wait on the same promise. */
-export function ensureTreeSitter(): Promise<void> {
-  if (!tsInitPromise) {
-    tsInitPromise = initTreeSitter().catch(() => {
-      // symbol layer stays degraded; callers fall back per spec D8
-    });
-  }
-  return tsInitPromise;
-}
-
-/**
- * Background symbol-cache warmup. Never throws. Same projectRoot reuses the
- * in-flight (or already-settled) promise so session_start cannot double-parse.
- */
-export function startSymbolWarmup(projectRoot: string): Promise<void> {
-  const root = projectRoot;
-  if (warmupPromise && warmupRoot === root) return warmupPromise;
-  warmupRoot = root;
-  warmupPromise = runSymbolWarmup(root);
-  return warmupPromise;
-}
-
-async function runSymbolWarmup(projectRoot: string): Promise<void> {
-  try {
-    await ensureTreeSitter();
-    if (!isTreeSitterReady()) return;
-    const settings = await loadRetrievalSettings(projectRoot);
-    await extractProjectCached(projectRoot, { excludeGlobs: settings.excludeGlobs });
-  } catch {
-    // D8: wasm missing / init / extract failure must not affect session load.
   }
 }
 
@@ -251,7 +264,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Code search",
     promptSnippet: "Search code from a description when grep would need a keyword guess",
     description:
-      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Weighs your terms against each other inside symbol boundaries and returns ranked compressed R# refs (top 12 inline), never file bodies; pull the ones worth reading with read_spans. It is the right call the moment grep would need a second keyword guess. It ranks the words you give it and has no semantic index in this build, so a query whose answer uses none of your words comes back empty — that means change vocabulary, not tool. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
+      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Weighs your terms against each other inside symbol boundaries and returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap), so one call is enough to reject or choose candidates; never full file bodies — pull those with read_spans. It is the right call the moment grep would need a second keyword guess. It ranks the words you give it and has no semantic index in this build, so a query whose answer uses none of your words comes back empty — that means change vocabulary, not tool. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
     parameters: {
       type: "object",
       properties: {
@@ -283,6 +296,12 @@ export default function (pi: ExtensionAPI): void {
           excludeGlobs: settings.excludeGlobs,
           sidecar: runtime.sidecar,
           signal,
+          providerInfo: {
+            requested: settings.exactProvider,
+            actual: runtime.sidecar?.provider,
+          },
+          tokenBudget: settings.tokenBudget,
+          ledger: runtime.ledger,
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -299,7 +318,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Code nav",
     promptSnippet: "Symbol graph: definition, callers, implementations",
     description:
-      "Answer the symbol-graph questions text search flattens: where a symbol is defined, who calls it, what implements it. Prefer it over grepping a symbol name, which returns the definition, every call site and every passing mention as one undifferentiated list. Degrades to a stub when the symbol layer is unavailable.",
+      "Answer the symbol-graph questions text search flattens: where a symbol is defined, who calls it, what implements it. Prefer it over grepping a symbol name, which returns the definition, every call site and every passing mention as one undifferentiated list. Ranked hits carry a bounded source preview under the top refs (a few lines each) so most choices need no follow-up read. Degrades to a stub when the symbol layer is unavailable.",
     parameters: {
       type: "object",
       properties: {
@@ -368,12 +387,21 @@ export default function (pi: ExtensionAPI): void {
         }
         const assigned = runtime.registry.assignAll(nav.hits);
         const note = [nav.incomplete ? nav.reason : undefined].filter(Boolean).join(" ");
+        const settings = await loadRetrievalSettings(runtime.projectRoot);        const previews = await buildInlinePreviews(assigned, {
+          projectRoot: runtime.projectRoot,
+          ledger: runtime.ledger,
+          budgetTokens: settings.tokenBudget,
+        });
         return buildToolResult({
           projectRoot: runtime.projectRoot,
           kind: "code-retrieval.nav",
           hits: assigned,
           degraded: Boolean(nav.degraded),
-          content: formatCompressedContent(assigned, note || undefined),
+          content: formatCompressedContent(
+            assigned,
+            [note, previews.note].filter(Boolean).join(" ") || undefined,
+            previews.previews,
+          ),
           degradeReason: nav.degraded ? nav.reason : undefined,
         });
       } catch (error) {
@@ -388,7 +416,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Repo map",
     promptSnippet: "Map an unfamiliar tree before opening files",
     description:
-      "First move in a tree whose layout you cannot yet name: a token-budgeted map of signatures, imports and call edges across the project. Cheaper than walking directories and opening files to find out what is in them. Uses the symbol-layer hook when present.",
+      "First move in a tree whose layout you cannot yet name: a token-budgeted map of signatures, imports and call edges across the project. Cheaper than walking directories and opening files to find out what is in them. Ranked map hits carry stable R# refs with a bounded source preview under the top refs (~6 lines each), so one call is usually enough to choose; pull full bodies with read_spans. Uses the symbol-layer hook when present.",
     parameters: {
       type: "object",
       properties: {
@@ -399,30 +427,17 @@ export default function (pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       try {
         await runtime.ensure(ctx?.cwd);
-        await ensureTreeSitter();
-        const impl = getSymbolLayer().repoMap;
-        if (!impl) {
-          return emptyDegraded(
-            "code-retrieval.map",
-            "repo_map symbol extractor is not wired yet (hook vacant). Use grep / ls.",
-          );
-        }
-        const settings = await loadRetrievalSettings(runtime.projectRoot);
-        const hits = await impl({
-          tokenBudget: asNumber(params.tokenBudget) ?? settings.tokenBudget,
+        // Shared implementation (also importable as executeRepoMap from
+        // dist/map-tool.js) so the evaluator exercises the same path the tool does:
+        // stable refs + bounded inline previews under the top hits.
+        return await executeRepoMap({
           projectRoot: runtime.projectRoot,
+          registry: runtime.registry,
+          ledger: runtime.ledger,
+          tokenBudget: asNumber(params.tokenBudget),
         });
-        const assigned = runtime.registry.assignAll(hits);
-        return buildToolResult({
-          projectRoot: runtime.projectRoot,
-          kind: "code-retrieval.map",
-          hits: assigned,
-          degraded: false,
-          content: formatCompressedContent(assigned),
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        return emptyDegraded("code-retrieval.map", `repo_map failed: ${message}. Use grep / ls.`);
+      } catch {
+        return emptyDegraded("code-retrieval.map", "repo_map failed. Use grep / ls.");
       }
     },
   });
@@ -432,7 +447,7 @@ export default function (pi: ExtensionAPI): void {
     label: "Read spans",
     promptSnippet: "Fetch the span bodies a prior code_search ranked",
     description:
-      "Second half of a search: fetch the bodies of spans a prior code_search / repo_map ranked, by stable R# ref. Read the ranked list first, decide which spans deserve context, then pull only those — that ordering is what keeps a search cheap. A range already returned this session is cited, not re-inlined. Honors ext.code-retrieval.tokenBudget (default 4000).",
+      "Second half of a search: fetch the full bodies of spans a prior code_search / repo_map ranked, by stable R# ref. Read the ranked list first (its inline previews cover only the top hits), decide which spans deserve context, then pull only those — that ordering is what keeps a search cheap. A range already returned this session, including an exact range shown as an inline preview, is cited rather than re-inlined; wider reads such as full symbol bodies always come through in full. Honors ext.code-retrieval.tokenBudget (default 4000).",
     parameters: {
       type: "object",
       properties: {

@@ -56,6 +56,7 @@ describe("vendored philosophy: structure", () => {
       "method",
       "retrieval",
       "research",
+      "recon-stopping",
       "planning",
       "craft",
       "debugloop",
@@ -97,7 +98,7 @@ describe("vendored philosophy: delivery", () => {
     // `toolcall` names the code-reading agents directly: session-log measurement showed
     // every model family rebuilding grep/ls/cat in bash, so the correction is addressed to
     // whoever searches, not gated on a model allowlist.
-    expect(workerIds("explore")).toEqual(["retrieval", "research", "toolcall", "thinking"]);
+    expect(workerIds("explore")).toEqual(["retrieval", "research", "recon-stopping", "toolcall", "thinking"]);
     expect(workerIds("plan")).toEqual(["retrieval", "planning", "toolcall", "thinking"]);
     expect(workerIds("general-purpose")).toEqual(["retrieval", "craft", "same-turn", "nested-dispatch", "toolcall", "thinking"]);
   });
@@ -413,8 +414,14 @@ describe("vendored philosophy: delivery", () => {
     // one, so separable work kept running single-threaded behind a cohesion defect the boss
     // could have removed in one extraction. The section buys back wall-clock on every wave
     // that would otherwise have queued.
+    // Raised to 18800 for orchestration's [subagent-recovery] routing bullet: one reviewer
+    // run replayed four resumed episodes (~384 calls / 212 reads) into the same provider/
+    // context death because nothing at the boundary told the boss that continuing that
+    // conversation was itself the failure mode. The runtime now classifies ordinary vs
+    // poisoned-context deaths and persists an evidence-derived checkpoint; the bullet names
+    // the two routes so the fresh-episode dispatch reads it instead of blind-resuming.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(18100);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(18800);
   });
 
   it("delivers the semantic-slug identity rule into the composed boss prompt", () => {

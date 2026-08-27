@@ -4,6 +4,7 @@ import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sidecarJsonPath, sidecarLockPath, retrievalHome } from "./paths.js";
+import type { ExactProvider } from "./settings.js";
 import type { SidecarConnection, SidecarSnapshot } from "./types.js";
 
 const DEFAULT_IDLE_MS = 60_000;
@@ -17,7 +18,56 @@ export type AttachOptions = {
   sessionId: string;
   idleMs?: number;
   spawn?: boolean;
+  /** Requested exact-layer provider; auto = Tantivy first with honest rg fallback. */
+  provider?: ExactProvider;
 };
+
+/** Set when a requested provider could not be served as asked (req: no silent pretending). */
+export type ProviderFallback = { requested: ExactProvider; actual?: string; reason: string };
+
+/**
+ * Annotates a connection with the request it serves plus honest fallback info.
+ * A provider-less legacy sidecar is unknown, never silently trusted: for any
+ * explicit selection its identity stays unset and the fallback reason says so.
+ */
+function annotateProvider(conn: SidecarConnection, requested: ExactProvider): SidecarConnection {
+  conn.requestedProvider = requested;
+  const known = conn.provider !== undefined;
+  if (requested === "tantivy" && (!known || conn.provider !== "tantivy")) {
+    conn.providerFallback = {
+      requested,
+      ...(known ? { actual: conn.provider } : {}),
+      reason: known
+        ? `Tantivy was selected but is unavailable or failed to start; ` +
+          `exact search is served by ${conn.provider} (details.provider).`
+        : `Running sidecar predates provider reporting; identity unknown and not trusted as tantivy (degraded).`,
+    };
+  } else if (!known) {
+    // auto also must not pretend a legacy sidecar has any particular identity.
+    conn.providerFallback = {
+      requested,
+      reason: `Running sidecar predates provider reporting; identity unknown (not trusted as ${requested}).`,
+    };
+  }
+  return conn;
+}
+
+/**
+ * Reuse decision for an ALREADY-RUNNING sidecar under this session's selection.
+ * - rg never borrows another provider's process and never kills it either;
+ *   it uses the local rg path instead until that sidecar exits on its own.
+ * - A legacy sidecar without a reported provider counts as unknown, not rg:
+ *   equally refused rather than silently trusted to be what was asked for.
+ * Returns the annotated connection to reuse, or undefined when the caller must
+ * stay on the local path (it then does NOT spawn a second writer either, since
+ * that would hijack the shared sidecar.json from its current owner).
+ */
+function reusableLive(live: SidecarConnection, requested: ExactProvider): SidecarConnection | undefined {
+  if (requested === "rg") {
+    return live.provider === "rg" ? annotateProvider(live, requested) : undefined;
+  }
+  return annotateProvider(live, requested);
+}
 
 export function defaultIdleMs(): number {
   const raw = process.env.PIPIUI_CODE_RETRIEVAL_IDLE_MS;
@@ -79,7 +129,13 @@ export async function readSidecarSnapshot(projectRoot: string): Promise<SidecarS
   try {
     const raw = JSON.parse(await readFile(sidecarJsonPath(projectRoot), "utf8")) as Partial<SidecarSnapshot>;
     if (typeof raw.pid === "number" && typeof raw.port === "number" && typeof raw.token === "string") {
-      return { pid: raw.pid, port: raw.port, token: raw.token, startedAt: raw.startedAt };
+      return {
+        pid: raw.pid,
+        port: raw.port,
+        token: raw.token,
+        startedAt: raw.startedAt,
+        ...(typeof raw.provider === "string" ? { provider: raw.provider } : {}),
+      };
     }
   } catch {
     return undefined;
@@ -106,45 +162,10 @@ export async function pingSidecar(snapshot: SidecarSnapshot, timeoutMs = PING_TI
       ...snapshot,
       refcount: typeof resp.body.refcount === "number" ? resp.body.refcount : undefined,
       ready: resp.body.ready !== false,
+      ...(typeof resp.body.provider === "string" ? { provider: resp.body.provider } : {}),
     };
   } catch {
     return undefined;
-  }
-}
-
-export async function attachSidecar(options: AttachOptions): Promise<SidecarConnection | undefined> {
-  const existing = await readSidecarSnapshot(options.projectRoot);
-  if (existing) {
-    const live = await pingSidecar(existing);
-    if (live) {
-      // Health-only is not a lease. ensure() success === attach success.
-      return postAttach(live, options.sessionId);
-    }
-  }
-  if (options.spawn === false) return undefined;
-
-  const lock = await tryAcquireLock(options.projectRoot);
-  if (!lock) {
-    // Another writer holds the lock — read the old snapshot; do not start a second writer.
-    const raced = await waitForSnapshot(options.projectRoot, 800);
-    if (raced) {
-      const live = await pingSidecar(raced);
-      if (live) return postAttach(live, options.sessionId);
-    }
-    return undefined;
-  }
-
-  try {
-    const again = await readSidecarSnapshot(options.projectRoot);
-    if (again) {
-      const live = await pingSidecar(again);
-      if (live) return postAttach(live, options.sessionId);
-    }
-    const spawned = await spawnSidecar(options.projectRoot, options.idleMs ?? defaultIdleMs());
-    if (!spawned) return undefined;
-    return postAttach(spawned, options.sessionId);
-  } finally {
-    await lock.release();
   }
 }
 
@@ -205,6 +226,62 @@ export async function sidecarSearch(
   } catch {
     return undefined;
   }
+}
+
+export async function attachSidecar(options: AttachOptions): Promise<SidecarConnection | undefined> {
+  const requested: ExactProvider = options.provider ?? "auto";
+  const existing = await readSidecarSnapshot(options.projectRoot);
+  if (existing) {
+    const live = await pingSidecar(existing);
+    if (live) {
+      // Health-only is not a lease. ensure() success === attach success.
+      // Provider selection decides whether this live sidecar may serve us at all.
+      const usable = reusableLive(live, requested);
+      if (!usable) return undefined;
+      return annotateRequested(await postAttach(usable, options.sessionId) ?? usable, requested);
+    }
+  }
+  if (options.spawn === false) return undefined;
+
+  const lock = await tryAcquireLock(options.projectRoot);
+  if (!lock) {
+    // Another writer holds the lock — read the old snapshot; do not start a second writer.
+    const raced = await waitForSnapshot(options.projectRoot, 800);
+    if (raced) {
+      const live = await pingSidecar(raced);
+      if (live) {
+        const usable = reusableLive(live, requested);
+        if (!usable) return undefined;
+        return annotateRequested(await postAttach(usable, options.sessionId) ?? usable, requested);
+      }
+    }
+    return undefined;
+  }
+
+  try {
+    const again = await readSidecarSnapshot(options.projectRoot);
+    if (again) {
+      const live = await pingSidecar(again);
+      if (live) {
+        // Same refusal rule under the lock: never borrow nor displace a
+        // foreign-provider sidecar that already owns the slot.
+        const usable = reusableLive(live, requested);
+        if (!usable) return undefined;
+        return annotateRequested(await postAttach(usable, options.sessionId) ?? usable, requested);
+      }
+    }
+    const spawnedConn = await spawnSidecar(options.projectRoot, options.idleMs ?? defaultIdleMs(), requested);
+    if (!spawnedConn) return undefined;
+    return annotateProvider((await postAttach(spawnedConn, options.sessionId)) ?? spawnedConn, requested);
+  } finally {
+    await lock.release();
+  }
+}
+
+/** Keeps requestedProvider on the postAttach-merged copy (spread drops nothing, but be explicit). */
+function annotateRequested(conn: SidecarConnection, requested: ExactProvider): SidecarConnection {
+  conn.requestedProvider = requested;
+  return conn;
 }
 
 async function postAttach(conn: SidecarConnection, sessionId: string): Promise<SidecarConnection | undefined> {
@@ -282,13 +359,21 @@ function resolveSidecarScript(): string | undefined {
   return undefined;
 }
 
-async function spawnSidecar(projectRoot: string, idleMs: number): Promise<SidecarConnection | undefined> {
-  const rustBin = resolveTantivyBinary();
-  if (rustBin) {
-    const spawned = await spawnProcess(rustBin, [], projectRoot, idleMs);
-    if (spawned) return spawned;
+async function spawnSidecar(
+  projectRoot: string,
+  idleMs: number,
+  requested: ExactProvider,
+): Promise<SidecarConnection | undefined> {
+  if (requested !== "rg") {
+    const rustBin = resolveTantivyBinary();
+    if (rustBin) {
+      const spawned = await spawnProcess(rustBin, [], projectRoot, idleMs);
+      if (spawned) return spawned;
+    }
   }
   // D8: missing / failed Rust binary falls back to the Node rg sidecar.
+  // A "tantivy" request falling through here is surfaced by annotateProvider,
+  // never silently passed off as Tantivy.
   const script = resolveSidecarScript();
   if (!script) return undefined;
   return spawnProcess(process.execPath, [script], projectRoot, idleMs);

@@ -229,6 +229,16 @@ This section is about successive rounds on one slice, not how many slices run at
   matching or a program-owned task key.
 - `resumed=true` in a done header means that worker continued; its absence on a name you
   meant to continue is a signal you typed the name wrong.
+- A failed episode carrying `[subagent-recovery]` routes its own recovery.
+  `continue-slice` (verify-failure, retry-exhausted, unclassified) is an ordinary
+  implementation/test failure: re-dispatch the SAME agentId as above. `checkpoint-fresh-episode`
+  (provider-stall, context-overflow): the conversation is the failure — in-run resume and
+  compaction are spent, replaying reproduces both cost and death (the four-episode reviewer
+  blow-up). Dispatch a NEW semantic agentId whose brief starts *read
+  `.pi/checkpoints/<old-id>.md` first*: a bounded record of examined file families, swept
+  dimensions, prior findings, preserved worktree. With `checkpoint=-` no evidence existed:
+  narrow the fresh brief yourself; never discard the old worktree either way. Interruption
+  still continues by name; two wrong answers still mean `fresh`.
 
 ## Verification and supervision
 

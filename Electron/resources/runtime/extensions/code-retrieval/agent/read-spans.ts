@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
 import { getSymbolLayer } from "./hooks.js";
 import { extractSpanText, hashContent, mergeAdjacentSpans, type SeenRangeLedger } from "./ledger.js";
@@ -141,7 +141,7 @@ async function hydrateSpan(record: SpanRecord, projectRoot: string): Promise<Res
       // keep stored range
     }
   }
-  const abs = resolveProjectFile(projectRoot, record.path);
+  const abs = await resolveProjectFile(projectRoot, record.path);
   if (!abs) return undefined;
   let fileText: string;
   try {
@@ -161,11 +161,36 @@ async function hydrateSpan(record: SpanRecord, projectRoot: string): Promise<Res
   };
 }
 
-function resolveProjectFile(projectRoot: string, rawPath: string): string | undefined {
+/** Resolved real project roots, keyed by the caller-supplied root string. */
+const realRootCache = new Map<string, Promise<string>>();
+
+function realProjectRoot(projectRoot: string): Promise<string> {
+  let cached = realRootCache.get(projectRoot);
+  if (!cached) {
+    cached = realpath(projectRoot).catch(() => projectRoot);
+    realRootCache.set(projectRoot, cached);
+  }
+  return cached;
+}
+
+/**
+ * Containment check against REAL paths: an in-project symlink that points
+ * outside the project must not pass just because its lexical path is inside.
+ * Returns the fully-resolved real path, or undefined when it escapes / cannot
+ * be resolved. Preview and span reads both go through here (fail safe).
+ */
+export async function resolveProjectFile(projectRoot: string, rawPath: string): Promise<string | undefined> {
   const abs = isAbsolute(rawPath) ? rawPath : resolve(projectRoot, rawPath);
   const rel = relative(projectRoot, abs);
   if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
-  return abs;
+  try {
+    const [rootReal, absReal] = await Promise.all([realProjectRoot(projectRoot), realpath(abs)]);
+    const relReal = relative(rootReal, absReal);
+    if (relReal.startsWith("..") || isAbsolute(relReal)) return undefined;
+    return absReal;
+  } catch {
+    return undefined;
+  }
 }
 
 function formatHeader(hit: RetrievalHit): string {
@@ -173,7 +198,8 @@ function formatHeader(hit: RetrievalHit): string {
   return `${hit.ref} ${hit.path}:${hit.startLine}-${hit.endLine}${symbol}`;
 }
 
-function numberLines(text: string, startLine: number): string {
+/** Shared with previews.ts so inline lines are numbered exactly like span bodies. */
+export function numberLines(text: string, startLine: number): string {
   const lines = text.split("\n");
   const width = String(startLine + lines.length - 1).length;
   return lines

@@ -308,6 +308,7 @@ fn write_snapshot(shared: &Shared) {
         "port": shared.port.load(Ordering::SeqCst),
         "token": shared.token,
         "startedAt": now_ms(),
+        "provider": "tantivy",
     });
     if std::fs::write(&tmp, body.to_string()).is_ok() {
         if std::fs::rename(&tmp, &dest).is_err() {

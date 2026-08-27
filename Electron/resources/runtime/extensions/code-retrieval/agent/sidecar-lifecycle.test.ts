@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,6 +17,7 @@ import {
   pingSidecar,
   readSidecarSnapshot,
   startSidecarHeartbeat,
+  type AttachOptions,
 } from "./sidecar-lifecycle.js";
 import type { SidecarSnapshot } from "./types.js";
 
@@ -31,6 +33,7 @@ const SHARED_HEALTH_KEYS = [
   "sessionTtlMs",
   "oldestExpiresAt",
   "sessions",
+  "provider",
 ] as const;
 
 async function withEnv<T>(env: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> {
@@ -601,6 +604,119 @@ test("SessionRuntime root switch detaches the old lease", async () => {
         await runtime.shutdown();
         await rm(first, { recursive: true, force: true });
         await rm(second, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+/** A "tantivy" candidate that proves it ran, then dies before serving. */
+async function writeFailingTantivyStub(dir: string): Promise<{ path: string; marker: string }> {
+  const path = join(dir, "tantivy-candidate.sh");
+  const marker = join(dir, "tantivy-candidate-called");
+  await writeFile(
+    path,
+    `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 3\n`,
+    { encoding: "utf8", mode: 0o755 },
+  );
+  return { path, marker };
+}
+
+async function stopSidecar(pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // already gone
+  }
+  await waitDead(pid, 3000);
+}
+
+async function writeProviderSettings(root: string, provider: string): Promise<void> {
+  const dir = join(root, ".pi", "agent", "ext-settings");
+  await mkdir(dir, { recursive: true });
+  await writeFile(
+    join(dir, "code-retrieval.json"),
+    JSON.stringify({ settingsVersion: 1, settings: { "ext.code-retrieval.exactProvider": provider } }),
+    "utf8",
+  );
+}
+
+for (const selection of ["auto", "rg", "tantivy"] as const) {
+  test(`selection=${selection}: failing tantivy candidate falls back to the rg sidecar`, async () => {
+    const root = await mkdtemp(join(tmpdir(), `cr-provider-${selection}-`));
+    const { path: stub, marker } = await writeFailingTantivyStub(root);
+    await withEnv(
+      {
+        PIPIUI_CODE_RETRIEVAL_SIDECAR: stub,
+        PIPIUI_CODE_RETRIEVAL_IDLE_MS: "6000",
+        PIPIUI_CODE_RETRIEVAL_SESSION_TTL_MS: "8000",
+      },
+      async () => {
+        try {
+          const conn = await attachSidecar({ projectRoot: root, sessionId: "P1", idleMs: 6000, provider: selection });
+          assert.ok(conn, "usability must survive a broken tantivy candidate via rg");
+          // Discovery, snapshot and health all carry the actual provider.
+          assert.equal(conn.provider, "rg", String(selection));
+          assert.equal(conn.requestedProvider, selection);
+          const snap = await readSidecarSnapshot(root);
+          assert.equal(snap?.provider, "rg");
+          const health = await sidecarJson(snap!, "GET", "/health");
+          assert.equal(health.body.provider, "rg");
+          // Selection really controlled which layer was attempted.
+          assert.equal(existsSync(marker), selection !== "rg", `${selection} must honor its semantics`);
+          if (selection === "tantivy") {
+            assert.ok(conn.providerFallback, "a denied tantivy request must not pass silently");
+            assert.equal(conn.providerFallback!.actual, "rg");
+            assert.match(conn.providerFallback!.reason, /tantivy/i);
+          } else {
+            assert.equal(conn.providerFallback, undefined);
+          }
+          await stopSidecar(conn.pid);
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      },
+    );
+  });
+}
+
+test("SessionRuntime.ensure feeds the settings provider into attach and status reports degradation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "cr-runtime-provider-"));
+  const { path: stub } = await writeFailingTantivyStub(root);
+  await writeProviderSettings(root, "tantivy");
+  await withEnv(
+    {
+      PIPIUI_CODE_RETRIEVAL_SIDECAR: stub,
+      PIPIUI_CODE_RETRIEVAL_IDLE_MS: "8000",
+      PIPIUI_CODE_RETRIEVAL_SESSION_TTL_MS: "10000",
+    },
+    async () => {
+      const runtime = new SessionRuntime();
+      const seen: AttachOptions[] = [];
+      runtime.attachSidecarFn = async (opts) => {
+        seen.push(opts);
+        return attachSidecar(opts);
+      };
+      try {
+        await runtime.ensure(root);
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0]!.provider, "tantivy", "ensure must forward the settings value");
+        assert.equal(runtime.requestedProvider, "tantivy");
+        assert.ok(runtime.sidecar, "rg keeps the session usable");
+        assert.equal(runtime.sidecar!.provider, "rg");
+        assert.ok(runtime.sidecar!.providerFallback);
+
+        const status = await runtime.sidecarStatus();
+        assert.equal(status.requestedProvider, "tantivy");
+        assert.equal(status.provider, "rg");
+        assert.equal(status.providerDegraded, true);
+        assert.match(String(status.reason), /tantivy/i);
+        // Status surfaces the actual provider but never the bearer token.
+        assert.equal(JSON.stringify(status).includes(runtime.sidecar!.token), false);
+      } finally {
+        await runtime.shutdown();
+        const snap = await readSidecarSnapshot(root);
+        if (snap && pidAlive(snap.pid)) await stopSidecar(snap.pid);
+        await rm(root, { recursive: true, force: true });
       }
     },
   );

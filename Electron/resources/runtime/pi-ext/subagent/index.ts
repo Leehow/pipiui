@@ -98,6 +98,14 @@ import {
 	listFindings,
 	writeFindingsArtifact,
 } from "./findings-artifact.ts";
+import {
+	classifyWorkerRecovery,
+	extractReconFootprint,
+	formatFreshEpisodeReminderLines,
+	formatRecoveryReport,
+	writeRecoveryCheckpoint,
+	type RecoveryDecision,
+} from "./recovery-classification.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
 import {
 	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
@@ -2011,6 +2019,10 @@ interface JobRecord {
 	closeoutDisposition?: "cleaned";
 	closeoutReason?: string;
 	closeoutAt?: number;
+	/** Structured failure classification for reminder/fresh-episode routing (see recovery-classification.ts). */
+	recovery?: RecoveryDecision;
+	/** Checkpoint artifact written at a context/provider-poisoned boundary, when evidence existed. */
+	recoveryCheckpoint?: string;
 	worktreePath?: string;
 	worktreeBranch?: string;
 	integrationState?: SubagentIntegrationState;
@@ -3032,6 +3044,8 @@ type JobFinalizeFields = {
 	worktreeBranch?: string;
 	integrationState?: SubagentIntegrationState;
 	worktreeFinalization?: string;
+	recovery?: RecoveryDecision;
+	recoveryCheckpoint?: string;
 	/** Only watchdog disappearance settle uses this; the real terminal callback may replace it. */
 	provisional?: boolean;
 };
@@ -3100,6 +3114,10 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		worktreeBranch: fields.worktreeBranch ?? existing?.worktreeBranch,
 		integrationState: fields.integrationState ?? existing?.integrationState,
 		worktreeFinalization: fields.worktreeFinalization ?? existing?.worktreeFinalization,
+		...(fields.recovery ? { recovery: fields.recovery } : (existing?.recovery ? { recovery: existing.recovery } : {})),
+		...(fields.recoveryCheckpoint || existing?.recoveryCheckpoint
+			? { recoveryCheckpoint: fields.recoveryCheckpoint ?? existing?.recoveryCheckpoint }
+			: {}),
 		...(existing?.closeoutDisposition === "cleaned"
 			? {
 					closeoutDisposition: existing.closeoutDisposition,
@@ -3186,9 +3204,17 @@ function isInterruptedReminderState(state: JobState): boolean {
 function formatInterruptedReminder(job: JobRecord, idleSec: number, nudgeSeq: number): string {
 	const title =
 		job.title?.trim() || (job.task.split("\n")[0] ?? "").trim().slice(0, 80) || "(untitled)";
+	// A classified context/provider-poisoned boundary must not nudge the Boss toward blind
+	// same-id resume — replaying that conversation is the failure mode, not the recovery.
+	const continueLines =
+		job.recovery?.route === "checkpoint-fresh-episode"
+			? formatFreshEpisodeReminderLines(job.recoveryCheckpoint)
+			: [
+					`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
+				];
 	return [
 		`[subagent-interrupted-reminder] agentId=${job.agentId} runId=${job.runId} state=${job.state} title=${title} idle=${idleSec}s nudge=${nudgeSeq}/2`,
-		`This worker is ${job.state} but its stored context is intact. Re-dispatch the same agentId to continue where it left off, or pass fresh:true to abandon that context. Do not treat this message as a new user request.`,
+		...continueLines,
 		`If this episode's work is already complete, mark it handled with subagent_resolve({agentId:"${job.agentId}", runId:"${job.runId}"}) (or /subagent_resolve ${job.agentId} ${job.runId}) so no further reminders are sent; do not just reply "already completed".`,
 	].join("\n");
 }
@@ -7514,6 +7540,9 @@ async function runSingleAgent(
 			currentResult.verifySkipped = true;
 		}
 		const endOk = isHostEndOk(currentResult, { aborted: wasAborted });
+		// Failure classification + optional evidence-derived checkpoint (fresh-episode routing).
+		let recoveryClassification: RecoveryDecision | undefined;
+		let recoveryCheckpointFile: string | undefined;
 		if (wasAborted) currentResult.stopReason = currentResult.stopReason ?? "aborted";
 		// Notes appended after slice so they survive the -8000 tail trim on long outputs.
 		let endOutput = (getFinalOutput(currentResult.messages) || currentResult.stderr || "").slice(-8000);
@@ -7533,13 +7562,53 @@ async function runSingleAgent(
 			const note = `\n[pipiui] auto-resumed ${autoResumeCount}× after retryable errors.`;
 			endOutput += note;
 			endResultText += note;
-		} else if (
-			!endOk &&
-			!wasAborted &&
-			(currentResult.usage.contextTokens || 0) >= AUTO_RESUME_CONTEXT_HINT_TOKENS
-		) {
-			const n = Math.round((currentResult.usage.contextTokens || 0) / 1000);
-			const note = `\n[pipiui] 疑似上下文过大（~${n}k tokens）导致请求反复失败：建议 boss 以 fresh 重派该 agentId，缩小任务范围并要求小窗口读取。`;
+		} else if (!endOk && !wasAborted) {
+			// Structured recovery classification (see recovery-classification.ts): an ordinary
+			// implementation/test failure keeps same-agent continuity — INCLUDING at huge context;
+			// size alone never mints a fresh episode. A provider-stall or saturated-context death
+			// becomes checkpoint-fresh-episode ONLY with poisoned-broad-recon evidence: dispatched
+			// recon/review role or a read/search-dominated mutation-free trajectory observed in the
+			// tool-call record (the four-episode reviewer case). Insufficient evidence fails safe
+			// to continuity and persists no checkpoint.
+			recoveryClassification = classifyWorkerRecovery(
+				{
+					wasAborted,
+					stopReason: currentResult.stopReason,
+					errorText: [currentResult.errorMessage ?? "", currentResult.stderr.slice(-2000)].join("\n"),
+					verifyFailure:
+						!!currentResult.verify &&
+						!(currentResult.verify.exitCode === 0 && !currentResult.verify.timedOut),
+					contextTokens: currentResult.usage.contextTokens || 0,
+					sameModelResumeCount: autoResumeCount,
+					role: agentName,
+					readOnly: Boolean(agent.traits.readOnly),
+					footprint: extractReconFootprint(currentResult.messages),
+				},
+				{ contextHintTokens: AUTO_RESUME_CONTEXT_HINT_TOKENS },
+			);
+			if (recoveryClassification.route === "checkpoint-fresh-episode") {
+				const checkpoint = writeRecoveryCheckpoint({
+					mainCwd: PIPIUI_MAIN_CWD,
+					agentId: pipiuiAgentId,
+					runId,
+					title: options?.title,
+					task,
+					decision: recoveryClassification,
+					messages: currentResult.messages,
+					worktreePath: placement.worktreePath,
+					worktreeBranch: placement.worktreeBranch,
+				});
+				// A checkpoint is evidence-derived; none existing means none is written and the
+				// route line alone still tells the Boss not to replay this conversation.
+				if (checkpoint.ok && checkpoint.file) recoveryCheckpointFile = checkpoint.file;
+			}
+			let note = `\n${formatRecoveryReport({ agentId: pipiuiAgentId, runId, decision: recoveryClassification, checkpointFile: recoveryCheckpointFile })}`;
+			if (recoveryClassification.kind === "context-overflow") {
+				const n = Math.round((currentResult.usage.contextTokens || 0) / 1000);
+				note += recoveryClassification.route === "checkpoint-fresh-episode"
+					? `\n[pipiui] 侦查轨迹毒化证据成立（~${n}k tokens）：按上方报告走新的语义 episode。`
+					: `\n[pipiui] 终态时上下文已达 ~${n}k tokens，但无侦查毒化证据：继续同一 agentId 切片，缩小任务范围并要求小窗口读取。`;
+			}
 			endOutput += note;
 			endResultText += note;
 			// Append only — never replace an existing terminal errorMessage.
@@ -7570,6 +7639,8 @@ async function runSingleAgent(
 				turns: currentResult.usage.turns,
 				activity: pipiuiActivity,
 				verify: currentResult.verify,
+				...(recoveryClassification ? { recovery: recoveryClassification } : {}),
+				...(recoveryCheckpointFile ? { recoveryCheckpoint: recoveryCheckpointFile } : {}),
 				...(placement.worktreePath ? { worktreePath: placement.worktreePath } : {}),
 				...(placement.worktreeBranch ? { worktreeBranch: placement.worktreeBranch } : {}),
 				...(placement.worktreePath && placement.worktreeBranch

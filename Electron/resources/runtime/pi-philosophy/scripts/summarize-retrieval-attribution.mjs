@@ -13,6 +13,9 @@ import { join } from "node:path";
 
 const CALL_KIND = "retrieval_tool_call";
 const TURN_KIND = "session_toolset";
+const RESULT_KIND = "tool_result";
+
+const INDEXED_SEARCH_TOOLS = new Set(["code_search", "code_nav", "repo_map", "read_spans"]);
 
 const TOOL_GROUPS = {
   filesystem: ["bash", "edit", "find", "grep", "ls", "read", "write"],
@@ -53,12 +56,19 @@ function parseRecords(text) {
     try {
       const parsed = JSON.parse(line);
       if (parsed?.kind === TURN_KIND && typeof parsed.toolsetHash === "string") records.push(parsed);
+      else if (parsed?.kind === RESULT_KIND && typeof parsed.tool === "string" && typeof parsed.toolCallId === "string") records.push(parsed);
       else if (parsed?.kind === CALL_KIND && typeof parsed.tool === "string") records.push(parsed);
     } catch {
       // skip malformed lines
     }
   }
   return records;
+}
+
+function percentile(sorted, fraction) {
+  if (!sorted.length) return undefined;
+  const index = Math.min(sorted.length - 1, Math.max(0, Math.ceil(fraction * sorted.length) - 1));
+  return sorted[index];
 }
 
 function identity(record) {
@@ -79,12 +89,16 @@ function summarize(records) {
   const promptCounts = new Map();
   const usedBySlice = new Map();
   const toolsetBySlice = new Map();
+  const resultRows = new Map();
+  const providerRows = new Map();
+  const coverage = { turns: 0, calls: 0, results: 0, readCalls: 0, readCallsWithTarget: 0, indexedSearchCalls: 0, resultsWithProvider: 0 };
   let turns = 0;
   let calls = 0;
   for (const record of records) {
     const { role, agent, model } = identity(record);
     if (record.kind === TURN_KIND) {
       turns += 1;
+      coverage.turns += 1;
       const hash = record.toolsetHash || "";
       const key = sliceKey(role, agent, model, hash);
       if (!toolsetBySlice.has(key)) {
@@ -95,8 +109,45 @@ function summarize(records) {
         });
       }
       if (!usedBySlice.has(key)) usedBySlice.set(key, new Map());
-    } else if (record.tool) {
+    } else if (record.kind === RESULT_KIND) {
+      coverage.results += 1;
+      const result = record.result && typeof record.result === "object" ? record.result : undefined;
+      if (record.tool && result) {
+        const outcome = result.ok ? "ok" : "error";
+        const rowKey = [role, agent, record.tool, result.resultKind || "-", outcome].join("\t");
+        let row = resultRows.get(rowKey);
+        if (!row) {
+          row = { role, agent, tool: record.tool, resultKind: result.resultKind || "-", outcome, count: 0, degraded: 0, hitsSum: 0, maxHits: 0, durationsMs: [] };
+          resultRows.set(rowKey, row);
+        }
+        row.count += 1;
+        if (result.degraded === true) row.degraded += 1;
+        if (typeof result.provider === "string" && result.provider) {
+          coverage.resultsWithProvider += 1;
+          const providerKey = [role, agent, record.tool, result.provider].join("\t");
+          const existingProvider = providerRows.get(providerKey);
+          if (existingProvider) {
+            existingProvider.count += 1;
+            if (result.degraded === true) existingProvider.degraded += 1;
+          } else {
+            providerRows.set(providerKey, { role, agent, tool: record.tool, provider: result.provider, count: 1, degraded: result.degraded === true ? 1 : 0 });
+          }
+        }
+        const hits = typeof result.hitCount === "number" && Number.isFinite(result.hitCount) ? result.hitCount : 0;
+        row.hitsSum += hits;
+        if (hits > row.maxHits) row.maxHits = hits;
+        if (typeof result.durationMs === "number" && Number.isFinite(result.durationMs)) row.durationsMs.push(result.durationMs);
+      }
+    } else if (record.kind === CALL_KIND && record.tool) {
       calls += 1;
+      coverage.calls += 1;
+      if (record.tool === "read") {
+        coverage.readCalls += 1;
+        const retrieval = record.retrieval && typeof record.retrieval === "object" ? record.retrieval : undefined;
+        const hasTarget = (Array.isArray(retrieval?.paths) && retrieval.paths.length > 0) || typeof retrieval?.path === "string";
+        if (hasTarget) coverage.readCallsWithTarget += 1;
+      }
+      if (INDEXED_SEARCH_TOOLS.has(record.tool)) coverage.indexedSearchCalls += 1;
       const toolKey = `${role}\t${agent}\t${record.tool}`;
       const tool = toolCounts.get(toolKey);
       if (tool) tool.count += 1;
@@ -175,12 +226,46 @@ function summarize(records) {
     total: records.length,
     turns,
     calls,
+    coverage,
+    results: [...resultRows.values()]
+      .map((row) => ({ ...row, durationsMs: [...row.durationsMs].sort((a, b) => a - b) }))
+      .sort((left, right) =>
+        left.role.localeCompare(right.role) ||
+        left.agent.localeCompare(right.agent) ||
+        left.tool.localeCompare(right.tool) ||
+        left.resultKind.localeCompare(right.resultKind) ||
+        left.outcome.localeCompare(right.outcome)),
+    providers: [...providerRows.values()].sort((left, right) =>
+      left.role.localeCompare(right.role) ||
+      left.agent.localeCompare(right.agent) ||
+      left.tool.localeCompare(right.tool) ||
+      left.provider.localeCompare(right.provider)),
   };
 }
 
 function format(summary) {
   return [
     `total=${summary.total}\tturns=${summary.turns}\tcalls=${summary.calls}`,
+    `coverage=turns:${summary.coverage.turns}\tcalls:${summary.coverage.calls}\tresults:${summary.coverage.results}\treadCalls:${summary.coverage.readCalls}\treadCallsWithTarget:${summary.coverage.readCallsWithTarget}\tindexedSearchCalls:${summary.coverage.indexedSearchCalls}\tresultsWithProvider:${summary.coverage.resultsWithProvider}`,
+    "role\tagent\ttool\tresultKind\toutcome\tcount\tdegraded\thitsSum\tmaxHits\tp50Ms\tp95Ms\tmaxMs",
+    ...summary.results.map((row) =>
+      [
+        row.role,
+        row.agent,
+        row.tool,
+        row.resultKind,
+        row.outcome,
+        row.count,
+        row.degraded,
+        row.hitsSum,
+        row.maxHits,
+        percentile(row.durationsMs, 0.5) ?? "-",
+        percentile(row.durationsMs, 0.95) ?? "-",
+        row.durationsMs.length ? row.durationsMs[row.durationsMs.length - 1] : "-",
+      ].join("\t"),
+    ),
+    "role\tagent\ttool\tprovider\tcount\tdegraded",
+    ...summary.providers.map((row) => [row.role, row.agent, row.tool, row.provider, row.count, row.degraded].join("\t")),
     "role\tagent\tmodel\ttoolsetHash\tavailable\tused\tunused",
     ...summary.slices.map(
       (slice) =>

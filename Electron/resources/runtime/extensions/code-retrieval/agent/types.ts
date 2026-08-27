@@ -32,6 +32,8 @@ export type RetrievalDetails = {
   hits: Array<Omit<RetrievalHit, "text">>;
   resultsPath: string;
   degraded: boolean;
+  /** Exact-layer provider that actually served indexed hits ("rg" | "tantivy"). */
+  provider?: string;
 };
 
 export type TextContent = { type: "text"; text: string };
@@ -63,9 +65,15 @@ export type SidecarSnapshot = {
   port: number;
   token: string;
   startedAt?: number;
+  /** Actual provider identity advertised by this sidecar; never the bearer token. */
+  provider?: string;
 };
 
 export type SidecarConnection = SidecarSnapshot & {
   refcount?: number;
   ready?: boolean;
+  /** Exact-layer provider this session asked for (settings.ext.code-retrieval.exactProvider). */
+  requestedProvider?: string;
+  /** Set only when a "tantivy" request could not be served by Tantivy itself. */
+  providerFallback?: { requested: string; actual?: string; reason: string };
 };
