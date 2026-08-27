@@ -35,6 +35,7 @@ import {
 	type CloseoutTimelineRecord,
 } from "../closeout-timeline.ts";
 import { DeliveryObligationStore } from "../delivery-obligation.ts";
+import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 
 const MODULE_PATH = new URL("../closeout-timeline.ts", import.meta.url).pathname;
 const SECRET_TOKEN = "sk-ant-api99-real-secret-token";
@@ -44,6 +45,7 @@ const readSrc = (relative: string): string =>
 // One temp project root for the whole file: index.ts snapshots PIPIUI_MAIN_CWD at
 // import, so all later store bindings route under this root (per-sessionId subdir).
 const HARNESS_MAIN_CWD = mkdtempSync(join(tmpdir(), "ct-harness-"));
+scrubSubagentRuntimeTestHostEnvironment();
 process.env.PIPIUI_MAIN_CWD = HARNESS_MAIN_CWD;
 // index.ts also snapshots depth/supervisor/child-invocation vars AT IMPORT. A suite
 // running inside a dispatched-worker host inherits its ambient PIPIUI_* env, which
@@ -58,7 +60,10 @@ delete process.env.PIPIUI_AGENT_RUN_ID;
 delete process.env.PIPIUI_AGENT_ROLE;
 process.env.PIPIUI_NODE_PATH = process.execPath; // worker children re-execute THIS file
 
-after(() => {
+after(async () => {
+	const { drainPipiuiTrackedChildren } = await import("../index.ts");
+	const drained = await drainPipiuiTrackedChildren(250, 2_000);
+	assert.deepEqual(drained.remainingPids, [], "all closeout harness worker children were reaped");
 	setCloseoutTimelineSinkForTests(undefined);
 	rmSync(HARNESS_MAIN_CWD, { recursive: true, force: true });
 });

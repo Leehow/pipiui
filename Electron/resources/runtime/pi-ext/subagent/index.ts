@@ -19,6 +19,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+	ChildProcessTracker,
+	type ChildProcessDrainResult,
+} from "./child-process-tracker.ts";
 import { JSONLChunkScanner, projectToolResultMessageForParent } from "./rpc-stream.ts";
 import {
 	compactFileChangeFromArgs,
@@ -959,29 +963,24 @@ function fanoutLayerActive(): boolean {
 	}
 }
 
-// 跟踪本扩展 spawn 出的子 pi，父进程退出时尽量收割，避免孤儿继续打桥接
-const pipiuiChildProcs = new Set<ReturnType<typeof spawn>>();
+// 跟踪本扩展 spawn 出的子 pi：正常 shutdown 有界 TERM→KILL 并等待收割，
+// process exit 保留不可等待的同步 TERM 兜底。
+const pipiuiChildTracker = new ChildProcessTracker();
 
 function pipiuiTrackChild(proc: ReturnType<typeof spawn>): void {
-	pipiuiChildProcs.add(proc);
-	const done = () => pipiuiChildProcs.delete(proc);
-	proc.on("close", done);
-	proc.on("error", done);
+	pipiuiChildTracker.track(proc);
 }
 
-function pipiuiKillAllChildren(): void {
-	for (const child of pipiuiChildProcs) {
-		try {
-			child.kill("SIGTERM");
-		} catch {
-			/* ignore */
-		}
-	}
+export function drainPipiuiTrackedChildren(
+	graceMs = 2_000,
+	killGraceMs = 2_000,
+): Promise<ChildProcessDrainResult> {
+	return pipiuiChildTracker.drain(graceMs, killGraceMs);
 }
 
 // Only hook `exit` (does not replace Node's default SIGTERM/SIGINT behavior).
 // App-side PiProcess.terminate also SIGTERMs the process tree as a backstop.
-process.on("exit", pipiuiKillAllChildren);
+process.on("exit", () => pipiuiChildTracker.terminateNow("SIGTERM"));
 
 const PIPIUI_REPORT_TIMEOUT_MS = 5000;
 type PipiuiAgentReport = AgentBridgeEventPayloadV1;
@@ -8455,10 +8454,21 @@ export default function (pi: ExtensionAPI) {
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
 	});
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", async () => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
-		void disposeHostSupervisor();
+		// Cancel queued work before draining: otherwise a just-exited child could free a
+		// slot and start the next queued worker while shutdown is already collecting.
+		hostStopQuiet = true;
+		heldRuntimeSignals.length = 0;
+		abortAllRunningAgents();
+		const [, childDrain] = await Promise.all([
+			disposeHostSupervisor(),
+			drainPipiuiTrackedChildren(),
+		]);
+		if (childDrain.remainingPids.length > 0) {
+			console.error(`[pipiui-subagent] session shutdown left child pids=${childDrain.remainingPids.join(",")}`);
+		}
 	});
 	pi.on("context", (event, ctx) => {
 		noteIdleFoldContext(event, ctx);

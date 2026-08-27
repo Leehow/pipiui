@@ -11,15 +11,17 @@
  * the reentry guard at the bottom turns this process into a scripted fake worker whose
  * behavior per agentId comes from a control JSON next to this file.
  */
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 
 // Environment for the extension under test must exist BEFORE importing index.ts: the
 // module reads PIPIUI_AGENT_DEPTH / PIPIUI_MAIN_CWD / PIPIUI_AGENTS_DIR at load time.
+scrubSubagentRuntimeTestHostEnvironment();
 process.env.PIPIUI_AGENT_DEPTH = "0"; // this suite IS the boss (depth 0) regardless of the harness that ran it
 delete process.env.PIPIUI_AGENT_ID;
 delete process.env.PIPIUI_AGENT_RUN_ID;
@@ -143,7 +145,7 @@ process.env.PIPIUI_AGENTS_DIR = agentsDir;
 process.env.PIPIUI_NODE_PATH = process.execPath;
 process.env.PIPIUI_WORKTREE = "0";
 
-const { default: loadExtension } = await import("../index.ts");
+const { default: loadExtension, drainPipiuiTrackedChildren } = await import("../index.ts");
 
 /** Per-test reset: clear retained sessions and any leftover harness files. */
 function setupSuiteEnv() {
@@ -495,7 +497,12 @@ test("abort guidance in model-facing strings always carries runId", async (t) =>
 });
 
 
-// Suite-root teardown: the shared isolated main cwd must not outlive the run.
-process.on("exit", () => {
+// Suite-root teardown: prove every real spawned worker exited before removing its state.
+after(async () => {
+	const drained = await drainPipiuiTrackedChildren(250, 2_000);
+	assert.deepEqual(drained.remainingPids, [], "all dispatch-seam worker children were reaped");
 	rmSync(suiteMainCwd, { recursive: true, force: true });
 });
+
+// Sync fallback for abrupt runner exit; normal completion uses the awaited hook above.
+process.on("exit", () => rmSync(suiteMainCwd, { recursive: true, force: true }));
