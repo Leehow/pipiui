@@ -1,9 +1,0 @@
-{
-  "name": "pipiui-firecrawl-pdf-inspector",
-  "private": true,
-  "version": "1.0.0",
-  "dependencies": {
-    "@firecrawl/pdf-inspector": "1.15.0",
-    "@firecrawl/pdf-inspector-wasm": "1.15.0"
-  }
-}
