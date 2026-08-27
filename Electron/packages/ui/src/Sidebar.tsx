@@ -1,4 +1,4 @@
-import { useMemo, useState, type DragEvent } from 'react'
+import { useMemo, useRef, useState, type DragEvent } from 'react'
 import { ProviderLogo } from './ProviderLogo'
 import { SessionSourceIcon } from './SessionSourceIcon'
 import { adoptedSourceBadge, isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
@@ -60,6 +60,20 @@ function SfIconPencil() {
 function SfIconArchive() {
   return <svg className="sb-sf-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
     <path d="M3 5.5A1.5 1.5 0 0 1 4.5 4h15A1.5 1.5 0 0 1 21 5.5V7a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 7V5.5ZM4 10h16v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 18.5V10Zm5 2a1 1 0 0 0 0 2h6a1 1 0 1 0 0-2H9Z" />
+  </svg>
+}
+
+/** SF Symbols parity sun/moon glyphs for the manual light/dark toggle. */
+function SfIconSun() {
+  return <svg className="sb-sf-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+    <circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none" />
+    <path d="M12 2.6v2.6M12 18.8v2.6M2.6 12h2.6M18.8 12h2.6M5.3 5.3l1.8 1.8M16.9 16.9l1.8 1.8M18.7 5.3l-1.8 1.8M7.1 16.9l-1.8 1.8" />
+  </svg>
+}
+
+function SfIconMoon() {
+  return <svg className="sb-sf-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <path d="M20.9 14.4A9 9 0 0 1 9.6 3.1 9.5 9.5 0 1 0 20.9 14.4Z" />
   </svg>
 }
 
@@ -153,6 +167,10 @@ export interface SidebarProps {
   onOpenComputerUse?: () => void
   onOpenRemote?: () => void
   onOpenSubagentModels?: () => void
+  /** Current resolved mode for the manual theme toggle (drives label + glyph). */
+  theme?: 'light' | 'dark'
+  /** Manual light↔dark switch from the footer; absent hides the control. */
+  onToggleTheme?: () => void
 }
 
 /** Swift parity (SidebarView.SessionRowStatus): distinct caption per status. */
@@ -239,6 +257,11 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   onDrop?: (event: DragEvent, session: SidebarSession) => void
 }) {
   const [renaming, setRenaming] = useState(false)
+  // Touch selects on pointer-down for instant feedback, but the event must stay
+  // uncanceled — preventing its default kills the browser's native panning and
+  // froze the mobile drawer list. The trailing synthetic click is absorbed so a
+  // touch still reports exactly one selection.
+  const touchSelectedId = useRef<string | null>(null)
   const external = isExternalSidebarSource(session.source)
   const source = session.source ?? 'pi'
   const rowLabel = sessionRowLabel(session.title, source, session.adoptedFromSource)
@@ -272,10 +295,17 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       onPointerDown={event => {
         if ((event.pointerType !== 'touch' && event.pointerType !== 'pen') || renaming) return
         if ((event.target as HTMLElement | null)?.closest('button')) return
-        event.preventDefault()
+        touchSelectedId.current = session.id
         onSelect(session.id)
       }}
-      onClick={() => { if (!renaming) onSelect(session.id) }}
+      onClick={() => {
+        if (renaming) return
+        if (touchSelectedId.current === session.id) {
+          touchSelectedId.current = null
+          return
+        }
+        onSelect(session.id)
+      }}
       onKeyDown={event => { if (!renaming && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(session.id) } }}
       onDragStart={event => { if (!external) onDragStart?.(event, session) }}
       onDragEnd={onDragEnd}
@@ -542,11 +572,15 @@ export function Sidebar(props: SidebarProps) {
     onOpenSettings,
     onOpenComputerUse,
     onOpenRemote,
-    onOpenSubagentModels
+    onOpenSubagentModels,
+    theme,
+    onToggleTheme
   } = props
 
   const query = searchQuery.trim().toLowerCase()
   const expanded = useMemo(() => new Set(expandedIds), [expandedIds])
+  // Manual toggle label names the target mode so the accessible name stays accurate.
+  const themeLabel = theme === 'dark' ? '切换到浅色模式' : '切换到深色模式'
 
   // Per-project session shown counts — local state only, never persisted
   // (Swift parity: `sessionsShownByProject`). Defaults to SESSION_LIMIT (10).
@@ -751,12 +785,13 @@ export function Sidebar(props: SidebarProps) {
           </div>
         )}
       </div>
-      {(onOpenSettings || onOpenComputerUse || onOpenRemote || onOpenSubagentModels) && (
+      {(onOpenSettings || onOpenComputerUse || onOpenRemote || onOpenSubagentModels || onToggleTheme) && (
         <footer className="sb-footer" data-testid="sidebar-footer">
           {onOpenSettings && <button type="button" className="sb-footer-btn" aria-label="设置" title="设置" onClick={onOpenSettings}><FooterIcon src={gearIcon} label="设置" ratio={55 / 56} /></button>}
           {onOpenComputerUse && <button type="button" className="sb-footer-btn" aria-label="桌面控制" title="桌面控制" onClick={onOpenComputerUse}><FooterIcon src={desktopIcon} label="桌面控制" ratio={61 / 53} /></button>}
           {onOpenRemote && <button type="button" className="sb-footer-btn" aria-label="远程控制" title="远程控制" onClick={onOpenRemote}><FooterIcon src={qrcodeIcon} label="远程控制" ratio={49 / 49} /></button>}
           {onOpenSubagentModels && <button type="button" className="sb-footer-btn" aria-label="Subagent 模型" title="Subagent 模型" onClick={onOpenSubagentModels}><FooterIcon src={personGroupIcon} label="Subagent 模型" ratio={70 / 49} /></button>}
+          {onToggleTheme && <button type="button" className="sb-footer-btn" data-testid="sidebar-theme-toggle" aria-label={themeLabel} title={themeLabel} onClick={onToggleTheme}>{theme === 'dark' ? <SfIconSun /> : <SfIconMoon />}</button>}
         </footer>
       )}
     </nav>

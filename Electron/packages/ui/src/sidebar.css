@@ -93,6 +93,10 @@
   min-height:0;
   overflow-x:hidden;
   overflow-y:auto;
+  /* Touch viewports: vertical panning + momentum belong to this list alone
+     (the fixed drawer above/below stays pinned). */
+  -webkit-overflow-scrolling:touch;
+  touch-action:pan-y;
   overscroll-behavior:contain;
   padding:2px 8px 10px;
 }
@@ -127,6 +131,8 @@
   -webkit-mask-position:center;
   mask-position:center;
 }
+/* Inline-SVG footer glyph (sun/moon theme toggle) — matches the masked bitmaps. */
+.sb-footer-btn .sb-sf-icon{width:14px;height:14px}
 .sb-footer-btn:hover{background:var(--sb-surface-hover);color:var(--sb-text-strong)}
 .sb-section{margin-top:4px}
 .sb-section-title{

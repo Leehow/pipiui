@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { relativeTime, Sidebar, statusCaption } from './Sidebar'
 import type { SidebarProps, SidebarSession } from './Sidebar'
@@ -620,6 +620,30 @@ describe('Sidebar', () => {
     expect(onOpenSubagentModels).toHaveBeenCalledTimes(1)
   })
 
+  it('shows a manual theme toggle with mode-accurate labels in both states', () => {
+    const onToggleTheme = vi.fn()
+    const props = { ...defaultProps(), theme: 'light' as const, onToggleTheme }
+    const view = render(<Sidebar {...props} />)
+    let toggle = screen.getByTestId('sidebar-theme-toggle')
+    expect(toggle.getAttribute('aria-label')).toBe('切换到深色模式')
+    expect(toggle.getAttribute('title')).toBe('切换到深色模式')
+    expect(toggle.querySelector('svg')).not.toBeNull()
+    fireEvent.click(toggle)
+    expect(onToggleTheme).toHaveBeenCalledTimes(1)
+    // Dark mode flips the accessible name/title to the reverse action.
+    view.rerender(<Sidebar {...props} theme="dark" />)
+    toggle = screen.getByTestId('sidebar-theme-toggle')
+    expect(toggle.getAttribute('aria-label')).toBe('切换到浅色模式')
+    expect(toggle.getAttribute('title')).toBe('切换到浅色模式')
+    fireEvent.click(toggle)
+    expect(onToggleTheme).toHaveBeenCalledTimes(2)
+  })
+
+  it('hides the theme toggle when no handler is wired', () => {
+    render(<Sidebar {...defaultProps({ onOpenSettings: vi.fn() })} />)
+    expect(screen.queryByTestId('sidebar-theme-toggle')).toBeNull()
+  })
+
   it('omits the footer when no settings handler is wired', () => {
     render(<Sidebar {...defaultProps()} />)
     expect(screen.queryByTestId('sidebar-footer')).toBeNull()
@@ -658,6 +682,57 @@ describe('Sidebar', () => {
     expect(css).toMatch(/\.sb-brand-wordmark\{[^}]*position:absolute[^}]*inset:0/)
     expect(css).toMatch(/\.sb-brand-wordmark\{[^}]*justify-content:center/)
     expect(css).toMatch(/\.sb-pane-toggle\{[^}]*-webkit-app-region:no-drag/)
+  })
+
+  it('keeps .sb-scroll as the sole flexible vertical touch-scroll region of the drawer', () => {
+    const css = readFileSync(join(import.meta.dirname, 'sidebar.css'), 'utf8')
+    const scroll = css.match(/\.sb-scroll\{[^}]*\}/)?.[0] ?? ''
+    // The list owns the leftover flex space and is the only region that scrolls.
+    expect(scroll).toMatch(/flex:1 1 auto/)
+    expect(scroll).toMatch(/min-height:0/)
+    expect(scroll).toMatch(/overflow-x:hidden/)
+    expect(scroll).toMatch(/overflow-y:auto/)
+    // Mobile touch contract: vertical pan with momentum, contained so the
+    // gesture never chains into the document behind the fixed drawer.
+    expect(scroll).toMatch(/touch-action:pan-y/)
+    expect(scroll).toMatch(/-webkit-overflow-scrolling:touch/)
+    expect(scroll).toMatch(/overscroll-behavior:contain/)
+    // Topbar and footer stay pinned around it (flex row/column items, no scroll).
+    expect(css).toMatch(/\.sb-topbar\{[^}]*flex:0 0 50px/)
+    expect(css).toMatch(/\.sb-footer\{[^}]*flex:0 0 auto/)
+    // The drawer itself is a plain column — it must not scroll its own content.
+    expect(css).toMatch(/\.sb-root\{[^}]*display:flex[^}]*flex-direction:column[^}]*}/s)
+  })
+
+  it('orders the drawer chrome so topbar/search sit above and footer below the scroll list', () => {
+    const props = defaultProps({ onOpenSettings: vi.fn(), onOpenRemote: vi.fn() })
+    render(<Sidebar {...props} />)
+    const nav = screen.getByTestId('sidebar')
+    const order = [...nav.children].map(el => el.className.split(' ')[0])
+    expect(order.indexOf('sb-topbar')).toBe(0)
+    expect(order).toContain('sb-search')
+    const scrollIdx = order.indexOf('sb-scroll')
+    expect(scrollIdx).toBeGreaterThan(order.indexOf('sb-search'))
+    expect(order[order.length - 1]).toBe('sb-footer')
+  })
+
+  it('selects a session on touch pointer-down without canceling native panning and absorbs the trailing click', () => {
+    const props = defaultProps()
+    render(<Sidebar {...props} />)
+    const row = screen.getByText('s1').closest('.sb-session')!
+    const preventDefault = vi.fn()
+    const down = createEvent.pointerDown(row)
+    Object.defineProperty(down, 'pointerType', { value: 'touch' })
+    Object.defineProperty(down, 'preventDefault', { value: preventDefault })
+    fireEvent(row, down)
+    // Instant selection on touch — but the default action survives so the
+    // browser can still pan .sb-scroll (the mobile drawer scroll fix).
+    expect(preventDefault).not.toHaveBeenCalled()
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+    expect(props.onSelectSession).toHaveBeenCalledWith('s1')
+    // The gesture's synthetic click must not report a second selection.
+    fireEvent.click(row)
+    expect(props.onSelectSession).toHaveBeenCalledTimes(1)
   })
 
   it('hides the status caption and overlays the hover actions on the right corner (Swift parity CSS)', () => {

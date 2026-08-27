@@ -1035,6 +1035,10 @@ describe('PipiUI Electron main layout', () => {
     expect(narrow).toMatch(/\.pipiui-shell\.sidebar-collapsed \.sb-root[^}]*display:none/)
     expect(narrow).toMatch(/\.pipiui-shell\.tools-collapsed \.tool-panel[^}]*display:none/)
     expect(narrow).toContain('.pipiui-shell .resize-handle{visibility:hidden}')
+    // Mobile drawer scroll contract: the drawer overlays from the left edge at
+    // its capped width (no page widening) and the document itself never scrolls.
+    expect(narrow).toMatch(/\.pipiui-shell \.sb-root\{[^}]*left:0/)
+    expect(css).toMatch(/html,body,#root\{width:100%;height:100%;min-width:0;min-height:0;overflow:hidden\}/)
     const hamburger720 = [...css.matchAll(/@media \(max-width:720px\)\{[^\n]*\}/g)].at(-1)?.[0] ?? ''
     expect(css.lastIndexOf('@media (max-width:720px){.electron-chrome .pane-restore-sidebar')).toBeGreaterThan(
       css.lastIndexOf('.electron-chrome .pane-restore-sidebar{left:78px}'),
@@ -1044,6 +1048,98 @@ describe('PipiUI Electron main layout', () => {
     expect(hamburger720).toMatch(/\.electron-chrome\.sidebar-collapsed \.chat-header\{padding-left:54px/)
     expect(hamburger720).toMatch(/\.electron-chrome \.sb-topbar\{[^}]*-webkit-app-region:no-drag/)
     expect(hamburger720).toMatch(/\.electron-chrome \.sb-topbar\{[^}]*padding-left:10px/)
+  })
+
+  it('replaces the desktop vertical float rail with a header-docked horizontal phone bar', () => {
+    const css = readFileSync(join(import.meta.dirname, 'app.css'), 'utf8')
+    // Phone-only block (≤720px): the rail becomes a horizontal bar under the
+    // chat header instead of the tall desktop column, safe-area aware.
+    const phone = css.match(/@media \(max-width:720px\)\{\.tool-quick-rail-float[^\n]*\}/)?.[0] ?? ''
+    expect(phone).toContain('flex-direction:row')
+    expect(phone).toMatch(/top:calc\(60px \+ env\(safe-area-inset-top/)
+    expect(phone).toContain('bottom:auto')
+    // While another pane overlay owns the screen the bar hides entirely
+    // instead of floating above an open drawer.
+    expect(phone).toContain('.pipiui-shell.tools-collapsed:not(.sidebar-collapsed) .tool-quick-rail-float{display:none}')
+    // Touch-sized targets: 44px floating launcher buttons, ≥40px drawer tabs,
+    // both dropping the double-tap-zoom delay for direct manipulation.
+    expect(phone).toContain('touch-action:manipulation')
+    expect(phone).toMatch(/\.tool-quick-rail-float \.tool-rail-button\{width:44px;height:44px;min-height:44px;flex-basis:44px/)
+    expect(phone).toMatch(/\.tool-panel-header \.tool-rail-button\{width:40px;height:40px;min-height:40px;flex-basis:40px/)
+    // The desktop rule keeps its vertical column contract outside that block.
+    const floatRule = [...css.matchAll(/\.tool-quick-rail-float\{[^}]*\}/g)].map(match => match[0]).find(rule => rule.includes('position:fixed')) ?? ''
+    expect(floatRule).toContain('flex-direction:column')
+    expect(floatRule).not.toContain('44px')
+  })
+
+  it('keeps the compact phone rail usable over the chat while panes open as overlays', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    expect(shell.className).toContain('tools-collapsed')
+    // Collapsed tools ship the float rail inside the chat viewport — not a
+    // fixed side pane — and the composer stays mounted and usable.
+    const floatRail = container.querySelector('.chat-viewport .tool-quick-rail')!
+    expect(floatRail.className).toContain('tool-quick-rail-float')
+    expect(screen.getByLabelText('消息输入框')).toBeTruthy()
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(false))
+    // Tapping a tool opens the pane as a full overlay with its own header
+    // tabs; the float launcher unmounts so nothing obscures the overlay.
+    fireEvent.click(screen.getByRole('button', { name: 'Browser' }))
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(shell.className).not.toContain('tools-collapsed')
+    expect(container.querySelector('.chat-viewport .tool-quick-rail')).toBeNull()
+    expect(container.querySelector('.tool-panel-header')!.contains(container.querySelector('.tool-quick-rail'))).toBe(true)
+    // Re-tapping the active tool closes the overlay and restores the bar; the
+    // document never gains scroll: the shell lock stays in place throughout.
+    fireEvent.click(screen.getByRole('button', { name: 'Browser' }))
+    expect(shell.className).toContain('tools-collapsed')
+    expect(container.querySelector('.chat-viewport .tool-quick-rail')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框')).toBeTruthy()
+    vi.unstubAllGlobals()
+  })
+
+  it('phone overlays are mutually exclusive so drawer footer buttons are never covered', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const shell = container.querySelector('.pipiui-shell')!
+    // Regression at 390x844: tools (Subagents) already expanded, then the left
+    // drawer opened — both fixed panes stacked and .tool-panel swallowed taps
+    // aimed at the drawer footer (theme button reported target_obscured).
+    fireEvent.click(screen.getByLabelText('展开右栏'))
+    expect(shell.className).not.toContain('tools-collapsed')
+    const storedBefore = localStorage.getItem('pipiui:eui-pane-widths')
+    fireEvent.click(screen.getByLabelText('展开左栏'))
+    // Opening the drawer must close the tool panel: .sb-root becomes the only
+    // visible overlay, so nothing later in DOM can cover its footer controls.
+    expect(shell.className).not.toContain('sidebar-collapsed')
+    expect(shell.className).toContain('tools-collapsed')
+    const themeButton = screen.getByTestId('sidebar-theme-toggle') as HTMLButtonElement
+    expect(themeButton.disabled).toBe(false)
+    // Hit testing on footer controls works — clicking the theme toggle fires.
+    // The global media stub answers prefers-color-scheme dark=true, so the
+    // app boots dark here; one tap must resolve to light mode.
+    fireEvent.click(themeButton)
+    expect(themeButton.getAttribute('aria-label')).toBe('切换到深色模式')
+    expect(themeButton.getAttribute('title')).toBe('切换到深色模式')
+    expect(container.querySelector('.pipiui-shell')!.getAttribute('data-theme')).toBe('light')
+    // Selecting a tool swaps overlays back: drawer closes, tool pane opens and
+    // receives interaction; transient phone toggles never touch persisted prefs.
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Browser' }) as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByRole('button', { name: 'Browser' }))
+    expect(await screen.findByTestId('browser-panel')).toBeTruthy()
+    expect(shell.className).toContain('sidebar-collapsed')
+    expect(shell.className).not.toContain('tools-collapsed')
+    // Closing stays straightforward: one tap collapses the active overlay.
+    fireEvent.click(screen.getByTestId('toggle-tools'))
+    expect(shell.className).toContain('tools-collapsed')
+    expect(shell.className).toContain('sidebar-collapsed')
+    expect(localStorage.getItem('pipiui:eui-pane-widths')).toBe(storedBefore)
+    vi.unstubAllGlobals()
   })
 
   it('keeps collapsed drag handles in the grid flow instead of removing them', () => {
@@ -1805,6 +1901,60 @@ describe('PipiUI Electron main layout', () => {
     listener?.({ matches: true } as MediaQueryListEvent)
     await waitFor(() => expect(container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('dark'))
     vi.unstubAllGlobals()
+  })
+
+  it('starts from the system-resolved dark theme when no manual preference is stored', async () => {
+    window.localStorage.removeItem('pipiui.theme')
+    try {
+      vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: true, media: '(prefers-color-scheme: dark)', onchange: null, addEventListener: () => undefined, removeEventListener: () => undefined, addListener: () => undefined, removeListener: () => undefined, dispatchEvent: () => true } as MediaQueryList)))
+      const { container } = render(<App host={createMockHost()} />)
+      await screen.findAllByText('Electron 三栏界面')
+      expect(container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('dark')
+      expect(window.localStorage.getItem('pipiui.theme')).toBeNull()
+    } finally {
+      window.localStorage.removeItem('pipiui.theme')
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('switches theme from the sidebar footer toggle, persists it, and keeps it over later system flips', async () => {
+    let listener: ((event: MediaQueryListEvent) => void) | undefined
+    const media = { matches: false, media: '(prefers-color-scheme: dark)', onchange: null, addEventListener: (_: string, callback: (event: MediaQueryListEvent) => void) => { listener = callback }, removeEventListener: () => undefined, addListener: () => undefined, removeListener: () => undefined, dispatchEvent: () => true } as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    window.localStorage.removeItem('pipiui.theme')
+    try {
+      const view = render(<App host={createMockHost()} />)
+      await screen.findAllByText('Electron 三栏界面')
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+      // Toggle ON: switches immediately, renames to the reverse action, stores the choice.
+      let toggle = screen.getByTestId('sidebar-theme-toggle')
+      expect(toggle.getAttribute('aria-label')).toBe('切换到深色模式')
+      fireEvent.click(toggle)
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('dark')
+      toggle = screen.getByTestId('sidebar-theme-toggle')
+      expect(toggle.getAttribute('aria-label')).toBe('切换到浅色模式')
+      expect(toggle.getAttribute('title')).toBe('切换到浅色模式')
+      expect(window.localStorage.getItem('pipiui.theme')).toBe('dark')
+      // Toggle OFF, then force the system to resolve dark: the manual light
+      // choice must win over the conflicting system resolution.
+      fireEvent.click(screen.getByTestId('sidebar-theme-toggle'))
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+      expect(window.localStorage.getItem('pipiui.theme')).toBe('light')
+      Object.defineProperty(media, 'matches', { value: true, configurable: true })
+      listener?.({ matches: true } as MediaQueryListEvent)
+      // Give any wrongly-following update a chance to land before asserting no-op.
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+      // Remount (reload parity): the persisted choice restores and keeps beating
+      // the still-dark system resolution.
+      view.unmount()
+      const remount = render(<App host={createMockHost()} />)
+      await screen.findAllByText('Electron 三栏界面')
+      expect(remount.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+    } finally {
+      window.localStorage.removeItem('pipiui.theme')
+      vi.unstubAllGlobals()
+    }
   })
 
   it('mounts the standalone Sidebar without old blue-dot rows and maps the selected model', async () => {

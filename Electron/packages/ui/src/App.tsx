@@ -955,16 +955,38 @@ export function isElectronChrome(): boolean {
   return typeof navigator !== 'undefined' && /Electron/.test(navigator.userAgent)
 }
 
-function useSystemTheme() {
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+/** localStorage key for the manual light/dark choice. A stored value means the
+ *  user toggled explicitly; it keeps winning over `prefers-color-scheme` on reload. */
+const THEME_STORAGE_KEY = 'pipiui.theme'
+
+function readStoredTheme(): 'light' | 'dark' | null {
+  try {
+    const stored = window.localStorage?.getItem(THEME_STORAGE_KEY)
+    return stored === 'light' || stored === 'dark' ? stored : null
+  } catch {
+    return null
+  }
+}
+
+/** Resolved shell theme: an explicit sidebar toggle persists locally and wins;
+ *  with no stored choice the shell follows `prefers-color-scheme` live. */
+function useShellTheme(): { theme: 'light' | 'dark'; toggleTheme: () => void } {
+  const [manual, setManual] = useState<'light' | 'dark' | null>(readStoredTheme)
+  const [system, setSystem] = useState<'light' | 'dark'>(() => window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
   useEffect(() => {
     const media = window.matchMedia?.('(prefers-color-scheme: dark)')
     if (!media) return
-    const update = () => setTheme(media.matches ? 'dark' : 'light')
+    const update = () => setSystem(media.matches ? 'dark' : 'light')
     update(); media.addEventListener?.('change', update)
     return () => media.removeEventListener?.('change', update)
   }, [])
-  return theme
+  const setManualTheme = useCallback((value: 'light' | 'dark') => {
+    setManual(value)
+    try { window.localStorage?.setItem(THEME_STORAGE_KEY, value) } catch { /* storage unavailable: keep the in-memory choice */ }
+  }, [])
+  const theme = manual ?? system
+  const toggleTheme = useCallback(() => setManualTheme(theme === 'dark' ? 'light' : 'dark'), [theme, setManualTheme])
+  return { theme, toggleTheme }
 }
 
 /** Swift parity: below 720pt the sidebar collapses and the right pane becomes an overlay. */
@@ -1010,7 +1032,7 @@ function retainReceiptOptimisticUser(
 }
 
 export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
-  const theme = useSystemTheme()
+  const { theme, toggleTheme } = useShellTheme()
   // Do not allocate a default mock during every render: its changing identity
   // re-ran all host effects on each composer keystroke.
   const mockHost = useRef<PipiHostAPI>()
@@ -3019,15 +3041,20 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     window.addEventListener('pointerup', done)
   }
   const toggleSidebar = () => {
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, sidebar: !current.sidebar }))
+    // Phone overlays are mutually exclusive (≤720px): opening the drawer must
+    // close the tool panel, otherwise both fixed panes stack and the
+    // later-in-DOM .tool-panel swallows taps meant for drawer footer buttons.
+    // Only narrowPanes changes here — persisted widths.* desktop preferences
+    // are separate state and stay untouched by transient phone interactions.
+    if (narrowViewport) setNarrowPanes(current => ({ sidebar: !current.sidebar, tools: false }))
     else setWidths(current => ({ ...current, sidebarCollapsed: !current.sidebarCollapsed }))
   }
   const toggleTools = () => {
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: !current.tools }))
+    if (narrowViewport) setNarrowPanes(current => ({ sidebar: false, tools: !current.tools }))
     else setWidths(current => ({ ...current, toolsCollapsed: !current.toolsCollapsed }))
   }
   const expandTools = useCallback(() => {
-    if (narrowViewport) setNarrowPanes(current => ({ ...current, tools: true }))
+    if (narrowViewport) setNarrowPanes(current => ({ sidebar: false, tools: true }))
     else setWidths(current => current.toolsCollapsed ? { ...current, toolsCollapsed: false } : current)
   }, [narrowViewport])
   const navigateTool = useCallback((tab: PanelTab) => {
@@ -3120,7 +3147,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     : widths.tools
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
     {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} />
+    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} theme={theme} onToggleTheme={toggleTheme} />
     <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
       <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} canAdoptExternal={Boolean(isExternalSelected && host.adoptExternalSession && selectedExternalSession && externalSessionLooksAdoptable(selectedExternalSession) && externalAdoptableById[selectedSession] !== false)} adoptDisabledReason={isExternalSelected && selectedExternalSession && !externalSessionLooksAdoptable(selectedExternalSession) ? '此外部会话只有元数据，没有可导入的正文' : isExternalSelected && externalAdoptableById[selectedSession] === false ? '此外部会话没有可导入的正文' : undefined} adopting={adoptingExternalId === selectedSession} adoptError={adoptError} onDismissAdoptError={() => setAdoptError(null)} onAdoptExternal={() => void adoptExternalSession()} onViewOriginal={headerSession?.adoptedFrom ? () => viewOriginalExternalSession(headerSession.id) : undefined} />
