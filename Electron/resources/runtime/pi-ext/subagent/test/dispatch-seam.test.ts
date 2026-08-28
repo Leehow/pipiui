@@ -35,9 +35,8 @@ delete process.env.PIPIUI_AGENT_RUN_ID;
  * The hang mode keeps a referenced keepalive with a bounded hard exit so a leaked child
  * cannot hold the test process open.
  */
-async function runFakeWorkerChild(): Promise<never> {
+async function runFakeWorkerChild(prompt = process.argv[process.argv.length - 1] ?? "", rpcCommandId?: string): Promise<never> {
 	const argv = process.argv;
-	const prompt = argv[argv.length - 1] ?? "";
 	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
 	const fromSession = sessionIdArg.replace(/^pipiui-/, "");
 	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z]+))?\]/);
@@ -45,6 +44,7 @@ async function runFakeWorkerChild(): Promise<never> {
 	const mode = marker?.[2] ?? "ok";
 	const line = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
 	line({ type: "session_start", cwd: process.cwd() });
+	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
 	if (mode === "hang") {
 		// Referenced keepalive: the test aborts this run via subagent_abort exact-run
 		// binding; the hard cap bounds a leaked child's lifetime.
@@ -72,12 +72,33 @@ async function runFakeWorkerChild(): Promise<never> {
 	process.exit(0);
 }
 
+async function runFakeRpcWorkerChild(): Promise<never> {
+	let buffer = "";
+	process.stdin.on("data", (chunk) => {
+		buffer += String(chunk);
+		const newline = buffer.indexOf("\n");
+		if (newline < 0) return;
+		const line = buffer.slice(0, newline);
+		buffer = buffer.slice(newline + 1);
+		try {
+			const command = JSON.parse(line) as { id?: string; type?: string; message?: string };
+			if (command.type === "prompt") void runFakeWorkerChild(command.message ?? "", command.id);
+		} catch {
+			process.exit(2);
+		}
+	});
+	await new Promise<never>(() => {});
+}
+
 if (
 	process.argv.includes("-p")
 	&& process.argv.includes("--mode")
 	&& process.argv.includes("json")
 ) {
 	await runFakeWorkerChild();
+}
+if (process.argv.includes("--mode") && process.argv.includes("rpc")) {
+	await runFakeRpcWorkerChild();
 }
 
 import { sanitizeStrictToolArguments } from "../strict-json-schema.ts";

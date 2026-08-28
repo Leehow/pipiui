@@ -14,7 +14,7 @@ import {
 	decideStallWatchdogAction,
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
-import { createProviderWaitController, decideProviderStallRecovery, providerWaitDeadlineMs } from "../index.ts";
+import { createProviderWaitController, decideProviderStallRecovery, fanoutLayerActive, providerWaitDeadlineMs } from "../index.ts";
 import { classifyInsideWorkTree, resolveSubagentWorktree } from "../worktree.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
@@ -179,7 +179,7 @@ test("runtime budget expiry reads subtree CPU evidence so a delegating worker su
 
 test("fan-out treats a one-step chain as background and keeps multi-step chain synchronous", () => {
 	assert.deepEqual(
-		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 1, fanoutActive: true }),
+		decideDispatchBackground({ isChain: true, chainLength: 1, fanoutActive: true }),
 		{
 			useBackground: true,
 			warning:
@@ -187,16 +187,15 @@ test("fan-out treats a one-step chain as background and keeps multi-step chain s
 		},
 	);
 	assert.equal(
-		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 2, fanoutActive: true }).useBackground,
+		decideDispatchBackground({ isChain: true, chainLength: 2, fanoutActive: true }).useBackground,
 		false,
 	);
 	assert.equal(
-		decideDispatchBackground({ depth: 0, isChain: true, chainLength: 1, fanoutActive: false }).useBackground,
+		decideDispatchBackground({ isChain: true, chainLength: 1, fanoutActive: false }).useBackground,
 		false,
 	);
 	assert.equal(
 		decideDispatchBackground({
-			depth: 0,
 			isChain: false,
 			chainLength: 0,
 			fanoutActive: true,
@@ -206,7 +205,6 @@ test("fan-out treats a one-step chain as background and keeps multi-step chain s
 	);
 	assert.match(
 		decideDispatchBackground({
-			depth: 0,
 			isChain: false,
 			chainLength: 0,
 			fanoutActive: true,
@@ -216,7 +214,6 @@ test("fan-out treats a one-step chain as background and keeps multi-step chain s
 	);
 	assert.doesNotMatch(
 		decideDispatchBackground({
-			depth: 0,
 			isChain: false,
 			chainLength: 0,
 			fanoutActive: true,
@@ -224,6 +221,115 @@ test("fan-out treats a one-step chain as background and keeps multi-step chain s
 		}).warning,
 		/Use chain if you genuinely need ordered synchronous steps/,
 	);
+});
+
+test("nested dispatch backgrounds exactly like the Boss; warnings never blame depth", () => {
+	// Default at any permitted depth: a single dispatch returns a receipt instead of
+	// blocking the caller's tool call — the nested fan-out fix.
+	assert.deepEqual(
+		decideDispatchBackground({ isChain: false, chainLength: 0, fanoutActive: false }),
+		{ useBackground: true, warning: "" },
+	);
+	// Explicit background:true is honored, not warned away as "ignored at nested depth".
+	assert.deepEqual(
+		decideDispatchBackground({ isChain: false, chainLength: 0, fanoutActive: false, requestedBackground: true }),
+		{ useBackground: true, warning: "" },
+	);
+	// Fan-out active: background:false is not a synchronous-wait hatch at any depth.
+	const forced = decideDispatchBackground({ isChain: false, chainLength: 0, fanoutActive: true, requestedBackground: false });
+	assert.equal(forced.useBackground, true);
+	assert.match(forced.warning, /background:false ignored/);
+	assert.doesNotMatch(forced.warning, /nested|depth/);
+	// A one-step chain is fan-out work, not ordered work: background even nested.
+	assert.equal(
+		decideDispatchBackground({ isChain: true, chainLength: 1, fanoutActive: true }).useBackground,
+		true,
+	);
+	// Multi-step chains stay synchronous so {previous} can be substituted — no fan-out override.
+	assert.deepEqual(
+		decideDispatchBackground({ isChain: true, chainLength: 2, fanoutActive: true }),
+		{ useBackground: false, warning: "" },
+	);
+	// background:true on a multi-step chain is still ignored, and the warning names the
+	// chain — never "nested depth" — as the reason.
+	const chainBg = decideDispatchBackground({ isChain: true, chainLength: 3, fanoutActive: false, requestedBackground: true });
+	assert.equal(chainBg.useBackground, false);
+	assert.match(chainBg.warning, /background:true ignored/);
+	assert.match(chainBg.warning, /multi-step chain runs synchronously/);
+	assert.doesNotMatch(chainBg.warning, /nested|depth/);
+});
+
+test("nested workers inherit the fan-out invariant through the environment and re-stamp their children", (t) => {
+	// The philosophy fan-out layer is main-scoped, so a dispatched worker's own pid-scoped
+	// state file never lists it. The propagation seam is the env marker the parent stamps at
+	// spawn; the decision below is the exact wiring call, not a hand-fed policy input.
+	const previous = process.env.PIPIUI_FANOUT_ACTIVE;
+	t.after(() => {
+		if (previous === undefined) delete process.env.PIPIUI_FANOUT_ACTIVE;
+		else process.env.PIPIUI_FANOUT_ACTIVE = previous;
+	});
+
+	// Neither source active (fan-out off): explicit background:false stays synchronous —
+	// the Boss-compatible semantics must survive the propagation fix.
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	assert.equal(fanoutLayerActive(), false);
+	assert.equal(
+		decideDispatchBackground({ isChain: false, chainLength: 0, fanoutActive: fanoutLayerActive(), requestedBackground: false }).useBackground,
+		false,
+	);
+
+	// The inherited marker: the worker situation the first fix missed — no local layer,
+	// but a fan-out-active Boss stamped its resolved state into this process's env. The
+	// effective value must force background:false in the worker's own dispatch decision.
+	process.env.PIPIUI_FANOUT_ACTIVE = "1";
+	assert.equal(fanoutLayerActive(), true);
+	const forced = decideDispatchBackground({
+		isChain: false,
+		chainLength: 0,
+		fanoutActive: fanoutLayerActive(),
+		requestedBackground: false,
+	});
+	assert.equal(forced.useBackground, true);
+	assert.match(forced.warning, /background:false ignored/);
+
+	// Main-side source still works: a live philosophy state for THIS pid carries the layer
+	// even without an inherited marker ("0" is not "1", so only the file can activate).
+	process.env.PIPIUI_FANOUT_ACTIVE = "0";
+	const statePath = join(tmpdir(), `pipi-philosophy-${process.pid}.json`);
+	writeFileSync(statePath, JSON.stringify({ pid: process.pid, layers: ["fanout"], at: Date.now() }));
+	t.after(() => rmSync(statePath, { force: true }));
+	assert.equal(fanoutLayerActive(), true);
+});
+
+test("the fan-out invariant rides the spawned child env and stays decision-wired", () => {
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	// Reader: the inherited marker short-circuits before the pid-scoped philosophy state.
+	const fnStart = source.indexOf("export function fanoutLayerActive()");
+	assert.ok(fnStart >= 0, "fanoutLayerActive must stay exported for this seam");
+	const fn = source.slice(fnStart, source.indexOf("try {", fnStart));
+	assert.match(fn, /process\.env\.PIPIUI_FANOUT_ACTIVE === "1"/);
+	// Writer: every dispatched child's env carries the parent's resolved state, recomputed
+	// from the same effective value so a grandchild inherits transitively.
+	const writer = '...(fanoutLayerActive() ? { PIPIUI_FANOUT_ACTIVE: "1" } : {})';
+	assert.ok(source.includes(writer), "spawn env must stamp the inherited marker");
+	const envIdx = source.indexOf("const childEnvironmentInput = {");
+	assert.ok(envIdx >= 0 && source.indexOf(writer) > envIdx, "the stamp must live in childEnvironmentInput");
+	// And the dispatch decision keeps reading the effective value (not depth, not a constant).
+	assert.match(source, /fanoutActive: fanoutLayerActive\(\)/);
+});
+
+test("the dispatch wiring consults background policy without a depth gate", () => {
+	// Regression: the policy used to hard-code `input.depth === 0`, making every nested
+	// dispatch a synchronous wait. The caller must hand the decision only mode/fan-out/
+	// request — depth permission is the separate rejectDispatchAtDepth guard.
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	const callStart = source.indexOf("decideDispatchBackground({");
+	const callEnd = source.indexOf("requestedBackground: params.background,", callStart);
+	assert.ok(callStart >= 0 && callEnd > callStart, "decideDispatchBackground call site not found");
+	const callSite = source.slice(callStart, callEnd);
+	assert.doesNotMatch(callSite, /depth/i);
+	assert.match(callSite, /isChain/);
+	assert.match(callSite, /fanoutActive: fanoutLayerActive\(\)/);
 });
 
 test("stall watchdog aborts a sync wait and an unanswered background stall", () => {
@@ -384,6 +490,17 @@ test("provider wait deadline covers initial wait and mid-stream silence, never t
 		"running-tool",
 		"awaiting-model",
 	]);
+
+	// A resident RPC parent may be settled while its accepted descendants run.
+	// This is neither a provider wait nor a tool phase: suspend only that idle
+	// deadline, then re-arm it when the next real parent turn starts.
+	s = make();
+	s.controller.suspendForResidentIdle();
+	assert.equal(s.controller.phase(), "resident-idle");
+	assert.equal(s.timers.size, 0, "resident idle must not trip provider timeout");
+	s.controller.resumeFromResidentIdle();
+	assert.equal(s.controller.phase(), "model-active");
+	assert.equal(s.timers.size, 1, "the next parent turn restores provider protection");
 
 	// Assistant output mid-tool-run (out-of-order delta) wins the phase race,
 	// clears the pending batch, and re-arms: a late tool result must not arm a

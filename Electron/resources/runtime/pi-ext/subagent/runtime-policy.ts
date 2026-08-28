@@ -84,23 +84,30 @@ export type StallWatchdogAction = "ignore" | "notify" | "abort";
  * Fan-out makes background a runtime invariant. A one-step chain is not ordered
  * work, so it must not be a synchronous wait hatch. Multi-step chains still
  * run synchronously so `{previous}` can be substituted.
+ *
+ * Depth is deliberately not an input: every dispatch that already passed the
+ * depth/type guards — Boss or nested worker alike — follows the same rule.
+ * Single/parallel default to background, an explicit `background:true` is
+ * honored, and an active fan-out layer forces background on every non-ordered
+ * dispatch so `background:false` can never become a synchronous-wait hatch. A
+ * nested worker that returns a dispatch receipt instead of blocking its own
+ * tool call is what makes real fan-out trees possible.
  */
 export function decideDispatchBackground(input: {
-	depth: number;
 	isChain: boolean;
 	chainLength: number;
 	fanoutActive: boolean;
 	requestedBackground?: boolean;
 }): { useBackground: boolean; warning: string } {
 	const orderedChain = input.isChain && input.chainLength > 1;
-	const forcedBackground = input.depth === 0 && input.fanoutActive && !orderedChain;
-	const defaultBackground = input.depth === 0 && !input.isChain;
+	const forcedBackground = input.fanoutActive && !orderedChain;
+	const defaultBackground = !input.isChain;
 	const wantBg = forcedBackground || (input.requestedBackground ?? defaultBackground);
-	const useBackground = Boolean(wantBg && !orderedChain && input.depth === 0);
+	const useBackground = Boolean(wantBg && !orderedChain);
 	let warning = "";
-	if (input.requestedBackground === true && (input.depth > 0 || orderedChain)) {
+	if (input.requestedBackground === true && orderedChain) {
 		warning =
-			"Warning: background:true ignored (nested depth>0 or multi-step chain always runs synchronously).\n\n";
+			"Warning: background:true ignored (a multi-step chain runs synchronously so {previous} can be substituted).\n\n";
 	} else if (input.requestedBackground === false && forcedBackground) {
 		warning =
 			"Warning: background:false ignored — the fan-out philosophy layer is active, and it requires dispatch to stay asynchronous. A one-step chain is not ordered work. Do not wait here: keep dispatching independent work, then read [subagent-done]. Use a multi-step chain or blockedBy for genuine dependencies, or turn off the 瀑布流 layer in Settings.\n\n";

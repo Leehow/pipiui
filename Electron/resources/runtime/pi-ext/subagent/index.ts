@@ -157,6 +157,11 @@ import {
 	completionPersistenceState,
 	queueCompletionAfterCutIn,
 } from "./completion-notification.ts";
+import { NestedBackgroundLifecycle } from "./nested-background-lifecycle.ts";
+import {
+	createResidentRpcShutdownWaker,
+	residentRpcShutdownWakeStatusKey,
+} from "./resident-rpc-wake.ts";
 import {
 	createFileSupervisorStateStore,
 	createHostSupervisorDelivery,
@@ -775,6 +780,11 @@ function isolatedComputerWorkerChildProcessEnv(
 // 当前进程在 agent 树里的身份：主会话 depth=0，被派出的 subagent 由父进程注入
 const PIPIUI_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_DEPTH || "0", 10);
 const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
+// Only a spawned worker that can itself delegate uses the resident RPC lifecycle.
+// Leaf workers stay on the established one-shot JSON print path.
+const PIPIUI_NESTED_RPC_PARENT = process.env.PIPIUI_NESTED_RPC_PARENT === "1";
+/** Attempt-private transport token; never enters a prompt, report, or persisted state. */
+const PIPIUI_RESIDENT_RPC_WAKE_TOKEN = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN || undefined;
 // App-owned authoritative session root. Nested agents inherit it even when their own
 // process cwd is an isolated worktree.
 const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
@@ -952,7 +962,7 @@ function memoryBrokerExtensionPathForChild(
 const PHILOSOPHY_STATE = path.join(os.tmpdir(), `pipi-philosophy-${process.pid}.json`);
 
 /**
- * Is the fan-out philosophy layer live in this very process?
+ * Is the fan-out invariant in effect for this process?
  *
  * That layer's premise is that workers run in the background and report through signals — a
  * boss that blocks on each dispatch is running a fake fan-out. So while the layer is on,
@@ -960,11 +970,21 @@ const PHILOSOPHY_STATE = path.join(os.tmpdir(), `pipi-philosophy-${process.pid}.
  * the depth guard. The guard has to live here rather than in the prompt: session history shows
  * models passing background:false regardless of what the system prompt says.
  *
+ * The layer itself is main-scoped (its prompt content addresses the boss), so a dispatched
+ * worker's own state file never lists it — but the invariant must hold at every permitted
+ * depth, or a nested `background:false` would stay a synchronous wait. The parent therefore
+ * stamps its resolved state into every dispatched child's env (`PIPIUI_FANOUT_ACTIVE`, see
+ * childEnvironmentInput), and each worker re-derives this function from it and re-stamps its
+ * own children, so the invariant travels the whole delegation tree.
+ *
  * Read fresh per call, so a Settings toggle applies from the next turn without a restart. No
- * state file means the philosophy is not loaded here, and the old caller-decides behaviour
- * stands.
+ * state file and no inherited marker means the philosophy is not loaded here, and the old
+ * caller-decides behaviour stands.
  */
-function fanoutLayerActive(): boolean {
+export function fanoutLayerActive(): boolean {
+	// Inherited from a fan-out-active parent: authoritative even though a worker's own
+	// pid-scoped state file will never list the main-scoped layer.
+	if (process.env.PIPIUI_FANOUT_ACTIVE === "1") return true;
 	try {
 		const state = JSON.parse(fs.readFileSync(PHILOSOPHY_STATE, "utf-8")) as {
 			pid?: number;
@@ -2331,7 +2351,7 @@ export function providerWaitDeadlineMs(env: Record<string, string | undefined> =
 		: PROVIDER_WAIT_TIMEOUT_MS_DEFAULT;
 }
 
-type ProviderWaitPhase = "model-active" | "running-tool" | "awaiting-model";
+type ProviderWaitPhase = "model-active" | "running-tool" | "awaiting-model" | "resident-idle";
 type ProviderWaitTimer = ReturnType<typeof setTimeout>;
 
 /**
@@ -2400,11 +2420,23 @@ export function createProviderWaitController(options: {
 		},
 		dispose: clearTimer,
 		phase: () => currentPhase,
+		suspendForResidentIdle() {
+			clearTimer();
+			pending.clear();
+			setPhase("resident-idle");
+		},
+		resumeFromResidentIdle() {
+			if (currentPhase !== "resident-idle") return;
+			setPhase("model-active");
+			armDeadline();
+		},
 		activity: () => currentPhase === "awaiting-model"
 			? `工具结果已返回，等待 ${options.model || "model"} 响应…`
 			: currentPhase === "model-active"
 				? `等待 ${options.model || "model"} 流式输出超时（连接无新增数据）…`
-				: "",
+				: currentPhase === "resident-idle"
+					? "resident RPC parent is idle while accepted descendants run"
+					: "",
 	};
 }
 
@@ -2636,6 +2668,8 @@ interface RunningAgentHandle {
 	readOnly?: boolean;
 	/** True when the boss turn is awaiting this worker inline (chain / sync dispatch). */
 	syncWait?: boolean;
+	/** A recursive RPC parent settled an assistant turn and is legally waiting for descendants. */
+	residentIdleWait?: boolean;
 	/**
 	 * Set when the worker's last stdout was an assistant message that asked for tools, i.e.
 	 * the silence that follows is the tools running. Without this the stall detector cannot
@@ -2925,7 +2959,9 @@ function formatJobStateWithStall(job: JobRecord, now: number): string {
 	if (job.state !== "running") {
 		return isHandledJob(job) ? `${job.state} (resolved/handled)` : job.state;
 	}
-	if (handleForRun(job.agentId, job.runId)?.finalizing) return "finalizing";
+	const live = handleForRun(job.agentId, job.runId);
+	if (live?.finalizing) return "finalizing";
+	if (live?.residentIdleWait) return "running (resident RPC waiting for descendants)";
 	const info = stalledInfoFor(job.agentId, now);
 	if (info.stalled) {
 		const why = info.inTool
@@ -2942,6 +2978,7 @@ function formatJobStateWithStall(job: JobRecord, now: number): string {
 /** Compact state tag for a heartbeat worker line; the verbose status view keeps idle detail. */
 function formatHeartbeatWorkerState(agentId: string, handle: RunningAgentHandle, now: number): string {
 	if (handle.finalizing) return "finalizing";
+	if (handle.residentIdleWait) return "resident-idle(descendants)";
 	const job = jobRegistry.get(agentId);
 	if (!job || job.runId !== handle.runId || job.state === "running") {
 		const info = stalledInfoFor(agentId, now);
@@ -3063,6 +3100,7 @@ function abortRunningAgent(
 		// Accepted-but-unstarted work owns an id reservation; dropping it must give the id
 		// back — and re-evaluate the queue, so dependents of this id are re-admitted or held
 		// against its true post-cancel state instead of waiting on the stale reservation.
+		noteResidentDescendantTerminal(agentId, runId, false);
 		releaseAgentReservation(agentId);
 		return {
 			ok: true,
@@ -3500,6 +3538,10 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 				: "none",
 		});
 	}
+	// A registered resident descendant releases only through this exact run's terminal
+	// boundary. Successful/failed results still retain a completion obligation until
+	// its custom follow-up has a final assistant response; abort has no done wake.
+	noteResidentDescendantTerminal(agentId, runId, fields.state !== "aborted");
 	// A freed slot may admit a queued worker, and a satisfied dependency may release one.
 	dispatchQueue.onAgentTerminal(agentId);
 	return true;
@@ -5116,6 +5158,37 @@ interface PendingDoneEntry {
 const pendingDone = new Map<string, PendingDoneEntry>();
 let pendingDoneSettledRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let doneDeliveryStore: DeliveryObligationStore | undefined;
+/** Present only in a recursive nested RPC worker; its descendants own this process lease. */
+let nestedBackgroundLifecycle: NestedBackgroundLifecycle | undefined;
+/** Bound at session start, then called from every exact lease/obligation transition. */
+let residentParentShutdown: (() => void) | undefined;
+
+function maybeShutdownResidentParent(): void {
+	if (!nestedBackgroundLifecycle?.shouldShutdown()) return;
+	nestedBackgroundLifecycle.markShutdownRequested();
+	residentParentShutdown?.();
+}
+
+function registerResidentDescendant(agentId: string, runId: string): void {
+	nestedBackgroundLifecycle?.register(agentId, runId);
+}
+
+function noteResidentDescendantTerminal(agentId: string | undefined, runId: string | undefined, completionRequired: boolean): void {
+	if (!agentId || !runId) return;
+	nestedBackgroundLifecycle?.noteTerminal(agentId, runId, completionRequired);
+}
+
+function noteResidentDeliveryExhausted(agentId: string, runId: string, obligationId: string): void {
+	const job = jobRegistry.get(agentId);
+	if (job?.runId === runId && job.state !== "aborted") {
+		job.state = "failed";
+		job.endedAt = Date.now();
+		const failure = `[pipiui] completion delivery exhausted (obligationId=${obligationId}); parent follow-up was never consumed.`;
+		job.resultText = job.resultText ? `${job.resultText}\n${failure}` : failure;
+		dispatchQueue.onAgentTerminal(agentId);
+	}
+	nestedBackgroundLifecycle?.noteDeliveryExhausted(agentId, runId);
+}
 
 /**
  * An entry leaving the map while its delivery is still held must not leave a dangling
@@ -5475,6 +5548,7 @@ function sendDoneWithConfirmation(
 		if (!queued && settled.attempts >= DONE_MAX_ATTEMPTS) {
 			clearDoneHoldOnForget(entry);
 			pendingDone.delete(obligation.id);
+			noteResidentDeliveryExhausted(obligation.agentId, obligation.runId, obligation.id);
 			console.error(
 				`[pipiui-subagent] giving up done delivery after ${settled.attempts} attempts: ${settled.agentId}`,
 			);
@@ -5582,7 +5656,9 @@ function reconcilePersistedDone(piSessionId: string, branch: readonly unknown[])
 
 /** Bind persistence to Pi's durable session identity, then restore delivery only (not execution). */
 function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, activeBranch: readonly unknown[]): void {
-	if (!PIPIUI_MAIN_CWD || PIPIUI_DEPTH !== 0 || !piSessionId) return;
+	// Bosses and resident nested RPC parents both need durable, exact completion
+	// observations. Ordinary one-shot workers cannot outlive a future completion.
+	if (!PIPIUI_MAIN_CWD || (!PIPIUI_NESTED_RPC_PARENT && PIPIUI_DEPTH !== 0) || !piSessionId) return;
 	if (doneDeliveryPiSessionId === piSessionId && doneDeliveryStore) {
 		reconcilePersistedDone(piSessionId, activeBranch);
 		return;
@@ -5984,6 +6060,10 @@ function notifySubagentDone(
 	const runId = terminalAgentId
 		? (result.runId ?? terminalRunId ?? jobRegistry.get(terminalAgentId)?.runId ?? DeliveryObligationStore.runId())
 		: undefined;
+	// A resident parent observes the exact terminal before completion delivery. A
+	// normal result remains leased until the follow-up is actually consumed; an
+	// abort has no [subagent-done] wake by existing contract and releases directly.
+	if (terminalAgentId && runId) nestedBackgroundLifecycle?.noteTerminal(terminalAgentId, runId, !aborted);
 	if (aborted) {
 		if (terminalAgentId && runId && supervisorAbortTerminalCloseout) {
 			const text = `[subagent-aborted] agentId=${terminalAgentId} runId=${runId}; this exact run reached aborted terminal state.`;
@@ -6657,7 +6737,11 @@ async function runSingleAgent(
 	if (sessionDir && resumingSession && placement.worktreePath) {
 		alignResumedSessionCwd(sessionDir, sessionId, spawnCwd);
 	}
-	const args: string[] = ["--mode", "json", "-p"];
+	// A depth>0 worker that still receives delegation tools may return an immediate
+	// background receipt. It must remain resident long enough to consume its child's
+	// completion follow-up; Pi RPC is the supported stdin/stdout lifecycle for that.
+	const useNestedRpc = childDepth > 0 && allowRecursiveDelegation;
+	const args: string[] = useNestedRpc ? ["--mode", "rpc"] : ["--mode", "json", "-p"];
 	if (sessionDir) {
 		args.push("--session-id", sessionId, "--session-dir", sessionDir);
 	} else {
@@ -6975,7 +7059,9 @@ async function runSingleAgent(
 				? `awaiting model response (${currentResult.model || resolvedModel || agentName})`
 				: runtimeProviderPhase === "running-tool"
 					? `running tool${runtimePendingTools.length > 0 ? ` ${runtimePendingTools.join(",")}` : "s"}`
-					: "streaming model output";
+					: runtimeProviderPhase === "resident-idle"
+						? "resident RPC parent waiting for descendants"
+						: "streaming model output";
 		const pid = handle?.pid;
 		const alive = typeof pid === "number" ? (isProcessAlive(pid) ? "alive" : "dead") : "unknown";
 		return [
@@ -7021,7 +7107,10 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
+		// Print mode receives its sole prompt as argv. Resident RPC workers keep stdin
+		// open and receive this exact initial task after stdout listeners are attached.
+		if (!useNestedRpc) args.push(`Task: ${task}`);
+		const initialRpcPromptId = `initial-${runId}`;
 		let wasAborted = false;
 		// Auto-resume: transport/API deaths used to mark the job failed with zero recovery even
 		// though `--session-id` already supports resume. Re-spawn up to AUTO_RESUME_MAX times
@@ -7042,12 +7131,29 @@ async function runSingleAgent(
 			const attemptMessagesFrom = currentResult.messages.length;
 			const attemptStderrFrom = currentResult.stderr.length;
 			let providerStallTimedOut = false;
+			let rpcInitialPromptRejected = false;
+			// Retry attempts are separate processes: a stale status from the old pipe
+			// must never wake the new resident. Keep this opaque value transport-local.
+			const residentRpcWakeToken = useNestedRpc ? randomBytes(24).toString("base64url") : undefined;
+			const residentRpcWakeStatusKey = residentRpcWakeToken
+				? residentRpcShutdownWakeStatusKey(residentRpcWakeToken)
+				: undefined;
+			const residentRpcWakeRequestId = residentRpcWakeToken ? randomUUID() : undefined;
 			exitCode = await new Promise<number>((resolve) => {
 				const invocation = getPiInvocation(args);
 				const childEnvironmentInput = {
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_RUN_ID: runId,
 					PIPIUI_AGENT_DEPTH: String(childDepth),
+					// Marks only recursive nested parents. A leaf never enters resident mode,
+					// even if its own parent is resident.
+					PIPIUI_NESTED_RPC_PARENT: useNestedRpc ? "1" : undefined,
+					PIPIUI_RESIDENT_RPC_WAKE_TOKEN: residentRpcWakeToken,
+					// Fan-out invariant propagation: workers cannot see the main-scoped philosophy
+					// layer in their own state file, so the parent's resolved fan-out state rides
+					// the env. fanoutLayerActive() reads it back and re-stamps its own children,
+					// so grandchildren inherit transitively.
+					...(fanoutLayerActive() ? { PIPIUI_FANOUT_ACTIVE: "1" } : {}),
 					PIPIUI_AGENT_ROLE: runtimePolicy.role,
 					...(terminalMemoryBrokerEnvironment ?? {}),
 					...(computerMemoryEnabled
@@ -7097,7 +7203,8 @@ async function runSingleAgent(
 				const proc = spawn(invocation.command, invocation.args, {
 					cwd: spawnCwd,
 					shell: false,
-					stdio: ["ignore", "pipe", "pipe"],
+					// RPC owns its stdin until ctx.shutdown() after descendant completion.
+					stdio: [useNestedRpc ? "pipe" : "ignore", "pipe", "pipe"],
 					detached: false,
 					// 把 agent 树身份传给子进程：子进程再派 subagent 时 parentId/depth 自动正确
 					// PIPIUI_SUBAGENT_EXT / SEARCH_SCOPE_EXT / grant file / bridge / session
@@ -7251,6 +7358,25 @@ async function runSingleAgent(
 				});
 				// Recorded so the heartbeat can tell "quiet" from "gone". Bind it to this
 				// generation so an old child cannot attach its pid to a reused agentId.
+				const setResidentRpcIdle = (idle: boolean) => {
+					if (!useNestedRpc) return;
+					const residentHandle = handleForRun(pipiuiAgentId, runId);
+					if (residentHandle) residentHandle.residentIdleWait = idle;
+					if (idle) providerWait.suspendForResidentIdle();
+					else providerWait.resumeFromResidentIdle();
+				};
+				// ctx.shutdown() in bundled RPC marks a flag; its runtime checks that flag
+				// only after agent_settled or another JSONL command. The waker accepts only
+				// this attempt's opaque status channel after this child has settled idle.
+				const residentRpcShutdownWaker = residentRpcWakeStatusKey && residentRpcWakeRequestId
+					? createResidentRpcShutdownWaker({
+						statusKey: residentRpcWakeStatusKey,
+						requestId: residentRpcWakeRequestId,
+						stdin: () => proc.stdin,
+						isResidentIdle: () => handleForRun(pipiuiAgentId, runId)?.residentIdleWait === true,
+						isClosed: () => procExited || wasAborted,
+					})
+					: undefined;
 				const liveHandle = handleForRun(pipiuiAgentId, runId);
 				if (liveHandle) {
 					liveHandle.pid = proc.pid;
@@ -7376,6 +7502,29 @@ async function runSingleAgent(
 						event = JSON.parse(line);
 					} catch {
 						return;
+					}
+
+					// RPC responses are command-level truth, distinct from streamed agent
+					// events. A rejected initial prompt never produces a turn, so do not
+					// wait for a provider/stall timeout or attempt an auto-resume.
+					if (useNestedRpc && event.type === "response" && event.id === initialRpcPromptId && event.command === "prompt") {
+						if (event.success !== true) {
+							rpcInitialPromptRejected = true;
+							currentResult.stopReason = "error";
+							currentResult.errorMessage = `nested RPC prompt rejected: ${typeof event.error === "string" && event.error ? event.error : "unknown prompt preflight failure"}`;
+							pipiuiActivity = currentResult.errorMessage;
+							pipiuiUpdate(true);
+							proc.stdin?.end();
+						}
+						return;
+					}
+					if (useNestedRpc && residentRpcShutdownWaker?.consume(event)) return;
+					if (useNestedRpc && event.type === "agent_settled") {
+						setResidentRpcIdle(true);
+						return;
+					}
+					if (useNestedRpc && (event.type === "agent_start" || event.type === "turn_start")) {
+						setResidentRpcIdle(false);
 					}
 
 					// Live deltas (pi 0.84+). Do not wait for message_end.
@@ -7648,8 +7797,14 @@ async function runSingleAgent(
 						if (toolNames.length > 0) noteAgentToolWait(pipiuiAgentId, runId, toolNames);
 						else {
 							projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
-							childExitCloseout.arm();
-							childExitProbe.markFinal();
+							// A resident RPC parent may emit its first assistant final while
+							// accepted descendants still run. Its extension calls ctx.shutdown()
+							// only after their completion follow-up has been consumed, so the
+							// print-mode final-exit grace must not kill it in between.
+							if (!useNestedRpc) {
+								childExitCloseout.arm();
+								childExitProbe.markFinal();
+							}
 						}
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
@@ -7697,7 +7852,27 @@ async function runSingleAgent(
 					currentResult.stderr += data.toString();
 				});
 
+				if (useNestedRpc) {
+					const stdin = proc.stdin;
+					if (!stdin) {
+						currentResult.errorMessage = "nested RPC worker has no writable stdin";
+						terminateAttempt();
+					} else {
+						const initialPrompt = JSON.stringify({
+							id: initialRpcPromptId,
+							type: "prompt",
+							message: `Task: ${task}`,
+						}) + "\n";
+						stdin.write(initialPrompt, (err) => {
+							if (!err) return;
+							currentResult.errorMessage = `nested RPC initial prompt failed: ${err.message}`;
+							terminateAttempt();
+						});
+					}
+				}
+
 				proc.on("close", (code) => {
+						residentRpcShutdownWaker?.dispose();
 						procExited = true;
 						clearChildExitTimers();
 						providerWait.dispose();
@@ -7710,6 +7885,7 @@ async function runSingleAgent(
 				});
 
 				proc.on("error", () => {
+					residentRpcShutdownWaker?.dispose();
 					procExited = true;
 					clearChildExitTimers();
 					providerWait.dispose();
@@ -7746,7 +7922,7 @@ async function runSingleAgent(
 			// Decide whether to auto-resume before verify/end (those run once, after the loop).
 			if (wasAborted) break;
 			const runFailed = exitCode !== 0 || Boolean(currentResult.errorMessage);
-			if (!runFailed) break;
+			if (!runFailed || rpcInitialPromptRejected) break;
 			const providerRecovery = decideProviderStallRecovery({
 				timedOut: providerStallTimedOut,
 				wasAborted,
@@ -8503,7 +8679,7 @@ const SharedDispatchParams = {
 	background: Type.Optional(
 		Type.Boolean({
 			description:
-				"If true, return immediately after starting agents; completion is delivered later as a follow-up message. Default: true at boss depth (0), false for nested agents or chain mode.",
+				"If true, return immediately after starting agents; completion is delivered later as a follow-up message. Default: true for single and parallel dispatch at every permitted depth — Boss and nested workers alike; a multi-step chain runs synchronously so {previous} can be substituted. While the fan-out layer is active, every non-ordered dispatch is forced into the background regardless of this flag.",
 		}),
 	),
 };
@@ -8540,7 +8716,7 @@ const SubagentParams = Type.Object({
 	run_in_background: Type.Optional(
 		Type.Boolean({
 			default: true,
-			description: "If true, return immediately; completion arrives later. Default true at boss depth.",
+			description: "If true, return immediately; completion arrives later. Default true at every permitted depth (single and parallel; a multi-step chain stays synchronous, and the fan-out layer forces background on non-ordered dispatches). Mirrors `background`.",
 		}),
 	),
 	isolation: IsolationParam,
@@ -8988,6 +9164,17 @@ function registerContextManageTool(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	// This module is mounted inside the recursive worker itself. Its background
+	// descendants remain owned by that worker, so only this explicit RPC marker
+	// may create a lease that defers ctx.shutdown().
+	residentParentShutdown = undefined;
+	nestedBackgroundLifecycle = PIPIUI_NESTED_RPC_PARENT && PIPIUI_RESIDENT_RPC_WAKE_TOKEN
+		? new NestedBackgroundLifecycle(maybeShutdownResidentParent)
+		: undefined;
+	// Background jobs must survive a tool-turn abort, but not destruction of their
+	// owning session. This controller closes the tiny pre-handle spawn race during
+	// session_shutdown without coupling ordinary parent-turn aborts to descendants.
+	const sessionShutdownAbort = new AbortController();
 	bindIdleFoldRegistry(createIdleFoldRegistry({
 		...idleFoldConfig,
 		isContextAboveWatermark: () => !contextFoldIsStandby() && contextAboveIdleFoldWatermark(lastIdleFoldUsage, idleFoldConfig.lowWatermark),
@@ -9030,6 +9217,16 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
+		const residentRpcWakeToken = PIPIUI_RESIDENT_RPC_WAKE_TOKEN;
+		if (nestedBackgroundLifecycle && residentRpcWakeToken) {
+			residentParentShutdown = () => {
+				ctx.shutdown();
+				// The owning runSingleAgent accepts only this attempt-private status and
+				// sends get_state, which lets bundled RPC observe the shutdown flag without
+				// a provider turn. This token stays on the RPC transport, never in Pi text.
+				ctx.ui.setStatus(residentRpcShutdownWakeStatusKey(residentRpcWakeToken), "");
+			};
+		}
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
 	});
@@ -9038,6 +9235,7 @@ export default function (pi: ExtensionAPI) {
 		disposeAllIdleFoldTimers();
 		// Cancel queued work before draining: otherwise a just-exited child could free a
 		// slot and start the next queued worker while shutdown is already collecting.
+		sessionShutdownAbort.abort();
 		hostStopQuiet = true;
 		heldRuntimeSignals.length = 0;
 		abortAllRunningAgents();
@@ -9058,6 +9256,16 @@ export default function (pi: ExtensionAPI) {
 		if (event.message.role === "assistant") restoreNudgeThinking(pi);
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		const observations = completionObservations(event.message);
+		// Resident parents distinguish "the completion entered Pi" from "the parent
+		// answered that follow-up". Only the latter releases their RPC keepalive.
+		for (const observed of observations) {
+			if (observed.sessionId === piSessionId) {
+				nestedBackgroundLifecycle?.noteCompletionObserved(observed.agentId, observed.runId);
+			}
+		}
+		if (event.message.role === "assistant") {
+			nestedBackgroundLifecycle?.noteAssistantFinal((event.message as { stopReason?: unknown }).stopReason);
+		}
 		const assistantEnded = event.message.role === "assistant";
 		if ((observations.length === 0 && !assistantEnded) || observations.some(({ sessionId }) => sessionId !== piSessionId)) return;
 		const timer = setTimeout(() => {
@@ -9083,6 +9291,15 @@ export default function (pi: ExtensionAPI) {
 		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
 		flushHeldRuntimeSignals(pi);
+		if (!nestedBackgroundLifecycle) return;
+		nestedBackgroundLifecycle.noteSettled();
+		// Queue cancellation can terminalize without a completion callback; it must
+		// not strand a resident parent. Non-aborted completions are held separately
+		// above until their custom follow-up has a successful assistant final.
+		nestedBackgroundLifecycle.reconcileTerminal((agentId, runId) => {
+			const job = jobRegistry.get(agentId);
+			return Boolean(job && job.runId === runId && job.state !== "running");
+		});
 	});
 	registerSessionRecallTool(pi);
 	// UI-independent definition management. It only reads/scaffolds/installs
@@ -9204,6 +9421,7 @@ export default function (pi: ExtensionAPI) {
 	// snapshot actually changed.
 	pi.on("before_agent_start", (event) => {
 		bossTurnBusy = true;
+		nestedBackgroundLifecycle?.noteActive();
 		// A new turn is a new wave: last turn's briefs are not the ones this one repeats.
 		turnDispatchedBriefs.length = 0;
 		turnRepeatNudged = false;
@@ -9338,6 +9556,7 @@ export default function (pi: ExtensionAPI) {
 		// Start one tick after silence so a CPU pair already exists at the 120s threshold.
 		const quietWorkers = [...runningAgents.values()].filter(
 			(handle) => !handle.finalizing
+				&& !handle.residentIdleWait
 				&& handle.pid !== undefined
 				&& progressIdleMs(now, handle) >= LIVENESS_SAMPLE_AFTER_MS,
 		);
@@ -9371,7 +9590,7 @@ export default function (pi: ExtensionAPI) {
 
 		// (2c) Metadata-only stall probe. Logs only on decision change; never changes abort policy.
 		for (const [agentId, handle] of runningAgents) {
-			if (handle.finalizing) continue;
+			if (handle.finalizing || handle.residentIdleWait) continue;
 			const stallInfo = stalledInfoFor(agentId, now);
 			const idleMs = progressIdleMs(now, handle);
 			const action = decideStallWatchdogAction({
@@ -9422,7 +9641,7 @@ export default function (pi: ExtensionAPI) {
 
 		// (3) stall 推送 / 复推 / 预裁决 abort
 		for (const [agentId, handle] of runningAgents) {
-			if (handle.finalizing) continue;
+			if (handle.finalizing || handle.residentIdleWait) continue;
 			// Explained, measurably-progressing silence is not a stall and must not spend a
 			// notification — nor march toward the auto-abort. Crying wolf on every long build
 			// is what taught the Boss to discount the signal in the first place.
@@ -9506,7 +9725,7 @@ export default function (pi: ExtensionAPI) {
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing || handle.checkinInFlight) continue;
 			if (isHandleVanished(handle, now)) continue;
-			if (stalledInfoFor(agentId, now).stalled) continue;
+			if (!handle.residentIdleWait && stalledInfoFor(agentId, now).stalled) continue;
 			const delivered = handle.checkinCount ?? 0;
 			if (now < nextCheckinAt(handle.startedAt, delivered, handle.heartbeatMs)) continue;
 			due.push({ agentId, handle });
@@ -9749,12 +9968,13 @@ export default function (pi: ExtensionAPI) {
 						: {}),
 				});
 
-			// Default background at boss depth for single/parallel; multi-step chain stays
-			// sync so `{previous}` can be substituted. Fan-out also forces a one-step chain
-			// into the background — that is not ordered work, and waiting on it deadlocks
-			// stall recovery because signals are held while the boss turn is busy.
+			// Default background for single/parallel at every permitted depth — Boss and
+			// nested workers alike — so a nested dispatch returns a receipt and the caller
+			// can keep fanning out instead of blocking its own tool call. Multi-step chain
+			// stays sync so `{previous}` can be substituted. Fan-out also forces a one-step
+			// chain into the background — that is not ordered work, and waiting on it
+			// deadlocks stall recovery because signals are held while the caller turn is busy.
 			const dispatchBackground = decideDispatchBackground({
-				depth: PIPIUI_DEPTH,
 				isChain,
 				chainLength: params.chain?.length ?? 0,
 				fanoutActive: fanoutLayerActive(),
@@ -9851,6 +10071,9 @@ export default function (pi: ExtensionAPI) {
 				model?: string,
 				modelPin?: ValidatedModelPin,
 			): void => {
+				// A receipt is an accepted lifecycle obligation even while queue/blockedBy
+				// keeps it from spawning. The resident parent may not close over it.
+				registerResidentDescendant(agentId, runId);
 				recordRunningDispatchScope(agentId, scope);
 				void runSingleAgent(
 					ctx.cwd,
@@ -9859,7 +10082,7 @@ export default function (pi: ExtensionAPI) {
 					task,
 					cwd,
 					undefined,
-					undefined, // do not bind parent abort — turn abort must not kill background workers
+					sessionShutdownAbort.signal, // session teardown (not a turn abort) owns this descendant subtree
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
 					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
@@ -10386,9 +10609,10 @@ export default function (pi: ExtensionAPI) {
 						content: [
 							{
 								type: "text",
+								// formatStartedMessage already prefixes bgIgnoredWarning — adding it here
+								// duplicated the warning/note on one-step-chain receipts.
 								text:
 									dispatchNudgePrefix +
-									bgIgnoredWarning +
 									formatStartedMessage([
 										{ agentId, runId: stepRunId, name: agentName, task, title: step.title, fresh: step.fresh },
 									]),
@@ -10559,6 +10783,10 @@ export default function (pi: ExtensionAPI) {
 						const agentCfg = agents.find((a) => a.name === t.agent)!;
 						const agentId = t.agentId!.trim();
 						const acceptedRunId = DeliveryObligationStore.runId();
+						// Batch/blocked items are accepted before the scheduler starts them.
+						// Register every exact receipt now so an initial parent final cannot
+						// close over a queued sibling.
+						registerResidentDescendant(agentId, acceptedRunId);
 						agentIds.push(agentId);
 						runIds.push(acceptedRunId);
 						startedItems.push({ agentId, runId: acceptedRunId, name: t.agent, task: t.task, title: t.title, fresh: t.fresh });
@@ -10594,7 +10822,7 @@ export default function (pi: ExtensionAPI) {
 								t.task,
 								t.cwd,
 								undefined,
-								undefined, // no parent abort binding
+								sessionShutdownAbort.signal, // session teardown owns queued descendants too
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
 								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
@@ -10783,6 +11011,8 @@ export default function (pi: ExtensionAPI) {
 						dispatchQueue.snapshot(),
 					);
 					if (params.blockedBy && params.blockedBy.length > 0) {
+						// A blocked receipt is already an accepted descendant obligation.
+						registerResidentDescendant(agentId, runId);
 						// blockedBy is declared on the single schema with queue semantics ("held until every
 						// named agent succeeds"), so a single background dispatch with dependencies goes
 						// through the same queue as parallel batches: accepted runId, exact-run cancel,
@@ -10879,7 +11109,7 @@ export default function (pi: ExtensionAPI) {
 												params.task!,
 												params.cwd,
 												undefined,
-												undefined,
+												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
 												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
