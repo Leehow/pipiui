@@ -76,4 +76,58 @@ describe('office-extension manifest contract', () => {
     expect(assets.version).toBe(OFFICECLI_PROVENANCE.cliVersion)
     expect(existsSync(join(pkgRoot, 'bin/README.md'))).toBe(true)
   })
+
+  it('declares exactly one native OfficeCLI update component pinned to the assets metadata', () => {
+    const raw = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+      updateComponents?: Array<{
+        id: string
+        name: string
+        version: string
+        source: { type: string; owner?: string; repo?: string }
+        upstream?: string
+        license?: string
+      }>
+    }
+    const components = raw.updateComponents ?? []
+    expect(components).toHaveLength(1)
+
+    // officecli-assets.json is the authoritative version/repository/license pin.
+    const assets = JSON.parse(readFileSync(join(pkgRoot, '../../officecli-assets.json'), 'utf8')) as {
+      version: string
+      repository: string
+      license: string
+    }
+    const upstreamUrl = new URL(assets.repository)
+    expect(upstreamUrl.protocol).toBe('https:')
+    expect(upstreamUrl.hostname).toBe('github.com')
+    const [, owner, repo] = upstreamUrl.pathname.split('/')
+
+    const component = components[0]
+    expect(component?.id).toBe('officecli')
+    expect(component?.name).toBe('OfficeCLI')
+    expect(component?.version).toBe(assets.version)
+    expect(component?.source).toEqual({ type: 'githubReleases', owner, repo })
+    expect(component?.upstream).toBe(assets.repository)
+    expect(component?.license).toBe(assets.license)
+
+    // The generic update-component schema accepts the declaration as-is: no
+    // update-center special case for the native CLI.
+    const validated = validateExtensionManifest(raw)
+    expect(validated.ok, validated.ok ? '' : (validated as { errors: string[] }).errors.join('; ')).toBe(true)
+    if (!validated.ok) return
+    expect(validated.manifest.updateComponents).toEqual([
+      {
+        id: 'officecli',
+        name: 'OfficeCLI',
+        version: assets.version,
+        source: { type: 'githubReleases', owner, repo },
+        upstream: assets.repository,
+        license: assets.license,
+      },
+    ])
+
+    // The generated runtime manifest carries the identical declaration.
+    const runtimeRaw = JSON.parse(readFileSync(join(runtimeRoot, 'pipiui-extension.json'), 'utf8')) as typeof raw
+    expect(runtimeRaw.updateComponents).toEqual(raw.updateComponents)
+  })
 })

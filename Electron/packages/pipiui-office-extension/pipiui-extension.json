@@ -43,5 +43,19 @@
         }
       ]
     }
-  }
+  },
+  "updateComponents": [
+    {
+      "id": "officecli",
+      "name": "OfficeCLI",
+      "version": "1.0.144",
+      "source": {
+        "type": "githubReleases",
+        "owner": "iOfficeAI",
+        "repo": "OfficeCLI"
+      },
+      "upstream": "https://github.com/iOfficeAI/OfficeCLI",
+      "license": "Apache-2.0"
+    }
+  ]
 }
