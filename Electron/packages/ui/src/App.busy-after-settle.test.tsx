@@ -288,6 +288,29 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
   })
 
+  it('renders a delayed [subagent-blocked] card without reopening a settled turn', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '最终答复已经落地' }) })
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled', turnEpoch: 1 }) })
+    await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
+
+    act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'blocked-late', content: '[subagent-blocked] agentId=a2 title=实现 is held: dependency a1 did not succeed.' }) })
+    expect((await screen.findByTestId('subagent-signal-card')).getAttribute('data-signal-kind')).toBe('blocked')
+    expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+    expect(screen.queryByLabelText('停止生成')).toBeNull()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('给 PipiUI 发送消息…')
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
   it('does not reopen busy on late heartbeat or stalled projections after settle', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()

@@ -3292,11 +3292,11 @@ function shouldOpenWaitOnStarted(messages: ChatMessage[], pendingFollowUps?: str
 
 /** After a closed turn these kinds are transcript projections, not a Boss wake. */
 function isSettledSubagentProjection(signal: { kind: string } | null | undefined): boolean {
-  return signal?.kind === 'done' || signal?.kind === 'heartbeat' || signal?.kind === 'stalled'
+  return signal?.kind === 'done' || signal?.kind === 'heartbeat' || signal?.kind === 'stalled' || signal?.kind === 'blocked'
 }
 
 /** Queue-drain text and already-running turns still open processing. A late
- *  terminal/heartbeat/stalled `[subagent-*]` after idle must wait for `started`. */
+ *  terminal/heartbeat/stalled/blocked `[subagent-*]` after idle must wait for `started`. */
 function shouldOpenTurnOnUserMessage(content: string, alreadyRunning: boolean): boolean {
   const signal = parseSubagentSignal(content)
   if (isSettledSubagentProjection(signal) && !alreadyRunning) return false

@@ -43,7 +43,7 @@ export interface DispatchQueueOptionsV1 {
 	/** Terminal-state lookup for a dependency name the queue does not itself hold. */
 	lookup: (agentId: string) => DependencyState;
 	/** One-line signal to the boss. Called at most once per held item. */
-	notify: (text: string) => void;
+	notify: (text: string, item: Pick<QueuedDispatchV1, "agentId" | "runId" | "heldReason">) => void;
 	now?: () => number;
 }
 
@@ -82,6 +82,11 @@ export class DispatchQueueV1 {
 	/** Called when any agent reaches a terminal state, including agents this queue never held. */
 	onAgentTerminal(agentId: string): void {
 		this.running.delete(agentId);
+		this.pump();
+	}
+
+	/** Re-check queued dependencies after an external pending acceptance changes state. */
+	onDependencyStateChanged(): void {
 		this.pump();
 	}
 
@@ -160,6 +165,7 @@ export class DispatchQueueV1 {
 							"It has NOT run and will NOT run on its own. Re-dispatch that dependency — this task starts automatically when the dependency succeeds — " +
 							`or drop it with subagent_abort({agentId:"${item.agentId}", runId:"${item.runId}"}) if it is no longer wanted. ` +
 							"Before any wait or final closeout after this event, run the fan-out refill scan.",
+						item,
 					);
 				}
 				continue;

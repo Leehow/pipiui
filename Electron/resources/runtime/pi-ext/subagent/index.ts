@@ -2281,6 +2281,10 @@ const jobRegistry = new Map<string, JobRecord>();
 const pendingInterruptedReminders = new Map<string, InterruptedReminder>();
 /** Immediate in-process reservations close the selector-to-dispatch await/confirmation gap. */
 const localAgentReservations = new Set<string>();
+/** IDs whose dispatch acceptance is still awaiting validation, before they enter the queue.
+ *  Multi-owner on purpose: overlapping acceptances of one id each hold their own token, so
+ *  releasing one claimant can never make the id read unknown while another is still pending. */
+const pendingDispatchAcceptances = new Map<string, Set<symbol>>();
 
 function interruptedReminderKey(agentId: string, runId: string, nudgeSeq: number): string {
 	return `${agentId}\u0000${runId}\u0000${nudgeSeq}`;
@@ -3056,8 +3060,10 @@ function abortRunningAgent(
 	// A queued task has no process to signal, so abort means "drop it before it starts". This is
 	// also the escape hatch offered by the [subagent-blocked] signal for a task no longer wanted.
 	if (dispatchQueue.cancel(agentId, runId)) {
-		// Accepted-but-unstarted work owns an id reservation; dropping it must give the id back.
-		localAgentReservations.delete(agentId);
+		// Accepted-but-unstarted work owns an id reservation; dropping it must give the id
+		// back — and re-evaluate the queue, so dependents of this id are re-admitted or held
+		// against its true post-cancel state instead of waiting on the stale reservation.
+		releaseAgentReservation(agentId);
 		return {
 			ok: true,
 			message: `Dropped queued agentId=${agentId} runId=${runId} before it started; no process ran and no [subagent-done] will arrive for it.`,
@@ -3518,7 +3524,10 @@ function jobPatchIntegration(
  * Boss-facing signal channel for the dispatch queue, bound once the extension has `pi`.
  * A held task that nobody is told about is the forgetting this queue exists to end.
  */
-let dispatchQueueNotify: (text: string) => void = () => {};
+let dispatchQueueNotify: (
+	text: string,
+	item: Pick<QueuedDispatchV1, "agentId" | "runId" | "heldReason">,
+) => void = () => {};
 
 /** Boss channel for runtime-budget escalations ([subagent-timeout]); bound to pi in the default export. */
 let runtimeBudgetNotify: (text: string) => void = () => {};
@@ -3526,6 +3535,9 @@ let runtimeBudgetNotify: (text: string) => void = () => {};
 const dispatchQueue = new DispatchQueueV1({
 	limit: MAX_CONCURRENCY,
 	lookup: (agentId): DependencyState => {
+		// A sibling tool call may still be in async acceptance, before it can be queued or
+		// registered as a job. Its explicit reservation is a deterministic running-like state.
+		if (localAgentReservations.has(agentId) || pendingDispatchAcceptances.has(agentId)) return "running";
 		const job = jobRegistry.get(agentId);
 		if (!job) return "unknown";
 		if (job.state === "running") return "running";
@@ -3539,8 +3551,39 @@ const dispatchQueue = new DispatchQueueV1({
 		});
 		return admission === "ready" ? "ok" : admission === "waiting" ? "running" : "failed";
 	},
-	notify: (text) => dispatchQueueNotify(text),
+	notify: (text, item) => dispatchQueueNotify(text, item),
 });
+
+function releasePendingDispatchAcceptance(agentIds: readonly string[], token: symbol): void {
+	let released = false;
+	for (const agentId of agentIds) {
+		const owners = pendingDispatchAcceptances.get(agentId);
+		// Token-matched: one claimant's release must not drop another claimant's pending
+		// ownership of the same id — the id stays running-like while any owner remains.
+		if (!owners?.delete(token)) continue;
+		if (owners.size === 0) pendingDispatchAcceptances.delete(agentId);
+		released = true;
+	}
+	if (released) dispatchQueue.onDependencyStateChanged();
+}
+
+/**
+ * Release one agentId reservation deterministically. The reservation is a running-like
+ * dependency state, so removing it changes what the dispatch queue's lookup answers: the
+ * delete must land first and the queue must re-evaluate immediately, or a dependent whose
+ * producer just settled, failed, or was exact-aborted keeps waiting on a reservation that
+ * nobody will ever pump again.
+ */
+function releaseAgentReservation(agentId: string): void {
+	if (!localAgentReservations.delete(agentId)) return;
+	dispatchQueue.onDependencyStateChanged();
+}
+
+function queuedHeldRunIsCurrent(agentId: string, runId: string, heldReason: string | undefined): boolean {
+	return dispatchQueue.snapshot().some(
+		(item) => item.agentId === agentId && item.runId === runId && item.heldReason === heldReason,
+	);
+}
 
 function isInterruptedReminderState(state: JobState): boolean {
 	return state === "interrupted" || state === "aborted" || state === "failed";
@@ -4795,7 +4838,7 @@ async function sendUserMessageAfterCutIn(
 	// session. They are dropped for this cycle; the boss can still see every job
 	// state through subagent_status and the Subagents panel.
 	if (hostStopQuiet) return false;
-	if (!admitOrHoldRuntimeSignal(text)) return false;
+	if (!admitOrHoldRuntimeSignal(text, shouldSend)) return false;
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
 	if (shouldSend && !shouldSend()) return false;
@@ -4821,15 +4864,20 @@ async function sendUserMessageAfterCutIn(
 	}
 }
 
-async function trySendUserMessage(pi: ExtensionAPI, text: string): Promise<boolean> {
+async function trySendUserMessage(
+	pi: ExtensionAPI,
+	text: string,
+	shouldSend?: () => boolean,
+): Promise<boolean> {
 	// 插队保护：用户批量消息未进 turn 前，自动信号不得抢跑（超时自动释放）。
 	await awaitCutInHoldRelease();
+	if (shouldSend && !shouldSend()) return false;
 	const routed = await routeRuntimeSignalThroughSupervisor(text);
 	if (routed === "accepted") return true;
 	// The Supervisor has retained a pending durable receipt. Do not fall through
 	// to a second Boss admission attempt, and let heartbeat/stall callers retry.
 	if (routed === "pending") return false;
-	return sendUserMessageAfterCutIn(pi, text);
+	return sendUserMessageAfterCutIn(pi, text, shouldSend);
 }
 
 
@@ -5141,7 +5189,8 @@ let doneDeliveryPiSessionId: string | undefined;
 let hostStopQuiet = false;
 /** True between before_agent_start and agent_settled. Signals must not enter Pi's follow-up queue while this is set. */
 let bossTurnBusy = false;
-const heldRuntimeSignals: string[] = [];
+type HeldRuntimeSignal = { text: string; shouldSend?: () => boolean };
+const heldRuntimeSignals: HeldRuntimeSignal[] = [];
 
 function releaseHostStopQuiet(pi: ExtensionAPI | undefined): void {
 	if (!hostStopQuiet) return;
@@ -5168,7 +5217,8 @@ function reminderOpenForSignal(text: string): boolean {
 	return Boolean(job && !isHandledJob(job) && isInterruptedReminderState(job.state));
 }
 
-function admitOrHoldRuntimeSignal(text: string): boolean {
+function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boolean {
+	if (shouldSend && !shouldSend()) return false;
 	const kind = classifyRuntimeSignal(text);
 	if (!kind) return true;
 	const decision = admitSignal({
@@ -5179,14 +5229,18 @@ function admitOrHoldRuntimeSignal(text: string): boolean {
 		alreadyDelivered: false,
 	});
 	if (decision === "send") return true;
-	if (decision === "hold" && !heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
+	if (decision === "hold" && !heldRuntimeSignals.some((entry) => entry.text === text)) {
+		heldRuntimeSignals.push({ text, shouldSend });
+	}
 	return false;
 }
 
 function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 	if (hostStopQuiet || bossTurnBusy) return;
+	const held = heldRuntimeSignals.splice(0).filter((entry) => !entry.shouldSend || entry.shouldSend());
+	const byText = new Map(held.map((entry) => [entry.text, entry]));
 	const plan = planHeldSignalFlush({
-		held: heldRuntimeSignals.splice(0),
+		held: held.map((entry) => entry.text),
 		classify: (text) => classifyRuntimeSignal(text),
 		admit: ({ kind, text }) => admitSignal({
 			kind,
@@ -5197,17 +5251,22 @@ function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 		}),
 	});
 	for (const text of plan.rehold) {
-		if (!heldRuntimeSignals.includes(text)) heldRuntimeSignals.push(text);
+		const entry = byText.get(text);
+		if (entry && (!entry.shouldSend || entry.shouldSend()) && !heldRuntimeSignals.some((heldEntry) => heldEntry.text === text)) {
+			heldRuntimeSignals.push(entry);
+		}
 	}
 	const deliver = plan.deliver;
 	if (!deliver) return;
+	const shouldSend = byText.get(deliver.text)?.shouldSend;
+	if (shouldSend && !shouldSend()) return;
 	if (deliver.channel === "stall-wake") {
 		void deliverStallWake(pi, deliver.text).then((ok) => {
 			if (deliver.confirmsStallDelivery) confirmStallDelivery(deliver.text, ok);
 		});
 		return;
 	}
-	void trySendUserMessage(pi, deliver.text);
+	void trySendUserMessage(pi, deliver.text, shouldSend);
 }
 
 /** Stall/recovery must wake a settled Boss; sendUserMessage(followUp) only queues. */
@@ -6197,12 +6256,12 @@ async function runSingleAgent(
 			state: "failed",
 			resultText: fail.stderr,
 		});
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return fail;
 	}
 	if ((RETIRED_COMPUTER_AGENT_NAMES as readonly string[]).includes(agentName)) {
 		const message = `computer_task_leader_retired: "${agentName}" is retired. Boss holds the screenshot/action loop via computer_task; dispatch operator only as a bounded single-action escape hatch with an explicit desktop grant.`;
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -6226,7 +6285,7 @@ async function runSingleAgent(
 		fresh: options?.fresh,
 	});
 	if (identityProblem) {
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -6246,7 +6305,7 @@ async function runSingleAgent(
 	const executionPolicyResult = normalizeGeneralPurposeExecutionPolicy(agent, options);
 	if (executionPolicyResult.problem) {
 		const reason = executionPolicyResult.problem;
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -6277,7 +6336,7 @@ async function runSingleAgent(
 	if (createsWorktree && !callerAgentId) {
 		const reason = `Agent "${agentName}" writes code, so it needs a short semantic agentId — it becomes the git branch pipiui/<agentId>. Re-dispatch with one that names this slice, e.g. "quota-pill" or "doc-panel" (2-24 chars: lowercase letters, digits, "-", "_").`;
 		jobFinalize(pipiuiAgentId, runId, { name: agentName, task, state: "failed", resultText: reason });
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -6296,7 +6355,7 @@ async function runSingleAgent(
 	const leaseResult = acquireAgentLease(path.resolve(PIPIUI_MAIN_CWD || defaultCwd), pipiuiAgentId);
 	if (!leaseResult.lease) {
 		const message = leaseResult.problem;
-		localAgentReservations.delete(pipiuiAgentId);
+		releaseAgentReservation(pipiuiAgentId);
 		return {
 			agent: agentName,
 			agentSource: agent.source,
@@ -8287,7 +8346,10 @@ async function runSingleAgent(
 				error: "lease-release-error",
 			});
 		}
-		localAgentReservations.delete(pipiuiAgentId);
+		// Terminal state is already recorded; this release is what makes the queue actually
+		// re-evaluate dependents of this id (jobFinalize pumped while the reservation still
+		// answered running-like).
+		releaseAgentReservation(pipiuiAgentId);
 	}
 }
 
@@ -8941,8 +9003,11 @@ export default function (pi: ExtensionAPI) {
 	let lastInFlightSnapshot: string | null = null;
 	// Bind the queue's boss channel: a held task nobody is told about is the forgetting this
 	// queue exists to end.
-	dispatchQueueNotify = (text) => {
-		void trySendUserMessage(pi, text);
+	dispatchQueueNotify = (text, item) => {
+		// A blocked receipt is valid only for the exact queued generation that is still held.
+		// It may wait behind a busy Boss turn; abort/drop must make that delayed signal vanish.
+		const shouldSend = () => queuedHeldRunIsCurrent(item.agentId, item.runId, item.heldReason);
+		void trySendUserMessage(pi, text, shouldSend);
 	};
 	// Runtime-budget escalations ([subagent-timeout]) ride the same boss channel so a
 	// stalled worker's budget decision reaches the boss mid-turn instead of killing silently.
@@ -9934,202 +9999,19 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
-
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
-				}
-			}
-
-			const dispatchStatsTasks = hasChain
-				? params.chain!
-				: hasTasks
-					? params.tasks!
-					: [{ agent: params.agent!, task: params.task!, title: params.title }];
-			const dispatchMode: DispatchStatsMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
-
-			// Shape validator: single / tasks[] only. chain and same-agentId resume are exempt.
-			let dispatchNudgePrefix = "";
-			let dispatchValidatorStats: DispatchValidatorStats | null = null;
-			if (!hasChain) {
-				const shapeTasks = hasTasks
-					? (params.tasks ?? []).map((t) => ({
-							task: t.task,
-							agentId: t.agentId,
-							fresh: t.fresh,
-							title: t.title,
-						}))
-					: [
-							{
-								task: params.task!,
-								agentId: params.agentId,
-								fresh: params.fresh,
-								title: params.title,
-							},
-						];
-				const assessment = assessDispatchShape({
-					mode: hasTasks ? "tasks" : "single",
-					tasks: shapeTasks,
-				});
-				dispatchValidatorStats = assessment.stats;
-				if (assessment.enforceError) {
-					recordSubagentDispatchStats(
-						dispatchMode,
-						dispatchStatsTasks,
-						useBackground,
-						dispatchValidatorStats,
-					);
-					return {
-						content: [{ type: "text", text: assessment.enforceError }],
-						details: makeDetails(hasTasks ? "parallel" : "single")([]),
-						isError: true,
-					};
-				}
-					dispatchNudgePrefix = assessment.nudgeText;
-
-				// Shared-context detection. context_doc asks the Boss to foresee that a wave's
-				// briefs will repeat; nobody foresees that. The repetition is trivial to measure
-				// once the second brief exists, so say it here — at the dispatch where it becomes
-				// true — rather than as a standing rule to remember. Advisory only: the shared
-				// half cannot be lifted automatically without mangling coincidental overlap.
-				if (PIPIUI_DEPTH === 0 && PIPIUI_MAIN_CWD) {
-					// Accumulate as we go so two briefs in the SAME tasks[] call compare against
-					// each other, not only against earlier calls in the turn.
-					for (const task of shapeTasks) {
-						if (!turnRepeatNudged) {
-							const match = detectRepeatedBrief(
-								{ agentId: task.agentId, label: task.agentId || task.title || "(unnamed)", brief: task.task },
-								turnDispatchedBriefs,
-							);
-							if (match) {
-								dispatchNudgePrefix += formatRepeatedBriefNudge(
-									match,
-									contextDocPath(PIPIUI_MAIN_CWD, PIPIUI_SESSION),
-								);
-								turnRepeatNudged = true;
-							}
-						}
-						turnDispatchedBriefs.push({
-							agentId: task.agentId,
-							label: task.agentId || task.title || "(unnamed)",
-							brief: task.task,
-						});
-					}
-					if (turnDispatchedBriefs.length > TURN_BRIEF_MEMORY) {
-						turnDispatchedBriefs.splice(0, turnDispatchedBriefs.length - TURN_BRIEF_MEMORY);
-					}
-				}
-				}
-
-			if (hasTasks && (params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
-				return {
-					content: [{ type: "text", text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
-					details: makeDetails("parallel")([]),
-					isError: true,
-				};
-			}
-			const requestedNames = hasChain
-				? (params.chain ?? []).map((step) => step.agent)
-				: hasTasks
-					? (params.tasks ?? []).map((task) => task.agent)
-					: [params.agent!];
-			const unknownNames = [...new Set(requestedNames.filter((name) => !agents.some((agent) => agent.name === name)))];
-			if (unknownNames.length > 0) {
-				const available = agents.map((agent) => `"${agent.name}"`).join(", ") || "none";
-				const packageDiagnostics = discovery.diagnostics.length > 0
-					? `\n\nAgent package diagnostics:\n${formatAgentDiagnostics(discovery.diagnostics)}`
-					: "";
-				return {
-					content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.${packageDiagnostics}` }],
-					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-					isError: true,
-				};
-			}
-			const executionTargets = hasChain
-				? (params.chain ?? [])
-				: hasSingle
-					? [params]
-					: [];
-			for (const target of executionTargets) {
-				const config = agents.find((agent) => agent.name === target.agent)!;
-				const normalized = normalizeGeneralPurposeExecutionPolicy(config, target);
-				if (normalized.problem) {
-					return {
-						content: [{ type: "text", text: normalized.problem }],
-						details: makeDetails(hasChain ? "chain" : "single")([]),
-						isError: true,
-					};
-				}
-			}
-
-			// Per-dispatch model pins: ONE batched authoritative RPC before anything reserves or
-			// spawns. A pin names exactly one usable provider/modelId for one dispatch; any
-			// transport/host failure or logical deny fails the WHOLE wave loudly at acceptance
-			// time — never a silent substitution with the user's default model, never a disk read.
-			const modelPinItems = [
-				...(hasSingle ? [{ label: "model", model: params.model }] : []),
-				...(hasTasks ? (params.tasks ?? []).map((t, i) => ({ label: `tasks[${i}].model`, model: t.model })) : []),
-				...(hasChain ? (params.chain ?? []).map((s, i) => ({ label: `chain[${i}].model`, model: s.model })) : []),
-			];
-			let validatedModelPins = new Map<string, ValidatedModelPin>();
-			if (modelPinItems.some((item) => item.model !== undefined && item.model !== null)) {
-				const pinResult = await validateDispatchModelPinsViaHost(modelPinItems);
-				if (!pinResult.ok) {
-					return {
-						content: [{ type: "text", text: pinResult.problem }],
-						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						isError: true,
-					};
-				}
-				validatedModelPins = pinResult.pins;
-			}
-			/** Branded pin lookup for downstream spawn options; undefined when the item carries no model. */
-			const validatedPinOf = (model: unknown): ValidatedModelPin | undefined => {
-				if (model === undefined || model === null) return undefined;
-				return validatedModelPins.get(String(model).trim());
-			};
-
-			// Identity contract, one pure gate for every dispatch form. agentId is caller-chosen and
-			// required on every worker — single, tasks/parallel and chain steps alike; nothing is
-			// generated. The retired random-generator shape (agent-<16hex>) is refused for new work
-			// and may only resume when the role being dispatched would actually reopen a retained
-			// session for that id (read-only roles never do); abort/resolve/status never pass
-			// through this gate, so historical ids stay operable.
-			const dispatchIdTargets: Array<{ agentId: string | undefined; fresh?: boolean; agentName?: string; label: string }> = hasChain
+			// Announce these IDs before the FIRST asynchronous acceptance barrier (the project-agent
+			// confirmation below, then model-pin validation). A concurrent dependent dispatch sees
+			// this deterministic pending state instead of a transient "never dispatched" while the
+			// wave is suspended at either await.
+			const pendingDispatchIdTargets: Array<{ agentId: string | undefined; fresh?: boolean; agentName?: string; label: string }> = hasChain
 				? (params.chain ?? []).map((step, index) => ({ agentId: step.agentId, fresh: step.fresh, agentName: step.agent, label: `chain step ${index + 1}` }))
 				: hasTasks
 					? (params.tasks ?? []).map((task, index) => ({ agentId: task.agentId, fresh: task.fresh, agentName: task.agent, label: `task ${index + 1}` }))
 					: [{ agentId: params.agentId, fresh: params.fresh, agentName: params.agent, label: "this dispatch" }];
-			const identityProblem = dispatchIdentityGateProblem({
-				targets: dispatchIdTargets,
+			const preAcceptanceIdentityProblem = dispatchIdentityGateProblem({
+				targets: pendingDispatchIdTargets,
 				agentId: params.agentId,
 				resumeFrom: params.resume_from,
-				// Continuation-only gate for retired `agent-<16hex>` ids: actual resumability,
-				// not bookkeeping — and resumability under the ROLE being dispatched. The runner
-				// only opens a session for context-retaining (writable) roles: read-only roles force
-				// --no-session (runSingleAgent: sessionDir === undefined), so even a stray session
-				// file named after the id is not context this dispatch would reuse. Job/slice
-				// metadata alone proves nothing. Active ids never reach this check: the reservation
-				// selector below already rejects them as "already running", and abort/resolve/status
-				// do not pass through this gate at all.
 				isResumable: (agentId, agentName) => {
 					const config = agentName ? agents.find((agent) => agent.name === agentName) : undefined;
 					if (!config || config.traits.readOnly) return false;
@@ -10137,59 +10019,305 @@ export default function (pi: ExtensionAPI) {
 					return dir !== undefined && agentSessionExists(dir, `pipiui-${agentId}`);
 				},
 			});
-			if (identityProblem) {
+			if (preAcceptanceIdentityProblem) {
 				return {
-					content: [
-						{
-							type: "text",
-							text: identityProblem,
-						},
-					],
+					content: [{ type: "text", text: preAcceptanceIdentityProblem }],
 					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
 					isError: true,
 				};
 			}
-			// This is deliberately after the final await/validation and immediately before
-			// dispatch. Add to the module reservation set synchronously so a concurrent tool call
-			// cannot pass the same selector during any later async setup.
-			const activeAgentIds = new Set<string>([
-				...localAgentReservations,
-				...runningAgents.keys(),
-				...[...jobRegistry.values()]
-					.filter((job) => job.state === "running")
-					.map((job) => job.agentId),
-			]);
-			const callerSelection = selectAndReserveCallerAgentIds(
-				dispatchIdTargets.map((target) => target.agentId),
-				activeAgentIds,
-				localAgentReservations,
-			);
-			const writableProblem = unnamedWritableDispatchProblem(
-				hasChain
-					? (params.chain ?? []).map((step) => ({ agent: step.agent, agentId: step.agentId, worktree: step.worktree }))
+			const pendingAcceptanceToken = Symbol("dispatch-acceptance");
+			const pendingAcceptanceIds = pendingDispatchIdTargets.map((target) => target.agentId!.trim());
+			for (const agentId of pendingAcceptanceIds) {
+				// Overlapping acceptances coexist: each claimant registers its own token so a
+				// later duplicate can neither overwrite nor orphan an earlier pending claim.
+				let owners = pendingDispatchAcceptances.get(agentId);
+				if (!owners) pendingDispatchAcceptances.set(agentId, (owners = new Set()));
+				owners.add(pendingAcceptanceToken);
+			}
+			// Wave-scoped bindings the post-acceptance dispatch paths still read. Declared out here
+			// and assigned inside the try, so one finally below can centralize pending release on
+			// every exit from the acceptance window.
+			let dispatchStatsTasks: readonly DispatchStatsTask[] = hasChain
+				? params.chain!
+				: hasTasks
+					? params.tasks!
+					: [{ agent: params.agent!, task: params.task!, title: params.title }];
+			let dispatchMode: DispatchStatsMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
+			let dispatchNudgePrefix = "";
+			let dispatchValidatorStats: DispatchValidatorStats | null = null;
+			let validatedModelPins = new Map<string, ValidatedModelPin>();
+			/** Branded pin lookup for downstream spawn options; undefined when the item carries no model. */
+			const validatedPinOf = (model: unknown): ValidatedModelPin | undefined => {
+				if (model === undefined || model === null) return undefined;
+				return validatedModelPins.get(String(model).trim());
+			};
+			try {
+				if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
+					const requestedAgentNames = new Set<string>();
+					if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+					if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+					if (params.agent) requestedAgentNames.add(params.agent);
+
+					const projectAgentsRequested = Array.from(requestedAgentNames)
+						.map((name) => agents.find((a) => a.name === name))
+						.filter((a): a is AgentConfig => a?.source === "project");
+
+					if (projectAgentsRequested.length > 0) {
+						const names = projectAgentsRequested.map((a) => a.name).join(", ");
+						const dir = discovery.projectAgentsDir ?? "(unknown)";
+						const ok = await ctx.ui.confirm(
+							"Run project-local agents?",
+							`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+						);
+						if (!ok)
+							return {
+								content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+								details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							};
+					}
+				}
+
+				dispatchStatsTasks = hasChain
+					? params.chain!
 					: hasTasks
-						? (params.tasks ?? []).map((task) => ({ agent: task.agent, agentId: task.agentId }))
-						: [{ agent: params.agent!, agentId: params.agentId, worktree: params.worktree }],
-				(target) => {
-					const config = agents.find((agent) => agent.name === target.agent);
-					if (!config) return false;
-					const execution = normalizeGeneralPurposeExecutionPolicy(config, target).policy;
-					return execution ? execution.worktree === "isolated" : runtimeRolePolicyForAgent(config).worktree === "isolated";
-				},
-			);
-			if (writableProblem) {
-				return {
-					content: [{ type: "text", text: writableProblem }],
-					details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-					isError: true,
-				};
-			}
-			if (callerSelection.problem) {
-				return {
-					content: [{ type: "text", text: callerSelection.problem }],
-					details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-					isError: true,
-				};
+						? params.tasks!
+						: [{ agent: params.agent!, task: params.task!, title: params.title }];
+				dispatchMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
+
+				// Shape validator: single / tasks[] only. chain and same-agentId resume are exempt.
+				if (!hasChain) {
+					const shapeTasks = hasTasks
+						? (params.tasks ?? []).map((t) => ({
+								task: t.task,
+								agentId: t.agentId,
+								fresh: t.fresh,
+								title: t.title,
+							}))
+						: [
+								{
+									task: params.task!,
+									agentId: params.agentId,
+									fresh: params.fresh,
+									title: params.title,
+								},
+							];
+					const assessment = assessDispatchShape({
+						mode: hasTasks ? "tasks" : "single",
+						tasks: shapeTasks,
+					});
+					dispatchValidatorStats = assessment.stats;
+					if (assessment.enforceError) {
+						recordSubagentDispatchStats(
+							dispatchMode,
+							dispatchStatsTasks,
+							useBackground,
+							dispatchValidatorStats,
+						);
+						return {
+							content: [{ type: "text", text: assessment.enforceError }],
+							details: makeDetails(hasTasks ? "parallel" : "single")([]),
+							isError: true,
+						};
+					}
+						dispatchNudgePrefix = assessment.nudgeText;
+
+					// Shared-context detection. context_doc asks the Boss to foresee that a wave's
+					// briefs will repeat; nobody foresees that. The repetition is trivial to measure
+					// once the second brief exists, so say it here — at the dispatch where it becomes
+					// true — rather than as a standing rule to remember. Advisory only: the shared
+					// half cannot be lifted automatically without mangling coincidental overlap.
+					if (PIPIUI_DEPTH === 0 && PIPIUI_MAIN_CWD) {
+						// Accumulate as we go so two briefs in the SAME tasks[] call compare against
+						// each other, not only against earlier calls in the turn.
+						for (const task of shapeTasks) {
+							if (!turnRepeatNudged) {
+								const match = detectRepeatedBrief(
+									{ agentId: task.agentId, label: task.agentId || task.title || "(unnamed)", brief: task.task },
+									turnDispatchedBriefs,
+								);
+								if (match) {
+									dispatchNudgePrefix += formatRepeatedBriefNudge(
+										match,
+										contextDocPath(PIPIUI_MAIN_CWD, PIPIUI_SESSION),
+									);
+									turnRepeatNudged = true;
+								}
+							}
+							turnDispatchedBriefs.push({
+								agentId: task.agentId,
+								label: task.agentId || task.title || "(unnamed)",
+								brief: task.task,
+							});
+						}
+						if (turnDispatchedBriefs.length > TURN_BRIEF_MEMORY) {
+							turnDispatchedBriefs.splice(0, turnDispatchedBriefs.length - TURN_BRIEF_MEMORY);
+						}
+					}
+					}
+
+				if (hasTasks && (params.tasks?.length ?? 0) > MAX_PARALLEL_TASKS) {
+					return {
+						content: [{ type: "text", text: `Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
+						details: makeDetails("parallel")([]),
+						isError: true,
+					};
+				}
+				const requestedNames = hasChain
+					? (params.chain ?? []).map((step) => step.agent)
+					: hasTasks
+						? (params.tasks ?? []).map((task) => task.agent)
+						: [params.agent!];
+				const unknownNames = [...new Set(requestedNames.filter((name) => !agents.some((agent) => agent.name === name)))];
+				if (unknownNames.length > 0) {
+					const available = agents.map((agent) => `"${agent.name}"`).join(", ") || "none";
+					const packageDiagnostics = discovery.diagnostics.length > 0
+						? `\n\nAgent package diagnostics:\n${formatAgentDiagnostics(discovery.diagnostics)}`
+						: "";
+					return {
+						content: [{ type: "text", text: `Unknown agent(s): ${unknownNames.map((name) => `"${name}"`).join(", ")}. Available agents: ${available}.${packageDiagnostics}` }],
+						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				const executionTargets = hasChain
+					? (params.chain ?? [])
+					: hasSingle
+						? [params]
+						: [];
+				for (const target of executionTargets) {
+					const config = agents.find((agent) => agent.name === target.agent)!;
+					const normalized = normalizeGeneralPurposeExecutionPolicy(config, target);
+					if (normalized.problem) {
+						return {
+							content: [{ type: "text", text: normalized.problem }],
+							details: makeDetails(hasChain ? "chain" : "single")([]),
+							isError: true,
+						};
+					}
+				}
+
+				// Per-dispatch model pins: ONE batched authoritative RPC before anything reserves or
+				// spawns. A pin names exactly one usable provider/modelId for one dispatch; any
+				// transport/host failure or logical deny fails the WHOLE wave loudly at acceptance
+				// time — never a silent substitution with the user's default model, never a disk read.
+				const modelPinItems = [
+					...(hasSingle ? [{ label: "model", model: params.model }] : []),
+					...(hasTasks ? (params.tasks ?? []).map((t, i) => ({ label: `tasks[${i}].model`, model: t.model })) : []),
+					...(hasChain ? (params.chain ?? []).map((s, i) => ({ label: `chain[${i}].model`, model: s.model })) : []),
+				];
+				if (modelPinItems.some((item) => item.model !== undefined && item.model !== null)) {
+					const pinResult = await validateDispatchModelPinsViaHost(modelPinItems);
+					if (!pinResult.ok) {
+						// Pending release is centralized in the finally below.
+						return {
+							content: [{ type: "text", text: pinResult.problem }],
+							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+							isError: true,
+						};
+					}
+					validatedModelPins = pinResult.pins;
+				}
+
+				// Identity contract, one pure gate for every dispatch form. agentId is caller-chosen and
+				// required on every worker — single, tasks/parallel and chain steps alike; nothing is
+				// generated. The retired random-generator shape (agent-<16hex>) is refused for new work
+				// and may only resume when the role being dispatched would actually reopen a retained
+				// session for that id (read-only roles never do); abort/resolve/status never pass
+				// through this gate, so historical ids stay operable.
+				const dispatchIdTargets: Array<{ agentId: string | undefined; fresh?: boolean; agentName?: string; label: string }> = hasChain
+					? (params.chain ?? []).map((step, index) => ({ agentId: step.agentId, fresh: step.fresh, agentName: step.agent, label: `chain step ${index + 1}` }))
+					: hasTasks
+						? (params.tasks ?? []).map((task, index) => ({ agentId: task.agentId, fresh: task.fresh, agentName: task.agent, label: `task ${index + 1}` }))
+						: [{ agentId: params.agentId, fresh: params.fresh, agentName: params.agent, label: "this dispatch" }];
+				const identityProblem = dispatchIdentityGateProblem({
+					targets: dispatchIdTargets,
+					agentId: params.agentId,
+					resumeFrom: params.resume_from,
+					// Continuation-only gate for retired `agent-<16hex>` ids: actual resumability,
+					// not bookkeeping — and resumability under the ROLE being dispatched. The runner
+					// only opens a session for context-retaining (writable) roles: read-only roles force
+					// --no-session (runSingleAgent: sessionDir === undefined), so even a stray session
+					// file named after the id is not context this dispatch would reuse. Job/slice
+					// metadata alone proves nothing. Active ids never reach this check: the reservation
+					// selector below already rejects them as "already running", and abort/resolve/status
+					// do not pass through this gate at all.
+					isResumable: (agentId, agentName) => {
+						const config = agentName ? agents.find((agent) => agent.name === agentName) : undefined;
+						if (!config || config.traits.readOnly) return false;
+						const dir = agentSessionDir();
+						return dir !== undefined && agentSessionExists(dir, `pipiui-${agentId}`);
+					},
+				});
+				if (identityProblem) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: identityProblem,
+							},
+						],
+						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				// This is deliberately after the final await/validation and immediately before
+				// dispatch. Add to the module reservation set synchronously so a concurrent tool call
+				// cannot pass the same selector during any later async setup.
+				const activeAgentIds = new Set<string>([
+					...localAgentReservations,
+					...[...pendingDispatchAcceptances]
+						// An id with ANY other pending claimant is still taken: only this wave's own
+						// tokens are excluded, so a later duplicate selection is rejected as running.
+						.filter(([, owners]) => [...owners].some((owner) => owner !== pendingAcceptanceToken))
+						.map(([agentId]) => agentId),
+					...runningAgents.keys(),
+					...[...jobRegistry.values()]
+						.filter((job) => job.state === "running")
+						.map((job) => job.agentId),
+				]);
+				const callerSelection = selectAndReserveCallerAgentIds(
+					dispatchIdTargets.map((target) => target.agentId),
+					activeAgentIds,
+					localAgentReservations,
+				);
+				const writableProblem = unnamedWritableDispatchProblem(
+					hasChain
+						? (params.chain ?? []).map((step) => ({ agent: step.agent, agentId: step.agentId, worktree: step.worktree }))
+						: hasTasks
+							? (params.tasks ?? []).map((task) => ({ agent: task.agent, agentId: task.agentId }))
+							: [{ agent: params.agent!, agentId: params.agentId, worktree: params.worktree }],
+					(target) => {
+						const config = agents.find((agent) => agent.name === target.agent);
+						if (!config) return false;
+						const execution = normalizeGeneralPurposeExecutionPolicy(config, target).policy;
+						return execution ? execution.worktree === "isolated" : runtimeRolePolicyForAgent(config).worktree === "isolated";
+					},
+				);
+				if (writableProblem) {
+					// Pending release is centralized in the finally below.
+					return {
+						content: [{ type: "text", text: writableProblem }],
+						details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				if (callerSelection.problem) {
+					// Pending release is centralized in the finally below.
+					return {
+						content: [{ type: "text", text: callerSelection.problem }],
+						details: makeDetails(isChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						isError: true,
+					};
+				}
+				// The selector has synchronously transferred accepted IDs to local reservations;
+				// they keep the same running-like visibility without the pending map.
+			} finally {
+				// Centralized release for EVERY exit from the acceptance window — success after the
+				// reservation transfer, confirm denial, model-pin/identity/writable/selection
+				// rejection, and any thrown error. The token-matched delete repumps the queue, so no
+				// rejection can strand dependents on a phantom running-like id.
+				releasePendingDispatchAcceptance(pendingAcceptanceIds, pendingAcceptanceToken);
 			}
 			recordSubagentDispatchStats(
 				dispatchMode,
@@ -10369,7 +10497,7 @@ export default function (pi: ExtensionAPI) {
 					// Steps never handed over keep reservations only until this exit; stale
 					// reservations would block re-dispatching those ids forever.
 					for (const idleId of unstartedChainReservationIds(params.chain, chainDispatchedCount)) {
-						localAgentReservations.delete(idleId);
+						releaseAgentReservation(idleId);
 					}
 				}
 				const lastChainResult = results[results.length - 1];
@@ -10671,8 +10799,33 @@ export default function (pi: ExtensionAPI) {
 								queuedAt: Date.now(),
 								run: () =>
 									new Promise<void>((resolveRun) => {
+										// Pre-spawn ownership: this queued run still holds the reservation transferred
+										// at acceptance until runSingleAgent takes over cleanup. Any exit before that
+										// handoff must finalize honestly and release the exact reservation — or the id
+										// answers "running" forever, blocking redispatch and stranding dependents.
+										let queuedSpawnStarted = false;
+										let queuedTerminalSettled = false;
 										releaseBlockedQueuedSingle().catch((setupError) => {
-											console.error("[pipiui-subagent] background queued agent setup error:", agentId, setupError instanceof Error ? setupError.message : String(setupError));
+											const setupMsg = setupError instanceof Error ? setupError.message : String(setupError);
+											console.error("[pipiui-subagent] background queued agent setup error:", agentId, setupMsg);
+											if (!queuedTerminalSettled) {
+												queuedTerminalSettled = true;
+												notifySubagentDone(pi, {
+													agent: params.agent!,
+													agentId,
+													runId,
+													agentSource: agentCfg.source,
+													task: params.task!,
+													title: params.title,
+													exitCode: 1,
+													messages: [],
+													stderr: setupMsg,
+													errorMessage: setupMsg,
+													usage: emptyUsage(),
+													stopReason: "error",
+												});
+											}
+											if (!queuedSpawnStarted) releaseAgentReservation(agentId);
 											resolveRun();
 										});
 
@@ -10703,26 +10856,34 @@ export default function (pi: ExtensionAPI) {
 														usage: emptyUsage(),
 														stopReason: "error",
 													};
-												notifySubagentDone(pi, refusedResult);
-												resolveRun();
-												return;
+													queuedTerminalSettled = true;
+													notifySubagentDone(pi, refusedResult);
+													// No-spawn terminal: release the reservation this queued run still owns —
+													// after the job is terminal, so the repump reads the failure and the id is
+													// immediately redispatchable instead of answering running forever.
+													releaseAgentReservation(agentId);
+													resolveRun();
+													return;
+												}
+												releasedModelPin = revalidated.pins.get(String(params.model).trim())!;
 											}
-											releasedModelPin = revalidated.pins.get(String(params.model).trim())!;
-										}
-									}
-									recordRunningDispatchScope(agentId, params.scope);
-										void runSingleAgent(
-											ctx.cwd,
-											agents,
-											params.agent!,
-											params.task!,
-											params.cwd,
-											undefined,
-											undefined,
-											undefined,
-											makeDetails("single", { background: true, agentIds: [agentId] }),
-											{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
-										)
+											// The spawn lives inside this setup function so it is gated on the pin
+											// revalidation above, and releasedModelPin stays in scope for the call.
+											recordRunningDispatchScope(agentId, params.scope);
+											// From this call on, runSingleAgent owns the reservation release.
+											queuedSpawnStarted = true;
+											void runSingleAgent(
+												ctx.cwd,
+												agents,
+												params.agent!,
+												params.task!,
+												params.cwd,
+												undefined,
+												undefined,
+												undefined,
+												makeDetails("single", { background: true, agentIds: [agentId] }),
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
 												notifySubagentDone(pi, result);
@@ -10746,8 +10907,13 @@ export default function (pi: ExtensionAPI) {
 													usage: emptyUsage(),
 													stopReason: /abort/i.test(msg) ? "aborted" : "error",
 												});
+												// A rejection that escaped before runSingleAgent's own cleanup took ownership
+												// still holds the acceptance reservation; release it here. Idempotent once
+												// the run's finally has already released.
+												releaseAgentReservation(agentId);
 												resolveRun();
 											});
+										}
 									}),
 							},
 						]);

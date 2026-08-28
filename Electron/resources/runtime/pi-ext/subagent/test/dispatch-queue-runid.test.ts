@@ -152,6 +152,64 @@ function gateItem(
 
 const drain = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+test("cross-call pending dependency waits without a false never-dispatched signal", () => {
+	const started: string[] = [];
+	const notifications: string[] = [];
+	let producerPending = true;
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: (agentId) => (agentId === "producer" && producerPending ? "running" : "unknown"),
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+
+	q.enqueueBatch([recordingItem("consumer", "run-c", started, ["producer"])]);
+	assert.deepEqual(started, []);
+	assert.equal(notifications.length, 0, "an accepting dependency is running-like, never unknown");
+	assert.equal(q.snapshot()[0]?.heldReason, undefined);
+
+	// Acceptance succeeds into the ordinary atomic queue registration; no notification was emitted
+	// during the cross-call window and the consumer remains dependency-gated.
+	producerPending = false;
+	q.enqueueBatch([recordingItem("producer", "run-p", started)]);
+	assert.deepEqual(started, ["producer"]);
+	assert.equal(notifications.length, 0);
+});
+
+test("pending acceptance release re-pumps dependents into one genuine held notification", () => {
+	const notifications: string[] = [];
+	let producerPending = true;
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: (agentId) => (agentId === "producer" && producerPending ? "running" : "unknown"),
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+	q.enqueueBatch([item("consumer", "run-c", ["producer"])]);
+	assert.equal(notifications.length, 0);
+
+	producerPending = false; // acceptance failed/released before the producer was enqueued
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1);
+	assert.match(notifications[0]!, /dependency producer was never dispatched/);
+	assert.equal(q.snapshot()[0]?.heldReason, "dependency producer was never dispatched");
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1, "re-pumps must not duplicate the held signal");
+});
+
+test("a genuinely unknown dependency is held and notified immediately", () => {
+	const notifications: string[] = [];
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: () => "unknown",
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+	q.enqueueBatch([item("consumer", "run-c", ["missing"])]);
+	assert.equal(notifications.length, 1);
+	assert.match(notifications[0]!, /dependency missing was never dispatched/);
+});
+
 test("[subagent-blocked] signal carries the refill scan pointer after the abort instruction", () => {
 	const notifications: string[] = [];
 	const q = new DispatchQueueV1({
@@ -250,6 +308,71 @@ test("dependency failure still holds its dependent and notifies exactly once", a
 	assert.equal(q.snapshot().length, 0);
 });
 
+/**
+ * Regression (final-review critical): an agentId reservation is a running-like dependency
+ * state that lives OUTSIDE this queue, in the extension layer. Whatever releases it must end
+ * in a pump, or a dependent whose producer settled, failed, or was exact-aborted keeps
+ * waiting on a reservation nobody holds anymore. These two tests model that lifecycle
+ * contract around the queue; the seam suite covers the real wiring.
+ */
+test("releasing a settled producer's reservation repumps its dependent into starting", async () => {
+	const started: string[] = [];
+	const notifications: string[] = [];
+	let producerReserved = true;
+	const terminal = new Map<string, DependencyState>([["producer", "ok"]]);
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: (agentId) => {
+			// The extension's reservation keeps answering running even after the job went terminal.
+			if (agentId === "producer" && producerReserved) return "running";
+			return terminal.get(agentId) ?? "unknown";
+		},
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+	q.enqueueBatch([recordingItem("fixer", "run-x", started, ["producer"])]);
+	assert.deepEqual(started, [], "reservation still answers running; the dependent must wait");
+
+	// jobFinalize already pumped while the reservation masked the terminal state; the
+	// centralized reservation release (delete first, then re-evaluate) must start the
+	// dependent now — not leave it waiting forever.
+	producerReserved = false;
+	q.onDependencyStateChanged();
+	await drain();
+	assert.deepEqual(started, ["fixer"]);
+	assert.equal(notifications.length, 0, "a satisfied dependency is never a blocked signal");
+});
+
+test("dropping an exact queued producer hands its dependent a held signal, not an eternal wait", () => {
+	const notifications: string[] = [];
+	let producerReserved = true;
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: (agentId) => {
+			if (agentId === "producer" && producerReserved) return "running";
+			if (agentId === "gate") return "running"; // keeps the producer queued, like a busy slot
+			return "unknown";
+		},
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+	// The producer itself is a queued entry (waiting on gate); the consumer waits on it.
+	q.enqueueBatch([item("producer", "run-p"), item("consumer", "run-c", ["producer"])]);
+	assert.equal(notifications.length, 0, "a reserved/queued producer is running-like, never unknown");
+
+	// Exact queued abort, in the extension's real order: the queue entry is dropped first
+	// (cancel pumps; the reservation still answers running), then the reservation release
+	// must re-evaluate the queue against the producer's true post-cancel state.
+	assert.equal(q.cancel("producer", "run-p"), true);
+	producerReserved = false;
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1);
+	assert.match(notifications[0]!, /dependency producer was never dispatched/);
+	assert.equal(q.snapshot()[0]?.heldReason, "dependency producer was never dispatched");
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1, "re-pumps must not duplicate the held signal");
+});
+
 test("a waiting or held head of line does not block later ready items", () => {
 	const started: string[] = [];
 	const notifications: string[] = [];
@@ -271,4 +394,41 @@ test("a waiting or held head of line does not block later ready items", () => {
 	assert.deepEqual(started, ["runner"]);
 	assert.equal(notifications.length, 1);
 	assert.equal(q.snapshot().length, 2);
+});
+
+/**
+ * Regression (acceptance-ownership review): pending dispatch acceptances are multi-owner.
+ * Overlapping acceptances of one agentId each hold their own token, so releasing ONE
+ * claimant (e.g. a denied duplicate) must never flip the id to unknown — and with it a
+ * false "never dispatched" held signal — while another claimant is still pending.
+ */
+test("releasing one overlapping pending claimant keeps a second claimant running-like", () => {
+	const notifications: string[] = [];
+	// Models the extension's pendingDispatchAcceptances: one id, two pending tokens.
+	const pendingClaimants = new Map<string, number>([["shared", 2]]);
+	const q = new DispatchQueueV1({
+		limit: 4,
+		lookup: (agentId) => (pendingClaimants.get(agentId) ? "running" : "unknown"),
+		notify: (text) => notifications.push(text),
+		now: () => 1_000,
+	});
+	q.enqueueBatch([item("consumer", "run-c", ["shared"])]);
+	assert.equal(notifications.length, 0, "an overlapping pending acceptance is running-like, never unknown");
+
+	// One claimant denied and released: the OTHER claimant still holds the id, so the
+	// dependent keeps waiting — no held signal, no phantom never-dispatched flip.
+	pendingClaimants.set("shared", 1);
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 0);
+	assert.equal(q.snapshot()[0]?.heldReason, undefined);
+
+	// Only releasing the LAST token (the original claimant denied too) makes the id
+	// genuinely unknown — exactly one held signal.
+	pendingClaimants.delete("shared");
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1);
+	assert.match(notifications[0]!, /dependency shared was never dispatched/);
+	assert.equal(q.snapshot()[0]?.heldReason, "dependency shared was never dispatched");
+	q.onDependencyStateChanged();
+	assert.equal(notifications.length, 1, "re-pumps must not duplicate the held signal");
 });
