@@ -667,6 +667,84 @@ describe("external session native titles", () => {
     ]);
   });
 
+  it("upgrades a sqlite Codex thread when its rollout has readable text, even with five sqlite rows", async () => {
+    const { home, project } = await fixtureHome();
+    const origin = 1_780_000_000_000;
+    await mkdir(join(home, ".codex", "sqlite"), { recursive: true });
+    const day = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(day, { recursive: true });
+    await writeSqlite(join(home, ".codex", "sqlite", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      for (let i = 1; i <= 5; i += 1) {
+        db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+          `codex-${i}`,
+          `SQLite ${i}`,
+          project,
+          "2026-08-01",
+          origin + i,
+        );
+      }
+    });
+    await writeFile(join(day, "rollout-codex-5.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-5", cwd: project } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "continue this Codex thread" } },
+      { timestamp: "2026-08-01T00:00:02.000Z", type: "response_item", payload: { role: "assistant", content: [{ type: "output_text", text: "Codex reply" }] } },
+    ]));
+
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.filter((item) => item.source === "codex")).toHaveLength(5);
+    expect(listed.find((item) => item.id === "ext:codex:codex-5")).toMatchObject({
+      title: "SQLite 5",
+      historyAvailability: "text",
+    });
+    const history = await readExternalSessionHistory("ext:codex:codex-5", [project], { home });
+    expect(history.entries.map((entry) => entry.content)).toEqual(["continue this Codex thread", "Codex reply"]);
+  });
+
+  it("still upgrades a sqlite Codex thread whose rollout is older than many newer other-project rollouts", async () => {
+    const { home, project, other } = await fixtureHome();
+    const origin = 1_780_000_000_000;
+    await mkdir(join(home, ".codex", "sqlite"), { recursive: true });
+    const olderDay = join(home, ".codex", "sessions", "2026", "07", "01");
+    const newerDay = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(olderDay, { recursive: true });
+    await mkdir(newerDay, { recursive: true });
+    await writeSqlite(join(home, ".codex", "sqlite", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      for (let i = 1; i <= 5; i += 1) {
+        db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+          `codex-${i}`,
+          `SQLite ${i}`,
+          project,
+          "2026-08-02",
+          origin + i,
+        );
+      }
+    });
+    // Twelve newer rollouts from a different project: they must not crowd out
+    // the older same-id rollout of this project's sqlite thread.
+    for (let i = 1; i <= 12; i += 1) {
+      await writeFile(join(newerDay, `rollout-2026-08-01T00-00-${String(i).padStart(2, "0")}-other-${i}.jsonl`), jsonl([
+        { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: `other-${i}`, cwd: other } },
+      ]));
+    }
+    await writeFile(join(olderDay, "rollout-2026-07-01T00-00-00-codex-5.jsonl"), jsonl([
+      { timestamp: "2026-07-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-5", cwd: project } },
+      { timestamp: "2026-07-01T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "older but readable" } },
+    ]));
+
+    const listed = await listExternalSessionsForProject(project, { home });
+    const codex = listed.filter((item) => item.source === "codex");
+    expect(codex).toHaveLength(5);
+    expect(listed.find((item) => item.id === "ext:codex:codex-5")).toMatchObject({
+      title: "SQLite 5",
+      historyAvailability: "text",
+    });
+    expect(listed.every((item) => !item.id.includes("other-"))).toBe(true);
+    const history = await readExternalSessionHistory("ext:codex:codex-5", [project], { home });
+    expect(history.entries.map((entry) => entry.content)).toEqual(["older but readable"]);
+  });
+
   it("lists a Codex thread from sqlite cwd without a rollout file", async () => {
     const { home, project } = await fixtureHome();
     await mkdir(join(home, ".codex", "sqlite"), { recursive: true });

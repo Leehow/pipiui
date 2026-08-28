@@ -88,6 +88,43 @@ async function newestPaths(paths: readonly string[], limit: number): Promise<str
   return ranked.slice(0, limit).map((item) => item.path);
 }
 
+/** Day folders the sqlite-id lookup may walk; one readdir each, no file reads. */
+const CODEX_ROLLOUT_LOOKUP_DIR_LIMIT = 366;
+
+/** Resolve sqlite thread ids to rollout files by filename id (the same
+ *  `name.includes(id)` convention readCodexHistory uses), newest date folders
+ *  first. Budget is per-id, so newer rollouts from other projects cannot crowd
+ *  out this project's threads; the walk stops once every id is resolved or the
+ *  day-folder cap is hit. */
+async function rolloutsByThreadId(
+  sessionsDir: string,
+  ids: ReadonlySet<string>,
+): Promise<Map<string, string>> {
+  const found = new Map<string, string>();
+  if (!ids.size) return found;
+  const years = (await listDir(sessionsDir)).filter((name) => /^\d{4}$/.test(name)).sort().reverse();
+  let walked = 0;
+  for (const year of years) {
+    const months = (await listDir(join(sessionsDir, year))).filter((name) => /^\d{2}$/.test(name)).sort().reverse();
+    for (const month of months) {
+      const days = (await listDir(join(sessionsDir, year, month))).filter((name) => /^\d{2}$/.test(name)).sort().reverse();
+      for (const day of days) {
+        walked += 1;
+        if (walked > CODEX_ROLLOUT_LOOKUP_DIR_LIMIT) return found;
+        for (const name of await listDir(join(sessionsDir, year, month, day))) {
+          if (!name.endsWith(".jsonl")) continue;
+          for (const id of ids) {
+            if (found.has(id) || !name.includes(id)) continue;
+            found.set(id, join(sessionsDir, year, month, day, name));
+          }
+        }
+        if (found.size >= ids.size) return found;
+      }
+    }
+  }
+  return found;
+}
+
 /** Newest Codex rollouts by date folder, so we never walk years of archives. */
 async function newestDatedRollouts(sessionsDir: string, limit: number): Promise<string[]> {
   const out: string[] = [];
@@ -523,12 +560,6 @@ function loadCodexSqliteThreads(codexHome: string): Map<string, CodexSqliteThrea
   return map;
 }
 
-function rolloutNativeId(path: string): string | undefined {
-  const name = path.split(/[/\\]/).pop() ?? "";
-  const match = name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
-  return match?.[1];
-}
-
 async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots): Promise<ExternalSession[]> {
   const [index, sqlite] = await Promise.all([
     loadCodexIndex(roots.codexHome),
@@ -547,29 +578,43 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
       historyAvailability: "metadata",
     });
   }
-  let out = takeNewest(fromStore);
-  if (out.length >= EXTERNAL_SESSIONS_PER_SOURCE) return out;
-
-  const have = new Set(
+  const out = takeNewest(fromStore);
+  const byNativeId = new Map(
     out.flatMap((session) => {
       const parsed = parseExternalSessionId(session.id);
-      return parsed?.source === "codex" ? [parsed.nativeId] : [];
+      return parsed?.source === "codex" ? [[parsed.nativeId, session] as const] : [];
     }),
   );
+  // Exact-id resolution for the sqlite candidates we are about to display:
+  // other projects' newer rollouts cannot exhaust this budget the way a
+  // global newest-first cap would.
+  const sqliteRollouts = await rolloutsByThreadId(
+    join(roots.codexHome, "sessions"),
+    new Set(byNativeId.keys()),
+  );
+  for (const [id, path] of sqliteRollouts) {
+    const session = byNativeId.get(id);
+    const meta = await readCodexMeta(path);
+    if (!session || meta?.id !== id || !meta.cwd || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
+    byNativeId.set(id, { ...session, historyAvailability: "text" });
+  }
   const files = await newestDatedRollouts(
     join(roots.codexHome, "sessions"),
-    EXTERNAL_SESSIONS_PER_SOURCE + have.size,
+    EXTERNAL_SESSIONS_PER_SOURCE + byNativeId.size,
   );
   for (const path of files) {
-    if (out.length >= EXTERNAL_SESSIONS_PER_SOURCE) break;
-    const namedId = rolloutNativeId(path);
-    if (namedId && have.has(namedId)) continue;
     const meta = await readCodexMeta(path);
     if (!meta?.id || !meta.cwd || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
-    if (have.has(meta.id)) continue;
+    const existing = byNativeId.get(meta.id);
+    if (existing) {
+      // SQLite safely supplies the catalog metadata; the matching rollout proves
+      // this same thread has readable text history.
+      byNativeId.set(meta.id, { ...existing, historyAvailability: "text" });
+      continue;
+    }
     const indexed = index.get(meta.id);
     const storedTitle = firstTitle(indexed?.title, sqlite.get(meta.id)?.title, meta.title);
-    out.push({
+    byNativeId.set(meta.id, {
       id: makeExternalSessionId("codex", meta.id),
       source: "codex",
       title: storedTitle ?? fallbackExternalTitle("Codex", meta.id),
@@ -577,9 +622,8 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
       updatedAt: indexed?.updatedAt || meta.updatedAt,
       historyAvailability: "text",
     });
-    have.add(meta.id);
   }
-  return takeNewest(out);
+  return takeNewest([...byNativeId.values()]);
 }
 
 async function scanGrok(projectCwd: string, roots: ResolvedExternalSessionRoots): Promise<ExternalSession[]> {

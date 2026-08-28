@@ -133,6 +133,7 @@ describe('external session aggregation', () => {
     expect(screen.getByText('外部回答')).toBeTruthy()
     expect(screen.getByTestId('external-session-readonly').textContent).toContain('只读')
     expect(screen.getByTestId('composer-read-only').textContent).toContain('只读会话')
+    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).placeholder).toBe('外部会话只读')
     expect(screen.queryByTestId('composer-lease-takeover')).toBeNull()
     expect(screen.queryByTestId('model-chip')).toBeNull()
     expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).disabled).toBe(true)
@@ -201,6 +202,40 @@ describe('external session aggregation', () => {
     expect(screen.getByTestId('adopt-external-unavailable').textContent).toContain('元数据')
   })
 
+  it('offers adopt after metadata-only listing resolves to importable text history', async () => {
+    const sessionId = 'ext:opencode:o'
+    let resolveHistory: (history: ExternalSessionHistory) => void = () => undefined
+    const importableHistory = new Promise<ExternalSessionHistory>(resolve => { resolveHistory = resolve })
+    const metadataHistory: ExternalSessionHistory = { id: sessionId, source: 'opencode', availability: 'metadata', entries: [] }
+    const host = hostWithExternals({
+      getExternalSessionHistory: vi.fn((id: string) => id === sessionId ? importableHistory : Promise.resolve(metadataHistory)),
+    })
+    render(<App host={host} />)
+    const row = await waitFor(() => {
+      const found = document.querySelector(`[data-session-id="${sessionId}"]`)
+      if (!found) throw new Error('metadata external row missing')
+      return found as HTMLElement
+    })
+    fireEvent.click(row)
+    await waitFor(() => expect(host.getExternalSessionHistory).toHaveBeenCalledWith(sessionId))
+    expect(screen.queryByTestId('adopt-external-session')).toBeNull()
+
+    resolveHistory({
+      id: sessionId,
+      source: 'opencode',
+      availability: 'text',
+      entries: [
+        { id: 'u1', role: 'user', content: '导入这段正文', timestamp: 1 },
+        { id: 'a1', role: 'assistant', content: '可继续', timestamp: 2 },
+      ],
+    })
+    const adopt = await screen.findByTestId('adopt-external-session')
+    expect(adopt.textContent).toContain('用 Pi 继续')
+    fireEvent.click(adopt)
+    await waitFor(() => expect(host.adoptExternalSession).toHaveBeenCalledWith(sessionId))
+    await waitFor(() => expect(document.querySelector('[data-session-id="pi-adopted"]')).toBeTruthy())
+  })
+
   it('keeps the original row when adopt fails', async () => {
     const host = hostWithExternals({
       adoptExternalSession: vi.fn(async () => { throw new Error('disk full') }),
@@ -234,7 +269,7 @@ describe('external session aggregation', () => {
       listExternalSessions: () => new Promise(() => {}),
     })
     render(<App host={host} />)
-    await screen.findByText('Pi 会话')
+    await waitFor(() => expect(document.querySelector('[data-session-id="pi-mid"]')).toBeTruthy())
     expect(screen.getByText('Demo')).toBeTruthy()
     expect(screen.queryByTestId('sidebar-empty')).toBeNull()
     expect(screen.queryByText('Claude 新')).toBeNull()
