@@ -6760,6 +6760,18 @@ export class PiHostBackend implements HostBackend {
       ]);
     }
   }
+  /**
+   * Read-only bundled (builtin/app) extension snapshot for update-center discovery.
+   * Deliberately never scans or migrates: an update refresh must not unload
+   * project-origin extensions, reset the loaded project root, or disturb
+   * active-session enablement/context.
+   */
+  async listBundledUpdateExtensions(): Promise<ExtensionListItem[]> {
+    const overlay = await this.extensionEnableOverlay(undefined);
+    return this.extensionLoader
+      .list(overlay)
+      .filter((item) => item.origin === "builtin" || item.origin === "app");
+  }
   private async listExtensions(projectId: unknown): Promise<ExtensionListItem[]> {
     const projectRoot =
       typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;

@@ -9,6 +9,10 @@ import {
   parseExtensionAuthContribution,
   type ExtensionAuthContribution,
 } from "./extension-provider-contract.js";
+import {
+  parseExtensionUpdateComponents,
+  type ExtensionUpdateComponent,
+} from "./extension-update-components.js";
 
 /** Spec D2. */
 export const EXTENSION_MANIFEST_FILENAME = "pipiui-extension.json";
@@ -128,6 +132,8 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   hostEntry?: string;
   /** Declarative auth/provider contribution. Models use the Pi provider shape. */
   auth?: ExtensionAuthContribution;
+  /** Declared open-source update components (metadata only; checks stay host-side). */
+  updateComponents?: ExtensionUpdateComponent[];
 };
 
 export type ManifestValidationOk = { ok: true; manifest: ValidatedExtensionManifest };
@@ -684,6 +690,13 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     else auth = parsedAuth.contribution;
   }
 
+  let updateComponents: ExtensionUpdateComponent[] | undefined;
+  const parsedComponents = parseExtensionUpdateComponents(value.updateComponents);
+  if (parsedComponents) {
+    if (!parsedComponents.ok) errors.push(...parsedComponents.errors);
+    else if (parsedComponents.components.length) updateComponents = parsedComponents.components;
+  }
+
   if (errors.length) return { ok: false, errors, fallbackId };
 
   const manifest: ValidatedExtensionManifest = {
@@ -701,6 +714,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (agentPatches) manifest.agentPatches = agentPatches;
   if (hostEntry) manifest.hostEntry = hostEntry;
   if (auth) manifest.auth = auth;
+  if (updateComponents) manifest.updateComponents = updateComponents;
   return { ok: true, manifest };
 }
 

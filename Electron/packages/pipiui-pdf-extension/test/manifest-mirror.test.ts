@@ -39,6 +39,51 @@ describe("pipiui-pdf-extension manifest + generated runtime mirror", () => {
     expect(existsSync(join(packageRoot, "vendor/pdf-inspector/node_modules/@firecrawl/pdf-inspector-darwin-arm64"))).toBe(true);
   });
 
+  it("declares the vendored Firecrawl inspector as its update component", async () => {
+    const manifest = JSON.parse(await readFile(join(packageRoot, "pipiui-extension.json"), "utf8")) as {
+      updateComponents?: Array<Record<string, unknown>>;
+    };
+    expect(manifest.updateComponents).toEqual([
+      {
+        id: "firecrawl-pdf-inspector",
+        name: "@firecrawl/pdf-inspector",
+        version: "1.15.0",
+        source: { type: "npm", packageName: "@firecrawl/pdf-inspector" },
+        upstream: "https://github.com/firecrawl/pdf-inspector",
+        license: "MIT",
+      },
+    ]);
+  });
+
+  it("keeps the declared update component in lockfile lockstep with the vendored Firecrawl pins", () => {
+    const manifest = JSON.parse(readFileSync(join(packageRoot, "pipiui-extension.json"), "utf8")) as {
+      updateComponents?: Array<{ name: string; version: string }>;
+    };
+    const declared = manifest.updateComponents?.find((component) => component.name === "@firecrawl/pdf-inspector");
+    expect(declared).toBeDefined();
+    const vendorManifest = JSON.parse(readFileSync(join(packageRoot, "vendor/pdf-inspector/package.json"), "utf8")) as {
+      dependencies: Record<string, string>;
+    };
+    expect(vendorManifest.dependencies["@firecrawl/pdf-inspector"]).toBe(declared!.version);
+    expect(vendorManifest.dependencies["@firecrawl/pdf-inspector-wasm"]).toBe(declared!.version);
+    const lock = JSON.parse(readFileSync(join(packageRoot, "vendor/pdf-inspector/package-lock.json"), "utf8")) as {
+      packages: Record<string, { version: string }>;
+    };
+    const pinnedVersions = Object.entries(lock.packages)
+      .filter(([key]) => key.includes("node_modules/@firecrawl/pdf-inspector"))
+      .map(([, entry]) => entry.version);
+    expect(pinnedVersions.length).toBeGreaterThan(0);
+    for (const version of pinnedVersions) expect(version).toBe(declared!.version);
+  });
+
+  it("keeps no duplicate inspector version constant in the agent half (lockfile + manifest are the single source)", () => {
+    expect(readFileSync(join(packageRoot, "agent/pdf-inspector-local.ts"), "utf8")).not.toContain("PDF_INSPECTOR_VERSION");
+    // The generated mirror must not resurrect the removed duplicate from a stale build.
+    expect(existsSync(mirrorRoot), "run `npm run build -w @pipiui/pipiui-pdf-extension` first").toBe(true);
+    expect(readFileSync(join(mirrorRoot, "agent/dist/pdf-inspector-local.js"), "utf8")).not.toContain("PDF_INSPECTOR_VERSION");
+    expect(readFileSync(join(mirrorRoot, "agent/dist/pdf-inspector-local.d.ts"), "utf8")).not.toContain("PDF_INSPECTOR_VERSION");
+  });
+
   it("generates the mirror via sync-bundled-extension: manifest, compiled agent, and the owned dependency tree — no hand edits", () => {
     expect(existsSync(mirrorRoot), "run `npm run build -w @pipiui/pipiui-pdf-extension` first").toBe(true);
 

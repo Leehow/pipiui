@@ -15,6 +15,12 @@ const snapshot: UpdateCenterSnapshot = { checkedAt: 1, items: [
   { id: 'broken', name: 'Broken Extension', category: 'extension', currentVersion: '1.0.0', status: 'checkFailed', error: 'offline' }
 ] }
 
+const extensionSnapshot: UpdateCenterSnapshot = { checkedAt: 2, items: [
+  { id: 'pdf-extension:firecrawl-pdf-inspector', name: 'Firecrawl pdf-inspector', category: 'extension', packageName: '@firecrawl/pdf-inspector', currentVersion: '1.15.0', latestVersion: '1.17.0', status: 'updateAvailable', ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' },
+  { id: 'pdf-extension:firecrawl-pdf-inspector-wasm', name: '@firecrawl/pdf-inspector-wasm', category: 'extension', sourceLabel: 'firecrawl/pdf-inspector', currentVersion: '1.15.0', status: 'checkFailed', error: '版本服务返回 HTTP 503', ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' },
+  { id: 'pdf-extension:firecrawl-pdf-inspector-darwin-arm64', name: '@firecrawl/pdf-inspector-darwin-arm64', category: 'extension', packageName: '@firecrawl/pdf-inspector-darwin-arm64', currentVersion: 'workspace:*', status: 'notCheckable', error: '本机版本不是可识别的 SemVer', ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' },
+] }
+
 function UpdatesHarness({ host, onRequestUpdate = () => undefined, show = true }: {
   host: PipiHostAPI
   onRequestUpdate?: (prompt: string) => void
@@ -56,6 +62,35 @@ describe('UpdateCenter', () => {
     })
     expect(intent).not.toContain('release notes')
     expect(intent).not.toContain('Hermes')
+  })
+  it('renders extension-declared components with owner and source across status variants', async () => {
+    const checkForUpdates = vi.fn().mockResolvedValue(extensionSnapshot)
+    const onRequestUpdate = vi.fn()
+    render(<UpdatesHarness host={{ checkForUpdates } as unknown as PipiHostAPI} onRequestUpdate={onRequestUpdate} />)
+    await screen.findByTestId('update-item-pdf-extension:firecrawl-pdf-inspector')
+    expect(screen.getAllByText('来自扩展 PipiUI PDF')).toHaveLength(3)
+    const row = screen.getByTestId('update-item-pdf-extension:firecrawl-pdf-inspector')
+    expect(row.textContent).toContain('@firecrawl/pdf-inspector')
+    expect(screen.getByTestId('update-item-pdf-extension:firecrawl-pdf-inspector-wasm').textContent).toContain('firecrawl/pdf-inspector')
+    const extensionGroup = screen.getByTestId('update-group-extension')
+    expect(extensionGroup.textContent).toContain('检查失败')
+    expect(extensionGroup.textContent).toContain('来自扩展 PipiUI PDF')
+    expect(screen.getByText('有新版本')).toBeTruthy()
+    expect(screen.getByText('无法检查')).toBeTruthy()
+    const buttons = screen.getAllByRole('button', { name: '评估更新' })
+    expect(buttons).toHaveLength(1)
+    fireEvent.click(buttons[0])
+    expect(onRequestUpdate).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(onRequestUpdate.mock.calls[0][0].slice(PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX.length))).toEqual({
+      version: PIPIUI_UPDATE_EVALUATION_INTENT_VERSION,
+      id: 'pdf-extension:firecrawl-pdf-inspector',
+      name: 'Firecrawl pdf-inspector',
+      packageName: '@firecrawl/pdf-inspector',
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF',
+      currentVersion: '1.15.0',
+      latestVersion: '1.17.0',
+    })
   })
   it('refreshes and exposes a dismissible non-blocking request error', async () => {
     const checkForUpdates = vi.fn().mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(snapshot)

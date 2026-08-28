@@ -266,6 +266,129 @@ describe("extension loader via listExtensions", () => {
   });
 });
 
+describe("bundled update discovery (read-only seam)", () => {
+  it("listBundledUpdateExtensions exposes only builtin/app components and never rescans or disturbs the loaded project", async () => {
+    await tempRoot("pipi-ext-update-scope-");
+    const runtime = join(root, "runtime");
+    const agent = join(root, "agent");
+    const project = join(root, "repo");
+    await mkdir(project, { recursive: true });
+    await writeManifest(join(runtime, "extensions", "bundle-a"), {
+      id: "bundle-a",
+      name: "Bundle A",
+      version: "1.0.0",
+      capabilities: [],
+      updateComponents: [
+        { id: "lib-a", name: "Lib A", version: "1.0.0", source: { type: "npm", packageName: "lib-a" } },
+      ],
+    });
+    await writeManifest(join(agent, "extensions", "bundle-b"), {
+      id: "bundle-b",
+      name: "Bundle B",
+      version: "2.0.0",
+      capabilities: [],
+      updateComponents: [
+        { id: "lib-b", name: "Lib B", version: "0.9.0", source: { type: "githubReleases", owner: "acme", repo: "lib-b" } },
+      ],
+    });
+    await writeManifest(join(projectPiAgentDir(project), "extensions", "proj-x"), {
+      id: "proj-x",
+      name: "Proj X",
+      version: "0.1.0",
+      capabilities: [],
+      updateComponents: [
+        { id: "lib-x", name: "Lib X", version: "3.0.0", source: { type: "npm", packageName: "lib-x" } },
+      ],
+    });
+
+    const backend = await backendFor({ runtime, agent });
+    const added = (await backend.handle("addProject", [project])) as { id: string };
+    await backend.handle("setExtensionEnabled" as never, ["proj-x", true, "project", added.id]);
+    await backend.handle("setExtensionEnabled" as never, ["bundle-b", true, "app", undefined]);
+
+    const snapshot = await backend.listBundledUpdateExtensions();
+    // Enabled project-origin extensions with updateComponents never leak into the snapshot.
+    expect(snapshot.map((item) => item.id)).toEqual(expect.arrayContaining(["bundle-a", "bundle-b"]));
+    expect(snapshot.some((item) => item.id === "proj-x")).toBe(false);
+    expect(snapshot.find((item) => item.id === "bundle-a")).toMatchObject({
+      origin: "builtin",
+      state: "enabled",
+      updateComponents: [{ id: "lib-a", version: "1.0.0", source: { type: "npm", packageName: "lib-a" } }],
+    });
+    expect(snapshot.find((item) => item.id === "bundle-b")).toMatchObject({
+      origin: "app",
+      state: "enabled",
+      updateComponents: [{ id: "lib-b", version: "0.9.0", source: { type: "githubReleases", owner: "acme", repo: "lib-b" } }],
+    });
+
+    // App-scope disablement flips the snapshot state; the catalog filter drops non-enabled items.
+    await backend.handle("setExtensionEnabled" as never, ["bundle-b", false, "app", undefined]);
+    const afterDisable = await backend.listBundledUpdateExtensions();
+    expect(afterDisable.find((item) => item.id === "bundle-b")?.state).not.toBe("enabled");
+
+    // Snapshot semantics: disk drift since the last scan is not picked up by a refresh read.
+    await writeManifest(join(runtime, "extensions", "bundle-a"), {
+      id: "bundle-a",
+      name: "Bundle A",
+      version: "9.9.9",
+      capabilities: [],
+      updateComponents: [
+        { id: "lib-a", name: "Lib A", version: "9.9.9", source: { type: "npm", packageName: "lib-a" } },
+      ],
+    });
+    expect((await backend.listBundledUpdateExtensions()).find((item) => item.id === "bundle-a")).toMatchObject({
+      version: "1.0.0",
+    });
+
+    // The refresh read never disturbed the loaded project: its extension survives intact.
+    const projectView = (await backend.handle("listExtensions" as never, [added.id])) as Listed[];
+    expect(projectView.find((item) => item.id === "proj-x")).toMatchObject({
+      origin: "project",
+      state: "enabled",
+      updateComponents: [{ id: "lib-x", version: "3.0.0", source: { type: "npm", packageName: "lib-x" } }],
+    });
+    await backend.close();
+  });
+
+  it("loader list() never mutates: project extensions, loaded root and enablement survive a refresh-style read", async () => {
+    await tempRoot("pipi-ext-list-readonly-");
+    const builtinRoot = join(root, "runtime", "extensions");
+    const appRoot = join(root, "agent", "extensions");
+    const project = join(root, "repo");
+    await mkdir(project, { recursive: true });
+    await writeManifest(join(builtinRoot, "bundle-a"), {
+      id: "bundle-a",
+      name: "Bundle A",
+      version: "1.0.0",
+      capabilities: [],
+      updateComponents: [
+        { id: "lib-a", name: "Lib A", version: "1.0.0", source: { type: "npm", packageName: "lib-a" } },
+      ],
+    });
+    await writeManifest(join(projectPiAgentDir(project), "extensions", "proj-x"), {
+      id: "proj-x",
+      name: "Proj X",
+      version: "0.1.0",
+      capabilities: [],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({ registry, builtinRoot, appRoot });
+    loader.scan(project);
+    registry.enable("proj-x");
+    const loadedRoot = loader.loadedProject();
+
+    // The update-refresh seam reads the loader with the enablement overlay, no rescan.
+    const listed = loader.list({ "proj-x": true });
+    expect(listed.find((item) => item.id === "proj-x")).toMatchObject({ origin: "project", state: "enabled" });
+    expect(listed.find((item) => item.id === "bundle-a")?.updateComponents?.[0]).toMatchObject({
+      id: "lib-a",
+      version: "1.0.0",
+    });
+    expect(loader.loadedProject()).toBe(loadedRoot);
+    expect(registry.get("proj-x")?.state).toBe("enabled");
+  });
+});
+
 describe("extension loader agent spawn mounts", () => {
   it("reports agent.extension for overlay-enabled packages and not as enabled when disabled", async () => {
     await tempRoot("pipi-ext-spawn-");

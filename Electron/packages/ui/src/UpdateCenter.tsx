@@ -31,6 +31,8 @@ export function UpdateCenter({ updates, onRequestUpdate }: { updates: UpdateCent
       id: item.id,
       name: item.name,
       ...(item.packageName === undefined ? {} : { packageName: item.packageName }),
+      ...(item.ownerExtensionId === undefined ? {} : { ownerExtensionId: item.ownerExtensionId }),
+      ...(item.ownerExtensionName === undefined ? {} : { ownerExtensionName: item.ownerExtensionName }),
       currentVersion: item.currentVersion,
       latestVersion: item.latestVersion,
     }))
@@ -43,7 +45,7 @@ export function UpdateCenter({ updates, onRequestUpdate }: { updates: UpdateCent
       {groupedItems(updates.snapshot.items).map(({ category, items }) => <section className="update-center-group" key={category} data-testid={`update-group-${category}`}>
         <header className="update-center-group-header"><div><h3>{CATEGORY_COPY[category].title}</h3><p>{CATEGORY_COPY[category].description}</p></div><span>{items.length} 项</span></header>
         <div className="update-center-group-items">{items.map(item => <div className="update-center-row" key={item.id} data-testid={`update-item-${item.id}`}>
-          <div className="update-center-name"><strong>{item.name}</strong>{item.packageName && item.name !== item.packageName && <span>{item.packageName}</span>}</div>
+          <div className="update-center-name"><strong>{item.name}</strong>{item.packageName && item.name !== item.packageName && <span>{item.packageName}</span>}{!item.packageName && item.sourceLabel && <span>{item.sourceLabel}</span>}{item.ownerExtensionName && <span>来自扩展 {item.ownerExtensionName}</span>}</div>
           <div className="update-center-versions"><span><em>本机</em>{item.currentVersion}</span><span><em>最新</em>{item.latestVersion ?? '—'}</span></div>
           <span className={`update-center-status ${item.status}`} title={item.error}>{STATUS_LABEL[item.status]}</span>
           {item.status === 'updateAvailable' && item.latestVersion && <button type="button" className="update-center-update" onClick={() => requestUpdate(item)}>评估更新</button>}

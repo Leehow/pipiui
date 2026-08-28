@@ -411,6 +411,11 @@ export type UpdateCenterItem = {
   packageName?: string;
   /** Host-discovered ownership layer. Optional for older hosts and browser fixtures. */
   category?: UpdateCenterItemCategory;
+  /** Owning bundled extension when the item is an extension-declared update component. */
+  ownerExtensionId?: string;
+  ownerExtensionName?: string;
+  /** Human-facing version source when `packageName` does not apply (e.g. GitHub `owner/repo`). */
+  sourceLabel?: string;
   currentVersion: string;
   latestVersion?: string;
   status: UpdateCenterItemStatus;
@@ -425,6 +430,9 @@ export type PipiuiUpdateEvaluationIntent = {
   id: string;
   name: string;
   packageName?: string;
+  /** Owning bundled extension when the item is an extension-declared update component. */
+  ownerExtensionId?: string;
+  ownerExtensionName?: string;
   currentVersion: string;
   latestVersion: string;
 };
@@ -435,6 +443,8 @@ export function encodePipiuiUpdateEvaluationIntent(fields: PipiuiUpdateEvaluatio
     id: fields.id,
     name: fields.name,
     ...(fields.packageName === undefined ? {} : { packageName: fields.packageName }),
+    ...(fields.ownerExtensionId === undefined ? {} : { ownerExtensionId: fields.ownerExtensionId }),
+    ...(fields.ownerExtensionName === undefined ? {} : { ownerExtensionName: fields.ownerExtensionName }),
     currentVersion: fields.currentVersion,
     latestVersion: fields.latestVersion,
   })}`;

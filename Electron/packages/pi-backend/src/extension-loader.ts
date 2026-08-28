@@ -23,6 +23,7 @@ import {
   type ExtensionRegistry,
   type ExtensionSettingsManifest,
 } from "./extension-registry.js";
+import type { ExtensionUpdateComponent } from "./extension-update-components.js";
 import { projectPiAgentDir } from "./project-pi-home.js";
 import type {
   SpawnAgentContribution,
@@ -53,6 +54,8 @@ export type ExtensionListItem = ExtensionRecord & {
   /** Package install directory; app-half `entry` paths resolve against this. */
   directory?: string;
   grantedCapabilities?: readonly string[];
+  /** Declared open-source update components (metadata only; checks stay host-side). */
+  updateComponents?: ExtensionUpdateComponent[];
 };
 
 const SKIP_DIR_NAMES = new Set(["node_modules", ".git", ".DS_Store"]);
@@ -471,6 +474,7 @@ export class ExtensionLoader {
   private readonly ui = new Map<string, ExtensionUiSummary>();
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly auth = new Map<string, ExtensionAuthContribution>();
+  private readonly updateComponents = new Map<string, ExtensionUpdateComponent[]>();
   private readonly directories = new Map<string, string>();
   private readonly agent = new Map<string, RememberedAgent>();
   private readonly reservedBuiltinIds: Set<string>;
@@ -514,6 +518,7 @@ export class ExtensionLoader {
     this.ui.delete(id);
     this.settings.delete(id);
     this.auth.delete(id);
+    this.updateComponents.delete(id);
     this.directories.delete(id);
     this.agent.delete(id);
   }
@@ -612,6 +617,8 @@ export class ExtensionLoader {
       if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
       if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
       else this.auth.delete(descriptor.id);
+      if (manifest?.updateComponents) this.updateComponents.set(descriptor.id, manifest.updateComponents);
+      else this.updateComponents.delete(descriptor.id);
       const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
       if (missingAgent) {
         return this.registry.enterError(descriptor.id, missingAgent);
@@ -627,6 +634,8 @@ export class ExtensionLoader {
     else this.settings.delete(descriptor.id);
     if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
     else this.auth.delete(descriptor.id);
+    if (manifest?.updateComponents) this.updateComponents.set(descriptor.id, manifest.updateComponents);
+    else this.updateComponents.delete(descriptor.id);
     if (!validation.ok) {
       this.rememberAgent(descriptor.id, pkg.directory, undefined);
       return this.registry.enterError(descriptor.id, validation.errors.join("; "));
@@ -696,6 +705,8 @@ export class ExtensionLoader {
     }
     const directory = this.directories.get(record.id);
     if (directory) item.directory = directory;
+    const updateComponents = this.updateComponents.get(record.id);
+    if (updateComponents) item.updateComponents = updateComponents;
     return item;
   }
 }

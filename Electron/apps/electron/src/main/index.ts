@@ -21,7 +21,7 @@ import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resol
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
 import { EMBEDDED_NODE_VERSION, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
-import { createUpdateCenterService, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
+import { createUpdateCenterService, extensionUpdateCatalogItems, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
 import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
@@ -294,6 +294,19 @@ if (app) {
       { id: 'vite', name: 'Vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS.vite, source: { type: 'npm', packageName: 'vite' } },
       { id: 'electron-vite', name: 'electron-vite', category: 'toolchain', currentVersion: UPDATE_CENTER_FRAMEWORK_VERSIONS['electron-vite'], source: { type: 'npm', packageName: 'electron-vite' } }
     ]
+    // Per-check discovery: bundled (builtin/app) extension manifests contribute namespaced update
+    // components on top of the fixed catalog. Discovery is a read-only snapshot (never a rescan,
+    // so the active project's loaded extensions and context stay untouched); checks are read-only
+    // lookups at fixed registries. Discovery failures degrade to the fixed catalog and never
+    // affect extension function.
+    const resolveUpdateCatalog = async (): Promise<readonly UpdateCatalogItem[]> => {
+      try {
+        const listed = await piBackend.listBundledUpdateExtensions()
+        return [...updateCatalog, ...extensionUpdateCatalogItems(listed)]
+      } catch {
+        return updateCatalog
+      }
+    }
     const backend = withUpdateCenter(withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
       getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),
       isTrustedAccessibilityClient: prompt => systemPreferences.isTrustedAccessibilityClient(prompt),
@@ -301,7 +314,7 @@ if (app) {
         await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
       },
       openURL: url => shell.openExternal(url),
-    })), createUpdateCenterService({ catalog: updateCatalog }))
+    })), createUpdateCenterService({ catalog: resolveUpdateCatalog }))
     registerPipiHostIpc(ipcMain, backend)
     const remoteControl = createRemoteControlService({
       backend,

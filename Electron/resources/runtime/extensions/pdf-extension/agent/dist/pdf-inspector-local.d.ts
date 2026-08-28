@@ -1,4 +1,3 @@
-export declare const PDF_INSPECTOR_VERSION = "1.15.0";
 /**
  * Directory (relative to this compiled file) of the vendored dependency tree
  * owned by this package. `<pkg>/agent/dist` -> `<pkg>/vendor/pdf-inspector`;

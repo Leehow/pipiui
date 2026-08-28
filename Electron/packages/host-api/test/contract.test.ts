@@ -54,6 +54,25 @@ describe('update evaluation intent envelope', () => {
     })
     expect(encoded).not.toContain('release notes')
     expect(encoded).not.toContain('lockfile')
+    const owned = encodePipiuiUpdateEvaluationIntent({
+      id: 'pdf-extension:firecrawl-pdf-inspector',
+      name: 'Firecrawl pdf-inspector',
+      packageName: '@firecrawl/pdf-inspector',
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF',
+      currentVersion: '1.15.0',
+      latestVersion: '1.17.0',
+    })
+    expect(JSON.parse(owned.slice(PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX.length))).toEqual({
+      version: PIPIUI_UPDATE_EVALUATION_INTENT_VERSION,
+      id: 'pdf-extension:firecrawl-pdf-inspector',
+      name: 'Firecrawl pdf-inspector',
+      packageName: '@firecrawl/pdf-inspector',
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF',
+      currentVersion: '1.15.0',
+      latestVersion: '1.17.0',
+    })
   })
 })
 

@@ -12,7 +12,52 @@ export type UpdateCatalogItem = {
   name: string
   category: UpdateCenterItemCategory
   currentVersion: string
-  source: { type: 'npm'; packageName: string } | { type: 'pypi'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' }
+  source: { type: 'npm'; packageName: string } | { type: 'pypi'; packageName: string } | { type: 'cuaGitHub' } | { type: 'nodeDist' } | { type: 'githubReleases'; owner: string; repo: string }
+  /** Owning bundled extension when this item was discovered from a manifest `updateComponents` declaration. */
+  ownerExtensionId?: string
+  ownerExtensionName?: string
+  /** Human-facing version source when `packageName` does not apply (e.g. GitHub `owner/repo`). */
+  sourceLabel?: string
+}
+
+/**
+ * App-side structural view of a manifest-declared update component (pi-backend
+ * `ExtensionUpdateComponent`): the same closed fixed-registry source union.
+ */
+export type DeclaredUpdateComponent = {
+  id: string
+  name: string
+  version: string
+  source: UpdateCatalogItem['source']
+}
+
+/** Structural subset of the backend's bundled-extension list items this catalog consumes. */
+export type UpdateComponentSourceExtension = {
+  id: string
+  name: string
+  state?: string
+  origin?: string
+  updateComponents?: readonly DeclaredUpdateComponent[]
+}
+
+/**
+ * Maps bundled-extension declared update components into catalog items.
+ * Only enabled non-project (builtin/app) extensions contribute; component ids are
+ * namespaced by extension id so cross-extension collisions cannot shadow fixed items.
+ */
+export function extensionUpdateCatalogItems(extensions: readonly UpdateComponentSourceExtension[]): UpdateCatalogItem[] {
+  return extensions.flatMap(extension => {
+    if (extension.state !== 'enabled' || extension.origin === 'project') return []
+    return (extension.updateComponents ?? []).map(component => ({
+      id: `${extension.id}:${component.id}`,
+      name: component.name,
+      category: 'extension' as const,
+      currentVersion: component.version,
+      source: component.source,
+      ownerExtensionId: extension.id,
+      ownerExtensionName: extension.name
+    }))
+  })
 }
 
 export type UpdateCenterFetch = (input: string, init?: RequestInit) => Promise<Pick<Response, 'ok' | 'status' | 'json'>>
@@ -66,6 +111,19 @@ export function pypiLatestVersion(payload: unknown): string | undefined {
   return typeof version === 'string' && parseSemver(version) ? version : undefined
 }
 
+/** Generic GitHub Releases discovery: non-draft tags that are exactly `v<semver>` or `<semver>`, highest wins. */
+export function latestGitHubReleaseVersion(payload: unknown): string | undefined {
+  if (!Array.isArray(payload)) return undefined
+  const candidates = payload.flatMap(release => {
+    if (!release || typeof release !== 'object' || (release as { draft?: unknown }).draft === true) return []
+    const tag = (release as { tag_name?: unknown }).tag_name
+    if (typeof tag !== 'string') return []
+    const match = /^v?(.+)$/.exec(tag)
+    return match && parseSemver(match[1]) ? [match[1]] : []
+  })
+  return candidates.sort((a, b) => compareSemver(b, a) ?? 0)[0]
+}
+
 export function latestCuaDriverVersion(payload: unknown): string | undefined {
   if (!Array.isArray(payload)) return undefined
   const candidates = payload.flatMap(release => {
@@ -89,43 +147,46 @@ export function latestNodeVersion(payload: unknown): string | undefined {
   return versions.sort((a, b) => compareSemver(b, a) ?? 0)[0]
 }
 
-function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCenterItem {
-  const precedence = compareSemver(latestVersion, item.currentVersion)
-  const packageName = item.source.type === 'npm' || item.source.type === 'pypi' ? item.source.packageName : undefined
-  if (precedence === undefined) return {
-    id: item.id,
-    name: item.name,
-    category: item.category,
-    ...(packageName ? { packageName } : {}),
-    currentVersion: item.currentVersion,
-    status: 'notCheckable',
-    error: '本机版本不是可识别的 SemVer'
-  }
+/** Wire fields every outcome must carry, so category/ownership/source survive check failures. */
+function itemBase(item: UpdateCatalogItem): Omit<UpdateCenterItem, 'status' | 'latestVersion' | 'error'> {
+  const sourceLabel = item.source.type === 'githubReleases' ? `${item.source.owner}/${item.source.repo}` : item.sourceLabel
   return {
     id: item.id,
     name: item.name,
     category: item.category,
-    ...(packageName ? { packageName } : {}),
-    currentVersion: item.currentVersion,
+    ...(item.source.type === 'npm' || item.source.type === 'pypi' ? { packageName: item.source.packageName } : {}),
+    ...(sourceLabel ? { sourceLabel } : {}),
+    ...(item.ownerExtensionId ? { ownerExtensionId: item.ownerExtensionId } : {}),
+    ...(item.ownerExtensionName ? { ownerExtensionName: item.ownerExtensionName } : {}),
+    currentVersion: item.currentVersion
+  }
+}
+
+function checkedItem(item: UpdateCatalogItem, latestVersion: string): UpdateCenterItem {
+  const precedence = compareSemver(latestVersion, item.currentVersion)
+  if (precedence === undefined) return {
+    ...itemBase(item),
+    status: 'notCheckable',
+    error: '本机版本不是可识别的 SemVer'
+  }
+  return {
+    ...itemBase(item),
     latestVersion,
     status: precedence > 0 ? 'updateAvailable' : 'upToDate'
   }
 }
 
 function failedItem(item: UpdateCatalogItem, error: unknown): UpdateCenterItem {
-  const packageName = item.source.type === 'npm' || item.source.type === 'pypi' ? item.source.packageName : undefined
   return {
-    id: item.id,
-    name: item.name,
-    ...(packageName ? { packageName } : {}),
-    currentVersion: item.currentVersion,
+    ...itemBase(item),
     status: 'checkFailed',
     error: error instanceof Error ? error.message : String(error)
   }
 }
 
 export function createUpdateCenterService(options: {
-  catalog: readonly UpdateCatalogItem[]
+  /** Fixed items, or a per-check resolver merging discovered extension components into them. */
+  catalog: readonly UpdateCatalogItem[] | (() => readonly UpdateCatalogItem[] | Promise<readonly UpdateCatalogItem[]>)
   fetch?: UpdateCenterFetch
   timeoutMs?: number
   now?: () => number
@@ -134,7 +195,8 @@ export function createUpdateCenterService(options: {
   const timeoutMs = options.timeoutMs ?? 8_000
   const now = options.now ?? Date.now
   return async () => {
-    const items = await Promise.all(options.catalog.map(async item => {
+    const catalog = typeof options.catalog === 'function' ? await options.catalog() : options.catalog
+    const items = await Promise.all(catalog.map(async item => {
       if (!parseSemver(item.currentVersion)) return checkedItem(item, '')
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -145,10 +207,12 @@ export function createUpdateCenterService(options: {
             ? `https://pypi.org/pypi/${encodeURIComponent(item.source.packageName)}/json`
             : item.source.type === 'cuaGitHub'
               ? 'https://api.github.com/repos/trycua/cua/releases?per_page=100'
-              : 'https://nodejs.org/dist/index.json'
+              : item.source.type === 'githubReleases'
+                ? `https://api.github.com/repos/${encodeURIComponent(item.source.owner)}/${encodeURIComponent(item.source.repo)}/releases?per_page=100`
+                : 'https://nodejs.org/dist/index.json'
         const response = await fetcher(url, {
           signal: controller.signal,
-          headers: item.source.type === 'cuaGitHub'
+          headers: item.source.type === 'cuaGitHub' || item.source.type === 'githubReleases'
             ? { Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }
             : { Accept: 'application/json' }
         })
@@ -160,7 +224,9 @@ export function createUpdateCenterService(options: {
             ? pypiLatestVersion(payload)
             : item.source.type === 'cuaGitHub'
               ? latestCuaDriverVersion(payload)
-              : latestNodeVersion(payload)
+              : item.source.type === 'githubReleases'
+                ? latestGitHubReleaseVersion(payload)
+                : latestNodeVersion(payload)
         if (!latest) throw new Error('版本服务返回了无法识别的数据')
         return checkedItem(item, latest)
       } catch (error) {

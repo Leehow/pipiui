@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { compareSemver, createUpdateCenterService, latestCuaDriverVersion, latestNodeVersion, npmLatestVersion, pypiLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS } from './update-center.js'
+import { compareSemver, createUpdateCenterService, extensionUpdateCatalogItems, latestCuaDriverVersion, latestGitHubReleaseVersion, latestNodeVersion, npmLatestVersion, pypiLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS, type UpdateCatalogItem } from './update-center.js'
 
 const response = (payload: unknown, ok = true, status = 200) => ({ ok, status, json: async () => payload })
 
@@ -114,5 +114,129 @@ describe('update center version discovery', () => {
       { id: 'slow', name: 'Slow', category: 'extension', currentVersion: '1.0.0', source: { type: 'npm', packageName: 'slow-package' } }
     ] })()
     expect(snapshot.items[0]).toMatchObject({ status: 'checkFailed', error: 'aborted' })
+  })
+})
+
+describe('bundled extension update components', () => {
+  it('parses generic GitHub Releases payloads and ignores drafts and off-convention tags', () => {
+    expect(latestGitHubReleaseVersion([
+      { tag_name: 'v1.2.0', draft: false },
+      { tag_name: 'v2.0.0-rc.1', draft: false, prerelease: true },
+      { tag_name: 'v2.0.0', draft: true },
+      { tag_name: 'nightly-9', draft: false },
+      { tag_name: 'computer-v9.0.0', draft: false }
+    ])).toBe('2.0.0-rc.1')
+    expect(latestGitHubReleaseVersion({ tag_name: 'v1.0.0' })).toBeUndefined()
+    expect(latestGitHubReleaseVersion([])).toBeUndefined()
+  })
+
+  it('maps enabled bundled extension declarations into namespaced catalog items with owner metadata', () => {
+    const items = extensionUpdateCatalogItems([
+      {
+        id: 'pdf-extension',
+        name: 'PipiUI PDF',
+        state: 'enabled',
+        origin: 'app',
+        updateComponents: [
+          { id: 'pdf-inspector', name: 'Firecrawl PDF Inspector', version: '1.15.0', source: { type: 'npm', packageName: '@firecrawl/pdf-inspector' } },
+          { id: 'pdf-inspector-wasm', name: 'Firecrawl PDF Inspector WASM', version: '1.15.0', source: { type: 'githubReleases', owner: 'firecrawl', repo: 'pdf-inspector' } }
+        ]
+      },
+      { id: 'disabled-ext', name: 'Disabled', state: 'disabled', origin: 'app', updateComponents: [{ id: 'c', name: 'C', version: '1.0.0', source: { type: 'npm', packageName: 'c' } }] },
+      { id: 'project-ext', name: 'Project', state: 'enabled', origin: 'project', updateComponents: [{ id: 'c', name: 'C', version: '1.0.0', source: { type: 'npm', packageName: 'c' } }] },
+      { id: 'bare-ext', name: 'Bare', state: 'enabled', origin: 'builtin' }
+    ])
+    expect(items).toEqual([
+      { id: 'pdf-extension:pdf-inspector', name: 'Firecrawl PDF Inspector', category: 'extension', currentVersion: '1.15.0', source: { type: 'npm', packageName: '@firecrawl/pdf-inspector' }, ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' },
+      { id: 'pdf-extension:pdf-inspector-wasm', name: 'Firecrawl PDF Inspector WASM', category: 'extension', currentVersion: '1.15.0', source: { type: 'githubReleases', owner: 'firecrawl', repo: 'pdf-inspector' }, ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' }
+    ])
+  })
+
+  it('maps the read-only backend snapshot: extra list-item fields are ignored and project-origin or disabled entries never contribute', () => {
+    const snapshot = [
+      {
+        id: 'pdf-extension',
+        name: 'PipiUI PDF',
+        state: 'enabled',
+        origin: 'app',
+        source: 'app',
+        capabilities: ['bridge.emit'],
+        directory: '/extensions/pdf-extension',
+        contributions: {},
+        updateComponents: [
+          {
+            id: 'pdf-inspector',
+            name: 'Firecrawl PDF Inspector',
+            version: '1.15.0',
+            upstream: 'https://github.com/firecrawl/pdf-inspector',
+            license: 'MIT',
+            source: { type: 'npm', packageName: '@firecrawl/pdf-inspector' }
+          }
+        ]
+      },
+      { id: 'proj-ext', name: 'Project Ext', state: 'enabled', origin: 'project', updateComponents: [{ id: 'c', name: 'C', version: '1.0.0', source: { type: 'npm', packageName: 'c' } }] },
+      { id: 'off-builtin', name: 'Off Builtin', state: 'disabled', origin: 'builtin', updateComponents: [{ id: 'c', name: 'C', version: '1.0.0', source: { type: 'npm', packageName: 'c' } }] }
+    ] as Parameters<typeof extensionUpdateCatalogItems>[0]
+    const items = extensionUpdateCatalogItems(snapshot)
+    expect(items.map(item => item.id)).toEqual(['pdf-extension:pdf-inspector'])
+    expect(items[0]).toMatchObject({
+      name: 'Firecrawl PDF Inspector',
+      category: 'extension',
+      currentVersion: '1.15.0',
+      source: { type: 'npm', packageName: '@firecrawl/pdf-inspector' },
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF'
+    })
+  })
+
+  it('resolves a declared githubReleases component at the fixed GitHub API and keeps owner, category and source on failure', async () => {
+    const fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === 'https://api.github.com/repos/firecrawl/pdf-inspector/releases?per_page=100') {
+        expect(init?.headers).toEqual({ Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' })
+        return response([{ tag_name: 'v1.17.0', draft: false }])
+      }
+      if (url === 'https://registry.npmjs.org/electron') return response({ 'dist-tags': { latest: '44.0.0' } })
+      throw new Error('offline')
+    })
+    const catalog: UpdateCatalogItem[] = [
+      { id: 'electron', name: 'Electron', category: 'platform', currentVersion: '44.0.0', source: { type: 'npm', packageName: 'electron' } },
+      { id: 'pdf-extension:pdf-inspector', name: 'Firecrawl PDF Inspector', category: 'extension', currentVersion: '1.15.0', source: { type: 'githubReleases', owner: 'firecrawl', repo: 'pdf-inspector' }, ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' },
+      { id: 'pdf-extension:pdf-inspector-wasm', name: 'Firecrawl PDF Inspector WASM', category: 'extension', currentVersion: '1.15.0', source: { type: 'npm', packageName: '@firecrawl/pdf-inspector-wasm' }, ownerExtensionId: 'pdf-extension', ownerExtensionName: 'PipiUI PDF' }
+    ]
+    const snapshot = await createUpdateCenterService({ fetch, catalog: () => catalog })()
+    expect(snapshot.items[0]).toMatchObject({ id: 'electron', category: 'platform', status: 'upToDate' })
+    expect(snapshot.items[1]).toEqual({
+      id: 'pdf-extension:pdf-inspector',
+      name: 'Firecrawl PDF Inspector',
+      category: 'extension',
+      sourceLabel: 'firecrawl/pdf-inspector',
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF',
+      currentVersion: '1.15.0',
+      latestVersion: '1.17.0',
+      status: 'updateAvailable'
+    })
+    expect(snapshot.items[2]).toMatchObject({
+      packageName: '@firecrawl/pdf-inspector-wasm',
+      category: 'extension',
+      ownerExtensionId: 'pdf-extension',
+      ownerExtensionName: 'PipiUI PDF',
+      status: 'checkFailed',
+      error: 'offline'
+    })
+  })
+
+  it('merges discovered extension components per check without dropping fixed items and preserves owner when a local version is not SemVer', async () => {
+    const fetch = vi.fn(async () => response({ 'dist-tags': { latest: '1.16.0' } }))
+    const fixed: UpdateCatalogItem[] = [
+      { id: 'vite', name: 'Vite', category: 'toolchain', currentVersion: '7.3.6', source: { type: 'npm', packageName: 'vite' } }
+    ]
+    const discovered = extensionUpdateCatalogItems([
+      { id: 'pdf-extension', name: 'PipiUI PDF', state: 'enabled', origin: 'app', updateComponents: [{ id: 'pdf-inspector', name: 'Firecrawl PDF Inspector', version: 'not-a-version', source: { type: 'npm', packageName: '@firecrawl/pdf-inspector' } }] }
+    ])
+    const snapshot = await createUpdateCenterService({ fetch, catalog: () => [...fixed, ...discovered] })()
+    expect(snapshot.items.map(item => item.id)).toEqual(['vite', 'pdf-extension:pdf-inspector'])
+    expect(snapshot.items[1]).toMatchObject({ category: 'extension', ownerExtensionId: 'pdf-extension', status: 'notCheckable' })
+    expect(fetch).toHaveBeenCalledTimes(1)
   })
 })

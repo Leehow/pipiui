@@ -7,14 +7,21 @@ const INTENT_VERSION = 1;
 const MAX_ENVELOPE_LENGTH = 1024;
 const MAX_FIELD_LENGTH = 160;
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-const SAFE_ID = /^[A-Za-z0-9@._/-]+$/;
-const SAFE_NAME = /^[\p{L}\p{N} @._+/-]+$/u;
+const SAFE_ID = /^[A-Za-z0-9@._:/-]+$/; // `:` allowed for namespaced extension component ids ("owner-extension:component")
+// Human-readable component/extension names follow the manifest contract (any
+// non-empty name — extension-manifest.ts / extension-update-components.ts), so
+// accept ordinary Unicode including punctuation like `:` `&` `()`; only reject
+// control/format characters so a name cannot inject newlines or invisible
+// prompt structure. Length stays bounded by MAX_FIELD_LENGTH in safeField.
+const SAFE_NAME = /^[^\p{C}]+$/u;
 
 type Intent = {
   version: 1;
   id: string;
   name: string;
   packageName?: string;
+  ownerExtensionId?: string;
+  ownerExtensionName?: string;
   currentVersion: string;
   latestVersion: string;
 };
@@ -60,11 +67,13 @@ function parseIntent(text: string): Intent | undefined {
   try { value = JSON.parse(text.slice(INTENT_PREFIX.length)); } catch { return undefined; }
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const allowed = new Set(["version", "id", "name", "packageName", "currentVersion", "latestVersion"]);
+  const allowed = new Set(["version", "id", "name", "packageName", "ownerExtensionId", "ownerExtensionName", "currentVersion", "latestVersion"]);
   if (Object.keys(record).some(key => !allowed.has(key))) return undefined;
   if (record.version !== INTENT_VERSION) return undefined;
   if (!safeField(record.id, SAFE_ID) || !safeField(record.name, SAFE_NAME)) return undefined;
   if (record.packageName !== undefined && !safeField(record.packageName, SAFE_ID)) return undefined;
+  if (record.ownerExtensionId !== undefined && !safeField(record.ownerExtensionId, SAFE_ID)) return undefined;
+  if (record.ownerExtensionName !== undefined && !safeField(record.ownerExtensionName, SAFE_NAME)) return undefined;
   if (typeof record.currentVersion !== "string" || typeof record.latestVersion !== "string") return undefined;
   const current = parseSemver(record.currentVersion);
   const latest = parseSemver(record.latestVersion);
@@ -110,7 +119,8 @@ function componentChecks(intent: Intent): string {
 
 function evaluationPrompt(intent: Intent): string {
   const target = intent.name === "Pi" ? "Pi" : intent.name;
-  return `请评估 PipiUI 内置 ${target} 从 ${intent.currentVersion} 升级到 ${intent.latestVersion}，现在只做第一阶段调查，不要实施更新。
+  const owner = intent.ownerExtensionName ? `（由扩展 ${intent.ownerExtensionName} 声明的组件）` : "";
+  return `请评估 PipiUI 内置 ${target}${owner} 从 ${intent.currentVersion} 升级到 ${intent.latestVersion}，现在只做第一阶段调查，不要实施更新。
 
 两阶段协议：
 第一阶段（本次请求）：
