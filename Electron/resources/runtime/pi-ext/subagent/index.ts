@@ -351,6 +351,7 @@ import {
 	resetFinalizationFields,
 } from "./finalization-phase.ts";
 import { setCloseoutTimelineDir } from "./closeout-timeline.ts";
+import { createChildExitTimelineProbe } from "./child-exit-probe.ts";
 import {
 	DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS,
 	awaitTerminalCandidate,
@@ -6968,6 +6969,7 @@ async function runSingleAgent(
 		// (same args → session resume for stateful roles; cold restart for --no-session).
 		let autoResumeCount = 0;
 		let providerStallResumeCount = 0;
+		let spawnAttempt = 0;
 		let exitCode = 1;
 		// Model fallback chain: only advances when Settings gave this agent an explicit
 		// multi-model chain (index 0 is the primary model, i.e. resolvedModel).
@@ -6975,6 +6977,7 @@ async function runSingleAgent(
 		const modelFallbackNotes: string[] = [];
 
 		for (;;) {
+			spawnAttempt += 1;
 			// Snapshot so retry classification only sees THIS attempt (prior "fetch failed"
 			// text in accumulated messages/stderr must not force another resume).
 			const attemptMessagesFrom = currentResult.messages.length;
@@ -7148,6 +7151,23 @@ async function runSingleAgent(
 						if (!error) return;
 						const phase = handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "final-received";
 						projectFinalizationPhase(pipiuiAgentId, runId, phase, { error });
+					},
+				});
+				// Diagnostics only: never arms a deadline and never changes terminate.
+				const childExitProbe = createChildExitTimelineProbe({
+					proc,
+					agent: pipiuiAgentId,
+					run: runId,
+					role: childExitRole,
+					childPid: proc.pid,
+					depth: childDepth,
+					attempt: spawnAttempt,
+					cause: () => {
+						if (childExitCloseout.forced()) return "grace-timeout";
+						if (providerStallTimedOut) return "provider-stall";
+						if (runtimeTimedOut) return "runtime-budget";
+						if (wasAborted) return "abort";
+						return "none";
 					},
 				});
 				let providerWait!: ReturnType<typeof createProviderWaitController>;
@@ -7570,6 +7590,7 @@ async function runSingleAgent(
 						else {
 							projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
 							childExitCloseout.arm();
+							childExitProbe.markFinal();
 						}
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
@@ -7633,9 +7654,16 @@ async function runSingleAgent(
 					procExited = true;
 					clearChildExitTimers();
 					providerWait.dispose();
+					// Original semantics, restored: the error path terminates the attempt
+					// IMMEDIATELY — never waiting for close or any fallback timer. The
+					// probe's fine error mark is already on disk (its listener registered
+					// first); after this terminal the probe is SEALED so any late
+					// close/stdio/disconnect/sample is silently dropped and terminal-last
+					// holds without deferring business completion.
 					childExitCloseout.settled("error");
 					markAgentFinalizing(pipiuiAgentId, runId, "child-error");
 					resolve(childExitCloseout.accepted() ? 0 : 1);
+					childExitProbe.seal();
 				});
 
 				const effectiveSignal = signal ? AbortSignal.any([signal, dispatchAbort.signal]) : dispatchAbort.signal;

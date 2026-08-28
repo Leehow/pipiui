@@ -85,6 +85,11 @@ export const CLOSEOUT_TIMELINE_STATUSES = [
 	"late-ok",
 	"late-error",
 	"skip",
+	// child-exit probe extensions (additive): a phase-internal milestone marker and
+	// one tiered forensic sample. Phase terminals stay ok/error — mark/sample records
+	// never count as terminal samples in existing queries.
+	"mark",
+	"sample",
 ] as const;
 
 export const CLOSEOUT_TIMELINE_EVENTS = [
@@ -126,6 +131,72 @@ export const CLOSEOUT_TIMELINE_PHASES = [
 export const CLOSEOUT_TIMELINE_ROLES = ["read-only", "writable", "boss"] as const;
 
 /**
+ * child-exit probe milestone detail (closed): which point of the close sequence a
+ * `mark` record pins. `final` = final assistant received (= phase enter time);
+ * `exit` = the child process itself exited; `stdout-close`/`stderr-close` = that
+ * pipe closed in the PARENT; `disconnect` = IPC channel closed (only wired when
+ * an IPC channel exists); `close` = ChildProcess.close fired, carrying the
+ * computed durations; `sample` = tiered forensic sample record.
+ */
+export const CLOSEOUT_TIMELINE_EXIT_DETAILS = [
+	"final",
+	"exit",
+	"stdout-close",
+	"stderr-close",
+	"disconnect",
+	"close",
+	/** ChildProcess `error` (spawn failure etc.) — a real event, never a close. */
+	"error",
+	"sample",
+] as const;
+
+/** Why the child was being forced/aborted at sample or close time (closed domain). */
+export const CLOSEOUT_TIMELINE_EXIT_CAUSES = [
+	"none",
+	"grace-timeout",
+	"provider-stall",
+	"runtime-budget",
+	"abort",
+	"unknown",
+] as const;
+
+/** Tri-state for OS liveness answers: the OS refused to say, we record `unknown`. */
+export const CLOSEOUT_TIMELINE_TRI_STATE = ["yes", "no", "unknown"] as const;
+
+/** Which pipes were still open when a sample was taken (probe-local knowledge). */
+export const CLOSEOUT_TIMELINE_STDIO_OPEN = ["both", "stdout", "stderr", "none", "unknown"] as const;
+
+/** Fixed POSIX signal names only; anything else drops the field. */
+export const CLOSEOUT_TIMELINE_SIGNALS = [
+	"SIGHUP",
+	"SIGINT",
+	"SIGQUIT",
+	"SIGABRT",
+	"SIGKILL",
+	"SIGTERM",
+	"SIGTRAP",
+	"SIGPIPE",
+	"SIGALRM",
+	"SIGUSR1",
+	"SIGUSR2",
+	"SIGCHLD",
+	"SIGCONT",
+	"SIGSTOP",
+	"SIGTSTP",
+	"SIGTTIN",
+	"SIGTTOU",
+	"SIGURG",
+	"SIGXCPU",
+	"SIGXFSZ",
+	"SIGVTALRM",
+	"SIGPROF",
+	"SIGSYS",
+] as const;
+
+/** How a forensic sample was produced (or why it failed). */
+export const CLOSEOUT_TIMELINE_SAMPLE_SOURCES = ["ps", "error", "unsupported"] as const;
+
+/**
  * Closed error-code domain: exactly what the closeout probers can ever emit —
  * `${event}-timeout` / `${event}-error` over the enumerated events, plus the few
  * explicit fixed codes in index.ts. Anything else drops the error FIELD entirely
@@ -135,6 +206,14 @@ const CLOSEOUT_TIMELINE_EXTRA_ERROR_CODES = [
 	"done-not-queued",
 	"verify-failed",
 	"findings-error",
+	// child-exit probe: WHY one OS forensic sample failed (never faked as success).
+	"child-exit-sample-spawn",
+	"child-exit-sample-timeout",
+	"child-exit-sample-cap",
+	"child-exit-sample-exit",
+	"child-exit-sample-parse",
+	"child-exit-sample-identity",
+	"child-exit-sample-error",
 ] as const;
 
 export const CLOSEOUT_TIMELINE_ERROR_CODES: readonly string[] = (() => {
@@ -154,6 +233,7 @@ const RUN_KEY_DOMAIN = "pipiui-closeout-run-v1\n";
 
 export type CloseoutTimelineStatus = (typeof CLOSEOUT_TIMELINE_STATUSES)[number];
 export type CloseoutTimelineEvent = (typeof CLOSEOUT_TIMELINE_EVENTS)[number];
+export type CloseoutTimelineExitDetail = (typeof CLOSEOUT_TIMELINE_EXIT_DETAILS)[number];
 
 /** Input is deliberately loose; the builders whitelist what survives. */
 export type CloseoutTimelineFields = {
@@ -165,6 +245,23 @@ export type CloseoutTimelineFields = {
 	elapsedMs?: number;
 	error?: string;
 	attempt?: number;
+	// child-exit probe fields — every one a closed enum member or a clamped number:
+	detail?: string;
+	cause?: string;
+	childPid?: number;
+	pgid?: number;
+	sess?: number;
+	depth?: number;
+	exitCode?: number;
+	signal?: string;
+	descendants?: number;
+	rootAlive?: string;
+	stdioOpen?: string;
+	sampleSrc?: string;
+	tierMs?: number;
+	assistantToExitMs?: number;
+	exitToStdioCloseMs?: number;
+	exitToCloseMs?: number;
 };
 
 export type CloseoutTimelineRecord = {
@@ -184,6 +281,24 @@ export type CloseoutTimelineRecord = {
 	elapsedMs?: number;
 	error?: string;
 	attempt?: number;
+	// child-exit probe extension — same whitelist rules as above:
+	detail?: CloseoutTimelineExitDetail;
+	cause?: string;
+	/** Numeric OS identifiers only (ephemeral, recycled, no user content). */
+	childPid?: number;
+	pgid?: number;
+	sess?: number;
+	depth?: number;
+	exitCode?: number;
+	signal?: string;
+	descendants?: number;
+	rootAlive?: string;
+	stdioOpen?: string;
+	sampleSrc?: string;
+	tierMs?: number;
+	assistantToExitMs?: number;
+	exitToStdioCloseMs?: number;
+	exitToCloseMs?: number;
 };
 
 /**
@@ -222,6 +337,12 @@ export const sanitizeRunToken = closeoutTimelineRunKey;
 export function sanitizeErrorCode(error: unknown): string | undefined {
 	if (typeof error !== "string") return undefined;
 	return (CLOSEOUT_TIMELINE_ERROR_CODES as readonly string[]).includes(error) ? error : undefined;
+}
+
+/** Round and clamp into [min, max]; non-finite input drops the field. */
+export function clampTimelineInt(value: unknown, min: number, max: number): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 function memberOf<T extends string>(value: unknown, members: readonly T[]): T | undefined {
@@ -270,6 +391,22 @@ export function buildCloseoutTimelineRecord(
 		? Math.min(999, Math.max(0, Math.floor(fields.attempt)))
 		: undefined;
 	const error = sanitizeErrorCode(fields.error);
+	const detail = memberOf(fields.detail, CLOSEOUT_TIMELINE_EXIT_DETAILS);
+	const cause = memberOf(fields.cause, CLOSEOUT_TIMELINE_EXIT_CAUSES);
+	const childPid = clampTimelineInt(fields.childPid, 0, 2_147_483_647);
+	const pgid = clampTimelineInt(fields.pgid, 0, 2_147_483_647);
+	const sess = clampTimelineInt(fields.sess, 0, 2_147_483_647);
+	const depth = clampTimelineInt(fields.depth, 0, 99);
+	const exitCode = clampTimelineInt(fields.exitCode, -999, 999);
+	const signal = memberOf(fields.signal, CLOSEOUT_TIMELINE_SIGNALS);
+	const descendants = clampTimelineInt(fields.descendants, 0, 99_999);
+	const rootAlive = memberOf(fields.rootAlive, CLOSEOUT_TIMELINE_TRI_STATE);
+	const stdioOpen = memberOf(fields.stdioOpen, CLOSEOUT_TIMELINE_STDIO_OPEN);
+	const sampleSrc = memberOf(fields.sampleSrc, CLOSEOUT_TIMELINE_SAMPLE_SOURCES);
+	const tierMs = clampTimelineInt(fields.tierMs, 0, 604_800_000);
+	const assistantToExitMs = clampTimelineInt(fields.assistantToExitMs, 0, 2_147_483_647);
+	const exitToStdioCloseMs = clampTimelineInt(fields.exitToStdioCloseMs, 0, 2_147_483_647);
+	const exitToCloseMs = clampTimelineInt(fields.exitToCloseMs, 0, 2_147_483_647);
 	if (agent) record.agent = agent;
 	if (run) record.run = run;
 	if (role) record.role = role;
@@ -278,6 +415,22 @@ export function buildCloseoutTimelineRecord(
 	if (elapsedMs !== undefined) record.elapsedMs = elapsedMs;
 	if (error) record.error = error;
 	if (attempt !== undefined) record.attempt = attempt;
+	if (detail) record.detail = detail;
+	if (cause) record.cause = cause;
+	if (childPid !== undefined) record.childPid = childPid;
+	if (pgid !== undefined && pgid > 0) record.pgid = pgid;
+	if (sess !== undefined && sess > 0) record.sess = sess; // macOS `ps sess` reports 0 — drop, not available
+	if (depth !== undefined) record.depth = depth;
+	if (exitCode !== undefined) record.exitCode = exitCode;
+	if (signal) record.signal = signal;
+	if (descendants !== undefined) record.descendants = descendants;
+	if (rootAlive) record.rootAlive = rootAlive;
+	if (stdioOpen) record.stdioOpen = stdioOpen;
+	if (sampleSrc) record.sampleSrc = sampleSrc;
+	if (tierMs !== undefined) record.tierMs = tierMs;
+	if (assistantToExitMs !== undefined) record.assistantToExitMs = assistantToExitMs;
+	if (exitToStdioCloseMs !== undefined) record.exitToStdioCloseMs = exitToStdioCloseMs;
+	if (exitToCloseMs !== undefined) record.exitToCloseMs = exitToCloseMs;
 	return record;
 }
 

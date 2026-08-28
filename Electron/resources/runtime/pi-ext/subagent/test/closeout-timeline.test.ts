@@ -235,6 +235,62 @@ test("numerics clamp; pid stamped; unknown keys dropped wholesale", () => {
 	assert.ok(!("prompt" in record) && !("envHome" in record));
 });
 
+test("child-exit probe fields clamp; closed enums only; secrets never land", () => {
+	const record = buildCloseoutTimelineRecord("child-exit", {
+		status: "mark",
+		detail: "close",
+		cause: "none",
+		childPid: -5.2,
+		pgid: 12.4,
+		sess: 0,
+		depth: 500,
+		exitCode: -5000,
+		signal: "SIGKILL",
+		descendants: 1e9,
+		rootAlive: "yes",
+		stdioOpen: "stderr",
+		sampleSrc: "ps",
+		tierMs: -1,
+		assistantToExitMs: 12.6,
+		exitToStdioCloseMs: 3.1,
+		exitToCloseMs: 4.9,
+		cmd: "node --secret",
+		envHome: "/Users/x",
+		prompt: "do the thing",
+	} as unknown as CloseoutTimelineFields);
+	assert.equal(record.childPid, 0);
+	assert.equal(record.pgid, 12);
+	assert.equal(record.sess, undefined, "sess=0 is not available on this platform");
+	assert.equal(record.depth, 99);
+	assert.equal(record.exitCode, -999);
+	assert.equal(record.signal, "SIGKILL");
+	assert.equal(record.descendants, 99_999);
+	assert.equal(record.rootAlive, "yes");
+	assert.equal(record.stdioOpen, "stderr");
+	assert.equal(record.sampleSrc, "ps");
+	assert.equal(record.tierMs, 0);
+	assert.equal(record.assistantToExitMs, 13);
+	assert.equal(record.exitToStdioCloseMs, 3);
+	assert.equal(record.exitToCloseMs, 5);
+	assert.ok(!("cmd" in record) && !("envHome" in record) && !("prompt" in record));
+
+	const dropped = buildCloseoutTimelineRecord("child-exit", {
+		status: "sample",
+		detail: "not-a-detail",
+		cause: "DROP TABLE agents",
+		signal: "SIGFAKE",
+		rootAlive: "maybe",
+		stdioOpen: "fd3",
+		sampleSrc: "lsof",
+	} as unknown as CloseoutTimelineFields);
+	assert.equal(dropped.detail, undefined);
+	assert.equal(dropped.cause, undefined);
+	assert.equal(dropped.signal, undefined);
+	assert.equal(dropped.rootAlive, undefined);
+	assert.equal(dropped.stdioOpen, undefined);
+	assert.equal(dropped.sampleSrc, undefined);
+});
+
 /* ================================================================== */
 /* 2. Hot path + congestion                                            */
 /* ================================================================== */
