@@ -4,7 +4,7 @@ import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
 import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -99,6 +99,32 @@ const sidebarPreferencePrefix = 'pipiui:eui:sidebar:v1'
 const sidebarSemanticMigrationKey = 'pipiui:eui:sidebar-semantic-host:v1'
 export const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
 const HISTORY_PAGE_SIZE = 500
+
+/** Only measurements cross the renderer→host telemetry boundary; never bodies or paths. */
+function base64ByteLength(value: string): number | undefined {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 !== 0) return undefined
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+  return (value.length / 4) * 3 - padding
+}
+
+function createRendererTurnTelemetry(prompt: string, attachmentCount: number, documentCount: number): TurnTelemetryRendererSample {
+  const submittedAt = Date.now()
+  return {
+    turnId: `turn-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    submittedAt,
+    promptBytes: new TextEncoder().encode(prompt).byteLength,
+    attachmentCount,
+    documentCount,
+  }
+}
+
+function finishRendererPreflight(telemetry: TurnTelemetryRendererSample, attachments?: PromptAttachment[]): void {
+  telemetry.attachmentBytes = attachments
+    ?.map(attachment => base64ByteLength(attachment.dataBase64))
+    .reduce<number | undefined>((total, bytes) => total === undefined || bytes === undefined ? undefined : total + bytes, 0)
+  telemetry.preflightEndedAt = Date.now()
+}
+
 export const SIDEBAR_PROJECT_PAGE_SIZE = 6
 export const ARCHIVE_RETENTION_MS = 24 * 60 * 60 * 1000
 const ARCHIVE_CLEANUP_RETRY_MS = 60 * 1000
@@ -1275,7 +1301,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   /** Send from the empty "新会话" state creates the session first; the pending
    *  prompt is dispatched by the auto-send effect once the new session's history
    *  load and stream subscription are live (a direct sendPrompt would race them). */
-  const pendingAutoSendRef = useRef<{ sessionId: string; prompt: string; attachments?: ComposerAttachment[]; documents?: ComposerDocument[] } | null>(null)
+  const pendingAutoSendRef = useRef<{ sessionId: string; prompt: string; attachments?: ComposerAttachment[]; documents?: ComposerDocument[]; telemetry: TurnTelemetryRendererSample } | null>(null)
   // Mirror of observedSessionStatuses for the history-load effect. Adding the map
   // itself to that effect's deps would re-load history on every status event.
   const observedSessionStatusesRef = useRef(observedSessionStatuses)
@@ -2113,6 +2139,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           setWaitingPhase('awaiting')
           setWaitingDetail(undefined)
           setSessions(current => current.map(session => session.id === pending.sessionId ? { ...session, updatedAt: Date.now() } : session))
+          pending.telemetry.preflightStartedAt = Date.now()
           const payload = pending.attachments?.length ? await Promise.all(pending.attachments.map(toPromptAttachment)) : undefined
           if (payload?.length) {
             const converted = chatImagesFromAttachments(payload)
@@ -2120,8 +2147,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           }
           const documentPaths = pending.documents?.map(document => document.path).filter(Boolean) ?? []
           if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(pending.sessionId, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
-          if (payload?.length) await host.sendPrompt(pending.sessionId, pending.prompt, payload)
-          else await host.sendPrompt(pending.sessionId, pending.prompt)
+          finishRendererPreflight(pending.telemetry, payload)
+          if (payload?.length) await host.sendPrompt(pending.sessionId, pending.prompt, payload, pending.telemetry)
+          else await host.sendPrompt(pending.sessionId, pending.prompt, undefined, pending.telemetry)
         } catch (error) {
           activeUserTurnRef.current = false
           mainTurnOpenRef.current = false
@@ -2513,13 +2541,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     const prompt = draft.trim() || (documentPaths.length ? DEFAULT_COMPOSER_DOCUMENT_PROMPT : hasReadyInputFiles ? DEFAULT_COMPOSER_INPUT_FILES_PROMPT : '')
     if (!prompt && !attachments?.length) return false
     if (selectedSession && isExternalSessionId(selectedSession)) return false
+    const telemetry = createRendererTurnTelemetry(prompt, attachments?.length ?? 0, documentPaths.length)
     let targetSession: string | null = selectedSession
     if (!targetSession) {
       // Empty "新会话" state used to make Send a silent no-op; create the session
       // in the selected project and dispatch the prompt as soon as it is selected.
       // No lease exists yet in this state, so the write gate below must not apply.
       targetSession = await ensureSession(sessionId => {
-        pendingAutoSendRef.current = { sessionId, prompt, attachments, documents }
+        pendingAutoSendRef.current = { sessionId, prompt, attachments, documents, telemetry }
       })
       if (!targetSession) return false
       return true
@@ -2576,13 +2605,15 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         mutateLocalTranscript(items => items.filter(message => message.id !== localUserId))
       }
       try {
+        telemetry.preflightStartedAt = Date.now()
         const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
         if (payload?.length) {
           const converted = chatImagesFromAttachments(payload)
           mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
         }
         if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
-        const result = await sessionQueue.enqueue(prompt, payload)
+        finishRendererPreflight(telemetry, payload)
+        const result = await sessionQueue.enqueue(prompt, payload, telemetry)
         if (selectedSession !== targetSession) return true
         if (result.outcome === 'queued') {
           try {
@@ -2604,11 +2635,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
     beginDirectTurn()
     try {
+      telemetry.preflightStartedAt = Date.now()
       if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
       const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
       if (payload?.length) patchOptimisticImages(payload)
-      if (payload?.length) await host.sendPrompt(targetSession, prompt, payload)
-      else await host.sendPrompt(targetSession, prompt)
+      finishRendererPreflight(telemetry, payload)
+      if (payload?.length) await host.sendPrompt(targetSession, prompt, payload, telemetry)
+      else await host.sendPrompt(targetSession, prompt, undefined, telemetry)
       return true
     } catch (error) {
       resetFailedDirectTurn()

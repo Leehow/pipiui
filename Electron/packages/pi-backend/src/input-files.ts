@@ -176,9 +176,17 @@ export async function loadGrokInputFilesRemote(
   }
 }
 
+type InflightUpload = { controller: AbortController; epoch: number };
+
 export class InputFilesController {
-  private readonly inflight = new Map<string, AbortController>();
+  private readonly inflight = new Map<string, InflightUpload>();
   private readonly bytes = new Map<string, Uint8Array>();
+  /** Per-session generation invalidates upload continuations during teardown. */
+  private readonly sessionEpochs = new Map<string, number>();
+  /** Every mutating operation is tracked so teardown can settle it before file deletion. */
+  private readonly pending = new Map<string, Set<Promise<unknown>>>();
+  private readonly disposing = new Set<string>();
+  private readonly disposals = new Map<string, Promise<void>>();
 
   constructor(
     private readonly store: StoreLike,
@@ -186,18 +194,151 @@ export class InputFilesController {
     private readonly resolveModel: (sessionId: string) => Model | undefined,
   ) {}
 
+  private key(sessionId: string, attachmentId: string): string {
+    return `${sessionId}\0${attachmentId}`;
+  }
+
+  private belongsToSession(key: string, sessionId: string): boolean {
+    return key.startsWith(`${sessionId}\0`);
+  }
+
+  private epoch(sessionId: string): number {
+    return this.sessionEpochs.get(sessionId) ?? 0;
+  }
+
+  private isCurrent(sessionId: string, epoch: number): boolean {
+    return !this.disposing.has(sessionId) && this.epoch(sessionId) === epoch;
+  }
+
+  private track<T>(sessionId: string, task: Promise<T>): Promise<T> {
+    const tasks = this.pending.get(sessionId) ?? new Set<Promise<unknown>>();
+    tasks.add(task);
+    this.pending.set(sessionId, tasks);
+    const done = () => {
+      tasks.delete(task);
+      if (tasks.size === 0) this.pending.delete(sessionId);
+    };
+    void task.then(done, done);
+    return task;
+  }
+
+  private cancelledAttachment(draft: StoreAttachment): InputFileAttachment {
+    const cancelled: StoreAttachment = { ...draft, status: "cancelled" };
+    delete cancelled.error;
+    return publicInputFileAttachment(cancelled);
+  }
+
+  private releaseBytes(key: string, expected?: Uint8Array): void {
+    if (expected && this.bytes.get(key) !== expected) return;
+    this.bytes.delete(key);
+  }
+
+  private abortUpload(key: string): void {
+    const upload = this.inflight.get(key);
+    if (!upload) return;
+    this.inflight.delete(key);
+    upload.controller.abort();
+  }
+
+  /** Observable lifecycle diagnostics without exposing retained byte Maps. */
+  retainedByteCount(sessionId?: string): number {
+    return [...this.bytes.entries()]
+      .filter(([key]) => !sessionId || this.belongsToSession(key, sessionId))
+      .reduce((total, [, bytes]) => total + bytes.byteLength, 0);
+  }
+
+  /** Observable lifecycle diagnostics without exposing abort-controller Maps. */
+  inflightCount(sessionId?: string): number {
+    return [...this.inflight.keys()].filter((key) => !sessionId || this.belongsToSession(key, sessionId)).length;
+  }
+
+  /** Sessions with retained bytes, uploads, or mutating attachment work. */
+  runtimeSessionIds(): string[] {
+    const ids = new Set<string>([...this.pending.keys(), ...this.disposing, ...this.disposals.keys()]);
+    for (const key of [...this.bytes.keys(), ...this.inflight.keys()]) {
+      const separator = key.indexOf("\0");
+      if (separator > 0) ids.add(key.slice(0, separator));
+    }
+    return [...ids];
+  }
+
+  /**
+   * Abort and release every transient attachment resource for one session.
+   * The store metadata survives host shutdown; an explicit session deletion
+   * may remove persistent files afterwards. Repeated/concurrent calls share
+   * one safe settlement.
+   */
+  async disposeSession(sessionId: string): Promise<void> {
+    const current = this.disposals.get(sessionId);
+    if (current) return current;
+    this.disposing.add(sessionId);
+    const disposedEpoch = this.epoch(sessionId) + 1;
+    this.sessionEpochs.set(sessionId, disposedEpoch);
+    const task = (async () => {
+      for (const [key] of this.inflight) {
+        if (this.belongsToSession(key, sessionId)) this.abortUpload(key);
+      }
+      for (const key of [...this.bytes.keys()]) {
+        if (this.belongsToSession(key, sessionId)) this.releaseBytes(key);
+      }
+      // A stage/retry may be between a store write and remote upload. The
+      // disposal fence rejects new mutators, so one snapshot covers every
+      // operation that can still touch durable session files.
+      const pending = [...(this.pending.get(sessionId) ?? [])];
+      await Promise.allSettled(pending);
+      // Preserve attachment metadata, but never leave a shutdown-aborted
+      // upload permanently stuck in `uploading` after its bytes are gone.
+      const attachments = await this.store.list(sessionId).catch(() => []);
+      const next = attachments.map((item) => {
+        if (item.status !== "uploading") return item;
+        const cancelled: StoreAttachment = { ...item, status: "cancelled", error: "已取消" };
+        return cancelled;
+      });
+      if (next.some((item, index) => item !== attachments[index])) {
+        await this.store.write(sessionId, next).catch(() => undefined);
+      }
+    })().finally(() => {
+      this.disposing.delete(sessionId);
+      if (this.sessionEpochs.get(sessionId) === disposedEpoch) this.sessionEpochs.delete(sessionId);
+      this.disposals.delete(sessionId);
+    });
+    this.disposals.set(sessionId, task);
+    return task;
+  }
+
+  /** Dispose all transient attachment state without reaching into private Maps. */
+  async disposeAll(): Promise<void> {
+    await Promise.all([...this.runtimeSessionIds()].map((sessionId) => this.disposeSession(sessionId)));
+  }
+
   async list(sessionId: string): Promise<InputFileAttachment[]> {
     return (await this.store.list(sessionId)).map(publicInputFileAttachment);
   }
 
   async stage(sessionId: string, request: InputFileStageRequest): Promise<InputFileAttachment> {
+    if (this.disposing.has(sessionId)) throw new Error("会话正在关闭");
+    const epoch = this.epoch(sessionId);
+    return this.track(sessionId, this.stageForEpoch(sessionId, request, epoch));
+  }
+
+  private async stageForEpoch(sessionId: string, request: InputFileStageRequest, epoch: number): Promise<InputFileAttachment> {
     this.assertCapable(sessionId);
     if (!this.remote) throw new Error("当前环境未启用文件上传");
     const bytes = decodeStageBytes(request);
     const digest = digestOf(bytes);
+    const requestedId = request.id?.trim();
+    const draftId = requestedId || randomUUID();
+    const draft: StoreAttachment = {
+      id: draftId,
+      name: safeInputFileName(request.name),
+      size: bytes.byteLength,
+      mimeType: request.mimeType?.trim() || "application/octet-stream",
+      status: "uploading",
+      digest,
+    };
     const existing = this.store.findReusable(await this.store.list(sessionId), digest);
+    if (!this.isCurrent(sessionId, epoch)) return this.cancelledAttachment(draft);
     if (existing?.fileId) {
-      const requestedId = request.id?.trim();
       const reused: StoreAttachment = {
         ...existing,
         id: requestedId && requestedId !== existing.id ? requestedId : existing.id,
@@ -211,28 +352,44 @@ export class InputFilesController {
       };
       delete reused.error;
       await this.store.upsert(sessionId, reused);
-      return publicInputFileAttachment(reused);
+      return this.isCurrent(sessionId, epoch)
+        ? publicInputFileAttachment(reused)
+        : this.cancelledAttachment(reused);
     }
-    const id = request.id?.trim() || randomUUID();
-    const draft: StoreAttachment = {
-      id,
-      name: safeInputFileName(request.name),
-      size: bytes.byteLength,
-      mimeType: request.mimeType?.trim() || "application/octet-stream",
-      status: "uploading",
-      digest,
-    };
-    this.bytes.set(`${sessionId}:${id}`, bytes);
-    await this.store.upsert(sessionId, draft);
-    return this.upload(sessionId, draft, bytes);
+    const key = this.key(sessionId, draft.id);
+    this.bytes.set(key, bytes);
+    try {
+      await this.store.upsert(sessionId, draft);
+    } catch (error) {
+      this.releaseBytes(key, bytes);
+      throw error;
+    }
+    if (!this.isCurrent(sessionId, epoch) || this.bytes.get(key) !== bytes) {
+      this.releaseBytes(key, bytes);
+      return this.cancelledAttachment(draft);
+    }
+    return this.upload(sessionId, draft, bytes, epoch);
   }
 
   async retry(sessionId: string, attachmentId: string, request?: InputFileStageRequest): Promise<InputFileAttachment> {
+    if (this.disposing.has(sessionId)) throw new Error("会话正在关闭");
+    const epoch = this.epoch(sessionId);
+    return this.track(sessionId, this.retryForEpoch(sessionId, attachmentId, request, epoch));
+  }
+
+  private async retryForEpoch(
+    sessionId: string,
+    attachmentId: string,
+    request: InputFileStageRequest | undefined,
+    epoch: number,
+  ): Promise<InputFileAttachment> {
     this.assertCapable(sessionId);
     if (!this.remote) throw new Error("当前环境未启用文件上传");
     const current = (await this.store.list(sessionId)).find((item) => item.id === attachmentId);
     if (!current) throw new Error("找不到该附件");
-    const bytes = request ? decodeStageBytes(request) : this.bytes.get(`${sessionId}:${attachmentId}`);
+    if (!this.isCurrent(sessionId, epoch)) return this.cancelledAttachment(current);
+    const key = this.key(sessionId, attachmentId);
+    const bytes = request ? decodeStageBytes(request) : this.bytes.get(key);
     if (!bytes) throw new Error("请重新选择文件后再试");
     const digest = digestOf(bytes);
     const next: StoreAttachment = {
@@ -244,13 +401,31 @@ export class InputFilesController {
       digest,
     };
     delete next.error;
-    this.bytes.set(`${sessionId}:${attachmentId}`, bytes);
-    await this.store.upsert(sessionId, next);
-    return this.upload(sessionId, next, bytes);
+    this.abortUpload(key);
+    this.bytes.set(key, bytes);
+    try {
+      await this.store.upsert(sessionId, next);
+    } catch (error) {
+      this.releaseBytes(key, bytes);
+      throw error;
+    }
+    if (!this.isCurrent(sessionId, epoch) || this.bytes.get(key) !== bytes) {
+      this.releaseBytes(key, bytes);
+      return this.cancelledAttachment(next);
+    }
+    return this.upload(sessionId, next, bytes, epoch);
   }
 
   async cancel(sessionId: string, attachmentId: string): Promise<InputFileAttachment> {
-    this.inflight.get(`${sessionId}:${attachmentId}`)?.abort();
+    if (this.disposing.has(sessionId)) throw new Error("会话正在关闭");
+    const epoch = this.epoch(sessionId);
+    return this.track(sessionId, this.cancelForEpoch(sessionId, attachmentId, epoch));
+  }
+
+  private async cancelForEpoch(sessionId: string, attachmentId: string, epoch: number): Promise<InputFileAttachment> {
+    const key = this.key(sessionId, attachmentId);
+    this.abortUpload(key);
+    this.releaseBytes(key);
     const current = (await this.store.list(sessionId)).find((item) => item.id === attachmentId);
     const next: StoreAttachment = {
       id: attachmentId,
@@ -262,15 +437,25 @@ export class InputFilesController {
       ...(current?.digest ? { digest: current.digest } : {}),
       ...(current?.sent ? { sent: true } : {}),
     };
+    if (!this.isCurrent(sessionId, epoch)) return this.cancelledAttachment(next);
     await this.store.upsert(sessionId, next);
-    return publicInputFileAttachment(next);
+    return this.isCurrent(sessionId, epoch)
+      ? publicInputFileAttachment(next)
+      : this.cancelledAttachment(next);
   }
 
   async remove(sessionId: string, attachmentId: string): Promise<InputFileAttachment[]> {
-    this.inflight.get(`${sessionId}:${attachmentId}`)?.abort();
+    if (this.disposing.has(sessionId)) throw new Error("会话正在关闭");
+    const epoch = this.epoch(sessionId);
+    return this.track(sessionId, this.removeForEpoch(sessionId, attachmentId, epoch));
+  }
+
+  private async removeForEpoch(sessionId: string, attachmentId: string, epoch: number): Promise<InputFileAttachment[]> {
+    const key = this.key(sessionId, attachmentId);
+    this.abortUpload(key);
+    this.releaseBytes(key);
     const { removed, attachments } = await this.store.remove(sessionId, attachmentId);
-    this.bytes.delete(`${sessionId}:${attachmentId}`);
-    if (removed?.fileId && !removed.sent) {
+    if (removed?.fileId && !removed.sent && this.isCurrent(sessionId, epoch)) {
       await this.remote?.remove(removed.fileId).catch(() => undefined);
     }
     return attachments.map(publicInputFileAttachment);
@@ -278,15 +463,28 @@ export class InputFilesController {
 
   /** Provider after-response only. Never expose over host IPC. */
   async markSent(sessionId: string, attachmentIds?: readonly string[]): Promise<InputFileAttachment[]> {
+    if (this.disposing.has(sessionId)) return [];
+    const epoch = this.epoch(sessionId);
+    return this.track(sessionId, this.markSentForEpoch(sessionId, attachmentIds, epoch));
+  }
+
+  private async markSentForEpoch(
+    sessionId: string,
+    attachmentIds: readonly string[] | undefined,
+    epoch: number,
+  ): Promise<InputFileAttachment[]> {
     const selected = attachmentIds?.length ? new Set(attachmentIds) : undefined;
     const attachments = await this.store.list(sessionId);
+    if (!this.isCurrent(sessionId, epoch)) return [];
     const next = attachments.map((item) => (
       item.status === "ready" && item.fileId && (!selected || selected.has(item.id))
         ? { ...item, sent: true }
         : item
     ));
     await this.store.write(sessionId, next);
-    return next.filter((item) => item.sent && item.fileId).map(publicInputFileAttachment);
+    return this.isCurrent(sessionId, epoch)
+      ? next.filter((item) => item.sent && item.fileId).map(publicInputFileAttachment)
+      : [];
   }
 
   async readyForSend(sessionId: string): Promise<InputFileAttachment[]> {
@@ -309,11 +507,22 @@ export class InputFilesController {
     }
   }
 
-  private async upload(sessionId: string, draft: StoreAttachment, bytes: Uint8Array): Promise<InputFileAttachment> {
-    const key = `${sessionId}:${draft.id}`;
-    this.inflight.get(key)?.abort();
+  private async upload(
+    sessionId: string,
+    draft: StoreAttachment,
+    bytes: Uint8Array,
+    epoch: number,
+  ): Promise<InputFileAttachment> {
+    const key = this.key(sessionId, draft.id);
+    if (!this.isCurrent(sessionId, epoch) || this.bytes.get(key) !== bytes) {
+      this.releaseBytes(key, bytes);
+      return this.cancelledAttachment(draft);
+    }
+    this.abortUpload(key);
     const controller = new AbortController();
-    this.inflight.set(key, controller);
+    const upload: InflightUpload = { controller, epoch };
+    this.inflight.set(key, upload);
+    let retainBytesForRetry = false;
     try {
       const uploaded = await this.remote!.upload({
         bytes,
@@ -321,10 +530,14 @@ export class InputFilesController {
         mimeType: draft.mimeType,
         signal: controller.signal,
       });
-      const current = await this.currentAttachment(sessionId, draft.id);
-      if (!current || current.status === "cancelled") {
+      if (!this.isCurrent(sessionId, epoch) || this.inflight.get(key) !== upload) {
         if (uploaded.fileId) await this.remote?.remove(uploaded.fileId).catch(() => undefined);
-        return publicInputFileAttachment({ ...draft, ...current, status: "cancelled" });
+        return this.cancelledAttachment(draft);
+      }
+      const current = await this.currentAttachment(sessionId, draft.id);
+      if (!this.isCurrent(sessionId, epoch) || this.inflight.get(key) !== upload || !current || current.status === "cancelled") {
+        if (uploaded.fileId) await this.remote?.remove(uploaded.fileId).catch(() => undefined);
+        return this.cancelledAttachment({ ...draft, ...current });
       }
       const ready: StoreAttachment = {
         ...draft,
@@ -337,11 +550,16 @@ export class InputFilesController {
       };
       delete ready.error;
       await this.store.upsert(sessionId, ready);
-      return publicInputFileAttachment(ready);
+      return this.isCurrent(sessionId, epoch) && this.inflight.get(key) === upload
+        ? publicInputFileAttachment(ready)
+        : this.cancelledAttachment(ready);
     } catch (error) {
+      if (!this.isCurrent(sessionId, epoch) || this.inflight.get(key) !== upload) {
+        return this.cancelledAttachment(draft);
+      }
       const current = await this.currentAttachment(sessionId, draft.id);
-      if (!current || current.status === "cancelled") {
-        return publicInputFileAttachment({ ...draft, ...current, status: "cancelled" });
+      if (!this.isCurrent(sessionId, epoch) || this.inflight.get(key) !== upload || !current || current.status === "cancelled") {
+        return this.cancelledAttachment({ ...draft, ...current });
       }
       const aborted = controller.signal.aborted
         || (error as { code?: string })?.code === "aborted"
@@ -352,9 +570,13 @@ export class InputFilesController {
         error: aborted ? "已取消" : sanitizeInputFileError(error),
       };
       await this.store.upsert(sessionId, failed);
-      return publicInputFileAttachment(failed);
+      retainBytesForRetry = !aborted && this.isCurrent(sessionId, epoch) && this.inflight.get(key) === upload;
+      return retainBytesForRetry
+        ? publicInputFileAttachment(failed)
+        : this.cancelledAttachment(failed);
     } finally {
-      if (this.inflight.get(key) === controller) this.inflight.delete(key);
+      if (this.inflight.get(key) === upload) this.inflight.delete(key);
+      if (!retainBytesForRetry) this.releaseBytes(key, bytes);
     }
   }
 

@@ -17,6 +17,12 @@ export type LeaseRecord = {
   expiresAt: string;
 };
 export type LeaseStatus = { sessionId: string; writable: boolean; holder?: LeaseRecord };
+/** Non-enumerable metadata attached to acquire() results for host transaction guards. */
+export const LEASE_ACQUISITION_METADATA = Symbol("pipiui.leaseAcquisitionMetadata");
+export type LeaseAcquisitionMetadata = Readonly<{
+  acquired: boolean;
+  ownershipGeneration: number;
+}>;
 export type LeaseManagerOptions = {
   sessionId: string;
   sessionPath: string;
@@ -27,6 +33,31 @@ export type LeaseManagerOptions = {
   ttlMs?: number;
   now?: () => number;
 };
+
+/** One process hook tracks only currently owned leases, never every constructed manager. */
+const exitTrackedLeases = new Set<LeaseManager>();
+let exitHookInstalled = false;
+
+function releaseTrackedLeasesSync(): void {
+  exitHookInstalled = false;
+  const leases = [...exitTrackedLeases];
+  exitTrackedLeases.clear();
+  for (const lease of leases) lease.releaseSync();
+}
+
+function trackLeaseForExit(lease: LeaseManager): void {
+  exitTrackedLeases.add(lease);
+  if (exitHookInstalled) return;
+  process.once("exit", releaseTrackedLeasesSync);
+  exitHookInstalled = true;
+}
+
+function untrackLeaseForExit(lease: LeaseManager): void {
+  exitTrackedLeases.delete(lease);
+  if (exitTrackedLeases.size !== 0 || !exitHookInstalled) return;
+  process.removeListener("exit", releaseTrackedLeasesSync);
+  exitHookInstalled = false;
+}
 
 /** Coordinates a single JSONL writer shared by Electron and the future Swift host. */
 export class LeaseManager {
@@ -41,6 +72,7 @@ export class LeaseManager {
   private readonly instanceId = crypto.randomUUID();
   private timer?: NodeJS.Timeout;
   private owned = false;
+  private acquisitionGeneration = 0;
   private acquireChain: Promise<void> = Promise.resolve();
 
   constructor(options: LeaseManagerOptions) {
@@ -52,8 +84,11 @@ export class LeaseManager {
     this.heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
     this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
     this.now = options.now ?? Date.now;
-    process.once("exit", () => this.releaseSync());
   }
+
+  get isOwned(): boolean { return this.owned; }
+  /** Release-ownership token: advances on every successful claim or reuse. */
+  get ownershipGeneration(): number { return this.acquisitionGeneration; }
 
   private record(): LeaseRecord {
     const timestamp = new Date(this.now()).toISOString();
@@ -81,7 +116,9 @@ export class LeaseManager {
   }
   private claim(record: LeaseRecord): LeaseStatus {
     this.owned = true;
+    this.acquisitionGeneration += 1;
     this.startHeartbeat();
+    trackLeaseForExit(this);
     return { sessionId: this.sessionId, writable: true, holder: record };
   }
   private startHeartbeat(): void { if (!this.timer) this.timer = setInterval(() => { void this.heartbeat(); }, this.heartbeatMs); this.timer.unref?.(); }
@@ -101,13 +138,39 @@ export class LeaseManager {
   }
 
   async acquire(): Promise<LeaseStatus> {
-    const next = this.acquireChain.then(() => this.acquireUnlocked(), () => this.acquireUnlocked());
+    const run = async (): Promise<LeaseStatus> => {
+      const beforeGeneration = this.acquisitionGeneration;
+      const status = await this.acquireUnlocked();
+      // A claim changes the generation in claim(). A successful acquire that
+      // reuses an already-owned manager must advance it too, so an earlier
+      // installer cannot release a lease later relied on by this caller.
+      const acquired = this.owned && this.acquisitionGeneration !== beforeGeneration;
+      if (status.writable && this.owned && !acquired) this.acquisitionGeneration += 1;
+      // The metadata is deliberately non-enumerable: host-facing lease status
+      // remains the existing protocol shape while host transactions can tell
+      // this invocation's claim from a reused valid lease. The generation is
+      // sampled inside the serialized acquire operation, so concurrent callers
+      // do not mistake a prior caller's claim for their own.
+      Object.defineProperty(status, LEASE_ACQUISITION_METADATA, {
+        value: {
+          acquired,
+          ownershipGeneration: this.acquisitionGeneration,
+        } satisfies LeaseAcquisitionMetadata,
+        enumerable: false,
+        configurable: true,
+      });
+      return status;
+    };
+    const next = this.acquireChain.then(run, run);
     this.acquireChain = next.then(() => undefined, () => undefined);
     return next;
   }
 
   private async acquireUnlocked(): Promise<LeaseStatus> {
-    if (this.owned) { await this.heartbeat(); return this.query(); }
+    if (this.owned) {
+      const status = await this.heartbeat();
+      if (this.owned) return status;
+    }
     await fs.mkdir(dirname(this.leasePath), { recursive: true });
     const record = this.record();
     try {
@@ -130,7 +193,7 @@ export class LeaseManager {
   async heartbeat(): Promise<LeaseStatus> {
     if (!this.owned) return this.query();
     const current = await this.read();
-    if (!current || !this.same(current)) { this.owned = false; this.stopHeartbeat(); return this.query(); }
+    if (!current || !this.same(current)) { this.owned = false; this.stopHeartbeat(); untrackLeaseForExit(this); return this.query(); }
     const next: LeaseRecord = { ...current, heartbeatAt: new Date(this.now()).toISOString(), expiresAt: new Date(this.now() + this.ttlMs).toISOString() };
     const temporary = `${this.leasePath}.${this.instanceId}.tmp`;
     await fs.writeFile(temporary, JSON.stringify(next));
@@ -140,13 +203,27 @@ export class LeaseManager {
 
   async release(): Promise<void> {
     this.stopHeartbeat();
-    const current = await this.read();
-    if (current && this.same(current)) await fs.rm(this.leasePath, { force: true });
-    this.owned = false;
+    try {
+      const current = await this.read();
+      if (current && this.same(current)) await fs.rm(this.leasePath, { force: true });
+    } finally {
+      this.owned = false;
+      untrackLeaseForExit(this);
+    }
   }
-  private releaseSync(): void {
-    if (!this.owned || !existsSync(this.leasePath)) return;
-    try { const current = JSON.parse(readFileSync(this.leasePath, "utf8")) as LeaseRecord; if (this.same(current)) unlinkSync(this.leasePath); } catch { /* best effort at exit */ }
+  /** Process-exit cleanup for the shared tracker; synchronous by Node's exit contract. */
+  releaseSync(): void {
+    this.stopHeartbeat();
+    try {
+      if (!this.owned || !existsSync(this.leasePath)) return;
+      const current = JSON.parse(readFileSync(this.leasePath, "utf8")) as LeaseRecord;
+      if (this.same(current)) unlinkSync(this.leasePath);
+    } catch {
+      /* best effort at exit */
+    } finally {
+      this.owned = false;
+      untrackLeaseForExit(this);
+    }
   }
 
   async expire(): Promise<boolean> {
@@ -159,6 +236,7 @@ export class LeaseManager {
   async forceTakeover(): Promise<LeaseStatus> {
     this.stopHeartbeat();
     this.owned = false;
+    untrackLeaseForExit(this);
     await fs.rm(this.leasePath, { force: true });
     return this.acquire();
   }

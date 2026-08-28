@@ -46,6 +46,23 @@ export class DocumentInjectionStore {
     this.pending.delete(sessionId);
     return item.text;
   }
+
+  /** Explicit session lifecycle seam; keeps unrelated pending injections intact. */
+  clearSession(sessionId: string): void {
+    this.pending.delete(sessionId.trim());
+  }
+
+  hasPending(sessionId: string): boolean {
+    return this.pending.has(sessionId.trim());
+  }
+
+  pendingSessionIds(): string[] {
+    return [...this.pending.keys()];
+  }
+
+  clearAll(): void {
+    this.pending.clear();
+  }
 }
 
 export type BinaryMarkdownConverter = (path: string) => Promise<string | undefined>;

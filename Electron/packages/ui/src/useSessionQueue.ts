@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { PipiHostAPI, PromptAttachment, QueueEnqueueResult, QueuedMessage, StreamEvent } from '@pipi/host-api'
+import type { PipiHostAPI, PromptAttachment, QueueEnqueueResult, QueuedMessage, StreamEvent, TurnTelemetryRendererSample } from '@pipi/host-api'
 import type { MessageQueueItem } from './MessageQueue'
 
 function queueError(error: unknown): string {
@@ -18,6 +18,29 @@ function queueItem(message: QueuedMessage): MessageQueueItem {
   }
 }
 
+function base64ByteLength(value: string): number | undefined {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value) || value.length % 4 !== 0) return undefined
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+  return (value.length / 4) * 3 - padding
+}
+
+/** A queue edit is a new renderer submission; never reuse the old sample. */
+function queueEditTelemetry(text: string, attachments: PromptAttachment[]): TurnTelemetryRendererSample {
+  const submittedAt = Date.now()
+  const attachmentBytes = attachments
+    .map(attachment => base64ByteLength(attachment.dataBase64))
+    .reduce<number | undefined>((total, bytes) => total === undefined || bytes === undefined ? undefined : total + bytes, 0)
+  return {
+    turnId: `turn-${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    submittedAt,
+    preflightStartedAt: submittedAt,
+    preflightEndedAt: Date.now(),
+    promptBytes: new TextEncoder().encode(text).byteLength,
+    attachmentCount: attachments.length,
+    ...(attachmentBytes !== undefined ? { attachmentBytes } : {})
+  }
+}
+
 export type UseSessionQueueResult = {
   items: MessageQueueItem[]
   expanded: boolean
@@ -30,7 +53,7 @@ export type UseSessionQueueResult = {
   /** Re-pulls the authoritative queue snapshot (e.g. after settled) so a missed
    *  queue_update can never strand the composer in a busy state. */
   resync: () => Promise<void>
-  enqueue: (text: string, attachments?: PromptAttachment[]) => Promise<QueueEnqueueResult>
+  enqueue: (text: string, attachments?: PromptAttachment[], telemetry?: TurnTelemetryRendererSample) => Promise<QueueEnqueueResult>
   edit: (messageId: string, text: string) => Promise<void>
   remove: (messageId: string) => Promise<void>
   promote: (messageId: string) => Promise<void>
@@ -132,10 +155,11 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
     }
   }, [])
 
-  const enqueue = useCallback((text: string, attachments?: PromptAttachment[]) => mutate(activeSessionId => host.enqueueMessage(activeSessionId, text, attachments)), [host, mutate])
+  const enqueue = useCallback((text: string, attachments?: PromptAttachment[], telemetry?: TurnTelemetryRendererSample) => mutate(activeSessionId => host.enqueueMessage(activeSessionId, text, attachments, telemetry)), [host, mutate])
   const edit = useCallback(async (messageId: string, text: string) => {
     const attachments = queueRef.current.find(item => item.id === messageId)?.attachments
-    await mutate(activeSessionId => host.updateQueuedMessage(activeSessionId, messageId, text, attachments))
+    const telemetry = queueEditTelemetry(text, attachments ?? [])
+    await mutate(activeSessionId => host.updateQueuedMessage(activeSessionId, messageId, text, attachments, telemetry))
   }, [host, mutate])
   const remove = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.removeQueuedMessage(activeSessionId, messageId)) }, [host, mutate])
   const promote = useCallback(async (messageId: string) => { await mutate(activeSessionId => host.promoteQueuedMessage(activeSessionId, messageId)) }, [host, mutate])

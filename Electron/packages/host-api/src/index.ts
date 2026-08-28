@@ -471,11 +471,30 @@ export type SessionTokenUsage = { input: number; output: number; cacheRead: numb
 /** Context-window occupancy from pi's `get_session_stats`. `tokens`/`percent` are null when unknown (e.g. right after compaction). `percent` is 0–100. */
 export type SessionContextUsage = { tokens: number | null; contextWindow: number; percent: number | null };
 /**
- * Reserved for future performance telemetry (TTFT, tokens/second, sample
- * counts). Hosts MUST NOT fabricate these: pi exposes no such measurements, so
- * the field stays absent until a real source exists.
+ * Host-observed performance samples (TTFT, tokens/second, sample count).
+ * Each field remains absent until its underlying turn has real evidence; a
+ * real TTFT does not require provider output-token evidence. `sampleCount` is
+ * the number of retained turns with any performance evidence, while each
+ * average uses only turns that supplied that field. Clients must never treat
+ * a missing value as zero.
  */
 export type SessionPerformance = { ttftMs?: number; tokensPerSecond?: number; sampleCount?: number };
+/**
+ * Renderer-observed, privacy-safe timing for one user submission. The payload
+ * deliberately carries only a bounded opaque correlation id, timestamps, and
+ * byte/count measurements — never prompt, attachment, document, or tool data.
+ * Hosts validate every field and omit unavailable measurements.
+ */
+export type TurnTelemetryRendererSample = {
+  turnId: string;
+  submittedAt: number;
+  preflightStartedAt?: number;
+  preflightEndedAt?: number;
+  promptBytes?: number;
+  attachmentCount?: number;
+  attachmentBytes?: number;
+  documentCount?: number;
+};
 /** Image attachment carried by sendPrompt; mirrors Swift ImageAttachment.rpcPayload. */
 export type PromptAttachment = {
   /** Base64-encoded image bytes (no `data:` prefix). */
@@ -1034,8 +1053,8 @@ export interface PipiHostAPI {
   adoptExternalSession?(sessionId: string): Promise<Session>;
   getSessionLease(sessionId: string): Promise<SessionLease>; forceTakeoverSessionLease(sessionId: string): Promise<SessionLease>;
   /** Legacy-compatible send: direct sends and busy queueing are observed through `queue_update` stream events. */
-  sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[]): Promise<void>;
-  listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[]): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[]): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
+  sendPrompt(sessionId: string, prompt: string, attachments?: PromptAttachment[], telemetry?: TurnTelemetryRendererSample): Promise<void>;
+  listQueue(sessionId: string): Promise<QueuedMessage[]>; enqueueMessage(sessionId: string, text: string, attachments?: PromptAttachment[], telemetry?: TurnTelemetryRendererSample): Promise<QueueEnqueueResult>; updateQueuedMessage(sessionId: string, messageId: string, text: string, attachments?: PromptAttachment[], telemetry?: TurnTelemetryRendererSample): Promise<QueuedMessage>; removeQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; promoteQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; steerQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>; retryQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage>;
   stop(sessionId: string): Promise<void>; queueFollowUp(sessionId: string, prompt: string): Promise<void>; subscribeStream(sessionId: string, listener: (event: StreamEvent) => void): Unsubscribe;
   /** Optional compatibility extension: observe stream events from every session without changing the selected-session subscription. */
   subscribeAllStreams?(listener: (event: StreamEvent) => void): Unsubscribe;
@@ -1309,10 +1328,16 @@ function apiFrom(
     adoptExternalSession: sessionId => invoke("adoptExternalSession", sessionId),
     getSessionLease: sessionId => invoke("getSessionLease", sessionId),
     forceTakeoverSessionLease: sessionId => invoke("forceTakeoverSessionLease", sessionId),
-    sendPrompt: (sessionId, prompt, attachments) => attachments?.length ? invoke("sendPrompt", sessionId, prompt, attachments) : invoke("sendPrompt", sessionId, prompt),
+    sendPrompt: (sessionId, prompt, attachments, telemetry) => telemetry
+      ? invoke("sendPrompt", sessionId, prompt, attachments, telemetry)
+      : attachments?.length ? invoke("sendPrompt", sessionId, prompt, attachments) : invoke("sendPrompt", sessionId, prompt),
     listQueue: sessionId => invoke("listQueue", sessionId),
-    enqueueMessage: (sessionId, text, attachments) => attachments?.length ? invoke("enqueueMessage", sessionId, text, attachments) : invoke("enqueueMessage", sessionId, text),
-    updateQueuedMessage: (sessionId, messageId, text, attachments) => attachments === undefined ? invoke("updateQueuedMessage", sessionId, messageId, text) : invoke("updateQueuedMessage", sessionId, messageId, text, attachments),
+    enqueueMessage: (sessionId, text, attachments, telemetry) => telemetry
+      ? invoke("enqueueMessage", sessionId, text, attachments, telemetry)
+      : attachments?.length ? invoke("enqueueMessage", sessionId, text, attachments) : invoke("enqueueMessage", sessionId, text),
+    updateQueuedMessage: (sessionId, messageId, text, attachments, telemetry) => telemetry
+      ? invoke("updateQueuedMessage", sessionId, messageId, text, attachments, telemetry)
+      : attachments === undefined ? invoke("updateQueuedMessage", sessionId, messageId, text) : invoke("updateQueuedMessage", sessionId, messageId, text, attachments),
     removeQueuedMessage: (sessionId, messageId) => invoke("removeQueuedMessage", sessionId, messageId),
     promoteQueuedMessage: (sessionId, messageId) => invoke("promoteQueuedMessage", sessionId, messageId),
     steerQueuedMessage: (sessionId, messageId) => invoke("steerQueuedMessage", sessionId, messageId),

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend } from "../src/index.js";
 import {
   InputFilesController,
+  type InputFilesUploadResult,
   JsonInputFileStore,
   loadGrokInputFilesRemote,
   modelDeclaresInputFiles,
@@ -72,6 +73,8 @@ describe("input files host controller", () => {
     model = grok;
     const ready = await ctl.stage("s1", stage());
     expect(ready).toMatchObject({ name: "notes.md", status: "ready", fileId: "file-1" });
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
     expect(JSON.stringify(ready)).not.toContain("/abs/");
     expect(ready).not.toHaveProperty("digest");
     const stored = join(dir, "input-files", "s1.json");
@@ -101,16 +104,22 @@ describe("input files host controller", () => {
     const ctl = new InputFilesController(new JsonInputFileStore(dir), remote, () => grok);
     const failed = await ctl.stage("s1", stage("/abs/secret/notes.md", "hello files", "att-1"));
     expect(failed.status).toBe("failed");
+    expect(ctl.retainedByteCount("s1")).toBe(Buffer.byteLength("hello files"));
+    expect(ctl.inflightCount("s1")).toBe(0);
     expect(failed.error).not.toContain("at-secret");
     expect(failed.error).not.toContain("/Users/haoli");
     const retried = await ctl.retry("s1", "att-1");
     expect(retried.status).toBe("ready");
     expect(retried.fileId).toBe("file-2");
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
     const reused = await ctl.stage("s1", stage("other.md", "hello files"));
     expect(reused.fileId).toBe("file-2");
     expect(uploads).toBe(2);
     await ctl.remove("s1", reused.id);
     expect(deletes).toBe(1);
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
   });
 
   it("does not remote-DELETE a sent file and requires reselect when bytes are gone", async () => {
@@ -158,8 +167,12 @@ describe("input files host controller", () => {
     await expect(ctl.readyForSend("s1")).rejects.toThrow(/仍在上传/);
     const cancelled = await ctl.cancel("s1", "att-1");
     expect(cancelled.status).toBe("cancelled");
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
     release();
     expect((await pending).status).toBe("cancelled");
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
 
     const other = await ctl.stage("s2", stage("s2.md", "session two", "att-2"));
     expect(other.status).toBe("ready");
@@ -167,6 +180,35 @@ describe("input files host controller", () => {
     expect((await ctl.list("s2")).map((item) => item.id)).toEqual(["att-2"]);
     expect(JSON.parse(await readFile(join(dir, "input-files", "s1.json"), "utf8")).attachments).toHaveLength(1);
     expect(JSON.parse(await readFile(join(dir, "input-files", "s2.json"), "utf8")).attachments).toHaveLength(1);
+  });
+
+  it("disposes pending uploads without resurrecting bytes or abort controllers", async () => {
+    const dir = await tempDir();
+    let aborts = 0;
+    const remote = {
+      upload: async ({ signal }: { signal?: AbortSignal }) => new Promise<InputFilesUploadResult>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          aborts += 1;
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      }),
+      remove: async () => undefined,
+    };
+    const ctl = new InputFilesController(new JsonInputFileStore(dir), remote, () => grok);
+    const pending = ctl.stage("s1", stage(undefined, undefined, "att-teardown"));
+    await expect.poll(() => ctl.inflightCount("s1")).toBe(1);
+    expect(ctl.retainedByteCount("s1")).toBe(Buffer.byteLength("hello files"));
+
+    await ctl.disposeSession("s1");
+    await ctl.disposeSession("s1");
+    expect(aborts).toBe(1);
+    expect((await pending).status).toBe("cancelled");
+    expect(ctl.retainedByteCount("s1")).toBe(0);
+    expect(ctl.inflightCount("s1")).toBe(0);
+    expect((await ctl.list("s1")).at(0)).toMatchObject({ status: "cancelled" });
+    await expect(ctl.retry("s1", "att-teardown")).rejects.toThrow(/重新选择/);
   });
 
   it("fails closed when the bundled remote host export is missing", async () => {

@@ -419,6 +419,19 @@ export class ExtensionRegistry {
     this.sessionMounts.delete(sessionId);
   }
 
+  /** Explicit lifecycle diagnostics and host-shutdown seam. */
+  hasSessionMount(sessionId: string): boolean {
+    return this.sessionMounts.has(sessionId);
+  }
+
+  mountedSessionIds(): string[] {
+    return [...this.sessionMounts.keys()];
+  }
+
+  unmountAllSessions(): void {
+    this.sessionMounts.clear();
+  }
+
   isMounted(sessionId: string, extensionId: string): boolean {
     return this.sessionMounts.get(sessionId)?.has(extensionId) === true;
   }

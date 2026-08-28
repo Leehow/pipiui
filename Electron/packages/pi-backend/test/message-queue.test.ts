@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { SessionMessageQueue, type DispatchBehavior, type DispatchHandler, type QueuedAttachment } from "../src/message-queue.js";
+import {
+  SessionMessageQueue,
+  type DispatchBehavior,
+  type DispatchHandler,
+  type QueuedAttachment,
+  type QueuedDispatchPayload,
+} from "../src/message-queue.js";
 
-type RecordedCall = { sessionId: string; payload: { text: string; attachments: QueuedAttachment[] }; behavior: DispatchBehavior };
+type RecordedCall = { sessionId: string; payload: QueuedDispatchPayload; behavior: DispatchBehavior };
 
 /** Dispatch recorder with manual per-call resolve/reject control (no auto-settle). */
 function recordingHost() {
@@ -18,6 +24,34 @@ function recordingHost() {
 const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
 describe("SessionMessageQueue", () => {
+  it("disposes one session idempotently without resurrecting it from a late dispatch", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    queue.enqueue("s1", { text: "delete me" });
+    queue.markBusy("s2");
+    queue.enqueue("s2", { text: "keep me" });
+
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls).toHaveLength(1);
+    expect(queue.sessionCount()).toBe(2);
+
+    queue.disposeSession("s1");
+    queue.disposeSession("s1");
+    expect(queue.sessionCount()).toBe(1);
+    expect(queue.hasSession("s1")).toBe(false);
+    expect(queue.listQueue("s1")).toEqual([]);
+    expect(queue.listQueue("s2")).toEqual([expect.objectContaining({ text: "keep me" })]);
+
+    host.pending[0].resolve(undefined);
+    await idle;
+    await flush();
+    expect(queue.sessionCount()).toBe(1);
+    expect(queue.listQueue("s1")).toEqual([]);
+    expect(queue.listQueue("s2")).toEqual([expect.objectContaining({ text: "keep me" })]);
+    queue.finalizeSessionDisposal("s1");
+  });
+
   it("drains queued items in FIFO order across idle events", async () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch });
@@ -198,6 +232,45 @@ describe("SessionMessageQueue", () => {
     expect(updated).toMatchObject({ text: "edited", state: "queued" });
     expect(updated.attachments).toEqual([{ dataBase64: "d29ybGQ=", mimeType: "image/jpeg" }]);
     expect(queue.listQueue("s1")[0].text).toBe("edited");
+  });
+
+  it("discards stale renderer timing after queued content edits", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    const original = queue.enqueue("s1", {
+      text: "original",
+      attachments: [{ dataBase64: "aGVsbG8=", mimeType: "image/png" }],
+      turnTelemetry: { turnId: "stale", submittedAt: 1, promptBytes: 8, attachmentBytes: 5 },
+    }).message;
+    const edited = queue.updateMessage("s1", original.id, {
+      text: "edited",
+      attachments: [{ dataBase64: "d29ybGQ=", mimeType: "image/jpeg" }],
+    });
+    expect(edited.turnTelemetry).toBeUndefined();
+
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls[0]?.payload.turnTelemetry).toBeUndefined();
+    host.pending[0].resolve(undefined);
+    await idle;
+  });
+
+  it("refreshes renderer timing when an edited queued item supplies a new sample", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    const original = queue.enqueue("s1", {
+      text: "original",
+      turnTelemetry: { turnId: "old", submittedAt: 1, promptBytes: 8 },
+    }).message;
+    const refreshed = { turnId: "fresh", submittedAt: 10, promptBytes: 12 } as const;
+    const edited = queue.updateMessage("s1", original.id, { text: "edited", turnTelemetry: refreshed });
+    expect(edited.turnTelemetry).toEqual(refreshed);
+
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls[0]?.payload.turnTelemetry).toEqual(refreshed);
+    host.pending[0].resolve(undefined);
+    await idle;
   });
 
   it("keeps a failed item failed after an edit until it is retried", async () => {

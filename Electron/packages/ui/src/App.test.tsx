@@ -1567,7 +1567,7 @@ describe('PipiUI Electron main layout', () => {
     expect(document.querySelector('input[type="file"]')).toBeNull()
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(notifyComposerDocumentsDropped).toHaveBeenCalledWith('welcome', ['/Users/haoli/Downloads/form.doc']))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请分析这些文件的内容'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请分析这些文件的内容', undefined, rendererTelemetryMatcher()))
     expect(notifyDocumentsDropped).not.toHaveBeenCalled()
     await waitFor(() => expect(screen.queryByTestId('composer-doc-chips')).toBeNull())
   })
@@ -2564,13 +2564,13 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.change(composer, { target: { value: 'idle direct' } })
     await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle direct'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle direct', undefined, rendererTelemetryMatcher()))
     expect(enqueueMessage).not.toHaveBeenCalled()
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'busy insert' } })
     await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
     fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy insert', undefined))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'busy insert', undefined, rendererTelemetryMatcher()))
     await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'busy-item'))
     expect(steerQueuedMessage).not.toHaveBeenCalled()
     expect(sendPrompt).toHaveBeenCalledTimes(1)
@@ -2596,12 +2596,12 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold', undefined, rendererTelemetryMatcher()))
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in pending' } })
     await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
     fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in pending', undefined))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in pending', undefined, rendererTelemetryMatcher()))
     await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-item'))
     expect(steerQueuedMessage).not.toHaveBeenCalled()
     const pendingBubble = await screen.findByTestId('user-bubble-queued')
@@ -2651,7 +2651,7 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold', undefined, rendererTelemetryMatcher()))
     await act(async () => {
       listener?.({ type: 'status', sessionId: 'welcome', status: 'started' })
       listener?.({ type: 'text', sessionId: 'welcome', contentIndex: 0, delta: 'partial before cut-in' })
@@ -2660,7 +2660,7 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in after stop' } })
     await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
     fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in after stop', undefined))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in after stop', undefined, rendererTelemetryMatcher()))
     await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-stop'))
     expect(steerQueuedMessage).not.toHaveBeenCalled()
     expect((await screen.findByTestId('user-bubble-queued')).closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
@@ -2703,12 +2703,12 @@ describe('PipiUI Electron main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'idle hold' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'idle hold', undefined, rendererTelemetryMatcher()))
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: 'cut-in fail' } })
     await waitFor(() => expect(screen.getByLabelText('插入当前对话')).toBeTruthy())
     fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in fail', undefined))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in fail', undefined, rendererTelemetryMatcher()))
     await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
     await waitFor(() => expect(removeQueuedMessage).toHaveBeenCalledWith('welcome', 'cut-in-fail'))
     expect(steerQueuedMessage).not.toHaveBeenCalled()
@@ -2779,7 +2779,18 @@ describe('PipiUI Electron main layout', () => {
     fireEvent.click(screen.getByTestId('queue-edit-0'))
     fireEvent.change(screen.getByTestId('queue-editor-input-0'), { target: { value: '已编辑' } })
     fireEvent.click(screen.getByTestId('queue-save'))
-    await waitFor(() => expect(updateQueuedMessage).toHaveBeenCalledWith('welcome', 'editable', '已编辑', [expect.objectContaining({ name: 'keep.png' })]))
+    await waitFor(() => expect(updateQueuedMessage).toHaveBeenCalledWith(
+      'welcome',
+      'editable',
+      '已编辑',
+      [expect.objectContaining({ name: 'keep.png' })],
+      expect.objectContaining({
+        turnId: expect.stringMatching(/^turn-[a-f0-9]{24}$/),
+        promptBytes: expect.any(Number),
+        attachmentCount: 1,
+        attachmentBytes: 5,
+      }),
+    ))
 
     fireEvent.click(screen.getByTestId('queue-remove-0'))
     await waitFor(() => expect(removeQueuedMessage).toHaveBeenCalledWith('welcome', 'editable'))
@@ -2801,6 +2812,18 @@ async function renderChat(host: PipiHostAPI) {
   render(<App host={host} />)
   await screen.findAllByText('Electron 三栏界面')
   return screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+}
+
+function rendererTelemetryMatcher() {
+  return expect.objectContaining({
+    turnId: expect.stringMatching(/^turn-[a-f0-9]{24}$/),
+    submittedAt: expect.any(Number),
+    preflightStartedAt: expect.any(Number),
+    preflightEndedAt: expect.any(Number),
+    promptBytes: expect.any(Number),
+    attachmentCount: expect.any(Number),
+    documentCount: expect.any(Number),
+  })
 }
 
 /** Works both when vitest runs from packages/ui and from the workspace root. */
@@ -3143,7 +3166,7 @@ describe('composer slash commands and model management', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/plan 实现登录' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请为以下目标制定正式计划并发布，等我批准后再执行：实现登录'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请为以下目标制定正式计划并发布，等我批准后再执行：实现登录', undefined, rendererTelemetryMatcher()))
     expect(composer.value).toBe('')
   })
 
@@ -3153,7 +3176,7 @@ describe('composer slash commands and model management', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/plan' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请把当前目标整理成正式计划并发布，等我批准后再执行。'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '请把当前目标整理成正式计划并发布，等我批准后再执行。', undefined, rendererTelemetryMatcher()))
     expect(composer.value).toBe('')
   })
 
@@ -3163,7 +3186,7 @@ describe('composer slash commands and model management', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: '/goal status' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '/goal status'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '/goal status', undefined, rendererTelemetryMatcher()))
     expect(composer.value).toBe('')
   })
 
@@ -3636,7 +3659,7 @@ describe('composer image attachments', () => {
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [
       expect.objectContaining({ mimeType: 'image/png', name: 'dropped.png', dataBase64: expect.any(String) })
-    ]))
+    ], rendererTelemetryMatcher()))
     expect(composer.value).toBe('')
   })
 
@@ -3695,7 +3718,7 @@ describe('composer image attachments', () => {
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图', [
       expect.objectContaining({ mimeType: 'image/png', name: 'shot.png', dataBase64: expect.any(String) })
-    ]))
+    ], rendererTelemetryMatcher()))
     await waitFor(() => expect(composer.value).toBe(''))
     await waitFor(() => expect(screen.queryByTestId('composer-thumbs')).toBeNull())
     const bubbleImage = await waitFor(() => {
@@ -3750,7 +3773,7 @@ describe('composer image attachments', () => {
     await screen.findByTestId('composer-thumb-0')
     expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false)
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'only.png' })]))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'only.png' })], rendererTelemetryMatcher()))
   })
 
   it('creates a session on the fly when sending from the empty 新会话 state', async () => {
@@ -3839,7 +3862,7 @@ describe('composer image attachments', () => {
     expect(screen.getByTestId('composer-thumb-0').querySelector('img')?.getAttribute('src')).toBe('blob:mock-0')
     // The restored attachment is still sendable with its original file.
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'keep.png' })]))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '', [expect.objectContaining({ name: 'keep.png' })], rendererTelemetryMatcher()))
   })
 
   it('does not resurrect image attachments after a successful send', async () => {
@@ -3998,7 +4021,7 @@ describe('update center settings flow', () => {
     fireEvent.click(await screen.findByRole('button', { name: '评估更新' }))
     await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
-    expect(sendPrompt).toHaveBeenCalledWith('welcome', expect.stringMatching(/^\[\[PIPIUI_UPDATE_EVALUATION_INTENT\]\]\{"version":1,"id":"pi","name":"Pi","packageName":"@earendil-works\/pi-coding-agent","currentVersion":"0\.84\.0","latestVersion":"0\.84\.2"\}$/))
+    expect(sendPrompt).toHaveBeenCalledWith('welcome', expect.stringMatching(/^\[\[PIPIUI_UPDATE_EVALUATION_INTENT\]\]\{"version":1,"id":"pi","name":"Pi","packageName":"@earendil-works\/pi-coding-agent","currentVersion":"0\.84\.0","latestVersion":"0\.84\.2"\}$/), undefined, rendererTelemetryMatcher())
     expect((composer as HTMLTextAreaElement).value).toBe('')
   })
 
@@ -4222,7 +4245,7 @@ describe('composer textarea sizing and hints', () => {
     const composer = await renderChat(host)
     fireEvent.change(composer, { target: { value: 'hello' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'hello'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', 'hello', undefined, rendererTelemetryMatcher()))
     await waitFor(() => expect(composer.value).toBe(''))
     fireEvent.change(composer, { target: { value: 'line1' } })
     fireEvent.keyDown(composer, { key: 'Enter', shiftKey: true })

@@ -415,63 +415,162 @@ export function createSessionRedactionGate(hooks: {
   hasWork(sessionId: string): boolean;
   canRewrite(sessionId: string): boolean;
   confirmWriterIdle(sessionId: string): Promise<boolean>;
-  rewrite(sessionId: string): Promise<void>;
+  rewrite(sessionId: string, generation: number, lifecycleToken?: unknown): Promise<void>;
+  /** Route delayed retries through the owner of the session file barrier. */
+  scheduleRetry?: (sessionId: string, retry: () => Promise<unknown>, lifecycleToken?: unknown) => void;
+  /** Capture the host-owned lifecycle identity when a continuation is admitted. */
+  captureLifecycleToken?: (sessionId: string) => unknown;
+  /** Reject a continuation whose host-owned lifecycle identity is no longer current. */
+  isLifecycleTokenCurrent?: (sessionId: string, lifecycleToken: unknown) => boolean;
 }): {
-  request(sessionId: string): void;
-  flush(sessionId: string): Promise<SessionRedactionDecision>;
+  request(sessionId: string, lifecycleToken?: unknown): void;
+  flush(sessionId: string, lifecycleToken?: unknown): Promise<SessionRedactionDecision>;
   hasPending(sessionId: string): boolean;
+  /** Drop queued/retry state and revoke the current generation. */
+  clear(sessionId: string): void;
+  /** Await a rewrite that was already admitted before clear(). */
+  waitForSession(sessionId: string): Promise<void>;
+  /** Drop the generation tombstone after protected work has drained. */
+  reclaim(sessionId: string): void;
+  /** Observable generation-map size for lifecycle tests. */
+  retainedGenerationCount(): number;
 } {
   const pending = new Set<string>();
-  const inflight = new Set<string>();
-  const quietRetry = new Set<string>();
+  const generations = new Map<string, number>();
+  let generationSequence = 0;
+  const pendingLifecycleTokens = new Map<string, unknown>();
+  const inflight = new Map<string, Promise<SessionRedactionDecision>>();
+  const quietRetry = new Map<string, { generation: number; lifecycleToken?: unknown }>();
 
-  const scheduleQuietRetry = (sessionId: string) => {
-    if (quietRetry.has(sessionId) || inflight.has(sessionId)) return;
-    quietRetry.add(sessionId);
+  // This sequence deliberately survives per-session reclaim. A late retry can
+  // therefore never collide with the first generation of a recreated session.
+  const nextGeneration = (): number => ++generationSequence;
+  const generationOf = (sessionId: string): number | undefined => generations.get(sessionId);
+  const ensureGeneration = (sessionId: string): number => {
+    const current = generationOf(sessionId);
+    if (current !== undefined) return current;
+    const generation = nextGeneration();
+    generations.set(sessionId, generation);
+    return generation;
+  };
+  const lifecycleTokenOf = (sessionId: string, supplied?: unknown): unknown => {
+    if (supplied !== undefined) return supplied;
+    if (pendingLifecycleTokens.has(sessionId)) return pendingLifecycleTokens.get(sessionId);
+    return hooks.captureLifecycleToken?.(sessionId);
+  };
+  const lifecycleIsCurrent = (sessionId: string, lifecycleToken: unknown): boolean =>
+    hooks.isLifecycleTokenCurrent
+      ? lifecycleToken !== undefined && hooks.isLifecycleTokenCurrent(sessionId, lifecycleToken)
+      : true;
+  const isCurrent = (sessionId: string, generation: number, lifecycleToken: unknown): boolean =>
+    generationOf(sessionId) === generation && lifecycleIsCurrent(sessionId, lifecycleToken);
+
+  const scheduleQuietRetry = (sessionId: string, generation: number, lifecycleToken: unknown) => {
+    if (quietRetry.has(sessionId)) return;
+    quietRetry.set(sessionId, { generation, lifecycleToken });
     queueMicrotask(() => {
-      quietRetry.delete(sessionId);
-      void flush(sessionId);
+      const scheduled = quietRetry.get(sessionId);
+      if (scheduled?.generation === generation && scheduled.lifecycleToken === lifecycleToken) quietRetry.delete(sessionId);
+      // Let the current flush remove its in-flight marker before admitting the
+      // retry; the extra turn is a microtask ordering fence, not a time delay.
+      queueMicrotask(() => {
+        // clear() may have run while this retry was queued. Do not even create
+        // a new barrier for a revoked generation.
+        if (!isCurrent(sessionId, generation, lifecycleToken) || !pending.has(sessionId)) return;
+        const retry = () => flush(sessionId, lifecycleToken, generation);
+        if (hooks.scheduleRetry) hooks.scheduleRetry(sessionId, retry, lifecycleToken);
+        else void retry().catch(() => undefined);
+      });
     });
   };
 
-  const flush = async (sessionId: string): Promise<SessionRedactionDecision> => {
-    if (!pending.has(sessionId)) return "skipped";
-    if (inflight.has(sessionId)) return "deferred";
+  const flush = (
+    sessionId: string,
+    lifecycleToken?: unknown,
+    expectedGeneration?: number,
+  ): Promise<SessionRedactionDecision> => {
+    if (!pending.has(sessionId)) return Promise.resolve("skipped");
+    if (inflight.has(sessionId)) return Promise.resolve("deferred");
+    // A retry supplies its original generation; never allocate a new one for
+    // that continuation after reclaim. Ordinary flushes establish a generation.
+    const generation = expectedGeneration ?? ensureGeneration(sessionId);
+    const token = lifecycleTokenOf(sessionId, lifecycleToken);
+    if (!lifecycleIsCurrent(sessionId, token)) return Promise.resolve("skipped");
     if (!hooks.hasWork(sessionId)) {
       pending.delete(sessionId);
-      return "skipped";
+      pendingLifecycleTokens.delete(sessionId);
+      return Promise.resolve("skipped");
     }
-    if (!hooks.canRewrite(sessionId)) return "deferred";
-    inflight.add(sessionId);
-    try {
+    if (!hooks.canRewrite(sessionId)) return Promise.resolve("deferred");
+    const run = (async (): Promise<SessionRedactionDecision> => {
+      // The synchronous checks protect the gap between the caller and the
+      // first await; every await below rechecks the same session identity.
+      if (!isCurrent(sessionId, generation, token) || !pending.has(sessionId)) return "skipped";
       if (!await hooks.confirmWriterIdle(sessionId)) {
-        scheduleQuietRetry(sessionId);
+        if (isCurrent(sessionId, generation, token) && pending.has(sessionId))
+          scheduleQuietRetry(sessionId, generation, token);
         return "deferred";
       }
-      await hooks.rewrite(sessionId);
+      if (!isCurrent(sessionId, generation, token) || !pending.has(sessionId)) return "skipped";
+      await hooks.rewrite(sessionId, generation, token);
+      if (!isCurrent(sessionId, generation, token)) return "skipped";
       pending.delete(sessionId);
+      pendingLifecycleTokens.delete(sessionId);
       return "rewritten";
-    } finally {
-      inflight.delete(sessionId);
-    }
+    })();
+    inflight.set(sessionId, run);
+    void run.then(
+      () => { if (inflight.get(sessionId) === run) inflight.delete(sessionId); },
+      () => { if (inflight.get(sessionId) === run) inflight.delete(sessionId); },
+    );
+    return run;
   };
 
   return {
-    request(sessionId: string) { pending.add(sessionId); },
-    flush,
+    request(sessionId: string, lifecycleToken?: unknown) {
+      pending.add(sessionId);
+      ensureGeneration(sessionId);
+      if (hooks.captureLifecycleToken) {
+        const captured = lifecycleTokenOf(sessionId, lifecycleToken);
+        if (captured === undefined) pendingLifecycleTokens.delete(sessionId);
+        else pendingLifecycleTokens.set(sessionId, captured);
+      }
+    },
+    flush: (sessionId: string, lifecycleToken?: unknown) => flush(sessionId, lifecycleToken),
     hasPending: (sessionId: string) => pending.has(sessionId),
+    clear(sessionId: string) {
+      generations.set(sessionId, nextGeneration());
+      pending.delete(sessionId);
+      pendingLifecycleTokens.delete(sessionId);
+      quietRetry.delete(sessionId);
+    },
+    async waitForSession(sessionId: string) {
+      await inflight.get(sessionId)?.catch(() => undefined);
+    },
+    reclaim(sessionId: string) {
+      if (pending.has(sessionId) || inflight.has(sessionId) || quietRetry.has(sessionId)) return;
+      pendingLifecycleTokens.delete(sessionId);
+      generations.delete(sessionId);
+    },
+    retainedGenerationCount: () => generations.size,
   };
 }
 
 export function createSessionEnvRefreshGate(hooks: {
   canRefresh(sessionId: string): boolean;
   stopWriter(sessionId: string): Promise<boolean>;
+  scheduleRetry?: (sessionId: string, retry: () => Promise<unknown>, lifecycleToken?: unknown) => void;
+  captureLifecycleToken?: (sessionId: string) => unknown;
+  isLifecycleTokenCurrent?: (sessionId: string, lifecycleToken: unknown) => boolean;
 }) {
   return createSessionRedactionGate({
     hasWork: () => true,
     canRewrite: hooks.canRefresh,
     confirmWriterIdle: hooks.stopWriter,
     rewrite: async () => undefined,
+    scheduleRetry: hooks.scheduleRetry,
+    captureLifecycleToken: hooks.captureLifecycleToken,
+    isLifecycleTokenCurrent: hooks.isLifecycleTokenCurrent,
   });
 }
 

@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiHostBackend } from "../src/index.js";
 import {
   StructuredOutputController,
@@ -18,7 +18,7 @@ import type { Model, StructuredOutputRequest } from "@pipi/host-api";
 
 const dirs: string[] = [];
 afterEach(async () => {
-  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 40, retryDelay: 25 })));
 });
 
 const schema = {
@@ -142,6 +142,42 @@ describe("structured output backend handler routing", () => {
     expect(after).not.toContain("secret_schema_field_xyz");
     await backend.handle("setStructuredOutput", ["s1", null]);
     expect(await readFile(sessionPath, "utf8")).toBe(before);
+    await backend.close();
+  });
+
+  it("rejects a late set after deletion and accepts the recreated session token", async () => {
+    const { backend, sessionPath, project } = await backendWithSession();
+    const internals = backend as any;
+    const originalController = internals.structuredOutputController.bind(internals);
+    let releaseController!: () => void;
+    let controllerStarted!: () => void;
+    const controllerGate = new Promise<void>((resolve) => { releaseController = resolve; });
+    const controllerStartedGate = new Promise<void>((resolve) => { controllerStarted = resolve; });
+    const oldController = vi.spyOn(internals, "structuredOutputController").mockImplementation(async () => {
+      controllerStarted();
+      await controllerGate;
+      return originalController();
+    });
+
+    const lateSet = backend.handle("setStructuredOutput", ["s1", request]);
+    await controllerStartedGate;
+    const oldToken = internals.sessionRuntimeToken("s1");
+    await backend.handle("deleteSession", ["s1"]);
+    await writeFile(
+      sessionPath,
+      `${JSON.stringify({ type: "session", version: 3, id: "s1", timestamp: "2026-08-23T00:00:00.000Z", cwd: project })}\n`,
+    );
+    await backend.handle("resumeSession", ["s1"]);
+    const newToken = internals.sessionRuntimeToken("s1");
+    expect(newToken).not.toBe(oldToken);
+
+    releaseController();
+    await expect(lateSet).rejects.toThrow(/disposed/);
+    expect(internals.structuredOutputs?.peek("s1")).toBeUndefined();
+
+    oldController.mockRestore();
+    await backend.handle("setStructuredOutput", ["s1", request]);
+    expect(internals.structuredOutputs.peek("s1")).toMatchObject({ name: "flag", strict: true });
     await backend.close();
   });
 

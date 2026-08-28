@@ -263,6 +263,53 @@ describe("secret vault", () => {
     expect(writerLive ? "reused" : "respawned").toBe("respawned");
   });
 
+  it("revokes delayed and in-flight session rewrites after teardown", async () => {
+    let retry!: () => Promise<unknown>;
+    let retryScheduled!: () => void;
+    const retryScheduledGate = new Promise<void>((resolve) => { retryScheduled = resolve; });
+    let rewrites = 0;
+    const delayed = createSessionRedactionGate({
+      hasWork: () => true,
+      canRewrite: () => true,
+      confirmWriterIdle: async () => false,
+      rewrite: async () => { rewrites += 1; },
+      scheduleRetry: (_sessionId, run) => {
+        retry = run;
+        retryScheduled();
+      },
+    });
+    delayed.request("deleted");
+    expect(await delayed.flush("deleted")).toBe("deferred");
+    await retryScheduledGate;
+    delayed.clear("deleted");
+    await retry();
+    expect(rewrites).toBe(0);
+    expect(delayed.hasPending("deleted")).toBe(false);
+
+    let releaseConfirm!: () => void;
+    let confirmStarted!: () => void;
+    const confirmStartedGate = new Promise<void>((resolve) => { confirmStarted = resolve; });
+    const confirmRelease = new Promise<void>((resolve) => { releaseConfirm = resolve; });
+    const inflight = createSessionRedactionGate({
+      hasWork: () => true,
+      canRewrite: () => true,
+      confirmWriterIdle: async () => {
+        confirmStarted();
+        await confirmRelease;
+        return true;
+      },
+      rewrite: async () => { rewrites += 1; },
+    });
+    inflight.request("deleted");
+    const flushing = inflight.flush("deleted");
+    await confirmStartedGate;
+    inflight.clear("deleted");
+    releaseConfirm();
+    await inflight.waitForSession("deleted");
+    expect(await flushing).toBe("skipped");
+    expect(rewrites).toBe(0);
+  });
+
   it("never writes vault files even when leftover ciphertext already exists", async () => {
     const dir = await tmp();
     const { file, key } = vaultPaths(dir);
@@ -290,5 +337,22 @@ describe("secret vault", () => {
     confirmed = true;
     expect(await gate.flush("sess")).toBe("rewritten");
     expect(rewrites).toBe(1);
+  });
+
+  it("reclaims redaction generation tombstones after protected work drains", async () => {
+    const gate = createSessionRedactionGate({
+      hasWork: () => true,
+      canRewrite: () => true,
+      confirmWriterIdle: async () => true,
+      rewrite: async () => undefined,
+    });
+    expect(gate.retainedGenerationCount()).toBe(0);
+    gate.request("s1");
+    gate.clear("s1");
+    await gate.waitForSession("s1");
+    expect(gate.retainedGenerationCount()).toBe(1);
+    gate.reclaim("s1");
+    expect(gate.retainedGenerationCount()).toBe(0);
+    expect(gate.hasPending("s1")).toBe(false);
   });
 });

@@ -459,6 +459,27 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__telemetry__") {
+      // Deliberately spaced evidence for deterministic host timing tests. The
+      // sensitive-looking values prove the telemetry recorder keeps only
+      // counts/bytes/timestamps, never stream or tool payload bodies.
+      send({ type: "agent_start" });
+      setTimeout(() => send({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "private reasoning body" } }), 5);
+      setTimeout(() => send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "visible answer body" } }), 10);
+      setTimeout(() => send({ type: "tool_execution_start", toolCallId: "telemetry-tool", toolName: "read", args: { path: "/private/document/path" } }), 13);
+      setTimeout(() => send({ type: "tool_execution_end", toolCallId: "telemetry-tool", result: { content: [{ type: "text", text: "tool result secret body" }] }, isError: false }), 16);
+      setTimeout(() => send({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "visible answer body" }],
+          usage: { input: 120, output: 20 },
+          stopReason: "stop",
+        },
+      }), 24);
+      setTimeout(() => send({ type: "agent_settled" }), 28);
+      return;
+    }
     emitTurn(command.message, command.images);
     if (command.message === "__late_queue_update__") send({ type: "queue_update", followUp: [] });
     return;

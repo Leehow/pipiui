@@ -34,6 +34,7 @@ import {
   type ModelCatalogEvent,
   type ModelState,
   type PromptAttachment,
+  type TurnTelemetryRendererSample,
   type Project,
   type QueueEnqueueResult,
   type QuotaSnapshot,
@@ -75,7 +76,12 @@ import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
-import { LeaseManager } from "./lease.js";
+import {
+  LEASE_ACQUISITION_METADATA,
+  LeaseManager,
+  type LeaseAcquisitionMetadata,
+  type LeaseStatus,
+} from "./lease.js";
 import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge, type ModelPinValidateDecisionV1, type ModelPinValidateRequestV1 } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
@@ -165,6 +171,7 @@ import {
   provisionalSessionTitle,
 } from "./session-title.js";
 import { createToolBatchTelemetry, type ToolBatchTelemetry } from "./tool-batch-telemetry.js";
+import { createTurnTelemetry, type TurnTelemetry } from "./turn-telemetry.js";
 import { describeImages } from "./vision-describe.js";
 import { ensureWebSearchDefaults } from "./web-search-defaults.js";
 import { readPaddleocrAccessToken, writePaddleocrAccessToken } from "./paddleocr-key.js";
@@ -612,6 +619,7 @@ export type PiBackendOptions = {
   /** Injectable queue persistence; defaults to ~/.pi/agent/pipiui-queues. */ queueStore?: QueueStore;
   /** Injectable account-quota store for tests; defaults to the real Codex fetch. */ quotaStore?: QuotaStore;
   /** Injectable tool-batch stats helper for tests; defaults to agentDir JSONL. */ toolBatchTelemetry?: ToolBatchTelemetry;
+  /** Injectable bounded per-turn timing recorder; defaults to agentDir/telemetry/turns.jsonl. */ turnTelemetry?: TurnTelemetry;
   /** Injectable compaction diagnostics log; defaults to agentDir JSONL. */ compactionDiagnostics?: CompactionDiagnostics;
   /** Test/host-injected Chat with Files uploader. Production loads the grok host entry. */ inputFilesRemote?: InputFilesRemote;
   /** Test-injected Structured Outputs validator. Production loads the grok host entry. */ structuredOutputNormalize?: StructuredOutputNormalize;
@@ -668,8 +676,12 @@ async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<strin
     });
   });
 }
+type SessionRuntimeToken = number;
+
 type Live = {
   session: Session;
+  /** Lifecycle token captured when this Pi child was installed. */
+  runtimeToken: SessionRuntimeToken;
   path: string;
   cwd: string;
   process?: ChildProcessWithoutNullStreams;
@@ -738,6 +750,8 @@ type Live = {
   pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
   /** SIGKILL/close in flight: do not write another RPC to this child. */
   exiting?: boolean;
+  /** The child is not a settled turn until all spawn initialization has succeeded. */
+  spawnInitializing?: boolean;
   /** Monotonic timestamp of the last turn-related event (agent_start, deltas, tool, message_end). */
   lastTurnActivityAt?: number;
 };
@@ -933,6 +947,8 @@ function resolveMarkers(textContent: string, screenshots?: Map<string, { data: s
 const emitFrame = (listeners: Set<(e: HostEvent) => void>, event: HostEvent) =>
   listeners.forEach((l) => l(event));
 let projectionDebugBackendSerial = 0;
+/** Process-wide lifecycle token serial; per-session token entries are reclaimed. */
+let sessionRuntimeTokenSerial = 0;
 function asTime(value: any): number {
   const n = Date.parse(value ?? "");
   return Number.isFinite(n) ? n : Date.now();
@@ -951,6 +967,16 @@ function history(entries: any[]): HistoryEntry[] {
       };
     });
 }
+type SessionLeaseAttempt = {
+  sessionId: string;
+  lease: LeaseManager;
+  /** The manager was installed in this backend's lease map by this call. */
+  installed: boolean;
+  /** This acquire invocation transitioned the manager into ownership. */
+  acquired: boolean;
+  ownershipGeneration: number;
+};
+
 type SessionMeta = {
   path: string;
   header: any;
@@ -1820,7 +1846,10 @@ type IsolatedProjectHome = {
 export class PiHostBackend implements HostBackend {
   readonly protocolVersion = 2 as const;
   private listeners = new Set<(event: HostEvent) => void>();
+  /** Paths opened outside a chat session (for example the global document watcher). */
   private openedDocumentPaths: string[] = [];
+  /** Panel drops are session-owned and must leave with their session. */
+  private readonly openedDocumentPathsBySession = new Map<string, Set<string>>();
   private readonly documentInjections = new DocumentInjectionStore();
   private readonly documentWatcher = new DocumentFileWatcher((path) => {
     emitFrame(this.listeners, {
@@ -1837,16 +1866,34 @@ export class PiHostBackend implements HostBackend {
   private projectionDebugProvenance = new Map<string, string>();
   private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
+  /** A close/delete race may reach the same child through both teardown and spawn. */
+  private readonly liveStopPromises = new WeakMap<Live, Promise<void>>();
+  /** Active, deduplicated session runtime teardown operations. */
+  private readonly sessionRuntimeTeardowns = new Map<string, Promise<void>>();
+  /** Synchronous fence for late queue/file continuations while teardown settles. */
+  private readonly sessionRuntimeTearingDown = new Set<string>();
+  /** Extends the fence through explicit persistent-file deletion. */
+  private readonly sessionDeletionInProgress = new Set<string>();
+  /** Current lifecycle token per session; entries are removed after teardown drains. */
+  private readonly sessionRuntimeTokens = new Map<string, SessionRuntimeToken>();
+  /** Tombstones remain after teardown starts so callbacks that start before cleanup stay inert. */
+  private readonly sessionRuntimeTombstones = new Set<string>();
   private sessionFileBarriers = new Map<string, ExclusiveSessionWork>();
   private readonly sessionRedact = createSessionRedactionGate({
     hasWork: (sessionId) => this.sessionSecrets(sessionId).length > 0,
     canRewrite: (sessionId) => this.canRewriteSessionFile(sessionId),
     confirmWriterIdle: (sessionId) => this.confirmSessionFileIdle(sessionId),
-    rewrite: (sessionId) => this.rewriteSessionSecrets(sessionId),
+    rewrite: (sessionId, _generation, lifecycleToken) => this.rewriteSessionSecrets(sessionId, lifecycleToken),
+    scheduleRetry: (sessionId, retry, lifecycleToken) => this.scheduleSessionFileRetry(sessionId, retry, lifecycleToken),
+    captureLifecycleToken: (sessionId) => this.sessionRuntimeToken(sessionId),
+    isLifecycleTokenCurrent: (sessionId, lifecycleToken) => this.sessionRuntimeTokenIsCurrent(sessionId, lifecycleToken),
   });
   private readonly sessionEnvRefresh = createSessionEnvRefreshGate({
     canRefresh: (sessionId) => this.canRewriteSessionFile(sessionId),
     stopWriter: (sessionId) => this.closeQuietSessionWriter(sessionId),
+    scheduleRetry: (sessionId, retry, lifecycleToken) => this.scheduleSessionFileRetry(sessionId, retry, lifecycleToken),
+    captureLifecycleToken: (sessionId) => this.sessionRuntimeToken(sessionId),
+    isLifecycleTokenCurrent: (sessionId, lifecycleToken) => this.sessionRuntimeTokenIsCurrent(sessionId, lifecycleToken),
   });
   private readonly planStore = new PlanStore();
   private readonly extensions: ExtensionRegistry;
@@ -1854,6 +1901,8 @@ export class PiHostBackend implements HostBackend {
   private readonly headroomRuntime: HeadroomManagedRuntimeLike;
   private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
+  /** Serializes all host-side ownership and lease-map transitions per session. */
+  private readonly leaseOperationLanes = new Map<string, Promise<void>>();
   /**
    * Per-session in-flight spawn (ensure) promises. Concurrent ensure() calls for
    * the same cold session share one spawn, so only the winner races the
@@ -1990,6 +2039,7 @@ export class PiHostBackend implements HostBackend {
   private queueStore: QueueStore;
   private quotaStore: QuotaStore;
   private toolBatchTelemetry: ToolBatchTelemetry;
+  private turnTelemetry: TurnTelemetry;
   private compactionDiagnostics: CompactionDiagnostics;
   /** Monotonic per-host counter giving each compaction lifecycle a stable operationId. */
   private compactionOperationSeq = 0;
@@ -2053,6 +2103,23 @@ export class PiHostBackend implements HostBackend {
       void this.modelsWrite.enqueue(() => this.profileInitialization);
     }
     this.toolBatchTelemetry = options.toolBatchTelemetry ?? createToolBatchTelemetry({ agentDir: this.agentDir });
+    this.turnTelemetry = options.turnTelemetry ?? createTurnTelemetry({
+      agentDir: this.agentDir,
+      resourceSample: () => {
+        try {
+          const rssBytes = process.memoryUsage().rss;
+          // This is deliberately the count of Pi children owned by this host,
+          // not a platform-specific process-tree guess. FD count is omitted
+          // because Node has no portable, truthful descriptor API.
+          const childCount = [...this.live.values()].filter((live) =>
+            live.process?.exitCode === null && !live.process.signalCode,
+          ).length;
+          return { rssBytes, childCount };
+        } catch {
+          return undefined;
+        }
+      },
+    });
     this.compactionDiagnostics = options.compactionDiagnostics ?? createCompactionDiagnostics({ agentDir: this.agentDir });
     this.thinkingControl = new ThinkingControlReporter(this.agentDir);
     this.root = options.sessionsRoot ?? join(this.agentDir, "sessions");
@@ -2098,9 +2165,11 @@ export class PiHostBackend implements HostBackend {
     this.manualStopsLoaded = this.readManualStopsFromSettings().catch(() => undefined);
     this.sidebarPrefsLoaded = this.refreshSidebarArchivedCache().then(() => undefined).catch(() => undefined);
     this.queue = new SessionMessageQueue({
-      dispatch: (id, payload, behavior) =>
-        this.dispatchQueuedMessage(id, payload, behavior),
-      onChange: (id, items) => this.queueChanged(id, items),
+      dispatch: (id, payload, behavior, lifecycleToken) =>
+        this.dispatchQueuedMessage(id, payload, behavior, lifecycleToken),
+      onChange: (id, items, lifecycleToken) => this.queueChanged(id, items, lifecycleToken),
+      captureLifecycleToken: (id) => this.sessionRuntimeToken(id) ?? this.beginSessionRuntime(id),
+      isLifecycleTokenCurrent: (id, lifecycleToken) => this.sessionRuntimeTokenIsCurrent(id, lifecycleToken),
       // User Stop (and archival) must outlive queue restores: neither
       // restoreQueue nor a watchdog idle may deliver queued items again.
       isDrainSuppressed: (id) => this.autoRevivalSuppressed(id),
@@ -2328,7 +2397,15 @@ export class PiHostBackend implements HostBackend {
   }
 
   /** EOF first; if the child ignores it (or is not Node), SIGTERM then SIGKILL. */
-  private async stopLiveProcess(item: Live, graceMs = 250): Promise<void> {
+  private stopLiveProcess(item: Live, graceMs = 250): Promise<void> {
+    const existing = this.liveStopPromises.get(item);
+    if (existing) return existing;
+    const stopping = this.stopLiveProcessNow(item, graceMs);
+    this.liveStopPromises.set(item, stopping);
+    return stopping;
+  }
+
+  private async stopLiveProcessNow(item: Live, graceMs: number): Promise<void> {
     try {
       item.process?.stdin.end();
     } catch {
@@ -2364,15 +2441,287 @@ export class PiHostBackend implements HostBackend {
     }
   }
 
+  /** All resident session IDs whose state must be released when the host closes. */
+  private activeRuntimeSessionIds(): Set<string> {
+    const ids = new Set<string>([
+      ...this.live.keys(),
+      ...this.ensureInFlight.keys(),
+      ...this.leases.keys(),
+      ...this.leaseOperationLanes.keys(),
+      ...this.queue.sessionIds(),
+      ...this.queueLoads.keys(),
+      ...this.queueWrites.keys(),
+      ...this.sessionFileBarriers.keys(),
+      ...this.sessionContextLastKnown.keys(),
+      ...this.sessionLedgerTurns.keys(),
+      ...this.sessionModelStates.keys(),
+      ...this.sessionModelSnapshots.keys(),
+      ...this.unconfirmedSteers.keys(),
+      ...this.manualTitleOverrides,
+      ...this.autoRevivalUserLifts,
+      ...this.sessionRuntimeTokens.keys(),
+      ...this.sessionRuntimeTeardowns.keys(),
+      ...this.sessionRuntimeTombstones,
+      ...this.sessionDeletionInProgress,
+      ...this.documentInjections.pendingSessionIds(),
+      ...this.openedDocumentPathsBySession.keys(),
+      ...this.extensions.mountedSessionIds(),
+    ]);
+    for (const sessionId of this.inputFiles?.runtimeSessionIds() ?? []) ids.add(sessionId);
+    return ids;
+  }
+
+  /** Observable session-scoped state counts for lifecycle tests and diagnostics. */
+  runtimeStateCounts(sessionId: string) {
+    const id = sessionId.trim();
+    const path = this.live.get(id)?.path ?? this.sessionById.get(id)?.path;
+    return {
+      live: this.live.has(id) ? 1 : 0,
+      leaseOperationLane: this.leaseOperationLanes.has(id) ? 1 : 0,
+      queue: this.queue.hasSession(id) ? 1 : 0,
+      queueLoad: this.queueLoads.has(id) ? 1 : 0,
+      queueWrite: this.queueWrites.has(id) ? 1 : 0,
+      sessionFileBarrier: this.sessionFileBarriers.has(id) ? 1 : 0,
+      context: this.sessionContextLastKnown.has(id) ? 1 : 0,
+      ledger: this.sessionLedgerTurns.has(id) ? 1 : 0,
+      modelState: this.sessionModelStates.has(id) || this.sessionModelSnapshots.has(id) ? 1 : 0,
+      extensionMount: this.extensions.hasSessionMount(id) ? 1 : 0,
+      documentInjection: this.documentInjections.hasPending(id) ? 1 : 0,
+      openedDocuments: this.openedDocumentPathsBySession.get(id)?.size ?? 0,
+      historyCache: path && this.historyCache.has(path) ? 1 : 0,
+      inputBytes: this.inputFiles?.retainedByteCount(id) ?? 0,
+      inputUploads: this.inputFiles?.inflightCount(id) ?? 0,
+    };
+  }
+
+  /** Process-wide lifecycle registry sizes after create/delete churn. */
+  runtimeRegistryCounts() {
+    const telemetry = this.turnTelemetry.retainedState();
+    return {
+      generations: this.sessionRuntimeTokens.size,
+      leaseOperationLanes: this.leaseOperationLanes.size,
+      tombstones: this.sessionRuntimeTombstones.size,
+      tearingDown: this.sessionRuntimeTearingDown.size,
+      deletionInProgress: this.sessionDeletionInProgress.size,
+      telemetryActive: telemetry.active,
+      telemetryFenced: telemetry.fenced,
+      redactionGenerations: this.sessionRedact.retainedGenerationCount(),
+      envRefreshGenerations: this.sessionEnvRefresh.retainedGenerationCount(),
+    };
+  }
+
+  private async inputFilesForDisposal(): Promise<InputFilesController | undefined> {
+    if (this.inputFiles) return this.inputFiles;
+    if (!this.inputFilesReady) return undefined;
+    return this.inputFilesReady.catch(() => undefined);
+  }
+
+  private async disposeInputFilesSession(sessionId: string): Promise<void> {
+    await (await this.inputFilesForDisposal())?.disposeSession(sessionId);
+  }
+
+  private async disposeAllInputFiles(): Promise<void> {
+    await (await this.inputFilesForDisposal())?.disposeAll();
+  }
+
+  private sessionRuntimeToken(id: string): SessionRuntimeToken | undefined {
+    return this.sessionRuntimeTokens.get(id);
+  }
+
+  /** Start one runtime lifecycle, allocating a globally unique process token. */
+  private beginSessionRuntime(id: string): SessionRuntimeToken {
+    const current = this.sessionRuntimeToken(id);
+    if (current !== undefined) {
+      this.assertSessionRuntimeToken(id, current);
+      return current;
+    }
+    if (this.closed || this.sessionRuntimeTearingDown.has(id)
+      || this.sessionDeletionInProgress.has(id)
+      || this.sessionRuntimeTombstones.has(id)) {
+      throw new Error("session runtime disposed");
+    }
+    const token = ++sessionRuntimeTokenSerial;
+    this.sessionRuntimeTokens.set(id, token);
+    return token;
+  }
+
+  private invalidateSessionRuntime(id: string): SessionRuntimeToken {
+    // A delete/close can reach a cold session that has never spawned Pi. It
+    // still receives a token before the tombstone is installed.
+    const token = this.sessionRuntimeToken(id) ?? ++sessionRuntimeTokenSerial;
+    this.sessionRuntimeTokens.set(id, token);
+    this.sessionRuntimeTombstones.add(id);
+    this.turnTelemetry.fenceSession(id);
+    return token;
+  }
+
+  private reclaimSessionRuntime(id: string): void {
+    if (
+      this.sessionRuntimeTearingDown.has(id)
+      || this.sessionDeletionInProgress.has(id)
+      || this.sessionRuntimeTeardowns.has(id)
+      || this.live.has(id)
+    ) return;
+    this.sessionRuntimeTombstones.delete(id);
+    // Absence is intentional: a continuation carrying this token must fail
+    // closed rather than become implicit generation zero.
+    this.sessionRuntimeTokens.delete(id);
+    this.sessionRedact.reclaim(id);
+    this.sessionEnvRefresh.reclaim(id);
+    this.turnTelemetry.reclaimSession(id);
+  }
+
+  private sessionRuntimeTokenIsCurrent(id: string, token: unknown): token is SessionRuntimeToken {
+    return typeof token === "number"
+      && this.sessionRuntimeTokens.get(id) === token
+      && !this.sessionRuntimeTombstones.has(id)
+      && !this.sessionRuntimeTearingDown.has(id)
+      && !this.sessionDeletionInProgress.has(id)
+      && !this.closed;
+  }
+
+  private assertSessionRuntimeToken(id: string, token: unknown): asserts token is SessionRuntimeToken {
+    if (!this.sessionRuntimeTokenIsCurrent(id, token))
+      throw new Error("session runtime disposed");
+  }
+
+  /** Existing spawn fences use this compatibility assertion; the value is a lifecycle token. */
+  private assertSessionGeneration(id: string, generation: unknown): asserts generation is SessionRuntimeToken {
+    this.assertSessionRuntimeToken(id, generation);
+  }
+
+  private scheduleSessionFileRetry(
+    sessionId: string,
+    retry: () => Promise<unknown>,
+    runtimeToken?: unknown,
+  ): void {
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    void this.sessionFileExclusive(sessionId, runtimeToken)(retry).catch((error) => {
+      console.error(
+        `[secret-vault] session retry failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
+
+  /**
+   * Idempotent in-memory teardown boundary. It deliberately does not remove
+   * the JSONL, durable queue, or attachment metadata; explicit deletion does
+   * that only after this method has settled all in-flight session work.
+   */
+  async teardownSessionRuntime(sessionId: string): Promise<void> {
+    const id = sessionId.trim();
+    if (!id) return;
+    const existing = this.sessionRuntimeTeardowns.get(id);
+    if (existing) return existing;
+    this.invalidateSessionRuntime(id);
+    this.sessionRuntimeTearingDown.add(id);
+    const work = this.teardownSessionRuntimeNow(id).finally(() => {
+      if (!this.sessionDeletionInProgress.has(id)) this.queue.finalizeSessionDisposal(id);
+      this.sessionRuntimeTearingDown.delete(id);
+      this.sessionRuntimeTeardowns.delete(id);
+      this.reclaimSessionRuntime(id);
+    });
+    this.sessionRuntimeTeardowns.set(id, work);
+    return work;
+  }
+
+  private async teardownSessionRuntimeNow(id: string): Promise<void> {
+    const sessionPath = this.live.get(id)?.path ?? this.sessionById.get(id)?.path;
+    const queueLoad = this.queueLoads.get(id);
+    const queueWrite = this.queueWrites.get(id);
+    const ensure = this.ensureInFlight.get(id);
+    const barrier = this.sessionFileBarriers.get(id);
+    const historyReads = sessionPath
+      ? [...this.historyInflight.entries()]
+        .filter(([key]) => key.startsWith(`${sessionPath}\0`))
+        .map(([, read]) => read)
+      : [];
+
+    // Fence all new authority/state first. Everything after this point is a
+    // drain of already-started work only. disposeSession returns the queued
+    // dispatch acknowledgement so deletion cannot overtake it.
+    this.bridge.unregister(id);
+    this.stopEscalation.cancel(id);
+    this.extensionUi.abortSession(id);
+    this.extensions.unmountSession(id);
+    this.planStore.forget(id);
+    const queueDispatch = this.queue.disposeSession(id);
+    this.sessionRedact.clear(id);
+    this.sessionEnvRefresh.clear(id);
+    const redaction = this.sessionRedact.waitForSession(id);
+    const envRefresh = this.sessionEnvRefresh.waitForSession(id);
+    this.documentInjections.clearSession(id);
+    this.openedDocumentPathsBySession.delete(id);
+    this.structuredOutputs?.clear(id);
+    this.unconfirmedSteers.delete(id);
+    this.autoRevivalUserLifts.delete(id);
+
+    // Abort attachment uploads immediately, then await their settled store
+    // operations before a delete caller removes files underneath them.
+    const inputFiles = this.disposeInputFilesSession(id);
+
+    const stopLive = async (live: Live | undefined): Promise<void> => {
+      if (!live) return;
+      live.exiting = true;
+      live.compaction.dispose();
+      this.rejectPendingCommands(id, new Error("session runtime disposed"));
+      live.pendingDrainPrompt = undefined;
+      live.followUps = [];
+      if (this.live.get(id) === live) this.live.delete(id);
+      await this.stopLiveProcess(live);
+    };
+    await stopLive(this.live.get(id));
+
+    // A generation check in ensure/spawn prevents a cold spawn from reaching
+    // child creation after this fence. An already-installed child is stopped
+    // above before its ensure promise is awaited, so no polling handoff is
+    // needed here.
+    if (ensure) await Promise.allSettled([ensure]);
+    await stopLive(this.live.get(id));
+
+    // A no-op placed after prior work is the barrier's settle point. Delayed
+    // redaction/env retries are admitted through this same barrier; their own
+    // generations make a revoked retry a no-op even if it was already queued.
+    const barrierDrain = barrier ? barrier(async () => undefined) : undefined;
+    await Promise.allSettled([
+      queueDispatch,
+      ...(queueLoad ? [queueLoad] : []),
+      ...(queueWrite ? [queueWrite] : []),
+      ...historyReads,
+      inputFiles,
+      redaction,
+      envRefresh,
+      ...(barrierDrain ? [barrierDrain] : []),
+    ]);
+    if (this.queueLoads.get(id) === queueLoad) this.queueLoads.delete(id);
+    if (this.queueWrites.get(id) === queueWrite) this.queueWrites.delete(id);
+    if (this.sessionFileBarriers.get(id) === barrier) this.sessionFileBarriers.delete(id);
+
+    await this.withSessionLeaseOperation(id, async () => {
+      const lease = this.leases.get(id);
+      await lease?.release().catch(() => undefined);
+      if (this.leases.get(id) === lease) this.leases.delete(id);
+    });
+
+    this.sessionContextLastKnown.delete(id);
+    this.sessionLedgerTurns.delete(id);
+    this.sessionModelStates.delete(id);
+    this.sessionModelSnapshots.delete(id);
+    this.manualTitleOverrides.delete(id);
+    if (sessionPath) this.historyCache.delete(sessionPath);
+    this.turnTelemetry.clearSession(id);
+  }
+
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
+    if (this.closed) return;
     // Sweep before closed=true: abortSessionTurn no longer stops workers, so host
     // exit is the remaining path that must reap leftover subagent processes.
-    const sessionIds = new Set<string>(this.live.keys());
+    const agentSessionIds = this.activeRuntimeSessionIds();
     for (const agent of this.agents.values()) {
-      if (agent.sessionId && agent.state === "running") sessionIds.add(agent.sessionId);
+      if (agent.sessionId && agent.state === "running") agentSessionIds.add(agent.sessionId);
     }
-    await Promise.allSettled([...sessionIds].map((sessionId) => this.sweepSessionAgents(sessionId)));
+    await Promise.allSettled([...agentSessionIds].map((sessionId) => this.sweepSessionAgents(sessionId)));
     // Final durable flush after the sweep so its state changes ride the same
     // snapshot; both bypass the write throttle.
     this.persistAgentLogs();
@@ -2386,43 +2735,45 @@ export class PiHostBackend implements HostBackend {
     for (const wake of [...this.agentTerminalWaiters]) wake();
     this.titleGenerationAbort.abort();
     this.toolBatchTelemetry.dispose();
+    this.turnTelemetry.dispose();
     await this.thinkingControlWrite.catch(() => undefined);
     await Promise.allSettled([...this.backgroundTitleGenerations]);
-    await this.bridge.close();
+
+    // Runtime disposal deliberately preserves durable session files/queues for
+    // a later host. It is the same boundary explicit deletion uses before its
+    // separate persistent-file removal.
+    await Promise.allSettled([...this.activeRuntimeSessionIds()].map((sessionId) => this.teardownSessionRuntime(sessionId)));
+    await this.disposeAllInputFiles();
+    this.queue.disposeAll();
+    this.extensions.unmountAllSessions();
+    this.documentInjections.clearAll();
+    this.openedDocumentPathsBySession.clear();
+    this.openedDocumentPaths = [];
     this.structuredOutputs?.clearAll();
     this.extensionUi.dispose();
-    const live = [...this.live.values()];
-    for (const sessionId of this.live.keys()) this.extensions.unmountSession(sessionId);
-    this.live.clear();
     this.planStore.clear();
-    for (const item of live) {
-      item.compaction.dispose();
-      for (const pending of item.pending.values())
-        pending.reject(new Error("host backend closed"));
-      item.pending.clear();
-    }
-    await Promise.all(live.map((item) => this.stopLiveProcess(item)));
+    await this.bridge.close();
     await this.headroomRuntime.close();
     await Promise.allSettled([...this.backgroundStatsRefreshes]);
-    await Promise.all(
-      [...this.leases.values()].map((lease) =>
-        lease.release().catch(() => undefined),
-      ),
-    );
-    await Promise.all(
-      [...this.queueWrites.values()].map((write) =>
-        write.catch(() => undefined),
-      ),
-    );
+
     // Drain the durable agent index last: events from dying pi processes can
     // still enqueue persists until their exit settles, and callers (tests,
     // host shutdown) rely on close() completing every write to agentDir.
     await this.agentsWrite;
     // Bounded wait for already-queued stats lines; a hung append must not block exit.
     await this.toolBatchTelemetry.close();
+    await this.turnTelemetry.close();
     // Same contract for the compaction diagnostics probe.
     await this.compactionDiagnostics.close();
     this.leases.clear();
+    this.leaseOperationLanes.clear();
+    this.queueLoads.clear();
+    this.queueWrites.clear();
+    this.sessionFileBarriers.clear();
+    this.sessionContextLastKnown.clear();
+    this.sessionLedgerTurns.clear();
+    this.sessionModelStates.clear();
+    this.sessionModelSnapshots.clear();
     this.documentWatcher.stop();
     this.listeners.clear();
   }
@@ -2466,13 +2817,29 @@ export class PiHostBackend implements HostBackend {
     this.agentLogCache.set(key, logs)
     if (persist) this.schedulePersistAgentLogs()
   }
-  private queueChanged(id: string, items: QueuedMessage[]) {
-    if (this.closed) return;
-    this.persistQueue(id, items);
+  private publicQueueItem(item: QueuedMessage): Omit<QueuedMessage, "turnTelemetry"> {
+    // Correlation samples are in-memory dispatch metadata, not queue payload.
+    // The product queue already persists actionable user content; telemetry must
+    // not create another durable copy or leak timing ids through UI snapshots.
+    const { turnTelemetry: _turnTelemetry, ...publicItem } = item;
+    return publicItem;
+  }
+  private publicQueueItems(items: QueuedMessage[]): Array<Omit<QueuedMessage, "turnTelemetry">> {
+    return items.map((item) => this.publicQueueItem(item));
+  }
+  private queueChanged(id: string, items: QueuedMessage[], lifecycleToken?: unknown) {
+    // Queue snapshots carry the state identity that produced them. A stale
+    // queue continuation must not persist or stream into a recreated session.
+    if (lifecycleToken !== undefined && !this.sessionRuntimeTokenIsCurrent(id, lifecycleToken)) return;
+    if (this.closed || this.sessionRuntimeTearingDown.has(id)
+      || this.sessionDeletionInProgress.has(id)
+      || this.sessionRuntimeTombstones.has(id)) return;
+    const publicItems = this.publicQueueItems(items);
+    this.persistQueue(id, publicItems);
     this.stream({
       type: "queue_update",
       sessionId: id,
-      queue: items,
+      queue: publicItems,
       pendingFollowUps: this.live.get(id)?.followUps ?? [],
     });
   }
@@ -2488,13 +2855,21 @@ export class PiHostBackend implements HostBackend {
       ),
     );
   }
-  private async loadQueue(id: string): Promise<void> {
+  private async loadQueue(
+    id: string,
+    runtimeToken = this.sessionRuntimeToken(id),
+  ): Promise<void> {
+    // A queue restore is an asynchronous continuation, so it must retain the
+    // token captured by its caller. Missing tokens reject late work after
+    // reclaim instead of falling back to an implicit generation zero.
+    if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
     let task = this.queueLoads.get(id);
     if (!task) {
       task = (async () => {
         // Revival gates (manual stop / archived) must be resident before any
         // restored item can reach a drain.
         if (this.manualStopsLoaded) await this.manualStopsLoaded.catch(() => undefined);
+        if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
         let items: QueuedMessage[];
         try {
           items = await this.queueStore.load(id);
@@ -2504,37 +2879,54 @@ export class PiHostBackend implements HostBackend {
           );
           items = [];
         }
-        this.queue.restoreQueue(id, items);
+        // Teardown may begin while the durable read is in flight. In that
+        // case restoring would recreate a disposed session queue.
+        if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) this.queue.restoreQueue(id, items, runtimeToken);
       })();
       this.queueLoads.set(id, task);
     }
     await task;
   }
-  private async queueIdle(id: string, epoch?: number): Promise<void> {
-    if (this.closed) return;
-    await this.loadQueue(id);
+  /** Host entrypoints use this seam to establish a lifecycle before queue IO. */
+  private async loadQueueForSession(id: string): Promise<SessionRuntimeToken> {
+    const runtimeToken = this.beginSessionRuntime(id);
+    await this.loadQueue(id, runtimeToken);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    return runtimeToken;
+  }
+  private async queueIdle(
+    id: string,
+    epoch?: number,
+    runtimeToken = this.sessionRuntimeToken(id),
+  ): Promise<void> {
+    if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
+    await this.loadQueue(id, runtimeToken);
+    if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
     await new Promise<void>((resolve) => setImmediate(resolve));
+    if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
     await this.awaitUnusableLiveExit(id);
-    if (!this.closed) {
+    if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) {
       // Steer acks only prove pi queued the text in memory; a turn that
       // settles without echoing it (compaction/abort dropped it) loses the
       // message. Recycle before notifyIdle so the drain can redeliver.
       this.recycleUnconfirmedSteers(id);
-      await this.queue.notifyIdle(id, epoch);
+      await this.queue.notifyIdle(id, epoch, runtimeToken);
+      if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
       // Stats and queue-idle completion can race after agent_settled. Recheck
       // after the authoritative idle transition so an eligible wait wave is
       // never lost merely because its fresh stats response arrived first.
       this.live.get(id)?.compaction.reconsider();
     }
-    if (!this.closed) {
-      try {
-        await this.flushSessionRedact(id);
-        await this.flushSessionEnvRefresh(id);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error("[secret-vault] session redaction failed", message);
+    if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
+    try {
+      await this.flushSessionRedact(id, runtimeToken);
+      if (!this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) return;
+      await this.flushSessionEnvRefresh(id, runtimeToken);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error("[secret-vault] session redaction failed", message);
+      if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken))
         this.stream({ type: "error", sessionId: id, content: `secret redaction failed: ${message}` });
-      }
     }
   }
   /**
@@ -2545,15 +2937,20 @@ export class PiHostBackend implements HostBackend {
   private async abortSessionTurn(
     sessionId: string,
     options: { drain: false | "cutIn" },
+    expectedToken?: unknown,
   ): Promise<void> {
     const live = this.live.get(sessionId);
+    const runtimeToken = expectedToken !== undefined
+      ? expectedToken
+      : live?.runtimeToken ?? this.sessionRuntimeToken(sessionId);
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
     if (live) live.hostAbortedTurn = true;
     this.extensionUi.abortSession(sessionId);
     if (options.drain === false) {
       // User stop owns the queue: a hung prompt or parked cut-in must not keep
       // the composer locked on `sending`. Cut-in abort leaves pendingCutIn so
       // the next real idle can dispatch it.
-      this.queue.noteAbort(sessionId);
+      this.queue.noteAbort(sessionId, runtimeToken);
       this.rejectPendingCommands(sessionId, new Error("session stopped"));
       if (live) live.pendingDrainPrompt = undefined;
       // Persist the manual-stop intent: queue restores and pi-goal's
@@ -2561,7 +2958,7 @@ export class PiHostBackend implements HostBackend {
       // the user explicitly sends again.
       void this.markManualStop(sessionId);
     } else if (!this.queue.hasPendingCutIn(sessionId)) {
-      this.queue.suppressIdleDrain(sessionId);
+      this.queue.suppressIdleDrain(sessionId, runtimeToken);
     }
     const after = this.live.get(sessionId);
     this.stream({
@@ -2576,7 +2973,9 @@ export class PiHostBackend implements HostBackend {
     if (abortPid !== undefined && this.childStillRunning(after?.process ?? live?.process)) {
       queueMicrotask(() => {
         const current = this.live.get(sessionId);
-        if (!current || !this.childStillRunning(current.process)) return;
+        if (!current || current.runtimeToken !== runtimeToken
+          || !this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)
+          || !this.childStillRunning(current.process)) return;
         this.stopEscalation.start(
           sessionId,
           {
@@ -2596,12 +2995,17 @@ export class PiHostBackend implements HostBackend {
         );
       });
     }
-    void this.command(sessionId, { type: "abort" }).catch(() => undefined);
+    void this.command(sessionId, { type: "abort" }, false, runtimeToken).catch(() => undefined);
   }
-  private async cutInQueuedMessage(sessionId: string, messageId: string): Promise<QueuedMessage> {
-    const message = await this.queue.cutInMessage(sessionId, messageId);
+  private async cutInQueuedMessage(
+    sessionId: string,
+    messageId: string,
+    runtimeToken = this.sessionRuntimeToken(sessionId),
+  ): Promise<QueuedMessage> {
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
+    const message = await this.queue.cutInMessage(sessionId, messageId, runtimeToken);
     if (this.queue.hasPendingCutIn(sessionId)) {
-      await this.abortSessionTurn(sessionId, { drain: "cutIn" });
+      await this.abortSessionTurn(sessionId, { drain: "cutIn" }, runtimeToken);
     }
     return message;
   }
@@ -2609,20 +3013,31 @@ export class PiHostBackend implements HostBackend {
     id: string,
     text: string,
     attachments?: PromptAttachment[],
+    rendererTelemetry?: TurnTelemetryRendererSample,
   ): Promise<QueueEnqueueResult> {
     if (isExternalSessionId(id)) throw new Error("external session is read-only");
+    const runtimeToken = this.beginSessionRuntime(id);
+    this.assertInputFilesSessionAcceptingWork(id);
     this.structuredOutputs?.assertReadyToSend(id);
     // Archived sessions stay dead: refuse instead of reviving; unarchive first.
     this.assertNotArchived(id);
     // Explicit user input lifts manual-stop revival suppression.
     this.noteExplicitUserSend(id);
-    await this.loadQueue(id);
-    const result = this.queue.enqueue(id, { text, attachments });
-    if (result.outcome === "dispatched") await this.queue.waitForDispatch(id);
-    else this.retryPendingFinalReconciliation(id);
+    const telemetry = this.turnTelemetry.rendererSubmission(id, rendererTelemetry);
+    await this.loadQueue(id, runtimeToken);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    const result = this.queue.enqueue(id, { text, attachments, turnTelemetry: telemetry }, runtimeToken);
+    if (result.outcome === "dispatched") {
+      await this.queue.waitForDispatch(id, runtimeToken);
+      this.assertSessionRuntimeToken(id, runtimeToken);
+    }
+    else {
+      this.turnTelemetry.markQueued(telemetry);
+      this.retryPendingFinalReconciliation(id);
+    }
     return {
       outcome: result.outcome === "dispatched" ? "direct" : "queued",
-      message: result.message,
+      message: this.publicQueueItem(result.message),
     };
   }
   /** A later user prompt must be able to wake a missed-settled turn and drain. */
@@ -2761,7 +3176,24 @@ export class PiHostBackend implements HostBackend {
     try { return revealRedactionSecrets(this.vaultDir, sessionId); }
     catch { return []; }
   }
-  private sessionFileExclusive(sessionId: string): ExclusiveSessionWork {
+  private sessionFileExclusive(
+    sessionId: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(sessionId),
+  ): ExclusiveSessionWork {
+    // Direct host-owned file mutations establish a lifecycle lazily; delayed
+    // retries always pass their captured token and therefore never take this
+    // path after reclaim.
+    if (runtimeToken === undefined && !this.closed
+      && !this.sessionRuntimeTearingDown.has(sessionId)
+      && !this.sessionDeletionInProgress.has(sessionId)
+      && !this.sessionRuntimeTombstones.has(sessionId)) {
+      runtimeToken = this.beginSessionRuntime(sessionId);
+    }
+    // Late settle/redaction continuations are harmless during teardown, but
+    // must not recreate a barrier after its safe drain below.
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) {
+      return async <T>(_work: () => Promise<T>): Promise<T> => undefined as T;
+    }
     const existing = this.sessionFileBarriers.get(sessionId);
     if (existing) return existing;
     const created = createSessionWriteBarrier();
@@ -2769,6 +3201,9 @@ export class PiHostBackend implements HostBackend {
     return created;
   }
   private canRewriteSessionFile(sessionId: string): boolean {
+    if (this.closed || this.sessionRuntimeTearingDown.has(sessionId)
+      || this.sessionDeletionInProgress.has(sessionId)
+      || this.sessionRuntimeTombstones.has(sessionId)) return false;
     const live = this.live.get(sessionId);
     if (live && this.liveProcessUsable(live)) return this.isSessionQuiet(sessionId);
     return !this.queue.isBusy(sessionId) && this.queue.listQueue(sessionId).length === 0;
@@ -2779,6 +3214,9 @@ export class PiHostBackend implements HostBackend {
    * leave the panel stuck on 运行中.
    */
   private async confirmSessionFileIdle(sessionId: string): Promise<boolean> {
+    if (this.closed || this.sessionRuntimeTearingDown.has(sessionId)
+      || this.sessionDeletionInProgress.has(sessionId)
+      || this.sessionRuntimeTombstones.has(sessionId)) return false;
     const live = this.live.get(sessionId);
     if (!live || !this.liveProcessUsable(live)) return true;
     return this.isSessionQuiet(sessionId);
@@ -2850,34 +3288,60 @@ export class PiHostBackend implements HostBackend {
     if (messages.length === 0) return;
     this.stream({ type: "secret_redact", sessionId, messages });
   }
-  private async rewriteSessionSecrets(sessionId: string): Promise<void> {
+  private async rewriteSessionSecrets(
+    sessionId: string,
+    runtimeToken?: unknown,
+  ): Promise<void> {
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
     const secrets = this.sessionSecrets(sessionId);
     if (secrets.length === 0) return;
     const path = this.live.get(sessionId)?.path ?? (await this.findSession(sessionId).catch(() => undefined))?.path;
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
     if (!path) throw new Error("session file unavailable for redaction");
     const result = await redactSessionJsonl(path, secrets);
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
     this.historyCache.delete(path);
     if (result.changed) this.publishSessionSecretRedact(sessionId, path);
   }
-  private requestSessionRedact(sessionId: string): void {
-    this.sessionRedact.request(sessionId);
+  private requestSessionRedact(
+    sessionId: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(sessionId),
+  ): void {
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    this.sessionRedact.request(sessionId, runtimeToken);
   }
-  private async flushSessionRedact(sessionId: string): Promise<void> {
-    await this.sessionFileExclusive(sessionId)(() => this.sessionRedact.flush(sessionId));
+  private async flushSessionRedact(
+    sessionId: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(sessionId),
+  ): Promise<void> {
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    await this.sessionFileExclusive(sessionId, runtimeToken)(() => this.sessionRedact.flush(sessionId, runtimeToken));
   }
   private async redactSessionFile(sessionId: string): Promise<void> {
-    this.requestSessionRedact(sessionId);
-    await this.flushSessionRedact(sessionId);
+    const runtimeToken = this.sessionRuntimeToken(sessionId);
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    this.requestSessionRedact(sessionId, runtimeToken);
+    await this.flushSessionRedact(sessionId, runtimeToken);
   }
-  private requestSessionEnvRefresh(sessionId: string): void {
-    this.sessionEnvRefresh.request(sessionId);
+  private requestSessionEnvRefresh(
+    sessionId: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(sessionId),
+  ): void {
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    this.sessionEnvRefresh.request(sessionId, runtimeToken);
   }
-  private async flushSessionEnvRefresh(sessionId: string): Promise<void> {
-    await this.sessionFileExclusive(sessionId)(() => this.sessionEnvRefresh.flush(sessionId));
+  private async flushSessionEnvRefresh(
+    sessionId: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(sessionId),
+  ): Promise<void> {
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    await this.sessionFileExclusive(sessionId, runtimeToken)(() => this.sessionEnvRefresh.flush(sessionId, runtimeToken));
   }
   private async refreshSessionChildEnv(sessionId: string): Promise<void> {
-    this.requestSessionEnvRefresh(sessionId);
-    await this.flushSessionEnvRefresh(sessionId);
+    const runtimeToken = this.sessionRuntimeToken(sessionId);
+    if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
+    this.requestSessionEnvRefresh(sessionId, runtimeToken);
+    await this.flushSessionEnvRefresh(sessionId, runtimeToken);
   }
   private diagnoseVault(): VaultDiagnosis {
     return memoryVaultDiagnosis();
@@ -3147,43 +3611,55 @@ export class PiHostBackend implements HostBackend {
         );
       case "resumeSession": {
         const s = await this.locate(params[0] as string);
-        await this.leaseFor(s).acquire();
-        await this.loadQueue(s.header.id);
-        return this.toSession(s);
+        const runtimeToken = this.beginSessionRuntime(s.header.id);
+        const { attempt } = await this.acquireSessionLease(s, runtimeToken);
+        let committed = false;
+        try {
+          await this.loadQueue(s.header.id, runtimeToken);
+          this.assertSessionRuntimeToken(s.header.id, runtimeToken);
+          committed = true;
+          return this.toSession(s);
+        } catch (error) {
+          if (!committed) await this.rollbackSessionLeaseAttempt(attempt);
+          throw error;
+        }
       }
       case "renameSession":
         return this.renameSession(params[0] as string, params[1] as string);
       case "deleteSession": {
-        const s = await this.locate(params[0] as string);
-        // Revoke tool authority before any asynchronous filesystem/process
-        // cleanup; otherwise a stale Pi process can recreate deleted resources.
-        this.bridge.unregister(s.header.id);
-        this.planStore.forget(s.header.id);
-        this.terminalSessionDeleted?.(s.header.id);
-        await this.leases.get(s.header.id)?.release();
-        this.leases.delete(s.header.id);
-        await this.queueWrites.get(s.header.id)?.catch(() => undefined);
-        await this.queueStore.remove(s.header.id);
-        this.queueLoads.delete(s.header.id);
-        this.unconfirmedSteers.delete(s.header.id);
-        await fs.rm(s.path);
-        // The extension-contribution sidecar is session-owned: it must not outlive the
-        // session. The helper only removes files this system itself wrote (canonical name,
-        // versioned snapshot shape) and never touches anything else in the directory.
-        removeContributionSnapshotSidecar({
-          sessionPath: s.path,
-          sessionsRoot: this.root,
-          agentDir: this.agentDir,
-        });
-        this.historyCache.delete(s.path);
-        this.indexCache.delete(s.path);
-        this.sessionById.delete(s.header.id);
-        this.live.get(s.header.id)?.process?.stdin.end();
-        this.live.delete(s.header.id);
-        this.sessionModelStates.delete(s.header.id);
-        this.sessionModelSnapshots.delete(s.header.id);
-        this.manualTitleOverrides.delete(s.header.id);
-        this.structuredOutputs?.clear(s.header.id);
+        const raw = params[0];
+        if (typeof raw !== "string" || !raw.trim()) throw new Error("缺少会话");
+        const id = raw.trim();
+        // Fence before locate/IO so late mutations reject immediately, even
+        // while teardown later waits on an older queue persistence write.
+        this.sessionDeletionInProgress.add(id);
+        this.turnTelemetry.fenceSession(id);
+        try {
+          const s = await this.locate(id);
+          // The runtime boundary revokes authority synchronously, aborts/settles
+          // in-flight work, and releases all transient state. Persistent deletion
+          // intentionally remains below so host shutdown can use the same cleanup
+          // without deleting a resumable session.
+          this.terminalSessionDeleted?.(s.header.id);
+          await this.teardownSessionRuntime(s.header.id);
+          await this.queueStore.remove(s.header.id);
+          await fs.rm(s.path);
+          // The extension-contribution sidecar is session-owned: it must not outlive the
+          // session. The helper only removes files this system itself wrote (canonical name,
+          // versioned snapshot shape) and never touches anything else in the directory.
+          removeContributionSnapshotSidecar({
+            sessionPath: s.path,
+            sessionsRoot: this.root,
+            agentDir: this.agentDir,
+          });
+          this.historyCache.delete(s.path);
+          this.indexCache.delete(s.path);
+          this.sessionById.delete(s.header.id);
+        } finally {
+          this.sessionDeletionInProgress.delete(id);
+          this.queue.finalizeSessionDisposal(id);
+          this.reclaimSessionRuntime(id);
+        }
         return;
       }
       case "moveSession":
@@ -3231,70 +3707,116 @@ export class PiHostBackend implements HostBackend {
       }
       case "forceTakeoverSessionLease": {
         const s = await this.locate(params[0] as string);
-        return this.leaseFor(s).forceTakeover();
+        const runtimeToken = this.beginSessionRuntime(s.header.id);
+        return this.forceTakeoverSessionLease(s, runtimeToken);
       }
       case "sendPrompt":
         return this.enqueueMessage(
           params[0] as string,
           params[1] as string,
           params[2] as PromptAttachment[] | undefined,
+          params[3] as TurnTelemetryRendererSample | undefined,
         );
       case "listQueue":
-        await this.loadQueue(params[0] as string);
-        return this.queue.listQueue(params[0] as string);
+        await this.loadQueueForSession(params[0] as string);
+        return this.publicQueueItems(this.queue.listQueue(params[0] as string));
       case "enqueueMessage":
         return this.enqueueMessage(
           params[0] as string,
           params[1] as string,
           params[2] as PromptAttachment[] | undefined,
+          params[3] as TurnTelemetryRendererSample | undefined,
         );
       case "updateQueuedMessage": {
-        const input: any = { text: params[2] as string };
-        if (params.length > 3)
+        const sessionId = params[0] as string;
+        const messageId = params[1] as string;
+        const input: {
+          text: string;
+          attachments?: PromptAttachment[];
+          turnTelemetry?: TurnTelemetryRendererSample;
+        } = { text: params[2] as string };
+        if (params.length > 3 && params[3] !== undefined)
           input.attachments = params[3] as PromptAttachment[];
-        await this.loadQueue(params[0] as string);
-        return this.queue.updateMessage(
-          params[0] as string,
-          params[1] as string,
-          input,
-        );
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        const current = this.queue.listQueue(sessionId)
+          .find((item) => item.id === messageId);
+        let freshTelemetry: TurnTelemetryRendererSample | undefined;
+        try {
+          if (params.length > 4) {
+            freshTelemetry = this.turnTelemetry.rendererSubmission(sessionId, params[4]);
+            if (freshTelemetry) input.turnTelemetry = freshTelemetry;
+          }
+          const updated = this.queue.updateMessage(sessionId, messageId, input, runtimeToken);
+          // The renderer sample belongs to the old text/attachments. Remove its
+          // pending host turn even when a replacement reuses the same turn id.
+          if (current?.turnTelemetry && current.turnTelemetry.turnId !== updated.turnTelemetry?.turnId) {
+            this.turnTelemetry.discardRendererSubmission(current.turnTelemetry.turnId);
+          }
+          if (freshTelemetry && updated.state === "queued") this.turnTelemetry.markQueued(freshTelemetry);
+          return this.publicQueueItem(updated);
+        } catch (error) {
+          // A rejected edit must not leave a renderer sample waiting for a turn
+          // that was never installed in the queue.
+          if (freshTelemetry) this.turnTelemetry.discardRendererSubmission(freshTelemetry.turnId);
+          throw error;
+        }
       }
-      case "removeQueuedMessage":
-        await this.loadQueue(params[0] as string);
-        return this.queue.removeMessage(
-          params[0] as string,
+      case "removeQueuedMessage": {
+        const sessionId = params[0] as string;
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        const removed = this.queue.removeMessage(sessionId, params[1] as string, runtimeToken);
+        if (removed.turnTelemetry) this.turnTelemetry.discardRendererSubmission(removed.turnTelemetry.turnId);
+        return this.publicQueueItem(removed);
+      }
+      case "promoteQueuedMessage": {
+        const sessionId = params[0] as string;
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        const promoted = this.queue.promoteMessage(
+          sessionId,
           params[1] as string,
+          runtimeToken,
         );
-      case "promoteQueuedMessage":
-        await this.loadQueue(params[0] as string);
-        return this.queue.promoteMessage(
-          params[0] as string,
+        return this.publicQueueItem(promoted);
+      }
+      case "steerQueuedMessage": {
+        const sessionId = params[0] as string;
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        this.assertNotArchived(sessionId);
+        this.noteExplicitUserSend(sessionId);
+        const steered = await this.queue.steerMessage(
+          sessionId,
           params[1] as string,
+          runtimeToken,
         );
-      case "steerQueuedMessage":
-        await this.loadQueue(params[0] as string);
-        this.assertNotArchived(params[0] as string);
-        this.noteExplicitUserSend(params[0] as string);
-        return this.queue.steerMessage(
-          params[0] as string,
+        // Steer is a continuation of the current turn, not a new prompt;
+        // discard any queued renderer sample rather than leaving it pending.
+        if (steered.turnTelemetry) this.turnTelemetry.discardRendererSubmission(steered.turnTelemetry.turnId);
+        return this.publicQueueItem(steered);
+      }
+      case "cutInQueuedMessage": {
+        const sessionId = params[0] as string;
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        this.assertNotArchived(sessionId);
+        this.noteExplicitUserSend(sessionId);
+        const message = await this.cutInQueuedMessage(
+          sessionId,
           params[1] as string,
+          runtimeToken,
         );
-      case "cutInQueuedMessage":
-        await this.loadQueue(params[0] as string);
-        this.assertNotArchived(params[0] as string);
-        this.noteExplicitUserSend(params[0] as string);
-        return this.cutInQueuedMessage(
-          params[0] as string,
+        return this.publicQueueItem(message);
+      }
+      case "retryQueuedMessage": {
+        const sessionId = params[0] as string;
+        const runtimeToken = await this.loadQueueForSession(sessionId);
+        this.assertNotArchived(sessionId);
+        this.noteExplicitUserSend(sessionId);
+        const retried = this.queue.retryMessage(
+          sessionId,
           params[1] as string,
+          runtimeToken,
         );
-      case "retryQueuedMessage":
-        await this.loadQueue(params[0] as string);
-        this.assertNotArchived(params[0] as string);
-        this.noteExplicitUserSend(params[0] as string);
-        return this.queue.retryMessage(
-          params[0] as string,
-          params[1] as string,
-        );
+        return this.publicQueueItem(retried);
+      }
       case "stop":
         {
           const sessionId = params[0] as string;
@@ -3531,18 +4053,28 @@ export class PiHostBackend implements HostBackend {
         };
     }
   }
-  private rememberOpenedDocuments(input: unknown): void {
+  private rememberOpenedDocuments(input: unknown, sessionId?: string): void {
     const paths = Array.isArray(input) ? input : [input];
+    const id = sessionId?.trim();
+    const sessionPaths = id
+      ? this.openedDocumentPathsBySession.get(id) ?? new Set<string>()
+      : undefined;
     for (const raw of paths) {
       if (typeof raw !== "string") continue;
       const path = raw.trim();
       if (!path || !isAbsolute(path) || !documentKindForName(path)) continue;
-      if (!this.openedDocumentPaths.includes(path)) this.openedDocumentPaths.push(path);
+      if (sessionPaths) sessionPaths.add(path);
+      else if (!this.openedDocumentPaths.includes(path)) this.openedDocumentPaths.push(path);
     }
+    if (id && sessionPaths?.size) this.openedDocumentPathsBySession.set(id, sessionPaths);
   }
   private async listOpenedDocuments(): Promise<DocumentSummary[]> {
     const out: DocumentSummary[] = [];
-    for (const path of this.openedDocumentPaths) {
+    const paths = new Set<string>(this.openedDocumentPaths);
+    for (const sessionPaths of this.openedDocumentPathsBySession.values()) {
+      for (const path of sessionPaths) paths.add(path);
+    }
+    for (const path of paths) {
       const kind = documentKindForName(path);
       if (!kind) continue;
       try {
@@ -3586,31 +4118,44 @@ export class PiHostBackend implements HostBackend {
   }
   private async notifyDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
     const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
-    this.rememberOpenedDocuments(list);
-    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
-    if (!supported.length) return;
-    const parserMounted = await this.pdfParserMounted(typeof sessionId === "string" ? sessionId.trim() : undefined);
-    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("panel"), pdfParser: parserMounted });
-    if (!injection) return;
-    if (typeof sessionId !== "string" || !sessionId.trim()) {
+    const id = typeof sessionId === "string" && sessionId.trim() ? sessionId.trim() : undefined;
+    if (!id) {
       console.warn("[document-drop] no active session; skip announce");
       return;
     }
-    const id = sessionId.trim();
+    const runtimeToken = this.beginSessionRuntime(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
+    if (!supported.length) return;
+    const parserMounted = await this.pdfParserMounted(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    // Record only after the async lifecycle check. Teardown clears this
+    // session-owned set synchronously, and every later await uses this token.
+    this.rememberOpenedDocuments(supported, id);
+    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("panel"), pdfParser: parserMounted });
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    if (!injection) return;
+    this.assertSessionRuntimeToken(id, runtimeToken);
     this.documentInjections.setPending(id, injection, supported);
   }
   private async notifyComposerDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
-    const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
-    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
-    if (!supported.length) return;
-    const parserMounted = await this.pdfParserMounted(typeof sessionId === "string" ? sessionId.trim() : undefined);
-    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("composer"), pdfParser: parserMounted });
-    if (!injection) return;
     if (typeof sessionId !== "string" || !sessionId.trim()) {
       console.warn("[composer-docs] no active session; skip announce");
       return;
     }
-    this.documentInjections.setPending(sessionId.trim(), injection, supported);
+    const id = sessionId.trim();
+    const runtimeToken = this.beginSessionRuntime(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    const list = Array.isArray(paths) ? paths.filter((item): item is string => typeof item === "string") : [];
+    const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
+    if (!supported.length) return;
+    const parserMounted = await this.pdfParserMounted(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("composer"), pdfParser: parserMounted });
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    if (!injection) return;
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    this.documentInjections.setPending(id, injection, supported);
   }
   private async inputFilesAgentHome(sessionId: string): Promise<string> {
     const cwd = this.live.get(sessionId)?.cwd ?? (await this.findSession(sessionId)).header.cwd;
@@ -3646,10 +4191,23 @@ export class PiHostBackend implements HostBackend {
     }
     return this.inputFilesReady;
   }
+  private assertInputFilesSessionAcceptingWork(sessionId: string): void {
+    if (this.sessionRuntimeTearingDown.has(sessionId)
+      || this.sessionDeletionInProgress.has(sessionId)
+      || this.sessionRuntimeTombstones.has(sessionId)) {
+      throw new Error("会话正在关闭");
+    }
+  }
   private async stageInputFile(sessionId: unknown, file: unknown): Promise<InputFileAttachment> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
     if (!file || typeof file !== "object" || Array.isArray(file)) throw new Error("缺少文件");
-    return (await this.inputFilesController()).stage(sessionId.trim(), file as InputFileStageRequest);
+    const id = sessionId.trim();
+    this.assertInputFilesSessionAcceptingWork(id);
+    const inputFiles = await this.inputFilesController();
+    // Controller initialization can cross the teardown fence; check once more
+    // before letting a late caller begin a new upload.
+    this.assertInputFilesSessionAcceptingWork(id);
+    return inputFiles.stage(id, file as InputFileStageRequest);
   }
   private async listInputFiles(sessionId: unknown): Promise<InputFileAttachment[]> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
@@ -3658,18 +4216,30 @@ export class PiHostBackend implements HostBackend {
   private async removeInputFile(sessionId: unknown, attachmentId: unknown): Promise<InputFileAttachment[]> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
     if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
-    return (await this.inputFilesController()).remove(sessionId.trim(), attachmentId.trim());
+    const id = sessionId.trim();
+    this.assertInputFilesSessionAcceptingWork(id);
+    const inputFiles = await this.inputFilesController();
+    this.assertInputFilesSessionAcceptingWork(id);
+    return inputFiles.remove(id, attachmentId.trim());
   }
   private async retryInputFile(sessionId: unknown, attachmentId: unknown, file?: unknown): Promise<InputFileAttachment> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
     if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
+    const id = sessionId.trim();
+    this.assertInputFilesSessionAcceptingWork(id);
     const request = file && typeof file === "object" && !Array.isArray(file) ? file as InputFileStageRequest : undefined;
-    return (await this.inputFilesController()).retry(sessionId.trim(), attachmentId.trim(), request);
+    const inputFiles = await this.inputFilesController();
+    this.assertInputFilesSessionAcceptingWork(id);
+    return inputFiles.retry(id, attachmentId.trim(), request);
   }
   private async cancelInputFile(sessionId: unknown, attachmentId: unknown): Promise<InputFileAttachment> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
     if (typeof attachmentId !== "string" || !attachmentId.trim()) throw new Error("缺少附件");
-    return (await this.inputFilesController()).cancel(sessionId.trim(), attachmentId.trim());
+    const id = sessionId.trim();
+    this.assertInputFilesSessionAcceptingWork(id);
+    const inputFiles = await this.inputFilesController();
+    this.assertInputFilesSessionAcceptingWork(id);
+    return inputFiles.cancel(id, attachmentId.trim());
   }
   private async structuredOutputController(): Promise<StructuredOutputController> {
     if (this.structuredOutputs) return this.structuredOutputs;
@@ -3694,8 +4264,12 @@ export class PiHostBackend implements HostBackend {
   }
   private async setStructuredOutput(sessionId: unknown, request: unknown): Promise<void> {
     if (typeof sessionId !== "string" || !sessionId.trim()) throw new Error("缺少会话");
+    const id = sessionId.trim();
+    const runtimeToken = this.beginSessionRuntime(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
     const ctl = await this.structuredOutputController();
-    ctl.set(sessionId.trim(), request);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    ctl.set(id, request);
   }
   /** Configured display path: project identity, settings keys, and returned `path`. */
   private async configuredProject(projectId: string): Promise<Project> {
@@ -3824,6 +4398,7 @@ export class PiHostBackend implements HostBackend {
       };
       this.rememberSessionMeta(sessionMeta, created.size, created.mtimeMs);
       await rememberAdoption(agentDir, externalSessionId, built.sessionId);
+      this.beginSessionRuntime(built.sessionId);
       return {
         id: built.sessionId,
         projectId,
@@ -3848,13 +4423,169 @@ export class PiHostBackend implements HostBackend {
     }
     return lease;
   }
-  private async requireLease(id: string): Promise<void> {
-    const s = await this.locate(id);
-    const status = await this.leaseFor(s).acquire();
-    if (!status.writable)
-      throw new Error(
-        `session is read-only: held by ${status.holder?.holder ?? "another writer"}`,
-      );
+
+  /** Serialize lease ownership and map transitions, pruning idle lanes on release. */
+  private async withSessionLeaseOperation<T>(
+    sessionId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.leaseOperationLanes.get(sessionId);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.leaseOperationLanes.set(sessionId, current);
+    try {
+      if (previous) await previous;
+      return await operation();
+    } finally {
+      release();
+      if (this.leaseOperationLanes.get(sessionId) === current)
+        this.leaseOperationLanes.delete(sessionId);
+    }
+  }
+
+  /** Roll back only ownership installed by one host operation attempt. Caller holds the lane. */
+  private async rollbackSessionLeaseAttemptInLane(attempt: SessionLeaseAttempt | undefined): Promise<void> {
+    if (!attempt) return;
+    // A later acquisition generation means this attempt no longer owns the
+    // manager. In particular, never release a valid lease reused by another
+    // operation or a lease installed for a recreated lifecycle.
+    if (
+      attempt.acquired
+      && attempt.lease.isOwned
+      && attempt.lease.ownershipGeneration === attempt.ownershipGeneration
+    ) {
+      await attempt.lease.release().catch(() => undefined);
+    }
+    if (
+      attempt.installed
+      && this.leases.get(attempt.sessionId) === attempt.lease
+      && !attempt.lease.isOwned
+    ) {
+      this.leases.delete(attempt.sessionId);
+    }
+  }
+
+  /** Roll back only ownership installed by one host operation attempt. */
+  private async rollbackSessionLeaseAttempt(attempt: SessionLeaseAttempt | undefined): Promise<void> {
+    if (!attempt) return;
+    await this.withSessionLeaseOperation(
+      attempt.sessionId,
+      () => this.rollbackSessionLeaseAttemptInLane(attempt),
+    );
+  }
+
+  /** Acquire a session lease as part of the captured runtime lifecycle. */
+  private async acquireSessionLease(
+    session: { path: string; header: any },
+    runtimeToken: unknown,
+  ): Promise<{ status: LeaseStatus; attempt: SessionLeaseAttempt }> {
+    const sessionId = session.header.id as string;
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
+    return this.withSessionLeaseOperation(sessionId, async () => {
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+      // Look up the manager only after waiting for earlier ownership work. A
+      // queued reuse must never retain a manager that rollback has detached.
+      const existing = this.leases.get(sessionId);
+      const lease = existing ?? this.leaseFor(session);
+      const installed = existing === undefined;
+      const beforeGeneration = lease.ownershipGeneration;
+      let status: LeaseStatus;
+      let attempt: SessionLeaseAttempt | undefined;
+      try {
+        status = await lease.acquire();
+        const metadata = (status as LeaseStatus & {
+          [LEASE_ACQUISITION_METADATA]?: LeaseAcquisitionMetadata;
+        })[LEASE_ACQUISITION_METADATA];
+        attempt = {
+          sessionId,
+          lease,
+          installed,
+          acquired: metadata?.acquired
+            ?? (lease.isOwned && lease.ownershipGeneration !== beforeGeneration),
+          ownershipGeneration: metadata?.ownershipGeneration ?? lease.ownershipGeneration,
+        };
+        // This is the lease-acquire linearization point. No host side effect may
+        // follow a revoke/deletion of the token captured by the caller.
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
+        if (!status.writable)
+          throw new Error(
+            `session is read-only: held by ${status.holder?.holder ?? "another writer"}`,
+          );
+        return { status, attempt };
+      } catch (error) {
+        // A failed acquire normally cannot claim a lease, but preserve the same
+        // ownership/map cleanup if a future implementation fails after claiming.
+        attempt ??= {
+          sessionId,
+          lease,
+          installed,
+          acquired: lease.isOwned && lease.ownershipGeneration !== beforeGeneration,
+          ownershipGeneration: lease.ownershipGeneration,
+        };
+        await this.rollbackSessionLeaseAttemptInLane(attempt);
+        throw error;
+      }
+    });
+  }
+
+  /** Force takeover as a lifecycle transaction, including rollback of a late reacquire. */
+  private async forceTakeoverSessionLease(
+    session: { path: string; header: any },
+    runtimeToken: unknown,
+  ): Promise<LeaseStatus> {
+    const sessionId = session.header.id as string;
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
+    return this.withSessionLeaseOperation(sessionId, async () => {
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+      // Resolve the manager after lane admission so takeover cannot race a
+      // rollback that removed the previous manager from the backend map.
+      const existing = this.leases.get(sessionId);
+      const lease = existing ?? this.leaseFor(session);
+      const installed = existing === undefined;
+      const beforeGeneration = lease.ownershipGeneration;
+      let status: LeaseStatus;
+      let attempt: SessionLeaseAttempt | undefined;
+      try {
+        status = await lease.forceTakeover();
+        const metadata = (status as LeaseStatus & {
+          [LEASE_ACQUISITION_METADATA]?: LeaseAcquisitionMetadata;
+        })[LEASE_ACQUISITION_METADATA];
+        attempt = {
+          sessionId,
+          lease,
+          installed,
+          acquired: metadata?.acquired
+            ?? (lease.isOwned && lease.ownershipGeneration !== beforeGeneration),
+          ownershipGeneration: metadata?.ownershipGeneration ?? lease.ownershipGeneration,
+        };
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
+        if (!status.writable)
+          throw new Error(
+            `session is read-only: held by ${status.holder?.holder ?? "another writer"}`,
+          );
+        return status;
+      } catch (error) {
+        attempt ??= {
+          sessionId,
+          lease,
+          installed,
+          acquired: lease.isOwned && lease.ownershipGeneration !== beforeGeneration,
+          ownershipGeneration: lease.ownershipGeneration,
+        };
+        await this.rollbackSessionLeaseAttemptInLane(attempt);
+        throw error;
+      }
+    });
+  }
+
+  private async requireLease(
+    id: string,
+    runtimeToken: unknown = this.sessionRuntimeToken(id),
+  ): Promise<SessionLeaseAttempt> {
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    const session = await this.locate(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    return (await this.acquireSessionLease(session, runtimeToken)).attempt;
   }
   private lookupIsolatedHome(projectRoot: string): IsolatedProjectHome | undefined {
     return this.isolatedHomes.get(projectRoot) ?? this.isolatedHomes.get(resolve(projectRoot));
@@ -3989,6 +4720,7 @@ export class PiHostBackend implements HostBackend {
       created.mtimeMs,
     );
     this.sessionModelSnapshots.set(id, this.modelState);
+    this.beginSessionRuntime(id);
     return {
       id,
       projectId,
@@ -4000,41 +4732,50 @@ export class PiHostBackend implements HostBackend {
     const title = typeof name === "string" ? name.trim() : "";
     if (!title || title.length > 120) throw new Error("session name must be 1-120 characters");
     const session = await this.locate(sessionId);
-    const lease = this.leaseFor(session);
-    const status = await lease.acquire();
-    if (!status.writable)
-      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
-
+    const runtimeToken = this.beginSessionRuntime(sessionId);
+    const { attempt } = await this.acquireSessionLease(session, runtimeToken);
+    let committed = false;
     this.manualTitleOverrides.add(sessionId);
     const timestamp = new Date().toISOString();
     const live = this.live.get(sessionId);
     try {
       if (live) {
-        await this.command(sessionId, { type: "set_session_name", name: title });
+        await this.command(sessionId, { type: "set_session_name", name: title }, false, runtimeToken);
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
         live.session = { ...live.session, name: title, updatedAt: Date.now() };
+        committed = true;
       } else {
-        await this.sessionFileExclusive(sessionId)(async () => {
+        await this.sessionFileExclusive(sessionId, runtimeToken)(async () => {
+          this.assertSessionRuntimeToken(sessionId, runtimeToken);
+          const parentId = await lastJsonlEntryId(session.path);
+          this.assertSessionRuntimeToken(sessionId, runtimeToken);
           await fs.appendFile(session.path, `${JSON.stringify({
             type: "session_info",
             id: crypto.randomUUID(),
-            parentId: await lastJsonlEntryId(session.path),
+            parentId,
             timestamp,
             name: title,
           })}\n`);
+          committed = true;
         });
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
       }
+
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+      this.indexCache.delete(session.path);
+      const refreshed = await readSessionMeta(session.path);
+      const stat = await fs.stat(session.path);
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+      this.indexCache.set(session.path, { size: stat.size, mtimeMs: stat.mtimeMs, meta: refreshed });
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+      const renamed = live ? { ...live.session, name: title } : this.toSession(refreshed);
+      this.stream({ type: "session_title", sessionId, title, source: "manual" });
+      return renamed;
     } catch (error) {
       this.manualTitleOverrides.delete(sessionId);
+      if (!committed) await this.rollbackSessionLeaseAttempt(attempt);
       throw error;
     }
-
-    this.indexCache.delete(session.path);
-    const refreshed = await readSessionMeta(session.path);
-    const stat = await fs.stat(session.path);
-    this.indexCache.set(session.path, { size: stat.size, mtimeMs: stat.mtimeMs, meta: refreshed });
-    const renamed = live ? { ...live.session, name: title } : this.toSession(refreshed);
-    this.stream({ type: "session_title", sessionId, title, source: "manual" });
-    return renamed;
   }
   /**
    * Move a session's real working directory. An idle live Pi is closed first so
@@ -4047,7 +4788,9 @@ export class PiHostBackend implements HostBackend {
     if (!targetPath) throw new Error(`unknown project ${targetProjectId}`);
     const session = await this.locate(sessionId);
     if (dirId(session.header.cwd) === targetProjectId) return this.toSession(session);
-    await this.loadQueue(sessionId);
+    const runtimeToken = this.beginSessionRuntime(sessionId);
+    await this.loadQueue(sessionId, runtimeToken);
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
     if (this.ensureInFlight.has(sessionId) || this.queue.isBusy(sessionId) || this.queue.listQueue(sessionId).length > 0)
       throw new Error("会话正在执行或仍有排队消息，暂时不能移动");
     const live = this.live.get(sessionId);
@@ -4060,12 +4803,10 @@ export class PiHostBackend implements HostBackend {
         new Promise<never>((_, reject) => setTimeout(() => reject(new Error("等待会话停止超时，未移动")), 5_000)),
       ]);
     }
-    const lease = this.leaseFor(session);
-    const status = await lease.acquire();
-    if (!status.writable)
-      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
+    const { attempt } = await this.acquireSessionLease(session, runtimeToken);
     try {
       await rewriteSessionCwd(session.path, targetPath);
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
       // Old-project contribution/path snapshot must not outlive a successful cwd change.
       // Same helper as deleteSession: only versioned owned sidecars and our temps, never neighbors.
       removeContributionSnapshotSidecar({
@@ -4076,10 +4817,14 @@ export class PiHostBackend implements HostBackend {
       this.indexCache.delete(session.path);
       const moved = await readSessionMeta(session.path);
       const stat = await fs.stat(session.path);
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
       this.indexCache.set(session.path, { size: stat.size, mtimeMs: stat.mtimeMs, meta: moved });
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
       return this.toSession(moved);
     } finally {
-      await lease.release().catch(() => undefined);
+      // Moving is a short-lived file operation. Release only a lease this call
+      // claimed; a valid lease owned by another operation remains installed.
+      await this.rollbackSessionLeaseAttempt(attempt);
     }
   }
   /**
@@ -4093,13 +4838,18 @@ export class PiHostBackend implements HostBackend {
       return {};
     }
   }
-  private async ensure(id: string): Promise<Live> {
+  private async ensure(id: string, expectedGeneration?: unknown): Promise<Live> {
+    const generation = expectedGeneration !== undefined
+      ? expectedGeneration
+      : this.sessionRuntimeToken(id) ?? this.beginSessionRuntime(id);
+    this.assertSessionGeneration(id, generation);
     const live = this.live.get(id);
     if (live && this.liveProcessUsable(live)) return live;
     if (live && !this.liveProcessUsable(live)) {
       await (live.exit ?? Promise.resolve());
+      this.assertSessionGeneration(id, generation);
       if (this.live.get(id) === live) this.live.delete(id);
-      return this.ensure(id);
+      return this.ensure(id, generation);
     }
     const inFlight = this.ensureInFlight.get(id);
     if (inFlight) return inFlight;
@@ -4110,32 +4860,54 @@ export class PiHostBackend implements HostBackend {
     if (this.sidebarArchivedCache.has(id)) {
       if (this.manualStopsLoaded) await this.manualStopsLoaded.catch(() => undefined);
       if (this.sidebarPrefsLoaded) await this.sidebarPrefsLoaded.catch(() => undefined);
+      this.assertSessionGeneration(id, generation);
       if (this.sidebarArchivedCache.has(id)) {
         throw new Error("会话已归档：请先在侧栏取消归档，再继续该会话");
       }
     }
-    const attempt = this.spawnLive(id).finally(() => {
+    const attempt = this.spawnLive(id, generation).finally(() => {
       this.ensureInFlight.delete(id);
     });
     this.ensureInFlight.set(id, attempt);
     return attempt;
   }
-  private async spawnLive(id: string): Promise<Live> {
-    await this.requireLease(id);
+  private async spawnLive(id: string, generation = this.sessionRuntimeToken(id)): Promise<Live> {
+    this.assertSessionGeneration(id, generation);
     const found = await this.locate(id);
-    const session = this.toSession(found);
-    await this.loadConfiguredModels();
-    const desired = this.desiredModelFor(found);
-    this.sessionModelSnapshots.set(id, desired);
-    const bridgePort = await this.bridge.listen();
-    const sessionCapability = this.bridge.register(id);
-    const computerCapability =
-      this.features.computerUse &&
-      this.computerDescriptor &&
-      this.computerUsable()
-        ? this.bridge.registerComputer(id)
-        : undefined;
-    await this.loadAndMaterializeSubagentModels();
+    this.assertSessionGeneration(id, generation);
+    const rollback: Array<() => void | Promise<void>> = [];
+    let rollbackLive: Live | undefined;
+    let spawnedChild: ChildProcessWithoutNullStreams | undefined;
+    try {
+      const leaseAttempt = await this.acquireSessionLease(found, generation);
+      // Keep the lease until spawn commits. If any later acquisition/setup step
+      // fails, this guard releases only this invocation's claim.
+      rollback.push(() => this.rollbackSessionLeaseAttempt(leaseAttempt.attempt));
+      const session = this.toSession(found);
+      await this.loadConfiguredModels();
+      this.assertSessionGeneration(id, generation);
+      const desired = this.desiredModelFor(found);
+      const previousModelSnapshot = this.sessionModelSnapshots.get(id);
+      const hadModelSnapshot = this.sessionModelSnapshots.has(id);
+      rollback.push(() => {
+        if (hadModelSnapshot) this.sessionModelSnapshots.set(id, previousModelSnapshot!);
+        else this.sessionModelSnapshots.delete(id);
+      });
+      this.sessionModelSnapshots.set(id, desired);
+      const bridgePort = await this.bridge.listen();
+      this.assertSessionGeneration(id, generation);
+      // Register cleanup first: an injected or future registration error may follow a partial map write.
+      rollback.push(() => this.bridge.unregister(id));
+      const sessionCapability = this.bridge.register(id);
+      // `unregister` clears both capability kinds, including a partial computer registration.
+      const computerCapability =
+        this.features.computerUse &&
+        this.computerDescriptor &&
+        this.computerUsable()
+          ? this.bridge.registerComputer(id)
+          : undefined;
+      await this.loadAndMaterializeSubagentModels();
+      this.assertSessionGeneration(id, generation);
     if (this.features.webSearch && this.profileMode === "isolated") {
       try {
         await ensureWebSearchDefaults(this.agentDir);
@@ -4145,14 +4917,18 @@ export class PiHostBackend implements HostBackend {
         );
       }
     }
+    this.assertSessionGeneration(id, generation);
     const isolated = this.profileMode === "isolated"
       ? await this.ensureIsolatedProjectHome(found.header.cwd)
       : undefined;
+    this.assertSessionGeneration(id, generation);
     const spawnCwd = isolated?.realProjectRoot ?? found.header.cwd;
     const registeredExtensions = await this.registeredExtensionsForSpawn(spawnCwd);
+    this.assertSessionGeneration(id, generation);
     // Computed once with both durable feeds resident; drives the in-child
     // pi-goal auto-revival suppression.
     const goalAutoResume = await this.goalAutoResumeForSpawn(id);
+    this.assertSessionGeneration(id, generation);
     const output = assemblePiSpawn({
       sessionPath: found.path,
       sessionId: id,
@@ -4185,48 +4961,70 @@ export class PiHostBackend implements HostBackend {
       },
       goalAutoResume,
     });
-    this.extensions.mountSession(
-      id,
-      registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
-    );
-    // close() may race a cache-first background resume before the child is
-    // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
-    // process or leave its session lease behind.
-    if (this.closed) {
-      this.bridge.unregister(id);
-      await this.leases.get(id)?.release().catch(() => undefined);
-      throw new Error("host backend closed");
-    }
-    const child = this.proc(this.piCommand.executable, [
-      ...(this.piCommand.prefixArgs ?? []),
-      "--mode",
-      "rpc",
-      ...output.args,
-    ], {
-      cwd: spawnCwd,
-      // T17 parity: the configured agent profile's .env is layered under the internal host contract
-      // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
-      // that `listModels` sees via the auth runtime resolve in the RPC session too.
-      env: withToolPath(
-        // Main Pi and UI share the host in-memory vault. Workers only inherit mounted env vars.
-        applySessionMountsToMainEnv(
-          mergedSpawnEnvironment(this.env, await this.readDotEnv(), {
-            ...output.env,
-            ...(this.piCommand.env ?? {}),
-          }),
-          workerEnvFromVault(this.vaultDir, id),
+      this.assertSessionGeneration(id, generation);
+      // Mount cleanup is registered before the write for the same partial-acquisition guarantee.
+      rollback.push(() => this.extensions.unmountSession(id));
+      this.extensions.mountSession(
+        id,
+        registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
+      );
+      // close() may race a cache-first background resume before the child is
+      // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
+      // process or leave its session lease behind.
+      this.assertSessionGeneration(id, generation);
+      const dotEnv = await this.readDotEnv();
+      this.assertSessionGeneration(id, generation);
+      const child = this.proc(this.piCommand.executable, [
+        ...(this.piCommand.prefixArgs ?? []),
+        "--mode",
+        "rpc",
+        ...output.args,
+      ], {
+        cwd: spawnCwd,
+        // T17 parity: the configured agent profile's .env is layered under the internal host contract
+        // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
+        // that `listModels` sees via the auth runtime resolve in the RPC session too.
+        env: withToolPath(
+          // Main Pi and UI share the host in-memory vault. Workers only inherit mounted env vars.
+          applySessionMountsToMainEnv(
+            mergedSpawnEnvironment(this.env, dotEnv, {
+              ...output.env,
+              ...(this.piCommand.env ?? {}),
+            }),
+            workerEnvFromVault(this.vaultDir, id),
+          ),
+          this.piCommand.executable,
         ),
-        this.piCommand.executable,
-      ),
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let resolveExit!: () => void;
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      spawnedChild = child;
+      let resolveSpawnedChildExit!: () => void;
+      const spawnedChildExit = new Promise<void>((resolve) => {
+        resolveSpawnedChildExit = resolve;
+      });
+      child.once("close", resolveSpawnedChildExit);
+      rollback.push(async () => {
+        const live = rollbackLive;
+        if (live) {
+          // Rollback owns this child; its close callback must not project a
+          // terminal turn or trigger a queue drain for an uninstalled live.
+          live.exiting = true;
+          if (this.live.get(id) === live) this.live.delete(id);
+          live.compaction.dispose();
+          await this.stopLiveProcess(live).catch(() => undefined);
+          return;
+        }
+        await this.stopLiveProcess({ process: spawnedChild, exit: spawnedChildExit } as Live).catch(() => undefined);
+      });
+      let resolveExit!: () => void;
     const exit = new Promise<void>((resolve) => {
       resolveExit = resolve;
     });
     let live!: Live;
-    live = {
-      session,
+      live = {
+        session,
+        runtimeToken: generation,
+        spawnInitializing: true,
       path: found.path,
       cwd: spawnCwd,
       process: child,
@@ -4274,7 +5072,7 @@ export class PiHostBackend implements HostBackend {
           // pi reports the scheduler's compact RPC as `reason: "manual"`; this
           // intent is what lets compaction_start attribute it to proactive idle.
           live.compactionIntent = "proactive_idle";
-          return this.command(id, { type: "compact" }).finally(() => {
+          return this.command(id, { type: "compact" }, false, live.runtimeToken).finally(() => {
             // Request/lifecycle ownership: pi emits `compaction_start`
             // synchronously before doing any work and settles the compact RPC
             // only after the whole lifecycle, so an intent still ours here was
@@ -4285,9 +5083,10 @@ export class PiHostBackend implements HostBackend {
           });
         },
       }),
-    };
-    this.live.set(id, live);
-    child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
+      };
+      rollbackLive = live;
+      this.live.set(id, live);
+      child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
     child.stderr.on("data", (chunk) => {
       live!.stderrTail = (live!.stderrTail + chunk.toString()).slice(-PI_STDERR_TAIL_LIMIT);
     });
@@ -4300,29 +5099,34 @@ export class PiHostBackend implements HostBackend {
       const reason = new PiExitedError(code, signal, live!.stderrTail);
       live!.exitError = reason;
       failPending(reason);
-      this.bridge.unregister(id);
-      this.toolBatchTelemetry.flushSession(id);
-      // Pi sometimes writes the final assistant message and exits without
-      // `agent_settled`. Without this the UI stays 进行中 forever.
-      if (!this.closed && this.queue.isBusy(id))
-        this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled");
+      const lifecycleCurrent = this.sessionRuntimeTokenIsCurrent(id, live.runtimeToken);
+      if (lifecycleCurrent) {
+        this.bridge.unregister(id);
+        this.extensions.unmountSession(id);
+        this.toolBatchTelemetry.flushSession(id);
+        // Pi sometimes writes the final assistant message and exits without
+        // `agent_settled`. Without this the UI stays 进行中 forever. Rollback
+        // and teardown-owned closes are not completed turns.
+        if (!live.exiting && !live.spawnInitializing && this.queue.isBusy(id))
+          this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled");
+      }
       live.compaction.dispose();
       // A dead writer cannot still be compacting; drop the drain gate so FIFO
       // is not wedged waiting for a compaction_end that will never arrive.
-      this.queue.clearCompacting(id);
+      if (lifecycleCurrent && !live.exiting && !live.spawnInitializing) this.queue.clearCompacting(id, live.runtimeToken);
       const finish = () => {
         const stillCurrent = this.live.get(id) === live;
         if (stillCurrent) this.live.delete(id);
         resolveExit();
+        if (!lifecycleCurrent || live.exiting || live.spawnInitializing) return;
         this.reconcileOrphanedNow(id);
-        if (this.closed) return;
         // A dead writer cannot still own the turn. Passing its (possibly
         // stale) epoch into notifyIdle used to be ignored when the queue had
         // minted a newer epoch, leaving FIFO parked with no process to settle.
         // A replacement live may already own a newer turn — keep the epoch
         // fence only in that case.
-        if (stillCurrent) void this.queueIdle(id);
-        else void this.queueIdle(id, live.turnEpoch);
+        if (stillCurrent) void this.queueIdle(id, undefined, live.runtimeToken);
+        else void this.queueIdle(id, live.turnEpoch, live.runtimeToken);
       };
       // Keep the writer lease after Pi exits. Releasing here let another
       // pipiui-electron (dev:browser, a second App) steal the file while this
@@ -4330,12 +5134,11 @@ export class PiHostBackend implements HostBackend {
       // "session is read-only: held by pipiui-electron".
       finish();
     });
-    if (this.closed) {
-      await this.stopLiveProcess(live);
-      throw new Error("host backend closed");
-    }
-    if (desired.model.provider !== "unknown" && desired.model.id !== "unknown")
+    this.assertSessionGeneration(id, generation);
+    if (desired.model.provider !== "unknown" && desired.model.id !== "unknown") {
       await this.selectExactModel(live, desired.model.provider, desired.model.id);
+      this.assertSessionGeneration(id, generation);
+    }
     const spawnThinkingLevel = resolveThinkingLevel(
       desired.thinkingLevel,
       desired.availableThinkingLevels,
@@ -4346,9 +5149,22 @@ export class PiHostBackend implements HostBackend {
         type: "set_thinking_level",
         level: spawnThinkingLevel,
       });
+      this.assertSessionGeneration(id, generation);
     }
-    await this.refreshState(live);
-    return live;
+      await this.refreshState(live);
+      this.assertSessionGeneration(id, generation);
+      live.spawnInitializing = false;
+      return live;
+    } catch (error) {
+      for (const rollbackStep of rollback.reverse()) {
+        try {
+          await rollbackStep();
+        } catch {
+          /* preserve the spawn failure while every acquired resource is best-effort released */
+        }
+      }
+      throw error;
+    }
   }
   private lines(live: Live, chunk: string) {
     if (this.projectionDebugEnabled()) this.projectionDebugLine(`[stream-debug] stdout session=${this.projectionDebugSessionTag(live.session.id)} t=${Date.now()} bytes=${chunk.length}`, "log");
@@ -4366,6 +5182,10 @@ export class PiHostBackend implements HostBackend {
     }
   }
   private rpcEvent(live: Live, e: Rpc) {
+    // stdout can still deliver after child close/teardown. The child carries
+    // the lifecycle identity it was born under; absence or mismatch rejects
+    // every late event before it can touch queue, telemetry, or projections.
+    if (!this.sessionRuntimeTokenIsCurrent(live.session.id, live.runtimeToken)) return;
     try {
       const model =
         this.sessionModelStates.get(live.session.id)?.model
@@ -4378,6 +5198,11 @@ export class PiHostBackend implements HostBackend {
       });
     } catch {
       /* best-effort telemetry must not affect the live stream */
+    }
+    try {
+      this.turnTelemetry.observeRpc(live.session.id, e);
+    } catch {
+      /* timing telemetry is observational only */
     }
     if (this.extensionUi.handleRpc(live.session.id, e)) return;
     if (e.type === "agent_event" || e.type === "pipiui_agent_event") {
@@ -4401,14 +5226,14 @@ export class PiHostBackend implements HostBackend {
       // Must be synchronous: fake-pi/real Pi emit agent_start and agent_settled
       // in the same stdout chunk. An async markBusy lets the settle run with a
       // stale epoch and drop the drain that should release the next queued item.
-      live.turnEpoch = this.queue.markBusy(id);
+      live.turnEpoch = this.queue.markBusy(id, live.runtimeToken);
       live.lastTurnActivityAt = Date.now();
       live.pendingFinalReconciliation = undefined;
       // A fresh turn invalidates the previous turn's tool identities.
       live.toolNames.clear();
       if (!this.queueLoads.has(id)) {
         // Load only for queue restoration; do not re-mark busy (second epoch would strand the turn).
-        void this.loadQueue(id).catch((error) => {
+        void this.loadQueue(id, live.runtimeToken).catch((error) => {
           console.warn(`[pipi-backend] agent_start queue load failed for ${id}: ${error instanceof Error ? error.message : String(error)}`);
         });
       }
@@ -4428,10 +5253,10 @@ export class PiHostBackend implements HostBackend {
         turnEpoch: live.turnEpoch,
       });
     } else if (e.type === "agent_settled") {
-      this.requestSessionRedact(id);
+      this.requestSessionRedact(id, live.runtimeToken);
       this.projectTurnTerminal(live, live.hostAbortedTurn ? "stopped" : "settled", true);
     } else if (e.type === "agent_stopped" || e.type === "agent_error") {
-      this.requestSessionRedact(id);
+      this.requestSessionRedact(id, live.runtimeToken);
       this.projectTurnTerminal(live, "stopped");
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
@@ -4439,11 +5264,11 @@ export class PiHostBackend implements HostBackend {
       // and let a prompt reach pi mid-compaction. The queue's compact gate is
       // independent of turn epochs so restoreQueue cannot clear it.
       const turnAlreadyHeld = this.queue.isBusy(id);
-      this.queue.markCompacting(id);
+      this.queue.markCompacting(id, live.runtimeToken);
       if (!turnAlreadyHeld) {
         live.compactionHoldsQueue = true;
         if (!this.queueLoads.has(id)) {
-          void this.loadQueue(id).catch((error) => {
+          void this.loadQueue(id, live.runtimeToken).catch((error) => {
             console.warn(`[pipi-backend] compaction_start queue load failed for ${id}: ${error instanceof Error ? error.message : String(error)}`);
           });
         }
@@ -4539,10 +5364,10 @@ export class PiHostBackend implements HostBackend {
         });
       }
       live.compaction.compactionFinished(!aborted && !error);
-      this.queue.clearCompacting(id);
+      this.queue.clearCompacting(id, live.runtimeToken);
       if (live.compactionHoldsQueue) {
         live.compactionHoldsQueue = false;
-        void this.queueIdle(id);
+        void this.queueIdle(id, undefined, live.runtimeToken);
       }
       this.stream({
         type: "compaction",
@@ -4868,6 +5693,7 @@ export class PiHostBackend implements HostBackend {
     if (epoch === undefined || live.terminalEpoch === epoch) return false;
     live.terminalEpoch = epoch;
     live.pendingFinalReconciliation = undefined;
+    this.turnTelemetry.terminal(live.session.id, status);
     this.stopEscalation.cancel(live.session.id);
     // The durable agent index is authoritative at a terminal boundary. Replay
     // its current session view so a renderer that missed an end event cannot
@@ -4909,7 +5735,7 @@ export class PiHostBackend implements HostBackend {
       listeners: this.listeners.size,
       ...this.projectionDebugActive(live.session.id),
     });
-    void this.queueIdle(live.session.id, epoch);
+    void this.queueIdle(live.session.id, epoch, live.runtimeToken);
     // A compact lifecycle that omitted its end event must not wedge the
     // scheduler; terminal projection is the final authority for this turn.
     if (live.activeCompactionDiagnostics) {
@@ -4933,6 +5759,7 @@ export class PiHostBackend implements HostBackend {
     }
     live.compaction.settleTurn();
     if (pushStats) void this.pushSessionStats(live.session.id);
+    else this.turnTelemetry.flushTerminal(live.session.id);
     return true;
   }
   private terminalReconciliationHasPendingWork(live: Live, state: any): boolean {
@@ -5203,13 +6030,14 @@ export class PiHostBackend implements HostBackend {
       );
     });
   }
-  private async command(id: string, body: Rpc, retried = false): Promise<any> {
+  private async command(id: string, body: Rpc, retried = false, expectedToken?: unknown): Promise<any> {
+    if (expectedToken !== undefined && !this.sessionRuntimeTokenIsCurrent(id, expectedToken)) return;
     if (body.type === "abort") {
       const live = this.live.get(id);
       if (!live || !this.liveProcessUsable(live)) return;
       return this.writeCommand(live, body);
     }
-    const live = await this.ensure(id);
+    const live = await this.ensure(id, expectedToken);
     if (!this.liveProcessUsable(live)) {
       await (live.exit ?? Promise.resolve());
       if (this.live.get(id) === live) this.live.delete(id);
@@ -5220,7 +6048,7 @@ export class PiHostBackend implements HostBackend {
           live.stderrTail,
         );
       }
-      return this.command(id, body, true);
+      return this.command(id, body, true, expectedToken);
     }
     return this.writeCommand(live, body);
   }
@@ -7697,60 +8525,105 @@ export class PiHostBackend implements HostBackend {
     id: string,
     payload: QueuedDispatchPayload,
     behavior: DispatchBehavior,
+    lifecycleToken?: unknown,
   ) {
-    await this.requireLease(id);
-    const live = await this.ensure(id);
-    if (behavior === "prompt" && payload.text.trim()) {
-      await this.startAutomaticSessionTitle(live, payload.text);
-    }
-    const attachments = payload.attachments as PromptAttachment[];
-    const plan = attachments.length && behavior !== "follow_up"
-      ? await this.visionDescribePlan(live)
-      : { active: false, visionRef: null };
-    const promptText = prependDocumentInjection(payload.text, this.documentInjections.takePending(id));
-    const message = attachments.length
-      ? await this.prepareImageMessage(live, promptText, attachments, plan.active)
-      : promptText;
-    const body: Rpc = {
-      type:
-        behavior === "steer"
-          ? "steer"
-          : behavior === "follow_up"
-            ? "follow_up"
-            : "prompt",
-      message,
-    };
-    let described = false;
-    if (plan.active && plan.visionRef) {
-      const description = await this.describeAttachments(live, plan.visionRef, attachments, payload.text);
-      if (description) {
-        described = true;
-        body.message = `${body.message}\n\n${description}`;
-      }
-    }
-    if (attachments.length && behavior !== "follow_up" && !described)
-      body.images = attachments.map((a) => ({
-        type: "image",
-        data: a.dataBase64,
-        mimeType: a.mimeType,
-      }));
-    if (payload.text.trim() && behavior !== "steer") {
-      live.pendingDrainPrompt = payload.text;
-    }
+    // Only regular user prompts define a new main turn. Steer/follow-up RPCs
+    // belong to an already-running turn and would otherwise corrupt its phase
+    // boundary with a second correlation id. The token is captured before the
+    // first await so a late dispatch cannot join a recreated session.
+    const runtimeToken = lifecycleToken !== undefined
+      ? lifecycleToken
+      : this.sessionRuntimeToken(id);
+    this.assertSessionRuntimeToken(id, runtimeToken);
+    // Keep the historical local name for the existing dispatch fences; it now
+    // carries the process-monotonic lifecycle token.
+    const generation = runtimeToken;
+    const recordTurn = behavior === "prompt";
+    if (recordTurn) this.turnTelemetry.beginDispatch(id, payload.turnTelemetry);
+    let leaseAttempt: SessionLeaseAttempt | undefined;
+    let leaseCommitted = false;
     try {
-      this.structuredOutputs?.assertReadyToSend(id);
-      await this.command(id, body);
-    } catch (error) {
-      if (body.type !== "prompt" || !isAlreadyProcessingError(error)) {
-        if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
-        throw error;
+      leaseAttempt = await this.requireLease(id, generation);
+      this.assertSessionGeneration(id, generation);
+      // This check is the linearization point for a queued dispatch: teardown
+      // can revoke it while lease acquisition is paused, before ensure() runs.
+      const live = await this.ensure(id, generation);
+      this.assertSessionGeneration(id, generation);
+      if (behavior === "prompt" && payload.text.trim()) {
+        await this.startAutomaticSessionTitle(live, payload.text);
+        this.assertSessionGeneration(id, generation);
       }
-      // Queue thought the session was idle (stale settle, follow-up already
-      // running). Pi is the authority: re-send with the behavior it asked for
-      // instead of surfacing the raw RPC error to the composer.
-      await this.command(id, { ...body, streamingBehavior: "followUp" });
+      const attachments = payload.attachments as PromptAttachment[];
+      const plan = attachments.length && behavior !== "follow_up"
+        ? await this.visionDescribePlan(live)
+        : { active: false, visionRef: null };
+      this.assertSessionGeneration(id, generation);
+      const promptText = prependDocumentInjection(payload.text, this.documentInjections.takePending(id));
+      const message = attachments.length
+        ? await this.prepareImageMessage(live, promptText, attachments, plan.active)
+        : promptText;
+      this.assertSessionGeneration(id, generation);
+      const body: Rpc = {
+        type:
+          behavior === "steer"
+            ? "steer"
+            : behavior === "follow_up"
+              ? "follow_up"
+              : "prompt",
+        message,
+      };
+      let described = false;
+      if (plan.active && plan.visionRef) {
+        const description = await this.describeAttachments(live, plan.visionRef, attachments, payload.text);
+        this.assertSessionGeneration(id, generation);
+        if (description) {
+          described = true;
+          body.message = `${body.message}\n\n${description}`;
+        }
+      }
+      if (attachments.length && behavior !== "follow_up" && !described)
+        body.images = attachments.map((a) => ({
+          type: "image",
+          data: a.dataBase64,
+          mimeType: a.mimeType,
+        }));
+      if (payload.text.trim() && behavior !== "steer") {
+        live.pendingDrainPrompt = payload.text;
+      }
+      if (recordTurn) {
+        // This is the byte size of the JSON RPC written to Pi, not a provider
+        // request/context estimate. Only the number is retained.
+        this.turnTelemetry.preparationComplete(id, Buffer.byteLength(JSON.stringify(body), "utf8"));
+        this.turnTelemetry.dispatchStarted(id);
+      }
+      try {
+        this.structuredOutputs?.assertReadyToSend(id);
+        this.assertSessionGeneration(id, generation);
+        await this.command(id, body, false, runtimeToken);
+        this.assertSessionGeneration(id, generation);
+      } catch (error) {
+        if (body.type !== "prompt" || !isAlreadyProcessingError(error)) {
+          if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
+          throw error;
+        }
+        // Queue thought the session was idle (stale settle, follow-up already
+        // running). Pi is the authority: re-send with the behavior it asked for
+        // instead of surfacing the raw RPC error to the composer.
+        this.assertSessionGeneration(id, generation);
+        await this.command(id, { ...body, streamingBehavior: "followUp" }, false, runtimeToken);
+        this.assertSessionGeneration(id, generation);
+      }
+      this.assertSessionGeneration(id, generation);
+      if (recordTurn) this.turnTelemetry.dispatchAccepted(id);
+      if (behavior === "steer" && payload.text.trim()) this.noteUnconfirmedSteer(id, payload);
+      leaseCommitted = true;
+    } catch (error) {
+      if (!leaseCommitted) await this.rollbackSessionLeaseAttempt(leaseAttempt);
+      // A revoked dispatch must not terminalize telemetry belonging to a new
+      // lifecycle that reused this session id.
+      if (recordTurn && this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) this.turnTelemetry.failDispatch(id);
+      throw error;
     }
-    if (behavior === "steer" && payload.text.trim()) this.noteUnconfirmedSteer(id, payload);
   }
 
   // --- Steer delivery receipts -----------------------------------------
@@ -7783,7 +8656,7 @@ export class PiHostBackend implements HostBackend {
     const pending = this.unconfirmedSteers.get(id);
     if (!pending?.length) return;
     this.unconfirmedSteers.delete(id);
-    const restored = this.queue.requeueAtHead(id, pending.map(item => ({ text: item.text, attachments: item.attachments })));
+    const restored = this.queue.requeueAtHead(id, pending.map(item => ({ text: item.text, attachments: item.attachments })), this.sessionRuntimeToken(id));
     for (const item of restored) {
       console.warn(`[pipi-backend] steer requeued session=${id} id=${item.id} text=${previewSteerText(item.text)}`);
     }
@@ -7872,6 +8745,7 @@ export class PiHostBackend implements HostBackend {
     this.assertNotArchived(id);
     // Explicit user input lifts manual-stop revival suppression.
     this.noteExplicitUserSend(id);
+    this.beginSessionRuntime(id);
     await this.dispatchQueuedMessage(
       id,
       { text: prompt, attachments: [] },
@@ -7951,32 +8825,43 @@ export class PiHostBackend implements HostBackend {
       | { type: "thinking_level_change"; thinkingLevel: ThinkingLevel },
   ): Promise<void> {
     const meta = await this.findSession(sessionId);
-    const status = await this.leaseFor(meta).acquire();
-    if (!status.writable)
-      throw new Error(`session is read-only: held by ${status.holder?.holder ?? "another writer"}`);
-    await this.sessionFileExclusive(sessionId)(async () => {
-      const parentId = await lastJsonlEntryId(meta.path);
-      await fs.appendFile(
-        meta.path,
-        `${JSON.stringify({
-          ...row,
-          id: crypto.randomUUID(),
-          parentId,
-          timestamp: new Date().toISOString(),
-        })}\n`,
-      );
-      const stat = await fs.stat(meta.path);
-      this.rememberSessionMeta(
-        {
-          ...meta,
-          updatedAt: Date.now(),
-          model: row.type === "model_change" ? { provider: row.provider, modelId: row.modelId } : meta.model,
-          thinkingLevel: row.type === "thinking_level_change" ? row.thinkingLevel : meta.thinkingLevel,
-        },
-        stat.size,
-        stat.mtimeMs,
-      );
-    });
+    const runtimeToken = this.beginSessionRuntime(sessionId);
+    this.assertSessionRuntimeToken(sessionId, runtimeToken);
+    const { attempt } = await this.acquireSessionLease(meta, runtimeToken);
+    let committed = false;
+    try {
+      await this.sessionFileExclusive(sessionId, runtimeToken)(async () => {
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
+        const parentId = await lastJsonlEntryId(meta.path);
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
+        await fs.appendFile(
+          meta.path,
+          `${JSON.stringify({
+            ...row,
+            id: crypto.randomUUID(),
+            parentId,
+            timestamp: new Date().toISOString(),
+          })}\n`,
+        );
+        committed = true;
+        const stat = await fs.stat(meta.path);
+        this.assertSessionRuntimeToken(sessionId, runtimeToken);
+        this.rememberSessionMeta(
+          {
+            ...meta,
+            updatedAt: Date.now(),
+            model: row.type === "model_change" ? { provider: row.provider, modelId: row.modelId } : meta.model,
+            thinkingLevel: row.type === "thinking_level_change" ? row.thinkingLevel : meta.thinkingLevel,
+          },
+          stat.size,
+          stat.mtimeMs,
+        );
+      });
+      this.assertSessionRuntimeToken(sessionId, runtimeToken);
+    } catch (error) {
+      if (!committed) await this.rollbackSessionLeaseAttempt(attempt);
+      throw error;
+    }
   }
   private async setModel(sessionId: string, provider: string, modelId: string) {
     await this.loadModelCatalog();
@@ -8175,6 +9060,7 @@ export class PiHostBackend implements HostBackend {
     const state = cachedState ?? this.desiredModelFor(await this.findSession(id));
     this.sessionModelSnapshots.set(id, state);
     const known = this.sessionContextLastKnown.get(id);
+    const performance = this.turnTelemetry.sessionPerformance(id);
     return {
       sessionId: id,
       tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
@@ -8190,6 +9076,7 @@ export class PiHostBackend implements HostBackend {
         state.model.provider === "unknown" && state.model.id === "unknown"
           ? undefined
           : { provider: state.model.provider, id: state.model.id, name: state.model.name },
+      ...(performance ? { performance } : {}),
     };
   }
   /**
@@ -8257,6 +9144,17 @@ export class PiHostBackend implements HostBackend {
         };
       }
     }
+    // Only a fresh Pi context payload is a per-turn context sample. The
+    // renderer-facing fallback above is useful UI state but not telemetry.
+    this.turnTelemetry.observeSessionStats(id, {
+      contextTokens: liveUsage?.tokens,
+      contextWindow: liveUsage?.contextWindow,
+    });
+    // Post-settle stats are the last chance to attach an actual context sample
+    // before the terminal row is serialized and its performance aggregate is
+    // projected below. During a live turn this is intentionally a no-op.
+    this.turnTelemetry.flushTerminal(id);
+    const performance = this.turnTelemetry.sessionPerformance(id);
     const stats: SessionStats = {
       sessionId: id,
       tokens: {
@@ -8284,6 +9182,7 @@ export class PiHostBackend implements HostBackend {
         model.provider === "unknown" && model.id === "unknown"
           ? undefined
           : { provider: model.provider, id: model.id, name: model.name },
+      ...(performance ? { performance } : {}),
     };
     if (generation !== undefined)
       this.live.get(id)?.compaction.observeUsage(stats.contextUsage, generation);
@@ -8309,7 +9208,9 @@ export class PiHostBackend implements HostBackend {
    * finished the compaction; `compaction` stream events carry the progress.
    */
   private async compactSession(id: string): Promise<void> {
-    const live = await this.ensure(id);
+    const runtimeToken = this.beginSessionRuntime(id);
+    const live = await this.ensure(id, runtimeToken);
+    this.assertSessionRuntimeToken(id, runtimeToken);
     // The pending quiet-period timer is only a hint; an explicit compact
     // supersedes it rather than racing a second one behind it.
     live.compaction.cancel();
@@ -8320,7 +9221,7 @@ export class PiHostBackend implements HostBackend {
     // it instead of leaking the attribution onto the next compaction.
     live.compactionIntent = "manual";
     try {
-      await this.command(live.session.id, { type: "compact" });
+      await this.command(live.session.id, { type: "compact" }, false, runtimeToken);
     } finally {
       if (live.compactionIntent === "manual") live.compactionIntent = undefined;
     }
@@ -8336,6 +9237,10 @@ export class PiHostBackend implements HostBackend {
       });
     } catch {
       /* a missed snapshot is fine; getSessionStats returns the same data on demand */
+    } finally {
+      // A failed stats RPC must not turn telemetry into an unbounded in-memory
+      // queue; it merely leaves unavailable context/token fields absent.
+      this.turnTelemetry.flushTerminal(id);
     }
   }
   private agents = new Map<string, AgentSummary>();
@@ -8809,6 +9714,9 @@ export class PiHostBackend implements HostBackend {
     const running = [...this.agents.values()].filter(
       (agent) => agent.sessionId === sessionId && agent.state === "running",
     );
+    // There is no subagent work to abort, so do not make host shutdown wait for
+    // a main Pi child that may already be unresponsive.
+    if (running.length === 0) return;
     const target = this.live.get(sessionId);
     if (!target || !this.liveProcessUsable(target)) {
       for (const agent of running) {
