@@ -272,6 +272,31 @@ test("failed completion cannot be held by wait", async () => {
 	assert.equal(h.current[0]?.publicText, publicText);
 });
 
+test("failed completion is forwarded to Boss when Supervisor says forward", async () => {
+	const h = harness({
+		decide: () => ({ action: "forward", reason: "worker failed; notify Boss immediately" }),
+		active: 2,
+	});
+	const publicText = "[subagent-done] agentId=worker-a ok=false provider stall";
+	const result = await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({
+			agentId: "worker-a",
+			runId: "run-1",
+			status: "failed",
+			verify: "none",
+		}), "failed-job"),
+		wave: { waveId: "wave-forward-fail", running: 1, completed: 0, failed: 1, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-forward-fail",
+		publicText,
+	}));
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(h.current.length, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+	// 失败必须被 boss 感知，不得记成 supervisor 已处理
+	assert.equal(result.createBossObligation, true);
+});
+
 test("Supervisor failure on a completion fail-opens to the original done text", async () => {
 	const h = harness({
 		fail: new Error("provider 429"),

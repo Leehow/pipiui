@@ -818,7 +818,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			return result;
 		}
 
-		if (!abnormalTerminal && request.kind === "completion" && action.kind === "wait" && !isSuccessfulSupervisorCompletion(request)) {
+		if (!abnormalTerminal && request.kind === "completion" && (action.kind === "wait" || action.kind === "forward") && !isSuccessfulSupervisorCompletion(request)) {
 			return acceptBossWake(
 				request,
 				event,
