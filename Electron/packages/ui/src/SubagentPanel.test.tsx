@@ -1761,6 +1761,40 @@ describe('SubagentPanel', () => {
     expect(screen.getAllByText(/收尾中：验证/).length).toBeGreaterThan(0)
   })
 
+  it('stops streaming a large expanded transcript once the final answer enters closeout', async () => {
+    const harness = hostHarness()
+    const now = Date.now()
+    harness.host.listAgents = async () => [{
+      agentId: 'closing-report', runId: 'r-close-report', sessionId: 'session-1',
+      name: 'explore', task: 'write a large report', state: 'running',
+      createdAt: now - 180_000, updatedAt: now,
+      diagnostics: { finalizationPhase: 'final-received', phaseSince: now - 2_000 },
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} />)
+
+    await screen.findByTestId('agent-row-closing-report')
+    await waitFor(() => expect(harness.hasLogSubscriber('closing-report')).toBe(true))
+    for (let index = 0; index < 56; index += 1) {
+      harness.emitLog('closing-report', {
+        type: 'agent_log', agentId: 'closing-report', runId: 'r-close-report', sessionId: 'session-1',
+        itemType: 'tool', name: 'grep', text: `{"pattern":"evidence-${index}"}`, contentIndex: index * 2,
+      })
+      harness.emitLog('closing-report', {
+        type: 'agent_log', agentId: 'closing-report', runId: 'r-close-report', sessionId: 'session-1',
+        itemType: 'toolResult', name: 'grep', text: `match-${index}`, contentIndex: index * 2 + 1,
+      })
+    }
+    harness.emitLog('closing-report', {
+      type: 'agent_log', agentId: 'closing-report', runId: 'r-close-report', sessionId: 'session-1',
+      itemType: 'text', text: `# Final report\n\n${'| source | finding |\n| --- | --- |\n| file | result |\n'.repeat(80)}`, contentIndex: 112,
+    })
+
+    const group = await screen.findByRole('button', { name: /56 个步骤/ })
+    expect(group.closest('[data-activity-card]')?.getAttribute('data-activity-status')).toBe('ok')
+    fireEvent.click(group)
+    expect(await screen.findByText('Final report')).toBeTruthy()
+  })
+
   it('stalled list still shows closeout after final-received instead of ordinary stall copy', async () => {
     const harness = hostHarness()
     const now = Date.now()

@@ -12,7 +12,7 @@ import { AssistantTranscriptContent, type AssistantTranscriptMessage, type Trans
 import genericAgentIcon from './sf-icons/person-2.png'
 import type { AgentEvent, AgentState, AgentSummary, CostUnit, PipiHostAPI, WorktreeStatus } from '@pipi/host-api'
 import { diagnoseAgentProgress } from './agent-stall-diagnostics'
-import { formatFinalizationLine, liveRunningProgressLine } from './agent-finalization'
+import { formatFinalizationLine, isTerminalFinalizingPhase, liveRunningProgressLine } from './agent-finalization'
 import { staleRunningAgentIDs, statusChannelWarningText } from './subagent-status-check'
 
 type Log = {
@@ -480,7 +480,11 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
       thinking: activities.find((activity): activity is Extract<TranscriptActivity, { type: 'thinking' }> => activity.type === 'thinking')?.content,
       tools: tools.length > 0 ? tools : undefined,
       activities: hasSteps ? activities : undefined,
-      streaming: isActive(agent)
+      // The worker may keep running through verification/merge closeout after its
+      // final prose is complete. Streamdown's streaming parser is only for text
+      // that can still grow; reparsing a finished large report during closeout can
+      // starve input and delay the already-arrived terminal state in the renderer.
+      streaming: isActive(agent) && !isTerminalFinalizingPhase(agent.diagnostics?.finalizationPhase)
     })
   }
   if (finalResult && finalResult.trim() && !activities.some(activity => activity.type === 'text' && activity.content.includes(finalResult.trim()))) {
