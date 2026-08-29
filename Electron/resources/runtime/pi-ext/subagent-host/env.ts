@@ -65,12 +65,5 @@ export function buildSubagentEnvironmentV1(input: HostCapabilitiesV1 | unknown):
 		env.PIPIUI_SEARCH_GRANT_FILE = platform.search.grantFile;
 	}
 	if (platform?.memory?.available) env.PIPIUI_MEMORY_BROKER_ENABLED = "1";
-	if (platform?.computer?.available && paths.computer && platform.computer.routingCapability) {
-		env.PIPIUI_COMPUTER_EXT = paths.computer;
-		env.PIPIUI_COMPUTER_CAPABILITY = platform.computer.routingCapability;
-		if (platform.computer.protocolVersion !== undefined) {
-			env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL = String(platform.computer.protocolVersion);
-		}
-	}
 	return { ok: true, value: env, diagnostics: decoded.diagnostics };
 }

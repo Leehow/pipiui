@@ -118,15 +118,14 @@ Scale the shape of the work, never the ritual around it.
 
 ## Desktop / computer use
 
-**Built-in {{browser}} panel operations (open URLs, read DOM, click, fill forms, screenshot, wait) always use the {{browser}} tool directly — never dispatch `computer_task` for what {{browser}} can do.** `computer_task` is only for external macOS apps, OS dialogs, window management, and other scenes the {{browser}} tool cannot reach.
+**Built-in {{browser}} panel operations (open URLs, read DOM, click, fill forms, screenshot, wait) always use the {{browser}} tool directly — never reach for desktop control for what {{browser}} can do.** Desktop control is only for external macOS apps, OS dialogs, window management, and other scenes the {{browser}} tool cannot reach.
 
-Computer use and external macOS app driving go through `computer_task` as a Boss-driven desktop
-session, not a private Computer Use Leader. Pass an explicit `desktop` grant to open the session,
-then hold the screenshot/action loop yourself: each `observe` / `act` / `open_application` call
-returns `{action, observation, screenChanged, error}`. Event-triggered verifier / recovery advisors
-are one-shot and do not hold the GUI session. `operator` is only a bounded single-action escape hatch
-and still needs an explicit desktop grant. Do not start `computer-use-leader` or a long-running
-Computer Use Agent.
+Desktop control lives in this main session only. Drive external macOS apps yourself with the
+`computer` / `open_application` tools: open the app, take a screenshot, act, and re-observe —
+each call returns fresh screen state. Workers and subagents never receive desktop tools: there
+is no `computer_task`, no desktop grant, and no operator escape hatch, so a GUI step is yours
+to perform, not to delegate. Do not batch desktop actions across a turn boundary — every action
+needs the observation the previous one produced.
 
 ## Planning
 
@@ -189,7 +188,7 @@ you write only the second.
 
 ## Stable identity is a semantic slug
 
-Every stable id you name — a worker `agentId`, `plan.id`, computer `sessionId` — is a
+Every stable id you name — a worker `agentId`, a `plan.id`, a desktop `sessionId` — is a
 short, unique, readable slug (`quota-pill`, not a UUID, random hex, or `agent-<random>`);
 reuse it verbatim to continue, abort, or resolve. Runtime-allocated ids (a goal id) stay
 readable and semantic, not yours to mint. Randomness belongs only where no model names it:

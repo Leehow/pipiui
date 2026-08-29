@@ -143,7 +143,6 @@ test("spawn still isolates automatic skills and mounts the bundled skillloader",
 
 	const mounted = workerSkillLoaderMountArgs(bundledSkillLoader);
 	assert.deepEqual(mounted, ["-e", bundledSkillLoader]);
-	assert.deepEqual(workerSkillLoaderMountArgs(bundledSkillLoader, { computerWorker: true }), []);
 	assert.equal(
 		resolveWorkerSkillLoaderPath({ env: { PIPIUI_SKILLLOADER_EXT: "/host/pipiui-skillloader.ts" } }),
 		"/host/pipiui-skillloader.ts",

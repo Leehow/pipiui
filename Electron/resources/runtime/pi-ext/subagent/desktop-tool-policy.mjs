@@ -36,8 +36,9 @@ export const SESSION_RECALL_TOOL_NAME = "session_recall";
 // receives these tools, whatever its frontmatter or the denylist says.
 const RESERVED_DESKTOP_TOOLS = new Set(RESERVED_DESKTOP_TOOL_NAMES);
 
-/** Remove generic denylist entries that must be controlled only by the global
- * Computer Use button. The returned names are unique and sorted. */
+/** Drop generic denylist entries for main-session-only desktop tools: a
+ * dispatched child never carries them, so a stale entry is noise, not a gate.
+ * The returned names are unique and sorted. */
 export function sanitizeDisabledToolNames(names) {
 	return [...new Set(
 		[...(names ?? [])].filter(
@@ -195,15 +196,14 @@ export function resolveWorkerSkillLoaderPath({
 	return undefined;
 }
 
-export function workerSkillLoaderMountArgs(skillLoaderPath, { computerWorker = false } = {}) {
-	if (computerWorker || !skillLoaderPath) return [];
+export function workerSkillLoaderMountArgs(skillLoaderPath) {
+	if (!skillLoaderPath) return [];
 	return ["-e", skillLoaderPath];
 }
 
 export function resolveSubagentToolSelection({
 	declaredTools,
 	disabledTools,
-	hasDesktopCapability,
 	hasMemoryBrokerCapability = false,
 	hasSessionRecall = false,
 	hasSkillLoader = false,
@@ -220,8 +220,8 @@ export function resolveSubagentToolSelection({
 	);
 	// An array (including []) means a v1/explicit constrained policy. Undefined
 	// is the legacy no-`tools` form and intentionally keeps its old exclude-list
-	// behavior. Desktop names are never trusted from frontmatter: only a real
-	// dispatch grant adds them below.
+	// behavior. Desktop names are main-session-only and are never trusted from
+	// frontmatter.
 	if (Array.isArray(declaredTools)) {
 		const allowed = new Set(
 			declaredTools.filter(
@@ -232,9 +232,6 @@ export function resolveSubagentToolSelection({
 					(!PIPIUI_EXTENSION_ONLY_TOOL_SET.has(name) || available.has(name)),
 			),
 		);
-		if (hasDesktopCapability) {
-			for (const name of RESERVED_DESKTOP_TOOL_NAMES) allowed.add(name);
-		}
 		// Host-issued capability, not frontmatter, grants the bounded read-only
 		// broker tools. Dead names are stripped when the capability is absent.
 		// There are no broker durable-write tool names here.
@@ -265,11 +262,8 @@ export function resolveSubagentToolSelection({
 	if (!allowRecursiveDelegation) {
 		for (const name of DELEGATION_TOOL_NAMES) disabled.add(name);
 	}
-	// Even a legacy unconstrained worker cannot surface a provider/custom
-	// desktop tool unless the host AND this dispatch granted it.
-	if (!hasDesktopCapability) {
-		for (const name of RESERVED_DESKTOP_TOOL_NAMES) disabled.add(name);
-	}
+	// Even a legacy unconstrained worker never surfaces a main-session desktop tool.
+	for (const name of RESERVED_DESKTOP_TOOL_NAMES) disabled.add(name);
 	return {
 		flag: "--exclude-tools",
 		names: [...disabled].sort(),
