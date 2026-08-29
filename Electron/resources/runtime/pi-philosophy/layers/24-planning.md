@@ -67,7 +67,9 @@ untouched: grilling is never a gate for ordinary work.
    document; the transcript remains the primary presentation.
 3. **Publish** the structured plan as runtime data with `plan_publish`, carrying a **stable
    unique `plan.id`**, a title that names the whole spec, and ordered tasks with stable task
-   ids and initial states. The task list MUST cover the spec's entire scope — usually one
+   ids and initial states. If the request or its acceptance criteria are ambiguous, ask the
+   user first and only publish after the answer — a guessed plan is worse than no plan. The
+   task list MUST cover the spec's entire scope — usually one
    top-level task per executable phase or milestone. Publishing only the first implementation
    wave (e.g. 阶段0+1) as if it were the plan is forbidden; later phases belong on this same
    list as pending tasks. Then stop.
