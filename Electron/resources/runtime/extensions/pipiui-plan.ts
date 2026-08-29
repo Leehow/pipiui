@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { encodePlanEventBridgeRequestV1 } from "../pi-ext/subagent/host-bridge.ts";
+import { getPlanAdherenceSnapshot, type PlanAdherenceJob } from "../pi-ext/subagent/plan-drift.ts";
 
 export const TASK_STATES = [
   "pending",
@@ -253,6 +254,148 @@ export async function cancelPlan(
   return { ok: true, plan: active.plan };
 }
 
+const LIVE_JOB_STATES = new Set<PlanAdherenceJob["state"]>(["running", "queued"]);
+
+export type PlanCheckWorkerTag = "plan-drift:missing" | "plan-drift:unknown-task" | "scope-drift";
+
+export type PlanCheckTaskWorker = {
+  agentId: string;
+  runId: string;
+  state: PlanAdherenceJob["state"];
+  title?: string;
+};
+
+export type PlanCheckTask = {
+  id: string;
+  title: string;
+  state: TaskState;
+  note?: string;
+  workers: PlanCheckTaskWorker[];
+};
+
+export type PlanCheckWorker = {
+  agentId: string;
+  runId: string;
+  state: PlanAdherenceJob["state"];
+  title?: string;
+  planTask?: string;
+  tags: PlanCheckWorkerTag[];
+  scopeDrift?: string[];
+};
+
+export type PlanCheckCounts = {
+  live: number;
+  bound: number;
+  unbound: number;
+  planDrift: number;
+  scopeDrift: number;
+};
+
+export type PlanCheckResult = {
+  ok: true;
+  plan: {
+    id: string;
+    title: string;
+    lifecycle: PlanLifecycle;
+    tasks: PlanCheckTask[];
+    updatedAt: string;
+    approvedAt?: string;
+  } | null;
+  counts: PlanCheckCounts;
+  workers: PlanCheckWorker[];
+  recentPlanDrift: ReturnType<typeof getPlanAdherenceSnapshot>["recentPlanDrift"];
+};
+
+function isOpenTask(task: PlanTask): boolean {
+  return task.state === "pending" || task.state === "in_progress";
+}
+
+function isLiveJob(job: PlanAdherenceJob): boolean {
+  return LIVE_JOB_STATES.has(job.state);
+}
+
+/**
+ * Read-only join of the session plan store and the plan-adherence seam.
+ * Never writes the store, never signals, never changes dispatch.
+ */
+export function checkPlan(cwd: string): PlanCheckResult {
+  const store = loadStore(cwd);
+  const snapshot = getPlanAdherenceSnapshot();
+  const plan = store.activePlanId ? store.plans[store.activePlanId] ?? null : null;
+  const openTaskIds = new Set(
+    plan && plan.lifecycle === "approved"
+      ? plan.tasks.filter(isOpenTask).map((task) => task.id)
+      : [],
+  );
+
+  const latestDriftByAgent = new Map<string, (typeof snapshot.recentPlanDrift)[number]>();
+  for (const signal of snapshot.recentPlanDrift) {
+    latestDriftByAgent.set(signal.agentId, signal);
+  }
+
+  const workers: PlanCheckWorker[] = snapshot.jobs.map((job) => {
+    const tags: PlanCheckWorkerTag[] = [];
+    const drift = latestDriftByAgent.get(job.agentId);
+    if (drift) tags.push(`plan-drift:${drift.reason}`);
+    if (job.scopeDrift && job.scopeDrift.length > 0) tags.push("scope-drift");
+    return {
+      agentId: job.agentId,
+      runId: job.runId,
+      state: job.state,
+      ...(job.title ? { title: job.title } : {}),
+      ...(job.planTask ? { planTask: job.planTask } : {}),
+      tags,
+      ...(job.scopeDrift ? { scopeDrift: job.scopeDrift } : {}),
+    };
+  });
+
+  const liveJobs = snapshot.jobs.filter(isLiveJob);
+  let bound = 0;
+  for (const job of liveJobs) {
+    if (job.planTask && openTaskIds.has(job.planTask)) bound += 1;
+  }
+
+  const tasks: PlanCheckTask[] = plan
+    ? plan.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        state: task.state,
+        ...(task.note ? { note: task.note } : {}),
+        workers: liveJobs
+          .filter((job) => job.planTask === task.id)
+          .map((job) => ({
+            agentId: job.agentId,
+            runId: job.runId,
+            state: job.state,
+            ...(job.title ? { title: job.title } : {}),
+          })),
+      }))
+    : [];
+
+  return {
+    ok: true,
+    plan: plan
+      ? {
+          id: plan.id,
+          title: plan.title,
+          lifecycle: plan.lifecycle,
+          tasks,
+          updatedAt: plan.updatedAt,
+          ...(plan.approvedAt ? { approvedAt: plan.approvedAt } : {}),
+        }
+      : null,
+    counts: {
+      live: liveJobs.length,
+      bound,
+      unbound: liveJobs.length - bound,
+      planDrift: snapshot.recentPlanDrift.length,
+      scopeDrift: snapshot.jobs.filter((job) => (job.scopeDrift?.length ?? 0) > 0).length,
+    },
+    workers,
+    recentPlanDrift: snapshot.recentPlanDrift,
+  };
+}
+
 function cwdOf(ctx: { cwd?: string } | undefined): string {
   return ctx?.cwd || process.env.PIPIUI_MAIN_CWD || process.cwd();
 }
@@ -338,6 +481,17 @@ export default function (pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const outcome = await cancelPlan(cwdOf(ctx), params.planId, params.reason);
       return result(outcome, !outcome.ok);
+    },
+  });
+
+  pi.registerTool({
+    name: "plan_check",
+    label: "Plan Check",
+    description: "Read-only snapshot of the active plan: task status, bound workers, recent plan-drift and scope-drift. Advisory; never changes dispatch.",
+    promptSnippet: "Read-only plan × worker × drift snapshot",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      return result(checkPlan(cwdOf(ctx)));
     },
   });
 }
