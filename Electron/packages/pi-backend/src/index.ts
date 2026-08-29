@@ -6457,12 +6457,22 @@ export class PiHostBackend implements HostBackend {
       };
     });
   }
+  private isRetiredSubagentModelKey(name: string): boolean {
+    return name === "computer-use"
+      || name === "computer-use-leader"
+      || name === "computer-verifier"
+      || name === "computer-terminal";
+  }
+  private retiredSubagentModelsPresent(value: unknown): boolean {
+    return isRecord(value) && Object.keys(value).some((name) => this.isRetiredSubagentModelKey(name));
+  }
   private checkedSubagentModels(value: unknown): Record<string, SubagentModelSetting[]> {
     if (value === undefined) return {};
     if (!isRecord(value)) throw new Error("subagentModels 必须是 object");
-    return Object.fromEntries(Object.entries(value).map(([name, chain]) => {
+    return Object.fromEntries(Object.entries(value).flatMap(([name, chain]) => {
       if (!name.trim()) throw new Error("subagentModels agent name 不能为空");
-      return [name, this.checkedSubagentModelChain(chain)];
+      if (this.isRetiredSubagentModelKey(name)) return [];
+      return [[name, this.checkedSubagentModelChain(chain)]];
     }));
   }
   /** Qualify a historical bare id only when the authenticated catalog has one unambiguous owner. */
@@ -6486,29 +6496,36 @@ export class PiHostBackend implements HostBackend {
     })]));
     return { value: qualified, changed };
   }
+  private async persistSubagentModels(
+    qualify: boolean,
+  ): Promise<Record<string, SubagentModelSetting[]>> {
+    return this.updateSettings(settings => {
+      const current = this.checkedSubagentModels(settings.subagentModels);
+      const latest = qualify ? this.qualifyLegacySubagentModels(current).value : current;
+      settings.subagentModels = latest;
+      return latest;
+    });
+  }
   private async loadSubagentModels(waitForCatalog = false): Promise<Record<string, SubagentModelSetting[]>> {
-    const loaded = this.checkedSubagentModels((await this.readSettings()).subagentModels);
+    const settings = await this.readSettings();
+    const loaded = this.checkedSubagentModels(settings.subagentModels);
+    const dropRetired = this.retiredSubagentModelsPresent(settings.subagentModels);
     if (waitForCatalog) {
       try {
         await this.loadModelCatalog();
       } catch {
         // Preserve legacy settings when the auth-aware catalog is unavailable. Runtime will
         // reject a still-bare override explicitly instead of letting Pi guess a provider.
-        return loaded;
+        return dropRetired ? this.persistSubagentModels(false) : loaded;
       }
     } else if (!this.modelCatalogReady) {
       // Session spawn must never wait for the optional auth catalog preload. If it has not
       // completed yet, materialize the stored value and let the runtime's explicit guard handle it.
-      return loaded;
+      return dropRetired ? this.persistSubagentModels(false) : loaded;
     }
     const normalized = this.qualifyLegacySubagentModels(loaded);
-    if (!normalized.changed) return loaded;
-    return this.updateSettings(settings => {
-      const current = this.checkedSubagentModels(settings.subagentModels);
-      const latest = this.qualifyLegacySubagentModels(current).value;
-      settings.subagentModels = latest;
-      return latest;
-    });
+    if (!normalized.changed && !dropRetired) return loaded;
+    return this.persistSubagentModels(true);
   }
   private subagentModelsRuntimeFile(): string {
     return join(this.agentDir, "pipiui-subagent-models-runtime.json");
@@ -6715,16 +6732,18 @@ export class PiHostBackend implements HostBackend {
   private async saveSubagentModel(agentName: unknown, chain: unknown): Promise<Record<string, SubagentModelSetting[]>> {
     if (typeof agentName !== "string" || !agentName.trim())
       throw new Error("subagent agentName 必须是非空 string");
-    const checkedChain = this.checkedSubagentModelChain(chain, false);
+    const name = agentName.trim();
+    const retired = this.isRetiredSubagentModelKey(name);
+    const checkedChain = retired ? [] : this.checkedSubagentModelChain(chain, false);
     const all = await this.updateSettings((settings) => {
       const current = settings.subagentModels;
       if (current !== undefined && !isRecord(current))
         throw new Error("subagentModels 必须是 object");
-      const all: Record<string, SubagentModelSetting[]> = current
-        ? Object.fromEntries(Object.entries(current).map(([name, value]) => [name, this.checkedSubagentModelChain(value)]))
-        : {};
-      if (checkedChain.length) all[agentName] = checkedChain;
-      else delete all[agentName];
+      const all = this.checkedSubagentModels(current);
+      if (!retired) {
+        if (checkedChain.length) all[name] = checkedChain;
+        else delete all[name];
+      }
       settings.subagentModels = all;
       return all;
     });

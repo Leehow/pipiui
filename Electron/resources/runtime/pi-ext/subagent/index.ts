@@ -1989,13 +1989,26 @@ function formatRoutingCandidate(
 }
 
 /**
+ * Retired computer-use role names. The bundled manifests are gone and desktop
+ * control lives only in the main session, so a dispatch that still names one
+ * fails with the route to the surviving tools instead of an "unknown agent".
+ * Routing and settings must not advertise these names even if persisted keys remain.
+ */
+const RETIRED_COMPUTER_AGENT_NAMES = [
+	"computer-use-leader",
+	"computer-use",
+	"computer-verifier",
+	"computer-terminal",
+] as const;
+
+/**
  * Boss-only, hot-read dispatch reference. It is intentionally compact because it is appended to
  * the dynamic system prompt every turn: each route shows current primary/fallback candidates,
  * configured strength, and Swift-authoritative allowed levels. `?` means catalog capability is
  * unknown (the displayed persisted setting remains backward-compatible, but fallback tool
  * thinking will not be carried through it).
  */
-function formatSubagentModelRoutingBlock(): string | null {
+export function formatSubagentModelRoutingBlock(): string | null {
 	if (PIPIUI_DEPTH !== 0) return null;
 	const overrides = loadSubagentModelOverrides();
 	const catalog = loadSubagentModelCapabilities();
@@ -2006,7 +2019,9 @@ function formatSubagentModelRoutingBlock(): string | null {
 		// The routing reference is advisory; a transient directory read must never block a turn.
 	}
 	const byName = new Map(discovered.map((agent) => [agent.name, agent]));
-	const names = Array.from(new Set([...byName.keys(), ...Object.keys(overrides)])).sort();
+	const names = Array.from(new Set([...byName.keys(), ...Object.keys(overrides)]))
+		.filter((name) => !(RETIRED_COMPUTER_AGENT_NAMES as readonly string[]).includes(name))
+		.sort();
 	if (names.length === 0) return null;
 
 	const followMain = loadMainModelFile() || process.env.PIPIUI_MAIN_MODEL;
@@ -6268,13 +6283,6 @@ function messagesContainSuperpowersMarker(messages: unknown[]): boolean {
 		);
 	});
 }
-
-/**
- * Retired computer-use role names. The bundled manifests are gone and desktop
- * control lives only in the main session, so a dispatch that still names one
- * fails with the route to the surviving tools instead of an "unknown agent".
- */
-const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
 
 async function runSingleAgent(
 	defaultCwd: string,

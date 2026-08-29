@@ -147,19 +147,20 @@ describe("explicit sidebar project persistence", () => {
     const first = backend(fixture.agent, fixture.sessions);
     expect(await first.handle("getComputerUseState", [])).toEqual({ enabled: false });
     expect(await first.handle("setComputerUseEnabled", [true])).toEqual({ enabled: true });
-    expect(await first.handle("setSubagentModel", ["computer-use", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
-      "computer-use": [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
+    expect(await first.handle("setSubagentModel", ["explore", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
+      explore: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
     expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
-      expect.objectContaining({ name: "computer-use" }),
+      expect.objectContaining({ name: "explore" }),
     ]));
     const listed = await first.handle("listAgentDefinitions", []) as Array<{ name: string; description?: string }>;
-    expect(listed.map((a) => a.name)).toEqual(expect.arrayContaining(["explore", "general-purpose", "reviewer", "computer-use", "secretary"]));
+    expect(listed.map((a) => a.name)).toEqual(expect.arrayContaining(["explore", "general-purpose", "reviewer", "secretary", "operator"]));
+    expect(listed.map((a) => a.name)).not.toContain("computer-use");
     expect(listed.every((a) => typeof a.name === "string" && typeof a.description === "string")).toBe(true);
     const fresh = backend(fixture.agent, fixture.sessions);
     expect(await fresh.handle("getComputerUseState", [])).toEqual({ enabled: true });
     expect(await fresh.handle("getSubagentModels", [])).toEqual({
-      "computer-use": [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
+      explore: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
   });
 

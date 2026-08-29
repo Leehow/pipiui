@@ -336,7 +336,7 @@ function canonicalRoleFor(
   if (!isCanonical(name, origin)) return undefined;
   if (name === "secretary") return "secretary";
   if (name === "operator") return "operator";
-  return "computer";
+  return undefined;
 }
 
 function extensionIdFor(

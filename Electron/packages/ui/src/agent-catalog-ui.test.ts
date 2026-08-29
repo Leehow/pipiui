@@ -47,10 +47,10 @@ describe('agent catalog grouping', () => {
     const userWorker = { name: 'openai-user', description: 'User install', origin: 'user' as const, source: 'user' as const }
     const steward = { name: 'steward-init', description: 'COC L0', origin: 'project' as const, source: 'project' as const }
     const ext = { name: 'ext-researcher', description: 'Project ext', origin: 'project' as const, source: 'project' as const, extensionId: 'ext-research' }
-    const computer = { name: 'computer-use', description: 'Desktop', origin: 'project' as const, source: 'project' as const, canonicalRole: 'computer' as const }
-    const grouped = partitionCatalog([explore, userWorker, steward, ext, computer])
+    const extra = { name: 'research-helper', description: 'Extra project agent', origin: 'project' as const, source: 'project' as const }
+    const grouped = partitionCatalog([explore, userWorker, steward, ext, extra])
     expect(grouped.general.map(agent => agent.name)).toEqual(['explore', 'openai-user'])
-    expect(grouped.project.map(agent => agent.name)).toEqual(['steward-init', 'ext-researcher', 'computer-use'])
+    expect(grouped.project.map(agent => agent.name)).toEqual(['steward-init', 'ext-researcher', 'research-helper'])
   })
 
   it('labels project agents as project-specific instead of a bare 项目 badge', () => {

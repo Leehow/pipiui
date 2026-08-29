@@ -268,11 +268,11 @@ function catalogHost(agents: AgentDefinition[], settings: Record<string, Subagen
 }
 
 describe('SubagentModelModal dynamic catalog', () => {
-  it('keeps former Computer Use roles in the ordinary catalog and folds project-specific agents', async () => {
+  it('renders ordinary catalog cards without a computer-use hierarchy and folds project-specific agents', async () => {
     const host = catalogHost([
       { name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' },
       { name: 'operator', description: 'Desktop escape hatch', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'operator' },
-      { name: 'computer-use', description: 'Desktop goal', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'computer' },
+      { name: 'research-helper', description: 'Extra ordinary catalog role', origin: 'bundled', source: 'bundled' },
       {
         name: 'ext-researcher',
         description: 'Extension researcher',
@@ -289,9 +289,10 @@ describe('SubagentModelModal dynamic catalog', () => {
     await screen.findByTestId('subagent-agent-explore')
     expect(host.listAgentDefinitions).toHaveBeenCalledWith('proj-1')
     expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
-    expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-agent-computer-use')).toBeNull()
+    expect(screen.getByTestId('subagent-agent-research-helper')).toBeTruthy()
     expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
-    expect(within(screen.getByTestId('subagent-agent-computer-use')).queryByText(/需要查看截图/)).toBeNull()
+    expect(within(screen.getByTestId('subagent-agent-research-helper')).queryByText(/需要查看截图/)).toBeNull()
     expect(within(screen.getByTestId('subagent-agent-operator')).queryByText(/需要查看截图/)).toBeNull()
 
     const projectGroup = screen.getByTestId('project-subagent-group')
@@ -314,15 +315,16 @@ describe('SubagentModelModal dynamic catalog', () => {
   it('falls back to name/description rows when the host omits catalog metadata', async () => {
     const host = catalogHost([
       { name: 'explore', description: 'Research' },
-      { name: 'computer-use', description: 'Desktop' },
+      { name: 'research-helper', description: 'Extra ordinary catalog role' },
     ])
     render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
     await screen.findByTestId('subagent-agent-explore')
-    expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
+    expect(screen.getByTestId('subagent-agent-research-helper')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-agent-computer-use')).toBeNull()
     expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
     expect(screen.queryByRole('heading', { name: 'Computer Use Agent' })).toBeNull()
     expect(screen.queryByTestId('subagent-source-explore')).toBeNull()
-    expect(within(screen.getByTestId('subagent-agent-computer-use')).queryByText(/需要查看截图/)).toBeNull()
+    expect(within(screen.getByTestId('subagent-agent-research-helper')).queryByText(/需要查看截图/)).toBeNull()
   })
 
   it('shows requested custom addTools as pending verification, not as applied', async () => {
