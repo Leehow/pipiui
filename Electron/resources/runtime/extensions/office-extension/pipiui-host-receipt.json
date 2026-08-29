@@ -5,6 +5,6 @@
   "hostEntry": "agent/dist/host.js",
   "sha256": "8bc912dd8f3ad8826ae6dd21144fa526e5ad4439991ffb79dc32b52b0bd626aa",
   "bytes": 982,
-  "contentHash": "b3fbfc68075ea8a6588c692c367106c6e6b213fbd05fb462568df2e619303000",
-  "generatedAt": "2026-08-29T07:27:53.963Z"
+  "contentHash": "8bed976c56e50b0010f6905cc3e9589e8470298b46dfca33d878f170853b63d6",
+  "generatedAt": "2026-08-29T07:57:22.987Z"
 }
