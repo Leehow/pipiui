@@ -41,6 +41,7 @@ const splitKey = 'pipiui:subagent-list-ratio'
 const pageSize = 30
 const AGENT_LOG_RENDER_INTERVAL_MS = 200
 const AGENT_LOG_RENDER_LIMIT = 40
+const AGENT_FINAL_RESULT_TAIL_CAP = 8_000
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
 const terminalIcon: Record<AgentState, string> = { running: '◌', stalled: '!', ok: '✓', failed: '×', aborted: '■', interrupted: '⚡' }
 
@@ -1420,6 +1421,11 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
       ? liveAgentStatus(agent, now, activeChildCount)
       : undefined
   const detailTitle = detailTaskTitle(agent, output)
+  // Runtime terminal events intentionally retain only the last 8k characters.
+  // That tail can begin mid-table, mid-code span, or mid-fence; feeding such a
+  // fragment to a Markdown parser can take a pathological parse path. Preserve
+  // the complete retained tail as readable pre-wrapped text instead.
+  const finalResultNeedsPlainText = Boolean(agent.finalResult && agent.finalResult.length >= AGENT_FINAL_RESULT_TAIL_CAP)
 
   return <div className="agent-detail" style={{ position: 'relative' }}>
     <header className="agent-detail-header">
@@ -1449,7 +1455,9 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         {historyError && <div className="agent-log-scope agent-log-scope-error" data-testid="agent-log-scope-error" role="alert">{historyError}</div>}
         {/* Step groups default collapsed here — explicit false also suppresses the
             streaming auto-expand — so the boss expands each group manually. */}
-        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}><AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} /></article>)}
+        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}>{finalResultNeedsPlainText && message.content === output
+          ? <pre className="agent-final-result" data-testid="subagent-final-result-plain">{message.content}</pre>
+          : <AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} />}</article>)}
       </div>
       <details className="agent-technical-details">
       <summary>技术详情</summary>

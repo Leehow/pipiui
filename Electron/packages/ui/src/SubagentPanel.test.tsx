@@ -1734,6 +1734,23 @@ describe('SubagentPanel', () => {
     expect(await screen.findByText('Final report')).toBeTruthy()
   })
 
+  it('renders a runtime-capped terminal tail as plain text', async () => {
+    const harness = hostHarness()
+    const retainedTail = ('| partial table cell | `unterminated inline code\n'.repeat(220)).slice(0, 8_000)
+    harness.host.listAgents = async () => [{
+      agentId: 'capped-tail', runId: 'r-capped-tail', sessionId: 'session-1',
+      name: 'explore', task: 'long report', state: 'ok', finalResult: retainedTail,
+      createdAt: 1, endedAt: 2,
+    } as AgentSummary]
+
+    render(<SubagentPanel host={harness.host} sessionId="session-1" />)
+
+    const plain = await screen.findByTestId('subagent-final-result-plain')
+    expect(plain.tagName).toBe('PRE')
+    expect(plain.textContent).toBe(retainedTail)
+    expect(plain.querySelector('.markdown')).toBeNull()
+  })
+
   it('stalled list still shows closeout after final-received instead of ordinary stall copy', async () => {
     const harness = hostHarness()
     const now = Date.now()
