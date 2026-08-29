@@ -634,10 +634,28 @@ export class CuaDriverHost {
         ? launched.structuredContent
         : {};
       const pid = Number(structured.pid);
-      const windows = Array.isArray(structured.windows)
+      // Freshly launched document apps (TextEdit…) can take a moment to create
+      // or restore their first window, and some report none at all until a
+      // document exists. Poll the window list briefly before failing.
+      let windows = Array.isArray(structured.windows)
         ? structured.windows.filter(record)
         : [];
-      const windowID = Number(selectLaunchWindow(windows, pid)?.window_id);
+      let windowID = Number(selectLaunchWindow(windows, pid)?.window_id);
+      for (
+        let attempt = 0;
+        Number.isInteger(pid) && pid > 0 && !(Number.isInteger(windowID) && windowID > 0) && attempt < 4;
+        attempt += 1
+      ) {
+        await sleep(500);
+        const listed = await this.call("list_windows", {});
+        const listedStructured = record(listed.structuredContent)
+          ? listed.structuredContent
+          : {};
+        windows = (Array.isArray(listedStructured.windows)
+          ? listedStructured.windows.filter(record)
+          : []).filter((window) => Number(window.pid) === pid);
+        windowID = Number(selectLaunchWindow(windows, pid)?.window_id);
+      }
       if (
         !Number.isInteger(pid) ||
         pid <= 0 ||
@@ -649,7 +667,9 @@ export class CuaDriverHost {
         this.observations.delete(owner);
         return this.failure(
           "target_unavailable",
-          "Cua Driver launch_app did not return an exact pid and window_id",
+          Number.isInteger(pid) && pid > 0
+            ? `The application launched (pid ${pid}) but has no usable window; create or open a document window first, then retry open_application`
+            : "Cua Driver launch_app did not return an exact pid and window_id",
           true,
         );
       }

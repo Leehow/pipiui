@@ -2286,4 +2286,65 @@ if (mode === "serve") {
     expect(calls.filter((call) => call.name === "press_key")).toHaveLength(1);
     expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
   });
+
+  it("polls for a first document window before failing open_application", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-late-window-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    let lists = 0;
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return { structuredContent: { pid: 42, bundle_id: "org.example.app", name: "Example App", windows: [] } };
+      if (name === "list_windows") {
+        lists += 1;
+        return { structuredContent: {
+          windows: lists < 3 ? [] : [{ pid: 42, window_id: 88, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }],
+        } };
+      }
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 88, screenshot_png_b64: "PNG", elements: [] } };
+      if (name === "get_accessibility_tree") return { structuredContent: { windows: [{ pid: 42, window_id: 88, bounds: { width: 800, height: 600 }, is_on_screen: true, on_current_space: true }] } };
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "late",
+      action: "computer_open_application",
+      bundle_identifier: "org.example.app",
+    });
+    expect(result).toMatchObject({ ok: true, target: { pid: 42, window_id: 88 } });
+    expect(calls.filter((call) => call.name === "list_windows").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("fails open_application with an actionable message when the app never opens a window", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-no-window-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "launch_app") return { structuredContent: { pid: 42, bundle_id: "org.example.app", name: "Example App", windows: [] } };
+      if (name === "list_windows") return { structuredContent: { windows: [] } };
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "nowin",
+      action: "computer_open_application",
+      bundle_identifier: "org.example.app",
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      runtimeError: { code: "target_unavailable", retryable: true },
+    });
+    expect(result.error).toContain("pid 42");
+    expect(result.error).toContain("no usable window");
+    expect(calls.filter((call) => call.name === "list_windows")).toHaveLength(4);
+  });
 });
