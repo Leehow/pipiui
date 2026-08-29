@@ -81,18 +81,6 @@ import {
 	type PlanDriftCandidate,
 } from "./plan-drift.ts";
 import {
-	createBossDesktopDirectDrive,
-	formatDirectDriveToolResult,
-	createDirectDriveStuckGuard,
-	stepFromDirectDriveResult,
-	DIRECT_DRIVE_PAUSED_CODE,
-	createDirectDriveAdvisor,
-	adviseFromDirectDriveResult,
-	adviseFromStuckRecord,
-	queueAdvisorFollowUp,
-	evaluateBoundedOperatorEscape,
-} from "../packages/computer-agent/src/index.ts";
-import {
 	type AgentConfig,
 	type AgentScope,
 	discoverAgents,
@@ -121,13 +109,6 @@ import {
 	type RecoveryDecision,
 } from "./recovery-classification.ts";
 import { registerSessionRecallTool } from "./session-recall.ts";
-import {
-	COMPUTER_TASK_CONTINUATION_TIMEOUT_MS,
-	createComputerTaskContinuationWatchdog,
-	isComputerTaskAssistantActivity,
-	queueComputerTaskContinuation,
-	stripComputerTaskContinuationTrigger,
-} from "./computer-task-continuation.ts";
 import {
 	resolveSubagentToolSelection,
 	resolvePipiUIExtensionRouting,
@@ -309,8 +290,6 @@ import {
 	formatPreflightConflictSignal,
 } from "../subagent-host/worktree/preflight.ts";
 import {
-	bindCanonicalComputerAgents,
-	RETIRED_COMPUTER_AGENT_NAMES,
 	childReceivesDelegationTools,
 	configuredHeartbeatAt,
 	createRunScopedTimeout,
@@ -402,7 +381,6 @@ import {
 	applyToolResultEvent,
 	readAssistantToolCall,
 } from "./assistant-tool-call.ts";
-import { createComputerTaskRootLifecycle } from "./computer-task-root-lifecycle.ts";
 import {
 	createUsageEmitter,
 	type StreamingUsageSnapshot,
@@ -706,10 +684,8 @@ export function vaultWorkerChildEnv(
 
 function pipiuiChildProcessEnv(
 	extra: Record<string, string | undefined> = {},
-	preserveComputerCapability = false,
 ): Record<string, string | undefined> {
 	const env = { ...vaultWorkerChildEnv(process.env, extra) };
-	const terminalWorkerEnvKeys = new Set<string>(TERMINAL_WORKER_ENV_KEYS);
 	// A broker connection/capability is one dispatch generation only. Never let a
 	// verifier, helper, or nested child inherit the main token or another run's
 	// grant. The main extension re-adds this complete tuple only for this spawn.
@@ -728,17 +704,6 @@ function pipiuiChildProcessEnv(
 			: false,
 		),
 	);
-	const computerMemoryEnabled = extra.PIPIUI_COMPUTER_MEMORY_ENABLED;
-	const computerWorkerValues = Object.fromEntries(
-		Object.entries(extra).filter(([key, value]) =>
-			(key.startsWith("PIPIUI_COMPUTER_WORKER_") || terminalWorkerEnvKeys.has(key))
-			&& typeof value === "string"
-			&& value.length > 0,
-		),
-	);
-	for (const key of Object.keys(env)) {
-		if (key.startsWith("PIPIUI_TERMINAL_")) delete env[key];
-	}
 	delete env.PIPIUI_MEMORY_BROKER_MODE;
 	delete env.PIPIUI_MEMORY_BROKER_URL;
 	delete env.PIPIUI_MEMORY_BROKER_TOKEN;
@@ -747,46 +712,11 @@ function pipiuiChildProcessEnv(
 	delete env.PIPIUI_MEMORY_BROKER_PACKAGE_ROOT;
 	delete env.PIPIUI_MEMORY_BROKER_EXTENSION;
 	delete env.PIPIUI_MEMORY_BROKER_PACKAGE_VERSION;
-	delete env.PIPIUI_COMPUTER_MEMORY_ENABLED;
-	delete env.PIPIUI_COMPUTER_WORKER_BROKER_URL;
-	delete env.PIPIUI_COMPUTER_WORKER_BROKER_TOKEN;
-	delete env.PIPIUI_COMPUTER_WORKER_TASK_ID;
-	delete env.PIPIUI_COMPUTER_WORKER_STEP_ID;
-	delete env.PIPIUI_COMPUTER_WORKER_ROLE;
 	Object.assign(env, memoryBrokerValues);
-	Object.assign(env, computerWorkerValues);
-	// Only the dispatched Pi process may inherit desktop control. Verifier
-	// shells and git helpers still use the default false path. The companion
-	// Computer-memory marker is equally one-dispatch-only and is never inherited
-	// merely because a parent once held a desktop grant.
-	if (!preserveComputerCapability) {
-		delete env.PIPIUI_COMPUTER_CAPABILITY;
-	} else if (computerMemoryEnabled === "1") {
-		env.PIPIUI_COMPUTER_MEMORY_ENABLED = "1";
-	}
-	if (Object.keys(computerWorkerValues).length > 0) delete env.PIPIUI_COMPUTER_CAPABILITY;
-	return env;
-}
-
-function isolatedComputerWorkerChildProcessEnv(
-	extra: Record<string, string | undefined>,
-): Record<string, string | undefined> {
-	const terminalWorkerEnvKeys = new Set<string>(TERMINAL_WORKER_ENV_KEYS);
-	const desktopWorkerEnvKeys = new Set([
-		"PIPIUI_COMPUTER_WORKER_BROKER_URL", "PIPIUI_COMPUTER_WORKER_BROKER_TOKEN",
-		"PIPIUI_COMPUTER_WORKER_TASK_ID", "PIPIUI_COMPUTER_WORKER_STEP_ID", "PIPIUI_COMPUTER_WORKER_ROLE",
-	]);
-	const safeHostKeys = ["HOME", "PATH", "TMPDIR", "LANG", "LC_ALL", "SHELL", "USER", "LOGNAME"];
-	const env: Record<string, string | undefined> = {};
-	for (const key of safeHostKeys) if (process.env[key]) env[key] = process.env[key];
-	for (const key of ["PIPIUI_NODE_PATH", "PIPIUI_PI_PATH", "PIPIUI_ELECTRON_BINARY", "ELECTRON_RUN_AS_NODE"]) {
-		if (process.env[key]) env[key] = process.env[key];
-	}
-	env.ELECTRON_RUN_AS_NODE = "1";
-	for (const [key, value] of Object.entries(extra)) {
-		if (terminalWorkerEnvKeys.has(key) || desktopWorkerEnvKeys.has(key)
-			|| ["PIPIUI_AGENT_ID", "PIPIUI_AGENT_RUN_ID", "PIPIUI_AGENT_DEPTH", "PIPIUI_AGENT_ROLE", "PIPIUI_MAIN_MODEL", "PIPIUI_SUBAGENT_SKILL_ISOLATION", "PIPIUI_SKILL_READ_BLOCK", "PIPI_PHILOSOPHY_ROLE", "PIPI_PHILOSOPHY_AGENT"].includes(key)) env[key] = value;
-	}
+	// Desktop control lives only in the main session. The host may carry the
+	// Computer Use capability for its own tools; a dispatched child never
+	// inherits it.
+	delete env.PIPIUI_COMPUTER_CAPABILITY;
 	return env;
 }
 // 当前进程在 agent 树里的身份：主会话 depth=0，被派出的 subagent 由父进程注入
@@ -811,9 +741,6 @@ const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 const PIPIUI_MAX_DEPTH = resolveSubagentMaxDepth(process.env.PIPIUI_AGENT_MAX_DEPTH);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
-// Globally enabled Computer Use strategy path; mounted in a dispatched Pi
-// process only when that task carries an explicit per-task desktop grant.
-const PIPIUI_COMPUTER_EXT = process.env.PIPIUI_COMPUTER_EXT;
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // Managed pi-web-access supplies web_search, fetch_content, source_check, and
@@ -839,14 +766,13 @@ const PIPIUI_SKILLLOADER_EXT = process.env.PIPIUI_SKILLLOADER_EXT;
 // Read-only planners additionally cannot pull SKILL.md through the read tool.
 const PIPIUI_SKILL_READ_BLOCK = process.env.PIPIUI_SKILL_READ_BLOCK === "1";
 
-type MemoryBrokerChildRole = "worker" | "operator";
+type MemoryBrokerChildRole = "worker";
 type IssuedMemoryBrokerEnvironment = Record<string, string>;
 type IssuedMemoryBrokerPackage = { root: string; extension: string; version: string };
 type MainMemoryBrokerIssuer = ((input: {
 	agentID: string;
 	runID: string;
 	role: MemoryBrokerChildRole;
-	hostIssuedDesktopGrant?: "user-requested" | "ui-verify";
 }) => IssuedMemoryBrokerEnvironment | undefined) & {
 	validateIssuedPackageIdentity?: (
 		environment: Record<string, string | undefined>,
@@ -883,7 +809,6 @@ async function issueMemoryBrokerEnvironment(
 		agentID: string;
 		runID: string;
 		role: MemoryBrokerChildRole;
-		hostIssuedDesktopGrant?: "user-requested" | "ui-verify";
 	},
 ): Promise<IssuedMemoryBrokerEnvironment | undefined> {
 	try {
@@ -1498,21 +1423,6 @@ interface RunSingleAgentOptions {
 	heartbeatSecs?: number;
 	/** Bundled general-purpose absolute wall-clock runtime limit from first child spawn. */
 	timeoutSecs?: number;
-	/** Explicit per-task Computer Use grant; omission = no desktop tools. */
-	desktop?: "user-requested" | "ui-verify";
-	/** Runtime-owned scoped Computer Agent worker route; never model/frontmatter supplied. */
-	computerWorker?: {
-		role: "gui-operator" | "terminal-worker" | "verifier";
-		environment: Record<string, string>;
-		extensionPath: string;
-		toolNames: string[];
-	};
-	/** Runtime-owned single Computer Use Agent route. It inherits ordinary non-management tools. */
-	computerAgent?: {
-		environment: Record<string, string>;
-		extensionPath: string;
-		toolNames: string[];
-	};
 	/** Host-selected episode generation, used to bind runtime receipts to the visible child run. */
 	runId?: string;
 	/** Explicit bundled private skills; additive under --no-skills. */
@@ -2345,7 +2255,6 @@ function cancelInterruptedReminders(agentId: string, runId?: string): void {
 
 // ---- Stall watchdog + abort：运行中后台 job 的外部可触达句柄 ----
 const STALL_THRESHOLD_MS = 120_000;
-const COMPUTER_USE_SYNC_RECOVERY_GRACE_MS = 10 * 60_000;
 const STALL_WATCHDOG_INTERVAL_MS = 30_000;
 /** Start CPU pairs one tick after silence so the stall pass has a verdict at 120s. */
 const LIVENESS_SAMPLE_AFTER_MS = STALL_WATCHDOG_INTERVAL_MS;
@@ -6417,25 +6326,6 @@ async function runSingleAgent(
 		releaseAgentReservation(pipiuiAgentId);
 		return fail;
 	}
-	if ((RETIRED_COMPUTER_AGENT_NAMES as readonly string[]).includes(agentName)) {
-		const message = `computer_task_leader_retired: "${agentName}" is retired. Boss holds the screenshot/action loop via computer_task; dispatch operator only as a bounded single-action escape hatch with an explicit desktop grant.`;
-		releaseAgentReservation(pipiuiAgentId);
-		return {
-			agent: agentName,
-			agentSource: agent.source,
-			task,
-			title: options?.title,
-			exitCode: 1,
-			messages: [],
-			stderr: message,
-			errorMessage: message,
-			usage: emptyUsage(),
-			step,
-			agentId: pipiuiAgentId,
-			runId,
-			stopReason: "error",
-		};
-	}
 	const identityProblem = agentResumeIdentityProblem({
 		agentId: pipiuiAgentId,
 		requestedName: agentName,
@@ -6565,32 +6455,6 @@ async function runSingleAgent(
 		hostAvailable:
 			!!PIPIUI_COMPUTER_EXT && !!process.env.PIPIUI_COMPUTER_CAPABILITY,
 	});
-	if (agent.name === "operator" && options?.desktop) {
-		const escape = evaluateBoundedOperatorEscape({
-			goal: task,
-			desktop: options?.desktop,
-			agentName: agent.name,
-			retainContext: options?.retainContext,
-		});
-		if (!escape.ok) {
-			const message = escape.error;
-			return {
-				agent: agentName,
-				agentSource: agent.source,
-				task,
-				title: options?.title,
-				exitCode: 1,
-				messages: [],
-				stderr: message,
-				errorMessage: message,
-				usage: emptyUsage(),
-				step,
-				agentId: pipiuiAgentId,
-				runId,
-				stopReason: "error",
-			};
-		}
-	}
 	if (desktopGrant.problem) {
 		const message = desktopGrant.problem;
 		return {
@@ -9300,7 +9164,6 @@ export default function (pi: ExtensionAPI) {
 		onNudge: () => handleIdleFoldNudge(pi, { watermark: idleFoldConfig.lowWatermark }),
 		onFold: () => runProductionIdleFold(),
 	}));
-	registerComputerTaskTool(pi);
 	registerLedgerNoteTool(pi);
 	registerContextDocTool(pi);
 	registerContextManageTool(pi);
@@ -9720,7 +9583,6 @@ export default function (pi: ExtensionAPI) {
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
-				...(handle.name === "computer-use" ? { syncRecoveryGraceMs: COMPUTER_USE_SYNC_RECOVERY_GRACE_MS } : {}),
 			});
 			const probe = classifyWatchdogProbe({
 				inTool: Boolean(stallInfo.inTool),
@@ -9775,7 +9637,6 @@ export default function (pi: ExtensionAPI) {
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
-				...(handle.name === "computer-use" ? { syncRecoveryGraceMs: COMPUTER_USE_SYNC_RECOVERY_GRACE_MS } : {}),
 			});
 			if (action === "ignore") continue;
 			const idleSec = Math.floor(idleMs / 1000);

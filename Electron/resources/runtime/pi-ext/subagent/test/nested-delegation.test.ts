@@ -96,9 +96,6 @@ test("other built-in roles remain non-delegating", () => {
 		"reviewer",
 		"secretary",
 		"operator",
-		"computer-use",
-		"computer-verifier",
-		"computer-terminal",
 	]) {
 		const agent = requireBundled(name);
 		assert.equal(agent.capabilities.delegation, false, name);
