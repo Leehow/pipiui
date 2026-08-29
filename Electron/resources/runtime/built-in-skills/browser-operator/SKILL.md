@@ -1,11 +1,11 @@
 ---
 name: browser-operator
-description: Drive the built-in WebView with the browser tool. Use when navigating, observing, clicking, filling forms, scrolling, or recovering from stale snapshots / missing elements / unresponsive clicks; when the page is large, has popovers, or you must choose among observe, script, screenshot, and computer_task. 内置浏览器、填表、点选、观察页面时使用。
+description: Drive the built-in WebView with the browser tool. Use when navigating, observing, clicking, filling forms, scrolling, or recovering from stale snapshots / missing elements / unresponsive clicks; when the page is large, has popovers, or you must choose among observe, script, screenshot, and desktop escalation. 内置浏览器、填表、点选、观察页面时使用。
 ---
 
 # 操作内置 browser
 
-只控制应用内 WebView（工具名 `browser`）。Chrome / 系统浏览器走 `computer_task`，不要混用。动作契约以 `browser` `action:"help"` 为准；本技能教节奏，不发明工具没有的能力。
+只控制应用内 WebView（工具名 `browser`）。Chrome / 系统浏览器走主会话的 `computer` / `open_application` 桌面工具，不要混用。动作契约以 `browser` `action:"help"` 为准；本技能教节奏，不发明工具没有的能力。
 
 结构化动作只有 `click` / `input` / `select` / `scroll`，一律带当前 `snapshot_id`，且 `element_token` 与 `element_index` 二选一（优先 token）。token / snapshot 按 viewport 隔离，desktop 与 mobile 不可混用。
 
@@ -80,7 +80,7 @@ description: Drive the built-in WebView with the browser tool. Use when navigati
 
 `limitations` 里有几条**每次 observe 都会出现**（尤其 `closed_shadow_roots_not_structured`、`js_dialogs_not_handled`、`file_input_paths_not_supported`）。看见它们 ≠ 当前目标进了死角，禁止据此升级。
 
-只有**任务要点的那个控件**同时满足下面两条，才停手改 `computer_task`（或请用户在面板里手操）：
+只有**任务要点的那个控件**同时满足下面两条，才停手改用主会话的 `computer` 桌面工具（或请用户在面板里手操）：
 
 1. 结构化通道失败：换 `region` / `role` / `name` / `cursor`、滚动、`screenshot` 对照后，仍没有能操作该控件的 token；或对现有 token 的 `click`/`input` 无效。
 2. 有位置证据说明它落在工具进不去的地方：`screenshot` 看见控件，但结构化树只有外壳——对照到具体的跨域 iframe（`cross_origin_iframe:…` / `nested_iframe_unavailable`）、closed shadow 宿主、或 canvas/WebGL 自绘面。

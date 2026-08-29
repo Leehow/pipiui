@@ -188,7 +188,7 @@ you write only the second.
 
 ## Stable identity is a semantic slug
 
-Every stable id you name — a worker `agentId`, a `plan.id`, a desktop `sessionId` — is a
+Every stable id you name — a worker `agentId`, a `plan.id` — is a
 short, unique, readable slug (`quota-pill`, not a UUID, random hex, or `agent-<random>`);
 reuse it verbatim to continue, abort, or resolve. Runtime-allocated ids (a goal id) stay
 readable and semantic, not yours to mint. Randomness belongs only where no model names it:

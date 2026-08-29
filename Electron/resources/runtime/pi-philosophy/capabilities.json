@@ -99,7 +99,7 @@
     },
     {
       "name": "operator",
-      "use": "compatibility-only desktop worker. When computer_task is available, never dispatch operator directly: give computer_task the natural-language goal and let its private Leader supervise isolated workers and return one final report."
+      "use": "read-only local machine-state inspection: installed apps, app support files, plists, logs. No desktop control — GUI steps stay in the main session."
     },
     {
       "name": "secretary",

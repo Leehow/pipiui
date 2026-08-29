@@ -200,9 +200,6 @@ test("wiring: abort is exact-run everywhere and the runtime never generates a wo
 	assert.match(chainItem, /\tagentId: Type\.String\(\{ description: AGENT_ID_DESCRIPTION \}\),/);
 	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
 	assert.match(singleSchema, /\tagentId: Type\.Optional\(Type\.String\(\{[\s\S]*?tasks\[\] call omits this root field/, "root agentId must be schema-optional for the parallel tasks[] mode");
-	// computer_task sessionId is required, not optional-plus-runtime-error.
-	assert.match(source, /\tsessionId: Type\.String\(\{ minLength: 1, maxLength: 24,/);
-	assert.doesNotMatch(source, /sessionId: Type\.Optional/);
 	// Unknown subagent_type is never silently remapped into an identity.
 	assert.doesNotMatch(source, /remapUnknownSubagentType/);
 });
