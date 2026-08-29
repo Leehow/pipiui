@@ -22,6 +22,9 @@ export const ERROR_DONE_CAP = 6000;
 /** Tail lines of attested verify embedded in done / chain messages. */
 export const VERIFY_DONE_TAIL_LINES = 12;
 
+/** Files listed on the Scope-drift done line before the tail collapses to a +N count. */
+export const SCOPE_DRIFT_LIST_CAP = 20;
+
 export interface VerifyAttestation {
 	command: string;
 	exitCode: number | null;
@@ -44,6 +47,8 @@ export interface DoneMessageResult {
 	verify?: VerifyAttestation;
 	verifySkipped?: boolean;
 	verifyDropped?: boolean;
+	/** Attested completion measurement: worker-branch files outside the declared scope (empty = none). Absent when no scope was declared or the branch diff was not measurable. */
+	scopeDrift?: string[];
 	reportsInFull?: boolean;
 	resumed?: boolean;
 }
@@ -213,6 +218,19 @@ export function formatSubagentDoneMessage(
 		lines.push(formatVerifyLine(att));
 		for (const tailLine of att.tail.split("\n").slice(-VERIFY_DONE_TAIL_LINES)) {
 			lines.push(`  ${tailLine}`);
+		}
+	}
+	// Attested scope drift, same nature as the verify exit code: machine-measured, not worker-claimed.
+	// No line at all when the dispatch declared no scope or the branch diff was not measurable —
+	// an unmeasured run must never read as "none".
+	if (result.scopeDrift) {
+		const total = result.scopeDrift.length;
+		if (total === 0) {
+			lines.push("Scope-drift: none");
+		} else {
+			const listed = result.scopeDrift.slice(0, SCOPE_DRIFT_LIST_CAP);
+			const more = total > listed.length ? `, …+${total - listed.length} more` : "";
+			lines.push(`Scope-drift: ${total} file(s) outside declared scope: ${listed.join(", ")}${more}`);
 		}
 	}
 	lines.push(

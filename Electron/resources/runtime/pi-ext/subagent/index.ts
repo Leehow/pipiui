@@ -72,6 +72,15 @@ import {
 	recordRunningDispatchScope,
 } from "./scope-overlap.ts";
 import {
+	computeScopeDrift,
+	planDriftAdvisoryFor,
+	publishPlanAdherenceSeam,
+	readActivePlanTasks,
+	recentPlanDriftSignals,
+	type PlanAdherenceJob,
+	type PlanDriftCandidate,
+} from "./plan-drift.ts";
+import {
 	createBossDesktopDirectDrive,
 	formatDirectDriveToolResult,
 	createDirectDriveStuckGuard,
@@ -1406,6 +1415,8 @@ interface SingleResult {
 	verifySkipped?: boolean;
 	/** Brief carried `verify` for a read-only agent; the runtime dropped it as unattestable. */
 	verifyDropped?: boolean;
+	/** Attested scope-drift measurement (files outside declared scope); absent when not measured. */
+	scopeDrift?: string[];
 	/** Declared `deliverable: report`: the done message carries a report, capped higher. */
 	reportsInFull?: boolean;
 	/** Continued an existing worker's conversation instead of starting it cold. */
@@ -1446,6 +1457,8 @@ interface RunSingleAgentOptions {
 	blockedBy?: string[];
 	/** Advisory write-set path prefixes for overlap warnings. */
 	scope?: string[];
+	/** Declared plan task slug this dispatch implements (plan-adherence seam / [plan-drift]). */
+	planTask?: string;
 	/** Current session model as `provider/id` (depth 0 `ctx.model`); used for「跟随主 Agent」. */
 	sessionModel?: string;
 	/** Model context window from the dispatching session; shown on the detail header. */
@@ -2287,6 +2300,12 @@ interface JobRecord {
 	worktreeBranch?: string;
 	integrationState?: SubagentIntegrationState;
 	worktreeFinalization?: string;
+	/** Declared plan task slug this dispatch implements; surfaced by the plan-adherence seam. */
+	planTask?: string;
+	/** Declared scope prefixes, persisted past dispatch so completion can attest drift against them. */
+	scope?: string[];
+	/** Completion attestation: worker-branch files outside the declared scope (empty = none measured). */
+	scopeDrift?: string[];
 }
 
 interface InterruptedReminder {
@@ -3350,11 +3369,13 @@ function jobUpsertRunning(
 	blockedBy?: string[],
 	runId?: string,
 	model?: string,
+	planAdherence?: { planTask?: string; scope?: string[] },
 ): string {
 	// Every dispatch is a fresh episode, including a same-agentId continuation. A late old
 	// close/finalize callback is therefore unable to mutate the new row or its reminders.
 	const episodeRunId = runId ?? DeliveryObligationStore.runId();
 	cancelInterruptedReminders(agentId);
+	const declaredScope = planAdherence?.scope ? cleanScope(planAdherence.scope) : [];
 	jobRegistry.set(agentId, {
 		agentId,
 		runId: episodeRunId,
@@ -3363,6 +3384,8 @@ function jobUpsertRunning(
 		title,
 		...(blockedBy && blockedBy.length > 0 ? { blockedBy } : {}),
 		...(model ? { model } : {}),
+		...(planAdherence?.planTask ? { planTask: planAdherence.planTask } : {}),
+		...(declaredScope.length > 0 ? { scope: declaredScope } : {}),
 		state: "running",
 		startedAt: Date.now(),
 	});
@@ -3436,6 +3459,8 @@ type JobFinalizeFields = {
 	recoveryCheckpoint?: string;
 	/** Only watchdog disappearance settle uses this; the real terminal callback may replace it. */
 	provisional?: boolean;
+	/** Completion scope-drift attestation (see plan-drift.ts). */
+	scopeDrift?: string[];
 };
 
 function mergeTerminalJobFields(existing: JobRecord, fields: JobFinalizeFields): void {
@@ -3449,6 +3474,7 @@ function mergeTerminalJobFields(existing: JobRecord, fields: JobFinalizeFields):
 	if (fields.worktreeBranch) existing.worktreeBranch = fields.worktreeBranch;
 	if (fields.integrationState) existing.integrationState = fields.integrationState;
 	if (fields.worktreeFinalization) existing.worktreeFinalization = fields.worktreeFinalization;
+	if (!existing.scopeDrift && fields.scopeDrift) existing.scopeDrift = fields.scopeDrift;
 }
 
 /**
@@ -3503,6 +3529,11 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		worktreeBranch: fields.worktreeBranch ?? existing?.worktreeBranch,
 		integrationState: fields.integrationState ?? existing?.integrationState,
 		worktreeFinalization: fields.worktreeFinalization ?? existing?.worktreeFinalization,
+		...(existing?.planTask ? { planTask: existing.planTask } : {}),
+		...(existing?.scope && existing.scope.length > 0 ? { scope: existing.scope } : {}),
+		...(fields.scopeDrift
+			? { scopeDrift: fields.scopeDrift }
+			: (existing?.scopeDrift ? { scopeDrift: existing.scopeDrift } : {})),
 		...(fields.recovery ? { recovery: fields.recovery } : (existing?.recovery ? { recovery: existing.recovery } : {})),
 		...(fields.recoveryCheckpoint || existing?.recoveryCheckpoint
 			? { recoveryCheckpoint: fields.recoveryCheckpoint ?? existing?.recoveryCheckpoint }
@@ -3560,6 +3591,38 @@ function jobPatchIntegration(
 	rememberAgentSliceTerminal(agentId, runId, job);
 	// A dependency held while integration was active may now be releasable.
 	dispatchQueue.onAgentTerminal(agentId);
+}
+
+/**
+ * Read-only views behind the plan-adherence seam (plan-drift.ts → getPlanAdherenceSnapshot),
+ * consumed by extensions/pipiui-plan.ts's plan_check. Queued items are projected in too: a
+ * held dependency is exactly the work a plan_check must not miss.
+ */
+function planAdherenceJobForRecord(job: JobRecord): PlanAdherenceJob {
+	return {
+		agentId: job.agentId,
+		runId: job.runId,
+		...(job.title ? { title: job.title } : {}),
+		state: job.state,
+		...(job.planTask ? { planTask: job.planTask } : {}),
+		...(job.scope && job.scope.length > 0 ? { scope: job.scope } : {}),
+		...(job.scopeDrift ? { scopeDrift: job.scopeDrift } : {}),
+	};
+}
+
+function planAdherenceJobsSnapshot(): PlanAdherenceJob[] {
+	const jobs = [...jobRegistry.values()].map(planAdherenceJobForRecord);
+	for (const item of dispatchQueue.snapshot()) {
+		jobs.push({
+			agentId: item.agentId,
+			runId: item.runId,
+			...(item.title ? { title: item.title } : {}),
+			state: "queued",
+			...(item.planTask ? { planTask: item.planTask } : {}),
+			...(item.scope && item.scope.length > 0 ? { scope: item.scope } : {}),
+		});
+	}
+	return jobs;
 }
 
 /**
@@ -3785,6 +3848,7 @@ function ensureJobTerminalFromResult(
 		worktreeBranch: result.worktreeBranch,
 		integrationState: result.integrationState,
 		worktreeFinalization: result.worktreeFinalization,
+		...(result.scopeDrift ? { scopeDrift: result.scopeDrift } : {}),
 	});
 	return runId;
 }
@@ -6621,7 +6685,7 @@ async function runSingleAgent(
 			...(options?.background ? { background: true } : {}),
 			worktreeError: placement.worktreeError,
 		});
-		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
+		jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel, { planTask: options?.planTask, scope: options?.scope });
 		jobFinalize(pipiuiAgentId, runId, {
 			name: agentName,
 			task,
@@ -6685,7 +6749,7 @@ async function runSingleAgent(
 				...(options?.title ? { title: options.title } : {}),
 				...(options?.background ? { background: true } : {}),
 			});
-			jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
+			jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel, { planTask: options?.planTask, scope: options?.scope });
 			jobFinalize(pipiuiAgentId, runId, {
 				name: agentName,
 				task,
@@ -6961,7 +7025,7 @@ async function runSingleAgent(
 			lastActivityAt: Date.now(),
 		}),
 	});
-	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel);
+	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel, { planTask: options?.planTask, scope: options?.scope });
 	// Both foreground Computer Workers and background jobs need a separately
 	// addressable abort handle; the parent tool signal is composed at spawn.
 	const dispatchAbort = new AbortController();
@@ -8328,6 +8392,19 @@ async function runSingleAgent(
 		// Merge/cleanup runs before the terminal report so the report describes a settled tree:
 		// a host that handed finalization to pi must not see "ok" while the branch is still
 		// unmerged. A host that kept finalization gets undefined here and is unaffected.
+		// Scope-drift attestation (worker closeout, layer 2 of plan adherence): compare the
+		// worker branch's changed files against the declared scope BEFORE finalization — the
+		// merge may delete the branch, and this is the same merge-base diff the finalizer's
+		// inspection carries. Read-only roles and dispatches with no declared scope are
+		// skipped: there is nothing to drift from. An unmeasurable diff stays undefined and
+		// surfaces as NO attestation line, never as "none".
+		if (!agent.traits.readOnly && placement.worktreePath && placement.worktreeBranch) {
+			const declaredScope = cleanScope(options?.scope);
+			if (declaredScope.length > 0) {
+				const drift = computeScopeDrift(PIPIUI_MAIN_CWD, placement.worktreeBranch, declaredScope);
+				if (drift) currentResult.scopeDrift = drift;
+			}
+		}
 		let finalization: string | undefined;
 		let worktreeLifecycle: WorktreeLifecycleProjectionV1 | undefined;
 		const worktreeStartedAt = Date.now();
@@ -8544,6 +8621,9 @@ const BLOCKED_BY_DESCRIPTION =
 	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]. The runtime queue holds this task until every named agent succeeds; a failed or never-dispatched dependency holds the item and reports [subagent-blocked] instead of starting it.';
 const SCOPE_DESCRIPTION =
 	'Optional advisory path prefixes this worker expects to touch, e.g. ["Electron/packages/ui/src/session/", "Electron/packages/ui/src/session/store.ts"]. A trailing slash means that directory and everything under it. Concurrent dispatches whose scopes overlap get a [subagent-overlap] warning but still start. Omit when the task is read-only or has no predicted write set.';
+const PLAN_TASK_DESCRIPTION =
+	'Optional planTask: the semantic slug id of one task in the currently approved plan (.pi/plans) that this dispatch implements, so plan_check can tie the worker to the plan. When an approved plan still has open tasks, a dispatch that omits planTask or names an unknown task id gets an advisory [plan-drift] line on its receipt — it is never blocked. Legitimate out-of-plan work (failure recovery re-dispatches, secretary closeout, new user requests) may omit it.';
+const PlanTaskParam = Type.Optional(Type.String({ maxLength: 120, description: PLAN_TASK_DESCRIPTION }));
 const THINKING_PARAM_DESCRIPTION =
 	"Optional per-task thinking for this dispatch only: off|minimal|low|medium|high|xhigh|max. It never inherits the Boss current thinking and does not select a model (pass `model` for that). It overrides the current candidate's configured thinking; if a fallback is needed, it carries only when the Swift capability catalog explicitly allows that fallback level, otherwise that fallback uses its configured thinking/default.";
 
@@ -8615,6 +8695,7 @@ const TaskItem = Type.Object({
 	),
 	blockedBy: BlockedByParam,
 	scope: ScopeParam,
+	planTask: PlanTaskParam,
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
@@ -8664,6 +8745,7 @@ const ChainItem = Type.Object({
 		}),
 	),
 	scope: ScopeParam,
+	planTask: PlanTaskParam,
 }, { additionalProperties: false });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
@@ -8745,6 +8827,7 @@ const SubagentParams = Type.Object({
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
 	scope: ScopeParam,
+	planTask: PlanTaskParam,
 	tasks: Type.Optional(Type.Array(TaskItem, {
 		minItems: 1,
 		maxItems: MAX_PARALLEL_TASKS,
@@ -8803,6 +8886,7 @@ type SubagentExecuteParams = {
 	title?: string;
 	blockedBy?: string[];
 	scope?: string[];
+	planTask?: string;
 	thinking?: string;
 	/** Optional per-dispatch model pin: exact `provider/modelId`, catalog-validated at the gate. */
 	model?: string;
@@ -8845,6 +8929,7 @@ type SubagentExecuteParams = {
 		progressLog?: string;
 		desktop?: "user-requested" | "ui-verify";
 		scope?: string[];
+		planTask?: string;
 	}>;
 	tasks?: Array<{
 		agent: string;
@@ -8860,6 +8945,7 @@ type SubagentExecuteParams = {
 		fresh?: boolean;
 		desktop?: "user-requested" | "ui-verify";
 		scope?: string[];
+		planTask?: string;
 	}>;
 	agentScope?: AgentScope;
 	confirmProjectAgents?: boolean;
@@ -9175,6 +9261,13 @@ export default function (pi: ExtensionAPI) {
 	// owning session. This controller closes the tiny pre-handle spawn race during
 	// session_shutdown without coupling ordinary parent-turn aborts to descendants.
 	const sessionShutdownAbort = new AbortController();
+	// Publish the read-only plan-adherence seam over globalThis: jiti evaluates every
+	// extension entry fresh, so a module-level registry here would be invisible to
+	// extensions/pipiui-plan.ts importing plan-drift.ts in its own evaluation tree.
+	publishPlanAdherenceSeam({
+		jobs: planAdherenceJobsSnapshot,
+		recentPlanDrift: recentPlanDriftSignals,
+	});
 	bindIdleFoldRegistry(createIdleFoldRegistry({
 		...idleFoldConfig,
 		isContextAboveWatermark: () => !contextFoldIsStandby() && contextAboveIdleFoldWatermark(lastIdleFoldUsage, idleFoldConfig.lowWatermark),
@@ -9911,7 +10004,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Dispatch one worker. A single dispatch requires prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
-			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, run_in_background. resume_from is a deprecated alias of agentId.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
 			"Parallel mode: pass tasks[] (each item: task, agentId, and the same optional fields including its own model) instead of prompt/description. Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
 			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
@@ -10070,6 +10163,7 @@ export default function (pi: ExtensionAPI) {
 				scope?: string[],
 				model?: string,
 				modelPin?: ValidatedModelPin,
+				planTask?: string,
 			): void => {
 				// A receipt is an accepted lifecycle obligation even while queue/blockedBy
 				// keeps it from spawning. The resident parent may not close over it.
@@ -10085,7 +10179,7 @@ export default function (pi: ExtensionAPI) {
 					sessionShutdownAbort.signal, // session teardown (not a turn abort) owns this descendant subtree
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, desktop, blockedBy, scope, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, desktop, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -10231,16 +10325,17 @@ export default function (pi: ExtensionAPI) {
 				: hasTasks
 					? (params.tasks ?? []).map((task, index) => ({ agentId: task.agentId, fresh: task.fresh, agentName: task.agent, label: `task ${index + 1}` }))
 					: [{ agentId: params.agentId, fresh: params.fresh, agentName: params.agent, label: "this dispatch" }];
+			const dispatchResumableLookup = (agentId: string, agentName?: string): boolean => {
+				const config = agentName ? agents.find((agent) => agent.name === agentName) : undefined;
+				if (!config || config.traits.readOnly) return false;
+				const dir = agentSessionDir();
+				return dir !== undefined && agentSessionExists(dir, `pipiui-${agentId}`);
+			};
 			const preAcceptanceIdentityProblem = dispatchIdentityGateProblem({
 				targets: pendingDispatchIdTargets,
 				agentId: params.agentId,
 				resumeFrom: params.resume_from,
-				isResumable: (agentId, agentName) => {
-					const config = agentName ? agents.find((agent) => agent.name === agentName) : undefined;
-					if (!config || config.traits.readOnly) return false;
-					const dir = agentSessionDir();
-					return dir !== undefined && agentSessionExists(dir, `pipiui-${agentId}`);
-				},
+				isResumable: dispatchResumableLookup,
 			});
 			if (preAcceptanceIdentityProblem) {
 				return {
@@ -10249,6 +10344,41 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			// [plan-drift] advisory, measured at acceptance like [subagent-overlap] but never
+			// gating admission: when an approved plan still has open tasks, every fresh dispatch
+			// should either map onto one of them (planTask) or be a conscious out-of-plan move.
+			// Known ids (terminal job, queued item, reservation, resumable conversation) are
+			// re-dispatch/resume continuations and exempt, as are secretary closeouts.
+			// Computed BEFORE pending-acceptance registration so this call's own ids cannot
+			// whitelist themselves.
+			const planDriftCandidates: PlanDriftCandidate[] = hasChain
+				? (params.chain ?? []).map((step) => ({
+					agentId: String(step.agentId ?? "").trim(),
+					agentName: step.agent,
+					subagentType: step.subagent_type,
+					planTask: step.planTask,
+				}))
+				: hasTasks
+					? (params.tasks ?? []).map((task) => ({
+						agentId: String(task.agentId ?? "").trim(),
+						agentName: task.agent,
+						subagentType: task.subagent_type,
+						planTask: task.planTask,
+					}))
+					: [{
+						agentId: String(params.agentId ?? "").trim(),
+						agentName: params.agent,
+						subagentType: params.subagent_type,
+						planTask: params.planTask,
+					}];
+			const planDriftAdvisory = planDriftAdvisoryFor(planDriftCandidates, {
+				activePlan: readActivePlanTasks(PIPIUI_MAIN_CWD ?? ctx.cwd, process.env.PIPIUI_SESSION_ID),
+				isKnownAgentId: (agentId) =>
+					jobRegistry.has(agentId)
+					|| localAgentReservations.has(agentId)
+					|| dispatchQueue.snapshot().some((item) => item.agentId === agentId),
+				isResumable: dispatchResumableLookup,
+			});
 			const pendingAcceptanceToken = Symbol("dispatch-acceptance");
 			const pendingAcceptanceIds = pendingDispatchIdTargets.map((target) => target.agentId!.trim());
 			for (const agentId of pendingAcceptanceIds) {
@@ -10588,9 +10718,10 @@ export default function (pi: ExtensionAPI) {
 						step.heartbeatSecs,
 						step.timeoutSecs,
 						step.progressLog,
-						undefined,
+						step.scope,
 						step.model,
 						validatedPinOf(step.model),
+						step.planTask,
 					);
 					const placeholder: SingleResult = {
 						agent: agentName,
@@ -10612,6 +10743,7 @@ export default function (pi: ExtensionAPI) {
 								// formatStartedMessage already prefixes bgIgnoredWarning — adding it here
 								// duplicated the warning/note on one-step-chain receipts.
 								text:
+									(planDriftAdvisory ? `${planDriftAdvisory}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage([
 										{ agentId, runId: stepRunId, name: agentName, task, title: step.title, fresh: step.fresh },
@@ -10680,6 +10812,8 @@ export default function (pi: ExtensionAPI) {
 								heartbeatSecs: step.heartbeatSecs,
 								timeoutSecs: step.timeoutSecs,
 								progressLog: step.progressLog,
+								scope: step.scope,
+								planTask: step.planTask,
 							},
 						);
 						results.push(result);
@@ -10735,7 +10869,9 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text",
-							text: bgIgnoredWarning + formatChainVerifyPrefix(results) + chainOutput,
+							text:
+								(planDriftAdvisory ? `${planDriftAdvisory}\n\n` : "") +
+								bgIgnoredWarning + formatChainVerifyPrefix(results) + chainOutput,
 						},
 					],
 					details: makeDetails("chain")(results),
@@ -10825,7 +10961,7 @@ export default function (pi: ExtensionAPI) {
 								sessionShutdownAbort.signal, // session teardown owns queued descendants too
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -10864,6 +11000,7 @@ export default function (pi: ExtensionAPI) {
 						incomingScopes,
 						dispatchQueue.snapshot(),
 					);
+					const acceptanceNotices = [scopeOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
 					dispatchQueue.enqueueBatch(
 						params.tasks.map((t, index) => ({
 							agentId: agentIds[index],
@@ -10873,6 +11010,7 @@ export default function (pi: ExtensionAPI) {
 							task: t.task,
 							blockedBy: t.blockedBy ?? [],
 							scope: cleanScope(t.scope),
+							...(t.planTask ? { planTask: t.planTask } : {}),
 							queuedAt: Date.now(),
 							run: () => runQueuedParallelTask(t, index),
 						})),
@@ -10883,7 +11021,7 @@ export default function (pi: ExtensionAPI) {
 							{
 								type: "text",
 								text:
-									(scopeOverlapNotice ? `${scopeOverlapNotice}\n\n` : "") +
+									(acceptanceNotices ? `${acceptanceNotices}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage(startedItems),
 							},
@@ -10953,6 +11091,8 @@ export default function (pi: ExtensionAPI) {
 							fresh: t.fresh,
 							desktop: t.desktop,
 							blockedBy: t.blockedBy,
+							scope: t.scope,
+							planTask: t.planTask,
 						},
 					);
 					allResults[index] = result;
@@ -11010,6 +11150,7 @@ export default function (pi: ExtensionAPI) {
 						[{ agentId, scope: cleanScope(params.scope) }],
 						dispatchQueue.snapshot(),
 					);
+					const acceptanceNotices = [scopeOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
 					if (params.blockedBy && params.blockedBy.length > 0) {
 						// A blocked receipt is already an accepted descendant obligation.
 						registerResidentDescendant(agentId, runId);
@@ -11026,6 +11167,7 @@ export default function (pi: ExtensionAPI) {
 								task: params.task,
 								blockedBy: params.blockedBy,
 								scope: cleanScope(params.scope),
+								...(params.planTask ? { planTask: params.planTask } : {}),
 								queuedAt: Date.now(),
 								run: () =>
 									new Promise<void>((resolveRun) => {
@@ -11112,7 +11254,7 @@ export default function (pi: ExtensionAPI) {
 												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
-												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
 											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -11148,7 +11290,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						]);
 					} else {
-						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model));
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model), params.planTask);
 					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -11168,7 +11310,7 @@ export default function (pi: ExtensionAPI) {
 							{
 								type: "text",
 								text:
-									(scopeOverlapNotice ? `${scopeOverlapNotice}\n\n` : "") +
+									(acceptanceNotices ? `${acceptanceNotices}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage([
 										{ agentId, runId, name: params.agent, task: params.task, title: params.title, fresh: params.fresh },
@@ -11205,6 +11347,8 @@ export default function (pi: ExtensionAPI) {
 						fresh: params.fresh,
 						desktop: params.desktop,
 						blockedBy: params.blockedBy,
+						scope: params.scope,
+						planTask: params.planTask,
 						worktree: params.worktree,
 						noWorktreeReason: params.noWorktreeReason,
 						heartbeatSecs: params.heartbeatSecs,
@@ -11601,7 +11745,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_chain",
 		label: "Subagent Chain",
 		description:
-			"Run ordered worker steps. Each chain item needs prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose, unique within the chain (2-24 chars: lowercase letters, digits, \"-\", \"_\"). A step may reference the prior step's output as {previous}.",
+			"Run ordered worker steps. Each chain item needs prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose, unique within the chain (2-24 chars: lowercase letters, digits, \"-\", \"_\"). A step may reference the prior step's output as {previous}. Optional per step: planTask, the approved-plan task slug this step implements (missing/unknown planTask under an approved plan with open tasks only earns an advisory [plan-drift] line).",
 		promptSnippet: "Run ordered subagent steps in sequence; a step references the prior step's output as {previous}.",
 		promptGuidelines: [
 			"Use subagent_chain only for genuinely ordered multi-step work; a one-step chain is dispatched in the background while fan-out is on.",

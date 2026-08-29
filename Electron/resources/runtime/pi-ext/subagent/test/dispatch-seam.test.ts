@@ -103,6 +103,10 @@ if (process.argv.includes("--mode") && process.argv.includes("rpc")) {
 
 import { sanitizeStrictToolArguments } from "../strict-json-schema.ts";
 import { setAgentLeaseMutationHooksForTests } from "../agent-lease.ts";
+import {
+	getPlanAdherenceSnapshot,
+	resetPlanDriftSignalsForTests,
+} from "../plan-drift.ts";
 
 type RegisteredTool = {
 	name: string;
@@ -1050,6 +1054,221 @@ test("queued-single setup failure before spawn frees the id, repumps dependents,
 
 	// Hygiene: drop the held dependent so no queued leftover leaks into later tests.
 	await abort.execute("qs-5", { agentId: "predep", runId: depRunId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+// ── Plan adherence layer 1: planTask threading, [plan-drift] advisory, seam ──────────────
+
+const PLANS_DIR = join(suiteMainCwd, ".pi", "plans");
+const PLAN_SESSION = "seam-plan-session";
+const APPROVED_PLAN = {
+	activePlanId: "plan-seam",
+	plans: {
+		"plan-seam": {
+			id: "plan-seam",
+			title: "Seam plan",
+			lifecycle: "approved",
+			tasks: [
+				{ id: "pd-task-open", title: "Open", state: "pending" },
+				{ id: "pd-task-active", title: "Active", state: "in_progress" },
+				{ id: "pd-task-done", title: "Done", state: "completed" },
+			],
+		},
+	},
+};
+
+function writePlanStore(plan: unknown): void {
+	mkdirSync(PLANS_DIR, { recursive: true });
+	writeFileSync(join(PLANS_DIR, `${PLAN_SESSION}.json`), JSON.stringify(plan), "utf8");
+}
+
+function removePlanStore(): void {
+	rmSync(join(PLANS_DIR, `${PLAN_SESSION}.json`), { force: true });
+}
+
+/** Queued (never-spawning) single dispatch: blockedBy names a dependency that never existed. */
+async function queuedSeamDispatch(
+	subagent: RegisteredTool,
+	args: Record<string, unknown>,
+): Promise<{ text: string; runId: string }> {
+	const out = (await subagent.execute("pd", prepared(subagent, {
+		prompt: "Plan adherence probe.",
+		description: "plan probe",
+		subagent_type: "explore",
+		run_in_background: true,
+		blockedBy: ["pd-never-dispatched-dep"],
+		...args,
+	}), undefined, undefined, { cwd: tmpdir(), model: undefined })) as {
+		content: Array<{ type: string; text: string }>;
+		isError?: boolean;
+	};
+	assert.equal(out.isError === true, false, JSON.stringify(out.content));
+	const text = out.content[0]!.text;
+	const runId = text.match(/runId=([^\s]+)/)?.[1] ?? "";
+	assert.ok(runId, "queued dispatch receipt must carry a runId");
+	return { text, runId };
+}
+
+test("planTask: declared on the single, tasks[] and chain schemas and kept by prepare", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => cleanup());
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const chain = tools.get("subagent_chain")!;
+
+	assert.equal(prepared(subagent, { prompt: "x", description: "x", agentId: "pd-schema", planTask: "pd-task-open" }).planTask, "pd-task-open");
+	const tasksPrepared = prepared(subagent, {
+		tasks: [{ agent: "explore", task: "t", agentId: "pd-schema-t", planTask: "pd-task-open" }],
+	}) as { tasks: Array<{ planTask?: string }> };
+	assert.equal(tasksPrepared.tasks[0]!.planTask, "pd-task-open");
+	const chainPrepared = prepared(chain, {
+		chain: [{ prompt: "s", description: "d", subagent_type: "explore", agentId: "pd-schema-c", planTask: "pd-task-open" }],
+	}) as { chain: Array<{ planTask?: string }> };
+	assert.equal(chainPrepared.chain[0]!.planTask, "pd-task-open");
+});
+
+test("plan-drift: no approved plan with open tasks — every dispatch is silent", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		removePlanStore();
+		delete process.env.PIPIUI_SESSION_ID;
+		resetPlanDriftSignalsForTests();
+	});
+	process.env.PIPIUI_SESSION_ID = PLAN_SESSION;
+	removePlanStore();
+	resetPlanDriftSignalsForTests();
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+
+	const first = await queuedSeamDispatch(subagent, { agentId: "pd-quiet-1", planTask: "pd-task-open" });
+	const second = await queuedSeamDispatch(subagent, { agentId: "pd-quiet-2" });
+	assert.match(first.text, /Started background agent/);
+	assert.doesNotMatch(first.text, /\[plan-drift\]/);
+	assert.doesNotMatch(second.text, /\[plan-drift\]/);
+	assert.equal(getPlanAdherenceSnapshot().recentPlanDrift.length, 0, "silence means nothing recorded");
+
+	await abort.execute("pd-a1", { agentId: "pd-quiet-1", runId: first.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("pd-a2", { agentId: "pd-quiet-2", runId: second.runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+test("plan-drift: under an approved plan, missing planTask signals and a valid planTask is silent", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		removePlanStore();
+		delete process.env.PIPIUI_SESSION_ID;
+		resetPlanDriftSignalsForTests();
+	});
+	process.env.PIPIUI_SESSION_ID = PLAN_SESSION;
+	writePlanStore(APPROVED_PLAN);
+	resetPlanDriftSignalsForTests();
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+
+	// Missing planTask on a fresh id: advisory on the receipt, never an error.
+	const missing = await queuedSeamDispatch(subagent, { agentId: "pd-missing" });
+	assert.match(missing.text, /\[plan-drift\] agentId=pd-missing does not declare planTask/);
+	assert.match(missing.text, /Dispatch was not blocked/);
+
+	// Valid task id (pending or in_progress): silent.
+	const valid = await queuedSeamDispatch(subagent, { agentId: "pd-valid", planTask: "pd-task-active" });
+	assert.doesNotMatch(valid.text, /\[plan-drift\]/);
+
+	// Completed task ids are not open work: mapping onto one still signals unknown-task.
+	const doneTask = await queuedSeamDispatch(subagent, { agentId: "pd-done-map", planTask: "pd-task-done" });
+	assert.match(doneTask.text, /\[plan-drift\] agentId=pd-done-map planTask="pd-task-done" is not a task id/);
+
+	await abort.execute("pd-a3", { agentId: "pd-missing", runId: missing.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("pd-a4", { agentId: "pd-valid", runId: valid.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("pd-a5", { agentId: "pd-done-map", runId: doneTask.runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+test("plan-drift: secretary and resume continuations stay silent; ring + queued seam view", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		removePlanStore();
+		delete process.env.PIPIUI_SESSION_ID;
+		resetPlanDriftSignalsForTests();
+	});
+	process.env.PIPIUI_SESSION_ID = PLAN_SESSION;
+	writePlanStore(APPROVED_PLAN);
+	resetPlanDriftSignalsForTests();
+	// A stored conversation for this id makes the dispatch a resume/continuation.
+	writeFileSync(join(suiteSessionsDir, `1_pipiui-pd-resume.jsonl`), JSON.stringify({ cwd: suiteMainCwd }), "utf8");
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+
+	// Unknown task id: recorded with reason unknown-task and the receipt names it.
+	const unknown = await queuedSeamDispatch(subagent, { agentId: "pd-unknown", planTask: "no-such-task", scope: ["src/"] });
+	assert.match(unknown.text, /\[plan-drift\] agentId=pd-unknown planTask="no-such-task"/);
+
+	// Secretary closeout: exempt.
+	const secretary = await queuedSeamDispatch(subagent, { agentId: "pd-secretary", subagent_type: "secretary" });
+	assert.doesNotMatch(secretary.text, /\[plan-drift\]/);
+
+	// Resume of an existing worker conversation: exempt.
+	const resume = await queuedSeamDispatch(subagent, { agentId: "pd-resume", subagent_type: "general-purpose" });
+	assert.doesNotMatch(resume.text, /\[plan-drift\]/);
+
+	// The seam (as plan_check reads it): ring buffer newest-last, queued job carries planTask + scope.
+	const seam = getPlanAdherenceSnapshot();
+	assert.equal(seam.recentPlanDrift.length, 1);
+	assert.equal(seam.recentPlanDrift[0]?.agentId, "pd-unknown");
+	assert.equal(seam.recentPlanDrift[0]?.reason, "unknown-task");
+	assert.equal(seam.recentPlanDrift[0]?.planTask, "no-such-task");
+	const queued = seam.jobs.find((job) => job.agentId === "pd-unknown");
+	assert.ok(queued, "queued drifting dispatch must be visible on the seam");
+	assert.equal(queued.planTask, "no-such-task");
+	assert.deepEqual(queued.scope, ["src/"]);
+	assert.equal(queued.state, "queued");
+
+	await abort.execute("pd-a6", { agentId: "pd-unknown", runId: unknown.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("pd-a7", { agentId: "pd-secretary", runId: secretary.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("pd-a8", { agentId: "pd-resume", runId: resume.runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+test("plan-drift: planTask and scope persist onto the terminal job record the seam exposes", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		removePlanStore();
+		delete process.env.PIPIUI_SESSION_ID;
+		resetPlanDriftSignalsForTests();
+	});
+	process.env.PIPIUI_SESSION_ID = PLAN_SESSION;
+	writePlanStore(APPROVED_PLAN);
+	resetPlanDriftSignalsForTests();
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+
+	// Foreground dispatch runs to completion (fake worker): the JobRecord must retain the
+	// dispatch-time planTask/scope past the terminal boundary for plan_check.
+	const done = (await subagent.execute("pd-fg", prepared(subagent, {
+		prompt: "Finish quickly. [seam:pd-terminal].",
+		description: "finish",
+		subagent_type: "explore",
+		agentId: "pd-terminal",
+		run_in_background: false,
+		planTask: "pd-task-open",
+		scope: ["docs/"],
+	}), undefined, undefined, { cwd: tmpdir(), model: undefined })) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(done.isError === true, false, JSON.stringify(done.content));
+	assert.match(done.content[0]!.text, /fake-ok:pd-terminal/);
+
+	const job = getPlanAdherenceSnapshot().jobs.find((entry) => entry.agentId === "pd-terminal");
+	assert.ok(job, "completed dispatch must appear on the seam");
+	assert.equal(job.planTask, "pd-task-open");
+	assert.deepEqual(job.scope, ["docs/"]);
+	assert.equal(job.state, "ok");
 });
 
 after(async () => {

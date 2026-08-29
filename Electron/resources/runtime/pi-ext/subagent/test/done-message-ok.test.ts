@@ -75,3 +75,17 @@ test("failed result prefers assistant text over session-start stderr", () => {
 	});
 	assert.equal(getResultOutput(result), "I edited the asset card renderer");
 });
+
+test("scope-drift attestation: none / listed / omitted when unmeasured", () => {
+	const omitted = formatSubagentDoneMessage(minimalResult(), { runId: "run-sd" });
+	assert.doesNotMatch(omitted, /Scope-drift:/);
+
+	const none = formatSubagentDoneMessage(minimalResult({ scopeDrift: [] }), { runId: "run-sd" });
+	assert.match(none, /^Scope-drift: none$/m);
+
+	const listed = formatSubagentDoneMessage(
+		minimalResult({ scopeDrift: ["src/a.ts", "lib/b.ts"] }),
+		{ runId: "run-sd" },
+	);
+	assert.match(listed, /^Scope-drift: 2 file\(s\) outside declared scope: src\/a\.ts, lib\/b\.ts$/m);
+});

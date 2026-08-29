@@ -30,6 +30,8 @@ export interface QueuedDispatchV1 {
 	blockedBy: string[];
 	/** Advisory path prefixes this worker expects to touch. */
 	scope?: string[];
+	/** Declared plan task slug from the dispatch, kept so the adherence seam sees queued work. */
+	planTask?: string;
 	queuedAt: number;
 	/** Set once a dependency ended badly. The item stays queued and waits for the boss. */
 	heldReason?: string;
