@@ -1471,7 +1471,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     },
   }), [host])
   const loadLazySessionPage = useCallback(async (projectId: string, cursor?: string) => {
-    if (!host.listSessionPage || !host.preloadSession) return
+    if (!host.listSessionPage) return
     const loadKey = `${projectId}\u0000${cursor ?? 'first'}`
     if (lazyPageLoadsRef.current.has(loadKey)) return
     lazyPageLoadsRef.current.add(loadKey)
@@ -1481,15 +1481,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }))
     try {
       const page = await host.listSessionPage(projectId, cursor, 10)
-      // One session at a time: JSONL parsing stays background work and yields
-      // between sessions instead of contending with first paint/input.
-      for (const session of page.sessions) {
-        if (!preloadedSessionDetailsRef.current.has(session.id)) {
-          const snapshot = await host.preloadSession(session.id)
-          cacheSessionPreload(session.id, snapshot)
-        }
-        await new Promise<void>(resolve => window.setTimeout(resolve, 0))
-      }
       setSessions(current => {
         const merged = new Map(current.map(session => [session.id, session]))
         for (const session of page.sessions) merged.set(session.id, session)
@@ -1520,7 +1511,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     } finally {
       lazyPageLoadsRef.current.delete(loadKey)
     }
-  }, [cacheSessionPreload, host])
+  }, [host])
   const warmInitialSessionPages = useCallback(async (items: readonly Project[]) => {
     for (const project of items) await loadLazySessionPage(project.id)
   }, [loadLazySessionPage])

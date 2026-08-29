@@ -38,7 +38,7 @@ afterEach(() => {
 })
 
 describe('startup-first lazy session warming', () => {
-  it('paints project titles before the remembered transcript, then warms ten sessions and More warms only the next ten', async () => {
+  it('restores only the remembered transcript while session pages stay metadata-only', async () => {
     const project = { id: 'alpha', name: 'Alpha', path: '/tmp/alpha' }
     const remembered = { id: 'remembered', projectId: project.id, name: 'Remembered', updatedAt: 100 }
     const firstPage = Array.from({ length: 10 }, (_, index) => ({
@@ -102,13 +102,13 @@ describe('startup-first lazy session warming', () => {
     await waitFor(() => expect(listSessionPage).toHaveBeenCalledTimes(1))
     const group = await screen.findByRole('group', { name: 'Alpha 的会话' })
     await waitFor(() => expect(within(group).getAllByTestId('session-row')).toHaveLength(10))
-    await waitFor(() => expect(firstPage.every(session => preloadSession.mock.calls.some(([id]) => id === session.id))).toBe(true))
+    expect(preloadSession.mock.calls.map(([id]) => id)).toEqual([remembered.id])
     expect(within(group).getByTestId('show-more-sessions')).toBeTruthy()
 
     fireEvent.click(within(group).getByTestId('show-more-sessions'))
     await waitFor(() => expect(listSessionPage).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(within(group).getAllByTestId('session-row')).toHaveLength(20))
-    expect(secondPage.every(session => preloadSession.mock.calls.some(([id]) => id === session.id))).toBe(true)
+    expect(preloadSession.mock.calls.map(([id]) => id)).toEqual([remembered.id])
   })
 
   it('restores the exact remembered external session before lazy project pages', async () => {
