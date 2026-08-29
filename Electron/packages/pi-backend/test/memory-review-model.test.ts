@@ -26,9 +26,13 @@ describe("Hermes review model spawn wiring", () => {
       mkdir(agentDir, { recursive: true }),
       mkdir(join(sessionsRoot, "project"), { recursive: true }),
       mkdir(cwd, { recursive: true }),
-      mkdir(join(runtimeRoot, "pi-ext", "packages", "memory-broker"), { recursive: true }),
+      // The broker mount is the memory-extension agent half since the
+      // core-capability-extensions wave; no manifest on purpose so the
+      // extension loader skips the directory and the legacy file channel
+      // resolves it (the spawn itself is faked below).
+      mkdir(join(runtimeRoot, "extensions", "memory-extension", "agent"), { recursive: true }),
     ]);
-    await writeFile(join(runtimeRoot, "pi-ext", "packages", "memory-broker", "package.json"), JSON.stringify({ name: "pipiui-memory-broker" }));
+    await writeFile(join(runtimeRoot, "extensions", "memory-extension", "agent", "memory-broker-extension.ts"), "export default {};\n");
     await writeFile(join(sessionsRoot, "project", "session.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-10T00:00:00.000Z", cwd })}\n`);
     const spawnedEnvs: NodeJS.ProcessEnv[] = [];
     const makeBackend = () => createPiHostBackend({

@@ -1,0 +1,31 @@
+{
+  "id": "memory-extension",
+  "name": "PipiUI Memory",
+  "version": "0.1.0",
+  "description": "Project-scoped durable memory reads via the loopback memory broker (frozen tools: memory_query / memory_status). Identity binding and capability issuance stay in the Electron host.",
+  "capabilities": [],
+  "hostApi": ">=1.0.0 <2.0.0",
+  "permissions": [
+    "memory.read"
+  ],
+  "agent": {
+    "extension": "agent/memory-broker-extension.ts"
+  },
+  "update": {
+    "channel": "stable",
+    "signature": "ed25519"
+  },
+  "updateComponents": [
+    {
+      "id": "memory-extension",
+      "name": "PipiUI Memory",
+      "version": "0.1.0",
+      "source": {
+        "type": "githubReleases",
+        "owner": "Leehow",
+        "repo": "pipiui"
+      },
+      "upstream": "https://github.com/Leehow/pipiui"
+    }
+  ]
+}

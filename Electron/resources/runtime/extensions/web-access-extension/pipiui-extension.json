@@ -1,0 +1,31 @@
+{
+  "id": "web-access-extension",
+  "name": "PipiUI Web Access",
+  "version": "0.1.0",
+  "description": "Web search, page fetch, source checking, and retrieval continuation (frozen tools: web_search / fetch_content / source_check / get_search_content).",
+  "capabilities": [],
+  "agent": {
+    "extension": "agent/index.ts"
+  },
+  "hostApi": ">=1.0.0 <2.0.0",
+  "permissions": [
+    "net.request"
+  ],
+  "update": {
+    "channel": "stable",
+    "signature": "ed25519"
+  },
+  "updateComponents": [
+    {
+      "id": "web-access-extension",
+      "name": "PipiUI Web Access",
+      "version": "0.1.0",
+      "source": {
+        "type": "githubReleases",
+        "owner": "Leehow",
+        "repo": "pipiui"
+      },
+      "upstream": "https://github.com/Leehow/pipiui"
+    }
+  ]
+}

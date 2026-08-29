@@ -1,5 +1,5 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
-import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs } from "node:fs";
+import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs, type Dirent } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -40,6 +40,8 @@ import {
   type QuotaSnapshot,
   type PlanSnapshot,
   type Session,
+  type SessionPage,
+  type SessionPreloadSnapshot,
   type SessionStats,
   type SubagentModelSetting,
   type ThinkingLevel,
@@ -66,11 +68,21 @@ import {
   resolvePiExecutable,
   resolveSpawnPaths,
   withToolPath,
+  MEMORY_EXTENSION_ID,
   type ComputerDescriptor,
   type PiCommand,
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
+import { applyExtensionUpdate, extensionUpdateStoreRoot, type ExtensionUpdateResult } from "./extension-update-engine.js";
+import {
+  SEED_MANAGED_EXTENSION_IDS,
+  applySeedMountOverrides,
+  extensionUpdateSigningKey,
+  resolveSeedExtension,
+  selectTransactionalUpdateComponent,
+  withSeedVersionPriority,
+} from "./extension-seed.js";
 import { attachCatalogDiagnostics, buildAgentCatalog } from "./agent-catalog.js";
 import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
@@ -303,6 +315,18 @@ export {
   type ModelPinValidateDenyCodeV1,
   type ModelPinValidateRequestV1,
 } from "./bridge.js";
+export {
+  HostCapabilityBroker,
+  type HostCapabilityBrokerOptions,
+  type HostCapabilityDrivers,
+  type HostCapabilityPolicy,
+} from "./host-capability.js";
+export {
+  EXTENSION_HOST_API_VERSION,
+  EXTENSION_PERMISSIONS,
+  type ExtensionPermission,
+} from "./extension-manifest.js";
+export { readProjectExtensionGrants } from "./extension-grants.js";
 export {
   BROWSER_WATCH_ACTION,
   BROWSER_WATCH_MAX_TIMEOUT_SECS,
@@ -613,6 +637,16 @@ export type PiBackendOptions = {
   ) => Promise<Record<string, unknown>>;
   computerDescriptor?: ComputerDescriptor;
   computerUsable?: () => boolean;
+  /** Versioned Host Capability API — the gated extension→host channel. */
+  hostCapabilityAction?: (
+    request: Record<string, unknown>,
+    sessionId: string,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /** One-time capability token mint for the same channel (fail closed). */
+  hostCapabilityTokenAction?: (
+    request: Record<string, unknown>,
+    sessionId: string,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Injectable pi auth runtime for tests; defaults to ModelRuntime in-process. */ authRuntime?: AuthRuntimeLike;
   /** Packaged helper for the external Pi/Node runtime used by the Electron host. */ authHelperPath?: string;
   authNodePath?: string;
@@ -988,6 +1022,7 @@ type SessionMeta = {
   thinkingLevel?: ThinkingLevel;
   adoptedFrom?: SessionAdoptedFrom;
 };
+type SessionFileCandidate = { path: string; size: number; mtimeMs: number };
 const METADATA_HEAD_BYTES = 64 * 1024,
   METADATA_TAIL_BYTES = 64 * 1024;
 function parseLines(data: string): any[] {
@@ -2216,6 +2251,14 @@ export class PiHostBackend implements HostBackend {
         options.terminalAction
           ? options.terminalAction(event, sessionId)
           : { ok: false, error: "terminal host unavailable" },
+      onHostCapability: async (event, sessionId) =>
+        options.hostCapabilityAction
+          ? options.hostCapabilityAction(event, sessionId)
+          : { ok: false, code: "host_unavailable", error: "host capability broker unavailable" },
+      onHostCapabilityMint: async (event, sessionId) =>
+        options.hostCapabilityTokenAction
+          ? options.hostCapabilityTokenAction(event, sessionId)
+          : { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" },
       onComputerAction: async (event) => {
         if (!options.computerAction) return { ok: false, error: "computer host unavailable" }
         const result = await options.computerAction(event)
@@ -2291,7 +2334,9 @@ export class PiHostBackend implements HostBackend {
     // Catalog preload waits on that same promise so the first listModels cannot cache a
     // pre-migration snapshot.
     void this.loadModelCatalog().catch(() => undefined);
-    void this.index().catch(() => undefined);
+    // The sidebar now opens through project-scoped pages and a direct remembered
+    // session lookup. Keep the legacy global index lazy: scanning every JSONL
+    // here delayed first paint even though none of those rows were visible yet.
     this.turnWatchdogTimer = setInterval(() => void this.checkTurnWatchdogs(), TURN_WATCHDOG_CHECK_INTERVAL_MS);
     if (this.turnWatchdogTimer.unref) this.turnWatchdogTimer.unref();
   }
@@ -3055,6 +3100,120 @@ export class PiHostBackend implements HostBackend {
       this.indexScan = undefined;
     }));
   }
+  /**
+   * Files that can belong to one configured project. The current isolated home
+   * is authoritative; the exact legacy encoded directory remains readable for
+   * pre-migration continuity. Deliberately do not recurse into `sessions/spool`
+   * or unrelated historical project directories.
+   */
+  private async projectSessionCandidates(projectId: unknown): Promise<{ project: Project; files: SessionFileCandidate[] }> {
+    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("缺少项目");
+    const project = await this.configuredProject(projectId);
+    const directories: string[] = [];
+    const isolated = await this.ensureIsolatedProjectHome(project.path, { migrate: false, allowMissing: true });
+    if (isolated) directories.push(isolated.sessionsDir);
+    const legacy = join(this.root, encodeURIComponent(project.path));
+    if (!directories.includes(legacy)) directories.push(legacy);
+
+    const paths = new Set<string>();
+    for (const directory of directories) {
+      let entries: Dirent[];
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+      for (const entry of entries) {
+        if (entry.isFile() && entry.name.endsWith(".jsonl")) paths.add(join(directory, entry.name));
+      }
+    }
+    const files = (await Promise.all([...paths].map(async path => {
+      try {
+        const stat = await fs.stat(path);
+        return stat.isFile() ? { path, size: stat.size, mtimeMs: stat.mtimeMs } : undefined;
+      } catch {
+        return undefined;
+      }
+    }))).filter((entry): entry is SessionFileCandidate => Boolean(entry));
+    files.sort((left, right) => right.mtimeMs - left.mtimeMs || basename(right.path).localeCompare(basename(left.path)));
+    return { project, files };
+  }
+  private async sessionMetaFromCandidate(candidate: SessionFileCandidate): Promise<SessionMeta> {
+    const cached = this.indexCache.get(candidate.path);
+    if (cached && cached.size === candidate.size && cached.mtimeMs === candidate.mtimeMs) return cached.meta;
+    const meta = await readSessionMeta(candidate.path);
+    this.rememberSessionMeta(meta, candidate.size, candidate.mtimeMs);
+    return meta;
+  }
+  private async listSessionPage(projectId: unknown, cursorValue: unknown, limitValue: unknown): Promise<SessionPage> {
+    const { project, files } = await this.projectSessionCandidates(projectId);
+    const parsedCursor = cursorValue === undefined || cursorValue === null || cursorValue === ""
+      ? 0
+      : Number(cursorValue);
+    if (!Number.isInteger(parsedCursor) || parsedCursor < 0) throw new Error("无效的会话分页游标");
+    const requestedLimit = Number(limitValue ?? 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(10, Math.floor(requestedLimit))) : 10;
+    const sessions: Session[] = [];
+    const seen = new Set<string>();
+    let candidateIndex = parsedCursor;
+    while (candidateIndex < files.length && sessions.length < limit) {
+      const candidate = files[candidateIndex++]!;
+      try {
+        const meta = await this.sessionMetaFromCandidate(candidate);
+        if (dirId(meta.header.cwd) !== project.id || seen.has(meta.header.id)) continue;
+        seen.add(meta.header.id);
+        sessions.push(this.toSession(meta));
+      } catch {
+        /* incomplete/corrupt rows are skipped without widening beyond this project */
+      }
+    }
+    return {
+      sessions,
+      ...(candidateIndex < files.length ? { nextCursor: String(candidateIndex) } : {}),
+      hasMore: candidateIndex < files.length,
+    };
+  }
+  private async getProjectSession(projectId: unknown, sessionIdValue: unknown): Promise<Session> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
+    const sessionId = sessionIdValue.trim();
+    const { project, files } = await this.projectSessionCandidates(projectId);
+    const known = this.sessionById.get(sessionId);
+    if (known && dirId(known.header.cwd) === project.id) return this.toSession(known);
+    const suffix = `_${sessionId}.jsonl`;
+    const candidate = files.find(entry => basename(entry.path).endsWith(suffix));
+    if (!candidate) throw new Error(`unknown session ${sessionId}`);
+    const meta = await this.sessionMetaFromCandidate(candidate);
+    if (meta.header.id !== sessionId || dirId(meta.header.cwd) !== project.id) throw new Error(`unknown session ${sessionId}`);
+    return this.toSession(meta);
+  }
+  private async preloadSession(sessionIdValue: unknown): Promise<SessionPreloadSnapshot> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
+    const sessionId = sessionIdValue.trim();
+    const session = this.sessionById.get(sessionId);
+    if (!session) throw new Error(`unknown session ${sessionId}`);
+    const started = Date.now();
+    const history = await readHistory(session.path, 0, Number.MAX_SAFE_INTEGER, this.vaultDir, sessionId);
+    this.reconcileOrphanedNow(sessionId);
+    const agents = [...this.agents.values()]
+      .filter(agent => agent.sessionId === sessionId)
+      .sort((left, right) => (left.createdAt ?? 0) - (right.createdAt ?? 0) || left.runId.localeCompare(right.runId));
+    const agentLogs: SessionPreloadSnapshot["agentLogs"] = agents.map(agent => ({
+      agentId: agent.agentId,
+      sessionId,
+      runId: agent.runId,
+      entries: (this.agentLogCache.get(this.agentLogKey(sessionId, agent.agentId, agent.runId)) ?? []) as SessionPreloadSnapshot["agentLogs"][number]["entries"],
+    }));
+    freezeProbe("session_preload", {
+      session: sessionId,
+      size: (await fs.stat(session.path)).size,
+      historyRows: history.length,
+      agents: agents.length,
+      logRows: agentLogs.reduce((sum, item) => sum + item.entries.length, 0),
+      ms: Date.now() - started,
+    });
+    return { history, agents, agentLogs };
+  }
   private async scanIndex(): Promise<SessionMeta[]> {
     this.indexGenerations += 1;
     const files: string[] = [];
@@ -3488,6 +3647,12 @@ export class PiHostBackend implements HostBackend {
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
     switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension") {      case "listProjects":
         return this.listConfiguredProjects();
+      case "listSessionPage":
+        return this.listSessionPage(params[0], params[1], params[2]);
+      case "getSession":
+        return this.getProjectSession(params[0], params[1]);
+      case "preloadSession":
+        return this.preloadSession(params[0]);
       case "getProjectPaths":
         return [...(await this.loadProjectPaths())];
       case "setProjectPaths":
@@ -4924,6 +5089,24 @@ export class PiHostBackend implements HostBackend {
     this.assertSessionGeneration(id, generation);
     const spawnCwd = isolated?.realProjectRoot ?? found.header.cwd;
     const registeredExtensions = await this.registeredExtensionsForSpawn(spawnCwd);
+    // Keep the memory broker's legacy mount channel pointing at the same object
+    // as the registry mount: both channels must resolve to one path or pi loads
+    // the broker twice.
+    const spawnPaths = resolveSpawnPaths(this.refreshRuntimeTree(), {
+      managedNodeModulesRoot: this.managedNodeModulesRoot,
+    });
+    try {
+      const memorySeed = await resolveSeedExtension({
+        storeRoot: this.extensionStoreRoot(),
+        seedRoot: this.seedRoot(),
+        extensionId: MEMORY_EXTENSION_ID,
+      });
+      if (memorySeed && memorySeed.slot !== "seed" && memorySeed.agentEntry) {
+        spawnPaths.memoryBroker = join(memorySeed.objectDir, memorySeed.agentEntry);
+      }
+    } catch {
+      /* store unreadable → bundled seed path stays */
+    }
     this.assertSessionGeneration(id, generation);
     // Computed once with both durable feeds resident; drives the in-child
     // pi-goal auto-revival suppression.
@@ -4937,9 +5120,8 @@ export class PiHostBackend implements HostBackend {
       ...this.isolatedProjectPaths(found.header.cwd),
       resourceMode: this.resourceMode,
       features: this.features,
-      paths: resolveSpawnPaths(this.refreshRuntimeTree(), {
-        managedNodeModulesRoot: this.managedNodeModulesRoot,
-      }),
+      paths: spawnPaths,
+      managedNodeModulesRoot: this.managedNodeModulesRoot,
       mainModelId: this.mainModelId(),
       memoryReviewModelId: (await this.loadMemoryReviewModel()) ?? undefined,
       subagentModelsFile: this.subagentModelsRuntimeFile(),
@@ -6761,6 +6943,14 @@ export class PiHostBackend implements HostBackend {
     }
   }
   /**
+   * Desktop-grant check for the Host Capability API `native.exec` route:
+   * does this bridge session own the presented computerCapability?
+   * Constant-time; fails closed.
+   */
+  verifyDesktopGrant(sessionId: string, computerCapability: unknown): boolean {
+    return this.bridge.verifyComputerGrant(sessionId, computerCapability);
+  }
+  /**
    * Read-only bundled (builtin/app) extension snapshot for update-center discovery.
    * Deliberately never scans or migrates: an update refresh must not unload
    * project-origin extensions, reset the loaded project root, or disturb
@@ -6768,9 +6958,55 @@ export class PiHostBackend implements HostBackend {
    */
   async listBundledUpdateExtensions(): Promise<ExtensionListItem[]> {
     const overlay = await this.extensionEnableOverlay(undefined);
-    return this.extensionLoader
+    const listed = this.extensionLoader
       .list(overlay)
       .filter((item) => item.origin === "builtin" || item.origin === "app");
+    // Recovery-seed version priority: a shared-store install (active or previous
+    // slot) supersedes the bundled declaration, so the 更新中心 compares and
+    // updates against the version the runtime actually mounts.
+    return Promise.all(listed.map(async (item) => {
+      if (!SEED_MANAGED_EXTENSION_IDS.has(item.id)) return item;
+      const resolved = await resolveSeedExtension({
+        storeRoot: this.extensionStoreRoot(),
+        seedRoot: this.seedRoot(),
+        extensionId: item.id,
+      });
+      return withSeedVersionPriority(item, resolved);
+    }));
+  }
+  /** App-profile shared extension store (content-addressed objects + slots). */
+  private extensionStoreRoot(): string {
+    return extensionUpdateStoreRoot(this.agentDir);
+  }
+  /** Bundled runtime extensions tree — the read-only recovery seed. */
+  private seedRoot(): string {
+    return join(this.runtimeRoot, "extensions");
+  }
+  /**
+   * 更新中心 one-click update for a declared extension component. First version
+   * runs githubReleases package-artifact transactions only (official ed25519
+   * signature enforced by the engine); every other component stays
+   * discovery-only. Installs into the App-profile shared store; the bundled
+   * seed tree is never written.
+   */
+  async updateExtensionComponent(extensionId: string, componentId?: string): Promise<ExtensionUpdateResult> {
+    const listed = await this.listBundledUpdateExtensions();
+    const item = listed.find((entry) => entry.id === extensionId);
+    if (!item) throw new Error(`unknown extension ${extensionId}`);
+    const selection = selectTransactionalUpdateComponent({ extensionId, components: item.updateComponents, componentId });
+    if (!selection.ok) {
+      const error = new Error(selection.error) as Error & { code?: string };
+      error.code = selection.code;
+      throw error;
+    }
+    return applyExtensionUpdate(
+      { extensionId, source: selection.component.source, currentVersion: selection.component.version },
+      {
+        storeRoot: this.extensionStoreRoot(),
+        seedRoot: this.seedRoot(),
+        signingPublicKey: extensionUpdateSigningKey(),
+      },
+    );
   }
   private async listExtensions(projectId: unknown): Promise<ExtensionListItem[]> {
     const projectRoot =
@@ -7316,7 +7552,13 @@ export class PiHostBackend implements HostBackend {
       }
       out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}) });
     }
-    return out;
+    // Recovery-seed mount overrides: shared-store installs (active/previous slot)
+    // supersede the bundled seed copies of the six core-capability extensions.
+    return applySeedMountOverrides({
+      storeRoot: this.extensionStoreRoot(),
+      seedRoot: this.seedRoot(),
+      extensions: out,
+    });
   }
   private notifyExtensionSettingsChanged(id: string, settings: Record<string, unknown>): void {
     for (const [sessionId, live] of this.live) {

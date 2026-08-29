@@ -126,6 +126,19 @@ function parseSource(
 }
 
 /**
+ * Same closed source union as `updateComponents[].source`, exported for the
+ * manifest-level `update` metadata block (extension artifact discovery).
+ * Collects into `errors` and returns `undefined` on failure.
+ */
+export function parseExtensionUpdateSource(
+  value: unknown,
+  label: string,
+  errors: string[],
+): ExtensionUpdateComponentSource | undefined {
+  return parseSource(value, label, errors);
+}
+
+/**
  * Parse a manifest `updateComponents` array. Missing field is not an error
  * (no declared components). Malformed entries collect per-item errors; the
  * manifest fails validation when any error is present.

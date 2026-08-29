@@ -2,6 +2,7 @@
 export * from "./plan.js";
 export * from "./external-session.js";
 export * from "./native-search.js";
+export * from "./host-capability.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
 import type { ExternalSession, ExternalSessionHistory, SessionAdoptedFrom } from "./external-session.js";
 import type { ModelCapabilities } from "./native-search.js";
@@ -24,6 +25,24 @@ export type Session = {
   model?: { provider: string; modelId: string } | null;
   /** Present when this Pi session was adopted from a read-only external record. */
   adoptedFrom?: SessionAdoptedFrom;
+};
+/** Opaque-cursor page used by the Electron sidebar's 10-at-a-time lazy loader. */
+export type SessionPage = {
+  sessions: Session[];
+  nextCursor?: string;
+  hasMore: boolean;
+};
+export type SessionPreloadAgentLog = {
+  agentId: string;
+  sessionId: string;
+  runId: string;
+  entries: { itemType: "text" | "thinking" | "tool" | "toolResult"; text: string; name?: string; isError?: boolean; toolCallId?: string; contentIndex?: number; charCount?: number }[];
+};
+/** Render-ready data warmed after first paint so selecting a sidebar row is immediate. */
+export type SessionPreloadSnapshot = {
+  history: HistoryEntry[];
+  agents: AgentSummary[];
+  agentLogs: SessionPreloadAgentLog[];
 };
 export type SessionLease = { sessionId: string; writable: boolean; holder?: { protocolVersion: number; holder: string; pid: number; hostname: string; acquiredAt: string; heartbeatAt: string; expiresAt: string } };
 export type HistoryTool = { id: string; name: string; input: string };
@@ -416,12 +435,25 @@ export type UpdateCenterItem = {
   ownerExtensionName?: string;
   /** Human-facing version source when `packageName` does not apply (e.g. GitHub `owner/repo`). */
   sourceLabel?: string;
+  /** Host can run the one-click update transaction for this component (official githubReleases package artifact). */
+  transactional?: boolean;
   currentVersion: string;
   latestVersion?: string;
   status: UpdateCenterItemStatus;
   error?: string;
 };
 export type UpdateCenterSnapshot = { checkedAt: number; items: UpdateCenterItem[] };
+/** Result of a host-run extension component update transaction (store install; seed untouched). */
+export type ExtensionComponentUpdateResult = {
+  extensionId: string;
+  version: string;
+  contentHash: string;
+  objectDir: string;
+  receiptPath: string;
+  previousContentHash?: string;
+  /** True when discovery found the active version already current (no state change). */
+  skipped?: boolean;
+};
 /** Stable renderer-to-Pi seam. Policy expansion is owned by the bundled Pi extension. */
 export const PIPIUI_UPDATE_EVALUATION_INTENT_VERSION = 1 as const;
 export const PIPIUI_UPDATE_EVALUATION_INTENT_PREFIX = "[[PIPIUI_UPDATE_EVALUATION_INTENT]]";
@@ -1011,6 +1043,12 @@ export interface PipiHostAPI {
   /** Renderer hint: project full stream/log payloads only for this visible session. */
   setEventProjectionSession?(sessionId?: string): Promise<void>;
   listProjects(): Promise<Project[]>; listSessions(projectId: string): Promise<Session[]>;
+  /** Project-scoped lazy page. It must not build or await the global session index. */
+  listSessionPage?(projectId: string, cursor?: string, limit?: number): Promise<SessionPage>;
+  /** Direct remembered-session lookup inside one project; never falls back to a global scan. */
+  getSession?(projectId: string, sessionId: string): Promise<Session>;
+  /** Complete chat + Subagents projection for background page warming. */
+  preloadSession?(sessionId: string): Promise<SessionPreloadSnapshot>;
   /**
    * Read-only sessions written by other local agents for this project cwd.
    * Never mixed into `listSessions` and never leaseable / deletable / sendable.
@@ -1239,6 +1277,8 @@ export interface PipiHostAPI {
   listUserMcpServers?(projectId: string): Promise<UserMcpServer[]>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
   checkForUpdates?(): Promise<UpdateCenterSnapshot>;
+  /** 更新中心 one-click update for a transactional extension component. Electron-only; old hosts omit it. */
+  updateExtensionComponent?(extensionId: string, componentId?: string): Promise<ExtensionComponentUpdateResult>;
   /**
    * Extension architecture M1 (optional). Backends may omit these until wired.
    * Event channel is `ext.<id>` (spec D4); settings keys `ext.<id>.*` (spec D6).
@@ -1303,6 +1343,11 @@ function apiFrom(
     protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
     listProjects: () => invoke("listProjects"),
     listSessions: projectId => invoke("listSessions", projectId),
+    listSessionPage: (projectId, cursor, limit) => cursor === undefined
+      ? invoke("listSessionPage", projectId, undefined, limit)
+      : invoke("listSessionPage", projectId, cursor, limit),
+    getSession: (projectId, sessionId) => invoke("getSession", projectId, sessionId),
+    preloadSession: sessionId => invoke("preloadSession", sessionId),
     listExternalSessions: projectId => invoke("listExternalSessions", projectId),
     getProjectPaths: () => invoke("getProjectPaths"),
     setProjectPaths: paths => invoke("setProjectPaths", paths),
@@ -1417,6 +1462,9 @@ function apiFrom(
     revealProject: projectId => invoke("revealProject", projectId),
     listUserMcpServers: projectId => invoke("listUserMcpServers", projectId),
     checkForUpdates: () => invoke("checkForUpdates"),
+    updateExtensionComponent: (extensionId, componentId) => componentId === undefined
+      ? invoke("updateExtensionComponent", extensionId)
+      : invoke("updateExtensionComponent", extensionId, componentId),
     subscribeExt: (extensionId, listener) => {
       const channel = `ext.${extensionId}` as const;
       return subscribe(
@@ -1487,7 +1535,10 @@ function apiFrom(
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   if (options.computerUsePermissions) api.openComputerUsePermission = kind => invoke("openComputerUsePermission", kind);
-  if (!options.updateCenter) delete api.checkForUpdates;
+  if (!options.updateCenter) {
+    delete api.checkForUpdates;
+    delete api.updateExtensionComponent;
+  }
   return api;
 }
 

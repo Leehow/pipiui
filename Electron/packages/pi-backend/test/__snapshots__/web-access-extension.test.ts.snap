@@ -1,0 +1,377 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`web-access-extension schema snapshot > extension-mounted schemas are identical to the pinned package and snapshotted > fetch_content schema 1`] = `
+{
+  "properties": {
+    "answerModel": {
+      "description": "Optional provider/model-id override for mode answer. Defaults to the current Pi model.",
+      "type": "string",
+    },
+    "auth": {
+      "anyOf": [
+        {
+          "type": "string",
+        },
+        {
+          "type": "boolean",
+        },
+      ],
+      "description": "Opt into an authFetch profile for local browser-cookie fetching. Use a profile name, or true only when exactly one profile exists.",
+    },
+    "forceClone": {
+      "description": "Force cloning large GitHub repositories that exceed the size threshold",
+      "type": "boolean",
+    },
+    "frames": {
+      "description": "Number of frames to extract. Use with timestamp range for custom density, with single timestamp to get N frames at 5s intervals, or alone to sample across the entire video. Requires yt-dlp + ffmpeg for YouTube, ffmpeg for local video.",
+      "maximum": 12,
+      "minimum": 1,
+      "type": "integer",
+    },
+    "mode": {
+      "description": "Fetch mode: readable (default extraction), raw (exact textual HTTP body), or answer (answer prompt using only fetched content).",
+      "enum": [
+        "readable",
+        "raw",
+        "answer",
+      ],
+      "type": "string",
+    },
+    "model": {
+      "description": "Override the Gemini model for video/YouTube analysis (e.g. 'gemini-3.6-flash'). Defaults to config or gemini-3.6-flash.",
+      "type": "string",
+    },
+    "prompt": {
+      "description": "Question or instruction for video analysis, or the page-local question required by mode answer.",
+      "type": "string",
+    },
+    "timestamp": {
+      "description": "Extract video frame(s) at a timestamp or time range. Single: '1:23:45', '23:45', or '85' (seconds). Range: '23:41-25:00' extracts evenly-spaced frames across that span (default 6). Use frames with ranges to control density; single+frames uses a fixed 5s interval. YouTube requires yt-dlp + ffmpeg; local videos require ffmpeg. Use a range when you know the approximate area but not the exact moment — you'll get a contact sheet to visually identify the right frame.",
+      "type": "string",
+    },
+    "url": {
+      "description": "Single URL to fetch",
+      "type": "string",
+    },
+    "urls": {
+      "description": "Multiple URLs (parallel)",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+  },
+  "type": "object",
+}
+`;
+
+exports[`web-access-extension schema snapshot > extension-mounted schemas are identical to the pinned package and snapshotted > get_search_content schema 1`] = `
+{
+  "properties": {
+    "findMode": {
+      "description": "Matching mode for findText (default: case-insensitive). Requires findText.",
+      "enum": [
+        "exact",
+        "case-insensitive",
+        "fuzzy",
+      ],
+      "type": "string",
+    },
+    "findText": {
+      "anyOf": [
+        {
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string",
+        },
+        {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string",
+          },
+          "maxItems": 10,
+          "minItems": 1,
+          "type": "array",
+        },
+      ],
+      "description": "Text or texts to find in the selected stored content. Cannot be combined with offset or limit.",
+    },
+    "limit": {
+      "description": "Maximum characters to return for fetched URL content slices (default and max are set by maxInlineContentChars). Cannot be combined with findText.",
+      "maximum": 30000,
+      "minimum": 1,
+      "type": "integer",
+    },
+    "offset": {
+      "description": "Character offset for fetched URL content slices (default 0). Cannot be combined with findText.",
+      "minimum": 0,
+      "type": "integer",
+    },
+    "query": {
+      "description": "Get content for this query (web_search)",
+      "type": "string",
+    },
+    "queryIndex": {
+      "description": "Get content for query at index",
+      "minimum": 0,
+      "type": "integer",
+    },
+    "responseId": {
+      "description": "The responseId from web_search, source_check, or fetch_content",
+      "type": "string",
+    },
+    "url": {
+      "description": "Get content for this URL",
+      "type": "string",
+    },
+    "urlIndex": {
+      "description": "Get content for URL at index",
+      "minimum": 0,
+      "type": "integer",
+    },
+  },
+  "required": [
+    "responseId",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`web-access-extension schema snapshot > extension-mounted schemas are identical to the pinned package and snapshotted > source_check schema 1`] = `
+{
+  "properties": {
+    "claim": {
+      "description": "The assertion to check against web sources.",
+      "type": "string",
+    },
+    "domainFilter": {
+      "description": "Limit to domains; prefix with - to exclude.",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "fetchContent": {
+      "description": "Fetch up to 5 result pages for exact passage extraction.",
+      "type": "boolean",
+    },
+    "numResults": {
+      "description": "Results per query (default: 5, max: 20).",
+      "maximum": 20,
+      "minimum": 1,
+      "type": "integer",
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "enum": [
+            "auto",
+            "all",
+            "openai",
+            "brave",
+            "parallel",
+            "tinyfish",
+            "search1api",
+            "searchinfinity",
+            "querit",
+            "tavily",
+            "firecrawl",
+            "jina",
+            "searxng",
+            "duckduckgo",
+            "perplexity",
+            "gemini",
+            "exa",
+            "serpdive",
+            "kagi",
+            "ollama",
+            "anysearch",
+            "xai",
+            "brightdata",
+            "serpbase",
+            "bocha",
+          ],
+          "type": "string",
+        },
+        {
+          "items": {
+            "enum": [
+              "openai",
+              "brave",
+              "parallel",
+              "tinyfish",
+              "search1api",
+              "searchinfinity",
+              "querit",
+              "tavily",
+              "firecrawl",
+              "jina",
+              "searxng",
+              "duckduckgo",
+              "perplexity",
+              "gemini",
+              "exa",
+              "serpdive",
+              "kagi",
+              "ollama",
+              "anysearch",
+              "xai",
+              "brightdata",
+              "serpbase",
+              "bocha",
+            ],
+            "type": "string",
+          },
+          "minItems": 1,
+          "type": "array",
+        },
+      ],
+      "description": "Search provider or non-empty list of providers to search simultaneously; all searches every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase",
+    },
+    "queries": {
+      "description": "Search queries (default: the claim).",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "recencyFilter": {
+      "description": "Filter by recency.",
+      "enum": [
+        "day",
+        "week",
+        "month",
+        "year",
+      ],
+      "type": "string",
+    },
+  },
+  "required": [
+    "claim",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`web-access-extension schema snapshot > extension-mounted schemas are identical to the pinned package and snapshotted > web_search schema 1`] = `
+{
+  "properties": {
+    "domainFilter": {
+      "description": "Limit to domains (prefix with - to exclude)",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "includeContent": {
+      "description": "Fetch full page content (async)",
+      "type": "boolean",
+    },
+    "numResults": {
+      "description": "Results per query (default: 5, max: 20)",
+      "maximum": 20,
+      "minimum": 1,
+      "type": "integer",
+    },
+    "provider": {
+      "anyOf": [
+        {
+          "enum": [
+            "auto",
+            "all",
+            "openai",
+            "brave",
+            "parallel",
+            "tinyfish",
+            "search1api",
+            "searchinfinity",
+            "querit",
+            "tavily",
+            "firecrawl",
+            "jina",
+            "searxng",
+            "duckduckgo",
+            "perplexity",
+            "gemini",
+            "exa",
+            "serpdive",
+            "kagi",
+            "ollama",
+            "anysearch",
+            "xai",
+            "brightdata",
+            "serpbase",
+            "bocha",
+          ],
+          "type": "string",
+        },
+        {
+          "items": {
+            "enum": [
+              "openai",
+              "brave",
+              "parallel",
+              "tinyfish",
+              "search1api",
+              "searchinfinity",
+              "querit",
+              "tavily",
+              "firecrawl",
+              "jina",
+              "searxng",
+              "duckduckgo",
+              "perplexity",
+              "gemini",
+              "exa",
+              "serpdive",
+              "kagi",
+              "ollama",
+              "anysearch",
+              "xai",
+              "brightdata",
+              "serpbase",
+              "bocha",
+            ],
+            "type": "string",
+          },
+          "minItems": 1,
+          "type": "array",
+        },
+      ],
+      "description": "Search provider or non-empty list of providers to search simultaneously; use all to search every eligible provider except DuckDuckGo, AnySearch, xAI, Bright Data, and SerpBase, omit this field to use the configured provider, or use auto when none is configured",
+    },
+    "queries": {
+      "description": "Multiple queries searched in sequence, each returning its own synthesized answer. Prefer this for research — vary phrasing, scope, and angle across 2-4 queries to maximize coverage. Good: ['React vs Vue performance benchmarks 2026', 'React vs Vue developer experience comparison', 'React ecosystem size vs Vue ecosystem']. Bad: ['React vs Vue', 'React vs Vue comparison', 'React vs Vue review'] (too similar, redundant results).",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "query": {
+      "description": "Single search query. For research tasks, prefer 'queries' with multiple varied angles instead.",
+      "type": "string",
+    },
+    "recencyFilter": {
+      "description": "Filter by recency",
+      "enum": [
+        "day",
+        "week",
+        "month",
+        "year",
+      ],
+      "type": "string",
+    },
+    "workflow": {
+      "description": "Search workflow mode: none = no curator, summary-review = open curator with auto summary draft (default), auto-summary = generate summary without opening curator",
+      "enum": [
+        "none",
+        "summary-review",
+        "auto-summary",
+      ],
+      "type": "string",
+    },
+  },
+  "type": "object",
+}
+`;

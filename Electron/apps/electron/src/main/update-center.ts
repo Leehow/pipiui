@@ -1,4 +1,4 @@
-import type { HostBackend, UpdateCenterItem, UpdateCenterItemCategory, UpdateCenterSnapshot } from '@pipi/host-api'
+import type { ExtensionComponentUpdateResult, HostBackend, UpdateCenterItem, UpdateCenterItemCategory, UpdateCenterSnapshot } from '@pipi/host-api'
 
 /** Build-time tools are not shipped as runtime dependencies, so keep their resolved versions explicit and test them against the lockfile. */
 export const UPDATE_CENTER_FRAMEWORK_VERSIONS = {
@@ -18,6 +18,8 @@ export type UpdateCatalogItem = {
   ownerExtensionName?: string
   /** Human-facing version source when `packageName` does not apply (e.g. GitHub `owner/repo`). */
   sourceLabel?: string
+  /** Host can run the one-click update transaction for this component (official githubReleases package artifact). */
+  transactional?: boolean
 }
 
 /**
@@ -55,7 +57,13 @@ export function extensionUpdateCatalogItems(extensions: readonly UpdateComponent
       currentVersion: component.version,
       source: component.source,
       ownerExtensionId: extension.id,
-      ownerExtensionName: extension.name
+      ownerExtensionName: extension.name,
+      // The update transaction ships the extension package itself, so a
+      // component is one-click updatable exactly when its id equals the owning
+      // extension id and the release source is a fixed githubReleases repo
+      // (upstream-artifact components like office's `officecli` stay
+      // evaluation-only; the recovery seed keeps their binaries current).
+      ...(component.source.type === 'githubReleases' && component.id === extension.id ? { transactional: true } : {})
     }))
   })
 }
@@ -158,6 +166,7 @@ function itemBase(item: UpdateCatalogItem): Omit<UpdateCenterItem, 'status' | 'l
     ...(sourceLabel ? { sourceLabel } : {}),
     ...(item.ownerExtensionId ? { ownerExtensionId: item.ownerExtensionId } : {}),
     ...(item.ownerExtensionName ? { ownerExtensionName: item.ownerExtensionName } : {}),
+    ...(item.transactional ? { transactional: true } : {}),
     currentVersion: item.currentVersion
   }
 }
@@ -239,12 +248,26 @@ export function createUpdateCenterService(options: {
   }
 }
 
-/** Adds one read-only method; no URL, command or filesystem capability crosses into the renderer. */
-export function withUpdateCenter(backend: HostBackend, checkForUpdates: () => Promise<UpdateCenterSnapshot>): HostBackend {
+/** Adds read-only update checks and, when a transaction handler is supplied, the one-click extension update method; no URL, command or filesystem capability crosses into the renderer. */
+export function withUpdateCenter(
+  backend: HostBackend,
+  checkForUpdates: () => Promise<UpdateCenterSnapshot>,
+  updateExtensionComponent?: (extensionId: string, componentId?: string) => Promise<ExtensionComponentUpdateResult>
+): HostBackend {
   return {
-    handle: (method, params) => method === 'checkForUpdates'
-      ? (params.length ? Promise.reject(new Error('checkForUpdates takes no parameters')) : checkForUpdates())
-      : backend.handle(method, params),
+    handle: (method, params) => {
+      if (method === 'checkForUpdates') {
+        return params.length ? Promise.reject(new Error('checkForUpdates takes no parameters')) : checkForUpdates()
+      }
+      if (method === 'updateExtensionComponent') {
+        if (!updateExtensionComponent) return Promise.reject(new Error('updateExtensionComponent is not available'))
+        const [extensionId, componentId] = params
+        if (typeof extensionId !== 'string' || !extensionId.trim()) return Promise.reject(new Error('updateExtensionComponent requires an extensionId string'))
+        if (componentId !== undefined && typeof componentId !== 'string') return Promise.reject(new Error('updateExtensionComponent componentId must be a string'))
+        return updateExtensionComponent(extensionId, componentId)
+      }
+      return backend.handle(method, params)
+    },
     subscribe: listener => backend.subscribe(listener)
   }
 }

@@ -1,0 +1,41 @@
+{
+  "id": "cua-extension",
+  "name": "PipiUI CUA",
+  "version": "0.1.0",
+  "description": "Computer use via the host CuaDriverHost (frozen tools: computer / open_application). TCC/Accessibility, driver lifecycle, pid/window binding, and screenshot cleanup stay in the Electron host.",
+  "capabilities": [],
+  "hostApi": ">=1.0.0 <2.0.0",
+  "agent": {
+    "extension": "agent/index.ts"
+  },
+  "permissions": [
+    "native.exec"
+  ],
+  "nativeResources": [
+    {
+      "id": "cua-driver",
+      "entry": "native/cua-driver",
+      "platforms": [
+        "darwin-arm64",
+        "darwin-x64"
+      ]
+    }
+  ],
+  "update": {
+    "channel": "stable",
+    "signature": "ed25519"
+  },
+  "updateComponents": [
+    {
+      "id": "cua-extension",
+      "name": "PipiUI CUA",
+      "version": "0.1.0",
+      "source": {
+        "type": "githubReleases",
+        "owner": "Leehow",
+        "repo": "pipiui"
+      },
+      "upstream": "https://github.com/Leehow/pipiui"
+    }
+  ]
+}

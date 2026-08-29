@@ -48,7 +48,9 @@ export function UpdateCenter({ updates, onRequestUpdate }: { updates: UpdateCent
           <div className="update-center-name"><strong>{item.name}</strong>{item.packageName && item.name !== item.packageName && <span>{item.packageName}</span>}{!item.packageName && item.sourceLabel && <span>{item.sourceLabel}</span>}{item.ownerExtensionName && <span>来自扩展 {item.ownerExtensionName}</span>}</div>
           <div className="update-center-versions"><span><em>本机</em>{item.currentVersion}</span><span><em>最新</em>{item.latestVersion ?? '—'}</span></div>
           <span className={`update-center-status ${item.status}`} title={item.error}>{STATUS_LABEL[item.status]}</span>
-          {item.status === 'updateAvailable' && item.latestVersion && <button type="button" className="update-center-update" onClick={() => requestUpdate(item)}>评估更新</button>}
+          {item.status === 'updateAvailable' && item.latestVersion && (item.transactional && item.ownerExtensionId
+            ? <button type="button" className="update-center-update" disabled={updates.updatingExtensionId !== null} onClick={() => void updates.updateComponent(item.ownerExtensionId!)}>{updates.updatingExtensionId === item.ownerExtensionId ? '更新中…' : '一键更新'}</button>
+            : <button type="button" className="update-center-update" onClick={() => requestUpdate(item)}>评估更新</button>)}
         </div>)}</div>
       </section>)}
     </div>}

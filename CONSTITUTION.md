@@ -77,6 +77,7 @@ Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不
 - 项目隔离：每个打开项目的 sessions、skills、memory、resources、settings.json、trust.json、models-store.json 只存在于 `{projectRoot}/.pi/agent`，禁止跨写其他项目
 - 明确例外（App-profile canonical）：所有打开项目共享 Electron profile `pi-agent` 同一份 `.env`、`auth.json`、`models.json`；禁止再按项目复制 OAuth 或模型目录
 - 明确例外（host bookkeeping）：project list、调度队列、telemetry、agent-worktree projection 可留在 App profile
+- 明确例外（扩展共享安装，窄）：核心能力扩展的**不可变、内容寻址代码包与版本元数据**（含 active/previous slot 与 receipt）可存放于 App-profile 共享存储，所有打开项目共用同一份只读代码；启用状态、授权、扩展设置、memory 数据、browser session、trust 仍严格按项目隔离，禁止共享或跨项目读写
 - 新项目不得从 App profile 复制 `trust.json`；已有项目的 trust 决定不得删除或改写
 - chatrpgv4 `pi-coc`：`{chatrpgv4}/.pi/coc-agent`
 - 禁止使用或写入全局 `~/.pi`。禁止从 `~/.pi` 导入 packages。

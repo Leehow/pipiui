@@ -1,7 +1,7 @@
 import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
-import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
+import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
 
 import {
   PIPI_HOST_IPC_CHANNEL,
@@ -26,6 +26,7 @@ import { withOpenDocumentExternally } from './external-document.js'
 import { withOpenExternal } from './external-url.js'
 import { createElectronComputerUsePermissionHost, withComputerUsePermissions } from './computer-use-permissions.js'
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
+import { createElectronHostCapabilityBroker } from './host-capability-host.js'
 import {
   createRemoteControlService,
   PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
@@ -270,7 +271,36 @@ if (app) {
       revealPath: async (path) => {
         const error = await shell.openPath(path)
         if (error.trim()) throw new Error(error)
-      }
+      },
+      // Versioned Host Capability API: extensions reach native hosts only through
+      // this gated broker (hostApi handshake + per-project permission + one-time token).
+      hostCapabilityAction: (request, sessionId) => hostCapability.dispatch(request, sessionId),
+      hostCapabilityTokenAction: (request) => hostCapability.mint(request),
+    })
+    // Safe TDZ-forward reference: the arrow above only runs once bridge traffic
+    // arrives, long after this binding. Declared permissions resolve lazily from
+    // the bundled/app extension snapshot; project grants come from the project's
+    // own `.pi/agent/ext-grants.json` — both fail closed.
+    const hostCapability = createElectronHostCapabilityBroker({
+      browser,
+      browserWatch: (request, sessionId) => handleBrowserWatchEvent(request, sessionId, browser, watchCallbacks),
+      computer,
+      policy: {
+        declaredPermissions: async (extensionId) =>
+          (await piBackend.listBundledUpdateExtensions()).find(item => item.id === extensionId)?.permissions ?? [],
+        projectAllows: async (extensionId, projectRoot, permission) => {
+          try {
+            const grants = await readProjectExtensionGrants(projectPiAgentDir(projectRoot))
+            return grants[extensionId]?.grantedCapabilities.includes(permission) ?? false
+          } catch {
+            return false
+          }
+        },
+        // Desktop grant: the presented computerCapability must be the one this
+        // bridge session was minted (HostBridge.computers). Fail closed.
+        verifyDesktopGrant: ({ sessionId, computerCapability }) =>
+          piBackend.verifyDesktopGrant(sessionId, computerCapability),
+      },
     })
     const terminalBackend = terminalHost.wrapBackend(piBackend)
     const pickProjectDirectory = async (): Promise<string | null> => {
@@ -314,7 +344,7 @@ if (app) {
         await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 1, height: 1 } })
       },
       openURL: url => shell.openExternal(url),
-    })), createUpdateCenterService({ catalog: resolveUpdateCatalog }))
+    })), createUpdateCenterService({ catalog: resolveUpdateCatalog }), (extensionId, componentId) => piBackend.updateExtensionComponent(extensionId, componentId))
     registerPipiHostIpc(ipcMain, backend)
     const remoteControl = createRemoteControlService({
       backend,

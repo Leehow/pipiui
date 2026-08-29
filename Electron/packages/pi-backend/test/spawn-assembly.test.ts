@@ -814,6 +814,84 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
   });
 });
 
+describe("registered core-capability extension ownership", () => {
+  const legacyWebAccess = "/embedded/node_modules/pi-web-access/index.ts";
+  const legacyWebview = "/runtime/extensions/pipiui-electron-webview.ts";
+  const legacyBrowserSearch = "/runtime/extensions/pipiui-browser-search.ts";
+  const webAccessExtension = "/runtime/extensions/web-access-extension/agent/index.ts";
+  const webviewExtension = "/runtime/extensions/webview-browser-extension/agent/index.ts";
+
+  it("mounts each migrated tool family only through its enabled registered extension", () => {
+    const { args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { webSearch: true, browser: true, browserSearch: true },
+      paths: {
+        webSearch: legacyWebAccess,
+        webview: legacyWebview,
+        browserSearch: legacyBrowserSearch,
+      },
+      registeredExtensions: [
+        { id: "web-access-extension", enabled: true, extensionPath: webAccessExtension },
+        { id: "webview-browser-extension", enabled: true, extensionPath: webviewExtension },
+      ],
+    });
+    expect(args).toEqual(["-e", webAccessExtension, "-e", webviewExtension]);
+    expect(args).not.toContain(legacyWebAccess);
+    expect(args).not.toContain(legacyWebview);
+    expect(args).not.toContain(legacyBrowserSearch);
+  });
+
+  it("does not resurrect legacy tools when a migrated extension is known but disabled", () => {
+    const { args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { webSearch: true, browser: true, browserSearch: true },
+      paths: {
+        webSearch: legacyWebAccess,
+        webview: legacyWebview,
+        browserSearch: legacyBrowserSearch,
+      },
+      registeredExtensions: [
+        { id: "web-access-extension", enabled: false, extensionPath: webAccessExtension },
+        { id: "webview-browser-extension", enabled: false, extensionPath: webviewExtension },
+      ],
+    });
+    expect(args).toEqual([]);
+  });
+
+  it("keeps legacy fallback only when the migrated extension is absent", () => {
+    const { args } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { webSearch: true, browser: true, browserSearch: true },
+      paths: {
+        webSearch: legacyWebAccess,
+        webview: legacyWebview,
+        browserSearch: legacyBrowserSearch,
+      },
+    });
+    expect(args).toEqual([
+      "-e", legacyWebAccess,
+      "-e", legacyWebview,
+      "-e", legacyBrowserSearch,
+    ]);
+  });
+
+  it("adds the pinned managed package directory to extension module resolution", () => {
+    const managedNodeModulesRoot = "/embedded/pi/lib/node_modules";
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: {},
+      managedNodeModulesRoot,
+      registeredExtensions: [
+        { id: "web-access-extension", enabled: true, extensionPath: webAccessExtension },
+      ],
+    });
+    expect(env.NODE_PATH?.split(delimiter)).toContain(managedNodeModulesRoot);
+  });
+});
+
 describe("PIPIUI_EXT_AGENT_CONTRIBUTIONS spawn snapshot", () => {
   const updateCenter = "/runtime/update.ts";
   const runtimeInfo = "/runtime/info.ts";

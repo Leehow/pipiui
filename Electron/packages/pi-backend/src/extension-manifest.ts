@@ -4,6 +4,7 @@ import type {
   ExtensionSettingsMigration,
   ExtensionSettingsSchema,
 } from "./extension-registry.js";
+import { CORE_CAPABILITY_EXTENSION_IDS } from "./extension-registry.js";
 import { parseExtensionMigrations } from "./extension-migrations.js";
 import {
   parseExtensionAuthContribution,
@@ -11,7 +12,9 @@ import {
 } from "./extension-provider-contract.js";
 import {
   parseExtensionUpdateComponents,
+  parseExtensionUpdateSource,
   type ExtensionUpdateComponent,
+  type ExtensionUpdateComponentSource,
 } from "./extension-update-components.js";
 
 /** Spec D2. */
@@ -38,6 +41,64 @@ export type ExtensionCapability =
   | (typeof EXTENSION_L2_CAPABILITIES)[number];
 
 const CAPABILITY_SET = new Set<string>([...EXTENSION_CAPABILITIES, ...EXTENSION_L2_CAPABILITIES]);
+
+/**
+ * Host API level of the running host (contract wave: extensions declare which
+ * range they load against; the updater refuses artifacts outside the range).
+ */
+export const EXTENSION_HOST_API_VERSION = "1.0.0";
+
+/**
+ * First-version permission enum. Each value maps to a concrete host surface:
+ * `net.request` outbound network, `browser.session` host WebView session,
+ * `native.exec` host-managed native resources, `memory.read` memory broker
+ * read-only tools. Unknown permissions are errors, never silent grants.
+ */
+export const EXTENSION_PERMISSIONS = ["net.request", "browser.session", "native.exec", "memory.read"] as const;
+export type ExtensionPermission = (typeof EXTENSION_PERMISSIONS)[number];
+
+/** Platforms a native resource may target (matches the CUA driver slice scheme). */
+export const EXTENSION_NATIVE_RESOURCE_PLATFORMS = ["darwin-universal", "darwin-arm64", "darwin-x64"] as const;
+export type ExtensionNativeResourcePlatform = (typeof EXTENSION_NATIVE_RESOURCE_PLATFORMS)[number];
+
+/** Declared per-platform native artifact shipped inside the extension package. */
+export type ExtensionNativeResource = {
+  /** Semantic slug, unique within the manifest. */
+  id: string;
+  /** Extension-relative path. Existence/realpath is the loader's job. */
+  entry: string;
+  /** Defaults to every platform when omitted. */
+  platforms?: ExtensionNativeResourcePlatform[];
+};
+
+/**
+ * Extension artifact update metadata (host-side only; never fetched by
+ * validation). The updater downloads from the same closed source union as
+ * `updateComponents`, verifies SHA-256/bytes/arch/signature, then swaps the
+ * App-profile content-addressed slot. First version: official `stable` channel,
+ * ed25519 signatures only.
+ */
+export type ExtensionUpdateMetadata = {
+  /** Where the updater discovers artifacts. Optional at the manifest layer
+   *  (decided with the official release plumbing); required before download. */
+  source?: ExtensionUpdateComponentSource;
+  channel?: "stable";
+  signature?: "ed25519";
+};
+
+const SEMVER_COMPARATOR_RE = /^(>=|<=|>|<|=|\^|~)?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/;
+
+/**
+ * Simple semver range: space/comma-separated comparators (`>=`, `>`, `<=`, `<`,
+ * `=`, `^`, `~`, or bare exact), each with a full `X.Y.Z` version. OR (`||`)
+ * ranges and wildcards are not part of the first-version contract.
+ */
+export function isValidExtensionHostApiRange(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 128) return false;
+  return trimmed.split(/[\s,]+/).every((part) => SEMVER_COMPARATOR_RE.test(part));
+}
 
 /** Spec D2 / D7: first version only `toolPanel`. Unknown slots are errors, never silent skips. */
 export const EXTENSION_PANEL_SLOTS = ["toolPanel"] as const;
@@ -134,6 +195,14 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   auth?: ExtensionAuthContribution;
   /** Declared open-source update components (metadata only; checks stay host-side). */
   updateComponents?: ExtensionUpdateComponent[];
+  /** Host API versions this package loads against (required for core-capability ids). */
+  hostApi?: string;
+  /** Declared host-surface permissions (closed first-version enum). */
+  permissions?: ExtensionPermission[];
+  /** Declared per-platform native artifacts shipped in the package. */
+  nativeResources?: ExtensionNativeResource[];
+  /** Extension artifact update discovery (metadata only; the updater acts on it). */
+  update?: ExtensionUpdateMetadata;
 };
 
 export type ManifestValidationOk = { ok: true; manifest: ValidatedExtensionManifest };
@@ -355,6 +424,98 @@ function collectAgentPatches(value: unknown, errors: string[]): ExtensionAgentPa
   return patches.length ? patches : undefined;
 }
 
+const NATIVE_RESOURCE_KEYS = new Set(["id", "entry", "platforms"]);
+const UPDATE_METADATA_KEYS = new Set(["source", "channel", "signature"]);
+const UPDATE_CHANNEL_VALUES = new Set(["stable"]);
+const UPDATE_SIGNATURE_VALUES = new Set(["ed25519"]);
+
+function collectNativeResources(value: unknown, errors: string[]): ExtensionNativeResource[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) {
+    errors.push("nativeResources must be an array");
+    return undefined;
+  }
+  const out: ExtensionNativeResource[] = [];
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    const label = `nativeResources[${index}]`;
+    if (!isRecord(item)) {
+      errors.push(`${label} must be an object`);
+      continue;
+    }
+    rejectUnknownKeys(item, NATIVE_RESOURCE_KEYS, label, errors);
+    const id = asNonEmptyString(item.id);
+    if (!id) errors.push(`${label} missing id`);
+    else if (!EXTENSION_ID_RE.test(id)) errors.push(`${label} invalid id '${id}': must match [a-z][a-z0-9-]*`);
+    const entry = collectRelativePath(item.entry, `${label}.entry`, errors);
+    let platforms: ExtensionNativeResourcePlatform[] | undefined;
+    if (item.platforms !== undefined) {
+      if (!Array.isArray(item.platforms) || item.platforms.some((platform) => typeof platform !== "string")) {
+        errors.push(`${label}.platforms must be an array of platform strings`);
+      } else {
+        const normalized = [...new Set(item.platforms as string[])];
+        for (const platform of normalized) {
+          if (!(EXTENSION_NATIVE_RESOURCE_PLATFORMS as readonly string[]).includes(platform)) {
+            errors.push(
+              `${label}.platforms unknown platform '${platform}': not in ${EXTENSION_NATIVE_RESOURCE_PLATFORMS.join(", ")}`,
+            );
+          }
+        }
+        if (!errors.some((error) => error.startsWith(`${label}.platforms`))) {
+          platforms = normalized as ExtensionNativeResourcePlatform[];
+        }
+      }
+    }
+    if (id && seen.has(id)) errors.push(`duplicate native resource id '${id}'`);
+    if (id) seen.add(id);
+    if (id && entry && EXTENSION_ID_RE.test(id)) {
+      const resource: ExtensionNativeResource = { id, entry };
+      if (platforms) resource.platforms = platforms;
+      out.push(resource);
+    }
+  }
+  return out.length ? out : undefined;
+}
+
+function collectUpdateMetadata(value: unknown, errors: string[]): ExtensionUpdateMetadata | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    errors.push("update must be an object");
+    return undefined;
+  }
+  rejectUnknownKeys(value, UPDATE_METADATA_KEYS, "update", errors);
+  // Source stays optional at the manifest layer (scaffolds precede a decided
+  // official release source); the updater requires it before any download.
+  let source: ExtensionUpdateComponentSource | undefined;
+  if (value.source !== undefined) {
+    source = parseExtensionUpdateSource(value.source, "update", errors);
+  }
+  let channel: ExtensionUpdateMetadata["channel"];
+  if (value.channel !== undefined) {
+    if (typeof value.channel !== "string" || !UPDATE_CHANNEL_VALUES.has(value.channel)) {
+      errors.push(
+        `update.channel must be one of ${[...UPDATE_CHANNEL_VALUES].join(", ")} (first version ships official signed extensions only)`,
+      );
+    } else {
+      channel = value.channel as ExtensionUpdateMetadata["channel"];
+    }
+  }
+  let signature: ExtensionUpdateMetadata["signature"];
+  if (value.signature !== undefined) {
+    if (typeof value.signature !== "string" || !UPDATE_SIGNATURE_VALUES.has(value.signature)) {
+      errors.push(`update.signature must be one of ${[...UPDATE_SIGNATURE_VALUES].join(", ")}`);
+    } else {
+      signature = value.signature as ExtensionUpdateMetadata["signature"];
+    }
+  }
+  if (!source && !channel && !signature) return undefined;
+  const metadata: ExtensionUpdateMetadata = {};
+  if (source) metadata.source = source;
+  if (channel) metadata.channel = channel;
+  if (signature) metadata.signature = signature;
+  return metadata;
+}
+
 function settingsPrefix(id: string): string {
   return `ext.${id}.`;
 }
@@ -433,6 +594,40 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
       capabilities = value.capabilities as ExtensionCapability[];
     }
   }
+
+  // Frozen core-capability contract: hostApi range, permissions,
+  // nativeResources, and artifact update metadata. hostApi is REQUIRED for
+  // core-capability ids; every other manifest stays back-compat (validated
+  // only when present).
+  const isCoreCapability = typeof id === "string" && CORE_CAPABILITY_EXTENSION_IDS.has(id);
+  let hostApi: string | undefined;
+  if (value.hostApi !== undefined && value.hostApi !== null) {
+    if (!isValidExtensionHostApiRange(value.hostApi)) {
+      errors.push("hostApi must be a semver range like '>=1.0.0 <2.0.0' or '^1.0.0'");
+    } else {
+      hostApi = (value.hostApi as string).trim();
+    }
+  } else if (isCoreCapability) {
+    errors.push(`core-capability extension '${id}' must declare a hostApi version range`);
+  }
+
+  let permissions: ExtensionPermission[] | undefined;
+  if (value.permissions !== undefined) {
+    if (!Array.isArray(value.permissions) || value.permissions.some((item) => typeof item !== "string")) {
+      errors.push("permissions must be an array of strings");
+    } else {
+      const unknown = (value.permissions as string[]).filter(
+        (item) => !(EXTENSION_PERMISSIONS as readonly string[]).includes(item),
+      );
+      for (const item of unknown) {
+        errors.push(`unknown permission '${item}': not in the first-version enum`);
+      }
+      if (!unknown.length) permissions = [...new Set(value.permissions as ExtensionPermission[])];
+    }
+  }
+
+  const nativeResources = collectNativeResources(value.nativeResources, errors);
+  const update = collectUpdateMetadata(value.update, errors);
 
   let settings: ExtensionSettingsManifest | undefined;
   const app = value.app;
@@ -715,6 +910,10 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (hostEntry) manifest.hostEntry = hostEntry;
   if (auth) manifest.auth = auth;
   if (updateComponents) manifest.updateComponents = updateComponents;
+  if (hostApi) manifest.hostApi = hostApi;
+  if (permissions) manifest.permissions = permissions;
+  if (nativeResources) manifest.nativeResources = nativeResources;
+  if (update) manifest.update = update;
   return { ok: true, manifest };
 }
 

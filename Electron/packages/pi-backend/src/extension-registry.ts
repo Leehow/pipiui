@@ -100,6 +100,82 @@ export const BUILTIN_EXTENSION_PACKAGES: readonly ExtensionDescriptor[] = [
   { id: "built-in-skills", name: "Built-in Skills", version: "1.0.0", description: "内置技能集", origin: "builtin", layer: "built-in-skills", defaultEnabled: true, uninstallable: false },
 ];
 
+/**
+ * Frozen core-capability extension packages (shared-architecture wave).
+ *
+ * CUA / Web Access / WebView browser / memory migrate into extensions whose tool
+ * names and schemas are a frozen wire contract: web_search, fetch_content,
+ * source_check, get_search_content, browser_search, browser_fetch, browser,
+ * computer, open_application, memory_query, memory_status. This list freezes the
+ * id → owned-tools ownership map in the shared registry; it deliberately does
+ * NOT add them to `BUILTIN_EXTENSION_PACKAGES` (they have no pi runtime layer,
+ * and a registry builtin whose id is also discovered from the builtinRoot tree
+ * would crash `ExtensionLoader.scan` on ingest). Discovery comes from each
+ * package's `pipiui-extension.json` under the runtime extensions tree.
+ */
+export type CoreCapabilityExtensionPackage = ExtensionDescriptor & {
+  /** Tool names this extension alone owns. Names + schemas must not change. */
+  ownedTools: readonly string[];
+};
+
+export const CORE_CAPABILITY_EXTENSION_PACKAGES: readonly CoreCapabilityExtensionPackage[] = [
+  {
+    id: "web-access-extension",
+    name: "PipiUI Web Access",
+    version: "0.1.0",
+    description: "Web search, page fetch, source checking, and retrieval continuation.",
+    origin: "builtin",
+    defaultEnabled: true,
+    uninstallable: false,
+    ownedTools: ["web_search", "fetch_content", "source_check", "get_search_content"],
+  },
+  {
+    id: "webview-browser-extension",
+    name: "PipiUI WebView Browser",
+    version: "0.1.0",
+    description: "Managed browser sessions: search/fetch plus full browser automation.",
+    origin: "builtin",
+    defaultEnabled: true,
+    uninstallable: false,
+    ownedTools: ["browser_search", "browser_fetch", "browser"],
+  },
+  {
+    id: "cua-extension",
+    name: "PipiUI CUA",
+    version: "0.1.0",
+    description: "Computer use via the host CuaDriverHost, plus application launching.",
+    origin: "builtin",
+    defaultEnabled: true,
+    uninstallable: false,
+    ownedTools: ["computer", "open_application"],
+  },
+  {
+    id: "memory-extension",
+    name: "PipiUI Memory",
+    version: "0.1.0",
+    description: "Project-scoped durable memory reads via the loopback memory broker.",
+    origin: "builtin",
+    defaultEnabled: true,
+    uninstallable: false,
+    ownedTools: ["memory_query", "memory_status"],
+  },
+];
+
+/** Core-capability extension ids (manifest validation enforces their extra fields). */
+export const CORE_CAPABILITY_EXTENSION_IDS: ReadonlySet<string> = new Set(
+  CORE_CAPABILITY_EXTENSION_PACKAGES.map((pkg) => pkg.id),
+);
+
+/** Frozen id → owned tool names map (the registry-side pin of the wire contract). */
+export const CORE_CAPABILITY_TOOL_CONTRACT: Readonly<Record<string, readonly string[]>> = Object.freeze(
+  Object.fromEntries(CORE_CAPABILITY_EXTENSION_PACKAGES.map((pkg) => [pkg.id, Object.freeze([...pkg.ownedTools])])),
+);
+
+/** Every frozen core-capability tool name, in ownership order (no duplicates by construction). */
+export const FROZEN_CORE_CAPABILITY_TOOL_NAMES: readonly string[] = Object.freeze(
+  CORE_CAPABILITY_EXTENSION_PACKAGES.flatMap((pkg) => pkg.ownedTools),
+);
+
 /** Project-home enable overlay. Not a pi `settings.json` key (those are stripped). */
 export const PROJECT_EXTENSION_ENABLED_FILE = "ext-enabled.json";
 

@@ -43,6 +43,10 @@ export type BridgeHandlers = {
   onBrowserWatch?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   onTerminalAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
+  /** Versioned Host Capability API: the gated extension→host channel (own envelope in `event`). */
+  onHostCapability?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
+  /** Token mint for the same channel; logical denies ride HTTP 200 (fail closed when omitted). */
+  onHostCapabilityMint?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
   onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
   /** One-shot Structured Outputs take. Session id comes from the capability, never the body. */
@@ -136,6 +140,19 @@ export class HostBridge {
     const capability = randomBytes(32).toString("base64url");
     this.computers.set(capability, sessionId);
     return capability;
+  }
+
+  /**
+   * Desktop-grant check for the Host Capability API `native.exec` route: does
+   * this session own the `computerCapability` presented in `params`?
+   * Constant-time against the minted capabilities; anything else is false.
+   */
+  verifyComputerGrant(sessionId: string, computerCapability: unknown): boolean {
+    if (typeof computerCapability !== "string" || !computerCapability) return false;
+    for (const [capability, owner] of this.computers) {
+      if (owner === sessionId && safeEqual(capability, computerCapability)) return true;
+    }
+    return false;
   }
 
   unregister(sessionId: string): void {
@@ -266,6 +283,8 @@ export class HostBridge {
       else if (body.action === "plan_event") this.handlers.onPlanEvent?.(event as Record<string, unknown>, sessionId);
       else if (body.action === "browser_action") return this.reply(response, 200, await (this.handlers.onBrowserAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "browser host unavailable" })));
       else if (body.action === "browser_watch") return this.reply(response, 200, await Promise.resolve(this.handlers.onBrowserWatch?.(event as Record<string, unknown>, sessionId) ?? { ok: false, error: "browser watch unavailable" }));
+      else if (body.action === "host_capability") return this.reply(response, 200, await Promise.resolve(this.handlers.onHostCapability?.(event as Record<string, unknown>, sessionId) ?? { ok: false, code: "host_unavailable", error: "host capability broker unavailable" }));
+      else if (body.action === "host_capability_token") return this.reply(response, 200, await Promise.resolve(this.handlers.onHostCapabilityMint?.(event as Record<string, unknown>, sessionId) ?? { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" }));
       else if (body.action === "terminal_action") return this.reply(response, 200, await (this.handlers.onTerminalAction?.(event as Record<string, unknown>, sessionId) ?? Promise.resolve({ ok: false, error: "terminal host unavailable" })));
       else if (body.action === "structured_output") {
         try {

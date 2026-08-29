@@ -1,3 +1,4 @@
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { EXTENSION_L2_CAPABILITIES } from "./extension-manifest.js";
@@ -148,4 +149,77 @@ export function grantFromConfirmation(capabilities: readonly string[], at = new 
     grantedCapabilities: [...capabilities],
     grantedAt: at,
   };
+}
+
+/** One default-grant candidate (decision A): extension id + manifest-declared permissions. */
+export type ExtensionGrantSeed = {
+  id: string;
+  permissions: readonly string[];
+};
+
+/**
+ * Pure decision-A seed delta: an extension with no stored grant record receives
+ * exactly its manifest-declared permissions. A record that already exists is
+ * never rewritten (user revocation wins), ids without declared permissions are
+ * never seeded, and unrelated store entries pass through untouched (removal
+ * never cleans history). Returns undefined when nothing needs to be written.
+ */
+export function projectExtensionGrantSeed(
+  current: Record<string, ExtensionGrantRecord>,
+  seeds: readonly ExtensionGrantSeed[],
+  at = new Date().toISOString(),
+): Record<string, ExtensionGrantRecord> | undefined {
+  let changed = false;
+  const next = { ...current };
+  for (const seed of seeds) {
+    if (!seed.permissions.length) continue;
+    if (next[seed.id]) continue;
+    next[seed.id] = { grantedCapabilities: [...seed.permissions], grantedAt: at };
+    changed = true;
+  }
+  return changed ? next : undefined;
+}
+
+export function readProjectExtensionGrantsSync(projectAgentDir: string): Record<string, ExtensionGrantRecord> {
+  try {
+    return parseProjectExtensionGrants(JSON.parse(readFileSync(projectExtensionGrantsPath(projectAgentDir), "utf8")));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+/** Sync counterpart of `writeProjectExtensionGrant` for the synchronous scan path. */
+export function writeProjectExtensionGrantsSync(
+  projectAgentDir: string,
+  grants: Record<string, ExtensionGrantRecord>,
+): void {
+  mkdirSync(projectAgentDir, { recursive: true });
+  const path = projectExtensionGrantsPath(projectAgentDir);
+  const tmp = `${path}.${process.pid}-${Date.now()}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(grants, null, 2)}\n`, "utf8");
+  try {
+    renameSync(tmp, path);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Decision-A default grants on the scan path: a bundled core-capability extension
+ * ships usable by default, so its first sight in a project seeds exactly the
+ * permissions its manifest declares into `{project}/.pi/agent/ext-grants.json`.
+ * Existing records always win (revocation is never overwritten); nothing beyond
+ * the declared set is ever granted.
+ */
+export function seedProjectExtensionGrantsSync(
+  projectAgentDir: string,
+  seeds: readonly ExtensionGrantSeed[],
+): Record<string, ExtensionGrantRecord> {
+  const current = readProjectExtensionGrantsSync(projectAgentDir);
+  const next = projectExtensionGrantSeed(current, seeds);
+  if (!next) return current;
+  writeProjectExtensionGrantsSync(projectAgentDir, next);
+  return next;
 }

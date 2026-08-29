@@ -15,6 +15,11 @@ import {
   type ExtensionAuthContribution,
 } from "./extension-provider-contract.js";
 import {
+  type ExtensionGrantSeed,
+  seedProjectExtensionGrantsSync,
+} from "./extension-grants.js";
+import {
+  CORE_CAPABILITY_EXTENSION_IDS,
   type ExtensionDescriptor,
   type ExtensionEnableScope,
   type ExtensionLifecycleState,
@@ -44,6 +49,8 @@ export type DiscoveredExtensionPackage = {
 export type ExtensionListItem = ExtensionRecord & {
   source: ExtensionOrigin;
   capabilities: readonly string[];
+  /** Declared host-surface permissions (closed first-version enum; host capability gate input). */
+  permissions?: readonly string[];
   ui?: ExtensionUiSummary;
   /** Declarative contributions surfaced to the renderer (Extensions-tab schema forms). */
   contributions?: {
@@ -475,6 +482,7 @@ export class ExtensionLoader {
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly auth = new Map<string, ExtensionAuthContribution>();
   private readonly updateComponents = new Map<string, ExtensionUpdateComponent[]>();
+  private readonly permissions = new Map<string, readonly string[]>();
   private readonly directories = new Map<string, string>();
   private readonly agent = new Map<string, RememberedAgent>();
   private readonly reservedBuiltinIds: Set<string>;
@@ -509,8 +517,33 @@ export class ExtensionLoader {
 
     const records: ExtensionRecord[] = [];
     for (const pkg of resolved) records.push(this.loadOne(pkg));
+    if (projectRoot) this.seedCoreCapabilityGrants(projectRoot);
     this.loadedProjectRoot = projectRoot ? resolve(projectRoot) : undefined;
     return records;
+  }
+
+  /**
+   * Decision A (capability ships with the App, usability first): bundled
+   * core-capability extensions get their manifest-declared permissions seeded
+   * into the project grant store on first sight. Existing grant records are
+   * never rewritten (user revocation wins); non-builtin instances of a core id
+   * are never seeded; extension removal never cleans grants up. Best-effort —
+   * a failed seed never breaks the scan, and the capability gate stays fail-closed.
+   */
+  private seedCoreCapabilityGrants(projectRoot: string): void {
+    const seeds: ExtensionGrantSeed[] = [];
+    for (const record of this.registry.list()) {
+      if (record.origin !== "builtin" || !CORE_CAPABILITY_EXTENSION_IDS.has(record.id)) continue;
+      const permissions = this.permissions.get(record.id);
+      if (!permissions?.length) continue;
+      seeds.push({ id: record.id, permissions });
+    }
+    if (!seeds.length) return;
+    try {
+      seedProjectExtensionGrantsSync(projectPiAgentDir(projectRoot), seeds);
+    } catch {
+      /* default seeding is best-effort; nothing here may block loading */
+    }
   }
 
   private drop(id: string): void {
@@ -519,6 +552,7 @@ export class ExtensionLoader {
     this.settings.delete(id);
     this.auth.delete(id);
     this.updateComponents.delete(id);
+    this.permissions.delete(id);
     this.directories.delete(id);
     this.agent.delete(id);
   }
@@ -619,6 +653,8 @@ export class ExtensionLoader {
       else this.auth.delete(descriptor.id);
       if (manifest?.updateComponents) this.updateComponents.set(descriptor.id, manifest.updateComponents);
       else this.updateComponents.delete(descriptor.id);
+      if (manifest?.permissions) this.permissions.set(descriptor.id, manifest.permissions);
+      else this.permissions.delete(descriptor.id);
       const missingAgent = this.rememberAgent(descriptor.id, pkg.directory, manifest);
       if (missingAgent) {
         return this.registry.enterError(descriptor.id, missingAgent);
@@ -636,6 +672,8 @@ export class ExtensionLoader {
     else this.auth.delete(descriptor.id);
     if (manifest?.updateComponents) this.updateComponents.set(descriptor.id, manifest.updateComponents);
     else this.updateComponents.delete(descriptor.id);
+    if (manifest?.permissions) this.permissions.set(descriptor.id, manifest.permissions);
+    else this.permissions.delete(descriptor.id);
     if (!validation.ok) {
       this.rememberAgent(descriptor.id, pkg.directory, undefined);
       return this.registry.enterError(descriptor.id, validation.errors.join("; "));
@@ -707,6 +745,8 @@ export class ExtensionLoader {
     if (directory) item.directory = directory;
     const updateComponents = this.updateComponents.get(record.id);
     if (updateComponents) item.updateComponents = updateComponents;
+    const permissions = this.permissions.get(record.id);
+    if (permissions) item.permissions = permissions;
     return item;
   }
 }
