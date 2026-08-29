@@ -8435,8 +8435,6 @@ const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
 const MODEL_PARAM_DESCRIPTION =
 	'Optional exact model for THIS dispatch only, as a stable `provider/modelId` string (e.g. "openai/gpt-5", never a bare model id). It must exactly match one entry of the Available models list in your system prompt — unavailable or user-hidden models are rejected with an error, never silently replaced by a default. Omit it to follow the normal resolution (user role settings → current session/main model → agent frontmatter). A pin is never persisted and does not affect any later dispatch.';
-const DESKTOP_PARAM_DESCRIPTION =
-	'Explicit per-task Computer Use authorization. Omitted by default — desktop tools are NEVER injected without it, even when the global toggle is on. Only two values exist: "user-requested" (the user explicitly asked to operate an external app, or named Chrome/Safari/another external browser / "my browser" — then you MUST use exactly that external browser via open_application + computer, never swap in the built-in browser) and "ui-verify" (this task built/changed a UI that the built-in browser tool CANNOT open — a native macOS app or an OS dialog — and genuinely needs a visual acceptance check). If the changed screen loads in the built-in browser tool, ui-verify does NOT apply: check it there yourself and grant nothing. Ordinary web research → built-in browser tool, not desktop. Waiting, polling logs, reading files, and build/test verification never use desktop. Do not grant for convenience; each task is authorized independently and never inherits another task\'s grant.';
 const BLOCKED_BY_DESCRIPTION =
 	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]. The runtime queue holds this task until every named agent succeeds; a failed or never-dispatched dependency holds the item and reports [subagent-blocked] instead of starting it.';
 const SCOPE_DESCRIPTION =
@@ -8522,11 +8520,6 @@ const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
-	desktop: Type.Optional(
-		StringEnum(["user-requested", "ui-verify"] as const, {
-			description: DESKTOP_PARAM_DESCRIPTION,
-		}),
-	),
 }, { additionalProperties: false });
 
 // Chain items speak the same Grok Build / Claude-family dispatch contract as the
@@ -8559,11 +8552,6 @@ const ChainItem = Type.Object({
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
-	desktop: Type.Optional(
-		StringEnum(["user-requested", "ui-verify"] as const, {
-			description: DESKTOP_PARAM_DESCRIPTION,
-		}),
-	),
 	scope: ScopeParam,
 	planTask: PlanTaskParam,
 }, { additionalProperties: false });
