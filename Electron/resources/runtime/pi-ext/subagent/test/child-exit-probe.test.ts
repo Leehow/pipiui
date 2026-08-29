@@ -193,6 +193,33 @@ test("signal exit records SIGTERM and no sensitive values", { timeout: 15_000 },
 	});
 });
 
+test("post-final-grace-expired cause is a closed enum that lands on the close record", { timeout: 15_000 }, async () => {
+	await withSink(async (sink) => {
+		const proc = spawnNode(`setTimeout(() => {}, 30_000)`);
+		assert.ok(proc.pid && proc.pid > 0);
+		const probe = createChildExitTimelineProbe({
+			proc,
+			agent: "write-final-grace",
+			run: "run-final-grace",
+			role: "writable",
+			childPid: proc.pid,
+			cause: () => "post-final-grace-expired",
+		});
+		probe.markFinal();
+		assert.ok(proc.kill("SIGKILL"));
+		await waitClose(proc);
+		const recs = await flushed(sink);
+		const close = recs.find((r) => r.detail === "close")!;
+		// Closed-enum, not free text: exactly the writable post-final-grace value.
+		assert.equal(close.cause, "post-final-grace-expired");
+		assert.equal(close.role, "writable");
+		assert.equal(close.childPid, proc.pid);
+		const joined = sink.lines.join("\n");
+		assert.ok(!joined.includes("write-final-grace"));
+		assert.ok(!joined.includes("run-final-grace"));
+	});
+});
+
 test("IPC disconnect milestone fires when an IPC channel exists", { timeout: 15_000 }, async () => {
 	await withSink(async (sink) => {
 		const proc = spawnNode(

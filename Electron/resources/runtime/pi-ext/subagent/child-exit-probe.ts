@@ -51,6 +51,7 @@ const DEFAULT_TABLE_CAPS: SampleTableCaps = { maxBytes: SAMPLE_MAX_TABLE_BYTES, 
 export type ChildExitProbeCause =
 	| "none"
 	| "grace-timeout"
+	| "post-final-grace-expired"
 	| "provider-stall"
 	| "runtime-budget"
 	| "abort"

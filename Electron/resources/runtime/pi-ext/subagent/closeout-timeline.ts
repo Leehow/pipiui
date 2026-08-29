@@ -154,6 +154,7 @@ export const CLOSEOUT_TIMELINE_EXIT_DETAILS = [
 export const CLOSEOUT_TIMELINE_EXIT_CAUSES = [
 	"none",
 	"grace-timeout",
+	"post-final-grace-expired",
 	"provider-stall",
 	"runtime-budget",
 	"abort",

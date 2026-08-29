@@ -385,6 +385,7 @@ import {
 	readonlyChildExitGraceMs,
 	runAbortableRetries,
 	settleCloseoutWait,
+	writableChildExitGraceMs,
 } from "./closeout.ts";
 import {
 	type ActiveTool,
@@ -7373,7 +7374,9 @@ async function runSingleAgent(
 					run: runId,
 					role: childExitRole,
 					pid: proc.pid,
-					...(agent.traits.readOnly ? { graceMs: readonlyChildExitGraceMs() } : {}),
+					...(agent.traits.readOnly
+						? { graceMs: readonlyChildExitGraceMs() }
+						: { graceMs: writableChildExitGraceMs() }),
 					terminate: terminateAttempt,
 					onProbe(fields) {
 						logCloseoutProbe("child-exit", fields);
@@ -7393,7 +7396,9 @@ async function runSingleAgent(
 					depth: childDepth,
 					attempt: spawnAttempt,
 					cause: () => {
-						if (childExitCloseout.forced()) return "grace-timeout";
+						if (childExitCloseout.forced()) {
+							return childExitRole === "writable" ? "post-final-grace-expired" : "grace-timeout";
+						}
 						if (providerStallTimedOut) return "provider-stall";
 						if (runtimeTimedOut) return "runtime-budget";
 						if (wasAborted) return "abort";
@@ -7582,7 +7587,14 @@ async function runSingleAgent(
 						}
 						return;
 					}
-					if (useNestedRpc && residentRpcShutdownWaker?.consume(event)) return;
+					if (useNestedRpc && residentRpcShutdownWaker?.consume(event)) {
+						// Authenticated shutdown-ready: descendants/queued RPC are terminal,
+						// ctx.shutdown() was requested, and this attempt accepted the wake.
+						// No further tools will run. Arm here — never on the first assistant final.
+						childExitCloseout.arm();
+						childExitProbe.markFinal();
+						return;
+					}
 					if (useNestedRpc && event.type === "agent_settled") {
 						setResidentRpcIdle(true);
 						return;

@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 import {
 	DEFAULT_READONLY_CHILD_EXIT_GRACE_MS,
 	DEFAULT_REPORT_DRAIN_BUDGET_MS,
 	DEFAULT_TERMINAL_REPORT_BUDGET_MS,
+	DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS,
+	MAX_WRITABLE_CHILD_EXIT_GRACE_MS,
 	awaitBounded,
 	closeoutPhaseError,
 	consumeCloseoutLate,
@@ -20,6 +23,7 @@ import {
 	settleCloseoutWait,
 	waitAbortable,
 	worktreeProbeEvent,
+	writableChildExitGraceMs,
 	type CloseoutProbeFields,
 } from "../closeout.ts";
 
@@ -41,6 +45,52 @@ function collectUnhandled(): { seen: unknown[]; stop(): void } {
 			process.off("unhandledRejection", onUnhandled);
 		},
 	};
+}
+
+// Short real-process bounds for the writable TERM→KILL behavior tests.
+const GRACE_MS = 120;
+const KILL_GRACE_MS = 160;
+
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function childPid(child: ChildProcess): Promise<number> {
+	if (typeof child.pid === "number" && child.pid > 0) return child.pid;
+	await new Promise<void>((resolve, reject) => {
+		child.once("spawn", () => resolve());
+		child.once("error", reject);
+	});
+	return child.pid!;
+}
+
+function waitChildClose(child: ChildProcess): Promise<void> {
+	return new Promise((resolve, reject) => {
+		child.once("error", reject);
+		child.once("close", () => resolve());
+	});
+}
+
+/** Wait for a fixed marker line on the child's stdout — proves the SIGTERM handler
+ *  is installed before we signal it, so the signal-ignore assertion is deterministic. */
+async function waitStdoutMarker(child: ChildProcess, marker: string): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		let buffered = "";
+		const onData = (chunk: Buffer): void => {
+			buffered += chunk.toString();
+			if (buffered.includes(marker)) {
+				child.stdout?.off("data", onData);
+				resolve();
+			}
+		};
+		child.stdout?.on("data", onData);
+		child.once("error", reject);
+	});
 }
 
 test("production closeout bounds stay short and explicit", () => {
@@ -108,6 +158,170 @@ test("writable child-exit wait probes without killing", async () => {
 	assert.equal(terminated, 0);
 	assert.equal(closeout.forced(), false);
 	assert.deepEqual(probes.map((item) => item.state), ["enter", "ok"]);
+});
+
+test("writable post-final grace default is 15s, env-overridable, never unbounded", () => {
+	assert.equal(DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS, 15_000);
+	assert.equal(MAX_WRITABLE_CHILD_EXIT_GRACE_MS, 60_000);
+	assert.equal(writableChildExitGraceMs({}), 15_000);
+	assert.equal(writableChildExitGraceMs({ PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS: "40" }), 40);
+	// Invalid/negative/NaN fall back to the default — they must never disable the bound.
+	assert.equal(writableChildExitGraceMs({ PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS: "" }), 15_000);
+	assert.equal(writableChildExitGraceMs({ PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS: "abc" }), 15_000);
+	assert.equal(writableChildExitGraceMs({ PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS: "-5" }), 15_000);
+	// An explicit huge override is clamped, not honoured: ordinary config can't unbind it.
+	assert.equal(writableChildExitGraceMs({ PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS: "999999999" }), MAX_WRITABLE_CHILD_EXIT_GRACE_MS);
+	// The default stays well below the terminal-report budget scale the closeout relies on.
+	assert.ok(DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS > DEFAULT_READONLY_CHILD_EXIT_GRACE_MS);
+});
+
+test("writable post-final grace expires → terminate once, forced, exit on settle", async () => {
+	const probes: CloseoutProbeFields[] = [];
+	let terminated = 0;
+	const closeout = createChildExitCloseout({
+		agent: "write-1",
+		run: "run-1",
+		role: "writable",
+		pid: 777,
+		graceMs: SHORT_MS,
+		terminate: () => {
+			terminated += 1;
+		},
+		onProbe: (fields) => probes.push({ ...fields }),
+	});
+	const started = Date.now();
+	closeout.arm();
+	await delay(SHORT_MS + 20);
+	assert.equal(terminated, 1, "grace expiry must SIGTERM exactly once");
+	assert.equal(closeout.forced(), true);
+	closeout.settled("ok");
+	assert.ok(Date.now() - started < 1_000);
+	assert.deepEqual(probes.map((item) => item.state), ["enter", "timeout", "terminate", "exit"]);
+	assert.ok(probes.every((item) => item.elapsedMs !== undefined));
+	assert.equal(closeoutPhaseError("child-exit", "enter"), undefined);
+});
+
+test("writable settles inside grace → no terminate, not forced", async () => {
+	const probes: CloseoutProbeFields[] = [];
+	let terminated = 0;
+	const closeout = createChildExitCloseout({
+		role: "writable",
+		pid: 888,
+		graceMs: SHORT_MS,
+		terminate: () => {
+			terminated += 1;
+		},
+		onProbe: (fields) => probes.push({ ...fields }),
+	});
+	closeout.arm();
+	closeout.settled("ok");
+	await delay(SHORT_MS + 20);
+	assert.equal(terminated, 0, "close within the grace must not SIGTERM");
+	assert.equal(closeout.forced(), false);
+	assert.deepEqual(probes.map((item) => item.state), ["enter", "ok"]);
+});
+
+test("writable abort/cancel inside grace clears the terminate timer (no double kill)", async () => {
+	let terminated = 0;
+	const closeout = createChildExitCloseout({
+		role: "writable",
+		pid: 999,
+		graceMs: SHORT_MS,
+		terminate: () => {
+			terminated += 1;
+		},
+		onProbe: () => {},
+	});
+	closeout.arm();
+	closeout.cancel();
+	await delay(SHORT_MS + 20);
+	assert.equal(terminated, 0, "a pre-grace abort must cancel the pending terminate");
+	assert.equal(closeout.forced(), false);
+});
+
+test("writable TERM→KILL is bounded and leaves no process residue", { timeout: 15_000 }, async (t) => {
+	// A single-process child that logs READY once its SIGTERM handler is installed, then
+	// keeps running (ignores SIGTERM). Only the direct worker PID is targeted; it must be
+	// force-killed within grace + killGrace and nothing of it may survive.
+	const stubborn = spawn(process.execPath, [
+		"-e", "process.on('SIGTERM', () => {}); console.log('READY'); setInterval(() => {}, 1000)",
+	], { stdio: ["ignore", "pipe", "ignore"] });
+	await waitStdoutMarker(stubborn, "READY");
+	const pid = await childPid(stubborn);
+	t.after(() => {
+		try { stubborn.kill("SIGKILL"); } catch { /* best-effort cleanup */ }
+	});
+	let termSent = false;
+	let killSent = false;
+	let exited = false;
+	let forceTimer: ReturnType<typeof setTimeout> | undefined;
+	const terminate = () => {
+		termSent = true;
+		forceTimer = setTimeout(() => {
+			killSent = true;
+			if (!exited) { try { stubborn.kill("SIGKILL"); } catch { /* ESRCH = gone */ } }
+		}, KILL_GRACE_MS);
+		forceTimer.unref?.();
+		return stubborn.kill("SIGTERM");
+	};
+	stubborn.once("close", () => { exited = true; if (forceTimer !== undefined) clearTimeout(forceTimer); });
+	const closeout = createChildExitCloseout({
+		role: "writable",
+		pid,
+		graceMs: GRACE_MS,
+		terminate,
+		onProbe: () => {},
+	});
+	const started = Date.now();
+	closeout.arm();
+	await waitChildClose(stubborn);
+	assert.ok(Date.now() - started < GRACE_MS + KILL_GRACE_MS + 1_000, "stubborn child must be reaped within grace + killGrace + slack");
+	assert.equal(termSent, true, "grace expiry must send SIGTERM");
+	assert.equal(killSent, true, "a SIGTERM-ignoring child must be SIGKILLed");
+	assert.equal(alive(pid), false, "no residue: the direct worker pid must be gone");
+	closeout.settled("ok");
+});
+
+test("writable TERM then exit does not SIGKILL a cooperative child", { timeout: 15_000 }, async (t) => {
+	// Single-process child with no SIGTERM handler: default node behavior exits on SIGTERM,
+	// so the later KILL grace must NOT fire.
+	const cooperative = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+		stdio: "ignore",
+	});
+	const pid = await childPid(cooperative);
+	await delay(50);
+	t.after(() => {
+		try { cooperative.kill("SIGKILL"); } catch { /* best-effort cleanup */ }
+	});
+	let termSent = false;
+	let killSent = false;
+	let forceTimer: ReturnType<typeof setTimeout> | undefined;
+	let exited = false;
+	const terminate = () => {
+		termSent = true;
+		forceTimer = setTimeout(() => {
+			killSent = true;
+			if (!exited) { try { cooperative.kill("SIGKILL"); } catch { /* ESRCH = gone */ } }
+		}, KILL_GRACE_MS);
+		forceTimer.unref?.();
+		return cooperative.kill("SIGTERM");
+	};
+	cooperative.once("close", () => { exited = true; if (forceTimer !== undefined) clearTimeout(forceTimer); });
+	const closeout = createChildExitCloseout({
+		role: "writable",
+		pid,
+		graceMs: GRACE_MS,
+		terminate,
+		onProbe: () => {},
+	});
+	closeout.arm();
+	await waitChildClose(cooperative);
+	// The child answers SIGTERM with a prompt exit; the KILL grace must NOT fire.
+	await delay(KILL_GRACE_MS + 20);
+	assert.equal(termSent, true, "grace expiry must send SIGTERM");
+	assert.equal(killSent, false, "a child that dies on SIGTERM must not be SIGKILLed");
+	assert.equal(alive(pid), false);
+	closeout.settled("ok");
 });
 
 test("timer cleanup and nextAttempt do not kill a later child", async () => {
@@ -638,6 +852,9 @@ test("index wires closeout helpers onto the live finalization path", () => {
 	assert.match(source, /from "\.\/closeout\.ts"/);
 	assert.match(source, /childExitCloseout\.arm\(\)/);
 	assert.match(source, /childExitCloseout\.accepted\(\)/);
+	assert.match(source, /if \(!useNestedRpc\) \{[\s\S]*?childExitCloseout\.arm\(\)/);
+	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitCloseout\.arm\(\)/);
+	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitProbe\.markFinal\(\)/);
 	assert.match(source, /detachCloseout\(submitBrokerTerminalCandidate/);
 	assert.match(source, /settleCloseoutWait\(flight, DEFAULT_TERMINAL_REPORT_BUDGET_MS/);
 	assert.match(source, /createCloseoutReportQueue/);

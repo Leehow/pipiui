@@ -35,16 +35,52 @@ delete process.env.PIPIUI_AGENT_RUN_ID;
  * The hang mode keeps a referenced keepalive with a bounded hard exit so a leaked child
  * cannot hold the test process open.
  */
+function writeChildState(agentId: string, extra: Record<string, unknown> = {}): void {
+	const root = process.env.PIPIUI_MAIN_CWD;
+	if (!root) return;
+	const path = join(root, `rpc-child-${agentId}.json`);
+	let prev: Record<string, unknown> = {};
+	try {
+		prev = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	} catch {
+		/* first write */
+	}
+	writeFileSync(path, JSON.stringify({ ...prev, pid: process.pid, ...extra }));
+}
+
+function parkResident(agentId: string, ignoreTerm: boolean): Promise<never> {
+	writeChildState(agentId, { final: true });
+	if (ignoreTerm) {
+		process.on("SIGTERM", () => {
+			writeChildState(agentId, { sigterm: true });
+		});
+	}
+	const keepAlive = setInterval(() => {}, 60_000);
+	void keepAlive;
+	const hardExit = setTimeout(() => process.exit(0), 30_000);
+	void hardExit;
+	return new Promise(() => {});
+}
+
+let rpcExitOnGetState = false;
+
 async function runFakeWorkerChild(prompt = process.argv[process.argv.length - 1] ?? "", rpcCommandId?: string): Promise<never> {
 	const argv = process.argv;
 	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
 	const fromSession = sessionIdArg.replace(/^pipiui-/, "");
-	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z]+))?\]/);
+	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/);
 	const agentId = fromSession || marker?.[1] || "unknown";
 	const mode = marker?.[2] ?? "ok";
 	const line = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
 	line({ type: "session_start", cwd: process.cwd() });
 	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
+	if (mode === "final-hold") {
+		line({
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId}` }] },
+		});
+		return parkResident(agentId, false);
+	}
 	if (mode === "hang") {
 		// Referenced keepalive: the test aborts this run via subagent_abort exact-run
 		// binding; the hard cap bounds a leaked child's lifetime.
@@ -72,19 +108,63 @@ async function runFakeWorkerChild(prompt = process.argv[process.argv.length - 1]
 	process.exit(0);
 }
 
+function seamMode(prompt: string): string {
+	return prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/)?.[2] ?? "ok";
+}
+
+async function runResidentRpcFake(rpcCommandId: string | undefined, prompt: string, mode: string): Promise<never> {
+	const argv = process.argv;
+	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
+	const fromSession = sessionIdArg.replace(/^pipiui-/, "");
+	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/);
+	const agentId = fromSession || marker?.[1] || "unknown";
+	const line = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
+	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
+	line({ type: "session_start", cwd: process.cwd() });
+	line({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId}` }] },
+	});
+	line({ type: "agent_settled" });
+	writeChildState(agentId);
+	if (mode === "rpc-hold") return parkResident(agentId, false);
+	const token = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN ?? "";
+	line({
+		type: "extension_ui_request",
+		method: "setStatus",
+		statusKey: `pipiui-resident-rpc-wake:${token}`,
+	});
+	if (mode === "rpc-exit") {
+		rpcExitOnGetState = true;
+		return parkResident(agentId, false);
+	}
+	if (mode === "rpc-stubborn") return parkResident(agentId, true);
+	return parkResident(agentId, false);
+}
+
 async function runFakeRpcWorkerChild(): Promise<never> {
+	const spawnedId = process.env.PIPIUI_AGENT_ID;
+	if (spawnedId) writeChildState(spawnedId);
 	let buffer = "";
 	process.stdin.on("data", (chunk) => {
 		buffer += String(chunk);
-		const newline = buffer.indexOf("\n");
-		if (newline < 0) return;
-		const line = buffer.slice(0, newline);
-		buffer = buffer.slice(newline + 1);
-		try {
-			const command = JSON.parse(line) as { id?: string; type?: string; message?: string };
-			if (command.type === "prompt") void runFakeWorkerChild(command.message ?? "", command.id);
-		} catch {
-			process.exit(2);
+		for (;;) {
+			const newline = buffer.indexOf("\n");
+			if (newline < 0) break;
+			const line = buffer.slice(0, newline);
+			buffer = buffer.slice(newline + 1);
+			try {
+				const command = JSON.parse(line) as { id?: string; type?: string; message?: string };
+				if (command.type === "get_state" && rpcExitOnGetState) process.exit(0);
+				if (command.type === "prompt") {
+					const message = command.message ?? "";
+					const mode = seamMode(message);
+					if (mode.startsWith("rpc-")) void runResidentRpcFake(command.id, message, mode);
+					else void runFakeWorkerChild(message, command.id);
+				}
+			} catch {
+				process.exit(2);
+			}
 		}
 	});
 	await new Promise<never>(() => {});
@@ -177,6 +257,53 @@ function setupSuiteEnv() {
 		for (const file of readdirSync(suiteSessionsDir)) rmSync(join(suiteSessionsDir, file), { force: true });
 	};
 }
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function readChildState(agentId: string): { pid?: number; sigterm?: boolean; final?: boolean } {
+	try {
+		return JSON.parse(readFileSync(join(suiteMainCwd, `rpc-child-${agentId}.json`), "utf8")) as {
+			pid?: number;
+			sigterm?: boolean;
+			final?: boolean;
+		};
+	} catch {
+		return {};
+	}
+}
+
+async function waitChildPid(agentId: string, timeoutMs = 25_000): Promise<number> {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		const pid = readChildState(agentId).pid;
+		if (typeof pid === "number" && pid > 0) return pid;
+		await delay(20);
+	}
+	throw new Error(`rpc child pid for ${agentId} did not appear`);
+}
+
+async function waitChildFinal(agentId: string, timeoutMs = 25_000): Promise<number> {
+	const started = Date.now();
+	while (Date.now() - started < timeoutMs) {
+		const state = readChildState(agentId);
+		if (typeof state.pid === "number" && state.pid > 0 && state.final === true) return state.pid;
+		await delay(20);
+	}
+	throw new Error(`rpc child final for ${agentId} did not appear`);
+}
+
+const EXEC_CTX = { cwd: tmpdir(), model: undefined };
 
 test("registered tool seam: provider schema + prepare rejects missing IDs; explicit ids survive", async (t) => {
 	const cleanup = setupSuiteEnv();
@@ -1271,6 +1398,155 @@ test("plan-drift: planTask and scope persist onto the terminal job record the se
 	assert.equal(job.state, "ok");
 });
 
+test("RPC general-purpose does not arm child-exit on first final before shutdown-ready", { timeout: 40_000 }, async (t) => {
+	const cleanup = setupSuiteEnv();
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const previousGrace = process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = "80";
+	t.after(() => {
+		cleanup();
+		if (previousGrace === undefined) delete process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+	const dispatched = (await subagent.execute("cap-hold", prepared(subagent, {
+		prompt: "Stay after final. [seam:caphold:rpc-hold].",
+		description: "rpc hold",
+		subagent_type: "general-purpose",
+		agentId: "caphold",
+		isolation: "none",
+		run_in_background: true,
+	}), undefined, undefined, EXEC_CTX)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(dispatched.isError === true, false, JSON.stringify(dispatched.content));
+	const runId = dispatched.content[0]!.text.match(/runId=([^\s]+)/)?.[1];
+	assert.ok(runId, "background receipt must include runId");
+	const pid = await waitChildFinal("caphold");
+	await delay(280);
+	assert.equal(alive(pid), true, "must not SIGTERM before shutdown-ready even after assistant final");
+	await abort.execute("cap-hold-abort", { agentId: "caphold", runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+test("RPC general-purpose arms at shutdown-ready then SIGTERM after writable grace", { timeout: 40_000 }, async (t) => {
+	const cleanup = setupSuiteEnv();
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const previousGrace = process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = "80";
+	t.after(() => {
+		cleanup();
+		if (previousGrace === undefined) delete process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const dispatched = (await subagent.execute("cap-ready", prepared(subagent, {
+		prompt: "Wake then stay. [seam:capready:rpc-ready].",
+		description: "rpc ready",
+		subagent_type: "general-purpose",
+		agentId: "capready",
+		isolation: "none",
+		run_in_background: true,
+	}), undefined, undefined, EXEC_CTX)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(dispatched.isError === true, false, JSON.stringify(dispatched.content));
+	const pid = await waitChildPid("capready");
+	const deadline = Date.now() + 3_000;
+	while (alive(pid) && Date.now() < deadline) await delay(20);
+	assert.equal(alive(pid), false, "shutdown-ready must arm the 15s-class grace and SIGTERM the direct PID");
+});
+
+test("RPC general-purpose SIGTERM then SIGKILL when the child ignores TERM", { timeout: 40_000 }, async (t) => {
+	const cleanup = setupSuiteEnv();
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const previousGrace = process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = "80";
+	t.after(() => {
+		cleanup();
+		if (previousGrace === undefined) delete process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const started = Date.now();
+	const dispatched = (await subagent.execute("cap-stub", prepared(subagent, {
+		prompt: "Ignore TERM. [seam:capstub:rpc-stubborn].",
+		description: "rpc stubborn",
+		subagent_type: "general-purpose",
+		agentId: "capstub",
+		isolation: "none",
+		run_in_background: true,
+	}), undefined, undefined, EXEC_CTX)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(dispatched.isError === true, false, JSON.stringify(dispatched.content));
+	const pid = await waitChildPid("capstub");
+	const deadline = Date.now() + 12_000;
+	while (alive(pid) && Date.now() < deadline) await delay(50);
+	const elapsed = Date.now() - started;
+	assert.equal(alive(pid), false, "ignored SIGTERM must still be SIGKILL after the 5s kill grace");
+	assert.equal(readChildState("capstub").sigterm, true, "production terminateAttempt must send SIGTERM first");
+	assert.ok(elapsed >= 4_500, `SIGKILL must wait the 5s kill grace, elapsed=${elapsed}`);
+});
+
+test("RPC general-purpose cooperative exit after shutdown-ready clears the timer (no SIGKILL)", { timeout: 40_000 }, async (t) => {
+	const cleanup = setupSuiteEnv();
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const previousGrace = process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = "2000";
+	t.after(() => {
+		cleanup();
+		if (previousGrace === undefined) delete process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const dispatched = (await subagent.execute("cap-exit", prepared(subagent, {
+		prompt: "Exit on get_state. [seam:capexit:rpc-exit].",
+		description: "rpc exit",
+		subagent_type: "general-purpose",
+		agentId: "capexit",
+		isolation: "none",
+		run_in_background: true,
+	}), undefined, undefined, EXEC_CTX)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(dispatched.isError === true, false, JSON.stringify(dispatched.content));
+	const pid = await waitChildPid("capexit");
+	const started = Date.now();
+	const deadline = Date.now() + 3_000;
+	while (alive(pid) && Date.now() < deadline) await delay(20);
+	const elapsed = Date.now() - started;
+	assert.equal(alive(pid), false, "get_state must close the resident without a kill race");
+	assert.ok(elapsed < 1_500, `cooperative get_state exit must not wait TERM/KILL, elapsed=${elapsed}`);
+	assert.equal(readChildState("capexit").sigterm, undefined);
+});
+
+test("non-RPC explore still arms on first assistant final", { timeout: 40_000 }, async (t) => {
+	const cleanup = setupSuiteEnv();
+	delete process.env.PIPIUI_FANOUT_ACTIVE;
+	const previousGrace = process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS = "80";
+	t.after(() => {
+		cleanup();
+		if (previousGrace === undefined) delete process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const dispatched = (await subagent.execute("cap-print", prepared(subagent, {
+		prompt: "Print final then hold. [seam:capprint:final-hold].",
+		description: "print hold",
+		subagent_type: "explore",
+		agentId: "capprint",
+		run_in_background: true,
+	}), undefined, undefined, EXEC_CTX)) as { content: Array<{ type: string; text: string }>; isError?: boolean };
+	assert.equal(dispatched.isError === true, false, JSON.stringify(dispatched.content));
+	const pid = await waitChildPid("capprint");
+	const deadline = Date.now() + 3_000;
+	while (alive(pid) && Date.now() < deadline) await delay(20);
+	assert.equal(alive(pid), false, "print-mode workers must still arm on first assistant final");
+});
 after(async () => {
 	const drained = await drainPipiuiTrackedChildren(250, 2_000);
 	assert.deepEqual(drained.remainingPids, [], "all dispatch-seam worker children were reaped");

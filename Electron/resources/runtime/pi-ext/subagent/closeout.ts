@@ -7,6 +7,13 @@ import { recordCloseoutTimeline } from "./closeout-timeline.ts";
 import { logStallProbe } from "./stall-diagnostics.ts";
 
 export const DEFAULT_READONLY_CHILD_EXIT_GRACE_MS = 5_000;
+/** A writable worker that has emitted its final message but not yet closed is given
+ *  this post-final grace before the direct worker PID is SIGTERM'd (then SIGKILL'd
+ *  5s later). This bounds the child-exit long-tail: final → forced kill ≈ 20s. */
+export const DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS = 15_000;
+/** Safety ceiling so an operator/env override cannot make the writable post-final
+ *  wait effectively unbounded (default is 15s; this permits headroom, never infinite). */
+export const MAX_WRITABLE_CHILD_EXIT_GRACE_MS = 60_000;
 export const DEFAULT_TERMINAL_REPORT_BUDGET_MS = 8_000;
 export const DEFAULT_REPORT_DRAIN_BUDGET_MS = 3_000;
 
@@ -64,6 +71,16 @@ export function readonlyChildExitGraceMs(env: NodeJS.ProcessEnv = process.env): 
 	if (!raw) return DEFAULT_READONLY_CHILD_EXIT_GRACE_MS;
 	const parsed = Number(raw);
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_READONLY_CHILD_EXIT_GRACE_MS;
+}
+
+export function writableChildExitGraceMs(env: NodeJS.ProcessEnv = process.env): number {
+	const raw = env.PIPIUI_WRITABLE_CHILD_EXIT_GRACE_MS?.trim();
+	if (!raw) return DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_WRITABLE_CHILD_EXIT_GRACE_MS;
+	// Clamp to the safety ceiling: an override may shorten the grace (tests) but never
+	// lengthen it past the explicit bounded cap, so ordinary config can't unbrake it.
+	return Math.min(parsed, MAX_WRITABLE_CHILD_EXIT_GRACE_MS);
 }
 
 function notifyLate<T>(onLate: ((late: CloseoutLate<T>) => void) | undefined, late: CloseoutLate<T>): void {
