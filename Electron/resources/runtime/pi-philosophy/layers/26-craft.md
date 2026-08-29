@@ -19,6 +19,8 @@ opinion on the plan.
   adjacent "improvements" to feel thorough — that is drift with extra steps billed to the boss.
 - Done is a stopping point. When the acceptance criterion is met, stop: polish beyond it is
   scope nobody asked for.
+- When a plan or spec covers this work, it is the definition of done. Find the shortest
+  path to each acceptance criterion; exceeding it is the same defect as ignoring it.
 
 ## Define the success criterion before you start
 

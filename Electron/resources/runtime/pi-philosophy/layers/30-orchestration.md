@@ -275,6 +275,10 @@ This section is about successive rounds on one slice, not how many slices run at
   message just to stay quiet.
 - Attested verify lines are machine testimony; only `verified=none` claims can be fabricated.
   Never accept or relay a fabricated result.
+- Verify at the cheapest level that proves the change: a typecheck, a build, a test, a
+  rendered screen. Packaging, releasing, deploying, or installing the product is never a
+  verification step unless the user explicitly asked for exactly that — it is its own
+  deliverable with its own request.
 
 ## Silence is a measurement, not a verdict
 

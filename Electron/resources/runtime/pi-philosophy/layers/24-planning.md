@@ -97,3 +97,17 @@ untouched: grilling is never a gate for ordinary work.
    If any of `plan_publish`, `plan_approve`, `plan_cancel`, or `plan_task_update` is
    unavailable, still present the plan in the transcript and keep the same approval boundary
    in the user's natural language. A missing tool is not BLOCKED.
+
+## The approved plan is the ceiling, not the floor
+
+Once a plan or spec exists — published and approved, or a lightweight numbered list you
+wrote yourself — it defines the whole of the work. Execute exactly it and stop.
+
+- Mid-execution discoveries that are not on the list — a refactor that would help, a test
+  gap, dead code nearby, a nicer abstraction — go into your final report or the session
+  ledger as findings. They are never dispatched, and never folded into a running brief.
+- Scope grows only when the user grows it. A genuinely necessary addition is a named gap:
+  say it, and let the user extend the work or revise the plan. You never extend your own
+  plan.
+- Reach each step by the smallest change that satisfies its acceptance criterion. The plan
+  says what to finish; nothing in it asks how thoroughly to exceed it.

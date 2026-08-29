@@ -100,6 +100,13 @@ heavier build to ship. Read the skill's
 `build`, `scripts/fetch-pi-runtime.mjs`, or `scripts/fetch-cua-driver.mjs` —
 each holds a slimming invariant that an innocuous-looking edit silently undoes.
 
+### 修改 pipiui 自身不主动打包（binding）
+
+修改本仓库代码的默认终点是：对应 Electron workspace 编译 / 测试通过并完成提交。
+不要主动执行 `pipiui-electron-build`，不要重启或替换正在运行的 App。仅当用户明确
+要求“打包 / 装包 / 打开 App 验收”时才走打包流程；也只有那时才适用下文“Verify
+after package”的 mtime 检查。
+
 ### npm 在本机会经代理死锁（binding）
 
 本机 `HTTP_PROXY`/`HTTPS_PROXY` 指向 `127.0.0.1:6152`。npm 默认 `maxsockets=15`

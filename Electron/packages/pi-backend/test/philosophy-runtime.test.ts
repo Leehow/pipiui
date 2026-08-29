@@ -425,8 +425,12 @@ describe("vendored philosophy: delivery", () => {
     // conversation was itself the failure mode. The runtime now classifies ordinary vs
     // poisoned-context deaths and persists an evidence-derived checkpoint; the bullet names
     // the two routes so the fresh-episode dispatch reads it instead of blind-resuming.
+    // Raised to 19300 for the plan-ceiling / fanout width-boundary / cheapest-verify and
+    // no-unprompted-packaging rules: the drift they pin (sessions self-expanding scope
+    // mid-plan, packaging the app unprompted to "verify") was user-reported and costs more
+    // per turn than the ~380 tokens of prefix the four insertions spend.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(18800);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(19300);
   });
 
   it("delivers the semantic-slug identity rule into the composed boss prompt", () => {
