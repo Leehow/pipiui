@@ -34,6 +34,7 @@ import { DEFAULT_PANEL_TAB, usePanels, type PanelRailContext, type PanelTab } fr
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
+import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
 import { DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
@@ -1257,6 +1258,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const scanExternal = useScanExternalSessions(host)
   const scanExternalRef = useRef(scanExternal)
   scanExternalRef.current = scanExternal
+  const updates = useUpdateCenter(host)
   // Opening the settings modal refreshes the vision-routing snapshot so the 通用
   // tab always shows the host's current state (reads happen on open, per spec).
   const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
@@ -2829,6 +2831,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       throw error
     }
   }
+  const requestUpdate = (prompt: string) => {
+    closeModelManager()
+    void send(prompt).catch(error => setProjectError(`发送失败：${error instanceof Error ? error.message : String(error)}`))
+  }
   /**
    * `/compact`. Progress and the outcome normally arrive as `compaction` stream
    * events; a refusal ("Nothing to compact") never produces one, so the
@@ -3423,7 +3429,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
     <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
       if (!selectedSession || !host.browser) return

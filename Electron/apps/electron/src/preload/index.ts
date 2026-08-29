@@ -31,7 +31,7 @@ export interface RemoteControlIpcRendererLike {
 
 /** Electron preload entry: call with Electron's contextBridge and ipcRenderer. */
 export function exposePipiHost(contextBridge: ContextBridgeLike, ipc: IpcRendererLike): PipiHostAPI {
-  const host = createIpcHost(ipc, PIPI_HOST_IPC_CHANNEL, { openExternal: true, openDocumentExternally: true, projectDirectoryPicker: true, computerUsePermissions: true, updateCenter: false })
+  const host = createIpcHost(ipc, PIPI_HOST_IPC_CHANNEL, { openExternal: true, openDocumentExternally: true, projectDirectoryPicker: true, computerUsePermissions: true, updateCenter: true })
   contextBridge.exposeInMainWorld('pipiHost', host)
   contextBridge.exposeInMainWorld('pipiPathForFile', (file: File) => webUtils.getPathForFile(file))
   return host

@@ -107,8 +107,7 @@ export type ExtensionUpdateErrorCode =
   | "id_mismatch"
   | "host_api_incompatible"
   | "activation_failed"
-  | "lock_timeout"
-  | "updates_disabled";
+  | "lock_timeout";
 
 export class ExtensionUpdateError extends Error {
   readonly code: ExtensionUpdateErrorCode;
@@ -1049,12 +1048,7 @@ async function fetchReleaseDocument(
  * and an activation failure rolls the active slot back (previous slot and
  * receipts persist).
  */
-function rejectDisabledExtensionUpdate(): void {
-  throw new ExtensionUpdateError("updates_disabled", "更新功能已关闭");
-}
-
 export async function applyExtensionUpdate(request: ExtensionUpdateRequest, options: ExtensionUpdateEngineOptions): Promise<ExtensionUpdateResult> {
-  rejectDisabledExtensionUpdate();
   const extensionId = assertExtensionId(request.extensionId);
   const storeRoot = options.storeRoot;
   if (typeof storeRoot !== "string" || storeRoot.length < 2) {

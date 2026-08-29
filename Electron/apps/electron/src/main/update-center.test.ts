@@ -250,21 +250,51 @@ describe('withUpdateCenter', () => {
     }
   }
 
-  it('rejects checkForUpdates and updateExtensionComponent even when handlers are supplied', async () => {
+  it('forwards checkForUpdates with no parameters', async () => {
     const inner = backend()
-    const wrapped = withUpdateCenter(
-      inner,
-      async () => ({ checkedAt: 1, items: [] }),
-      async () => ({ extensionId: 'x', version: '1.0.0', contentHash: '', objectDir: '', receiptPath: '' }),
-    )
-    await expect(wrapped.handle('checkForUpdates', [])).rejects.toThrow('更新功能已关闭')
-    await expect(wrapped.handle('updateExtensionComponent', ['x'])).rejects.toThrow('更新功能已关闭')
+    const check = vi.fn(async () => ({ checkedAt: 1, items: [] }))
+    const wrapped = withUpdateCenter(inner, check)
+    await expect(wrapped.handle('checkForUpdates', [])).resolves.toEqual({ checkedAt: 1, items: [] })
+    expect(check).toHaveBeenCalledTimes(1)
     expect(inner.handle).not.toHaveBeenCalled()
+  })
+
+  it('rejects checkForUpdates when parameters are supplied', async () => {
+    const inner = backend()
+    const check = vi.fn(async () => ({ checkedAt: 1, items: [] }))
+    const wrapped = withUpdateCenter(inner, check)
+    await expect(wrapped.handle('checkForUpdates', ['x'])).rejects.toThrow('checkForUpdates takes no parameters')
+    expect(check).not.toHaveBeenCalled()
+  })
+
+  it('forwards updateExtensionComponent when a handler is supplied', async () => {
+    const inner = backend()
+    const update = vi.fn(async (extensionId: string) => ({
+      extensionId, version: '1.0.0', contentHash: '', objectDir: '', receiptPath: '',
+    }))
+    const wrapped = withUpdateCenter(inner, async () => ({ checkedAt: 1, items: [] }), update)
+    await expect(wrapped.handle('updateExtensionComponent', ['ext', 'comp'])).resolves.toMatchObject({ extensionId: 'ext' })
+    expect(update).toHaveBeenCalledWith('ext', 'comp')
+    expect(inner.handle).not.toHaveBeenCalled()
+  })
+
+  it('rejects updateExtensionComponent when no handler is supplied', async () => {
+    const wrapped = withUpdateCenter(backend(), async () => ({ checkedAt: 1, items: [] }))
+    await expect(wrapped.handle('updateExtensionComponent', ['ext'])).rejects.toThrow('updateExtensionComponent is not available')
+  })
+
+  it('validates updateExtensionComponent parameters', async () => {
+    const update = vi.fn(async () => ({ extensionId: 'x', version: '1.0.0', contentHash: '', objectDir: '', receiptPath: '' }))
+    const wrapped = withUpdateCenter(backend(), async () => ({ checkedAt: 1, items: [] }), update)
+    await expect(wrapped.handle('updateExtensionComponent', [])).rejects.toThrow('updateExtensionComponent requires an extensionId string')
+    await expect(wrapped.handle('updateExtensionComponent', [''])).rejects.toThrow('updateExtensionComponent requires an extensionId string')
+    await expect(wrapped.handle('updateExtensionComponent', ['ext', 1])).rejects.toThrow('updateExtensionComponent componentId must be a string')
+    expect(update).not.toHaveBeenCalled()
   })
 
   it('forwards unrelated methods to the inner backend', async () => {
     const inner = backend()
-    const wrapped = withUpdateCenter(inner)
+    const wrapped = withUpdateCenter(inner, async () => ({ checkedAt: 1, items: [] }))
     await expect(wrapped.handle('listProjects', [])).resolves.toBe('forwarded')
     expect(inner.handle).toHaveBeenCalledWith('listProjects', [])
   })

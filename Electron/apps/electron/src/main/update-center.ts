@@ -248,17 +248,24 @@ export function createUpdateCenterService(options: {
   }
 }
 
-const UPDATES_DISABLED = () => Promise.reject(new Error('更新功能已关闭'))
-
-/** Update-center RPCs are permanently fail-closed for every user; the methods still intercept so they cannot fall through to an unknown-method handler. */
+/** Adds read-only update checks and, when a transaction handler is supplied, the one-click extension update method; no URL, command or filesystem capability crosses into the renderer. */
 export function withUpdateCenter(
   backend: HostBackend,
-  _checkForUpdates?: () => Promise<UpdateCenterSnapshot>,
-  _updateExtensionComponent?: (extensionId: string, componentId?: string) => Promise<ExtensionComponentUpdateResult>
+  checkForUpdates: () => Promise<UpdateCenterSnapshot>,
+  updateExtensionComponent?: (extensionId: string, componentId?: string) => Promise<ExtensionComponentUpdateResult>
 ): HostBackend {
   return {
     handle: (method, params) => {
-      if (method === 'checkForUpdates' || method === 'updateExtensionComponent') return UPDATES_DISABLED()
+      if (method === 'checkForUpdates') {
+        return params.length ? Promise.reject(new Error('checkForUpdates takes no parameters')) : checkForUpdates()
+      }
+      if (method === 'updateExtensionComponent') {
+        if (!updateExtensionComponent) return Promise.reject(new Error('updateExtensionComponent is not available'))
+        const [extensionId, componentId] = params
+        if (typeof extensionId !== 'string' || !extensionId.trim()) return Promise.reject(new Error('updateExtensionComponent requires an extensionId string'))
+        if (componentId !== undefined && typeof componentId !== 'string') return Promise.reject(new Error('updateExtensionComponent componentId must be a string'))
+        return updateExtensionComponent(extensionId, componentId)
+      }
       return backend.handle(method, params)
     },
     subscribe: listener => backend.subscribe(listener)
