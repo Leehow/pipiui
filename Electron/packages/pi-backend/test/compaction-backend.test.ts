@@ -313,9 +313,10 @@ describe("context compaction", () => {
   });
 
   it("uses exact live-agent host state to compact a quiet waiting Boss below the ordinary watermark", async () => {
-    // The fake's ordinary settled context is ~5.7%. Lower only the injected
-    // wait watermark so this integration test exercises the host wiring without
-    // adding a second fake-pi control surface; unit tests own the real 50%/30s values.
+    // `__agent_running__` parks at 200000/262144 ≈ 76%: above the 200k floor
+    // and the injected wait watermark, but below this suite's 80% ordinary
+    // high watermark. Lower only the wait watermark so the test exercises
+    // host live-agent wiring; unit tests own the real 45%/4-minute values.
     const backend = await fixture({ waitWatermark: 0.05, waitQuietDelayMs: 20 });
     const events: any[] = [];
     const off = backend.subscribe((e) => events.push(e));

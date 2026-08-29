@@ -151,6 +151,10 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (command.message === "__agent_running__" || command.message === "__hold_agent_running__") {
       // A background subagent starts and never ends. `__hold_agent_running__`
       // also parks the Boss turn so cut-in must abort it without sweeping.
+      // 200000/262144 ≈ 76%: meets the 200k proactive floor but stays below
+      // this suite's 80% ordinary watermark, so only the wait-for-subagents
+      // path can arm (when a test injects a lower waitWatermark).
+      contextTokens = 200000;
       durableAgent = true;
       send({ type: "agent_event", event: { kind: "start", agentId: "agent-1", runId: "run-1", parentId: null, name: "builder", role: "general-purpose", title: "Sweep fixture", task: "long task", depth: 1, at: new Date().toISOString() } });
       send({ type: "agent_start" });

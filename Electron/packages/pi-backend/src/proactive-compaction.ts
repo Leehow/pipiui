@@ -31,8 +31,9 @@ export interface ProactiveCompactionConfiguration {
 
 /**
  * PipiUI auto-compaction policy (user-mandated AND semantics): a non-urgent
- * proactive compaction requires BOTH context usage >= 45% AND >= 4 minutes
- * of continuous quiet. The quiet timer measures continuous idleness because
+ * proactive compaction requires context usage >= 45%, an absolute floor of
+ * >= 200_000 tokens, AND >= 4 minutes of continuous quiet. The quiet timer
+ * measures continuous idleness because
  * the host cancels it on `agent_start` and every queue/follow-up transition,
  * then re-arms a fresh full window when the turn settles. Near-overflow /
  * model-safety compaction is NOT this scheduler's job: pi's own reserve line
@@ -52,6 +53,13 @@ export const STANDARD_PROACTIVE_COMPACTION = Object.freeze({
   waitWatermark: 0.45,
   waitQuietDelayMs: 240_000,
 });
+
+/**
+ * Absolute token floor for non-urgent proactive compaction. Combined with
+ * `highWatermark` (45%), a 200k-window model almost never trips this path —
+ * overflow / near-overflow recovery stays at the session layer.
+ */
+export const PROACTIVE_COMPACTION_MIN_TOKENS = 200_000;
 
 type ResolvedProactiveCompactionConfiguration = Required<ProactiveCompactionConfiguration>;
 
@@ -194,6 +202,14 @@ export class ProactiveCompactionPolicy {
     if (!this.isArmed) return undefined;
     const fraction = contextUsageFraction(this.usage);
     if (fraction === undefined) return undefined;
+    const tokens = this.usage?.tokens;
+    if (
+      typeof tokens !== "number" ||
+      !Number.isFinite(tokens) ||
+      tokens < PROACTIVE_COMPACTION_MIN_TOKENS
+    ) {
+      return undefined;
+    }
     const mode: ProactiveCompactionMode | undefined =
       fraction >= this.configuration.highWatermark
         ? "ordinary"

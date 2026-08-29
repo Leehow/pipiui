@@ -6,6 +6,7 @@ import {
 	AUTO_COMPACTION_IDLE_MS_DEFAULT,
 	AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT,
 	AUTO_COMPACTION_USAGE_FRACTION_DEFAULT,
+	PROACTIVE_COMPACTION_MIN_TOKENS,
 	autoCompactionIdleMs,
 	contextTokensFromUsage,
 	installFollowUpCompactionGuard,
@@ -118,6 +119,7 @@ test("policy constants match the mandated AND semantics", () => {
 	assert.equal(AUTO_COMPACTION_USAGE_FRACTION_DEFAULT, 0.45);
 	assert.equal(AUTO_COMPACTION_IDLE_MS_DEFAULT, 4 * 60 * 1000);
 	assert.equal(AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT, 16_384);
+	assert.equal(PROACTIVE_COMPACTION_MIN_TOKENS, 200_000);
 });
 
 test("contextTokensFromUsage matches native totalTokens-or-sum", () => {
@@ -213,6 +215,61 @@ test("unified gate: 45% + 4 minutes idle compactes (exact boundary)", () => {
 			tokens: MID_USAGE,
 			contextWindow: WINDOW,
 			idleMs: 6 * 60_000,
+		}),
+		true,
+	);
+});
+
+test("unified gate: >=45% but under 200k tokens does not compact", () => {
+	// 45% of a 200k window is 90k — the floor is the whole point of the rule.
+	assert.equal(
+		shouldAllowAutoCompaction({
+			reason: "threshold",
+			tokens: 90_000,
+			contextWindow: 200_000,
+			idleMs: AUTO_COMPACTION_IDLE_MS_DEFAULT,
+		}),
+		false,
+	);
+	assert.equal(
+		shouldAllowAutoCompaction({
+			reason: "threshold",
+			tokens: 199_999,
+			contextWindow: 400_000,
+			idleMs: 10 * 60_000,
+		}),
+		false,
+	);
+});
+
+test("unified gate: >=45% and >=200k tokens compactes", () => {
+	assert.equal(
+		shouldAllowAutoCompaction({
+			reason: "threshold",
+			tokens: 200_000,
+			contextWindow: 400_000,
+			idleMs: AUTO_COMPACTION_IDLE_MS_DEFAULT,
+		}),
+		true,
+	);
+});
+
+test("unified gate: overflow and near-overflow still compact below 200k", () => {
+	assert.equal(
+		shouldAllowAutoCompaction({
+			reason: "overflow",
+			tokens: 50_000,
+			contextWindow: 200_000,
+		}),
+		true,
+	);
+	// 90k on a 100k window is past the reserve line but under the 200k floor.
+	assert.equal(
+		shouldAllowAutoCompaction({
+			reason: "threshold",
+			tokens: 90_000,
+			contextWindow: 100_000,
+			idleMs: 0,
 		}),
 		true,
 	);

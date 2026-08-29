@@ -3,9 +3,10 @@
  *
  * POLICY (user-mandated, AND semantics)
  * -------------------------------------
- * A non-urgent automatic compaction may run ONLY when BOTH hold:
+ * A non-urgent automatic compaction may run ONLY when ALL hold:
  *   A) context usage >= 45% of the model window, and
- *   B) the session has been continuously idle for >= 4 minutes.
+ *   B) absolute tokens >= 200_000, and
+ *   C) the session has been continuously idle for >= 4 minutes.
  * Busy periods (user/extension prompt, tool loop provider requests,
  * subagent-driven turns) reset the idle clock, so no ordinary
  * threshold/proactive compaction may run while the session is busy.
@@ -20,10 +21,10 @@
  *     gated anywhere in this module.
  *
  * GENUINELY IDLE normal compaction is owned by the idle-fold timer (boss
- * waves, 45% watermark + 4-minute TTL, activity re-arms) and by the host
- * ProactiveCompactionScheduler (45% + 4-minute continuous quiet). This
- * module's 45%+idle branch is defense-in-depth: any threshold call that
- * fires BELOW the near-overflow line must satisfy it.
+ * waves, 45% watermark + 4-minute TTL, activity re-arms; no 200k floor) and
+ * by the host ProactiveCompactionScheduler (45% + 200k tokens + 4-minute
+ * continuous quiet). This module's 45%+200k+idle branch is defense-in-depth:
+ * any threshold call that fires BELOW the near-overflow line must satisfy it.
  *
  * WRAPS (same mechanism as mid-turn-compaction.ts)
  * ------------------------------------------------
@@ -33,7 +34,7 @@
  *     `_runAutoCompaction` call during heartbeat-driven turns.
  *   - `_checkCompaction` is gated on EVERY turn (pre-prompt and post-
  *     agent_end, user/RPC/extension alike): a "threshold" decision below the
- *     near-overflow line is vetoed unless 45% + 4-minute idle both hold.
+ *     near-overflow line is vetoed unless 45% + 200k tokens + 4-minute idle hold.
  *
  * node_modules is not patched; fetch-pi-runtime cannot overwrite this wrap.
  */
@@ -50,6 +51,8 @@ export const AUTO_COMPACTION_USAGE_FRACTION_DEFAULT = 0.45;
 export const AUTO_COMPACTION_IDLE_MS_DEFAULT = 4 * 60 * 1000;
 /** pi default compaction reserve; the near-overflow/model-safety line. */
 export const AUTO_COMPACTION_RESERVE_TOKENS_DEFAULT = 16_384;
+/** Absolute token floor for non-urgent auto-compaction. 200k-window models almost never trip this. */
+export const PROACTIVE_COMPACTION_MIN_TOKENS = 200_000;
 
 export type FollowUpUsageLike = {
 	input?: number;
@@ -144,7 +147,8 @@ export function isNearContextOverflow(
  *
  * - `overflow` (real provider context-overflow recovery): always allowed.
  * - `threshold`: allowed when near-overflow (model safety, busy included), or
- *   when usage >= 45% AND `idleMs` >= 4 minutes of continuous idleness.
+ *   when usage >= 45% AND tokens >= 200_000 AND `idleMs` >= 4 minutes of
+ *   continuous idleness.
  * - Any other reason (manual never routes here; unknown future reasons stay
  *   permissive): allowed.
  */
@@ -168,6 +172,7 @@ export function shouldAllowAutoCompaction(args: {
 	if (!Number.isFinite(fraction) || fraction <= 0) return false;
 	if (typeof args.idleMs !== "number" || !Number.isFinite(args.idleMs)) return false;
 	if (args.tokens / args.contextWindow < fraction) return false;
+	if (args.tokens < PROACTIVE_COMPACTION_MIN_TOKENS) return false;
 	if (args.idleMs < idleThresholdMs) return false;
 	return true;
 }
@@ -299,7 +304,7 @@ export function installFollowUpCompactionGuard(sessionClass?: FollowUpSessionCto
 			// Gate every `_checkCompaction` call — pre-prompt and
 			// post-agent_end, on user/RPC turns as well as extension turns.
 			// A threshold decision is vetoed unless it is near-overflow or the
-			// 45% + 4-minute-idle policy holds; overflow always passes.
+			// 45% + 200k + 4-minute-idle policy holds; overflow always passes.
 			const origRun = this._runAutoCompaction;
 			if (typeof origRun !== "function") return original.apply(this, args);
 
