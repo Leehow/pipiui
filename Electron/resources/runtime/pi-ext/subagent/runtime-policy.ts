@@ -2,20 +2,6 @@ import type { AgentConfig } from "./agents.ts";
 import { sanitizeProgressLogInput } from "./progress-log.ts";
 import type { LivenessVerdict } from "./worker-liveness.ts";
 
-export const PRIVATE_COMPUTER_AGENT_NAMES = ["operator", "computer-verifier", "computer-terminal"] as const;
-export const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
-
-/** Bind Computer Task protocol principals to exact App-shipped definitions. */
-export function bindCanonicalComputerAgents(discovered: AgentConfig[], canonical: AgentConfig[]): AgentConfig[] {
-	const result = new Map(discovered.map((agent) => [agent.name, agent]));
-	for (const name of PRIVATE_COMPUTER_AGENT_NAMES) {
-		const agent = canonical.find((candidate) => candidate.name === name && candidate.origin === "bundled");
-		if (!agent) throw new Error(`Canonical Computer Agent role is unavailable: ${name}`);
-		result.set(name, agent);
-	}
-	return [...result.values()];
-}
-
 /** Runtime-only grants that frontmatter is never allowed to manufacture. */
 export interface AgentRuntimeRolePolicy {
 	role: "worker" | "operator" | "closeout-secretary";
@@ -337,15 +323,15 @@ export function runtimeRolePolicyForAgent(agent: AgentConfig): AgentRuntimeRoleP
 			allowRecursiveDelegation: false,
 		};
 	}
-	// Only the shipped operator may carry the role marker consumed by the
-	// host's Computer-memory grant fence. A user/project agent named operator
-	// remains an ordinary worker and cannot self-declare this route.
+	// Only the shipped operator carries the operator role marker. A user/project
+	// agent named operator remains an ordinary worker and cannot self-declare
+	// this route.
 	if (agent.origin === "bundled" && agent.name === "operator") {
 		return {
 			role: "operator",
 			// The bundled Operator is declaratively read-only and never edits code.
-			// Giving it an isolated worktree incorrectly classifies an unnamed desktop
-			// dispatch as a writable branch-producing worker before model/spawn setup.
+			// Giving it an isolated worktree incorrectly classifies its dispatch as a
+			// writable branch-producing worker before model/spawn setup.
 			worktree: "direct",
 			allowRecursiveDelegation: false,
 		};

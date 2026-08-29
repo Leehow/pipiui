@@ -28,7 +28,7 @@ export const PLAN_TOOL_NAMES = new Set([
 	"plan_approve",
 	"plan_cancel",
 ]);
-/** Worker / desktop tools whose un-externalized results are evidence, never inspect candidates. */
+/** Worker tools whose un-externalized results are evidence, never inspect candidates. */
 export const WORKER_TOOL_NAMES = new Set([
 	"subagent",
 	"subagent_status",
@@ -36,7 +36,6 @@ export const WORKER_TOOL_NAMES = new Set([
 	"subagent_abort",
 	"subagent_resolve",
 	"subagent_manage",
-	"computer_task",
 ]);
 
 export interface ContextManageConfig {

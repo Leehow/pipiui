@@ -40,6 +40,7 @@ type Pricing = { unit: CostUnit; exchangeRate: number }
 const splitKey = 'pipiui:subagent-list-ratio'
 const pageSize = 30
 const AGENT_LOG_RENDER_INTERVAL_MS = 200
+const AGENT_LOG_RENDER_LIMIT = 40
 const clamp = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value))
 const terminalIcon: Record<AgentState, string> = { running: '◌', stalled: '!', ok: '✓', failed: '×', aborted: '■', interrupted: '⚡' }
 
@@ -1369,7 +1370,10 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
   // unified transcript (and its memoized Markdown subtree) until one of the
   // fields that actually changes transcript output changes. The explicit history
   // view substitutes its own cross-run logs for the current run's.
-  const sourceLogs = historyLogs ?? agent?.logs
+  const sourceLogs = useMemo(() => {
+    const logs = historyLogs ?? agent?.logs
+    return logs && logs.length > AGENT_LOG_RENDER_LIMIT ? logs.slice(-AGENT_LOG_RENDER_LIMIT) : logs
+  }, [historyLogs, agent?.logs])
   const transcript = useMemo(
     () => agent && sourceLogs ? agentTranscript({ ...agent, logs: sourceLogs }, output) : [],
     [sourceLogs, agent?.startedAt, agent?.state, agent?.worktreeError, output],

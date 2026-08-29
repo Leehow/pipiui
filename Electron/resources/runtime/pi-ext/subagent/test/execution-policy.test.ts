@@ -374,7 +374,7 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	// execution layer actually reads for one dispatch — including agentId — so the strict
 	// sanitizer cannot drop a supported field. Internal old names stay out of the public shape.
 	const singleSchema = source.slice(source.indexOf("const SubagentParams"), source.indexOf("const SubagentChainParams"));
-	for (const declared of ["agentId:", "title:", "fresh:", "verify:", "thinking: ThinkingParam", "blockedBy:", "desktop:", "heartbeatSecs:", "timeoutSecs:", "progressLog:"]) {
+	for (const declared of ["agentId:", "title:", "fresh:", "verify:", "thinking: ThinkingParam", "blockedBy:", "heartbeatSecs:", "timeoutSecs:", "progressLog:"]) {
 		assert.match(singleSchema, new RegExp(declared.replace(":", "\\s*:")), `single schema must declare ${declared}`);
 	}
 	// Scope knobs arrive via the same shared block the chain wrapper spreads.

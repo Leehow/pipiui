@@ -6847,7 +6847,7 @@ async function runSingleAgent(
 		}),
 	});
 	jobUpsertRunning(pipiuiAgentId, agentName, task, options?.title, options?.blockedBy, runId, resolvedModel, { planTask: options?.planTask, scope: options?.scope });
-	// Both foreground Computer Workers and background jobs need a separately
+	// Foreground and background dispatches alike need a separately
 	// addressable abort handle; the parent tool signal is composed at spawn.
 	const dispatchAbort = new AbortController();
 	// Prime the progress-log baseline at spawn time so watchdog deltas measure only THIS run's
@@ -8577,7 +8577,7 @@ const SharedDispatchParams = {
 // Each public tool is one intent. The shared execute still accepts the internal
 // union (single / chain / tasks / abort / resolve) so wrappers can delegate.
 // The single schema speaks the same field set the execution layer actually reads for a
-// single dispatch (title, fresh, verify, thinking, blockedBy, desktop, heartbeatSecs,
+// single dispatch (title, fresh, verify, thinking, blockedBy, heartbeatSecs,
 // timeoutSecs, agentScope): anything declared here survives the strict sanitizer, so a
 // field the runner supports must not be silently dropped at the provider boundary.
 const SubagentParams = Type.Object({
@@ -8626,11 +8626,6 @@ const SubagentParams = Type.Object({
 	thinking: ThinkingParam,
 	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	blockedBy: BlockedByParam,
-	desktop: Type.Optional(
-		StringEnum(["user-requested", "ui-verify"] as const, {
-			description: DESKTOP_PARAM_DESCRIPTION,
-		}),
-	),
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
@@ -8711,7 +8706,6 @@ type SubagentExecuteParams = {
 	fresh?: boolean;
 	cwd?: string;
 	verify?: string;
-	desktop?: "user-requested" | "ui-verify";
 	// The public schema speaks Grok-family names (prompt/description/subagent_type/
 	// isolation); adoptGrokBuildDispatch at execute entry fills the internal old names
 	// this runner reads, so agent/task stay required here.
@@ -8735,7 +8729,6 @@ type SubagentExecuteParams = {
 		heartbeatSecs?: number;
 		timeoutSecs?: number;
 		progressLog?: string;
-		desktop?: "user-requested" | "ui-verify";
 		scope?: string[];
 		planTask?: string;
 	}>;
@@ -8751,7 +8744,6 @@ type SubagentExecuteParams = {
 		model?: string;
 		agentId?: string;
 		fresh?: boolean;
-		desktop?: "user-requested" | "ui-verify";
 		scope?: string[];
 		planTask?: string;
 	}>;
@@ -8790,234 +8782,6 @@ const SecretaryCommitParams = Type.Object({
 		}, { additionalProperties: false }),
 	),
 }, { additionalProperties: false });
-
-const COMPUTER_AGENT_ROOT = fileURLToPath(new URL("../packages/computer-agent", import.meta.url));
-const COMPUTER_WORKER_EXTENSION = path.join(COMPUTER_AGENT_ROOT, "extensions/computer-worker.ts");
-const COMPUTER_TERMINAL_EXTENSION = path.join(COMPUTER_AGENT_ROOT, "extensions/computer-terminal.ts");
-const COMPUTER_AGENT_SKILLS = path.join(COMPUTER_AGENT_ROOT, "skills");
-const TERMINAL_WORKER_ENV_KEYS = [
-	"PIPIUI_TERMINAL_WORKER_BROKER_URL",
-	"PIPIUI_TERMINAL_WORKER_BROKER_TOKEN",
-	"PIPIUI_TERMINAL_WORKER_CWD",
-	"PIPIUI_TERMINAL_WORKER_WRITE_ROOTS",
-	"PIPIUI_TERMINAL_WORKER_EXECUTABLES",
-	"PIPIUI_TERMINAL_WORKER_MAX_COMMANDS",
-] as const;
-type ComputerAgentModule = typeof import("../packages/computer-agent/src/index.ts");
-let computerAgentModule: Promise<ComputerAgentModule> | undefined;
-let computerWorkerBrokerServer: InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]> | undefined;
-let bossDesktopDirectDrive: ReturnType<typeof createBossDesktopDirectDrive> | undefined;
-let bossDesktopAdvisor: ReturnType<typeof createDirectDriveAdvisor> | undefined;
-const bossDesktopStuckGuards = new Map<string, ReturnType<typeof createDirectDriveStuckGuard>>();
-
-function loadComputerAgentModule(): Promise<ComputerAgentModule> {
-	computerAgentModule ??= import("../packages/computer-agent/src/index.ts");
-	return computerAgentModule;
-}
-
-function containedRegularComputerResource(root: string, candidate: string): string {
-	const realRoot = fs.realpathSync(root);
-	const realCandidate = fs.realpathSync(candidate);
-	const relative = path.relative(realRoot, realCandidate);
-	const metadata = fs.statSync(realCandidate);
-	if (relative.startsWith("..") || path.isAbsolute(relative) || !metadata.isFile() || metadata.nlink !== 1) {
-		throw new Error(`Computer Agent private resource escapes its package root: ${candidate}`);
-	}
-	return realCandidate;
-}
-
-function assertComputerAgentRuntimeContract(): void {
-	for (const extension of [COMPUTER_WORKER_EXTENSION, COMPUTER_TERMINAL_EXTENSION]) {
-		containedRegularComputerResource(COMPUTER_AGENT_ROOT, extension);
-	}
-	const skillPath = containedRegularComputerResource(COMPUTER_AGENT_SKILLS, path.join(COMPUTER_AGENT_SKILLS, "cua-driver-operation", "SKILL.md"));
-	const skill = fs.readFileSync(skillPath, "utf8");
-	const expected = skill.match(/cua-driver-version:\s*["']?([^"'\s]+)["']?/)?.[1];
-	const actual = process.env.PIPIUI_CUA_DRIVER_VERSION;
-	if (!expected || !actual || expected !== actual) {
-		throw new Error(`Computer Agent Cua private skill/driver contract mismatch (skill=${expected ?? "missing"}, driver=${actual ?? "missing"})`);
-	}
-}
-
-async function computerRuntimeRequest(request: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
-	const computerCapability = process.env.PIPIUI_COMPUTER_CAPABILITY;
-	if (!PIPIUI_PORT || !PIPIUI_SESSION || !computerCapability) throw new Error("Computer Runtime is unavailable");
-	const response = await fetch(`http://127.0.0.1:${PIPIUI_PORT}/rpc`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		signal,
-		body: JSON.stringify({
-			sessionKey: PIPIUI_SESSION,
-			computerCapability,
-			protocolVersion: 1,
-			requestID: randomUUID(),
-			displayID: Number(process.env.PIPIUI_COMPUTER_DISPLAY_ID),
-			displayWidth: Number(process.env.PIPIUI_COMPUTER_WIDTH),
-			displayHeight: Number(process.env.PIPIUI_COMPUTER_HEIGHT),
-			...request,
-		}),
-	});
-	const json = await response.json() as Record<string, unknown>;
-	const runtimeError = json.runtimeError as Record<string, unknown> | undefined;
-	const structuredUnknown = json.ok === false
-		&& json.outcomeUnknown === true
-		&& runtimeError?.code === "mutation_outcome_unknown"
-		&& runtimeError?.requiresObservation === true;
-	if ((!response.ok || json.ok === false) && !structuredUnknown) {
-		if (runtimeError?.code === "cua_driver_rpc_timeout") throw Object.assign(new Error("cua_driver_rpc_timeout"), { code: "cua_driver_rpc_timeout" });
-		throw new Error(String(runtimeError?.message ?? json.error ?? `Computer Runtime returned ${response.status}`));
-	}
-	return json;
-}
-
-function computerObservationFromRuntime(raw: any): ComputerWorkerResult["observation"] {
-	if (!raw || typeof raw !== "object") return undefined;
-	const id = String(raw.observationId ?? raw.screenshotId ?? "");
-	if (!id) return undefined;
-	const elements = Array.isArray(raw.accessibility?.elements) ? raw.accessibility.elements.slice(0, 128).map((item: any) => ({ role: typeof item.role === "string" ? item.role : undefined, name: typeof item.name === "string" ? item.name : undefined, value: typeof item.value === "string" ? item.value : undefined })) : undefined;
-	return { id, ...(elements ? { elements, visibleText: elements.flatMap((item: any) => [item.name, item.value]).filter((item: any) => typeof item === "string") } : {}) };
-}
-
-async function ensureComputerWorkerBroker(): Promise<InstanceType<ComputerAgentModule["ComputerWorkerBrokerServer"]>> {
-	if (!computerWorkerBrokerServer) {
-		const { ComputerWorkerBroker, ComputerWorkerBrokerServer, WorkflowMemoryStore } = await loadComputerAgentModule();
-		const activeProjectPiHome = process.env.PIPIUI_ACTIVE_PROJECT_PI_HOME || process.env.PI_CODING_AGENT_DIR;
-		if (!activeProjectPiHome || !path.isAbsolute(activeProjectPiHome)) throw new Error("Computer Use requires the backend-resolved active project Pi home");
-		computerWorkerBrokerServer = new ComputerWorkerBrokerServer(new ComputerWorkerBroker({
-			request: computerRuntimeRequest,
-			cancelRuntime: async () => {
-				await computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000));
-			},
-			workflowMemory: new WorkflowMemoryStore(activeProjectPiHome),
-			onFatal: ({ code }) => {
-				if (code !== "computer_worker_no_progress") void computerRuntimeRequest({ action: "computer_cancel" }, AbortSignal.timeout(5_000)).catch(() => {});
-			},
-		}));
-		await computerWorkerBrokerServer.start();
-	}
-	return computerWorkerBrokerServer;
-}
-
-function registerComputerTaskTool(pi: ExtensionAPI): void {
-	if (PIPIUI_DEPTH !== 0 || !PIPIUI_PORT || !PIPIUI_SESSION || !process.env.PIPIUI_COMPUTER_CAPABILITY) return;
-	assertComputerAgentRuntimeContract();
-	const followUpPi = pi as ExtensionAPI & {
-		sendMessage?: (
-			message: { customType: string; content: string; display: boolean; details: Record<string, unknown> },
-			options: { triggerTurn: true; deliverAs: "followUp" },
-		) => unknown;
-	};
-	bossDesktopAdvisor ??= createDirectDriveAdvisor({
-		injectFollowUp: (text, envelope, report) => {
-			if (typeof followUpPi.sendMessage === "function") {
-				return queueAdvisorFollowUp(followUpPi as never, text, envelope, report);
-			}
-			void trySendUserMessage(pi, text);
-			return true;
-		},
-	});
-	pi.on("session_shutdown", () => {
-		bossDesktopDirectDrive?.closeAll?.();
-		bossDesktopStuckGuards.clear();
-	});
-
-	const computerTaskParameters = makeStrictJsonSchema(Type.Object({
-		goal: Type.Optional(Type.String({ minLength: 1, maxLength: 12_000 })),
-		desktop: Type.Optional(Type.Union([
-			Type.Literal("user-requested"),
-			Type.Literal("ui-verify"),
-		], { description: "Per-task desktop grant required to open a Boss-driven session." })),
-		sessionId: Type.String({ minLength: 1, maxLength: 24, description: "Short semantic session id you choose, e.g. \"textedit-install\" (2-24 chars: lowercase letters, digits, \"-\", \"_\", starting with a letter or digit). Required on every call — nothing is generated for you. Opening a session (action \"session\" or a desktop grant) creates/reuses it; observe/act/open_application/close reuse the same sessionId." }),
-		action: Type.Optional(Type.Union([
-			Type.Literal("session"),
-			Type.Literal("observe"),
-			Type.Literal("open_application"),
-			Type.Literal("act"),
-			Type.Literal("close"),
-		], { description: "Direct-drive operation. computer_task never starts Computer Use Leader or a long Computer Use Agent." })),
-		actions: Type.Optional(Type.Array(Type.Object({
-			type: Type.String({ minLength: 1 }),
-		}, { additionalProperties: true }), { minItems: 1, maxItems: 64 })),
-		expectedEffect: Type.Optional(Type.Object({}, { additionalProperties: true, description: "Optional caller-supplied expected effect. Omitted when the caller has none; never invented." })),
-		fresh: Type.Optional(Type.Boolean()),
-		bundle_identifier: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
-		application_name: Type.Optional(Type.String({ minLength: 1, maxLength: 200 })),
-	}, { additionalProperties: false }));
-	pi.registerTool({
-		name: "computer_task",
-		label: "Computer Task",
-		description: "Drive external macOS apps and OS-level UI (native dialogs, window management, apps other than the in-app browser). For the built-in browser panel, use the browser tool instead. Authorize a Boss-driven desktop session and run one screenshot/action on it. Pass desktop (user-requested|ui-verify) AND a short semantic sessionId you choose, e.g. \"textedit-install\" (2-24 chars: lowercase letters, digits, \"-\", \"_\") — nothing is generated for you; then call again with the same sessionId and action observe|act|open_application|close. Each call returns {action, observation, screenChanged, error}. This tool does not start Computer Use Leader or a long-running Computer Use Agent; for one explicit leftover GUI click, dispatch operator with an explicit desktop grant.",
-		parameters: computerTaskParameters,
-		prepareArguments: bindSanitizeStrictToolArguments(computerTaskParameters),
-		async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
-			params = omitNulls(params);
-			if (params && typeof params === "object" && ("agentId" in params || "recoveryPolicy" in params)) {
-				return formatDirectDriveToolResult({
-					action: { type: "session" },
-					observation: null,
-					screenChanged: null,
-					error: "computer_task_leader_retired: Computer Use Leader is retired. Open a Boss-driven session with desktop:\"user-requested\" or desktop:\"ui-verify\", then observe/act yourself. Do not pass agentId or recoveryPolicy.",
-					sessionId: "",
-					spawnedLeader: false,
-					code: "computer_task_leader_retired",
-				});
-			}
-			bossDesktopDirectDrive ??= createBossDesktopDirectDrive({
-				acquireBroker: async () => ensureComputerWorkerBroker(),
-			});
-			const requested = typeof params.action === "string" ? params.action : "";
-			const existingId = typeof params.sessionId === "string" ? params.sessionId.trim() : "";
-			const existingGuard = existingId ? bossDesktopStuckGuards.get(existingId) : undefined;
-			if (existingGuard?.paused && requested !== "close" && requested !== "observe" && requested !== "session") {
-				const paused = {
-					action: { type: requested || "act" },
-					observation: null,
-					screenChanged: null,
-					error: `${DIRECT_DRIVE_PAUSED_CODE}: desktop session is paused after a stuck or step-budget escalation.`,
-					sessionId: existingId,
-					spawnedLeader: false as const,
-					code: DIRECT_DRIVE_PAUSED_CODE,
-				};
-				const advice = await adviseFromDirectDriveResult(bossDesktopAdvisor!, {
-					...paused,
-					progress: { verdict: "stuck", reason: "direct_drive_paused", paused: true },
-				});
-				const formatted = formatDirectDriveToolResult(paused);
-				if (advice.fired) formatted.details = { ...formatted.details, advisor: advice };
-				return formatted;
-			}
-			const result = await bossDesktopDirectDrive.execute(params, {
-				hostAvailable: !!process.env.PIPIUI_COMPUTER_CAPABILITY,
-				signal,
-			});
-			if (result.action?.type === "close" && result.sessionId) {
-				bossDesktopStuckGuards.delete(result.sessionId);
-			} else if (result.sessionId) {
-				let guard = bossDesktopStuckGuards.get(result.sessionId);
-				if (!guard) {
-					guard = createDirectDriveStuckGuard({ sessionId: result.sessionId });
-					bossDesktopStuckGuards.set(result.sessionId, guard);
-				}
-				const step = stepFromDirectDriveResult(result);
-				if (step) {
-					const progress = await guard.record(step);
-					const advice = await adviseFromStuckRecord(bossDesktopAdvisor!, progress, result.sessionId);
-					const formatted = formatDirectDriveToolResult(result);
-					formatted.details = {
-						...formatted.details,
-						progress,
-						...(advice.fired ? { advisor: advice } : {}),
-					};
-					return formatted;
-				}
-			}
-			const advice = await adviseFromDirectDriveResult(bossDesktopAdvisor!, result);
-			const formatted = formatDirectDriveToolResult(result);
-			if (advice.fired) formatted.details = { ...formatted.details, advisor: advice };
-			return formatted;
-		},
-	});
-}
 
 /**
  * The Boss's ledger write, restored as a tool that can reach nothing else.
@@ -9203,7 +8967,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	registerSessionRecallTool(pi);
 	// UI-independent definition management. It only reads/scaffolds/installs
-	// agent packages and never enters the dispatch, desktop, or grant paths.
+	// agent packages and never enters the dispatch path.
 	registerSubagentManagementTool(pi);
 	// Cut-in hold 提前释放：真实用户消息（本地/远程，非扩展自己的 followUp）已进入
 	// turn，说明 cut-in prompt 抢到了先手，暂缓的自动信号可以按原逻辑继续投递。
@@ -9809,7 +9573,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Dispatch one worker. A single dispatch requires prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
-			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, desktop, heartbeatSecs, timeoutSecs, progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, heartbeatSecs, timeoutSecs, progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
 			"Parallel mode: pass tasks[] (each item: task, agentId, and the same optional fields including its own model) instead of prompt/description. Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
 			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
@@ -9958,7 +9722,6 @@ export default function (pi: ExtensionAPI) {
 				verify: string | undefined,
 				thinking: string | undefined,
 				fresh?: boolean,
-				desktop?: "user-requested" | "ui-verify",
 				blockedBy?: string[],
 				worktree?: "isolated" | "none",
 				noWorktreeReason?: string,
@@ -9984,7 +9747,7 @@ export default function (pi: ExtensionAPI) {
 					sessionShutdownAbort.signal, // session teardown (not a turn abort) owns this descendant subtree
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, desktop, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -10516,7 +10279,6 @@ export default function (pi: ExtensionAPI) {
 						step.verify,
 						step.thinking,
 						step.fresh,
-						step.desktop,
 						undefined,
 						step.worktree,
 						step.noWorktreeReason,
@@ -10611,7 +10373,6 @@ export default function (pi: ExtensionAPI) {
 								modelPin: validatedPinOf(step.model),
 								agentId: step.agentId!.trim(),
 								fresh: step.fresh,
-								desktop: step.desktop,
 								worktree: step.worktree,
 								noWorktreeReason: step.noWorktreeReason,
 								heartbeatSecs: step.heartbeatSecs,
@@ -10766,7 +10527,7 @@ export default function (pi: ExtensionAPI) {
 								sessionShutdownAbort.signal, // session teardown owns queued descendants too
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, desktop: t.desktop, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -10894,7 +10655,6 @@ export default function (pi: ExtensionAPI) {
 							modelPin: validatedPinOf(t.model),
 							agentId: t.agentId!.trim(),
 							fresh: t.fresh,
-							desktop: t.desktop,
 							blockedBy: t.blockedBy,
 							scope: t.scope,
 							planTask: t.planTask,
@@ -11059,7 +10819,7 @@ export default function (pi: ExtensionAPI) {
 												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
-												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, desktop: params.desktop, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
 											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -11095,7 +10855,7 @@ export default function (pi: ExtensionAPI) {
 							},
 						]);
 					} else {
-						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.desktop, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model), params.planTask);
+						startBackgroundAgent(params.agent, params.task, params.cwd, agentId, runId, "single", params.title, params.verify, params.thinking, params.fresh, params.blockedBy, params.worktree, params.noWorktreeReason, params.heartbeatSecs, params.timeoutSecs, params.progressLog, params.scope, params.model, validatedPinOf(params.model), params.planTask);
 					}
 					const placeholder: SingleResult = {
 						agent: params.agent,
@@ -11150,7 +10910,6 @@ export default function (pi: ExtensionAPI) {
 						modelPin: validatedPinOf(params.model),
 						agentId: params.agentId!.trim(),
 						fresh: params.fresh,
-						desktop: params.desktop,
 						blockedBy: params.blockedBy,
 						scope: params.scope,
 						planTask: params.planTask,

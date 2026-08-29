@@ -147,7 +147,7 @@ test("candidates never include user messages, plans, or un-externalized worker e
 	assert.deepEqual(manifest.candidates.map((row) => row.id).sort(), ["r:ext", "r:ok"]);
 });
 
-test("guard rejects real plan_* and computer_task outputs, not fictional plan names", () => {
+test("guard rejects real plan_* outputs, not fictional plan names", () => {
 	assert.deepEqual([...PLAN_TOOL_NAMES].sort(), [
 		"plan_approve",
 		"plan_cancel",
@@ -161,19 +161,12 @@ test("guard rejects real plan_* and computer_task outputs, not fictional plan na
 	assert.equal(isPlanToolName("plan_future_hook"), true);
 	assert.equal(isPlanToolName("plan"), false);
 	assert.equal(isPlanToolName("write_plan"), false);
-	assert.equal(WORKER_TOOL_NAMES.has("computer_task"), true);
 	assert.equal(candidateRejection(block({
 		id: "r:pub", kind: "tool_result", tokens: 80, toolName: "plan_publish", text: "plan body",
 	})), "plan");
 	assert.equal(candidateRejection(block({
 		id: "r:upd", kind: "tool_result", tokens: 80, toolName: "plan_task_update", text: "task running",
 	})), "plan");
-	assert.equal(candidateRejection(block({
-		id: "r:desk", kind: "tool_result", tokens: 400, toolName: "computer_task", text: "desktop dump",
-	})), "unexternalized_evidence");
-	assert.equal(isContextManageCandidate(block({
-		id: "r:desk-ext", kind: "tool_result", tokens: 400, toolName: "computer_task", externalized: true, text: "findings exist",
-	})), true);
 });
 
 test("inspect execute does not call an LLM and returns JSON without full text", async () => {

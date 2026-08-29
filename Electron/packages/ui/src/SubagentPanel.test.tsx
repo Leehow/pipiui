@@ -1727,9 +1727,10 @@ describe('SubagentPanel', () => {
       itemType: 'text', text: `# Final report\n\n${'| source | finding |\n| --- | --- |\n| file | result |\n'.repeat(80)}`, contentIndex: 112,
     })
 
-    const group = await screen.findByRole('button', { name: /56 个步骤/ })
+    const group = await screen.findByRole('button', { name: /个步骤/ })
     expect(group.closest('[data-activity-card]')?.getAttribute('data-activity-status')).toBe('ok')
     fireEvent.click(group)
+    expect(screen.getAllByRole('button', { name: /^grep/ })).toHaveLength(20)
     expect(await screen.findByText('Final report')).toBeTruthy()
   })
 

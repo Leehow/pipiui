@@ -246,7 +246,6 @@ test("replacePrompt replaces definition text; later append follows; runtime suff
 		const definitionPush = runtimeIndex.indexOf("if (agent.systemPrompt.trim()) promptParts.push(agent.systemPrompt);");
 		assert.ok(definitionPush >= 0);
 		assert.ok(definitionPush < runtimeIndex.indexOf("[Runtime placement: shared cwd]"));
-		assert.ok(definitionPush < runtimeIndex.indexOf("if (desktopGrant.granted) promptParts.push(DESKTOP_GRANT_CHILD_POLICY);"));
 		assert.ok(definitionPush < runtimeIndex.indexOf("systemPrompt: [systemPrompt, isolation, findingsIndex]"));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -929,7 +928,6 @@ test("reserved and host-issued addTools are denied", () => {
 							"session_recall",
 							"skill_load",
 							"subagent",
-							"computer_task",
 						],
 					},
 				],

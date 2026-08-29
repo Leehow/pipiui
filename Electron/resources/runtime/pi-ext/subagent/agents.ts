@@ -173,6 +173,9 @@ const CAPABILITY_FIELDS = new Set([
 	"desktop",
 	"delegation",
 ]);
+// Desktop control lives only in the main session. These host tools are never
+// available to a dispatched agent, so frontmatter and extension patches must
+// never name them.
 const RESERVED_DESKTOP_TOOLS = new Set(["computer", "open_application"]);
 const WORKER_BROWSER_TOOL = "browser";
 const SECRETARY_COMMIT_TOOL = "secretary_commit";
@@ -549,7 +552,7 @@ function validateExplicitTools(
 				diagnostics,
 				"error",
 				"reserved-tool",
-				`\`${tool}\` is injected only by the global Computer Use × per-task desktop grant; it cannot be declared in agent frontmatter.`,
+				`\`${tool}\` is a main-session-only desktop tool; it cannot be declared in agent frontmatter.`,
 				filePath,
 			);
 			continue;
@@ -716,8 +719,8 @@ export function validateAgentDefinition(input: AgentValidationInput): AgentValid
 
 /**
  * Static, inspectable capability/tools projection. It intentionally does not
- * claim a tool is usable: disabled-tools, mounted extensions, a per-task
- * desktop grant, and recursive depth/trust guards are evaluated only at dispatch.
+ * claim a tool is usable: disabled-tools, mounted extensions, and recursive
+ * depth/trust guards are evaluated only at dispatch.
  */
 export function summarizeAgentPermissions(agent: AgentConfig): AgentPermissionSummary {
 	const trustedSecretary = agent.origin === "bundled" && agent.name === "secretary";
@@ -734,7 +737,7 @@ export function summarizeAgentPermissions(agent: AgentConfig): AgentPermissionSu
 		runtimeConstraints: [
 			"Global disabled-tools can remove any listed tool at dispatch.",
 			"PipiUI extension availability can remove extension-only tools; web_search may instead be provider-native.",
-			"desktop: requestable injects computer/open_application only after the global Computer Use host gate and an explicit per-task desktop grant.",
+			"computer/open_application are main-session-only desktop tools; a dispatched agent never receives them.",
 			"delegation is still constrained by runtime role policy and the recursive depth limit.",
 		],
 	};
@@ -915,10 +918,6 @@ const EXT_AGENT_CONTRIBUTIONS_SIDECAR_SUFFIX = ".ext-agent-contributions.json";
 export const CANONICAL_PRIVILEGED_BUNDLED_ROLES = [
 	"secretary",
 	"operator",
-	"computer-verifier",
-	"computer-terminal",
-	"computer-use-leader",
-	"computer-use",
 ] as const;
 
 const CANONICAL_PRIVILEGED_BUNDLED_ROLE_SET = new Set<string>(CANONICAL_PRIVILEGED_BUNDLED_ROLES);
@@ -938,7 +937,6 @@ const HOST_DENIED_PATCH_TOOLS = new Set<string>([
 	"subagent_resolve",
 	"subagent_status",
 	"subagent_manage",
-	"computer_task",
 ]);
 const BUILTIN_PATCH_TOOLS = new Set<string>([
 	"read",
