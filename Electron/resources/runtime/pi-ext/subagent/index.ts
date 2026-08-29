@@ -113,8 +113,6 @@ import {
 	resolveSubagentToolSelection,
 	resolvePipiUIExtensionRouting,
 	selectPipiUIExtensionRoutes,
-	resolveDesktopGrant,
-	DESKTOP_GRANT_CHILD_POLICY,
 	sanitizeDisabledToolNames,
 	isDelegationTool,
 	hideGenericWebSearchForModelRef,
@@ -747,7 +745,6 @@ const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // get_search_content. Provider-hosted search may also reach workers through pi's own
 // extension discovery; this pinned route makes research delegable for other providers.
 const PIPIUI_WEB_ACCESS_EXT = process.env.PIPIUI_WEB_ACCESS_EXT;
-const PIPIUI_WEBVIEW_EXT = process.env.PIPIUI_WEBVIEW_EXT;
 const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
 // The philosophy package. Workers run with `--no-extensions`, so unless it is mounted here
 // explicitly a dispatched child loads no philosophy at all — and every layer written for one
@@ -6272,6 +6269,13 @@ function messagesContainSuperpowersMarker(messages: unknown[]): boolean {
 	});
 }
 
+/**
+ * Retired computer-use role names. The bundled manifests are gone and desktop
+ * control lives only in the main session, so a dispatch that still names one
+ * fails with the route to the surviving tools instead of an "unknown agent".
+ */
+const RETIRED_COMPUTER_AGENT_NAMES = ["computer-use-leader", "computer-use"] as const;
+
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
@@ -6301,6 +6305,25 @@ async function runSingleAgent(
 	const isBackground = options?.background === true;
 	localAgentReservations.add(pipiuiAgentId);
 
+	if ((RETIRED_COMPUTER_AGENT_NAMES as readonly string[]).includes(agentName)) {
+		const message = `Retired computer agents were removed: "${agentName}" no longer exists. Drive the desktop directly with the main-session \`computer\` / \`open_application\` tools instead of dispatching an agent.`;
+		releaseAgentReservation(pipiuiAgentId);
+		return {
+			agent: agentName,
+			agentSource: "retired",
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: message,
+			errorMessage: message,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+		};
+	}
 	if (!agent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		const fail: SingleResult = {
@@ -6426,77 +6449,17 @@ async function runSingleAgent(
 	// Pre-dispatch recall is advisory and fail-soft; the launcher never gains a
 	// backend handle and the serialized boundary remains visible to the child.
 	task = await advisoryMemoryForSubagent(runId, path.resolve(PIPIUI_MAIN_CWD || defaultCwd), task);
-	// A package may make desktop requestable, but it never receives desktop merely
-	// by declaring that field. The boss still needs one explicit per-task grant.
-	if (options?.desktop && agent.capabilities.desktop !== "requestable") {
-		const message = `Agent "${agent.name}" does not declare desktop: requestable. Omit desktop or choose an agent whose v1 capability policy permits a per-task desktop grant.`;
-		return {
-			agent: agentName,
-			agentSource: agent.source,
-			task,
-			title: options?.title,
-			exitCode: 1,
-			messages: [],
-			stderr: message,
-			errorMessage: message,
-			usage: emptyUsage(),
-			step,
-			agentId: pipiuiAgentId,
-			runId,
-			stopReason: "error",
-		};
-	}
-	// Per-task desktop gate: a worker gets computer/open_application (plus the
-	// strategy extension and capability env) ONLY when the boss attached an
-	// explicit grant AND the host capability is live. A requested grant with no
-	// host capability fails fast with a clear reason — never a silent no-op.
-	const desktopGrant = resolveDesktopGrant({
-		desktop: options?.desktop,
-		hostAvailable:
-			!!PIPIUI_COMPUTER_EXT && !!process.env.PIPIUI_COMPUTER_CAPABILITY,
-	});
-	if (desktopGrant.problem) {
-		const message = desktopGrant.problem;
-		return {
-			agent: agentName,
-			agentSource: agent.source,
-			task,
-			title: options?.title,
-			exitCode: 1,
-			messages: [],
-			stderr: message,
-			errorMessage: message,
-			usage: emptyUsage(),
-			step,
-			agentId: pipiuiAgentId,
-			runId,
-			stopReason: "error",
-		};
-	}
-	// The bundled operator receives the existing broker capability only while
-	// this exact dispatch has an explicit desktop grant. It is not a second
-	// desktop capability: it merely authorizes bounded app-recipe recall and
-	// host-generated metadata candidates for the already granted run.
-	const computerMemoryEnabled =
-		runtimePolicy.role === "operator" && desktopGrant.granted;
 	// The formal main extension owns the live registry and returns the only
 	// capability tuple a child may receive. No Swift/AppStore RPC registration or
 	// child-selected root is involved. An unavailable broker simply removes the
 	// optional query/candidate surface for this dispatch.
 	const memoryBrokerRole: MemoryBrokerChildRole | undefined =
-		runtimePolicy.role === "worker"
-			? "worker"
-			: computerMemoryEnabled
-				? "operator"
-				: undefined;
+		runtimePolicy.role === "worker" ? "worker" : undefined;
 	const issuedMemoryBrokerEnvironment = memoryBrokerRole
 		? await issueMemoryBrokerEnvironment({
 			agentID: pipiuiAgentId,
 			runID: runId,
 			role: memoryBrokerRole,
-			...(computerMemoryEnabled && (desktopGrant.reason === "user-requested" || desktopGrant.reason === "ui-verify")
-				? { hostIssuedDesktopGrant: desktopGrant.reason }
-				: {}),
 		})
 		: undefined;
 	// A complete capability is not enough on its own: the child must also be
@@ -6710,13 +6673,11 @@ async function runSingleAgent(
 		resolvedModel ? stripModelThinkingSuffix(resolvedModel) : undefined,
 		loadNativeSearchCatalog(),
 	);
-	const workerSkillLoaderPath = options?.computerWorker
-		? undefined
-		: resolveWorkerSkillLoaderPath({
-			env: { PIPIUI_SKILLLOADER_EXT },
-			bundledPath: fileURLToPath(new URL("../../extensions/pipiui-skillloader.ts", import.meta.url)),
-			existsSync: (candidate) => fs.existsSync(candidate),
-		});
+	const workerSkillLoaderPath = resolveWorkerSkillLoaderPath({
+		env: { PIPIUI_SKILLLOADER_EXT },
+		bundledPath: fileURLToPath(new URL("../../extensions/pipiui-skillloader.ts", import.meta.url)),
+		existsSync: (candidate) => fs.existsSync(candidate),
+	});
 	const memoryOmissionReason = terminalMemoryBrokerEnvironment
 		? undefined
 		: !memoryBrokerRole
@@ -6739,18 +6700,17 @@ async function runSingleAgent(
 		mountedExtensionIds,
 		extensionToolOwnership(),
 	);
-	const normalToolSelection = resolveSubagentToolSelection({
+	const toolSelection = resolveSubagentToolSelection({
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
 		// Depth-gated: a child at/above PIPIUI_MAX_DEPTH must not even see the tools.
 		// Extension extras stay provenance-tagged until this mount filter; runtime
-		// suffixes (placement/isolation/desktop/closeout/findings) are appended after
+		// suffixes (placement/isolation/closeout/findings) are appended after
 		// the (already patched) definition prompt below.
-		declaredTools: options?.computerAgent ? undefined : toolPatch.declaredTools?.filter(
+		declaredTools: toolPatch.declaredTools?.filter(
 			(t) => allowRecursiveDelegation || !isDelegationTool(t),
 		),
 		disabledTools: [...loadDisabledTools(), ...toolPatch.extraDisabledTools],
-		hasDesktopCapability: desktopGrant.granted,
 		hasMemoryBrokerCapability: !!terminalMemoryBrokerEnvironment,
 		// The subagent extension that registers session_recall is mounted below
 		// (`-e PIPIUI_SUBAGENT_EXT`); without recall a compacted worker cannot
@@ -6761,29 +6721,20 @@ async function runSingleAgent(
 		availableExtensionTools: pipiuiExtensionRouting.extensionOnlyTools,
 		hideGenericWebSearch,
 	});
-	const toolSelection = options?.computerWorker
-		? { flag: "--tools" as const, names: [...options.computerWorker.toolNames] }
-		: normalToolSelection;
 	// 嵌套委派也加载补丁版 subagent（主会话通过 PIPIUI_SUBAGENT_EXT 传入目录）
 	if (PIPIUI_SUBAGENT_EXT) args.push("-e", PIPIUI_SUBAGENT_EXT);
-	if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
-	for (const part of workerSkillLoaderMountArgs(workerSkillLoaderPath, {
-		computerWorker: Boolean(options?.computerWorker),
-	})) {
+	if (PIPIUI_CODING_TOOLS_EXT) args.push("-e", PIPIUI_CODING_TOOLS_EXT);
+	for (const part of workerSkillLoaderMountArgs(workerSkillLoaderPath)) {
 		args.push(part);
 	}
-	// Not for computer workers: their Leader owns their process discipline, and the layers
-	// here are written about code work.
-	if (PIPIUI_PHILOSOPHY_EXT && !options?.computerWorker) args.push("-e", PIPIUI_PHILOSOPHY_EXT);
-	if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT && !options?.computerWorker) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT);
+	if (PIPIUI_PHILOSOPHY_EXT) args.push("-e", PIPIUI_PHILOSOPHY_EXT);
+	if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT);
 	// Registry-enabled project extensions: remount the main-session snapshot (D3 / D9).
 	// Same `-e` paths assemblePiSpawn already mounted; do not scan bare files here.
-	if (!options?.computerWorker) {
-		const registered = process.env.PIPIUI_EXT_REGISTERED_PATHS;
-		if (registered) {
-			for (const mount of registered.split(path.delimiter)) {
-				if (mount) args.push("-e", mount);
-			}
+	const registeredExtensionPaths = process.env.PIPIUI_EXT_REGISTERED_PATHS;
+	if (registeredExtensionPaths) {
+		for (const mount of registeredExtensionPaths.split(path.delimiter)) {
+			if (mount) args.push("-e", mount);
 		}
 	}
 	// The official package owns the child-side read-only query registration.
@@ -6795,14 +6746,6 @@ async function runSingleAgent(
 	if (PIPIUI_SEARCH_SCOPE_EXT) args.push("-e", PIPIUI_SEARCH_SCOPE_EXT);
 	for (const route of selectPipiUIExtensionRoutes(pipiuiExtensionRouting, toolSelection)) {
 		args.push("-e", route.path);
-	}
-	if (desktopGrant.granted && PIPIUI_COMPUTER_EXT) {
-		args.push("-e", PIPIUI_COMPUTER_EXT);
-	}
-	if (options?.computerWorker) args.push("-e", options.computerWorker.extensionPath);
-	if (options?.computerAgent) {
-		args.push("-e", options.computerAgent.extensionPath);
-		if (PIPIUI_WEBVIEW_EXT) args.push("-e", PIPIUI_WEBVIEW_EXT);
 	}
 	for (const skillPath of options?.privateSkillPaths ?? []) args.push("--skill", skillPath);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
@@ -7020,9 +6963,8 @@ async function runSingleAgent(
 		].join(" · ");
 	};
 	try {
-		// Central child prompt: the agent's own system prompt plus, for desktop-
-		// granted dispatches only, the shared Computer Use policy (applies to ALL
-		// subagents — a grant never turns desktop into a general-purpose tool).
+		// Central child prompt: the agent's own system prompt plus any runtime
+		// placement or bundled private-skill suffixes.
 		const promptParts: string[] = [];
 		if (agent.systemPrompt.trim()) promptParts.push(agent.systemPrompt);
 		if (executionPolicy?.worktree === "none" && executionPolicy.noWorktreeReason) {
@@ -7038,7 +6980,6 @@ async function runSingleAgent(
 				throw new Error(`Cannot load bundled private skill ${skillPath}: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
-		if (desktopGrant.granted) promptParts.push(DESKTOP_GRANT_CHILD_POLICY);
 		if (promptParts.length > 0) {
 			const tmp = await writePromptToTempFile(
 				agent.name,
@@ -7084,10 +7025,10 @@ async function runSingleAgent(
 			exitCode = await new Promise<number>((resolve) => {
 				const invocation = getPiInvocation(args);
 				const childEnvironmentInput = {
-						PIPIUI_AGENT_ID: pipiuiAgentId,
-						PIPIUI_AGENT_RUN_ID: runId,
-						PIPIUI_AGENT_DEPTH: String(childDepth),
-						PIPIUI_AGENT_TREE_DEPTH: String(childDepth),
+					PIPIUI_AGENT_ID: pipiuiAgentId,
+					PIPIUI_AGENT_RUN_ID: runId,
+					PIPIUI_AGENT_DEPTH: String(childDepth),
+					PIPIUI_AGENT_TREE_DEPTH: String(childDepth),
 					// Marks only recursive nested parents. A leaf never enters resident mode,
 					// even if its own parent is resident.
 					PIPIUI_NESTED_RPC_PARENT: useNestedRpc ? "1" : undefined,
@@ -7099,12 +7040,6 @@ async function runSingleAgent(
 					...(fanoutLayerActive() ? { PIPIUI_FANOUT_ACTIVE: "1" } : {}),
 					PIPIUI_AGENT_ROLE: runtimePolicy.role,
 					...(terminalMemoryBrokerEnvironment ?? {}),
-					...(computerMemoryEnabled
-						? { PIPIUI_COMPUTER_MEMORY_ENABLED: "1" }
-						: {}),
-					...(options?.computerWorker?.environment ?? {}),
-					...(options?.computerAgent?.environment ?? {}),
-					...(options?.computerAgent ? { PIPIUI_AGENT_NO_DELEGATION: "1" } : {}),
 					// Scope marker read by the philosophy package. Every dispatched agent is a
 					// worker, whatever it may itself dispatch. There used to be a third role
 					// here — `lead`, for an agent that delegates — but the roster it was
@@ -7136,9 +7071,7 @@ async function runSingleAgent(
 					...(placement.worktreePath ? { PIPIUI_WORKTREE_PATH: placement.worktreePath } : {}),
 					...(placement.worktreeBranch ? { PIPIUI_WORKTREE_BRANCH: placement.worktreeBranch } : {}),
 				};
-				const childEnv = options?.computerWorker
-					? isolatedComputerWorkerChildProcessEnv(childEnvironmentInput)
-					: pipiuiChildProcessEnv(childEnvironmentInput, desktopGrant.granted);
+				const childEnv = pipiuiChildProcessEnv(childEnvironmentInput);
 				// chatrpg/keeper and similar packages skip setActiveTools(kpSet) when this is set.
 				// `--no-extensions` is the primary isolation; this keeps the child surface if a
 				// package is still mounted via explicit `-e`.
@@ -8266,11 +8199,8 @@ async function runSingleAgent(
 		}
 		// Candidate evidence comes only from the final assistant text. It never
 		// reads stream previews, tool results, stderr, or a non-terminal run.
-		// A desktop-granted operator receives only host-projected Computer
-		// candidates from settled open/batch paths. Do not turn its broad terminal
-		// report into a second memory source that could contain UI prose.
 		// Optional: never delay done. Timeout/error stay on this background task.
-		if (terminalFinalized && !wasAborted && !computerMemoryEnabled) {
+		if (terminalFinalized && !wasAborted) {
 			detachCloseout(submitBrokerTerminalCandidate(terminalMemoryBrokerEnvironment, {
 				runID: runId,
 				task,
