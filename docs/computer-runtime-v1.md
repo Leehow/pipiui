@@ -1,91 +1,68 @@
 # PipiUI Computer Runtime v1
 
-PipiUI exposes a loopback-only, capability-authenticated desktop runtime and
-explicitly mounts exactly one Pi strategy selected by the user. PipiUI owns
-macOS permissions, capture, accessibility, input delivery, target PID/window
-validation, coordinate conversion, cancellation, the global execution mutex,
-helper lifecycle, emergency stop, and held-input cleanup. The Pi strategy owns
-tool schemas and descriptions, prompting, routing, batching, retries, provider
-adaptation, and model-context shaping.
+PipiUI exposes the desktop runtime to exactly one client: the bundled
+`cua-extension` (`Electron/resources/runtime/extensions/cua-extension/`,
+enabled by default, gated by the Settings → Computer Use master switch), which
+registers the `computer` and `open_application` tools in the main Pi session.
+PipiUI owns macOS permissions, capture, input delivery, target PID/window
+validation, coordinate mapping, cancellation, request serialization, helper
+lifecycle, and teardown. The extension owns tool schemas and descriptions,
+prompting, routing, batching, retries, provider adaptation, and model-context
+shaping.
 
-This is a selection boundary, not code isolation. Pi can also auto-discover or
-load other extensions, and every extension in the same Pi process can read the
-process environment that carries Runtime capabilities. Treat all extensions in
-that process as trusted.
+There is no selectable/external strategy surface. Workers and subagents have
+no desktop capability: `computer` / `open_application` are main-session-only
+reserved tools, and no `PIPIUI_COMPUTER_*` value is exported to dispatched
+agents.
 
-The Cua helper is private implementation detail. Strategy extensions must use
-this contract rather than starting or calling that helper directly.
+The Cua helper is a private implementation detail. The extension reaches it
+only through this contract, never by starting or calling the helper directly.
 
-## Selecting a strategy
+## Transport: host-capability broker
 
-Settings → Computer Use → **Pi 操作策略** offers:
-
-- **PipiUI 内置策略**: the reference strategy bundled with the App.
-- **外部 Pi 策略**: a user-selected `.ts`, `.js`, `.mjs`, or `.cjs` file, or a
-  directory containing `index.ts`, `index.js`, `index.mjs`, or `index.cjs`.
-
-PipiUI validates the configured path and blocks Pi session startup with a clear
-error if it is missing, unreadable, or unsupported. It never silently falls
-back to the built-in strategy. Exactly one strategy is mounted with Pi `-e`.
-Nested Pi processes dispatched by PipiUI mount the same selected path.
-Choosing **应用** restarts all open Pi sessions when Computer Use is enabled
-and the external strategy is selected. Applying an unchanged path deliberately
-does the same, providing a simple edit-and-reload loop; merely opening Settings
-or refreshing its status does not restart sessions.
-
-External Pi extensions are trusted executable code. While Computer Use is on,
-the explicitly selected strategy and any other extension in the same Pi process
-can read the Runtime capability and attempt desktop requests. Review the source
-and provenance of the complete Pi extension set before enabling it.
-
-### Required nested strategy surface
-
-An external v1 strategy that must work in PipiUI-dispatched nested Pi processes
-must register tools named exactly `computer` and `open_application`. PipiUI's
-explicit subagent tool allowlist knows only those two reserved names. Additional
-custom tools may work in a top-level Pi session, but arbitrary names are not
-automatically added to nested explicit allowlists.
+Driver calls do not use a dedicated `computer_*` bridge route anymore. Every
+call travels as one versioned `HostCapabilityRequestV1` envelope over the
+loopback bridge `host_capability` action (`POST http://127.0.0.1:$PIPIUI_BRIDGE_PORT/rpc`),
+with `permission: "native.exec"` and `op: "native.cua"`; the exact
+`computer_*` request body (including `sessionKey` and the desktop-grant
+`computerCapability`) rides inside `params`. Before dispatch, the broker
+re-negotiates the manifest `hostApi` range, re-checks the per-project
+permission grant, verifies the desktop grant against the owning bridge
+session, and consumes a one-time capability token the host minted via the
+loopback `host_capability_token` op (single use, TTL-bound, context-bound).
+The reference client is
+`cua-extension/agent/host-capability-client.ts`; it never invents tokens and
+fails closed when the host does not mint one.
 
 ## Discovery and lifecycle
 
-PipiUI injects these environment variables into the owning top-level Pi process,
-and dispatched Pi children inherit the corresponding values. They are not
-scoped to the selected extension: every extension loaded in one of those
-processes can read its process environment.
+PipiUI injects these environment variables into the owning top-level Pi
+process. They are readable by every extension loaded in that process; treat
+all of them as trusted.
 
 | Variable | Meaning |
 |---|---|
 | `PIPIUI_BRIDGE_PORT` | Ephemeral loopback HTTP port. |
-| `PIPIUI_SESSION_KEY` | Ephemeral capability for the owning Pi session. |
-| `PIPIUI_COMPUTER_CAPABILITY` | Separate ephemeral desktop capability. |
+| `PIPIUI_SESSION_CAPABILITY` | Capability authenticating the bridge `host_capability` route. |
+| `PIPIUI_SESSION_KEY` | Session key; the driver's pid/window owner-binding input inside `params`. |
+| `PIPIUI_COMPUTER_CAPABILITY` | Desktop-grant capability, presented inside `params` and verified per session. |
 | `PIPIUI_COMPUTER_RUNTIME_PROTOCOL` | Requested major protocol version (`1`). |
-| `PIPIUI_COMPUTER_EXT` | Selected extension file/directory path, used by PipiUI's subagent extension when spawning nested Pi. |
+| `PIPIUI_COMPUTER_DISPLAY_ID` / `PIPIUI_COMPUTER_WIDTH` / `PIPIUI_COMPUTER_HEIGHT` | Initialization hints for the synchronous Anthropic typed-tool hook; runtime negotiation remains authoritative and a mismatch is rejected. |
+| `PIPIUI_CUA_DRIVER_VERSION` | Pinned driver version (currently `0.22.0`). |
 
-The built-in strategy also receives `PIPIUI_COMPUTER_DISPLAY_ID`,
-`PIPIUI_COMPUTER_WIDTH`, and `PIPIUI_COMPUTER_HEIGHT` because Pi's Anthropic
-provider-request hook is synchronous and must describe the typed tool before
-the first action. These are initialization hints, not the public discovery
-contract. Third-party strategies must use the negotiated `display` object, and
-the built-in strategy rejects a mismatch between its hint and the handshake.
-
-The endpoint is `POST http://127.0.0.1:$PIPIUI_BRIDGE_PORT/rpc` with
-`content-type: application/json`. It is bound only to `127.0.0.1`. Every
-Computer Runtime request must carry both capability values and
-`protocolVersion: 1`.
-
-Capabilities are per session, remain in process memory, and must not be written
-to disk or logs. Closing a session terminates its Pi process. Disabling Computer
-Use restarts open sessions without the strategy mount or desktop capability, so
-the old process-held values become unusable. Emergency stop is different: it
-latches desktop execution off, cancels active work, clears targets, and releases
-held input, but does not rotate the `computerRoutingKey` or the environment
-value in a still-live Pi process. Runtime execution remains blocked until the
-user explicitly re-enables it. Extensions must not pass capabilities to
+Capabilities are per session, remain in process memory, and must not be
+written to disk or logs. Closing a session terminates its Pi process.
+Disabling Computer Use means new sessions are spawned without the desktop
+capability, so old process-held values become useless. Cancellation is
+different: it bumps the host request generation, tears down the current
+driver generation, clears targets, but does not rotate the capability values
+in a still-live Pi process. Extensions must not pass capabilities to
 unrelated subprocesses.
 
 ## Request envelope and negotiation
 
-Before the first desktop action, negotiate the runtime:
+Before the first desktop action, negotiate the runtime (inside the broker
+envelope's `params`):
 
 ```json
 {
@@ -111,54 +88,34 @@ A successful response has this shape (values are illustrative):
     "computer_open_application",
     "computer_cancel"
   ],
-  "actions": ["screenshot", "mouse_move", "left_click", "type", "key"],
-  "actionAliases": {
-    "click": "left_click",
-    "move": "mouse_move",
-    "keypress": "key",
-    "drag": "left_click_drag"
-  },
+  "actions": [
+    "screenshot", "click", "left_click", "right_click", "middle_click",
+    "double_click", "triple_click", "invoke_menu", "type", "key",
+    "keypress", "scroll", "wait"
+  ],
   "features": {
     "batchActions": true,
-    "accessibilityElements": true,
-    "windowPinning": true,
-    "backgroundInput": true,
     "inMemoryScreenshots": true,
-    "requestCancellation": true,
-    "nativeOpenAIComputerCall": false
-  },
-  "limits": {
-    "maxActionsPerBatch": 64,
-    "maxRequestBodyBytes": 2097152,
-    "maxExecutionMilliseconds": 30000,
-    "maxEstimatedActionMilliseconds": 28000,
-    "maxPauseMilliseconds": 10000,
-    "maxTypedUTF16Units": 65536
+    "requestCancellation": true
   },
   "display": {
     "id": 1,
     "width": 1440,
-    "height": 900,
-    "globalBounds": {
-      "x": 0,
-      "y": 0,
-      "width": 1728,
-      "height": 1117
-    }
+    "height": 900
   },
-  "runtime": {
-    "platform": "macOS",
-    "transport": "loopback-http-json",
-    "endpoint": "/rpc",
-    "helperExposed": false,
-    "screenRecordingGranted": true,
-    "accessibilityGranted": true
-  }
+  "permissions": {}
 }
 ```
 
-Use the negotiated `display.id`, `display.width`, and `display.height` in normal
-requests. Do not cache negotiation across Pi processes or PipiUI sessions.
+`permissions` is the driver-reported TCC status (`check_permissions`
+structured content), passed through verbatim.
+
+The `actions` list is the complete supported set; anything else is rejected
+by batch pre-validation with `unsupported_action` before anything executes.
+Use the negotiated `display.id`, `display.width`, and `display.height` in
+normal requests. Do not cache negotiation across Pi processes or PipiUI
+sessions. The model-facing `computer` schema caps one batch at 64 actions,
+`wait` at 10 seconds, and `scroll_amount` at 1–50.
 
 ### Batch
 
@@ -168,7 +125,6 @@ requests. Do not cache negotiation across Pi processes or PipiUI sessions.
   "computerCapability": "<desktop capability>",
   "action": "computer_batch",
   "protocolVersion": 1,
-  "requestID": "caller-generated-unique-id",
   "displayID": 1,
   "displayWidth": 1440,
   "displayHeight": 900,
@@ -179,6 +135,17 @@ requests. Do not cache negotiation across Pi processes or PipiUI sessions.
 }
 ```
 
+Every batch response carries per-action `outcomes` receipts
+(`ok` / `failed` / `not_executed`); the batch stops at the first failure and
+the tail is `not_executed`. A mutation whose driver call fails or times out
+after input may have happened is reported as `mutation_outcome_unknown` with
+`outcomeUnknown: true` after one re-observation — never blindly replay it.
+When a settled action changes the actionable context or the AX snapshot, the
+host answers `ok: true, batchOK: false, batchInterrupted: true` with
+`interruptionReason: "actionable_context_changed" | "snapshot_changed"` and
+`requiresReplan: true`: re-observe and replan instead of continuing the old
+plan.
+
 ### Open or activate an application
 
 ```json
@@ -187,7 +154,6 @@ requests. Do not cache negotiation across Pi processes or PipiUI sessions.
   "computerCapability": "<desktop capability>",
   "action": "computer_open_application",
   "protocolVersion": 1,
-  "requestID": "caller-generated-unique-id",
   "displayID": 1,
   "displayWidth": 1440,
   "displayHeight": 900,
@@ -195,8 +161,10 @@ requests. Do not cache negotiation across Pi processes or PipiUI sessions.
 }
 ```
 
-Use either `bundle_identifier` or `application_name`. Paths, URLs, and arbitrary
-commands are not accepted by this lifecycle operation.
+Use either `bundle_identifier` or `application_name`. Paths, URLs, and
+arbitrary commands are not accepted by this lifecycle operation. A session
+with an established exact target rejects unproven alias replacements with
+`target_handoff_untrusted`.
 
 ### Cancel
 
@@ -205,28 +173,43 @@ commands are not accepted by this lifecycle operation.
   "sessionKey": "<session capability>",
   "computerCapability": "<desktop capability>",
   "action": "computer_cancel",
-  "protocolVersion": 1,
-  "requestID": "the-original-request-id"
+  "protocolVersion": 1
 }
 ```
 
-Transport disconnect and timeout cancellation remain App-owned safeguards;
-strategies should still send explicit cancellation when their tool signal is
-aborted.
+Cancellation bumps the request generation, rejects pending RPCs, clears
+targets and cached scales, and tears down the current daemon/proxy
+generation (SIGTERM, then SIGKILL after a bounded wait); the next call
+starts a fresh generation. The host serializes all runtime requests
+(`requestTail`) and retries driver "desktop busy" rejections with a bounded
+same-session backoff budget before surfacing `desktop_already_active`.
+
+## Coordinates and observations
+
+Screenshots delivered to the model are downscaled to a ≤1568px long edge by
+the Electron `nativeImage` pipeline. Every observation may carry a top-level
+`screenshot: { width, height, scaleX, scaleY }` block: the delivered image
+pixel dimensions and the scale back to driver pixels. Model coordinates are
+interpreted in the delivered screenshot pixel space; the host bounds-checks
+them (`coordinate_out_of_bounds`, retryable, message carries the valid pixel
+range) and maps them back with the scale recorded at the latest observation.
+There is no letterboxing. AX snapshots are captured with
+`max_elements: 2000`, `max_depth: 25`; the extension further trims the
+model-facing element list (interactive controls first, cap 48) while
+`elementCount` always reports the pre-trim total.
 
 ## Errors
 
-v1 failures retain the legacy top-level `error` string and add the stable
+Failures keep a top-level human-readable `error` string and add the stable
 `runtimeError` envelope:
 
 ```json
 {
   "ok": false,
   "error": "human-readable compatibility message",
-  "errorCode": "unsupported_protocol_version",
   "runtimeError": {
     "code": "unsupported_protocol_version",
-    "message": "PipiUI Computer Runtime requires protocolVersion 1",
+    "message": "Electron Computer Runtime requires protocolVersion 1",
     "retryable": false,
     "requiresObservation": false
   }
@@ -234,149 +217,55 @@ v1 failures retain the legacy top-level `error` string and add the stable
 ```
 
 Clients should branch on `runtimeError.code`, `retryable`, and
-`requiresObservation`; `message` and legacy `error` are diagnostic text and may
-change. `retryable: true` means a retry is eligible only after satisfying
-`requiresObservation` and any user/runtime prerequisite; it never instructs a
-client to retry blindly. The boolean fields are authoritative Runtime guidance,
-including for generic and unknown codes. Stable v1 guidance includes:
+`requiresObservation`; `message` and legacy `error` are diagnostic text and
+may change. `retryable: true` means a retry is eligible only after satisfying
+`requiresObservation` (observe again first); it never instructs a client to
+retry blindly. The codes the host actually emits:
 
-- `unauthorized_session_capability`: do not retry; the owning Pi session ended
-  or the session capability is invalid.
-- `unauthorized_computer_capability`: do not retry; discard the capability.
-- `unsupported_protocol_version`: renegotiate or use a compatible strategy.
-- `runtime_unavailable`: fix display/runtime configuration or permissions.
-- `request_cancelled`: retry only when the user still wants the operation, and
-  observe again first.
-- `computer_busy`: the request was rejected before execution; retry after the
-  current desktop operation finishes.
-- `computer_cancelled`: cancellation can race with posted input; observe again
-  before a user-intended retry.
-- `computer_target_missing` / `computer_target_lost`: do not retry the same
-  batch; use `open_application` to establish and observe the exact target.
-- `computer_outcome_unknown`: do not blindly retry. Reopen and observe the exact
-  target before deciding the next action.
-- `user_handoff_required`: let the user complete the protected prompt, then
-  observe before retrying.
-- `cua_driver_error`: do not retry the same mutation because its outcome may be
-  uncertain; observe first.
-- `invalid_application_target` / `invalid_computer_request`: correct the
-  request rather than retrying it unchanged.
-- `runtime_error`: compatibility wrapper for a runtime-mechanics failure that
-  does not yet have a narrower stable code; do not retry and observe before
-  continuing.
+- `unsupported_protocol_version`: renegotiate with `protocolVersion: 1`.
+- `unsupported_platform`: Computer Use is macOS-only; do not retry.
+- `driver_unavailable`: the bundled driver is missing or not executable; fix
+  the installation, do not retry the same call.
+- `missing_session`: the request carried no session key; do not retry.
+- `target_unavailable`: no exact target is pinned (or launch returned no exact
+  pid/window); use `computer_open_application` to establish and observe the
+  target.
+- `target_handoff_untrusted`: the target handoff was not authoritative
+  (unproven alias replacement, window-ownership check failure, app-switcher
+  shortcut after pinning); reopen the exact application.
+- `stale_snapshot`: the action is bound to an older accessibility snapshot;
+  observe and locate again, never reuse the old token.
+- `mutation_outcome_unknown` (with top-level `outcomeUnknown: true`): the
+  mutation's outcome is uncertain; observe before deciding the next action,
+  never blindly retry.
+- `unsupported_action`: batch pre-validation rejected the request; nothing
+  executed, and the message lists the supported action types.
+- `coordinate_out_of_bounds`: the coordinate is outside the latest delivered
+  screenshot pixel space; the message carries the valid range — re-observe and
+  pick fresh coordinates.
+- `cua_driver_rpc_timeout`: a single driver RPC exceeded its timeout; if it
+  followed a mutation, treat the outcome as unknown.
+- `desktop_already_active`: the driver stayed busy past the host's bounded
+  same-session retry budget; retry after the current desktop operation
+  finishes.
 
-Additional lower-level codes may be returned. Unknown codes fail closed with
-`retryable: false` and `requiresObservation: true`; clients can trust those
-fields directly, must surface the diagnostic, and must not guess behavior from
-message text.
-
-## Minimal third-party TypeScript strategy
-
-This example registers the two required nested-compatible tool names. A
-production strategy should add cancellation, result shaping, screenshot memory
-handling, and provider-specific hooks as needed.
-
-```ts
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-
-const port = process.env.PIPIUI_BRIDGE_PORT!;
-const sessionKey = process.env.PIPIUI_SESSION_KEY!;
-const computerCapability = process.env.PIPIUI_COMPUTER_CAPABILITY!;
-const protocolVersion = 1;
-
-async function rpc(body: Record<string, unknown>) {
-  const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      sessionKey,
-      computerCapability,
-      protocolVersion,
-      ...body,
-    }),
-  });
-  const json = await response.json() as any;
-  if (!json.ok) throw new Error(json.runtimeError?.message || json.error);
-  return json;
-}
-
-let capabilities: any;
-
-export default function strategy(pi: ExtensionAPI) {
-  pi.registerTool({
-    name: "computer",
-    label: "Computer",
-    description: "Observe the selected desktop or run one atomic action.",
-    parameters: Type.Object({
-      type: Type.Union([Type.Literal("screenshot"), Type.Literal("left_click")]),
-      coordinate: Type.Optional(Type.Array(Type.Number(), {
-        minItems: 2,
-        maxItems: 2,
-      })),
-    }),
-    async execute(_toolCallId, input) {
-      capabilities ??= await rpc({
-        action: "computer_runtime_capabilities",
-      });
-      const result = await rpc({
-        action: "computer_batch",
-        requestID: crypto.randomUUID(),
-        displayID: capabilities.display.id,
-        displayWidth: capabilities.display.width,
-        displayHeight: capabilities.display.height,
-        actions: [input],
-      });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result) }],
-        details: result,
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "open_application",
-    label: "Open Application",
-    description: "Launch or activate an exact app and establish its target.",
-    parameters: Type.Object({
-      bundle_identifier: Type.Optional(Type.String()),
-      application_name: Type.Optional(Type.String()),
-    }),
-    async execute(_toolCallId, input) {
-      capabilities ??= await rpc({
-        action: "computer_runtime_capabilities",
-      });
-      const result = await rpc({
-        action: "computer_open_application",
-        requestID: crypto.randomUUID(),
-        displayID: capabilities.display.id,
-        displayWidth: capabilities.display.width,
-        displayHeight: capabilities.display.height,
-        ...input,
-      });
-      return {
-        content: [{ type: "text", text: JSON.stringify(result) }],
-        details: result,
-      };
-    },
-  });
-}
-```
+Unknown codes fail closed with `retryable: false` and
+`requiresObservation: true`; clients can trust those fields directly, must
+surface the diagnostic, and must not guess behavior from message text.
 
 ## Compatibility policy
 
 `protocolVersion` is a major integer. PipiUI rejects missing or unsupported
 versions rather than interpreting them as the old private bridge. Additive
-response fields, operations, actions, features, limits, and error codes may
-appear within v1; clients must ignore unknown fields and capability-gate
-optional behavior. Removing or changing a documented field or operation
-requires a new major protocol version.
+response fields, operations, actions, features, and error codes may appear
+within v1; clients must ignore unknown fields and capability-gate optional
+behavior. Removing or changing a documented field or operation requires a new
+major protocol version.
 
-The built-in strategy continues to register the custom Pi `computer` and
-`open_application` tools and adapts supported Anthropic models to
-`computer_20251124`. External strategies should keep those exact names when
-nested compatibility is required. The current Pi extension surface does
-**not** promise an OpenAI-native `computer_call` / `computer_call_output`
-lifecycle. OpenAI and OpenAI-compatible providers continue to use the custom
-tool unless a future runtime and Pi extension contract explicitly adds native
-support.
+The built-in `cua-extension` registers the custom Pi `computer` and
+`open_application` tools and adapts whitelisted Anthropic models to the typed
+`computer_20251124` tool plus the `computer-use-2025-11-24` beta header; the
+typed tool may still emit actions outside the supported set, which the host
+rejects with `unsupported_action`. Other providers use the plain custom
+schema. The runtime does **not** promise an OpenAI-native `computer_call` /
+`computer_call_output` lifecycle.

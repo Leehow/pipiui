@@ -371,7 +371,7 @@ describe("vendored philosophy: delivery", () => {
 
   it("keeps the boss's whole prefix inside budget", () => {
     // The standalone package capped this at 11500; the vendored tree also carries the
-    // host-policy sections (tool withholding, computer_task routing, status persistence,
+    // host-policy sections (tool withholding, main-session desktop routing, status persistence,
     // session recall) and the thinking-discipline layer, which are
     // load-bearing here and cost the difference. Raised again for the domain-memory layer
     // (CONTEXT.md vocabulary + ADR gate), which pays for itself in re-derived terminology.
@@ -437,7 +437,7 @@ describe("vendored philosophy: delivery", () => {
     // The shipped defect: stable worker identity fell back to `agent-<random>` — an id no
     // model can read, repeat, or retype to continue, abort, or resolve. The contract now
     // lives in the orchestration layer and splits by who mints the id: caller-chosen
-    // identities (agentId, plan id, computer sessionId) the model supplies explicitly;
+    // identities (agentId, plan id) the model supplies explicitly;
     // runtime-allocated model-visible identities (a goal id) the runtime may mint but must
     // keep readable and semantic; randomness only for ids no model ever names. The first
     // wording overreached — "every stable id the model must generate" — and contradicted

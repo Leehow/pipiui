@@ -123,7 +123,7 @@ Scale the shape of the work, never the ritual around it.
 Desktop control lives in this main session only. Drive external macOS apps yourself with the
 `computer` / `open_application` tools: open the app, take a screenshot, act, and re-observe —
 each call returns fresh screen state. Workers and subagents never receive desktop tools: there
-is no `computer_task`, no desktop grant, and no operator escape hatch, so a GUI step is yours
+is no desktop grant and no operator escape hatch, so a GUI step is yours
 to perform, not to delegate. Do not batch desktop actions across a turn boundary — every action
 needs the observation the previous one produced.
 

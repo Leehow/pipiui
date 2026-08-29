@@ -1,5 +1,12 @@
 # PipiUI Computer Use 上下文优化（P0–P3）
 
+> **Superseded（2026-08-29）**：本优化针对的 Swift 时代 `computer-use-strategy.ts` 已删除，
+> 其结论已由 computer-use 重构落地：模型侧截图 FIFO 固定为 3、toolResult 只留
+> `[PIPIUI_COMPUTER_SCREENSHOT:id]` marker 并由 provider-context 钩子 prune+inject、
+> AX elements 按可交互性裁剪（上限 48）、坐标错误结构化（`coordinate_out_of_bounds` 含
+> 有效范围）。当前实现见 `Electron/resources/runtime/extensions/cua-extension/` 与
+> [`docs/computer-use.md`](../computer-use.md)。
+
 状态：草案（2026）。相关主文档：[`docs/computer-use.md`](../computer-use.md)、[`docs/computer-runtime-v1.md`](../computer-runtime-v1.md)。
 
 ## 背景与根因

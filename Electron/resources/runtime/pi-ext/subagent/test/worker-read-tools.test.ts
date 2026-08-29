@@ -104,7 +104,6 @@ function parsePackage(name: string, frontmatter: string) {
 function selection(partial: Parameters<typeof resolveSubagentToolSelection>[0]) {
 	return resolveSubagentToolSelection({
 		disabledTools: [],
-		hasDesktopCapability: false,
 		allowRecursiveDelegation: false,
 		availableExtensionTools: ["fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
 		...partial,

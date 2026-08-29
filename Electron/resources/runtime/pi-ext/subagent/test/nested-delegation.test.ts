@@ -63,7 +63,6 @@ function assembleChildTools(agent: AgentConfig, childDepth: number, maxDepth = D
 	return resolveSubagentToolSelection({
 		declaredTools: agent.tools?.filter((name) => allowRecursiveDelegation || !isDelegationTool(name)),
 		disabledTools: [],
-		hasDesktopCapability: false,
 		hasMemoryBrokerCapability: false,
 		hasSessionRecall: true,
 		allowRecursiveDelegation,
@@ -147,9 +146,6 @@ test("depth-1 general-purpose may dispatch only explore and general-purpose", ()
 		"reviewer",
 		"secretary",
 		"operator",
-		"computer-use",
-		"computer-verifier",
-		"computer-terminal",
 	]) {
 		const problem = rejectNestedDelegationTypes({ callerDepth: 1, agentNames: [name] });
 		assert.match(problem ?? "", /not allowed/);

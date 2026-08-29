@@ -1,140 +1,225 @@
 # PipiUI Computer Use
 
-可替换策略与公开 Runtime API 见
-[`computer-runtime-v1.md`](./computer-runtime-v1.md)。
+Runtime 线路契约见 [`computer-runtime-v1.md`](./computer-runtime-v1.md)；扩展侧
+模型 schema、坐标契约与 marker 管线见
+[`Electron/resources/runtime/extensions/cua-extension/README.md`](../Electron/resources/runtime/extensions/cua-extension/README.md)。
 
-状态（2026-08-24）：主会话通过 `computer_task` 开启 Boss 直驱桌面会话并自己持有观察—动作闭环。Computer Use Leader 与长任务 Computer Use Agent 已退役。Cua Driver Runtime v1 的精确目标、坐标变换、mutex、取消、急停、输入清理和 `outcome_unknown` 语义保持不变。真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由 worktree 的 Node/TypeScript 测试代替。
+状态（2026-08-29）：桌面自动化的唯一入口是内置扩展 `cua-extension`
+（`Electron/resources/runtime/extensions/cua-extension/`，默认启用，不可卸载），
+由设置里的 Computer Use 总开关控制（侧栏底部 `desktopcomputer` 按钮打开
+「Computer Use（桌面控制）」面板）。它在**主会话**注册且只注册两个工具：
+`open_application`（按 bundle identifier 或应用名钉住精确 App 窗口）和
+`computer`（有序动作批）。`computer_task`、`computer-agent` 包
+（Leader/Operator/Verifier/worker）、旧 `computer_*` 桥路由与 worker 桌面授权
+已全部删除；worker/subagent 没有任何桌面能力——`computer`/`open_application`
+是主会话专属保留工具，agent frontmatter 声明即被拒绝，桌面工作只发生在主会话。
+真实打包 Electron App 的 TCC 归属和 GUI 任务仍须在主 checkout 手工验收，不能由
+worktree 的 Node/TypeScript 测试代替。
 
 ## 架构
 
-主会话暴露 `computer_task`：用 `desktop:"user-requested"|"ui-verify"` 申请授权并打开会话，再用 `sessionId` + `action`（`observe` / `act` / `open_application` / `close`）逐步驱动。每次调用返回 `{action, observation, screenChanged, error}`。运行时按需触发一次性 verifier / recovery 顾问；`operator` 只作为有界单操作逃生门。不再启动 `computer-use-leader` 或长任务 `computer-use` episode。
-
-子 episode 继承当前 Pi 会话中适用的普通非管理工具，但桌面能力只通过三个小接口提供：
-
-1. `desktop_observe`：新鲜观察，并把约束与成功条件写入 Host Task Checkpoint；
-2. `desktop_open_application`：按 Runtime v1 固定精确目标，并检索当前项目的 Workflow Memory；
-3. `desktop_run_action_block`：执行 Host guarded block，逐动作 fresh-state 对账和 receipt，在 modal、窗口/target 漂移、stale locator、人工接管或未知后果处停止尾部。
-
-Host 对 Cold/Candidate/Practiced block 分别限制最多 2/4/12 个 mutation，Runtime v1 的 64-action 技术上限不变。Checkpoint 保存目标、约束、成功条件、已验证事实、未知后果、活动应用/Workflow 和 evidence refs；恢复必须跳过已满足动作，只执行最短安全后缀，consequential `outcome_unknown` 不得盲重放。
-
-Workflow Memory schema v2 只写入 backend 解析出的 `{activeProjectPiHome}/computer-use/`。第一次独立自主成功生成 Candidate，第二个不同 task/run 的成功晋升 Practiced；连续漂移/失败或一次未知后果会 Suspended。每次最多召回一个 Workflow 和两个 Recovery Lesson，敏感应用不学习，任务值在持久化前参数化，损坏记录隔离，旧 App-profile/global Procedure Store 不自动导入。
-
-PipiUI 的 `computer` 与 `open_application` 仍是 provider 可移植的自定义工具；Anthropic 支持的模型会在 provider 边界改写为官方 `computer_20251124`。v1 不假设 Pi 能处理 OpenAI 原生 `computer_call` / `computer_call_output`。
-
-桌面执行由嵌入 App 的 Cua Driver 完成：
-
 ```text
-Pi extension
-  -> loopback BridgeServer + session capability
-  -> process-global ComputerCoordinator
-  -> cua-driver serve --embedded (private Unix socket)
-  -> cua-driver mcp --embedded (stdio JSON-RPC)
-  -> target window screenshot + AX metadata / background input
+cua-extension（主 Pi 会话进程内）
+  -> loopback bridge `host_capability` action
+     （Host Capability API broker：`native.cua` op + 一次性 capability token；
+     desktop-grant `computerCapability` 随每个请求的 params 传递）
+  -> CuaDriverHost（Electron 主进程，apps/electron/src/main/cua-driver-host.ts）
+  -> Rust cua-driver v0.22.0（embedded daemon + stdio MCP proxy）
 ```
 
-GUI App 用 `Foundation.Process` 直接启动两个子进程，不经过 Launch Services。运行环境固定为：
+扩展每次调用先经 loopback `host_capability_token` op 让宿主铸一枚一次性 token，
+broker 在分发前依次校验 hostApi 版本范围、manifest 声明权限（`native.exec`）、
+项目授权与 desktop grant，然后消费 token 才把 `params` 原样交给
+`CuaDriverHost.handle`。driver wire action 不变：
+`computer_runtime_capabilities` / `computer_open_application` /
+`computer_batch` / `computer_cancel`。
 
-```text
-CUA_DRIVER_EMBEDDED=1
-CUA_DRIVER_HOST_BUNDLE_ID=com.leehow.pipiui
-CUA_DRIVER_PERMISSION_MODE=unrestricted
-CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS=1
-CUA_DRIVER_RS_TELEMETRY_ENABLED=false
-```
+宿主在同一主进程内启动两个子进程（不经过 Launch Services）：
 
-每个 daemon generation 使用完整 UUID 的独立 `/tmp` socket。readiness 会用 `lstat` 验证它是当前用户拥有的 `0600` Unix socket，而不是仅检查同名路径存在。daemon 使用官方 embedded host 的 `--parent-liveness-stdio --no-permissions-gate --host-bundle-id com.leehow.pipiui --permission-mode unrestricted --dangerously-bypass-approvals` 形态，并由 App 持有专用 stdin liveness pipe 的写端；MCP 也显式传 `--host-bundle-id`。MCP initialize 只接受固定版本支持的 `2025-06-18`，随后 `check_permissions` 必须同时返回 `source.attribution == host`、`source.embedded == true` 和精确 host bundle ID，否则 teardown。App 不在运行时下载代码。
+- daemon：`cua-driver serve --embedded --parent-liveness-stdio
+  --no-permissions-gate --socket <私有 /tmp socket> --host-bundle-id
+  com.leehow.pipiui-electron --permission-mode unrestricted
+  --dangerously-bypass-approvals`
+- MCP proxy：`cua-driver mcp --embedded --socket <同一 socket>
+  --host-bundle-id com.leehow.pipiui-electron`，stdio JSON-RPC，MCP
+  initialize 固定 `2025-06-18`
+
+TCC/Accessibility 权限、driver 生命周期、精确 pid/window 绑定、截图管线与清理
+都留在 Electron 宿主；扩展不直接启动或调用 helper。
 
 ## 模型路由优先级
 
-Computer Use 是混合桌面能力包，不等于所有任务都从截图中找坐标。模型侧工具说明固定采用以下顺序：
+Computer Use 是混合桌面能力包，不等于所有任务都从截图中找坐标。模型侧工具说明
+固定采用以下顺序：
 
-1. **确定性应用生命周期优先**：启动或激活目标 App 使用 `open_application`；它只接受 bundle identifier 或 application name，不接受 path/URL。运行状态检查和优雅退出继续优先使用已有 shell/macOS lifecycle 命令，默认不 force quit / `kill -9`。
-2. **Accessibility/AX 或应用内快捷键其次**：窗口已选定后，只要最新 snapshot 提供 `element_index` / `element_token`，就优先使用 AX element action。Finder 目录导航推荐先固定 Finder，再发送 `Cmd-Shift-G`、输入精确绝对路径并按 Enter。
-3. **截图坐标最后**：只有生命周期命令和 AX 都不能完成目标时，才回退到截图像素坐标。
+1. **确定性应用生命周期优先**：启动或激活目标 App 使用 `open_application`；它只
+   接受 bundle identifier 或 application name，不接受 path/URL。运行状态检查和
+   优雅退出继续优先使用已有 shell/macOS lifecycle 命令，默认不 force quit /
+   `kill -9`。
+2. **Accessibility/AX 或应用内快捷键其次**：窗口已选定后，只要最新 snapshot
+   提供 `element_index` / `element_token`，就优先使用 AX element action。
+   Finder 目录导航推荐先固定 Finder，再发送 `Cmd-Shift-G`、输入精确绝对路径并
+   按 Enter。
+3. **截图坐标最后**：只有生命周期命令和 AX 都不能完成目标时，才回退到截图像素
+   坐标。
 
-这只是给模型的路由纪律；目录/文件导航留在已经固定的目标窗口内完成。扩展会拒绝直接、wrapper 或嵌套 shell 中的 `/usr/bin/open` / `open`，并引导模型先调用 `open_application`，再使用 `computer` AX/快捷键。Web URL 优先使用现有 browser 工具。
+这只是给模型的路由纪律；目录/文件导航留在已经固定的目标窗口内完成。扩展会拒绝
+直接、wrapper 或嵌套 shell 中的 `/usr/bin/open` / `open`，并引导模型先调用
+`open_application`，再使用 `computer` AX/快捷键。Web URL 优先使用现有 browser
+工具。
 
-普通 Web 任务仍优先使用 browser 工具。若用户明确要求操作 Chrome、Safari 等外部浏览器 App，则先用 `open_application` 固定该浏览器，把完整 percent-encoded URL 通过 `printf '%s' '<URL>' | pbcopy` 放入剪贴板，再在固定窗口上用一个 `computer` batch 顺序执行 `CMD+L → CMD+V → RETURN → wait`。不要用 AppleScript/`osascript` 或 shell `open` 做外部浏览器导航，避免 AppleEvents TCC 提示或无响应。
+普通 Web 任务仍优先使用 browser 工具。若用户明确要求操作 Chrome、Safari 等外部
+浏览器 App，则先用 `open_application` 固定该浏览器，把完整 percent-encoded URL
+通过 `printf '%s' '<URL>' | pbcopy` 放入剪贴板，再在固定窗口上用一个
+`computer` batch 顺序执行 `CMD+L → CMD+V → RETURN → wait`。不要用
+AppleScript/`osascript` 或 shell `open` 做外部浏览器导航，避免 AppleEvents TCC
+提示或无响应。
+
+## 动作集与批次语义
+
+支持的动作恰好是：`screenshot`、`wait`、`click`、`left_click`、`right_click`、
+`middle_click`、`double_click`、`triple_click`、`type`、`key`、`keypress`、
+`scroll`、`invoke_menu`。`invoke_menu` 用 `path` 传无点菜单路径（如
+`File > Save As…`），宿主原样转发给 driver。每批最多 64 个动作；`wait` 的
+duration 上限 10 秒，`scroll_amount` 1–50。扩展 `tool_call` 钩子与宿主
+`SUPPORTED_COMPUTER_ACTIONS` 保持同一集合。
+
+- **整批预校验**：批内出现支持集之外的动作时以 `unsupported_action`
+  （retryable:false）整体拒绝，任何动作都不执行，message 列出支持的类型。
+- **逐动作 receipt**：`computer_batch` 返回 `outcomes[]`，逐动作给出
+  `ok | failed | not_executed`；首个失败即停批，尾部全部 `not_executed`。
+- **批中断**：动作落定后发现可操作上下文或 AX snapshot 已变化时，返回
+  `ok:true, batchOK:false, batchInterrupted:true`，
+  `interruptionReason` 为 `actionable_context_changed` 或 `snapshot_changed`，
+  并带 `requiresReplan:true`——先重新观察再规划，不要续跑旧计划。
+- **未知后果**：mutation 发出后 driver 超时/失败时，宿主观察一次并返回
+  `mutation_outcome_unknown` + `outcomeUnknown:true`，尾部不再执行；禁止盲重放。
+- 绑定旧 snapshot 的 element 动作以 `stale_snapshot`（retryable:true）拒绝：
+  重新观察、重新定位，不要复用旧 token/坐标。
 
 ## 目标与坐标
 
-`open_application` 接受 `bundle_identifier` 或 `application_name`。Cua `launch_app` 返回 PID 后，PipiUI 执行 `bring_to_front` 与 `get_window_state`，并为 bridge session 原子保存：
+`open_application` 接受 `bundle_identifier` 或 `application_name`。driver
+`launch_app` 返回 PID 后，宿主执行 `bring_to_front` 并原子保存该会话的精确
+target（pid + 固定 window id）；后续 batch 不使用「当前前台 App」选择目标，主
+会话窗口成为前台也不会抢走 target。已有 root target 的会话收到未经证实的别名
+替换时返回 `target_handoff_untrusted`；钉住窗口后再发 App 切换快捷键
+（Cmd-Tab）同样以该码拒绝。primary window 消失（同 PID 仍有其他窗口）时清
+target，要求重新 `open_application`，绝不把旧坐标/AX snapshot 漂移到 sibling
+window。
 
-- bundle ID、应用名和 PID；
-- 当前 window ID、同 PID 的 window ID 集合和 revision；
-- screenshot identity；
-- Cua 原图到 provider 公布尺寸的精确 aspect-fit/letterbox 变换。
+截图经 Electron `nativeImage` 管线（`apps/electron/src/main/index.ts`）降采样到
+长边 ≤1568px 再交付模型；每次观察带顶层
+`screenshot: { width, height, scaleX, scaleY }`——交付图像的像素尺寸和回到
+driver 像素的缩放。**模型坐标按交付截图像素空间解释**：宿主做边界检查（越界即
+`coordinate_out_of_bounds`，retryable:true，message 含有效像素范围），再按
+最新 scale 映射回 driver 像素。模型不要自行 rescale。
 
-若调用者给出精确 bundle ID，`launch_app` 的返回值必须大小写不敏感地精确匹配，否则不会保存 target。后续 batch 不使用“当前前台 App”来选择目标。执行前后都按保存的 PID、bundle ID 和**固定 primary window ID** 复核；primary window 消失时即使同 PID 仍有其他窗口，也会清 target 并要求重新 `open_application`，绝不把旧坐标/AX snapshot 漂移到 sibling window。不同 session 的 target 独立，但所有真实桌面调用共享 process-global in-flight mutex。
+每次观察的 AX 抓取固定 `max_elements: 2000`、`max_depth: 25`。扩展在写入模型
+上下文前再做一次 `compactAccessibility`：可交互控件优先、保留
+window/sheet/dialog/drawer 结构脊，上限 48 个元素
+（`MAX_ACCESSIBILITY_ELEMENTS_IN_CONTEXT`），`elementCount` 始终反映裁剪前
+真实总数。
 
-截图在内存中变换成 provider 已公布的固定像素尺寸。模型坐标先反变换为 Cua 原图坐标；落在 letterbox 黑边中的输入会被拒绝。每个 session target 会保存该截图的 `element_index -> element_token` 映射；纯 index 动作在调用 Cua 前改成该 session 的 snapshot token，使另一 session 刷新同窗 AX cache 时由 Cua 的 stale-token 机制 fail closed。显式 `element_token` 仍直接使用，`delivery_mode` 会传给支持的动作。
+## 上下文卫生
 
-初次打开和每批动作后的两次 `get_window_state` 都显式使用 `max_elements: 256`、`max_depth: 12`。这会同时限制 Cua 的 structured elements 与兼容 markdown；模型侧只保留上游推荐的 structured `elements`，不再重复 `tree_markdown`。元素中的 `element_index` / `element_token` 完整保留，截图仍作为深层节点未进入 AX 预算时的 fallback。工具 `details` 只保存小型状态与 AX element count，不再复制整个模型上下文。
+toolResult 只把 opaque `[PIPIUI_COMPUTER_SCREENSHOT:id]` marker 写进 agent
+state/session JSONL（图像字节不落盘）；扩展的 provider-context 钩子做
+prune+inject：带 marker 的消息，其 inline image 被重建为「该 marker ID 仍在
+3 项内存 FIFO（`MAX_IN_MEMORY_SCREENSHOTS = 3`，对齐 Anthropic 官方默认）中」
+的那些图像——被淘汰的截图从 provider 上下文剔除，不再无限累积；不带 marker 的
+消息原样放行，其它工具的图像不受影响。
 
-批量动作支持截图、Cua overlay 指示、左右/中键点击、双击/像素三击、拖拽、Unicode 输入、按键/快捷键、滚动和等待。`mouse_move` 在固定 v0.12.5 的 window scope 只移动可见 agent overlay，结果会明确报告 `nativeHover: false`，不声称触发 macOS hover。上游没有 key-down/up，因此 `hold_key` 不在通用自定义 schema 中，直接调用也会明确拒绝。AX double click 使用 Cua `double_click`；AX triple click 被拒绝，像素 triple click 继续使用 count=3。`left_mouse_down -> mouse_move* -> left_mouse_up` 只允许出现在同一批连续序列，并合并为一次真实 Cua `drag`。
+## Provider 适配
 
-所有坐标、duration/duration_ms 和 scroll amount 在任何浮点到整数转换前都必须 finite 且处于技术边界内（坐标绝对值不超过 1,000,000；duration 0–10 秒；scroll 1–50）。每个已落定 batch 都重新取得目标状态并返回最新 PNG 和 AX metadata，同时返回真实观察到的 foreground App/window 与 focus drift，而不是把 target 伪装成 foreground。
+Anthropic `anthropic-messages` 且命中白名单（claude-sonnet-5、claude-opus-4-8/
+4-7/4-6、claude-sonnet-4-6、claude-opus-4-5 前缀）时，扩展在 provider 请求边界
+把 `computer` 替换为官方 typed tool `computer_20251124` 并合并
+`anthropic-beta: computer-use-2025-11-24` header；typed tool 仍可能发出支持集
+之外的动作（如 `mouse_move`），宿主以 `unsupported_action` 预校验拒绝、如实
+失败。其它 provider 使用通用 `actions:[...]` 自定义 schema；不承诺 OpenAI 原生
+`computer_call` / `computer_call_output`。
 
-## 生命周期与急停
+## 错误语义
 
-只有一个 Cua 操作可处于 in-flight；并发调用返回 `computer_busy`。会话释放会结束其 Cua session，App 释放全部桌面状态时会停止 daemon/proxy。
+失败响应统一为 `{ ok:false, error, runtimeError:{ code, message, retryable,
+requiresObservation } }`；`retryable:true` 只在满足 `requiresObservation`（先
+重新观察）后才可重试，绝不表示盲重试。当前宿主实际发出的稳定码：
 
-急停和 transport cancel 不会在主线程对 MCP 串行队列执行 `sync`。它们会：
+- `unsupported_protocol_version` / `unsupported_platform` /
+  `driver_unavailable`：不可重试；修协议版本、平台（仅 macOS）或打包驱动。
+- `missing_session`：请求缺 sessionKey，不可重试。
+- `target_unavailable`：没有钉住精确 target 或 launch 未返回精确 pid/window；
+  用 `open_application` 建立目标后重试。
+- `target_handoff_untrusted`：target 交接不权威（别名替换、窗口归属校验失败、
+  钉住后使用 App 切换快捷键）；重新 `open_application`。
+- `stale_snapshot`：动作绑定旧 AX snapshot；重新观察定位。
+- `mutation_outcome_unknown`（带 `outcomeUnknown:true`）：mutation 后果未知；
+  禁止盲重放，观察后再决定下一步。
+- `unsupported_action`：批预校验拒绝，未执行任何动作；改用支持集内动作。
+- `coordinate_out_of_bounds`：坐标超出最新交付截图像素空间；message 含有效
+  范围，重新观察取坐标。
+- `cua_driver_rpc_timeout`：driver 单次 RPC 超过 32s；若发生在 mutation 之后按
+  未知后果处理。
+- `desktop_already_active`：driver 被同会话另一操作占用且超过宿主有界重试预算
+  （约 2.5s 内多次退避）；等当前桌面操作结束再重试。
 
-1. 原子递增 cancellation generation；
-2. 立即向当前登记的 daemon/proxy PID 发 `SIGTERM`；
-3. 由子进程退出唤醒可能阻塞的 MCP `poll/read`；
-4. 由 transport 所属队列 bounded reap、关闭 liveness/stdio、注销 `Process` identity 并清 socket；延迟强杀只针对仍登记的同一个 `Process` 对象，不保留可误杀 PID reuse 的裸 PID。
+## 并发与取消
 
-新调用捕获 generation；取消前排队或在 spawn 中竞态出现的进程都会 fail closed。任何 cancellation、timeout、child exit 或协议失败都会终止该 generation；下一次调用会启动全新 daemon/proxy。若写动作已经发出但 transport 或最终 observation 失败，响应保留已完成 outcomes、标记 `outcomeUnknown`，明确禁止盲重试，并清 target 要求重新打开/观察。
-
-认证、Touch ID、密码或授权提示被识别为 `user_handoff_required`：PipiUI 不尝试填写或永久拒绝，用户完成系统/应用提示后再让模型重试。
+宿主用 `requestTail` 串行化所有 runtime 请求；driver 返回「desktop 忙」时宿主
+在同会话内有界退避重试（20ms→1s，总预算约 2.5s），超过后报
+`desktop_already_active`。`computer_cancel` 与工具 abort 信号触发宿主
+`cancel()`：原子递增 request generation、拒绝全部挂起 RPC、清空
+target/observation/scale 缓存，并对当前 daemon/proxy generation 做
+SIGTERM→SIGKILL 有界回收、删除私有 socket；取消前排队或竞态出现的请求一律
+fail closed，下一次调用启动全新 generation。
 
 ## 固定 helper 与签名
 
-Electron 打包侧由 `Electron/scripts/fetch-cua-driver.mjs` + `Electron/cua-driver-assets.json`
-固定各架构的 cua-driver slice（版本契约同时写进
-`pi-ext/packages/computer-agent/skills/cua-driver-operation/SKILL.md`，pretest 会校验一致），并把 helper 安装为：
+打包侧由 `Electron/scripts/fetch-cua-driver.mjs` +
+`Electron/cua-driver-assets.json`（tag + sha256 固定，当前 v0.22.0）拉取各架构
+cua-driver slice；macOS universal 二进制按目标架构 `lipo -thin` 出单架构
+slice，打包进 `Contents/Resources/cua-driver/cua-driver`（刻意裸 Mach-O，不包
+Helper.app，避免重新触发 Gatekeeper），运行时物化为 userData 下的 detached
+host 再执行。MIT notice 安装到 `Contents/Resources/ThirdPartyNotices/`。这足够
+记录 Cua 项目自身许可，但**不代表公开再分发合规已经完成**：public release 前仍
+须从精确固定的 dependency graph 生成完整第三方 notices，并完成 MPL 组件的对应
+源码提供 gate。打包与签名一律经 `pipiui-electron-build` skill（见 `AGENTS.md` →
+Electron packaging adapter），不要手调 electron-builder。
 
-```text
-PipiUI Electron.app/Contents/MacOS/cua-driver
-```
+## 权限
 
-MIT notice 安装到 `Contents/Resources/ThirdPartyNotices/`。这足够记录 Cua 项目自身许可，但**不代表公开再分发合规已经完成**：public release 前仍须从精确固定的 dependency graph 生成完整第三方 notices，并完成 MPL 组件的对应源码提供 gate。本轮只验证本地/内部开发集成，不能声称已完成公开发布合规。
-
-固定 release helper 的实测签名元数据包含 hardened runtime，以及：
-
-```xml
-<key>com.apple.security.automation.apple-events</key><true/>
-<key>com.apple.security.device.screen-capture</key><true/>
-```
-
-因此重签不能裸用 `codesign --force --sign`，须保留 identifier/entitlements/flags/runtime。
-打包与签名一律经 `pipiui-electron-build` skill（见 `AGENTS.md` → Electron packaging adapter），
-不要手调 electron-builder。
-
-## 开发与权限
-
-打包 App 从 `Contents/MacOS/cua-driver` 加载 helper。需要给 PipiUI Electron App 本身授予：
+打包 App 需要给 PipiUI Electron App 本身授予两项 macOS TCC 权限：
 
 1. System Settings -> Privacy & Security -> Screen Recording
 2. System Settings -> Privacy & Security -> Accessibility
 
-权限变化后应完全退出并重启 App，以重建 embedded daemon generation。dev 模式（`npm run dev`）的 TCC 身份不等价于签名后的 `PipiUI Electron.app`，不能作为产品权限验收。
+Computer Use 设置面板（`computer-use-permissions.ts`）实时显示两项状态并可直接
+打开对应 System Settings 面板请求授权；driver 以
+`--permission-mode unrestricted` embedded 运行，权限闸门在 App 层。权限变化后应
+完全退出并重启 App，以重建 embedded daemon generation。dev 模式
+（`npm run dev`）的 TCC 身份不等价于签名后的 `PipiUI Electron.app`，不能作为
+产品权限验收。
 
 ## 验证边界
 
-自动测试覆盖真实 Unix socket 的 fake MCP initialize/host attribution、timeout 后 generation teardown/reap/自动重启、parent-liveness launch flags、精确 bundle、primary window 消失但 sibling 存活、session-pinned AX token、模型生命周期/AX/像素路由指引、数值边界、overlay/hold/double/triple 语义、最终观察失败的 unknown-outcome、真实 foreground/focus metadata、坐标/letterbox、急停无队列阻塞、固定 artifact/hash、nested signing 顺序与输入框不抢焦点。
-
-Electron 的 Computer Task 面板只应显示一个 `computer-use` episode；Task Checkpoint、guarded-block receipts 和 Workflow 状态属于结构化详情，不应伪装成多个子 Agent。截图不会因为新结果自动展开，避免历史或新结果立即排版大段 AX 内容。
+自动测试覆盖 broker 一次性 token/权限闸门、driver generation 启动/teardown/
+reap、MCP initialize、精确 bundle、primary window 消失但 sibling 存活、
+snapshot 绑定与 `stale_snapshot`、批预校验与逐动作 outcomes、
+`actionable_context_changed`/`snapshot_changed` 批中断、坐标边界检查与
+scale 映射、`mutation_outcome_unknown`、FIFO marker prune+inject、AX 裁剪上限、
+Anthropic typed tool 替换与 beta header、`/usr/bin/open` 拦截。
 
 仍需在主 checkout 单独完成：
 
-1. 通过 `pipiui-electron-build` 在主 checkout 生成 canonical `build/PipiUI Electron.app`，核对 helper、外层 App 签名/entitlements 和产物 freshness；
+1. 通过 `pipiui-electron-build` 在主 checkout 生成 canonical
+   `build/PipiUI Electron.app`，核对 helper、外层 App 签名/entitlements 和产物
+   freshness；
 2. PipiUI 单一 TCC 归属与权限重启；
 3. TextEdit 编辑保存、Finder 文件操作、浏览器表单、Office 编辑导出和跨工具任务；
-4. 两个真实 Pi session 并发、急停和 target-loss；
-5. 登录、Touch ID、密码提示只返回 user handoff。
-6. 公开分发前生成精确 v0.12.5 dependency notices/MPL source package；本地打包验收不能替代该 release gate。
+4. 两个真实 Pi session 并发、取消和 target-loss；
+5. 登录、Touch ID、密码提示等系统/应用保护弹窗只由用户在真实桌面处理，宿主不
+   代填也不永久拒绝。
 
-在这些 live checks 完成前，只能报告源码和自动测试通过，不能报告 Computer Use 产品验收完成。
+在这些 live checks 完成前，只能报告源码和自动测试通过，不能报告 Computer Use
+产品验收完成。

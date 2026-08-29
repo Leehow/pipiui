@@ -229,7 +229,7 @@ type ExtInvokeResult<T> =
 
 **D6. 设置 = JSON Schema 驱动，不新开存储族。** 键强制 `ext.<id>.*`。`scope: "app"` 落入 App profile 设置文件的 `extensions[id]` 槽（原子 RMW）；`scope: "project"` 落入 `{project}/.pi/agent/ext-settings/<id>.json`。读写走泛化 `getExtensionSettings(id)` / `updateExtensionSettings(id, patch)`，按 manifest schema 校验；非 schema 属性拒绝。`"format": "secret"` → secret vault，永不写入上述 JSON。加载时若磁盘 `settingsVersion` < manifest，按 `migrations[]` 顺序执行；失败则该扩展进入 `error`，不部分应用。
 
-**D7. UI 贡献点由可逆 registry 支撑。** 贡献点：`panels` / `settingsSections` / `toolRenderers` / `slashCommands` / `themes` / `statusBar`。每个 `register*(extId, contribution)` 返回 disposer，按扩展 ID 归集。**禁用 = 整组 dispose。** 核心功能（Subagents / Plan / Browser / Document / Terminal、内置斜杠、computer_task 卡等）自己走同一机制。app 半三种形态：① 声明式/schema（首选，L0）；② 受控 React 组件，只注入 D8 收窄 API，拿不到完整 `window.pipiHost`；③ 隔离 webview 本规范不实现。
+**D7. UI 贡献点由可逆 registry 支撑。** 贡献点：`panels` / `settingsSections` / `toolRenderers` / `slashCommands` / `themes` / `statusBar`。每个 `register*(extId, contribution)` 返回 disposer，按扩展 ID 归集。**禁用 = 整组 dispose。** 核心功能（Subagents / Plan / Browser / Document / Terminal、内置斜杠、`computer`/`open_application` 工具卡等）自己走同一机制。app 半三种形态：① 声明式/schema（首选，L0）；② 受控 React 组件，只注入 D8 收窄 API，拿不到完整 `window.pipiHost`；③ 隔离 webview 本规范不实现。
 
 **D8. 扩展 API = 按声明注入的类型化服务，不是一袋函数。** 未声明的服务不存在于注入对象上。运行时调用未授权能力 → `capability_denied`。空 `capabilities` 仅允许 L0。类型包 `@pipiui/extension-api` 在 M3；禁止把完整 host-api 当扩展公共 API。
 

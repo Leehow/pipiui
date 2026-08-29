@@ -5,7 +5,7 @@
  * `{ version: 1, success, action, diagnostics, data }`.
  * `data` is action-specific but always JSON-safe; diagnostics are the exact
  * `agents.ts` parser/catalog diagnostics. This module never dispatches an
- * agent, mounts desktop, changes search grants, or bypasses project-agent
+ * agent, changes search grants, or bypasses project-agent
  * confirmation. It only reads definitions or safely writes a user/project
  * package after explicit `install`.
  */
@@ -514,7 +514,7 @@ export function registerSubagentManagementTool(pi: ExtensionAPI): void {
 			"UI-independent management API for PipiUI agent definitions. It never dispatches or starts an agent.",
 			"list returns current user/project/bundled definitions with origin, format, diagnostics and static permission summaries.",
 			"inspect returns one definition; validate uses the runtime agents.ts parser; scaffold produces a least-privilege schema:1 package; install safely writes only a validated user/project package.",
-			"Every result is structured JSON `{version:1, success, action, diagnostics, data}`. Runtime dispatch still applies disabled-tools, extension availability, desktop per-task grants, role/depth limits, and project confirmation separately.",
+			"Every result is structured JSON `{version:1, success, action, diagnostics, data}`. Runtime dispatch still applies disabled-tools, extension availability, role/depth limits, and project confirmation separately.",
 		].join(" "),
 		parameters: makeStrictJsonSchema(SubagentManageParams),
 		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {

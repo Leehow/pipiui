@@ -1,5 +1,12 @@
 # PipiUI 单 Agent 自学习 Computer Use 实现
 
+> **Superseded（2026-08-29）**：本计划已被随后的 computer-use 重构取代。`computer_task`、
+> Computer Use Agent、guarded action block 与 Workflow Memory 均已删除；当前实现是内置
+> `cua-extension`（`Electron/resources/runtime/extensions/cua-extension/`）在主会话直接
+> 注册 `computer` / `open_application` 两个工具，桌面能力不再委派给任何子 agent。现状见
+> [`docs/computer-use.md`](../computer-use.md) 与
+> [`docs/computer-runtime-v1.md`](../computer-runtime-v1.md)。
+
 Work ID: `pipiui-single-agent-computer-use`
 Status: `Source Complete / Integration Blocked`
 Last updated: `2026-08-19`

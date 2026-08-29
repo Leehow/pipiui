@@ -119,7 +119,6 @@ function workerToolNames(agent: AgentConfig, mounted: string[], ownership = exte
 	return resolveSubagentToolSelection({
 		declaredTools: patched.declaredTools,
 		disabledTools: [],
-		hasDesktopCapability: false,
 		allowRecursiveDelegation: false,
 		availableExtensionTools: [],
 	}).names;
@@ -343,7 +342,6 @@ test("addTools of a real extension tool keep provenance until mount and owned ex
 		const omitted = resolveSubagentToolSelection({
 			declaredTools: mounted.declaredTools,
 			disabledTools: [],
-			hasDesktopCapability: false,
 			allowRecursiveDelegation: false,
 			availableExtensionTools: [],
 		});
@@ -388,7 +386,6 @@ test("runtime registerTool ownership, not snapshot providedTools, feeds worker -
 		assert.equal(resolveSubagentToolSelection({
 			declaredTools: dispatchToolPatch(agent, ["ext.owner"]).declaredTools,
 			disabledTools: [],
-			hasDesktopCapability: false,
 			allowRecursiveDelegation: false,
 			availableExtensionTools: [],
 		}).flag, "--tools");
@@ -940,7 +937,6 @@ test("reserved and host-issued addTools are denied", () => {
 		const selection = resolveSubagentToolSelection({
 			declaredTools: patched.declaredTools?.filter((name) => !isDelegationTool(name)),
 			disabledTools: [],
-			hasDesktopCapability: false,
 			hasMemoryBrokerCapability: false,
 			hasSessionRecall: false,
 			hasSkillLoader: false,
