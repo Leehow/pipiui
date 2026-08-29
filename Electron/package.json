@@ -6,7 +6,6 @@
     "apps/*"
   ],
   "scripts": {
-    "sync:computer-agent": "node scripts/sync-computer-agent-runtime.mjs",
     "runtime:prepare": "node scripts/fetch-pi-runtime.mjs",
     "runtime:check": "node scripts/fetch-pi-runtime.mjs --check",
     "runtime:update": "node scripts/fetch-pi-runtime.mjs --force",
@@ -18,10 +17,6 @@
     "runtime:check:linux": "node scripts/fetch-pi-runtime.mjs --platform linux --arch x64 --check",
     "test:secret-vault": "vitest run --exclude '**/dist/**' --exclude 'resources/runtime/**' packages/pi-backend/test/secret-vault.test.ts packages/pi-backend/test/pipiui-secret-vault.test.ts packages/pi-backend/test/secret-vault-host-contract.test.ts packages/ui/src/ModelVisibilityModal.test.tsx packages/ui/src/App.secret-redact.test.tsx packages/ui/src/UserMessageBubble.test.tsx apps/electron/src/main/linux-secret-service.test.ts apps/electron/src/main/secret-vault-key.test.ts packages/pi-backend/test/spawn-assembly.test.ts apps/electron/packaging-contract.test.ts",
     "benchmark:agent-aging": "node scripts/agent-aging.mjs",
-    "predev": "npm run sync:computer-agent",
-    "predev:watch": "npm run sync:computer-agent",
-    "prebuild": "npm run sync:computer-agent",
-    "pretest": "node scripts/sync-computer-agent-runtime.mjs --check",
     "dev": "npm run dev -w @pipiui/electron",
     "dev:watch": "npm run dev:watch -w @pipiui/electron",
     "dev:browser": "npm run build -w @pipi/host-api && npm run build -w @pipiui/extension-api && npm run build -w @pipiui/ui && npm run build -w @pipi/pi-backend && npm run build -w @pipiui/server && PIPIUI_SERVER_HOST=127.0.0.1 PIPIUI_SERVER_PORT=5173 PIPIUI_SERVER_PUBLIC_ORIGIN=http://localhost:5173 npm run start -w @pipiui/server",

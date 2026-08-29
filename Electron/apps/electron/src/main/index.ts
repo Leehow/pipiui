@@ -1,4 +1,4 @@
-import { app, BaseWindow, desktopCapturer, dialog, ipcMain, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
+import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
 import { join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
@@ -17,6 +17,7 @@ import { BrowserMobileWindowController } from './browser-mobile-window.js'
 import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { resolveSystemProxyEnvironment } from './system-proxy.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
+import type { ComputerImagePipeline } from './computer-image-pipeline.js'
 import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
@@ -207,7 +208,22 @@ if (app) {
       env: process.env,
       userData
     })
-    const computer = new CuaDriverHost(assets.cuaDriver, display)
+    // Screenshots delivered to the model are bounded to a 1568px long edge; the
+    // host maps model coordinates back to driver pixels with these scale factors.
+    const computerImagePipeline: ComputerImagePipeline = {
+      prepareScreenshot(png, maxLongEdge) {
+        const image = nativeImage.createFromBuffer(png)
+        const size = image.getSize()
+        if (!(size.width > 0) || !(size.height > 0)) throw new Error('Cua Driver screenshot is not decodable')
+        const longEdge = Math.max(size.width, size.height)
+        if (longEdge <= maxLongEdge) return { png, width: size.width, height: size.height, scaleX: 1, scaleY: 1 }
+        const width = Math.max(1, Math.round(size.width * (maxLongEdge / longEdge)))
+        const height = Math.max(1, Math.round(size.height * (maxLongEdge / longEdge)))
+        const resized = image.resize({ width, height, quality: 'best' })
+        return { png: resized.toPNG(), width, height, scaleX: width / size.width, scaleY: height / size.height }
+      },
+    }
+    const computer = new CuaDriverHost(assets.cuaDriver, display, undefined, undefined, computerImagePipeline)
     // Host chrome (queues, pipiui-settings, model catalog) stays under this Electron
     // profile. Coding Pi homes are per opened project: `{project}/.pi/agent`. Never
     // import or share `~/.pi/agent`.
@@ -252,7 +268,6 @@ if (app) {
       browserWatch: (request, sessionId) => handleBrowserWatchEvent(request, sessionId, browser, watchCallbacks),
       terminalAction: (request, sessionId) => terminalHost.toolAction(sessionId, request as any),
       terminalSessionDeleted: sessionId => terminalHost.disposeSession(sessionId),
-      computerAction: request => computer.handle(request),
       computerDescriptor: display,
       computerUsable: () => computer.usable(),
       authHelperPath: assets.sourceRoot ? join(assets.sourceRoot, 'auth', 'pi-auth-helper.mjs') : undefined,

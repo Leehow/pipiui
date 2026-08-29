@@ -15,7 +15,6 @@ async function started() {
     onPlanEvent: (event, sessionId) => received.push({ channel: "plan", sessionId, payload: event }),
     onBrowserAction: async (event, sessionId) => { received.push({ channel: "browser", sessionId, payload: event }); return { ok: true, text: "page text" } },
     onTerminalAction: async (event, sessionId) => { received.push({ channel: "terminal", sessionId, payload: event }); return { ok: true, terminalId: "term-1" } },
-    onComputerAction: async (event, sessionId) => { received.push({ channel: "computer", sessionId, payload: event }); return { ok: true, screenshotId: "shot" } },
     onVaultAction: async (event, sessionId) => { received.push({ channel: "vault", sessionId, payload: event }); return { secrets: [{ id: "1", name: "demo", envName: "DEMO_TOKEN" }], mounts: [], sessionId } },
     onStructuredOutput: async (event, sessionId) => {
       received.push({ channel: "structured_output", sessionId, payload: event });
@@ -139,29 +138,6 @@ describe("HostBridge", () => {
     expect(received.at(-1)).toEqual({ channel: "terminal", sessionId: "session-1", payload: { action: "list", sessionId: "forged" } });
     bridge.unregister("session-1");
     expect((await post(port, { schemaVersion: 1, sessionCapability: capability, action: "terminal_action", event: { action: "list" } })).status).toBe(403);
-  });
-
-  it("routes computer actions only with the separate per-session capability", async () => {
-    const { port, received, bridge } = await started();
-    const computerCapability = bridge.registerComputer("session-1");
-    const response = await post(port, { sessionKey: "session-1", computerCapability, protocolVersion: 1, action: "computer_batch", actions: [{ type: "screenshot" }] });
-    expect(await response.json()).toEqual({ ok: true, screenshotId: "shot" });
-    expect(received.at(-1)).toMatchObject({ channel: "computer", sessionId: "session-1" });
-    expect((await post(port, { sessionKey: "session-1", computerCapability: "forged", protocolVersion: 1, action: "computer_batch", actions: [] })).status).toBe(403);
-  });
-
-  it("preserves only the closed typed CUA RPC timeout code across the computer bridge", async () => {
-    bridge = new HostBridge({
-      onAgentEvent: () => {},
-      onPlanEvent: () => {},
-      onComputerAction: async () => { throw Object.assign(new Error("private driver detail"), { code: "cua_driver_rpc_timeout" }); },
-    });
-    const port = await bridge.listen();
-    const computerCapability = bridge.registerComputer("session-1");
-    const response = await post(port, { sessionKey: "session-1", computerCapability, protocolVersion: 1, action: "computer_batch", actions: [{ type: "screenshot" }] });
-    const result = await response.json();
-    expect(result).toMatchObject({ ok: false, error: "Cua Driver request timed out", runtimeError: { code: "cua_driver_rpc_timeout", message: "Cua Driver request timed out" } });
-    expect(JSON.stringify(result)).not.toContain("private driver detail");
   });
 
   it("serves only POST /rpc", async () => {

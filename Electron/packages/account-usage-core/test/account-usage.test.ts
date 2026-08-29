@@ -16,6 +16,7 @@ import {
   parseGrokWindows,
   parseKimiWindows,
   parseMoonshotBalance,
+  parseOpenCodeGoUsage,
   parseOpenRouterBalance,
   parseQoderWindows,
   parseQwenWindows,
@@ -50,6 +51,31 @@ describe("provider parsers", () => {
     const windows = openCodeGoWindows([{ createdMs: now - 60_000, cost: 6 }], now);
     expect(windows.map(w => w.usedPercent)).toEqual([50, 20, 10]);
     expect(windows.map(w => w.title)).toEqual(["5小时本机用量", "周本机用量", "月本机用量"]);
+  });
+
+  it("parses OpenCode Go official usage windows", () => {
+    const rollingReset = "2026-08-29T07:38:42.348Z";
+    const weeklyReset = "2026-08-31T00:00:00.348Z";
+    const monthlyReset = "2026-09-08T01:22:14.348Z";
+    const windows = parseOpenCodeGoUsage({
+      usage: {
+        rolling: { status: "ok", percent: 13, resetsAt: rollingReset },
+        weekly: { status: "ok", percent: 54, resetsAt: weeklyReset },
+        monthly: { status: "ok", percent: 67, resetsAt: monthlyReset },
+      },
+    });
+    expect(windows.map(w => [w.id, w.usedPercent, w.label, w.title])).toEqual([
+      ["fiveHour", 13, "5h", "5小时额度"],
+      ["weekly", 54, "周", "周额度"],
+      ["monthly", 67, "月", "月额度"],
+    ]);
+    expect(windows[0].resetsAt).toBe(Date.parse(rollingReset));
+    expect(windows[1].resetsAt).toBe(Date.parse(weeklyReset));
+    expect(windows[2].resetsAt).toBe(Date.parse(monthlyReset));
+    expect(parseOpenCodeGoUsage({ usage: { weekly: { percent: 54 } } })).toEqual([
+      expect.objectContaining({ id: "weekly", usedPercent: 54, label: "周" }),
+    ]);
+    expect(parseOpenCodeGoUsage({})).toEqual([]);
   });
 
   it("isolates Grok's protobuf parser", () => {
@@ -267,6 +293,53 @@ describe("built-in adapters", () => {
     const result = await monitor.snapshot("opencode-go", true);
     expect(result.status).toBe("ready");
     if (result.status === "ready") expect(result.snapshot.source).toBe("local");
+  });
+  it("prefers OpenCode Go server usage over local rows", async () => {
+    const readLocalUsage = vi.fn(async () => [{ createdMs: Date.now() - 1000, cost: 6 }]);
+    const fetchSpy = vi.fn(async () => response({
+      usage: {
+        rolling: { status: "ok", percent: 13, resetsAt: "2026-08-29T07:38:42.348Z" },
+        weekly: { status: "ok", percent: 54, resetsAt: "2026-08-31T00:00:00.348Z" },
+        monthly: { status: "ok", percent: 67, resetsAt: "2026-09-08T01:22:14.348Z" },
+      },
+    })) as unknown as typeof fetch;
+    const serverFirst = new AccountUsageMonitor({
+      fetch: fetchSpy,
+      env: { OPENCODE_API_KEY: "go-key" },
+      readAuth: async () => ({}),
+      readLocalUsage,
+    });
+    const result = await serverFirst.snapshot("opencode-go", true);
+    expect(result.status).toBe("ready");
+    if (result.status === "ready") {
+      expect(result.snapshot.source).toBe("subscription");
+      expect(result.snapshot.windows.map(w => w.usedPercent)).toEqual([13, 54, 67]);
+    }
+    expect(readLocalUsage).not.toHaveBeenCalled();
+  });
+  it("falls back to OpenCode Go local rows when the server request fails", async () => {
+    const now = Date.now();
+    const fetchSpy = vi.fn(async () => { throw new Error("offline"); }) as unknown as typeof fetch;
+    const ready = new AccountUsageMonitor({
+      fetch: fetchSpy,
+      env: { OPENCODE_API_KEY: "go-key" },
+      readAuth: async () => ({}),
+      readLocalUsage: async () => [{ createdMs: now - 1000, cost: 6 }],
+      now: () => now,
+    });
+    const readyResult = await ready.snapshot("opencode-go", true);
+    expect(readyResult.status).toBe("ready");
+    if (readyResult.status === "ready") {
+      expect(readyResult.snapshot.source).toBe("local");
+      expect(readyResult.snapshot.windows[0].usedPercent).toBeCloseTo(50);
+    }
+    const empty = new AccountUsageMonitor({
+      fetch: fetchSpy,
+      env: { OPENCODE_API_KEY: "go-key" },
+      readAuth: async () => ({}),
+      readLocalUsage: async () => [],
+    });
+    await expect(empty.snapshot("opencode-go", true)).resolves.toMatchObject({ status: "no-data" });
   });
   it("loads GLM quota from ZAI_CODING_CN_API_KEY when no auth entry exists", async () => {
     const envOnly = new AccountUsageMonitor({ fetch: fakeFetch, env: { ZAI_CODING_CN_API_KEY: "cn-key" }, readAuth: async () => ({}) });

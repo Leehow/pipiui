@@ -300,10 +300,12 @@ describe("QuotaStore", () => {
     try {
       // agentDir points at the temp dir so a real ~/.pi/agent/.env (which may
       // carry OPENCODE_API_KEY) never satisfies the credential gate.
-      const withoutKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "  " } }) });
+      const withoutKeyFetch = vi.fn(async () => { throw new Error("offline"); });
+      const withoutKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "  " } }), fetch: withoutKeyFetch as unknown as typeof fetch });
       expect(await withoutKey.snapshot("opencode-go", true)).toBeNull();
+      expect(withoutKeyFetch).not.toHaveBeenCalled();
 
-      const withKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }) });
+      const withKey = new QuotaStore({}, { now: () => now, agentDir: directory, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }), fetch: async () => { throw new Error("offline"); } });
       const snapshot = await withKey.snapshot("opencode-go", true);
       expect(snapshot?.provider).toBe("opencodeGo");
       expect(snapshot?.windows.map(window => window.usedPercent)).toEqual([expect.closeTo(5 / 12 * 100), expect.closeTo(5 / 30 * 100), expect.closeTo(5 / 60 * 100)]);
@@ -315,10 +317,27 @@ describe("QuotaStore", () => {
   it("lets an injected OpenCode local reader override the default auth/database capability", async () => {
     const now = Date.UTC(2026, 7, 13, 12);
     const readLocalUsage = vi.fn(async () => [{ createdMs: now - 1_000, cost: 6 }]);
-    const store = new QuotaStore({ OPENCODE_API_KEY: "go-key" }, { now: () => now, readOpenCodeAuth: async () => "{}", openCodeDatabasePath: "/must/not/be/opened", readLocalUsage });
+    const store = new QuotaStore({ OPENCODE_API_KEY: "go-key" }, { now: () => now, readOpenCodeAuth: async () => "{}", openCodeDatabasePath: "/must/not/be/opened", readLocalUsage, fetch: async () => { throw new Error("offline"); } });
     const snapshot = await store.snapshot("opencode-go", true);
     expect(snapshot?.windows[0].usedPercent).toBe(50);
     expect(readLocalUsage).toHaveBeenCalledOnce();
+  });
+
+  it("reads OpenCode Go usage from the official API when a key is present", async () => {
+    const store = new QuotaStore({ OPENCODE_API_KEY: "go-key" }, {
+      readOpenCodeAuth: async () => "{}",
+      fetch: (async () => new Response(JSON.stringify({
+        usage: {
+          rolling: { percent: 13, resetsAt: "2026-08-29T07:38:42.348Z" },
+          weekly: { percent: 54, resetsAt: "2026-08-31T00:00:00.348Z" },
+          monthly: { percent: 67, resetsAt: "2026-09-08T01:22:14.348Z" },
+        },
+      }), { status: 200 })) as unknown as typeof fetch,
+    });
+    const snapshot = await store.snapshot("opencode-go", true);
+    expect(snapshot?.provider).toBe("opencodeGo");
+    expect(snapshot?.accountLabel).toBe("OpenCode Go 额度");
+    expect(snapshot?.windows.map(window => window.usedPercent)).toEqual([13, 54, 67]);
   });
 
   it("falls back to assistant message costs when the OpenCode database has no part table", async () => {
@@ -333,7 +352,7 @@ describe("QuotaStore", () => {
       database.close();
     }
     try {
-      const store = new QuotaStore({}, { now: () => now, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }) });
+      const store = new QuotaStore({}, { now: () => now, openCodeDatabasePath: databasePath, readOpenCodeAuth: async () => JSON.stringify({ "opencode-go": { key: "go-key" } }), fetch: async () => { throw new Error("offline"); } });
       expect((await store.snapshot("opencode-go", true))?.windows[0].usedPercent).toBe(50);
     } finally {
       await rm(directory, { recursive: true, force: true });

@@ -15,28 +15,24 @@ import { createNativeCuaClient, type NativeCuaClient } from "../../../resources/
 // version itself is pinned by host-capability-api.test.ts.)
 
 /**
- * cua-extension migration contract.
+ * cua-extension contract tests.
  *
  * The extension package `resources/runtime/extensions/cua-extension` owns the
- * mounting of the two frozen CUA tools (`computer` / `open_application`); the
- * tool layer is migrated byte-identical from the built-in
- * `pipiui-computer-use.ts` strategy, with the driver transport swapped to the
- * versioned Host Capability API broker (`host_capability` wire action,
- * `native.cua` op, one-time capability token; the desktop-grant capability
- * still rides inside params). These tests pin, in order: the schema contract
- * against the legacy twin, the registration path (manifest → loader → spawn
- * `-e`), the broker authorization semantics (deny codes surfaced, driver
- * untouched), and the driver transport/cleanup path (cancel op with the same
- * requestID, legacy error phrasing).
+ * computer-use surface (`computer` / `open_application`) in the main session;
+ * driver transport is the versioned Host Capability API broker
+ * (`host_capability` wire action, `native.cua` op, one-time capability token;
+ * the desktop-grant capability still rides inside params). These tests pin, in
+ * order: the model-facing schema honesty against the host-supported action
+ * set, the registration path (manifest → loader → spawn `-e`), the broker
+ * authorization semantics (deny codes surfaced, driver untouched), the driver
+ * transport/cleanup path (cancel op with the same requestID), the host wire
+ * metadata pass-through (`screenshot` scale block, `outcomes`), and the
+ * provider-context screenshot prune+inject.
  */
 
 const extensionDir = join(
   dirname(fileURLToPath(import.meta.url)),
   "../../../resources/runtime/extensions/cua-extension",
-);
-const legacyStrategyPath = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "../../../resources/runtime/extensions/pipiui-computer-use.ts",
 );
 
 type CapturedTool = {
@@ -71,8 +67,8 @@ function capturePi() {
 // ---------------------------------------------------------------------------
 // Stub loopback bridge: mirrors the pinned HostBridge semantics (session
 // capability auth, 403 deny shape) and adds the `host_capability_token` mint op
-// the extension's default token provider calls (land-phase contract; see the
-// extension README). The broker itself is the real cherry-picked one.
+// the extension's default token provider calls (see the extension README). The
+// broker itself is the real one.
 // ---------------------------------------------------------------------------
 
 type StubBridge = {
@@ -172,6 +168,7 @@ function makeFakeDriver() {
         displayID: 7,
         width: 1440,
         height: 900,
+        screenshot: { width: 1200, height: 750, scaleX: 1.2, scaleY: 1.2 },
         accessibility: { elements: [{ role: "AXButton", element_token: "tok-1" }], elementCount: 1 },
       };
     }
@@ -180,13 +177,14 @@ function makeFakeDriver() {
       return {
         ok: true,
         batchOK: true,
-        outcomes: [],
+        outcomes: [{ index: 0, type: "screenshot", status: "ok" }],
         screenshotId: "shot-batch",
         base64: PNG_BASE64,
         mimeType: "image/png",
         displayID: 7,
         width: 1440,
         height: 900,
+        screenshot: { width: 1200, height: 750, scaleX: 1.2, scaleY: 1.2 },
       };
     }
     if (params.action === "computer_cancel") {
@@ -233,13 +231,12 @@ function makeBroker(options: {
 
 // ---------------------------------------------------------------------------
 // Module loading: env must be set before the extension entry is imported
-// (module-level env gate, same as the legacy strategy).
+// (module-level env gate).
 // ---------------------------------------------------------------------------
 
 let stub: StubBridge | undefined;
 let fake: ReturnType<typeof makeFakeDriver>;
 let extensionEntry: { default: (pi: object) => void };
-let legacyEntry: { default: (pi: object) => void };
 const savedEnv: Record<string, string | undefined> = {};
 
 beforeAll(async () => {
@@ -260,7 +257,6 @@ beforeAll(async () => {
     process.env[key] = value;
   }
   extensionEntry = await import(pathToFileURL(join(extensionDir, "agent", "index.ts")).href);
-  legacyEntry = await import(pathToFileURL(legacyStrategyPath).href);
 });
 
 afterAll(async () => {
@@ -280,54 +276,57 @@ function mountModule(entry: { default: (pi: object) => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Frozen tool schema contract (twin = legacy pipiui-computer-use.ts).
+// 1. Schema honesty: the model-facing schema matches the host-supported set.
 // ---------------------------------------------------------------------------
 
-describe("cua-extension frozen tool schema contract", () => {
-  it("mounts exactly the two frozen tools through the extension agent half", () => {
+describe("cua-extension schema honesty", () => {
+  // Kept in sync with SUPPORTED_COMPUTER_ACTIONS in CuaDriverHost.
+  const SUPPORTED_ACTIONS = [
+    "screenshot", "click", "left_click", "right_click", "middle_click",
+    "double_click", "triple_click", "type", "key", "keypress", "scroll",
+    "wait", "invoke_menu",
+  ];
+  const REMOVED_ACTIONS = [
+    "mouse_move", "drag", "left_click_drag", "left_mouse_down",
+    "left_mouse_up", "typeahead",
+  ];
+
+  /** TypeBox union → JSON Schema anyOf of const literals. */
+  function enumConsts(node: any): string[] {
+    return Array.isArray(node?.anyOf)
+      ? node.anyOf
+        .map((branch: any) => branch?.const)
+        .filter((value: any) => typeof value === "string")
+      : [];
+  }
+
+  it("mounts exactly the two computer-use tools through the extension agent half", () => {
     const { tools } = mountModule(extensionEntry);
     expect(tools.map((tool) => tool.name).sort()).toEqual(["computer", "open_application"]);
   });
 
-  it("extension-mounted schemas, labels and descriptions are identical to the legacy strategy", () => {
-    const extension = mountModule(extensionEntry);
-    const legacy = mountModule(legacyEntry);
-    for (const name of ["computer", "open_application"] as const) {
-      const tool = extension.byName.get(name)!;
-      const twin = legacy.byName.get(name)!;
-      expect(twin, `legacy twin for ${name}`).toBeDefined();
-      expect(tool.parameters).toEqual(twin.parameters);
-      expect(tool.label).toBe(twin.label);
-      expect(tool.description).toBe(twin.description);
-      expect(JSON.parse(JSON.stringify(tool.parameters))).toMatchSnapshot(`${name} schema`);
+  it("computer action enums contain exactly the 13 host-supported types", () => {
+    const { byName } = mountModule(extensionEntry);
+    const schema = JSON.parse(JSON.stringify(byName.get("computer")!.parameters));
+    const single = enumConsts(schema.properties?.action);
+    const batched = enumConsts(schema.properties?.actions?.items?.properties?.type);
+    expect(single.sort()).toEqual([...SUPPORTED_ACTIONS].sort());
+    expect(batched.sort()).toEqual([...SUPPORTED_ACTIONS].sort());
+    for (const removed of REMOVED_ACTIONS) {
+      expect(single).not.toContain(removed);
+      expect(batched).not.toContain(removed);
     }
+    // invoke_menu carries its dot-free menu path on batch actions.
+    expect(schema.properties?.actions?.items?.properties?.path?.type).toBe("string");
   });
 
-  it("provider adaptation helpers behave identically to the legacy strategy", async () => {
-    const extension = await import(pathToFileURL(join(extensionDir, "agent", "index.ts")).href);
-    const legacy = await import(pathToFileURL(legacyStrategyPath).href);
-    // Anthropic typed-tool replacement.
-    expect(extension.replaceComputerTool([{ name: "computer", type: "function" }, { name: "bash" }]))
-      .toEqual(legacy.replaceComputerTool([{ name: "computer", type: "function" }, { name: "bash" }]));
-    expect(extension.isAnthropicComputer20251124Model({ api: "anthropic-messages", provider: "anthropic", id: "claude-opus-4-6" }))
-      .toBe(legacy.isAnthropicComputer20251124Model({ api: "anthropic-messages", provider: "anthropic", id: "claude-opus-4-6" }));
-    expect(extension.mergeBeta("computer-use-2025-11-24", "computer-use-2025-11-24"))
-      .toBe(legacy.mergeBeta("computer-use-2025-11-24", "computer-use-2025-11-24"));
-    // Legacy single-action normalization.
-    const single = { action: "screenshot" };
-    expect(extension.normalizeActions(single)).toEqual(legacy.normalizeActions(single));
-    const batch = { actions: [{ type: "click" }] };
-    expect(extension.normalizeActions(batch)).toEqual(legacy.normalizeActions(batch));
-    // Shell open interception (direct + nested-shell cases).
-    for (const command of ["open -a Safari", "env -i /usr/bin/open -a Safari", "bash -c 'open -a Safari'", "echo /usr/bin/open", "git --open x"]) {
-      const input = { command };
-      expect(extension.lifecycleShellBlockReason("bash", input))
-        .toEqual(legacy.lifecycleShellBlockReason("bash", input));
+  it("computer description does not advertise removed actions or deleted agents", () => {
+    const { byName } = mountModule(extensionEntry);
+    const description = byName.get("computer")!.description ?? "";
+    for (const removed of [...REMOVED_ACTIONS, "hold_key", "computer_task"]) {
+      expect(description).not.toContain(removed);
     }
-    // AX compaction keeps interactive elements and the pre-trim count.
-    const ax = { elements: [{ role: "AXButton", element_token: "t" }, { role: "AXStaticText" }, { role: "AXWindow" }], elementCount: 3 };
-    expect(extension.compactAccessibility(ax)).toEqual(legacy.compactAccessibility(ax));
-    expect(extension.elementIsInteractive({ role: "button" })).toBe(legacy.elementIsInteractive({ role: "button" }));
+    expect(description).not.toMatch(/Computer Use agent/i);
   });
 });
 
@@ -336,7 +335,7 @@ describe("cua-extension frozen tool schema contract", () => {
 // ---------------------------------------------------------------------------
 
 describe("cua-extension registration path", () => {
-  it("manifest pins the frozen core-capability contract and declares the agent half", () => {
+  it("manifest pins the core-capability contract and declares the agent half", () => {
     const manifest = JSON.parse(readFileSync(join(extensionDir, "pipiui-extension.json"), "utf8"));
     expect(manifest.id).toBe("cua-extension");
     expect(manifest.name).toBe("PipiUI CUA");
@@ -514,7 +513,7 @@ describe("cua-extension broker authorization semantics", () => {
 // ---------------------------------------------------------------------------
 
 describe("cua-extension driver transport and cleanup", () => {
-  it("open_application rides the broker with unchanged driver fields and renders the frozen result shape", async () => {
+  it("open_application rides the broker with unchanged driver fields and renders the tool result shape", async () => {
     fake.calls.length = 0;
     const { byName } = mountModule(extensionEntry);
     const result = (await byName.get("open_application")!.execute!("probe", {
@@ -527,7 +526,7 @@ describe("cua-extension driver transport and cleanup", () => {
     expect(op!.bundle_identifier).toBe("com.apple.TextEdit");
     expect(op!.displayID).toBe(7);
     expect(op!.requestID).toEqual(expect.any(String));
-    // Frozen result shape: metadata text + opaque marker + inline image.
+    // Tool result shape: metadata text + opaque marker + inline image.
     const text = result.content[0]?.text ?? "";
     expect(text).toContain('"openedApplication": true');
     expect(text).toContain("[PIPIUI_COMPUTER_SCREENSHOT:shot-open]");
@@ -551,6 +550,27 @@ describe("cua-extension driver transport and cleanup", () => {
     expect(text).toContain('"batchOK": true');
     expect(text).toContain("[PIPIUI_COMPUTER_SCREENSHOT:shot-batch]");
     expect(result.content[1]).toMatchObject({ type: "image", data: PNG_BASE64 });
+  });
+
+  it("passes the screenshot scale block and outcomes through metadata text and details", async () => {
+    fake.calls.length = 0;
+    const { byName } = mountModule(extensionEntry);
+    const batch = (await byName.get("computer")!.execute!("probe", {
+      actions: [{ type: "screenshot" }],
+    })) as ToolResult;
+    const batchText = batch.content[0]?.text ?? "";
+    expect(batchText).toContain('"scaleX": 1.2');
+    expect(batchText).toContain('"status": "ok"');
+    // details carry dims+scale only — never image bytes.
+    expect((batch.details as any).screenshot).toEqual({ width: 1200, height: 750, scaleX: 1.2, scaleY: 1.2 });
+    expect((batch.details as any).outcomes).toEqual([{ index: 0, type: "screenshot", status: "ok" }]);
+
+    const opened = (await byName.get("open_application")!.execute!("probe", {
+      bundle_identifier: "com.apple.TextEdit",
+    })) as ToolResult;
+    const openText = opened.content[0]?.text ?? "";
+    expect(openText).toContain('"scaleX": 1.2');
+    expect((opened.details as any).screenshot).toEqual({ width: 1200, height: 750, scaleX: 1.2, scaleY: 1.2 });
   });
 
   it("aborts send the computer_cancel cleanup op with the same requestID and keep legacy error phrasing", async () => {
@@ -604,6 +624,58 @@ describe("cua-extension driver transport and cleanup", () => {
       projectRoot: process.cwd(),
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 5. Provider-context screenshot prune+inject (the context-bloat bound).
+// ---------------------------------------------------------------------------
+
+describe("cua-extension screenshot context pruning", () => {
+  it("drops inline images evicted from the FIFO and leaves foreign toolResult images alone", async () => {
+    const ext = await import(pathToFileURL(join(extensionDir, "agent", "index.ts")).href);
+    // Retain four screenshots: the 3-entry FIFO evicts the oldest, so `a1` is
+    // gone regardless of what earlier tests retained.
+    ext.retainScreenshot("data-a1", "image/png", "a1");
+    ext.retainScreenshot("data-b2", "image/png", "b2");
+    ext.retainScreenshot("data-c3", "image/png", "c3");
+    ext.retainScreenshot("data-d4", "image/png", "d4");
+    const foreign = {
+      role: "toolResult",
+      content: [
+        { type: "text", text: "other tool output" },
+        { type: "image", data: "foreign-image", mimeType: "image/png" },
+      ],
+    };
+    const messages = [
+      {
+        role: "toolResult",
+        content: [
+          { type: "text", text: "meta\n[PIPIUI_COMPUTER_SCREENSHOT:a1]" },
+          { type: "image", data: "data-a1", mimeType: "image/png" },
+        ],
+      },
+      {
+        role: "toolResult",
+        content: [
+          { type: "text", text: "meta\n[PIPIUI_COMPUTER_SCREENSHOT:b2]" },
+          { type: "image", data: "data-b2", mimeType: "image/png" },
+        ],
+      },
+      foreign,
+    ];
+    const out = ext.injectInMemoryScreenshots(messages);
+    // Evicted id: marker text stays, the stale inline image is pruned.
+    expect(out[0].content).toEqual([
+      { type: "text", text: "meta\n[PIPIUI_COMPUTER_SCREENSHOT:a1]" },
+    ]);
+    // Retained id: exactly one image, rebuilt from the FIFO entry.
+    expect(out[1].content).toEqual([
+      { type: "text", text: "meta\n[PIPIUI_COMPUTER_SCREENSHOT:b2]" },
+      { type: "image", data: "data-b2", mimeType: "image/png" },
+    ]);
+    // No marker: untouched, foreign image preserved.
+    expect(out[2]).toBe(foreign);
+  });
 });
 
 afterEach(() => {

@@ -42,7 +42,6 @@ export type BridgeHandlers = {
   /** register / unwatch / list / subscribe for long-lived browser watches. */
   onBrowserWatch?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   onTerminalAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
-  onComputerAction?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>>;
   /** Versioned Host Capability API: the gated extension→host channel (own envelope in `event`). */
   onHostCapability?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Token mint for the same channel; logical denies ride HTTP 200 (fail closed when omitted). */
@@ -199,40 +198,6 @@ export class HostBridge {
   }
 
   private async dispatch(body: any, response: ServerResponse): Promise<void> {
-    const computerSession =
-      body && typeof body === "object" && typeof body.computerCapability === "string"
-        ? [...this.computers].find(([capability]) => safeEqual(capability, body.computerCapability))?.[1]
-        : undefined;
-    if (
-      computerSession &&
-      body.sessionKey === computerSession &&
-      typeof body.action === "string" &&
-      body.action.startsWith("computer_")
-    ) {
-      try {
-        return this.reply(
-          response,
-          200,
-          await (this.handlers.onComputerAction?.(body, computerSession) ??
-            Promise.resolve({ ok: false, error: "computer host unavailable" })),
-        );
-      } catch (error) {
-				const code = error && typeof error === "object" && (error as { code?: unknown }).code === "cua_driver_rpc_timeout"
-					? "cua_driver_rpc_timeout"
-					: "computer_host_error";
-				const message = code === "cua_driver_rpc_timeout" ? "Cua Driver request timed out" : error instanceof Error ? error.message : String(error);
-        return this.reply(response, 200, {
-          ok: false,
-          error: message,
-          runtimeError: {
-            code,
-            message,
-            retryable: true,
-            requiresObservation: true,
-          },
-        });
-      }
-    }
     const sessionId = body && typeof body === "object" ? this.sessionFor(body.sessionCapability) : undefined;
     // Fail closed and identically for a missing, stale or forged capability: an unauthorized
     // caller learns nothing about which sessions exist.

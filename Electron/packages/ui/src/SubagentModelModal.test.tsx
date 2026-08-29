@@ -104,32 +104,6 @@ describe('SubagentModelModal', () => {
     expect(screen.queryByTestId('memory-review-model-row')).toBeNull()
   })
 
-  it('persists the provider-qualified model selected for the Computer Use Agent', async () => {
-    const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
-    const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
-    const host = createMockHost()
-    render(<SubagentModelModal host={host} current={gpt} visibility={visibility({
-      models: [xaiGrok, copilotGrok],
-      visibleModels: [xaiGrok, copilotGrok],
-      quickModels: [xaiGrok, copilotGrok],
-      quickProviders: ['xai', 'github-copilot'],
-      hiddenIds: new Set(),
-    })} onClose={() => undefined} />)
-    await screen.findByTestId('subagent-agent-computer-use')
-    expect(screen.queryByTestId('subagent-agent-computer-use-leader')).toBeNull()
-    expect(screen.queryByTestId('subagent-agent-operator')).toBeNull()
-    expect(screen.queryByTestId('subagent-agent-computer-verifier')).toBeNull()
-    expect(screen.queryByTestId('subagent-agent-computer-terminal')).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'computer-use 0 模型' }))
-    expect(screen.getByTestId('subagent-model-option-computer-use-0-xai-grok-4.5').textContent).toContain('xai/grok-4.5')
-    expect(screen.getByTestId('subagent-model-option-computer-use-0-github-copilot-grok-4.5').textContent).toContain('github-copilot/grok-4.5')
-    fireEvent.click(screen.getByTestId('subagent-model-option-computer-use-0-xai-grok-4.5'))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'computer-use 0 模型' }).textContent).toContain('xai/grok-4.5'))
-    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
-      'computer-use': [{ model: 'xai/grok-4.5' }],
-    }))
-  })
-
   it('does not present an ambiguous historical bare id as either provider', async () => {
     const xaiGrok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
     const copilotGrok: Model = { provider: 'github-copilot', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
@@ -148,36 +122,17 @@ describe('SubagentModelModal', () => {
     expect(screen.getByTestId('subagent-model-option-explore-0-github-copilot-grok-4.5').getAttribute('aria-selected')).toBe('false')
   })
 
-  it('shows a non-binding visual-model hint only for screenshot-reading roles without changing defaults', async () => {
-    const host = createMockHost()
-    const save = vi.spyOn(host, 'setSubagentModel')
-    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
-    const computerUse = await screen.findByTestId('subagent-agent-computer-use')
-    expect(within(computerUse).getByText(/需要查看截图，建议选择支持图像输入的模型/)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'computer-use 0 模型' }).textContent).toContain('跟随主 Agent')
-    expect(save).not.toHaveBeenCalled()
-  })
-
   it('leaves loading, filters to model-management enabled models, and persists independent role chains', async () => {
     const host = createMockHost()
     render(<SubagentModelModal host={host} current={null} visibility={visibility()} onClose={() => undefined} />)
     await screen.findByTestId('subagent-agent-explore')
     expect(screen.queryByText('正在加载 Subagent 模型设置…')).toBeNull()
-	expect(screen.getAllByTestId(/^subagent-agent-/)).toHaveLength(5)
-	expect(screen.getByRole('heading', { name: 'Computer Use Agent' })).toBeTruthy()
-	expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
+	expect(screen.getAllByTestId(/^subagent-agent-/)).toHaveLength(4)
 	const generalHeading = screen.getByRole('heading', { name: '通用 Subagents' })
 	expect(screen.getByText('PipiUI 内置与用户安装')).toBeTruthy()
 	expect(screen.queryByTestId('project-subagent-group')).toBeNull()
-	const computerHeading = screen.getByRole('heading', { name: 'Computer Use Agent' })
-	expect(generalHeading.compareDocumentPosition(computerHeading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-	const computerHierarchy = screen.getByTestId('computer-use-model-hierarchy')
-	expect(within(computerHierarchy).getByTestId('subagent-agent-computer-use')).toBeTruthy()
-	expect(within(computerHierarchy).queryByText('Leader 调度')).toBeNull()
-
-	fireEvent.click(screen.getByRole('button', { name: 'computer-use 0 模型' }))
-	fireEvent.click(screen.getByTestId('subagent-model-option-computer-use-0-openai-gpt-5'))
-	await waitFor(() => expect(screen.getByRole('button', { name: 'computer-use 0 模型' }).textContent).toContain('GPT-5'))
+	expect(generalHeading.closest('section')?.querySelector('[data-testid="subagent-agent-explore"]')).toBeTruthy()
+	expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'explore 0 模型' }))
     expect(screen.getByTestId('subagent-model-option-explore-0-openai-gpt-5')).toBeTruthy()
@@ -197,7 +152,6 @@ describe('SubagentModelModal', () => {
 
     await waitFor(async () => {
       expect(await host.getSubagentModels?.()).toMatchObject({
-        'computer-use': [{ model: 'openai/gpt-5' }],
         explore: [{ model: 'openai/gpt-5', thinking: 'high' }],
         reviewer: [{ model: 'anthropic/claude-sonnet-4' }, { model: 'openai/gpt-5' }]
       })
@@ -314,7 +268,7 @@ function catalogHost(agents: AgentDefinition[], settings: Record<string, Subagen
 }
 
 describe('SubagentModelModal dynamic catalog', () => {
-  it('groups Computer Use by canonicalRole and keeps project-specific agents folded away from general', async () => {
+  it('keeps former Computer Use roles in the ordinary catalog and folds project-specific agents', async () => {
     const host = catalogHost([
       { name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' },
       { name: 'operator', description: 'Desktop escape hatch', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'operator' },
@@ -334,10 +288,10 @@ describe('SubagentModelModal dynamic catalog', () => {
     render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} projectId="proj-1" />)
     await screen.findByTestId('subagent-agent-explore')
     expect(host.listAgentDefinitions).toHaveBeenCalledWith('proj-1')
-    expect(screen.getByTestId('computer-use-model-hierarchy').textContent).toContain('computer-use')
-    expect(within(screen.getByTestId('computer-use-model-hierarchy')).queryByTestId('subagent-agent-operator')).toBeNull()
+    expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
+    expect(screen.getByTestId('subagent-agent-computer-use')).toBeTruthy()
     expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
-    expect(within(screen.getByTestId('subagent-agent-computer-use')).getByText(/需要查看截图/)).toBeTruthy()
+    expect(within(screen.getByTestId('subagent-agent-computer-use')).queryByText(/需要查看截图/)).toBeNull()
     expect(within(screen.getByTestId('subagent-agent-operator')).queryByText(/需要查看截图/)).toBeNull()
 
     const projectGroup = screen.getByTestId('project-subagent-group')

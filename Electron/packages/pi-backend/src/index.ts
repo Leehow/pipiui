@@ -632,9 +632,6 @@ export type PiBackendOptions = {
     sessionId: string,
   ) => Promise<Record<string, unknown>>;
   terminalSessionDeleted?: (sessionId: string) => void;
-  computerAction?: (
-    request: Record<string, unknown>,
-  ) => Promise<Record<string, unknown>>;
   computerDescriptor?: ComputerDescriptor;
   computerUsable?: () => boolean;
   /** Versioned Host Capability API — the gated extension→host channel. */
@@ -943,14 +940,11 @@ function isAlreadyProcessingError(error: unknown): boolean {
 }
 const SCREENSHOT_MARKER = /\[PIPIUI_COMPUTER_SCREENSHOT:([^\]]+)\]/g;
 /** Extract display text and inline images from a tool-result content payload.
- *  Handles structured `{type:"image"}` parts and resolves computer-use markers
- *  from the in-process screenshot cache. Markers without a cache hit are stripped
- *  from the display text so the user never sees raw marker syntax. */
-function extractResult(content: any, screenshots?: Map<string, { data: string; mimeType: string }>): { text: string; images: { data: string; mimeType: string }[] } {
-  if (typeof content === "string") {
-    const { text: clean, images } = resolveMarkers(content, screenshots)
-    return { text: clean, images }
-  }
+ *  Handles structured `{type:"image"}` parts (the cua-extension returns its
+ *  screenshots inline) and strips computer-use screenshot markers from the
+ *  display text so the user never sees raw marker syntax. */
+function extractResult(content: any): { text: string; images: { data: string; mimeType: string }[] } {
+  if (typeof content === "string") return { text: stripScreenshotMarkers(content), images: [] }
   if (!Array.isArray(content)) return { text: "", images: [] }
   const textParts: string[] = []
   const images: { data: string; mimeType: string }[] = []
@@ -964,19 +958,13 @@ function extractResult(content: any, screenshots?: Map<string, { data: string; m
       textParts.push(part.text ?? part.thinking ?? "")
     }
   }
-  const { text: clean, images: markerImages } = resolveMarkers(textParts.join(""), screenshots)
-  return { text: clean, images: [...images, ...markerImages] }
+  return { text: stripScreenshotMarkers(textParts.join("")), images }
 }
-function resolveMarkers(textContent: string, screenshots?: Map<string, { data: string; mimeType: string }>): { text: string; images: { data: string; mimeType: string }[] } {
-  if (!screenshots || !textContent.includes("PIPIUI_COMPUTER_SCREENSHOT")) return { text: textContent, images: [] }
-  const images: { data: string; mimeType: string }[] = []
-  let match
+function stripScreenshotMarkers(textContent: string): string {
+  if (!textContent.includes("PIPIUI_COMPUTER_SCREENSHOT")) return textContent
+  const stripped = textContent.replace(SCREENSHOT_MARKER, "").trim()
   SCREENSHOT_MARKER.lastIndex = 0
-  while ((match = SCREENSHOT_MARKER.exec(textContent)) !== null) {
-    const shot = screenshots.get(match[1])
-    if (shot) images.push(shot)
-  }
-  return { text: textContent.replace(SCREENSHOT_MARKER, "").trim(), images }
+  return stripped
 }
 const emitFrame = (listeners: Set<(e: HostEvent) => void>, event: HostEvent) =>
   listeners.forEach((l) => l(event));
@@ -2097,9 +2085,6 @@ export class PiHostBackend implements HostBackend {
   private turnWatchdogTimer?: NodeJS.Timeout;
   private closed = false;
   private agentTerminalWaiters = new Set<() => void>();
-  /** Computer-use screenshot cache: screenshotId → base64+mimeType. Populated by
-   * the computerAction handler so tool-result markers resolve to inline images. */
-  private computerScreenshots = new Map<string, { data: string; mimeType: string }>();
   private bridge: HostBridge;
   /** Durable Electron-side projection of runtime lifecycle events. Pi owns the worker
    * conversations; this small index only lets the UI rebuild its tree after host restart. */
@@ -2259,17 +2244,6 @@ export class PiHostBackend implements HostBackend {
         options.hostCapabilityTokenAction
           ? options.hostCapabilityTokenAction(event, sessionId)
           : { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" },
-      onComputerAction: async (event) => {
-        if (!options.computerAction) return { ok: false, error: "computer host unavailable" }
-        const result = await options.computerAction(event)
-        // Cache computer-use screenshots so tool-result markers resolve into
-        // inline images for the transcript.
-        if (result && typeof result === "object" && typeof (result as any).screenshotId === "string" && typeof (result as any).base64 === "string") {
-          this.computerScreenshots.set((result as any).screenshotId, { data: (result as any).base64, mimeType: (result as any).mimeType ?? "image/png" })
-          if (this.computerScreenshots.size > 24) this.computerScreenshots.delete(this.computerScreenshots.keys().next().value!)
-        }
-        return result
-      },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
       onModelPinValidate: (input) =>
         // Authorization is proven by the capability→sessionId map; the request body carries
@@ -5822,7 +5796,7 @@ export class PiHostBackend implements HostBackend {
       }
     } else if (e.type === "tool_execution_end") {
       this.touchTurnActivity(live);
-      const { text: resultText, images } = extractResult(e.result?.content, this.computerScreenshots)
+      const { text: resultText, images } = extractResult(e.result?.content)
       this.stream({
         type: "tool_result",
         sessionId: id,

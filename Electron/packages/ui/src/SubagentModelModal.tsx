@@ -10,7 +10,6 @@ import {
   formatPatchOperations,
   isAgentUnavailable,
   isBlockingCatalogDiagnostic,
-  needsVisualModelHint,
   partitionCatalog,
 } from './agent-catalog-ui'
 import { DismissibleError } from './DismissibleError'
@@ -42,7 +41,7 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
   const candidateModels = visibility.quickModels.filter(model => !visibility.hiddenIds.has(modelRef(model)))
-  const { general: generalAgents, project: projectAgents, computer: computerAgents } = useMemo(() => partitionCatalog(agents), [agents])
+  const { general: generalAgents, project: projectAgents } = useMemo(() => partitionCatalog(agents), [agents])
   const catalogDiagnostics = useMemo(() => collectCatalogDiagnostics(agents), [agents])
   const visibleCatalogDiagnostics = catalogDiagnostics.filter(entry => (
     isBlockingCatalogDiagnostic(entry) && !dismissedDiagnostics.has(diagnosticKey(entry))
@@ -167,12 +166,6 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
               {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
             </section>}
             <ProjectSubagentGroup agents={projectAgents} settings={settings} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
-            {computerAgents.length > 0 && <section className="subagent-agent-group subagent-computer-use-group" aria-labelledby="computer-use-models-heading" data-testid="computer-use-model-hierarchy">
-              <div className="subagent-agent-group-heading"><h3 id="computer-use-models-heading">Computer Use Agent</h3><span>单个 Agent 完成规划、操作、恢复与验证</span></div>
-              <div className="subagent-computer-use-tree">
-                {computerAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
-              </div>
-            </section>}
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
           </div>
         )}
@@ -224,7 +217,7 @@ function ProjectSubagentGroup({
   )
 }
 
-function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hierarchy, hideProjectSource }: {
+function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hideProjectSource }: {
   agent: AgentDefinition
   chain: SubagentModelSetting[]
   models: Model[]
@@ -232,7 +225,6 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
   dismissed: Set<string>
   onDismiss: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
-  hierarchy?: 'leader' | 'worker'
   hideProjectSource?: boolean
 }) {
   const sourceLabel = agentSourceLabel(agent, { skipProject: hideProjectSource })
@@ -279,8 +271,8 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
   const remove = (index: number) => void onSave(agent.name, chain.filter((_, itemIndex) => itemIndex !== index))
 
   return (
-    <article className={`subagent-agent-row${hierarchy ? ` subagent-agent-${hierarchy}` : ''}${unavailable ? ' subagent-agent-unavailable' : ''}`} data-testid={`subagent-agent-${agent.name}`}>
-      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{sourceLabel && <span data-testid={`subagent-source-${agent.name}`}>{sourceLabel}</span>}{availabilityLabel && <span className="subagent-agent-status" data-testid={`subagent-status-${agent.name}`}>{availabilityLabel}</span>}{hierarchy && <span className="subagent-agent-hierarchy-badge">{hierarchy === 'leader' ? '主管' : '子 Agent'}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
+    <article className={`subagent-agent-row${unavailable ? ' subagent-agent-unavailable' : ''}`} data-testid={`subagent-agent-${agent.name}`}>
+      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{sourceLabel && <span data-testid={`subagent-source-${agent.name}`}>{sourceLabel}</span>}{availabilityLabel && <span className="subagent-agent-status" data-testid={`subagent-status-${agent.name}`}>{availabilityLabel}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
       <p>{agent.description}</p>
       {agent.permissionSummary && <p className="subagent-agent-permissions" data-testid={`subagent-permissions-${agent.name}`}>{agent.permissionSummary}</p>}
       {agent.patches && agent.patches.length > 0 && <p className="subagent-agent-patches" data-testid={`subagent-patches-${agent.name}`}>{agent.patches.map(patch => `${patch.extensionId} · ${formatPatchOperations(patch)}`).join('; ')}</p>}
@@ -293,7 +285,6 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
           />
         ))}
       </div>}
-      {needsVisualModelHint(agent) && <p className="subagent-visual-model-hint">需要查看截图，建议选择支持图像输入的模型（如 Grok）。这只是建议，不会自动选择或覆盖你的设置。</p>}
       {rows.map((entry, index) => {
         const selected = findModel(entry.model)
         const thinkingLevels = selected ? thinkingLevelsForModel(selected) : []

@@ -72,14 +72,6 @@ function subagentSummary(args: Record<string, unknown>): string {
   return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`
 }
 
-/** `computer_task` → the natural-language goal, so the folded card says what the desktop task is. */
-function computerTaskSummary(args: Record<string, unknown>): string {
-  const goal = stringField(args, 'goal')
-  if (!goal) return '…'
-  const compact = goal.replace(/\s+/g, ' ').trim()
-  return compact.length <= MAX_PROMPT ? compact : `${compact.slice(0, MAX_PROMPT)}…`
-}
-
 function fetchContentSummary(args: Record<string, unknown>): string {
   const url = stringField(args, 'url')
   if (url) return url
@@ -224,8 +216,6 @@ function scrapeFields(name: string, text: string): string | undefined {
     }
     case 'subagent':
       return scrapeJSONString('title', text) ?? scrapeJSONString('task', text)
-    case 'computer_task':
-      return scrapeJSONString('goal', text)
     default:
       return scrapeJSONString('path', text)
         ?? scrapeJSONString('file_path', text)
@@ -349,7 +339,6 @@ for (const contribution of [
   { toolName: 'find', summarizeArgs: findSummary, scrapeSummary: findScrapedSummary },
   { toolName: 'grep', summarizeArgs: grepSummary, scrapeSummary: grepScrapedSummary },
   { toolName: 'subagent', summarizeArgs: subagentSummary, scrapeSummary: (text: string) => scrapeJSONString('title', text) ?? scrapeJSONString('task', text) },
-  { toolName: 'computer_task', summarizeArgs: computerTaskSummary, scrapeSummary: (text: string) => scrapeJSONString('goal', text) },
   { toolName: 'skill_load', summarizeArgs: skillNameSummary, scrapeSummary: (text: string) => scrapeJSONString('name', text) },
   { toolName: 'skill_search', summarizeArgs: querySummary, scrapeSummary: (text: string) => scrapeJSONString('query', text) },
 ]) {

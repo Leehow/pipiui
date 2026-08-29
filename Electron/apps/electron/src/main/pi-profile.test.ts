@@ -230,6 +230,85 @@ describe('Electron Pi profile', () => {
 
   })
 
+  it('does not resurrect a deleted custom provider as a modelOverrides-only shell', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-no-shell-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    const snapshotPath = join(root, 'model-capabilities.json')
+    await mkdir(profile.agentDir, { recursive: true })
+    await writeFile(snapshotPath, JSON.stringify({
+      schemaVersion: 1,
+      source: 'https://models.dev/api.json',
+      retrievedAt: '2026-08-27T00:00:00Z',
+      providers: {
+        jellytoken: {
+          models: {
+            'deepseek-v4-flash': {
+              reasoning: true,
+              thinkingLevelMap: { off: null, minimal: 'low', low: 'low', medium: 'high', high: 'high', xhigh: 'max', max: 'max' },
+              compat: { supportsReasoningEffort: true }
+            }
+          }
+        },
+        relay: {
+          models: {
+            reasoner: {
+              reasoning: true,
+              reasoningOptions: [{ type: 'effort', values: ['low', 'medium', 'high'] }]
+            }
+          }
+        }
+      }
+    }))
+    // Post-delete state: the custom provider's definition is gone from models.json; only
+    // another provider remains. The snapshot still carries jellytoken capability overrides.
+    const modelsJsonPath = join(profile.agentDir, 'models.json')
+    await writeFile(modelsJsonPath, `${JSON.stringify({
+      providers: {
+        relay: {
+          api: 'openai-completions',
+          apiKey: 'RELAY_KEY',
+          baseUrl: 'https://relay.example.test/v1',
+          models: [{ id: 'reasoner', name: 'Reasoner', reasoning: false, input: ['text'], contextWindow: 200000, maxTokens: 16384 }]
+        }
+      }
+    }, null, 2)}\n`)
+
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+    const installed = JSON.parse(await readFile(modelsJsonPath, 'utf8'))
+    // No shell resurrection: the deleted provider stays gone; the surviving provider keeps
+    // its definition and still receives its own capability overrides.
+    expect(Object.keys(installed.providers)).toEqual(['relay'])
+    expect(installed.providers.relay.apiKey).toBe('RELAY_KEY')
+    expect(installed.providers.relay.modelOverrides.reasoner).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { low: 'low', medium: 'medium', high: 'high' }
+    })
+
+    // Next launch stays clean: the rewritten provenance must not bring the shell back.
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+    expect(Object.keys(JSON.parse(await readFile(modelsJsonPath, 'utf8')).providers)).toEqual(['relay'])
+
+    // Re-adding the custom provider (fresh definition) gets overrides applied again.
+    await writeFile(modelsJsonPath, `${JSON.stringify({
+      providers: {
+        ...installed.providers,
+        jellytoken: {
+          api: 'openai-completions',
+          apiKey: 'JELLY_KEY',
+          baseUrl: 'https://aiservice.jellytoken.com/v1',
+          models: [{ id: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash', reasoning: false, input: ['text'], contextWindow: 200000, maxTokens: 16384 }]
+        }
+      }
+    }, null, 2)}\n`)
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+    const readded = JSON.parse(await readFile(modelsJsonPath, 'utf8'))
+    expect(readded.providers.jellytoken.api).toBe('openai-completions')
+    expect(readded.providers.jellytoken.modelOverrides['deepseek-v4-flash']).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: { off: null, medium: 'high', max: 'max' }
+    })
+  })
+
   it('feeds the bundled override through installed Pi ModelRuntime and into the xhigh request payload', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-profile-real-model-runtime-'))
     const profile = resolveElectronPiProfile(join(root, 'user-data'))

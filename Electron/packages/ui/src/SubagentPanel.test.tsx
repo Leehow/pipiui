@@ -4,7 +4,6 @@ import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
 import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
-import { PLAN_JSON } from './computer-task-report.test.fixture'
 
 afterEach(() => {
   cleanup()
@@ -324,7 +323,7 @@ describe('SubagentPanel', () => {
     expect(screen.getByText('0 个')).toBeTruthy()
   })
 
-  it('localizes known task, activity, and profile labels while preserving raw tool details', async () => {
+  it('localizes known generic task and activity labels while preserving raw legacy roles and tool details', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [
       { agentId: 'fixture', runId: 'r1', sessionId: 'session-1', name: 'builder', task: 'Build fixture', state: 'ok', createdAt: 1 },
@@ -338,8 +337,8 @@ describe('SubagentPanel', () => {
     expect(await screen.findByText('构建测试夹具')).toBeTruthy()
     expect(screen.getByText('同一任务第 2 轮')).toBeTruthy()
     expect(screen.getByText('优先恢复配置验证成功')).toBeTruthy()
-    expect(screen.getByText('协调并核验桌面操作任务')).toBeTruthy()
-    expect(screen.getAllByText('执行受限终端步骤').length).toBeGreaterThan(0)
+    expect(screen.getByText('Computer Use Leader')).toBeTruthy()
+    expect(screen.getAllByText('查看文件状态 · /tmp/raw fixture.txt').length).toBeGreaterThan(0)
     expect(screen.queryByText('构建')).toBeNull()
     expect(screen.queryByText('探索')).toBeNull()
 
@@ -898,7 +897,7 @@ describe('SubagentPanel', () => {
     expect(technical.textContent).toContain('session-exact')
   })
 
-  it('hides generated agent ids, uses real provider marks, localizes the desktop leader, and fills TLDR from the latest result', async () => {
+  it('hides generated agent ids, uses real provider marks, preserves legacy roles, and fills TLDR from the latest result', async () => {
     const harness = hostHarness()
     harness.host.listAgents = async () => [
       {
@@ -924,8 +923,7 @@ describe('SubagentPanel', () => {
     expect(leader.querySelector('strong')?.textContent).toBe('computer-use-leader')
     expect(terminal.textContent).not.toContain('agent-695e75d')
     expect(leader.textContent).not.toContain('agent-13cbc')
-    expect(leader.textContent).toContain('协调并核验桌面操作任务')
-    expect(leader.textContent).not.toContain('Give the main agent')
+    expect(leader.textContent).toContain('Give the main agent')
 
     const icon = terminal.querySelector('[role="img"]')!
     expect(icon.getAttribute('aria-label')).toBe('DeepSeek 模型')
@@ -1122,66 +1120,6 @@ describe('SubagentPanel', () => {
     expect(screen.getAllByRole('button', { name: /个步骤/ }).length).toBeGreaterThan(0)
     expect(screen.queryByText('README contents')).toBeNull()
     expect(screen.getByText(/TLDR only/)).toBeTruthy()
-  })
-
-  it('hydrates earlier computer-use-leader runs through the explicit history view so the plan stays after the final report', async () => {
-    const harness = hostHarness()
-    const conclusion = '验收通过：COC Keeper 主窗口已清晰显示“战役卷宗”。'
-    harness.host.listAgents = async () => [
-      {
-        agentId: 'cua-lead-1', runId: 'report-1', sessionId: 's1', name: 'computer-use-leader',
-        task: 'Computer Use Leader', title: '电脑操作主管', state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(),
-        finalResult: conclusion,
-      },
-    ]
-    harness.host.getAgentLogs = async (_agentId, _session, runId, scope) => {
-      if (scope === 'agent') return [
-        { itemType: 'text', text: PLAN_JSON },
-        { itemType: 'text', text: conclusion },
-      ]
-      if (runId === 'report-1') return [{ itemType: 'text', text: conclusion }]
-      return []
-    }
-    render(<SubagentPanel host={harness.host} />)
-    await screen.findByTestId('agent-row-cua-lead-1')
-    // Default view is the exact current run: the conclusion only, no plan bleed.
-    expect(await screen.findByText(/战役卷宗/)).toBeTruthy()
-    expect(screen.queryByTestId('computer-plan-card')).toBeNull()
-    // The cross-run history — including the earlier plan run — is one explicit toggle away.
-    fireEvent.click(await screen.findByText('查看全部运行历史'))
-    expect(await screen.findByTestId('computer-plan-card')).toBeTruthy()
-    expect(screen.getByText(/战役卷宗/)).toBeTruthy()
-    expect(screen.getByTestId('computer-plan-card').textContent).toContain('共 2 步')
-  })
-
-  it('renders a computer worker verdict JSON as a result card after the stream completes', async () => {
-    const harness = hostHarness()
-    const verdict = '{"outcome":"completed","summary":"目标应用主窗口已刷新观察并显示所需文本。"}'
-    render(<SubagentPanel host={harness.host} />)
-    harness.emitAgent({
-      type: 'agent',
-      agent: {
-        agentId: 'op-1', runId: 'op-run', name: 'operator', title: 'Operate Computer Task',
-        task: 'Operate Computer Task', state: 'running', createdAt: 1,
-      },
-    })
-    await screen.findByTestId('agent-row-op-1')
-    await waitFor(() => expect(harness.hasLogSubscriber('op-1')).toBe(true))
-    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'tool', name: 'desktop_observe', text: '{}', contentIndex: 0 })
-    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'toolResult', name: 'desktop_observe', text: 'ok', contentIndex: 1 })
-    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'text', text: '{"outcome":"com', contentIndex: 2 })
-    expect(screen.queryByTestId('computer-worker-result-card')).toBeNull()
-    harness.emitLog('op-1', { type: 'agent_log', agentId: 'op-1', itemType: 'text', text: verdict, contentIndex: 2 })
-    harness.emitAgent({
-      type: 'agent',
-      agent: {
-        agentId: 'op-1', runId: 'op-run', name: 'operator', title: 'Operate Computer Task',
-        task: 'Operate Computer Task', state: 'ok', createdAt: Date.now() - 2_000, endedAt: Date.now(), finalResult: verdict,
-      },
-    })
-    const card = await screen.findByTestId('computer-worker-result-card')
-    expect(card.textContent).toContain('目标应用主窗口已刷新观察并显示所需文本。')
-    expect(document.querySelector('[data-testid="subagent-transcript"] .markdown')?.textContent ?? '').not.toContain('{"outcome"')
   })
 
   it('shows the running bash command on the live tool row and status line', async () => {

@@ -109,14 +109,6 @@ const scan = {
   dismissError: () => undefined,
 }
 
-const updates = {
-  available: false,
-  loading: false,
-  snapshot: null,
-  error: null,
-  refresh: async () => undefined,
-}
-
 describe('general settings no longer host Firecrawl OCR', () => {
   it('does not render Firecrawl key controls on the general tab', async () => {
     render(
@@ -125,9 +117,7 @@ describe('general settings no longer host Firecrawl OCR', () => {
         visibility={visibility as never}
         vision={vision as never}
         scan={scan as never}
-        updates={updates as never}
         current={null}
-        onRequestUpdate={() => undefined}
         onClose={() => undefined}
         projectId="project-1"
       />,
@@ -150,9 +140,7 @@ describe('general settings no longer host Firecrawl OCR', () => {
         visibility={visibility as never}
         vision={vision as never}
         scan={scanToggle as never}
-        updates={updates as never}
         current={null}
-        onRequestUpdate={() => undefined}
         onClose={() => undefined}
         projectId="project-1"
       />,
@@ -175,9 +163,7 @@ describe('settings modal has no secret vault entry', () => {
         visibility={visibility as never}
         vision={vision as never}
         scan={scan as never}
-        updates={updates as never}
         current={null}
-        onRequestUpdate={() => undefined}
         onClose={() => undefined}
         projectId="project-1"
       />,
@@ -185,7 +171,7 @@ describe('settings modal has no secret vault entry', () => {
     expect(screen.getByTestId('model-tab-general')).toBeTruthy()
     expect(screen.getByTestId('model-tab-models')).toBeTruthy()
     expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
-    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-updates')).toBeNull()
     expect(screen.queryByTestId('model-tab-secrets')).toBeNull()
     expect(screen.queryByTestId('secret-vault-pane')).toBeNull()
     expect(screen.queryByTestId('secret-vault-form')).toBeNull()

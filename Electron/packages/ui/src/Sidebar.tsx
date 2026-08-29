@@ -156,6 +156,11 @@ export interface SidebarProps {
   onDismissProjectError?: () => void
   onSearch: (query: string) => void
   onShowMore: () => void
+  /** Host-backed 10-row pages. When present, loaded rows are already the visible prefix. */
+  sessionHasMoreByProject?: Readonly<Record<string, boolean>>
+  sessionPageLoadingByProject?: Readonly<Record<string, boolean>>
+  sessionVisibleLimitByProject?: Readonly<Record<string, number>>
+  onShowMoreSessions?: (projectId: string) => void
   /** Session row hover actions (Swift SessionRowContainer parity). */
   onPinSession?: (sessionId: string) => void
   onRenameSession?: (sessionId: string, title: string) => Promise<void> | void
@@ -239,6 +244,8 @@ function StatusGlyph({ status, count }: { status: SessionStatus; count: number }
   return <span className="sb-dot" aria-hidden="true" />
 }
 
+const TOUCH_DRAG_THRESHOLD_PX = 8
+
 function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, onArchive, onViewOriginal, draggable, dragging, dropPlacement, onDragStart, onDragEnd, onDragOver, onDrop }: {
   session: SidebarSession
   selected: boolean
@@ -257,11 +264,10 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
   onDrop?: (event: DragEvent, session: SidebarSession) => void
 }) {
   const [renaming, setRenaming] = useState(false)
-  // Touch selects on pointer-down for instant feedback, but the event must stay
-  // uncanceled — preventing its default kills the browser's native panning and
-  // froze the mobile drawer list. The trailing synthetic click is absorbed so a
-  // touch still reports exactly one selection.
-  const touchSelectedId = useRef<string | null>(null)
+  // Do not navigate on pointer-down: the same gesture may become a native
+  // vertical pan. Pointer-cancel is expected once the browser owns that pan.
+  const touchGesture = useRef<{ pointerId: number; startX: number; startY: number; moved: boolean } | null>(null)
+  const suppressTouchClick = useRef(false)
   const external = isExternalSidebarSource(session.source)
   const source = session.source ?? 'pi'
   const rowLabel = sessionRowLabel(session.title, source, session.adoptedFromSource)
@@ -293,17 +299,51 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
       aria-label={rowLabel}
       title={rowLabel}
       onPointerDown={event => {
-        if ((event.pointerType !== 'touch' && event.pointerType !== 'pen') || renaming) return
-        if ((event.target as HTMLElement | null)?.closest('button')) return
-        touchSelectedId.current = session.id
-        onSelect(session.id)
-      }}
-      onClick={() => {
-        if (renaming) return
-        if (touchSelectedId.current === session.id) {
-          touchSelectedId.current = null
+        if (event.pointerType !== 'touch' && event.pointerType !== 'pen') {
+          touchGesture.current = null
+          suppressTouchClick.current = false
           return
         }
+        if (renaming) return
+        if ((event.target as HTMLElement | null)?.closest('button')) return
+        suppressTouchClick.current = false
+        touchGesture.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startY: event.clientY,
+          moved: false
+        }
+      }}
+      onPointerMove={event => {
+        const gesture = touchGesture.current
+        if (!gesture || gesture.pointerId !== event.pointerId || gesture.moved) return
+        const dx = event.clientX - gesture.startX
+        const dy = event.clientY - gesture.startY
+        if ((dx * dx) + (dy * dy) >= TOUCH_DRAG_THRESHOLD_PX * TOUCH_DRAG_THRESHOLD_PX) {
+          gesture.moved = true
+        }
+      }}
+      onPointerUp={event => {
+        const gesture = touchGesture.current
+        if (!gesture || gesture.pointerId !== event.pointerId) return
+        const dx = event.clientX - gesture.startX
+        const dy = event.clientY - gesture.startY
+        const moved = gesture.moved || (dx * dx) + (dy * dy) >= TOUCH_DRAG_THRESHOLD_PX * TOUCH_DRAG_THRESHOLD_PX
+        touchGesture.current = null
+        suppressTouchClick.current = true
+        if (!moved && !renaming) onSelect(session.id)
+      }}
+      onPointerCancel={() => {
+        touchGesture.current = null
+        suppressTouchClick.current = false
+      }}
+      onClick={event => {
+        if (renaming) return
+        if (suppressTouchClick.current && event.detail > 0) {
+          suppressTouchClick.current = false
+          return
+        }
+        suppressTouchClick.current = false
         onSelect(session.id)
       }}
       onKeyDown={event => { if (!renaming && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(session.id) } }}
@@ -340,7 +380,7 @@ function isWorkingSession(session: SidebarSession): boolean {
  *  Browse view truncates to `SESSION_LIMIT` (10) with a 「更多/收起」 toggle that
  *  pages 10 at a time; a search bypasses pagination so every match shows.
  *  A collapsed folder (`peekWorking`) still lists currently working rows. */
-function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, onViewOriginalSession, shown, onToggle, draggedSessionId, sessionDrop, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop, peekWorking }: {
+function ProjectSessions({ project, query, selectedSessionId, onSelectSession, onPinSession, onRenameSession, onArchiveSession, onViewOriginalSession, shown, onToggle, remoteHasMore, remoteLoading, remoteShown, draggedSessionId, sessionDrop, onSessionDragStart, onDragEnd, onSessionDragOver, onSessionDrop, peekWorking }: {
   project: SidebarProject
   query: string
   selectedSessionId: string | null
@@ -351,6 +391,9 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
   onViewOriginalSession?: (id: string) => void
   shown: number
   onToggle: () => void
+  remoteHasMore?: boolean
+  remoteLoading?: boolean
+  remoteShown?: number
   draggedSessionId?: string
   sessionDrop?: { id: string; placement: 'before' | 'after' } | null
   onSessionDragStart?: (event: DragEvent, session: SidebarSession) => void
@@ -361,17 +404,20 @@ function ProjectSessions({ project, query, selectedSessionId, onSelectSession, o
 }) {
   const sessions = peekWorking ? project.sessions.filter(isWorkingSession) : project.sessions
   const isSearch = query !== ''
-  const visible = peekWorking || isSearch ? sessions : visiblePrefix(sessions, SESSION_LIMIT, shown).items
-  const showsToggle = !peekWorking && !isSearch && sessions.length > SESSION_LIMIT
-  const collapsed = showsToggle && shown >= sessions.length
+  const remotePaged = remoteHasMore !== undefined || remoteLoading !== undefined
+  const visible = peekWorking || isSearch
+    ? sessions
+    : visiblePrefix(sessions, SESSION_LIMIT, remotePaged ? remoteShown ?? SESSION_LIMIT : shown).items
+  const showsToggle = !peekWorking && !isSearch && (remotePaged ? Boolean(remoteHasMore) || visible.length < sessions.length : sessions.length > SESSION_LIMIT)
+  const collapsed = !remotePaged && showsToggle && shown >= sessions.length
   return (
     <div className="sb-project-sessions" role="group" aria-label={`${project.name} 的会话`}>
       {visible.map(session => (
         <SessionRow key={session.id} session={session} selected={selectedSessionId === session.id} onSelect={onSelectSession} onPin={onPinSession} onRename={onRenameSession} onArchive={onArchiveSession} onViewOriginal={onViewOriginalSession} draggable={Boolean(onSessionDragStart)} dragging={draggedSessionId === session.id} dropPlacement={sessionDrop?.id === session.id ? sessionDrop.placement : undefined} onDragStart={onSessionDragStart} onDragEnd={onDragEnd} onDragOver={onSessionDragOver} onDrop={onSessionDrop} />
       ))}
       {showsToggle && (
-        <button type="button" className="sb-more sb-more-sessions" data-testid="show-more-sessions" aria-label={collapsed ? `收起${project.name} 会话` : `展开更多${project.name} 会话`} onClick={onToggle}>
-          {collapsed ? '收起' : '更多'}
+        <button type="button" className="sb-more sb-more-sessions" data-testid="show-more-sessions" disabled={remoteLoading} aria-label={collapsed ? `收起${project.name} 会话` : `展开更多${project.name} 会话`} onClick={onToggle}>
+          {remoteLoading ? '加载中…' : collapsed ? '收起' : '更多'}
         </button>
       )}
     </div>
@@ -564,6 +610,10 @@ export function Sidebar(props: SidebarProps) {
     onDismissProjectError,
     onSearch,
     onShowMore,
+    sessionHasMoreByProject,
+    sessionPageLoadingByProject,
+    sessionVisibleLimitByProject,
+    onShowMoreSessions,
     onPinSession,
     onRenameSession,
     onArchiveSession,
@@ -755,7 +805,10 @@ export function Sidebar(props: SidebarProps) {
                   onArchiveSession={onArchiveSession}
                   onViewOriginalSession={onViewOriginalSession}
                   shown={sessionsShownByProject[project.id] ?? SESSION_LIMIT}
-                  onToggle={() => toggleProjectSessions(project.id, project.sessions.length)}
+                  onToggle={() => onShowMoreSessions ? onShowMoreSessions(project.id) : toggleProjectSessions(project.id, project.sessions.length)}
+                  remoteHasMore={onShowMoreSessions ? Boolean(sessionHasMoreByProject?.[project.id]) : undefined}
+                  remoteLoading={onShowMoreSessions ? Boolean(sessionPageLoadingByProject?.[project.id]) : undefined}
+                  remoteShown={onShowMoreSessions ? sessionVisibleLimitByProject?.[project.id] ?? SESSION_LIMIT : undefined}
                   draggedSessionId={dragged?.type === 'session' ? dragged.id : undefined}
                   sessionDrop={sessionDrop}
                   onSessionDragStart={!query && onMoveSession ? startSessionDrag : undefined}

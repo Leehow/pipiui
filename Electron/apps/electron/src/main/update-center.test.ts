@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { compareSemver, createUpdateCenterService, extensionUpdateCatalogItems, latestCuaDriverVersion, latestGitHubReleaseVersion, latestNodeVersion, npmLatestVersion, pypiLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS, type UpdateCatalogItem } from './update-center.js'
+import { compareSemver, createUpdateCenterService, extensionUpdateCatalogItems, latestCuaDriverVersion, latestGitHubReleaseVersion, latestNodeVersion, npmLatestVersion, pypiLatestVersion, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
+import type { HostBackend } from '@pipi/host-api'
 
 const response = (payload: unknown, ok = true, status = 200) => ({ ok, status, json: async () => payload })
 
@@ -238,5 +239,33 @@ describe('bundled extension update components', () => {
     expect(snapshot.items.map(item => item.id)).toEqual(['vite', 'pdf-extension:pdf-inspector'])
     expect(snapshot.items[1]).toMatchObject({ category: 'extension', ownerExtensionId: 'pdf-extension', status: 'notCheckable' })
     expect(fetch).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('withUpdateCenter', () => {
+  function backend(): HostBackend {
+    return {
+      handle: vi.fn(async () => 'forwarded'),
+      subscribe: vi.fn(() => () => undefined),
+    }
+  }
+
+  it('rejects checkForUpdates and updateExtensionComponent even when handlers are supplied', async () => {
+    const inner = backend()
+    const wrapped = withUpdateCenter(
+      inner,
+      async () => ({ checkedAt: 1, items: [] }),
+      async () => ({ extensionId: 'x', version: '1.0.0', contentHash: '', objectDir: '', receiptPath: '' }),
+    )
+    await expect(wrapped.handle('checkForUpdates', [])).rejects.toThrow('更新功能已关闭')
+    await expect(wrapped.handle('updateExtensionComponent', ['x'])).rejects.toThrow('更新功能已关闭')
+    expect(inner.handle).not.toHaveBeenCalled()
+  })
+
+  it('forwards unrelated methods to the inner backend', async () => {
+    const inner = backend()
+    const wrapped = withUpdateCenter(inner)
+    await expect(wrapped.handle('listProjects', [])).resolves.toBe('forwarded')
+    expect(inner.handle).toHaveBeenCalledWith('listProjects', [])
   })
 })

@@ -1,6 +1,7 @@
 import { constants as fsConstants } from 'node:fs'
 import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, rename, rm, rmdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
+import { getBuiltinProviders } from '@earendil-works/pi-ai/providers/all'
 
 export const PI_PROFILE_MIGRATION_MARKER = '.pipiui-profile-migration-v1.json'
 
@@ -149,7 +150,15 @@ export function mergeBundledModelCapabilityOverrides(
   const sourced = sourcedOverrides(snapshot)
   const previous = objectValue(previousManaged, 'model capability provenance')
   const previousProviders = objectValue(previous.providers ?? {}, 'model capability provenance providers')
+  // A provider models.json no longer defines must not be resurrected as a modelOverrides-only
+  // shell: for a custom provider (no built-in catalog entry) pi composes that shell into a
+  // ghost provider with zero models. Built-in providers (xai) keep their entry because pi
+  // composes it over the built-in catalog — that entry is how their overrides reach Pi.
+  // The provenance file is rewritten wholesale from the snapshot on every install, so
+  // skipping here (including previousManaged cleanup for the absent provider) stays idempotent.
+  const builtins: Set<string> = new Set(getBuiltinProviders())
   for (const providerId of new Set([...Object.keys(sourced.providers), ...Object.keys(previousProviders)])) {
+    if (!(providerId in providers) && !builtins.has(providerId)) continue
     const sourcedModels = sourced.providers[providerId]?.modelOverrides ?? {}
     const previousModels = previousProviders[providerId]?.modelOverrides ?? {}
     for (const modelId of new Set([...Object.keys(sourcedModels), ...Object.keys(previousModels)])) {

@@ -6,8 +6,6 @@ import { ProviderLogo } from './ProviderLogo'
 import { ProviderLoginPanel } from './ProviderLoginPanel'
 import type { VisionRoutingController } from './useVisionRouting'
 import type { ScanExternalSessionsController } from './useScanExternalSessions'
-import type { UpdateCenterController } from './useUpdateCenter'
-import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane } from './ExtensionsPane'
 import { WebSearchKeysPane } from './WebSearchKeysPane'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
@@ -338,25 +336,23 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
 }
 
 /**
- * `/model` — settings modal with four tabs: 通用 (vision-routing switch +
+ * `/model` — settings modal with three tabs: 通用 (vision-routing switch +
  * selector, default off), 模型管理 (provider-collapsible model visibility
- * management mirroring Swift Settings > 模型, the default tab), 扩展 (MCP /
- * Pi plugins, add-via-main-chat), and 更新中心. Provider headers carry a
+ * management mirroring Swift Settings > 模型, the default tab), and 扩展 (MCP /
+ * Pi plugins, add-via-main-chat). Provider headers carry a
  * tri-state checkbox (all/none/partial visible), a per-provider delete action
  * (pi logout with confirmation) and an "添加模型" flow driving pi's native
  * OAuth/api-key login. Visibility state is persisted through the host
  * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
  * setVisionEnabled + getVisionModel/setVisionModel.
  */
-export function ModelVisibilityModal({ host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId }: {
+export function ModelVisibilityModal({ host, visibility, vision, scan, current, onModelState, onClose, initialView = 'manage', projectId }: {
   host: PipiHostAPI
   visibility: ModelVisibilityController
   vision: VisionRoutingController
   scan: ScanExternalSessionsController
-  updates: UpdateCenterController
   current: Model | null
   onModelState?: (state: ModelState) => void
-  onRequestUpdate: (prompt: string) => void
   onClose: () => void
   /** First-run onboarding opens straight into the provider login pane. */
   initialView?: 'manage' | 'add'
@@ -374,7 +370,7 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   }, [onClose])
 
   const ctx: SettingsSectionContext = {
-    host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, projectId,
+    host, visibility, vision, scan, current, onModelState, projectId,
     view, setView, extensionsAddOpen, setExtensionsAddOpen,
   }
   const active = sections.find(section => section.id === tab)
@@ -466,13 +462,4 @@ registerSettingsSection(BUILTIN_EXTENSION_ID, {
   description: '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。',
   headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加</button>,
   render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} />,
-})
-
-registerSettingsSection(BUILTIN_EXTENSION_ID, {
-  id: 'updates',
-  label: '更新中心',
-  title: '更新中心',
-  description: '比较内置 Pi、Cua Driver 和托管运行时组件的本机与最新版本。',
-  onActivate: ({ setExtensionsAddOpen }) => setExtensionsAddOpen(false),
-  render: ctx => <UpdateCenter updates={ctx.updates} onRequestUpdate={ctx.onRequestUpdate} />,
 })

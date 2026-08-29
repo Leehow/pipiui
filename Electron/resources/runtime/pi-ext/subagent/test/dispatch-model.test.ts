@@ -7,9 +7,8 @@
  * host-catalog visibility in the Boss routing block, pin-suppressed fallback advancement,
  * and actual-model observability on job records.
  *
- * Same harness trick as dispatch-seam.test.ts: the runtime re-executes THIS FILE as the
- * worker child (getPiInvocation resolves PIPIUI_NODE_PATH + process.argv[1]); the guard
- * below turns that execution into a scripted fake worker that echoes the resolved --model.
+ * Worker children execute the dedicated fake-pi-worker.ts fixture. The test suite itself is
+ * never a child entry, so transport changes cannot recursively register these tests.
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -24,6 +23,7 @@ import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 // Environment for the extension under test must exist BEFORE importing index.ts.
 scrubSubagentRuntimeTestHostEnvironment();
 process.env.PIPIUI_AGENT_DEPTH = "0"; // this suite IS the boss
+process.env.PIPIUI_AGENT_TREE_DEPTH = "0";
 delete process.env.PIPIUI_AGENT_ID;
 delete process.env.PIPIUI_AGENT_RUN_ID;
 // Hermetic model resolution: this dev process may have been launched by the PipiUI host with
@@ -31,35 +31,6 @@ delete process.env.PIPIUI_AGENT_RUN_ID;
 // module import so「跟随主」resolves from the suite, never from the developer's machine.
 delete process.env.PIPIUI_MAIN_MODEL;
 delete process.env.PIPIUI_SUBAGENT_MODELS_FILE;
-
-/** Worker-mode fake pi: echoes the resolved --model argv value, then exits 0. */
-async function runFakeWorkerChild(): Promise<never> {
-	const argv = process.argv;
-	const mi = argv.indexOf("--model");
-	const resolvedModel = mi >= 0 && mi + 1 < argv.length ? argv[mi + 1]! : "(none)";
-	const ti = argv.indexOf("--thinking");
-	const resolvedThinking = ti >= 0 && ti + 1 < argv.length ? argv[ti + 1]! : "";
-	const prompt = argv[argv.length - 1] ?? "";
-	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
-	const agentId = sessionIdArg.replace(/^pipiui-/, "") || prompt.match(/\[dm:([a-z0-9_-]+)/)?.[1] || "unknown";
-	process.stdout.write(JSON.stringify({
-		type: "session_start",
-		cwd: process.cwd(),
-	}) + "\n");
-	process.stdout.write(JSON.stringify({
-		type: "message_end",
-		message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId} model=${resolvedModel}${resolvedThinking ? ` thinking=${resolvedThinking}` : ""}` }] },
-	}) + "\n");
-	process.exit(0);
-}
-
-if (
-	process.argv.includes("-p")
-	&& process.argv.includes("--mode")
-	&& process.argv.includes("json")
-) {
-	await runFakeWorkerChild();
-}
 
 type RegisteredTool = {
 	name: string;
@@ -100,6 +71,7 @@ mkdirSync(join(suiteMainCwd, ".pi"), { recursive: true });
 process.env.PIPIUI_MAIN_CWD = suiteMainCwd;
 process.env.PIPIUI_AGENTS_DIR = fileURLToPath(new URL("../../agents", import.meta.url));
 process.env.PIPIUI_NODE_PATH = process.execPath;
+process.env.PIPIUI_SUBAGENT_TEST_CHILD_ENTRY = fileURLToPath(new URL("./fake-pi-worker.ts", import.meta.url));
 process.env.PIPIUI_WORKTREE = "0";
 // Neutralize the host's real main-model.txt so frontmatter/session priorities are observable.
 process.env.PIPIUI_MAIN_MODEL_FILE = join(suiteMainCwd, "no-such-main-model.txt");

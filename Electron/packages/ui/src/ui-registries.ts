@@ -5,7 +5,6 @@ import type { LiveSubagentProjection } from './live-subagent-projection'
 import type { ModelVisibilityController } from './useModelVisibility'
 import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { TranscriptTool } from './transcript-model'
-import type { UpdateCenterController } from './useUpdateCenter'
 import type { VisionRoutingController } from './useVisionRouting'
 import { disposeSlashCommands } from './slash-commands'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
@@ -36,7 +35,7 @@ export type ToolRendererContribution = {
   render?: (props: ToolRenderProps) => ReactNode
   summarizeArgs?: (args: Record<string, unknown>) => string
   scrapeSummary?: (text: string) => string | undefined
-  /** Running instances project into live subagent rows (subagent / computer_task). */
+  /** Running instances project into live subagent rows. */
   liveProjected?: boolean
 }
 
@@ -88,10 +87,8 @@ export type SettingsSectionContext = {
   visibility: ModelVisibilityController
   vision: VisionRoutingController
   scan: ScanExternalSessionsController
-  updates: UpdateCenterController
   current: Model | null
   onModelState?: (state: ModelState) => void
-  onRequestUpdate: (prompt: string) => void
   projectId?: string
   view: 'manage' | 'add'
   setView: (view: 'manage' | 'add') => void

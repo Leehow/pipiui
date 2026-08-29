@@ -320,6 +320,8 @@ import {
 	normalizeGeneralPurposeExecutionPolicy,
 	rejectDispatchAtDepth,
 	rejectNestedDelegationTypes,
+	resolveEffectiveSubagentDepth,
+	resolveSubagentMaxDepth,
 	runtimeRolePolicyForAgent,
 } from "./runtime-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
@@ -788,7 +790,10 @@ function isolatedComputerWorkerChildProcessEnv(
 	return env;
 }
 // 当前进程在 agent 树里的身份：主会话 depth=0，被派出的 subagent 由父进程注入
-const PIPIUI_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_DEPTH || "0", 10);
+const PIPIUI_DEPTH = resolveEffectiveSubagentDepth(
+	process.env.PIPIUI_AGENT_DEPTH,
+	process.env.PIPIUI_AGENT_TREE_DEPTH,
+);
 const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
 // Only a spawned worker that can itself delegate uses the resident RPC lifecycle.
 // Leaf workers stay on the established one-shot JSON print path.
@@ -803,7 +808,7 @@ const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
 setCloseoutTimelineDir(PIPIUI_MAIN_CWD ? path.join(PIPIUI_MAIN_CWD, ".pi", "agent") : undefined);
 const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 // 多层护栏：depth >= 上限的进程不允许再派 subagent（终端裸跑同样生效）
-const PIPIUI_MAX_DEPTH = Number.parseInt(process.env.PIPIUI_AGENT_MAX_DEPTH || "2", 10);
+const PIPIUI_MAX_DEPTH = resolveSubagentMaxDepth(process.env.PIPIUI_AGENT_MAX_DEPTH);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
 // Globally enabled Computer Use strategy path; mounted in a dispatched Pi
@@ -6271,6 +6276,14 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const nodeShim = process.env.PIPIUI_NODE_PATH;
+	const testChildEntry = process.env.PIPIUI_SUBAGENT_TEST_CHILD_ENTRY;
+	if (testChildEntry) {
+		if (!path.isAbsolute(testChildEntry) || !fs.existsSync(testChildEntry)) {
+			throw new Error(`PIPIUI_SUBAGENT_TEST_CHILD_ENTRY must name an existing absolute file: ${testChildEntry}`);
+		}
+		const testRuntime = nodeShim && fs.existsSync(nodeShim) ? nodeShim : process.execPath;
+		return { command: testRuntime, args: [testChildEntry, ...args] };
+	}
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (nodeShim && fs.existsSync(nodeShim) && currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
@@ -7207,9 +7220,10 @@ async function runSingleAgent(
 			exitCode = await new Promise<number>((resolve) => {
 				const invocation = getPiInvocation(args);
 				const childEnvironmentInput = {
-					PIPIUI_AGENT_ID: pipiuiAgentId,
-					PIPIUI_AGENT_RUN_ID: runId,
-					PIPIUI_AGENT_DEPTH: String(childDepth),
+						PIPIUI_AGENT_ID: pipiuiAgentId,
+						PIPIUI_AGENT_RUN_ID: runId,
+						PIPIUI_AGENT_DEPTH: String(childDepth),
+						PIPIUI_AGENT_TREE_DEPTH: String(childDepth),
 					// Marks only recursive nested parents. A leaf never enters resident mode,
 					// even if its own parent is resident.
 					PIPIUI_NESTED_RPC_PARENT: useNestedRpc ? "1" : undefined,

@@ -48,6 +48,48 @@ describe('live subagent binding', () => {
     await waitFor(() => expect(screen.getByTestId('binding-state').textContent).toBe('0/1/0'))
   })
 
+  it('keeps sibling runs of one agentId separate so a late old-run terminal cannot stop the live run', async () => {
+    const run1: AgentSummary = { agentId: 'root', runId: 'r1', name: 'explorer', task: 'inspect', sessionId: 'A', toolCallId: 'call-1', state: 'running', createdAt: 10 }
+    let listener: ((event: AgentEvent) => void) | undefined
+    const host = {
+      listAgents: vi.fn(async () => [] as AgentSummary[]),
+      subscribeAgents: vi.fn((next: (event: AgentEvent) => void) => { listener = next; return () => undefined })
+    } as unknown as PipiHostAPI
+
+    render(<LiveSubagentBindingProvider host={host} sessionId="A"><BindingProbe /></LiveSubagentBindingProvider>)
+    act(() => listener?.({ type: 'agent', agent: run1 }))
+    expect(screen.getByTestId('binding-state').textContent).toBe('1/0/0')
+    // Same agentId re-dispatched: the successor run is a sibling episode.
+    act(() => listener?.({ type: 'agent', agent: { ...run1, runId: 'r2', createdAt: 50 } }))
+    expect(screen.getByTestId('binding-state').textContent).toBe('2/0/0')
+    // A LATE terminal for the retired run must not stop the live successor.
+    act(() => listener?.({ type: 'agent', agent: { ...run1, state: 'interrupted', updatedAt: 500 } }))
+    expect(screen.getByTestId('binding-state').textContent).toBe('1/0/1')
+    // And a late running update for the retired run cannot reopen its verdict.
+    act(() => listener?.({ type: 'agent', agent: { ...run1, state: 'running', updatedAt: 600 } }))
+    expect(screen.getByTestId('binding-state').textContent).toBe('1/0/1')
+  })
+
+  it('does not let a delayed snapshot of the retired run downgrade the live successor run', async () => {
+    const run1: AgentSummary = { agentId: 'root', runId: 'r1', name: 'explorer', task: 'inspect', sessionId: 'A', toolCallId: 'call-1', state: 'running', createdAt: 10 }
+    let listener: ((event: AgentEvent) => void) | undefined
+    let resolveSnapshot!: (value: AgentSummary[]) => void
+    const host = {
+      listAgents: vi.fn(() => new Promise<AgentSummary[]>(resolve => { resolveSnapshot = resolve })),
+      subscribeAgents: vi.fn((next: (event: AgentEvent) => void) => { listener = next; return () => undefined })
+    } as unknown as PipiHostAPI
+
+    render(<LiveSubagentBindingProvider host={host} sessionId="A"><BindingProbe /></LiveSubagentBindingProvider>)
+    act(() => listener?.({ type: 'agent', agent: run1 }))
+    act(() => listener?.({ type: 'agent', agent: { ...run1, runId: 'r2', createdAt: 50 } }))
+    expect(screen.getByTestId('binding-state').textContent).toBe('2/0/0')
+
+    // Out-of-order snapshot: it still describes the retired run (terminal, newer
+    // timestamp) while the successor run is live. Episode identity must keep both.
+    await act(async () => resolveSnapshot([{ ...run1, state: 'interrupted', updatedAt: 500 }]))
+    await waitFor(() => expect(screen.getByTestId('binding-state').textContent).toBe('1/0/1'))
+  })
+
   it('keeps event-fed state when the initial list request fails', async () => {
     const running: AgentSummary = { agentId: 'root', runId: 'r1', name: 'explorer', task: 'inspect', sessionId: 'A', toolCallId: 'call-1', state: 'running' }
     let listener: ((event: AgentEvent) => void) | undefined

@@ -7,7 +7,7 @@ import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
 
 export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent"|"bossReadOnly";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
-export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"computerUse"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
+export type SpawnPaths = Partial<Record<"philosophy"|"media"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetchPackage"|"mcp"|"skillLoader"|"builtInSkills"|"planRuntime"|"goalRuntime"|"searchScope"|"memoryBroker"|"contextFold"|"hermesMemory"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"webview"|"terminal"|"updateCenter"|"runtimeInfo"|"secretVault"|"codingTools"|"officeDocShotGate"|"firecrawlAnydoc"|"anydoc"|"subagentDir"|"agentsDir", string>>;
 export type ComputerDescriptor = { displayID: number; width: number; height: number };
 /** Origin of the resolved extension instance that produced a contribution snapshot. */
 export type SpawnExtensionOrigin = "builtin" | "app" | "project";
@@ -158,12 +158,12 @@ if(enabled(f,"terminal"))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(inpu
 // Canonical v1: the extension encodes `sessionCapability` envelopes and fails closed when the
 // capability is missing, so the protocol marker is only ever set together with a real credential.
 if(input.sessionCapability){env.PIPIUI_HOST_PROTOCOL="1";env.PIPIUI_SESSION_CAPABILITY=input.sessionCapability}
-if(enabled(f,"computerUse")&&enabled(f,"subagent")&&p.subagentDir&&p.computerUse&&input.computerCapability&&input.computerDescriptor){
-// The main Pi session owns computer_task as a Boss-driven desktop session through
-// the subagent extension. Export the reviewed strategy for explicitly granted
-// bounded operator children; never register mutating computer/open_application
-// tools directly in the main session.
-env.PIPIUI_COMPUTER_EXT=p.computerUse;env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.22.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
+if(enabled(f,"computerUse")&&input.computerCapability&&input.computerDescriptor){
+// The main Pi session owns the computer-use tools through the cua-extension,
+// which reaches the CuaDriverHost only via the host-capability broker. Export
+// the per-session capability and display geometry the broker's desktop-grant
+// check verifies against.
+env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.22.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.
@@ -602,8 +602,7 @@ function appendRegisteredExtensions(args:string[], env:Record<string,string>, pa
  * Worker `-e` remount of the main-session registered-extension snapshot.
  * Same registry channel as assemblePiSpawn; does not scan bare files.
  */
-export function workerRegisteredExtensionArgs(env:NodeJS.ProcessEnv=process.env, options:{computerWorker?:boolean}={}):string[] {
-  if(options.computerWorker)return[];
+export function workerRegisteredExtensionArgs(env:NodeJS.ProcessEnv=process.env):string[] {
   const raw=env[REGISTERED_EXTENSION_PATHS_ENV];
   if(!raw)return[];
   const args:string[]=[];
@@ -800,7 +799,6 @@ export function resolveSpawnPaths(runtimeRoot:string=defaultRuntimeRoot(),option
     xaiServerTools:fileIfPresent(extensions,"pipiui-xai-server-tools.ts"),
     deepseekServerTools:fileIfPresent(extensions,"pipiui-deepseek-server-tools.ts"),
     glmSearchMcp:fileIfPresent(extensions,"pipiui-glm-search-mcp.ts"),
-    computerUse:fileIfPresent(extensions,"pipiui-computer-use.ts"),
     webview:fileIfPresent(extensions,"pipiui-electron-webview.ts"),
     browserSearch:fileIfPresent(extensions,"pipiui-browser-search.ts"),
     browserMemory:fileIfPresent(extensions,"pipiui-browser-memory.ts"),

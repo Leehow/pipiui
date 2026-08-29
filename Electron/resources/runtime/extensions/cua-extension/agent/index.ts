@@ -1,17 +1,26 @@
-// PipiUI Computer Use strategy v1 — cua-extension agent half.
+// PipiUI Computer Use — cua-extension agent half.
 //
-// Migrated from the built-in `pipiui-computer-use.ts` strategy: the tool
-// schemas, prompting, batching, screenshot context, provider adaptation, and
-// result formatting are byte-identical (frozen wire contract: `computer` /
-// `open_application`, Anthropic `computer_20251124` replacement, opaque
-// screenshot markers). What changed is only the transport to the native host:
-// driver calls now travel through the versioned Host Capability API broker
-// (`host_capability` wire action, `native.cua` op, one-time capability token)
-// instead of the legacy `computer_*` bridge route. TCC/Accessibility,
-// CuaDriverHost lifecycle, exact pid/window binding, and screenshot capture and
-// cleanup stay in the Electron core; the desktop-grant capability is still
-// presented inside every driver request, so its authorization semantics are
-// unchanged.
+// The single thin computer-use surface: this extension mounts the `computer`
+// and `open_application` tools in the main session. Driver calls travel
+// through the versioned Host Capability API broker (`host_capability` wire
+// action, `native.cua` op, one-time capability token) into the Electron core's
+// CuaDriverHost and the bundled cua-driver; the desktop-grant capability rides
+// inside every driver request, so its authorization semantics are unchanged.
+// TCC/Accessibility, CuaDriverHost lifecycle, exact pid/window binding, and
+// screenshot capture and cleanup stay in the Electron core.
+//
+// Coordinate/scale contract: every observation may carry a top-level
+// `screenshot: { width, height, scaleX, scaleY }` block — the delivered image
+// pixel dims and the scale back to driver pixels. Model coordinates are
+// interpreted in the delivered screenshot pixel space; the host bounds-checks
+// and maps them back. Every `computer_batch` response carries per-action
+// `outcomes` (first failure stops the batch; the tail is `not_executed`).
+//
+// Screenshot marker pipeline: toolResults keep only an opaque
+// [PIPIUI_COMPUTER_SCREENSHOT:id] marker in agent state/session JSONL; the
+// provider-context hook prunes evicted inline images and injects exactly the
+// retained 3-entry FIFO screenshots, so provider context never accumulates
+// every screenshot forever and image bytes never hit disk.
 //
 // Anthropic messages replaces only computer with computer_20251124. OpenAI native computer_call is not promised.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -74,7 +83,13 @@ function nativeCua(): NativeCuaClient {
 }
 
 function runtimeFailureMessage(json: any, fallback: string): string {
-  return json?.runtimeError?.message || json?.error || fallback;
+  const message = json?.runtimeError?.message || json?.error || fallback;
+  // Surface the host failure code (e.g. `unsupported_action`,
+  // `coordinate_out_of_bounds`) so the model can classify without parsing prose.
+  const code = json?.runtimeError?.code;
+  return typeof code === "string" && code.length > 0
+    ? `${code}: ${message}`
+    : message;
 }
 
 export async function negotiateRuntime(): Promise<RuntimeCapabilities> {
@@ -124,31 +139,29 @@ export async function negotiateRuntime(): Promise<RuntimeCapabilities> {
   return runtimeCapabilitiesPromise;
 }
 
+// The complete action set the host can execute — kept in sync with
+// SUPPORTED_COMPUTER_ACTIONS in CuaDriverHost. Anything outside this set is
+// rejected up-front by the host with `unsupported_action` (nothing executes).
 const ActionTypeSchema = Type.Union([
   Type.Literal("screenshot"),
-  Type.Literal("mouse_move"),
   Type.Literal("click"),
   Type.Literal("left_click"),
   Type.Literal("right_click"),
   Type.Literal("middle_click"),
   Type.Literal("double_click"),
   Type.Literal("triple_click"),
-  Type.Literal("left_mouse_down"),
-  Type.Literal("left_mouse_up"),
-  Type.Literal("drag"),
-  Type.Literal("left_click_drag"),
   Type.Literal("type"),
   Type.Literal("key"),
   Type.Literal("keypress"),
   Type.Literal("scroll"),
   Type.Literal("wait"),
+  Type.Literal("invoke_menu"),
 ], {
     description:
-      "screenshot | mouse_move | click | left_click | right_click | middle_click | " +
-      "double_click | triple_click | left_mouse_down | left_mouse_up | drag | " +
-      "left_click_drag | type | key | keypress | scroll | wait. mouse_move changes " +
-      "the visible Cua agent overlay only; it does not synthesize native macOS hover. " +
-    "left_mouse_down/mouse_move/left_mouse_up must be one complete contiguous batch.",
+      "screenshot | click | left_click | right_click | middle_click | " +
+      "double_click | triple_click | type | key | keypress | scroll | wait | " +
+      "invoke_menu. invoke_menu triggers an app menu item via its dot-free " +
+      'menu path in the path field (e.g. "File > Save As…").',
 });
 
 // Some OpenAI-compatible providers (including xAI) reject JSON Schema's
@@ -171,6 +184,10 @@ const ActionSchema = Type.Object({
   scroll_amount: Type.Optional(Type.Number({ minimum: 1, maximum: 50 })),
   duration: Type.Optional(Type.Number({ minimum: 0, maximum: 10 })),
   duration_ms: Type.Optional(Type.Number({ minimum: 0, maximum: 10_000 })),
+  path: Type.Optional(Type.String({
+    description:
+      'Dot-free menu path for invoke_menu, e.g. "File > Save As…".',
+  })),
   element_index: Type.Optional(Type.Number({
     description: "Element index from the latest AX snapshot for the selected target.",
   })),
@@ -521,9 +538,19 @@ export function compactToolDetails(
   for (const key of [
     "openedApplication", "batchOK", "batchError", "focusDrift",
     "foregroundApp", "windowTitle", "displayID", "width", "height",
-    "target", "screenshotTarget",
+    "target", "screenshotTarget", "outcomes",
   ]) {
     if (metadata[key] !== undefined) details[key] = metadata[key];
+  }
+  // Delivered-screenshot pixel dims + scale back to driver pixels only; the
+  // base64 bytes themselves stay on the marker/in-memory pipeline.
+  const screenshot = metadata.screenshot;
+  if (isRecord(screenshot)) {
+    const scale: Record<string, unknown> = {};
+    for (const key of ["width", "height", "scaleX", "scaleY"]) {
+      if (screenshot[key] !== undefined) scale[key] = screenshot[key];
+    }
+    if (Object.keys(scale).length > 0) details.screenshot = scale;
   }
   const accessibility = metadata.accessibility;
   if (isRecord(accessibility)) {
@@ -613,23 +640,23 @@ export function injectInMemoryScreenshots(messages: any[]): any[] {
     if (!isRecord(message) || message.role !== "toolResult") return message;
     const ids = screenshotIDs(message.content);
     if (ids.length === 0) return message;
+    // Prune + inject: a message carrying our markers gets image blocks equal to
+    // exactly the retained FIFO entries for those marker IDs — an evicted
+    // screenshot's inline image leaves the provider context instead of
+    // accumulating forever. Non-image blocks (metadata text + marker) pass
+    // through, and messages without our marker are untouched, so other tools'
+    // images are never pruned.
+    const blocks = message.content as any[];
+    const withoutImages = blocks.filter(
+      (block) => !(isRecord(block) && block.type === "image"),
+    );
     const images = ids.flatMap((id) => {
       const screenshot = screenshots.get(id);
       return screenshot
         ? [{ type: "image", data: screenshot.data, mimeType: screenshot.mimeType }]
         : [];
     });
-    const existingImages = new Set(
-      (message.content as any[])
-        .filter((block) => isRecord(block) && block.type === "image")
-        .map((block) => block.data),
-    );
-    const missingImages = images.filter(
-      (image) => !existingImages.has(image.data),
-    );
-    return missingImages.length > 0
-      ? { ...message, content: [...(message.content as any[]), ...missingImages] }
-      : message;
+    return { ...message, content: [...withoutImages, ...images] };
   });
 }
 
@@ -699,6 +726,8 @@ export default function (pi: ExtensionAPI) {
         height: result.height,
         target: result.target,
         screenshotTarget: result.screenshotTarget,
+        ...(result.screenshot ? { screenshot: result.screenshot } : {}),
+        ...(result.outcomes ? { outcomes: result.outcomes } : {}),
         ...(accessibility ? { accessibility } : {}),
       };
       return screenshotToolResult(result, metadata);
@@ -709,28 +738,23 @@ export default function (pi: ExtensionAPI) {
     name: "computer",
     label: "Computer",
     description:
-      "Operate this session's selected pid/window target through embedded Cua Driver while " +
-      "the global desktop button is on. Call open_application first to select or switch " +
-      "the target; PipiUI becoming frontmost never changes it. This is unrestricted mode: there are no per-session, " +
-      "per-app, sensitive-action, or destructive-action prompts. " +
-      "Routing priority: deterministic app lifecycle first (open_application for launch, activation, " +
-      "or target switching), then in-app AX or keyboard-shortcut navigation, then pixels. Never shell open. " +
-      "Use existing shell/macOS lifecycle commands for running-state checks and graceful quit; " +
-      "do not default to force quit or kill -9. " +
-      "Prefer the browser tool for ordinary web tasks. If the user explicitly requests Chrome, Safari, or another external browser App, " +
-      "first pin that browser with open_application, copy one complete percent-encoded URL using " +
-      "printf '%s' '<URL>' | pbcopy, then send one computer batch: CMD+L, CMD+V, RETURN, wait. " +
-      "Do not use AppleScript/osascript or shell open for external-browser navigation because AppleEvents may require TCC or hang. " +
-      "Prefer element_index/element_token AX actions over screenshot coordinates. " +
-      "Use screenshot coordinates only as a fallback when lifecycle commands and AX cannot complete the task. " +
-      "Batch discipline (hard rule): one accepted batch = one round-trip (one screenshot plus one full model inference); batches are the unit of cost. Put every coherent sequence into ONE actions:[...] batch — e.g. click field + type + Enter; CMD+L + CMD+V + RETURN + wait; navigate + observe. Split only when the next step genuinely depends on seeing the previous result. Single-action batches are the expensive anti-pattern; avoid them for anything non-exploratory. Every accepted batch returns a fresh screenshot. " +
-      "Failure discipline: when a coordinate is reported out-of-bounds or an element_token is stale, that input is permanent-fail until you re-observe. Do not retry the same coordinate or token. Re-capture a fresh screenshot / AX snapshot first, recompute, then act. If the result reports actionable_context_changed, snapshot_changed, batchInterrupted, noProgress, or outcomeUnknown, stop the old sequence: re-observe and replan inside the dedicated Computer Use agent. Never click a parent-window control while a sheet/dialog/modal layer is present. " +
-      "Use element_index/element_token from the latest AX snapshot when available. " +
-      "mouse_move points with the Cua overlay and does not trigger native hover; " +
-      "hold_key is unsupported. Mouse down/up are accepted only as one complete " +
-      "same-batch drag sequence. " +
-      "Use browser for local/web UI whenever it is more precise. PipiUI still validates " +
-      "the exact target, screenshot coordinate transform, cancellation, and cleanup.",
+      "Operate this session's pinned macOS app window through the embedded Cua Driver. " +
+      "Call open_application first to pin the exact app window; PipiUI becoming frontmost never steals that target. " +
+      "Routing ladder: open_application for launch or activation, then element_index/element_token AX actions or " +
+      "keyboard shortcuts, and pixel coordinates only as the last resort; never shell open. " +
+      "Coordinates are in the pixel space of the LATEST returned screenshot (see the `screenshot` metadata block " +
+      "for its dims); the host bounds-checks and maps them back to driver pixels, so never rescale them yourself. " +
+      "Batch discipline: put one coherent deterministic sequence into ONE actions[] batch (e.g. click field + type + Enter); " +
+      "the batch stops at the first failure and `outcomes` marks every skipped tail action not_executed, so split " +
+      "only at genuine decision points. " +
+      "Failure discipline: never retry the same coordinate or element token after stale_snapshot or " +
+      "coordinate_out_of_bounds — re-observe with one screenshot action and replan; after two failed verified " +
+      "attempts, switch mode (AX/keyboard instead of pixels) or stop and ask. " +
+      "Prefer the browser tool for ordinary web tasks; for an explicitly requested external browser, pin it with " +
+      "open_application, put the URL on the clipboard via printf '%s' '<URL>' | pbcopy, then send one batch: " +
+      "CMD+L, CMD+V, RETURN, wait — never open/osascript for navigation. " +
+      "Use wait only to let the UI settle (duration at most 10s, duration_ms at most 10000); " +
+      "scroll_amount is 1-50, so scroll in small steps and re-observe.",
     // `action` plus single-action fields remain optional so Anthropic's official
     // schema can dispatch into the same executor after the provider-side replacement.
     parameters: Type.Object({
@@ -774,6 +798,7 @@ export default function (pi: ExtensionAPI) {
         focusDrift: result.focusDrift,
         target: result.target,
         screenshotTarget: result.screenshotTarget,
+        ...(result.screenshot ? { screenshot: result.screenshot } : {}),
         ...(accessibility ? { accessibility } : {}),
         ...(result.batchError ? { batchError: result.batchError } : {}),
       };
@@ -782,9 +807,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Pi persists toolResult messages to JSONL. Keep only an opaque marker in agent
-  // state/session history, then inject the PNG into the cloned provider context.
-  // This gives every provider a normal image tool result without writing screenshot
-  // bytes to disk. Markers from a restarted session simply have no in-memory image.
+  // state/session history, then prune evicted inline images and inject the
+  // retained PNGs into the cloned provider context. This gives every provider a
+  // normal image tool result without writing screenshot bytes to disk or letting
+  // old screenshots accumulate. Markers from a restarted session simply have no
+  // in-memory image.
   pi.on("context", (event) => ({
     messages: injectInMemoryScreenshots(event.messages as any[]),
   }));

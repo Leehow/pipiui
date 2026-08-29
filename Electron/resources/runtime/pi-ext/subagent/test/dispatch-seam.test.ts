@@ -5,11 +5,9 @@
  * registers it against a fake ExtensionAPI, then calls the registered `subagent` /
  * `subagent_abort` tools' prepareArguments + execute exactly like pi would.
  *
- * Worker children never spawn real Pi: the runtime resolves the child invocation through
- * getPiInvocation(), which prefers PIPIUI_NODE_PATH + process.argv[1]. Under this test both
- * point at this very file, so the child re-executes it with `--mode json` worker args —
- * the reentry guard at the bottom turns this process into a scripted fake worker whose
- * behavior per agentId comes from a control JSON next to this file.
+ * Worker children never spawn real Pi: the runtime resolves the explicit
+ * PIPIUI_SUBAGENT_TEST_CHILD_ENTRY to a dedicated protocol fixture that does not
+ * import node:test or register this suite again.
  */
 import test, { after } from "node:test";
 import assert from "node:assert/strict";
@@ -23,163 +21,9 @@ import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 // module reads PIPIUI_AGENT_DEPTH / PIPIUI_MAIN_CWD / PIPIUI_AGENTS_DIR at load time.
 scrubSubagentRuntimeTestHostEnvironment();
 process.env.PIPIUI_AGENT_DEPTH = "0"; // this suite IS the boss (depth 0) regardless of the harness that ran it
+process.env.PIPIUI_AGENT_TREE_DEPTH = "0";
 delete process.env.PIPIUI_AGENT_ID;
 delete process.env.PIPIUI_AGENT_RUN_ID;
-
-/**
- * Worker-mode fake pi. The runtime re-executes THIS FILE as the worker child
- * (getPiInvocation: PIPIUI_NODE_PATH + process.argv[1]); this branch speaks the worker
- * protocol and ALWAYS process.exit()s — it can never fall through into the test suite
- * below. Per-child behavior is scripted entirely through the prompt markers this suite
- * embeds ([seam:<id>:<mode>]), the only channel that survives child-env sanitization.
- * The hang mode keeps a referenced keepalive with a bounded hard exit so a leaked child
- * cannot hold the test process open.
- */
-function writeChildState(agentId: string, extra: Record<string, unknown> = {}): void {
-	const root = process.env.PIPIUI_MAIN_CWD;
-	if (!root) return;
-	const path = join(root, `rpc-child-${agentId}.json`);
-	let prev: Record<string, unknown> = {};
-	try {
-		prev = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-	} catch {
-		/* first write */
-	}
-	writeFileSync(path, JSON.stringify({ ...prev, pid: process.pid, ...extra }));
-}
-
-function parkResident(agentId: string, ignoreTerm: boolean): Promise<never> {
-	writeChildState(agentId, { final: true });
-	if (ignoreTerm) {
-		process.on("SIGTERM", () => {
-			writeChildState(agentId, { sigterm: true });
-		});
-	}
-	const keepAlive = setInterval(() => {}, 60_000);
-	void keepAlive;
-	const hardExit = setTimeout(() => process.exit(0), 30_000);
-	void hardExit;
-	return new Promise(() => {});
-}
-
-let rpcExitOnGetState = false;
-
-async function runFakeWorkerChild(prompt = process.argv[process.argv.length - 1] ?? "", rpcCommandId?: string): Promise<never> {
-	const argv = process.argv;
-	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
-	const fromSession = sessionIdArg.replace(/^pipiui-/, "");
-	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/);
-	const agentId = fromSession || marker?.[1] || "unknown";
-	const mode = marker?.[2] ?? "ok";
-	const line = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
-	line({ type: "session_start", cwd: process.cwd() });
-	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
-	if (mode === "final-hold") {
-		line({
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId}` }] },
-		});
-		return parkResident(agentId, false);
-	}
-	if (mode === "hang") {
-		// Referenced keepalive: the test aborts this run via subagent_abort exact-run
-		// binding; the hard cap bounds a leaked child's lifetime.
-		const keepAlive = setInterval(() => {}, 60_000);
-		void keepAlive;
-		const hardExit = setTimeout(() => process.exit(0), 30_000);
-		void hardExit;
-		// Park forever inside worker mode — never return into the module.
-		for (;;) {
-			// eslint-disable-next-line no-await-in-loop
-			await new Promise((resolve) => setTimeout(resolve, 5_000));
-		}
-	}
-	if (mode === "fail") {
-		line({
-			type: "message_end",
-			message: { role: "assistant", content: [{ type: "text", text: "planned failure" }] },
-		});
-		process.exit(3);
-	}
-	line({
-		type: "message_end",
-		message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId}` }] },
-	});
-	process.exit(0);
-}
-
-function seamMode(prompt: string): string {
-	return prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/)?.[2] ?? "ok";
-}
-
-async function runResidentRpcFake(rpcCommandId: string | undefined, prompt: string, mode: string): Promise<never> {
-	const argv = process.argv;
-	const sessionIdArg = argv.find((value) => value.startsWith("pipiui-")) ?? "";
-	const fromSession = sessionIdArg.replace(/^pipiui-/, "");
-	const marker = prompt.match(/\[seam:([a-z0-9_-]+?)(?::([a-z0-9-]+))?\]/);
-	const agentId = fromSession || marker?.[1] || "unknown";
-	const line = (event: unknown) => process.stdout.write(JSON.stringify(event) + "\n");
-	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
-	line({ type: "session_start", cwd: process.cwd() });
-	line({
-		type: "message_end",
-		message: { role: "assistant", content: [{ type: "text", text: `fake-ok:${agentId}` }] },
-	});
-	line({ type: "agent_settled" });
-	writeChildState(agentId);
-	if (mode === "rpc-hold") return parkResident(agentId, false);
-	const token = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN ?? "";
-	line({
-		type: "extension_ui_request",
-		method: "setStatus",
-		statusKey: `pipiui-resident-rpc-wake:${token}`,
-	});
-	if (mode === "rpc-exit") {
-		rpcExitOnGetState = true;
-		return parkResident(agentId, false);
-	}
-	if (mode === "rpc-stubborn") return parkResident(agentId, true);
-	return parkResident(agentId, false);
-}
-
-async function runFakeRpcWorkerChild(): Promise<never> {
-	const spawnedId = process.env.PIPIUI_AGENT_ID;
-	if (spawnedId) writeChildState(spawnedId);
-	let buffer = "";
-	process.stdin.on("data", (chunk) => {
-		buffer += String(chunk);
-		for (;;) {
-			const newline = buffer.indexOf("\n");
-			if (newline < 0) break;
-			const line = buffer.slice(0, newline);
-			buffer = buffer.slice(newline + 1);
-			try {
-				const command = JSON.parse(line) as { id?: string; type?: string; message?: string };
-				if (command.type === "get_state" && rpcExitOnGetState) process.exit(0);
-				if (command.type === "prompt") {
-					const message = command.message ?? "";
-					const mode = seamMode(message);
-					if (mode.startsWith("rpc-")) void runResidentRpcFake(command.id, message, mode);
-					else void runFakeWorkerChild(message, command.id);
-				}
-			} catch {
-				process.exit(2);
-			}
-		}
-	});
-	await new Promise<never>(() => {});
-}
-
-if (
-	process.argv.includes("-p")
-	&& process.argv.includes("--mode")
-	&& process.argv.includes("json")
-) {
-	await runFakeWorkerChild();
-}
-if (process.argv.includes("--mode") && process.argv.includes("rpc")) {
-	await runFakeRpcWorkerChild();
-}
 
 import { sanitizeStrictToolArguments } from "../strict-json-schema.ts";
 import { setAgentLeaseMutationHooksForTests } from "../agent-lease.ts";
@@ -246,6 +90,7 @@ mkdirSync(suiteSessionsDir, { recursive: true });
 process.env.PIPIUI_MAIN_CWD = suiteMainCwd;
 process.env.PIPIUI_AGENTS_DIR = agentsDir;
 process.env.PIPIUI_NODE_PATH = process.execPath;
+process.env.PIPIUI_SUBAGENT_TEST_CHILD_ENTRY = fileURLToPath(new URL("./fake-pi-worker.ts", import.meta.url));
 process.env.PIPIUI_WORKTREE = "0";
 
 const { default: loadExtension, drainPipiuiTrackedChildren } = await import("../index.ts");

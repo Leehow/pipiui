@@ -168,10 +168,6 @@ const profileNames: Record<string, string> = {
   plan: '规划',
   secretary: '收尾秘书',
   'long-test': '长时测试',
-  'computer-use': '电脑操作 Agent',
-  'computer-use-leader': '电脑操作主管',
-  'computer-terminal': '终端操作',
-  'computer-verifier': '操作验证',
   operator: '操作'
 }
 
@@ -195,7 +191,6 @@ function knownTaskSummary(text: string): string | undefined {
   if (sameTask) return `同一任务第 ${sameTask[1]} 轮`
   if (/^profile-first-ok[.!]?$/i.test(compact)) return '优先恢复配置验证成功'
   if (/^profile-second-ok[.!]?$/i.test(compact)) return '第二轮配置恢复成功'
-  if (/^computer use leader[.!]?$/i.test(compact)) return '电脑操作主管'
   return undefined
 }
 
@@ -231,10 +226,6 @@ function shortTaskLabel(task: string): string {
 function agentListSubtitle(agent: Agent): string {
   const title = agent.title?.trim()
   if (title) return localizedTaskSummary(title)
-  if (agent.name === 'computer-use' || agent.role === 'computer-use-agent') return '规划、操作并核验桌面任务'
-  if (agent.name === 'computer-use-leader' || agent.role === 'computer-use-leader') return '协调并核验桌面操作任务'
-  if (agent.name === 'computer-terminal') return '执行受限终端步骤'
-  if (agent.name === 'computer-verifier') return '核验桌面操作结果'
   const taskLabel = agent.task?.trim() ? shortTaskLabel(agent.task) : ''
   if (taskLabel) return taskLabel
   const activity = agent.listSubtitle?.trim()
@@ -294,12 +285,9 @@ function liveAgentStatus(agent: Agent, now: number, activeChildCount = 0): LiveA
   const liveName = rawActivity.match(/^([a-z][a-z0-9_-]*)\b/i)?.[1]
   const tokenSuffix = liveName === 'write' || liveName === 'edit' ? latestWriteEditTokenLabel(agent) : undefined
   const toolLabel = activityActive ? liveToolActivityLabel(rawActivity, tokenSuffix) : undefined
-  const replanning = /^(?:Revise this Computer Task plan|Repair this Computer Task plan)/i.test(agent.task)
-  const phase = replanning
-    ? '正在调查失败并重新规划'
-    : toolLabel
-      ? `最近活动 · ${toolLabel}`
-      : '等待模型响应'
+  const phase = toolLabel
+    ? `最近活动 · ${toolLabel}`
+    : '等待模型响应'
   const deadlineSeconds = agent.deadlineAt ? Math.max(0, Math.ceil((agent.deadlineAt - now) / 1000)) : undefined
   if (quietSeconds === undefined) {
     return { text: `${phase} · 等待新的状态事件`, severity: 'active' }
@@ -641,8 +629,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
   useEffect(() => {
     if (!hasRunning) return
     // Agent events update the activity text immediately. Age quiet/deadline
-    // labels on a coarse clock so Computer Use is not rejected by a 1Hz
-    // accessibility-tree churn. Running elapsed time ticks in RunningElapsed.
+    // labels on a coarse clock; running elapsed time ticks in RunningElapsed.
     setNow(Date.now())
     const timer = window.setInterval(() => setNow(Date.now()), 15_000)
     return () => window.clearInterval(timer)

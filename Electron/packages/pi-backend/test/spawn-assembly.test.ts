@@ -324,7 +324,7 @@ describe("Computer Agent host contract", () => {
       cwd: "/tmp/project",
       agentDir: "/tmp/project/.pi/agent",
       features: { subagent: true, computerUse: true },
-      paths: { subagentDir: "/ext/subagent", computerUse: "/ext/computer.ts" },
+      paths: { subagentDir: "/ext/subagent" },
       bridgePort: 1234,
       computerCapability: "cap",
       computerDescriptor: { displayID: 1, width: 100, height: 100 },
@@ -632,14 +632,18 @@ describe("default feature set", () => {
     expect(sanitizeEnvironment({ PIPIUI_SKILLLOADER_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 
-  it("exports computer runtime routing only with a resolved extension, descriptor and capability", () => {
-    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true, subagent: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts", subagentDir: "/runtime/pi-ext/subagent" }, bridgePort: 1234, bridgeRoutingKey: "session-id", computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
-    expect(ready.args).toEqual(expect.arrayContaining(["-e", "/runtime/pi-ext/subagent"]));
-    expect(ready.args).not.toContain("/runtime/pipiui-computer-use.ts");
-    expect(ready.env).toMatchObject({ PIPIUI_COMPUTER_EXT: "/runtime/pipiui-computer-use.ts", PIPIUI_COMPUTER_CAPABILITY: "computer-secret", PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1", PIPIUI_COMPUTER_DISPLAY_ID: "7", PIPIUI_COMPUTER_WIDTH: "1440", PIPIUI_COMPUTER_HEIGHT: "900" });
-    const unavailable = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: { computerUse: "/runtime/pipiui-computer-use.ts" }, bridgePort: 1234, computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
-    expect(unavailable.args).not.toContain("/runtime/pipiui-computer-use.ts");
-    expect(unavailable.env.PIPIUI_COMPUTER_EXT).toBeUndefined();
+  it("exports computer runtime routing with feature, capability and descriptor — no extension path or subagent required", () => {
+    const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: {}, bridgePort: 1234, bridgeRoutingKey: "session-id", computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
+    expect(ready.env).toMatchObject({ PIPIUI_COMPUTER_CAPABILITY: "computer-secret", PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1", PIPIUI_CUA_DRIVER_VERSION: "0.22.0", PIPIUI_COMPUTER_DISPLAY_ID: "7", PIPIUI_COMPUTER_WIDTH: "1440", PIPIUI_COMPUTER_HEIGHT: "900" });
+    // The legacy reviewed-strategy twin is deleted; its env path must never be exported.
+    expect(ready.env.PIPIUI_COMPUTER_EXT).toBeUndefined();
+    const noCapability = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: {}, bridgePort: 1234, computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
+    expect(noCapability.env.PIPIUI_COMPUTER_CAPABILITY).toBeUndefined();
+    expect(noCapability.env.PIPIUI_CUA_DRIVER_VERSION).toBeUndefined();
+    const disabled = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: false }, paths: {}, bridgePort: 1234, computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
+    expect(disabled.env.PIPIUI_COMPUTER_CAPABILITY).toBeUndefined();
+    const noDescriptor = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: {}, bridgePort: 1234, computerCapability: "computer-secret" });
+    expect(noDescriptor.env.PIPIUI_COMPUTER_CAPABILITY).toBeUndefined();
   });
 
   it("does not register the browser extension when the feature is explicitly disabled", () => {
@@ -722,7 +726,6 @@ describe("registered PipiUI extension agent mounts (D3 / §5.5)", () => {
       "-e", quotaAgent,
       "-e", "/pkg/my-ext/agent.js",
     ]);
-    expect(workerRegisteredExtensionArgs(env, { computerWorker: true })).toEqual([]);
   });
 
   it("keeps skills when agent-half is absent and drops colliding mount paths", () => {

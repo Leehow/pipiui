@@ -6,8 +6,30 @@ import { join, resolve } from "node:path";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 import { resolveCuaDriverLaunchPath } from "./runtime-assets.js";
+import {
+  createIdentityPipeline,
+  type ComputerImagePipeline,
+} from "./computer-image-pipeline.js";
 
 export const CUA_DRIVER_VERSION = "0.22.0";
+/** Model-delivered screenshots never exceed this long edge (Anthropic tool_result image budget). */
+export const MAX_SCREENSHOT_LONG_EDGE = 1568;
+/** The complete set of batch action types this host can execute — the model-facing schema must match. */
+export const SUPPORTED_COMPUTER_ACTIONS = new Set([
+  "screenshot",
+  "wait",
+  "click",
+  "left_click",
+  "right_click",
+  "middle_click",
+  "double_click",
+  "triple_click",
+  "type",
+  "key",
+  "keypress",
+  "scroll",
+  "invoke_menu",
+]);
 export type DisplayDescriptor = {
   displayID: number;
   width: number;
@@ -136,66 +158,6 @@ function isStandardFilePanelObservation(observation: Record<string, unknown>): b
     ? observation.tree_markdown.split("\n", 1)[0]
     : "";
   return /\bAXWindow\b[^\n]*\[id=(?:open-panel|save-panel)(?:\s|\])/.test(firstLine);
-}
-
-function normalizedBasename(value: unknown): string {
-  return typeof value === "string" ? value.normalize("NFC") : "";
-}
-
-function observedElements(observation: Record<string, unknown>): Array<Record<string, unknown>> {
-  return Array.isArray(observation.elements) ? observation.elements.filter(record) : [];
-}
-
-function resolveObservedFileTarget(
-  observation: Record<string, unknown>,
-  basename: string,
-): Record<string, unknown> | undefined {
-  if (!isStandardFilePanelObservation(observation)) return undefined;
-  const elements = observedElements(observation);
-  const lists = elements.filter((element) =>
-    element.role === "AXList" &&
-    (
-      typeof element.element_token === "string" ||
-      Number.isInteger(element.element_index)
-    )
-  );
-  if (lists.length !== 1) return undefined;
-  const list = lists[0];
-  const listIndex = Number.isInteger(list.element_index) ? Number(list.element_index) : undefined;
-  if (listIndex === undefined) return undefined;
-  const normalized = normalizedBasename(basename);
-  const candidates = elements.filter((element) =>
-    Number(element.parent_index) === listIndex &&
-    ["AXImage", "AXRow", "AXCell"].includes(String(element.role ?? "")) &&
-    normalizedBasename(element.label ?? element.name ?? element.title) === normalized &&
-    (
-      typeof element.element_token === "string" ||
-      Number.isInteger(element.element_index)
-    )
-  );
-  if (candidates.length !== 1) return undefined;
-  const candidate = candidates[0];
-  const candidateIndex = Number(candidate.element_index);
-  const actionLine = String(observation.tree_markdown ?? "")
-    .split("\n")
-    .find((line) => new RegExp(`^\\s*- \\[${candidateIndex}\\]\\s`).test(line));
-  if (!actionLine || !/\bactions=\[[^\]]*\bopen\b[^\]]*\]/.test(actionLine)) return undefined;
-  const currentSnapshotID = snapshotID(observation);
-  if (typeof candidate.element_token === "string") {
-    return {
-      element_token: candidate.element_token,
-      ...(currentSnapshotID ? { snapshot_id: currentSnapshotID } : {}),
-    };
-  }
-  if (!currentSnapshotID) return undefined;
-  return { element_index: candidate.element_index, snapshot_id: currentSnapshotID };
-}
-
-function isDocumentSurfaceObservation(observation: Record<string, unknown>): boolean {
-  if (isStandardFilePanelObservation(observation)) return false;
-  return observedElements(observation).some((element) =>
-    ["AXTextArea", "AXTextView", "AXDocument", "AXWebArea"].includes(String(element.role ?? ""))
-  );
 }
 
 /** Pick the app's real content window, not a thin menu/title-bar surface. */
@@ -511,6 +473,10 @@ export class CuaDriverHost {
   private observations = new Map<string, { target: CuaTarget; observation: Record<string, unknown> }>();
   private applicationIdentities = new Map<string, Set<string>>();
   private sessionScopes = new Map<string, "window" | "desktop">();
+  private scales = new Map<
+    string,
+    { scaleX: number; scaleY: number; width: number; height: number }
+  >();
   private requestTail: Promise<void> = Promise.resolve();
   private requestGeneration = 0;
   private teardowns = new Set<Promise<void>>();
@@ -525,6 +491,7 @@ export class CuaDriverHost {
     readonly display: DisplayDescriptor,
     private readonly spawnDriver: SpawnDriver = spawn,
     private readonly timeoutMs = 32_000,
+    private readonly imagePipeline: ComputerImagePipeline = createIdentityPipeline(),
   ) {}
 
   private launchPath(): string {
@@ -615,10 +582,11 @@ export class CuaDriverHost {
           "click",
           "left_click",
           "right_click",
+          "middle_click",
           "double_click",
-		  "invoke_menu",
+          "triple_click",
+          "invoke_menu",
           "type",
-		  "typeahead",
           "key",
           "keypress",
           "scroll",
@@ -725,6 +693,33 @@ export class CuaDriverHost {
           false,
         );
       const owner = computerTaskOwnerKey(session, request.taskId);
+      const outcomes: Array<{
+        index: number;
+        type: string;
+        status: "ok" | "failed" | "not_executed";
+        error?: string;
+      }> = actions.map((raw, index) => ({
+        index,
+        type: record(raw) ? String(raw.type ?? raw.action ?? "") : "",
+        status: "not_executed",
+      }));
+      // Validate the whole batch before anything executes: an unsupported
+      // action is a permanent model error, not a post-mutation unknown.
+      for (const outcome of outcomes) {
+        if (!SUPPORTED_COMPUTER_ACTIONS.has(outcome.type)) {
+          outcome.status = "failed";
+          outcome.error = "unsupported_action";
+          return {
+            ...this.failure(
+              "unsupported_action",
+              `unsupported computer action ${outcome.type || "(missing)"}; supported: ${[...SUPPORTED_COMPUTER_ACTIONS].join(", ")}`,
+              false,
+            ),
+            completedActions: 0,
+            outcomes,
+          };
+        }
+      }
       const mutates = actions.some(
         (raw) =>
           record(raw) &&
@@ -734,17 +729,25 @@ export class CuaDriverHost {
       );
       let target = this.targets.get(owner);
       if (mutates && !target)
-        return this.failure(
-          "target_unavailable",
-          "Open an application before sending desktop input; no exact target is pinned for this session",
-          false,
-        );
+        return {
+          ...this.failure(
+            "target_unavailable",
+            "Open an application before sending desktop input; no exact target is pinned for this session",
+            false,
+          ),
+          completedActions: 0,
+          outcomes,
+        };
       if (target && actions.some((raw) => record(raw) && isAppSwitcherAction(raw)))
-        return this.failure(
-          "target_handoff_untrusted",
-          "App-switcher shortcuts cannot be used after an exact application window is pinned; observe the pinned target instead",
-          false,
-        );
+        return {
+          ...this.failure(
+            "target_handoff_untrusted",
+            "App-switcher shortcuts cannot be used after an exact application window is pinned; observe the pinned target instead",
+            false,
+          ),
+          completedActions: 0,
+          outcomes,
+        };
       let observation: Record<string, unknown> | undefined;
       if (target) {
         const suppliedSnapshotIDs = actions.flatMap((raw) => {
@@ -779,23 +782,13 @@ export class CuaDriverHost {
       const batchSnapshotID = snapshotID(observation);
       let completedActions = 0;
       let completedMutations = 0;
-      for (const raw of actions) {
-        if (!record(raw)) continue;
+      for (const [actionIndex, raw] of actions.entries()) {
+        if (!record(raw)) continue; // batch pre-validation already rejected these
         const type = String(raw.type ?? raw.action ?? "");
+        const outcome = outcomes[actionIndex]!;
         const mutation = !["screenshot", "wait"].includes(type);
         let boundAction = raw;
         if (mutation && target && observation) {
-		  if (type === "typeahead") {
-			const fileTarget = resolveObservedFileTarget(observation, String(raw.text ?? ""));
-			if (!fileTarget) {
-			  return this.failure(
-				"typeahead_target_untrusted",
-				"File type-ahead requires one unique observed Open Panel file list",
-				true,
-			  );
-			}
-			boundAction = { ...raw, ...fileTarget };
-          }
           const currentSnapshotID = snapshotID(observation);
           const boundSnapshotIDs = actionSnapshotIDs(boundAction);
           const suppliedSnapshotID = boundSnapshotIDs[0];
@@ -813,10 +806,13 @@ export class CuaDriverHost {
               interruptionReason: "snapshot_changed",
               requiresReplan: true,
               completedActions,
+              outcomes,
               ...observation,
             };
           }
           if (usesSnapshotElement && currentSnapshotID && boundSnapshotIDs.some(id => id !== currentSnapshotID)) {
+            outcome.status = "failed";
+            outcome.error = "stale_snapshot";
             return {
               ...this.failure(
                 "stale_snapshot",
@@ -824,6 +820,7 @@ export class CuaDriverHost {
                 true,
               ),
               completedActions,
+              outcomes,
               ...observation,
             };
           }
@@ -843,31 +840,33 @@ export class CuaDriverHost {
             // window target and select its only safe keyboard route.
             boundAction = { ...boundAction, delivery_mode: "foreground" };
           }
-
-		  if (type === "typeahead") boundAction = { ...boundAction, delivery_mode: "foreground" };
+        }
+        if (mutation && target) {
+          // Model coordinates live in the delivered screenshot's pixel space;
+          // bounds-check them, then map back to driver pixels via the latest scale.
+          const mapping = this.mapModelCoordinates(boundAction, owner);
+          if ("failure" in mapping) {
+            outcome.status = "failed";
+            outcome.error = "coordinate_out_of_bounds";
+            return {
+              ...mapping.failure,
+              completedActions,
+              outcomes,
+              ...(observation ?? {}),
+            };
+          }
+          boundAction = mapping.action;
         }
         try {
           await this.perform(boundAction, target);
           if (mutation && target) {
-            const immutableRoot = this.rootTargets.get(owner);
             const freshState = await this.observeSessionTarget(owner, true);
             target = freshState.target;
             const fresh = freshState.observation;
             this.observations.set(owner, freshState);
-			if (type === "typeahead" && (
-			  !immutableRoot ||
-			  target.pid !== immutableRoot.pid ||
-			  target.window_id !== immutableRoot.window_id ||
-			  !isDocumentSurfaceObservation(fresh)
-			)) {
-			  return this.failure(
-				"typeahead_open_unverified",
-				"Open Panel did not freshly return to the immutable document surface",
-				true,
-			  );
-			}
             completedActions += 1;
             completedMutations += 1;
+            outcome.status = "ok";
             if (observation && actionableContextChanged(observation, fresh, target)) {
               return {
                 ok: true,
@@ -876,6 +875,7 @@ export class CuaDriverHost {
                 interruptionReason: "actionable_context_changed",
                 requiresReplan: true,
                 completedActions,
+                outcomes,
                 ...fresh,
               };
             }
@@ -894,6 +894,9 @@ export class CuaDriverHost {
             } catch {
               observation = undefined;
             }
+            outcome.status = "failed";
+            outcome.error =
+              error instanceof Error ? error.message : "mutation outcome unknown";
             return {
               ...this.failure(
                 "mutation_outcome_unknown",
@@ -902,12 +905,14 @@ export class CuaDriverHost {
               ),
               outcomeUnknown: true,
               completedActions,
+              outcomes,
               ...(observation ?? {}),
             };
           }
           throw error;
         }
         completedActions += 1;
+        outcome.status = "ok";
         if (type === "wait" && target) {
           const freshState = await this.observeSessionTarget(owner, true);
           target = freshState.target;
@@ -918,6 +923,7 @@ export class CuaDriverHost {
       }
       return {
         ok: true,
+        outcomes,
         ...(target
           ? observation ?? (await this.observeSessionTarget(owner)).observation
           : await this.observeDesktop()),
@@ -952,6 +958,7 @@ export class CuaDriverHost {
     this.observations.clear();
     this.applicationIdentities.clear();
     this.sessionScopes.clear();
+    this.scales.clear();
     const teardown = this.terminateGeneration(proxy, daemon, socket);
     this.teardowns.add(teardown);
     void teardown.catch(() => {}).finally(() => this.teardowns.delete(teardown));
@@ -1393,20 +1400,44 @@ export class CuaDriverHost {
     }
     if (type === "screenshot") return;
     if (!target) throw new Error("computer action requires an exact target");
-	if (type === "typeahead") {
-	  // Use only the exact AX action advertised by the Host-resolved file child.
-	  await this.call("click", {
-		pid: target.pid,
-		window_id: target.window_id,
-		...(typeof action.element_token === "string" ? { element_token: action.element_token } : {}),
-		...(Number.isInteger(action.element_index) ? { element_index: action.element_index } : {}),
-		...(typeof action.snapshot_id === "string" ? { snapshot_id: action.snapshot_id } : {}),
-		action: "open",
-	  });
-	  return;
-	}
     const call = buildActionCall(action, target);
     if (call) await this.call(call.tool, call.arguments);
+  }
+
+  /**
+   * Model coordinates live in the delivered screenshot's pixel space. Map them
+   * back to driver pixels with the scale recorded at that owner's latest
+   * observation; element-targeted actions carry no coordinates and pass through.
+   */
+  private mapModelCoordinates(
+    action: Record<string, unknown>,
+    owner: string,
+  ): { action: Record<string, unknown> } | { failure: Record<string, unknown> } {
+    const scale = this.scales.get(owner);
+    if (!scale || !(scale.scaleX > 0) || !(scale.scaleY > 0)) return { action };
+    const coordinate = Array.isArray(action.coordinate)
+      ? action.coordinate
+      : Number.isFinite(Number(action.x)) && Number.isFinite(Number(action.y))
+        ? [Number(action.x), Number(action.y)]
+        : undefined;
+    if (!coordinate) return { action };
+    const x = Number(coordinate[0]);
+    const y = Number(coordinate[1]);
+    if (!(x >= 0 && y >= 0 && x <= scale.width && y <= scale.height)) {
+      return {
+        failure: this.failure(
+          "coordinate_out_of_bounds",
+          `coordinate (${x}, ${y}) is outside the latest screenshot pixel space 0..${scale.width} x 0..${scale.height}; re-observe and pick coordinates from the latest screenshot`,
+          true,
+        ),
+      };
+    }
+    const mapped = { ...action };
+    // buildActionCall prefers `coordinate` over x/y, so the stale pair must go.
+    delete mapped.coordinate;
+    mapped.x = Math.round(x / scale.scaleX);
+    mapped.y = Math.round(y / scale.scaleY);
+    return { action: mapped };
   }
 
   private async observe(target: CuaTarget): Promise<Record<string, unknown>> {
@@ -1529,6 +1560,15 @@ export class CuaDriverHost {
       observation = await this.observe(target);
       if (requireRootOwner) discoverNewSurface = false;
     }
+    const shot = record(observation.screenshot) ? observation.screenshot : undefined;
+    if (shot && Number(shot.width) > 0 && Number(shot.height) > 0) {
+      this.scales.set(session, {
+        scaleX: Number(shot.scaleX) > 0 ? Number(shot.scaleX) : 1,
+        scaleY: Number(shot.scaleY) > 0 ? Number(shot.scaleY) : 1,
+        width: Number(shot.width),
+        height: Number(shot.height),
+      });
+    }
     return { target, observation };
   }
   private async observeDesktop(): Promise<Record<string, unknown>> {
@@ -1551,17 +1591,34 @@ export class CuaDriverHost {
           ? structured.screenshot_png_b64
           : undefined;
     if (!base64) throw new Error("Cua Driver screenshot returned no image");
+    const pngBuffer = Buffer.from(base64, "base64");
+    const prepared = this.imagePipeline.prepareScreenshot(
+      pngBuffer,
+      MAX_SCREENSHOT_LONG_EDGE,
+    );
     const metadata = { ...structured };
     delete metadata.screenshot_png_b64;
     return {
       ...metadata,
       screenshotId: randomUUID(),
-      base64,
+      // Keep the driver's original base64 when the pipeline returned the buffer
+      // untouched; re-encode only after a real resize.
+      base64: prepared.png === pngBuffer ? base64 : prepared.png.toString("base64"),
       mimeType:
         image?.mimeType ??
         image?.mime_type ??
         structured.screenshot_mime_type ??
         "image/png",
+      ...(prepared.width > 0 && prepared.height > 0
+        ? {
+            screenshot: {
+              width: prepared.width,
+              height: prepared.height,
+              scaleX: prepared.scaleX,
+              scaleY: prepared.scaleY,
+            },
+          }
+        : {}),
       accessibility: {
         elements: Array.isArray(structured.elements) ? structured.elements : [],
         elementCount: Array.isArray(structured.elements)

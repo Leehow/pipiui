@@ -716,23 +716,72 @@ describe('Sidebar', () => {
     expect(order[order.length - 1]).toBe('sb-footer')
   })
 
-  it('selects a session on touch pointer-down without canceling native panning and absorbs the trailing click', () => {
+  it('defers touch selection until pointer-up and absorbs the trailing click', () => {
     const props = defaultProps()
     render(<Sidebar {...props} />)
     const row = screen.getByText('s1').closest('.sb-session')!
     const preventDefault = vi.fn()
     const down = createEvent.pointerDown(row)
-    Object.defineProperty(down, 'pointerType', { value: 'touch' })
-    Object.defineProperty(down, 'preventDefault', { value: preventDefault })
+    Object.defineProperties(down, {
+      pointerType: { value: 'touch' },
+      pointerId: { value: 7 },
+      clientX: { value: 20 },
+      clientY: { value: 20 },
+      preventDefault: { value: preventDefault }
+    })
     fireEvent(row, down)
-    // Instant selection on touch — but the default action survives so the
-    // browser can still pan .sb-scroll (the mobile drawer scroll fix).
     expect(preventDefault).not.toHaveBeenCalled()
+    expect(props.onSelectSession).not.toHaveBeenCalled()
+
+    const up = createEvent.pointerUp(row)
+    Object.defineProperties(up, {
+      pointerType: { value: 'touch' },
+      pointerId: { value: 7 },
+      clientX: { value: 21 },
+      clientY: { value: 22 }
+    })
+    fireEvent(row, up)
     expect(props.onSelectSession).toHaveBeenCalledTimes(1)
     expect(props.onSelectSession).toHaveBeenCalledWith('s1')
-    // The gesture's synthetic click must not report a second selection.
-    fireEvent.click(row)
+
+    fireEvent.click(row, { detail: 1 })
     expect(props.onSelectSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps a vertical touch drag in the sidebar from selecting a session', () => {
+    const props = defaultProps()
+    render(<Sidebar {...props} />)
+    const row = screen.getByText('s1').closest('.sb-session')!
+
+    const down = createEvent.pointerDown(row)
+    Object.defineProperties(down, {
+      pointerType: { value: 'touch' },
+      pointerId: { value: 8 },
+      clientX: { value: 20 },
+      clientY: { value: 20 }
+    })
+    fireEvent(row, down)
+
+    const move = createEvent.pointerMove(row)
+    Object.defineProperties(move, {
+      pointerType: { value: 'touch' },
+      pointerId: { value: 8 },
+      clientX: { value: 20 },
+      clientY: { value: 36 }
+    })
+    fireEvent(row, move)
+
+    const up = createEvent.pointerUp(row)
+    Object.defineProperties(up, {
+      pointerType: { value: 'touch' },
+      pointerId: { value: 8 },
+      clientX: { value: 20 },
+      clientY: { value: 36 }
+    })
+    fireEvent(row, up)
+    fireEvent.click(row, { detail: 1 })
+
+    expect(props.onSelectSession).not.toHaveBeenCalled()
   })
 
   it('hides the status caption and overlays the hover actions on the right corner (Swift parity CSS)', () => {

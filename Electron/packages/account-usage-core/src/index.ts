@@ -383,6 +383,19 @@ export function openCodeGoWindows(rows: LocalUsageRow[], now: number): UsageWind
   ];
 }
 
+const OPEN_CODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+
+export function parseOpenCodeGoUsage(body: unknown): UsageWindow[] {
+  const usage = record(record(body)?.usage); if (!usage) return [];
+  const out: UsageWindow[] = [];
+  for (const [key, id, label, title] of [["rolling", "fiveHour", "5h", "5小时额度"], ["weekly", "weekly", "周", "周额度"], ["monthly", "monthly", "月", "月额度"]] as const) {
+    const entry = record(usage[key]); const percent = number(entry?.percent);
+    if (!entry || percent === undefined) continue;
+    out.push(window(id, percent, label, title, resetMs(entry.resetsAt)));
+  }
+  return out;
+}
+
 const isRelay = (provider: string) => provider.toLowerCase().includes("relay");
 const includes = (...values: string[]) => (provider: string) => !isRelay(provider) && values.some(value => provider.toLowerCase().includes(value));
 
@@ -588,11 +601,13 @@ export const builtinAccountUsageAdapters: AccountUsageAdapter[] = [
   {
     id: "opencodeGo", kind: "subscription", matches: includes("opencode-go"), async load(ctx) {
       if (!ctx.readLocalUsage) throw new NoDataError("missing-capability");
-      // Credential gate mirrors the Swift client: an OPENCODE_API_KEY in env/.env or an
-      // opencode-go auth entry marks the Go plan as configured; usage is local-only.
-      const configured = Boolean(envToken(ctx, "OPENCODE_API_KEY")) || Boolean(token(authEntry(await ctx.readAuth?.("opencode"), "opencode-go"), "key"));
-      if (!configured) return;
-      const rows = await ctx.readLocalUsage("opencode-go"); if (!rows) return;
+      const key = envToken(ctx, "OPENCODE_API_KEY") ?? token(authEntry(await ctx.readAuth?.("opencode"), "opencode-go"), "key");
+      if (!key) return;
+      try {
+        const windows = parseOpenCodeGoUsage(await fetchJson(ctx, OPEN_CODE_GO_USAGE_URL, { method: "GET", headers: bearer(key) }));
+        if (windows.length) return { provider: "opencodeGo", accountLabel: "OpenCode Go 额度", windows, source: "subscription" };
+      } catch { /* server usage is best-effort; fall through to local rows */ }
+      const rows = await ctx.readLocalUsage("opencode-go"); if (!rows || rows.length === 0) return;
       return { provider: "opencodeGo", accountLabel: "OpenCode Go 本机用量", windows: openCodeGoWindows(rows, ctx.now()), source: "local" };
     },
   },

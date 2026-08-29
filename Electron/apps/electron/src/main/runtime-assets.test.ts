@@ -192,28 +192,6 @@ describe('resolveRuntimeAssets', () => {
     expect(await readFile(assets.cuaDriver, 'utf8')).toBe('pkg-driver')
   })
 
-  it('ships a provider-visible image block in every screenshot tool result', async () => {
-    const source = await readFile(new URL('../../../../resources/runtime/extensions/pipiui-computer-use.ts', import.meta.url), 'utf8')
-    expect(source).toMatch(/type:\s*"image" as const,\s*data:\s*base64,\s*mimeType:/)
-    expect(source).toContain('PIPIUI_COMPUTER_SCREENSHOT')
-    expect(source).toContain('["window", "sheet", "dialog", "drawer"]')
-    expect(source).toContain('snapshot_changed')
-    expect(source).toContain('replan inside the dedicated Computer Use agent')
-  })
-
-  it('preserves only the structured unknown-mutation failure through the computer runtime adapter', async () => {
-    const source = await readFile(new URL('../../../../resources/runtime/pi-ext/subagent/index.ts', import.meta.url), 'utf8')
-    const classifier = await readFile(new URL('../../../../resources/runtime/pi-ext/packages/computer-agent/src/action-block.ts', import.meta.url), 'utf8')
-    expect(source).toContain('const structuredUnknown = json.ok === false')
-    expect(source).toContain('&& json.outcomeUnknown === true')
-    expect(source).toContain('runtimeError?.code === "mutation_outcome_unknown"')
-    expect(source).toContain('runtimeError?.requiresObservation === true')
-    expect(source).toContain('&& !structuredUnknown')
-    expect(classifier).toContain('if (result.outcomeUnknown === true || result.runtimeError?.code === "mutation_outcome_unknown") return "outcome_unknown"')
-    expect(source).not.toContain('new ComputerAgentCoordinator')
-    expect(source).not.toContain('summary: runtimeError?.message')
-  })
-
   it('launches nested Pi through the packaged node shim, not raw Helper execPath', async () => {
     const source = await readFile(new URL('../../../../resources/runtime/pi-ext/subagent/index.ts', import.meta.url), 'utf8')
     const start = source.indexOf('function getPiInvocation')

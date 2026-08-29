@@ -1101,6 +1101,35 @@ describe('PipiUI Electron main layout', () => {
     vi.unstubAllGlobals()
   })
 
+  it('collapses the phone tool rail to the active tool and remembers the choice after reopening a pane', async () => {
+    const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
+    vi.stubGlobal('matchMedia', vi.fn(() => media))
+    localStorage.removeItem('pipiui:eui:tool-quick-rail-collapsed:v1')
+    const { container } = render(<App host={createMockHost()} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    const floatRail = () => container.querySelector('.chat-viewport .tool-quick-rail')
+    expect(screen.getByRole('button', { name: '收起工具快捷栏' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Browser' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '收起工具快捷栏' }))
+
+    expect(floatRail()?.className).toContain('is-collapsed')
+    expect(screen.getByRole('button', { name: '展开工具快捷栏' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Subagents' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Browser' })).toBeNull()
+    expect(localStorage.getItem('pipiui:eui:tool-quick-rail-collapsed:v1')).toBe('true')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    expect(floatRail()).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Subagents' }))
+    expect(floatRail()?.className).toContain('is-collapsed')
+
+    fireEvent.click(screen.getByRole('button', { name: '展开工具快捷栏' }))
+    expect(screen.getByRole('button', { name: 'Browser' })).toBeTruthy()
+    expect(localStorage.getItem('pipiui:eui:tool-quick-rail-collapsed:v1')).toBe('false')
+    vi.unstubAllGlobals()
+  })
+
   it('phone overlays are mutually exclusive so drawer footer buttons are never covered', async () => {
     const media = { matches: true, media: '(max-width: 720px)', onchange: null, addEventListener: vi.fn(), removeEventListener: vi.fn(), addListener: vi.fn(), removeListener: vi.fn(), dispatchEvent: vi.fn() } as unknown as MediaQueryList
     vi.stubGlobal('matchMedia', vi.fn(() => media))
@@ -2469,6 +2498,111 @@ describe('PipiUI Electron main layout', () => {
     await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('subagents-running'))
     act(() => resolveList?.([]))
     await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('subagents-running'))
+  })
+
+  it('keeps sibling episodes of one agentId separate so an old run terminal never stops the current run', () => {
+    const run1: AgentSummary = { agentId: 'bg', runId: 'r1', name: 'explore', task: '', state: 'running', sessionId: 'layout', createdAt: 10, updatedAt: 10 }
+    const run2: AgentSummary = { ...run1, runId: 'r2', createdAt: 50, updatedAt: 50 }
+    // A re-dispatch of the same agentId adds a sibling episode, not an overwrite.
+    let merged = mergeAgentSummary([run1], run2)
+    expect(merged).toHaveLength(2)
+    // A LATE terminal for the retired run repaints only its own row.
+    merged = mergeAgentSummary(merged, { ...run1, state: 'interrupted', updatedAt: 500 })
+    expect(merged.find(agent => agent.runId === 'r2')?.state).toBe('running')
+    expect(merged.find(agent => agent.runId === 'r1')?.state).toBe('interrupted')
+    // The last running episode terminating clears every running row.
+    merged = mergeAgentSummary(merged, { ...run2, state: 'ok', updatedAt: 600 })
+    expect(merged.filter(agent => agent.state === 'running')).toHaveLength(0)
+    // Within one run, a late running event must not reopen a terminal verdict.
+    expect(mergeAgentSummary(merged, { ...run2, state: 'running', updatedAt: 700 }).find(agent => agent.runId === 'r2')?.state).toBe('ok')
+  })
+
+  it('reconciles agent snapshots per episode: fresh terminal wins, stale snapshot cannot cross-run overwrite', () => {
+    const running: AgentSummary = { agentId: 'bg', runId: 'r2', name: 'explore', task: '', state: 'running', sessionId: 'layout', createdAt: 50 }
+    // End event missed by the subscription: a fresh snapshot terminal for the
+    // SAME run must clear the stale running row (last worker ends → cleared).
+    expect(mergeAgentSnapshot([running], [{ ...running, state: 'ok', updatedAt: 100 }]).find(agent => agent.runId === 'r2')?.state).toBe('ok')
+    // A stale snapshot row captured before the verdict must not downgrade it.
+    expect(mergeAgentSnapshot([{ ...running, state: 'ok', updatedAt: 100 }], [running]).find(agent => agent.runId === 'r2')?.state).toBe('ok')
+    // The reported bug: an old-run row in a folded snapshot must survive as a
+    // sibling WITHOUT repainting the current running run.
+    const retired: AgentSummary = { ...running, runId: 'r1', state: 'interrupted', updatedAt: 500 }
+    const reconciled = mergeAgentSnapshot([retired], [running])
+    expect(reconciled.find(agent => agent.runId === 'r2')?.state).toBe('running')
+    expect(reconciled.find(agent => agent.runId === 'r1')?.state).toBe('interrupted')
+    expect(reconciled).toHaveLength(2)
+  })
+
+  it('shows background subagents running in the sidebar after the Boss turn settled, until the last run ends', () => {
+    const agents: AgentSummary[] = [
+      { agentId: 'bg', runId: 'r1', name: 'explore', task: '', state: 'running', sessionId: 'subtask' }
+    ]
+    // Boss turn terminal (observed mapped to completed/interrupted): the row
+    // must still advertise the live background worker.
+    expect(sidebarStatusForSession('subtask', 'selected', false, 'completed', agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    expect(sidebarStatusForSession('subtask', 'selected', false, 'interrupted', agents)).toEqual({ status: 'subagents-running', subagentCount: 1 })
+    // Once the last run terminates, the subagents-running projection is gone.
+    const ended: AgentSummary[] = [{ ...agents[0], state: 'interrupted' }]
+    expect(sidebarStatusForSession('subtask', 'selected', false, 'completed', ended).status).not.toBe('subagents-running')
+  })
+
+  it('keeps the subagents-running badge across a late old-run terminal and clears it when the last run ends', async () => {
+    const base = createMockHost()
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    const host: PipiHostAPI = {
+      ...base,
+      listAgents: async () => [],
+      subscribeAgents: listener => {
+        agentListeners.add(listener)
+        return () => { agentListeners.delete(listener) }
+      }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    const emit = (agent: AgentSummary) => act(() => {
+      const event: AgentEvent = { type: 'agent', agent }
+      for (const listener of agentListeners) listener(event)
+    })
+    const status = () => container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')
+    emit({ agentId: 'bg', runId: 'r1', sessionId: 'layout', name: 'explore', task: '', state: 'running', updatedAt: 10 })
+    await waitFor(() => expect(status()).toBe('subagents-running'))
+    // Same agentId re-dispatched: a new episode starts beside the old one.
+    emit({ agentId: 'bg', runId: 'r2', sessionId: 'layout', name: 'explore', task: '', state: 'running', updatedAt: 20 })
+    expect(status()).toBe('subagents-running')
+    // A LATE terminal for the retired run (e.g. a terminal_replay broadcast)
+    // must not stop the badge while the successor run is still live.
+    emit({ agentId: 'bg', runId: 'r1', sessionId: 'layout', name: 'explore', task: '', state: 'interrupted', updatedAt: 500 })
+    expect(status()).toBe('subagents-running')
+    // The last running episode terminating clears the running projection promptly.
+    emit({ agentId: 'bg', runId: 'r2', sessionId: 'layout', name: 'explore', task: '', state: 'interrupted', updatedAt: 600 })
+    await waitFor(() => expect(status()).not.toBe('subagents-running'))
+  })
+
+  it('re-syncs background agent rows from the host index when the window regains focus', async () => {
+    const base = createMockHost()
+    const agentListeners = new Set<(event: AgentEvent) => void>()
+    let snapshot: AgentSummary[] = []
+    const host: PipiHostAPI = {
+      ...base,
+      listAgents: async () => snapshot,
+      subscribeAgents: listener => {
+        agentListeners.add(listener)
+        return () => { agentListeners.delete(listener) }
+      }
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    act(() => {
+      const event: AgentEvent = { type: 'agent', agent: { agentId: 'bg', runId: 'r1', sessionId: 'layout', name: 'explore', task: '', state: 'running' } }
+      for (const listener of agentListeners) listener(event)
+    })
+    const status = () => container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')
+    await waitFor(() => expect(status()).toBe('subagents-running'))
+    // The terminal event was missed (hidden window / silent subscription loss).
+    // The durable host index is authoritative: regaining focus must clear it.
+    snapshot = [{ agentId: 'bg', runId: 'r1', sessionId: 'layout', name: 'explore', task: '', state: 'ok', updatedAt: 100 }]
+    act(() => { window.dispatchEvent(new Event('focus')) })
+    await waitFor(() => expect(status()).not.toBe('subagents-running'))
   })
 
   it('shows return-to-latest after leaving the bottom and rail jumps with Virtuoso', async () => {
@@ -3914,7 +4048,7 @@ describe('extensions settings tab', () => {
     expect(screen.getByTestId('model-tab-general')).toBeTruthy()
     expect(screen.getByTestId('model-tab-models')).toBeTruthy()
     expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
-    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-updates')).toBeNull()
     expect(screen.queryByTestId('model-tab-grok-build-oauth')).toBeNull()
     expect(screen.queryByRole('tab', { name: 'Grok Build' })).toBeNull()
     fireEvent.click(screen.getByTestId('model-tab-extensions'))
@@ -4010,39 +4144,17 @@ describe('model catalog fallback', () => {
 })
 
 describe('update center settings flow', () => {
-  it('closes settings and sends exactly one update request through the selected main session', async () => {
-    const host = createMockHost()
-    const sendPrompt = vi.spyOn(host, 'sendPrompt').mockResolvedValue(undefined)
-    const composer = await openModelModal(host)
-    fireEvent.click(screen.getByTestId('model-tab-updates'))
-    expect(await screen.findByTestId('update-center')).toBeTruthy()
-    expect(screen.getByRole('dialog', { name: '设置' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: '关闭设置' })).toBeTruthy()
-    fireEvent.click(await screen.findByRole('button', { name: '评估更新' }))
-    await waitFor(() => expect(screen.queryByTestId('model-modal')).toBeNull())
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledTimes(1))
-    expect(sendPrompt).toHaveBeenCalledWith('welcome', expect.stringMatching(/^\[\[PIPIUI_UPDATE_EVALUATION_INTENT\]\]\{"version":1,"id":"pi","name":"Pi","packageName":"@earendil-works\/pi-coding-agent","currentVersion":"0\.84\.0","latestVersion":"0\.84\.2"\}$/), undefined, rendererTelemetryMatcher())
-    expect((composer as HTMLTextAreaElement).value).toBe('')
-  })
-
-  it('prefetches updates at startup and only refetches when the user clicks refresh', async () => {
+  it('does not expose an updates tab, evaluation entry, or startup prefetch', async () => {
     const host = createMockHost()
     const check = vi.spyOn(host, 'checkForUpdates')
-    await renderChat(host)
-    await waitFor(() => expect(check).toHaveBeenCalledTimes(1))
-    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
-    fireEvent.change(composer, { target: { value: '/model' } })
-    fireEvent.keyDown(composer, { key: 'Enter' })
-    await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-updates'))
-    expect(await screen.findByTestId('update-center')).toBeTruthy()
-    expect(check).toHaveBeenCalledTimes(1)
-    fireEvent.click(screen.getByTestId('model-tab-models'))
-    fireEvent.click(screen.getByTestId('model-tab-updates'))
-    expect(await screen.findByTestId('update-item-pi')).toBeTruthy()
-    expect(check).toHaveBeenCalledTimes(1)
-    fireEvent.click(screen.getByRole('button', { name: '⟳ 刷新' }))
-    await waitFor(() => expect(check).toHaveBeenCalledTimes(2))
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    await openModelModal(host)
+    expect(screen.queryByTestId('model-tab-updates')).toBeNull()
+    expect(screen.queryByTestId('update-center')).toBeNull()
+    expect(screen.queryByRole('button', { name: '评估更新' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '一键更新' })).toBeNull()
+    expect(check).not.toHaveBeenCalled()
+    expect(sendPrompt).not.toHaveBeenCalled()
   })
 })
 

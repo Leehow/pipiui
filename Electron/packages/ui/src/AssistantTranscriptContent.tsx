@@ -13,9 +13,6 @@ import { useLiveSubagentBindings } from './LiveSubagentBinding'
 import { TruncatedText } from './TruncatedText'
 import { TranscriptMarkdown } from './TranscriptMarkdown'
 import { HostedCodeInterpreterCard } from './HostedCodeInterpreterCard'
-import { ComputerPlanCard } from './ComputerPlanCard'
-import { ComputerTaskResultCard, ComputerWorkerResultCard, computerTaskGoalFromInput } from './ComputerTaskResultCard'
-import { parseComputerPlanSegment, parseComputerTaskResult, parseComputerWorkerResult } from './computer-task-report'
 import type { ChatMessage, TranscriptActivity, TranscriptTool } from './transcript-model'
 import { displaySecretPlaceholders } from './secret-display'
 import { activitiesFromMessage, PENDING_THINKING_ID, planAssistantTranscript } from './transcript-model'
@@ -102,8 +99,6 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   const tools = segments.flatMap(segment => segment.type === 'steps' ? segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : []) : [])
   useToolRenderers()
   const liveByTool = useLiveSubagentBindings(tools)
-  // `computer_task` children carry the same toolCallId linkage as `subagent`
-  // children, so both project into live row cards while running.
   const liveProjectable = (tool: TranscriptTool) => isLiveProjectedTool(tool.name)
   const subagentProjections = tools.filter(liveProjectable).map(tool => liveByTool.get(tool.id)).filter((projection): projection is NonNullable<typeof projection> => Boolean(projection))
   const linkedRunning = subagentProjections.some(projection => projection.runningCount > 0)
@@ -124,13 +119,6 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   return <div className="assistant-transcript-content" data-testid="assistant-transcript-content">
     {segments.map((segment, index) => {
       if (segment.type === 'text') {
-        // The Computer Use Leader's plan JSON streams as cumulative text
-        // snapshots; a plan-shaped segment renders as a growing plan card
-        // instead of a raw JSON markdown dump.
-        const plan = parseComputerPlanSegment(segment.content)
-        if (plan) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerPlanCard plan={plan} /></div>
-        const worker = parseComputerWorkerResult(segment.content)
-        if (worker) return <div key={`text:${segment.id}`} data-transcript-segment="text"><ComputerWorkerResultCard result={worker} /></div>
         return <div key={`text:${segment.id}`} data-transcript-segment="text"><TranscriptMarkdown content={displaySecretPlaceholders(segment.content)} streaming={message.streaming && index === segments.length - 1} />{!message.streaming && <DocumentReferenceCards content={displaySecretPlaceholders(segment.content)} basePath={documentBasePath} onOpenDocument={onOpenDocument} />}</div>
       }
       const groupTools = segment.activities.flatMap(activity => activity.type === 'tool' ? [activity.tool] : [])
@@ -192,28 +180,6 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
 registerToolRenderer(BUILTIN_EXTENSION_ID, {
   toolName: 'code_interpreter',
   render: ({ tool, streaming }) => <HostedCodeInterpreterCard key={`tool:${tool.id}`} tool={tool} streaming={streaming} />,
-})
-
-registerToolRenderer(BUILTIN_EXTENSION_ID, {
-  toolName: 'computer_task',
-  liveProjected: true,
-  render: ({ tool, projection, onOpenSubagents, elapsed }) => {
-    if (tool.finished && tool.result) {
-      const computerResult = parseComputerTaskResult(tool.result)
-      if (computerResult) return <ComputerTaskResultCard
-        key={`tool:${tool.id}`}
-        result={computerResult}
-        goal={computerTaskGoalFromInput(tool.input)}
-        raw={tool.result}
-        elapsed={elapsed(tool.startedAt, tool.finishedAt ?? tool.startedAt)}
-        onOpenSubagents={onOpenSubagents}
-      />
-    }
-    if (projection && projection.totalCount > 0) {
-      return <LiveSubagentCard key={`tool:${tool.id}`} projection={projection} onOpenSubagents={onOpenSubagents} title="桌面任务" />
-    }
-    return null
-  },
 })
 
 registerToolRenderer(BUILTIN_EXTENSION_ID, {

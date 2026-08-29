@@ -14,7 +14,6 @@ import {
   isDriverSessionEndedError,
   selectLaunchWindow,
 } from "./cua-driver-host.js";
-import { ComputerWorkerBroker } from "../../../../resources/runtime/pi-ext/packages/computer-agent/src/worker-broker.ts";
 
 describe("CuaDriverHost", () => {
   const roots: string[] = [];
@@ -227,95 +226,6 @@ describe("CuaDriverHost", () => {
     });
     expect(calls.filter((call) => call.name === "press_key")).toHaveLength(1);
     expect(calls.filter((call) => call.name === "click")).toHaveLength(0);
-  });
-
-  it("requires re-observation and then blocks a repeated no-progress click", async () => {
-    let capture = 0;
-    let runtimeCalls = 0;
-    const unchanged = () => ({
-      screenshotId: `observation-${++capture}`,
-      base64: "SAME_PNG",
-      accessibility: {
-        snapshot_id: `snapshot-${capture}`,
-        elements: [{ role: "button", name: "Behind sheet", snapshot_id: `element-snapshot-${capture}` }],
-      },
-    });
-    const broker = new ComputerWorkerBroker({ request: async () => {
-      runtimeCalls += 1;
-      return unchanged();
-    } });
-    const grant = broker.issue({ taskId: "task", stepId: "step", runId: "run", role: "gui-operator" });
-    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
-    const action = { operation: "mutate" as const, payload: {
-      actions: [{ type: "click", coordinate: [700, 500] }],
-    } };
-    await expect(broker.execute(grant.token, action)).resolves.toMatchObject({
-      noProgress: { status: "reobserve_required", unchangedAttempts: 1 },
-    });
-    await expect(broker.execute(grant.token, action)).rejects.toThrow(
-      "no_progress_requires_fresh_observation",
-    );
-    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
-    const callsBeforeBlockedRetry = runtimeCalls;
-    await expect(broker.execute(grant.token, action)).rejects.toThrow(
-      "no_progress_budget_exhausted",
-    );
-    expect(runtimeCalls).toBe(callsBeforeBlockedRetry);
-    await expect(broker.execute(grant.token, {
-      operation: "mutate",
-      payload: { actions: [{ type: "key", key: "ESCAPE" }] },
-    })).resolves.toMatchObject({ noProgress: { status: "reobserve_required" } });
-    expect(runtimeCalls).toBe(callsBeforeBlockedRetry + 1);
-  });
-
-  it("unblocks a mutation signature after a fresh observation proves UI progress", async () => {
-    let state = "A";
-    let runtimeCalls = 0;
-    const broker = new ComputerWorkerBroker({ request: async (request) => {
-      runtimeCalls += 1;
-      if ((request as any).actions?.[0]?.coordinate?.[0] === 10 && state === "B") state = "C";
-      return {
-        screenshotId: `observation-${runtimeCalls}`,
-        base64: `PNG-${state}`,
-        accessibility: { snapshot_id: `snapshot-${runtimeCalls}`, elements: [{ role: "button", name: state }] },
-      };
-    } });
-    const grant = broker.issue({ taskId: "task-change", stepId: "step", runId: "run", role: "gui-operator" });
-    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
-    const action = { operation: "mutate" as const, payload: {
-      actions: [{ type: "click", coordinate: [10, 10] }],
-    } };
-    await expect(broker.execute(grant.token, action)).resolves.toMatchObject({
-      noProgress: { status: "reobserve_required" },
-    });
-    state = "B";
-    await broker.execute(grant.token, { operation: "observe", payload: { fresh: true } });
-    await expect(broker.execute(grant.token, action)).resolves.not.toHaveProperty("noProgress");
-  });
-
-  it("preserves a structured mutation outcome unknown through the worker broker", async () => {
-    const unknown = {
-      ok: false,
-      outcomeUnknown: true,
-      runtimeError: {
-        code: "mutation_outcome_unknown",
-        message: "post-action observation failed",
-        requiresObservation: true,
-      },
-      screenshotId: "best-effort-observation",
-      base64: "PNG",
-      accessibility: { elements: [] },
-    };
-    const broker = new ComputerWorkerBroker({ request: async () => unknown });
-    const grant = broker.issue({ taskId: "unknown", stepId: "step", runId: "run", role: "gui-operator" });
-    await expect(broker.execute(grant.token, {
-      operation: "mutate",
-      payload: { actions: [{ type: "click", coordinate: [10, 10] }] },
-    })).resolves.toMatchObject({
-      outcomeUnknown: true,
-      runtimeError: { code: "mutation_outcome_unknown", requiresObservation: true },
-    });
-    expect(broker.observation("unknown", "step")).toMatchObject({ outcomeUnknown: true });
   });
 
   it("does not rebind a tail element action after the snapshot changes", async () => {
@@ -1100,141 +1010,6 @@ if (mode === "serve") {
         { name: "type_text", pid: 91023, window: 101369, delivery: "foreground" },
         { name: "press_key", pid: 91023, window: 101369, delivery: "foreground" },
       ]);
-  });
-
-  it("opens one exact Open Panel file child and proves return to the immutable document surface", async () => {
-    const root = await mkdtemp(join(tmpdir(), "cua-typeahead-"));
-    roots.push(root);
-    const helper = join(root, "cua-driver");
-    await writeFile(helper, "#!/bin/sh\n");
-    await chmod(helper, 0o755);
-    const calls: Array<{ name: string; args: any }> = [];
-	let panelRoot = '- [0] AXWindow "打开" [id=open-panel actions=[raise]]\n  - [55] AXList [actions=[showmenu]]\n    - [57] AXImage "pipiui-computer-agent-final-acceptance-24.txt" [actions=[open,showmenu]]';
-	let fileLists: Array<Record<string, unknown>> = [
-	  { element_index: 55, element_token: "s00000024:55", role: "AXList", label: "图标视图" },
-	];
-	let fileChildren: Array<Record<string, unknown>> = [];
-	let opened = false;
-    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
-    host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
-	host.rootTargets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101240 });
-    host.call = async (name: string, args: any) => {
-      calls.push({ name, args });
-	  if (name === "get_window_state" && opened && args.window_id === 101369) throw Object.assign(new Error("closed"), { code: "window_id_not_found" });
-      if (name === "get_window_state") return { structuredContent: {
-        screenshot_png_b64: "PNG",
-        snapshot_id: "s00000024",
-        tree_markdown: args.window_id === 101240 ? '- [0] AXWindow "Document" [id=_NS:34]\n  - [1] AXTextArea' : panelRoot,
-        elements: [
-		  { element_index: 0, element_token: "s00000024:0", role: "AXWindow" },
-		  ...fileLists,
-		  ...(args.window_id === 101240 ? [{ element_index: 1, role: "AXTextArea", enabled: true }] : fileChildren),
-        ],
-      } };
-	  if (name === "click") opened = true;
-      return { structuredContent: {} };
-    };
-
-    const longBasename = "pipiui-computer-agent-final-acceptance-24.txt";
-	fileChildren = [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: longBasename, selected: false }];
-	expect(await host.handle({
-      protocolVersion: 1,
-      sessionKey: "open-panel",
-      action: "computer_batch",
-      actions: [{
-        type: "typeahead",
-        text: longBasename,
-      }],
-	})).toMatchObject({ ok: true });
-
-	expect(calls.filter((call) => call.name === "press_key")).toHaveLength(0);
-	expect(calls.filter((call) => call.name === "type_text")).toHaveLength(0);
-	expect(calls.filter((call) => call.name === "click").map((call) => ({
-	  action: call.args.action,
-	  pid: call.args.pid,
-	  window: call.args.window_id,
-	  token: call.args.element_token,
-	}))).toEqual([
-	  { action: "open", pid: 91023, window: 101369, token: "s00000024:57" },
-	]);
-
-	const beforeRejected = calls.filter((call) => call.name === "click").length;
-	for (const state of [
-	  { root: panelRoot, lists: [], children: fileChildren },
-	  { root: panelRoot, lists: [
-		{ element_index: 55, element_token: "s00000024:55", role: "AXList" },
-		{ element_index: 56, element_token: "s00000024:56", role: "AXList" },
-	  ], children: fileChildren },
-	  { root: panelRoot, lists: fileLists, children: [] },
-	  { root: panelRoot, lists: fileLists, children: [
-		{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "mismatch.txt" },
-	  ] },
-	  { root: panelRoot, lists: fileLists, children: [
-		{ element_index: 57, element_token: "s00000024:57", parent_index: 0, role: "AXImage", label: "other.txt" },
-	  ] },
-	  { root: panelRoot, lists: fileLists, children: [
-		{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "other.txt" },
-		{ element_index: 58, element_token: "s00000024:58", parent_index: 55, role: "AXImage", label: "other.txt" },
-	  ] },
-	  { root: '- [0] AXWindow "打开" [id=open-panel]\n  - [55] AXList\n    - [57] AXImage "other.txt" [actions=[showmenu]]', lists: [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }], children: [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "other.txt" }] },
-	  { root: "- [0] AXWindow \"Document\"", lists: [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }], children: fileChildren },
-	]) {
-	  panelRoot = state.root;
-	  fileLists = state.lists;
-	  fileChildren = state.children;
-	  opened = false;
-	  host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
-	  await expect(host.handle({
-		protocolVersion: 1,
-		sessionKey: "open-panel",
-		action: "computer_batch",
-		actions: [{ type: "typeahead", text: "other.txt" }],
-	  })).resolves.toMatchObject({
-		ok: false,
-		runtimeError: { code: "typeahead_target_untrusted", requiresObservation: true },
-	  });
-	}
-	expect(calls.filter((call) => call.name === "click")).toHaveLength(beforeRejected);
-
-	panelRoot = '- [0] AXWindow "打开" [id=open-panel actions=[raise]]\n  - [55] AXList\n    - [57] AXImage "unproven.txt" [actions=[open,showmenu]]';
-	fileLists = [{ element_index: 55, element_token: "s00000024:55", role: "AXList" }];
-	fileChildren = [{ element_index: 57, element_token: "s00000024:57", parent_index: 55, role: "AXImage", label: "unproven.txt" }];
-	opened = false;
-	host.call = async (name: string, args: any) => {
-	  calls.push({ name, args });
-	  if (name === "get_window_state") return { structuredContent: {
-		screenshot_png_b64: "PNG", snapshot_id: "s00000024", tree_markdown: panelRoot,
-		elements: [{ element_index: 0, role: "AXWindow" }, ...fileLists, ...fileChildren],
-	  } };
-	  return { structuredContent: {} };
-	};
-	await expect(host.handle({ protocolVersion: 1, sessionKey: "open-panel", action: "computer_batch", actions: [{ type: "typeahead", text: "unproven.txt" }] }))
-	  .resolves.toMatchObject({ ok: false, runtimeError: { code: "typeahead_open_unverified" } });
-
-	for (const driftTarget of [
-	  { session: "open-panel", pid: 91024, window_id: 101369 },
-	  { session: "open-panel", pid: 91023, window_id: 101370 },
-	]) {
-	  opened = false;
-	  host.targets.set("open-panel", { session: "open-panel", pid: 91023, window_id: 101369 });
-	  host.call = async (name: string, args: any) => {
-		calls.push({ name, args });
-		if (name === "click") {
-		  opened = true;
-		  host.targets.set("open-panel", driftTarget);
-		}
-		if (name === "get_window_state") return { structuredContent: {
-		  screenshot_png_b64: "PNG", snapshot_id: "s00000024", tree_markdown: panelRoot,
-		  elements: [
-			{ element_index: 0, role: "AXWindow" }, ...fileLists,
-			...fileChildren,
-		  ],
-		} };
-		return { structuredContent: {} };
-	  };
-	  await expect(host.handle({ protocolVersion: 1, sessionKey: "open-panel", action: "computer_batch", actions: [{ type: "typeahead", text: "unproven.txt" }] }))
-		.resolves.toMatchObject({ ok: false, runtimeError: { code: "typeahead_open_unverified" } });
-	}
   });
 
   it("resumes an authoritative pre-existing Open Panel at application launch without adopting sibling documents", async () => {
@@ -2366,5 +2141,149 @@ if (mode === "serve") {
     await expect(host.call("get_desktop_state", { session: "pipiui-desktop-x" }))
       .rejects.toThrow("capture_failed on display 1");
     expect(calls.map((call) => call.name)).toEqual(["get_desktop_state"]);
+  });
+
+  it("maps model coordinates back to driver pixels with the delivered scale", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-scale-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 }, undefined, undefined, {
+      prepareScreenshot: (png: Buffer) => ({ png, width: 400, height: 300, scaleX: 0.5, scaleY: 0.5 }),
+    });
+    host.targets.set("scaled", { session: "scaled", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "scaled",
+      action: "computer_batch",
+      actions: [{ type: "click", coordinate: [100, 50] }],
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      outcomes: [{ index: 0, type: "click", status: "ok" }],
+      screenshot: { width: 400, height: 300, scaleX: 0.5, scaleY: 0.5 },
+    });
+    const click = calls.find((call) => call.name === "click");
+    expect(click?.args).toMatchObject({ x: 200, y: 100 });
+  });
+
+  it("rejects out-of-bounds model coordinates before any driver mutation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-bounds-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 }, undefined, undefined, {
+      prepareScreenshot: (png: Buffer) => ({ png, width: 400, height: 300, scaleX: 0.5, scaleY: 0.5 }),
+    });
+    host.targets.set("bounds", { session: "bounds", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "bounds",
+      action: "computer_batch",
+      actions: [{ type: "click", coordinate: [500, 50] }],
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      runtimeError: { code: "coordinate_out_of_bounds", retryable: true },
+      completedActions: 0,
+      outcomes: [{ index: 0, type: "click", status: "failed", error: "coordinate_out_of_bounds" }],
+    });
+    expect(result.error).toContain("0..400");
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(0);
+  });
+
+  it("rejects unsupported action types before executing anything in the batch", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-unsupported-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("strict", { session: "strict", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "strict",
+      action: "computer_batch",
+      actions: [
+        { type: "click", coordinate: [10, 10] },
+        { type: "drag", start_coordinate: [1, 2], coordinate: [3, 4] },
+      ],
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      runtimeError: { code: "unsupported_action", retryable: false },
+      completedActions: 0,
+      outcomes: [
+        { index: 0, type: "click", status: "not_executed" },
+        { index: 1, type: "drag", status: "failed", error: "unsupported_action" },
+      ],
+    });
+    expect(result.error).toContain("drag");
+    expect(calls).toHaveLength(0);
+    await expect(host.handle({
+      protocolVersion: 1,
+      sessionKey: "strict",
+      action: "computer_batch",
+      actions: [{ type: "typeahead", text: "file.txt" }],
+    })).resolves.toMatchObject({ ok: false, runtimeError: { code: "unsupported_action" } });
+  });
+
+  it("marks the failing action and skips the batch tail in the outcomes receipt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-outcomes-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 800, height: 600 });
+    host.targets.set("receipt", { session: "receipt", pid: 42, window_id: 77 });
+    host.call = async (name: string, args: any) => {
+      calls.push({ name, args });
+      if (name === "get_window_state") return { structuredContent: { pid: 42, window_id: 77, screenshot_png_b64: "PNG", elements: [] } };
+      if (name === "click") throw new Error("driver exploded");
+      return { structuredContent: {} };
+    };
+    const result = await host.handle({
+      protocolVersion: 1,
+      sessionKey: "receipt",
+      action: "computer_batch",
+      actions: [
+        { type: "key", keys: ["F5"] },
+        { type: "click", coordinate: [10, 10] },
+        { type: "wait", duration_ms: 1 },
+      ],
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      runtimeError: { code: "mutation_outcome_unknown" },
+      outcomeUnknown: true,
+      completedActions: 1,
+      outcomes: [
+        { index: 0, type: "key", status: "ok" },
+        { index: 1, type: "click", status: "failed" },
+        { index: 2, type: "wait", status: "not_executed" },
+      ],
+    });
+    expect(calls.filter((call) => call.name === "press_key")).toHaveLength(1);
+    expect(calls.filter((call) => call.name === "click")).toHaveLength(1);
   });
 });

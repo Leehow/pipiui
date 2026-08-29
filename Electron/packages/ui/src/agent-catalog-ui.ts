@@ -1,14 +1,5 @@
 import type { AgentCatalogDiagnostic, AgentDefinition, AgentPatchProvenance } from '@pipi/host-api'
 
-/** Computer-use settings grouping uses catalog metadata, never a name list. */
-export function isComputerRole(agent: AgentDefinition): boolean {
-  return agent.canonicalRole === 'computer'
-}
-
-export function needsVisualModelHint(agent: AgentDefinition): boolean {
-  return agent.canonicalRole === 'computer'
-}
-
 export function isAgentUnavailable(agent: AgentDefinition): boolean {
   return agent.available === false || agent.availability === 'unavailable'
 }
@@ -32,7 +23,6 @@ export function agentSourceLabel(
 }
 
 export function isProjectScopedAgent(agent: AgentDefinition): boolean {
-  if (isComputerRole(agent)) return false
   return (agent.source ?? agent.origin) === 'project'
 }
 
@@ -78,17 +68,14 @@ export function collectCatalogDiagnostics(agents: AgentDefinition[]): AgentCatal
 export function partitionCatalog(agents: AgentDefinition[]): {
   general: AgentDefinition[]
   project: AgentDefinition[]
-  computer: AgentDefinition[]
 } {
   const general: AgentDefinition[] = []
   const project: AgentDefinition[] = []
-  const computer: AgentDefinition[] = []
   for (const agent of agents) {
-    if (isComputerRole(agent)) computer.push(agent)
-    else if (isProjectScopedAgent(agent)) project.push(agent)
+    if (isProjectScopedAgent(agent)) project.push(agent)
     else general.push(agent)
   }
-  return { general, project, computer }
+  return { general, project }
 }
 
 export function contributedAgentsFor(agents: AgentDefinition[], extensionId: string): AgentDefinition[] {

@@ -4,7 +4,7 @@ import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
 import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SessionPreloadSnapshot, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -34,7 +34,6 @@ import { DEFAULT_PANEL_TAB, usePanels, type PanelRailContext, type PanelTab } fr
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
-import { useUpdateCenter } from './useUpdateCenter'
 import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
 import { DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
@@ -53,6 +52,7 @@ type PaneWidths = { sidebar: number; tools: number; browserTools: number; sideba
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
 type SessionWithSidebarMetadata = Session & { provider?: unknown; modelId?: unknown; modelRef?: unknown; model?: unknown }
 type RuntimeSessionLease = SessionLease & { canWrite?: unknown; ownerLabel?: unknown }
+type LazySessionPageState = { nextCursor?: string; hasMore: boolean; loading: boolean }
 
 /** Accept both the current host-api shape and lease payloads from older running Electron hosts.
  *  `null` means the lease has not loaded yet. The composer is already writable in that
@@ -98,6 +98,7 @@ const storageKey = 'pipiui:eui-pane-widths'
 const sidebarPreferencePrefix = 'pipiui:eui:sidebar:v1'
 const sidebarSemanticMigrationKey = 'pipiui:eui:sidebar-semantic-host:v1'
 export const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
+const TOOL_QUICK_RAIL_COLLAPSED_KEY = 'pipiui:eui:tool-quick-rail-collapsed:v1'
 const HISTORY_PAGE_SIZE = 500
 
 /** Only measurements cross the renderer→host telemetry boundary; never bodies or paths. */
@@ -311,18 +312,31 @@ export function sidebarStatusForSession(sessionId: string, selectedSessionId: st
   return { status: 'idle' }
 }
 
-/** Global sidebar snapshot keeps session identity; transcripts receive only the selected slice. */
+/** Global sidebar snapshot keeps session identity; transcripts receive only the selected slice.
+ *  Rows are episodes ({sessionId, agentId, runId}): a second run of one agentId
+ *  ADDS a sibling row instead of replacing, so a late terminal from a retired
+ *  run cannot repaint the current run's row (and vice versa). Only legacy
+ *  runId-less rows fall back to an agentId-level replace. */
 export function mergeAgentSummary(current: AgentSummary[], incoming: AgentSummary): AgentSummary[] {
   const index = current.findIndex(agent => agent.agentId === incoming.agentId && (
-    incoming.sessionId ? agent.sessionId === incoming.sessionId : true
+    incoming.runId
+      ? agent.runId === incoming.runId && (incoming.sessionId ? agent.sessionId === incoming.sessionId : true)
+      : incoming.sessionId ? agent.sessionId === incoming.sessionId : true
   ))
-  const next = index < 0 ? incoming : { ...incoming, sessionId: incoming.sessionId ?? current[index]?.sessionId }
-  return index < 0
-    ? [...current, next]
-    : current.map((agent, candidate) => candidate === index ? next : agent)
+  if (index < 0) return [...current, incoming]
+  const previous = current[index]
+  // Within ONE episode a reached terminal verdict must not be reopened by a
+  // late running event or an older snapshot row captured before the verdict.
+  const isTerminal = (agent: AgentSummary) => agent.state !== 'running' && agent.state !== 'stalled'
+  if (isTerminal(previous) && !isTerminal(incoming)) return current
+  const next = { ...incoming, sessionId: incoming.sessionId ?? previous.sessionId }
+  return current.map((agent, candidate) => candidate === index ? next : agent)
 }
 
-/** Overlay live agent events on a listAgents snapshot so a stale/empty snapshot cannot drop a running row. */
+/** Overlay live agent events on a listAgents snapshot so a stale/empty snapshot cannot drop a running row.
+ *  Episode-scoped: observed rows replace only the snapshot row of the SAME run.
+ *  A fresh snapshot terminal for a run whose end event was missed wins over the
+ *  stale observed running row; rows of other runs are kept as siblings. */
 export function mergeAgentSnapshot(current: AgentSummary[], snapshot: readonly AgentSummary[]): AgentSummary[] {
   return current.reduce((items, agent) => mergeAgentSummary(items, agent), snapshot.slice())
 }
@@ -726,7 +740,6 @@ export function createMockHost(): PipiHostAPI {
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
     { name: 'general-purpose', description: 'Grok-style full-capability worker. Uses an isolated worktree by default; runs directly only when the Boss supplies an explicit reason.', origin: 'bundled', source: 'bundled', mode: 'worker', worktree: 'isolated', available: true, availability: 'available' },
     { name: 'reviewer', description: 'Read-only code review specialist for quality and security.', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
-    { name: 'computer-use', description: 'Completes one desktop goal in one private Computer Use episode by planning, operating, reconciling, recovering, and verifying without delegation.', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'computer', available: true, availability: 'available' },
     { name: 'secretary', description: 'Boss closeout secretary. Reconciles agent outcomes, worktrees, branches, verification, temporary artifacts, and the existing Boss ledger without creating another worktree.', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'secretary', available: true, availability: 'available' },
   ]
   const emit = (sessionId: string, event: StreamEvent) => {
@@ -1095,6 +1108,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   selectedSessionRef.current = selectedSession
   const restoredLastSessionRef = useRef(false)
   const [projectsLoaded, setProjectsLoaded] = useState(false)
+  const [lazyStartupReady, setLazyStartupReady] = useState(() => !host.listSessionPage)
+  const [lazySessionPages, setLazySessionPages] = useState<Record<string, LazySessionPageState>>({})
+  const lazySessionPagesRef = useRef(lazySessionPages)
+  lazySessionPagesRef.current = lazySessionPages
+  const lazyPageLoadsRef = useRef(new Set<string>())
+  const [sidebarSessionIdsByProject, setSidebarSessionIdsByProject] = useState<Record<string, string[]>>({})
+  const [lazyVisibleSessionLimits, setLazyVisibleSessionLimits] = useState<Record<string, number>>({})
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [modelState, setModelState] = useState<ModelState | null>(null)
   const modelStatesBySessionRef = useRef(new Map<string, ModelState>())
@@ -1175,6 +1195,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const historyCursorBySessionRef = useRef(new Map<string, string>())
   const historyOlderLoadInFlightRef = useRef(new Set<string>())
   const historyCompleteBySessionRef = useRef(new Map<string, boolean>())
+  const preloadedSessionDetailsRef = useRef(new Map<string, SessionPreloadSnapshot>())
   const historyFingerprintBySessionRef = useRef(new Map<string, string>())
   const historySettledReplacementRef = useRef(new Map<string, { fingerprint: string; liveRevision: number }>())
   const locallyCreatedSessionIdsRef = useRef(new Set<string>())
@@ -1236,7 +1257,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const scanExternal = useScanExternalSessions(host)
   const scanExternalRef = useRef(scanExternal)
   scanExternalRef.current = scanExternal
-  const updates = useUpdateCenter(host)
   // Opening the settings modal refreshes the vision-routing snapshot so the 通用
   // tab always shows the host's current state (reads happen on open, per spec).
   const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
@@ -1336,7 +1356,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       && previous.turnEpoch === mainTurnEpochRef.current
       && mainTurnOpenRef.current
     ) {
-      // A Computer Task can durably settle all of its agents even when the
+      // A subagent tree can durably settle all of its agents even when the
       // selected main-stream `settled` event is lost. Re-read the authoritative
       // JSONL; the existing history/live-revision gates decide whether this
       // exact turn is terminal and refuse to close a newer one.
@@ -1407,12 +1427,156 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const leaseConflictError = sessionQueue.items.find(item =>
     item.status === 'failed' && typeof item.error === 'string' && item.error.includes('session is read-only'),
   )?.error
+  const cacheSessionPreload = useCallback((sessionId: string, snapshot: SessionPreloadSnapshot) => {
+    preloadedSessionDetailsRef.current.set(sessionId, snapshot)
+    historyEntriesBySessionRef.current.set(sessionId, snapshot.history)
+    historyCompleteBySessionRef.current.set(sessionId, true)
+    historyCursorBySessionRef.current.delete(sessionId)
+    const reconciled = reconcileHistorySnapshot(snapshot.history, 0, 0)
+    messagesBySessionRef.current.set(sessionId, reconciled.messages)
+    historyFingerprintBySessionRef.current.set(sessionId, reconciled.fingerprint)
+  }, [])
+  /** SubagentPanel receives already-warmed snapshots/logs on the first click,
+   * then its normal live subscriptions keep the selected session current. */
+  const preloadedHost = useMemo<PipiHostAPI>(() => ({
+    ...host,
+    listAgents: async (sessionId, scope) => {
+      const cached = sessionId ? preloadedSessionDetailsRef.current.get(sessionId) : undefined
+      if (cached && scope === 'history') return cached.agents
+      return host.listAgents(sessionId, scope)
+    },
+    getAgentLogs: async (agentId, sessionId, runId, scope) => {
+      // Match the host-api convention: an omitted scope stays a 3-argument read.
+      const readLive = () => scope
+        ? host.getAgentLogs(agentId, sessionId, runId, scope)
+        : host.getAgentLogs(agentId, sessionId, runId)
+      const cached = preloadedSessionDetailsRef.current.get(sessionId)
+      if (!cached) return readLive()
+      if (scope === 'agent') {
+        const cachedEntries = cached.agentLogs
+          .filter(item => item.agentId === agentId)
+          .flatMap(item => item.entries)
+        if (cachedEntries.length > 0) return cachedEntries
+      } else {
+        const cachedEntry = cached.agentLogs.find(item => item.agentId === agentId && item.runId === runId)
+        // The snapshot is a startup-time slice: a nested agent registered early
+        // can carry an empty (or still-growing) prefetch entry even though its
+        // transcript landed afterwards. An empty cached entry is never
+        // authoritative — fall back to the live host, whose cache is keyed by
+        // the exact {sessionId, agentId, runId} triple, so no other run's or
+        // parent's logs can leak in.
+        if (cachedEntry && cachedEntry.entries.length > 0) return cachedEntry.entries
+      }
+      return readLive()
+    },
+  }), [host])
+  const loadLazySessionPage = useCallback(async (projectId: string, cursor?: string) => {
+    if (!host.listSessionPage || !host.preloadSession) return
+    const loadKey = `${projectId}\u0000${cursor ?? 'first'}`
+    if (lazyPageLoadsRef.current.has(loadKey)) return
+    lazyPageLoadsRef.current.add(loadKey)
+    setLazySessionPages(current => ({
+      ...current,
+      [projectId]: { ...current[projectId], loading: true, hasMore: current[projectId]?.hasMore ?? false },
+    }))
+    try {
+      const page = await host.listSessionPage(projectId, cursor, 10)
+      // One session at a time: JSONL parsing stays background work and yields
+      // between sessions instead of contending with first paint/input.
+      for (const session of page.sessions) {
+        if (!preloadedSessionDetailsRef.current.has(session.id)) {
+          const snapshot = await host.preloadSession(session.id)
+          cacheSessionPreload(session.id, snapshot)
+        }
+        await new Promise<void>(resolve => window.setTimeout(resolve, 0))
+      }
+      setSessions(current => {
+        const merged = new Map(current.map(session => [session.id, session]))
+        for (const session of page.sessions) merged.set(session.id, session)
+        return [...merged.values()]
+      })
+      setSidebarSessionIdsByProject(current => ({
+        ...current,
+        [projectId]: [...new Set([...(current[projectId] ?? []), ...page.sessions.map(session => session.id)])],
+      }))
+      setLazySessionPages(current => ({
+        ...current,
+        [projectId]: { nextCursor: page.nextCursor, hasMore: page.hasMore, loading: false },
+      }))
+      setLazyVisibleSessionLimits(current => ({
+        ...current,
+        [projectId]: cursor ? (current[projectId] ?? 10) + 10 : Math.max(current[projectId] ?? 0, 10),
+      }))
+      if (!selectedSessionRef.current && page.sessions[0]) {
+        setSelectedProject(projectId)
+        setSelectedSession(page.sessions[0].id)
+      }
+    } catch (error) {
+      setLazySessionPages(current => ({
+        ...current,
+        [projectId]: { ...current[projectId], loading: false, hasMore: current[projectId]?.hasMore ?? false },
+      }))
+      setProjectError(`加载会话列表失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      lazyPageLoadsRef.current.delete(loadKey)
+    }
+  }, [cacheSessionPreload, host])
+  const warmInitialSessionPages = useCallback(async (items: readonly Project[]) => {
+    for (const project of items) await loadLazySessionPage(project.id)
+  }, [loadLazySessionPage])
   /** The explicit path read performs the one-time backend migration; listProjects supplies matching UI metadata. */
   const refreshProjects = useCallback(async () => {
     const paths = host.getProjectPaths ? await host.getProjectPaths() : undefined
     const listed = await host.listProjects()
     const explicitPaths = paths ? new Set(paths) : undefined
     const items = explicitPaths ? listed.filter(project => explicitPaths.has(project.path)) : listed
+    if (host.listSessionPage && host.getSession && host.preloadSession) {
+      const validProjectIds = new Set(items.map(project => project.id))
+      const remembered = restoredLastSessionRef.current ? null : readLastSessionSelection()
+      restoredLastSessionRef.current = true
+      setProjects(items)
+      setProjectsLoaded(true)
+      let rememberedReady = false
+      if (remembered && validProjectIds.has(remembered.projectId)) {
+        try {
+          if (isExternalSessionId(remembered.sessionId)) {
+            if (!host.listExternalSessions || !host.getExternalSessionHistory) throw new Error('external session restore unavailable')
+            const external = (await host.listExternalSessions(remembered.projectId)).find(item => item.id === remembered.sessionId)
+            if (!external) throw new Error(`unknown external session ${remembered.sessionId}`)
+            const history = await host.getExternalSessionHistory(remembered.sessionId)
+            const projected: ProjectExternalSession = { ...external, projectId: remembered.projectId }
+            const messages = externalHistoryToMessages(history)
+            messagesBySessionRef.current.set(remembered.sessionId, messages)
+            messagesRef.current = messages
+            setMessages(messages)
+            setExternalSessions(current => [projected, ...current.filter(item => item.id !== remembered.sessionId)])
+            setExternalAdoptableById(current => ({ ...current, [remembered.sessionId]: canAdoptExternalHistory(history) }))
+            setExternalHistoryAvailabilityById(current => ({ ...current, [remembered.sessionId]: history.availability }))
+            setSelectedProject(remembered.projectId)
+            setSelectedSession(remembered.sessionId)
+          } else {
+            const session = await host.getSession(remembered.projectId, remembered.sessionId)
+            const snapshot = await host.preloadSession(session.id)
+            cacheSessionPreload(session.id, snapshot)
+            const messages = messagesBySessionRef.current.get(session.id) ?? []
+            messagesRef.current = messages
+            setMessages(messages)
+            setSessions(current => current.some(item => item.id === session.id) ? current : [session, ...current])
+            setSelectedProject(session.projectId)
+            setSelectedSession(session.id)
+          }
+          rememberedReady = true
+        } catch {
+          /* Deleted/renamed remembered session: first lazy page chooses a replacement. */
+        }
+      }
+      if (!rememberedReady) setSelectedProject(current => validProjectIds.has(current) ? current : items[0]?.id ?? '')
+      setLazyStartupReady(true)
+      // Schedule only after the remembered render cache is ready. This timeout
+      // yields a paint opportunity before any page starts parsing full histories.
+      window.setTimeout(() => { void warmInitialSessionPages(items) }, 0)
+      return items
+    }
     const groupedSessions = await Promise.all(items.map(async project => {
       const request = beginSessionListRequest(project.id)
       try {
@@ -1483,7 +1647,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       setSelectedSession(rememberedExternal.id)
     }
     return items
-  }, [beginSessionListRequest, host, isCurrentSessionListRequest])
+  }, [beginSessionListRequest, cacheSessionPreload, host, isCurrentSessionListRequest, warmInitialSessionPages])
 
   useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setPlanAvailable(Boolean(capabilities.plan && host.getPlans)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setPlanAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
   useEffect(() => {
@@ -1509,14 +1673,37 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [host, rememberToolReturn, selectedSession])
   useEffect(() => {
     let mounted = true
+    const refresh = () => {
+      void host.listAgents().then(snapshot => {
+        if (mounted) setSidebarAgents(current => mergeAgentSnapshot(current, snapshot))
+      }).catch(() => undefined)
+    }
     const unsubscribe = host.subscribeAgents(event => {
+      const eventSessionId = event.type === 'agent'
+        ? event.agent.sessionId
+        : event.type === 'agent_log'
+          ? event.sessionId
+          : event.type === 'worktree' ? event.status.sessionId : undefined
+      if (eventSessionId) preloadedSessionDetailsRef.current.delete(eventSessionId)
       if (event.type !== 'agent') return
       setSidebarAgents(current => mergeAgentSummary(current, event.agent))
     })
-    void host.listAgents().then(snapshot => {
-      if (mounted) setSidebarAgents(current => mergeAgentSnapshot(current, snapshot))
-    }).catch(() => undefined)
-    return () => { mounted = false; unsubscribe() }
+    refresh()
+    // subscribeAgents is a fire-and-forget broadcast with no replay: lifecycle
+    // events that fired while the window was hidden, or while the subscription
+    // was silently lost, never come back. Background subagents can outlive the
+    // Boss turn, so reconcile from the durable host index whenever the user
+    // returns to the window — this both recovers a missed `running` and clears
+    // a running row whose terminal event was missed.
+    const onVisible = () => { if (document.visibilityState === 'visible') refresh() }
+    window.addEventListener('focus', onVisible)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      mounted = false
+      unsubscribe()
+      window.removeEventListener('focus', onVisible)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
   }, [host])
   useEffect(() => {
     if (!projects.length || loadedSidebarPreferencesKey === sidebarStorageKey) return
@@ -1619,6 +1806,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [archivedSessionIds, archivedSessionTimestamps, host, loadedSidebarPreferencesKey, projects.length, selectedSession, sessions, sidebarStorageKey])
   useEffect(() => {
     if (!projectsLoaded || !selectedProject) return
+    if (host.listSessionPage && host.preloadSession) return
     const request = beginSessionListRequest(selectedProject)
     void host.listSessions(selectedProject).then(items => {
       if (!isCurrentSessionListRequest(selectedProject, request.generation)) return
@@ -1647,6 +1835,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [beginSessionListRequest, host, isCurrentSessionListRequest, projectsLoaded, selectedProject])
   useEffect(() => {
     if (scanExternal.loading) return
+    if (host.listSessionPage && !lazyStartupReady) return
     if (!scanExternal.enabled) {
       setExternalSessions(current => current.length === 0 ? current : [])
       if (!isExternalSessionId(selectedSessionRef.current)) return
@@ -1664,7 +1853,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     void loadExternalSessionsForProjects(host.listExternalSessions, projects).then(items => {
       setExternalSessions(items)
     })
-  }, [host, projects, projectsLoaded, scanExternal.enabled, scanExternal.loading])
+  }, [host, lazyStartupReady, projects, projectsLoaded, scanExternal.enabled, scanExternal.loading])
   useEffect(() => {
     if (!projectsLoaded || !selectedProject || !selectedSession) return
     const knownPi = sessions.some(session => session.id === selectedSession && session.projectId === selectedProject)
@@ -2530,6 +2719,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     historyCompleteBySessionRef.current.set(session.id, true)
     beforeSelect?.(session.id)
     setSessions(items => [session, ...items])
+    setSidebarSessionIdsByProject(current => ({ ...current, [selectedProject]: [session.id, ...(current[selectedProject] ?? []).filter(id => id !== session.id)] }))
     setSelectedProject(selectedProject)
     setSelectedSession(session.id)
     setSidebarExpandedIds(current => current.includes(selectedProject) ? current : [...current, selectedProject])
@@ -2648,10 +2838,6 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       throw error
     }
   }
-  const requestUpdate = (prompt: string) => {
-    closeModelManager()
-    void send(prompt).catch(error => setProjectError(`发送失败：${error instanceof Error ? error.message : String(error)}`))
-  }
   /**
    * `/compact`. Progress and the outcome normally arrive as `compaction` stream
    * events; a refusal ("Nothing to compact") never produces one, so the
@@ -2701,6 +2887,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     historyCursorBySessionRef.current.delete(session.id)
     historyCompleteBySessionRef.current.set(session.id, true)
     setSessions(items => [session, ...items])
+    setSidebarSessionIdsByProject(current => ({ ...current, [projectId]: [session.id, ...(current[projectId] ?? []).filter(id => id !== session.id)] }))
     setSelectedProject(projectId)
     setSelectedSession(session.id)
     setSidebarExpandedIds(current => current.includes(projectId) ? current : [...current, projectId])
@@ -2716,6 +2903,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       const session = await host.adoptExternalSession(sessionId)
       setExternalSessions(current => current.filter(item => item.id !== sessionId))
       setSessions(items => [session, ...items.filter(item => item.id !== session.id)])
+      setSidebarSessionIdsByProject(current => ({ ...current, [session.projectId]: [session.id, ...(current[session.projectId] ?? []).filter(id => id !== session.id)] }))
       setSelectedProject(session.projectId)
       setSelectedSession(session.id)
       setSidebarExpandedIds(current => current.includes(session.projectId) ? current : [...current, session.projectId])
@@ -2852,13 +3040,16 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     path: project.path,
     // Pinned sessions live in the dedicated section; archived ones in the global archive.
     sessions: sessionsByActivityAndManualOrder([
-      ...sessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)),
+      ...sessions.filter(session => session.projectId === project.id
+        && (!host.listSessionPage || (sidebarSessionIdsByProject[project.id] ?? []).includes(session.id))
+        && !pinnedSessionIdSet.has(session.id)
+        && !archivedSessionIdSet.has(session.id)),
       ...externalSessions.filter(session => session.projectId === project.id && !pinnedSessionIdSet.has(session.id) && !archivedSessionIdSet.has(session.id)),
     ]).flatMap(session => {
       const mapped = sidebarSessionById.get(session.id)
       return mapped ? [mapped] : []
     })
-  })), [archivedSessionIdSet, externalSessions, pinnedSessionIdSet, projects, sessions, sidebarSessionById])
+  })), [archivedSessionIdSet, externalSessions, host.listSessionPage, pinnedSessionIdSet, projects, sessions, sidebarSessionById, sidebarSessionIdsByProject])
   const sidebarProjectMenuUnavailable = useMemo<ProjectMenuUnavailable>(() => ({
     ...(!host.renameProject ? { rename: '待宿主支持' } : {}),
     ...(!host.removeProject ? { remove: '当前连接不支持移除项目' } : {}),
@@ -3042,7 +3233,14 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (!source || source.projectId === targetProjectId) return
     const snapshot = sessions
     const snapshotPinned = pinnedSessionIds
+    const snapshotSidebarIds = sidebarSessionIdsByProject
     setSessions(current => current.map(session => session.id === sessionId ? { ...session, projectId: targetProjectId } : session))
+    setSidebarSessionIdsByProject(current => Object.fromEntries(Object.entries(current).map(([projectId, ids]) => [
+      projectId,
+      projectId === targetProjectId
+        ? [sessionId, ...ids.filter(id => id !== sessionId)]
+        : ids.filter(id => id !== sessionId),
+    ])))
     setPinnedSessionIds(current => current.filter(id => id !== sessionId))
     setSidebarExpandedIds(current => current.includes(targetProjectId) ? current : [...current, targetProjectId])
     try {
@@ -3051,6 +3249,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (selectedSession === sessionId) setSelectedProject(targetProjectId)
     } catch (error) {
       setSessions(snapshot)
+      setSidebarSessionIdsByProject(snapshotSidebarIds)
       setPinnedSessionIds(snapshotPinned)
       setProjectError(`移动会话失败：${error instanceof Error ? error.message : String(error)}`)
     }
@@ -3182,13 +3381,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     : widths.tools
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
     {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} theme={theme} onToggleTheme={toggleTheme} />
+    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} sessionHasMoreByProject={host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined} sessionPageLoadingByProject={host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined} sessionVisibleLimitByProject={host.listSessionPage ? lazyVisibleSessionLimits : undefined} onShowMoreSessions={host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} theme={theme} onToggleTheme={toggleTheme} />
     <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
     <section className="chat-column">
       <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} canAdoptExternal={Boolean(isExternalSelected && host.adoptExternalSession && externalAdoptableById[selectedSession] === true)} adoptDisabledReason={isExternalSelected && externalAdoptableById[selectedSession] === false ? externalHistoryAvailabilityById[selectedSession] === 'metadata' ? '此外部会话只有元数据，没有可导入的正文' : externalHistoryAvailabilityById[selectedSession] === 'summary' ? '此外部会话只有摘要，没有可导入的正文' : '此外部会话没有可导入的正文' : undefined} adopting={adoptingExternalId === selectedSession} adoptError={adoptError} onDismissAdoptError={() => setAdoptError(null)} onAdoptExternal={() => void adoptExternalSession()} onViewOriginal={headerSession?.adoptedFrom ? () => viewOriginalExternalSession(headerSession.id) : undefined} />
       <div className="chat-viewport" data-testid="chat-viewport">
-        {toolsCollapsed && <ToolQuickRail variant="float" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
-        {projectsLoaded && !selectedSession ? (
+        {toolsCollapsed && <ToolQuickRail variant="float" collapsible={narrowViewport} activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
+        {projectsLoaded && lazyStartupReady && !selectedSession ? (
           <div className="empty-setup-viewport">
             <EmptySetupGuide
               modelsLoading={modalVisibility.loading}
@@ -3232,8 +3431,8 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div> : null}
     </section>
     <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={host} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
-    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
+    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
+    {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} current={modelState?.model ?? null} onModelState={applySelectedModelState} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
       if (!selectedSession || !host.browser) return
@@ -3696,12 +3895,25 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
 }
-function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }: { variant: 'header' | 'float'; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; planTabVisible: boolean; planProgress: { completed: number; total: number } | null; subagentsRunningCount: number }) {
+function ToolQuickRail({ variant, collapsible = false, activeTab, toolsCollapsed, onSelect, host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }: { variant: 'header' | 'float'; collapsible?: boolean; activeTab: PanelTab; toolsCollapsed: boolean; onSelect: (tab: PanelTab) => void; host: PipiHostAPI; browserAvailable: boolean | undefined; terminalAvailable: boolean | undefined; planTabVisible: boolean; planProgress: { completed: number; total: number } | null; subagentsRunningCount: number }) {
   const panels = usePanels()
   const railCtx: PanelRailContext = { host, browserAvailable, terminalAvailable, planTabVisible, planProgress, subagentsRunningCount }
-  return <nav className={`tool-quick-rail tool-quick-rail-${variant}`} aria-label="工具面板" data-testid="tool-quick-rail">
-    {panels.map(panel => {
-      if (panel.visibleInRail && !panel.visibleInRail(railCtx)) return null
+  const [floatCollapsed, setFloatCollapsed] = useState(() => {
+    if (variant !== 'float') return false
+    try { return localStorage.getItem(TOOL_QUICK_RAIL_COLLAPSED_KEY) === 'true' } catch { return false }
+  })
+  const visiblePanels = panels.filter(panel => !panel.visibleInRail || panel.visibleInRail(railCtx))
+  const compact = variant === 'float' && collapsible && floatCollapsed
+  const displayedPanels = compact
+    ? [visiblePanels.find(panel => panel.id === activeTab) ?? visiblePanels[0]].filter(Boolean)
+    : visiblePanels
+  const toggleCompact = () => {
+    const next = !floatCollapsed
+    setFloatCollapsed(next)
+    try { localStorage.setItem(TOOL_QUICK_RAIL_COLLAPSED_KEY, String(next)) } catch { /* local layout preference is best-effort */ }
+  }
+  return <nav className={`tool-quick-rail tool-quick-rail-${variant}${compact ? ' is-collapsed' : ''}`} aria-label="工具面板" data-testid="tool-quick-rail">
+    {displayedPanels.map(panel => {
       const unavailableTitle = panel.railUnavailable?.(railCtx)
       const unavailable = Boolean(unavailableTitle)
       const active = activeTab === panel.id && !toolsCollapsed
@@ -3710,6 +3922,7 @@ function ToolQuickRail({ variant, activeTab, toolsCollapsed, onSelect, host, bro
         {panel.railBadge?.(railCtx)}
       </button>
     })}
+    {variant === 'float' && collapsible && <button type="button" className="tool-rail-button tool-rail-collapse" aria-label={compact ? '展开工具快捷栏' : '收起工具快捷栏'} aria-expanded={!compact} title={compact ? '展开工具快捷栏' : '收起工具快捷栏'} onClick={toggleCompact}><span aria-hidden="true">{compact ? '‹' : '›'}</span></button>}
   </nav>
 }
 function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void; workspaceFullscreen?: boolean; onToggleWorkspaceFullscreen?: () => void }) {

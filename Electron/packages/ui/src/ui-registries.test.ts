@@ -33,14 +33,14 @@ describe('dogfood lists match the pre-registry hardcoded sets', () => {
     expect(listToolRendererNames()).toEqual([
       'write', 'edit', 'generate_image', 'image_gen', 'image_edit',
       'web_search', 'x_search', 'code_interpreter', 'browser_search', 'fetch_content', 'browser_fetch',
-      'browser', 'computer', 'find', 'grep', 'subagent', 'computer_task',
+      'browser', 'computer', 'find', 'grep', 'subagent',
       'skill_load', 'skill_search',
     ])
   })
 
   it('settings sections', () => {
-    expect(listSettingsSections().map(section => section.id)).toEqual(['general', 'models', 'extensions', 'updates'])
-    expect(listSettingsSections().map(section => section.label)).toEqual(['通用', '模型管理', '扩展', '更新中心'])
+    expect(listSettingsSections().map(section => section.id)).toEqual(['general', 'models', 'extensions'])
+    expect(listSettingsSections().map(section => section.label)).toEqual(['通用', '模型管理', '扩展'])
   })
 
   it('panels', () => {

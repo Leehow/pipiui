@@ -42,7 +42,7 @@ describe('agent catalog diagnostic formatting', () => {
 })
 
 describe('agent catalog grouping', () => {
-  it('keeps bundled and user agents in general, folds project agents, and prefers computer role', () => {
+  it('keeps bundled and user agents in general and folds project agents', () => {
     const explore = { name: 'explore', description: 'Research', origin: 'bundled' as const, source: 'bundled' as const }
     const userWorker = { name: 'openai-user', description: 'User install', origin: 'user' as const, source: 'user' as const }
     const steward = { name: 'steward-init', description: 'COC L0', origin: 'project' as const, source: 'project' as const }
@@ -50,8 +50,7 @@ describe('agent catalog grouping', () => {
     const computer = { name: 'computer-use', description: 'Desktop', origin: 'project' as const, source: 'project' as const, canonicalRole: 'computer' as const }
     const grouped = partitionCatalog([explore, userWorker, steward, ext, computer])
     expect(grouped.general.map(agent => agent.name)).toEqual(['explore', 'openai-user'])
-    expect(grouped.project.map(agent => agent.name)).toEqual(['steward-init', 'ext-researcher'])
-    expect(grouped.computer.map(agent => agent.name)).toEqual(['computer-use'])
+    expect(grouped.project.map(agent => agent.name)).toEqual(['steward-init', 'ext-researcher', 'computer-use'])
   })
 
   it('labels project agents as project-specific instead of a bare 项目 badge', () => {

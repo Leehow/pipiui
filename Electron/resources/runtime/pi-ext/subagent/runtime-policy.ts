@@ -27,6 +27,29 @@ export interface AgentRuntimeRolePolicy {
 /** Depth-1 workers may dispatch only these types. Depth 0 (Boss) is unrestricted. */
 export const NESTED_DELEGATION_ALLOWED_TYPES = ["explore", "general-purpose"] as const;
 
+/** Boss depth 0 plus worker depths 1 and 2: at most three agent-tree layers. */
+export const ABSOLUTE_MAX_SUBAGENT_DEPTH = 2;
+
+export function resolveSubagentMaxDepth(raw: string | undefined): number {
+	const requested = raw === undefined || raw.trim() === ""
+		? ABSOLUTE_MAX_SUBAGENT_DEPTH
+		: Number(raw);
+	if (!Number.isInteger(requested)) return ABSOLUTE_MAX_SUBAGENT_DEPTH;
+	return Math.max(0, Math.min(requested, ABSOLUTE_MAX_SUBAGENT_DEPTH));
+}
+
+export function resolveEffectiveSubagentDepth(
+	reportedRaw: string | undefined,
+	inheritedRaw: string | undefined,
+): number {
+	const normalize = (raw: string | undefined): number => {
+		const value = Number(raw ?? 0);
+		if (!Number.isInteger(value)) return 0;
+		return Math.max(0, Math.min(value, ABSOLUTE_MAX_SUBAGENT_DEPTH));
+	};
+	return Math.max(normalize(reportedRaw), normalize(inheritedRaw));
+}
+
 /** Capability may declare delegation; children at/above the max depth still lose the tools. */
 export function childReceivesDelegationTools(input: {
 	allowRecursiveDelegation: boolean;

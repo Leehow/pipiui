@@ -17,6 +17,8 @@ import {
 	childReceivesDelegationTools,
 	rejectDispatchAtDepth,
 	rejectNestedDelegationTypes,
+	resolveEffectiveSubagentDepth,
+	resolveSubagentMaxDepth,
 	runtimeRolePolicyForAgent,
 } from "../runtime-policy.ts";
 
@@ -31,6 +33,25 @@ function requireBundled(name: string): AgentConfig {
 }
 
 const DEFAULT_MAX_DEPTH = 2;
+
+test("agent tree is hard-capped at three layers even when the environment asks for more", () => {
+	assert.equal(resolveSubagentMaxDepth(undefined), 2);
+	assert.equal(resolveSubagentMaxDepth("0"), 0);
+	assert.equal(resolveSubagentMaxDepth("1"), 1);
+	assert.equal(resolveSubagentMaxDepth("2"), 2);
+	assert.equal(resolveSubagentMaxDepth("3"), 2);
+	assert.equal(resolveSubagentMaxDepth("999"), 2);
+	assert.equal(resolveSubagentMaxDepth("-1"), 0);
+	assert.equal(resolveSubagentMaxDepth("invalid"), 2);
+});
+
+test("inherited tree depth cannot move backward when a child rewrites its reported depth", () => {
+	assert.equal(resolveEffectiveSubagentDepth(undefined, undefined), 0);
+	assert.equal(resolveEffectiveSubagentDepth("1", undefined), 1);
+	assert.equal(resolveEffectiveSubagentDepth("0", "2"), 2);
+	assert.equal(resolveEffectiveSubagentDepth("1", "2"), 2);
+	assert.equal(resolveEffectiveSubagentDepth("999", "1"), 2);
+});
 
 function assembleChildTools(agent: AgentConfig, childDepth: number, maxDepth = DEFAULT_MAX_DEPTH) {
 	const runtimePolicy = runtimeRolePolicyForAgent(agent);
@@ -147,7 +168,9 @@ test("wired execute/assembly path uses the depth and nested-type guards", () => 
 	assert.match(runtimeIndex, /rejectNestedDelegationTypes\(/);
 	assert.match(runtimeIndex, /childReceivesDelegationTools\(/);
 	assert.match(runtimeIndex, /callerDepth: PIPIUI_DEPTH/);
-	assert.match(runtimeIndex, /PIPIUI_AGENT_MAX_DEPTH \|\| "2"/);
+	assert.match(runtimeIndex, /resolveEffectiveSubagentDepth\([\s\S]*PIPIUI_AGENT_TREE_DEPTH/);
+	assert.match(runtimeIndex, /PIPIUI_AGENT_TREE_DEPTH: String\(childDepth\)/);
+	assert.match(runtimeIndex, /resolveSubagentMaxDepth\(process\.env\.PIPIUI_AGENT_MAX_DEPTH\)/);
 	const agentDefinition = readFileSync(new URL("../../agents/general-purpose/AGENT.md", import.meta.url), "utf8");
 	assert.match(agentDefinition, /delegation: true/);
 	assert.match(agentDefinition, /ONLY `subagent_type` explore and general-purpose/);
