@@ -3,6 +3,7 @@
 // google-generative-ai (generateContent) requests.
 // Docs: https://ai.google.dev/gemini-api/docs/grounding
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isLocalSearchFunctionToolName } from "./hosted-search-exclusion.ts";
 
 // REST JSON uses snake_case; v1beta supports the same shape. `google_search: {}` enables
 // Grounding with Google Search on the server, returning citations in the response.
@@ -35,18 +36,17 @@ function isGoogleGenerateContentRequest(
   return Array.isArray(payload.contents);
 }
 
-// Gemini declares client tools as functionDeclarations inside a tools element. Strip a
-// function named `web_search` so the server-side google_search does not double up on it.
-function isWebSearchTool(tool: Record<string, unknown>): boolean {
-  const decls = tool.functionDeclarations;
-  if (!Array.isArray(decls)) return false;
-  return decls.some((d) => isRecord(d) && d.name === "web_search");
+// Gemini declares client tools as functionDeclarations inside a tools element. Strip the
+// local search functions (`web_search`, `browser_search`, `browser_fetch`) so the
+// server-side google_search is the only search channel.
+function isLocalSearchDeclaration(decl: unknown): boolean {
+  return isRecord(decl) && typeof decl.name === "string" && isLocalSearchFunctionToolName(decl.name);
 }
 
-function stripWebSearchDeclarations(tool: Record<string, unknown>): Record<string, unknown> | undefined {
+function stripLocalSearchDeclarations(tool: Record<string, unknown>): Record<string, unknown> | undefined {
   const decls = tool.functionDeclarations;
   if (!Array.isArray(decls)) return tool;
-  const kept = decls.filter((d) => !(isRecord(d) && d.name === "web_search"));
+  const kept = decls.filter((d) => !isLocalSearchDeclaration(d));
   if (kept.length === decls.length) return tool;
   if (kept.length === 0) return undefined;
   return { ...tool, functionDeclarations: kept };
@@ -65,11 +65,15 @@ function mergeServerTools(existing: unknown): unknown[] {
         return acc;
       }
       if (isRecord(tool.google_search)) {
-        acc.hasGoogleSearch = true;
-        acc.filtered.push(tool);
+        // Exactly one hosted google_search survives: the first upstream entry
+        // (with its configuration), duplicates dropped.
+        if (!acc.hasGoogleSearch) {
+          acc.hasGoogleSearch = true;
+          acc.filtered.push(tool);
+        }
         return acc;
       }
-      const stripped = stripWebSearchDeclarations(tool);
+      const stripped = stripLocalSearchDeclarations(tool);
       if (stripped !== undefined) {
         acc.filtered.push(stripped);
       }

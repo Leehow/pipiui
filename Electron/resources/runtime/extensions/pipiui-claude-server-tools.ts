@@ -2,6 +2,7 @@
 // Inject Anthropic server-side web_search into anthropic-messages requests.
 // Docs: https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isLocalSearchMessagesFunctionTool } from "./hosted-search-exclusion.ts";
 
 // Basic version: works without code_execution / dynamic filtering.
 // Use allowed_callers:direct on newer types if upgrading later.
@@ -47,18 +48,28 @@ function isAnthropicServerWebSearch(tool: Record<string, unknown>): boolean {
 
 function mergeServerTools(existing: unknown): unknown[] {
   const current = Array.isArray(existing) ? [...existing] : [];
-  // Drop client/custom tools named web_search so they don't collide with the
-  // Anthropic server tool (same name, different shape).
-  const filtered = current.filter((tool) => {
-    if (!isRecord(tool)) return true;
-    if (isAnthropicServerWebSearch(tool)) return true;
-    const name = typeof tool.name === "string" ? tool.name : "";
-    return name !== "web_search";
-  });
-
-  const hasServer = filtered.some(
-    (tool) => isRecord(tool) && isAnthropicServerWebSearch(tool),
-  );
+  // Hosted exclusivity: strip local search function tools (web_search,
+  // browser_search, browser_fetch — pi sends them flat, without a type) so the
+  // server tool is the only search channel. Server tools carry their own type
+  // (`web_search_*`, `custom`, …) and are never matched; every other tool and
+  // merely similar names are kept. Exactly one hosted `web_search_*` survives:
+  // the first upstream instance (with its configuration), duplicates dropped.
+  const filtered: unknown[] = [];
+  let hasServer = false;
+  for (const tool of current) {
+    if (!isRecord(tool)) {
+      filtered.push(tool);
+      continue;
+    }
+    if (isAnthropicServerWebSearch(tool)) {
+      if (!hasServer) {
+        filtered.push(tool);
+        hasServer = true;
+      }
+      continue;
+    }
+    if (!isLocalSearchMessagesFunctionTool(tool)) filtered.push(tool);
+  }
   if (!hasServer) {
     filtered.push({ ...CLAUDE_WEB_SEARCH_TOOL });
   }

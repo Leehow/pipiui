@@ -85,6 +85,7 @@ import {
 } from "./extension-seed.js";
 import { attachCatalogDiagnostics, buildAgentCatalog } from "./agent-catalog.js";
 import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
+import { enrichCapabilitiesForOfficialHostedSearch } from "./hosted-search-capabilities.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
@@ -1771,7 +1772,19 @@ function hostModelFromPi(raw: any, fallbackProvider?: string, inherited: any = {
     ? raw.reasoning
     : (typeof inherited?.reasoning === "boolean" ? inherited.reasoning : undefined);
   const thinkingLevelMap = thinkingLevelMapFrom(raw?.thinkingLevelMap ?? inherited?.thinkingLevelMap);
-  const capabilities = capabilitiesForHostModel(raw, inherited);
+  // Canonical hosted-search enrichment seam: exact provider+API contracts of the
+  // bundled official server-tools adapters (openai / openai-codex / anthropic /
+  // google) fill the capability bag for rows that declare none, so the
+  // capability-driven filters (main tool policy, worker native-search catalog)
+  // hide generic search for hosted-web models. Declared/contributed
+  // capabilities and x_search-only rows always win — see the seam module.
+  const capabilities = enrichCapabilitiesForOfficialHostedSearch(
+    provider,
+    typeof raw?.api === "string"
+      ? raw.api
+      : (typeof inherited?.api === "string" ? inherited.api : undefined),
+    capabilitiesForHostModel(raw, inherited),
+  );
   let thinkingConfigurable: boolean | undefined;
   if (reasoning === false) {
     thinkingConfigurable = false;
@@ -5068,6 +5081,18 @@ export class PiHostBackend implements HostBackend {
       rollback.push(() => this.rollbackSessionLeaseAttempt(leaseAttempt.attempt));
       const session = this.toSession(found);
       await this.loadConfiguredModels();
+      this.assertSessionGeneration(id, generation);
+      // Hosted-search exclusivity is capability-driven: the auth-aware catalog
+      // (official hosted-web enrichment + extension contributions) must be
+      // resident BEFORE the selected model is resolved for assemblePiSpawn and
+      // before the worker native-search file is materialized below. Best-effort:
+      // an unavailable runtime catalog must never block the spawn (configured
+      // rows still resolve).
+      try {
+        await this.loadModelCatalog();
+      } catch {
+        /* runtime catalog unavailable → configured rows only */
+      }
       this.assertSessionGeneration(id, generation);
       const desired = this.desiredModelFor(found);
       const previousModelSnapshot = this.sessionModelSnapshots.get(id);

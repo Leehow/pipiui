@@ -27,6 +27,18 @@ export const GROK_BUILD_NATIVE_SEARCH: NativeSearchCapability = {
   tools: ["web_search", "x_search"],
 };
 
+/**
+ * Local tools whose job is taken over by the hosted built-in: the PipiUI
+ * generic web search plus the browser-search route. Mirrors host-api's
+ * `NATIVE_SEARCH_EXCLUDED_LOCAL_TOOLS`; enforced here so a stale spawn's tool
+ * list can never leak the local tools to the wire.
+ */
+const LOCAL_SEARCH_FUNCTION_TOOL_NAMES = new Set([
+  "web_search",
+  "browser_search",
+  "browser_fetch",
+]);
+
 /** Official Responses cap for web_search domain lists. */
 export const WEB_SEARCH_DOMAIN_LIMIT = 5;
 
@@ -160,14 +172,19 @@ export function hostedSearchToolsOf(capability: NativeSearchCapability | undefin
   return tools;
 }
 
-function isClientNamedTool(tool: Record<string, unknown>, name: string): boolean {
-  if (tool.type === name && tool.function === undefined && (typeof tool.name !== "string" || tool.name === name)) {
-    return false;
-  }
-  if (typeof tool.name === "string" && tool.name === name) return true;
-  if (tool.type === "function") {
-    const fn = isRecord(tool.function) ? tool.function : undefined;
-    return typeof fn?.name === "string" && fn.name === name;
+/**
+ * True only for function tools whose exact name is a local search tool, in
+ * either Responses shape (`{type:"function", name}`) or Chat Completions
+ * shape (`{type:"function", function:{name}}`). Hosted built-ins and other
+ * typed tools (e.g. `{type:"custom", name:"web_search"}`) are never matched,
+ * and merely similar names (e.g. `web_search_preview`) never match either.
+ */
+function isLocalSearchFunctionTool(tool: unknown): boolean {
+  if (!isRecord(tool) || tool.type !== "function") return false;
+  if (typeof tool.name === "string") return LOCAL_SEARCH_FUNCTION_TOOL_NAMES.has(tool.name);
+  if (isRecord(tool.function)) {
+    const { name } = tool.function;
+    return typeof name === "string" && LOCAL_SEARCH_FUNCTION_TOOL_NAMES.has(name);
   }
   return false;
 }
@@ -185,7 +202,10 @@ export function mergeHostedSearchTools(
   const dropWeb = hidesGenericWebSearch(capability);
   const filtered = current.filter((tool) => {
     if (!isRecord(tool)) return true;
-    if (dropWeb && isClientNamedTool(tool, "web_search")) return false;
+    // Effective native web_search hides every PipiUI local search function
+    // tool (web_search, browser_search, browser_fetch) so the hosted tools
+    // are the only search channel. x_search-only capabilities keep them all.
+    if (dropWeb && isLocalSearchFunctionTool(tool)) return false;
     if (hosted.some((item) => isHostedTool(tool, item.type))) return false;
     return true;
   });

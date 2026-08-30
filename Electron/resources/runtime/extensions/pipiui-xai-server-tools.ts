@@ -24,6 +24,7 @@ import { renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { installHostedSearchCapture } from "./hosted-search-events.ts";
+import { isLocalSearchFunctionTool } from "./hosted-search-exclusion.ts";
 
 const XAI_WEB_SEARCH_TOOL = {
   type: "web_search",
@@ -163,18 +164,6 @@ function isXaiCompletionsRequest(
   return Array.isArray(payload.messages) && !Array.isArray(payload.input);
 }
 
-function isClientNamedTool(tool: Record<string, unknown>, name: string): boolean {
-  if (tool.type === name && tool.function === undefined && (typeof tool.name !== "string" || tool.name === name)) {
-    return false;
-  }
-  if (typeof tool.name === "string" && tool.name === name) return true;
-  if (tool.type === "function") {
-    const fn = isRecord(tool.function) ? tool.function : undefined;
-    return typeof fn?.name === "string" && fn.name === name;
-  }
-  return false;
-}
-
 function isHostedSearchTool(tool: Record<string, unknown>, type: NativeSearchToolName): boolean {
   return tool.type === type && tool.function === undefined && (typeof tool.name !== "string" || tool.name === type);
 }
@@ -201,11 +190,7 @@ function hostedSearchToolsOf(capability: NativeSearchCapability): Record<string,
 
 function dropClientWebSearch(existing: unknown): unknown[] {
   const current = Array.isArray(existing) ? [...existing] : [];
-  return current.filter((tool) => {
-    if (!isRecord(tool)) return true;
-    if (isHostedSearchTool(tool, "web_search")) return true;
-    return !isClientNamedTool(tool, "web_search");
-  });
+  return current.filter((tool) => !isLocalSearchFunctionTool(tool));
 }
 
 function mergeHostedSearchTools(existing: unknown, capability: NativeSearchCapability): unknown[] {
@@ -214,7 +199,10 @@ function mergeHostedSearchTools(existing: unknown, capability: NativeSearchCapab
   const current = Array.isArray(existing) ? [...existing] : [];
   const filtered = current.filter((tool) => {
     if (!isRecord(tool)) return true;
-    if (dropWeb && isClientNamedTool(tool, "web_search")) return false;
+    // Effective native web_search hides every PipiUI local search function
+    // tool (web_search, browser_search, browser_fetch) so the hosted tools
+    // are the only search channel. x_search-only capabilities keep them all.
+    if (dropWeb && isLocalSearchFunctionTool(tool)) return false;
     if (hosted.some((item) => typeof item.type === "string" && isHostedSearchTool(tool, item.type as NativeSearchToolName))) {
       return false;
     }

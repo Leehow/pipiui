@@ -2,6 +2,7 @@
 // Inject OpenAI server-side web_search into openai-responses requests.
 // Docs: https://platform.openai.com/docs/guides/tools-web-search
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { isLocalSearchFunctionTool } from "./hosted-search-exclusion.ts";
 
 // Server-side "hosted" tool shipped by OpenAI for the Responses API. Using it means
 // the search executes on OpenAI's servers instead of a client tool with the same name.
@@ -37,25 +38,31 @@ function isOpenAIResponsesRequest(
   return Array.isArray(payload.input);
 }
 
-function isWebSearchTool(tool: Record<string, unknown>): boolean {
-  const type = typeof tool.type === "string" ? tool.type : "";
-  const name = typeof tool.name === "string" ? tool.name : "";
-  return type === "web_search" || name === "web_search";
+function isHostedWebSearchTool(tool: unknown): boolean {
+  return isRecord(tool) && tool.type === "web_search" && !isRecord(tool.function);
 }
 
 function mergeServerTools(existing: unknown): unknown[] {
-  const current = Array.isArray(existing) ? [...existing] : [];
-  // Drop client/custom tools named/web_search typed web_search so they don't collide with
-  // the OpenAI server tool (same name, different execution path). Keep every other tool.
-  const filtered = current.filter((tool) => {
-    if (!isRecord(tool)) return true;
-    return !isWebSearchTool(tool);
-  });
-
-  const hasServer = filtered.some((tool) => isRecord(tool) && isWebSearchTool(tool));
-  if (!hasServer) {
-    filtered.push({ ...OPENAI_WEB_SEARCH_TOOL });
+  const current = Array.isArray(existing) ? existing : [];
+  // Hosted exclusivity: drop local search function tools (web_search,
+  // browser_search, browser_fetch) so the hosted built-in is the only search
+  // channel (same names, different execution path), keep every other tool —
+  // including merely similar hosted types such as `web_search_preview` — and
+  // ensure exactly one hosted `{type:"web_search"}`.
+  const filtered: unknown[] = [];
+  let hasHosted = false;
+  for (const tool of current) {
+    if (isLocalSearchFunctionTool(tool)) continue;
+    if (isHostedWebSearchTool(tool)) {
+      if (!hasHosted) {
+        filtered.push(tool);
+        hasHosted = true;
+      }
+      continue;
+    }
+    filtered.push(tool);
   }
+  if (!hasHosted) filtered.push({ ...OPENAI_WEB_SEARCH_TOOL });
   return filtered;
 }
 

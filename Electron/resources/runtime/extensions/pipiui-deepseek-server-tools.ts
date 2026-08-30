@@ -8,6 +8,7 @@
 // web_search, and tees the Responses stream so citations reach the host.
 import { writeSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isLocalSearchFunctionTool } from "./hosted-search-exclusion.ts";
 
 export type Citation = {
   url: string;
@@ -70,18 +71,6 @@ export function isChatCompletionsPayload(payload: unknown): payload is ProviderP
   return isRecord(payload) && Array.isArray(payload.messages) && !Array.isArray(payload.input);
 }
 
-function isClientNamedTool(tool: Record<string, unknown>, name: string): boolean {
-  if (tool.type === name && tool.function === undefined && (typeof tool.name !== "string" || tool.name === name)) {
-    return false;
-  }
-  if (typeof tool.name === "string" && tool.name === name) return true;
-  if (tool.type === "function") {
-    const fn = isRecord(tool.function) ? tool.function : undefined;
-    return typeof fn?.name === "string" && fn.name === name;
-  }
-  return false;
-}
-
 function isHostedWebSearchTool(tool: Record<string, unknown>): boolean {
   return tool.type === "web_search" && tool.function === undefined && (typeof tool.name !== "string" || tool.name === "web_search");
 }
@@ -97,7 +86,7 @@ function flattenFunctionTool(tool: Record<string, unknown>): Record<string, unkn
   return next;
 }
 
-/** Drop client `web_search` and ensure a single hosted `{ type: "web_search" }`. */
+/** Drop local search function tools and ensure a single hosted `{ type: "web_search" }`. */
 export function mergeHostedWebSearch(existing: unknown): unknown[] {
   const current = Array.isArray(existing) ? existing : [];
   const filtered: unknown[] = [];
@@ -114,7 +103,10 @@ export function mergeHostedWebSearch(existing: unknown): unknown[] {
       }
       continue;
     }
-    if (isClientNamedTool(tool, "web_search")) continue;
+    // Hosted exclusivity: strip every PipiUI local search function tool
+    // (web_search, browser_search, browser_fetch) so the hosted built-in is
+    // the only search channel; keep every other tool.
+    if (isLocalSearchFunctionTool(tool)) continue;
     filtered.push(flattenFunctionTool(tool));
   }
   if (!hasHosted) filtered.push({ ...DEEPSEEK_WEB_SEARCH_TOOL });

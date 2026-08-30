@@ -3,6 +3,7 @@
 // Upstream: https://chatgpt.com/backend-api/codex/responses
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { makeStrictFunctionTools } from "../pi-ext/subagent/strict-json-schema.ts";
+import { isLocalSearchFunctionTool } from "./hosted-search-exclusion.ts";
 
 const CODEX_SERVER_TOOLS = [{ type: "web_search" }] as const;
 
@@ -36,21 +37,29 @@ function isOpenAICodexResponsesRequest(
   return Array.isArray(payload.input);
 }
 
-function mergeServerTools(existing: unknown): unknown[] {
-  const current = Array.isArray(existing) ? [...existing] : [];
-  const present = new Set(
-    current
-      .filter(isRecord)
-      .map((tool) => (typeof tool.type === "string" ? tool.type : undefined))
-      .filter((type): type is string => Boolean(type)),
-  );
+function isHostedWebSearchTool(tool: unknown): boolean {
+  return isRecord(tool) && tool.type === "web_search" && !isRecord(tool.function);
+}
 
-  const merged = [...current];
-  for (const tool of CODEX_SERVER_TOOLS) {
-    if (!present.has(tool.type)) {
-      merged.push({ ...tool });
+function mergeServerTools(existing: unknown): unknown[] {
+  const current = Array.isArray(existing) ? existing : [];
+  // Hosted exclusivity: strip every local search function tool (web_search,
+  // browser_search, browser_fetch) so the hosted built-in is the only search
+  // channel, keep every other tool, and ensure exactly one hosted web_search.
+  const merged: unknown[] = [];
+  let hasHosted = false;
+  for (const tool of current) {
+    if (isLocalSearchFunctionTool(tool)) continue;
+    if (isHostedWebSearchTool(tool)) {
+      if (!hasHosted) {
+        merged.push(tool);
+        hasHosted = true;
+      }
+      continue;
     }
+    merged.push(tool);
   }
+  if (!hasHosted) merged.push({ ...CODEX_SERVER_TOOLS[0] });
   return merged;
 }
 

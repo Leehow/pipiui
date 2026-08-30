@@ -59,6 +59,30 @@ describe("hosted search request contract", () => {
     ]);
   });
 
+  it("strips every PipiUI local search function tool when native web_search is declared", () => {
+    const existing = [
+      { type: "function", name: "web_search", parameters: { type: "object" } },
+      { type: "function", name: "browser_search", parameters: { type: "object" } },
+      { type: "function", name: "browser_fetch", parameters: { type: "object" } },
+      { type: "function", function: { name: "web_search", parameters: { type: "object" } } },
+      { type: "function", name: "bash", parameters: { type: "object" } },
+      // Typed non-function tools and merely similar names are preserved.
+      { type: "custom", name: "web_search" },
+      { type: "function", name: "web_search_preview", parameters: { type: "object" } },
+    ];
+    expect(mergeHostedSearchTools(existing, { tools: ["web_search"] })).toEqual([
+      { type: "function", name: "bash", parameters: { type: "object" } },
+      { type: "custom", name: "web_search" },
+      { type: "function", name: "web_search_preview", parameters: { type: "object" } },
+      { type: "web_search" },
+    ]);
+    // x_search-only keeps every local tool, including the browser route.
+    expect(mergeHostedSearchTools(existing, { tools: ["x_search"] })).toEqual([
+      ...existing,
+      { type: "x_search" },
+    ]);
+  });
+
   it("strips retired search_parameters and does not duplicate hosted tools", () => {
     const payload = applyHostedSearchToPayload(
       {
