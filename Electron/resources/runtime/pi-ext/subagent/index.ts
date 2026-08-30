@@ -31,6 +31,7 @@ import {
 } from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
 import { forkSpawnArgs, resolveFork } from "./fork-policy.ts";
+import { bossWriteSet, formatBossWriteOverlapWarning } from "./boss-write-set.ts";
 import { applySessionMountsToWorkerEnv } from "../../extensions/secret-vault-core.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
@@ -761,6 +762,19 @@ const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
  * which is absent for a nested worker whose parent was itself a child.
  */
 const SUBAGENT_EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The Boss's uncommitted paths, as an overlap participant. Workers branch from `HEAD` and
+ * cannot see the working tree, so a dispatch aimed at a file the Boss has open produces either
+ * a merge that fails or one that succeeds against a stale version. Advisory and fail-open: a
+ * Git hiccup returns null and the dispatch proceeds exactly as it did before this existed.
+ */
+function currentBossWriteSet() {
+	return bossWriteSet(PIPIUI_MAIN_CWD, (args) => {
+		const r = gitSpawnSync([...args], undefined, 4000);
+		return { ok: r.ok, stdout: r.stdout };
+	});
+}
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // Managed pi-web-access supplies web_search, fetch_content, source_check, and
@@ -11081,7 +11095,8 @@ export default function (pi: ExtensionAPI) {
 						incomingScopes,
 						dispatchQueue.snapshot(),
 					);
-					const acceptanceNotices = [scopeOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
+					const bossOverlapNotice = formatBossWriteOverlapWarning(incomingScopes, currentBossWriteSet());
+					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
 					dispatchQueue.enqueueBatch(
 						params.tasks.map((t, index) => ({
 							agentId: agentIds[index],
@@ -11230,7 +11245,11 @@ export default function (pi: ExtensionAPI) {
 						[{ agentId, scope: cleanScope(params.scope) }],
 						dispatchQueue.snapshot(),
 					);
-					const acceptanceNotices = [scopeOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
+					const bossOverlapNotice = formatBossWriteOverlapWarning(
+						[{ agentId, scope: cleanScope(params.scope) }],
+						currentBossWriteSet(),
+					);
+					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
 					if (params.blockedBy && params.blockedBy.length > 0) {
 						// A blocked receipt is already an accepted descendant obligation.
 						registerResidentDescendant(agentId, runId);

@@ -99,6 +99,24 @@ Hand it away when:
 
 Difficulty is not a reason to hand something away. A hard problem on the mainline is the work.
 
+## Your open files are a write set
+
+You edit the main checkout. Workers branch from `HEAD` into their own worktrees and merge back
+into it, which means **a worker cannot see anything you have not committed.** Hand it a file you
+are halfway through and it works against the old version: the merge either fails, or succeeds
+in different hunks and leaves the file incoherent with nobody notified.
+
+- A file you are currently editing is yours until you finish it. Do not put it in a sidecar's
+  `scope`, and do not dispatch work that obviously has to touch it.
+- Give every writable dispatch a `scope`. It is what lets the runtime warn you — a
+  `[boss-write-overlap]` line means the worker you just sent is aimed at something you are
+  holding, and it is advice, not a block: the runtime will not decide this for you.
+- The remedy is one of two things, never both: keep the file and narrow the worker's scope to
+  exclude it, or finish your change and hand the file over. Editing it while a worker rewrites
+  it is the case with no good ending.
+- This is the same rule fan-out already applies between workers — coupled files stay with one
+  owner. You are now one of the owners.
+
 ## Say what you are doing, in one line
 
 Someone is watching this session. They cannot read your thinking, so a run of forty tool calls
