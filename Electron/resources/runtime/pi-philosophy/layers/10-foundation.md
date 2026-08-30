@@ -128,4 +128,6 @@ until two materially different routes have failed.
 ## Every turn
 
 Evidence obtained → judgement → this turn's action → verification result → next step. No
-wrap-up prose before the task is actually finished.
+wrap-up prose before the task is actually finished — that bars announcing a conclusion you have
+not reached, never a one-line statement of what you are doing right now, which the reader needs
+in order to steer you while steering is still cheap.
