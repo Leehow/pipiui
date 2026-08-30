@@ -412,7 +412,6 @@ describe("external session native titles", () => {
     ]));
     await writeFile(join(day, "rollout-blank-codex.jsonl"), jsonl([
       { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "blank-codex", cwd: project } },
-      { timestamp: "2026-08-01T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "do not use body" } },
     ]));
     const listed = await listExternalSessionsForProject(project, { home });
     expect(listed.find((item) => item.id === "ext:claude:blank-claude")?.title).toBe("Claude blank-cl");
@@ -623,7 +622,7 @@ describe("external session native titles", () => {
     expect(listed.find((item) => item.id === "ext:codex:codex-meta")?.title).toBe("Rollout title");
     expect(listed.find((item) => item.id === "ext:codex:codex-sql")?.title).toBe("SQLite title");
     expect(listed.find((item) => item.id === "ext:codex:codex-catalog")?.title).toBe("Catalog title");
-    expect(listed.find((item) => item.id === "ext:codex:codex-prompt")?.title).toBe("Codex codex-pr");
+    expect(listed.find((item) => item.id === "ext:codex:codex-prompt")?.title).toBe("Prompt title only");
   });
 
   it("keeps only the five newest sessions per source", async () => {
@@ -766,5 +765,134 @@ describe("external session native titles", () => {
       cwd: project,
       source: "codex",
     });
+  });
+
+  it("reads Codex titles from the canonical root state_5.sqlite", async () => {
+    const { home, project } = await fixtureHome();
+    await writeSqlite(join(home, ".codex", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+        "codex-root",
+        "Root sqlite title",
+        project,
+        "2026-08-01",
+        1_780_000_000_000,
+      );
+    });
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.find((item) => item.id === "ext:codex:codex-root")).toMatchObject({
+      title: "Root sqlite title",
+      cwd: project,
+      source: "codex",
+    });
+  });
+
+  it("prefers canonical root state_5.sqlite titles over nested sqlite copies", async () => {
+    const { home, project } = await fixtureHome();
+    await mkdir(join(home, ".codex", "sqlite"), { recursive: true });
+    await writeSqlite(join(home, ".codex", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+        "codex-both",
+        "Canonical title",
+        project,
+        "2026-08-01",
+        1,
+      );
+    });
+    await writeSqlite(join(home, ".codex", "sqlite", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+        "codex-both",
+        "Nested title",
+        project,
+        "2026-08-01",
+        2,
+      );
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+        "codex-nested-only",
+        "Nested only title",
+        project,
+        "2026-08-01",
+        3,
+      );
+    });
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.find((item) => item.id === "ext:codex:codex-both")?.title).toBe("Canonical title");
+    expect(listed.find((item) => item.id === "ext:codex:codex-nested-only")?.title).toBe("Nested only title");
+  });
+
+  it("titles untitled Codex rollouts from the first user message", async () => {
+    const { home, project } = await fixtureHome();
+    const day = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(day, { recursive: true });
+    await writeSqlite(join(home, ".codex", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run(
+        "codex-sql-empty",
+        "",
+        project,
+        "2026-08-01",
+        1_780_000_000_000,
+      );
+    });
+    await writeFile(join(day, "rollout-codex-user.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-user", cwd: project } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "response_item", payload: { role: "system", content: [{ type: "text", text: "system ignored" }] } },
+      { timestamp: "2026-08-01T00:00:02.000Z", type: "response_item", payload: { role: "developer", content: [{ type: "text", text: "developer ignored" }] } },
+      { timestamp: "2026-08-01T00:00:03.000Z", type: "response_item", payload: { type: "function_call", name: "shell" } },
+      { timestamp: "2026-08-01T00:00:04.000Z", type: "response_item", payload: { role: "user", content: [{ type: "text", text: "   " }] } },
+      { timestamp: "2026-08-01T00:00:05.000Z", type: "response_item", payload: { role: "user", content: [{ type: "text", text: "  修复 Codex 会话标题  \n第二行" }] } },
+      { timestamp: "2026-08-01T00:00:06.000Z", type: "response_item", payload: { role: "user", content: [{ type: "text", text: "later user ignored" }] } },
+    ]));
+    await writeFile(join(day, "rollout-codex-sql-empty.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-sql-empty", cwd: project } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Untitled sqlite subagent" }] } },
+    ]));
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.find((item) => item.id === "ext:codex:codex-user")?.title).toBe("修复 Codex 会话标题 第二行");
+    expect(listed.find((item) => item.id === "ext:codex:codex-sql-empty")?.title).toBe("Untitled sqlite subagent");
+  });
+
+  it("keeps explicit Codex titles over the first user message", async () => {
+    const { home, project } = await fixtureHome();
+    const day = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(day, { recursive: true });
+    await mkdir(join(home, ".codex", "sqlite"), { recursive: true });
+    await writeFile(join(home, ".codex", "session_index.jsonl"), jsonl([
+      { id: "codex-index-win", thread_name: "Index wins", updated_at: "2026-08-03T00:00:00.000Z" },
+    ]));
+    await writeFile(join(day, "rollout-codex-index-win.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-index-win", cwd: project, title: "Meta ignored" } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "response_item", payload: { role: "user", content: [{ type: "text", text: "user ignored" }] } },
+    ]));
+    await writeFile(join(day, "rollout-codex-meta-win.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-meta-win", cwd: project, title: "Meta wins" } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "event_msg", payload: { type: "user_message", message: "user ignored" } },
+    ]));
+    await writeFile(join(day, "rollout-codex-sql-win.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-sql-win", cwd: project } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "response_item", payload: { role: "user", content: [{ type: "input_text", text: "user ignored" }] } },
+    ]));
+    await writeSqlite(join(home, ".codex", "sqlite", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER)");
+      db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?)").run("codex-sql-win", "SQLite wins", project, "2026-08-01", 1);
+    });
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.find((item) => item.id === "ext:codex:codex-index-win")?.title).toBe("Index wins");
+    expect(listed.find((item) => item.id === "ext:codex:codex-meta-win")?.title).toBe("Meta wins");
+    expect(listed.find((item) => item.id === "ext:codex:codex-sql-win")?.title).toBe("SQLite wins");
+  });
+
+  it("falls back to Codex short id when no title or user message is available", async () => {
+    const { home, project } = await fixtureHome();
+    const day = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(day, { recursive: true });
+    await writeFile(join(day, "rollout-codex-empty.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-empty", cwd: project } },
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "response_item", payload: { role: "assistant", content: [{ type: "output_text", text: "no user" }] } },
+    ]));
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.find((item) => item.id === "ext:codex:codex-empty")?.title).toBe("Codex codex-em");
   });
 });

@@ -6,9 +6,10 @@
  * others. SQLite is opened read-only and only allow-listed metadata columns
  * are selected — never account / credential / token / message / FTS bodies.
  * Session titles prefer each platform's own saved title fields. Message bodies
- * are never used as default titles. Each source keeps only the five
- * newest matching sessions so a machine with years of Codex rollouts cannot
- * stall the sidebar.
+ * are not used as default titles, except untitled Codex threads which fall back
+ * to the first user message before the short-id label. Each source keeps only
+ * the five newest matching sessions so a machine with years of Codex rollouts
+ * cannot stall the sidebar.
  */
 import { createReadStream, existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
@@ -497,6 +498,7 @@ async function readCodexMeta(path: string): Promise<{
     let id: string | undefined;
     let cwd: string | undefined;
     let title: string | undefined;
+    let userTitle: string | undefined;
     let stamp = updatedAt;
     for await (const rec of readJsonlRecords(path)) {
       if (rec.type === "session_meta" && isRecord(rec.payload)) {
@@ -508,12 +510,13 @@ async function readCodexMeta(path: string): Promise<{
           rec.payload.session_title,
         ) ?? title;
         stamp = parseTime(rec.timestamp, stamp) || stamp;
-        if (id && cwd) break;
-      } else if (id && cwd) {
-        break;
+      } else if (!title && !userTitle) {
+        const entry = codexHistoryEntry(rec, 0);
+        if (entry?.role === "user") userTitle = firstTitle(entry.content);
       }
+      if (id && cwd && (title || userTitle)) break;
     }
-    return { id, cwd, updatedAt: stamp, title };
+    return { id, cwd, updatedAt: stamp, title: title ?? userTitle };
   } catch {
     return null;
   }
@@ -521,26 +524,38 @@ async function readCodexMeta(path: string): Promise<{
 
 type CodexSqliteThread = { title?: string; cwd?: string; updatedAt?: number };
 
-function loadCodexSqliteThreads(codexHome: string): Map<string, CodexSqliteThread> {
-  const map = new Map<string, CodexSqliteThread>();
-  const threadDb = join(codexHome, "sqlite", "state_5.sqlite");
-  const catalogDb = join(codexHome, "sqlite", "codex-dev.db");
+function ingestCodexThreadDb(
+  map: Map<string, CodexSqliteThread>,
+  dbPath: string,
+  fillOnly: boolean,
+): void {
+  if (!existsSync(dbPath)) return;
   try {
-    if (existsSync(threadDb)) {
-      for (const row of queryReadonlySqlite(threadDb, { table: "threads", columns: CODEX_THREAD_COLUMNS })) {
-        const id = text(row.id);
-        if (!id) continue;
-        const prev = map.get(id);
-        map.set(id, {
-          title: firstTitle(row.title) ?? prev?.title,
-          cwd: text(row.cwd) ?? prev?.cwd,
-          updatedAt: parseTime(row.updated_at_ms, 0) || parseTime(row.updated_at, 0) || prev?.updatedAt,
-        });
-      }
+    for (const row of queryReadonlySqlite(dbPath, { table: "threads", columns: CODEX_THREAD_COLUMNS })) {
+      const id = text(row.id);
+      if (!id) continue;
+      const prev = map.get(id);
+      const nextTitle = firstTitle(row.title);
+      const nextCwd = text(row.cwd);
+      const nextUpdated = parseTime(row.updated_at_ms, 0) || parseTime(row.updated_at, 0);
+      map.set(id, {
+        title: fillOnly ? (prev?.title ?? nextTitle) : (nextTitle ?? prev?.title),
+        cwd: fillOnly ? (prev?.cwd ?? nextCwd) : (nextCwd ?? prev?.cwd),
+        updatedAt: fillOnly ? (prev?.updatedAt || nextUpdated) : (nextUpdated || prev?.updatedAt),
+      });
     }
   } catch {
     // schema drift in one Codex db must not hide rollouts
   }
+}
+
+function loadCodexSqliteThreads(codexHome: string): Map<string, CodexSqliteThread> {
+  const map = new Map<string, CodexSqliteThread>();
+  // Canonical Codex home DB first; nested sqlite/ is compatibility-only and
+  // must not overwrite a title already present on the root record.
+  ingestCodexThreadDb(map, join(codexHome, "state_5.sqlite"), false);
+  ingestCodexThreadDb(map, join(codexHome, "sqlite", "state_5.sqlite"), true);
+  const catalogDb = join(codexHome, "sqlite", "codex-dev.db");
   try {
     if (existsSync(catalogDb)) {
       for (const row of queryReadonlySqlite(catalogDb, { table: "local_thread_catalog", columns: CODEX_CATALOG_COLUMNS })) {
@@ -572,7 +587,7 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
     fromStore.push({
       id: makeExternalSessionId("codex", id),
       source: "codex",
-      title: firstTitle(indexed?.title, row.title) ?? fallbackExternalTitle("Codex", id),
+      title: firstTitle(indexed?.title, row.title) ?? "",
       cwd: normalizeProjectCwd(row.cwd),
       updatedAt: indexed?.updatedAt || row.updatedAt || 0,
       historyAvailability: "metadata",
@@ -596,7 +611,11 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
     const session = byNativeId.get(id);
     const meta = await readCodexMeta(path);
     if (!session || meta?.id !== id || !meta.cwd || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
-    byNativeId.set(id, { ...session, historyAvailability: "text" });
+    byNativeId.set(id, {
+      ...session,
+      title: firstTitle(session.title, meta.title) ?? session.title,
+      historyAvailability: "text",
+    });
   }
   const files = await newestDatedRollouts(
     join(roots.codexHome, "sessions"),
@@ -609,7 +628,11 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
     if (existing) {
       // SQLite safely supplies the catalog metadata; the matching rollout proves
       // this same thread has readable text history.
-      byNativeId.set(meta.id, { ...existing, historyAvailability: "text" });
+      byNativeId.set(meta.id, {
+        ...existing,
+        title: firstTitle(existing.title, meta.title) ?? existing.title,
+        historyAvailability: "text",
+      });
       continue;
     }
     const indexed = index.get(meta.id);
@@ -617,13 +640,22 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
     byNativeId.set(meta.id, {
       id: makeExternalSessionId("codex", meta.id),
       source: "codex",
-      title: storedTitle ?? fallbackExternalTitle("Codex", meta.id),
+      title: storedTitle ?? "",
       cwd: normalizeProjectCwd(meta.cwd),
       updatedAt: indexed?.updatedAt || meta.updatedAt,
       historyAvailability: "text",
     });
   }
-  return takeNewest([...byNativeId.values()]);
+  return takeNewest(
+    [...byNativeId.values()].map((session) => {
+      const parsed = parseExternalSessionId(session.id);
+      const nativeId = parsed?.nativeId ?? session.id;
+      return {
+        ...session,
+        title: firstTitle(session.title) ?? fallbackExternalTitle("Codex", nativeId),
+      };
+    }),
+  );
 }
 
 async function scanGrok(projectCwd: string, roots: ResolvedExternalSessionRoots): Promise<ExternalSession[]> {
