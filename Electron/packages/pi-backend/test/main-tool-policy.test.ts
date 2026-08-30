@@ -2,47 +2,55 @@ import { describe, expect, it } from "vitest";
 import { assemblePiSpawn, sanitizeEnvironment } from "../src/spawn-assembly.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
 import {
-  BOSS_MUTATION_TOOL_NAMES,
   mainSessionExcludeToolArgs,
   resolveMainSessionExcludedTools,
 } from "../src/main-tool-policy.js";
 
-describe("boss read-only tool policy", () => {
-  it("removes every mutation path, not only the two file tools", () => {
-    // A denylist holding edit/write but not bash is theatre: `sed -i` reaches the same disk.
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: true })).toEqual(["bash", "edit", "write"]);
-    expect([...BOSS_MUTATION_TOOL_NAMES].sort()).toEqual(["bash", "edit", "write"]);
+describe("main session tool policy", () => {
+  it("withholds nothing from the Boss by default", () => {
+    // The inverse of the rule this file used to pin. `bossReadOnly` removed bash/edit/write so
+    // the Boss could not work the floor; the Boss now owns the mainline and implements it, so
+    // a denylist here would block the work it is supposed to be doing. Drift is bought by the
+    // mainline philosophy layer, not by an argv flag.
+    expect(resolveMainSessionExcludedTools({})).toEqual([]);
+    expect(mainSessionExcludeToolArgs({})).toEqual([]);
   });
 
-  it("keeps the Boss's read and verification tools", () => {
-    const excluded = new Set(resolveMainSessionExcludedTools({ bossReadOnly: true }));
-    for (const kept of ["read", "grep", "find", "ls", "git", "web_search", "browser", "browser_search", "browser_fetch", "subagent", "subagent_status", "ledger_note", "context_doc"]) {
-      expect(excluded.has(kept)).toBe(false);
+  it("keeps every tool the Boss needs to hold a mainline", () => {
+    const excluded = new Set(resolveMainSessionExcludedTools({ disabledToolNames: ["generate_image"] }));
+    for (const kept of [
+      "bash", "edit", "write",
+      "read", "grep", "find", "ls", "git",
+      "web_search", "browser", "browser_search", "browser_fetch",
+      "subagent", "subagent_status", "ledger_note", "context_doc",
+    ]) {
+      expect(excluded.has(kept), kept).toBe(false);
     }
-  });
-
-  it("leaves the legacy fully-capable main session untouched when disabled", () => {
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: false })).toEqual([]);
-    expect(mainSessionExcludeToolArgs({ bossReadOnly: false })).toEqual([]);
   });
 
   it("merges the user's own denylist and expands the browser group id", () => {
     // The browser group covers every tool driven by the built-in browser surface,
     // including the bridge-backed search/fetch route.
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: true, disabledToolNames: ["browser_*", "generate_image"] }))
-      .toEqual(["bash", "browser", "browser_fetch", "browser_search", "edit", "generate_image", "write"]);
+    expect(resolveMainSessionExcludedTools({ disabledToolNames: ["browser_*", "generate_image"] }))
+      .toEqual(["browser", "browser_fetch", "browser_search", "generate_image"]);
   });
 
-  it("never denies the desktop tools, which only the global Computer Use toggle controls", () => {
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: true, disabledToolNames: ["computer", "open_application"] }))
+  it("still honours a user who denies the mutation tools themselves", () => {
+    // The host no longer imposes this, but the user's own 工具开关 remains authoritative.
+    expect(resolveMainSessionExcludedTools({ disabledToolNames: ["bash", "edit", "write"] }))
       .toEqual(["bash", "edit", "write"]);
   });
 
+  it("never denies the desktop tools, which only the global Computer Use toggle controls", () => {
+    expect(resolveMainSessionExcludedTools({ disabledToolNames: ["computer", "open_application"] }))
+      .toEqual([]);
+  });
+
   it("emits a stable sorted argv so the prompt cache is not invalidated by ordering", () => {
-    const a = mainSessionExcludeToolArgs({ bossReadOnly: true, disabledToolNames: ["zed", "abacus"] });
-    const b = mainSessionExcludeToolArgs({ bossReadOnly: true, disabledToolNames: ["abacus", "zed"] });
+    const a = mainSessionExcludeToolArgs({ disabledToolNames: ["zed", "abacus"] });
+    const b = mainSessionExcludeToolArgs({ disabledToolNames: ["abacus", "zed"] });
     expect(a).toEqual(b);
-    expect(a).toEqual(["--exclude-tools", "abacus,bash,edit,write,zed"]);
+    expect(a).toEqual(["--exclude-tools", "abacus,zed"]);
   });
 
   it("hides generic web_search and the local browser-search route only when effective native web_search is present", () => {
@@ -51,36 +59,30 @@ describe("boss read-only tool policy", () => {
     const ordinary = { provider: "anthropic", id: "claude" };
     const undeclaredXai = { provider: "xai", id: "grok-3" };
     const excluded = ["browser_fetch", "browser_search", "web_search"];
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: nativeWeb })).toEqual(excluded);
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: xOnly })).toEqual([]);
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: ordinary })).toEqual([]);
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: false, model: undeclaredXai })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ model: nativeWeb })).toEqual(excluded);
+    expect(resolveMainSessionExcludedTools({ model: xOnly })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ model: ordinary })).toEqual([]);
+    expect(resolveMainSessionExcludedTools({ model: undeclaredXai })).toEqual([]);
     expect(resolveMainSessionExcludedTools({
-      bossReadOnly: false,
       model: { capabilities: { hostedTools: { tools: ["web_search"] as const } } },
     })).toEqual(excluded);
     expect(resolveMainSessionExcludedTools({
-      bossReadOnly: false,
       model: { capabilities: { hostedTools: { tools: ["code_interpreter"] as const } } },
     })).toEqual([]);
-    expect(resolveMainSessionExcludedTools({ bossReadOnly: true, model: nativeWeb })).toEqual([
-      "bash", "browser_fetch", "browser_search", "edit", "web_search", "write",
-    ]);
-    expect(mainSessionExcludeToolArgs({ bossReadOnly: false, model: nativeWeb })).toEqual([
+    expect(mainSessionExcludeToolArgs({ model: nativeWeb })).toEqual([
       "--exclude-tools", excluded.join(","),
     ]);
-    expect(mainSessionExcludeToolArgs({ bossReadOnly: false, model: xOnly })).toEqual([]);
+    expect(mainSessionExcludeToolArgs({ model: xOnly })).toEqual([]);
   });
 });
 
 describe("main session spawn", () => {
   const paths = { git: "/runtime/git.ts" };
 
-  it("is read-only by default in this host", () => {
-    expect(DEFAULT_FEATURES.bossReadOnly).toBe(true);
+  it("is fully capable by default in this host", () => {
     const runtimeInfo = "/runtime/pipiui-runtime-info.ts";
     const { args } = assemblePiSpawn({ cwd: "/tmp/project", features: DEFAULT_FEATURES, paths: { runtimeInfo } });
-    expect(args).toEqual(expect.arrayContaining(["--exclude-tools", "bash,edit,write"]));
+    expect(args).not.toContain("--exclude-tools");
     expect(args).toEqual(expect.arrayContaining(["-e", runtimeInfo]));
     expect(args.join(" ")).not.toContain("pipiui_runtime_info,");
   });
@@ -98,14 +100,16 @@ describe("main session spawn", () => {
   });
 
   it("never inherits a leftover PIPIUI_BOSS_READ_ONLY marker from an outer shell", () => {
+    // The feature is gone, but the scrub stays: a stale marker in the user's shell must not
+    // reach a child that might one day read it again.
     expect(sanitizeEnvironment({ PIPIUI_BOSS_READ_ONLY: "0", HOME: "/home/x" })).toEqual({ HOME: "/home/x" });
   });
 
-  it("does not leak the Boss policy into a worker's tool selection", () => {
+  it("does not write a host tool denylist into the settings a worker reads", () => {
     // Workers assemble their own args from their agent definition; this asserts the host
-    // never writes the Boss denylist into the settings file children read.
+    // never leaks a main-session denylist into the child environment.
     const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: DEFAULT_FEATURES, paths });
-    expect(args.filter((a) => a === "--exclude-tools")).toHaveLength(1);
+    expect(args).not.toContain("--exclude-tools");
     expect(Object.values(env)).not.toContain("bash,edit,write");
   });
 

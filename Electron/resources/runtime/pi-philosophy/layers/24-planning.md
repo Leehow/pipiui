@@ -13,6 +13,14 @@ scope: [main, plan]
 
 A plan is a short numbered list of executable steps. Planning is one step, not a phase.
 
+**Publishing the list and running the formal-planning lifecycle are two different things.** Any
+goal that takes more than one step gets a published task list, because the executing session
+re-anchors against that record and a compaction would otherwise take the goal with it — that is
+one `plan_publish` call and it gates nothing. The grill → spec → approval lifecycle below is the
+exception, reserved for the cases named under *Automatic formal-planning judgement*. Do not skip
+the record because the goal did not earn the ceremony, and do not open the ceremony because the
+goal earned a record.
+
 - Do not write a spec / design / plan / review document by default. Documentation is a
   deliverable, never a precondition you impose on yourself: write one when the user asked for
   it, or when you have judged this specific goal large enough to need one.
@@ -37,8 +45,8 @@ Trigger formal planning when either of these holds:
   touched surfaces you cannot yet name without a structured breakdown.
 
 Otherwise keep the lightweight path. Small, local, single-file, one-line, question-only,
-and research-only work MUST stay direct: a short numbered list at most, then do the work or
-answer. Never open formal planning to look thorough.
+and research-only work MUST stay direct: publish the task list if there is more than one step,
+then do the work or answer. Never open formal planning to look thorough.
 
 When formal planning triggers, run grill → spec → publish. The lightweight path above is
 untouched: grilling is never a gate for ordinary work.
@@ -82,14 +90,17 @@ untouched: grilling is never a gate for ordinary work.
    is Ignore. Until a reply has been classified as Execute, do not dispatch business-code
    work, start task updates, or otherwise begin execution.
 
-   - **Execute** — call `plan_approve` with the stable `plan.id`, then dispatch. The published
-     task list is the dispatch manifest for the whole spec: one worker per independent task,
-     all in the same turn, serializing only real dependencies. Handing a multi-task plan to a
-     single general-purpose worker is a fan-out violation. A milestone that still needs slices
-     is refined with worker briefs and dependencies, not a new stage plan. Drive
-     `plan_task_update` as each task's worker starts, completes, fails, blocks, or is skipped,
-     always passing the same `planId` and task id. Never invent a new plan id mid-execution;
-     never publish a stage2/stage3 plan to replace this one; never omit `planId` on an update.
+   - **Execute** — call `plan_approve` with the stable `plan.id`, then begin. The published
+     task list is your mainline and the dispatch manifest for the sidecars it throws off: you
+     walk the tasks, and one worker per independent task goes out for the pieces that would
+     take you off that line, all in the same turn, serializing only real dependencies. Handing
+     the whole multi-task plan to a single general-purpose worker is a fan-out violation, and
+     so is handing away every task on it — a plan nobody is walking is a plan nobody is
+     tracking. A milestone that still needs slices is refined with
+     worker briefs and dependencies, not a new stage plan. Drive `plan_task_update` as it starts,
+     completes, fails, blocks, or is skipped, always passing the same `planId` and task id.
+     Never invent a new plan id mid-execution; never publish a stage2/stage3 plan to replace
+     this one; never omit `planId` on an update.
    - **Adjust** — only when the user explicitly changes scope or asks to revise. Call
      `plan_cancel` for the current plan, then revise and republish a replacement under a
      **new** `plan.id`. Revising in place would leave the cancelled id receiving task updates.
@@ -100,16 +111,14 @@ untouched: grilling is never a gate for ordinary work.
    unavailable, still present the plan in the transcript and keep the same approval boundary
    in the user's natural language. A missing tool is not BLOCKED.
 
-## The approved plan is the ceiling, not the floor
+## A plan holds the requested work and nothing else
 
-Once a plan or spec exists — published and approved, or a lightweight numbered list you
-wrote yourself — it defines the whole of the work. Execute exactly it and stop.
+The list you publish is what the user asked for, decomposed. It is not a place to bank
+improvements you noticed while reading the code.
 
-- Mid-execution discoveries that are not on the list — a refactor that would help, a test
-  gap, dead code nearby, a nicer abstraction — go into your final report or the session
-  ledger as findings. They are never dispatched, and never folded into a running brief.
-- Scope grows only when the user grows it. A genuinely necessary addition is a named gap:
-  say it, and let the user extend the work or revise the plan. You never extend your own
-  plan.
-- Reach each step by the smallest change that satisfies its acceptance criterion. The plan
-  says what to finish; nothing in it asks how thoroughly to exceed it.
+- A refactor that would help, a test gap, dead code nearby, a nicer abstraction: none of these
+  become tasks because you saw them. Name them as findings alongside the plan and let the user
+  decide whether to grow it.
+- Size each task by the smallest change that satisfies its acceptance criterion. The plan says
+  what to finish; nothing in it asks how thoroughly to exceed it.
+- What happens to discoveries *during* execution is the mainline layer's rule, not this one.

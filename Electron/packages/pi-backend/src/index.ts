@@ -453,7 +453,6 @@ export async function readLocalDocument(input: unknown): Promise<DocumentContent
   }
 }
 export {
-  BOSS_MUTATION_TOOL_NAMES,
   mainSessionExcludeToolArgs,
   resolveMainSessionExcludedTools,
   type MainToolPolicyInput,
@@ -6530,7 +6529,8 @@ export class PiHostBackend implements HostBackend {
     return name === "computer-use"
       || name === "computer-use-leader"
       || name === "computer-verifier"
-      || name === "computer-terminal";
+      || name === "computer-terminal"
+      || name === "operator";
   }
   private retiredSubagentModelsPresent(value: unknown): boolean {
     return isRecord(value) && Object.keys(value).some((name) => this.isRetiredSubagentModelKey(name));
@@ -10474,7 +10474,7 @@ export class PiHostBackend implements HostBackend {
       ? raw.name ?? current?.name ?? "subagent"
       : current?.name ?? raw.name ?? "subagent";
     const reportedName = stableName;
-    const privateComputerWorker = reportedName === "operator" || reportedName === "computer-verifier" || reportedName === "computer-terminal";
+    const privateComputerWorker = reportedName === "computer-verifier" || reportedName === "computer-terminal";
     let closedWorkerOutcome: string | undefined;
     if (privateComputerWorker && raw.kind === "end" && typeof raw.output === "string") {
       try {

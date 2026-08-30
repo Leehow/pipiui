@@ -1,48 +1,34 @@
 /**
  * Main-session (Boss) tool policy.
  *
- * The orchestration philosophy layer already tells the Boss not to work the floor, but a
- * prompt rule is advice. A model that decides the remaining change is "one line" edits the
- * file itself, and nothing in the runtime stops it. This module makes that boundary
- * structural instead of persuasive.
+ * This module used to withhold `bash`, `edit` and `write` from the main session, so that the
+ * orchestration layer's "you do not work the floor" rule was structural rather than
+ * persuasive. That rule is gone: the Boss now owns the mainline and implements it, and the
+ * roles it delegates are the ones that would pull it off that line. A Boss that cannot edit
+ * cannot hold a mainline — it can only describe one to somebody else, which is exactly the
+ * hand-off where intent used to be lost.
  *
- * The cut is by verb, not by role. The Boss keeps every read it needs to size a goal,
- * spot-check a worker, and own the completion decision: `read`, `grep`, `find`, `ls`, the
- * read-only `git` tool, web access, the browser, and the subagent/status channel. It loses
- * exactly the tools that mutate the machine.
+ * What replaced the withholding is not a weaker version of it. Drift was the real thing the
+ * old policy was buying protection from, and a tool denylist never addressed it; it only
+ * moved the drift into a worker nobody reviewed. The mainline layer (`25-mainline.md`) buys
+ * it directly: a durable plan record, countable re-anchor triggers, and a hard rule that
+ * discovered work is never done inline. Those are in the philosophy because they are
+ * judgement, and judgement is not something an argv flag can express.
  *
- * `bash` is on that list for the same reason as `edit` and `write`. Denying the two file
- * tools while leaving a shell is theatre — `sed -i`, a heredoc, `git commit` and `rm` all
- * reach the same disk. The Boss's legitimate shell needs are already served by narrower
- * channels: the `git` extension for status/diff/log/show, and the dispatch runtime's
- * attested `verify`, whose exit code is stronger evidence than a command the Boss ran and
- * then summarized for itself.
+ * So what remains here is only what was always orthogonal to that argument: the user's own
+ * Settings → 工具开关 denylist, and the native-search filter.
  *
- * The two writes the Boss legitimately owns are served by narrow subagent-extension tools
- * rather than by restoring `write`, and both are strictly narrower than the tool they
- * replace: `ledger_note` reaches only `.pi/boss/**` (the Decisions / Done / Risks half of its
- * own ledger), and `context_doc` reaches only `.pi/context/**` (the shared briefing workers
- * read so it is not retyped into every brief). Because this policy is a denylist of mutation
- * verbs, neither needs an entry here — but neither may be added to the mutation set either,
- * which `main-tool-policy.test.ts` pins.
- *
- * Scope: this governs the main pi process only. Dispatched workers assemble their own tool
- * selection from their agent definition (`resolveSubagentToolSelection`) and never inherit
- * this process's argv, so a read-only Boss still commands fully capable workers.
- *
- * Generic `web_search` is also excluded when the selected model has effective native
+ * Generic `web_search` is excluded when the selected model has effective native
  * `web_search` (declared `nativeSearch` or the search slice of `hostedTools`). That
  * decision is capability-driven — see `hidesGenericWebSearch` — never a provider-name
  * branch at this seam.
+ *
+ * Scope: this governs the main pi process only. Dispatched workers assemble their own tool
+ * selection from their agent definition (`resolveSubagentToolSelection`) and never inherit
+ * this process's argv.
  */
 
 import { extraExcludedGenericSearchTools, type NativeSearchModelRef } from "./generic-search-filter.js";
-
-/**
- * Tools removed from the main session when the Boss is read-only. Every entry is a
- * mutation path; nothing here is needed to observe state.
- */
-export const BOSS_MUTATION_TOOL_NAMES: readonly string[] = Object.freeze(["bash", "edit", "write"]);
 
 /**
  * Controlled by the global Computer Use toggle alone, exactly as on the worker side. The
@@ -57,8 +43,6 @@ const BROWSER_GROUP_ID = "browser_*";
 const BROWSER_TOOL_NAMES = ["browser", "browser_search", "browser_fetch"];
 
 export interface MainToolPolicyInput {
-  /** False restores the legacy fully-capable main session. */
-  bossReadOnly?: boolean;
   /** The user's own Settings → 工具开关 denylist, as stored (group ids allowed). */
   disabledToolNames?: readonly string[];
   /** Selected session model; used only for native-search tool-list filtering. */
@@ -67,8 +51,8 @@ export interface MainToolPolicyInput {
 
 /**
  * The main session's effective `--exclude-tools` names: the user's denylist expanded and
- * sanitized, plus the mutation set when the Boss is read-only. Unique and sorted so the
- * spawn argv is stable across launches and cannot invalidate the prompt cache by ordering.
+ * sanitized, plus the native-search filter. Unique and sorted so the spawn argv is stable
+ * across launches and cannot invalidate the prompt cache by ordering.
  */
 export function resolveMainSessionExcludedTools(input: MainToolPolicyInput = {}): string[] {
   const names = new Set<string>();
@@ -77,7 +61,6 @@ export function resolveMainSessionExcludedTools(input: MainToolPolicyInput = {})
     if (name === BROWSER_GROUP_ID) { for (const tool of BROWSER_TOOL_NAMES) names.add(tool); continue; }
     names.add(name);
   }
-  if (input.bossReadOnly) for (const name of BOSS_MUTATION_TOOL_NAMES) names.add(name);
   for (const name of extraExcludedGenericSearchTools(input.model)) names.add(name);
   for (const reserved of RESERVED_DESKTOP_TOOL_NAMES) names.delete(reserved);
   return [...names].sort();

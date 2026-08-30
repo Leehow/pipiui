@@ -58,6 +58,7 @@ describe("vendored philosophy: structure", () => {
       "research",
       "recon-stopping",
       "planning",
+      "mainline",
       "craft",
       "debugloop",
       "domain",
@@ -152,6 +153,7 @@ describe("vendored philosophy: delivery", () => {
       "method",
       "research",
       "planning",
+      "mainline",
       "craft",
       "debugloop",
       "domain",
@@ -292,11 +294,15 @@ describe("vendored philosophy: delivery", () => {
     expect(fanout).toMatch(/accepting a same-region collision/);
   });
 
-  it("delivers last-resort terminal discipline in debugloop and orchestration", () => {
+  it("delivers last-resort terminal discipline in debugloop", () => {
     expect(layers.find((l) => l.id === "debugloop")!.body).toMatch(/Last-resort only/);
-    expect(layers.find((l) => l.id === "orchestration")!.body).toMatch(
-      /do not look for another route to the same edit/,
-    );
+    // The orchestration half of this pin is gone with `bossReadOnly`. It told the Boss that a
+    // missing `edit`/`write`/shell was the host holding it to "you do not work the floor", so
+    // it must not look for another route to the same edit. The Boss now owns and implements the
+    // mainline; the layer must NOT still be telling it its own tools are withheld on purpose.
+    const orchestration = layers.find((l) => l.id === "orchestration")!.body;
+    expect(orchestration).not.toMatch(/do not look for another route to the same edit/);
+    expect(orchestration).not.toMatch(/you do not write code yourself/);
   });
 
   it("delivers same-turn independent-call discipline to the boss and the worker that dispatches", () => {

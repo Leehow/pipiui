@@ -618,17 +618,24 @@ test("philosophy layers gate the final closeout, not all progress speech", () =>
 		new URL("../../../pi-philosophy/layers/40-fanout.md", import.meta.url),
 		"utf8",
 	);
+	// The prohibitive wording must not come back in EITHER layer — that is the regression, and
+	// it could reappear on either side.
 	for (const layer of [orchestration, fanout]) {
 		assert.doesNotMatch(layer, /do not give the user a progress update, partial conclusion/);
 		assert.doesNotMatch(layer, /give the user no progress,/);
-		assert.match(layer, /never an empty assistant\s+message just to stay quiet/);
-		assert.match(layer, /never one update per done\s+event/);
-		assert.match(layer, /never fabricat(?:e|ed) results/);
 	}
+	// The permissive rule itself is stated once, in the layer that owns completion. Both copies
+	// shipped until the mainline rewrite, and `fanout` declares `requires: [orchestration]`, so
+	// it can never reach a session without this text beside it — a second copy bought nothing
+	// and was one more place for the two to drift apart.
+	assert.match(orchestration, /never an empty assistant\s+message just to stay quiet/);
+	assert.match(orchestration, /never one update per done\s+event/);
+	assert.match(orchestration, /never fabricat(?:e|ed) results/);
 	assert.match(orchestration, /the gate is on the final conclusion: do not present the/);
 	assert.match(orchestration, /when the user directly asks what is going/);
-	assert.match(fanout, /a direct user question still gets a brief factual answer/);
-	assert.match(fanout, /give no final closeout or\s+completion claim yet/);
+	// `fanout` defers to it by name rather than restating it.
+	assert.match(fanout, /completion gate\s+that snapshot feeds is orchestration's rule/);
+	assert.doesNotMatch(fanout, /never an empty assistant/);
 });
 
 test("direct general-purpose placement does not require a branch-shaped agentId", async () => {

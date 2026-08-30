@@ -30,6 +30,7 @@ import {
 	stringifyCompactFileChange,
 } from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
+import { forkSpawnArgs, resolveFork } from "./fork-policy.ts";
 import { applySessionMountsToWorkerEnv } from "../../extensions/secret-vault-core.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
@@ -52,18 +53,28 @@ import { Type } from "typebox";
 
 import {
 	DEFAULT_PROGRESS_LOG_REPORT_MS,
+	claimProgressLogReport,
+	consumeProgressLogExcerpt,
 	formatProgressLogReport,
 	formatProgressLogRetargetReceipt,
 	describeProgressChannelForStall,
 	progressIdleMs,
 	readProgressLogTail,
-	readProgressLogExcerpt,
+	releaseProgressLogReport,
 	resolveProgressLogPath,
 	retargetProgressLog,
 	sampleProgressLog,
 	sanitizeProgressReportSecs,
 	type ProgressLogSample,
 } from "./progress-log.ts";
+import {
+	buildWatchFingerprint,
+	createWatchRegistry,
+	sanitizeWatchIntervalSecs,
+	sanitizeWatchTarget,
+	WATCH_ACTIONS,
+	type WatchTickEvent,
+} from "./watch-registry.ts";
 import { adoptGrokBuildDispatch, makeStrictJsonSchema, omitNulls, bindSanitizeStrictToolArguments } from "./strict-json-schema.ts";
 import {
 	cleanScope,
@@ -1406,6 +1417,10 @@ interface RunSingleAgentOptions {
 	verify?: string;
 	/** Discard this worker's stored conversation and start it cold. */
 	fresh?: boolean;
+	/** Start this worker from a copy of the Boss's own conversation instead of cold (see fork-policy.ts). */
+	fork?: boolean;
+	/** Absolute path of the Boss session file a fork copies from; resolved by the tool layer from ctx. */
+	forkSourceFile?: string;
 	/** Keep this role's conversation even when it is read-only. Authority and memory are separate. */
 	retainContext?: boolean;
 	/** Host-owned absolute deadline surfaced to UIs; it never grants the child more runtime. */
@@ -1424,6 +1439,23 @@ interface RunSingleAgentOptions {
 	runId?: string;
 	/** Explicit bundled private skills; additive under --no-skills. */
 	privateSkillPaths?: string[];
+}
+
+/**
+ * This session's own JSONL path, the only thing a fork can copy from. Same accessor
+ * `session_recall` uses: the live SessionManager first, then pi's env fallback for hosts that
+ * expose one. Undefined for an ephemeral session, which fork-policy reports as a refusal.
+ */
+function bossSessionFile(ctx: unknown): string | undefined {
+	const manager = (ctx as { sessionManager?: { getSessionFile?: () => string } } | undefined)?.sessionManager;
+	try {
+		const file = manager?.getSessionFile?.();
+		if (typeof file === "string" && file.trim()) return file.trim();
+	} catch {
+		// A host without the accessor is not an error; fall through to the env fallback.
+	}
+	const fromEnv = process.env.PI_SESSION_FILE;
+	return typeof fromEnv === "string" && fromEnv.trim() ? fromEnv.trim() : undefined;
 }
 
 /** Format ExtensionAPI ctx.model → `provider/id`. */
@@ -2592,7 +2624,10 @@ interface RunningAgentHandle {
 	/** Progress-forward bookkeeping: last claimed send slot, monotonically growing sequence, one in-flight guard. */
 	lastProgressReportAt?: number;
 	progressReportCount?: number;
+	/** The ProgressLogClaimState slice: token-checked single-flight for log reads/deliveries. */
 	progressReportInFlight?: boolean;
+	progressReportClaim?: number;
+	progressReportClaimSeq?: number;
 	/** Absolute runtime deadline for this exact generation, computed at first child spawn. */
 	deadlineAt?: number;
 	/**
@@ -2634,6 +2669,17 @@ interface RunningAgentHandle {
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
 const runningAgents = new Map<string, RunningAgentHandle>();
+
+/**
+ * Process-local `subagent_watch` subscriptions (Boss-side monitoring of exact runs).
+ * Pure bookkeeping driven only by the shared 30s watchdog tick — the registry never owns
+ * a timer. Cleared on session start, shutdown, and extension reload: a subscription
+ * never outlives the session that made it, and completion delivery stays the only
+ * terminal notification.
+ */
+const watchRegistry = createWatchRegistry();
+let watchSessionGeneration = 0;
+let watchSessionShutdownAbort: AbortController = new AbortController();
 
 /**
  * Dispatch-idle fold timer. Independent one-shot setTimeout (default 4 min of
@@ -2837,6 +2883,7 @@ function deleteRunningAgentHandle(agentId: string, runId: string): void {
 	// always carry it, while an old untagged handle is still safe to remove only here.
 	if (handle && (handle.runId === runId || handle.runId === undefined)) {
 		runningAgents.delete(agentId);
+		watchRegistry.stop({ agentId, runId: handle.runId ?? runId });
 		noteIdleFoldCompleted(agentId);
 	}
 }
@@ -3020,6 +3067,172 @@ function retargetRunningProgressLog(input: {
 	return {
 		ok: true,
 		message: formatProgressLogRetargetReceipt({ agentId, runId, path: resolved.path, result }),
+	};
+}
+
+/**
+ * The `subagent_watch` control surface: start/update/stop/list bounded monitoring of exact
+ * live runs. Mutations bind {agentId, runId} exactly — a stale runId is rejected, never
+ * silently re-targeted at a newer run under the same agentId. Sampling itself is driven
+ * only by the shared 30s watchdog (see the watch sweep in the unified tick); start merely
+ * records a baseline, so an unchanged run stays silent and the run's normal completion
+ * receipt remains the only terminal notification. The optional progressLog borrows the
+ * exact subagent_progress path: same general-purpose gate, same containment, and the same
+ * single-flight delivery — it corrects where the runtime looks, never what the worker does.
+ */
+export function runSubagentWatch(input: {
+	action: string;
+	agentId?: string;
+	runId?: string;
+	intervalSecs?: number;
+	progressLog?: string;
+}): { ok: boolean; message: string } {
+	const action = typeof input.action === "string" ? input.action.trim() : "";
+	if (!(WATCH_ACTIONS as readonly string[]).includes(action)) {
+		return { ok: false, message: `subagent_watch action must be one of ${WATCH_ACTIONS.join(" | ")}.` };
+	}
+
+	const agentId = input.agentId?.trim() ?? "";
+	const runId = input.runId?.trim() ?? "";
+
+	if (action === "list") {
+		const hasAgent = agentId !== "";
+		const hasRun = runId !== "";
+		if (hasAgent !== hasRun) {
+			return {
+				ok: false,
+				message: 'subagent_watch action="list" takes either both agentId and runId (exact filter) or neither (every subscription).',
+			};
+		}
+		const subs = watchRegistry.list(hasAgent ? { agentId, runId } : undefined);
+		if (subs.length === 0) {
+			return {
+				ok: true,
+				message: hasAgent
+					? `No watch subscription for agentId=${agentId} runId=${runId}.`
+					: "No active watch subscriptions.",
+			};
+		}
+		const now = Date.now();
+		const shown = subs.slice(0, WATCH_LIST_MAX_ROWS);
+		const omitted = subs.length - shown.length;
+		return {
+			ok: true,
+			message: [
+				`Watch subscriptions: ${subs.length}${omitted > 0 ? ` (showing ${shown.length}, ${omitted} omitted)` : ""}`,
+				...shown.map((sub) =>
+					`  ${sub.agentId} runId=${sub.runId} every=${sub.intervalSecs}s next-in=${Math.max(0, Math.ceil((sub.nextSampleAt - now) / 1000))}s lastEventSeq=${sub.lastEventSeq}${sub.inFlight ? " delivering" : ""}${sub.pendingChange ? " (change coalesced)" : ""}`),
+			].join("\n"),
+		};
+	}
+
+	const target = sanitizeWatchTarget(agentId, runId);
+	if ("problem" in target) {
+		return {
+			ok: false,
+			message: `subagent_watch action="${action}" requires both agentId and the exact runId from the dispatch receipt or subagent_status. ${target.problem}`,
+		};
+	}
+	const pair = target.value;
+
+	if (action === "stop") {
+		const removed = watchRegistry.stop(pair);
+		if (removed.removed) {
+			return { ok: true, message: `Watch stopped: agentId=${pair.agentId} runId=${pair.runId}. No further samples will be taken.` };
+		}
+		const live = runningAgents.get(pair.agentId);
+		return {
+			ok: false,
+			message: live
+				? `Cannot stop watch for agentId=${pair.agentId}: no subscription for runId=${pair.runId}${live.runId !== pair.runId ? ` (current run is runId=${live.runId}; stale runIds are rejected, never re-targeted)` : ""}.`
+				: `Cannot stop watch for agentId=${pair.agentId}: no subscription for runId=${pair.runId}, and no live run under this agentId here.`,
+		};
+	}
+
+	// start/update mutate a live exact run; same identity gate as subagent_progress.
+	const handle = handleForRun(pair.agentId, pair.runId);
+	if (!handle) {
+		const live = runningAgents.get(pair.agentId);
+		const job = jobRegistry.get(pair.agentId);
+		return {
+			ok: false,
+			message: `Cannot ${action} watch for agentId=${pair.agentId}: no live run with runId=${pair.runId} here (${live ? `current runId=${live.runId}` : job ? `job state "${job.state}"` : "no such run in this session process"}). Re-check with subagent_status and pass the current run's exact runId.`,
+		};
+	}
+	if (handle.finalizing) {
+		return {
+			ok: false,
+			message: `Cannot ${action} watch for agentId=${pair.agentId} runId=${pair.runId}: the worker already reported and is closing out; its completion receipt is imminent. Read its result with subagent_status.`,
+		};
+	}
+	const interval = input.intervalSecs === undefined ? undefined : sanitizeWatchIntervalSecs(input.intervalSecs);
+	if (interval && "problem" in interval) return { ok: false, message: interval.problem };
+	// Validate the optional progress aim before mutating anything: eligibility gate and path
+	// containment are the subagent_progress ones, judged against this run's own roots.
+	if (input.progressLog !== undefined && !handle.progressLogEligible) {
+		return {
+			ok: false,
+			message: `watch progressLog is only available for the bundled general-purpose worker, and agentId=${pair.agentId} runs "${handle.name}".`,
+		};
+	}
+	const resolvedLog = input.progressLog === undefined ? undefined : resolveProgressLogPath({
+		progressLog: input.progressLog,
+		spawnCwd: handle.spawnCwd ?? PIPIUI_MAIN_CWD,
+		allowedRoots: [PIPIUI_MAIN_CWD, handle.spawnCwd ?? "", handle.worktreePath ?? ""],
+	});
+	if (resolvedLog && "problem" in resolvedLog) return { ok: false, message: resolvedLog.problem };
+
+	if (action === "update") {
+		const updated = watchRegistry.update({
+			...pair,
+			now: Date.now(),
+			...(interval ? { intervalSecs: interval.secs } : {}),
+		});
+		if (!updated.ok) return { ok: false, message: updated.problem };
+		if (resolvedLog && "path" in resolvedLog) {
+			retargetProgressLog(handle, {
+				path: resolvedLog.path,
+				now: Date.now(),
+				...(interval ? { intervalMs: interval.secs * 1000 } : {}),
+			});
+		}
+		return {
+			ok: true,
+			message: [
+				`Watch updated: agentId=${pair.agentId} runId=${pair.runId} now samples every ${updated.subscription.intervalSecs}s (cadence re-armed; identity, baseline, and receipt sequence unchanged).`,
+				...(resolvedLog && "path" in resolvedLog ? [`Progress channel re-pointed to ${resolvedLog.path} with the same containment and single-flight delivery as subagent_progress.`] : []),
+			].join("\n"),
+		};
+	}
+
+	// start: the baseline is this instant's observation — the first event fires only when a
+	// later sample differs from it. A duplicate start re-arms and re-baselines the same
+	// subscription without rewinding its receipt sequence (the registry's documented contract).
+	const fingerprint = watchObservationFor(pair.agentId, pair.runId, Date.now());
+	if (fingerprint === undefined) {
+		return { ok: false, message: `Cannot start watch for agentId=${pair.agentId} runId=${pair.runId}: the run left before the subscription could be armed.` };
+	}
+	const started = watchRegistry.start({
+		...pair,
+		now: Date.now(),
+		fingerprint,
+		...(interval ? { intervalSecs: interval.secs } : {}),
+	});
+	if (!started.ok) return { ok: false, message: started.problem };
+	if (resolvedLog && "path" in resolvedLog) {
+		retargetProgressLog(handle, {
+			path: resolvedLog.path,
+			now: Date.now(),
+			...(interval ? { intervalMs: interval.secs * 1000 } : {}),
+		});
+	}
+	return {
+		ok: true,
+		message: [
+			`Watch ${started.created ? "started" : "re-armed"}: agentId=${pair.agentId} runId=${pair.runId} samples every ${started.subscription.intervalSecs}s.`,
+			"Baseline recorded; you are told only on a state change (status/activity/tool/finalization/verify), routed through Supervisor — unchanged ticks stay silent, and the run's normal completion receipt remains the only terminal notification.",
+			...(resolvedLog && "path" in resolvedLog ? [`Progress channel aimed at ${resolvedLog.path} (only appends from now are forwarded).`] : []),
+		].join("\n"),
 	};
 }
 
@@ -3432,6 +3645,7 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 	// A new terminal boundary (or correction of watchdog-only interruption) invalidates every
 	// queued reminder from its prior view of this episode. `ok` consequently has no reminder path.
 	cancelInterruptedReminders(agentId, runId);
+	watchRegistry.stop({ agentId, runId });
 	jobRegistry.set(agentId, {
 		agentId,
 		runId,
@@ -5207,6 +5421,26 @@ export const __doneLifecycleForTests = {
 	/** Full boss-delivery entry: obligation creation, store, probing included. */
 	deliverToBoss: deliverConfirmedDoneToBossAsync,
 };
+export const __watchRuntimeForTests = {
+	get generation(): number {
+		return watchSessionGeneration;
+	},
+	set generation(val: number) {
+		watchSessionGeneration = val;
+	},
+	get shutdownAbort(): AbortController {
+		return watchSessionShutdownAbort;
+	},
+	set shutdownAbort(val: AbortController) {
+		watchSessionShutdownAbort = val;
+	},
+	registry: watchRegistry,
+	runningAgents,
+	jobRegistry,
+	isWatchDeliveryValid,
+	isWatchDeliveryValidForAgent,
+	deliverWatchSample,
+};
 /** Default-off injection point letting behavior tests exercise the rejection closure. */
 let doneDeliverCutInOverride: (() => Promise<void>) | undefined;
 export function setDoneDeliverCutInOverrideForTests(fn?: () => Promise<void>): void {
@@ -5824,8 +6058,7 @@ export function applyProgressLogSampleTick(
  *  noteAgentActivity / toolWaitSince: log progress must not masquerade as JSONL activity.
  */
 async function deliverProgressLogReport(pi: ExtensionAPI, agentId: string, handle: RunningAgentHandle): Promise<void> {
-	const excerpt = readProgressLogExcerpt({ path: handle.progressLogPath!, offset: handle.progressLogOffset ?? 0 });
-	handle.progressLogOffset = excerpt.nextOffset;
+	const excerpt = consumeProgressLogExcerpt(handle, { path: handle.progressLogPath! });
 	if (!excerpt.grew) return;
 	const now = Date.now();
 	const text = formatProgressLogReport({
@@ -5855,6 +6088,152 @@ async function deliverProgressLogReport(pi: ExtensionAPI, agentId: string, handl
 	// unhandled → no Supervisor host bound this session, send straight to Boss.
 	if (routed !== "unhandled") return;
 	await sendUserMessageAfterCutIn(pi, text);
+}
+
+/** Watch list output cap: bounded metadata rows, never a firehose. */
+const WATCH_LIST_MAX_ROWS = 32;
+
+/** Coarse status for a watch sample: transitions only, never the churning idle seconds. */
+function watchStateFor(agentId: string, handle: RunningAgentHandle, now: number): string {
+	if (handle.finalizing) return "finalizing";
+	if (handle.residentIdleWait) return "resident-idle";
+	if (stalledInfoFor(agentId, now).stalled) return "stalled";
+	return "running";
+}
+
+/**
+ * The compact observation one due watch tick takes of its exact run: coarse status,
+ * finalization phase, current tool wait, and this run's verify verdict. Log bytes are
+ * deliberately absent — new progress-log bytes already have their own single-flight
+ * forward path, and a second wake channel for the same growth would double-notify.
+ * Returns undefined when the exact run is gone or the completion receipt is imminent
+ * (done-await-host): the registry then drops the subscription silently, so the normal
+ * completion/verify delivery stays the only terminal notification.
+ */
+export function watchObservationFor(agentId: string, runId: string, now: number): string | undefined {
+	const handle = handleForRun(agentId, runId);
+	if (!handle) return undefined;
+	if (handle.diagnostics.finalizationPhase === "done-await-host") return undefined;
+	const record = jobRegistry.get(agentId);
+	const verify = record && record.runId === runId && record.verify
+		? (record.verify.timedOut || record.verify.exitCode !== 0 ? "failed" : "passed")
+		: undefined;
+	return buildWatchFingerprint({
+		state: watchStateFor(agentId, handle, now),
+		...(handle.diagnostics.finalizationPhase ? { phase: handle.diagnostics.finalizationPhase } : {}),
+		...(handle.toolWaitNames?.[0] ? { tool: handle.toolWaitNames[0] } : {}),
+		...(verify ? { verify } : {}),
+		...(handle.lastActivityAt !== undefined ? { lastActivityAt: handle.lastActivityAt } : {}),
+		...(handle.diagnostics?.eventSeq !== undefined ? { eventSeq: handle.diagnostics.eventSeq } : {}),
+	});
+}
+
+/** The fingerprint is a canonical key=value join; the description is the same fields, readable. */
+function describeWatchFingerprint(fingerprint: string): string {
+	return fingerprint.split("\u0001").join(" ");
+}
+
+function isWatchDeliveryValid(
+	agentId: string,
+	runId: string,
+	sequence: number,
+	generation: number,
+): boolean {
+	if (generation !== watchSessionGeneration) return false;
+	if (watchSessionShutdownAbort.signal.aborted) return false;
+
+	const handle = handleForRun(agentId, runId);
+	if (!handle || handle.finalizing || handle.diagnostics.finalizationPhase === "done-await-host") {
+		return false;
+	}
+
+	const job = jobRegistry.get(agentId);
+	if (
+		job &&
+		job.runId === runId &&
+		(job.state === "ok" ||
+			job.state === "failed" ||
+			job.state === "aborted" ||
+			job.state === "interrupted")
+	) {
+		return false;
+	}
+
+	const subs = watchRegistry.list({ agentId, runId });
+	if (subs.length === 0) return false;
+	const sub = subs[0];
+	if (!sub.inFlight || sub.lastEventSeq !== sequence) return false;
+
+	return true;
+}
+
+function isWatchDeliveryValidForAgent(agentId: string, runId: string): boolean {
+	if (watchSessionShutdownAbort.signal.aborted) return false;
+	const handle = handleForRun(agentId, runId);
+	if (!handle || handle.finalizing || handle.diagnostics.finalizationPhase === "done-await-host") {
+		return false;
+	}
+	const job = jobRegistry.get(agentId);
+	if (
+		job &&
+		job.runId === runId &&
+		(job.state === "ok" ||
+			job.state === "failed" ||
+			job.state === "aborted" ||
+			job.state === "interrupted")
+	) {
+		return false;
+	}
+	return watchRegistry.list({ agentId, runId }).length > 0;
+}
+
+/**
+ * Route one changed watch sample. The Supervisor judges the compact packet: wait/status
+ * stay silent (durable receipt only), forward/escalate wake Boss once with bounded text —
+ * and with no Supervisor bound this session the compact line goes straight to Boss, the
+ * same fallback the progress excerpt rides. The registry's single in-flight slot is
+ * settled in `finally` with the exact sequence, so a failed route can never wedge the
+ * subscription; a coalesced change re-emits on the next due tick on its own.
+ */
+async function deliverWatchSample(
+	pi: ExtensionAPI,
+	event: WatchTickEvent,
+	generation = watchSessionGeneration,
+): Promise<void> {
+	if (!isWatchDeliveryValid(event.agentId, event.runId, event.sequence, generation)) {
+		return;
+	}
+	const handle = handleForRun(event.agentId, event.runId);
+	const job = jobRegistry.get(event.agentId);
+	const title = handle?.title?.trim() || job?.title?.trim() || job?.name || "(untitled)";
+	const fields = describeWatchFingerprint(event.fingerprint);
+	const text = [
+		`[subagent-watch] ${event.agentId} (${title}) — ${fields}`,
+		`runId=${event.runId} seq=${event.sequence}. Periodic watch sample: one state transition since the previous sample; unchanged ticks never send one. Keep waiting unless this shows abnormal activity or finalization trouble.`,
+	].join("\n");
+	const request: SupervisorDeliveryRequest = {
+		kind: "watch",
+		agentId: event.agentId,
+		runId: event.runId,
+		sequence: event.sequence,
+		publicText: text,
+		job: supervisorJobSnapshot(event.agentId, event.runId, "running"),
+		summary: `watch: ${fields}`.slice(0, 600),
+	};
+	try {
+		if (!isWatchDeliveryValid(event.agentId, event.runId, event.sequence, generation)) {
+			return;
+		}
+		const routed = await routeSupervisorDelivery(request);
+		if (routed !== "unhandled") return;
+		if (!isWatchDeliveryValid(event.agentId, event.runId, event.sequence, generation)) {
+			return;
+		}
+		await sendUserMessageAfterCutIn(pi, text);
+	} finally {
+		// A rejection (subscription pruned mid-delivery) is fine — the slot went with it.
+		watchRegistry.ack({ agentId: event.agentId, runId: event.runId, sequence: event.sequence });
+	}
 }
 
 function supervisorRequestFromCompletion(agentId: string, runId: string, text: string): SupervisorDeliveryRequest {
@@ -6018,6 +6397,11 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 				}
 				if (kind === "stall") {
 					return deliverStallWakeToBoss(pi, publicText);
+				}
+				if (kind === "watch") {
+					if (agentId && runId && !isWatchDeliveryValidForAgent(agentId, runId)) {
+						return false;
+					}
 				}
 				return sendUserMessageAfterCutIn(pi, publicText);
 			},
@@ -6493,13 +6877,13 @@ async function runSingleAgent(
 	// ── Branded-pin contract ─────────────────────────────────────────────────────────
 	// Only a host-validated pin may pass this point (see requireValidatedModelPin).
 	const modelPin = requireValidatedModelPin(options?.model, options?.modelPin);
-	const resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel, modelPin);
+	let resolvedModel = resolveAgentModel(agentName, agent.model, options?.sessionModel, modelPin);
 	// Tool-selected thinking belongs to this one dispatch only; it never reads the Boss's
 	// current thinking level. The initial candidate may use it directly by priority. With a
 	// pinned model the persisted role-thinking no longer describes the actual candidate, so
 	// only an explicit task thinking (or Pi default) applies.
 	const taskThinking = normalizeTaskThinking(options?.thinking);
-	const resolvedThinking = modelPin ? taskThinking : resolveAgentThinking(agentName, taskThinking);
+	let resolvedThinking = modelPin ? taskThinking : resolveAgentThinking(agentName, taskThinking);
 	const mainModelForChild = inheritMainModel(options?.sessionModel);
 	if (placement.worktreeError) {
 		const message = `Writable subagent isolation failed before spawn: ${placement.worktreeError}`;
@@ -6634,6 +7018,47 @@ async function runSingleAgent(
 	const resumingSession = Boolean(
 		sessionDir && !options?.fresh && agentSessionExists(sessionDir, sessionId),
 	);
+	// A fork copies this session's conversation into the child's new session, so the decision
+	// needs the resume state (continuity outranks forking) and can only be made once the model
+	// is known. On acceptance the child is pinned to the Boss's model: the copied prefix is only
+	// cheap while it stays a cache hit, and a silent cross-model fork would pay full price for
+	// every token of it.
+	const forkDecision = resolveFork({
+		fork: options?.fork,
+		agentName,
+		readOnly: agent.traits.readOnly,
+		depth: PIPIUI_DEPTH,
+		modelPin: options?.model,
+		bossModel: mainModelForChild,
+		sessionFile: options?.forkSourceFile,
+		resuming: resumingSession,
+	});
+	if (options?.fork === true && !forkDecision.fork && forkDecision.reason) {
+		const fail: SingleResult = {
+			agent: agentName,
+			agentSource: agent.source,
+			task,
+			title: options?.title,
+			exitCode: 1,
+			messages: [],
+			stderr: forkDecision.reason,
+			errorMessage: forkDecision.reason,
+			usage: emptyUsage(),
+			model: resolvedModel,
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+		};
+		return fail;
+	}
+	if (forkDecision.fork && forkDecision.model) {
+		// The role's persisted thinking level describes the role's own model, which a fork has
+		// just replaced with the Boss's. Fall back to an explicit task thinking exactly as a
+		// pinned model does, rather than sending a level the new model may not accept.
+		resolvedModel = forkDecision.model;
+		resolvedThinking = taskThinking;
+	}
+
 	if (sessionDir && options?.fresh) {
 		// Explicitly starting over: drop the old conversation rather than resuming a poisoned one.
 		for (const file of agentSessionFiles(sessionDir, sessionId)) {
@@ -6656,6 +7081,10 @@ async function runSingleAgent(
 	const useNestedRpc = childDepth > 0 && allowRecursiveDelegation;
 	const args: string[] = useNestedRpc ? ["--mode", "rpc"] : ["--mode", "json", "-p"];
 	if (sessionDir) {
+		// `--fork <src>` mints a NEW session carrying the copied entries; pi treats the
+		// `--session-id` beside it as that new session's id and refuses a collision, which is
+		// why fork-policy makes a resume win outright rather than reaching this pair.
+		args.push(...forkSpawnArgs(forkDecision));
 		args.push("--session-id", sessionId, "--session-dir", sessionDir);
 	} else {
 		args.push("--no-session");
@@ -8441,6 +8870,8 @@ const AGENT_ID_DESCRIPTION =
 	"Short semantic name you choose for this worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\", starting with a letter or digit. Required on every dispatch — no id is generated for you. Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch pipiui/<agentId>: use one agentId per vertical slice (implement, verify, debug, fix, re-verify), and pass fresh:true only to start the same id cold. Also the target id for action=\"abort\" or action=\"resolve\".";
 const FRESH_DESCRIPTION =
 	"Discard this agentId's stored conversation and start it cold. Use when its context went wrong, not routinely.";
+const FORK_DESCRIPTION =
+	"Start this worker from a copy of THIS session's conversation instead of cold, so it already knows what you know and the prompt can be a directive rather than a briefing. A fork runs your own model. Use it when restating the background would take more than a paragraph, or when the worker must judge what the user actually wants. Do NOT use it for reviewer/explore/plan (their value is the cold start, and it is refused), nor when you can already write a complete brief — a cold worker with precise file:line anchors is cheaper and no less correct.";
 const MODEL_PARAM_DESCRIPTION =
 	'Optional exact model for THIS dispatch only, as a stable `provider/modelId` string (e.g. "openai/gpt-5", never a bare model id). It must exactly match one entry of the Available models list in your system prompt — unavailable or user-hidden models are rejected with an error, never silently replaced by a default. Omit it to follow the normal resolution (user role settings → current session/main model → agent frontmatter). A pin is never persisted and does not affect any later dispatch.';
 const BLOCKED_BY_DESCRIPTION =
@@ -8528,6 +8959,7 @@ const TaskItem = Type.Object({
 	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	fork: Type.Optional(Type.Boolean({ description: FORK_DESCRIPTION })),
 }, { additionalProperties: false });
 
 // Chain items speak the same Grok Build / Claude-family dispatch contract as the
@@ -8630,6 +9062,7 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
+	fork: Type.Optional(Type.Boolean({ description: FORK_DESCRIPTION })),
 	verify: Type.Optional(Type.String({ description: VERIFY_PARAM_DESCRIPTION })),
 	thinking: ThinkingParam,
 	model: Type.Optional(Type.String({ description: MODEL_PARAM_DESCRIPTION })),
@@ -8684,6 +9117,25 @@ const SubagentResolveParams = Type.Object({
 	runId: Type.String({ minLength: 1, description: "Exact runId from [subagent-done] or subagent_status. Stale runIds are rejected." }),
 	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
 }, { additionalProperties: false });
+const SubagentWatchParams = Type.Object({
+	action: StringEnum(WATCH_ACTIONS, {
+		description: "start arms sampling of one exact live run (baseline first: an unchanged run emits nothing); update re-arms cadence or re-points the progress channel of an existing subscription; stop removes the exact pair; list shows every subscription, or one exact pair when agentId and runId are both given.",
+	}),
+	agentId: Type.Optional(Type.String({ description: "Worker to observe. Required for start/update/stop; for list, supply both agentId and runId for an exact filter, or neither for everything." })),
+	runId: Type.Optional(Type.String({
+		minLength: 1,
+		description: "Exact run to watch, from the dispatch receipt or subagent_status. start/update/stop bind this exact pair: a stale runId is rejected, never re-targeted at a newer run under the same agentId.",
+	})),
+	intervalSecs: Type.Optional(Type.Integer({
+		minimum: 30,
+		maximum: 3600,
+		description: "Sampling cadence in seconds, driven by the shared 30s watchdog (never a new timer). Default 60.",
+	})),
+	progressLog: Type.Optional(Type.String({
+		minLength: 1,
+		description: "start/update only: optionally (re)aim this run's progress channel at this file first — same path containment, general-purpose eligibility, and single-flight delivery as subagent_progress.",
+	})),
+}, { additionalProperties: false });
 type SubagentExecuteParams = {
 	action?: "abort" | "resolve" | "progress";
 	prompt?: string;
@@ -8712,6 +9164,8 @@ type SubagentExecuteParams = {
 	runId?: string;
 	reason?: string;
 	fresh?: boolean;
+	/** Start this worker from a copy of this session's conversation (see fork-policy.ts). */
+	fork?: boolean;
 	cwd?: string;
 	verify?: string;
 	// The public schema speaks Grok-family names (prompt/description/subagent_type/
@@ -8752,6 +9206,7 @@ type SubagentExecuteParams = {
 		model?: string;
 		agentId?: string;
 		fresh?: boolean;
+		fork?: boolean;
 		scope?: string[];
 		planTask?: string;
 	}>;
@@ -8840,7 +9295,8 @@ export default function (pi: ExtensionAPI) {
 	// Background jobs must survive a tool-turn abort, but not destruction of their
 	// owning session. This controller closes the tiny pre-handle spawn race during
 	// session_shutdown without coupling ordinary parent-turn aborts to descendants.
-	const sessionShutdownAbort = new AbortController();
+	watchSessionShutdownAbort = new AbortController();
+	const sessionShutdownAbort = watchSessionShutdownAbort;
 	// Publish the read-only plan-adherence seam over globalThis: jiti evaluates every
 	// extension entry fresh, so a module-level registry here would be invisible to
 	// extensions/pipiui-plan.ts importing plan-drift.ts in its own evaluation tree.
@@ -8889,6 +9345,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
+		// A new session inherits nothing: old subscriptions point at runs that no longer
+		// exist here, and a resurrected one would leak stale-run events into this session.
+		watchSessionGeneration += 1;
+		watchSessionShutdownAbort = new AbortController();
+		watchRegistry.clear();
 		const residentRpcWakeToken = PIPIUI_RESIDENT_RPC_WAKE_TOKEN;
 		if (nestedBackgroundLifecycle && residentRpcWakeToken) {
 			residentParentShutdown = () => {
@@ -8905,6 +9366,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
+		// Drop every watch subscription before the delivery host goes: no sample may enter
+		// the Supervisor (or Boss) channel after the session that owned it is collecting.
+		watchSessionGeneration += 1;
+		watchSessionShutdownAbort.abort();
+		watchRegistry.clear();
 		// Cancel queued work before draining: otherwise a just-exited child could free a
 		// slot and start the next queued worker while shutdown is already collecting.
 		sessionShutdownAbort.abort();
@@ -9245,19 +9711,32 @@ export default function (pi: ExtensionAPI) {
 		}
 		// (2b++) progressLog 回传：独立于墙钟检查点。默认每 60s（设了 heartbeatSecs 用该间隔）
 		// 读取自上次偏移的新增字节（≤4KB），经 Supervisor force-forward 直达 Boss；无新字节不打扰。
+		// 单飞：上一次投递未结算就持有 claim，本拍直接跳过——不排队，也绝不重复读同一段字节。
 		for (const [progressAgentId, progressHandle] of runningAgents) {
 			if (!progressHandle.progressLogPath || progressHandle.finalizing) continue;
 			const intervalMs = progressHandle.progressLogIntervalMs ?? DEFAULT_PROGRESS_LOG_REPORT_MS;
 			if (now - (progressHandle.lastProgressReportAt ?? progressHandle.startedAt) < intervalMs) continue;
+			const claim = claimProgressLogReport(progressHandle);
+			if (!claim) continue;
 			progressHandle.lastProgressReportAt = now;
-			progressHandle.progressReportInFlight = true;
 			void deliverProgressLogReport(pi, progressAgentId, progressHandle)
 				.catch((err) => {
 					console.error("[pipiui-subagent] progress-log delivery failed:", progressAgentId, err instanceof Error ? err.message : err);
 				})
 				.finally(() => {
-					progressHandle.progressReportInFlight = false;
+					releaseProgressLogReport(progressHandle, claim);
 				});
+		}
+
+		// (2b*3) watch 订阅采样：subagent_watch 的到期订阅在同一拍各采样一次紧凑状态
+		// （status/activity/tool/finalization/verify）。指纹不变 → 什么都不发；变化 → Supervisor
+		// kind=watch 判定（wait/status 静默，forward/escalate 才唤醒 Boss）。订阅的 exact run
+		// 消失或进入 done-await-host 时被静默丢弃——完成回执永远只由既有投递发一次。
+		// 无新 timer：这里就是唯一的调度源（共享 30s watchdog tick）。
+		for (const event of watchRegistry.tick({ now, observe: (target) => watchObservationFor(target.agentId, target.runId, now) })) {
+			void deliverWatchSample(pi, event, watchSessionGeneration).catch((err) => {
+				console.error("[pipiui-subagent] watch delivery failed:", event.agentId, err instanceof Error ? err.message : err);
+			});
 		}
 
 		// (2c) Metadata-only stall probe. Logs only on decision change; never changes abort policy.
@@ -9601,6 +10080,10 @@ export default function (pi: ExtensionAPI) {
 			const ctxModel = (ctx as { model?: { provider?: string; id?: string; contextWindow?: number } } | undefined)?.model;
 			const sessionModel = formatCtxModel(ctxModel);
 			const contextWindow = ctxContextWindow(ctxModel);
+			// Fork source: this session's own JSONL. Resolved once per wave from the same
+			// accessor session_recall uses; absent for an ephemeral/in-memory session, which
+			// fork-policy turns into a named refusal rather than a silent cold dispatch.
+			const forkSourceFile = bossSessionFile(ctx);
 			// 多层深度护栏：达到上限的进程不允许继续派 subagent
 			const depthLimitMessage = rejectDispatchAtDepth({ depth: PIPIUI_DEPTH, maxDepth: PIPIUI_MAX_DEPTH });
 			if (depthLimitMessage) {
@@ -9755,7 +10238,7 @@ export default function (pi: ExtensionAPI) {
 					sessionShutdownAbort.signal, // session teardown (not a turn abort) owns this descendant subtree
 					undefined,
 					makeDetails(mode, { background: true, agentIds: [agentId] }),
-					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
+					{ toolCallId, background: true, agentId, runId, title, sessionModel, contextWindow, verify, thinking, model, modelPin, fresh, fork: params.fork, forkSourceFile, blockedBy, scope, planTask, worktree, noWorktreeReason, heartbeatSecs, timeoutSecs, progressLog },
 				)
 					.then((result) => {
 						clearRunningDispatchScope(agentId);
@@ -10535,7 +11018,7 @@ export default function (pi: ExtensionAPI) {
 								sessionShutdownAbort.signal, // session teardown owns queued descendants too
 								undefined,
 								makeDetails("parallel", { background: true, agentIds }),
-								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
+								{ toolCallId, background: true, agentId, runId: acceptedRunId, title: t.title, sessionModel, contextWindow, verify: t.verify, thinking: t.thinking, model: t.model, modelPin: validatedPinOf(t.model), fresh: t.fresh, fork: t.fork, forkSourceFile, blockedBy: t.blockedBy, scope: t.scope, planTask: t.planTask },
 							);
 							notifySubagentDone(pi, result);
 						} catch (err) {
@@ -10827,7 +11310,7 @@ export default function (pi: ExtensionAPI) {
 												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
-												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, fork: params.fork, forkSourceFile, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
 											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -11436,6 +11919,32 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("toolTitle", theme.bold("subagent_resolve ")) +
 					theme.fg("accent", args.agentId || "?") +
 					theme.fg("muted", ` ${args.runId || "?"}`),
+				0,
+				0,
+			);
+		},
+	});
+	pi.registerTool({
+		name: "subagent_watch",
+		label: "Subagent Watch",
+		description: [
+			"Periodically observe one running worker without polling subagent_status. start arms a bounded sampling subscription on the exact run: the shared 30s watchdog takes one compact sample per due tick (status/activity/tool/finalization/verify), and only a CHANGE since the previous sample is routed as a Supervisor watch event — wait/status stay silent, forward/escalate wake you. Unchanged ticks emit nothing.",
+			"Required for start/update/stop: agentId and the exact runId (from the dispatch receipt or subagent_status); a stale runId is rejected, never re-targeted at a newer run. list shows every subscription, or one exact pair when both agentId and runId are given.",
+			"intervalSecs (30–3600, default 60) only sets the sampling cadence — it is not a new timer. Optional progressLog on start/update re-aims the run's progress channel first, under the same path containment, general-purpose eligibility, and single-flight delivery as subagent_progress.",
+			"The registry is process-local and cleared on session start/shutdown. A terminal run drops its subscription silently: the run's normal completion receipt stays the only terminal notification, and watch never re-runs verify.",
+		].join(" "),
+		promptSnippet: "Periodically observe one exact run via the shared watchdog; only state changes surface, unchanged ticks stay silent.",
+		parameters: SubagentWatchParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentWatchParams),
+		async execute(_toolCallId, params) {
+			const result = runSubagentWatch(params);
+			return { content: [{ type: "text", text: result.message }], details: null, isError: !result.ok };
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent_watch ")) +
+					theme.fg("accent", String(args.action ?? "?")) +
+					theme.fg("muted", ` ${args.agentId ?? ""}${args.runId ? ` ${args.runId}` : ""}`),
 				0,
 				0,
 			);

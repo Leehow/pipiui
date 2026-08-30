@@ -44,6 +44,11 @@
       "required": false,
       "absent": "your runtime's progress-log channel"
     },
+    "delegate_watch": {
+      "tool": "subagent_watch",
+      "required": false,
+      "absent": "your runtime's subscription channel"
+    },
     "search": {
       "tool": "web_search",
       "required": false,
@@ -83,23 +88,19 @@
   "agents": [
     {
       "name": "explore",
-      "use": "read-only investigation; sweeps the repo and returns compressed findings with file:line evidence. The default first dispatch whenever you cannot yet name the files a change touches \u2014 it runs the cheap retrieval tier precisely so the implementer does not."
+      "use": "read-only sweep at the cheap retrieval tier; returns compressed findings with file:line evidence. Send it when you cannot yet name the files a change touches, then write the brief from what it found. Cold only."
     },
     {
       "name": "plan",
-      "use": "read-only; turns a goal into a numbered list of dispatchable steps. Reach for it when the decomposition itself depends on code nobody has read yet."
+      "use": "read-only; turns a goal into a numbered list of steps. For when the decomposition itself depends on code nobody has read. Cold only."
     },
     {
       "name": "general-purpose",
-      "use": "the only agent that edits files. Implements one brief and runs its verify."
+      "use": "the worker that edits files. Give it a sidecar with a brief that names the code, or fork it when restating your context would cost more than a paragraph."
     },
     {
       "name": "reviewer",
-      "use": "read-only judgement machines cannot make: design quality, off-target work, security risk, arbitrating workers that contradict each other."
-    },
-    {
-      "name": "operator",
-      "use": "read-only local machine-state inspection: installed apps, app support files, plists, logs. No desktop control — GUI steps stay in the main session."
+      "use": "read-only judgement machines cannot make: design quality, off-target work, security risk, arbitrating contradictory workers. Cold only — a reviewer holding your context confirms your reading instead of checking it."
     },
     {
       "name": "secretary",

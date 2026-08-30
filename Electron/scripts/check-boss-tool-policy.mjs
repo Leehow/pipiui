@@ -45,7 +45,7 @@ const CAPTURE_TIMEOUT_MS = 30_000;
 const { assemblePiSpawn, resolveSpawnPaths, mergedSpawnEnvironment, resolvePiExecutable, withToolPath } =
 	await import(join(electronRoot, "packages/pi-backend/src/spawn-assembly.ts"));
 const { DEFAULT_FEATURES } = await import(join(electronRoot, "packages/pi-backend/src/features.ts"));
-const { BOSS_MUTATION_TOOL_NAMES, resolveMainSessionExcludedTools } =
+const { resolveMainSessionExcludedTools } =
 	await import(join(electronRoot, "packages/pi-backend/src/main-tool-policy.ts"));
 const { BUNDLED_MANIFEST_EXTENSIONS } =
 	await import(join(electronRoot, "packages/pi-backend/src/runtime-install.ts"));
@@ -201,27 +201,26 @@ async function registeredTools(features) {
 // checks
 // ---------------------------------------------------------------------------
 
-const legacyFeatures = { ...DEFAULT_FEATURES, bossReadOnly: false };
-const readOnlyPrompt = await capturePrompt(DEFAULT_FEATURES);
-const legacyPrompt = await capturePrompt(legacyFeatures);
+const bossPrompt = await capturePrompt(DEFAULT_FEATURES);
+console.log(`\nBoss: ${toolList(bossPrompt)?.join(", ") ?? "(no tool list found)"}`);
 
-for (const [label, prompt] of [["read-only Boss", readOnlyPrompt], ["flag off", legacyPrompt]]) {
-	console.log(`\n${label}: ${toolList(prompt)?.join(", ") ?? "(no tool list found)"}`);
+/*
+ * This block used to assert the opposite: that `bossReadOnly` had removed bash/edit/write, and
+ * that they came back with the flag off. The Boss now owns and implements the mainline, so the
+ * live invariant is that the real Pi binary really does offer it the tools to do that — a
+ * philosophy that says "you implement the mainline" against a session that cannot edit is the
+ * worst of both designs, and only the real prompt can prove which one shipped.
+ */
+console.log("\n== the Boss can actually do the work it is told to own ==");
+for (const name of ["bash", "edit", "write"]) {
+	toolList(bossPrompt)?.includes(name)
+		? pass(`${name} offered`)
+		: fail(`${name} is missing — the Boss is told to implement the mainline but cannot`);
 }
 
-console.log("\n== the mutation set is gone, and only because of the flag ==");
-for (const name of BOSS_MUTATION_TOOL_NAMES) {
-	toolList(readOnlyPrompt)?.includes(name)
-		? fail(`${name} is still offered to a read-only Boss`)
-		: pass(`${name} removed`);
-	if (!toolList(legacyPrompt)?.includes(name)) {
-		fail(`${name} is absent with the flag off too — the check above proves nothing`);
-	}
-}
-
-console.log("\n== the Boss keeps what it reads and verifies with ==");
+console.log("\n== the Boss keeps what it reads, records and verifies with ==");
 for (const name of ["read", "git", "ledger_note"]) {
-	toolList(readOnlyPrompt)?.includes(name) ? pass(`${name} kept`) : fail(`${name} is missing from a read-only Boss`);
+	toolList(bossPrompt)?.includes(name) ? pass(`${name} kept`) : fail(`${name} is missing from the Boss`);
 }
 
 /*
@@ -238,9 +237,9 @@ for (const name of ["read", "git", "ledger_note"]) {
 console.log("\n== every tool we ship is introduced to the model ==");
 const layers = await philosophyText();
 const baseline = new Set(JSON.parse(await readFile(join(electronRoot, "scripts/boss-tool-policy-baseline.json"), "utf8")).notIntroduced);
-for (const [label, features, prompt] of [["read-only Boss", DEFAULT_FEATURES, readOnlyPrompt], ["flag off", legacyFeatures, legacyPrompt]]) {
+for (const [label, features, prompt] of [["Boss", DEFAULT_FEATURES, bossPrompt]]) {
 	const { registered, unloadable } = await registeredTools(features);
-	const excluded = new Set(resolveMainSessionExcludedTools({ bossReadOnly: Boolean(features.bossReadOnly) }));
+	const excluded = new Set(resolveMainSessionExcludedTools({}));
 	const expected = [...registered.keys()].filter((name) => !excluded.has(name));
 	if (!expected.length) { fail(`${label}: no tools collected — the loader is not seeing our extensions`); continue; }
 
