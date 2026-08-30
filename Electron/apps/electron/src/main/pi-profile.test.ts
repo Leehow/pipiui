@@ -555,4 +555,118 @@ describe('Electron Pi profile', () => {
     expect(await captureQwen('off')).not.toHaveProperty('reasoning_effort')
     expect(await captureQwen('off')).not.toHaveProperty('thinking')
   })
+
+  it('installs hand-curated gemini thinkingLevelMaps so official Google models expose selectable thinking levels', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-gemini-thinking-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    await mkdir(profile.agentDir, { recursive: true })
+    // The broken state this guards against: models.dev-refreshed Google Gemini 3 entries report
+    // reasoning with an off-only thinkingLevelMap and no supported string levels, so
+    // thinkingLevelsForModel returns [] and the ThinkingChip locks to auto.
+    const flashIds = ['gemini-3.7-flash', 'gemini-3.5-flash', 'gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-flash-latest']
+    const proIds = ['gemini-3-pro-preview', 'gemini-3.1-pro-preview']
+    const storeModel = (id: string) => ({
+      provider: 'google',
+      id,
+      name: id,
+      api: 'google-generative-ai',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      reasoning: true,
+      thinkingLevelMap: { off: null },
+      input: ['text', 'image'],
+      cost: { input: 2, output: 12, cacheRead: 0.5, cacheWrite: 0 },
+      contextWindow: 1000000,
+      maxTokens: 65536
+    })
+    await writeFile(join(profile.agentDir, 'models-store.json'), JSON.stringify({
+      google: {
+        lastModified: 4102444800000,
+        checkedAt: 4102444800000,
+        models: [...flashIds, ...proIds].map(storeModel)
+      }
+    }))
+    const modelsJsonPath = join(profile.agentDir, 'models.json')
+    await writeFile(modelsJsonPath, `${JSON.stringify({ providers: {} }, null, 2)}\n`)
+
+    const snapshotPath = join(process.cwd(), 'resources', 'runtime', 'model-capabilities', 'models-dev-reasoning-options.json')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+
+    const installed = JSON.parse(await readFile(modelsJsonPath, 'utf8'))
+    for (const id of flashIds) {
+      expect(installed.providers.google.modelOverrides[id]).toMatchObject({
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high' },
+        compat: { supportsReasoningEffort: true }
+      })
+    }
+    for (const id of proIds) {
+      expect(installed.providers.google.modelOverrides[id]).toMatchObject({
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: 'high' },
+        compat: { supportsReasoningEffort: true }
+      })
+    }
+
+    const { ModelRuntime } = await import('@earendil-works/pi-coding-agent')
+    const runtime = await ModelRuntime.create({
+      modelsPath: modelsJsonPath,
+      modelsStorePath: join(profile.agentDir, 'models-store.json'),
+      allowModelNetwork: false
+    })
+    const { thinkingLevelsForModel } = await import('@pipi/host-api')
+    for (const id of flashIds) {
+      const model = runtime.getModel('google', id)
+      expect(model).toMatchObject({
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high' }
+      })
+      // xhigh/max stay unsupported: MINIMAL | LOW | MEDIUM | HIGH is the whole vocabulary.
+      expect(model?.thinkingLevelMap).not.toHaveProperty('xhigh')
+      expect(model?.thinkingLevelMap).not.toHaveProperty('max')
+      // UI contract: a non-empty selectable list instead of a ThinkingChip locked to auto.
+      expect(thinkingLevelsForModel(model as any)).toEqual(['minimal', 'low', 'medium', 'high'])
+    }
+    for (const id of proIds) {
+      const model = runtime.getModel('google', id)
+      expect(model).toMatchObject({
+        reasoning: true,
+        thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: null, high: 'high' }
+      })
+      expect(thinkingLevelsForModel(model as any)).toEqual(['low', 'high'])
+    }
+
+    // The override must actually reach the wire as Google's uppercase thinkingLevel enum.
+    const { streamSimple } = await import('@earendil-works/pi-ai/api/google-generative-ai')
+    const capture = async (id: string, reasoning?: string) => {
+      const model = runtime.getModel('google', id)
+      expect(model).toBeDefined()
+      let payload: Record<string, unknown> | undefined
+      const stream = streamSimple(model as any, {
+        messages: [{ role: 'user', content: 'probe', timestamp: Date.now() }]
+      }, {
+        apiKey: 'not-sent',
+        ...(reasoning ? { reasoning } : {}),
+        maxTokens: 1,
+        onPayload: value => {
+          payload = value as unknown as Record<string, unknown>
+          throw new Error('payload captured before network')
+        }
+      })
+      await stream.result().catch(() => undefined)
+      expect(payload).toBeDefined()
+      return payload!
+    }
+    // Flash vocabulary is MINIMAL | LOW | MEDIUM | HIGH: medium forwards verbatim.
+    expect(await capture('gemini-3.7-flash', 'medium'))
+      .toMatchObject({ config: { thinkingConfig: { includeThoughts: true, thinkingLevel: 'MEDIUM' } } })
+    // Pro only accepts LOW | HIGH: minimal collapses down to LOW.
+    expect(await capture('gemini-3-pro-preview', 'minimal'))
+      .toMatchObject({ config: { thinkingConfig: { thinkingLevel: 'LOW' } } })
+    expect(await capture('gemini-3-pro-preview', 'high'))
+      .toMatchObject({ config: { thinkingConfig: { thinkingLevel: 'HIGH' } } })
+    // off is not a Gemini 3 level: it clamps to the floor instead of disabling thinking.
+    expect(await capture('gemini-3.7-flash', 'off'))
+      .toMatchObject({ config: { thinkingConfig: { thinkingLevel: 'MINIMAL' } } })
+  })
 })

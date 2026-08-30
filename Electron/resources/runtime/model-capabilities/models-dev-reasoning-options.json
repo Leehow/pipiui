@@ -24,6 +24,140 @@
         }
       }
     },
+    "google": {
+      "models": {
+        "gemini-3.7-flash": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Hand-curated against the official Google Gemini 3 thinking contract (ai.google.dev/gemini-api/docs): requests carry generationConfig.thinkingConfig.thinkingLevel with the documented vocabulary MINIMAL | LOW | MEDIUM | HIGH, and Gemini 3 Flash / Flash-Lite cannot fully disable thinking (MINIMAL is the floor). Levels map same-name; off: null keeps an unset level at the provider default instead of forwarding an unsupported off.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"],
+            "result": "Effort vocabulary is documented, not probed: values are taken from the official Gemini 3 API contract, which pi's google-generative-ai adapter forwards verbatim as thinkingConfig.thinkingLevel."
+          }
+        },
+        "gemini-3.5-flash": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Flash thinkingLevel contract as gemini-3.7-flash.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"]
+          }
+        },
+        "gemini-3.6-flash": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Flash thinkingLevel contract as gemini-3.7-flash.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"]
+          }
+        },
+        "gemini-3-flash-preview": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Flash thinkingLevel contract as gemini-3.7-flash.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"]
+          }
+        },
+        "gemini-3.1-flash-lite": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Flash / Flash-Lite thinkingLevel contract as gemini-3.7-flash.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"]
+          }
+        },
+        "gemini-flash-latest": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "minimal",
+            "low": "low",
+            "medium": "medium",
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Flash thinkingLevel contract as gemini-3.7-flash; gemini-flash-latest is the official alias that tracks the newest Flash model.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["minimal", "low", "medium", "high"],
+            "rejectedValues": ["off", "xhigh", "max"]
+          }
+        },
+        "gemini-3-pro-preview": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high"
+          },
+          "verification": {
+            "method": "Hand-curated against the official Google Gemini 3 Pro thinking contract: thinkingLevel accepts only LOW | HIGH on Gemini 3 Pro models, and thinking cannot be fully disabled (LOW is the floor). minimal/medium map to null so they stay unselectable instead of forwarding an invalid value; off: null keeps an unset level at the provider default.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["low", "high"],
+            "rejectedValues": ["off", "minimal", "medium", "xhigh", "max"],
+            "result": "Effort vocabulary is documented, not probed: values are taken from the official Gemini 3 Pro API contract, which pi's google-generative-ai adapter collapses onto LOW | HIGH."
+          }
+        },
+        "gemini-3.1-pro-preview": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high"
+          },
+          "verification": {
+            "method": "Same hand-curated Gemini 3 Pro thinkingLevel contract as gemini-3-pro-preview.",
+            "verifiedAt": "2026-08-30T00:00:00Z",
+            "acceptedValues": ["low", "high"],
+            "rejectedValues": ["off", "minimal", "medium", "xhigh", "max"]
+          }
+        }
+      }
+    },
     "jellytoken": {
       "models": {
         "deepseek-v4-flash": {
