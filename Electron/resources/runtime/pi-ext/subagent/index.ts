@@ -411,6 +411,8 @@ type DispatchStatsTask = {
 	agent: string;
 	task: string;
 	title?: string;
+	/** Whether this dispatch asked to start from a copy of the Boss's conversation. */
+	fork?: boolean;
 };
 
 type DispatchValidatorAction = "nudge" | "enforce";
@@ -666,6 +668,7 @@ function recordSubagentDispatchStats(
 				title: task.title ?? null,
 				brief_chars: task.task.length,
 				brief_items: estimateBriefItems(task.task),
+				fork: task.fork === true,
 			})),
 			...(validator ? { validator } : {}),
 		})}\n`;
@@ -10454,7 +10457,7 @@ export default function (pi: ExtensionAPI) {
 				? params.chain!
 				: hasTasks
 					? params.tasks!
-					: [{ agent: params.agent!, task: params.task!, title: params.title }];
+					: [{ agent: params.agent!, task: params.task!, title: params.title, fork: params.fork }];
 			let dispatchMode: DispatchStatsMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
 			let dispatchNudgePrefix = "";
 			let dispatchValidatorStats: DispatchValidatorStats | null = null;
@@ -10494,7 +10497,7 @@ export default function (pi: ExtensionAPI) {
 					? params.chain!
 					: hasTasks
 						? params.tasks!
-						: [{ agent: params.agent!, task: params.task!, title: params.title }];
+						: [{ agent: params.agent!, task: params.task!, title: params.title, fork: params.fork }];
 				dispatchMode = hasChain ? "chain" : hasTasks ? "tasks" : "single";
 
 				// Shape validator: single / tasks[] only. chain and same-agentId resume are exempt.
