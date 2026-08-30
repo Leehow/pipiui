@@ -36,6 +36,28 @@ const CONFIG_FILE = path.join(AGENT_DIR, "philosophy.json");
 const USER_LAYERS_DIR = path.join(AGENT_DIR, "philosophy-user");
 
 /**
+ * Layer directories contributed by other extensions, path-delimited, set by whoever spawned
+ * this process (the host for the main session, the dispatcher for a worker). An extension that
+ * owns a capability ships the layers that are only true while it is mounted; disable it and its
+ * prose leaves with it, instead of surviving as prose about a tool nobody has.
+ *
+ * Read fresh rather than cached at import: the same reload path that picks up an edited layer
+ * file should pick up a newly mounted extension.
+ */
+const LAYER_DIRS_ENV = "PIPI_PHILOSOPHY_LAYER_DIRS";
+
+function extensionLayerDirs(): string[] {
+  const raw = process.env[LAYER_DIRS_ENV];
+  if (!raw) return [];
+  const seen = new Set<string>();
+  for (const entry of raw.split(path.delimiter)) {
+    const dir = entry.trim();
+    if (dir) seen.add(dir);
+  }
+  return [...seen];
+}
+
+/**
  * Idempotence marker. pi treats duplicate *tools* as a hard failure but says nothing about a
  * duplicate extension, so a copy reached both through `packages` and through an explicit `-e`
  * would silently append the whole philosophy twice. The marker makes the second pass a no-op.
@@ -122,7 +144,7 @@ function readLayerDir(dir: string, source: "bundled" | "user"): Layer[] {
 /** Signature of everything on disk, so an edited layer needs no session restart. */
 function diskSignature(): string {
   const parts: string[] = [];
-  for (const dir of [path.join(PACKAGE_DIR, "layers"), USER_LAYERS_DIR]) {
+  for (const dir of [path.join(PACKAGE_DIR, "layers"), ...extensionLayerDirs(), USER_LAYERS_DIR]) {
     let names: string[];
     try {
       names = fs.readdirSync(dir).sort();
@@ -152,6 +174,7 @@ function loadLayers(): { layers: Layer[]; capabilities: CapabilityTable } {
     cachedCapabilities = readCapabilities();
     cachedLayers = mergeLayers(
       readLayerDir(path.join(PACKAGE_DIR, "layers"), "bundled"),
+      ...extensionLayerDirs().map((dir) => readLayerDir(dir, "extension")),
       readLayerDir(USER_LAYERS_DIR, "user"),
     );
     cachedSignature = signature;

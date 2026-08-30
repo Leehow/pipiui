@@ -26,14 +26,26 @@ const capabilities = JSON.parse(readFileSync(join(ROOT, "capabilities.json"), "u
 const ALL_TOOLS = Object.values(capabilities.capabilities).map((c) => c.tool);
 const SCOPED_MODEL = "deepseek/deepseek-v4-flash";
 
-const layers: Layer[] = readdirSync(join(ROOT, "layers"))
-  .filter((name) => name.endsWith(".md"))
-  .sort()
-  .map((name) => {
-    const parsed = parseLayer(readFileSync(join(ROOT, "layers", name), "utf8"), name);
-    if (!parsed.ok) throw new Error(parsed.error);
-    return parsed.layer;
-  });
+/*
+ * Layers now come from two owners, and this test composes what a real session composes.
+ * `pi-philosophy` keeps the cross-cutting layers — the ones true whatever is mounted — while
+ * the subagent extension ships the three that are only true while it is: orchestration,
+ * fanout and nested-dispatch all declare a delegate capability or depend on one that does.
+ * Reading only the philosophy directory here would silently stop testing them.
+ */
+const LAYER_DIRS = [
+  join(ROOT, "layers"),
+  join(ROOT, "..", "pi-ext", "subagent", "layers"),
+];
+const layers: Layer[] = LAYER_DIRS.flatMap((dir) =>
+  readdirSync(dir)
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => {
+      const parsed = parseLayer(readFileSync(join(dir, name), "utf8"), name);
+      if (!parsed.ok) throw new Error(parsed.error);
+      return parsed.layer;
+    }),
+).sort((a, b) => a.file.localeCompare(b.file));
 
 const config = () => structuredClone(DEFAULT_CONFIG);
 const compose = (overrides: Partial<Parameters<typeof composePhilosophy>[0]> = {}) =>

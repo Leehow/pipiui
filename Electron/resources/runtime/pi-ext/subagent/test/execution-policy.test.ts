@@ -611,11 +611,11 @@ test("philosophy layers gate the final closeout, not all progress speech", () =>
 	// Same family, injected into the Boss system prompt via pi-philosophy: the layers used to
 	// say "do not give the user a progress update, partial conclusion, or summary" outright.
 	const orchestration = readFileSync(
-		new URL("../../../pi-philosophy/layers/30-orchestration.md", import.meta.url),
+		new URL("../layers/30-orchestration.md", import.meta.url),
 		"utf8",
 	);
 	const fanout = readFileSync(
-		new URL("../../../pi-philosophy/layers/40-fanout.md", import.meta.url),
+		new URL("../layers/40-fanout.md", import.meta.url),
 		"utf8",
 	);
 	// The prohibitive wording must not come back in EITHER layer — that is the regression, and

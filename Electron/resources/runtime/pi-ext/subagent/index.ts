@@ -753,6 +753,14 @@ const PIPIUI_AGENT_ROLE = process.env.PIPIUI_AGENT_ROLE;
 const PIPIUI_MAX_DEPTH = resolveSubagentMaxDepth(process.env.PIPIUI_AGENT_MAX_DEPTH);
 // App 注入的补丁版 subagent 扩展目录；嵌套 spawn 时再传 `-e`，保持上报/护栏一致
 const PIPIUI_SUBAGENT_EXT = process.env.PIPIUI_SUBAGENT_EXT;
+
+/**
+ * This extension's own directory. It owns the orchestration / fan-out / nested-dispatch
+ * philosophy layers as well as the dispatch tools, so a spawned child has to be told where
+ * that `layers/` directory is. Derived from `import.meta.url` rather than the env var above,
+ * which is absent for a nested worker whose parent was itself a child.
+ */
+const SUBAGENT_EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
 // Managed pi-web-access supplies web_search, fetch_content, source_check, and
@@ -7497,6 +7505,11 @@ async function runSingleAgent(
 					// craft rules to whoever writes code, research rules to whoever investigates.
 					// Without it every dispatched agent looks alike and only role-wide layers land.
 					PIPI_PHILOSOPHY_AGENT: agentName,
+					// This extension owns the orchestration / fan-out / nested-dispatch layers,
+					// so a child that loads the philosophy has to be pointed at them too — the
+					// nested-dispatch layer is scoped to `general-purpose` and reaches nobody
+					// if only the main session is told where the directory is.
+					PIPI_PHILOSOPHY_LAYER_DIRS: path.join(SUBAGENT_EXT_DIR, "layers"),
 					...(mainModelForChild ? { PIPIUI_MAIN_MODEL: mainModelForChild } : {}),
 					// Automatic skill catalog stays off; explicit skill_search/skill_load may still mount.
 					// An agent that asks for it (`block-skill-reads: true`) also cannot read SKILL.md at all.

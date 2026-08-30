@@ -130,7 +130,7 @@ export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:strin
  * a reason to crash the worker"). Dispatch, worktree creation and finalization are all decided by
  * env, not by the bridge — so a bridge-less host still gets real workers, just no live panel.
  */
-if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBAGENT_EXT=p.subagentDir;env.PIPIUI_MAIN_CWD=input.cwd;
+if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBAGENT_EXT=p.subagentDir;env.PIPI_PHILOSOPHY_LAYER_DIRS=join(p.subagentDir,"layers");env.PIPIUI_MAIN_CWD=input.cwd;
 // This host does not directly finalize Git worktrees. Electron hands merge/cleanup/disposition
 // to the audited service in pi so
 // exactly one finalizer ever runs against a repository.

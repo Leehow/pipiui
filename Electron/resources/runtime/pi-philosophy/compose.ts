@@ -74,7 +74,7 @@ export interface Layer {
   body: string;
   /** Where it came from; user layers shadow bundled ones with the same id. */
   file: string;
-  source: "bundled" | "user";
+  source: "bundled" | "extension" | "user";
 }
 
 export interface PhilosophyConfig {
@@ -151,7 +151,7 @@ export type ParseResult = { ok: true; layer: Layer } | { ok: false; error: strin
 export function parseLayer(
   text: string,
   file: string,
-  source: "bundled" | "user" = "bundled",
+  source: "bundled" | "extension" | "user" = "bundled",
 ): ParseResult {
   const match = text.match(FRONTMATTER);
   if (!match) return { ok: false, error: `${file}: missing frontmatter` };
@@ -269,11 +269,21 @@ export function modelMatches(model: string, pattern: string): boolean {
   return p.endsWith("*") ? m.startsWith(p.slice(0, -1)) : m === p;
 }
 
-/** User layers shadow bundled layers with the same id; that is how a user edits a philosophy. */
-export function mergeLayers(bundled: Layer[], user: Layer[]): Layer[] {
+/**
+ * Later groups shadow earlier ones by id. The call order is the precedence order, and it is
+ * bundled < extension < user: a capability-owning extension may ship the layer that describes
+ * its own capability, and a user edit still overrides whatever shipped it.
+ *
+ * Extension-owned layers exist because the alternative had already cost a real defect. The
+ * orchestration prose lived here while the tool it describes lived in the subagent extension,
+ * so nobody owned "does the Boss know it can dispatch?" end to end — and it shipped without a
+ * promptSnippet, invisible in the model's tool list, for as long as it took someone to measure
+ * zero dispatches. A layer whose frontmatter says `requires-capabilities: [delegate]` is
+ * already declaring which extension owns it; this lets it live there.
+ */
+export function mergeLayers(...groups: Layer[][]): Layer[] {
   const byId = new Map<string, Layer>();
-  for (const layer of bundled) byId.set(layer.id, layer);
-  for (const layer of user) byId.set(layer.id, layer);
+  for (const group of groups) for (const layer of group) byId.set(layer.id, layer);
   return [...byId.values()];
 }
 
