@@ -5,7 +5,18 @@ import { fileURLToPath } from "node:url";
 import { inspectPdfWithOfficial, indicatesOcr, } from "./pdf-inspector-local.js";
 import { callPaddleocrVl } from "./paddleocr-mcp-client.js";
 export const FIRECRAWL_PDF_TOOL = "pipiui_firecrawl_pdf";
-export const MAX_PDF_BYTES = 50 * 1024 * 1024;
+export const MAX_PDF_BYTES = 128 * 1024 * 1024;
+export const MAX_PDF_MB_LABEL = `${Math.floor(MAX_PDF_BYTES / (1024 * 1024))}MB`;
+const PDF_READ_CHUNK_BYTES = 1024 * 1024;
+function pdfOversizeError(scope, detail) {
+    return `${scope} PDF 超过 ${MAX_PDF_MB_LABEL} 上限（${detail}）`;
+}
+/** Test seam: lower the byte cap without raising it past the public 128 MiB limit. */
+function pdfByteLimit(maxBytes) {
+    if (typeof maxBytes !== "number" || !Number.isFinite(maxBytes) || maxBytes <= 0)
+        return MAX_PDF_BYTES;
+    return Math.min(Math.floor(maxBytes), MAX_PDF_BYTES);
+}
 export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 300_000;
 export const MIN_PAGES = 1;
@@ -130,12 +141,13 @@ export function resolvePdfSource(raw) {
 export async function readLocalPdfBytes(path, io) {
     const statFn = io?.stat ?? stat;
     const openFn = io?.open ?? open;
+    const limit = pdfByteLimit(io?.maxBytes);
     try {
         const info = await statFn(path);
         if (!info.isFile())
             return { ok: false, error: "路径不是普通 PDF 文件" };
-        if (info.size > MAX_PDF_BYTES)
-            return { ok: false, error: `本地 PDF 超过 50MB 上限（${info.size} 字节）` };
+        if (info.size > limit)
+            return { ok: false, error: pdfOversizeError("本地", `${info.size} 字节`) };
     }
     catch (error) {
         const code = error.code;
@@ -148,11 +160,19 @@ export async function readLocalPdfBytes(path, io) {
     let handle;
     try {
         handle = await openFn(path, "r");
-        const buf = Buffer.alloc(MAX_PDF_BYTES + 1);
-        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-        if (bytesRead > MAX_PDF_BYTES)
-            return { ok: false, error: `本地 PDF 超过 50MB 上限（读取后 ${bytesRead} 字节）` };
-        const bytes = Buffer.from(buf.subarray(0, bytesRead));
+        const chunks = [];
+        let total = 0;
+        while (total <= limit) {
+            const chunk = Buffer.allocUnsafe(Math.min(PDF_READ_CHUNK_BYTES, limit + 1 - total));
+            const { bytesRead } = await handle.read(chunk, 0, chunk.length, total);
+            if (bytesRead === 0)
+                break;
+            total += bytesRead;
+            if (total > limit)
+                return { ok: false, error: pdfOversizeError("本地", `读取后 ${total} 字节`) };
+            chunks.push(chunk.subarray(0, bytesRead));
+        }
+        const bytes = Buffer.concat(chunks, total);
         if (!isPdfMagic(bytes))
             return { ok: false, error: "文件不是有效的 PDF（缺少 %PDF- 头）" };
         return { ok: true, bytes };
@@ -169,6 +189,7 @@ export async function readLocalPdfBytes(path, io) {
 }
 export async function downloadPdfBytes(options) {
     const fetchImpl = options.fetchImpl ?? fetch;
+    const limit = pdfByteLimit(options.maxBytes);
     let response;
     try {
         response = await fetchImpl(options.url, {
@@ -188,8 +209,8 @@ export async function downloadPdfBytes(options) {
     if (!/^https?:\/\//i.test(finalUrl))
         return { ok: false, error: "下载被重定向到非 http/https 地址" };
     const declared = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declared) && declared > MAX_PDF_BYTES) {
-        return { ok: false, error: `远程 PDF 超过 50MB 上限（Content-Length ${declared}）` };
+    if (Number.isFinite(declared) && declared > limit) {
+        return { ok: false, error: pdfOversizeError("远程", `Content-Length ${declared}`) };
     }
     const reader = response.body?.getReader();
     const chunks = [];
@@ -202,17 +223,17 @@ export async function downloadPdfBytes(options) {
             if (!value)
                 continue;
             total += value.byteLength;
-            if (total > MAX_PDF_BYTES) {
+            if (total > limit) {
                 await reader.cancel().catch(() => undefined);
-                return { ok: false, error: `远程 PDF 超过 50MB 上限（下载中 ${total} 字节）` };
+                return { ok: false, error: pdfOversizeError("远程", `下载中 ${total} 字节`) };
             }
             chunks.push(value);
         }
     }
     else {
         const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.length > MAX_PDF_BYTES)
-            return { ok: false, error: `远程 PDF 超过 50MB 上限（${buffer.length} 字节）` };
+        if (buffer.length > limit)
+            return { ok: false, error: pdfOversizeError("远程", `${buffer.length} 字节`) };
         chunks.push(buffer);
         total = buffer.length;
     }

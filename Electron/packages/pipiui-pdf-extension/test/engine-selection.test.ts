@@ -7,6 +7,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   MAX_PAGES,
   MAX_PDF_BYTES,
+  MAX_PDF_MB_LABEL,
   MAX_TIMEOUT_MS,
   MIN_PAGES,
   executeFirecrawlPdf,
@@ -111,11 +112,45 @@ describe("parameter and size bounds", () => {
   it("rejects an oversized local PDF before reading it and refuses non-file paths", async () => {
     const huge = (async () => ({ isFile: () => true, size: MAX_PDF_BYTES + 1 })) as never;
     expect(await readLocalPdfBytes("/somewhere/big.pdf", { stat: huge }))
-      .toMatchObject({ ok: false, error: expect.stringContaining("50MB 上限") });
+      .toMatchObject({ ok: false, error: expect.stringContaining(`${MAX_PDF_MB_LABEL} 上限`) });
 
     const directory = (async () => ({ isFile: () => false, size: 12 })) as never;
     expect(await readLocalPdfBytes("/somewhere/dir", { stat: directory }))
       .toMatchObject({ ok: false, error: expect.stringContaining("普通 PDF 文件") });
+  });
+
+  it("rejects a local growth race across successive bounded reads and closes the handle", async () => {
+    const limit = 32;
+    const requested: number[] = [];
+    const reads: number[] = [];
+    let closed = 0;
+    const grown = Buffer.alloc(limit + 16, 0x61);
+    const small = (async () => ({ isFile: () => true, size: 20 })) as never;
+    const handle = {
+      read: async (buf: Buffer, offset = 0, length = buf.length, position = 0) => {
+        requested.push(length);
+        const n = Math.min(length, buf.length - offset, grown.length - position, 16);
+        const bytesRead = Math.max(0, n);
+        if (bytesRead > 0) grown.copy(buf, offset, position, position + bytesRead);
+        reads.push(bytesRead);
+        return { bytesRead };
+      },
+      close: async () => {
+        closed += 1;
+      },
+    };
+    const result = await readLocalPdfBytes("/somewhere/grew.pdf", {
+      stat: small,
+      open: (async () => handle) as never,
+      maxBytes: limit,
+    });
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining(`${MAX_PDF_MB_LABEL} 上限`) });
+    if (!result.ok) expect(result.error).toMatch(/读取后 \d+ 字节/);
+    expect(reads.length).toBeGreaterThanOrEqual(2);
+    expect(reads.every((n, i) => n <= requested[i]!)).toBe(true);
+    expect(reads.reduce((a, b) => a + b, 0)).toBeGreaterThan(limit);
+    expect(requested.every((n) => n > 0 && n <= limit + 1)).toBe(true);
+    expect(closed).toBe(1);
   });
 });
 

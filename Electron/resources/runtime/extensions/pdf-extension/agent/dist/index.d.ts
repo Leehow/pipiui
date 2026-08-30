@@ -3,6 +3,7 @@ import { open, stat } from "node:fs/promises";
 import { type LocalInspectResult } from "./pdf-inspector-local.js";
 export declare const FIRECRAWL_PDF_TOOL = "pipiui_firecrawl_pdf";
 export declare const MAX_PDF_BYTES: number;
+export declare const MAX_PDF_MB_LABEL: string;
 export declare const DEFAULT_TIMEOUT_MS = 30000;
 export declare const MAX_TIMEOUT_MS = 300000;
 export declare const MIN_PAGES = 1;
@@ -59,6 +60,7 @@ export declare function resolvePdfSource(raw: string): ResolvedPdfSource | {
 export declare function readLocalPdfBytes(path: string, io?: {
     stat?: typeof stat;
     open?: typeof open;
+    maxBytes?: number;
 }): Promise<{
     ok: true;
     bytes: Buffer;
@@ -70,6 +72,7 @@ export declare function downloadPdfBytes(options: {
     url: string;
     timeout: number;
     fetchImpl?: typeof fetch;
+    maxBytes?: number;
 }): Promise<{
     ok: true;
     bytes: Buffer;

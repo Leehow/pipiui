@@ -358,6 +358,20 @@ export {
 
 const MAX_TEXT_DOCUMENT_BYTES = 2 * 1024 * 1024;
 const MAX_BINARY_DOCUMENT_BYTES = 50 * 1024 * 1024;
+const MAX_PDF_DOCUMENT_BYTES = 128 * 1024 * 1024;
+
+function documentReadLimit(kind: NonNullable<ReturnType<typeof documentKindForName>>): number {
+  if (kind === "markdown" || kind === "plain") return MAX_TEXT_DOCUMENT_BYTES;
+  if (kind === "pdf") return MAX_PDF_DOCUMENT_BYTES;
+  return MAX_BINARY_DOCUMENT_BYTES;
+}
+
+function documentTooLargeMessage(kind: NonNullable<ReturnType<typeof documentKindForName>>, size: number, limit: number): string {
+  if (kind === "pdf") {
+    return `PDF 超过 ${Math.floor(limit / (1024 * 1024))}MB 上限（${size} 字节）`;
+  }
+  return `Document is too large (maximum ${limit} bytes)`;
+}
 export class DocumentReadError extends Error {
   constructor(readonly code: DocumentErrorCode, message: string) {
     super(message);
@@ -369,7 +383,11 @@ function documentError(code: DocumentErrorCode, message: string): DocumentReadEr
   return new DocumentReadError(code, message);
 }
 
-async function readBoundedFile(handle: Awaited<ReturnType<typeof fs.open>>, limit: number): Promise<Buffer> {
+async function readBoundedFile(
+  handle: Awaited<ReturnType<typeof fs.open>>,
+  limit: number,
+  tooLargeMessage: (size: number) => string,
+): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let total = 0;
   while (total <= limit) {
@@ -379,7 +397,7 @@ async function readBoundedFile(handle: Awaited<ReturnType<typeof fs.open>>, limi
     chunks.push(chunk.subarray(0, bytesRead));
     total += bytesRead;
   }
-  if (total > limit) throw documentError("document_too_large", `Document is too large (maximum ${limit} bytes)`);
+  if (total > limit) throw documentError("document_too_large", tooLargeMessage(total));
   return Buffer.concat(chunks, total);
 }
 
@@ -391,7 +409,8 @@ export async function readLocalDocument(input: unknown): Promise<DocumentContent
   const kind = documentKindForName(extname(path));
   if (!kind)
     throw documentError("document_unsupported_type", "unsupported document type");
-  const limit = kind === "markdown" || kind === "plain" ? MAX_TEXT_DOCUMENT_BYTES : MAX_BINARY_DOCUMENT_BYTES;
+  const limit = documentReadLimit(kind);
+  const tooLarge = (size: number) => documentTooLargeMessage(kind, size, limit);
 
   let handle: Awaited<ReturnType<typeof fs.open>>;
   try {
@@ -404,11 +423,11 @@ export async function readLocalDocument(input: unknown): Promise<DocumentContent
     const stat = await handle.stat();
     if (!stat.isFile()) throw documentError("document_not_file", `Document is not a regular file: ${path}`);
     if (stat.size > limit)
-      throw documentError("document_too_large", `Document is too large (maximum ${limit} bytes)`);
+      throw documentError("document_too_large", tooLarge(stat.size));
 
     // Read through the validated handle in bounded chunks. The cap+1 probe also
     // catches a file that grows between stat and read without a large up-front allocation.
-    const buffer = await readBoundedFile(handle, limit);
+    const buffer = await readBoundedFile(handle, limit, tooLarge);
     const summary = {
       id: path,
       name: basename(path),

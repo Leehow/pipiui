@@ -5,6 +5,7 @@ import { join } from "node:path";
 import firecrawlPdf, {
   FIRECRAWL_PDF_TOOL,
   MAX_PDF_BYTES,
+  MAX_PDF_MB_LABEL,
   OCR_MODE_NEEDS_KEY,
   OCR_SKIPPED_NOTE,
   downloadPdfBytes,
@@ -180,7 +181,7 @@ describe("pipiui_firecrawl_pdf tool contract", () => {
       fetchImpl: (async () => new Response("x", { status: 200, headers: { "content-length": String(MAX_PDF_BYTES + 1) } })) as never,
     });
     expect(tooBig.ok).toBe(false);
-    if (!tooBig.ok) expect(tooBig.error).toContain("50MB");
+    if (!tooBig.ok) expect(tooBig.error).toContain(MAX_PDF_MB_LABEL);
 
     const notPdf = await downloadPdfBytes({
       url: "https://example.com/page",
@@ -197,6 +198,37 @@ describe("pipiui_firecrawl_pdf tool contract", () => {
     });
     expect(badStatus.ok).toBe(false);
     if (!badStatus.ok) expect(badStatus.error).toContain("404");
+  });
+
+  it("cancels a remote stream when successive chunks cross a lying Content-Length", async () => {
+    const limit = 32;
+    let cancelled = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(20).fill(0x61));
+        controller.enqueue(new Uint8Array(20).fill(0x62));
+        controller.enqueue(new Uint8Array(20).fill(0x63));
+      },
+      cancel() {
+        cancelled += 1;
+      },
+    });
+    const result = await downloadPdfBytes({
+      url: "https://example.com/grew.pdf",
+      timeout: 1000,
+      maxBytes: limit,
+      fetchImpl: (async () =>
+        new Response(stream, {
+          status: 200,
+          headers: { "content-length": "12" },
+        })) as never,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toContain(MAX_PDF_MB_LABEL);
+      expect(result.error).toMatch(/下载中 \d+ 字节/);
+    }
+    expect(cancelled).toBe(1);
   });
 
   it("validates local sources before touching them", async () => {

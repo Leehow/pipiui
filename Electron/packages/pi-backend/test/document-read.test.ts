@@ -76,11 +76,14 @@ describe("explicit local document reads", () => {
     const unsupported = join(root, "notes.js");
     const oversized = join(root, "large.md");
     const oversizedPdf = join(root, "large.pdf");
+    const oversizedOffice = join(root, "large.docx");
     await mkdir(directory);
     await writeFile(unsupported, "plain");
     await writeFile(oversized, Buffer.alloc(2 * 1024 * 1024 + 1));
     await writeFile(oversizedPdf, "");
-    await truncate(oversizedPdf, 50 * 1024 * 1024 + 1);
+    await truncate(oversizedPdf, 128 * 1024 * 1024 + 1);
+    await writeFile(oversizedOffice, "");
+    await truncate(oversizedOffice, 50 * 1024 * 1024 + 1);
 
     await expect(backend.handle("readDocument", [""])).rejects.toMatchObject({ code: "document_invalid_path" });
     await expect(backend.handle("readDocument", ["relative.md"])).rejects.toMatchObject({ code: "document_invalid_path" });
@@ -88,7 +91,31 @@ describe("explicit local document reads", () => {
     await expect(backend.handle("readDocument", [directory])).rejects.toMatchObject({ code: "document_not_file" });
     await expect(backend.handle("readDocument", [join(root, "missing.md")])).rejects.toMatchObject({ code: "document_not_found" });
     await expect(backend.handle("readDocument", [oversized])).rejects.toMatchObject({ code: "document_too_large" });
-    await expect(backend.handle("readDocument", [oversizedPdf])).rejects.toMatchObject({ code: "document_too_large" });
+    await expect(backend.handle("readDocument", [oversizedOffice])).rejects.toMatchObject({ code: "document_too_large" });
+    await expect(backend.handle("readDocument", [oversizedPdf])).rejects.toMatchObject({
+      code: "document_too_large",
+      message: expect.stringContaining("128MB"),
+    });
+    await backend.close();
+  });
+
+  it("accepts a 53,099,883-byte PDF while still rejecting PDF above 128 MiB before reading", async () => {
+    const backend = await fixture();
+    const keeperClassPdf = join(root, "keeper.pdf");
+    await writeFile(keeperClassPdf, "%PDF-1.4\n");
+    await truncate(keeperClassPdf, 53_099_883);
+    const accepted = await backend.handle("readDocument", [keeperClassPdf]) as { kind: string; size: number; bytes: Uint8Array };
+    expect(accepted).toMatchObject({ kind: "pdf", size: 53_099_883 });
+    expect(accepted.bytes).toBeInstanceOf(Uint8Array);
+    expect(accepted.bytes.byteLength).toBe(53_099_883);
+
+    const tooBigPdf = join(root, "over-128.pdf");
+    await writeFile(tooBigPdf, "%PDF-1.4\n");
+    await truncate(tooBigPdf, 128 * 1024 * 1024 + 1);
+    await expect(backend.handle("readDocument", [tooBigPdf])).rejects.toMatchObject({
+      code: "document_too_large",
+      message: expect.stringMatching(/128MB/),
+    });
     await backend.close();
   });
 
