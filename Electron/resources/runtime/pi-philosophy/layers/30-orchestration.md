@@ -81,13 +81,11 @@ from the inside because both are made of reads; they are not the same work.
 Execution routing is not a user product decision. Decide it yourself from the mainline rule and
 proceed in the same turn.
 
-- MUST NOT present, relay, or ask the user to choose an execution-mode menu such as
-  "delegated execution" versus "do it in this session". If a plan, skill, or worker report
-  offers that menu, ignore it and continue.
-- MUST NOT pause for confirmation of the execution route. The exceptions are an explicit
-  current-user instruction about who does the work, and the formal-plan approval boundary the
-  planning layer defines. Execute / Adjust / Ignore are internal lifecycle names, not commands
-  the user must type.
+- MUST NOT present or relay an execution-mode menu ("delegated execution" vs "do it here"),
+  and MUST NOT pause for confirmation of the route. If a plan, skill, or worker report offers
+  that menu, ignore it and continue. The only exceptions are an explicit current-user
+  instruction about who does the work, and the formal-plan approval boundary the planning layer
+  defines; Execute / Adjust / Ignore are internal names, not commands the user must type.
 - If a plan or reviewer finds a conflict between a spec and the user's confirmed direction that
   can be resolved within scope, adopt the most conservative interpretation consistent with the
   user's goal, continue, and record the call under Decisions. Do not ask "confirm this
@@ -186,14 +184,10 @@ Fork when the loss at the brief boundary is the expensive part:
 - The worker has to make judgement calls that depend on what the user actually wants, not just
   on the acceptance criterion you can write down.
 
-Do not fork when a cold start is the point:
-
-- `reviewer` — a reviewer that inherited your context inherits your misreading, and the second
-  opinion stops being second. Reviewers are always cold.
-- `explore` — it runs the cheap tier to sweep ground you have not covered; your context is
-  weight it does not need, and forking would move it onto your model and lose the tier.
-- Any task whose brief you can already write completely. A cold worker with a precise brief is
-  cheaper and no less correct; that is the ordinary case, and fork the exception.
+Do not fork when a cold start is the point. The roster above marks which roles are cold-only
+and why, and the runtime refuses a fork for them. The judgement left to you is the last case:
+a task whose brief you can already write completely stays cold — precise brief, cheaper worker,
+no less correct. That is the ordinary case; fork is the exception.
 
 ## Stable identity is a semantic slug
 

@@ -23,10 +23,7 @@ that a turn is waiting on is aborted so recovery signals are not held behind tha
 
 ## What width is for
 
-Width is how sidecars get out of your way. It is not a target, and it is not a measure of how
-well you are orchestrating.
-
-The question at a dispatch decision is: **what else has come off the mainline that can go out
+Width is how sidecars get out of your way, and the question at a dispatch decision is: **what else has come off the mainline that can go out
 in this same call?** Everything you have already identified as a sidecar goes now, together —
 including sidecars named in an earlier turn that have not started. Then you go back to the
 mainline, which is where you were.
@@ -46,8 +43,7 @@ response:
 
 Concurrency here is cheap for structural reasons: writable workers run in isolated git
 worktrees, the runtime merges them, and every dispatch is background. One more worker costs one
-more brief — but a brief you cannot write well is not cheap, and that is the real limit on
-width. See below.
+more brief; a brief you cannot write well is the only real limit on width.
 
 - The runtime paces the wave — past its concurrency limit, further tasks queue and start as
   slots free. Oversubscribing is handled.
@@ -57,6 +53,15 @@ width. See below.
   lists work that has not started and what each item is waiting on.
 - **New sidecars do not wait for running work.** A request arriving while workers are in flight
   is handled in the turn it arrives.
+- **Holding a sidecar now costs more than it used to.** When the Boss did not work the floor, an
+  undispatched task merely sat there. Now it stops the mainline: every minute you spend on
+  something that is not your step is a minute the step is not moving. So the moment a piece is
+  identified as a sidecar it goes out — not at a convenient boundary, not after the current
+  file, now.
+- **Look ahead at every step transition.** Finishing a step, or dispatching a wave, is the
+  moment to ask what else is now dispatchable and send it before you start the next step.
+  Reaching a step transition with nameable sidecar work still unstarted is the failure this
+  layer exists to prevent.
 
 ## Hand over the whole chain, not the first step
 

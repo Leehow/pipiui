@@ -451,8 +451,26 @@ describe("vendored philosophy: delivery", () => {
     //      81 read/grep calls, 1 retrieval call, 0 dispatches — the Boss hand-searched the repo
     //      at its own prices for 22 turns. The countable 8-call trigger and the index-before-
     //      matcher line are that regression's fix, and they are worth more than they cost.
+    // Raised to 20200 for the dispatch-density rules in `fanout`. The mainline rewrite deleted
+    // "Look ahead after every dispatch — idle boss time while nameable work sits unstarted is
+    // the most expensive thing in this system", on the reasoning that a Boss holding the
+    // mainline is never idle. The reasoning was right and the deletion was wrong: it removed
+    // the pressure without replacing it, and dispatches went from ~15 per session to zero.
+    // The replacement inverts it correctly — a Boss that works the mainline makes holding a
+    // sidecar *more* expensive, not less, because the sidecar now stops the step rather than
+    // sitting beside an idle Boss. Measured baseline for what this protects: 1155 dispatches
+    // over 7 days, 97% of them single-task, i.e. the product's signature is dispatch density
+    // and non-blocking throughput, not wave width. Six compression rounds paid for everything
+    // up to 20000; the last 200 is bought outright rather than by deleting the rule this
+    // ledger exists to justify.
+    // Raised to 25000 (user's call, 2026-08-30) to stop this ledger governing the work. Six
+    // compression rounds in one session had started trading rules with named regression
+    // histories for a few hundred tokens, which is the wrong optimisation: a re-derived rule
+    // costs a shipped defect, and the prefix is a fraction of any real turn. The cap keeps its
+    // original job — noticing unbounded growth — at a level where it no longer decides content.
+    // Current composed prefix ~20040, so this is headroom, not a budget to spend.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(20000);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(25000);
   });
 
   it("delivers the semantic-slug identity rule into the composed boss prompt", () => {
