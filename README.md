@@ -4,8 +4,8 @@ pi coding agent 的图形界面，Electron 实现，支持 macOS 14+ 与 Linux a
 
 ### 下载
 
-- **macOS**：[PipiUI-Electron-latest.zip](https://pipi.aichattrpg.com/downloads/PipiUI-Electron-latest.zip)
-- **Linux**：[PipiUI-Electron-linux-latest.deb](https://pipi.aichattrpg.com/downloads/PipiUI-Electron-linux-latest.deb)
+- **macOS**：[PipiUI-latest.zip](https://pipi.aichattrpg.com/downloads/PipiUI-latest.zip)
+- **Linux**：[PipiUI-linux-latest.deb](https://pipi.aichattrpg.com/downloads/PipiUI-linux-latest.deb)
 
 官网：[https://pipi.aichattrpg.com/](https://pipi.aichattrpg.com/)
 
@@ -103,7 +103,7 @@ Anthropic 白名单模型会把 `computer` 替换为官方 typed tool `computer_
 
 ## 构建运行
 
-**宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建 `build/PipiUI Electron.app`；其他 worktree 只能跑 Electron 工作区 build/test，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。
+**宪章（强制）：只有主工作区 `/Users/haoli/leehow/code/pipiui` 能创建 `build/PipiUI.app`；其他 worktree 只能跑 Electron 工作区 build/test，不能打包 App。** 详见 [`CONSTITUTION.md`](./CONSTITUTION.md)；agent 入口见 [`AGENTS.md`](./AGENTS.md)。
 
 打包一律走 `pipiui-electron-build` skill：
 

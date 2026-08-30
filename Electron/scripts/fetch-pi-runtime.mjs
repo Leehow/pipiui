@@ -338,7 +338,7 @@ async function inspectRuntime(root, expected) {
     const text = head.toString('utf8')
     const isShim = text.startsWith('#!') || text.startsWith('@echo')
     if (expected.platform === 'darwin' && isShim) {
-      return { ok: false, reason: 'embedded Node is the Electron shim; darwin needs a standalone Node so Gatekeeper does not re-scan PipiUI Electron.app' }
+      return { ok: false, reason: 'embedded Node is the Electron shim; darwin needs a standalone Node so Gatekeeper does not re-scan PipiUI.app' }
     }
     if (expected.platform !== 'darwin' && !isShim) {
       return { ok: false, reason: 'embedded Node is a standalone binary, not the Electron shim (prepared before the shim existed)' }

@@ -153,7 +153,7 @@ function createWindow(
 
 // Electron's package exports no runtime app object under Vitest; keep IPC registration importable.
 if (app) {
-  // productName stays "PipiUI Electron" so the artifact folder does not collide
+  // productName stays "PipiUI" so the artifact folder does not collide
   // with the frozen Swift app. Override the process name so Dock / About / menus
   // show PipiUI. setName also changes the default userData folder, so pin it
   // back to the historical Electron profile immediately.
@@ -179,7 +179,7 @@ if (app) {
           }).catch(error => appendFileSync(browserDebugPath, `${JSON.stringify({ timestamp: Date.now(), stage: 'capture:error', error: String(error) })}\n`))
         })
       }
-      // The default UA advertises "PipiUI Electron/… Electron/…" tokens; some sites
+      // The default UA advertises "PipiUI/… Electron/…" tokens; some sites
       // (e.g. DuckDuckGo's HTML search endpoint) answer such framework UAs with
       // bot-challenge pages instead of content. Keep the standard Chrome tokens only.
       view.webContents.session.setUserAgent(

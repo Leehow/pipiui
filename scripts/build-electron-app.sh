@@ -1,9 +1,9 @@
 #!/bin/bash
-# Build PipiUI Electron packages.
+# Build PipiUI packages.
 # Usage: scripts/build-electron-app.sh [mac|mac --stage-only|win|linux|--check-signing]   (default: mac)
-#   mac   → dmg + zip (x64 + arm64) + canonical single artifact build/PipiUI Electron.app
-#   mac --stage-only → stage the container build/PipiUI Electron.release-staged/
-#                      (verified arm64 PipiUI Electron.app + receipt.json) without
+#   mac   → dmg + zip (x64 + arm64) + canonical single artifact build/PipiUI.app
+#   mac --stage-only → stage the container build/PipiUI.release-staged/
+#                      (verified arm64 PipiUI.app + receipt.json) without
 #                      touching the canonical App; see publish_release_staged below.
 #   win   → NSIS installer (x64) — cross-built on any host (no .app produced)
 #   linux → AppImage + deb (x64) — cross-built on any host (no .app produced)
@@ -70,7 +70,7 @@ MAC_INHERIT_ENTITLEMENTS="${PIPIUI_ELECTRON_INHERIT_ENTITLEMENTS:-$MAC_ENTITLEME
 expected_mac_bundle_is_complete() {
   local app="$1"
   [[ -d "$app" ]] \
-    && [[ -x "$app/Contents/MacOS/PipiUI Electron" ]] \
+    && [[ -x "$app/Contents/MacOS/PipiUI" ]] \
     && [[ -d "$app/Contents/Frameworks/Electron Framework.framework" ]] \
     && [[ -x "$app/Contents/Resources/cua-driver/cua-driver" ]] \
     && [[ -x "$app/Contents/Resources/pipiui-embedded/node/bin/node" ]] \
@@ -309,7 +309,7 @@ package_mac_arch() {
     arm64) app_subdir="mac-arm64" ;;
     *) echo "ERROR: unsupported mac architecture: $arch" >&2; return 1 ;;
   esac
-  app="$out_dir/$app_subdir/PipiUI Electron.app"
+  app="$out_dir/$app_subdir/PipiUI.app"
   if [[ "${PIPIUI_ELECTRON_PACKAGING_FUNCTION_TEST:-0}" == "1" ]]; then
     # Function-test seam: optionally materialize a complete fake candidate and
     # fake arch-tagged artifacts from a fixture, so the top-level release route
@@ -320,8 +320,8 @@ package_mac_arch() {
       local skip="${PIPIUI_PACKAGING_TEST_SKIP:-}" extra
       mkdir -p "$(dirname "$app")"
       cp -R "$PIPIUI_PACKAGING_TEST_FIXTURE" "$app"
-      [[ "$skip" == *"$arch-dmg"* ]] || printf 'fake %s dmg %s\n' "$arch" "$version" > "$out_dir/PipiUI Electron-$version-$arch.dmg"
-      [[ "$skip" == *"$arch-zip"* ]] || printf 'fake %s zip %s\n' "$arch" "$version" > "$out_dir/PipiUI Electron-$version-$arch.zip"
+      [[ "$skip" == *"$arch-dmg"* ]] || printf 'fake %s dmg %s\n' "$arch" "$version" > "$out_dir/PipiUI-$version-$arch.dmg"
+      [[ "$skip" == *"$arch-zip"* ]] || printf 'fake %s zip %s\n' "$arch" "$version" > "$out_dir/PipiUI-$version-$arch.zip"
       if [[ "$arch" == "arm64" && -n "${PIPIUI_PACKAGING_TEST_EXTRA_ARM64:-}" ]]; then
         for extra in ${PIPIUI_PACKAGING_TEST_EXTRA_ARM64}; do
           printf 'extra %s\n' "$extra" > "$out_dir/$extra"
@@ -529,21 +529,21 @@ extension_manifests_aggregate() {
 # Stage-only step: verify the finished arm64 candidate strictly, gather its
 # cryptographic identity, publish this run's four validated artifacts into
 # build/, and publish candidate+receipt together as one atomic container swap
-# to build/PipiUI Electron.release-staged/ (App + receipt.json). The canonical
+# to build/PipiUI.release-staged/ (App + receipt.json). The canonical
 # App (running or not) is never touched, and a failed run leaves the previous
 # complete container pair intact - a mismatched candidate/receipt pair is
 # never exposed.
 publish_release_staged() {
   local run_root="$1"
-  local app_src="$run_root/arm64/mac-arm64/PipiUI Electron.app"
-  local container_dst="$ROOT/build/PipiUI Electron.release-staged"
+  local app_src="$run_root/arm64/mac-arm64/PipiUI.app"
+  local container_dst="$ROOT/build/PipiUI.release-staged"
   local main_exe office_bin office_receipt_dir office_receipt office_target office_sha office_bytes office_version office_receipt_sha
   local cdhash exe_sha exe_bytes plist_sha bundle_version archs epoch staged_at tmp_container tmp_receipt inventory
   local manifest_identity manifest_agg manifest_count
 
   [[ -d "$app_src" ]] || { echo "ERROR: stage-only: expected the arm64 App at $app_src" >&2; return 1; }
   expected_mac_bundle_is_complete "$app_src" || { echo "ERROR: stage-only: refusing to stage an incomplete Electron bundle: $app_src" >&2; return 1; }
-  main_exe="$app_src/Contents/MacOS/PipiUI Electron"
+  main_exe="$app_src/Contents/MacOS/PipiUI"
   if ! codesign --verify --deep --strict --verbose=2 "$app_src"; then
     echo "ERROR: stage-only: strict codesign verification failed for $app_src" >&2
     return 1
@@ -590,7 +590,7 @@ publish_release_staged() {
   # never a candidate/receipt mismatch.
   tmp_container="$(mktemp -d "$ROOT/build/.release-staged-container.XXXXXX")"
   stage_cleanup_paths+=("$tmp_container")
-  if ! mv "$app_src" "$tmp_container/PipiUI Electron.app"; then
+  if ! mv "$app_src" "$tmp_container/PipiUI.app"; then
     echo "ERROR: stage-only: failed to assemble the staged container" >&2
     return 1
   fi
@@ -604,13 +604,13 @@ publish_release_staged() {
     printf '  "sourceScriptVersion": %s,\n' "$(json_quote "$BUILD_ELECTRON_APP_VERSION")"
     printf '  "version": %s,\n' "$(json_quote "$bundle_version")"
     printf '  "containerPath": %s,\n' "$(json_quote "$container_dst")"
-    printf '  "stagedPath": %s,\n' "$(json_quote "$container_dst/PipiUI Electron.app")"
+    printf '  "stagedPath": %s,\n' "$(json_quote "$container_dst/PipiUI.app")"
     printf '  "mainArch": "arm64",\n'
     printf '  "stagedAt": %s,\n' "$(json_quote "$staged_at")"
     printf '  "stagedAtEpoch": %s,\n' "$epoch"
     printf '  "app": {\n'
     printf '    "cdhash": %s,\n' "$(json_quote "$cdhash")"
-    printf '    "mainExecutable": {"path": %s, "sha256": %s, "bytes": %s},\n' "$(json_quote "Contents/MacOS/PipiUI Electron")" "$(json_quote "$exe_sha")" "$exe_bytes"
+    printf '    "mainExecutable": {"path": %s, "sha256": %s, "bytes": %s},\n' "$(json_quote "Contents/MacOS/PipiUI")" "$(json_quote "$exe_sha")" "$exe_bytes"
     printf '    "infoPlist": {"path": %s, "sha256": %s},\n' "$(json_quote "Contents/Info.plist")" "$(json_quote "$plist_sha")"
     printf '    "extensionManifests": {"count": %s, "aggregateSha256": %s}\n' "$manifest_count" "$(json_quote "$manifest_agg")"
     printf '  },\n'
@@ -644,9 +644,9 @@ publish_release_staged() {
 
 PLATFORM="${1:-mac}"
 # mac --stage-only: full dual-architecture DMG/ZIP release build that never
-# touches, moves, or quits build/PipiUI Electron.app. The verified arm64
+# touches, moves, or quits build/PipiUI.app. The verified arm64
 # candidate and its receipt are published as one atomic container to
-# build/PipiUI Electron.release-staged/ (PipiUI Electron.app + receipt.json),
+# build/PipiUI.release-staged/ (PipiUI.app + receipt.json),
 # for scripts/install-electron-release-staged.sh.
 STAGE_ONLY=0
 USAGE_LINE="usage: $0 [mac [--stage-only]|win|linux|--check-signing]"
@@ -675,8 +675,8 @@ case "$PLATFORM" in
     echo "Override intentionally with PIPIUI_ELECTRON_SIGNING_IDENTITY=<exact SHA-1>."
     echo "Prepare release runtimes first: npm --prefix Electron run runtime:prepare:mac"
     echo "mac --stage-only keeps a running PipiUI alive: it publishes the verified arm64"
-    echo "candidate plus receipt as one atomic container, build/PipiUI Electron.release-staged/"
-    echo "(PipiUI Electron.app + receipt.json), and never touches the canonical App."
+    echo "candidate plus receipt as one atomic container, build/PipiUI.release-staged/"
+    echo "(PipiUI.app + receipt.json), and never touches the canonical App."
     echo "Install it later with install-electron-release-staged.sh."
     echo "Note: electron-vite dev runs the framework Electron binary and does not share the packaged App's TCC signing identity."
     exit 0
@@ -697,7 +697,7 @@ if [[ "$CURRENT_ROOT" != "$PRIMARY_ROOT" ]]; then
     # writes an empty archive — and is rejected with a clear error below).
     echo "Worktree checkout: cross-building $PLATFORM packages (no .app produced)." >&2
   else
-    echo "Refusing to package PipiUI Electron.app outside the primary checkout." >&2
+    echo "Refusing to package PipiUI.app outside the primary checkout." >&2
     echo "Primary checkout: $PRIMARY_ROOT" >&2
     echo "Current checkout: $CURRENT_ROOT" >&2
     echo "Running the Electron workspace build only." >&2
@@ -706,10 +706,10 @@ if [[ "$CURRENT_ROOT" != "$PRIMARY_ROOT" ]]; then
 fi
 
 if [[ "$PLATFORM" == "mac" && "$STAGE_ONLY" != "1" ]]; then
-  CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"
+  CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI.app/Contents/MacOS/PipiUI"
   if canonical_electron_app_is_running "$CANONICAL_ELECTRON_EXECUTABLE"; then
     echo "ERROR: refusing to build or replace the canonical Electron App while it is running." >&2
-    echo "Quit PipiUI Electron manually, then rerun this command. The running process was not terminated." >&2
+    echo "Quit PipiUI manually, then rerun this command. The running process was not terminated." >&2
     echo "For a full release while PipiUI stays open, rerun with: $0 mac --stage-only" >&2
     exit 1
   fi
@@ -746,13 +746,13 @@ case "$PLATFORM" in
       # Two-phase release, step 1. DMG/ZIP artifacts for both architectures
       # are validated and published into build/; the verified arm64 candidate
       # and its receipt are published as one atomic container swap to
-      # build/PipiUI Electron.release-staged/. The canonical App — running or
+      # build/PipiUI.release-staged/. The canonical App — running or
       # not — is never touched, moved, or quit, and nothing is installed.
       publish_release_staged "$run_root"
     else
-    # Canonical single artifact: build/PipiUI Electron.app
-    APP_SRC="$run_root/arm64/mac-arm64/PipiUI Electron.app"
-    APP_DST="$ROOT/build/PipiUI Electron.app"
+    # Canonical single artifact: build/PipiUI.app
+    APP_SRC="$run_root/arm64/mac-arm64/PipiUI.app"
+    APP_DST="$ROOT/build/PipiUI.app"
     if [[ -d "$APP_SRC" ]]; then
       APP_VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$APP_SRC/Contents/Info.plist" 2>/dev/null || true)"
       publish_release_artifacts "$ROOT" "$run_root" "$APP_VERSION" >/dev/null
@@ -768,7 +768,7 @@ case "$PLATFORM" in
     ;;
   win)
     npm --prefix Electron run package:win
-    echo "Win installer: $ROOT/build/PipiUI Electron Setup *.exe"
+    echo "Win installer: $ROOT/build/PipiUI Setup *.exe"
     ;;
   linux)
     npm --prefix Electron run package:linux

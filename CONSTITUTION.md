@@ -17,17 +17,17 @@ Binding rules for humans and coding agents. Short and enforceable.
 
 ## 1. 唯一可运行包与唯一打包地点（强制）
 
-**The only permitted runnable App is `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`. Only this primary checkout may package it.**
+**The only permitted runnable App is `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`. Only this primary checkout may package it.**
 
 凡成功编译、功能完成、或声称「构建通过 / 可运行」且意图更新可双击运行的 App 时，**只能**在主工作区 `/Users/haoli/leehow/code/pipiui` 随后打包。不得只停在 Electron 工作区的 `dist` / `out` 产物。
 
-所有 linked worktree、临时 worktree 与 `pipiui-wt/*` 目录只可运行 Electron workspace build/test 作验证；**严禁**运行会创建 `build/PipiUI Electron.app` 的打包命令。不得保留、打开、分发或在 Launchpad 中依赖这些目录里的 `.app`。若发现历史遗留副本，应删除该副本，主工作区的唯一包不受影响。
+所有 linked worktree、临时 worktree 与 `pipiui-wt/*` 目录只可运行 Electron workspace build/test 作验证；**严禁**运行会创建 `build/PipiUI.app` 的打包命令。不得保留、打开、分发或在 Launchpad 中依赖这些目录里的 `.app`。若发现历史遗留副本，应删除该副本，主工作区的唯一包不受影响。
 
 Canonical commands:
 
 ```bash
 cd /Users/haoli/leehow/code/pipiui
-# Electron release → build/PipiUI Electron.app（一律经 pipiui-electron-build skill）
+# Electron release → build/PipiUI.app（一律经 pipiui-electron-build skill）
 ~/.codex/skills/pipiui-electron-build/scripts/pipiui-electron-build fast-app
 ```
 
@@ -37,7 +37,7 @@ Agents 不直接调用 `build-electron-app.sh`，一律经 `pipiui-electron-buil
 
 本项目对精确 canonical App 提供持续的用户生命周期授权：当用户要求构建、打包、安装、打开、重启或继续真实验收时，Agents/workers 可温和退出对应 App、使用 `--overwrite-running` 覆盖安装、重新打开并继续测试，**不得再次索要单独或逐轮授权**。
 
-该授权仅限 `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`。禁止终止其他 App，禁止用模糊进程名批量匹配。优先发送正常退出请求并有界等待；若其失败且阻塞用户已经要求的生命周期/验收操作，只能终止经过路径核验的精确 canonical-App PID，强制终止仅作为再次有界等待后的最后手段，并须报告终止对象与原因。
+该授权仅限 `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`。禁止终止其他 App，禁止用模糊进程名批量匹配。优先发送正常退出请求并有界等待；若其失败且阻塞用户已经要求的生命周期/验收操作，只能终止经过路径核验的精确 canonical-App PID，强制终止仅作为再次有界等待后的最后手段，并须报告终止对象与原因。
 
 仅分析、仅源码修改或仅单元测试不自动触发生命周期操作；不得在真实验收并非必要时凭空重启。
 
@@ -47,15 +47,15 @@ Agents 不直接调用 `build-electron-app.sh`，一律经 `pipiui-electron-buil
 
 ```bash
 stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI\ Electron.app/Contents/MacOS/PipiUI\ Electron \
+  build/PipiUI.app/Contents/MacOS/PipiUI \
   <本次实际改动的源文件>
 ```
 
-`build/PipiUI Electron.app` 的对应二进制必须新于本次变更的 sources，否则不算完成。
+`build/PipiUI.app` 的对应二进制必须新于本次变更的 sources，否则不算完成。
 
 ## 3. 禁止「半完成」话术
 
-- **Do not** tell the user "done / ready to open app" if only the Electron workspace build succeeded and `build/PipiUI Electron.app` is older than sources.
+- **Do not** tell the user "done / ready to open app" if only the Electron workspace build succeeded and `build/PipiUI.app` is older than sources.
 - 仅 Electron 工作区 build/test 成功而 `.app` 仍旧时，**不得**说「完成 / 可以打开 App 了」。
 
 ## 4. 开发 vs 交付
@@ -63,12 +63,12 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | 用途 | 命令 |
 |------|------|
 | 任意 worktree 的快速调试/验证 | `Electron/` 下的 workspace build / `npm test` |
-| 主工作区的可双击 Electron App | `pipiui-electron-build` skill 的 `fast-app` / `release`（仅主工作区，打包到 `build/PipiUI Electron.app`；勿手调 electron-builder） |
+| 主工作区的可双击 Electron App | `pipiui-electron-build` skill 的 `fast-app` / `release`（仅主工作区，打包到 `build/PipiUI.app`；勿手调 electron-builder） |
 
 ## 5. 其它质量底线（简）
 
 - 改动业务逻辑 / 解析 / 状态机时：在 `Electron/` 跑 `npm test`（vitest 工作区）。
-- 声称完成前：有命令级证据（构建/打包输出 + `build/PipiUI Electron.app` 时间戳），禁止口头「应该好了」。
+- 声称完成前：有命令级证据（构建/打包输出 + `build/PipiUI.app` 时间戳），禁止口头「应该好了」。
 
 ## 6. Pi 按项目完全隔离（强制）
 
@@ -96,6 +96,6 @@ A 与 B 都禁止 opaque randomness，区别只在提供方；暴露 A/B 类 ID 
 
 ---
 
-**权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`（唯一可运行包）
+**权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`（唯一可运行包）
 **入口：** Electron 打包一律走 `pipiui-electron-build` skill（其 `release` 内部调 `./scripts/build-electron-app.sh`）
 **Agent 入口：** 见根目录 `AGENTS.md`

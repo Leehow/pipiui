@@ -6,12 +6,12 @@ orchestration runtime. Glossary only: no implementation details, no plans, no st
 ## Product
 
 **Canonical App**:
-The user-authorized packaged app: `build/PipiUI Electron.app`. Only the primary checkout may
+The user-authorized packaged app: `build/PipiUI.app`. Only the primary checkout may
 create it. The former Swift/SwiftUI edition was retired in 2026-08 and removed from the repo.
 _Avoid_: the app, the build, the bundle
 
 **Electron edition**:
-The only product (`Electron/packages/ui` → `build/PipiUI Electron.app`). All UI, product,
+The only product (`Electron/packages/ui` → `build/PipiUI.app`). All UI, product,
 and acceptance work targets it.
 
 **fast-app**:

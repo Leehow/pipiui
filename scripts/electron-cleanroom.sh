@@ -1,7 +1,7 @@
 #!/bin/bash
-# 净室启动打包后的 PipiUI Electron：模拟"全新用户首次安装"。
+# 净室启动打包后的 PipiUI：模拟"全新用户首次安装"。
 #
-# 同一个 build/PipiUI Electron.app 可以和日常实例并存（App 没有单实例锁），
+# 同一个 build/PipiUI.app 可以和日常实例并存（App 没有单实例锁），
 # 隔离靠 --user-data-dir 把整个 userData（pi-agent 凭据/会话、runtime、缓存）
 # 指到沙盒目录；HOME 指到空目录以屏蔽 ~/.pi 的 legacy 迁移；PATH 收缩成
 # Finder 双击的最小集合（npm 不可用也是新用户真实环境的一部分）。
@@ -16,8 +16,8 @@
 # [pipi-install] 路径是否落在沙盒内。
 set -euo pipefail
 
-APP="/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app"
-BIN="$APP/Contents/MacOS/PipiUI Electron"
+APP="/Users/haoli/leehow/code/pipiui/build/PipiUI.app"
+BIN="$APP/Contents/MacOS/PipiUI"
 SANDBOX_DIR="/tmp/pipiui-cleanroom"
 SANDBOX_HOME="/tmp/pipiui-cleanroom-home"
 LOG="/tmp/pipiui-cleanroom.log"

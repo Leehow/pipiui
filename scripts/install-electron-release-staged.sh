@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install the staged PipiUI Electron release candidate into the canonical App
+# Install the staged PipiUI release candidate into the canonical App
 # path, atomically, with rollback. Repo-owned and directly testable; the
 # pipiui-electron-build skill invokes it for `release --install-staged`
 # (detached through launchd when the running App must be replaced).
@@ -7,7 +7,7 @@
 # usage: install-electron-release-staged.sh [--root <repo>] [--overwrite-running] [--no-relaunch]
 #
 # Consumes the stable container:
-#   build/PipiUI Electron.release-staged/{PipiUI Electron.app,receipt.json}
+#   build/PipiUI.release-staged/{PipiUI.app,receipt.json}
 #   receipt schema pipiui-electron-release-staged/2
 #
 # Guarantees:
@@ -116,13 +116,13 @@ done
 
 INSTALL_ROOT="${INSTALL_ROOT%/}"
 BUILD_DIR="$INSTALL_ROOT/build"
-CANONICAL_APP="$BUILD_DIR/PipiUI Electron.app"
-CANONICAL_EXE="$CANONICAL_APP/Contents/MacOS/PipiUI Electron"
-STAGED_CONTAINER="$BUILD_DIR/PipiUI Electron.release-staged"
-STAGED_APP="$STAGED_CONTAINER/PipiUI Electron.app"
+CANONICAL_APP="$BUILD_DIR/PipiUI.app"
+CANONICAL_EXE="$CANONICAL_APP/Contents/MacOS/PipiUI"
+STAGED_CONTAINER="$BUILD_DIR/PipiUI.release-staged"
+STAGED_APP="$STAGED_CONTAINER/PipiUI.app"
 STAGED_RECEIPT="$STAGED_CONTAINER/receipt.json"
-LOG_FILE="$BUILD_DIR/PipiUI Electron.release-install.log"
-INSTALL_RECEIPT="$BUILD_DIR/PipiUI Electron.release-install.json"
+LOG_FILE="$BUILD_DIR/PipiUI.release-install.log"
+INSTALL_RECEIPT="$BUILD_DIR/PipiUI.release-install.json"
 
 RECEIPT_WRITTEN=0
 INSTALL_STATUS="failed"
@@ -480,13 +480,13 @@ relaunch_canonical_app() {
 validate_staged_paths() {
   require_real_dir "$STAGED_CONTAINER" "staged container"
   require_under "$STAGED_CONTAINER" "$PHYSICAL_BUILD" "staged container"
-  [[ "$STAGED_CONTAINER" == "$PHYSICAL_BUILD/PipiUI Electron.release-staged" ]] \
+  [[ "$STAGED_CONTAINER" == "$PHYSICAL_BUILD/PipiUI.release-staged" ]] \
     || fail "staged container is not the physical build's release-staged directory: $STAGED_CONTAINER"
 
   require_real_dir "$STAGED_APP" "staged App"
   require_under "$STAGED_APP" "$STAGED_CONTAINER" "staged App"
-  [[ "$STAGED_APP" == "$STAGED_CONTAINER/PipiUI Electron.app" ]] \
-    || fail "staged App is not the container's PipiUI Electron.app: $STAGED_APP"
+  [[ "$STAGED_APP" == "$STAGED_CONTAINER/PipiUI.app" ]] \
+    || fail "staged App is not the container's PipiUI.app: $STAGED_APP"
 
   require_real_file "$STAGED_RECEIPT" "staged receipt"
   require_under "$STAGED_RECEIPT" "$STAGED_CONTAINER" "staged receipt"
@@ -634,15 +634,15 @@ validate_staged() {
   if (( now - epoch > STAGED_MAX_AGE_S )); then
     fail "staged candidate is stale (staged ${STAGED_MAX_AGE_S}s+ ago); rerun the stage step"
   fi
-  if [[ ! -x "$STAGED_APP/Contents/MacOS/PipiUI Electron" ]]; then
+  if [[ ! -x "$STAGED_APP/Contents/MacOS/PipiUI" ]]; then
     fail "staged App has no main executable"
   fi
-  reject_symlink "$STAGED_APP/Contents/MacOS/PipiUI Electron" "staged main executable"
+  reject_symlink "$STAGED_APP/Contents/MacOS/PipiUI" "staged main executable"
   reject_symlink "$STAGED_APP/Contents/Info.plist" "staged Info.plist"
 
   bundle_version="$("$PLUTIL_BIN" -extract CFBundleShortVersionString raw -o - "$STAGED_APP/Contents/Info.plist" 2>/dev/null || true)"
   [[ "$bundle_version" == "$STAGED_VERSION" ]] || fail "staged bundle version '$bundle_version' does not match receipt version '$STAGED_VERSION'"
-  archs="$("$LIPO_BIN" -archs "$STAGED_APP/Contents/MacOS/PipiUI Electron" 2>/dev/null || true)"
+  archs="$("$LIPO_BIN" -archs "$STAGED_APP/Contents/MacOS/PipiUI" 2>/dev/null || true)"
   [[ "$archs" == *"arm64"* ]] || fail "staged main executable is not arm64 (${archs:-unknown})"
   if ! "$CODESIGN_BIN" --verify --deep --strict --verbose=2 "$STAGED_APP"; then
     fail "staged App failed strict codesign verification"
@@ -659,12 +659,12 @@ validate_staged() {
   exe_path="$(receipt_field app.mainExecutable.path)"
   exe_sha="$(receipt_field app.mainExecutable.sha256)"
   exe_bytes="$(receipt_field app.mainExecutable.bytes)"
-  [[ "$exe_path" == "Contents/MacOS/PipiUI Electron" ]] || fail "receipt mainExecutable.path is '${exe_path:-missing}'"
+  [[ "$exe_path" == "Contents/MacOS/PipiUI" ]] || fail "receipt mainExecutable.path is '${exe_path:-missing}'"
   [[ "$exe_sha" =~ ^[0-9a-f]{64}$ ]] || fail "staged receipt has no valid main executable sha256"
   [[ "$exe_bytes" =~ ^[0-9]+$ ]] || fail "staged receipt has no numeric main executable bytes"
-  [[ "$(sha256_file "$STAGED_APP/Contents/MacOS/PipiUI Electron")" == "$exe_sha" ]] \
+  [[ "$(sha256_file "$STAGED_APP/Contents/MacOS/PipiUI")" == "$exe_sha" ]] \
     || fail "staged main executable hash does not match the receipt"
-  [[ "$(stat -f %z "$STAGED_APP/Contents/MacOS/PipiUI Electron")" == "$exe_bytes" ]] \
+  [[ "$(stat -f %z "$STAGED_APP/Contents/MacOS/PipiUI")" == "$exe_bytes" ]] \
     || fail "staged main executable size does not match the receipt"
 
   plist_path="$(receipt_field app.infoPlist.path)"
@@ -775,12 +775,12 @@ if [[ -d "$CANONICAL_APP" ]]; then had_canonical=1; fi
 
 if (( had_canonical )); then
   # The App is not running any more; only now may its bundle be moved.
-  mv "$CANONICAL_APP" "$backup_dir/PipiUI Electron.app"
+  mv "$CANONICAL_APP" "$backup_dir/PipiUI.app"
 fi
 if ! mv "$STAGED_APP" "$CANONICAL_APP"; then
   if (( had_canonical )); then
-    if ! mv "$backup_dir/PipiUI Electron.app" "$CANONICAL_APP"; then
-      fail "failed to move the staged candidate and failed to restore the previous App from $backup_dir/PipiUI Electron.app"
+    if ! mv "$backup_dir/PipiUI.app" "$CANONICAL_APP"; then
+      fail "failed to move the staged candidate and failed to restore the previous App from $backup_dir/PipiUI.app"
     fi
   fi
   rmdir "$backup_dir" 2>/dev/null || true
@@ -789,8 +789,8 @@ fi
 
 rollback_to_previous() {
   ROLLBACK_PERFORMED=1
-  ROLLBACK_RESTORED_FROM="$backup_dir/PipiUI Electron.app"
-  FAILED_CANDIDATE="$BUILD_DIR/PipiUI Electron.release-install.failed.$(date +%Y%m%d-%H%M%S).app"
+  ROLLBACK_RESTORED_FROM="$backup_dir/PipiUI.app"
+  FAILED_CANDIDATE="$BUILD_DIR/PipiUI.release-install.failed.$(date +%Y%m%d-%H%M%S).app"
   if [[ -L "$FAILED_CANDIDATE" ]]; then
     log "ERROR: failed-candidate destination is a symlink; previous App remains at $ROLLBACK_RESTORED_FROM"
     return 1
@@ -799,8 +799,8 @@ rollback_to_previous() {
     log "ERROR: could not park the failed candidate; previous App remains at $ROLLBACK_RESTORED_FROM"
     return 1
   fi
-  if [[ -d "$backup_dir/PipiUI Electron.app" ]]; then
-    if ! mv "$backup_dir/PipiUI Electron.app" "$CANONICAL_APP"; then
+  if [[ -d "$backup_dir/PipiUI.app" ]]; then
+    if ! mv "$backup_dir/PipiUI.app" "$CANONICAL_APP"; then
       log "ERROR: failed to restore previous App from $ROLLBACK_RESTORED_FROM; it remains there and the failed candidate is at $FAILED_CANDIDATE"
       return 1
     fi
@@ -863,13 +863,13 @@ elif (( was_running )); then
 fi
 
 previous_app=""
-if [[ -d "$backup_dir/PipiUI Electron.app" ]]; then
+if [[ -d "$backup_dir/PipiUI.app" ]]; then
   reject_symlink "$TRASH_DIR" "Trash directory"
-  previous_app="$TRASH_DIR/PipiUI Electron previous $(date +%Y%m%d-%H%M%S).app"
+  previous_app="$TRASH_DIR/PipiUI previous $(date +%Y%m%d-%H%M%S).app"
   if [[ -L "$previous_app" ]]; then
     fail "Trash destination is a symlink; previous App remains in $backup_dir"
   fi
-  mv "$backup_dir/PipiUI Electron.app" "$previous_app"
+  mv "$backup_dir/PipiUI.app" "$previous_app"
   unregister_path "$previous_app"
 fi
 rmdir "$backup_dir" 2>/dev/null || true

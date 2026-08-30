@@ -24,8 +24,8 @@ describe('macOS packaging contract', () => {
     expect(packageJSON.build.mac.target).toEqual(['dmg', 'zip'])
   })
 
-  it('keeps the artifact folder as PipiUI Electron while Launchpad/Dock show PipiUI', () => {
-    expect(packageJSON.build.productName).toBe('PipiUI Electron')
+  it('keeps the artifact folder as PipiUI while Launchpad/Dock show PipiUI', () => {
+    expect(packageJSON.build.productName).toBe('PipiUI')
     expect(packageJSON.build.appId).toBe('com.leehow.pipiui-electron')
     expect(packageJSON.build.mac.extendInfo.CFBundleDisplayName).toBe('PipiUI')
     // Electron resolves helpers as `${CFBundleName} Helper.app`. Shortening
@@ -323,11 +323,11 @@ describe('macOS packaging contract', () => {
       'mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks/Electron Framework.framework"',
       'mkdir -p "$app/Contents/Resources/cua-driver" "$(dirname "$embedded_node")"',
       'mkdir -p "$app/Contents/Resources/pipiui-runtime"',
-      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI Electron"`,
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI"`,
       `cp ${JSON.stringify(process.execPath)} "$app/Contents/Resources/cua-driver/cua-driver"`,
       `cp ${JSON.stringify(process.execPath)} "$embedded_node"`,
       `cp ${JSON.stringify(process.execPath)} "$generic_helper"`,
-      'chmod +x "$app/Contents/MacOS/PipiUI Electron" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node" "$generic_helper"',
+      'chmod +x "$app/Contents/MacOS/PipiUI" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node" "$generic_helper"',
       `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
       `MAC_ENTITLEMENTS=${JSON.stringify(entitlementsPath)}`,
       'MAC_INHERIT_ENTITLEMENTS="$MAC_ENTITLEMENTS"',
@@ -368,10 +368,10 @@ describe('macOS packaging contract', () => {
       'mkdir -p "$app/Contents/MacOS" "$app/Contents/Frameworks/Electron Framework.framework"',
       'mkdir -p "$app/Contents/Resources/cua-driver" "$(dirname "$embedded_node")"',
       'mkdir -p "$app/Contents/Resources/pipiui-runtime"',
-      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI Electron"`,
+      `cp ${JSON.stringify(process.execPath)} "$app/Contents/MacOS/PipiUI"`,
       `cp ${JSON.stringify(process.execPath)} "$app/Contents/Resources/cua-driver/cua-driver"`,
       `cp ${JSON.stringify(process.execPath)} "$embedded_node"`,
-      'chmod +x "$app/Contents/MacOS/PipiUI Electron" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node"',
+      'chmod +x "$app/Contents/MacOS/PipiUI" "$app/Contents/Resources/cua-driver/cua-driver" "$embedded_node"',
       `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
       `MAC_ENTITLEMENTS=${JSON.stringify(entitlementsPath)}`,
       'MAC_INHERIT_ENTITLEMENTS="$MAC_ENTITLEMENTS"',
@@ -396,7 +396,7 @@ describe('macOS packaging contract', () => {
     expect(wrapper).toMatch(/grep -Fq "\$app" "\$log"/)
     expect(wrapper).toMatch(/a sealed resource is missing or invalid\|file \(added\|modified\|missing\):\|resource envelope is obsolete/)
     for (const resource of [
-      'Contents/MacOS/PipiUI Electron',
+      'Contents/MacOS/PipiUI',
       'Contents/Frameworks/Electron Framework.framework',
       'Contents/Resources/cua-driver/cua-driver',
       'Contents/Resources/pipiui-embedded/node/bin/node',
@@ -418,8 +418,8 @@ describe('macOS packaging contract', () => {
     // Pins the electron-builder unpacked-dir naming the run-root layout
     // depends on: <out>/mac for x64, <out>/mac-arm64 for arm64.
     const [arm64App, x64App] = output.trim().split('\n')
-    expect(arm64App).toBe('/tmp/rel-arm64/mac-arm64/PipiUI Electron.app')
-    expect(x64App).toBe('/tmp/rel-x64/mac/PipiUI Electron.app')
+    expect(arm64App).toBe('/tmp/rel-arm64/mac-arm64/PipiUI.app')
+    expect(x64App).toBe('/tmp/rel-x64/mac/PipiUI.app')
   })
 
   it('matches only the exact canonical Electron executable and guards before mac build work', () => {
@@ -428,13 +428,13 @@ describe('macOS packaging contract', () => {
     const result = spawnSync('/bin/bash', ['-c', [
       'set -euo pipefail',
       `eval "$(sed '/^PLATFORM=/,$d' ${JSON.stringify(scriptPath)})"`,
-      'target="/workspace/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"',
+      'target="/workspace/build/PipiUI.app/Contents/MacOS/PipiUI"',
       'printf \' 42 %s\\n\' "$target" | process_list_contains_exact_executable "$target"',
       'if printf \' 43 %s Helper\\n\' "$target" | process_list_contains_exact_executable "$target"; then exit 41; fi',
-      'if printf \' 44 /other/PipiUI Electron.app/Contents/MacOS/PipiUI Electron\\n\' | process_list_contains_exact_executable "$target"; then exit 42; fi',
+      'if printf \' 44 /other/PipiUI.app/Contents/MacOS/PipiUI\\n\' | process_list_contains_exact_executable "$target"; then exit 42; fi',
     ].join('\n')], { encoding: 'utf8' })
     expect(result.status, result.stderr).toBe(0)
-    expect(wrapper).toContain('CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"')
+    expect(wrapper).toContain('CANONICAL_ELECTRON_EXECUTABLE="$ROOT/build/PipiUI.app/Contents/MacOS/PipiUI"')
     expect(wrapper).toMatch(/canonical_electron_app_is_running "\$CANONICAL_ELECTRON_EXECUTABLE"[\s\S]*exit 1[\s\S]*prepare_mac_signing_identity/)
   })
 

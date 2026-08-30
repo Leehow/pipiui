@@ -1,6 +1,6 @@
 ---
 name: pipiui-upload
-description: Upload the packaged PipiUI Electron app (build/PipiUI Electron.app) to the DMIT download host and return a public download link on pipi.aichattrpg.com. Use whenever the user asks to 上传 app / 发个下载链接 / 分发一下 / give me a link / upload the build to dmit / share the Electron app / 把打好的包传上去 — also handles uploading any build artifact (.zip/.dmg) to the same downloads host.
+description: Upload the packaged PipiUI app (build/PipiUI.app) to the DMIT download host and return a public download link on pipi.aichattrpg.com. Use whenever the user asks to 上传 app / 发个下载链接 / 分发一下 / give me a link / upload the build to dmit / share the Electron app / 把打好的包传上去 — also handles uploading any build artifact (.zip/.dmg) to the same downloads host.
 ---
 
 # PipiUI Upload
@@ -22,20 +22,20 @@ From the repo root (`/Users/haoli/leehow/code/pipiui`):
 
 No-argument mode:
 
-1. Refuses to run unless `build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron`
+1. Refuses to run unless `build/PipiUI.app/Contents/MacOS/PipiUI`
    is newer than every file under `Electron/` (binding rule: never ship a stale
    build — repackage via the `pipiui-electron-build` skill first, or pass
    `--force` only when the user explicitly accepts shipping the current binary).
 2. Zips with `ditto -c -k --sequesterRsrc --keepParent` (preserves symlinks and
    the code signature — plain `zip` without symlink handling breaks the bundle)
-   to `PipiUI-Electron-YYYY-MM-DD.zip` (~230MB for the ~610MB app).
+   to `PipiUI-YYYY-MM-DD.zip` (~230MB for the ~610MB app).
 3. Uploads via `scp` (the VPS has **no rsync** — don't try it), verifies md5 on
    both ends, then verifies the public URL (`HEAD` 200 + `Content-Length`
    matches + a one-byte `Range` request returns 206) before printing the link.
 
 Skips the transfer when the remote file already has the same md5. If the same
 date-name already exists remotely with *different* content, it publishes as
-`PipiUI-Electron-YYYY-MM-DD-2.zip` (then -3, …) so an already-shared link never
+`PipiUI-YYYY-MM-DD-2.zip` (then -3, …) so an already-shared link never
 silently changes contents.
 
 ## Manual fallback
@@ -43,8 +43,8 @@ silently changes contents.
 If the script cannot run, the flow is:
 
 ```bash
-ditto -c -k --sequesterRsrc --keepParent "build/PipiUI Electron.app" /tmp/PipiUI-Electron-$(date +%F).zip
-scp -i ~/.ssh/id_rsa -o IdentitiesOnly=yes -o BatchMode=yes /tmp/PipiUI-Electron-<date>.zip \
+ditto -c -k --sequesterRsrc --keepParent "build/PipiUI.app" /tmp/PipiUI-$(date +%F).zip
+scp -i ~/.ssh/id_rsa -o IdentitiesOnly=yes -o BatchMode=yes /tmp/PipiUI-<date>.zip \
   root@179.253.244.124:/opt/pipiui-relay/downloads/
 # then verify md5 on both ends, and curl -sSI the public link (200 + correct Content-Length)
 ```

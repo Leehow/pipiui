@@ -460,7 +460,7 @@ describe("CuaDriverHost", () => {
 
   it("keeps the daemon socket below the macOS sockaddr_un byte limit", () => {
     const realisticLongTemp =
-      "/var/folders/zz/abcdefghijklmnopqrstuvwxyz0123456789/T/TemporaryItems/Very Long PipiUI Electron Session Name";
+      "/var/folders/zz/abcdefghijklmnopqrstuvwxyz0123456789/T/TemporaryItems/Very Long PipiUI Session Name";
     const path = cuaSocketPath(
       realisticLongTemp,
       123456,
@@ -1308,7 +1308,7 @@ if (mode === "serve") {
         return {
           structuredContent: {
             apps: [
-              { name: "PipiUI Electron", bundle_id: "com.leehow.pipiui-electron", pid: 56148, running: true },
+              { name: "PipiUI", bundle_id: "com.leehow.pipiui-electron", pid: 56148, running: true },
               { name: "COC Keeper", bundle_id: "org.chatrpg.cockeyper", pid: 91368, running: true },
             ],
           },

@@ -25,7 +25,7 @@ function fakeAppBundle(appDir: string, marker: string, version = '1.2.3') {
   const officeDir = join(appDir, 'Contents/Resources/pipiui-runtime/extensions/office-extension/bin/darwin-arm64')
   mkdirSync(join(appDir, 'Contents/MacOS'), { recursive: true })
   mkdirSync(officeDir, { recursive: true })
-  const exe = join(appDir, 'Contents/MacOS/PipiUI Electron')
+  const exe = join(appDir, 'Contents/MacOS/PipiUI')
   writeFileSync(exe, `#!/bin/sh\n# ${marker}\n`)
   chmodSync(exe, 0o755)
   writeFileSync(join(appDir, 'Contents/marker'), marker)
@@ -73,7 +73,7 @@ function writeReleaseArtifacts(root: string, version = '1.2.3') {
   const artifacts: Array<{ kind: string; arch: string; path: string; bytes: number; sha256: string }> = []
   for (const arch of ['arm64', 'x64'] as const) {
     for (const kind of ['dmg', 'zip'] as const) {
-      const path = join(root, 'build', `PipiUI Electron-${version}-${arch}.${kind}`)
+      const path = join(root, 'build', `PipiUI-${version}-${arch}.${kind}`)
       const body = `${kind}-${arch}-${version}\n`
       writeFileSync(path, body)
       artifacts.push({
@@ -87,15 +87,15 @@ function writeReleaseArtifacts(root: string, version = '1.2.3') {
 }
 
 const DEFAULT_TEST_CDHASH = `${'a'.repeat(63)}b`
-const stagedContainerOf = (root: string) => join(root, 'build/PipiUI Electron.release-staged')
+const stagedContainerOf = (root: string) => join(root, 'build/PipiUI.release-staged')
 const stagedReceiptOf = (root: string) => join(stagedContainerOf(root), 'receipt.json')
-const stagedAppOf = (root: string) => join(stagedContainerOf(root), 'PipiUI Electron.app')
+const stagedAppOf = (root: string) => join(stagedContainerOf(root), 'PipiUI.app')
 
 function writeStagedReceipt(root: string, appDir: string, sha256: string, bytes: number, over: Record<string, unknown> = {}) {
   const container = stagedContainerOf(root)
   const stagedPath = stagedAppOf(root)
   mkdirSync(container, { recursive: true })
-  const exe = join(appDir, 'Contents/MacOS/PipiUI Electron')
+  const exe = join(appDir, 'Contents/MacOS/PipiUI')
   const plist = join(appDir, 'Contents/Info.plist')
   const officeReceipt = join(appDir, 'Contents/Resources/pipiui-runtime/extensions/office-extension/bin/darwin-arm64/receipt.json')
   const manifests = extensionManifestAggregate(appDir)
@@ -114,7 +114,7 @@ function writeStagedReceipt(root: string, appDir: string, sha256: string, bytes:
     app: {
       cdhash,
       mainExecutable: {
-        path: 'Contents/MacOS/PipiUI Electron',
+        path: 'Contents/MacOS/PipiUI',
         sha256: sha256OfFile(exe),
         bytes: statSync(exe).size
       },
@@ -160,7 +160,7 @@ function makeReleaseFixture() {
   const stagedDir = stagedAppOf(root)
   const office = fakeAppBundle(stagedDir, 'staged-candidate')
   writeStagedReceipt(root, stagedDir, office.sha256, office.bytes)
-  fakeAppBundle(join(root, 'build/PipiUI Electron.app'), 'old-canonical', '1.2.2')
+  fakeAppBundle(join(root, 'build/PipiUI.app'), 'old-canonical', '1.2.2')
   const seams = makeSeams(root)
   return { root, stagedDir, seams, ...seams }
 }
@@ -186,7 +186,7 @@ function makeSeams(root: string) {
   }
   write('ps', `
 state="$(cat "${stateFile}")"
-exe="$(cat "${rootFile}")/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"
+exe="$(cat "${rootFile}")/build/PipiUI.app/Contents/MacOS/PipiUI"
 if [[ "\${2:-}" == "-p" ]]; then
   case "$state" in
     running|running-after-open) echo "$exe" ;;
@@ -215,7 +215,7 @@ case "$mode" in
   ok) ;;
   always-fail) exit 1 ;;
   fail-mac-arm64) [[ "$target" == *"mac-arm64"* ]] && exit 1; exit 0 ;;
-  fail-canonical) if [[ "$target" != *"release-staged"* && "$target" == *"/build/PipiUI Electron.app" ]]; then exit 1; fi ;;
+  fail-canonical) if [[ "$target" != *"release-staged"* && "$target" == *"/build/PipiUI.app" ]]; then exit 1; fi ;;
 esac
 if [[ "$1" == "-d" ]]; then
   printf 'CDHash=%s\\n' "$(cat "${codesignCdhashFile}")"
@@ -226,7 +226,7 @@ exit 0`)
 echo "lsregister $*" >> "${dir}/lsregister.calls"
 if [[ "\${1:-}" == "-dump" ]]; then
   printf -- '%s\\n' "--------------------"
-  printf 'path:          %s\\n' "$(cat "${rootFile}")/build/PipiUI Electron.app"
+  printf 'path:          %s\\n' "$(cat "${rootFile}")/build/PipiUI.app"
   printf 'identifier:    com.leehow.pipiui-electron\\n'
 fi
 exit 0`)
@@ -234,7 +234,7 @@ exit 0`)
 echo "open $*" >> "${dir}/open.calls"
 echo running-after-open > "${stateFile}"
 exit 0`)
-  write('lsof', `printf 'n%s\\n' "$(cat "${rootFile}")/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron"`)
+  write('lsof', `printf 'n%s\\n' "$(cat "${rootFile}")/build/PipiUI.app/Contents/MacOS/PipiUI"`)
   const trash = join(dir, 'Trash')
   mkdirSync(trash, { recursive: true })
   const envFor = (over: Record<string, string> = {}) => ({
@@ -278,7 +278,7 @@ describe('two-phase release: build script stage-only contract', () => {
     const help = spawnSync('/bin/bash', [buildScriptPath, '-h'], { encoding: 'utf8' })
     expect(help.status, help.stderr).toBe(0)
     expect(help.stdout).toContain('--stage-only')
-    expect(help.stdout).toContain('PipiUI Electron.release-staged/')
+    expect(help.stdout).toContain('PipiUI.release-staged/')
     expect(help.stdout).toContain('receipt.json')
     expect(spawnSync('/bin/bash', [buildScriptPath, 'win', '--stage-only'], { encoding: 'utf8' }).status).toBe(2)
     expect(spawnSync('/bin/bash', [buildScriptPath, 'mac', '--bogus'], { encoding: 'utf8' }).status).toBe(2)
@@ -335,7 +335,7 @@ describe('two-phase release: build script stage-only contract', () => {
     mkdirSync(join(c, 'Resources/pipiui-embedded/node/bin'), { recursive: true })
     mkdirSync(join(c, 'Resources/pipiui-runtime/extensions/deepseek'), { recursive: true })
     mkdirSync(officeDir, { recursive: true })
-    const exe = join(c, 'MacOS/PipiUI Electron')
+    const exe = join(c, 'MacOS/PipiUI')
     writeFileSync(exe, `#!/bin/sh\n# ${marker}\n`)
     chmodSync(exe, 0o755)
     writeFileSync(join(c, 'marker'), marker)
@@ -364,7 +364,7 @@ describe('two-phase release: build script stage-only contract', () => {
     mkdirSync(join(root, 'build'), { recursive: true })
     copyFileSync(buildScriptPath, join(root, 'scripts/build-electron-app.sh'))
     const seams = makeSeams(root)
-    const fixtureApp = join(root, 'fixture/PipiUI Electron.app')
+    const fixtureApp = join(root, 'fixture/PipiUI.app')
     fakeCompleteBundle(fixtureApp, 'route-candidate', '1.2.3')
     const psListingFile = join(seams.dir, 'ps-listing')
     writeFileSync(psListingFile, '')
@@ -383,11 +383,11 @@ describe('two-phase release: build script stage-only contract', () => {
         }
       })
     const setRunning = (running: boolean) =>
-      writeFileSync(psListingFile, running ? `  4242 ${root}/build/PipiUI Electron.app/Contents/MacOS/PipiUI Electron\n` : '')
+      writeFileSync(psListingFile, running ? `  4242 ${root}/build/PipiUI.app/Contents/MacOS/PipiUI\n` : '')
     return { root, seams, run, setRunning, fixtureApp }
   }
 
-  const containerOf = (root: string) => join(root, 'build/PipiUI Electron.release-staged')
+  const containerOf = (root: string) => join(root, 'build/PipiUI.release-staged')
   const buildEntries = (root: string, prefix: string) =>
     readdirSync(join(root, 'build')).filter(name => name.startsWith(prefix))
   const sha256OfFile = (p: string) => createHash('sha256').update(readFileSync(p)).digest('hex')
@@ -396,7 +396,7 @@ describe('two-phase release: build script stage-only contract', () => {
     if (!darwin) return
     const h = makeRouteHarness()
     try {
-      fakeCompleteBundle(join(h.root, 'build/PipiUI Electron.app'), 'old-canonical', '1.2.2')
+      fakeCompleteBundle(join(h.root, 'build/PipiUI.app'), 'old-canonical', '1.2.2')
       h.setRunning(true)
       const plain = h.run(['mac'])
       expect(plain.status).toBe(1)
@@ -407,9 +407,9 @@ describe('two-phase release: build script stage-only contract', () => {
 
       const staged = h.run(['mac', '--stage-only'])
       expect(staged.status, staged.stderr).toBe(0)
-      expect(readFileSync(join(h.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+      expect(readFileSync(join(h.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
       expect(existsSync(join(containerOf(h.root), 'receipt.json'))).toBe(true)
-      expect(readFileSync(join(containerOf(h.root), 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate')
+      expect(readFileSync(join(containerOf(h.root), 'PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate')
     } finally {
       rmSync(h.root, { recursive: true, force: true })
     }
@@ -419,17 +419,17 @@ describe('two-phase release: build script stage-only contract', () => {
     if (!darwin) return
     const h = makeRouteHarness()
     try {
-      fakeCompleteBundle(join(h.root, 'build/PipiUI Electron.app'), 'old-canonical', '1.2.2')
+      fakeCompleteBundle(join(h.root, 'build/PipiUI.app'), 'old-canonical', '1.2.2')
       const result = h.run(['mac'])
       expect(result.status, result.stderr).toBe(0)
       expect(result.stdout).toContain('Packaged:')
-      expect(readFileSync(join(h.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate')
+      expect(readFileSync(join(h.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate')
       expect(existsSync(containerOf(h.root))).toBe(false)
       expect(readdirSync(join(h.root, 'build')).filter(name => /\.(dmg|zip)$/.test(name)).sort()).toEqual([
-        'PipiUI Electron-1.2.3-arm64.dmg',
-        'PipiUI Electron-1.2.3-arm64.zip',
-        'PipiUI Electron-1.2.3-x64.dmg',
-        'PipiUI Electron-1.2.3-x64.zip'
+        'PipiUI-1.2.3-arm64.dmg',
+        'PipiUI-1.2.3-arm64.zip',
+        'PipiUI-1.2.3-x64.dmg',
+        'PipiUI-1.2.3-x64.zip'
       ])
       expect(buildEntries(h.root, '.release-run')).toEqual([])
     } finally {
@@ -462,7 +462,7 @@ describe('two-phase release: build script stage-only contract', () => {
       expect(buildEntries(h.root, '.PipiUI')).toEqual([])
       expect(readFileSync(join(h.root, 'build/mac/sentinel'), 'utf8')).toBe('keep')
       expect(readFileSync(join(h.root, 'build/mac-arm64/sentinel'), 'utf8')).toBe('keep')
-      expect(readFileSync(join(containerOf(h.root), 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate')
+      expect(readFileSync(join(containerOf(h.root), 'PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate')
     } finally {
       rmSync(h.root, { recursive: true, force: true })
     }
@@ -472,21 +472,21 @@ describe('two-phase release: build script stage-only contract', () => {
     if (!darwin) return
     const h = makeRouteHarness()
     try {
-      writeFileSync(join(h.root, 'build/PipiUI Electron-0.9.9-arm64.dmg'), 'old release dmg\n')
+      writeFileSync(join(h.root, 'build/PipiUI-0.9.9-arm64.dmg'), 'old release dmg\n')
       const ok = h.run(['mac', '--stage-only'])
       expect(ok.status, ok.stderr).toBe(0)
-      const goodDmg = readFileSync(join(h.root, 'build/PipiUI Electron-1.2.3-arm64.dmg'), 'utf8')
+      const goodDmg = readFileSync(join(h.root, 'build/PipiUI-1.2.3-arm64.dmg'), 'utf8')
       const firstReceipt = readFileSync(join(containerOf(h.root), 'receipt.json'), 'utf8')
 
       const missing = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_SKIP: 'arm64-zip' })
       expect(missing.status).not.toBe(0)
       expect(missing.stderr).toContain('expected exactly 4 artifacts')
 
-      const duplicate = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_EXTRA_ARM64: 'PipiUI Electron-1.2.3-arm64-2.dmg' })
+      const duplicate = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_EXTRA_ARM64: 'PipiUI-1.2.3-arm64-2.dmg' })
       expect(duplicate.status).not.toBe(0)
       expect(duplicate.stderr).toContain('duplicate arm64 dmg artifact')
 
-      const wrongVersion = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_EXTRA_ARM64: 'PipiUI Electron-0.0.1-arm64.dmg' })
+      const wrongVersion = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_EXTRA_ARM64: 'PipiUI-0.0.1-arm64.dmg' })
       expect(wrongVersion.status).not.toBe(0)
       expect(wrongVersion.stderr).toContain('not tagged with the release version 1.2.3')
 
@@ -494,8 +494,8 @@ describe('two-phase release: build script stage-only contract', () => {
         expect(failed.stdout).not.toContain('Staged release container')
       }
       // Prior artifacts and prior staged container intact; no leftovers.
-      expect(readFileSync(join(h.root, 'build/PipiUI Electron-1.2.3-arm64.dmg'), 'utf8')).toBe(goodDmg)
-      expect(readFileSync(join(h.root, 'build/PipiUI Electron-0.9.9-arm64.dmg'), 'utf8')).toBe('old release dmg\n')
+      expect(readFileSync(join(h.root, 'build/PipiUI-1.2.3-arm64.dmg'), 'utf8')).toBe(goodDmg)
+      expect(readFileSync(join(h.root, 'build/PipiUI-0.9.9-arm64.dmg'), 'utf8')).toBe('old release dmg\n')
       expect(readFileSync(join(containerOf(h.root), 'receipt.json'), 'utf8')).toBe(firstReceipt)
       expect(buildEntries(h.root, '.release-run')).toEqual([])
       expect(buildEntries(h.root, '.PipiUI')).toEqual([])
@@ -512,7 +512,7 @@ describe('two-phase release: build script stage-only contract', () => {
       const first = h.run(['mac', '--stage-only'])
       expect(first.status, first.stderr).toBe(0)
       const firstReceipt = readFileSync(join(containerOf(h.root), 'receipt.json'), 'utf8')
-      const fixture2 = join(h.root, 'fixture2/PipiUI Electron.app')
+      const fixture2 = join(h.root, 'fixture2/PipiUI.app')
       fakeCompleteBundle(fixture2, 'route-candidate-2', '1.2.3')
 
       // Strict codesign failure on the new candidate: previous pair kept.
@@ -521,7 +521,7 @@ describe('two-phase release: build script stage-only contract', () => {
       expect(failed.status).not.toBe(0)
       expect(failed.stderr).toContain('strict codesign verification failed')
       expect(readFileSync(join(containerOf(h.root), 'receipt.json'), 'utf8')).toBe(firstReceipt)
-      expect(readFileSync(join(containerOf(h.root), 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate')
+      expect(readFileSync(join(containerOf(h.root), 'PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate')
 
       // OfficeCLI hash drift in the new candidate: same guarantee.
       h.seams.setCodesign('ok')
@@ -530,7 +530,7 @@ describe('two-phase release: build script stage-only contract', () => {
       expect(failedHash.status).not.toBe(0)
       expect(failedHash.stderr).toContain('OfficeCLI')
       expect(readFileSync(join(containerOf(h.root), 'receipt.json'), 'utf8')).toBe(firstReceipt)
-      expect(readFileSync(join(containerOf(h.root), 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate')
+      expect(readFileSync(join(containerOf(h.root), 'PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate')
       expect(buildEntries(h.root, '.PipiUI')).toEqual([])
       expect(buildEntries(h.root, '.release-staged-container')).toEqual([])
 
@@ -538,7 +538,7 @@ describe('two-phase release: build script stage-only contract', () => {
       fakeCompleteBundle(fixture2, 'route-candidate-2', '1.2.3')
       const second = h.run(['mac', '--stage-only'], { PIPIUI_PACKAGING_TEST_FIXTURE: fixture2 })
       expect(second.status, second.stderr).toBe(0)
-      expect(readFileSync(join(containerOf(h.root), 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('route-candidate-2')
+      expect(readFileSync(join(containerOf(h.root), 'PipiUI.app/Contents/marker'), 'utf8')).toBe('route-candidate-2')
       expect(readJson(join(containerOf(h.root), 'receipt.json')).version).toBe('1.2.3')
       expect(buildEntries(h.root, '.PipiUI')).toEqual([])
     } finally {
@@ -553,7 +553,7 @@ describe('two-phase release: build script stage-only contract', () => {
       const result = h.run(['mac', '--stage-only'])
       expect(result.status, result.stderr).toBe(0)
       const container = containerOf(h.root)
-      const staged = join(container, 'PipiUI Electron.app')
+      const staged = join(container, 'PipiUI.app')
       const receipt = readJson(join(container, 'receipt.json'))
       expect(receipt.schema).toBe('pipiui-electron-release-staged/2')
       expect(receipt.sourceScriptVersion).toBe('2')
@@ -565,7 +565,7 @@ describe('two-phase release: build script stage-only contract', () => {
       expect(receipt.app.cdhash).toBe(h.seams.cdhash)
       expect(receipt.codesign).toEqual({ verified: true, mode: 'deep-strict', cdhash: h.seams.cdhash })
       // Main executable and Info.plist hashes.
-      const exe = join(staged, 'Contents/MacOS/PipiUI Electron')
+      const exe = join(staged, 'Contents/MacOS/PipiUI')
       expect(receipt.app.mainExecutable.sha256).toBe(sha256OfFile(exe))
       expect(receipt.app.mainExecutable.bytes).toBe(statSync(exe).size)
       expect(receipt.app.infoPlist.sha256).toBe(sha256OfFile(join(staged, 'Contents/Info.plist')))
@@ -588,7 +588,7 @@ describe('two-phase release: build script stage-only contract', () => {
       const artifacts = [...receipt.artifacts].sort((a: { kind: string; arch: string }, b: { kind: string; arch: string }) => `${a.kind}-${a.arch}`.localeCompare(`${b.kind}-${b.arch}`))
       expect(artifacts.map((a: { kind: string; arch: string }) => `${a.kind}-${a.arch}`)).toEqual(['dmg-arm64', 'dmg-x64', 'zip-arm64', 'zip-x64'])
       for (const artifact of artifacts) {
-        expect(artifact.path).toBe(join(h.root, 'build', `PipiUI Electron-1.2.3-${artifact.arch}.${artifact.kind}`))
+        expect(artifact.path).toBe(join(h.root, 'build', `PipiUI-1.2.3-${artifact.arch}.${artifact.kind}`))
         expect(existsSync(artifact.path)).toBe(true)
         expect(artifact.bytes).toBe(statSync(artifact.path).size)
         expect(artifact.sha256).toBe(sha256OfFile(artifact.path))
@@ -605,15 +605,15 @@ describe('two-phase release: repo installer contract', () => {
     expect(installerSource).not.toContain('pkill')
     expect(installerSource).not.toContain('killall')
     expect(installerSource).toMatch(/pid_is_canonical_process "\$pid"/)
-    expect(installerSource).toContain('PipiUI Electron.release-staged/')
+    expect(installerSource).toContain('PipiUI.release-staged/')
     expect(installerSource).toContain('receipt.json')
     expect(installerSource).toContain('pipiui-electron-release-staged/2')
-    expect(installerSource).not.toContain('PipiUI Electron.release-staged.app')
+    expect(installerSource).not.toContain('PipiUI.release-staged.app')
     expect(installerSource).toContain('[[ -L ')
     expect(installerSource).toContain('walk_absolute_path')
     expect(installerSource).toContain('PIPIUI_INSTALLER_TEST_MODE')
-    expect(installerSource).toContain('PipiUI Electron.release-install.json')
-    expect(installerSource).toContain('PipiUI Electron.release-install.log')
+    expect(installerSource).toContain('PipiUI.release-install.json')
+    expect(installerSource).toContain('PipiUI.release-install.log')
   })
 
   it('rejects every invalid staged candidate before touching anything', { timeout: 20_000 }, () => {
@@ -761,9 +761,9 @@ describe('two-phase release: repo installer contract', () => {
       expect(result.status, `${item.name}: ${result.stderr}`).not.toBe(0)
       expect(result.stderr).toContain(item.expectError)
       // Nothing was mutated.
-      expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+      expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
       expect(readFileSync(join(f.stagedDir, 'Contents/marker'), 'utf8')).toBe('staged-candidate')
-      const installReceipt = join(f.root, 'build/PipiUI Electron.release-install.json')
+      const installReceipt = join(f.root, 'build/PipiUI.release-install.json')
       if (item.writesReceipt === false) {
         expect(existsSync(installReceipt), item.name).toBe(false)
       } else {
@@ -813,7 +813,7 @@ describe('two-phase release: repo installer contract', () => {
       {
         name: 'symlinked canonical App',
         mutate: f => {
-          const canon = join(f.root, 'build/PipiUI Electron.app')
+          const canon = join(f.root, 'build/PipiUI.app')
           const elsewhere = join(f.root, 'canon-elsewhere.app')
           renameSync(canon, elsewhere)
           symlinkSync(elsewhere, canon)
@@ -840,7 +840,7 @@ describe('two-phase release: repo installer contract', () => {
       expect(result.stderr, item.name).toMatch(item.expectError)
       expect(f.calls('osascript'), item.name).toBe('')
       expect(f.calls('kill'), item.name).toBe('')
-      expect(existsSync(join(f.root, 'build/PipiUI Electron.release-install.json')), item.name).toBe(false)
+      expect(existsSync(join(f.root, 'build/PipiUI.release-install.json')), item.name).toBe(false)
     }
   })
 
@@ -852,8 +852,8 @@ describe('two-phase release: repo installer contract', () => {
     const viaLink = f.runInstaller(['--root', linkRoot, '--no-relaunch'])
     expect(viaLink.status).not.toBe(0)
     expect(viaLink.stderr).toMatch(/symlink|no-follow walk/)
-    expect(existsSync(join(f.root, 'build/PipiUI Electron.release-install.json'))).toBe(false)
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    expect(existsSync(join(f.root, 'build/PipiUI.release-install.json'))).toBe(false)
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
 
     const g = makeReleaseFixture()
     const realBuild = join(g.root, 'build')
@@ -863,15 +863,15 @@ describe('two-phase release: repo installer contract', () => {
     const viaBuild = g.runInstaller(['--root', g.root, '--no-relaunch'])
     expect(viaBuild.status).not.toBe(0)
     expect(viaBuild.stderr).toMatch(/symlink|no-follow walk/)
-    expect(existsSync(join(elsewhere, 'PipiUI Electron.release-install.json'))).toBe(false)
-    expect(readFileSync(join(elsewhere, 'PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    expect(existsSync(join(elsewhere, 'PipiUI.release-install.json'))).toBe(false)
+    expect(readFileSync(join(elsewhere, 'PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
     expect(g.calls('osascript')).toBe('')
   })
 
   it('rejects an ancestor symlink (/tmp/link/repo) before any log/receipt mutation', { timeout: 20_000 }, () => {
     if (!darwin) return
     const f = makeReleaseFixture()
-    const logPath = join(f.root, 'build/PipiUI Electron.release-install.log')
+    const logPath = join(f.root, 'build/PipiUI.release-install.log')
     const prior = 'PREEXISTING-LOG-BYTES\n'
     writeFileSync(logPath, prior)
     const linkDir = join('/tmp', `pipiui-link-${basename(f.root)}`)
@@ -883,10 +883,10 @@ describe('two-phase release: repo installer contract', () => {
       expect(result.status, result.stderr).not.toBe(0)
       expect(result.stderr).toMatch(/symlink|no-follow walk/)
       expect(readFileSync(logPath, 'utf8')).toBe(prior)
-      expect(existsSync(join(f.root, 'build/PipiUI Electron.release-install.json'))).toBe(false)
+      expect(existsSync(join(f.root, 'build/PipiUI.release-install.json'))).toBe(false)
       expect(f.calls('osascript')).toBe('')
       expect(f.calls('kill')).toBe('')
-      expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+      expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
     } finally {
       rmSync(linkDir, { force: true })
     }
@@ -895,7 +895,7 @@ describe('two-phase release: repo installer contract', () => {
   it('leaves preexisting install log byte-identical when early path validation fails', { timeout: 20_000 }, () => {
     if (!darwin) return
     const f = makeReleaseFixture()
-    const logPath = join(f.root, 'build/PipiUI Electron.release-install.log')
+    const logPath = join(f.root, 'build/PipiUI.release-install.log')
     const prior = Buffer.from('KEEP-THIS-LOG-EXACTLY\n')
     writeFileSync(logPath, prior)
     const container = stagedContainerOf(f.root)
@@ -906,7 +906,7 @@ describe('two-phase release: repo installer contract', () => {
     expect(result.status, result.stderr).not.toBe(0)
     expect(result.stderr).toMatch(/symlink|no-follow walk/)
     expect(readFileSync(logPath)).toEqual(prior)
-    expect(existsSync(join(f.root, 'build/PipiUI Electron.release-install.json'))).toBe(false)
+    expect(existsSync(join(f.root, 'build/PipiUI.release-install.json'))).toBe(false)
     expect(f.calls('osascript')).toBe('')
     expect(f.calls('kill')).toBe('')
   })
@@ -926,7 +926,7 @@ describe('two-phase release: repo installer contract', () => {
     // the overwrite gate, and real codesign rejects the unsigned fixture.
     expect(result.stderr).not.toContain('--overwrite-running')
     expect(f.calls('osascript')).toBe('')
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
   })
 
   it('running App without --overwrite-running changes nothing', { timeout: 20_000 }, () => {
@@ -936,7 +936,7 @@ describe('two-phase release: repo installer contract', () => {
     const result = f.runInstaller(['--root', f.root])
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('--overwrite-running')
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
     expect(readFileSync(join(f.stagedDir, 'Contents/marker'), 'utf8')).toBe('staged-candidate')
     expect(f.calls('osascript')).toBe('')
     expect(f.calls('kill')).toBe('')
@@ -947,15 +947,15 @@ describe('two-phase release: repo installer contract', () => {
     const f = makeReleaseFixture()
     const result = f.runInstaller(['--root', f.root])
     expect(result.status, result.stderr).toBe(0)
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('staged-candidate')
-    expect(existsSync(join(f.root, 'build/PipiUI Electron.release-staged/PipiUI Electron.app'))).toBe(false)
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('staged-candidate')
+    expect(existsSync(join(f.root, 'build/PipiUI.release-staged/PipiUI.app'))).toBe(false)
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('installed')
     expect(receipt.version).toBe('1.2.3')
-    expect(receipt.canonicalPath).toBe(join(f.root, 'build/PipiUI Electron.app'))
+    expect(receipt.canonicalPath).toBe(join(f.root, 'build/PipiUI.app'))
     expect(receipt.rollback.performed).toBe(0)
     expect(receipt.relaunch.performed).toBe(0)
-    expect(existsSync(join(f.root, 'build/PipiUI Electron.release-install.log'))).toBe(true)
+    expect(existsSync(join(f.root, 'build/PipiUI.release-install.log'))).toBe(true)
     expect(f.calls('open')).toBe('')
     expect(f.calls('kill')).toBe('')
     // Registers the canonical App; the only unregister target is the previous
@@ -966,7 +966,7 @@ describe('two-phase release: repo installer contract', () => {
     expect(unregisterCalls.length).toBeGreaterThan(0)
     expect(unregisterCalls.every(line => line.includes('previous'))).toBe(true)
     // The old App was moved to the trash seam, not deleted.
-    expect(readdirSync(f.trash).some(name => name.startsWith('PipiUI Electron previous'))).toBe(true)
+    expect(readdirSync(f.trash).some(name => name.startsWith('PipiUI previous'))).toBe(true)
   })
 
   it('--overwrite-running --no-relaunch quits gracefully, swaps, and never relaunches', { timeout: 20_000 }, () => {
@@ -978,8 +978,8 @@ describe('two-phase release: repo installer contract', () => {
     expect(f.calls('osascript')).toContain('quit')
     // Graceful only: no TERM/KILL ever reached the canonical pid.
     expect(f.calls('kill')).not.toContain('4242')
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('staged-candidate')
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('staged-candidate')
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('installed')
     expect(receipt.stopMethod).toBe('graceful')
     expect(receipt.relaunch.noRelaunchRequested).toBe(1)
@@ -999,7 +999,7 @@ describe('two-phase release: repo installer contract', () => {
     const killCalls = f.calls('kill')
     expect(killCalls).toContain('-TERM 4242')
     expect(killCalls).not.toContain('-KILL 4242')
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('installed')
     expect(receipt.stopMethod).toBe('term')
   })
@@ -1015,8 +1015,8 @@ describe('two-phase release: repo installer contract', () => {
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('did not exit')
     expect(f.calls('kill')).not.toContain('4242')
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('failed')
   })
 
@@ -1029,12 +1029,12 @@ describe('two-phase release: repo installer contract', () => {
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('rolled back')
     // Previous App restored.
-    expect(readFileSync(join(f.root, 'build/PipiUI Electron.app/Contents/marker'), 'utf8')).toBe('old-canonical')
+    expect(readFileSync(join(f.root, 'build/PipiUI.app/Contents/marker'), 'utf8')).toBe('old-canonical')
     // Failed candidate retained as evidence.
     const failed = readdirSync(join(f.root, 'build')).filter(name => name.includes('release-install.failed.'))
     expect(failed).toHaveLength(1)
     expect(readFileSync(join(f.root, 'build', failed[0], 'Contents/marker'), 'utf8')).toBe('staged-candidate')
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('rolled_back')
     expect(receipt.rollback.performed).toBe(1)
   })
@@ -1045,7 +1045,7 @@ describe('two-phase release: repo installer contract', () => {
     f.setState('running')
     const result = f.runInstaller(['--root', f.root, '--overwrite-running'])
     expect(result.status, result.stderr).toBe(0)
-    const receipt = readJson(join(f.root, 'build/PipiUI Electron.release-install.json'))
+    const receipt = readJson(join(f.root, 'build/PipiUI.release-install.json'))
     expect(receipt.status).toBe('installed')
     expect(receipt.relaunch.performed).toBe(1)
     expect(receipt.relaunch.pid).toBe('777')

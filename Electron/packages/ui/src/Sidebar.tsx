@@ -78,7 +78,7 @@ function SfIconMoon() {
 }
 
 /**
- * Standalone sidebar for the PipiUI Electron UI — a 1:1 visual/behavior
+ * Standalone sidebar for the PipiUI UI — a 1:1 visual/behavior
  * projection of the Swift `SidebarView` (搜索 + 置顶 + 项目分组 + 状态徽标 +
  * 更多分页), deliberately decoupled from the host so the integration worker
  * can mount it later and feed it from real host state.

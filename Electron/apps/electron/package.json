@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "main": "./out/main/index.js",
-  "description": "pipiui_e — cross-platform PipiUI Electron client",
+  "description": "pipiui_e — cross-platform PipiUI client",
   "author": {
     "name": "PipiUI",
     "email": "pipiui@leehow.com"
@@ -47,7 +47,7 @@
   },
   "build": {
     "appId": "com.leehow.pipiui-electron",
-    "productName": "PipiUI Electron",
+    "productName": "PipiUI",
     "forceCodeSigning": true,
     "files": [
       "out/**/*",
@@ -214,7 +214,7 @@
       "icon": "build/icon.icns",
       "extendInfo": {
         "CFBundleDisplayName": "PipiUI",
-        "CFBundleName": "PipiUI Electron"
+        "CFBundleName": "PipiUI"
       },
       "target": [
         "dmg",

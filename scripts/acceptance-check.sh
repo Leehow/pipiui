@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PipiUI Electron 集成验收自动检查脚本（integration-acceptance）
+# PipiUI 集成验收自动检查脚本（integration-acceptance）
 # 只读检查 + 运行 Electron 工作区测试；不修改产品代码，不打包。
 # 用法: ./scripts/acceptance-check.sh [--skip-tests]
 # 退出码: 0=自动项全过; 1=存在失败项; 人工项不参与退出码。
@@ -14,20 +14,20 @@ ok()   { PASS=$((PASS+1)); printf '  [PASS] %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  [FAIL] %s\n' "$1"; }
 warn() { WARN=$((WARN+1)); printf '  [WARN] %s\n' "$1"; }
 
-echo "== PipiUI Electron 集成验收：自动检查 =="
+echo "== PipiUI 集成验收：自动检查 =="
 
 # ---------- 1. Electron .app 产物存在 ----------
 echo "-- 1. Electron App 产物 --"
 ELECTRON_APP=""
-for candidate in "$ROOT/build/PipiUI Electron.app" "$ROOT/build/pipiui_e.app"; do
+for candidate in "$ROOT/build/PipiUI.app" "$ROOT/build/pipiui_e.app"; do
   [ -d "$candidate" ] && ELECTRON_APP="$candidate" && break
 done
 if [ -n "$ELECTRON_APP" ]; then
   ok "Electron App 存在: ${ELECTRON_APP#$ROOT/build/}"
-  [ "$(basename "$ELECTRON_APP")" = "PipiUI Electron.app" ] || \
-    warn "Electron 产物名为 $(basename "$ELECTRON_APP")，spec 约定为 'PipiUI Electron.app'"
+  [ "$(basename "$ELECTRON_APP")" = "PipiUI.app" ] || \
+    warn "Electron 产物名为 $(basename "$ELECTRON_APP")，spec 约定为 'PipiUI.app'"
 else
-  bad "Electron App 缺失（期望 build/PipiUI Electron.app 或 build/pipiui_e.app）"
+  bad "Electron App 缺失（期望 build/PipiUI.app 或 build/pipiui_e.app）"
 fi
 
 # ---------- 2. 产物时间戳 vs 源码（AGENTS.md 规则） ----------

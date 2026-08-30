@@ -91,7 +91,7 @@ vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = 
 
 import { App, createMockHost, fitBrowserToolsWidth, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, CHAT_MIN_WIDTH, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY, PANE_HANDLE_TRACKS } from './App'
 
-describe('PipiUI Electron main layout', () => {
+describe('PipiUI main layout', () => {
   it('keeps archive timestamps stable, grants legacy archives a fresh window, and expires at 24 hours', () => {
     const now = 2_000_000_000_000
     const existing = now - 10_000
@@ -1236,7 +1236,7 @@ describe('PipiUI Electron main layout', () => {
 
   it('uses the pane headers as macOS hiddenInset chrome in Electron only', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
-    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI Electron/32.3.3', configurable: true })
+    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI/32.3.3', configurable: true })
     try {
       const { container } = render(<App host={createMockHost()} />)
       await screen.findAllByText('Electron 三栏界面')

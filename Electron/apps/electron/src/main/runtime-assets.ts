@@ -41,7 +41,7 @@ export function resolveCuaDriverLaunchPath(
   return configuredPath
 }
 
-/** Copy a sealed-in-app Mach-O to userData and ad-hoc sign it so Gatekeeper does not scan PipiUI Electron.app. */
+/** Copy a sealed-in-app Mach-O to userData and ad-hoc sign it so Gatekeeper does not scan PipiUI.app. */
 export function materializeDetachedDarwinHost(source: string, destDir: string | undefined, name: string): string {
   if (!destDir || !source || !existsSync(source)) return source
   mkdirSync(destDir, { recursive: true })

@@ -7,7 +7,7 @@
 ### Default product UI: Electron only (binding)
 
 - The only product is the Electron edition (`Electron/packages/ui` →
-  `build/PipiUI Electron.app`). The former Swift/SwiftUI app was retired in
+  `build/PipiUI.app`). The former Swift/SwiftUI app was retired in
   2026-08 and removed from the repo; do not reintroduce Swift targets,
   `Package.swift`, or `build/PipiUI.app`.
 - `Electron/resources/runtime/` (pi-ext + pi-philosophy) is the single source
@@ -52,7 +52,7 @@ Pi 必须按打开的项目隔离，自己找自己项目的家。禁止使用�
   agent to gracefully quit the relevant canonical App, pass `--overwrite-running`, install the
   replacement, relaunch it, and continue the requested test. Do not ask for a separate or repeated
   overwrite/restart confirmation.
-- Scope this authority to `/Users/haoli/leehow/code/pipiui/build/PipiUI Electron.app`
+- Scope this authority to `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`
   only. Never terminate unrelated Apps or broad process-name matches.
 - Prefer the App's normal quit request and a bounded wait. If that fails and blocks an already
   requested lifecycle/test operation, terminate only the exact verified canonical-App PID; force
@@ -60,7 +60,7 @@ Pi 必须按打开的项目隔离，自己找自己项目的家。禁止使用�
 - Analysis-only, source-only, or test-only requests do not imply a lifecycle operation. Do not
   invent restarts when they are unnecessary for the requested result.
 
-Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with Electron workspace builds/tests only and must never create `build/PipiUI Electron.app`.
+Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may create runnable Apps.** All other linked/temporary worktrees must verify with Electron workspace builds/tests only and must never create `build/PipiUI.app`.
 
 ### Worktree ownership adapter (binding)
 
@@ -71,7 +71,7 @@ Hard rule: **only the primary checkout `/Users/haoli/leehow/code/pipiui` may cre
   `.worktrees/*` paths on `codex/*` branches) must be created, audited, and
   closed through `/Users/haoli/.codex/scripts/codex-worktree-lifecycle`.
 - Linked worktrees remain build/test-only. The primary checkout below remains
-  the sole location allowed to package `build/PipiUI Electron.app`.
+  the sole location allowed to package `build/PipiUI.app`.
 
 ### Electron packaging adapter (binding)
 
@@ -139,13 +139,13 @@ philosophy 的 orchestration 层（有 runtime 测试钉住）。
 
 - 只验证 Electron 工作区能否编译、不打包时，在 `Electron/` 跑对应 workspace build / 测试。
 
-Do **not** report "done / open the app" if only `Electron/**/dist` is fresh and `build/PipiUI Electron.app` is older than sources.
+Do **not** report "done / open the app" if only `Electron/**/dist` is fresh and `build/PipiUI.app` is older than sources.
 
 Verify after package:
 
 ```bash
 stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
-  build/PipiUI\ Electron.app/Contents/MacOS/PipiUI\ Electron \
+  build/PipiUI.app/Contents/MacOS/PipiUI \
   <changed-source-files>
 ```
 
@@ -156,8 +156,8 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 | Project rules | `CONSTITUTION.md` |
 | 稳定 ID 规则（语义 slug） | `CONSTITUTION.md` §7 · philosophy `orchestration` 层 |
 | Build / run docs | `README.md` → 构建运行 |
-| Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI Electron.app` |
+| Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI.app` |
 | Electron release (dual arch + DMG/ZIP) | `pipiui-electron-build` skill → `release`；never `electron-builder` by hand |
 | Worker/dev verification | Electron workspace build / test |
 
-macOS 14+ · the only product is Electron (`build/PipiUI Electron.app`). The former Swift App was retired and removed.
+macOS 14+ · the only product is Electron (`build/PipiUI.app`). The former Swift App was retired and removed.

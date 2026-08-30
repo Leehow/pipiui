@@ -3712,7 +3712,7 @@ class CuaDriverHost {
     const initialized = await this.rpc("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
-      clientInfo: { name: "PipiUI Electron", version: "0.1" }
+      clientInfo: { name: "PipiUI", version: "0.1" }
     });
     if (!record(initialized?.result) || typeof initialized.result.protocolVersion !== "string")
       throw new Error("Cua Driver returned an invalid initialize response");

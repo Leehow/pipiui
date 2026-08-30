@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Publishes the canonical PipiUI Electron.app (or any build artifact) to the
+# Publishes the canonical PipiUI.app (or any build artifact) to the
 # DMIT download host and verifies the public link end to end.
 set -euo pipefail
 
@@ -13,18 +13,18 @@ usage() {
   cat <<'EOF'
 usage: pipiui-upload [options] [file]
 
-  no file        zip build/PipiUI Electron.app and publish as PipiUI-Electron-YYYY-MM-DD.zip
+  no file        zip build/PipiUI.app and publish as PipiUI-YYYY-MM-DD.zip
   file           publish this existing artifact (.zip/.dmg) under its own name
 
 options:
-  --app <path>   app bundle to zip (default: <repo>/build/PipiUI Electron.app)
+  --app <path>   app bundle to zip (default: <repo>/build/PipiUI.app)
   --force        skip the stale-build freshness check
   -h, --help     this help
 EOF
 }
 
 repo_root="${0:A:h:h:h:h:h}"
-app_path="$repo_root/build/PipiUI Electron.app"
+app_path="$repo_root/build/PipiUI.app"
 force=0
 target=""
 while [[ $# -gt 0 ]]; do
@@ -86,7 +86,7 @@ if [[ -n "$target" ]]; then
   exit 0
 fi
 
-binary="$app_path/Contents/MacOS/PipiUI Electron"
+binary="$app_path/Contents/MacOS/PipiUI"
 [[ -x "$binary" ]] || { print -u2 "app bundle missing: $app_path"; exit 2 }
 if (( ! force )); then
   stale=$(find "$repo_root/Electron" -type f -newer "$binary" -not -path "*/node_modules/*" -not -path "*/out/*" -not -path "*/dist/*" -print -quit 2>/dev/null || true)
@@ -97,7 +97,7 @@ if (( ! force )); then
   fi
 fi
 
-name="PipiUI-Electron-$(date +%F).zip"
+name="PipiUI-$(date +%F).zip"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 ditto -c -k --sequesterRsrc --keepParent "$app_path" "$work/$name"

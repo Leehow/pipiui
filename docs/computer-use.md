@@ -189,7 +189,7 @@ Electron packaging adapter），不要手调 electron-builder。
 
 ## 权限
 
-打包 App 需要给 PipiUI Electron App 本身授予两项 macOS TCC 权限：
+打包 App 需要给 PipiUI App 本身授予两项 macOS TCC 权限：
 
 1. System Settings -> Privacy & Security -> Screen Recording
 2. System Settings -> Privacy & Security -> Accessibility
@@ -198,7 +198,7 @@ Computer Use 设置面板（`computer-use-permissions.ts`）实时显示两项�
 打开对应 System Settings 面板请求授权；driver 以
 `--permission-mode unrestricted` embedded 运行，权限闸门在 App 层。权限变化后应
 完全退出并重启 App，以重建 embedded daemon generation。dev 模式
-（`npm run dev`）的 TCC 身份不等价于签名后的 `PipiUI Electron.app`，不能作为
+（`npm run dev`）的 TCC 身份不等价于签名后的 `PipiUI.app`，不能作为
 产品权限验收。
 
 ## 验证边界
@@ -213,7 +213,7 @@ Anthropic typed tool 替换与 beta header、`/usr/bin/open` 拦截。
 仍需在主 checkout 单独完成：
 
 1. 通过 `pipiui-electron-build` 在主 checkout 生成 canonical
-   `build/PipiUI Electron.app`，核对 helper、外层 App 签名/entitlements 和产物
+   `build/PipiUI.app`，核对 helper、外层 App 签名/entitlements 和产物
    freshness；
 2. PipiUI 单一 TCC 归属与权限重启；
 3. TextEdit 编辑保存、Finder 文件操作、浏览器表单、Office 编辑导出和跨工具任务；
