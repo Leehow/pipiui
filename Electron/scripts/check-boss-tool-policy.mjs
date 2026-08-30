@@ -218,6 +218,23 @@ for (const name of ["bash", "edit", "write"]) {
 		: fail(`${name} is missing — the Boss is told to implement the mainline but cannot`);
 }
 
+/*
+ * The generic invariant below accepts a tool named EITHER in the rendered tool list OR anywhere
+ * in the philosophy prose. That OR is too lenient for the dispatch tool itself, and it hid a
+ * real gap: `subagent` shipped with no promptSnippet while `subagent_chain` and `subagent_watch`
+ * had one, so Pi's "Available tools:" list showed the Boss two exotic delegation tools and not
+ * the primary one. The check passed because the orchestration layer names it. That was
+ * survivable while the Boss had no hands; once it also holds read/grep/edit/bash — all of them
+ * itemized in that same list — the one tool it should reach for first was the only one missing,
+ * and measured behaviour was 238 turns across three sessions with zero dispatches.
+ */
+console.log("\n== the dispatch tools are in the tool list, not only in the prose ==");
+for (const name of ["subagent", "subagent_status"]) {
+	toolList(bossPrompt)?.includes(name)
+		? pass(`${name} itemized`)
+		: fail(`${name} is registered but absent from the rendered tool list — give it a promptSnippet`);
+}
+
 console.log("\n== the Boss keeps what it reads, records and verifies with ==");
 for (const name of ["read", "git", "ledger_note"]) {
 	toolList(bossPrompt)?.includes(name) ? pass(`${name} kept`) : fail(`${name} is missing from the Boss`);

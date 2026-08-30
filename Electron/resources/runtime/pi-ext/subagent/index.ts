@@ -10021,6 +10021,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_status",
 		label: "Subagent Status",
+		promptSnippet: "See what workers are running, what finished, and what can be resumed — check before re-dispatching.",
 		description: [
 			"Query subagent job status (running / ok / failed / aborted / interrupted), including the exact runId required to resolve an old failed episode safely.",
 			"The unfiltered view lists every running job plus the most recent ended jobs (same cap as a Wave line), then the most recently touched resumable workers. Older ended, resumable, and historical workers are omitted with a count; inspect one with subagent_status({agentId, full:true}), or list the whole archive with subagent_status({full:true}).",
@@ -10061,6 +10062,13 @@ export default function (pi: ExtensionAPI) {
 	const subagentTool = {
 		name: "subagent",
 		label: "Subagent",
+		// The Boss's own hands-on tools (read/grep/edit/bash) are all itemized in Pi's rendered
+		// tool list; without a snippet the dispatch tool is the one thing missing from it, which
+		// is exactly backwards for the tool it is supposed to reach for first. `subagent_chain`
+		// and `subagent_watch` have carried snippets since they shipped; this one did not, and
+		// the boss-tool policy check let it pass because the philosophy layer names it — an OR
+		// that is too lenient for the primary tool.
+		promptSnippet: "Dispatch a worker: recon you do not want to run yourself (explore), an implementation sidecar, or a review. Several in one message run concurrently.",
 		description: [
 			"Dispatch one worker. A single dispatch requires prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
 			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, heartbeatSecs, timeoutSecs, progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
