@@ -435,8 +435,24 @@ describe("vendored philosophy: delivery", () => {
     // no-unprompted-packaging rules: the drift they pin (sessions self-expanding scope
     // mid-plan, packaging the app unprompted to "verify") was user-reported and costs more
     // per turn than the ~380 tokens of prefix the four insertions spend.
+    // Raised to 20000 for the mainline rewrite (the round number is the user's call, taken
+    // 2026-08-30 after the third consecutive compression round started eating rules that
+    // existed for named regressions — headroom is cheaper than re-deriving why a line was
+    // there). Two entries, both paid for in part by compression rather than purely by the
+    // raise — the completion gate, the `verified=fail` rule, the smallest-change rule and the
+    // desktop-batching clause each had two copies across layers that ship together, and each
+    // now has one:
+    //   1. `25-mainline.md`. The Boss now implements, so drift is no longer bounded by a tool
+    //      denylist and has to be bought with a durable plan, countable re-anchor triggers, and
+    //      a rule that discovered work is never done inline.
+    //   2. Orchestration's "Reading is yours; locating is not". The first version of the
+    //      rewrite granted reading without a ceiling and deleted the old one ("past a handful
+    //      of file bodies it is an `explore`"). Measured on the first real post-change session:
+    //      81 read/grep calls, 1 retrieval call, 0 dispatches — the Boss hand-searched the repo
+    //      at its own prices for 22 turns. The countable 8-call trigger and the index-before-
+    //      matcher line are that regression's fix, and they are worth more than they cost.
     const result = compose({ model: SCOPED_MODEL });
-    expect(Math.round(result.text.length / 4)).toBeLessThan(19300);
+    expect(Math.round(result.text.length / 4)).toBeLessThan(20000);
   });
 
   it("delivers the semantic-slug identity rule into the composed boss prompt", () => {
