@@ -250,7 +250,8 @@ import {
   HeadroomManagedRuntime,
   type HeadroomManagedRuntimeLike,
 } from "./headroom-managed-runtime.js";
-import { readWebSearchApiKeys, writeWebSearchApiKeys } from "./web-search-keys.js";
+import { readWebSearchApiKeys, writeWebSearchApiKeys, applyKeyedSearchRouting, restoreDefaultSearchRoutingProviders } from "./web-search-keys.js";
+import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from "./host-feature-extensions.js";
 import { describeImagesViaGlmMcp, isGlmProvider } from "./glm-vision-mcp.js";
 import {
   ensureProjectPiHome,
@@ -2264,6 +2265,7 @@ export class PiHostBackend implements HostBackend {
           ? options.hostCapabilityTokenAction(event, sessionId)
           : { ok: false, code: "host_unavailable", error: "host capability token mint unavailable" },
       onVaultAction: async (event, sessionId) => this.dispatchVaultHostMethod(event, sessionId),
+      onDocumentsList: (sessionId) => this.listOpenedDocumentsForSession(sessionId),
       onModelPinValidate: (input) =>
         // Authorization is proven by the capability→sessionId map; the request body carries
         // nothing but refs. The synchronous return IS the shared linearization point.
@@ -3747,6 +3749,7 @@ export class PiHostBackend implements HostBackend {
       case "listExternalSessions": {
         if (!(await this.loadScanExternalSessions())) return [];
         const project = await this.configuredProject(params[0] as string);
+        if (await this.hostFeatureExtensionDisabled(EXTERNAL_SESSION_SCAN_EXTENSION_ID, params[0])) return [];
         const listed = await listExternalSessionsForProject(
           project.path,
           this.externalSessionRoots,
@@ -4244,6 +4247,35 @@ export class PiHostBackend implements HostBackend {
     }
     return out;
   }
+  /** Capability session only — never merge watcher paths or other sessions, never read body. */
+  private async listOpenedDocumentsForSession(sessionId: string): Promise<{ documents: Array<{
+    name: string;
+    kind: NonNullable<ReturnType<typeof documentKindForName>>;
+    path: string;
+    size?: number;
+    updatedAt?: number;
+  }> }> {
+    const documents: Array<{
+      name: string;
+      kind: NonNullable<ReturnType<typeof documentKindForName>>;
+      path: string;
+      size?: number;
+      updatedAt?: number;
+    }> = [];
+    const paths = this.openedDocumentPathsBySession.get(sessionId);
+    if (!paths?.size) return { documents };
+    for (const path of paths) {
+      const kind = documentKindForName(path);
+      if (!kind) continue;
+      try {
+        const stat = await fs.stat(path);
+        documents.push({ name: basename(path), kind, path, size: stat.size, updatedAt: stat.mtimeMs });
+      } catch {
+        documents.push({ name: basename(path), kind, path });
+      }
+    }
+    return { documents };
+  }
   private documentInjectionOptions(source: "panel" | "composer") {
     return { source, anydocRoot: join(this.runtimeRoot, "anydoc") };
   }
@@ -4285,16 +4317,9 @@ export class PiHostBackend implements HostBackend {
     this.assertSessionRuntimeToken(id, runtimeToken);
     const supported = list.map((item) => item.trim()).filter((item) => item && isAbsolute(item) && documentKindForName(item));
     if (!supported.length) return;
-    const parserMounted = await this.pdfParserMounted(id);
-    this.assertSessionRuntimeToken(id, runtimeToken);
-    // Record only after the async lifecycle check. Teardown clears this
-    // session-owned set synchronously, and every later await uses this token.
+    // Panel open/preview/drop only registers a session-available resource.
+    // Do not read, convert, or queue prompt injection — that remains composer-only.
     this.rememberOpenedDocuments(supported, id);
-    const injection = await buildDocumentsOpenedInjection(supported, { ...this.documentInjectionOptions("panel"), pdfParser: parserMounted });
-    this.assertSessionRuntimeToken(id, runtimeToken);
-    if (!injection) return;
-    this.assertSessionRuntimeToken(id, runtimeToken);
-    this.documentInjections.setPending(id, injection, supported);
   }
   private async notifyComposerDocumentsDropped(sessionId: unknown, paths: unknown): Promise<void> {
     if (typeof sessionId !== "string" || !sessionId.trim()) {
@@ -7114,6 +7139,16 @@ export class PiHostBackend implements HostBackend {
     }
     return readAppExtensionEnabled(await this.readSettings());
   }
+  /**
+   * Host-feature builtin gate. Extensions are default-on builtins, so an
+   * absent registration (fixtures that never bundled the manifest) keeps
+   * today's behavior — only an explicit project "disabled" state gates off.
+   */
+  private async hostFeatureExtensionDisabled(id: string, projectId: unknown): Promise<boolean> {
+    const overlay = await this.extensionEnableOverlay(projectId);
+    const record = this.extensions.list(overlay).find((item) => item.id === id);
+    return record?.state === "disabled";
+  }
   private async setExtensionEnabled(
     idValue: unknown,
     enabledValue: unknown,
@@ -7162,6 +7197,13 @@ export class PiHostBackend implements HostBackend {
     const record = this.extensions.list(overlay).find((item) => item.id === id);
     if (!record) throw new Error(`unknown extension ${id}`);
     await this.refreshCatalogAfterExtensionChange(id);
+    if (id === WEB_SEARCH_KEYS_EXTENSION_ID) {
+      // Disabled means "no keyed routing": restore the default provider order
+      // without deleting stored keys; enabling re-applies keyed priority.
+      const agentDir = await this.webSearchAgentDir(projectIdValue);
+      if (enabledValue) await applyKeyedSearchRouting(agentDir);
+      else await restoreDefaultSearchRoutingProviders(agentDir);
+    }
     if (id === HEADROOM_EXTENSION_ID) {
       if (enabledValue) {
         void this.headroomRuntime.prepare(root).catch((error) => {
@@ -7876,12 +7918,14 @@ export class PiHostBackend implements HostBackend {
   }
   private async loadWebSearchKeys(projectId: unknown): Promise<Record<string, boolean>> {
     const agentDir = await this.webSearchAgentDir(projectId);
+    if (await this.hostFeatureExtensionDisabled(WEB_SEARCH_KEYS_EXTENSION_ID, projectId)) return {};
     return readWebSearchApiKeys(agentDir);
   }
   private async saveWebSearchKeys(projectId: unknown, keys: unknown): Promise<string[]> {
     if (!keys || typeof keys !== "object" || Array.isArray(keys)) throw new Error("keys 必须是 object");
     const agentDir = await this.webSearchAgentDir(projectId);
-    return writeWebSearchApiKeys(agentDir, keys as Record<string, string>);
+    const disabled = await this.hostFeatureExtensionDisabled(WEB_SEARCH_KEYS_EXTENSION_ID, projectId);
+    return writeWebSearchApiKeys(agentDir, keys as Record<string, string>, { reorder: !disabled });
   }
   private checkedSidebarSessionPreferences(value: unknown): { pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; orderedSessionIds: string[]; sessionOrderVersion?: 2 | 3 } {
     if (!isRecord(value)) throw new Error("sidebarSessionPreferences 必须是 object");
@@ -8701,6 +8745,13 @@ export class PiHostBackend implements HostBackend {
    * accept images.
    */
   private async visionDescribePlan(live: Live): Promise<{ active: boolean; visionRef: string | null }> {
+    // vision-routing is a project-scoped builtin (default on): an explicit project
+    // disable makes the describe path inert — original images flow unchanged, the
+    // same semantics as visionEnabled=false. Sessions rooted outside the configured
+    // project list (adopted/detached cwds) fail open to today's behavior.
+    if (await this.hostFeatureExtensionDisabled(VISION_ROUTING_EXTENSION_ID, dirId(live.cwd)).catch(() => false)) {
+      return { active: false, visionRef: null };
+    }
     if (!(await this.loadVisionEnabled())) return { active: false, visionRef: null };
     const visionRef = await this.loadVisionModel();
     if (!visionRef) return { active: false, visionRef: null };

@@ -621,3 +621,130 @@ describe('ExtensionsPane agent contributions', () => {
     expect(host.confirmCapabilityGrant).not.toHaveBeenCalled()
   })
 })
+
+describe('ExtensionsPane host-owned feature panes', () => {
+  const vision = {
+    enabled: false,
+    model: null as string | null,
+    available: true,
+    loading: false,
+    saving: false,
+    error: null as string | null,
+    refresh: async () => undefined,
+    setEnabled: async () => undefined,
+    setModel: async () => undefined,
+    dismissError: () => undefined,
+  }
+  const visibility = {
+    models: [],
+    quickModels: [],
+    visibleModels: [],
+    hiddenIds: new Set<string>(),
+    loading: false,
+    error: null,
+    refresh: async () => undefined,
+    toggle: async () => undefined,
+    toggleProvider: async () => undefined,
+    dismissError: () => undefined,
+  }
+  const scan = {
+    enabled: true,
+    available: true,
+    loading: false,
+    saving: false,
+    error: null,
+    refresh: async () => undefined,
+    setEnabled: async () => undefined,
+    dismissError: () => undefined,
+  }
+
+  it('renders vision, web-search, and scan panes for enabled builtins and hides schema toggles', async () => {
+    const host = managementHost([
+      pkg({
+        id: 'vision-routing',
+        name: '识图模型',
+        state: 'enabled',
+        source: 'builtin',
+        contributions: {
+          settings: { scope: 'project', schema: { type: 'object', properties: { 'ext.vision-routing.enabled': { type: 'boolean' } } } },
+          settingsSections: [{ id: 'vision-routing', title: '识图模型' }],
+        },
+      }),
+      pkg({
+        id: 'web-search-keys',
+        name: 'Web 搜索密钥',
+        state: 'enabled',
+        source: 'builtin',
+        contributions: {
+          settings: { scope: 'project', schema: { type: 'object', properties: {} } },
+          settingsSections: [{ id: 'web-search-keys', title: 'Web 搜索密钥' }],
+        },
+      }),
+      pkg({
+        id: 'external-session-scan',
+        name: '自动扫描外部会话',
+        state: 'enabled',
+        source: 'builtin',
+        contributions: {
+          settings: { scope: 'project', schema: { type: 'object', properties: {} } },
+          settingsSections: [{ id: 'external-session-scan', title: '自动扫描外部会话' }],
+        },
+      }),
+    ])
+    Object.assign(host, {
+      getWebSearchKeys: vi.fn(async () => ({})),
+      setWebSearchKeys: vi.fn(async () => []),
+    })
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} vision={vision as never} visibility={visibility as never} scan={scan as never} />)
+    expect(await screen.findByTestId('vision-picker')).toBeTruthy()
+    expect(screen.getByTestId('web-search-keys-pane')).toBeTruthy()
+    expect(screen.getByTestId('scan-external-pane')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-vision-routing')).toBeNull()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-web-search-keys')).toBeNull()
+    expect(screen.queryByTestId('extensions-pkg-settings-toggle-external-session-scan')).toBeNull()
+  })
+
+  it('hides the vision pane when the extension is disabled', async () => {
+    const host = managementHost([pkg({
+      id: 'vision-routing',
+      name: '识图模型',
+      state: 'disabled',
+      source: 'builtin',
+      contributions: { settingsSections: [{ id: 'vision-routing', title: '识图模型' }] },
+    })])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} vision={vision as never} visibility={visibility as never} />)
+    expect(await screen.findByTestId('extensions-pkg-vision-routing')).toBeTruthy()
+    expect(screen.queryByTestId('vision-picker')).toBeNull()
+  })
+
+  it('renders the external-session scan switch and persists the toggle', async () => {
+    const host = managementHost([pkg({
+      id: 'external-session-scan',
+      name: '自动扫描外部会话',
+      state: 'enabled',
+      source: 'builtin',
+      contributions: { settingsSections: [{ id: 'external-session-scan', title: '自动扫描外部会话' }] },
+    })])
+    const setEnabled = vi.fn(async (enabled: boolean) => enabled)
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} scan={{ ...scan, setEnabled } as never} />)
+    const pane = await screen.findByTestId('scan-external-pane')
+    const toggle = screen.getByTestId('scan-external-sessions-switch')
+    expect(toggle.getAttribute('aria-checked')).toBe('true')
+    expect(within(pane).getByText('自动扫描其他 coding agent 聊天记录')).toBeTruthy()
+    fireEvent.click(toggle)
+    expect(setEnabled).toHaveBeenCalledWith(false)
+  })
+
+  it('hides the external-session scan pane when the extension is disabled', async () => {
+    const host = managementHost([pkg({
+      id: 'external-session-scan',
+      name: '自动扫描外部会话',
+      state: 'disabled',
+      source: 'builtin',
+      contributions: { settingsSections: [{ id: 'external-session-scan', title: '自动扫描外部会话' }] },
+    })])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} scan={scan as never} />)
+    expect(await screen.findByTestId('extensions-pkg-external-session-scan')).toBeTruthy()
+    expect(screen.queryByTestId('scan-external-pane')).toBeNull()
+  })
+})

@@ -1,0 +1,45 @@
+{
+  "id": "vision-routing",
+  "name": "识图模型",
+  "version": "0.1.0",
+  "description": "主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。",
+  "capabilities": [
+    "settings.read",
+    "settings.write"
+  ],
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.vision-routing.enabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "启用识图模型"
+          },
+          "ext.vision-routing.model": {
+            "type": "string",
+            "title": "识图模型"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [],
+      "settingsSections": [
+        {
+          "id": "vision-routing",
+          "title": "识图模型",
+          "entry": "app/dist/settings-pane.js"
+        }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

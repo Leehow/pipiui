@@ -25,7 +25,14 @@ import {
   L2_CAPABILITY_HINT,
 } from './extension-capabilities'
 import { ExtensionAuthCard } from './ExtensionAuthCard'
+import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, HOST_FEATURE_SETTINGS_EXTENSION_IDS, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from './host-feature-extensions'
+import { ScanExternalSessionsPane } from './ScanExternalSessionsPane'
 import { SchemaSettingsForm } from './schema-settings-form'
+import type { ModelVisibilityController } from './useModelVisibility'
+import type { ScanExternalSessionsController } from './useScanExternalSessions'
+import type { VisionRoutingController } from './useVisionRouting'
+import { VisionRoutingPane } from './VisionRoutingPane'
+import { WebSearchKeysPane } from './WebSearchKeysPane'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
 
@@ -289,6 +296,9 @@ function ExtensionPackageRow({
   onDismissDiagnostics,
   onToggle,
   onUninstall,
+  vision,
+  visibility,
+  scan,
 }: {
   ext: ExtensionDescriptor
   host: PipiHostAPI
@@ -300,6 +310,9 @@ function ExtensionPackageRow({
   onDismissDiagnostics: (next: Set<string> | ((current: Set<string>) => Set<string>)) => void
   onToggle: (ext: ExtensionDescriptor) => void
   onUninstall: (ext: ExtensionDescriptor) => void
+  vision?: VisionRoutingController
+  visibility?: ModelVisibilityController
+  scan?: ScanExternalSessionsController
 }) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const enabled = ext.state === 'enabled'
@@ -307,7 +320,8 @@ function ExtensionPackageRow({
   const settingsSchema = ext.contributions?.settings?.schema
   const declaresAuth = Boolean(ext.contributions?.auth?.provider?.id)
   const declaresSettings = Boolean(ext.contributions?.settingsSections?.length || settingsSchema)
-  const canEditSettings = enabled && declaresSettings && !declaresAuth && Boolean(host.getExtensionSettings && host.updateExtensionSettings)
+  const hostOwnedSettings = HOST_FEATURE_SETTINGS_EXTENSION_IDS.has(ext.id)
+  const canEditSettings = enabled && declaresSettings && !declaresAuth && !hostOwnedSettings && Boolean(host.getExtensionSettings && host.updateExtensionSettings)
   const canShowAuth = enabled && declaresAuth
   const l2Blocked = blocksEnableForL2(ext.source, caps)
   const errorText = readableError(ext)
@@ -352,6 +366,15 @@ function ExtensionPackageRow({
         <p className="extensions-pkg-desc" data-testid={`extensions-pkg-desc-${ext.id}`}>{ext.description}</p>
       )}
       {canShowAuth && <ExtensionAuthCard host={host} extensionId={ext.id} />}
+      {enabled && ext.id === VISION_ROUTING_EXTENSION_ID && visibility && vision && (
+        <VisionRoutingPane visibility={visibility} vision={vision} />
+      )}
+      {enabled && ext.id === WEB_SEARCH_KEYS_EXTENSION_ID && (
+        <WebSearchKeysPane host={host} projectId={projectId} />
+      )}
+      {enabled && ext.id === EXTERNAL_SESSION_SCAN_EXTENSION_ID && scan && (
+        <ScanExternalSessionsPane scan={scan} />
+      )}
       {canEditSettings && (
         <div className="extensions-pkg-settings" data-testid={`extensions-pkg-settings-${ext.id}`}>
           <button
@@ -398,7 +421,13 @@ function ExtensionPackageRow({
   )
 }
 
-function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; projectId?: string }) {
+function ExtensionPackagesSection({ host, projectId, vision, visibility, scan }: {
+  host: PipiHostAPI
+  projectId?: string
+  vision?: VisionRoutingController
+  visibility?: ModelVisibilityController
+  scan?: ScanExternalSessionsController
+}) {
   const [items, setItems] = useState<ExtensionDescriptor[]>([])
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -554,6 +583,9 @@ function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; proj
                 onDismissDiagnostics={setDismissedDiagnostics}
                 onToggle={ext => { void onToggle(ext) }}
                 onUninstall={setUninstallTarget}
+                vision={vision}
+                visibility={visibility}
+                scan={scan}
               />
             ))}
           </div>
@@ -596,7 +628,23 @@ function ExtensionPackagesSection({ host, projectId }: { host: PipiHostAPI; proj
   )
 }
 
-export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOpen: boolean; onCloseAdd: () => void; host?: PipiHostAPI; projectId?: string }) {
+export function ExtensionsPane({
+  addOpen,
+  onCloseAdd,
+  host,
+  projectId,
+  vision,
+  visibility,
+  scan,
+}: {
+  addOpen: boolean
+  onCloseAdd: () => void
+  host?: PipiHostAPI
+  projectId?: string
+  vision?: VisionRoutingController
+  visibility?: ModelVisibilityController
+  scan?: ScanExternalSessionsController
+}) {
   const [servers, setServers] = useState<UserMcpServer[]>([])
   const resolvedHost = host ?? hostFromWindow()
 
@@ -612,7 +660,7 @@ export function ExtensionsPane({ addOpen, onCloseAdd, host, projectId }: { addOp
 
   return (
     <div className="extensions-pane" data-testid="extensions-pane">
-      {resolvedHost?.listExtensions && <ExtensionPackagesSection host={resolvedHost} projectId={projectId} />}
+      {resolvedHost?.listExtensions && <ExtensionPackagesSection host={resolvedHost} projectId={projectId} vision={vision} visibility={visibility} scan={scan} />}
       <section className="update-center-group" data-testid="extensions-builtin">
         <header className="update-center-group-header">
           <div>

@@ -1,0 +1,35 @@
+{
+  "id": "external-session-scan",
+  "name": "自动扫描外部会话",
+  "version": "0.1.0",
+  "description": "自动扫描 Codex / Claude / Cursor 等外部 coding agent 的聊天记录并显示在侧栏；关闭后侧栏不再显示。",
+  "capabilities": [
+    "settings.read",
+    "settings.write"
+  ],
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "ui": {
+      "panels": [],
+      "settingsSections": [
+        {
+          "id": "external-session-scan",
+          "title": "自动扫描外部会话",
+          "entry": "app/dist/settings-pane.js"
+        }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

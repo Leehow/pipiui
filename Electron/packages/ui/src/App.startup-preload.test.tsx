@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PipiHostAPI, SessionPreloadSnapshot } from '@pipi/host-api'
+import type { AgentSummary, HistoryEntry, PipiHostAPI, SessionPreloadSnapshot, StreamEvent } from '@pipi/host-api'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -238,4 +238,62 @@ describe('startup-first lazy session warming', () => {
     expect(getAgentLogs).not.toHaveBeenCalled()
     expect(screen.queryByText(/UNEXPECTED-HOST-READ/)).toBeNull()
   }, 20_000)
+
+  it('hydrates persisted history and clears stale running workers after a blank running restore', async () => {
+    const project = { id: 'alpha', name: 'Alpha', path: '/tmp/alpha' }
+    const remembered = { id: 'vision-search', projectId: project.id, name: '识图与搜索扩展', updatedAt: 100 }
+    const neighbor = { id: 'neighbor', projectId: project.id, name: '邻会话', updatedAt: 90 }
+    const history = deferred<HistoryEntry[]>()
+    const durableHistory: HistoryEntry[] = [
+      { id: 'u1', role: 'user', content: '请调研识图与搜索扩展', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '已派发两个 explore。', timestamp: 2 },
+    ]
+    const staleRunning: AgentSummary[] = [
+      { agentId: 'vision-websearch-recon', runId: 'run-vision', sessionId: remembered.id, name: 'explore', title: '摸清识图+搜索设置现状', task: '摸清识图+搜索设置现状', state: 'running', createdAt: 1 },
+      { agentId: 'extension-pattern-recon', runId: 'run-ext', sessionId: remembered.id, name: 'explore', title: '梳理内置扩展标准结构', task: '梳理内置扩展标准结构', state: 'running', createdAt: 2 },
+    ]
+    const terminalAgents: AgentSummary[] = staleRunning.map(agent => ({ ...agent, state: 'ok', updatedAt: 50, endedAt: 50, finalResult: 'done' }))
+    let stream: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const preloadSession = vi.fn(async (_sessionId: string): Promise<SessionPreloadSnapshot> => ({
+      history: [],
+      agents: staleRunning,
+      agentLogs: [],
+    }))
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: vi.fn(async () => [project]),
+      getProjectPaths: vi.fn(async () => [project.path]),
+      listSessionPage: vi.fn(async () => ({ sessions: [remembered, neighbor], hasMore: false })),
+      getSession: vi.fn(async () => remembered),
+      preloadSession,
+      getSessionHistory: vi.fn(async sessionId => sessionId === remembered.id ? history.promise : []),
+      listAgents: vi.fn(async sessionId => terminalAgents.filter(agent => !sessionId || agent.sessionId === sessionId)),
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === remembered.id) stream = callback
+        return () => { if (stream === callback) stream = undefined }
+      },
+      subscribeAgents: () => () => undefined,
+      listExternalSessions: vi.fn(async () => []),
+    }
+    localStorage.setItem(LAST_SESSION_STORAGE_KEY, JSON.stringify({ projectId: project.id, sessionId: remembered.id }))
+
+    const { container } = render(<App host={host} />)
+    expect((await screen.findAllByText('识图与搜索扩展')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('请调研识图与搜索扩展')).toBeNull()
+
+    await waitFor(() => expect(stream).toBeDefined())
+    act(() => {
+      stream?.({ type: 'status', sessionId: remembered.id, status: 'started' })
+      stream?.({ type: 'thinking', sessionId: remembered.id, contentIndex: 0, delta: 'ghost' })
+    })
+
+    await act(async () => history.resolve(durableHistory))
+    expect(await screen.findByText('请调研识图与搜索扩展')).toBeTruthy()
+    expect(screen.getByText('已派发两个 explore。')).toBeTruthy()
+    act(() => stream?.({ type: 'status', sessionId: remembered.id, status: 'settled' }))
+    await waitFor(() => expect(screen.queryByText(/个子任务执行中/)).toBeNull())
+    await waitFor(() => expect(container.querySelector('[data-session-id="vision-search"]')?.getAttribute('data-status')).not.toBe('subagents-running'))
+    expect(preloadSession.mock.calls.map(([id]) => id)).toEqual([remembered.id])
+  })
 })

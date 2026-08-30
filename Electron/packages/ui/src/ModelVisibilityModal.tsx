@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { Model, ModelState, PipiHostAPI } from '@pipi/host-api'
 import type { ModelVisibilityController } from './useModelVisibility'
-import { groupByProvider, modelRef, usesBuiltInVisionMcp } from './model-visibility'
+import { groupByProvider, modelRef } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
 import { ProviderLoginPanel } from './ProviderLoginPanel'
 import type { VisionRoutingController } from './useVisionRouting'
@@ -9,10 +9,10 @@ import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane } from './ExtensionsPane'
-import { WebSearchKeysPane } from './WebSearchKeysPane'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import {
   DEFAULT_SETTINGS_TAB,
+  HOST_SETTINGS_TAB_IDS,
   registerSettingsSection,
   useSettingsSections,
   type SettingsSectionContext,
@@ -51,177 +51,6 @@ function ProviderTriState({ visibleCount, total, provider, onChange }: {
       data-testid={`provider-check-${provider}`}
       onChange={onChange}
     />
-  )
-}
-
-/**
- * 通用 tab — 识图路由开关 + 识图模型选择。开关仿 ComputerUsePanel
- * (role="switch" + computer-use-switch CSS)；选择器为原生 <select>
- * (仿 SubagentModelModal 的原生 select 风格)。候选 = 模型管理中已勾选
- * (visible) 且 supportsImages !== false 的模型；已选识图模型即便未勾选
- * 也保底出现在列表中（与 quickGroups 对当前模型的保底逻辑一致）。
- * 持久化走 useVisionRouting (getVisionEnabled/setVisionEnabled +
- * getVisionModel/setVisionModel)。
- */
-function ScanExternalSessionsPane({ scan }: { scan: ScanExternalSessionsController }) {
-  if (!scan.available) {
-    return <div className="model-modal-state" data-testid="scan-external-unsupported">当前连接不支持外部会话扫描设置。</div>
-  }
-  if (scan.loading) {
-    return <div className="model-modal-state" data-testid="scan-external-loading">正在加载外部会话扫描设置…</div>
-  }
-  return (
-    <div className="vision-picker" data-testid="scan-external-pane">
-      <div className="computer-use-toggle-row">
-        <div>
-          <strong>自动扫描其他 coding agent 聊天记录</strong>
-          <p>关闭后侧栏不再显示 Codex / Claude / Cursor 等外部会话。</p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={scan.enabled}
-          aria-label="自动扫描其他 coding agent 聊天记录"
-          className={`computer-use-switch${scan.enabled ? ' enabled' : ''}`}
-          disabled={scan.saving}
-          data-testid="scan-external-sessions-switch"
-          onClick={() => void scan.setEnabled(!scan.enabled)}
-        >
-          <span />
-        </button>
-      </div>
-      {scan.error && (
-        <div className="model-modal-error" role="alert" data-testid="scan-external-error">
-          <span>{scan.error}</span>
-          <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="scan-external-error-close" onClick={() => scan.dismissError()}>×</button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function VisionRoutingPane({ visibility, vision }: {
-  visibility: ModelVisibilityController
-  vision: VisionRoutingController
-}) {
-  const candidates = useMemo(() => {
-    const list = visibility.quickModels.filter(model => model.supportsImages !== false)
-    const selected = vision.model
-    if (selected && !list.some(model => modelRef(model) === selected)) {
-      const current = visibility.models.find(model => modelRef(model) === selected)
-      if (current) list.push(current)
-    }
-    return list
-  }, [visibility.quickModels, visibility.models, vision.model])
-  const groups = useMemo(() => groupByProvider(candidates), [candidates])
-  const textOnlyChecked = useMemo(
-    () => visibility.visibleModels.filter(model => model.supportsImages === false),
-    [visibility.visibleModels]
-  )
-  const textOnlyGroups = useMemo(() => groupByProvider(textOnlyChecked), [textOnlyChecked])
-  const [textOnlyOpen, setTextOnlyOpen] = useState(false)
-
-  if (!vision.available) {
-    return <div className="model-modal-state" data-testid="vision-unsupported">当前连接不支持识图设置。</div>
-  }
-  if (vision.loading) {
-    return <div className="model-modal-state" data-testid="vision-loading">正在加载识图设置…</div>
-  }
-  return (
-    <div className="vision-picker" data-testid="vision-picker">
-      <div className="computer-use-toggle-row">
-        <div>
-          <strong>识图模型</strong>
-          <p>图片识别</p>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={vision.enabled}
-          aria-label="启用识图模型"
-          className={`computer-use-switch${vision.enabled ? ' enabled' : ''}`}
-          disabled={vision.saving}
-          data-testid="vision-enabled-switch"
-          onClick={() => void vision.setEnabled(!vision.enabled)}
-        >
-          <span />
-        </button>
-      </div>
-      <p className="vision-picker-hint">主线模型不支持图片时，用指定识图模型识别图片后交给文字模型。</p>
-      {vision.error && (
-        <div className="model-modal-error" role="alert" data-testid="vision-error">
-          <span>{vision.error}</span>
-          <button className="visibility-error-close" aria-label="关闭错误提示" data-testid="vision-error-close" onClick={() => vision.dismissError()}>×</button>
-        </div>
-      )}
-      <label className="vision-model-select-row" style={{ display: 'flex', flexDirection: 'column', gap: 5, marginTop: 10, color: 'var(--muted)', fontSize: 11 }}>
-        <span>识图模型</span>
-        <select
-          className="vision-model-select"
-          aria-label="识图模型"
-          data-testid="vision-model-select"
-          value={vision.model ?? ''}
-          disabled={!vision.enabled || vision.saving}
-          onChange={event => void vision.setModel(event.target.value || null)}
-          style={{ width: '100%', maxWidth: 'none', padding: '5px', border: '1px solid var(--border-strong)', borderRadius: 6, color: 'var(--text)', background: 'var(--surface-input)', fontSize: 11 }}
-        >
-          <option value="">未选择识图模型</option>
-          {groups.map(group => (
-            <optgroup key={group.provider} label={group.provider}>
-              {group.models.map(model => (
-                <option key={modelRef(model)} value={modelRef(model)}>
-                  {model.name}（{modelRef(model)}）
-                </option>
-              ))}
-            </optgroup>
-          ))}
-        </select>
-      </label>
-      {vision.enabled && vision.model && (
-        <p className="vision-picker-hint" data-testid="vision-model-selected">已选：{vision.model}</p>
-      )}
-      <div className="vision-text-models">
-        <button
-          type="button"
-          className="vision-text-models-toggle"
-          aria-expanded={textOnlyOpen}
-          aria-label={textOnlyOpen ? '折叠非多模态模型' : '展开非多模态模型'}
-          data-testid="non-multimodal-fold"
-          onClick={() => setTextOnlyOpen(open => !open)}
-        >
-          <span aria-hidden="true">{textOnlyOpen ? '▾' : '▸'}</span>
-          <span>已勾选的非多模态模型</span>
-          <span className="vision-text-models-count">{textOnlyChecked.length}</span>
-        </button>
-        {textOnlyOpen && (
-          <div className="vision-text-models-list" data-testid="non-multimodal-list">
-            {textOnlyChecked.length === 0
-              ? <p className="vision-picker-hint">已勾选的模型都支持图片。</p>
-              : textOnlyGroups.map(group => (
-                <div key={group.provider} className="vision-group">
-                  <div className="vision-group-header">
-                    <ProviderLogo provider={group.provider} size={14} />
-                    <span className="vision-group-name">{group.provider}</span>
-                  </div>
-                  {group.models.map(model => (
-                    <div key={modelRef(model)} className="vision-text-model-row">
-                      <span className="vision-row-name">{model.name}</span>
-                      {usesBuiltInVisionMcp(model.provider) && (
-                        <span
-                          className="vision-text-model-badge"
-                          title="自带视觉 MCP，不走通用识图模型"
-                          data-testid={`vision-mcp-badge-${model.provider}-${model.id}`}
-                        >内置识图 MCP</span>
-                      )}
-                      <span className="model-row-id">{modelRef(model)}</span>
-                    </div>
-                  ))}
-                </div>
-              ))}
-          </div>
-        )}
-      </div>
-    </div>
   )
 }
 
@@ -338,10 +167,10 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
 }
 
 /**
- * `/model` — settings modal with four tabs: 通用 (vision-routing switch +
- * selector, default off), 模型管理 (provider-collapsible model visibility
- * management mirroring Swift Settings > 模型, the default tab), 扩展 (MCP /
- * Pi plugins, add-via-main-chat), and 更新中心. Provider headers carry a
+ * `/model` — settings modal with three tabs: 模型管理 (provider-collapsible
+ * model visibility management mirroring Swift Settings > 模型, the default
+ * tab), 扩展 (extension packages incl. the host-feature builtin panes, add
+ * MCP / Pi extensions via main chat), and 更新中心. Provider headers carry a
  * tri-state checkbox (all/none/partial visible), a per-provider delete action
  * (pi logout with confirmation) and an "添加模型" flow driving pi's native
  * OAuth/api-key login. Visibility state is persisted through the host
@@ -362,7 +191,9 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   initialView?: 'manage' | 'add'
   projectId?: string
 }) {
-  const sections = useSettingsSections()
+  const sections = useSettingsSections().filter(section => (
+    HOST_SETTINGS_TAB_IDS as readonly string[]
+  ).includes(section.id))
   const [tab, setTab] = useState(DEFAULT_SETTINGS_TAB)
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
   const [view, setView] = useState<'manage' | 'add'>(initialView)
@@ -423,19 +254,6 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
 }
 
 registerSettingsSection(BUILTIN_EXTENSION_ID, {
-  id: 'general',
-  label: '通用',
-  title: '通用',
-  description: '识图路由、外部会话扫描与 Web 搜索密钥',
-  onActivate: ({ setExtensionsAddOpen }) => setExtensionsAddOpen(false),
-  render: ctx => <>
-    <ScanExternalSessionsPane scan={ctx.scan} />
-    <VisionRoutingPane visibility={ctx.visibility} vision={ctx.vision} />
-    <WebSearchKeysPane host={ctx.host} projectId={ctx.projectId} />
-  </>,
-})
-
-registerSettingsSection(BUILTIN_EXTENSION_ID, {
   id: 'models',
   label: '模型管理',
   title: ctx => ctx.view === 'manage' ? '模型管理' : '添加模型',
@@ -465,7 +283,7 @@ registerSettingsSection(BUILTIN_EXTENSION_ID, {
   title: 'MCP / 扩展',
   description: '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。',
   headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加</button>,
-  render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} />,
+  render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} vision={ctx.vision} visibility={ctx.visibility} scan={ctx.scan} />,
 })
 
 registerSettingsSection(BUILTIN_EXTENSION_ID, {

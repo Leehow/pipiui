@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import type { Model, PipiHostAPI } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 
@@ -117,8 +117,8 @@ const updates = {
   refresh: async () => undefined,
 }
 
-describe('general settings no longer host Firecrawl OCR', () => {
-  it('does not render Firecrawl key controls on the general tab', async () => {
+describe('general settings moved into extensions', () => {
+  it('does not render Firecrawl key controls anywhere in the modal', async () => {
     render(
       <ModelVisibilityModal
         host={hostStub()}
@@ -132,24 +132,19 @@ describe('general settings no longer host Firecrawl OCR', () => {
         projectId="project-1"
       />,
     )
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-models'))
     expect(screen.queryByTestId('firecrawl-pdf-pane')).toBeNull()
     expect(screen.queryByText('Firecrawl OCR Key（选填）')).toBeNull()
     expect(screen.queryByTestId('firecrawl-pdf-key-input')).toBeNull()
   })
 
-  it('renders the external-session scan switch on by default and persists the toggle', async () => {
-    const setScanExternalSessions = vi.fn(async (enabled: boolean) => enabled)
-    const scanToggle = {
-      ...scan,
-      setEnabled: setScanExternalSessions,
-    }
+  it('has no 通用 tab left: the scan toggle moved under the external-session-scan builtin in 扩展', () => {
     render(
       <ModelVisibilityModal
-        host={hostStub({ setScanExternalSessions })}
+        host={hostStub()}
         visibility={visibility as never}
         vision={vision as never}
-        scan={scanToggle as never}
+        scan={scan as never}
         updates={updates as never}
         current={null}
         onRequestUpdate={() => undefined}
@@ -157,13 +152,13 @@ describe('general settings no longer host Firecrawl OCR', () => {
         projectId="project-1"
       />,
     )
-    fireEvent.click(screen.getByTestId('model-tab-general'))
-    const toggle = screen.getByTestId('scan-external-sessions-switch')
-    expect(toggle.getAttribute('aria-checked')).toBe('true')
-    expect(screen.getByText('自动扫描其他 coding agent 聊天记录')).toBeTruthy()
-    expect(screen.getByText('关闭后侧栏不再显示 Codex / Claude / Cursor 等外部会话。')).toBeTruthy()
-    fireEvent.click(toggle)
-    expect(setScanExternalSessions).toHaveBeenCalledWith(false)
+    expect(screen.queryByTestId('model-tab-general')).toBeNull()
+    expect(screen.getByTestId('model-tab-models')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
+    expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
+    expect(screen.queryByTestId('scan-external-pane')).toBeNull()
+    expect(screen.queryByTestId('vision-picker')).toBeNull()
+    expect(screen.queryByTestId('web-search-keys-pane')).toBeNull()
   })
 })
 
@@ -182,7 +177,7 @@ describe('settings modal has no secret vault entry', () => {
         projectId="project-1"
       />,
     )
-    expect(screen.getByTestId('model-tab-general')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-general')).toBeNull()
     expect(screen.getByTestId('model-tab-models')).toBeTruthy()
     expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
     expect(screen.getByTestId('model-tab-updates')).toBeTruthy()

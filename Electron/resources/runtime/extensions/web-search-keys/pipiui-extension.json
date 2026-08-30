@@ -1,0 +1,35 @@
+{
+  "id": "web-search-keys",
+  "name": "Web 搜索密钥",
+  "version": "0.1.0",
+  "description": "按项目配置 Pi 联网搜索服务的 API Key；密钥只存本地，界面只显示是否已配置。",
+  "capabilities": [
+    "settings.read",
+    "settings.write"
+  ],
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "ui": {
+      "panels": [],
+      "settingsSections": [
+        {
+          "id": "web-search-keys",
+          "title": "Web 搜索密钥",
+          "entry": "app/dist/settings-pane.js"
+        }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

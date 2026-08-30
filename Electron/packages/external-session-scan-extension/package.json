@@ -1,0 +1,18 @@
+{
+  "name": "@pipiui/external-session-scan-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "自动扫描 Codex / Claude / Cursor 等外部会话；关闭后侧栏不再显示",
+  "scripts": {
+    "build": "tsc -p app/tsconfig.json",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs external-session-scan-extension",
+    "test": "vitest run",
+    "pretest": "npm run build",
+    "clean": "rm -rf app/dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

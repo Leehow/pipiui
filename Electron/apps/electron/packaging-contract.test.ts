@@ -75,6 +75,21 @@ describe('macOS packaging contract', () => {
       filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
     }))
     expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/vision-routing',
+      to: 'pipiui-runtime/extensions/vision-routing',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/web-search-keys',
+      to: 'pipiui-runtime/extensions/web-search-keys',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
+      from: '../../resources/runtime/extensions/external-session-scan',
+      to: 'pipiui-runtime/extensions/external-session-scan',
+      filter: ['**/*', '!**/node_modules/**', '!**/.git/**', '!**/*.tsbuildinfo']
+    }))
+    expect(packageJSON.build.extraResources).toContainEqual(expect.objectContaining({
       from: '../../resources/runtime/extensions/office-extension',
       to: 'pipiui-runtime/extensions/office-extension',
       filter: [

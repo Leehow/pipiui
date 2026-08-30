@@ -4,7 +4,7 @@ import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
 import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SessionPreloadSnapshot, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExtensionDescriptor, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SessionPreloadSnapshot, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -734,6 +734,54 @@ export function createMockHost(): PipiHostAPI {
   let computerUseEnabled = false
   let visionEnabled = false
   let visionModel: string | null = null
+  const webSearchKeyPresence: Record<string, boolean> = {}
+  const mockExtensions: ExtensionDescriptor[] = [
+    {
+      id: 'vision-routing',
+      name: '识图模型',
+      version: '0.1.0',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: ['settings.read', 'settings.write'],
+      contributions: {
+        settings: {
+          scope: 'project',
+          schema: {
+            type: 'object',
+            properties: {
+              'ext.vision-routing.enabled': { type: 'boolean', default: false, title: '启用识图模型' },
+              'ext.vision-routing.model': { type: 'string', title: '识图模型' },
+            },
+          },
+        },
+        settingsSections: [{ id: 'vision-routing', title: '识图模型' }],
+      },
+    },
+    {
+      id: 'web-search-keys',
+      name: 'Web 搜索密钥',
+      version: '0.1.0',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: ['settings.read', 'settings.write'],
+      contributions: {
+        settings: { scope: 'project', schema: { type: 'object', properties: {} } },
+        settingsSections: [{ id: 'web-search-keys', title: 'Web 搜索密钥' }],
+      },
+    },
+    {
+      id: 'external-session-scan',
+      name: '自动扫描外部会话',
+      version: '0.1.0',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: ['settings.read', 'settings.write'],
+      contributions: {
+        settings: { scope: 'project', schema: { type: 'object', properties: {} } },
+        settingsSections: [{ id: 'external-session-scan', title: '自动扫描外部会话' }],
+      },
+    },
+  ]
   let scanExternalSessions = true
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
   let memoryReviewModel: string | null = null
@@ -909,6 +957,15 @@ export function createMockHost(): PipiHostAPI {
     setVisionModel: async ref => { visionModel = ref; return visionModel },
     getVisionEnabled: async () => visionEnabled,
     setVisionEnabled: async enabled => { visionEnabled = enabled; return visionEnabled },
+    getWebSearchKeys: async () => ({ ...webSearchKeyPresence }),
+    setWebSearchKeys: async (_projectId, keys) => {
+      for (const [field, value] of Object.entries(keys)) {
+        if (typeof value === 'string' && value.trim()) webSearchKeyPresence[field] = true
+        else delete webSearchKeyPresence[field]
+      }
+      return Object.keys(webSearchKeyPresence)
+    },
+    listExtensions: async () => mockExtensions.map(item => ({ ...item, contributions: item.contributions ? { ...item.contributions } : undefined })),
     getScanExternalSessions: async () => scanExternalSessions,
     setScanExternalSessions: async enabled => { scanExternalSessions = enabled; return scanExternalSessions },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
@@ -1259,7 +1316,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const scanExternalRef = useRef(scanExternal)
   scanExternalRef.current = scanExternal
   const updates = useUpdateCenter(host)
-  // Opening the settings modal refreshes the vision-routing snapshot so the 通用
+  // Opening the settings modal refreshes the vision-routing snapshot so the 扩展
   // tab always shows the host's current state (reads happen on open, per spec).
   const openModelManager = () => { setModalInitialView('manage'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
   const openAddProvider = () => { setModalInitialView('add'); setModalOpen(true); void vision.refresh(); void scanExternal.refresh() }
@@ -1444,8 +1501,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     ...host,
     listAgents: async (sessionId, scope) => {
       const cached = sessionId ? preloadedSessionDetailsRef.current.get(sessionId) : undefined
-      if (cached && scope === 'history') return cached.agents
-      return host.listAgents(sessionId, scope)
+      const cachedLive = cached?.agents.some(agent => agent.state === 'running' || agent.state === 'stalled') === true
+      // A startup snapshot can freeze workers as `running` after they have already
+      // reached a terminal verdict. Live index wins whenever the cache still looks active.
+      if (cached && scope === 'history' && !cachedLive) return cached.agents
+      const live = await host.listAgents(sessionId, scope)
+      if (cached && sessionId && scope === 'history') preloadedSessionDetailsRef.current.set(sessionId, { ...cached, agents: live })
+      return live
     },
     getAgentLogs: async (agentId, sessionId, runId, scope) => {
       // Match the host-api convention: an omitted scope stays a 3-argument read.
@@ -1698,6 +1760,17 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       document.removeEventListener('visibilitychange', onVisible)
     }
   }, [host])
+  useEffect(() => {
+    if (!selectedSession || isExternalSessionId(selectedSession)) return
+    let mounted = true
+    void host.listAgents(selectedSession, 'history').then(snapshot => {
+      if (!mounted) return
+      setSidebarAgents(current => mergeAgentSnapshot(current, snapshot))
+      const cached = preloadedSessionDetailsRef.current.get(selectedSession)
+      if (cached) preloadedSessionDetailsRef.current.set(selectedSession, { ...cached, agents: snapshot })
+    }).catch(() => undefined)
+    return () => { mounted = false }
+  }, [host, selectedSession])
   useEffect(() => {
     if (!projects.length || loadedSidebarPreferencesKey === sidebarStorageKey) return
     let active = true
@@ -2099,18 +2172,25 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         // A stream mutation supersedes this request generation. While a turn is
         // open its terminal event owns the retry; otherwise schedule one bounded
         // exact-context retry instead of letting the old response win.
-        if (!mainTurnOpenRef.current && !staleRetryScheduled) {
-          staleRetryScheduled = true
-          staleRetryTimer = window.setTimeout(() => {
-            if (historyLoadRef.current === request
-              && historyContextRef.current?.host === host
-              && historyContextRef.current.sessionId === selectedSession) {
-              freezeProbe('history_refresh', { reason: 'stale_request_retry', session: selectedSession })
-              setHistoryRefreshKey(key => key + 1)
-            }
-          }, 0)
+        // Exception: an empty (or user-less) live pane must still accept durable
+        // history. Otherwise a lost settle / stale running resume keeps the
+        // middle column blank forever because mainTurnOpen blocks the retry.
+        const liveLacksUser = !messagesRef.current.some(message => message.role === 'user' && !message.queued)
+        const historyHasUser = reconciliation.messages.some(message => message.role === 'user')
+        if (!(liveLacksUser && historyHasUser)) {
+          if (!mainTurnOpenRef.current && !staleRetryScheduled) {
+            staleRetryScheduled = true
+            staleRetryTimer = window.setTimeout(() => {
+              if (historyLoadRef.current === request
+                && historyContextRef.current?.host === host
+                && historyContextRef.current.sessionId === selectedSession) {
+                freezeProbe('history_refresh', { reason: 'stale_request_retry', session: selectedSession })
+                setHistoryRefreshKey(key => key + 1)
+              }
+            }, 0)
+          }
+          return
         }
-        return
       }
       if (reconciliation.status === 'unchanged') {
         resumeOrCloseLostSettle(reconciliation.messages)

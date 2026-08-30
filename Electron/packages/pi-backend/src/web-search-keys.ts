@@ -97,20 +97,50 @@ function reorderProvidersForKeyPriority(config: JsonObject): string[] | null {
   return [...withKeys, ...withoutKeys];
 }
 
+function applyProviderOrder(config: JsonObject, providers: readonly string[]): void {
+  const existingRouting = asObject(config.searchRouting);
+  if (existingRouting) {
+    config.searchRouting = { ...existingRouting, providers: [...providers] };
+    return;
+  }
+  config.searchRouting = {
+    providers: [...providers],
+    fallbackOn: [...(DEFAULT_SEARCH_ROUTING.fallbackOn as readonly string[])],
+  };
+}
+
+/** Restore default provider order without touching *ApiKey fields. */
+export async function restoreDefaultSearchRoutingProviders(agentDir: string): Promise<void> {
+  const current = await readWebSearchConfig(agentDir);
+  if (!asObject(current.searchRouting) && Object.keys(current).length === 0) return;
+  const next: JsonObject = { ...current };
+  applyProviderOrder(next, DEFAULT_SEARCH_ROUTING.providers);
+  await writeWebSearchConfigAtomic(agentDir, next);
+}
+
+/** Reorder searchRouting.providers from currently configured keys. No-op when none. */
+export async function applyKeyedSearchRouting(agentDir: string): Promise<void> {
+  const current = await readWebSearchConfig(agentDir);
+  const reordered = reorderProvidersForKeyPriority(current);
+  if (reordered === null) return;
+  const next: JsonObject = { ...current };
+  applyProviderOrder(next, reordered);
+  await writeWebSearchConfigAtomic(agentDir, next);
+}
+
 /**
  * Merge the given keys into web-search.json atomically.
  * - Non-empty values are set (overwriting existing).
  * - Empty strings delete the field.
  * - All other fields in the config are preserved (passed through untouched).
- * - After merging, if at least one non-empty ApiKey exists, reorders
- *   `searchRouting.providers` so keyed providers come first (relative order
- *   from DEFAULT_SEARCH_ROUTING preserved). If no keys are present, leaves
- *   searchRouting untouched.
+ * - After merging, if at least one non-empty ApiKey exists and `reorder` is
+ *   not false, reorders `searchRouting.providers` so keyed providers come first.
  * Returns the list of configured (non-empty) ApiKey field names.
  */
 export async function writeWebSearchApiKeys(
   agentDir: string,
   keys: Record<string, string>,
+  options: { reorder?: boolean } = {},
 ): Promise<string[]> {
   const current = await readWebSearchConfig(agentDir);
   const next: JsonObject = { ...current };
@@ -125,18 +155,9 @@ export async function writeWebSearchApiKeys(
     }
   }
 
-  // Reorder searchRouting.providers based on key priority
-  const reordered = reorderProvidersForKeyPriority(next);
-  if (reordered !== null) {
-    const existingRouting = asObject(next.searchRouting);
-    if (existingRouting) {
-      next.searchRouting = { ...existingRouting, providers: reordered };
-    } else {
-      next.searchRouting = {
-        providers: reordered,
-        fallbackOn: [...(DEFAULT_SEARCH_ROUTING.fallbackOn as readonly string[])],
-      };
-    }
+  if (options.reorder !== false) {
+    const reordered = reorderProvidersForKeyPriority(next);
+    if (reordered !== null) applyProviderOrder(next, reordered);
   }
 
   await writeWebSearchConfigAtomic(agentDir, next);

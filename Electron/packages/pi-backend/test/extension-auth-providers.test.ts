@@ -136,7 +136,7 @@ export function createGrokBuildProvider() {
     expect(loaded?.id).toBe("grok-build");
     expect(loaded?.config).toMatchObject({
       name: "Grok Build",
-      api: "openai-completions",
+      api: "openai-responses",
       baseUrl: "https://api.x.ai/v1",
     });
     const models = (loaded?.config as { models: Array<{ id: string }> }).models.map((model) => model.id);

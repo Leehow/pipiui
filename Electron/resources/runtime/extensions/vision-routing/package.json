@@ -1,0 +1,18 @@
+{
+  "name": "@pipiui/vision-routing-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "识图模型：主线不支持图片时用指定识图模型识别后交给文字模型",
+  "scripts": {
+    "build": "tsc -p app/tsconfig.json",
+    "postbuild": "node ../../scripts/sync-bundled-extension.mjs vision-routing-extension",
+    "test": "vitest run",
+    "pretest": "npm run build",
+    "clean": "rm -rf app/dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vitest": "^4.1.10"
+  }
+}

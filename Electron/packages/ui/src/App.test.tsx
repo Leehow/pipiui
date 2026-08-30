@@ -1543,6 +1543,27 @@ describe('PipiUI Electron main layout', () => {
     expect(await screen.findByLabelText('文档内容 README.md')).toBeTruthy()
   })
 
+  it('does not attach a panel-opened document to the next prompt', async () => {
+    const host = createMockHost()
+    const notifyDocumentsDropped = vi.fn(async () => undefined)
+    const notifyComposerDocumentsDropped = vi.fn(async () => undefined)
+    const sendPrompt = vi.spyOn(host, 'sendPrompt')
+    host.notifyDocumentsDropped = notifyDocumentsDropped
+    host.notifyComposerDocumentsDropped = notifyComposerDocumentsDropped
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    fireEvent.click(await screen.findByRole('button', { name: '打开文档 README.md' }))
+    await waitFor(() => expect(notifyDocumentsDropped).toHaveBeenCalledWith('welcome', ['/Users/demo/code/pipiui/README.md']))
+    expect(notifyComposerDocumentsDropped).not.toHaveBeenCalled()
+    const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
+    fireEvent.change(composer, { target: { value: '把这个 bug 改一下' } })
+    await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '把这个 bug 改一下', undefined, rendererTelemetryMatcher()))
+    expect(notifyComposerDocumentsDropped).not.toHaveBeenCalled()
+    expect(sendPrompt).toHaveBeenCalledTimes(1)
+  })
+
   it('drops a document on the right panel without focusing composer or attaching files', async () => {
     const host = createMockHost()
     const notifyDocumentsDropped = vi.fn(async () => undefined)
@@ -4045,7 +4066,7 @@ describe('extensions settings tab', () => {
       },
     }])
     await openModelModal(host)
-    expect(screen.getByTestId('model-tab-general')).toBeTruthy()
+    expect(screen.queryByTestId('model-tab-general')).toBeNull()
     expect(screen.getByTestId('model-tab-models')).toBeTruthy()
     expect(screen.getByTestId('model-tab-extensions')).toBeTruthy()
     expect(screen.getByTestId('model-tab-updates')).toBeTruthy()
@@ -4180,16 +4201,18 @@ describe('update center settings flow', () => {
   })
 })
 
-describe('vision routing (通用 tab)', () => {
-  it('renders the 通用 tab with the switch and a disabled selector while the switch is off', async () => {
+describe('vision routing (扩展 tab)', () => {
+  it('renders the 扩展 tab with the switch and a disabled selector while the switch is off', async () => {
     const composer = await renderChat(createMockHost())
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
     await screen.findByTestId('model-modal')
-    // 模型管理 stays the default tab
+    // 模型管理 stays the default tab; 通用 is gone (scan moved into the external-session-scan builtin)
     expect(screen.getByTestId('model-tab-models').getAttribute('aria-selected')).toBe('true')
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    expect(screen.queryByTestId('model-tab-general')).toBeNull()
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
+    expect(screen.getByTestId('scan-external-pane')).toBeTruthy()
     const toggle = screen.getByTestId('vision-enabled-switch')
     expect(toggle.getAttribute('role')).toBe('switch')
     expect(toggle.getAttribute('aria-checked')).toBe('false')
@@ -4206,7 +4229,7 @@ describe('vision routing (通用 tab)', () => {
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
     await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
     const select = screen.getByTestId('vision-model-select') as HTMLSelectElement
     expect(select.disabled).toBe(true)
@@ -4234,7 +4257,7 @@ describe('vision routing (通用 tab)', () => {
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
     await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
     const select = (await screen.findByTestId('vision-model-select')) as HTMLSelectElement
     await waitFor(() => expect(select.disabled).toBe(false))
@@ -4252,7 +4275,7 @@ describe('vision routing (通用 tab)', () => {
     fireEvent.change(composer, { target: { value: '/model' } })
     fireEvent.keyDown(composer, { key: 'Enter' })
     await screen.findByTestId('model-modal')
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
     const select = screen.getByTestId('vision-model-select') as HTMLSelectElement
     await waitFor(() => expect(select.disabled).toBe(false))
@@ -4305,7 +4328,7 @@ describe('vision routing (通用 tab)', () => {
     const host = createMockHost()
     await host.setHiddenModelIds(['moonshot/moonshot-v8-32k'])
     await openModelModal(host)
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
     const fold = await screen.findByTestId('non-multimodal-fold')
     expect(fold.getAttribute('aria-expanded')).toBe('false')
@@ -4332,7 +4355,7 @@ describe('vision routing (通用 tab)', () => {
       { provider: 'zai-coding-cn', id: 'glm-4.6', name: 'GLM-4.6', reasoning: true, supportsImages: false },
     ])
     await openModelModal(host)
-    fireEvent.click(screen.getByTestId('model-tab-general'))
+    fireEvent.click(screen.getByTestId('model-tab-extensions'))
     await screen.findByTestId('vision-picker')
     fireEvent.click(await screen.findByTestId('non-multimodal-fold'))
     const list = await screen.findByTestId('non-multimodal-list')
