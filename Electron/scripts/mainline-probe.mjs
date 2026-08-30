@@ -77,7 +77,13 @@ const FAMILY = {
 	terminal: ["terminal"],
 	dispatch: ["subagent", "subagent_chain"],
 	supervise: ["subagent_status", "subagent_abort", "subagent_resolve", "subagent_watch", "subagent_progress"],
-	read: ["read", "grep", "ls", "find", "code_search", "code_nav", "repo_map", "read_spans", "git"],
+	// Split on purpose. The first version of this probe lumped these together as one `read`
+	// family, and that is exactly what hid the regression it was supposed to catch: a Boss
+	// running 81 greps while touching the retrieval index once scored the same as one using
+	// the index properly. Locating and reading are different work; measure them apart.
+	grep: ["grep", "find", "ls"],
+	retrieval: ["code_search", "code_nav", "repo_map", "read_spans"],
+	read: ["read", "git"],
 	track: ["plan_publish", "plan_task_update", "plan_approve", "plan_cancel", "plan_check"],
 	record: ["ledger_note", "context_doc"],
 };
@@ -227,7 +233,10 @@ function summarize(label, from, to) {
 		terminal: sum("terminal"),
 		dispatch: sum("dispatch"),
 		supervise: sum("supervise"),
+		grep: sum("grep"),
+		retrieval: sum("retrieval"),
 		read: sum("read"),
+		exploreDispatched: 0,
 		track: sum("track"),
 		record: sum("record"),
 		sessionsThatImplemented: active.filter((s) => s.family.implement > 0).length,
@@ -242,6 +251,7 @@ function summarize(label, from, to) {
 		briefsWithAnchor: briefs.filter((b) => ANCHOR.test(b.text)).length,
 		agentMix,
 		forkRequested: briefs.filter((b) => b.fork).length,
+		exploreShare: briefs.length ? briefs.filter((b) => b.agent === "explore").length / briefs.length : 0,
 		workersStarted: workers.length,
 		workersForked: workers.filter((w) => w.forked).length,
 	};
@@ -280,6 +290,17 @@ row("既实现又派工的会话", before.sessionsThatDidBoth, after.sessionsTha
 row("wave 宽度中位数", before.medianWaveWidth, after.medianWaveWidth);
 console.log(`    agent 组成  前: ${JSON.stringify(before.agentMix)}`);
 console.log(`                后: ${JSON.stringify(after.agentMix)}`);
+
+console.log("\n— 检索行为 —  Boss 自己找代码 vs 用索引 vs 派 explore。这一节是 2026-08-30 回归的看门狗。");
+// Raw totals across windows with very different session counts invite a wrong reading, so
+// the search metrics are normalised per Boss session and the ratio is stated outright.
+const per = (w, key) => (w.bossSessions ? (w[key] / w.bossSessions).toFixed(1) : "—");
+const indexShare = (w) => (w.grep + w.retrieval ? `${Math.round((w.retrieval / (w.grep + w.retrieval)) * 100)}%` : "—");
+row("grep/find/ls 每会话", per(before, "grep"), per(after, "grep"), "自己硬找，越高越可疑");
+row("检索索引 每会话", per(before, "retrieval"), per(after, "retrieval"), "code_search/code_nav/repo_map/read_spans");
+row("索引占检索比", indexShare(before), indexShare(after), "越低=越在用 grep 硬扫");
+row("read/git 每会话", per(before, "read"), per(after, "read"), "读已定位的东西，属主线");
+row("explore 占派发比", `${Math.round(before.exploreShare * 100)}%`, `${Math.round(after.exploreShare * 100)}%`);
 
 console.log("\n— 主线纪律 —  计划是否被记下并持续更新。gap = 两次 plan_task_update 之间的 Boss 工具调用数。");
 row("发布的计划", before.plansPublished, after.plansPublished);
