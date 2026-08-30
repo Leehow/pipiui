@@ -76,6 +76,7 @@ const FORBIDDEN_SQL_IDENT = /account|credential|token|message|fts|blob|prompt|se
 export const OPENCODE_SESSION_COLUMNS = ["id", "title", "directory", "path", "time_updated"] as const;
 export const ZCODE_TASK_COLUMNS = ["task_id", "title", "workspace_path", "updated_at"] as const;
 export const CODEX_THREAD_COLUMNS = ["id", "title", "cwd", "updated_at", "updated_at_ms"] as const;
+const CODEX_THREAD_SOURCE_COLUMNS = [...CODEX_THREAD_COLUMNS, "source", "thread_source"] as const;
 export const CODEX_CATALOG_COLUMNS = ["thread_id", "display_title", "cwd", "source_updated_at"] as const;
 export const EXTERNAL_SESSIONS_PER_SOURCE = 5;
 
@@ -150,7 +151,7 @@ async function newestDatedRollouts(sessionsDir: string, limit: number): Promise<
 const SQLITE_ALLOWLIST: Record<string, readonly string[]> = {
   session: OPENCODE_SESSION_COLUMNS,
   tasks: ZCODE_TASK_COLUMNS,
-  threads: CODEX_THREAD_COLUMNS,
+  threads: CODEX_THREAD_SOURCE_COLUMNS,
   local_thread_catalog: CODEX_CATALOG_COLUMNS,
 };
 
@@ -201,6 +202,19 @@ function isRecord(value: unknown): value is JsonRecord {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function isCodexSubagentSource(source: unknown, threadSource?: unknown): boolean {
+  if (text(threadSource)?.toLowerCase() === "subagent") return true;
+  if (isRecord(source)) return isRecord(source.subagent);
+  const serialized = text(source);
+  if (!serialized) return false;
+  try {
+    const parsed = JSON.parse(serialized);
+    return isRecord(parsed) && isRecord(parsed.subagent);
+  } catch {
+    return false;
+  }
 }
 
 const TITLE_MAX = 120;
@@ -492,6 +506,7 @@ async function readCodexMeta(path: string): Promise<{
   cwd?: string;
   updatedAt: number;
   title?: string;
+  isSubagent: boolean;
 } | null> {
   try {
     const updatedAt = await fileMtime(path);
@@ -499,11 +514,13 @@ async function readCodexMeta(path: string): Promise<{
     let cwd: string | undefined;
     let title: string | undefined;
     let userTitle: string | undefined;
+    let isSubagent = false;
     let stamp = updatedAt;
     for await (const rec of readJsonlRecords(path)) {
       if (rec.type === "session_meta" && isRecord(rec.payload)) {
         id = text(rec.payload.id) ?? text(rec.payload.session_id) ?? id;
         cwd = text(rec.payload.cwd) ?? cwd;
+        isSubagent ||= isCodexSubagentSource(rec.payload.source, rec.payload.thread_source);
         title = firstTitle(
           rec.payload.title,
           rec.payload.thread_name,
@@ -516,13 +533,13 @@ async function readCodexMeta(path: string): Promise<{
       }
       if (id && cwd && (title || userTitle)) break;
     }
-    return { id, cwd, updatedAt: stamp, title: title ?? userTitle };
+    return { id, cwd, updatedAt: stamp, title: title ?? userTitle, isSubagent };
   } catch {
     return null;
   }
 }
 
-type CodexSqliteThread = { title?: string; cwd?: string; updatedAt?: number };
+type CodexSqliteThread = { title?: string; cwd?: string; updatedAt?: number; isSubagent?: boolean };
 
 function ingestCodexThreadDb(
   map: Map<string, CodexSqliteThread>,
@@ -531,17 +548,26 @@ function ingestCodexThreadDb(
 ): void {
   if (!existsSync(dbPath)) return;
   try {
-    for (const row of queryReadonlySqlite(dbPath, { table: "threads", columns: CODEX_THREAD_COLUMNS })) {
+    let rows: JsonRecord[];
+    try {
+      rows = queryReadonlySqlite(dbPath, { table: "threads", columns: CODEX_THREAD_SOURCE_COLUMNS });
+    } catch {
+      // Older Codex schemas predate source/thread_source; retain compatibility.
+      rows = queryReadonlySqlite(dbPath, { table: "threads", columns: CODEX_THREAD_COLUMNS });
+    }
+    for (const row of rows) {
       const id = text(row.id);
       if (!id) continue;
       const prev = map.get(id);
       const nextTitle = firstTitle(row.title);
       const nextCwd = text(row.cwd);
       const nextUpdated = parseTime(row.updated_at_ms, 0) || parseTime(row.updated_at, 0);
+      const nextIsSubagent = isCodexSubagentSource(row.source, row.thread_source);
       map.set(id, {
         title: fillOnly ? (prev?.title ?? nextTitle) : (nextTitle ?? prev?.title),
         cwd: fillOnly ? (prev?.cwd ?? nextCwd) : (nextCwd ?? prev?.cwd),
         updatedAt: fillOnly ? (prev?.updatedAt || nextUpdated) : (nextUpdated || prev?.updatedAt),
+        isSubagent: prev?.isSubagent || nextIsSubagent || undefined,
       });
     }
   } catch {
@@ -582,7 +608,7 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
   ]);
   const fromStore: ExternalSession[] = [];
   for (const [id, row] of sqlite) {
-    if (!row.cwd || !cwdMatchesProject(row.cwd, projectCwd)) continue;
+    if (!row.cwd || row.isSubagent || !cwdMatchesProject(row.cwd, projectCwd)) continue;
     const indexed = index.get(id);
     fromStore.push({
       id: makeExternalSessionId("codex", id),
@@ -611,6 +637,10 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
     const session = byNativeId.get(id);
     const meta = await readCodexMeta(path);
     if (!session || meta?.id !== id || !meta.cwd || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
+    if (meta.isSubagent) {
+      byNativeId.delete(id);
+      continue;
+    }
     byNativeId.set(id, {
       ...session,
       title: firstTitle(session.title, meta.title) ?? session.title,
@@ -623,7 +653,7 @@ async function scanCodex(projectCwd: string, roots: ResolvedExternalSessionRoots
   );
   for (const path of files) {
     const meta = await readCodexMeta(path);
-    if (!meta?.id || !meta.cwd || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
+    if (!meta?.id || !meta.cwd || meta.isSubagent || !cwdMatchesProject(meta.cwd, projectCwd)) continue;
     const existing = byNativeId.get(meta.id);
     if (existing) {
       // SQLite safely supplies the catalog metadata; the matching rollout proves

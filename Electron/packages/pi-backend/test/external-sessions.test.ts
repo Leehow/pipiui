@@ -625,6 +625,40 @@ describe("external session native titles", () => {
     expect(listed.find((item) => item.id === "ext:codex:codex-prompt")?.title).toBe("Prompt title only");
   });
 
+  it("hides Codex subagent threads while keeping ordinary Codex sessions", async () => {
+    const { home, project } = await fixtureHome();
+    const day = join(home, ".codex", "sessions", "2026", "08", "01");
+    await mkdir(day, { recursive: true });
+    await mkdir(join(home, ".codex", "sqlite"), { recursive: true });
+    await writeFile(join(day, "rollout-codex-user.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:00.000Z", type: "session_meta", payload: { id: "codex-user", cwd: project, title: "Ordinary Codex session", thread_source: "user" } },
+    ]));
+    await writeFile(join(day, "rollout-codex-subagent.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:01.000Z", type: "session_meta", payload: {
+        id: "codex-subagent",
+        cwd: project,
+        title: "Internal worker",
+        parent_thread_id: "codex-user",
+        source: { subagent: { thread_spawn: { parent_thread_id: "codex-user", depth: 1 } } },
+      } },
+    ]));
+    await writeFile(join(day, "rollout-codex-legacy-subagent.jsonl"), jsonl([
+      { timestamp: "2026-08-01T00:00:02.000Z", type: "session_meta", payload: { id: "codex-legacy-subagent", cwd: project, title: "Legacy worker", thread_source: "subagent" } },
+    ]));
+    await writeSqlite(join(home, ".codex", "sqlite", "state_5.sqlite"), (db) => {
+      db.exec("CREATE TABLE threads (id TEXT, title TEXT, cwd TEXT, updated_at TEXT, updated_at_ms INTEGER, source TEXT, thread_source TEXT)");
+      const insert = db.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)");
+      insert.run("codex-user", "Ordinary Codex session", project, "2026-08-01", 1, "vscode", "user");
+      insert.run("codex-subagent", "Internal worker", project, "2026-08-01", 2, JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: "codex-user" } } }), "subagent");
+      insert.run("codex-db-only-subagent", "Database-only worker", project, "2026-08-01", 3, JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: "codex-user" } } }), "subagent");
+    });
+
+    const listed = await listExternalSessionsForProject(project, { home });
+    expect(listed.filter((item) => item.source === "codex").map((item) => item.id)).toEqual([
+      "ext:codex:codex-user",
+    ]);
+  });
+
   it("keeps only the five newest sessions per source", async () => {
     const { home, project } = await fixtureHome();
     const claudeDir = join(home, ".claude", "projects", encodeClaudeProjectDir(project));
