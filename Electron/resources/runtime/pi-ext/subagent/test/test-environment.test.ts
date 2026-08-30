@@ -18,6 +18,16 @@ test("real-seam suites use a dedicated worker entry instead of re-executing thei
 	assert.match(worker, /rejects unsupported transport mode/);
 });
 
+test("bundled nested lifecycle suite scrubs the child environment before spawning Pi", () => {
+	const source = readFileSync(new URL("nested-background-lifecycle.test.ts", import.meta.url), "utf8");
+	assert.match(source, /import \{ scrubSubagentRuntimeTestHostEnvironment \} from "\.\/test-environment\.ts";/);
+	assert.match(source, /scrubSubagentRuntimeTestHostEnvironment\(env\);/);
+	assert.ok(
+		source.indexOf("scrubSubagentRuntimeTestHostEnvironment(env);") < source.indexOf("spawn(process.execPath, args"),
+		"the live host bridge must be removed before the bundled Pi child is spawned",
+	);
+});
+
 test("dedicated fake worker fails closed outside a marked supported child invocation", () => {
 	const fixture = fileURLToPath(new URL("fake-pi-worker.ts", import.meta.url));
 	const baseEnv = {

@@ -20,6 +20,7 @@ import {
 	RESIDENT_RPC_SHUTDOWN_WAKE_STATUS_PREFIX,
 	residentRpcShutdownWakeStatusKey,
 } from "../resident-rpc-wake.ts";
+import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 
 type Scenario = "print" | "single" | "parallel" | "abort";
 type PiEvent = { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> }; [key: string]: unknown };
@@ -251,6 +252,7 @@ function spawnBundledParent(
 		PIPIUI_RESIDENT_RPC_WAKE_TOKEN: wakeToken,
 		PIPIUI_TEST_NOISE_WAKE_STATUS_KEY: options.noiseStatusKey,
 	};
+	scrubSubagentRuntimeTestHostEnvironment(env);
 	const args = [cliPath, "--mode", mode, "--no-session", "--approve", "--no-skills", "--no-extensions", "-e", subagentExtension, "-e", providerPath, "--model", "fixture/mock"];
 	if (mode === "json") args.push("-p", `Task: parent-${scenario}`);
 	const proc = spawn(process.execPath, args, { cwd: suiteRoot, env, stdio: ["pipe", "pipe", "pipe"] });
