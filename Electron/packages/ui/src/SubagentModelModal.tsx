@@ -227,6 +227,10 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
   onSave: (agentName: string, chain: SubagentModelSetting[]) => Promise<void>
   hideProjectSource?: boolean
 }) {
+  // Drag bookkeeping stays per AgentRow: rows of other agents see `dragging`
+  // as null and therefore ignore dragover/drop from a foreign chain.
+  const [dragging, setDragging] = useState<number | null>(null)
+  const [dragOver, setDragOver] = useState<number | null>(null)
   const sourceLabel = agentSourceLabel(agent, { skipProject: hideProjectSource })
   const availabilityLabel = agentAvailabilityLabel(agent)
   const unavailable = isAgentUnavailable(agent)
@@ -269,6 +273,18 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
     void onSave(agent.name, [...primary, { model: firstRef }])
   }
   const remove = (index: number) => void onSave(agent.name, chain.filter((_, itemIndex) => itemIndex !== index))
+  // Reorder keeps each { model, thinking } entry intact: the array order is
+  // the fallback order, so moving an entry moves its thinking with it.
+  const move = (from: number, to: number) => {
+    if (saving || from === to) return
+    if (from < 0 || to < 0 || from >= chain.length || to >= chain.length) return
+    const next = [...chain]
+    const [entry] = next.splice(from, 1)
+    next.splice(to, 0, entry)
+    void onSave(agent.name, next)
+  }
+  const clearDrag = () => { setDragging(null); setDragOver(null) }
+  const reorderable = chain.length > 1
 
   return (
     <article className={`subagent-agent-row${unavailable ? ' subagent-agent-unavailable' : ''}`} data-testid={`subagent-agent-${agent.name}`}>
@@ -289,9 +305,42 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
         const selected = findModel(entry.model)
         const thinkingLevels = selected ? thinkingLevelsForModel(selected) : []
         const selectedThinking = thinkingLevels.includes(entry.thinking as ThinkingLevel) ? entry.thinking : ''
+        const entryLabel = index === 0 ? '主选' : `备用 ${index}`
         return (
-          <div className="subagent-chain-row" key={`${index}:${entry.model}`} data-testid={`subagent-chain-${agent.name}-${index}`}>
-            {(index > 0 || chain.length > 1) && <div className="subagent-chain-label"><span>{index === 0 ? '主选' : `备用 ${index}`}</span>{chain.length > 1 && <button type="button" aria-label={`移除 ${agent.name} 备用模型 ${index}`} disabled={saving} onClick={() => remove(index)}>删除</button>}</div>}
+          <div
+            className={`subagent-chain-row${reorderable ? ' reorderable' : ''}${dragging === index ? ' dragging' : ''}${dragOver === index && dragging !== null && dragging !== index ? ' drag-over' : ''}`}
+            key={`${index}:${entry.model}`}
+            data-testid={`subagent-chain-${agent.name}-${index}`}
+            onDragOver={event => {
+              if (dragging === null || saving) return
+              event.preventDefault()
+              setDragOver(index)
+            }}
+            onDrop={event => {
+              if (dragging === null || saving) return
+              event.preventDefault()
+              const from = dragging
+              clearDrag()
+              if (from !== index) move(from, index)
+            }}
+          >
+            {(index > 0 || chain.length > 1) && <div className="subagent-chain-label"><span>{entryLabel}</span><span className="subagent-chain-actions">{reorderable && <>
+              <button type="button" className="subagent-move-btn" aria-label={`上移 ${agent.name} ${entryLabel}`} title={`上移 ${agent.name} ${entryLabel}`} disabled={saving || index === 0} onClick={() => move(index, index - 1)}>↑</button>
+              <button type="button" className="subagent-move-btn" aria-label={`下移 ${agent.name} ${entryLabel}`} title={`下移 ${agent.name} ${entryLabel}`} disabled={saving || index === chain.length - 1} onClick={() => move(index, index + 1)}>↓</button>
+            </>}{reorderable && <button type="button" aria-label={`移除 ${agent.name} 备用模型 ${index}`} disabled={saving} onClick={() => remove(index)}>删除</button>}</span></div>}
+            {reorderable && <span
+              className="subagent-drag-handle"
+              draggable={!saving}
+              title={`拖动调整 ${agent.name} ${entryLabel} 顺序`}
+              aria-label={`拖动调整 ${agent.name} ${entryLabel} 顺序`}
+              data-testid={`subagent-drag-${agent.name}-${index}`}
+              onDragStart={event => {
+                if (saving) return
+                ;(event.dataTransfer as DataTransfer | null | undefined)?.setData('text/plain', String(index))
+                setDragging(index)
+              }}
+              onDragEnd={clearDrag}
+            >⠿</span>}
             <ModelPicker models={models} selected={selected} configuredRef={entry.model} follow={index === 0 && !entry.model} allowFollow={index === 0} disabled={saving} onSelect={modelId => changeModel(index, modelId)} agentName={agent.name} index={index} />
             {entry.model && !selected && <div className="subagent-model-warning" role="alert">历史设置「{entry.model}」无法在当前模型中确认，请重新选择完整 provider/model。</div>}
             {selected && thinkingLevels.length === 0 ? <div className="subagent-thinking-note">{selected.reasoning === false || selected.thinkingConfigurable === false ? '思考强度由模型决定' : '模型未报告可配置思考强度'}</div> : selected ? (

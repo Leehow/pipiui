@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting } from '@pipi/host-api'
@@ -463,5 +465,166 @@ describe('SubagentModelModal dynamic catalog', () => {
       'gone-ext-agent': [{ model: 'xai/grok-4.5' }],
     })
     expect(save).not.toHaveBeenCalled()
+  })
+})
+
+describe('SubagentModelModal model chain reorder', () => {
+  const grok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
+  const initialChain: SubagentModelSetting[] = [
+    { model: 'openai/gpt-5', thinking: 'high' },
+    { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+    { model: 'xai/grok-4.5' },
+  ]
+  const reorderVisibility = () => visibility({
+    models: [gpt, claude, grok], visibleModels: [gpt, claude, grok], quickModels: [gpt, claude, grok],
+    quickProviders: ['openai', 'anthropic', 'xai'], hiddenIds: new Set(),
+  })
+
+  it('reorders a whole {model, thinking} entry via the drag handle, saves the exact new order, and recomputes primary/fallback labels', async () => {
+    const host = catalogHost([{ name: 'reviewer', description: 'Review' }], { reviewer: initialChain })
+    const save = vi.spyOn(host, 'setSubagentModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
+    const reviewer = await screen.findByTestId('subagent-agent-reviewer')
+    expect(within(reviewer).getByText('主选')).toBeTruthy()
+    expect(within(reviewer).getByText('备用 1')).toBeTruthy()
+    expect(within(reviewer).getByText('备用 2')).toBeTruthy()
+    expect(within(reviewer).getByTestId('subagent-drag-reviewer-0')).toBeTruthy()
+    expect((within(reviewer).getByLabelText('reviewer 0 思考强度') as HTMLSelectElement).value).toBe('high')
+
+    // Drag the primary row onto the last row: only the handle starts the drag,
+    // the row itself is only a drop target.
+    fireEvent.dragStart(within(reviewer).getByTestId('subagent-drag-reviewer-0'))
+    expect(within(reviewer).getByTestId('subagent-chain-reviewer-0').className).toContain('dragging')
+    fireEvent.dragOver(within(reviewer).getByTestId('subagent-chain-reviewer-2'))
+    expect(within(reviewer).getByTestId('subagent-chain-reviewer-2').className).toContain('drag-over')
+    fireEvent.drop(within(reviewer).getByTestId('subagent-chain-reviewer-2'))
+
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save).toHaveBeenLastCalledWith('reviewer', [
+      { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+      { model: 'xai/grok-4.5' },
+      { model: 'openai/gpt-5', thinking: 'high' },
+    ])
+
+    // Labels follow the new array order, and each thinking stays bound to its model.
+    await waitFor(() => expect(within(reviewer).getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('claude-sonnet-4'))
+    expect(within(reviewer).getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('anthropic/claude-sonnet-4')
+    expect(within(reviewer).getByRole('button', { name: 'reviewer 1 模型' }).textContent).toContain('xai/grok-4.5')
+    expect(within(reviewer).getByRole('button', { name: 'reviewer 2 模型' }).textContent).toContain('openai/gpt-5')
+    expect(within(reviewer).getByText('主选')).toBeTruthy()
+    expect(within(reviewer).getByText('备用 1')).toBeTruthy()
+    expect(within(reviewer).getByText('备用 2')).toBeTruthy()
+    expect((within(reviewer).getByLabelText('reviewer 0 思考强度') as HTMLSelectElement).value).toBe('medium')
+    expect((within(reviewer).getByLabelText('reviewer 2 思考强度') as HTMLSelectElement).value).toBe('high')
+    expect(within(reviewer).queryByTestId('subagent-chain-reviewer-0')?.className).not.toContain('dragging')
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({
+      reviewer: [
+        { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+        { model: 'xai/grok-4.5' },
+        { model: 'openai/gpt-5', thinking: 'high' },
+      ],
+    }))
+  })
+
+  it('moves entries with up/down buttons, recomputes labels, and disables boundary moves', async () => {
+    const host = catalogHost([{ name: 'reviewer', description: 'Review' }], { reviewer: initialChain })
+    const save = vi.spyOn(host, 'setSubagentModel')
+    render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
+    const reviewer = await screen.findByTestId('subagent-agent-reviewer')
+
+    // Boundary items: primary cannot move up, last fallback cannot move down.
+    expect(within(reviewer).getByRole('button', { name: '上移 reviewer 主选' }).hasAttribute('disabled')).toBe(true)
+    expect(within(reviewer).getByRole('button', { name: '下移 reviewer 备用 2' }).hasAttribute('disabled')).toBe(true)
+    expect(within(reviewer).getByRole('button', { name: '上移 reviewer 备用 1' }).hasAttribute('disabled')).toBe(false)
+    expect(within(reviewer).getByRole('button', { name: '下移 reviewer 主选' }).hasAttribute('disabled')).toBe(false)
+
+    fireEvent.click(within(reviewer).getByRole('button', { name: '下移 reviewer 主选' }))
+    expect(save).toHaveBeenLastCalledWith('reviewer', [
+      { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+      { model: 'openai/gpt-5', thinking: 'high' },
+      { model: 'xai/grok-4.5' },
+    ])
+    await waitFor(() => expect(within(reviewer).getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('claude-sonnet-4'))
+    expect(within(reviewer).getByRole('button', { name: 'reviewer 1 模型' }).textContent).toContain('openai/gpt-5')
+    expect(within(reviewer).getByText('主选')).toBeTruthy()
+    expect((within(reviewer).getByLabelText('reviewer 1 思考强度') as HTMLSelectElement).value).toBe('high')
+
+    // Moving the new 备用 1 back up restores the saved order exactly.
+    fireEvent.click(within(reviewer).getByRole('button', { name: '上移 reviewer 备用 1' }))
+    expect(save).toHaveBeenLastCalledWith('reviewer', initialChain)
+    await waitFor(async () => expect(await host.getSubagentModels?.()).toMatchObject({ reviewer: initialChain }))
+  })
+
+  it('blocks reordering while a save is in flight and ignores drag events until it resolves', async () => {
+    // Own storage mock (not a passthrough spy): the gated promise must only
+    // apply the chain when the test releases it.
+    let stored: Record<string, SubagentModelSetting[]> = { reviewer: initialChain.map(entry => ({ ...entry })) }
+    let release!: () => void
+    const host = createMockHost()
+    host.listAgentDefinitions = vi.fn(async () => [{ name: 'reviewer', description: 'Review' }])
+    host.getSubagentModels = vi.fn(async () => JSON.parse(JSON.stringify(stored)) as Record<string, SubagentModelSetting[]>)
+    const save = vi.fn((agentName: string, chain: SubagentModelSetting[]) =>
+      new Promise<Record<string, SubagentModelSetting[]>>(resolve => {
+        release = () => {
+          if (chain.length) stored = { ...stored, [agentName]: chain.map(entry => ({ ...entry })) }
+          else {
+            const { [agentName]: _drop, ...rest } = stored
+            stored = rest
+          }
+          resolve(JSON.parse(JSON.stringify(stored)) as Record<string, SubagentModelSetting[]>)
+        }
+      }))
+    host.setSubagentModel = save
+    render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
+    const reviewer = await screen.findByTestId('subagent-agent-reviewer')
+
+    fireEvent.click(within(reviewer).getByRole('button', { name: '下移 reviewer 主选' }))
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(save.mock.calls[0]).toEqual(['reviewer', [
+      { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+      { model: 'openai/gpt-5', thinking: 'high' },
+      { model: 'xai/grok-4.5' },
+    ]])
+    expect(within(reviewer).getByRole('button', { name: '下移 reviewer 主选' }).hasAttribute('disabled')).toBe(true)
+    expect(within(reviewer).getByRole('button', { name: '上移 reviewer 备用 1' }).hasAttribute('disabled')).toBe(true)
+    expect(within(reviewer).getByRole('button', { name: '上移 reviewer 主选' }).hasAttribute('disabled')).toBe(true)
+    expect(within(reviewer).getByTestId('subagent-drag-reviewer-0').getAttribute('draggable')).toBe('false')
+    fireEvent.dragStart(within(reviewer).getByTestId('subagent-drag-reviewer-0'))
+    fireEvent.dragOver(within(reviewer).getByTestId('subagent-chain-reviewer-2'))
+    expect(within(reviewer).getByTestId('subagent-chain-reviewer-2').className).not.toContain('drag-over')
+    fireEvent.drop(within(reviewer).getByTestId('subagent-chain-reviewer-2'))
+    expect(save).toHaveBeenCalledTimes(1)
+
+    release()
+    await waitFor(() => expect(within(reviewer).getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('claude-sonnet-4'))
+    expect(within(reviewer).getByRole('button', { name: '下移 reviewer 主选' }).hasAttribute('disabled')).toBe(false)
+    expect(within(reviewer).getByTestId('subagent-drag-reviewer-0').getAttribute('draggable')).toBe('true')
+    expect(JSON.parse(JSON.stringify(stored))).toMatchObject({
+      reviewer: [
+        { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+        { model: 'openai/gpt-5', thinking: 'high' },
+        { model: 'xai/grok-4.5' },
+      ],
+    })
+  })
+
+  it('offers no drag handle or move buttons for single-entry and follow chains', async () => {
+    const host = catalogHost(
+      [{ name: 'reviewer', description: 'Review' }],
+      { reviewer: [{ model: 'openai/gpt-5', thinking: 'high' }] },
+    )
+    render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
+    const reviewer = await screen.findByTestId('subagent-agent-reviewer')
+    expect(within(reviewer).queryByTestId('subagent-drag-reviewer-0')).toBeNull()
+    expect(within(reviewer).queryByRole('button', { name: '上移 reviewer 主选' })).toBeNull()
+    expect(within(reviewer).queryByRole('button', { name: '下移 reviewer 主选' })).toBeNull()
+    expect(within(reviewer).getByRole('button', { name: 'reviewer 0 模型' }).textContent).toContain('openai/gpt-5')
+  })
+
+  it('pins the thinking control to the content column in narrow reorderable chain rows', () => {
+    const css = readFileSync(join(import.meta.dirname, 'subagent-models.css'), 'utf8')
+    expect(css).toContain('.subagent-chain-row.reorderable{grid-template-columns:14px 1fr}')
+    // Without this pin, grid auto-placement drops the select/note into the 14px handle column.
+    expect(css).toContain('.subagent-chain-row.reorderable .subagent-thinking-select,.subagent-chain-row.reorderable .subagent-thinking-note{grid-column:2}')
   })
 })
