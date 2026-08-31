@@ -1,7 +1,7 @@
 ---
 id: domain
-name: 领域记忆哲学
-summary: 会话会蒸发，词汇表和 ADR 不会：术语解决的当下落进 CONTEXT.md，够格的决策才写 ADR。
+name: Domain memory
+summary: Sessions evaporate, the glossary and ADRs do not — a resolved term lands in CONTEXT.md the moment it settles; only qualifying decisions earn an ADR.
 order: 28
 requires: []
 requires-capabilities: []

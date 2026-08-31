@@ -1,7 +1,7 @@
 ---
 id: mainline
-name: 主线哲学
-summary: 主线是你自己干的那条线，写在计划里而不是记在脑子里；偏离主线的活一律外派或推迟，绝不顺手做。
+name: Mainline
+summary: The mainline is the line you work yourself, written in the plan rather than remembered; anything off it is dispatched or deferred, never done in passing.
 order: 25
 requires: []
 requires-capabilities: []

@@ -1,7 +1,7 @@
 ---
 id: method
-name: 工作方式哲学
-summary: 流程的重量必须配得上工作量；能完成的路里选最快的那条，并记下每个任务实际花了多久。
+name: Working method
+summary: Process weight must match the work; of the routes that finish, take the fastest and record what each task actually cost.
 order: 20
 requires: []
 requires-capabilities: []

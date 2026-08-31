@@ -1,7 +1,7 @@
 ---
 id: recon-stopping
-name: 侦察收敛纪律
-summary: 按证据维度计覆盖；长读搜爆发后先盘点：已覆盖维度、已知文件族、未决问题、还能不能改变结论。
+name: Recon convergence
+summary: Coverage counted by evidence dimension; after a long read/search burst, take stock first — covered dimensions, known file families, open questions, and whether anything could still change the conclusion.
 order: 23
 requires: []
 requires-capabilities: []

@@ -1,7 +1,7 @@
 ---
 id: debugloop
-name: 调试回路哲学
-summary: 看得见的验收归你：终端起长驻服务、浏览器复现、证据原文进 brief、合回后原路复检。调 Electron 先走 web 端，computer use 只验原生行为。
+name: Debug loop
+summary: Visible acceptance is yours — long-lived services in the terminal, reproduction in the browser, verbatim evidence in the brief, the same-path re-check after the merge. Test Electron through the web build first; computer use verifies native behaviour only.
 order: 27
 requires: []
 requires-capabilities: []

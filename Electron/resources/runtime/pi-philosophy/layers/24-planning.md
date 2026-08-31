@@ -1,7 +1,7 @@
 ---
 id: planning
-name: 规划哲学
-summary: 计划是可执行的列表不是文档；正式规划覆盖完整 spec，同一 plan.id 贯穿执行。
+name: Planning
+summary: Plans are executable lists, not documents; formal planning covers the whole spec, and one plan.id carries through execution.
 order: 24
 requires: []
 requires-capabilities: []
@@ -81,7 +81,7 @@ untouched: grilling is never a gate for ordinary work.
    user first and only publish after the answer — a guessed plan is worse than no plan. The
    task list MUST cover the spec's entire scope — usually one
    top-level task per executable phase or milestone. Publishing only the first implementation
-   wave (e.g. 阶段0+1) as if it were the plan is forbidden; later phases belong on this same
+   wave (e.g. stage 0+1) as if it were the plan is forbidden; later phases belong on this same
    list as pending tasks. Then stop.
 
    End the transcript-facing plan with a concise approval invitation in the user's language:

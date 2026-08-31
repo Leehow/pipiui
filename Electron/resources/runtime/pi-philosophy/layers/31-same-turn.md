@@ -1,7 +1,7 @@
 ---
 id: same-turn
-name: 同轮调用纪律
-summary: 参数已知且互不依赖的探查与派工同一轮发出；依赖前一轮结果的才跨轮；桌面操作与冲突写入不批量。
+name: Same-turn discipline
+summary: Probes and dispatches whose arguments you already know go out in the same turn; only a dependency on a prior result crosses a turn; desktop actions and colliding writes are not batched.
 order: 31
 requires: []
 requires-capabilities: [delegate]

@@ -1,7 +1,7 @@
 ---
 id: foundation
-name: 基础哲学
-summary: 交往公理：你有什么授权、什么算证据、什么时候能停、谁是流程的主人。
+name: Foundation
+summary: The interaction axioms — what authorizes work, what counts as evidence, when you may stop, and who owns the process.
 order: 10
 requires: []
 requires-capabilities: []

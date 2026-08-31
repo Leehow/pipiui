@@ -1,7 +1,7 @@
 ---
 id: orchestration
-name: 编排哲学
-summary: 你自己干主线，把会把你拽离主线的活派出去；brief 里必须有你已经建立的理解，回来的改动你要看。
+name: Orchestration
+summary: You work the mainline yourself and dispatch what would pull you off it; a brief carries the understanding you already built, and a returned change gets read.
 order: 30
 requires: []
 requires-capabilities: [delegate]

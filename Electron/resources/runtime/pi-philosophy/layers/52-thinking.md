@@ -1,7 +1,7 @@
 ---
 id: thinking
-name: 思考纪律
-summary: 思考是手段不是表演：想够即动手，不复述、不反复自我确认。
+name: Thinking discipline
+summary: Thinking is a tool, not a performance — think enough, then act; no restating the brief, no re-confirming what you already decided.
 order: 52
 requires: []
 requires-capabilities: []

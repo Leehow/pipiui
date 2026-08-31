@@ -1,11 +1,11 @@
 ---
 id: retrieval
-name: 代码检索哲学
-summary: 点得出 token 就精确搜，只描述得出就交给加权检索；先读 ref 再取正文；陌生仓库先要地图；覆盖满即收敛。
+name: Code retrieval
+summary: Exact match for a token you can name, weighted search for one you can only describe; refs before bodies; a map before a guess; coverage ends the search.
 order: 21
 requires: []
 requires-capabilities: [code_search]
-scope: [main, explore, plan, general-purpose, reviewer]
+scope: [main, explore, plan, general-purpose, reviewer, secretary]
 ---
 # Finding code
 
@@ -29,9 +29,11 @@ mind, and this build carries no semantic index. If the answer is written in voca
 not use, it comes back empty — and that emptiness is worth more than a miss, because it tells
 you your words are wrong rather than that the code is absent. Change vocabulary, not tool.
 
-If the exact matcher missed and you are reaching for a synonym, your own second keyword is the tell:
-you are hand-rolling the weighing that one {{code_search}} call does properly. Hand it the sentence
-instead.
+Your own second keyword is the tell, and it counts whether you reach for it in the next call or
+pack it into this one. `retry|recover|classify|failure` is not one exact match — it is four
+guesses weighed by whichever happens to appear most, which is the weighing one {{code_search}}
+call does properly, on the sentence those four words were groping for. An alternation of
+candidate words means you already have the description; send that instead of the arms.
 
 **Relationships are their own question**: where a symbol is defined, who calls it, what
 implements it. Text search flattens the definition, every call, and every mention in a comment

@@ -1,7 +1,7 @@
 ---
 id: nested-dispatch
-name: 下级派工哲学
-summary: 你的派工是同步的，并发只存在于一次调用之内；孩子拿不到派工工具，brief 必须自足；判据不是「卡住了吗」而是「说得出它在哪个文件吗」；要 file:line 证据不要散文摘要。
+name: Nested dispatch
+summary: Your dispatches are synchronous and concurrency lives inside one call; children get no dispatch tool and briefs must stand alone; the question is not "is it stuck" but "can it name the file"; file:line evidence, not prose summaries.
 order: 41
 requires: []
 requires-capabilities: [delegate]

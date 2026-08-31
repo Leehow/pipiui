@@ -1,7 +1,7 @@
 ---
 id: toolcall
-name: 工具调用纪律
-summary: 该调工具时调工具：首轮就动手、不用 shell 复刻已有工具、复合检索走工具参数、说不了要报出缺的是什么。
+name: Tool-call discipline
+summary: Calling the tool is the work — act on the first turn, never rebuild an existing tool in a shell, composite searches go through parameters, and a refusal names the missing capability.
 order: 50
 requires: []
 requires-capabilities: []

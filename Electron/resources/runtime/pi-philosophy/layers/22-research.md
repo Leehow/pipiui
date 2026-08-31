@@ -1,7 +1,7 @@
 ---
 id: research
-name: 调研哲学
-summary: 先自己形成判断，再对外交叉验证；证据高于权威。
+name: Research
+summary: Form your own read first, then cross-validate outside; evidence outranks authority.
 order: 22
 requires: []
 requires-capabilities: []

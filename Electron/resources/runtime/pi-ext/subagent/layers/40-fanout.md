@@ -1,7 +1,7 @@
 ---
 id: fanout
-name: 瀑布流哲学
-summary: 侧枝一次全派出去，别小气——分得开就分得宽；你留在主线上；真正耦合的活自己做而不是盲切；异步信号自己收，不回头看原始产物。
+name: Fan-out
+summary: Every sidecar goes out in one wave, no thrift — as wide as the work genuinely decomposes; you stay on the mainline; genuinely coupled work is kept, not blindly split; signals arrive on their own, raw artifacts stay out.
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]

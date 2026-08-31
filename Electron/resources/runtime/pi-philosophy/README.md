@@ -57,23 +57,23 @@ The rest of the split is by audience. A layer is written for whoever can act on 
 why `craft` reaches the worker that writes code and `orchestration` does not: a rule delivered
 to someone who cannot perform it is prompt weight and nothing else.
 
-| id | 中文名 | What it governs | Delivered to |
+| id | Name | What it governs | Delivered to |
 |---|---|---|---|
-| `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + worker |
-| `method` | 工作方式哲学 | Process weight matches the work; of the routes that finish, take the fastest and record what each task actually cost; research-only requests are terminal | main |
-| `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
-| `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
-| `recon-stopping` | 侦察收敛纪律 | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
-| `planning` | 规划哲学 | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |
-| `craft` | 编码手艺哲学 | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + `general-purpose` |
-| `debugloop` | 调试回路哲学 | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main |
-| `domain` | 领域记忆哲学 | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main |
-| `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main |
-| `same-turn` | 同轮调用纪律 | Every call whose arguments you already know goes out in the same message | main + `general-purpose` |
-| `fanout` | 瀑布流哲学 | Parallel by default; the boss spends width freely — twenty or forty when the decomposition is real — and holds the mainline tighter the wider the wave gets; worker state arrives as signals; keep the wave's raw output out of your context | main |
-| `nested-dispatch` | 下级派工哲学 | For a worker that may itself delegate: dispatches are synchronous, concurrency exists only inside one call, children cannot delegate, and recon returns file:line evidence rather than prose | `general-purpose` |
-| `toolcall` | 工具调用纪律 | Calling the tool *is* the work; act on the first turn; "I can't" has to name something | one model family (see below) |
-| `thinking` | 思考纪律 | Decide, act, verify — once each; resolve an unknown with the cheapest sufficient probe | every family measured to sprawl |
+| `foundation` | Foundation | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + worker |
+| `method` | Working method | Process weight matches the work; of the routes that finish, take the fastest and record what each task actually cost; research-only requests are terminal | main |
+| `retrieval` | Code retrieval | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
+| `research` | Research | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
+| `recon-stopping` | Recon convergence | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
+| `planning` | Planning | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |
+| `craft` | Craft | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + `general-purpose` |
+| `debugloop` | Debug loop | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main |
+| `domain` | Domain memory | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main |
+| `orchestration` | Orchestration | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main |
+| `same-turn` | Same-turn discipline | Every call whose arguments you already know goes out in the same message | main + `general-purpose` |
+| `fanout` | Fan-out | Parallel by default; the boss spends width freely — twenty or forty when the decomposition is real — and holds the mainline tighter the wider the wave gets; worker state arrives as signals; keep the wave's raw output out of your context | main |
+| `nested-dispatch` | Nested dispatch | For a worker that may itself delegate: dispatches are synchronous, concurrency exists only inside one call, children cannot delegate, and recon returns file:line evidence rather than prose | `general-purpose` |
+| `toolcall` | Tool-call discipline | Calling the tool *is* the work; act on the first turn; "I can't" has to name something | one model family (see below) |
+| `thinking` | Thinking discipline | Decide, act, verify — once each; resolve an unknown with the cheapest sufficient probe | every family measured to sprawl |
 
 `fanout` requires `orchestration`. `orchestration`, `same-turn`, `fanout` and `nested-dispatch`
 require a dispatch tool and are skipped entirely in a session that has none; `retrieval` requires a code-search
@@ -124,7 +124,7 @@ philosophy needs no fork and no rebuild.
 ```markdown
 ---
 id: foundation
-name: 我的基础哲学
+name: My foundation
 summary: shown by /philosophy
 order: 10
 requires: []

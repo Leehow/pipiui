@@ -1,7 +1,7 @@
 ---
 id: craft
-name: 编码手艺哲学
-summary: 先定成功判据；只写必要的代码；只改该改的。
+name: Craft
+summary: Define the success criterion first; write only the code that solves it; change only what the task requires.
 order: 26
 requires: []
 requires-capabilities: []
