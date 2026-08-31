@@ -13,31 +13,13 @@ vi.mock('@xterm/xterm', () => ({ Terminal: class { open = vi.fn(); write = vi.fn
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
 import { App, createMockHost } from './App'
-import { appendLiveUserMessage, type ChatMessage } from './transcript-model'
 import { transcriptMessageIdentity, countTranscriptPrepended, nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE } from './transcript-scroll'
-import { UserMessageBubble } from './UserMessageBubble'
 
 beforeEach(() => { localStorage.clear(); Reflect.deleteProperty(window, 'pipiHost') })
 afterEach(() => { cleanup(); vi.restoreAllMocks(); localStorage.clear(); Reflect.deleteProperty(window, 'pipiHost') })
 
 describe('fix1: queue busy local echo + dedup', () => {
-  it('appendLiveUserMessage merges queued optimistic via FIFO content match and clears queued flag', () => {
-    const live: ChatMessage[] = [
-      { id: 'q1', role: 'user', content: 'first queued', timestamp: 1, queued: true },
-      { id: 'q2', role: 'user', content: 'second queued', timestamp: 2, queued: true },
-    ]
-    const afterFirstEcho = appendLiveUserMessage(live, { content: 'first queued', id: 'srv1' })
-    expect(afterFirstEcho).toHaveLength(2)
-    expect(afterFirstEcho[0]).toMatchObject({ id: 'srv1', content: 'first queued' })
-    expect((afterFirstEcho[0] as ChatMessage).queued).toBeUndefined()
-    expect(afterFirstEcho[1]).toMatchObject({ id: 'q2', queued: true })
-
-    const afterSecondEcho = appendLiveUserMessage(afterFirstEcho, { content: 'second queued', id: 'srv2' })
-    expect(afterSecondEcho[1]).toMatchObject({ id: 'srv2' })
-    expect((afterSecondEcho[1] as ChatMessage).queued).toBeUndefined()
-  })
-
-  it('busy send shows optimistic bubble with 排队中 and dedups on host echo', async () => {
+  it('busy send keeps the message out of the transcript until the host echo lands', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()
     // Make busy by having streaming true after first started
@@ -59,16 +41,14 @@ describe('fix1: queue busy local echo + dedup', () => {
     fireEvent.change(input, { target: { value: 'queued prompt text' } })
     fireEvent.keyDown(input, { key: 'Enter', metaKey: true })
 
-    await waitFor(() => expect(screen.getByText('queued prompt text')).toBeTruthy())
-    expect(screen.getByTestId('user-bubble-queued')).toBeTruthy()
-    expect(screen.getByText('排队中')).toBeTruthy()
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    // The queued message stays in the queue panel — no transcript bubble yet.
+    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('queued prompt text'))).toBe(true)
 
-    // Host echo for queued prompt should dedup, not double
+    // The host echo (queue drained) is what puts the bubble in the transcript.
     act(() => { listener?.({ type: 'user_message', sessionId: 'layout', id: 'srv-queued-1', content: 'queued prompt text' }) })
-    // Should still be one bubble, queued flag cleared
-    const bubbles = screen.getAllByText('queued prompt text')
+    const bubbles = screen.getAllByText('queued prompt text').filter(node => node.closest('[data-user-prompt]'))
     expect(bubbles.length).toBe(1)
-    expect(screen.queryByTestId('user-bubble-queued')).toBeNull()
   })
 })
 
@@ -164,11 +144,4 @@ describe('fix3: identity stable across content streaming', () => {
     expect(nextTranscriptFirstItemIndex(TRANSCRIPT_FIRST_ITEM_BASE, streamed, older)).toBe(TRANSCRIPT_FIRST_ITEM_BASE - 1)
   })
 
-  it('UserMessageBubble shows queued badge when queued', () => {
-    const { container } = render(<UserMessageBubble text='hello' queued />)
-    expect(container.querySelector('[data-testid="user-bubble-queued"]')).toBeTruthy()
-    expect(container.textContent).toContain('排队中')
-    const { container: c2 } = render(<UserMessageBubble text='hello' />)
-    expect(c2.querySelector('[data-testid="user-bubble-queued"]')).toBeNull()
-  })
 })

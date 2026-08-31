@@ -2734,7 +2734,7 @@ describe('PipiUI main layout', () => {
     expect(sendPrompt).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps a busy queued bubble pending until the later user echo arrives', async () => {
+  it('keeps a busy queued message out of the transcript until the queue drains it', async () => {
     const base = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined
     const sendPrompt = vi.fn(async () => undefined)
@@ -2762,20 +2762,19 @@ describe('PipiUI main layout', () => {
     await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in pending', undefined, rendererTelemetryMatcher()))
     expect(cutInQueuedMessage).not.toHaveBeenCalled()
     expect(steerQueuedMessage).not.toHaveBeenCalled()
-    const pendingBubble = await screen.findByTestId('user-bubble-queued')
-    expect(pendingBubble.closest('[data-user-prompt]')?.textContent).toContain('cut-in pending')
-    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
+    // The queued message stays in the queue panel only — no transcript bubble yet.
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 50)) })
+    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in pending'))).toBe(true)
 
     await act(async () => {
       listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-cut-in', content: 'cut-in pending' })
     })
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
     const confirmed = screen.getAllByText('cut-in pending').filter(node => node.closest('[data-user-prompt]'))
     expect(confirmed).toHaveLength(1)
     expect(confirmed[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
   })
 
-  it('busy queued send survives stopped reconciliation', async () => {
+  it('busy queued send stays out of the transcript across stopped reconciliation', async () => {
     const base = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined
     const sendPrompt = vi.fn(async () => undefined)
@@ -2821,27 +2820,25 @@ describe('PipiUI main layout', () => {
     await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', 'cut-in after stop', undefined, rendererTelemetryMatcher()))
     expect(cutInQueuedMessage).not.toHaveBeenCalled()
     expect(steerQueuedMessage).not.toHaveBeenCalled()
-    expect((await screen.findByTestId('user-bubble-queued')).closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
+    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in after stop'))).toBe(true)
 
     serveAbortedHistory = true
     await act(async () => {
       listener?.({ type: 'status', sessionId: 'welcome', status: 'stopped' })
     })
     expect(await screen.findByText(historyOnlyMarker)).toBeTruthy()
-    const pendingAfterStop = await screen.findByTestId('user-bubble-queued')
-    expect(pendingAfterStop.closest('[data-user-prompt]')?.textContent).toContain('cut-in after stop')
-    expect(document.querySelectorAll('[data-user-prompt][data-queued="true"]').length).toBe(1)
+    // The post-stop reconciliation must not resurrect the queued item either.
+    expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in after stop'))).toBe(true)
 
     await act(async () => {
       listener?.({ type: 'user_message', sessionId: 'welcome', id: 'echo-after-stop', content: 'cut-in after stop' })
     })
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
     const confirmedAfterStop = screen.getAllByText('cut-in after stop').filter(node => node.closest('[data-user-prompt]'))
     expect(confirmedAfterStop).toHaveLength(1)
     expect(confirmedAfterStop[0].closest('[data-user-prompt]')?.getAttribute('data-queued')).toBeNull()
   })
 
-  it('busy enqueue failure removes the optimistic queued bubble and restores the draft', async () => {
+  it('busy enqueue failure keeps the transcript clean and restores the draft', async () => {
     const base = createMockHost()
     const sendPrompt = vi.fn(async () => undefined)
     const enqueueMessage = vi.fn(async () => { throw new Error('enqueue rejected') })
@@ -2870,7 +2867,6 @@ describe('PipiUI main layout', () => {
     expect(cutInQueuedMessage).not.toHaveBeenCalled()
     expect(removeQueuedMessage).not.toHaveBeenCalled()
     expect(steerQueuedMessage).not.toHaveBeenCalled()
-    await waitFor(() => expect(screen.queryByTestId('user-bubble-queued')).toBeNull())
     expect([...document.querySelectorAll('[data-user-prompt]')].every(node => !node.textContent?.includes('cut-in fail'))).toBe(true)
     expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).value).toBe('cut-in fail')
   })

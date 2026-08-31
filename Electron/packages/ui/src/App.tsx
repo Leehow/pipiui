@@ -1319,21 +1319,23 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const loadedWorkbenchViews = useWorkbenchViews()
   useLayoutEffect(() => {
     if (!selectedProject || !host.listProductProfiles || !host.getProductProfile) {
-      return productWorkbench.activateLegacyCodingWorkbench()
+      productWorkbench.activateLegacyCodingWorkbench()
+      return
     }
     let cancelled = false
-    let dispose: (() => void) | undefined
+    // Activating REPLACES the whole workbench plan in one emit (store.apply and
+    // applyActiveExtensionIds both overwrite), so the new profile is applied
+    // directly over the old one and the plan never drops to empty between
+    // projects. Retiring via dispose in the cleanup — before the profile IPC
+    // resolves — is what flashed the entire shell on every project switch.
     void Promise.all([host.listProductProfiles(selectedProject), host.getProductProfile(selectedProject)]).then(([profiles, activation]) => {
       if (cancelled) return
       const profile = profiles.find(item => item.id === activation.profile && item.state === 'available')
-      if (profile) dispose = productWorkbench.activateProductWorkbenchProfile(profile, activation)
+      if (profile) productWorkbench.activateProductWorkbenchProfile(profile, activation)
     }).catch(() => {
-      // Older or temporarily unavailable hosts keep the already-active Coding plan.
+      // Older or temporarily unavailable hosts keep the already-active plan.
     })
-    return () => {
-      cancelled = true
-      dispose?.()
-    }
+    return () => { cancelled = true }
   }, [host, selectedProject, loadedWorkbenchContainers, loadedWorkbenchViews, productWorkbench])
   const [selectedSession, setSelectedSession] = useState('')
   const sessionsRef = useRef(sessions)

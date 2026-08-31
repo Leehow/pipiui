@@ -49,8 +49,6 @@ export type ChatMessage = {
   fileSources?: TranscriptFileSource[]
   /** assistant only: provider server-side tool usage counts, when present. */
   serverSideToolUsage?: Record<string, number>
-  /** Local optimistic state for messages sent while queue is busy; cleared on host echo. */
-  queued?: boolean
 }
 
 function isBackgroundSubagentAck(content: string): boolean {
@@ -406,21 +404,9 @@ export function appendLiveUserMessage(messages: ChatMessage[], incoming: { conte
     if (index >= 0) {
       const next = [...messages]
       const merged = { ...next[index], id: incoming.id ?? next[index].id, content, images: next[index].images?.length ? next[index].images : incoming.images }
-      if (merged.queued) delete (merged as { queued?: boolean }).queued
       next[index] = merged
       return next
     }
-  }
-  // Also handle queued optimistic bubbles: find earliest queued user message
-  // with matching content (FIFO queue drain order) and merge in place.
-  const queuedIndex = messages.findIndex(item => item.role === 'user' && item.queued && stripAttachmentPathsForDisplay(item.content).trim() === content.trim())
-  if (queuedIndex >= 0) {
-    const next = [...messages]
-    const queued = next[queuedIndex]
-    const merged = { ...queued, id: incoming.id ?? queued.id, content, images: queued.images?.length ? queued.images : incoming.images }
-    delete (merged as { queued?: boolean }).queued
-    next[queuedIndex] = merged
-    return next
   }
   const last = messages[messages.length - 1]
   if (last?.role === 'user' && last.content === raw) return messages
@@ -432,7 +418,6 @@ export function appendLiveUserMessage(messages: ChatMessage[], incoming: { conte
       content,
       images: last.images?.length ? last.images : incoming.images,
     }
-    if ((merged as { queued?: boolean }).queued) delete (merged as { queued?: boolean }).queued
     next[next.length - 1] = merged
     return next
   }
