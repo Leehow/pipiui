@@ -40,6 +40,14 @@ body{overscroll-behavior:none}
 .chat-viewport>.transcript-area,.chat-viewport>.session-transcript-slot{height:100%;min-height:0}
 .chat-viewport>.session-transcript-slot>.transcript-area{height:100%;min-height:0}
 .chat-viewport>.session-transcript-slot[hidden]{display:none!important}
+/* Session switch remounts this slot (key=sessionId). A short opacity reveal
+   softens the hard content swap so switching does not flash; the animation
+   replays on every remount and is dropped under reduced motion. */
+.chat-viewport>.session-transcript-slot{animation:session-slot-fade-in .18s ease-out}
+@keyframes session-slot-fade-in{from{opacity:0}to{opacity:1}}
+@media (prefers-reduced-motion: reduce){
+  .chat-viewport>.session-transcript-slot{animation:none}
+}
 .chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible;padding-right:var(--chat-scrollbar-gutter)}
 .chat-header,.composer{min-width:0;flex:none}
 /* Lease state is content in the fixed composer row, never a separate grid row. */

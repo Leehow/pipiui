@@ -93,12 +93,17 @@ function createWindow(
     width: 1280,
     height: 800,
     title: 'PipiUI',
+    // Pre-paint base color: matches the shell's dark default (--bg in app.css)
+    // so the window never shows the system-white behind the renderer during
+    // first paint or a heavy remount (project/session switch).
+    backgroundColor: '#17181c',
     // Like VS Code/Notion on macOS: no system title strip, only the traffic
     // lights remain. The renderer reserves a draggable strip via
     // env(titlebar-area-*). Keep the default framed titlebar elsewhere.
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default'
   })
   const shellView = new WebContentsView({
+    backgroundColor: '#17181c',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
