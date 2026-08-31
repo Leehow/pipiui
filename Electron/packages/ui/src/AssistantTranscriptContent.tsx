@@ -46,6 +46,16 @@ function toolRunSummary(steps: number, thinking: string | null, tools: { name: s
   return `${steps} 个步骤 · ${[thinking, label].filter((part): part is string => Boolean(part)).join(' · ')}`
 }
 
+function toolFailed(tool: TranscriptTool): boolean {
+  return Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)
+}
+
+function failedToolCount(activities: TranscriptActivity[]): number {
+  let count = 0
+  for (const activity of activities) if (activity.type === 'tool' && toolFailed(activity.tool)) count += 1
+  return count
+}
+
 const TranscriptToolCard = memo(function TranscriptToolCard({ tool }: { tool: TranscriptTool; streaming?: boolean }) {
   const argsSummary = toolArgsSummary(tool.name, tool.input)
   const subagentNotice = tool.name === 'subagent' && tool.finished && tool.result && !tool.error ? parseSubagentNotice(tool.result) : null
@@ -104,7 +114,6 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
   const linkedRunning = subagentProjections.some(projection => projection.runningCount > 0)
   const pendingDispatch = tools.some(tool => liveProjectable(tool) && Boolean(tool.dispatched) && (liveByTool.get(tool.id)?.roots.length ?? 0) === 0)
   const linkedFailed = subagentProjections.some(projection => projection.failedCount > 0)
-  const failed = tools.some(tool => Boolean(tool.error) || (tool.name === 'subagent' && tool.finished && tool.result ? parseSubagentNotice(tool.result)?.ok === false : false)) || linkedFailed
   const running = Boolean(message.streaming && !activeTool && !textAfterUnfinishedTool) || linkedRunning || pendingDispatch
   // Main transcript: expand only while this turn is still producing local
   // steps. A dispatched/linked subagent is finished work in the transcript —
@@ -125,7 +134,12 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
       const hasThinking = segment.activities.some(activity => activity.type === 'thinking')
       const groupRunning = running && index === lastStepsIndex
       const groupExpanded = expandSteps ? index === lastStepsIndex && !activeTool : stepsExpanded
-      return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={failed && !running && index === lastStepsIndex} meta={failed && !running && index === lastStepsIndex ? '失败' : undefined} defaultExpanded={groupExpanded}>{segment.activities.map((activity, activityIndex) => {
+      const groupFailed = failedToolCount(segment.activities)
+      const groupError = !running && (groupFailed > 0 || (linkedFailed && index === lastStepsIndex))
+      const groupMeta = !running && groupFailed > 0
+        ? `${groupFailed} 失败 · ${segment.activities.length - groupFailed} 成功`
+        : !running && linkedFailed && groupFailed === 0 && index === lastStepsIndex ? '失败' : undefined
+      return <ActivityCard key={stepsKey(index)} summary={toolRunSummary(segment.activities.length, hasThinking ? 'Thinking' : null, groupTools)} running={groupRunning} error={groupError} meta={groupMeta} defaultExpanded={groupExpanded}>{segment.activities.map((activity, activityIndex) => {
         const pendingThinking = activity.type === 'thinking' && activity.id === PENDING_THINKING_ID
         const live = Boolean(message.streaming && index === lastStepsIndex && !activeTool && (
           activity.type === 'thinking'

@@ -413,6 +413,22 @@ describe('subagent tool card stays live while linked workers run', () => {
     expect(tool.textContent).not.toContain('general-purpose')
   })
 
+  it('summarizes failed vs succeeded step counts on the group card', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-ok', name: 'bash', delta: '{"command":"echo hi"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-ok', content: 'hi' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-bad', name: 'bash', delta: '{"command":"exit 1"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-bad', content: 'boom', isError: true })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-ok-2', name: 'bash', delta: '{"command":"echo ok"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-ok-2', content: 'ok' })
+    messages = finishStreamingMessage(messages)
+
+    render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    const outer = screen.getByRole('button', { name: /3 个步骤/ })
+    expect(outer.querySelector('.activity-status')?.textContent).toBe('×')
+    expect(outer.textContent).toContain('1 失败 · 2 成功')
+  })
+
   it('renders a standalone compact failed notice with a failure indicator', () => {
     render(<MessageView message={{ id: 'legacy-failed', role: 'tool', content: 'subagent task finished · general-purpose · failed · cost ¥0.05' }} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
 
