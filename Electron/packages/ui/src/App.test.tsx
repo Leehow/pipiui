@@ -4040,7 +4040,7 @@ describe('extensions settings tab', () => {
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
     await openModelModal(createMockHost())
     expect(screen.queryByTestId('model-tab-profiles')).toBeNull()
-    expect(screen.getAllByRole('tab')).toHaveLength(3)
+    expect(screen.getAllByRole('tab')).toHaveLength(4)
     fireEvent.click(screen.getByTestId('model-tab-extensions'))
     expect(await screen.findByTestId('extensions-pane')).toBeTruthy()
     expect(screen.getByRole('heading', { name: '扩展' })).toBeTruthy()

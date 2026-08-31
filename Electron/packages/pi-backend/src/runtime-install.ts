@@ -157,7 +157,7 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
     report.failures.push("runtime source root: no source path resolved");
     return report;
   }
-  for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"] as const)
+  for (const name of ["pi-core-prompt", "pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"] as const)
     syncTree(join(assets.sourceRoot, name), join(runtimeRoot, name), report);
   // Second pass: bundled manifest extensions ship compiled `dist/` halves that the
   // generic extensions sync strips. Re-sync each one over its stripped copy; a missing

@@ -75,7 +75,7 @@ describe("installRuntimeTree", () => {
     try {
       const source = join(root, "source");
       const destination = join(root, "destination");
-      for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"]) {
+      for (const name of ["pi-core-prompt", "pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"]) {
         await mkdir(join(source, name), { recursive: true });
       }
       await writeFile(join(source, "pipiui-runtime-manifest.json"), JSON.stringify({
@@ -99,6 +99,7 @@ describe("installRuntimeTree", () => {
       }, root);
       expect(report.failures).toEqual([]);
       const entries = await readdir(root);
+      expect(entries).toContain("pi-core-prompt");
       expect(entries).toContain("pi-ext");
       expect(entries).toContain("pi-philosophy");
       expect(entries).toContain("extensions");

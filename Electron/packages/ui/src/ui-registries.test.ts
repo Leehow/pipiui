@@ -39,8 +39,8 @@ describe('dogfood lists match the pre-registry hardcoded sets', () => {
   })
 
   it('settings sections', () => {
-    expect(listSettingsSections().map(section => section.id)).toEqual(['models', 'extensions', 'updates'])
-    expect(listSettingsSections().map(section => section.label)).toEqual(['模型管理', '扩展', '更新中心'])
+    expect(listSettingsSections().map(section => section.id)).toEqual(['models', 'extensions', 'themes', 'updates'])
+    expect(listSettingsSections().map(section => section.label)).toEqual(['模型管理', '扩展', '主题', '更新中心'])
   })
 
   it('panels', () => {

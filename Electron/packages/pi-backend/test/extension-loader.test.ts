@@ -181,6 +181,31 @@ describe("extension loader via listExtensions", () => {
     await backend.close();
   });
 
+  it("reads only manifest-declared controlled UI entry source", async () => {
+    await tempRoot("pipi-ext-ui-source-");
+    const runtime = join(root, "runtime");
+    const extensionRoot = join(runtime, "extensions", "git-capability");
+    await writeManifest(extensionRoot, {
+      id: "git-capability",
+      name: "PipiUI Git",
+      version: "1.0.0",
+      capabilities: [],
+      app: { ui: { headerActions: [{ id: "git.branch", entry: "app/dist/branch-menu.js" }] } },
+    });
+    await mkdir(join(extensionRoot, "app", "dist"), { recursive: true });
+    await writeFile(join(extensionRoot, "app", "dist", "branch-menu.js"), "export const createHeaderAction = () => () => null\n");
+    await writeFile(join(extensionRoot, "app", "dist", "undeclared.js"), "export const secret = true\n");
+
+    const backend = await backendFor({ runtime });
+    await expect(backend.handle("getExtensionUiEntrySource" as never, ["git-capability", "app/dist/branch-menu.js"]))
+      .resolves.toContain("createHeaderAction");
+    await expect(backend.handle("getExtensionUiEntrySource" as never, ["git-capability", "app/dist/undeclared.js"]))
+      .rejects.toThrow(/no declared UI entry/);
+    await expect(backend.handle("getExtensionUiEntrySource" as never, ["git-capability", "../secret.js"]))
+      .rejects.toThrow(/no declared UI entry/);
+    await backend.close();
+  });
+
   it("puts invalid packages in error with a readable reason", async () => {
     await tempRoot("pipi-ext-invalid-");
     const runtime = join(root, "runtime");

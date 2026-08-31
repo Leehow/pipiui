@@ -10,8 +10,8 @@
   `build/PipiUI.app`). The former Swift/SwiftUI app was retired in
   2026-08 and removed from the repo; do not reintroduce Swift targets,
   `Package.swift`, or `build/PipiUI.app`.
-- `Electron/resources/runtime/` (pi-ext + pi-philosophy) is the single source
-  of truth for the bundled pi runtime.
+- `Electron/resources/runtime/` (pi-core-prompt + pi-ext + pi-philosophy) is the
+  single source of truth for the bundled pi runtime.
 - “打包 / 打开 App / 验收” means the Electron App and the
   `pipiui-electron-build` skill.
 
@@ -120,6 +120,19 @@ after package”的 mtime 检查。
 数百条 ESTABLISHED socket。**registry 全程可达（3-4 秒），所以连通性测试查不出来**
 —— 要看 CPU 时间和写入量，别看能不能 ping 通。
 
+### 基础系统提示词已锁定（binding）
+
+架构已完全扩展化，常驻核心只剩 pi 运行时、宿主，以及
+`Electron/resources/runtime/pi-core-prompt/SYSTEM_BASE.md` 这一份基础提示词；它由宿主
+无条件下发，关掉全部扩展后仍然存在，因此**不接受新增规则**。它只承载身份、扩展化架构，
+以及在所有扩展关闭时仍成立的少数不变量。
+
+要改提示词，默认改扩展：工作方法进 philosophy 层，随能力生效的规则进该扩展自己的 layer
+目录，单工具的规则进 `promptGuidelines`。完整去处表与修订流程见
+[`CONSTITUTION.md`](./CONSTITUTION.md) §8 与
+`Electron/resources/runtime/pi-core-prompt/README.md`；`core-prompt-lock.test.ts` 用
+digest 钉住内容，改动会显式失败。
+
 ### 稳定 ID 必须是语义 slug（binding）
 
 凡 LLM 需要读取、复述、续接、跨调用引用的稳定 ID，必须是短、唯一、可读的语义
@@ -155,6 +168,8 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 |------|--------|
 | Project rules | `CONSTITUTION.md` |
 | 稳定 ID 规则（语义 slug） | `CONSTITUTION.md` §7 · philosophy `orchestration` 层 |
+| 基础系统提示词（已锁定，勿改） | `CONSTITUTION.md` §8 · `Electron/resources/runtime/pi-core-prompt/` |
+| 改提示词该改哪里 | `pi-core-prompt/README.md` 的去处表 —— 默认是哲学层，不是基础层 |
 | Build / run docs | `README.md` → 构建运行 |
 | Default UI / package App | `pipiui-electron-build` skill → `fast-app` → `build/PipiUI.app` |
 | Electron release (dual arch + DMG/ZIP) | `pipiui-electron-build` skill → `release`；never `electron-builder` by hand |

@@ -94,6 +94,51 @@ Pi 配置家是当前打开项目自己的目录，不是全局 `~/.pi`，也不
 
 A 与 B 都禁止 opaque randomness，区别只在提供方；暴露 A/B 类 ID 的工具契约（schema 与 description）必须写明对应要求。bundled philosophy 的 orchestration 层同步承载该规则，并由 philosophy runtime 测试钉住。
 
+
+## 8. 基础系统提示词已锁定（强制）
+
+**The base system prompt is closed. Change the extension, not the base.**
+
+架构已经完全扩展化：常驻核心只剩 pi 运行时、宿主进程，以及唯一一份基础提示词
+`Electron/resources/runtime/pi-core-prompt/SYSTEM_BASE.md`。其余一切能力，连同**工作方法
+本身**，都是可按项目开关的扩展，且**随产品包变化**——`profiles/base` 只 required
+`skill-loader-extension`，git / 终端 / 计划 / 目标 / Web / 浏览器 / 代码检索乃至哲学扩展
+（`coding-method`）都只在 `profiles/coding` 里。
+
+- 该文件无条件下发，没有 feature flag，任何扩展都无法移除。它是所有扩展关闭后唯一还在
+  的提示词。两条投送路径（PipiUI 有两个 spawn 组装器）：主会话由 `assemblePiSpawn` 以第一个
+  `--append-system-prompt` 传入；派工 worker 由 `PIPIUI_CORE_PROMPT` 传路径、subagent 在
+  agent 自身提示词**之前**追加同一份文件。worker 在另一个进程里自己拼参数，两边靠这个 env
+  名字对齐且无编译期保护——有测试钉住双方。
+- 会话最终 prompt 的构成可查：`pipiui_runtime_info` 的 `systemPrompt` 字段给出总大小、
+  digest 和按贡献者分段（`pi-frame` / `pipiui-base` / `philosophy` / `project-context` /
+  `skills`），同一份写进 session 旁的 runtime debug sidecar。只记 provenance 不落全文。
+  worker 不能挂 runtime-info（它注册工具，而 worker 工具集是收窄白名单），改挂 tool-free 的
+  `pipiui-prompt-observer`，同一份 provenance 形状，每次派工写
+  `{project}/.pi/agent-prompts/<agentId>.<runId>.json`（原子写、仅变化时写、保留最新 200）。
+- 基础提示词**只承载三样东西**：身份（运行在 PipiUI 里，底下是 pi）、扩展化架构的**形状**
+  （能力随扩展进出；工具清单即全部事实；缺能力要如实报告而非模拟），以及在所有扩展
+  关闭时仍必须成立的少数不变量（用户语言即回复语言；提问不是工单；授权由请求确立；
+  没执行的断言不是结果；宿主进程属于用户）。
+- **禁止在基础提示词里枚举具体扩展或能力清单。** 清单随产品包变，写死就等于在别的包里
+  说假话；而且它会是最长的一段。只写形状，内容交给工具清单自己说。有测试按
+  `profiles/*` 的 id 钉住这条。
+- 基础提示词用**英语**书写，并保持**尽可能小**（当前 ~630 tokens，预算 800）。它是每个
+  会话都要付、且谁都关不掉的那份开销。
+- **禁止**往基础提示词里加规则。加在这里的规则关不掉、不能按模型/按 agent 收窄、
+  不改代码就换不掉——哲学层的存在就是为了让这些都不必要。
+- 改动去处：工作方法 → `pi-philosophy/layers/` 或项目内 `philosophy-user/`；只在某能力
+  挂载时成立的规则 → 该扩展自己的 layer 目录；只对某模型族 → `requires-models` /
+  `excludes-models`；挂在单个工具上 → 该工具的 `promptGuidelines`；单个派工 agent →
+  其自身 system prompt；项目专属 → 项目的 `AGENTS.md`。
+- 与 philosophy `foundation` 层的重叠（语言、宿主生命周期）是**故意的**：philosophy 可以
+  被用户关掉，基础层不能。不要以「去重」为由删掉任一侧。
+- 确需修订：改文件 → 跑 `packages/pi-backend/test/core-prompt-lock.test.ts` → 把新 digest
+  写回 `EXPECTED_DIGEST` → 在 commit message 里说明改了哪条不变量、以及为什么没有任何
+  扩展能承载它。这一步的噪音是设计目的：让评审看见有人动了关不掉的提示词。
+
+细则见 `Electron/resources/runtime/pi-core-prompt/README.md`。
+
 ---
 
 **权威产物路径：** `/Users/haoli/leehow/code/pipiui/build/PipiUI.app`（唯一可运行包）

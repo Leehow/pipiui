@@ -59,7 +59,7 @@ function loadDeclarative(descriptor: ExtensionDescriptor): void {
   loaded.set(descriptor.id, disposers)
 }
 
-async function loadControlled(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI): Promise<void> {
+async function loadControlled(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI, projectId?: string): Promise<void> {
   if (descriptor.id === BUILTIN_EXTENSION_ID) return
   if (controlledLoaded.has(descriptor.id)) return
   if (!hasControlledEntry(descriptor)) return
@@ -67,7 +67,7 @@ async function loadControlled(descriptor: LoadableExtensionDescriptor, host: Pip
   if (!bucket) return
   controlledLoaded.add(descriptor.id)
   try {
-    const extra = await loadControlledContributions(descriptor, host)
+    const extra = await loadControlledContributions(descriptor, host, undefined, projectId)
     if (!loaded.has(descriptor.id) || !controlledLoaded.has(descriptor.id)) {
       for (const dispose of extra) dispose()
       return
@@ -99,10 +99,11 @@ export function syncDeclarativeContributions(descriptors: readonly ExtensionDesc
 export async function syncExtensionContributions(
   descriptors: readonly ExtensionDescriptor[],
   host: PipiHostAPI,
+  projectId?: string,
 ): Promise<void> {
   syncDeclarativeContributions(descriptors)
   const enabled = descriptors.filter(descriptor => isEnabled(descriptor) && descriptor.id !== BUILTIN_EXTENSION_ID)
-  await Promise.all(enabled.map(descriptor => loadControlled(descriptor as LoadableExtensionDescriptor, host)))
+  await Promise.all(enabled.map(descriptor => loadControlled(descriptor as LoadableExtensionDescriptor, host, projectId)))
 }
 
 async function resolveContributions(
@@ -136,7 +137,7 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, 
       if (cancelled) return
       const resolved = await Promise.all(list.map(descriptor => resolveContributions(host, descriptor)))
       if (cancelled) return
-      await syncExtensionContributions(resolved, host)
+      await syncExtensionContributions(resolved, host, projectId)
       for (const descriptor of list) {
         if (subscribed.has(descriptor.id)) continue
         subscribed.add(descriptor.id)

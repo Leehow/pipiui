@@ -893,3 +893,15 @@ describe('statusCaption / relativeTime', () => {
     expect(statusCaption({ ...base, status: 'stalled' })).toBe('停滞')
   })
 })
+
+describe('Sidebar custom logo', () => {
+  it('renders img.sb-brand-logo from the stored localStorage logo instead of the wordmark', () => {
+    localStorage.setItem('pipiui.logo', 'data:image/png;base64,abc123')
+    render(<Sidebar {...defaultProps()} />)
+    const logo = document.querySelector('img.sb-brand-logo') as HTMLImageElement | null
+    expect(logo).toBeTruthy()
+    expect(logo!.getAttribute('src')).toBe('data:image/png;base64,abc123')
+    expect(logo!.getAttribute('alt')).toBe('自定义 Logo')
+    expect(screen.queryByLabelText('PipiUI')).toBeNull()
+  })
+})

@@ -62,6 +62,16 @@
   white-space:nowrap;
 }
 .sb-brand-wordmark span{color:#13b8d3}
+/* Custom logo takes the wordmark's absolute centering slot. */
+.sb-brand-logo{
+  position:absolute;
+  inset:0;
+  margin:auto;
+  max-height:22px;
+  max-width:70%;
+  object-fit:contain;
+  pointer-events:none;
+}
 .sb-pane-toggle{position:relative;z-index:1;-webkit-app-region:no-drag}
 .sb-search{
   display:flex;

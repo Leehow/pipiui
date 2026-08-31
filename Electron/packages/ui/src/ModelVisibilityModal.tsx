@@ -10,6 +10,7 @@ import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
 import { ExtensionsPane, ExtensionsSubnavSlotContext } from './ExtensionsPane'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
+import { ThemeSettingsPane } from './ThemeSettingsPane'
 import {
   DEFAULT_SETTINGS_TAB,
   HOST_SETTINGS_TAB_IDS,
@@ -22,6 +23,7 @@ import './computer-use.css'
 const SETTINGS_NAV_HINTS: Record<string, string> = {
   models: '模型与凭据',
   extensions: '能力与集成',
+  themes: 'Logo 与配色',
   updates: '运行时版本',
 }
 
@@ -325,6 +327,14 @@ registerSettingsSection(BUILTIN_EXTENSION_ID, {
   description: '查看当前项目由哪些能力组成，并管理扩展、MCP 连接与专属设置。',
   headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加扩展</button>,
   render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} vision={ctx.vision} visibility={ctx.visibility} scan={ctx.scan} />,
+})
+
+registerSettingsSection(BUILTIN_EXTENSION_ID, {
+  id: 'themes',
+  label: '主题',
+  title: '主题',
+  description: '挑选工作台配色主题，并可自定义左上角品牌 Logo。',
+  render: () => <ThemeSettingsPane />,
 })
 
 registerSettingsSection(BUILTIN_EXTENSION_ID, {

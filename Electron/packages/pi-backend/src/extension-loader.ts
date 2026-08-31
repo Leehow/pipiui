@@ -96,6 +96,21 @@ function confinedRealpath(path: string, jail: string): string | undefined {
   }
 }
 
+const EXTENSION_UI_ENTRY_MAX_BYTES = 2 * 1024 * 1024;
+
+function declaredUiEntryPaths(ui: ExtensionUiSummary | undefined): Set<string> {
+  if (!ui) return new Set();
+  const entries = [
+    ...(ui.panels ?? []).map(item => item.entry),
+    ...(ui.toolRenderers ?? []).map(item => item.entry),
+    ...(ui.documentRenderers ?? []).map(item => item.entry),
+    ...(ui.settingsSections ?? []).map(item => item.entry),
+    ...(ui.views ?? []).map(item => item.entry),
+    ...(ui.headerActions ?? []).map(item => item.entry),
+  ].filter((entry): entry is string => typeof entry === "string" && Boolean(entry.trim()));
+  return new Set(entries.map(entry => entry.trim()));
+}
+
 /** Matches runtime prompt-file cap so oversized prompts never enter the snapshot. */
 const EXTENSION_CONTRIB_PROMPT_MAX_BYTES = 64 * 1024;
 
@@ -765,6 +780,26 @@ export class ExtensionLoader {
 
   directoryOf(id: string): string | undefined {
     return this.directories.get(id);
+  }
+
+  /** Read only an entry declared by this extension's validated app.ui manifest. */
+  readUiEntrySource(id: string, entry: string): string {
+    const relativeEntry = entry.trim();
+    if (!relativeEntry || !declaredUiEntryPaths(this.ui.get(id)).has(relativeEntry)) {
+      throw new Error(`extension ${id} has no declared UI entry '${relativeEntry || entry}'`);
+    }
+    const directory = this.directories.get(id);
+    const candidate = directory ? confinedJoin(directory, relativeEntry) : undefined;
+    const real = candidate && directory ? confinedRealpath(candidate, directory) : undefined;
+    if (!real) throw new Error(`extension ${id} UI entry is unavailable`);
+    try {
+      const stat = lstatSync(real);
+      if (!stat.isFile()) throw new Error("not a regular file");
+      if (stat.size > EXTENSION_UI_ENTRY_MAX_BYTES) throw new Error("entry is too large");
+      return readFileSync(real, "utf8");
+    } catch {
+      throw new Error(`extension ${id} UI entry is unavailable`);
+    }
   }
 
   authContribution(id: string): ExtensionAuthContribution | undefined {

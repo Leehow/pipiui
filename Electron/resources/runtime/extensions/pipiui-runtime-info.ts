@@ -3,6 +3,8 @@ import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import { closeSync, constants as fsConstants, fchmodSync, fstatSync, fsyncSync, ftruncateSync, openSync, writeSync } from "node:fs";
 import { Type } from "typebox";
 
+import { type PromptProvenance, promptProvenance } from "./pipiui-prompt-provenance.ts";
+
 import { listSkillCatalogMetadata } from "./pipiui-skillloader.ts";
 import { buildSubagentToolProjection } from "./subagent-debug-projection.ts";
 
@@ -163,6 +165,7 @@ function writeRuntimeDebugSnapshot(
   ctx: ExtensionContext,
   previous: RuntimeDebugState,
   refreshResources: boolean,
+  systemPrompt?: PromptProvenance,
 ): RuntimeDebugState {
   const sessionFile = ctx.sessionManager.getSessionFile?.();
   if (!sessionFile) return previous;
@@ -179,6 +182,7 @@ function writeRuntimeDebugSnapshot(
       version: 1 as const,
       sessionId: ctx.sessionManager.getSessionId(),
       activeTools,
+      ...(systemPrompt ? { systemPrompt } : {}),
       ...collected.resources,
     };
     const oversized = collected.oversized
@@ -214,6 +218,7 @@ function writeRuntimeDebugSnapshot(
 
 export default function (pi: ExtensionAPI) {
   let lastRequest: RequestEvidence | undefined;
+  let lastSystemPrompt: PromptProvenance | undefined;
   let debugState: RuntimeDebugState = { signature: "" };
 
   // Pi invokes before_provider_request handlers in mount order. PipiUI mounts this extension
@@ -232,20 +237,28 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     lastRequest = undefined;
+    lastSystemPrompt = undefined;
     debugState = writeRuntimeDebugSnapshot(pi, ctx, { signature: "" }, true);
   });
 
-  pi.on("before_agent_start", (_event, ctx) => {
-    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, true);
+  // Pi chains before_agent_start through every extension in mount order, handing each the
+  // running result; PipiUI mounts this one last, so `event.systemPrompt` here is the finished
+  // prompt after the base, philosophy, the skill catalog and every provider tip. This is the
+  // only place in the process that sees it whole.
+  pi.on("before_agent_start", (event, ctx) => {
+    lastSystemPrompt = promptProvenance(event.systemPrompt);
+    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, true, lastSystemPrompt);
   });
 
   pi.on("tool_result", (_event, ctx) => {
     // Tool results may activate a deferred tool. Reuse the cached Skill/agent projection unless the active set changed.
-    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, false);
+    // The retained provenance rides along: omitting it would drop the field, change the
+    // signature, and rewrite the sidecar on every tool result just to restore it next turn.
+    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, false, lastSystemPrompt);
   });
 
   pi.on("model_select", (_event, ctx) => {
-    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, true);
+    debugState = writeRuntimeDebugSnapshot(pi, ctx, debugState, true, lastSystemPrompt);
   });
 
   pi.registerTool({
@@ -258,6 +271,7 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "Call pipiui_runtime_info first for questions about the current model/provider/thinking or reasoning effort/session/cwd/tools/context usage.",
       "For whether a provider request actually used an effort, report only lastProviderRequest; do not infer it from chat history, the system prompt, or old PI_* output.",
+      "For what is in your own system prompt — whether the PipiUI base, philosophy, project context or the skill catalog is present, and how large each is — report systemPrompt.segments rather than describing the prompt from memory.",
     ],
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
@@ -280,6 +294,7 @@ export default function (pi: ExtensionAPI) {
         cwd: ctx.cwd,
         activeTools: pi.getActiveTools(),
         contextUsage: ctx.getContextUsage() ?? null,
+        systemPrompt: lastSystemPrompt ?? { status: "not_observed" as const },
         lastProviderRequest: safeLastRequest,
       });
     },

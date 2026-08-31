@@ -82,6 +82,12 @@ export async function importExtensionEntry(specifier: string): Promise<unknown> 
   return import(/* @vite-ignore */ specifier)
 }
 
+/** Chromium cannot import file:// extension paths; host-read source stays within the existing RPC boundary. */
+export async function importExtensionSource(source: string): Promise<unknown> {
+  const specifier = `data:text/javascript;charset=utf-8,${encodeURIComponent(source)}`
+  return import(/* @vite-ignore */ specifier)
+}
+
 function componentFromModule(mod: unknown): ComponentType<Record<string, unknown>> | undefined {
   if (typeof mod === 'function') return mod as ComponentType<Record<string, unknown>>
   if (mod && typeof mod === 'object') {
@@ -130,25 +136,23 @@ function registerSettingsError(extId: string, section: ControlledUiSettingsSecti
   })
 }
 
+type EntryModuleLoader = (entry: string) => Promise<unknown>
+
 async function loadComponent(
-  directory: string | undefined,
   entry: string,
-  importModule: (specifier: string) => Promise<unknown>,
+  loadEntryModule: EntryModuleLoader,
 ): Promise<ComponentType<Record<string, unknown>>> {
-  const specifier = resolveEntrySpecifier(directory, entry)
-  const mod = await importModule(specifier)
+  const mod = await loadEntryModule(entry)
   const component = componentFromModule(mod)
   if (!component) throw new Error('entry module did not export a component')
   return component
 }
 
 async function loadHeaderActionComponent(
-  directory: string | undefined,
   entry: string,
-  importModule: (specifier: string) => Promise<unknown>,
+  loadEntryModule: EntryModuleLoader,
 ): Promise<ComponentType<Record<string, unknown>>> {
-  const specifier = resolveEntrySpecifier(directory, entry)
-  const mod = await importModule(specifier)
+  const mod = await loadEntryModule(entry)
   if (mod && typeof mod === 'object') {
     const factory = (mod as Record<string, unknown>).createHeaderAction
     if (typeof factory === 'function') {
@@ -177,9 +181,20 @@ function createApi(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI): 
 export async function loadControlledContributions(
   descriptor: LoadableExtensionDescriptor,
   host: PipiHostAPI,
-  importModule: (specifier: string) => Promise<unknown> = importExtensionEntry,
+  importModule?: (specifier: string) => Promise<unknown>,
+  projectId?: string,
 ): Promise<Disposer[]> {
   const directory = packageDirectory(descriptor)
+  const resolvedImportModule = importModule ?? importExtensionEntry
+  const loadFileEntryModule: EntryModuleLoader = entry =>
+    resolvedImportModule(resolveEntrySpecifier(directory, entry))
+  const loadHeaderEntryModule: EntryModuleLoader = async entry => {
+    if (!importModule && host.getExtensionUiEntrySource) {
+      const source = await host.getExtensionUiEntrySource(descriptor.id, entry, projectId)
+      return importExtensionSource(source)
+    }
+    return loadFileEntryModule(entry)
+  }
   const ui = descriptor.ui
   const contrib = descriptor.contributions
   const panels = [...(ui?.panels ?? []), ...(contrib?.panels ?? [])]
@@ -199,7 +214,7 @@ export async function loadControlledContributions(
     const entry = action.entry?.trim()
     if (!entry || !action.id) continue
     try {
-      const Component = await loadHeaderActionComponent(directory, entry, importModule)
+      const Component = await loadHeaderActionComponent(entry, loadHeaderEntryModule)
       disposers.push(registerHeaderAction(descriptor.id, {
         id: action.id,
         ...(action.order !== undefined ? { order: action.order } : {}),
@@ -238,7 +253,7 @@ export async function loadControlledContributions(
     const entry = view.entry?.trim()
     if (!entry) continue
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadComponent(entry, loadFileEntryModule)
       disposers.push(registerWorkbenchView(descriptor.id, {
         id: view.id,
         container: view.container,
@@ -258,7 +273,7 @@ export async function loadControlledContributions(
     if (!entry || !panel.id || seenPanel.has(panel.id)) continue
     seenPanel.add(panel.id)
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadComponent(entry, loadFileEntryModule)
       const title = panel.title ?? panel.id
       disposers.push(registerPanel(descriptor.id, {
         id: panel.id,
@@ -277,7 +292,7 @@ export async function loadControlledContributions(
     if (!entry || !renderer.tool || seenTool.has(renderer.tool)) continue
     seenTool.add(renderer.tool)
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadComponent(entry, loadFileEntryModule)
       disposers.push(registerToolRenderer(descriptor.id, {
         toolName: renderer.tool,
         render: ({ content, details, images }) => createElement(Component, { content, details, images }),
@@ -294,7 +309,7 @@ export async function loadControlledContributions(
     if (!entry || !renderer.id || seenDocumentRenderer.has(renderer.id)) continue
     seenDocumentRenderer.add(renderer.id)
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadComponent(entry, loadFileEntryModule)
       disposers.push(registerDocumentRenderer(descriptor.id, {
         id: renderer.id,
         kinds: renderer.kinds?.length ? [...renderer.kinds] : undefined,
@@ -315,7 +330,7 @@ export async function loadControlledContributions(
     seenSection.add(section.id)
     const title = section.title ?? section.id
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadComponent(entry, loadFileEntryModule)
       disposers.push(registerSettingsSection(descriptor.id, {
         id: section.id,
         label: title,

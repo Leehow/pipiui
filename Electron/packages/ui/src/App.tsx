@@ -50,6 +50,8 @@ import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEn
 import { DismissibleError } from './DismissibleError'
 import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
+import { BUILTIN_THEMES } from './theme-registry'
+import { useShellTheme } from './useShellTheme'
 import './app.css'
 import './message-actions.css'
 import './subagent.css'
@@ -1217,40 +1219,6 @@ export function isElectronChrome(): boolean {
   return typeof navigator !== 'undefined' && /Electron/.test(navigator.userAgent)
 }
 
-/** localStorage key for the manual light/dark choice. A stored value means the
- *  user toggled explicitly; it keeps winning over `prefers-color-scheme` on reload. */
-const THEME_STORAGE_KEY = 'pipiui.theme'
-
-function readStoredTheme(): 'light' | 'dark' | null {
-  try {
-    const stored = window.localStorage?.getItem(THEME_STORAGE_KEY)
-    return stored === 'light' || stored === 'dark' ? stored : null
-  } catch {
-    return null
-  }
-}
-
-/** Resolved shell theme: an explicit sidebar toggle persists locally and wins;
- *  with no stored choice the shell follows `prefers-color-scheme` live. */
-function useShellTheme(): { theme: 'light' | 'dark'; toggleTheme: () => void } {
-  const [manual, setManual] = useState<'light' | 'dark' | null>(readStoredTheme)
-  const [system, setSystem] = useState<'light' | 'dark'>(() => window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
-  useEffect(() => {
-    const media = window.matchMedia?.('(prefers-color-scheme: dark)')
-    if (!media) return
-    const update = () => setSystem(media.matches ? 'dark' : 'light')
-    update(); media.addEventListener?.('change', update)
-    return () => media.removeEventListener?.('change', update)
-  }, [])
-  const setManualTheme = useCallback((value: 'light' | 'dark') => {
-    setManual(value)
-    try { window.localStorage?.setItem(THEME_STORAGE_KEY, value) } catch { /* storage unavailable: keep the in-memory choice */ }
-  }, [])
-  const theme = manual ?? system
-  const toggleTheme = useCallback(() => setManualTheme(theme === 'dark' ? 'light' : 'dark'), [theme, setManualTheme])
-  return { theme, toggleTheme }
-}
-
 /** Swift parity: below 720pt the sidebar collapses and the right pane becomes an overlay. */
 const NARROW_VIEWPORT_QUERY = '(max-width: 720px)'
 function useNarrowViewport(): boolean {
@@ -1280,19 +1248,6 @@ function useViewportWidth(): number {
   return width
 }
 
-/** Keep the in-flight cut-in optimistic user across a JSONL snapshot that has not persisted it yet. Match the current receipt id only. */
-function retainReceiptOptimisticUser(
-  snapshot: ChatMessage[],
-  live: readonly ChatMessage[],
-  receipt: { sessionId: string; id: string } | null,
-  sessionId: string,
-): ChatMessage[] {
-  if (!receipt || receipt.sessionId !== sessionId) return snapshot
-  if (snapshot.some(message => message.id === receipt.id)) return snapshot
-  const extra = live.find(message => message.role === 'user' && message.id === receipt.id)
-  return extra ? [...snapshot, extra] : snapshot
-}
-
 export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const productWorkbenchRuntimeRef = useRef<ProductWorkbenchRuntime | null>(null)
   const productWorkbenchRuntime = productWorkbenchRuntimeRef.current ?? (productWorkbenchRuntimeRef.current = createProductWorkbenchRuntime())
@@ -1301,6 +1256,9 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 
 function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const { theme, toggleTheme } = useShellTheme()
+  // Light/dark-only consumers (sidebar toggle glyph, terminal colors) key off the
+  // resolved theme's scheme: forest/neon are dark, paper is light.
+  const themeScheme = BUILTIN_THEMES.find(themeDefinition => themeDefinition.id === theme)?.scheme ?? 'dark'
   const productWorkbench = useProductWorkbenchRuntime()
   // Do not allocate a default mock during every render: its changing identity
   // re-ran all host effects on each composer keystroke.
@@ -1561,8 +1519,6 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
    *  `user_message` echo merges back into this bubble by id, so an assistant
    *  placeholder that already streamed past it cannot wedge a duplicate below. */
   const pendingLocalUserRef = useRef<{ id: string; content: string } | null>(null)
-  /** Id-only receipt for the current busy cut-in optimistic user. Echo or failure clears it. */
-  const persistLocalUserReceiptRef = useRef<{ sessionId: string; id: string } | null>(null)
   const stoppingSessionRef = useRef<string | null>(null)
   const historyLoadRef = useRef(0)
   const historyContextRef = useRef<{ host: PipiHostAPI; sessionId: string } | null>(null)
@@ -1649,16 +1605,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (selectedSessionRef.current !== sessionId) return
     mainTurnOpenRef.current = false
     turnJustSettledRef.current = true
-    const receipt = persistLocalUserReceiptRef.current
-    const keepReceipt = Boolean(
-      receipt
-      && receipt.sessionId === sessionId
-      && messagesRef.current.some(message => message.id === receipt.id),
-    )
-    if (!keepReceipt) {
-      pendingLocalUserRef.current = null
-      if (receipt?.sessionId === sessionId) persistLocalUserReceiptRef.current = null
-    }
+    pendingLocalUserRef.current = null
     setStreaming(false)
     setCompacting(false)
     setStatsRefreshKey(key => key + 1)
@@ -2374,7 +2321,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         // Exception: an empty (or user-less) live pane must still accept durable
         // history. Otherwise a lost settle / stale running resume keeps the
         // middle column blank forever because mainTurnOpen blocks the retry.
-        const liveLacksUser = !messagesRef.current.some(message => message.role === 'user' && !message.queued)
+        const liveLacksUser = !messagesRef.current.some(message => message.role === 'user')
         const historyHasUser = reconciliation.messages.some(message => message.role === 'user')
         if (!(liveLacksUser && historyHasUser)) {
           if (!mainTurnOpenRef.current && !staleRetryScheduled) {
@@ -2411,12 +2358,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       const liveBefore = messagesRef.current
       const restored = restoreOpenHop(next, liveBefore)
-      const retained = retainReceiptOptimisticUser(
-        restored,
-        liveBefore,
-        persistLocalUserReceiptRef.current,
-        selectedSession,
-      )
+      const retained = restored
       messagesBySessionRef.current.set(selectedSession, retained)
       setMessages(retained)
       messagesRef.current = retained
@@ -2550,12 +2492,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       if (reconciliation.status === 'unchanged') return
       historyFingerprintBySessionRef.current.set(sessionId, reconciliation.fingerprint)
-      const retained = retainReceiptOptimisticUser(
-        reconciliation.messages,
-        messagesRef.current,
-        persistLocalUserReceiptRef.current,
-        sessionId,
-      )
+      const retained = reconciliation.messages
       messagesBySessionRef.current.set(sessionId, retained)
       messagesRef.current = retained
       setMessages(retained)
@@ -2693,10 +2630,6 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         const pendingEcho = pendingLocalUserRef.current
         pendingLocalUserRef.current = null
         const next = appendLiveUserMessage(messagesRef.current, event, pendingEcho ?? undefined)
-        const receipt = persistLocalUserReceiptRef.current
-        if (receipt && receipt.sessionId === event.sessionId && !next.some(message => message.id === receipt.id && message.queued)) {
-          persistLocalUserReceiptRef.current = null
-        }
         if (next !== messagesRef.current) transcriptLiveRevisionRef.current += 1
         messagesRef.current = next
         setMessages(next)
@@ -3057,32 +2990,16 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       // Ordinary Send while the Boss is busy is FIFO-only. The explicit
       // “立即发送” action on a queue row owns interruption; composing a new
       // message must never abort or steer the current Boss turn.
-      // The optimistic row stays queued until the later user echo lands.
-      const localUserId = crypto.randomUUID()
-      pendingLocalUserRef.current = { id: localUserId, content: prompt }
-      persistLocalUserReceiptRef.current = { sessionId: targetSession, id: localUserId }
-      mutateLocalTranscript(items => [...items, { id: localUserId, role: 'user', content: prompt, images: attachments?.length ? attachments.map(attachment => ({ data: attachment.url, mimeType: attachment.mimeType })) : undefined, timestamp: Date.now(), queued: true } as ChatMessage])
-      const dropOptimistic = () => {
-        if (pendingLocalUserRef.current?.id === localUserId) pendingLocalUserRef.current = null
-        if (persistLocalUserReceiptRef.current?.id === localUserId) persistLocalUserReceiptRef.current = null
-        mutateLocalTranscript(items => items.filter(message => message.id !== localUserId))
-      }
+      // The message stays in the queue panel only; it enters the transcript
+      // when the queue actually sends it and the real user echo lands.
       try {
         telemetry.preflightStartedAt = Date.now()
         const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
-        if (payload?.length) {
-          const converted = chatImagesFromAttachments(payload)
-          mutateLocalTranscript(items => items.map(message => message.id === localUserId && message.images?.some(image => image.data.startsWith('blob:')) ? { ...message, images: converted } : message))
-        }
         if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
         finishRendererPreflight(telemetry, payload)
-        const result = await sessionQueue.enqueue(prompt, payload, telemetry)
-        if (selectedSession !== targetSession) return true
-        if (result.outcome === 'queued') return true
-        // Race: host dispatched directly despite busy check. Keep queued until the real echo.
+        await sessionQueue.enqueue(prompt, payload, telemetry)
         return true
       } catch {
-        dropOptimistic()
         return false
       }
     }
@@ -3652,7 +3569,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const toolsTrack = productBrowserWorkspaceActive
     ? fitBrowserToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
     : widths.tools
-  const baseSidebarProps: SidebarProps = { projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, theme, onToggleTheme: toggleTheme }
+  const baseSidebarProps: SidebarProps = { projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, theme: themeScheme, onToggleTheme: toggleTheme }
   const codingSidebarProps: SidebarProps = { ...baseSidebarProps, onOpenComputerUse: computerUseAvailable ? () => setComputerUseOpen(true) : undefined, onOpenRemote: () => setRemoteOpen(true), onOpenSubagentModels: () => setSubagentModelsOpen(true) }
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
     {narrowViewport && (!productSidebarCollapsed || !productToolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
@@ -3706,7 +3623,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div> : null}
     </section>
     {productPanels.length > 0 && <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />}
-    {productPanels.length > 0 && <ToolPanel activeTab={activeTab} collapsed={productToolsCollapsed} onToggleCollapsed={toggleTools} rail={!productToolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />}
+    {productPanels.length > 0 && <ToolPanel activeTab={activeTab} collapsed={productToolsCollapsed} onToggleCollapsed={toggleTools} rail={!productToolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={themeScheme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />}
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {

@@ -3742,7 +3742,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack") {
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack") {
       case "listProductProfiles":
         return this.listProductProfiles(params[0]);
       case "getProductProfile":
@@ -3799,6 +3799,8 @@ export class PiHostBackend implements HostBackend {
         return this.confirmCapabilityGrant(params[0], params[1], params[2]);
       case "getExtensionContributions":
         return this.getExtensionContributions(params[0], params[1]);
+      case "getExtensionUiEntrySource":
+        return this.getExtensionUiEntrySource(params[0], params[1], params[2]);
       case "getExtensionAuthStatus":
         return this.getExtensionAuthStatus(params[0], params[1]);
       case "beginExtensionLogin":
@@ -7555,6 +7557,20 @@ export class PiHostBackend implements HostBackend {
     const item = listed.find((entry) => entry.id === id);
     if (!item) throw new Error(`unknown extension ${id}`);
     return item.contributions;
+  }
+  private async getExtensionUiEntrySource(
+    idValue: unknown,
+    entryValue: unknown,
+    projectId?: unknown,
+  ): Promise<string> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    if (typeof entryValue !== "string" || !entryValue.trim()) throw new Error("extension UI entry 必须是 string");
+    const id = idValue.trim();
+    const listed = await this.listExtensions(projectId);
+    const item = listed.find((entry) => entry.id === id);
+    if (!item) throw new Error(`unknown extension ${id}`);
+    if (item.state !== "enabled") throw new Error(`extension ${id} is not enabled`);
+    return this.extensionLoader.readUiEntrySource(id, entryValue);
   }
   private async getExtensionAuthStatus(
     idValue: unknown,

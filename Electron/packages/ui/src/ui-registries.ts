@@ -133,7 +133,7 @@ export function useSettingsSections(): readonly SettingsSectionContribution[] {
 export const DEFAULT_SETTINGS_TAB = 'models'
 
 /** Top-level settings tabs. Extension settings panes stay nested under 扩展. */
-export const HOST_SETTINGS_TAB_IDS = ['models', 'extensions', 'updates'] as const
+export const HOST_SETTINGS_TAB_IDS = ['models', 'extensions', 'themes', 'updates'] as const
 
 // --- panels ----------------------------------------------------------------
 

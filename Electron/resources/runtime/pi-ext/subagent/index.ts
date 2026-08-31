@@ -799,6 +799,18 @@ const PIPIUI_PHILOSOPHY_EXT = process.env.PIPIUI_PHILOSOPHY_EXT;
 // close. The architecture half earns its keep here in particular: workers run on a narrowed
 // tool set, so "the tools you were given are the whole truth" is aimed straight at them.
 const PIPIUI_CORE_PROMPT = process.env.PIPIUI_CORE_PROMPT;
+// Tool-free worker prompt observer. `pipiui-runtime-info` answers "what is in my system
+// prompt?" for the main session, but it registers a tool and a worker's tool set is a
+// curated allowlist — so the half of the fleet whose prompt is assembled here, by this file
+// rather than by `assemblePiSpawn`, was the half nobody could inspect.
+const PIPIUI_PROMPT_OBSERVER_EXT = process.env.PIPIUI_PROMPT_OBSERVER_EXT;
+
+/** Where a dispatched child reports its assembled prompt. Bounded and swept by the observer. */
+function promptDebugFile(agentId: string, run: string): string | undefined {
+	if (!PIPIUI_MAIN_CWD || !PIPIUI_PROMPT_OBSERVER_EXT) return undefined;
+	const safe = (value: string) => value.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 80);
+	return path.join(PIPIUI_MAIN_CWD, ".pi", "agent-prompts", `${safe(agentId)}.${safe(run)}.json`);
+}
 const PIPIUI_OFFICE_DOC_SHOT_GATE_EXT = process.env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
@@ -7152,6 +7164,7 @@ async function runSingleAgent(
 	// background receipt. It must remain resident long enough to consume its child's
 	// completion follow-up; Pi RPC is the supported stdin/stdout lifecycle for that.
 	const useNestedRpc = childDepth > 0 && allowRecursiveDelegation;
+	const promptDebugPath = promptDebugFile(pipiuiAgentId, runId);
 	const args: string[] = useNestedRpc ? ["--mode", "rpc"] : ["--mode", "json", "-p"];
 	if (sessionDir) {
 		// `--fork <src>` mints a NEW session carrying the copied entries; pi treats the
@@ -7257,6 +7270,9 @@ async function runSingleAgent(
 	for (const route of selectPipiUIExtensionRoutes(pipiuiExtensionRouting, toolSelection)) {
 		args.push("-e", route.path);
 	}
+	// Last on purpose: pi chains before_agent_start through extensions in mount order, so only
+	// a final mount sees the prompt every other one has finished writing.
+	if (promptDebugPath) args.push("-e", PIPIUI_PROMPT_OBSERVER_EXT!);
 	for (const skillPath of options?.privateSkillPaths ?? []) args.push("--skill", skillPath);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
 	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
@@ -7611,6 +7627,8 @@ async function runSingleAgent(
 					// craft rules to whoever writes code, research rules to whoever investigates.
 					// Without it every dispatched agent looks alike and only role-wide layers land.
 					PIPI_PHILOSOPHY_AGENT: agentName,
+					// Absent when the observer is not mounted; the extension no-ops without it.
+					PIPIUI_PROMPT_DEBUG_FILE: promptDebugPath,
 					// This extension owns the orchestration / fan-out / nested-dispatch layers,
 					// so a child that loads the philosophy has to be pointed at them too — the
 					// nested-dispatch layer is scoped to `general-purpose` and reaches nobody

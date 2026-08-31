@@ -5,21 +5,25 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PipiUI</title>
     <style>
-      /* Pre-React base color: matches the shell defaults in app.css
-         (--bg #17181c dark / #f5f5f7 light) so the window never shows the
-         white system background before first paint or behind heavy remounts. */
+      /* Pre-React base color: matches each builtin theme's --bg in app.css so
+         the window never shows the white system background before first paint
+         or behind heavy remounts. Keep in sync with BUILTIN_THEMES. */
       html { background: #17181c }
       html.pipiui-theme-light { background: #f5f5f7 }
+      html.pipiui-theme-forest { background: #141a16 }
+      html.pipiui-theme-neon { background: #16121f }
+      html.pipiui-theme-paper { background: #f7f3ea }
     </style>
     <script>
-      // Resolve the same theme useShellTheme resolves (stored choice wins,
-      // else prefers-color-scheme) before any paint, synchronously.
-      try {
-        var stored = localStorage.getItem('pipiui.theme')
-        var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
-        var dark = stored ? stored === 'dark' : Boolean(prefersDark)
-        if (!dark) document.documentElement.classList.add('pipiui-theme-light')
-      } catch (e) { /* unreadable storage: keep dark default */ }
+      // Resolve the same theme useShellTheme resolves (explicit builtin theme
+      // id wins; 'system', missing, unreadable or unknown values follow
+      // prefers-color-scheme) before any paint, synchronously.
+      var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
+      var stored = null
+      try { stored = localStorage.getItem('pipiui.theme') } catch (e) { /* unreadable storage: follow system */ }
+      var ids = { dark: 1, light: 1, forest: 1, neon: 1, paper: 1 }
+      var id = stored && Object.prototype.hasOwnProperty.call(ids, stored) ? stored : (prefersDark ? 'dark' : 'light')
+      if (id !== 'dark') document.documentElement.classList.add('pipiui-theme-' + id)
     </script>
   </head>
   <body>

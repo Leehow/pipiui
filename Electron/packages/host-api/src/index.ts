@@ -1389,6 +1389,8 @@ export interface PipiHostAPI {
   confirmCapabilityGrant?(id: string, capabilities: readonly string[]): Promise<ExtensionCapabilityGrant>;
   /** Optional: declarative contributions when they are not inlined on the descriptor. */
   getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
+  /** Read one manifest-declared controlled UI module without exposing its filesystem path to Chromium. */
+  getExtensionUiEntrySource?(id: string, entry: string, projectId?: string): Promise<string>;
   /** Host-owned secret-free status for an extension auth contribution. */
   getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
   /** Start login for the extension's contributed provider. Credentials stay in the host. */
@@ -1591,6 +1593,9 @@ function apiFrom(
     getCapabilityGrant: id => invoke("getCapabilityGrant", id),
     confirmCapabilityGrant: (id, capabilities) => invoke("confirmCapabilityGrant", id, capabilities),
     getExtensionContributions: id => invoke("getExtensionContributions", id),
+    getExtensionUiEntrySource: (id, entry, projectId) => projectId === undefined
+      ? invoke("getExtensionUiEntrySource", id, entry)
+      : invoke("getExtensionUiEntrySource", id, entry, projectId),
     getExtensionAuthStatus: id => invoke("getExtensionAuthStatus", id),
     beginExtensionLogin: (id, authType) => authType === undefined
       ? invoke("beginExtensionLogin", id)

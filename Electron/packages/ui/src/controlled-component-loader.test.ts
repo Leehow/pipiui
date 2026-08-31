@@ -211,6 +211,35 @@ describe('loadControlledContributions', () => {
     expect(listHeaderActions().some(item => item.id === 'quota.header')).toBe(false)
   })
 
+  it('loads a controlled header from host-read source instead of a file URL', async () => {
+    const readExtensionUiEntrySource = vi.fn(async () => [
+      'export function createHeaderAction(React) {',
+      '  return function Header({ workspaceId }) {',
+      "    return React.createElement('div', { 'data-testid': 'host-source-header' }, workspaceId)",
+      '  }',
+      '}',
+    ].join('\n'))
+    const host = hostStub()
+    host.getExtensionUiEntrySource = readExtensionUiEntrySource
+    expect(host.getExtensionUiEntrySource).toBe(readExtensionUiEntrySource)
+    const disposers = await loadControlledContributions({
+      id: EXT,
+      directory: '/filesystem-path-chromium-cannot-import',
+      ui: { headerActions: [{ id: 'quota.host-source', entry: 'app/dist/header.js' }] },
+    }, host, undefined, 'project-a')
+
+    expect(readExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/header.js', 'project-a')
+    const action = listHeaderActions().find(item => item.id === 'quota.host-source')
+    const rendered = render(action!.render({
+      host,
+      workspaceId: 'workspace-a',
+      hostCapabilities: { git: false },
+    }))
+    expect(rendered.getByTestId('host-source-header').textContent).toBe('workspace-a')
+
+    for (const dispose of disposers) dispose()
+  })
+
   it('shows a readable panel placeholder when entry import fails and does not throw', async () => {
     const panelsBefore = listPanels().map(panel => panel.id)
     await loadControlledContributions({

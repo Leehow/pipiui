@@ -3,6 +3,7 @@
   "bundledExtensions": [
     "grok-build-oauth",
     "code-retrieval",
+    "git-capability",
     "deepseek",
     "qoder",
     "pipiui-headroom",

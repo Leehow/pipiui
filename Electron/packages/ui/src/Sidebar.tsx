@@ -3,6 +3,7 @@ import { ProviderLogo } from './ProviderLogo'
 import { SessionSourceIcon } from './SessionSourceIcon'
 import { adoptedSourceBadge, isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
+import { useCustomLogo } from './custom-logo'
 import './sidebar.css'
 import gearIcon from './sf-icons/gearshape.png'
 import desktopIcon from './sf-icons/desktopcomputer.png'
@@ -721,6 +722,7 @@ export function Sidebar(props: SidebarProps) {
   const projectMatches = (p: SidebarProject) =>
     !query || p.name.toLowerCase().includes(query) || (p.path ?? '').toLowerCase().includes(query)
 
+  const logo = useCustomLogo()
   const visiblePinned = pinnedSessions.filter(sessionMatches)
   // During a search the folder view becomes a results view: every matching
   // project shows its matching sessions regardless of expansion state.
@@ -741,7 +743,9 @@ export function Sidebar(props: SidebarProps) {
     <nav className="sb-root" aria-label="会话侧边栏" data-testid="sidebar">
       {!collapsed && (
         <header className="sb-topbar">
-          <div className="sb-brand-wordmark" aria-label="PipiUI">Pip<span>i</span> UI</div>
+          {logo
+            ? <img className="sb-brand-logo" src={logo} alt="自定义 Logo" />
+            : <div className="sb-brand-wordmark" aria-label="PipiUI">Pip<span>i</span> UI</div>}
           <button type="button" className="pane-toggle sb-pane-toggle" data-testid="toggle-sidebar" title="收起左栏" aria-label="收起左栏" aria-expanded="true" onClick={onToggleCollapsed}>≡</button>
         </header>
       )}

@@ -1,0 +1,62 @@
+/* 设置-主题页（ThemeSettingsPane）样式。独立文件，不改 app.css。
+ *
+ * `.pipiui-shell` 上的暗色基线 token 只作用于壳元素；预览卡靠 app.css 的
+ * `[data-theme="light|forest|neon|paper"]` 块拿到变量。这里补一个等值的
+ * `[data-theme="dark"]` 块（取值与 .pipiui-shell 基线逐项一致），让暗夜
+ * 预览卡和 system 卡的暗色半分在任意壳主题下都解析到正确变量。 */
+[data-theme="dark"] { --bg:#17181c;--surface:#202126;--surface-raised:#25262c;--surface-hover:#2c2d34;--surface-input:#2a2b31;--border:#303137;--border-strong:#373941;--text:#e5e7eb;--text-strong:#f3f4f6;--muted:#9da2ad;--subtle:#747a86;--selection:#353750;--accent:#6578ea;--accent-soft:#33354c;--danger:#a75b63;--warning:#f5c76e;--success:#76c59b; }
+
+.tsp-root { display:flex; flex-direction:column; gap:22px; max-width:860px; }
+
+.tsp-section { display:flex; flex-direction:column; gap:10px; }
+.tsp-section-title { margin:0; font-size:13px; font-weight:650; color:var(--text-strong); }
+
+/* 当前主题大卡 */
+.tsp-current { display:flex; gap:16px; align-items:stretch; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--bg); }
+.tsp-current-preview { flex:0 0 220px; min-width:0; }
+.tsp-current .tsp-mock { height:92px; }
+.tsp-current-info { display:flex; flex-direction:column; gap:6px; justify-content:center; min-width:0; }
+.tsp-current-name-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.tsp-current-name { font-size:16px; font-weight:700; color:var(--text-strong); }
+.tsp-badge { padding:2px 8px; border-radius:999px; font-size:11px; color:var(--accent); background:var(--accent-soft); }
+.tsp-badge-system { color:var(--muted); background:var(--surface-hover); }
+.tsp-current-desc { margin:0; font-size:12px; line-height:1.6; color:var(--muted); }
+
+/* 全部主题网格 */
+.tsp-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; }
+.tsp-card { display:flex; flex-direction:column; gap:8px; padding:8px; text-align:left; border:1px solid var(--border); border-radius:12px; background:var(--bg); color:var(--text); cursor:pointer; }
+.tsp-card:hover { border-color:var(--border-strong); }
+.tsp-card.selected { outline:2px solid var(--accent); outline-offset:1px; border-color:var(--accent); }
+.tsp-card-preview { min-width:0; }
+.tsp-card-meta { display:flex; flex-direction:column; gap:2px; min-width:0; }
+.tsp-card-name { font-size:13px; font-weight:650; color:var(--text-strong); }
+.tsp-card-desc { font-size:11px; line-height:1.5; color:var(--muted); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+
+/* system 卡：左右半分 dark / light */
+.tsp-sys-split { display:flex; gap:4px; }
+.tsp-sys-half { flex:1; min-width:0; }
+.tsp-sys-half .tsp-mock { height:72px; }
+
+/* 迷你 mock：侧栏条 / 用户气泡 / 助手文本 / composer 条，全变量取色 */
+.tsp-mock { display:flex; width:100%; height:72px; border-radius:8px; overflow:hidden; background:var(--bg); border:1px solid var(--border); }
+.tsp-mock-side { flex:0 0 14px; background:var(--surface); border-right:1px solid var(--border); }
+.tsp-mock-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:5px; padding:7px 9px; }
+.tsp-mock-user { align-self:flex-end; width:44%; height:9px; border-radius:5px; background:var(--accent); }
+.tsp-mock-line { height:5px; border-radius:3px; }
+.tsp-mock-line-text { width:72%; background:var(--text); opacity:.8; }
+.tsp-mock-line-muted { width:50%; background:var(--muted); }
+.tsp-mock-composer { margin-top:auto; height:12px; border-radius:6px; background:var(--surface-raised); border:1px solid var(--border-strong); }
+
+/* 品牌 Logo 区 */
+.tsp-logo-row { display:flex; gap:16px; align-items:center; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface); }
+.tsp-logo-preview { flex:0 0 150px; height:64px; display:flex; align-items:center; justify-content:center; border-radius:8px; background:var(--bg); border:1px solid var(--border); }
+.tsp-logo-img { max-height:40px; max-width:80%; object-fit:contain; }
+.tsp-logo-wordmark { font-size:16px; font-weight:700; letter-spacing:-.3px; color:var(--text-strong); }
+.tsp-logo-wordmark span { color:var(--accent); }
+.tsp-logo-actions { display:flex; flex-direction:column; gap:8px; min-width:0; }
+.tsp-logo-buttons { display:flex; gap:8px; }
+.tsp-btn { padding:6px 14px; border-radius:7px; border:1px solid var(--border-strong); background:var(--surface-raised); color:var(--text-strong); font-size:12px; cursor:pointer; }
+.tsp-btn:hover:not(:disabled) { background:var(--surface-hover); }
+.tsp-btn:disabled { opacity:.45; cursor:default; }
+.tsp-logo-hint { margin:0; font-size:11px; color:var(--muted); }
+.tsp-logo-error { margin:0; font-size:11px; color:var(--danger); }

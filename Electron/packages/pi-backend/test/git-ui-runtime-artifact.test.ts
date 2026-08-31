@@ -7,8 +7,21 @@ import { describe, expect, it } from "vitest";
 import { BUNDLED_MANIFEST_EXTENSIONS, installRuntimeTree } from "../src/runtime-install.js";
 
 const runtimeDirectories = ["pi-core-prompt", "pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"];
+const shippedRuntime = new URL("../../../resources/runtime/", import.meta.url).pathname;
 
 describe("Git header runtime artifact", () => {
+  it("selects git-capability for the shipped runtime keepDist pass", async () => {
+    const selection = JSON.parse(await readFile(join(shippedRuntime, "pipiui-runtime-manifest.json"), "utf8")) as {
+      bundledExtensions?: string[];
+    };
+    const gitManifest = JSON.parse(await readFile(join(shippedRuntime, "extensions", "git-capability", "pipiui-extension.json"), "utf8")) as {
+      app?: { ui?: { headerActions?: Array<{ entry?: string }> } };
+    };
+    expect(gitManifest.app?.ui?.headerActions?.[0]?.entry).toBe("app/dist/branch-menu.js");
+    expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("git-capability");
+    expect(selection.bundledExtensions).toContain("git-capability");
+  });
+
   it("preserves the manifest-declared branch menu through runtime installation", async () => {
     const root = await mkdtemp(join(tmpdir(), "pipiui-git-header-runtime-"));
     try {

@@ -1348,6 +1348,9 @@ describe('extension architecture M1 host-api contract', () => {
         if (request.method === 'getExtensionContributions') {
           return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { slashCommands: [{ name: 'quota', description: '查看当前用量' }] } }
         }
+        if (request.method === 'getExtensionUiEntrySource') {
+          return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: 'export const HeaderAction = () => null' }
+        }
         if (request.method === 'getExtensionAuthStatus') {
           return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: { extensionId: 'quota', providerId: 'acme-chat', loggedIn: false, usable: false } }
         }
@@ -1375,6 +1378,8 @@ describe('extension architecture M1 host-api contract', () => {
     await expect(host.getCapabilityGrant?.('quota')).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.confirmCapabilityGrant?.('quota', ['settings.read'])).resolves.toEqual({ capabilities: ['settings.read'] })
     await expect(host.getExtensionContributions?.('quota')).resolves.toEqual({ slashCommands: [{ name: 'quota', description: '查看当前用量' }] })
+    await expect(host.getExtensionUiEntrySource?.('quota', 'app/dist/header.js')).resolves.toContain('HeaderAction')
+    await expect(host.getExtensionUiEntrySource?.('quota', 'app/dist/header.js', 'project-1')).resolves.toContain('HeaderAction')
     await expect(host.getExtensionAuthStatus?.('quota')).resolves.toEqual({ extensionId: 'quota', providerId: 'acme-chat', loggedIn: false, usable: false })
     await expect(host.beginExtensionLogin?.('quota', 'oauth')).resolves.toEqual({ loginId: 'login-1' })
     await expect(host.logoutExtension?.('quota')).resolves.toMatchObject({ model: { provider: 'unknown' } })
@@ -1392,6 +1397,8 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'getCapabilityGrant', params: ['quota'] },
       { method: 'confirmCapabilityGrant', params: ['quota', ['settings.read']] },
       { method: 'getExtensionContributions', params: ['quota'] },
+      { method: 'getExtensionUiEntrySource', params: ['quota', 'app/dist/header.js'] },
+      { method: 'getExtensionUiEntrySource', params: ['quota', 'app/dist/header.js', 'project-1'] },
       { method: 'getExtensionAuthStatus', params: ['quota'] },
       { method: 'beginExtensionLogin', params: ['quota', 'oauth'] },
       { method: 'logoutExtension', params: ['quota'] },

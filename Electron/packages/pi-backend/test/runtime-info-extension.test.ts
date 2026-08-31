@@ -303,3 +303,66 @@ describe("pipiui_runtime_info extension", () => {
     expect(tool.promptGuidelines.join("\n")).toMatch(/history|system prompt|PI_/i);
   });
 });
+
+
+/**
+ * Prompt provenance. PipiUI mounts this extension last, so its `before_agent_start` handler
+ * receives the assembled prompt after the base, philosophy, the skill catalog and every
+ * provider tip — the only point in the process that sees it whole. Before this existed there
+ * was no way to answer "did the locked base actually reach this session"; the base could have
+ * silently stopped shipping and nothing would have said so.
+ */
+describe("system prompt provenance", () => {
+  const BASE = "<!-- pipiui-system-base v2 -->\nbase text";
+  const PHILOSOPHY = "<!-- pipi-philosophy -->\nlayers";
+  const FRAME = "You are an expert coding assistant.\n";
+
+  it("attributes each contributor and calls the unmarked head Pi's own frame", async () => {
+    const { tool, handlers } = await loadRuntimeInfo();
+    const prompt = `${FRAME}${BASE}\n<project_context>ctx</project_context>\n${PHILOSOPHY}`;
+    await handlers.get("before_agent_start")![0]({ systemPrompt: prompt }, context());
+
+    const info = parseResult(await tool.execute("id", {}, undefined, undefined, context()));
+    expect(info.systemPrompt.segments.map((s: any) => s.id)).toEqual([
+      "pi-frame",
+      "pipiui-base",
+      "project-context",
+      "philosophy",
+    ]);
+    expect(info.systemPrompt.chars).toBe(prompt.length);
+    // Segments partition the prompt: nothing counted twice, nothing unattributed.
+    expect(info.systemPrompt.segments.reduce((n: number, s: any) => n + s.chars, 0)).toBe(prompt.length);
+  });
+
+  it("omits a contributor that is not in the prompt", async () => {
+    // The point of the field: philosophy off has to be visible, not inferred.
+    const { tool, handlers } = await loadRuntimeInfo();
+    await handlers.get("before_agent_start")![0]({ systemPrompt: `${FRAME}${BASE}` }, context());
+
+    const info = parseResult(await tool.execute("id", {}, undefined, undefined, context()));
+    expect(info.systemPrompt.segments.map((s: any) => s.id)).toEqual(["pi-frame", "pipiui-base"]);
+  });
+
+  it("reports not_observed before any turn, and forgets across sessions", async () => {
+    const { tool, handlers } = await loadRuntimeInfo();
+    const before = parseResult(await tool.execute("id", {}, undefined, undefined, context()));
+    expect(before.systemPrompt).toEqual({ status: "not_observed" });
+
+    await handlers.get("before_agent_start")![0]({ systemPrompt: `${FRAME}${BASE}` }, context());
+    await handlers.get("session_start")![0]({}, context());
+
+    const after = parseResult(await tool.execute("id", {}, undefined, undefined, context()));
+    expect(after.systemPrompt).toEqual({ status: "not_observed" });
+  });
+
+  it("digests the prompt so an unchanged composition is recognizable across turns", async () => {
+    const { tool, handlers } = await loadRuntimeInfo();
+    const read = async (prompt: string) => {
+      await handlers.get("before_agent_start")![0]({ systemPrompt: prompt }, context());
+      return parseResult(await tool.execute("id", {}, undefined, undefined, context())).systemPrompt.sha256;
+    };
+    const first = await read(`${FRAME}${BASE}`);
+    expect(await read(`${FRAME}${BASE}`)).toBe(first);
+    expect(await read(`${FRAME}${BASE}\n${PHILOSOPHY}`)).not.toBe(first);
+  });
+});

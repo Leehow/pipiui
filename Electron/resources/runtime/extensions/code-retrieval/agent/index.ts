@@ -11,6 +11,7 @@
  */
 
 import { executeCodeSearch } from "./code-search.js";
+import { GrepTellBudget } from "./grep-tell.js";
 import { getSymbolLayer, normalizeCodeNavResult, setSymbolLayer } from "./hooks.js";
 import { SeenRangeLedger } from "./ledger.js";
 import { executeRepoMap } from "./map-tool.js";
@@ -32,6 +33,7 @@ import { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
 import { installSymbolLayer } from "./symbol/hooks-adapter.js";
 
 export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
+export { GrepTellBudget, alternationArms } from "./grep-tell.js";
 export { RefRegistry, formatRefLine, buildToolResult } from "./protocol.js";
 export { SeenRangeLedger } from "./ledger.js";
 export { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
@@ -45,6 +47,9 @@ type ExtensionAPI = {
     /** One line under Pi's `Available tools:`. Absent means the model meets the tool only as
      *  a schema in an array, with no steering about when it is the right call. */
     promptSnippet?: string;
+    /** Bullets appended to the system prompt's `Guidelines:` section while the tool is active.
+     *  The snippet says what the tool is; these say when it is the call. */
+    promptGuidelines?: string[];
     parameters: Record<string, unknown>;
     execute: (
       toolCallId: string,
@@ -63,7 +68,7 @@ type ExtensionAPI = {
   ): void;
   on?(
     event: string,
-    handler: (event: unknown, ctx: { cwd: string }) => void | Promise<void>,
+    handler: (event: unknown, ctx: { cwd: string }) => unknown,
   ): void;
 };
 
@@ -241,6 +246,14 @@ function asStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
+/** Using any of these is the session electing indexed retrieval; the grep tell goes quiet after. */
+const INDEXED_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "code_search",
+  "code_nav",
+  "repo_map",
+  "read_spans",
+]);
+
 export default function (pi: ExtensionAPI): void {
   // Wire the tree-sitter symbol layer into the hook table (spec D4/D6).
   // Hooks install is cheap; WASM + full extract run in the background after
@@ -248,8 +261,10 @@ export default function (pi: ExtensionAPI): void {
   installSymbolLayer(setSymbolLayer);
 
   const runtime = new SessionRuntime();
+  const grepTell = new GrepTellBudget();
 
   pi.on?.("session_start", async (_event, ctx) => {
+    grepTell.reset();
     await runtime.ensure(ctx.cwd);
     // Fire-and-forget: never block session_start on tree-sitter / extract.
     void startSymbolWarmup(runtime.projectRoot);
@@ -259,10 +274,55 @@ export default function (pi: ExtensionAPI): void {
     await runtime.shutdown();
   });
 
+  /**
+   * The packed-guess tell (grep-tell.ts).
+   *
+   * The philosophy layer states the tell sequentially — *your own second keyword* —
+   * but models pack the guesses into one alternation, so the tell is invisible at
+   * the moment it holds. This puts one line where the model can act on it: on the
+   * grep result itself. Budgeted, deduped, and silent for the rest of a session
+   * that reaches for indexed retrieval on its own.
+   *
+   * Best-effort throughout: any failure here must leave the grep result untouched
+   * rather than break a search.
+   */
+  pi.on?.("tool_result", event => {
+    try {
+      const result = event as {
+        toolName?: unknown;
+        isError?: unknown;
+        input?: Record<string, unknown>;
+        content?: unknown;
+      };
+      if (result.isError === true) return undefined;
+      const toolName = typeof result.toolName === "string" ? result.toolName : "";
+      if (INDEXED_TOOL_NAMES.has(toolName)) {
+        grepTell.silence();
+        return undefined;
+      }
+      if (toolName !== "grep") return undefined;
+      const input = result.input ?? {};
+      const tell = grepTell.consider({
+        pattern: typeof input.pattern === "string" ? input.pattern : undefined,
+        path: typeof input.path === "string" ? input.path : undefined,
+        literal: typeof input.literal === "boolean" ? input.literal : undefined,
+        at: Date.now(),
+      });
+      if (!tell) return undefined;
+      const content = Array.isArray(result.content) ? result.content : [];
+      return { content: [...content, { type: "text", text: tell.line }] };
+    } catch {
+      return undefined;
+    }
+  });
+
   pi.registerTool({
     name: "code_search",
     label: "Code search",
     promptSnippet: "Search code from a description when grep would need a keyword guess",
+    promptGuidelines: [
+      "When a grep pattern would carry several alternative keywords, that alternation is the weighing code_search does properly — send the description instead of the arms.",
+    ],
     description:
       "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Weighs your terms against each other inside symbol boundaries and returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap), so one call is enough to reject or choose candidates; never full file bodies — pull those with read_spans. It is the right call the moment grep would need a second keyword guess. It ranks the words you give it and has no semantic index in this build, so a query whose answer uses none of your words comes back empty — that means change vocabulary, not tool. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
     parameters: {
@@ -317,6 +377,9 @@ export default function (pi: ExtensionAPI): void {
     name: "code_nav",
     label: "Code nav",
     promptSnippet: "Symbol graph: definition, callers, implementations",
+    promptGuidelines: [
+      "Use code_nav, not grep, for where a symbol is defined / who calls it / what implements it: grep flattens the definition, the call sites and passing mentions into one list.",
+    ],
     description:
       "Answer the symbol-graph questions text search flattens: where a symbol is defined, who calls it, what implements it. Prefer it over grepping a symbol name, which returns the definition, every call site and every passing mention as one undifferentiated list. Ranked hits carry a bounded source preview under the top refs (a few lines each) so most choices need no follow-up read. Degrades to a stub when the symbol layer is unavailable.",
     parameters: {
@@ -415,6 +478,9 @@ export default function (pi: ExtensionAPI): void {
     name: "repo_map",
     label: "Repo map",
     promptSnippet: "Map an unfamiliar tree before opening files",
+    promptGuidelines: [
+      "In a tree whose layout you cannot yet name, call repo_map before walking directories or opening files to find out what is in them.",
+    ],
     description:
       "First move in a tree whose layout you cannot yet name: a token-budgeted map of signatures, imports and call edges across the project. Cheaper than walking directories and opening files to find out what is in them. Ranked map hits carry stable R# refs with a bounded source preview under the top refs (~6 lines each), so one call is usually enough to choose; pull full bodies with read_spans. Uses the symbol-layer hook when present.",
     parameters: {
@@ -446,6 +512,9 @@ export default function (pi: ExtensionAPI): void {
     name: "read_spans",
     label: "Read spans",
     promptSnippet: "Fetch the span bodies a prior code_search ranked",
+    promptGuidelines: [
+      "After a code_search or repo_map, pull bodies with read_spans by ref rather than re-opening whole files — the ranked list already named the lines.",
+    ],
     description:
       "Second half of a search: fetch the full bodies of spans a prior code_search / repo_map ranked, by stable R# ref. Read the ranked list first (its inline previews cover only the top hits), decide which spans deserve context, then pull only those — that ordering is what keeps a search cheap. A range already returned this session, including an exact range shown as an inline preview, is cited rather than re-inlined; wider reads such as full symbol bodies always come through in full. Honors ext.code-retrieval.tokenBudget (default 4000).",
     parameters: {
