@@ -636,7 +636,7 @@ function mockPlans(): PlanSnapshot[] {
 }
 
 /** Local development host; production injects the Electron preload/IPC host. */
-export function createMockHost(): PipiHostAPI {
+export function createMockHost(options: { productProfiles?: boolean } = {}): PipiHostAPI {
   const projects: Project[] = [
     { id: 'pipiui', name: 'PipiUI', path: '/Users/demo/code/pipiui' },
     { id: 'website', name: 'Website', path: '/Users/demo/code/website' },
@@ -1038,47 +1038,6 @@ export function createMockHost(): PipiHostAPI {
       }
       return Object.keys(webSearchKeyPresence)
     },
-    listProductProfiles: async () => mockProductProfiles.map(profile => ({
-      ...profile,
-      requiredExtensionIds: [...(profile.requiredExtensionIds ?? [])],
-      recommendedExtensionIds: [...(profile.recommendedExtensionIds ?? [])],
-    })),
-    getProductProfile: async () => ({ ...mockProductActivation, overrides: { ...mockProductActivation.overrides } }),
-    setProductProfile: async (_projectId, profileId) => {
-      const profile = mockProductProfiles.find(item => item.id === profileId)
-      if (!profile) throw new Error(`unknown Product Profile ${profileId}`)
-      mockProductActivation = { schemaVersion: 2, profile: profileId, overrides: {} }
-      const enabledIds = new Set([...(profile.requiredExtensionIds ?? []), ...(profile.recommendedExtensionIds ?? [])])
-      for (const extension of mockExtensions) extension.state = enabledIds.has(extension.id) ? 'enabled' : 'disabled'
-      return { ...mockProductActivation, overrides: {} }
-    },
-    createProductProfile: async (_projectId, name) => {
-      const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'custom-pack'
-      let id = base
-      let suffix = 2
-      while (mockProductProfiles.some(profile => profile.id === id)) id = `${base}-${suffix++}`
-      const created: ProductProfileDescriptor = {
-        id,
-        name,
-        description: '项目自定义扩展包',
-        state: 'available',
-        source: 'project',
-        customizable: true,
-        requiredExtensionIds: ['skill-loader-extension'],
-        recommendedExtensionIds: [],
-        layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
-      }
-      mockProductProfiles = [...mockProductProfiles, created]
-      return { ...created, requiredExtensionIds: [...created.requiredExtensionIds!] }
-    },
-    updateProductProfileExtensions: async (_projectId, profileId, extensionIds) => {
-      const current = mockProductProfiles.find(profile => profile.id === profileId)
-      if (!current?.customizable) throw new Error(`Product Profile ${profileId} is not customizable`)
-      mockProductProfiles = mockProductProfiles.map(profile => profile.id === profileId
-        ? { ...profile, recommendedExtensionIds: [...extensionIds] }
-        : profile)
-      return { ...mockProductProfiles.find(profile => profile.id === profileId)! }
-    },
     listExtensions: async () => mockExtensions.map(item => ({ ...item, contributions: item.contributions ? { ...item.contributions } : undefined })),
     setExtensionEnabled: async (id, enabled) => {
       const extension = mockExtensions.find(item => item.id === id)
@@ -1183,6 +1142,49 @@ export function createMockHost(): PipiHostAPI {
     },
     browser
   }
+  if (options.productProfiles) Object.assign(mock, {
+    listProductProfiles: async () => mockProductProfiles.map(profile => ({
+      ...profile,
+      requiredExtensionIds: [...(profile.requiredExtensionIds ?? [])],
+      recommendedExtensionIds: [...(profile.recommendedExtensionIds ?? [])],
+    })),
+    getProductProfile: async () => ({ ...mockProductActivation, overrides: { ...mockProductActivation.overrides } }),
+    setProductProfile: async (_projectId: string, profileId: string) => {
+      const profile = mockProductProfiles.find(item => item.id === profileId)
+      if (!profile) throw new Error(`unknown Product Profile ${profileId}`)
+      mockProductActivation = { schemaVersion: 2, profile: profileId, overrides: {} }
+      const enabledIds = new Set([...(profile.requiredExtensionIds ?? []), ...(profile.recommendedExtensionIds ?? [])])
+      for (const extension of mockExtensions) extension.state = enabledIds.has(extension.id) ? 'enabled' : 'disabled'
+      return { ...mockProductActivation, overrides: {} }
+    },
+    createProductProfile: async (_projectId: string, name: string) => {
+      const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'custom-pack'
+      let id = base
+      let suffix = 2
+      while (mockProductProfiles.some(profile => profile.id === id)) id = `${base}-${suffix++}`
+      const created: ProductProfileDescriptor = {
+        id,
+        name,
+        description: '项目自定义扩展包',
+        state: 'available',
+        source: 'project',
+        customizable: true,
+        requiredExtensionIds: ['skill-loader-extension'],
+        recommendedExtensionIds: [],
+        layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
+      }
+      mockProductProfiles = [...mockProductProfiles, created]
+      return { ...created, requiredExtensionIds: [...created.requiredExtensionIds!] }
+    },
+    updateProductProfileExtensions: async (_projectId: string, profileId: string, extensionIds: string[]) => {
+      const current = mockProductProfiles.find(profile => profile.id === profileId)
+      if (!current?.customizable) throw new Error(`Product Profile ${profileId} is not customizable`)
+      mockProductProfiles = mockProductProfiles.map(profile => profile.id === profileId
+        ? { ...profile, recommendedExtensionIds: [...extensionIds] }
+        : profile)
+      return { ...mockProductProfiles.find(profile => profile.id === profileId)! }
+    },
+  } satisfies Partial<PipiHostAPI>)
   return mock
 }
 

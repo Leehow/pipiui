@@ -6,6 +6,6 @@ import { RemoteBrowserApp } from './RemoteBrowserApp'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <RemoteBrowserApp demoHost={createMockHost} />
+    <RemoteBrowserApp demoHost={() => createMockHost({ productProfiles: true })} />
   </React.StrictMode>
 )
