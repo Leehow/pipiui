@@ -49,6 +49,7 @@ async function start() {
 async function connectHost(
   port: number,
   onRequest?: (request: Record<string, unknown>, ws: WebSocket, epoch: string) => void,
+  isReady?: () => boolean,
 ) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/host/ws`, {
     headers: {
@@ -78,9 +79,14 @@ async function connectHost(
     ws.close();
     await closed;
   });
-  // Upgrade now includes asynchronous Access JWT verification before the
-  // legacy WSS is accepted and its hello reaches the broker.
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  // Upgrade includes asynchronous Access verification and hello processing.
+  // Wait on the broker contract rather than a load-sensitive fixed sleep.
+  if (isReady) {
+    for (let attempt = 0; attempt < 100 && !isReady(); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(isReady(), true, "legacy host hello never reached the broker");
+  }
   return { ws, epoch };
 }
 
@@ -355,7 +361,7 @@ test("authenticated host forwards index and no credential appears in page", asyn
       status: 200,
       body: { projects: [], sessions: [] },
     }));
-  });
+  }, () => relay.broker.isOnline());
   const response = await relay.broker.request("index", {});
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, { projects: [], sessions: [] });
@@ -394,7 +400,7 @@ test("response above request cap and below 8 MiB is forwarded", async () => {
       status: 200,
       body: { payload },
     }));
-  });
+  }, () => relay.broker.isOnline());
   const response = await relay.broker.request("index", {});
   assert.equal(response.status, 200);
   assert.equal((response.body as { payload: string }).payload.length, payload.length);
@@ -412,7 +418,7 @@ test("response frame near 8 MiB is accepted", async () => {
       status: 200,
       body: { payload },
     }));
-  });
+  }, () => relay.broker.isOnline());
   const response = await relay.broker.request("index", {});
   assert.equal(response.status, 200);
   assert.equal((response.body as { payload: string }).payload.length, payload.length);

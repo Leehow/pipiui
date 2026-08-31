@@ -33,3 +33,4 @@
 .remote-link-check.checking{color:var(--muted)}
 .remote-link-check.ok{color:var(--success)}
 .remote-link-check.failed{color:var(--danger)}
+.remote-rotation-notice{display:flex;align-items:flex-start;gap:8px}.remote-rotation-notice span{min-width:0;flex:1}.remote-rotation-notice-close{flex:none;display:grid;width:18px;height:18px;place-items:center;margin:0;padding:0;border-radius:4px;color:var(--muted);font-size:13px;line-height:1}.remote-rotation-notice-close:hover{color:var(--danger);background:var(--surface-hover)}

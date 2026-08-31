@@ -143,6 +143,7 @@ export function RemoteConnectionPanel({
   const [error, setError] = useState<string | null>(null)
   const [originDraft, setOriginDraft] = useState(DEFAULT_RELAY_ORIGIN)
   const [lessonOpen, setLessonOpen] = useState(false)
+  const [dismissedRotationNotice, setDismissedRotationNotice] = useState<string | null>(null)
 
   useEffect(() => {
     if (!api) {
@@ -207,6 +208,9 @@ export function RemoteConnectionPanel({
       return null
     }
   }, [state.pairUrl])
+  const rotationNoticeKey = state.rotationNotice && state.pairUrl
+    ? `${state.pairUrl}\u0000${state.rotationNotice}`
+    : null
 
   const dismissLesson = () => {
     persistLessonDismissed()
@@ -389,8 +393,11 @@ export function RemoteConnectionPanel({
             {state.status === 'ready' && <p className="computer-use-description">已连上 Relay，等待浏览器扫描或打开配对链接。</p>}
             {state.pairUrl && (
               <div className="remote-pair-block">
-                {state.rotationNotice && (
-                  <p className="remote-link-check failed" data-testid="remote-rotation-notice" role="alert">{state.rotationNotice}</p>
+                {state.rotationNotice && rotationNoticeKey !== dismissedRotationNotice && (
+                  <div className="remote-link-check failed remote-rotation-notice" data-testid="remote-rotation-notice" role="alert">
+                    <span>{state.rotationNotice}</span>
+                    <button type="button" className="remote-rotation-notice-close" aria-label="关闭远程链接轮换提示" onClick={() => setDismissedRotationNotice(rotationNoticeKey)}>×</button>
+                  </div>
                 )}
                 {qr && (
                   <div

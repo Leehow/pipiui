@@ -564,6 +564,9 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
         room.inflight.clear();
       } else if (room.host === peer) {
         room.host = null;
+        // Expiry is an offline lease: a disconnect starts a fresh full TTL
+        // instead of inheriting the remainder of the last attached interval.
+        armExpiry(room);
       }
     });
     peer.socket.on("error", () => {

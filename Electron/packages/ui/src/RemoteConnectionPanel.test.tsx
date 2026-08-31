@@ -205,6 +205,8 @@ describe('RemoteConnectionPanel', () => {
     }))
     const notice = await screen.findByTestId('remote-rotation-notice')
     expect(notice.textContent).toContain('旧配对链接已失效')
+    fireEvent.click(screen.getByRole('button', { name: '关闭远程链接轮换提示' }))
+    expect(screen.queryByTestId('remote-rotation-notice')).toBeNull()
   })
 
   it('reads window.pipiRemoteControl when prop omitted', async () => {

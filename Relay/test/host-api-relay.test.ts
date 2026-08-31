@@ -659,6 +659,23 @@ test("host re-hello refreshes the room expiry", async () => {
   }
 });
 
+test("host disconnect starts a fresh full TTL window", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture({ v2TTLMs: 400 });
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const closed = once(host, "close");
+    host.close();
+    await closed;
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(relay.instance.getV2RoomCount(), 1, "room expired on the old hello deadline instead of a full offline TTL");
+    await waitUntil(() => relay.instance.getV2RoomCount() === 0, "hostless room did not expire after the fresh offline TTL");
+  } finally {
+    await relay.close();
+  }
+});
+
 test("static UI fallback when the browser build is missing, and serves files when present", async () => {
   const roomID = randomUUID();
   const missing = await fixture();
