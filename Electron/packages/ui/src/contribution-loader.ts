@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useRef } from 'react'
 import type { ExtensionContributions, ExtensionDescriptor, PipiHostAPI } from '@pipi/host-api'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import {
@@ -68,13 +68,13 @@ async function loadControlled(descriptor: LoadableExtensionDescriptor, host: Pip
   controlledLoaded.add(descriptor.id)
   try {
     const extra = await loadControlledContributions(descriptor, host, undefined, projectId)
-    if (!loaded.has(descriptor.id) || !controlledLoaded.has(descriptor.id)) {
+    if (loaded.get(descriptor.id) !== bucket || !controlledLoaded.has(descriptor.id)) {
       for (const dispose of extra) dispose()
       return
     }
     bucket.push(...extra)
   } catch {
-    controlledLoaded.delete(descriptor.id)
+    if (loaded.get(descriptor.id) === bucket) controlledLoaded.delete(descriptor.id)
   }
 }
 
@@ -121,11 +121,14 @@ async function resolveContributions(
 
 /** Start-up + enable/disable refresh via listExtensions and subscribeExt. */
 export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, projectId?: string): void {
+  const refreshGeneration = useRef(0)
   useEffect(() => {
+    const generation = ++refreshGeneration.current
     if (!host) return
     let cancelled = false
     const unsubs: Disposer[] = []
     const subscribed = new Set<string>()
+    const isCurrent = () => !cancelled && refreshGeneration.current === generation
 
     const refresh = async () => {
       let list: ExtensionDescriptor[] = []
@@ -134,10 +137,11 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, 
       } catch {
         list = []
       }
-      if (cancelled) return
+      if (!isCurrent()) return
       const resolved = await Promise.all(list.map(descriptor => resolveContributions(host, descriptor)))
-      if (cancelled) return
+      if (!isCurrent()) return
       await syncExtensionContributions(resolved, host, projectId)
+      if (!isCurrent()) return
       for (const descriptor of list) {
         if (subscribed.has(descriptor.id)) continue
         subscribed.add(descriptor.id)
@@ -148,6 +152,7 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, 
     void refresh()
     return () => {
       cancelled = true
+      if (refreshGeneration.current === generation) refreshGeneration.current += 1
       for (const unsubscribe of unsubs) unsubscribe()
       resetDeclarativeContributions()
     }

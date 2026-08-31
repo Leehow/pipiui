@@ -1997,6 +1997,8 @@ export class PiHostBackend implements HostBackend {
   private readonly planStore = new PlanStore();
   private readonly extensions: ExtensionRegistry;
   private readonly extensionLoader: ExtensionLoader;
+  /** FIFO lane for project-bound scans whose result must survive awaited migrations. */
+  private extensionScanLane: Promise<void> = Promise.resolve();
   /** Watches extension discovery roots; `changed(id)` drives graceful live-session respawns. */
   private readonly extensionHotReload: ExtensionHotReloader;
   /** Per-session hot-restart dedup: a burst or a deferred retry never stacks two stops. */
@@ -7573,13 +7575,34 @@ export class PiHostBackend implements HostBackend {
       },
     );
   }
+  /**
+   * ExtensionLoader is a shared mutable scanner. Serialize project-bound reads,
+   * then rescan synchronously after awaited migrations so unrelated legacy scan
+   * call sites cannot leave this request pointed at another project.
+   */
+  private async withStableExtensionScan<T>(projectRoot: string | undefined, read: () => T): Promise<T> {
+    const expectedRoot = projectRoot ? resolve(projectRoot) : undefined;
+    const previous = this.extensionScanLane;
+    let release!: () => void;
+    this.extensionScanLane = new Promise<void>((resolveLane) => { release = resolveLane; });
+    await previous;
+    try {
+      this.extensionLoader.scan(projectRoot);
+      await this.migrateLoadedExtensions(projectRoot);
+      if (this.extensionLoader.loadedProject() !== expectedRoot) this.extensionLoader.scan(projectRoot);
+      return read();
+    } finally {
+      release();
+    }
+  }
   private async listExtensions(projectId: unknown): Promise<ExtensionListItem[]> {
     const projectRoot =
       typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;
-    this.extensionLoader.scan(projectRoot);
-    await this.migrateLoadedExtensions(projectRoot);
-    const listed = this.extensionLoader.list(await this.extensionEnableOverlay(projectId));
-    const grants = await this.capabilityGrantsOverlay(projectId);
+    const [overlay, grants] = await Promise.all([
+      this.extensionEnableOverlay(projectId),
+      this.capabilityGrantsOverlay(projectId),
+    ]);
+    const listed = await this.withStableExtensionScan(projectRoot, () => this.extensionLoader.list(overlay));
     return listed.map((item) => {
       const grant = grants[item.id];
       if (!grant) return item;
@@ -7605,11 +7628,15 @@ export class PiHostBackend implements HostBackend {
     if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
     if (typeof entryValue !== "string" || !entryValue.trim()) throw new Error("extension UI entry 必须是 string");
     const id = idValue.trim();
-    const listed = await this.listExtensions(projectId);
-    const item = listed.find((entry) => entry.id === id);
-    if (!item) throw new Error(`unknown extension ${id}`);
-    if (item.state !== "enabled") throw new Error(`extension ${id} is not enabled`);
-    return this.extensionLoader.readUiEntrySource(id, entryValue);
+    const projectRoot =
+      typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;
+    const overlay = await this.extensionEnableOverlay(projectId);
+    return this.withStableExtensionScan(projectRoot, () => {
+      const item = this.extensionLoader.list(overlay).find((entry) => entry.id === id);
+      if (!item) throw new Error(`unknown extension ${id}`);
+      if (item.state !== "enabled") throw new Error(`extension ${id} is not enabled`);
+      return this.extensionLoader.readUiEntrySource(id, entryValue);
+    });
   }
   private async getExtensionAuthStatus(
     idValue: unknown,

@@ -203,6 +203,99 @@ describe("extension loader via listExtensions", () => {
       .rejects.toThrow(/no declared UI entry/);
     await expect(backend.handle("getExtensionUiEntrySource" as never, ["git-capability", "../secret.js"]))
       .rejects.toThrow(/no declared UI entry/);
+
+    await writeManifest(extensionRoot, {
+      id: "git-capability",
+      name: "PipiUI Git",
+      version: "1.0.0",
+      capabilities: [],
+    });
+    await expect(backend.handle("getExtensionUiEntrySource" as never, ["git-capability", "app/dist/branch-menu.js"]))
+      .rejects.toThrow(/no declared UI entry/);
+    await backend.close();
+  });
+
+  it("keeps a project UI source bound to the project that requested it", async () => {
+    await tempRoot("pipi-ext-ui-project-race-");
+    const runtime = join(root, "runtime");
+    const projectA = join(root, "project-a");
+    const projectB = join(root, "project-b");
+    const extensionId = "project-ui";
+    const entry = "app/dist/header.js";
+    for (const [project, marker] of [[projectA, "PROJECT_A"], [projectB, "PROJECT_B"]] as const) {
+      await mkdir(project, { recursive: true });
+      const extensionRoot = join(projectPiAgentDir(project), "extensions", extensionId);
+      await writeManifest(extensionRoot, {
+        id: extensionId,
+        name: `Project UI ${marker}`,
+        version: "1.0.0",
+        capabilities: [],
+        app: { ui: { headerActions: [{ id: "project.header", entry }] } },
+      });
+      await mkdir(join(extensionRoot, "app", "dist"), { recursive: true });
+      await writeFile(join(extensionRoot, entry), `export const marker = '${marker}'\n`);
+    }
+
+    const backend = await backendFor({ runtime });
+    const addedA = (await backend.handle("addProject", [projectA])) as { id: string };
+    const addedB = (await backend.handle("addProject", [projectB])) as { id: string };
+    await backend.handle("setExtensionEnabled" as never, [extensionId, true, "project", addedA.id]);
+    await backend.handle("setExtensionEnabled" as never, [extensionId, true, "project", addedB.id]);
+    const projectARoot = realpathSync(projectA);
+    const projectBRoot = realpathSync(projectB);
+    const internals = backend as unknown as {
+      migrateLoadedExtensions(projectRoot?: string): Promise<void>;
+      extensionEnableOverlay(projectId: unknown): Promise<Record<string, boolean>>;
+    };
+    const migrate = internals.migrateLoadedExtensions.bind(backend);
+    internals.extensionEnableOverlay = async () => ({ [extensionId]: true });
+    const migrationOrder: string[] = [];
+    const gate = () => {
+      let markEntered!: () => void;
+      let release!: () => void;
+      return {
+        entered: new Promise<void>((resolve) => { markEntered = resolve; }),
+        released: new Promise<void>((resolve) => { release = resolve; }),
+        markEntered: () => markEntered(),
+        release: () => release(),
+        seen: false,
+      };
+    };
+    const gateA = gate();
+    const gateB = gate();
+    const gates = new Map([[projectARoot, gateA], [projectBRoot, gateB]]);
+    internals.migrateLoadedExtensions = async (projectRoot?: string) => {
+      const canonical = projectRoot ? realpathSync(projectRoot) : "";
+      const currentGate = gates.get(canonical);
+      if (currentGate) {
+        if (!currentGate.seen) {
+          currentGate.seen = true;
+          migrationOrder.push(canonical);
+          currentGate.markEntered();
+        }
+        await currentGate.released;
+      }
+      await migrate(projectRoot);
+    };
+
+    const sourceARequest = backend.handle("getExtensionUiEntrySource" as never, [extensionId, entry, addedA.id]);
+    await gateA.entered;
+    const sourceBRequest = backend.handle("getExtensionUiEntrySource" as never, [extensionId, entry, addedB.id]);
+    await Promise.race([
+      gateB.entered,
+      new Promise<void>((resolve) => setTimeout(resolve, 50)),
+    ]);
+    const enteredBeforeRelease = [...migrationOrder];
+    gateA.release();
+    gateB.release();
+    const [sourceA, sourceB] = await Promise.all([sourceARequest, sourceBRequest]);
+
+    expect(enteredBeforeRelease).toEqual([projectARoot]);
+    expect(migrationOrder).toEqual([projectARoot, projectBRoot]);
+    expect(sourceA).toContain("PROJECT_A");
+    expect(sourceA).not.toContain("PROJECT_B");
+    expect(sourceB).toContain("PROJECT_B");
+    expect(sourceB).not.toContain("PROJECT_A");
     await backend.close();
   });
 

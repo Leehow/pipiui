@@ -5,6 +5,7 @@ import type { ExtensionDescriptor, ExtEvent, PipiHostAPI } from '@pipi/host-api'
 import { resetDeclarativeContributions, syncDeclarativeContributions, syncExtensionContributions, useDeclarativeContributionLoader } from './contribution-loader'
 import { parseSlashInvocation, slashCommandByName, listSlashCommands } from './slash-commands'
 import { listPanels, listSettingsSections, listStatusBarItems } from './ui-registries'
+import { listHeaderActions } from './workbench/header-actions'
 
 const EXT = 'quota'
 
@@ -92,6 +93,36 @@ describe('syncDeclarativeContributions', () => {
     expect(listPanels().some(panel => /grok/i.test(panel.id))).toBe(false)
   })
 
+  it('disposes a stale controlled header when the same extension id reloads for another project', async () => {
+    let releaseProjectA!: (source: string) => void
+    const projectASource = new Promise<string>(resolve => { releaseProjectA = resolve })
+    const source = (marker: string) => [
+      'export function createHeaderAction(React) {',
+      `  return function Header() { return React.createElement('span', null, '${marker}') }`,
+      '}',
+    ].join('\n')
+    const host = {
+      getExtensionUiEntrySource: vi.fn((_id: string, _entry: string, projectId?: string) => (
+        projectId === 'project-a' ? projectASource : Promise.resolve(source('PROJECT_B'))
+      )),
+    } as unknown as PipiHostAPI
+    const descriptor = {
+      ...quotaDescriptor('enabled'),
+      directory: '/controlled-source-is-host-read',
+      ui: { headerActions: [{ id: 'quota.aba', entry: 'app/dist/header.js' }] },
+    } as ExtensionDescriptor
+
+    const oldLoad = syncExtensionContributions([descriptor], host, 'project-a')
+    await vi.waitFor(() => expect(host.getExtensionUiEntrySource).toHaveBeenCalledWith(EXT, 'app/dist/header.js', 'project-a'))
+    resetDeclarativeContributions()
+    await syncExtensionContributions([descriptor], host, 'project-b')
+    expect(listHeaderActions().filter(item => item.id === 'quota.aba')).toHaveLength(1)
+
+    releaseProjectA(source('PROJECT_A'))
+    await oldLoad
+    expect(listHeaderActions().filter(item => item.id === 'quota.aba')).toHaveLength(1)
+  })
+
   it('does not register panels that lack an entry (M3)', () => {
     const panelsBefore = listPanels().map(panel => panel.id)
     syncDeclarativeContributions([quotaDescriptor('enabled')])
@@ -151,6 +182,59 @@ describe('useDeclarativeContributionLoader', () => {
     } as unknown as PipiHostAPI
     renderHook(() => useDeclarativeContributionLoader(host, 'campaign-project'))
     await vi.waitFor(() => expect(host.listExtensions).toHaveBeenCalledWith('campaign-project'))
+  })
+
+  it('does not keep a stale project subscription after a controlled load crosses project cleanup', async () => {
+    let releaseProjectA!: (source: string) => void
+    const projectASource = new Promise<string>(resolve => { releaseProjectA = resolve })
+    const descriptorA = {
+      id: 'alpha',
+      name: 'Alpha',
+      version: '1.0.0',
+      state: 'enabled',
+      source: 'project',
+      directory: '/controlled-source-is-host-read',
+      ui: { headerActions: [{ id: 'alpha.header', entry: 'app/dist/header.js' }] },
+    } as ExtensionDescriptor
+    const descriptorB = {
+      id: 'beta',
+      name: 'Beta',
+      version: '1.0.0',
+      state: 'enabled',
+      source: 'project',
+    } as ExtensionDescriptor
+    const listeners = new Map<string, Set<(event: ExtEvent) => void>>()
+    const host = {
+      listExtensions: vi.fn(async (projectId?: string) => projectId === 'project-a' ? [descriptorA] : [descriptorB]),
+      getExtensionUiEntrySource: vi.fn(() => projectASource),
+      subscribeExt: (extensionId: string, listener: (event: ExtEvent) => void) => {
+        let set = listeners.get(extensionId)
+        if (!set) {
+          set = new Set()
+          listeners.set(extensionId, set)
+        }
+        set.add(listener)
+        return () => { set!.delete(listener) }
+      },
+    } as unknown as PipiHostAPI
+    const { rerender, unmount } = renderHook(
+      ({ projectId }) => useDeclarativeContributionLoader(host, projectId),
+      { initialProps: { projectId: 'project-a' } },
+    )
+    await vi.waitFor(() => expect(host.getExtensionUiEntrySource).toHaveBeenCalled())
+
+    rerender({ projectId: 'project-b' })
+    await vi.waitFor(() => expect(listeners.get('beta')?.size ?? 0).toBe(1))
+    releaseProjectA([
+      'export function createHeaderAction(React) {',
+      "  return function Header() { return React.createElement('span', null, 'PROJECT_A') }",
+      '}',
+    ].join('\n'))
+    await vi.waitFor(() => expect(listeners.get('alpha')?.size ?? 0).toBe(0))
+    expect(listHeaderActions().some(item => item.id === 'alpha.header')).toBe(false)
+
+    unmount()
+    expect(listeners.get('beta')?.size ?? 0).toBe(0)
   })
 
   it('loads from listExtensions and tears down on disable via subscribeExt', async () => {

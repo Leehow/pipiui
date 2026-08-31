@@ -739,6 +739,7 @@ export class ExtensionLoader {
         return this.registry.enterError(descriptor.id, validation.errors.join("; "));
       }
       if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
+      else this.ui.delete(descriptor.id);
       if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
       if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
       else this.auth.delete(descriptor.id);
