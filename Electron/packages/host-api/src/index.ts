@@ -364,7 +364,7 @@ export type AgentDebugSubagent = {
 export type SubagentDebugInfo = {
   available: boolean;
   source?: "live" | "demo";
-  reason?: "no-session" | "snapshot-not-ready" | "snapshot-invalid";
+  reason?: "no-session" | "snapshot-not-ready" | "snapshot-invalid" | "snapshot-too-large";
   sessionId?: string;
   capturedAt?: number;
   bossTools: AgentDebugTool[];

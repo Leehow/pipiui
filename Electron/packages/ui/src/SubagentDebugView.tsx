@@ -37,6 +37,8 @@ export function SubagentDebugView({ agents, info, loading, error, onDismissError
   if (!info?.available) {
     const reason = info?.reason === 'no-session'
       ? '当前没有打开的会话，暂时无法读取 Boss 的实时工具快照。'
+      : info?.reason === 'snapshot-too-large'
+        ? 'Boss 的运行时 Debug 快照超过 1 MiB 安全上限，未加载；请减少已启用的工具或 Skills 后刷新。'
       : info?.reason === 'snapshot-invalid'
         ? 'Boss 的运行时 Debug 快照无效，请刷新或重新进入一次会话。'
         : 'Boss 的运行时 Debug 快照尚未生成；发送一条消息后即可读取。'

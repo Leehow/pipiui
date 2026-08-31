@@ -97,7 +97,7 @@ export async function readSubagentDebugInfo(sessionPath: string, expectedSession
       await handle.close();
     }
     const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (parsed.unavailable === "snapshot-too-large") return unavailable("snapshot-invalid");
+    if (parsed.unavailable === "snapshot-too-large") return unavailable("snapshot-too-large");
     if (parsed.version !== 1 || parsed.sessionId !== expectedSessionId) return unavailable("snapshot-invalid");
 
     const toolCatalog = uniqueByName((Array.isArray(parsed.tools) ? parsed.tools : []).flatMap(value => {

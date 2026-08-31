@@ -94,7 +94,7 @@ describe("subagent debug runtime snapshot", () => {
     }));
     expect(await readSubagentDebugInfo(sessionPath, "session-1")).toMatchObject({
       available: false,
-      reason: "snapshot-invalid",
+      reason: "snapshot-too-large",
     });
   });
 

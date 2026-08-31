@@ -97,6 +97,7 @@ describe('SubagentModelModal Debug mode', () => {
   it('opens live Debug even when the model-settings API rejects', async () => {
     const host = createMockHost()
     host.getSubagentModels = vi.fn(async () => { throw new Error('model catalog offline') })
+    host.listAgentDefinitions = vi.fn(async () => [{ name: 'catalog-survivor', description: 'Loaded independently of model settings' }])
     host.getSubagentDebugInfo = vi.fn(async () => liveDebug('session-live', 'live-only-tool'))
     render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} sessionId="session-live" />)
     await screen.findByText(/model catalog offline/)
@@ -105,7 +106,26 @@ describe('SubagentModelModal Debug mode', () => {
 
     expect(await screen.findByTestId('subagent-debug-view')).toBeTruthy()
     expect(screen.getByText('live-only-tool')).toBeTruthy()
+    expect(screen.getByTestId('debug-role-catalog-survivor')).toBeTruthy()
     expect(host.getSubagentDebugInfo).toHaveBeenCalledWith('session-live')
+  })
+
+  it('explains when the live Debug snapshot exceeds the bounded file limit', async () => {
+    const host = createMockHost()
+    host.getSubagentDebugInfo = vi.fn(async (): Promise<SubagentDebugInfo> => ({
+      available: false,
+      reason: 'snapshot-too-large',
+      bossTools: [],
+      toolCatalog: [],
+      skills: [],
+      subagents: [],
+    }))
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} sessionId="session-large" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Debug' }))
+
+    expect(await screen.findByText(/超过 1 MiB/)).toBeTruthy()
+    expect(screen.queryByText(/重新进入一次会话/)).toBeNull()
   })
 
   it('shows the no-session state without inventing a session id', async () => {

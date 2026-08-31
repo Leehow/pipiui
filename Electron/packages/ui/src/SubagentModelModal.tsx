@@ -59,19 +59,35 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   useEffect(() => {
     if (!host.getSubagentModels || !host.listAgentDefinitions) return
     let active = true
+    let settled = 0
+    let failed = false
     const catalogProjectId = projectId?.trim() || undefined
-    void Promise.all([host.getSubagentModels(), host.listAgentDefinitions(catalogProjectId)]).then(([nextSettings, nextAgents]) => {
+    const reject = (reason: unknown) => {
       if (!active) return
-      setSettings(nextSettings)
-      setAgents(nextAgents)
-      setDismissedDiagnostics(new Set())
-    }).catch((err) => {
+      failed = true
       // `apiFrom` cannot know whether an older IPC backend implements these
       // optional methods until it receives its unknown-method response.
-      if (!active) return
       setAvailable(false)
-      setError(`无法加载 Subagent 模型设置：${err instanceof Error ? err.message : String(err)}`)
-    }).finally(() => { if (active) setLoading(false) })
+      setError(`无法加载 Subagent 模型设置：${reason instanceof Error ? reason.message : String(reason)}`)
+    }
+    const finish = () => {
+      if (!active) return
+      settled += 1
+      if (settled === 2) {
+        setLoading(false)
+        if (failed) return
+        setAvailable(true)
+        setError(null)
+      }
+    }
+    void host.getSubagentModels().then(nextSettings => {
+      if (active) setSettings(nextSettings)
+    }).catch(reject).finally(finish)
+    void host.listAgentDefinitions(catalogProjectId).then(nextAgents => {
+      if (!active) return
+      setAgents(nextAgents)
+      setDismissedDiagnostics(new Set())
+    }).catch(reject).finally(finish)
     return () => { active = false }
   }, [host, projectId])
 
