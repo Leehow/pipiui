@@ -71,7 +71,7 @@ describe('App message actions', () => {
     await screen.findByText('完整原文 😀', { exact: false })
     const user = document.querySelector('[data-user-prompt="user-full"]') as HTMLElement
     fireEvent.click(within(user).getByRole('button', { name: '重发消息' }))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '完整原文 😀\n第二行'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '完整原文 😀\n第二行', undefined, expect.anything()))
     await waitFor(() => expect(document.querySelectorAll('[data-user-prompt]').length).toBe(2))
     // Both resend controls belong to the historical and optimistic user messages;
     // assistant and tool rows never render one.
@@ -102,6 +102,6 @@ describe('App message actions', () => {
     fireEvent.click(within(user).getByRole('button', { name: '复制消息' }))
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith('看图'))
     fireEvent.click(within(user).getByRole('button', { name: '重发消息' }))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图', undefined, expect.anything()))
   })
 })

@@ -518,7 +518,7 @@ describe("pipiui-office-doc-shot-gate extension", () => {
 
   it("is the same worker -e gate the subagent spawn uses", async () => {
     const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
-    expect(source).toContain('if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT && !options?.computerWorker) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT)');
+    expect(source).toContain('if (PIPIUI_OFFICE_DOC_SHOT_GATE_EXT) args.push("-e", PIPIUI_OFFICE_DOC_SHOT_GATE_EXT)');
     expect(workerOfficeDocShotGateArgs("/runtime/extensions/pipiui-office-doc-shot-gate.ts")).toEqual([
       "-e",
       "/runtime/extensions/pipiui-office-doc-shot-gate.ts",

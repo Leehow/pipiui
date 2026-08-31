@@ -1236,7 +1236,9 @@ describe('PipiUI main layout', () => {
 
   it('uses the pane headers as macOS hiddenInset chrome in Electron only', async () => {
     const descriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
-    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI/32.3.3', configurable: true })
+    // Real Electron UAs always carry the framework token even after the app
+    // rename ("…PipiUI/32.3.3 … Electron/32.3.3"); isElectronChrome() keys on it.
+    Object.defineProperty(navigator, 'userAgent', { value: 'Mozilla/5.0 PipiUI/32.3.3 Electron/32.3.3', configurable: true })
     try {
       const { container } = render(<App host={createMockHost()} />)
       await screen.findAllByText('Electron 三栏界面')

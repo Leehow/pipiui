@@ -722,7 +722,12 @@ export class SessionMessageQueue {
       return;
     }
     if (session.suppressDrainEpoch !== undefined && session.suppressDrainEpoch === session.turnEpoch) {
-      return;
+      // User Stop owns this epoch: the aborted turn's late settle must not
+      // auto-drain the FIFO. When the user has explicitly sent again, the host
+      // lifts the suppression — a message queued behind this pin (e.g. one
+      // enqueued while the stop escalation still held the turn busy) must not
+      // strand here; drain re-checks the suppression gate before delivering.
+      if (this.isDrainSuppressed === undefined || this.isDrainSuppressed(sessionId)) return;
     }
     await this.drain(sessionId, session.lifecycleToken);
   }

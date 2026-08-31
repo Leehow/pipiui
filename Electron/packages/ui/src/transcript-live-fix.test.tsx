@@ -117,7 +117,7 @@ describe('fix2: turnClosed late events not dropped', () => {
     expect(historyCalls).toBe(0)
   })
 
-  it('settled turn rereads history once, not immediate plus trailing', async () => {
+  it('settled turn rereads history exactly twice: immediate plus one trailing confirmation', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     let historyCalls = 0
     const base = createMockHost()
@@ -140,7 +140,10 @@ describe('fix2: turnClosed late events not dropped', () => {
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
     await waitFor(() => expect(screen.queryByLabelText('停止生成')).toBeNull())
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 400)) })
-    expect(historyCalls).toBe(1)
+    // The terminal reconciliation reads once immediately and once after the
+    // 250ms trailing window so a compaction record following the terminal
+    // event still converges — and never re-reads beyond that single trailing.
+    expect(historyCalls).toBe(2)
   })
 })
 

@@ -197,7 +197,7 @@ describe('composer input files', () => {
     await screen.findByTestId('composer-input-file-0')
     expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).value).toBe('')
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', DEFAULT_COMPOSER_INPUT_FILES_PROMPT))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', DEFAULT_COMPOSER_INPUT_FILES_PROMPT, undefined, expect.anything()))
     expect(DEFAULT_COMPOSER_INPUT_FILES_PROMPT.trim()).not.toBe('')
     expect(sendPrompt).not.toHaveBeenCalledWith('welcome', '')
   })
@@ -223,7 +223,7 @@ describe('composer input files', () => {
     await screen.findByTestId('composer-input-file-0')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '分析这份文件' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '分析这份文件'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '分析这份文件', undefined, expect.anything()))
     expect(screen.getByTestId('composer-input-file-0')).toBeTruthy()
     const stored = JSON.stringify(localStorage)
     expect(stored).not.toContain('file-notes.pdf')
@@ -265,7 +265,7 @@ describe('composer input files', () => {
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图', [
       expect.objectContaining({ name: 'pasted.png', mimeType: 'image/png' }),
-    ]))
+    ], expect.anything()))
     await waitFor(() => expect(screen.queryByTestId('composer-thumbs')).toBeNull())
   })
 })

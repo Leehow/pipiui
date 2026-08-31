@@ -848,6 +848,11 @@ export const TURN_WATCHDOG_TIMEOUT_MS = 120_000;
 export const TURN_WATCHDOG_CHECK_INTERVAL_MS = 30_000;
 const TERMINAL_RECONCILIATION_PENDING_RETRY_MS = 250;
 const TERMINAL_RECONCILIATION_PENDING_MAX_RETRIES = 6;
+/** Spawn waits this long for the auth-aware catalog (hosted-search exclusivity),
+ * then proceeds on configured rows; a pending-forever catalog must not wedge startup. */
+const SPAWN_CATALOG_WAIT_MS = 5_000;
+/** Pace for deferred session-file work (redaction / env refresh) while a writer stays busy. */
+const SESSION_FILE_RETRY_PACE_MS = 250;
 /** Matches Swift `SubagentWatchdog.staleThreshold`. */
 const ORPHAN_STALE_MS = 10 * 60 * 1000;
 const ORPHAN_RECONCILE_INTERVAL_MS = 60 * 1000;
@@ -2660,7 +2665,16 @@ export class PiHostBackend implements HostBackend {
     runtimeToken?: unknown,
   ): void {
     if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
-    void this.sessionFileExclusive(sessionId, runtimeToken)(retry).catch((error) => {
+    void this.sessionFileExclusive(sessionId, runtimeToken)(async () => {
+      // Paced retry: the writer-idle probe can legitimately stay false while a
+      // session keeps working. The gate's microtask fence only orders attempts;
+      // without a real pause here a never-idle writer would spin the CPU.
+      await new Promise<void>(resolve => {
+        const pace = setTimeout(resolve, SESSION_FILE_RETRY_PACE_MS);
+        pace.unref?.();
+      });
+      return retry();
+    }).catch((error) => {
       console.error(
         `[secret-vault] session retry failed: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -3501,7 +3515,16 @@ export class PiHostBackend implements HostBackend {
     await this.sessionFileExclusive(sessionId, runtimeToken)(() => this.sessionRedact.flush(sessionId, runtimeToken));
   }
   private async redactSessionFile(sessionId: string): Promise<void> {
-    const runtimeToken = this.sessionRuntimeToken(sessionId);
+    // Vault puts may target a session that never spawned (no token yet). Match
+    // sessionFileExclusive's lazy establishment: a never-started session is a
+    // valid redaction target, while a torn-down/tombstoned one is not.
+    let runtimeToken = this.sessionRuntimeToken(sessionId);
+    if (runtimeToken === undefined && !this.closed
+      && !this.sessionRuntimeTearingDown.has(sessionId)
+      && !this.sessionDeletionInProgress.has(sessionId)
+      && !this.sessionRuntimeTombstones.has(sessionId)) {
+      runtimeToken = this.beginSessionRuntime(sessionId);
+    }
     if (!this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)) return;
     this.requestSessionRedact(sessionId, runtimeToken);
     await this.flushSessionRedact(sessionId, runtimeToken);
@@ -4122,6 +4145,11 @@ export class PiHostBackend implements HostBackend {
       case "listAgentDefinitions":
         return this.listAgentDefinitions(params[0]);
       case "listModels":
+        // Never straddle an in-flight canonical models write (project
+        // migration): hold on the write-queue tail first, then serve the
+        // (possibly refreshed) catalog. When the queue is idle this is a
+        // no-op turn and the loadModelCatalog cache shortcut still applies.
+        await this.awaitCanonicalModelsIdle();
         await this.loadModelCatalog();
         return this.models;
       case "getModelState":
@@ -5108,9 +5136,16 @@ export class PiHostBackend implements HostBackend {
       // resident BEFORE the selected model is resolved for assemblePiSpawn and
       // before the worker native-search file is materialized below. Best-effort:
       // an unavailable runtime catalog must never block the spawn (configured
-      // rows still resolve).
+      // rows still resolve). The bound covers the wedged case too — a catalog
+      // that never settles is unavailable, and startup may not hang on it.
       try {
-        await this.loadModelCatalog();
+        await Promise.race([
+          this.loadModelCatalog(),
+          new Promise<void>(resolve => {
+            const bound = setTimeout(resolve, SPAWN_CATALOG_WAIT_MS);
+            bound.unref?.();
+          }),
+        ]);
       } catch {
         /* runtime catalog unavailable → configured rows only */
       }

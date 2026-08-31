@@ -385,7 +385,7 @@ describe('Plan approval bar in main chat', () => {
     render(<App host={host} />)
     await screen.findByTestId('plan-approval-bar')
     fireEvent.click(screen.getByTestId('plan-approval-approve'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划', undefined, expect.anything()))
     expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
   })
 
@@ -400,7 +400,7 @@ describe('Plan approval bar in main chat', () => {
     const view = render(<App host={host} />)
     await screen.findByTestId('plan-approval-bar')
     fireEvent.click(screen.getByTestId('plan-approval-approve'))
-    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '批准该计划', undefined, expect.anything()))
     expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
 
     const nextHost: PipiHostAPI = { ...host, getPlans: async () => [draftPlan()] }

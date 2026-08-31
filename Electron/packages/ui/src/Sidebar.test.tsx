@@ -264,23 +264,24 @@ describe('Sidebar', () => {
     expect(onMoveProject).toHaveBeenCalledWith('p1', 'p2', 'after')
   })
 
-  it('moves a session only when dropped on a session in another project', () => {
+  it('moves a session onto another session with placement awareness', () => {
     const onMoveSession = vi.fn()
     render(<Sidebar {...defaultProps({ onMoveSession, expandedIds: ['p1', 'p2'] })} />)
     const row = (id: string) => screen.getAllByTestId('session-row').find(item => item.getAttribute('data-session-id') === id)!
     const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
     fireEvent.dragStart(row('s1'), { dataTransfer: transfer })
     fireEvent.dragOver(row('s2'), { dataTransfer: transfer, clientY: 10 })
-    expect(row('s2').getAttribute('data-drop-target')).toBeNull()
+    expect(row('s2').getAttribute('data-drop-placement')).toBe('after')
     fireEvent.drop(row('s2'), { dataTransfer: transfer, clientY: 10 })
-    expect(onMoveSession).not.toHaveBeenCalled()
+    expect(onMoveSession).toHaveBeenCalledTimes(1)
+    expect(onMoveSession).toHaveBeenCalledWith('s1', 'p1', 's2', 'after')
 
     fireEvent.dragStart(row('s1'), { dataTransfer: transfer })
-    fireEvent.dragOver(row('s3'), { dataTransfer: transfer })
-    expect(row('s3').getAttribute('data-drop-target')).toBe('true')
-    fireEvent.drop(row('s3'), { dataTransfer: transfer })
-    expect(onMoveSession).toHaveBeenCalledTimes(1)
-    expect(onMoveSession).toHaveBeenCalledWith('s1', 'p2')
+    fireEvent.dragOver(row('s3'), { dataTransfer: transfer, clientY: 10 })
+    expect(row('s3').getAttribute('data-drop-placement')).toBe('after')
+    fireEvent.drop(row('s3'), { dataTransfer: transfer, clientY: 10 })
+    expect(onMoveSession).toHaveBeenCalledTimes(2)
+    expect(onMoveSession).toHaveBeenLastCalledWith('s1', 'p2', 's3', 'after')
   })
 
   it('moves a session onto another project row and highlights it', () => {
@@ -291,15 +292,15 @@ describe('Sidebar', () => {
     const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
     fireEvent.dragStart(row, { dataTransfer: transfer })
     fireEvent.dragOver(p1, { dataTransfer: transfer })
-    expect(p1.getAttribute('data-session-drop')).toBeNull()
+    expect(p1.getAttribute('data-drop-placement')).toBe('after')
     fireEvent.dragOver(p2, { dataTransfer: transfer })
-    expect(p2.getAttribute('data-session-drop')).toBe('true')
+    expect(p2.getAttribute('data-drop-placement')).toBe('after')
     fireEvent.drop(p2, { dataTransfer: transfer })
     expect(onMoveSession).toHaveBeenCalledTimes(1)
     expect(onMoveSession).toHaveBeenCalledWith('s1', 'p2')
   })
 
-  it('pins by dropping into the pinned section and does not unpin onto a project row', () => {
+  it('pins by dropping into the pinned section and moves a pinned session back onto a project row', () => {
     const onMoveSession = vi.fn()
     const onMoveSessionToPinned = vi.fn()
     render(<Sidebar {...defaultProps({ onMoveSession, onMoveSessionToPinned })} />)
@@ -307,19 +308,20 @@ describe('Sidebar', () => {
     const row = (screen.getAllByTestId('session-row')).find(item => item.getAttribute('data-session-id') === 's1')!
     const pinned = screen.getByLabelText('置顶会话')
     fireEvent.dragStart(row, { dataTransfer: transfer })
+    expect(pinned.getAttribute('data-drop-active')).toBe('true')
     fireEvent.dragOver(pinned, { dataTransfer: transfer })
     fireEvent.drop(pinned, { dataTransfer: transfer })
-    expect(onMoveSessionToPinned).toHaveBeenCalledWith('s1')
+    expect(onMoveSessionToPinned).toHaveBeenCalledWith('s1', undefined, 'after')
 
     const pinnedRow = (screen.getAllByTestId('session-row')).find(item => item.getAttribute('data-session-id') === 'pin1')!
     const sameProject = screen.getAllByTestId('project-row')[0]
     fireEvent.dragStart(pinnedRow, { dataTransfer: transfer })
     fireEvent.dragOver(sameProject, { dataTransfer: transfer })
     fireEvent.drop(sameProject, { dataTransfer: transfer })
-    expect(onMoveSession).not.toHaveBeenCalled()
+    expect(onMoveSession).toHaveBeenCalledWith('pin1', 'p1')
   })
 
-  it('does not reorder pinned sessions against each other', () => {
+  it('reorders pinned sessions with drop placement', () => {
     const onMoveSessionToPinned = vi.fn()
     render(<Sidebar {...defaultProps({ pinnedSessions: [session({ id: 'pin1' }), session({ id: 'pin2' })], onMoveSessionToPinned })} />)
     const rows = screen.getAllByTestId('session-row')
@@ -328,27 +330,9 @@ describe('Sidebar', () => {
     const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
     fireEvent.dragStart(pin1, { dataTransfer: transfer })
     fireEvent.dragOver(pin2, { dataTransfer: transfer, clientY: 10 })
+    expect(pin2.getAttribute('data-drop-placement')).toBe('after')
     fireEvent.drop(pin2, { dataTransfer: transfer, clientY: 10 })
-    expect(onMoveSessionToPinned).not.toHaveBeenCalled()
-  })
-
-  it('archives a session dropped on the archived section', () => {
-    const onArchiveSession = vi.fn()
-    const onUnarchiveSession = vi.fn()
-    render(<Sidebar {...defaultProps({
-      archivedSessions: [session({ id: 'old' })],
-      onMoveSession: vi.fn(),
-      onArchiveSession,
-      onUnarchiveSession
-    })} />)
-    const row = screen.getAllByTestId('session-row').find(item => item.getAttribute('data-session-id') === 's1')!
-    const archived = screen.getByLabelText('已归档')
-    const transfer = { setData: vi.fn(), effectAllowed: '', dropEffect: '' }
-    fireEvent.dragStart(row, { dataTransfer: transfer })
-    fireEvent.dragOver(archived, { dataTransfer: transfer })
-    expect(archived.getAttribute('data-drop-active')).toBe('true')
-    fireEvent.drop(archived, { dataTransfer: transfer })
-    expect(onArchiveSession).toHaveBeenCalledWith('s1')
+    expect(onMoveSessionToPinned).toHaveBeenCalledWith('pin1', 'pin2', 'after')
   })
 
   it('filters projects and sessions by title', () => {

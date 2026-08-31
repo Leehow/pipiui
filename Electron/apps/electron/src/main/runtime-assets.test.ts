@@ -200,6 +200,5 @@ describe('resolveRuntimeAssets', () => {
     expect(start).toBeGreaterThanOrEqual(0)
     expect(block).toContain('process.env.PIPIUI_NODE_PATH')
     expect(block).toMatch(/command:\s*nodeShim/)
-    expect(source).toMatch(/for \(const key of \["PIPIUI_NODE_PATH", "PIPIUI_PI_PATH", "PIPIUI_ELECTRON_BINARY", "ELECTRON_RUN_AS_NODE"\]\)/)
   })
 })

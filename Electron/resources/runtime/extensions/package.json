@@ -1,0 +1,5 @@
+{
+	"name": "pipiui-runtime-extensions",
+	"private": true,
+	"type": "module"
+}

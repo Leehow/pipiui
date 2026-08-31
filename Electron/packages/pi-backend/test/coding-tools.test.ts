@@ -105,7 +105,7 @@ describe("readToolDescription", () => {
 describe("workerCodingToolsArgs", () => {
   it("is the same gate the worker spawn uses", async () => {
     const source = await readFile(new URL("../../../resources/runtime/pi-ext/subagent/index.ts", import.meta.url), "utf8");
-    expect(source).toContain('if (PIPIUI_CODING_TOOLS_EXT && !options?.computerWorker) args.push("-e", PIPIUI_CODING_TOOLS_EXT)');
+    expect(source).toContain('if (PIPIUI_CODING_TOOLS_EXT) args.push("-e", PIPIUI_CODING_TOOLS_EXT)');
   });
 
   it("mounts the wrapper on ordinary workers and skips computer workers", () => {

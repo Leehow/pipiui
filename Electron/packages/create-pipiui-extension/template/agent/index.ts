@@ -57,13 +57,13 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // App → agent: host `invokeExtension(id, method, params)` is answered here.
-  // Return ExtInvokeResult: { ok: true, data } | { ok: false, error: { code, message } }.
+  // Handlers are `Promise<void>`: deliver results to the app via the bridge
+  // `emit` below (requires capability `bridge.emit`), never via the return value.
   pi.registerCommand(EXTENSION_ID, {
     description: "Sample invoke target for __NAME__",
     handler: async (args) => {
-      const data = { args: args ?? "", settings: settingsSnapshot() };
+      const data = { args: args ?? "", settings: settingsSnapshot(), ok: true };
       await emit("invoked", data);
-      return { ok: true, data };
     },
   });
 }

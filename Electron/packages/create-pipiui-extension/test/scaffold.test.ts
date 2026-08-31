@@ -124,7 +124,21 @@ describe("scaffolded package on the pi-backend loader scan path", () => {
     await mkdir(project, { recursive: true });
     const scanDir = join(projectPiAgentDir(project), "extensions");
     const dest = join(scanDir, result.id);
-    const { cp } = await import("node:fs/promises");
+    const { cp, symlink } = await import("node:fs/promises");
+    // The manifest pins agent/dist/index.js and the loader fail-closes on a
+    // missing entry, so build the agent slice exactly like a developer
+    // checkout would: types resolve from the installed workspace deps.
+    const electronRoot = fileURLToPath(new URL("../../..", import.meta.url));
+    await symlink(join(electronRoot, "node_modules"), join(generated, "node_modules"), "dir");
+    const tsc = join(electronRoot, "node_modules", "typescript", "bin", "tsc");
+    await new Promise<void>((resolve, reject) => {
+      const build = spawn(process.execPath, [tsc, "-p", join(generated, "agent", "tsconfig.json")], { stdio: "pipe" });
+      let out = "";
+      build.stdout.on("data", (chunk) => { out += chunk; });
+      build.stderr.on("data", (chunk) => { out += chunk; });
+      build.on("error", reject);
+      build.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`template agent build failed: ${code}\n${out}`)));
+    });
     await mkdir(scanDir, { recursive: true });
     await cp(generated, dest, { recursive: true });
 

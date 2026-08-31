@@ -36,10 +36,12 @@ describe("runtime tree refresh across spawns", () => {
 
     let sessionArgs: string[] = [];
     let sessionEnv: NodeJS.ProcessEnv = {};
+    let spawnCount = 0;
     const backend = createPiHostBackend({
       sessionsRoot, runtimeRoot, piPath: "node", runtimeAssets: assets,
       spawn: (_bin, _args, options) => {
         // Title/vision helpers also spawn; they must not overwrite the session contract.
+        spawnCount += 1;
         if (_args.includes("--session")) {
           sessionArgs = _args;
           sessionEnv = options?.env ?? {};
@@ -60,18 +62,30 @@ describe("runtime tree refresh across spawns", () => {
     expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));
     expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).not.toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
     expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "anydoc", "node_modules"));
-    const layer = join(runtimeRoot, "pi-philosophy", "layers", "30-orchestration.md");
+    const layer = join(runtimeRoot, "pi-philosophy", "layers", "10-foundation.md");
     expect(await readFile(layer, "utf8")).not.toContain("REFRESH-PROBE");
 
     // Edit the source the way a developer would while the app stays up.
-    const sourceLayer = join(sources, "pi-philosophy", "layers", "30-orchestration.md");
+    const sourceLayer = join(sources, "pi-philosophy", "layers", "10-foundation.md");
     await writeFile(sourceLayer, `${await readFile(sourceLayer, "utf8")}\n<!-- REFRESH-PROBE -->\n`);
     const sourceGit = join(sources, "extensions", "pipiui-git.ts");
     await writeFile(sourceGit, (await readFile(sourceGit, "utf8")).replace("## Git (Pipi UI)", "## Git (REFRESH-PROBE)"));
 
-    await backend.close?.();
-    await backend.handle("sendPrompt", ["session-1", "second"]);
-    expect(await readFile(layer, "utf8")).toContain("REFRESH-PROBE");
+    // Same live backend instance on purpose: the contract is that a spawn (not a
+    // relaunch) re-reads the runtime tree. A second, never-spawned session gives
+    // a guaranteed brand-new spawn; killing the first session's pi mid-turn
+    // would strand that turn's busy state and prove nothing about refresh.
+    const sessionTwoDir = join(sessionsRoot, "project2");
+    await mkdir(sessionTwoDir, { recursive: true });
+    await writeFile(join(sessionTwoDir, "session.jsonl"), `${JSON.stringify({
+      type: "session", version: 3, id: "session-2", timestamp: "2026-08-10T00:00:00.000Z", cwd,
+    })}\n`);
+    const spawnCountBefore = spawnCount;
+    await backend.handle("sendPrompt", ["session-2", "second"]);
+    expect(spawnCount).toBeGreaterThan(spawnCountBefore);
+    const installed = await readFile(layer, "utf8");
+    const sourceNow = await readFile(join(sources, "pi-philosophy", "layers", "10-foundation.md"), "utf8");
+    expect(installed).toContain("REFRESH-PROBE");
     expect(await readFile(join(runtimeRoot, "extensions", "pipiui-git.ts"), "utf8")).toContain("REFRESH-PROBE");
     expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBeUndefined();
     expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));

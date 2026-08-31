@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -347,6 +347,18 @@ describe("isolated project Pi homes", () => {
     await writeFile(join(otherProject, "SENTINEL"), "external-sentinel\n");
     const captured: Array<{ env: NodeJS.ProcessEnv; cwd?: string }> = [];
     const revealed: string[] = [];
+    // setPaddleOcrAccessToken was removed with the legacy PDF parser runtime;
+    // the durable paddleocr.json projection now rides the generic extension
+    // settings secret path (pdf-extension, ext.pdf-extension.aistudioAccessToken).
+    // That path requires the extension to be registered, so seed the backend's
+    // builtin scan root (runtimeRoot/extensions) before the backend is created.
+    const extensionScanRoot = join(root, "runtime", "extensions");
+    await mkdir(extensionScanRoot, { recursive: true });
+    await cp(
+      new URL("../../../resources/runtime/extensions/pdf-extension", import.meta.url).pathname,
+      join(extensionScanRoot, "pdf-extension"),
+      { recursive: true },
+    );
     backend = createPiHostBackend({
       agentDir: host,
       sessionsRoot: join(root, "host-sessions"),
@@ -388,7 +400,14 @@ describe("isolated project Pi homes", () => {
     );
     await expect(readdir(join(otherProject, ".pi", "agent", "sessions"))).rejects.toMatchObject({ code: "ENOENT" });
 
-    await backend.handle("setPaddleOcrAccessToken", [added.id, "ast-test-key"]);
+    // setPaddleOcrAccessToken was removed with the legacy PDF parser runtime;
+    // the durable paddleocr.json projection now rides the generic extension
+    // settings secret path (pdf-extension, ext.pdf-extension.aistudioAccessToken).
+    await backend.handle("updateExtensionSettings", [
+      "pdf-extension",
+      { "ext.pdf-extension.aistudioAccessToken": "ast-test-key" },
+      added.id,
+    ]);
     expect(await readFile(join(realRoot, ".pi", "agent", "paddleocr.json"), "utf8")).toContain("ast-test-key");
     await expect(readFile(join(otherProject, ".pi", "agent", "paddleocr.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
