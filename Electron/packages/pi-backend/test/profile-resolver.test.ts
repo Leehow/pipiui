@@ -255,4 +255,82 @@ describe("Product Profile resolution", () => {
       "git-capability": false,
     });
   });
+
+  it("lets explicit user overrides survive fail-closed plan resolution", () => {
+    const parsed = parseProductProfileManifestJson(JSON.stringify({
+      schemaVersion: 1,
+      id: "lab-tools",
+      name: "Lab Tools",
+      extensions: {
+        required: [{ id: "agent-orchestration", version: "^1.0.0" }],
+        recommended: [],
+      },
+      layout: {},
+    }));
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+
+    const plan = resolveProductProfile({
+      profile: parsed.profile,
+      installed: [
+        {
+          id: "agent-orchestration",
+          version: "1.0.0",
+          dependencies: { required: [{ id: "git-capability", version: ">=1.0.0 <2.0.0" }] },
+        },
+        { id: "git-capability", version: "1.0.0" },
+        { id: "pdf-extension", version: "1.0.0" },
+      ],
+      overrides: { "git-capability": "disabled", "pdf-extension": "enabled" },
+    });
+
+    // The plan itself still fails closed on the required_disabled conflict…
+    expect(plan.conflicts).toEqual([expect.objectContaining({ code: "required_disabled", id: "git-capability" })]);
+    // …but toggles the user set themselves keep their state: the disabled
+    // required stays off, and the outside extension they enabled stays on
+    // instead of the whole pane flipping off until the next successful scan.
+    expect(overlayFromActivationPlan(plan, ["agent-orchestration", "git-capability", "pdf-extension"], {
+      "git-capability": "disabled",
+      "pdf-extension": "enabled",
+    })).toEqual({
+      "agent-orchestration": false,
+      "git-capability": false,
+      "pdf-extension": true,
+    });
+  });
+
+  it("applies user overrides on top of a healthy plan", () => {
+    const parsed = parseProductProfileManifestJson(JSON.stringify({
+      schemaVersion: 1,
+      id: "lab-tools",
+      name: "Lab Tools",
+      extensions: {
+        required: [{ id: "agent-orchestration", version: "^1.0.0" }],
+        recommended: [{ id: "git-capability", version: "^1.0.0" }],
+      },
+      layout: {},
+    }));
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+
+    const plan = resolveProductProfile({
+      profile: parsed.profile,
+      installed: [
+        { id: "agent-orchestration", version: "1.0.0" },
+        { id: "git-capability", version: "1.0.0" },
+        { id: "pdf-extension", version: "1.0.0" },
+      ],
+      overrides: { "git-capability": "disabled", "pdf-extension": "enabled" },
+    });
+    // A disabled recommended is silently skipped; enabling an outside
+    // extension pulls it in as a project override without conflicts.
+    expect(plan.conflicts).toEqual([]);
+
+    expect(overlayFromActivationPlan(plan, ["agent-orchestration", "git-capability", "pdf-extension"], {
+      "git-capability": "disabled",
+      "pdf-extension": "enabled",
+    })).toEqual({
+      "agent-orchestration": true,
+      "git-capability": false,
+      "pdf-extension": true,
+    });
+  });
 });

@@ -197,10 +197,19 @@ export function projectedProfileExtensionIds(plan: ProductActivationPlan): {
 export function overlayFromActivationPlan(
   plan: ProductActivationPlan,
   extensionIds: readonly string[],
+  overrides: Readonly<Record<string, "enabled" | "disabled">> = {},
 ): Record<string, boolean> {
-  if (plan.missingRequired.length || plan.conflicts.length) {
-    return Object.fromEntries(extensionIds.map(id => [id, false]));
+  const resolved = plan.missingRequired.length || plan.conflicts.length
+    ? Object.fromEntries(extensionIds.map(id => [id, false]))
+    : (() => {
+      const enabled = new Set(plan.enabled.map(item => item.id));
+      return Object.fromEntries(extensionIds.map(id => [id, enabled.has(id)]));
+    })();
+  // Explicit user choices from the Extensions pane outlive plan recomputation:
+  // a transient scan hiccup or a fail-closed profile resolution must not flip
+  // toggles the user set themselves (2026-08-31 flip fix).
+  for (const [id, state] of Object.entries(overrides)) {
+    if (id in resolved) resolved[id] = state === "enabled";
   }
-  const enabled = new Set(plan.enabled.map(item => item.id));
-  return Object.fromEntries(extensionIds.map(id => [id, enabled.has(id)]));
+  return resolved;
 }

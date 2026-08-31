@@ -8040,7 +8040,7 @@ export class PiHostBackend implements HostBackend {
     if (plan.missingRequired.length || plan.conflicts.length) {
       console.warn(`[pipiui] Product Profile ${activation.profile} overlay fail-closed: ${formatActivationPlanProblems(plan)}`);
     }
-    return overlayFromActivationPlan(plan, extensionIds);
+    return overlayFromActivationPlan(plan, extensionIds, activation.overrides);
   }
   private async readExtensionSettingsSnapshot(id: string, projectRoot?: string): Promise<Record<string, unknown>> {
     const manifest = this.extensions.settingsManifest(id);
