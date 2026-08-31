@@ -45,7 +45,7 @@ import { WebSearchKeysPane } from './WebSearchKeysPane'
 import { useOptionalProductWorkbenchRuntime } from './workbench/workbench-runtime'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
-type DisplayExtensionCategory = ExtensionCategory | 'other'
+type DisplayExtensionCategory = ExtensionCategory | 'other' | 'outside'
 
 const EXTENSION_CATEGORY_ORDER: readonly DisplayExtensionCategory[] = [
   'foundation',
@@ -56,6 +56,7 @@ const EXTENSION_CATEGORY_ORDER: readonly DisplayExtensionCategory[] = [
   'integration',
   'developer',
   'other',
+  'outside',
 ]
 
 const EXTENSION_CATEGORY_LABEL: Record<DisplayExtensionCategory, string> = {
@@ -67,6 +68,7 @@ const EXTENSION_CATEGORY_LABEL: Record<DisplayExtensionCategory, string> = {
   integration: '模型与外部服务',
   developer: '开发者',
   other: '其它扩展',
+  outside: '包外扩展',
 }
 
 const EXTENSION_CATEGORY_DESCRIPTION: Record<DisplayExtensionCategory, string> = {
@@ -78,6 +80,7 @@ const EXTENSION_CATEGORY_DESCRIPTION: Record<DisplayExtensionCategory, string> =
   integration: '模型接入、MCP 与外部服务连接',
   developer: '创建、调试和维护 PipiUI 扩展',
   other: '尚未归入专门类别的扩展',
+  outside: '已安装但不属于当前扩展包的核心能力与独立扩展（如 PDF、Office、Memory、CUA）',
 }
 
 type ExtensionStatusFilter = 'all' | 'enabled' | 'disabled'
@@ -382,7 +385,7 @@ function ExtensionPackageRow({
   onToggle: (ext: ExtensionDescriptor) => void
   onUninstall: (ext: ExtensionDescriptor) => void
   packActive: boolean
-  membership: 'required' | 'optional'
+  membership: 'required' | 'optional' | 'outside'
   vision?: VisionRoutingController
   visibility?: ModelVisibilityController
   scan?: ScanExternalSessionsController
@@ -398,7 +401,8 @@ function ExtensionPackageRow({
   const canShowAuth = enabled && declaresAuth
   const l2Blocked = blocksEnableForL2(ext.source, caps)
   const errorText = readableError(ext)
-  const canToggle = packActive && membership !== 'required' && !busy && ext.state !== 'error' && !(l2Blocked && !enabled)
+  // 包外扩展不属于包成员关系，独立于整包激活状态，随时可按项目开关。
+  const canToggle = (membership === 'outside' || packActive) && membership !== 'required' && !busy && ext.state !== 'error' && !(l2Blocked && !enabled)
   const sourceLabel = EXTENSION_SOURCE_LABEL[ext.source] ?? ext.source
   const stateLabel = EXTENSION_STATE_LABEL[ext.state] ?? ext.state
   const category = extensionCategory(ext)
@@ -410,7 +414,7 @@ function ExtensionPackageRow({
           <div className="extensions-pkg-title-line">
             <strong>{ext.name ?? ext.id}</strong>
             <span className="extensions-pkg-category">{EXTENSION_CATEGORY_LABEL[category]}</span>
-            <span className={`extensions-membership-pill ${membership}`}>{membership === 'required' ? '包必需' : '可选'}</span>
+            <span className={`extensions-membership-pill ${membership}`}>{membership === 'required' ? '包必需' : membership === 'outside' ? '包外' : '可选'}</span>
           </div>
           <div className="extensions-pkg-meta" data-testid={`extensions-pkg-meta-${ext.id}`}>
             <span>{ext.version ?? '—'}</span>
@@ -627,6 +631,8 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
   const packExtensionIds = useMemo(() => new Set(profileExtensionIds(selectedProfile)), [selectedProfile])
   const requiredExtensionIds = useMemo(() => new Set(selectedProfile?.requiredExtensionIds ?? []), [selectedProfile])
   const packItems = useMemo(() => items.filter(item => packExtensionIds.has(item.id)), [items, packExtensionIds])
+  const outsideItems = useMemo(() => items.filter(item => !packExtensionIds.has(item.id)), [items, packExtensionIds])
+  const listableCount = packItems.length + outsideItems.length
   const packActive = Boolean(selectedProfile && (selectedProfile.id === 'installed-extensions' || activation?.profile === selectedProfile.id))
   const categories = useMemo(() => {
     const grouped = new Map<DisplayExtensionCategory, ExtensionDescriptor[]>()
@@ -636,10 +642,13 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
       bucket.push(item)
       grouped.set(category, bucket)
     }
+    if (outsideItems.length > 0) {
+      grouped.set('outside', [...outsideItems].sort((left, right) => (left.name ?? left.id).localeCompare(right.name ?? right.id)))
+    }
     return EXTENSION_CATEGORY_ORDER
       .map(category => ({ category, items: (grouped.get(category) ?? []).sort((left, right) => (left.name ?? left.id).localeCompare(right.name ?? right.id)) }))
       .filter(group => group.items.length > 0)
-  }, [packItems])
+  }, [items, packExtensionIds, outsideItems, packItems])
   const enabledCount = packItems.filter(item => item.state === 'enabled').length
   const filteredCategories = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase()
@@ -1045,7 +1054,7 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
                     type="search"
                     value={query}
                     aria-label="搜索扩展"
-                    placeholder="搜索包内扩展"
+                    placeholder="搜索扩展"
                     data-testid="extensions-search"
                     onChange={event => setQuery(event.target.value)}
                   />
@@ -1070,7 +1079,7 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
                   aria-pressed={categoryFilter === 'all'}
                   data-testid="extensions-category-filter-all"
                   onClick={() => setCategoryFilter('all')}
-                >全部 <span>{packItems.length}</span></button>
+                >全部 <span>{listableCount}</span></button>
                 {categories.map(group => (
                   <button
                     key={group.category}
@@ -1083,8 +1092,8 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
                 ))}
               </div>
               <div className="extensions-results-summary" aria-live="polite">
-                <strong>{categoryFilter === 'all' ? '包内扩展' : EXTENSION_CATEGORY_LABEL[categoryFilter]}</strong>
-                <span>显示 {filteredCount} / {packItems.length} 项</span>
+                <strong>{categoryFilter === 'all' ? (outsideItems.length > 0 ? '全部扩展' : '包内扩展') : EXTENSION_CATEGORY_LABEL[categoryFilter]}</strong>
+                <span>显示 {filteredCount} / {listableCount} 项</span>
               </div>
               {packItems.length === 0
                 ? <div className="extensions-filter-empty" data-testid="extensions-packages-empty">这个扩展包还没有可选扩展。{selectedProfile.customizable ? '点击“管理包内扩展”添加。' : ''}</div>
@@ -1116,7 +1125,7 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
                                 onToggle={ext => { void onToggle(ext) }}
                                 onUninstall={setUninstallTarget}
                                 packActive={packActive}
-                                membership={requiredExtensionIds.has(ext.id) ? 'required' : 'optional'}
+                                membership={group.category === 'outside' ? 'outside' : requiredExtensionIds.has(ext.id) ? 'required' : 'optional'}
                                 vision={vision}
                                 visibility={visibility}
                                 scan={scan}

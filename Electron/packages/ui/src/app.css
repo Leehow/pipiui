@@ -949,6 +949,7 @@ body{overscroll-behavior:none}
 .extensions-membership-pill { padding: 2px 6px; border-radius: 999px; font-size: 8px; white-space: nowrap; }
 .extensions-membership-pill.required { color: var(--accent); background: var(--accent-soft); }
 .extensions-membership-pill.optional { color: var(--muted); background: color-mix(in srgb, var(--text) 5%, transparent); }
+.extensions-membership-pill.outside { color: var(--muted); background: transparent; border: 1px dashed var(--border-strong); }
 .extensions-pack-name-field { display: flex; flex-direction: column; gap: 5px; }
 .extensions-pack-name-field > span { color: var(--muted); font-size: 10px; }
 .extensions-pack-name-field input { height: 34px; padding: 0 10px; border: 1px solid var(--border-strong); border-radius: 8px; outline: none; background: var(--surface); color: var(--text-strong); font-size: 12px; }

@@ -168,11 +168,12 @@ function managementHost(initial: ExtensionDescriptor[]) {
   return host as unknown as PipiHostAPI & typeof host
 }
 
-function extensionPackHost() {
+function extensionPackHost(extra: ExtensionDescriptor[] = []) {
   const host = managementHost([
     pkg({ id: 'skill-loader-extension', name: 'Skill Loader', category: 'foundation', state: 'enabled', source: 'builtin' }),
     pkg({ id: 'coding-runtime', name: 'Coding Runtime', category: 'coding', state: 'enabled', source: 'builtin' }),
     pkg({ id: 'document-workbench', name: 'Documents', category: 'knowledge', state: 'enabled', source: 'builtin' }),
+    ...extra,
   ])
   let activation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
   let profiles: ProductProfileDescriptor[] = [
@@ -271,6 +272,32 @@ describe('ExtensionsPane package management', () => {
     fireEvent.click(within(memberList).getByText('Documents'))
     fireEvent.click(screen.getByTestId('extensions-pack-members-confirm'))
     await waitFor(() => expect(host.updateProductProfileExtensions).toHaveBeenCalledWith('demo', 'lab-tools', ['document-workbench']))
+  })
+
+  it('keeps out-of-pack extensions visible, searchable, and individually toggleable', async () => {
+    const host = extensionPackHost([
+      pkg({ id: 'pdf-extension', name: 'PipiUI PDF', category: 'knowledge', state: 'enabled', source: 'builtin' }),
+      pkg({ id: 'office-extension', name: 'PipiUI Office', category: 'knowledge', state: 'enabled', source: 'builtin' }),
+    ])
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+
+    // 包外扩展有自己的分组，不会混进包内分类计数。
+    const outside = await screen.findByTestId('extensions-category-outside')
+    expect(outside.textContent).toContain('包外扩展')
+    expect(within(outside).getByTestId('extensions-pkg-pdf-extension')).toBeTruthy()
+    expect(within(outside).getByTestId('extensions-pkg-office-extension')).toBeTruthy()
+    expect(screen.getByTestId('extensions-category-filter-outside').textContent).toContain('2')
+
+    // 包外扩展不依赖整包激活状态，随时可以按项目开关。
+    const toggle = screen.getByTestId('extensions-pkg-toggle-pdf-extension')
+    expect(toggle).toHaveProperty('disabled', false)
+    fireEvent.click(toggle)
+    await waitFor(() => expect(host.setExtensionEnabled).toHaveBeenCalledWith('pdf-extension', false, 'project', 'demo'))
+
+    // 搜索同时覆盖包内和包外扩展。
+    fireEvent.change(screen.getByTestId('extensions-search'), { target: { value: 'Office' } })
+    await waitFor(() => expect(screen.queryByTestId('extensions-pkg-pdf-extension')).toBeNull())
+    expect(screen.getByTestId('extensions-pkg-office-extension')).toBeTruthy()
   })
 
   it('groups packages into readable categories while keeping uncategorized packages visible', async () => {

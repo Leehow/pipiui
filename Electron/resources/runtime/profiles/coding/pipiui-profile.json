@@ -14,7 +14,7 @@
       { "id": "agent-orchestration", "version": "^1.0.0" },
       { "id": "code-retrieval", "version": "^1.0.0" },
       { "id": "document-workbench", "version": "^1.0.0" },
-      { "id": "external-coding-sessions", "version": "^1.0.0" },
+      { "id": "external-session-scan", "version": "^0.1.0" },
       { "id": "goal-extension", "version": "^1.0.0" },
       { "id": "git-capability", "version": "^1.0.0" },
       { "id": "plan-extension", "version": "^1.0.0" },
