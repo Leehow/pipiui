@@ -397,20 +397,6 @@ export async function settleCloseoutWait<T>(
 	return outcome;
 }
 
-/** Fire-and-forget: never delay done, never leak an unhandled rejection. */
-export function detachCloseout(
-	work: Promise<unknown>,
-	onError?: (reason: unknown) => void,
-): void {
-	void work.then(undefined, (reason) => {
-		try {
-			onError?.(reason);
-		} catch {
-			/* probe must not throw */
-		}
-	});
-}
-
 export function logCloseoutProbe(event: string, fields: CloseoutProbeFields): void {
 	logStallProbe(event, {
 		agent: fields.agent,

@@ -16,7 +16,6 @@ import {
 	createCloseoutReportQueue,
 	createTimeoutAbort,
 	createWorktreePhaseProber,
-	detachCloseout,
 	isSupersededCloseoutReport,
 	readonlyChildExitGraceMs,
 	runAbortableRetries,
@@ -362,35 +361,6 @@ test("abort cancel clears the grace timer", async () => {
 	await delay(SHORT_MS + 20);
 	assert.equal(terminated, 0);
 	assert.equal(closeout.forced(), false);
-});
-
-test("unresolved terminal candidate / closeout work does not block completion", async () => {
-	const started = Date.now();
-	const pending = new Promise<string>(() => {});
-	detachCloseout(pending);
-	const closeout: string[] = [];
-	closeout.push("job-finalize");
-	closeout.push("end-report");
-	assert.deepEqual(closeout, ["job-finalize", "end-report"]);
-	assert.ok(Date.now() - started < 50);
-});
-
-test("detached rejection is not unhandled", async () => {
-	const unhandled = collectUnhandled();
-	try {
-		let rejectLate: ((error: Error) => void) | undefined;
-		const pending = new Promise<void>((_, reject) => {
-			rejectLate = reject;
-		});
-		const seen: unknown[] = [];
-		detachCloseout(pending, (reason) => seen.push(reason));
-		rejectLate?.(new Error("broker-down"));
-		await delay(15);
-		assert.deepEqual(unhandled.seen, []);
-		assert.equal((seen[0] as Error).message, "broker-down");
-	} finally {
-		unhandled.stop();
-	}
 });
 
 test("unresolved report/drain wait returns on budget and keeps late probes", async () => {
@@ -855,7 +825,6 @@ test("index wires closeout helpers onto the live finalization path", () => {
 	assert.match(source, /if \(!useNestedRpc\) \{[\s\S]*?childExitCloseout\.arm\(\)/);
 	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitCloseout\.arm\(\)/);
 	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitProbe\.markFinal\(\)/);
-	assert.match(source, /detachCloseout\(submitBrokerTerminalCandidate/);
 	assert.match(source, /settleCloseoutWait\(flight, DEFAULT_TERMINAL_REPORT_BUDGET_MS/);
 	assert.match(source, /createCloseoutReportQueue/);
 	assert.match(source, /abandonPipiuiReports\(/);
@@ -866,7 +835,6 @@ test("index wires closeout helpers onto the live finalization path", () => {
 	assert.match(source, /pipiuiReportQueue\.beginRun\(/);
 	assert.match(source, /return proc\.kill\("SIGTERM"\)/);
 	assert.match(source, /else pipiuiReportQueue\.seal\(/);
-	assert.doesNotMatch(source, /await submitBrokerTerminalCandidate/);
 	assert.doesNotMatch(source, /error: "job-finalize-error"[\s\S]{0,400}throw error/);
 	assert.match(closeout, /void flight\.then\(cleanup, cleanup\)/);
 	assert.doesNotMatch(closeout, /flight\.finally/);

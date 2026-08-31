@@ -10,6 +10,8 @@ export interface DeliveryObligation {
 	routingKeyHash: string;
 	agentId: string;
 	runId: string;
+	/** Model-visible semantic identity. Internal runId remains opaque. */
+	alarmId?: string;
 	payloadHash: string;
 	text: string;
 	state: DeliveryState;
@@ -74,6 +76,7 @@ const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS = 256;
 const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS_PER_AGENT = 16;
 const ALARM_OVERFLOW_AGENT_ID = "alarm-overflow";
 const ALARM_OVERFLOW_RUN_ID = "alarm-overflow";
+const ALARM_OVERFLOW_ID = "alarm-overflow.1";
 
 export function deliveryRetryDue(
 	record: Pick<DeliveryObligation, "state" | "attempts" | "lastAttemptAt">,
@@ -142,6 +145,7 @@ function isRecord(value: unknown): value is DeliveryObligation {
 		typeof r.routingKeyHash === "string" && /^[a-f0-9]{64}$/.test(r.routingKeyHash) &&
 		typeof r.agentId === "string" && r.agentId.length > 0 &&
 		typeof r.runId === "string" && r.runId.length > 0 &&
+		(r.alarmId === undefined || (typeof r.alarmId === "string" && r.alarmId.length > 0)) &&
 		typeof r.payloadHash === "string" && /^[a-f0-9]{64}$/.test(r.payloadHash) &&
 		typeof r.text === "string" &&
 			(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "acknowledged" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
@@ -227,8 +231,8 @@ export class DeliveryObligationStore {
 		text: string,
 		identityNamespace?: string,
 		acknowledgementRequired = false,
+		formatAlarmText?: (alarmId: string) => string,
 	): DeliveryObligation {
-		const payloadHash = sha256(text);
 		// The default keeps existing worker-completion identities byte-for-byte stable.
 		// Named host channels (for example Supervisor escalation) must not consume that
 		// worker receipt merely because they share an agent/run coordinate.
@@ -237,7 +241,8 @@ export class DeliveryObligationStore {
 			: `${this.routingKeyHash}\0${agentId}\0${runId}`);
 		const existing = this.read(id);
 		if (existing) {
-			if (!acknowledgementRequired || existing.acknowledgementRequired) return existing;
+			if (!acknowledgementRequired) return existing;
+			if (existing.acknowledgementRequired && existing.state === "acknowledged") return existing;
 		}
 		if (acknowledgementRequired) {
 			if (!this.acquireClaim(this.alarmCapacityClaimId)) {
@@ -247,27 +252,41 @@ export class DeliveryObligationStore {
 				// Re-read inside the serialized capacity section: another process may have
 				// created the exact row while this caller waited for the claim.
 				const current = this.read(id);
-				if (current?.acknowledgementRequired) return current;
-				const unacknowledged = this.readAll().filter((row) =>
+				if (current?.acknowledgementRequired && current.state === "acknowledged") return current;
+				const rows = this.readAll();
+				const alarmId = current?.alarmId ?? this.nextAlarmId(agentId, rows);
+				const alarmText = formatAlarmText ? formatAlarmText(alarmId) : text;
+				const payloadHash = sha256(alarmText);
+				if (current?.acknowledgementRequired) {
+					if (current.alarmId === alarmId && current.text === alarmText && current.payloadHash === payloadHash) return current;
+					const refreshed = { ...current, alarmId, text: alarmText, payloadHash, updatedAt: this.now() };
+					this.write(refreshed);
+					return refreshed;
+				}
+				const unacknowledged = rows.filter((row) =>
 					row.acknowledgementRequired &&
 					row.state !== "acknowledged" &&
 					row.state !== "fulfilled" &&
 					!row.alarmRollup);
 				const perAgent = unacknowledged.filter((row) => row.agentId === agentId).length;
+				// Reserve one durable row for the overflow rollup so the configured
+				// global maximum is a true on-disk hard limit, not max+1.
+				const exactGlobalLimit = Math.max(0, this.maxUnacknowledgedAlarms - 1);
 				if (
-					unacknowledged.length >= this.maxUnacknowledgedAlarms ||
+					unacknowledged.length >= exactGlobalLimit ||
 					perAgent >= this.maxUnacknowledgedAlarmsPerAgent
 				) {
-					return this.upsertAlarmOverflow({ agentId, runId, text, payloadHash });
+					return this.upsertAlarmOverflow({ agentId, runId, text, payloadHash: sha256(text) });
 				}
 				const now = this.now();
 				if (current) {
 					const upgraded: DeliveryObligation = {
 						...current,
+						alarmId,
 						acknowledgementRequired: true,
 						state: current.state === "fulfilled" ? "pending" : current.state,
 						payloadHash,
-						text,
+						text: alarmText,
 						updatedAt: now,
 					};
 					this.write(upgraded);
@@ -280,8 +299,9 @@ export class DeliveryObligationStore {
 					routingKeyHash: this.routingKeyHash,
 					agentId,
 					runId,
+					alarmId,
 					payloadHash,
-					text,
+					text: alarmText,
 					state: "pending",
 					attempts: 0,
 					createdAt: now,
@@ -297,6 +317,7 @@ export class DeliveryObligationStore {
 			}
 		}
 		const now = this.now();
+		const payloadHash = sha256(text);
 		const record: DeliveryObligation = {
 			version: 1,
 			id,
@@ -315,6 +336,17 @@ export class DeliveryObligationStore {
 		this.write(record);
 		this.prune(id);
 		return record;
+	}
+
+	private nextAlarmId(agentId: string, rows: DeliveryObligation[]): string {
+		const prefix = `${agentId}.`;
+		let generation = 0;
+		for (const row of rows) {
+			if (!row.alarmId?.startsWith(prefix)) continue;
+			const candidate = Number(row.alarmId.slice(prefix.length));
+			if (Number.isSafeInteger(candidate) && candidate > generation) generation = candidate;
+		}
+		return `${agentId}.${generation + 1}`;
 	}
 
 	private upsertAlarmOverflow(input: {
@@ -340,9 +372,9 @@ export class DeliveryObligationStore {
 		const latest = (input.text.replace(/\0/gu, "").trim().split("\n")[0] ?? "").slice(0, 600);
 		const text = [
 			`[boss-alarm-overflow] ${rollup.count} terminal alarm(s) exceeded the exact-row capacity and were compacted into this durable rollup.`,
-			`Latest exact episode: agentId=${input.agentId} runId=${input.runId}. digest=${rollup.digest}.`,
+			`Latest compacted episode belonged to agentId=${input.agentId}. digest=${rollup.digest}.`,
 			`Latest bounded alarm text: ${latest || "(empty)"}`,
-			`Handle the overflow as one explicit episode, then call subagent_alarm_ack({agentId:"${ALARM_OVERFLOW_AGENT_ID}", runId:"${ALARM_OVERFLOW_RUN_ID}", note:"handled overflow rollup"}). This row remains on the 1m/2m/5m cadence until acknowledged.`,
+			`Handle the overflow as one explicit episode, then call subagent_alarm_ack({alarmId:"${ALARM_OVERFLOW_ID}", note:"handled overflow rollup"}). This row remains on the 1m/2m/5m cadence until acknowledged.`,
 		].join("\n");
 		const row: DeliveryObligation = {
 			version: 1,
@@ -350,6 +382,7 @@ export class DeliveryObligationStore {
 			routingKeyHash: this.routingKeyHash,
 			agentId: ALARM_OVERFLOW_AGENT_ID,
 			runId: ALARM_OVERFLOW_RUN_ID,
+			alarmId: ALARM_OVERFLOW_ID,
 			payloadHash: sha256(text),
 			text,
 			state: "pending",
@@ -473,6 +506,10 @@ export class DeliveryObligationStore {
 		return matches.find((record) => record.state !== "acknowledged") ?? matches[0];
 	}
 
+	readAlarm(alarmId: string): DeliveryObligation | undefined {
+		return this.readAll().find((record) => record.acknowledgementRequired && record.alarmId === alarmId);
+	}
+
 	markAlarmEpisodeAcknowledged(agentId: string, runId: string, note?: string): DeliveryObligation[] {
 		const matches = this.readAll().filter((record) =>
 			record.acknowledgementRequired && record.agentId === agentId && record.runId === runId);
@@ -480,6 +517,13 @@ export class DeliveryObligationStore {
 			const acknowledged = this.markAcknowledged(record.id, note);
 			return acknowledged ? [acknowledged] : [];
 		});
+	}
+
+	markAlarmAcknowledged(alarmId: string, note?: string): DeliveryObligation[] {
+		const record = this.readAlarm(alarmId);
+		if (!record) return [];
+		const acknowledged = this.markAcknowledged(record.id, note);
+		return acknowledged ? [acknowledged] : [];
 	}
 
 	/** A persisted Boss assistant ended unsuccessfully; retry through normal bounded gates. */

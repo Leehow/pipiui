@@ -322,10 +322,7 @@ import {
 	runtimeRolePolicyForAgent,
 	type SemanticProgressState,
 } from "./runtime-policy.ts";
-import {
-	prepareSubagentMemoryTask,
-	prepareTerminalMemorySubmission,
-} from "./memory-policy.ts";
+import { prepareSubagentMemoryTask } from "./memory-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
 import {
 	encodeAgentEventBridgeRequestV1,
@@ -371,11 +368,6 @@ import {
 import { setCloseoutTimelineDir } from "./closeout-timeline.ts";
 import { createChildExitTimelineProbe } from "./child-exit-probe.ts";
 import {
-	DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS,
-	awaitTerminalCandidate,
-	terminalCandidatePhaseError,
-} from "./terminal-candidate.ts";
-import {
 	DEFAULT_REPORT_DRAIN_BUDGET_MS,
 	DEFAULT_TERMINAL_REPORT_BUDGET_MS,
 	closeoutPhaseError,
@@ -383,7 +375,6 @@ import {
 	createCloseoutReportQueue,
 	createTimeoutAbort,
 	createWorktreePhaseProber,
-	detachCloseout,
 	isSupersededCloseoutReport,
 	logCloseoutProbe,
 	readonlyChildExitGraceMs,
@@ -880,67 +871,6 @@ function issuedMemoryBrokerPackageForChild(
 	} catch {
 		return undefined;
 	}
-}
-
-/** Terminal memory is optional and must never delay done delivery. */
-async function submitBrokerTerminalCandidate(
-	environment: IssuedMemoryBrokerEnvironment | undefined,
-	input: {
-		runID: string;
-		agentName: string;
-		task: string;
-		title?: string;
-		terminalText: string;
-		outcome: "success" | "failure";
-		verificationPassed: boolean;
-	},
-): Promise<void> {
-	const submission = prepareTerminalMemorySubmission(input);
-	if (!environment || !submission) return;
-	const startedAt = Date.now();
-	const agent = environment.PIPIUI_AGENT_ID;
-	const probe = (state: "wait" | "timeout" | "ok" | "error"): void => {
-		logStallProbe("terminal-candidate", {
-			agent,
-			run: input.runID,
-			state,
-			elapsedMs: Date.now() - startedAt,
-		});
-		const error = terminalCandidatePhaseError(state);
-		if (!agent || !error) return;
-		const phase = handleForRun(agent, input.runID)?.diagnostics.finalizationPhase ?? "final-received";
-		projectFinalizationPhase(agent, input.runID, phase, { error });
-	};
-	probe("wait");
-	// Memory broker HTTP already has its own 3s AbortController; this outer
-	// bound covers import / flight hang and a stale client without a timeout.
-	const outcome = await awaitTerminalCandidate((async () => {
-		const identity = issuedMemoryBrokerPackageForChild(environment);
-		if (!identity) return;
-		const clientPath = fs.realpathSync(path.join(identity.root, "src/client.ts"));
-		const prefix = identity.root.endsWith(path.sep) ? identity.root : `${identity.root}${path.sep}`;
-		if (!clientPath.startsWith(prefix) || !fs.statSync(clientPath).isFile()) return;
-		const { createMemoryBrokerClient, submitTerminalExperienceCandidate } = await import(pathToFileURL(clientPath).href);
-		await submitTerminalExperienceCandidate(createMemoryBrokerClient(environment), submission);
-	})(), DEFAULT_TERMINAL_CANDIDATE_TIMEOUT_MS, {
-		onLate: (late) => {
-			logStallProbe("terminal-candidate", {
-				agent,
-				run: input.runID,
-				state: late.status === "rejected" ? "late-reject" : "late-ok",
-				elapsedMs: Date.now() - startedAt,
-			});
-		},
-	});
-	if (outcome.status === "timeout") {
-		probe("timeout");
-		return;
-	}
-	if (outcome.status === "rejected") {
-		probe("error");
-		return;
-	}
-	probe("ok");
 }
 
 function memoryBrokerExtensionPathForChild(
@@ -5687,18 +5617,19 @@ function createDoneObligation(
 	text: string,
 	identityNamespace?: string,
 	acknowledgementRequired = false,
+	formatAlarmText?: (alarmId: string) => string,
 ): DeliveryObligation {
 	if (!doneDeliveryStore) {
 		return acknowledgementRequired
-			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace)
+			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace, formatAlarmText)
 			: volatileObligation(agentId, runId, text, identityNamespace);
 	}
 	try {
-		return doneDeliveryStore.create(agentId, runId, text, identityNamespace, acknowledgementRequired);
+		return doneDeliveryStore.create(agentId, runId, text, identityNamespace, acknowledgementRequired, formatAlarmText);
 	} catch (err) {
 		logDonePersistenceFailure("create", "", err);
 		return acknowledgementRequired
-			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace)
+			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace, formatAlarmText)
 			: volatileObligation(agentId, runId, text, identityNamespace);
 	}
 }
@@ -5760,7 +5691,7 @@ function sendDoneWithConfirmation(
 				// The row vanished/corrupted after create: do not suppress the actual completion.
 				logDonePersistenceFailure("missing-before-send", obligation.id, undefined);
 					obligation = obligation.acknowledgementRequired
-						? volatileBossAlarmStore.create(obligation.agentId, obligation.runId, obligation.text, obligation.id)
+						? volatileBossAlarmStore.create(obligation.agentId, obligation.runId, obligation.text, obligation.id, undefined, obligation.alarmId)
 						: volatileObligation(obligation.agentId, obligation.runId, obligation.text);
 			}
 		} catch (err) {
@@ -5903,15 +5834,15 @@ async function deliverConfirmedDoneToBossAsync(
 		return trySendUserMessage(pi, text);
 	}
 	const acknowledgementRequired = PIPIUI_DEPTH === 0;
-	const alarmText = acknowledgementRequired
-		? formatBossAlarmMessage({ text, agentId, runId })
-		: text;
 	const obligation = createDoneObligation(
 		agentId,
 		runId,
-		alarmText,
+		text,
 		identityNamespace,
 		acknowledgementRequired,
+		acknowledgementRequired
+			? alarmId => formatBossAlarmMessage({ text, agentId, alarmId })
+			: undefined,
 	);
 	if (
 		obligation.state === "acknowledged" ||
@@ -6038,20 +5969,21 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 	}
 }
 
-function acknowledgeSubagentAlarm(agentId: string, runId: string, note?: string) {
-	const current = jobRegistry.get(agentId);
-	const alarmStore = doneDeliveryStore?.readAlarmEpisode(agentId, runId)
+function acknowledgeSubagentAlarm(alarmId: string, note?: string) {
+	const durable = doneDeliveryStore?.readAlarm(alarmId);
+	const alarmStore = durable
 		? doneDeliveryStore
 		: volatileBossAlarmStore;
+	const record = durable ?? volatileBossAlarmStore.readAlarm(alarmId);
+	const current = record ? jobRegistry.get(record.agentId) : undefined;
 	const result = acknowledgeBossAlarm(alarmStore, {
-		agentId,
-		runId,
+		alarmId,
 		...(note ? { note } : {}),
 		...(current ? { currentJob: { runId: current.runId, state: current.state } } : {}),
 	});
 	if (!result.ok) return result;
 	for (const [obligationId, entry] of [...pendingDone]) {
-		if (entry.obligation.agentId !== agentId || entry.obligation.runId !== runId) continue;
+		if (entry.obligation.alarmId !== alarmId) continue;
 		clearDoneHoldOnForget(entry);
 		pendingDone.delete(obligationId);
 	}
@@ -8828,24 +8760,6 @@ async function runSingleAgent(
 				/* best-effort idempotent release only */
 			}
 		}
-		// Candidate evidence comes only from the final assistant text. It never
-		// reads stream previews, tool results, stderr, or a non-terminal run.
-		// Optional: never delay done. Timeout/error stay on this background task.
-			if (terminalFinalized && !wasAborted) {
-				detachCloseout(submitBrokerTerminalCandidate(terminalMemoryBrokerEnvironment, {
-					runID: runId,
-					agentName,
-					task,
-					title: options?.title,
-					terminalText: getFinalOutput(currentResult.messages),
-					outcome: endOk ? "success" : "failure",
-					verificationPassed: Boolean(
-						currentResult.verify &&
-						!currentResult.verify.timedOut &&
-						currentResult.verify.exitCode === 0
-					),
-				}));
-		}
 		// Merge/cleanup runs before the terminal report so the report describes a settled tree:
 		// a host that handed finalization to pi must not see "ok" while the branch is still
 		// unmerged. A host that kept finalization gets undefined here and is unaffected.
@@ -9320,8 +9234,7 @@ const SubagentResolveParams = Type.Object({
 	reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional handled/superseded reason shown in closeout status." })),
 }, { additionalProperties: false });
 const SubagentAlarmAckParams = Type.Object({
-	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
-	runId: Type.String({ minLength: 1, description: "Exact terminal runId named by the Boss alarm. Stale or still-running episodes are rejected." }),
+	alarmId: Type.String({ minLength: 3, description: "Semantic alarm identity named by the Boss alarm, for example quota-pill.2. Internal opaque runId is never required." }),
 	note: Type.Optional(Type.String({ maxLength: 500, description: "Optional short handling note. Acknowledgement stops only this exact episode's recurring alarm." })),
 }, { additionalProperties: false });
 const SubagentWatchParams = Type.Object({
@@ -10201,16 +10114,15 @@ export default function (pi: ExtensionAPI) {
 		});
 
 		if (PIPIUI_DEPTH === 0) pi.registerCommand("subagent_alarm_ack", {
-			description: "Stop one recurring terminal Boss alarm: /subagent_alarm_ack <agentId> <runId> [note] (PipiUI)",
+			description: "Stop one recurring terminal Boss alarm: /subagent_alarm_ack <alarmId> [note] (PipiUI)",
 			handler: async (args, ctx) => {
 				const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
-				const agentId = parts.shift();
-				const runId = parts.shift();
-				if (!agentId || !runId) {
-					ctx.ui.notify("Usage: /subagent_alarm_ack <agentId> <runId> [note]", "error");
+				const alarmId = parts.shift();
+				if (!alarmId) {
+					ctx.ui.notify("Usage: /subagent_alarm_ack <alarmId> [note]", "error");
 					return;
 				}
-				const result = acknowledgeSubagentAlarm(agentId, runId, parts.join(" ") || undefined);
+				const result = acknowledgeSubagentAlarm(alarmId, parts.join(" ") || undefined);
 				ctx.ui.notify(result.message, result.ok ? "info" : "error");
 			},
 		});
@@ -12162,13 +12074,13 @@ export default function (pi: ExtensionAPI) {
 	if (PIPIUI_DEPTH === 0) pi.registerTool({
 		name: "subagent_alarm_ack",
 		label: "Subagent Alarm Ack",
-		description: "Stop the recurring Boss alarm for one handled terminal episode. Requires the exact agentId and runId. This does not verify, resolve, or clean up the job.",
-		promptSnippet: "After handling a terminal worker alarm, acknowledge its exact agentId and runId; text replies do not stop alarms.",
+		description: "Stop the recurring Boss alarm for one handled terminal episode. Requires the semantic alarmId printed by the alarm; internal runId is never model-facing here. This does not verify, resolve, or clean up the job.",
+		promptSnippet: "After handling a terminal worker alarm, acknowledge its semantic alarmId; text replies do not stop alarms.",
 		parameters: SubagentAlarmAckParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentAlarmAckParams),
 		async execute(_toolCallId, params) {
 			const clean = omitNulls(params);
-			const result = acknowledgeSubagentAlarm(clean.agentId.trim(), clean.runId.trim(), clean.note);
+			const result = acknowledgeSubagentAlarm(clean.alarmId.trim(), clean.note);
 			return {
 				content: [{ type: "text", text: result.message }],
 				details: null,
@@ -12178,8 +12090,7 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			return new Text(
 				theme.fg("toolTitle", theme.bold("subagent_alarm_ack ")) +
-					theme.fg("accent", args.agentId || "?") +
-					theme.fg("muted", ` ${args.runId || "?"}`),
+					theme.fg("accent", args.alarmId || "?"),
 				0,
 				0,
 			);

@@ -86,6 +86,26 @@ test("exact terminal-run acknowledgement is durable and idempotent", (t) => {
 	assert.equal(again.idempotent, true);
 });
 
+test("model-visible alarm identity is a semantic per-agent alias, never the opaque runId", (t) => {
+	const store = tempStore(t);
+	const first = alarm(store, "quota-pill", "mtfa1b2-3c4d5e6f7a8b");
+	const second = alarm(store, "quota-pill", "mtfa1b2-3c4d5e6f7a8c");
+	assert.equal(first.alarmId, "quota-pill.1");
+	assert.equal(second.alarmId, "quota-pill.2");
+	const text = formatBossAlarmMessage({
+		text: "[subagent-done] ok=true",
+		agentId: first.agentId,
+		runId: first.runId,
+		alarmId: first.alarmId,
+	} as Parameters<typeof formatBossAlarmMessage>[0]);
+	assert.match(text, /subagent_alarm_ack\(\{alarmId:"quota-pill\.1"/);
+	assert.doesNotMatch(text, /mtfa1b2-3c4d5e6f7a8b/);
+	assert.equal(acknowledgeBossAlarm(store, {
+		alarmId: "quota-pill.1",
+		currentJob: { runId: "mtfa1b2-3c4d5e6f7a8c", state: "running" },
+	} as Parameters<typeof acknowledgeBossAlarm>[1]).ok, true);
+});
+
 test("persisted history observation can never revive an acknowledged alarm", (t) => {
 	const store = tempStore(t);
 	const row = alarm(store);
@@ -161,22 +181,22 @@ test("hard alarm caps fold overflow into one explicit ackable durable rollup", (
 	const overflowGlobal = alarm(store, "worker-c", "run-c1", "fourth");
 
 	assert.equal(store.read(first.id)?.runId, "run-a1", "old exact alarm is retained");
-	assert.equal(store.read(secondExact.id)?.runId, "run-b1");
+	assert.equal(overflowA.id, secondExact.id);
 	assert.equal(overflowA.id, overflowGlobal.id, "all overflow updates one non-recursive rollup row");
 	assert.equal(overflowGlobal.agentId, "alarm-overflow");
 	assert.equal(overflowGlobal.runId, "alarm-overflow");
-	assert.equal(overflowGlobal.alarmRollup?.count, 2);
+	assert.equal(overflowGlobal.alarmRollup?.count, 3);
 	assert.equal(overflowGlobal.alarmRollup?.latestAgentId, "worker-c");
 	assert.match(overflowGlobal.alarmRollup?.digest ?? "", /^[a-f0-9]{64}$/);
-	assert.match(overflowGlobal.text, /subagent_alarm_ack\(\{agentId:"alarm-overflow", runId:"alarm-overflow"/);
-	assert.equal(readdirSync(store.directory).filter((name) => /^[a-f0-9]{64}\.json$/u.test(name)).length, 3);
+	assert.match(overflowGlobal.text, /subagent_alarm_ack\(\{alarmId:"alarm-overflow\.1"/);
+	assert.equal(readdirSync(store.directory).filter((name) => /^[a-f0-9]{64}\.json$/u.test(name)).length, 2);
 
 	now += 10_000;
 	alarm(store, "worker-d", "run-d1", "fifth");
 	assert.equal(store.read(first.id)?.state, "pending", "age pruning never drops retained exact alarms");
 	const rollup = store.readAlarmEpisode("alarm-overflow", "alarm-overflow")!;
 	assert.equal(alarmRetryDue(rollup, rollup.lastAttemptAt + 300_000), true);
-	assert.equal(acknowledgeBossAlarm(store, { agentId: "alarm-overflow", runId: "alarm-overflow" }).ok, true);
+	assert.equal(acknowledgeBossAlarm(store, { alarmId: "alarm-overflow.1" }).ok, true);
 });
 
 test("legacy fulfilled upgrade refreshes alarm text and payload integrity", (t) => {
@@ -238,9 +258,10 @@ test("acknowledgement during the completion batch window also wins before enqueu
 	assert.equal(checks, 2);
 });
 
-test("alarm message and terminal-state gate carry the explicit exact-run contract", () => {
-	const text = formatBossAlarmMessage({ text: "[subagent-done] ok=false", agentId: "worker-a", runId: "run-a" });
-	assert.match(text, /subagent_alarm_ack\(\{agentId:"worker-a", runId:"run-a"/);
+test("alarm message and terminal-state gate carry the explicit semantic alarm contract", () => {
+	const text = formatBossAlarmMessage({ text: "[subagent-done] ok=false", agentId: "worker-a", alarmId: "worker-a.1" });
+	assert.match(text, /subagent_alarm_ack\(\{alarmId:"worker-a\.1"/);
+	assert.doesNotMatch(text, /runId/);
 	assert.match(text, /text-only reply does not stop/i);
 	for (const state of ["ok", "failed", "aborted", "interrupted"]) {
 		assert.equal(shouldArmBossAlarmForJobState(state), true, state);
