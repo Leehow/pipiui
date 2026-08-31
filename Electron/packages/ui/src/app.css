@@ -48,6 +48,17 @@ body{overscroll-behavior:none}
 @media (prefers-reduced-motion: reduce){
   .chat-viewport>.session-transcript-slot{animation:none}
 }
+/* Modal entrance: the four footer panels ({open && <Modal/>} mounts) fade the
+   backdrop and rise the dialog card instead of popping in hard. Replays on
+   every open; dropped under reduced motion. */
+.model-modal-backdrop,.settings-modal-backdrop,.subagent-modal-backdrop{animation:pipiui-modal-backdrop-in .16s ease-out}
+.model-modal,.settings-modal,.subagent-modal{animation:pipiui-modal-card-in .18s ease-out}
+@keyframes pipiui-modal-backdrop-in{from{opacity:0}to{opacity:1}}
+@keyframes pipiui-modal-card-in{from{opacity:0;transform:translateY(6px) scale(.985)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){
+  .model-modal-backdrop,.settings-modal-backdrop,.subagent-modal-backdrop,
+  .model-modal,.settings-modal,.subagent-modal{animation:none}
+}
 .chat-composer-stack{grid-row:3;align-self:end;display:flex;min-width:0;min-height:0;flex:0 0 auto;flex-direction:column;overflow:visible;padding-right:var(--chat-scrollbar-gutter)}
 .chat-header,.composer{min-width:0;flex:none}
 /* Lease state is content in the fixed composer row, never a separate grid row. */
