@@ -536,6 +536,22 @@ describe("SessionMessageQueue", () => {
     expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["head"]);
   });
 
+  it("treats an immediate-send race after direct acceptance as idempotent success", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    const direct = queue.enqueue("s1", { text: "already accepted" });
+    expect(direct.outcome).toBe("dispatched");
+    host.pending[0].resolve(undefined);
+    await queue.waitForDispatch("s1");
+    expect(queue.listQueue("s1")).toEqual([]);
+
+    const accepted = await queue.cutInMessage("s1", direct.message.id);
+    await queue.waitForMessageDelivery("s1", direct.message.id);
+
+    expect(accepted).toMatchObject({ id: direct.message.id, text: "already accepted", state: "sending" });
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["already accepted"]);
+  });
+
   it("cutIn while busy parks pendingCutIn and notifyIdle sends only that item", async () => {
     const host = recordingHost();
     const queue = new SessionMessageQueue({ dispatch: host.dispatch });
@@ -550,6 +566,26 @@ describe("SessionMessageQueue", () => {
     host.pending[0].resolve(undefined);
     await idle;
     expect(queue.listQueue("s1").map((item) => item.text)).toEqual(["head"]);
+  });
+
+  it("acknowledges immediate-send only after delivery and retains a failed item for retry", async () => {
+    const host = recordingHost();
+    const queue = new SessionMessageQueue({ dispatch: host.dispatch });
+    queue.markBusy("s1");
+    const chosen = queue.enqueue("s1", { text: "chosen" }).message;
+    await queue.cutInMessage("s1", chosen.id);
+    const accepted = queue.waitForMessageDelivery("s1", chosen.id);
+
+    const idle = queue.notifyIdle("s1");
+    expect(host.calls.map((call) => call.payload.text)).toEqual(["chosen"]);
+    host.pending[0].reject(new Error("Boss rejected prompt"));
+    await idle;
+
+    await expect(accepted).rejects.toThrow(/immediate send failed: Boss rejected prompt/);
+    expect(queue.listQueue("s1")).toEqual([
+      expect.objectContaining({ id: chosen.id, text: "chosen", state: "failed", error: "Boss rejected prompt" }),
+    ]);
+    expect(queue.retryMessage("s1", chosen.id)).toMatchObject({ id: chosen.id, state: "queued", error: undefined });
   });
 
   it("rejects a second cutIn while one is pending and leaves the other queued", async () => {

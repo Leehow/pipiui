@@ -2137,7 +2137,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
     const scheduleSettledReplacementConfirmation = (snapshot: ChatMessage[]) => {
       if (!resumedRunning || !mainTurnOpenRef.current) return
-      const last = snapshot[snapshot.length - 1]
+      const last = assistantBeforeTrailingCompactions(snapshot)
       if (!last || last.role !== 'assistant' || !assistantLooksSettled(last) || assistantEndedAwaitingModel(last)) return
       const fingerprint = transcriptFingerprint(snapshot)
       const existing = historySettledReplacementRef.current.get(selectedSession)
@@ -2244,7 +2244,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
           scheduleSettledReplacementConfirmation(retained)
         }
       } else {
-        const last = retained[retained.length - 1]
+        const last = assistantBeforeTrailingCompactions(retained)
         turnJustSettledRef.current = Boolean(last && last.role === 'assistant' && !last.streaming)
       }
     }
@@ -2871,9 +2871,10 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
     }
 
     if (sessionQueue.busy || leftoverQueued) {
-      // Optimistic local echo even while busy. Host user_message dedups via pendingLocalUserRef.
-      // Composer insert cut-ins the parent turn; background subagents keep running.
-      // queued stays until a real user echo (cut-in ack is not delivery).
+      // Ordinary Send while the Boss is busy is FIFO-only. The explicit
+      // “立即发送” action on a queue row owns interruption; composing a new
+      // message must never abort or steer the current Boss turn.
+      // The optimistic row stays queued until the later user echo lands.
       const localUserId = crypto.randomUUID()
       pendingLocalUserRef.current = { id: localUserId, content: prompt }
       persistLocalUserReceiptRef.current = { sessionId: targetSession, id: localUserId }
@@ -2894,16 +2895,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
         finishRendererPreflight(telemetry, payload)
         const result = await sessionQueue.enqueue(prompt, payload, telemetry)
         if (selectedSession !== targetSession) return true
-        if (result.outcome === 'queued') {
-          try {
-            await sessionQueue.cutIn(result.message.id)
-          } catch {
-            dropOptimistic()
-            void host.removeQueuedMessage(targetSession, result.message.id).catch(() => undefined)
-            return false
-          }
-          return true
-        }
+        if (result.outcome === 'queued') return true
         // Race: host dispatched directly despite busy check. Keep queued until the real echo.
         return true
       } catch {
@@ -3561,10 +3553,10 @@ function hasVisibleAssistantOutput(messages: ChatMessage[]): boolean {
  *  streaming. A finished historical conclusion plus a new `started` is a
  *  first-token wait — closing it is the idle-composer side of the seesaw. */
 function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages: ChatMessage[], settledReplacementConfirmed = false): boolean {
-  const historyLast = historyMessages[historyMessages.length - 1]
+  const historyLast = assistantBeforeTrailingCompactions(historyMessages)
   if (!historyLast || !assistantLooksSettled(historyLast)) return false
-  const liveLast = liveMessages[liveMessages.length - 1]
-  if (!liveLast || liveLast.role !== 'assistant') return true
+  const liveLast = assistantBeforeTrailingCompactions(liveMessages)
+  if (!liveLast) return true
   // Text-then-tools is still the silent next hop. JSONL stores that as
   // content+finished tools, which looks settled and must not close the wait.
   if (assistantEndedAwaitingModel(liveLast)) return false
@@ -3574,6 +3566,16 @@ function historyConfirmsLostSettle(historyMessages: ChatMessage[], liveMessages:
   // remains running. Only the bounded, revision-stable replacement candidate
   // may close that split state; an unchanged old final cannot close a new wait.
   return Boolean(liveLast.streaming || settledReplacementConfirmed)
+}
+
+/** Compaction is durable metadata for the preceding transcript, not a new
+ * turn boundary. Only peel an uninterrupted compaction suffix: a later user
+ * or tool row still blocks terminal-assistant recovery. */
+function assistantBeforeTrailingCompactions(messages: ChatMessage[]): ChatMessage | undefined {
+  let index = messages.length - 1
+  while (index >= 0 && messages[index]?.role === 'compaction') index -= 1
+  const candidate = messages[index]
+  return candidate?.role === 'assistant' ? candidate : undefined
 }
 
 function streamingAssistantToolsAllFinished(messages: ChatMessage[]): boolean {
@@ -3611,8 +3613,9 @@ function shouldOpenWaitOnStarted(messages: ChatMessage[], pendingFollowUps?: str
   const last = messages[messages.length - 1]
   if (!last) return true
   if (last.role === 'user') return true
-  if (last.role === 'assistant' && Boolean(last.streaming)) return true
-  return last.role === 'assistant' && assistantEndedAwaitingModel(last)
+  const assistant = assistantBeforeTrailingCompactions(messages)
+  if (assistant?.streaming) return true
+  return Boolean(assistant && assistantEndedAwaitingModel(assistant))
 }
 
 /** After a closed turn these kinds are transcript projections, not a Boss wake. */
@@ -3952,7 +3955,6 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
     }
   }, [modelState, host, sessionId, onEnsureSession, onModel])
   const canSend = !readOnly && (draft.trim() !== '' || attachments.length > 0 || documents.length > 0 || inputFileGate.hasReady || inputFileGate.hasUnsent)
-  const showQueueSubmit = queueBusy && canSend
   // Chromium's AXObjectCache invalidates an existing text field on `class`
   // changes but not on `placeholder` changes. Keep the same textarea (and thus
   // draft/focus/IME ownership) while making busy → idle dirty the AX node.
@@ -3983,7 +3985,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
       </div>
     )}
     {(attachError || sendError || stopError) && <div className="composer-error" data-testid="composer-error"><span>{stopError ?? sendError ?? attachError}</span><button className="composer-error-close" aria-label="关闭错误提示" data-testid="composer-error-close" onClick={() => { setSendError(null); setAttachError(null); onDismissStopError() }}>×</button></div>}
-    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? (hideSessionChrome ? '外部会话只读' : '会话由另一版本运行中') : queueBusy ? '当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label={showQueueSubmit ? '插入当前对话' : '发送消息'} title={showQueueSubmit ? '将终止当前回复并立即插入；后台子任务继续' : undefined} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
+    <div className="composer-card"><div className="composer-shell"><textarea ref={textareaRef} className={inputStateClass} aria-label="消息输入框" disabled={readOnly} value={draft} placeholder={readOnly ? (hideSessionChrome ? '外部会话只读' : '会话由另一版本运行中') : queueBusy ? 'Boss 正在工作，发送将进入队列，待当前回复完成后处理…' : '给 PipiUI 发送消息…'} rows={1} style={{ height: `${estimatedTextareaHeight(draft)}px` }} onChange={event => changeDraft(event.target.value)} onKeyDown={onKeyDown} onPaste={onPaste} />{working && <button aria-label={stopping ? '正在停止' : '停止生成'} className="send stop" disabled={stopping} onClick={onStop}>{stopping ? '…' : '■'}</button>}<button aria-label="发送消息" title={queueBusy ? '加入队列，待 Boss 当前回复完成后发送' : undefined} className="send" disabled={!canSend} onClick={() => void submit()}>↑</button></div></div>
     <ComposerOptions hideSessionChrome={hideSessionChrome} readOnly={readOnly} streaming={streaming} compacting={compacting} compactingLabel={compactingLabel} statsRefreshKey={statsRefreshKey} host={host} sessionId={sessionId} modelState={modelState} visibility={visibility} quickOpen={quickOpen} onOpenBrowserLogin={onOpenBrowserLogin} onSelectModel={handleQuickSelect} onThinkingChange={setThinking} onQuickOpenChange={setQuickOpen} />
     {lightboxIndex !== null && attachments[lightboxIndex] && <div className="lightbox-backdrop" data-testid="lightbox" onMouseDown={event => { if (event.target === event.currentTarget) setLightboxIndex(null) }}><img src={attachments[lightboxIndex].url} alt="图片预览" /><button className="lightbox-close" aria-label="关闭预览" onClick={() => setLightboxIndex(null)}>×</button></div>}
   </footer>
