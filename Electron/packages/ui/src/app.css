@@ -487,7 +487,7 @@ body{overscroll-behavior:none}
 .model-modal {
   position: relative;
   display: grid;
-  grid-template-columns: 190px minmax(0, 1fr);
+  grid-template-columns: 232px minmax(0, 1fr);
   width: min(1040px, calc(100vw - 48px));
   height: min(760px, calc(100dvh - 48px));
   max-height: 760px;
@@ -591,6 +591,16 @@ body{overscroll-behavior:none}
   padding: 0;
   background: transparent;
 }
+/* Indented sub-nav slot under the 扩展 tab; ExtensionsPane portals into it. */
+.extensions-subnav-slot {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 1px 0 3px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
+.extensions-subnav-slot:empty { display: none; }
 .model-modal-tab {
   position: relative;
   display: flex;
@@ -665,7 +675,7 @@ body{overscroll-behavior:none}
 .extensions-overview-stats dd { margin: 3px 0 0; color: var(--text-strong); font-size: 17px; font-weight: 700; }
 .extensions-library-shell {
   display: grid;
-  grid-template-columns: 172px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   min-height: 360px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -799,7 +809,6 @@ body{overscroll-behavior:none}
 
 @media (max-width: 980px) {
   .extensions-overview { grid-template-columns: 1fr; }
-  .extensions-library-shell { grid-template-columns: 150px minmax(0, 1fr); }
   .extensions-overview-stats { width: 100%; }
   .extensions-support-grid { grid-template-columns: 1fr; }
 }
@@ -822,7 +831,6 @@ body{overscroll-behavior:none}
   .model-modal-header { min-height: 78px; padding: 17px 56px 14px 16px !important; }
   .model-modal-heading h2 { font-size: 16px !important; }
   .model-modal-body { padding: 14px 16px 20px; }
-  .extensions-library-shell { grid-template-columns: 1fr; }
   .extensions-category-nav { flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--border); }
   .extensions-category-nav-heading { display: none; }
   .extensions-category-nav button { flex: none; }
@@ -832,14 +840,12 @@ body{overscroll-behavior:none}
 }
 
 /* Extension packs reuse Product Profiles as the project-local grouping seam. */
-.extensions-library-shell { grid-template-columns: 210px minmax(0, 1fr); min-height: 520px; }
+.extensions-library-shell { min-height: 520px; }
 .extensions-pack-sidebar {
   display: flex;
   min-width: 0;
   flex-direction: column;
-  padding: 12px 10px;
-  border-right: 1px solid var(--border);
-  background: color-mix(in srgb, var(--surface) 92%, var(--text) 1%);
+  padding: 2px 0;
 }
 .extensions-pack-dropdown {
   display: flex;
@@ -969,12 +975,10 @@ body{overscroll-behavior:none}
 .extensions-mcp-hub .extensions-mcp-builtin { margin-top: 0; }
 
 @media (max-width: 980px) {
-  .extensions-library-shell { grid-template-columns: 180px minmax(0, 1fr); }
   .extensions-hub-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
-  .extensions-library-shell { grid-template-columns: 1fr; }
-  .extensions-pack-sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
+  .extensions-subnav-slot { margin: 0; padding-left: 0; border-left: 0; }
   .extensions-pack-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .extensions-pack-sidebar-divider, .extensions-pack-sidebar-heading { display: none; }
   .extensions-capability-nav { display: inline-flex; width: calc(50% - 3px); }

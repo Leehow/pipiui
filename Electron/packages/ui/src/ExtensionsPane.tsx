@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionCategory, ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, UserMcpServer } from '@pipi/host-api'
 import {
   agentAvailabilityLabel,
@@ -28,6 +29,14 @@ import { ExtensionAuthCard } from './ExtensionAuthCard'
 import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, HOST_FEATURE_SETTINGS_EXTENSION_IDS, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from './host-feature-extensions'
 import { ScanExternalSessionsPane } from './ScanExternalSessionsPane'
 import { SchemaSettingsForm } from './schema-settings-form'
+
+/**
+ * DOM node hosting the pack sub-nav (扩展包 / Skills / MCP) when ExtensionsPane
+ * is embedded in the settings modal — ModelVisibilityModal provides the slot
+ * under its 扩展 tab so the sub-nav indents into the main sidebar. Null (tests,
+ * standalone usage) → the sub-nav renders inline as a second column.
+ */
+export const ExtensionsSubnavSlotContext = createContext<HTMLElement | null>(null)
 import type { ModelVisibilityController } from './useModelVisibility'
 import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { VisionRoutingController } from './useVisionRouting'
@@ -900,73 +909,78 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
     }
   }
 
+  const subnavSlot = useContext(ExtensionsSubnavSlotContext)
+  const packSubnav = (
+    <aside className="extensions-pack-sidebar">
+      <button
+        type="button"
+        className="extensions-pack-dropdown"
+        aria-expanded={packsOpen}
+        data-testid="extensions-pack-dropdown"
+        onClick={() => setPacksOpen(open => !open)}
+      >
+        <span>扩展包</span>
+        <span aria-hidden="true">{packsOpen ? '▾' : '▸'}</span>
+      </button>
+      {packsOpen && (
+        <div className="extensions-pack-list" data-testid="extensions-pack-list">
+          {packs.map(profile => {
+            const active = activation?.profile === profile.id || profile.id === 'installed-extensions'
+            const selected = selectedView === 'packs' && selectedProfile?.id === profile.id
+            return (
+              <div key={profile.id} className={`extensions-pack-item${selected ? ' selected' : ''}`} data-testid={`extensions-pack-${profile.id}`}>
+                <button type="button" className="extensions-pack-select" onClick={() => choosePack(profile)}>
+                  <strong>{profileDisplayName(profile)}</strong>
+                  <span>{profile.customizable ? '自定义' : '内置'} · {profileExtensionIds(profile).length} 个扩展</span>
+                </button>
+                <button
+                  type="button"
+                  role="switch"
+                  className={`computer-use-switch extensions-pack-switch${active ? ' enabled' : ''}`}
+                  aria-checked={active}
+                  aria-label={active ? `关闭 ${profileDisplayName(profile)} 扩展包` : `启用 ${profileDisplayName(profile)} 扩展包`}
+                  disabled={profileBusy !== null || profile.id === 'installed-extensions' || !host.setProductProfile || !activation}
+                  data-testid={`extensions-pack-toggle-${profile.id}`}
+                  onClick={() => void setPackActive(profile, !active)}
+                ><span /></button>
+              </div>
+            )
+          })}
+          {host.createProductProfile && resolvedProjectId && (
+            <button type="button" className="extensions-pack-create" disabled={!activation || profileBusy !== null} title={!activation ? '先选择一个有效项目' : undefined} data-testid="extensions-pack-create" onClick={() => setCreatePackOpen(true)}>＋ 新建扩展包</button>
+          )}
+          {host.pickProductPackArchive && host.installProductPackArchive && resolvedProjectId && (
+            <button type="button" className="extensions-pack-import" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-import" onClick={() => void importPack()}>{archiveBusy === 'import' ? '正在加载…' : '加载 ZIP'}</button>
+          )}
+        </div>
+      )}
+      <div className="extensions-pack-sidebar-divider" />
+      <div className="extensions-pack-sidebar-heading">能力</div>
+      <button
+        type="button"
+        className={`extensions-capability-nav${selectedView === 'skills' ? ' active' : ''}`}
+        data-testid="extensions-nav-skills"
+        onClick={() => setSelectedView('skills')}
+      >
+        <strong>Skills</strong>
+        <span>按需知识与创建工具</span>
+      </button>
+      <button
+        type="button"
+        className={`extensions-capability-nav${selectedView === 'mcp' ? ' active' : ''}`}
+        data-testid="extensions-nav-mcp"
+        onClick={() => setSelectedView('mcp')}
+      >
+        <strong>MCP 连接</strong>
+        <span>{servers.length} 个项目连接</span>
+      </button>
+    </aside>
+  )
   return (
     <section className="extensions-library" data-testid="extensions-packages">
+      {subnavSlot && createPortal(packSubnav, subnavSlot)}
       <div className="extensions-library-shell">
-        <aside className="extensions-pack-sidebar">
-          <button
-            type="button"
-            className="extensions-pack-dropdown"
-            aria-expanded={packsOpen}
-            data-testid="extensions-pack-dropdown"
-            onClick={() => setPacksOpen(open => !open)}
-          >
-            <span>扩展包</span>
-            <span aria-hidden="true">{packsOpen ? '▾' : '▸'}</span>
-          </button>
-          {packsOpen && (
-            <div className="extensions-pack-list" data-testid="extensions-pack-list">
-              {packs.map(profile => {
-                const active = activation?.profile === profile.id || profile.id === 'installed-extensions'
-                const selected = selectedView === 'packs' && selectedProfile?.id === profile.id
-                return (
-                  <div key={profile.id} className={`extensions-pack-item${selected ? ' selected' : ''}`} data-testid={`extensions-pack-${profile.id}`}>
-                    <button type="button" className="extensions-pack-select" onClick={() => choosePack(profile)}>
-                      <strong>{profileDisplayName(profile)}</strong>
-                      <span>{profile.customizable ? '自定义' : '内置'} · {profileExtensionIds(profile).length} 个扩展</span>
-                    </button>
-                    <button
-                      type="button"
-                      role="switch"
-                      className={`computer-use-switch extensions-pack-switch${active ? ' enabled' : ''}`}
-                      aria-checked={active}
-                      aria-label={active ? `关闭 ${profileDisplayName(profile)} 扩展包` : `启用 ${profileDisplayName(profile)} 扩展包`}
-                      disabled={profileBusy !== null || profile.id === 'installed-extensions' || !host.setProductProfile || !activation}
-                      data-testid={`extensions-pack-toggle-${profile.id}`}
-                      onClick={() => void setPackActive(profile, !active)}
-                    ><span /></button>
-                  </div>
-                )
-              })}
-              {host.createProductProfile && resolvedProjectId && (
-                <button type="button" className="extensions-pack-create" disabled={!activation || profileBusy !== null} title={!activation ? '先选择一个有效项目' : undefined} data-testid="extensions-pack-create" onClick={() => setCreatePackOpen(true)}>＋ 新建扩展包</button>
-              )}
-              {host.pickProductPackArchive && host.installProductPackArchive && resolvedProjectId && (
-                <button type="button" className="extensions-pack-import" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-import" onClick={() => void importPack()}>{archiveBusy === 'import' ? '正在加载…' : '加载 ZIP'}</button>
-              )}
-            </div>
-          )}
-          <div className="extensions-pack-sidebar-divider" />
-          <div className="extensions-pack-sidebar-heading">能力</div>
-          <button
-            type="button"
-            className={`extensions-capability-nav${selectedView === 'skills' ? ' active' : ''}`}
-            data-testid="extensions-nav-skills"
-            onClick={() => setSelectedView('skills')}
-          >
-            <strong>Skills</strong>
-            <span>按需知识与创建工具</span>
-          </button>
-          <button
-            type="button"
-            className={`extensions-capability-nav${selectedView === 'mcp' ? ' active' : ''}`}
-            data-testid="extensions-nav-mcp"
-            onClick={() => setSelectedView('mcp')}
-          >
-            <strong>MCP 连接</strong>
-            <span>{servers.length} 个项目连接</span>
-          </button>
-        </aside>
+        {!subnavSlot && packSubnav}
         <div className="extensions-library-content">
           {profileError && <DismissibleError message={profileError} onDismiss={() => setProfileError(null)} />}
           {archiveNotice && <div className="extensions-archive-notice" data-testid="extensions-archive-notice"><span>{archiveNotice}</span><button type="button" aria-label="关闭扩展包提示" onClick={() => setArchiveNotice(null)}>×</button></div>}

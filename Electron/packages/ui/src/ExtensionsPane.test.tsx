@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
 import type { ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, UserMcpServer } from '@pipi/host-api'
-import { ExtensionsPane } from './ExtensionsPane'
+import { ExtensionsPane, ExtensionsSubnavSlotContext } from './ExtensionsPane'
 import { CAPABILITY_LABELS } from './extension-capabilities'
 
 let originalClipboard: PropertyDescriptor | undefined
@@ -30,6 +30,24 @@ describe('ExtensionsPane', () => {
     expect(screen.getByTestId('extensions-builtin').textContent).toContain('1 项')
     expect(screen.getByTestId('extensions-user-empty').textContent).toContain('还没有额外添加')
     expect(screen.queryByTestId('extensions-add-dialog')).toBeNull()
+  })
+
+  it('portals the pack sub-nav into the settings sidebar slot when provided', async () => {
+    const host = { listExtensions: async () => [] } as unknown as PipiHostAPI
+    const slot = document.createElement('div')
+    document.body.appendChild(slot)
+    render(
+      <ExtensionsSubnavSlotContext.Provider value={slot}>
+        <ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />
+      </ExtensionsSubnavSlotContext.Provider>,
+    )
+    expect(await screen.findByTestId('extensions-pack-dropdown')).toBeTruthy()
+    expect(slot.contains(screen.getByTestId('extensions-pack-dropdown'))).toBe(true)
+    expect(slot.contains(screen.getByTestId('extensions-nav-skills'))).toBe(true)
+    expect(slot.contains(screen.getByTestId('extensions-nav-mcp'))).toBe(true)
+    // The pane content column no longer hosts the sub-nav when a slot exists.
+    expect(screen.getByTestId('extensions-packages').contains(screen.getByTestId('extensions-pack-dropdown'))).toBe(false)
+    slot.remove()
   })
 
   it('lists project mcpServers from the host without secrets', async () => {

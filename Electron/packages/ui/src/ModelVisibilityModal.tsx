@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import type { Model, ModelState, PipiHostAPI } from '@pipi/host-api'
 import type { ModelVisibilityController } from './useModelVisibility'
 import { groupByProvider, modelRef } from './model-visibility'
@@ -8,7 +8,7 @@ import type { VisionRoutingController } from './useVisionRouting'
 import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { UpdateCenterController } from './useUpdateCenter'
 import { UpdateCenter } from './UpdateCenter'
-import { ExtensionsPane } from './ExtensionsPane'
+import { ExtensionsPane, ExtensionsSubnavSlotContext } from './ExtensionsPane'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import {
   DEFAULT_SETTINGS_TAB,
@@ -203,6 +203,8 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   const [tab, setTab] = useState(DEFAULT_SETTINGS_TAB)
   const [extensionsAddOpen, setExtensionsAddOpen] = useState(false)
   const [view, setView] = useState<'manage' | 'add'>(initialView)
+  // DOM slot under the 扩展 tab; ExtensionsPane portals its pack sub-nav here.
+  const [extensionsSubnavSlot, setExtensionsSubnavSlot] = useState<HTMLDivElement | null>(null)
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
@@ -222,6 +224,7 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
 
   return (
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
+      <ExtensionsSubnavSlotContext.Provider value={extensionsSubnavSlot}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
         <aside className="model-modal-sidebar">
           <div className="model-modal-sidebar-heading">
@@ -231,23 +234,27 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
           </div>
           <div className="model-modal-tabs" role="tablist" aria-label="设置分类" aria-orientation="vertical">
             {sections.map(section => (
-              <button
-                key={section.id}
-                id={`settings-tab-${section.id}`}
-                type="button"
-                role="tab"
-                aria-selected={tab === section.id}
-                aria-controls={`settings-panel-${section.id}`}
-                className={`model-modal-tab${tab === section.id ? ' active' : ''}`}
-                data-testid={`model-tab-${section.id}`}
-                onClick={() => {
-                  section.onActivate?.({ setView, setExtensionsAddOpen })
-                  setTab(section.id)
-                }}
-              >
-                <span className="model-modal-tab-label">{section.label}</span>
-                <span className="model-modal-tab-hint">{SETTINGS_NAV_HINTS[section.id] ?? '相关设置'}</span>
-              </button>
+              <Fragment key={section.id}>
+                <button
+                  id={`settings-tab-${section.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === section.id}
+                  aria-controls={`settings-panel-${section.id}`}
+                  className={`model-modal-tab${tab === section.id ? ' active' : ''}`}
+                  data-testid={`model-tab-${section.id}`}
+                  onClick={() => {
+                    section.onActivate?.({ setView, setExtensionsAddOpen })
+                    setTab(section.id)
+                  }}
+                >
+                  <span className="model-modal-tab-label">{section.label}</span>
+                  <span className="model-modal-tab-hint">{SETTINGS_NAV_HINTS[section.id] ?? '相关设置'}</span>
+                </button>
+                {section.id === 'extensions' && (
+                  <div ref={setExtensionsSubnavSlot} className="extensions-subnav-slot" data-testid="extensions-subnav-slot" />
+                )}
+              </Fragment>
             ))}
           </div>
         </aside>
@@ -282,6 +289,7 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
           </div>
         </div>
       </section>
+      </ExtensionsSubnavSlotContext.Provider>
     </div>
   )
 }

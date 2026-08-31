@@ -4048,6 +4048,11 @@ describe('extensions settings tab', () => {
     fireEvent.click(screen.getByTestId('model-tab-extensions'))
     expect(await screen.findByTestId('extensions-pane')).toBeTruthy()
     expect(screen.getByRole('heading', { name: '扩展' })).toBeTruthy()
+    // Pack sub-nav indents into the settings sidebar under the 扩展 tab.
+    const subnavSlot = screen.getByTestId('extensions-subnav-slot')
+    expect(subnavSlot.closest('.model-modal-sidebar')).toBeTruthy()
+    expect(subnavSlot.contains(screen.getByTestId('extensions-pack-dropdown'))).toBe(true)
+    expect(screen.getByTestId('extensions-packages').contains(screen.getByTestId('extensions-pack-dropdown'))).toBe(false)
     fireEvent.click(screen.getByTestId('extensions-nav-mcp'))
     expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
     fireEvent.click(screen.getByTestId('extensions-add-button'))
