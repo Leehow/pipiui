@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -121,6 +121,37 @@ describe("create-pipiui-extension CLI", () => {
     expect(profileTemplateRoot()).toBe(join(pkgRoot, "profile-template"));
     expect(createPipiuiProfile({ name: "Lab", dir: join(cwd, "lab"), cwd }).id).toBe("lab");
   });
+
+  it("scaffolds into the project extensions dir with --install (discovered path)", async () => {
+    const cwd = await tempRoot("pipi-create-install-");
+    await mkdir(join(cwd, ".git"), { recursive: true });
+    const spawned = await runCli(["My Tool", "--install"], cwd);
+    expect(spawned.code, spawned.stderr).toBe(0);
+    // The child reports process.cwd(), which macOS resolves past the /var→/private/var symlink.
+    const dest = join(realpathSync(cwd), ".pi", "agent", "extensions", "my-tool");
+    expect(spawned.stdout).toContain(`installed my-tool at ${dest}`);
+    const parsed = JSON.parse(await readFile(join(dest, "pipiui-extension.json"), "utf8"));
+    expect(parsed).toMatchObject({ id: "my-tool", name: "My Tool", version: "0.1.0" });
+  });
+
+  it("keeps an explicit [dir] winning over --install", async () => {
+    const cwd = await tempRoot("pipi-create-install-dir-");
+    await mkdir(join(cwd, ".git"), { recursive: true });
+    const dest = join(cwd, "custom-out");
+    const spawned = await runCli(["My Tool", "--install", dest], cwd);
+    expect(spawned.code, spawned.stderr).toBe(0);
+    expect(spawned.stdout).toMatch(/created my-tool/);
+    expect(existsSync(join(dest, "pipiui-extension.json"))).toBe(true);
+    expect(existsSync(join(cwd, ".pi", "agent", "extensions", "my-tool"))).toBe(false);
+  });
+
+  it("errors out when --install cannot find a project root", async () => {
+    const cwd = await tempRoot("pipi-create-install-orphan-");
+    const spawned = await runCli(["My Tool", "--install"], cwd);
+    expect(spawned.code).toBe(1);
+    expect(spawned.stderr).toMatch(/--install/);
+    expect(existsSync(join(cwd, "my-tool"))).toBe(false);
+  });
 });
 
 describe("scaffolded package on the pi-backend loader scan path", () => {
@@ -174,7 +205,8 @@ describe("scaffolded package on the pi-backend loader scan path", () => {
       name: "Hello Ping",
       version: "0.1.0",
       origin: "project",
-      state: "loaded",
+      // Project-origin packages default to enabled (no overlay record needed).
+      state: "enabled",
     });
     expect(rec?.error).toBeUndefined();
     expect(loader.list().find((item) => item.id === "hello-ping")?.capabilities).toEqual(

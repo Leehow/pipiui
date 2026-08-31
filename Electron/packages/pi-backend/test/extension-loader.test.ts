@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createPiHostBackend } from "../src/index.js";
 import { createExtensionLoader } from "../src/extension-loader.js";
 import { validateExtensionManifest } from "../src/extension-manifest.js";
-import { createExtensionRegistry } from "../src/extension-registry.js";
+import { createExtensionRegistry, readAppExtensionEnabled, writeAppExtensionEnabled } from "../src/extension-registry.js";
 import { projectPiAgentDir } from "../src/project-pi-home.js";
 
 const fixtures = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "extensions");
@@ -515,6 +515,59 @@ describe("extension loader scan confinement", () => {
     });
     loader.scan(projectA);
     expect(registry.get("escaped")).toBeUndefined();
+  });
+});
+
+describe("project-origin default enablement", () => {
+  it("discovers a project extension enabled by default, with no overlay record", async () => {
+    await tempRoot("pipi-ext-project-default-");
+    const project = join(root, "repo");
+    await mkdir(project, { recursive: true });
+    await writeManifest(join(projectPiAgentDir(project), "extensions", "my-tool"), {
+      id: "my-tool",
+      name: "My Tool",
+      version: "0.1.0",
+      capabilities: [],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot: join(root, "agent", "extensions"),
+    });
+    loader.scan(project);
+    expect(registry.get("my-tool")).toMatchObject({ origin: "project", defaultEnabled: true, state: "enabled" });
+    expect(loader.spawnPackages().find((pkg) => pkg.id === "my-tool")?.enabled).toBe(true);
+  });
+
+  it("keeps an explicit disable winning over the project default across rescans", async () => {
+    await tempRoot("pipi-ext-project-disable-");
+    const project = join(root, "repo");
+    await mkdir(project, { recursive: true });
+    await writeManifest(join(projectPiAgentDir(project), "extensions", "my-tool"), {
+      id: "my-tool",
+      name: "My Tool",
+      version: "0.1.0",
+      capabilities: [],
+    });
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot: join(root, "agent", "extensions"),
+    });
+    const settings: Record<string, unknown> = {};
+    writeAppExtensionEnabled(settings, "my-tool", false);
+    const overlay = readAppExtensionEnabled(settings);
+
+    loader.scan(project);
+    expect(loader.spawnPackages(overlay).find((pkg) => pkg.id === "my-tool")?.enabled).toBe(false);
+
+    // A rescan must not resurrect the extension behind an explicit disable record…
+    loader.scan(project);
+    expect(loader.spawnPackages(overlay).find((pkg) => pkg.id === "my-tool")?.enabled).toBe(false);
+    // …while the same scan without the record falls back to the project default.
+    expect(loader.spawnPackages().find((pkg) => pkg.id === "my-tool")?.enabled).toBe(true);
   });
 });
 
