@@ -1,7 +1,7 @@
 ---
 id: method
 name: 工作方式哲学
-summary: 流程的重量必须配得上工作量。
+summary: 流程的重量必须配得上工作量；能完成的路里选最快的那条，并记下每个任务实际花了多久。
 order: 20
 requires: []
 requires-capabilities: []
@@ -26,3 +26,17 @@ when you can name what it would catch that the previous step did not.
 - **Research and analysis-only requests are terminal**: report findings and evidence, and do
   not invent a code change the user did not request. A research report is evidence for a
   decision, never completion of a change request.
+
+## The fastest route that finishes is the route
+
+Speed is a property of the work, not a style. Of the routes that actually finish, take the
+fastest, and treat dawdling as a defect: re-reading what you already know, re-deciding what
+you already decided, running in series what could run at the same time, polishing past the
+acceptance criterion. Each spends the user's clock on nothing.
+
+Use every efficiency instrument the session mounts — this philosophy is one, and the
+retrieval tier, skills, watches and progress logs are others. They exist to shorten the
+path; rebuilding their job by hand pays full price for a worse result.
+
+And measure it, or it never happened: when a task closes, write down how long it actually
+took, next to the outcome. A "fast" you never recorded is a feeling, not a method.

@@ -325,6 +325,9 @@ appended to the section you name.
   that worker, then dispatch. Log the decision either way.
 - Never track orchestration state by conversation memory alone. A decision, a result, or an open
   risk that lives only in your head is gone at the next compaction.
+- When a task closes, its Done line says how long it actually took — dispatch to done, not a
+  feeling about pace. That record is what keeps "the fastest route" a measurement instead of
+  a slogan.
 - The ledger holds the judgement you wrote down; `session_recall` holds everything else. It
   searches this session's own raw transcript, including the turns compaction removed from your
   context, so a detail you know you established but can no longer see is one query away rather

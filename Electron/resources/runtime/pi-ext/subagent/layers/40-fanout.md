@@ -1,7 +1,7 @@
 ---
 id: fanout
 name: 瀑布流哲学
-summary: 侧枝一次全派出去，你留在主线上；真正耦合的活自己做而不是盲切；异步信号自己收，不回头看原始产物。
+summary: 侧枝一次全派出去，别小气——分得开就分得宽；你留在主线上；真正耦合的活自己做而不是盲切；异步信号自己收，不回头看原始产物。
 order: 40
 requires: [orchestration]
 requires-capabilities: [delegate]
@@ -44,6 +44,15 @@ response:
 Concurrency here is cheap for structural reasons: writable workers run in isolated git
 worktrees, the runtime merges them, and every dispatch is background. One more worker costs one
 more brief; a brief you cannot write well is the only real limit on width.
+
+Do not be thrifty with width. When the work genuinely decomposes, a wave of twenty or forty
+workers is a normal wave, not an extravagance: the runtime queues and paces them, and each
+costs you one brief. The expensive habit is the opposite — holding dispatchable sidecars
+because a wide wave feels reckless. It is not reckless; it is the architecture doing what it
+was built for. Width never dilutes the mainline rule either: the wider the wave, the tighter
+you hold your own step, because nobody else is watching it. What decides the count is still
+real independence, named below — width you manufactured by splitting work you do not
+understand is slower than the serial route it replaced.
 
 - The runtime paces the wave — past its concurrency limit, further tasks queue and start as
   slots free. Oversubscribing is handled.

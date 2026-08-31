@@ -30,6 +30,23 @@ To try it without touching your settings:
 pi -e /path/to/pipi-philosophy/philosophy.ts
 ```
 
+## What sits underneath
+
+Since the base-prompt lock, this package is no longer the bottom of the stack.
+`../pi-core-prompt/SYSTEM_BASE.md` is: the host passes it to every session
+unconditionally, it survives every extension being disabled, and it is closed to new
+rules. It holds identity, the extension architecture, and a handful of invariants — and
+nothing about method.
+
+That makes the division of labour explicit. **The base says what is true; the layers say
+how to work.** Anything that reads as advice, judgement, or process belongs here, where it
+can be toggled, scoped to a model, replaced per project, or dropped when its capability is
+unmounted — none of which the base can do.
+
+Two rules appear in both: the reply-language rule and the PipiUI host lifecycle rule. That
+duplication is deliberate. `foundation` can be switched off; the base cannot, and neither
+rule is safe to lose. Do not "de-duplicate" them.
+
 ## The layers
 
 The split that matters most runs along one line: **delete `foundation` and the agent becomes
@@ -43,7 +60,7 @@ to someone who cannot perform it is prompt weight and nothing else.
 | id | 中文名 | What it governs | Delivered to |
 |---|---|---|---|
 | `foundation` | 基础哲学 | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + worker |
-| `method` | 工作方式哲学 | Process weight matches the work; research-only requests are terminal | main |
+| `method` | 工作方式哲学 | Process weight matches the work; of the routes that finish, take the fastest and record what each task actually cost; research-only requests are terminal | main |
 | `retrieval` | 代码检索哲学 | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
 | `research` | 调研哲学 | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
 | `recon-stopping` | 侦察收敛纪律 | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
@@ -53,7 +70,7 @@ to someone who cannot perform it is prompt weight and nothing else.
 | `domain` | 领域记忆哲学 | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main |
 | `orchestration` | 编排哲学 | Do not work the floor: decompose, delegate, verify, integrate, report. Briefs, verification, ledger, completion ownership | main |
 | `same-turn` | 同轮调用纪律 | Every call whose arguments you already know goes out in the same message | main + `general-purpose` |
-| `fanout` | 瀑布流哲学 | Parallel by default; boss dispatches any width directly; worker state arrives as signals; keep the wave's raw output out of your context | main |
+| `fanout` | 瀑布流哲学 | Parallel by default; the boss spends width freely — twenty or forty when the decomposition is real — and holds the mainline tighter the wider the wave gets; worker state arrives as signals; keep the wave's raw output out of your context | main |
 | `nested-dispatch` | 下级派工哲学 | For a worker that may itself delegate: dispatches are synchronous, concurrency exists only inside one call, children cannot delegate, and recon returns file:line evidence rather than prose | `general-purpose` |
 | `toolcall` | 工具调用纪律 | Calling the tool *is* the work; act on the first turn; "I can't" has to name something | one model family (see below) |
 | `thinking` | 思考纪律 | Decide, act, verify — once each; resolve an unknown with the cheapest sufficient probe | every family measured to sprawl |
