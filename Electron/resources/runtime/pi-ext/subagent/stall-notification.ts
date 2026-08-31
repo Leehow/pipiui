@@ -202,21 +202,21 @@ export interface StallMessageInput {
 export function formatStallMessage(input: StallMessageInput): string {
 	const inTool = input.inTool ? ` in=${input.inTool.names.join("+")} for=${input.inTool.forSec}s` : "";
 	return [
-		`[subagent-stalled] agentId=${input.agentId} title=${input.title} idle=${input.idleSec}s${inTool} last=${input.lastLine}`,
+		`[subagent-stalled] agentId=${input.agentId} runId=${input.runId} title=${input.title} idle=${input.idleSec}s${inTool} last=${input.lastLine}`,
 		`Liveness: ${input.liveness ?? "no CPU measurement available for this worker"}.`,
 		...(input.progress ? [input.progress] : []),
-		`Query it first with subagent_status({agentId:"${input.agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / re-point its progress log and keep waiting (only when the next line applies) / abort and re-dispatch by a materially different route / abort and ask the user. An aborted agent does not push a [subagent-done] follow-up — confirm its terminal state via subagent_status — and a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+		`Query it first with subagent_status({agentId:"${input.agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / re-point its progress log and keep waiting (only when the next line applies) / abort and re-dispatch by a materially different route / abort and ask the user. Aborting stops this running-worker stall signal and arms the exact terminal Boss alarm; a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 		`Watching the wrong file looks exactly like a stall. If this worker's real output is appended to a log this runtime is not watching — a pytest run, a playtest driver, a long build — that silence is a measurement error, not a wedge: correct it with subagent_progress({agentId:"${input.agentId}", runId:"${input.runId}", progressLog:"<the path it actually appends to>"}) instead of aborting. It resets the idle clock, so name a path the worker genuinely writes; it is not a way to buy a wedged worker more time.`,
-		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) so this recurring message stops; if it is terminal (failed/aborted/interrupted), resolve it with subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_resolve ${input.agentId} ${input.runId}). A text-only reply does not stop this message.`,
+		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) so this recurring stall message stops. For terminal failed/aborted/interrupted cleanup, subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_resolve ${input.agentId} ${input.runId}) remains separate from subagent_alarm_ack({agentId:"${input.agentId}", runId:"${input.runId}"}). A text-only reply does not stop this message or a later terminal alarm.`,
 	].join("\n");
 }
 
 /** The terminal signal: this worker was auto-aborted after exhausting its stall budget. */
 export function formatBlockedMessage(
-	input: Pick<StallMessageInput, "agentId" | "title" | "idleSec" | "lastLine">,
+	input: Pick<StallMessageInput, "agentId" | "runId" | "title" | "idleSec" | "lastLine">,
 ): string {
 	return [
-		`[subagent-blocked] agentId=${input.agentId} title=${input.title} idle=${input.idleSec}s last=${input.lastLine} auto-aborted after stall`,
-		`This worker was auto-aborted after stall. Query subagent_status({agentId:"${input.agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Do not treat this message as a new user request.`,
+		`[subagent-blocked] agentId=${input.agentId} runId=${input.runId} title=${input.title} idle=${input.idleSec}s last=${input.lastLine} auto-aborted after stall`,
+		`This worker was auto-aborted after stall. Query subagent_status({agentId:"${input.agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Its exact terminal Boss alarm remains until subagent_alarm_ack({agentId:"${input.agentId}", runId:"${input.runId}"}); abnormal closeout via subagent_resolve is separate. Do not treat this message as a new user request.`,
 	].join("\n");
 }

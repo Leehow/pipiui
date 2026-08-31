@@ -360,12 +360,12 @@ test("runtime timeout aborts the exact run before provider or transient auto-res
 	assert.ok(abortShortCircuit < transientDecision, "runtime abort must short-circuit transient recovery");
 	// Tolerant of the error carrying attached properties (Object.assign(new Error(…), {…})):
 	// the assertion is that an EXTERNAL abort throws while a runtime timeout does not.
-	assert.match(source, /if \(wasAborted && !runtimeTimedOut\) throw [\s\S]{0,40}?new Error\("Subagent was aborted"\)/);
-	assert.match(source, /const externallyAborted = wasAborted && !runtimeTimedOut;/);
+	assert.match(source, /if \(externallyAborted\) throw [\s\S]{0,40}?new Error\("Subagent was aborted"\)/);
+	assert.match(source, /const externallyAborted = wasAborted && !runtimeTimedOut && !semanticNoProgress;/);
 	assert.match(source, /const endState: JobState = externallyAborted \? "aborted" : endOk \? "ok" : "failed";/);
 	assert.match(source, /aborted: externallyAborted,/);
-	assert.match(source, /if \(runtimeTimedOut && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
-	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: wasAborted \}\)/);
+	assert.match(source, /if \(\(runtimeTimedOut \|\| semanticNoProgress\) && currentResult\.errorMessage\) \{[\s\S]*?endOutput\.includes\(currentResult\.errorMessage\)[\s\S]*?endResultText\.includes\(currentResult\.errorMessage\)/);
+	assert.match(source, /terminalStateForFinalization\(\{ ok: endOk, aborted: externallyAborted \}\)/);
 	assert.match(source, /const ChainItem = Type\.Object\(\{[\s\S]*?isolation: IsolationParam,[\s\S]*?timeoutSecs: TimeoutSecsParam,[\s\S]*?progressLog: ProgressLogParam,/);
 	// Prompt is Optional at the SCHEMA level only so the parallel tasks[] mode can share this
 	// strict schema; single-mode calls still must provide both fields (runtime exact-one-mode gate).

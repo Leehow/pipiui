@@ -265,7 +265,7 @@ test("the stall message carries identity, liveness, and the one-of-three instruc
 		liveness: "12% cpu over 30s",
 	});
 	const lines = text.split("\n");
-	assert.equal(lines[0], "[subagent-stalled] agentId=research-one title=recon idle=120s in=read+grep for=45s last=grep src");
+	assert.equal(lines[0], "[subagent-stalled] agentId=research-one runId=run-1 title=recon idle=120s in=read+grep for=45s last=grep src");
 	assert.equal(lines[1], "Liveness: 12% cpu over 30s.");
 	assert.match(text, /choose exactly one/);
 	assert.match(text, /subagent_resolve\(\{agentId:"[^"]+", runId:"[^"]+"\}\)/);
@@ -273,16 +273,16 @@ test("the stall message carries identity, liveness, and the one-of-three instruc
 });
 
 test("a stall with no tool and no CPU measurement says so rather than omitting the line", () => {
-	const text = formatStallMessage({ agentId: "a", title: "t", idleSec: 9, lastLine: "x" });
+	const text = formatStallMessage({ agentId: "a", runId: "run-a", title: "t", idleSec: 9, lastLine: "x" });
 	const lines = text.split("\n");
-	assert.equal(lines[0], "[subagent-stalled] agentId=a title=t idle=9s last=x");
+	assert.equal(lines[0], "[subagent-stalled] agentId=a runId=run-a title=t idle=9s last=x");
 	// "Keep waiting" must always have to answer to a liveness line, even an absent measurement.
 	assert.equal(lines[1], "Liveness: no CPU measurement available for this worker.");
 });
 
 test("the blocked message states the auto-abort and tells the Boss to confirm terminal state", () => {
-	const text = formatBlockedMessage({ agentId: "a", title: "t", idleSec: 300, lastLine: "x" });
-	assert.match(text, /^\[subagent-blocked\] agentId=a title=t idle=300s last=x auto-aborted after stall$/m);
+	const text = formatBlockedMessage({ agentId: "a", runId: "run-a", title: "t", idleSec: 300, lastLine: "x" });
+	assert.match(text, /^\[subagent-blocked\] agentId=a runId=run-a title=t idle=300s last=x auto-aborted after stall$/m);
 	assert.match(text, /Query subagent_status\(\{agentId:"a"\}\) to confirm the terminal state/);
 	assert.match(text, /Do not treat this message as a new user request\./);
 });

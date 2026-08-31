@@ -273,12 +273,15 @@ export function completionObservationMatches(
  */
 export function completionPersistenceState(
 	entries: readonly unknown[],
-	expected: Pick<CompletionNotificationInput, "sessionId" | "agentId" | "runId" | "obligationId">,
+	expected: Pick<CompletionNotificationInput, "sessionId" | "agentId" | "runId" | "obligationId"> & {
+		acknowledgementRequired?: boolean;
+	},
 ): "absent" | "observed" | "retryable" | "fulfilled" {
 	let state: "absent" | "observed" | "indeterminate" | "retryable" | "fulfilled" = "absent";
 	for (const value of entries) {
 		const observed = completionObservations(value).some((candidate) => completionObservationMatches(candidate, expected));
 		if (observed) {
+			if (expected.acknowledgementRequired) return "observed";
 			// A replay with the same obligation ID begins a new logical delivery
 			// attempt. Only its own first subsequent assistant decides that attempt.
 			state = "observed";

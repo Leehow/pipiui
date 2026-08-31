@@ -87,6 +87,169 @@ export interface GeneralPurposeExecutionPolicy {
 /** Default GP budget: producing workers extend silently; a stalled one can be aborted. */
 export const DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS = 600_000;
 
+/** Independent semantic safety limit for the exact bundled writable worker route. */
+export const GENERAL_PURPOSE_SEMANTIC_TURN_CAP = 12;
+
+export interface SemanticProgressState {
+	completedTurns: number;
+	inspectOnlyStreak: number;
+	progressEvents: number;
+	pendingToolIds: string[];
+	pendingAnonymousTools: string[];
+	lastSummary: string;
+}
+
+export type SemanticProgressEvent =
+	| {
+			type: "assistant-turn";
+			toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
+	  }
+	| { type: "tool-result"; toolCallId: string; toolName?: string; isError: boolean }
+	| { type: "settle" };
+
+const MUTATION_TOOL_NAMES = new Set([
+	"write",
+	"edit",
+	"apply_patch",
+	"write_file",
+	"create_file",
+	"replace_in_file",
+	"multi_edit",
+]);
+
+/** Narrow command recognizer: validation/build evidence only, never generic shell activity. */
+function isRecognizableValidationCommand(command: string): boolean {
+	const normalized = command.trim().replace(/\s+/g, " ");
+	if (!normalized) return false;
+	const executable = normalized.replace(
+		/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/,
+		"",
+	);
+	return [
+		/^(?:npm|pnpm|yarn|bun) (?:test|run (?:test|build|check|verify)(?::[\w.-]+)?)(?: |$)/,
+		/^npx (?:--[\w-]+ )*(?:tsx|vitest|jest|tsc)(?: |$).*(?:--test| test|--run|--noEmit| run)(?: |$)/,
+		/^(?:cargo|swift) (?:test|build|check)(?: |$)/,
+		/^go test(?: |$)/,
+		/^(?:python(?:3)? -m )?pytest(?: |$)/,
+		/^make (?:test|build|check|verify)(?: |$)/,
+	].some((pattern) => pattern.test(executable));
+}
+
+function isSemanticToolCall(call: { name: string; arguments: Record<string, unknown> }): boolean {
+	const name = call.name.trim().toLowerCase();
+	if (MUTATION_TOOL_NAMES.has(name)) return true;
+	if (name !== "bash" && name !== "shell") return false;
+	return isRecognizableValidationCommand(String(call.arguments.command ?? ""));
+}
+
+export function createSemanticProgressState(
+	overrides: Partial<SemanticProgressState> = {},
+): SemanticProgressState {
+	return {
+		completedTurns: 0,
+		inspectOnlyStreak: 0,
+		progressEvents: 0,
+		pendingToolIds: [],
+		pendingAnonymousTools: [],
+		lastSummary: "no completed assistant turn",
+		...overrides,
+	};
+}
+
+/** Pure semantic-progress transition; transport liveness remains a separate policy. */
+export function advanceSemanticProgress(
+	state: SemanticProgressState,
+	event: SemanticProgressEvent,
+): { state: SemanticProgressState; terminate: boolean } {
+	if (event.type === "settle") {
+		if (state.pendingToolIds.length === 0 && state.pendingAnonymousTools.length === 0) {
+			return { state, terminate: false };
+		}
+		const next: SemanticProgressState = {
+			...state,
+			inspectOnlyStreak: state.inspectOnlyStreak + 1,
+			pendingToolIds: [],
+			pendingAnonymousTools: [],
+			lastSummary: `${state.lastSummary}; semantic tool missing result at process settlement`,
+		};
+		return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
+	}
+
+	if (event.type === "assistant-turn") {
+		const hadUnsettledSemanticTool = state.pendingToolIds.length > 0 || state.pendingAnonymousTools.length > 0;
+		const names = event.toolCalls.map((call) => call.name).filter(Boolean);
+		const semanticCalls = event.toolCalls.filter(isSemanticToolCall);
+		const pendingToolIds = semanticCalls.filter((call) => call.id).map((call) => call.id);
+		const pendingAnonymousTools = semanticCalls
+			.filter((call) => !call.id)
+			.map((call) => call.name.trim().toLowerCase());
+		const next: SemanticProgressState = {
+			...state,
+			completedTurns: state.completedTurns + 1,
+			inspectOnlyStreak: state.inspectOnlyStreak + (hadUnsettledSemanticTool ? 1 : 0),
+			pendingToolIds,
+			pendingAnonymousTools,
+			lastSummary: hadUnsettledSemanticTool
+				? `turn ${state.completedTurns + 1}: previous semantic tool missing result`
+				: `turn ${state.completedTurns + 1}: ${names.length > 0 ? names.join(",") : "assistant-only"}`,
+		};
+		if (next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP) {
+			return { state: next, terminate: true };
+		}
+		if (pendingToolIds.length > 0 || pendingAnonymousTools.length > 0) {
+			return { state: next, terminate: false };
+		}
+		next.inspectOnlyStreak += 1;
+		return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
+	}
+
+	let matchedLabel: string | undefined;
+	let pendingToolIds = state.pendingToolIds;
+	let pendingAnonymousTools = state.pendingAnonymousTools;
+	if (event.toolCallId && state.pendingToolIds.includes(event.toolCallId)) {
+		matchedLabel = event.toolCallId;
+		pendingToolIds = state.pendingToolIds.filter((id) => id !== event.toolCallId);
+	} else if (!event.toolCallId && event.toolName?.trim()) {
+		const normalizedName = event.toolName.trim().toLowerCase();
+		const matchIndex = state.pendingAnonymousTools.indexOf(normalizedName);
+		if (matchIndex >= 0) {
+			matchedLabel = `anonymous ${normalizedName}`;
+			pendingAnonymousTools = state.pendingAnonymousTools.filter((_, index) => index !== matchIndex);
+		}
+	}
+	if (!matchedLabel) return { state, terminate: false };
+	if (!event.isError) {
+		const next: SemanticProgressState = {
+			...state,
+			inspectOnlyStreak: 0,
+			progressEvents: state.progressEvents + 1,
+			pendingToolIds: [],
+			pendingAnonymousTools: [],
+			lastSummary: `${state.lastSummary}; semantic tool ${matchedLabel} succeeded`,
+		};
+		return { state: next, terminate: false };
+	}
+	if (pendingToolIds.length > 0 || pendingAnonymousTools.length > 0) {
+		return {
+			state: {
+				...state,
+				pendingToolIds,
+				pendingAnonymousTools,
+				lastSummary: `${state.lastSummary}; semantic tool ${matchedLabel} failed`,
+			},
+			terminate: false,
+		};
+	}
+	const next: SemanticProgressState = {
+		...state,
+		inspectOnlyStreak: state.inspectOnlyStreak + 1,
+		pendingToolIds,
+		pendingAnonymousTools,
+		lastSummary: `${state.lastSummary}; all semantic tools failed`,
+	};
+	return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
+}
+
 export type StallWatchdogAction = "ignore" | "notify" | "abort";
 
 /**

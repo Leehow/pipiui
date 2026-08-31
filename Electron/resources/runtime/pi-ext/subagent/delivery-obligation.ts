@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type DeliveryState = "pending" | "attempting" | "failed" | "queued" | "observed" | "fulfilled";
+export type DeliveryState = "pending" | "attempting" | "failed" | "queued" | "observed" | "acknowledged" | "fulfilled";
 
 export interface DeliveryObligation {
 	version: 1;
@@ -17,8 +17,12 @@ export interface DeliveryObligation {
 	createdAt: number;
 	updatedAt: number;
 	lastAttemptAt: number;
+	/** Top-level Boss alarms require an explicit exact-run acknowledgement. */
+	acknowledgementRequired: boolean;
 	ownerPid?: number;
 	ownerToken?: string;
+	acknowledgedAt?: number;
+	acknowledgementNote?: string;
 }
 
 export interface RecoverableDelivery {
@@ -69,6 +73,24 @@ export function deliveryRetryDue(
 	return record.attempts === 0 || now - record.lastAttemptAt >= minimumIntervalMs;
 }
 
+/** Manual-ack alarm cadence: first repeat after 1m, second after 2m, then every 5m. */
+export function alarmRetryIntervalMs(attempts: number): number {
+	if (attempts <= 1) return 60_000;
+	if (attempts === 2) return 120_000;
+	return 300_000;
+}
+
+export function alarmRetryDue(
+	record: Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts" | "lastAttemptAt">,
+	now: number,
+): boolean {
+	if (!record.acknowledgementRequired) return false;
+	if (record.state !== "pending" && record.state !== "failed" && record.state !== "queued" && record.state !== "observed") {
+		return false;
+	}
+	return record.attempts === 0 || now - record.lastAttemptAt >= alarmRetryIntervalMs(record.attempts);
+}
+
 /** Confirmed [subagent-done] must not enter Pi's follow-up queue during a live
  *  Boss turn (2026-08-15 receipt storm). The idle settle flush is the one
  *  exception: the first receipt immediately sets busy, and later siblings in
@@ -107,14 +129,17 @@ function isRecord(value: unknown): value is DeliveryObligation {
 		typeof r.runId === "string" && r.runId.length > 0 &&
 		typeof r.payloadHash === "string" && /^[a-f0-9]{64}$/.test(r.payloadHash) &&
 		typeof r.text === "string" &&
-		(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
-		Number.isSafeInteger(r.attempts) && (r.attempts ?? -1) >= 0 &&
+			(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "acknowledged" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
+			Number.isSafeInteger(r.attempts) && (r.attempts ?? -1) >= 0 &&
 		typeof r.createdAt === "number" && Number.isFinite(r.createdAt) &&
 		typeof r.updatedAt === "number" && Number.isFinite(r.updatedAt) &&
 		typeof r.lastAttemptAt === "number" && Number.isFinite(r.lastAttemptAt) &&
 		(r.ownerPid === undefined || (Number.isSafeInteger(r.ownerPid) && r.ownerPid > 0)) &&
-		(r.ownerToken === undefined || (typeof r.ownerToken === "string" && r.ownerToken.length > 0))
-	);
+			(r.acknowledgementRequired === undefined || typeof r.acknowledgementRequired === "boolean") &&
+			(r.ownerToken === undefined || (typeof r.ownerToken === "string" && r.ownerToken.length > 0)) &&
+			(r.acknowledgedAt === undefined || (typeof r.acknowledgedAt === "number" && Number.isFinite(r.acknowledgedAt))) &&
+			(r.acknowledgementNote === undefined || typeof r.acknowledgementNote === "string")
+		);
 }
 
 /**
@@ -160,7 +185,13 @@ export class DeliveryObligationStore {
 		return sha256(routingKey).slice(0, 24);
 	}
 
-	create(agentId: string, runId: string, text: string, identityNamespace?: string): DeliveryObligation {
+	create(
+		agentId: string,
+		runId: string,
+		text: string,
+		identityNamespace?: string,
+		acknowledgementRequired = false,
+	): DeliveryObligation {
 		const payloadHash = sha256(text);
 		// The default keeps existing worker-completion identities byte-for-byte stable.
 		// Named host channels (for example Supervisor escalation) must not consume that
@@ -169,7 +200,18 @@ export class DeliveryObligationStore {
 			? `${this.routingKeyHash}\0${identityNamespace}\0${agentId}\0${runId}`
 			: `${this.routingKeyHash}\0${agentId}\0${runId}`);
 		const existing = this.read(id);
-		if (existing) return existing;
+		if (existing) {
+			if (!acknowledgementRequired || existing.acknowledgementRequired) return existing;
+			const now = this.now();
+			const upgraded: DeliveryObligation = {
+				...existing,
+				acknowledgementRequired: true,
+				state: existing.state === "fulfilled" ? "pending" : existing.state,
+				updatedAt: now,
+			};
+			this.write(upgraded);
+			return upgraded;
+		}
 		const now = this.now();
 		const record: DeliveryObligation = {
 			version: 1,
@@ -184,6 +226,7 @@ export class DeliveryObligationStore {
 			createdAt: now,
 			updatedAt: now,
 			lastAttemptAt: 0,
+			acknowledgementRequired,
 		};
 		this.write(record);
 		this.prune(id);
@@ -193,7 +236,12 @@ export class DeliveryObligationStore {
 	beginAttempt(id: string): DeliveryObligation | undefined {
 		if (!this.acquireClaim(id)) return undefined;
 		const record = this.read(id);
-		if (!record || record.state === "fulfilled" || record.attempts >= this.maxAttempts) {
+		if (
+			!record ||
+			record.state === "acknowledged" ||
+			record.state === "fulfilled" ||
+			(!record.acknowledgementRequired && record.attempts >= this.maxAttempts)
+		) {
 			this.releaseClaim(id);
 			return undefined;
 		}
@@ -264,6 +312,43 @@ export class DeliveryObligationStore {
 		return next;
 	}
 
+	markAcknowledged(id: string, note?: string): DeliveryObligation | undefined {
+		const record = this.read(id);
+		if (!record || !record.acknowledgementRequired) return undefined;
+		if (record.state === "acknowledged") return record;
+		const normalizedNote = typeof note === "string"
+			? note.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim().replace(/\s+/gu, " ").slice(0, 500)
+			: "";
+		const now = this.now();
+		const next: DeliveryObligation = {
+			...record,
+			state: "acknowledged",
+			updatedAt: now,
+			acknowledgedAt: now,
+			...(normalizedNote ? { acknowledgementNote: normalizedNote } : {}),
+			ownerPid: undefined,
+			ownerToken: undefined,
+		};
+		this.write(next);
+		this.releaseClaim(id);
+		return next;
+	}
+
+	readAlarmEpisode(agentId: string, runId: string): DeliveryObligation | undefined {
+		const matches = this.readAll().filter((record) =>
+			record.acknowledgementRequired && record.agentId === agentId && record.runId === runId);
+		return matches.find((record) => record.state !== "acknowledged") ?? matches[0];
+	}
+
+	markAlarmEpisodeAcknowledged(agentId: string, runId: string, note?: string): DeliveryObligation[] {
+		const matches = this.readAll().filter((record) =>
+			record.acknowledgementRequired && record.agentId === agentId && record.runId === runId);
+		return matches.flatMap((record) => {
+			const acknowledged = this.markAcknowledged(record.id, note);
+			return acknowledged ? [acknowledged] : [];
+		});
+	}
+
 	/** A persisted Boss assistant ended unsuccessfully; retry through normal bounded gates. */
 	markRetryable(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
@@ -285,8 +370,9 @@ export class DeliveryObligationStore {
 		const now = this.now();
 		const result: RecoverableDelivery[] = [];
 		for (const record of this.readAll()) {
-			if (record.state === "fulfilled" || record.attempts >= this.maxAttempts) continue;
-			if (now - record.createdAt > this.maxAgeMs) continue;
+			if (record.state === "fulfilled" || record.state === "acknowledged") continue;
+			if (!record.acknowledgementRequired && record.attempts >= this.maxAttempts) continue;
+			if (!record.acknowledgementRequired && now - record.createdAt > this.maxAgeMs) continue;
 			if (this.attemptIsLiveRecent(record)) continue;
 			result.push({
 				record,
@@ -310,9 +396,12 @@ export class DeliveryObligationStore {
 			// Older rows used `accepted`/`delivered` for a fire-and-forget call return.
 			// That was not a persistence acknowledgement, so recover them as queued.
 			if ((parsed as { state?: unknown }).state === "accepted" || (parsed as { state?: unknown }).state === "delivered") {
-				return { ...(parsed as DeliveryObligation), state: "queued" };
+				return { ...(parsed as DeliveryObligation), acknowledgementRequired: false, state: "queued" };
 			}
-			return parsed;
+			return {
+				...parsed,
+				acknowledgementRequired: parsed.acknowledgementRequired === true,
+			};
 		} catch {
 			return undefined;
 		}
@@ -348,8 +437,9 @@ export class DeliveryObligationStore {
 		let rows = this.readAll();
 		for (const row of rows) {
 			if (this.attemptIsLiveRecent(row)) continue;
+			if (row.acknowledgementRequired && row.state !== "acknowledged") continue;
 			const expired = now - row.createdAt > this.maxAgeMs;
-			const fulfilledExpired = row.state === "fulfilled" && now - row.updatedAt > this.deliveredRetentionMs;
+			const fulfilledExpired = (row.state === "fulfilled" || row.state === "acknowledged") && now - row.updatedAt > this.deliveredRetentionMs;
 			// Exhausted failures remain as bounded tombstones until age/cap pruning. Removing
 			// them immediately would let a duplicate terminal callback recreate the same run
 			// and silently reset its retry budget.
@@ -359,6 +449,11 @@ export class DeliveryObligationStore {
 		const keep = new Set<string>();
 		if (protectedId && rows.some((row) => row.id === protectedId)) keep.add(protectedId);
 		for (const row of rows) if (this.attemptIsLiveRecent(row)) keep.add(row.id);
+		// Explicit-ack alarms are loss-intolerant. Their count may exceed the legacy
+		// row cap until the Boss acknowledges exact episodes.
+		for (const row of rows) {
+			if (row.acknowledgementRequired && row.state !== "acknowledged") keep.add(row.id);
+		}
 		for (const row of rows) {
 			if (keep.size >= this.maxRows) break;
 			keep.add(row.id);
