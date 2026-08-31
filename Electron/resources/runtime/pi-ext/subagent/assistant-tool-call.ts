@@ -97,6 +97,8 @@ export type ResultEventProjectionDeps = {
 	reportLog: (items: Array<Record<string, unknown>>) => void;
 	/** emitUpdate + pipiuiUpdate after the projection. */
 	onProjected?: () => void;
+	/** Optional runtime policy observer for the same authoritative projected result. */
+	onResult?: (result: { toolCallId: string; toolName?: string; isError: boolean }) => void;
 };
 
 /**
@@ -128,6 +130,11 @@ export function applyToolResultEvent(
 	const endedName = typeof resultMsg.toolName === "string" && resultMsg.toolName
 		? resultMsg.toolName
 		: undefined;
+	deps.onResult?.({
+		toolCallId: endedId ?? "",
+		...(endedName ? { toolName: endedName } : {}),
+		isError: resultMsg.isError === true,
+	});
 	deps.finishActiveTool({ ...(endedId ? { toolCallId: endedId } : {}), ...(endedName ? { name: endedName } : {}) });
 	const resultText = (
 		Array.isArray(resultMsg.content)

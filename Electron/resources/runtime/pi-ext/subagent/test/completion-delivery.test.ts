@@ -544,9 +544,9 @@ test("runtime finalizes status before using the custom completion channel", () =
 	assert.ok(notify.indexOf("ensureJobTerminalFromResult") < notify.indexOf("deliverConfirmedDone"));
 	assert.match(source, /pi\.on\("message_end"[\s\S]*?setTimeout\([\s\S]*?sessionManager\.getBranch\(\)/);
 	assert.doesNotMatch(source.slice(source.indexOf('pi.on("session_start"'), source.indexOf("registerSessionRecallTool")), /sessionManager\.getEntries\(\)/);
-	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?deliveryRetryDue\(/);
+	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?doneDeliveryRetryDue\(/);
 	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?flushAfterSettle:\s*true/);
-	assert.match(source, /const existing = pendingDone\.get\(obligation\.id\);[\s\S]*?deliveryRetryDue\(\s*existing\.obligation/);
+	assert.match(source, /const existing = pendingDone\.get\(obligation\.id\);[\s\S]*?doneDeliveryRetryDue\(existing\.obligation/);
 	assert.match(source, /for \(const observed of completionObservations\(value\)\)/);
 });
 

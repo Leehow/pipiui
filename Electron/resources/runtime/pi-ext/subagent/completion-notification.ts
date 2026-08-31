@@ -37,6 +37,7 @@ export interface CompletionWaveOptions {
 interface PendingCompletion {
 	input: CompletionNotificationInput;
 	currentSessionId: () => string | undefined;
+	shouldSend?: () => boolean;
 	resolve: (queued: boolean) => void;
 }
 
@@ -131,9 +132,13 @@ class CompletionWaveBroker {
 		this.options = options;
 	}
 
-	enqueue(input: CompletionNotificationInput, currentSessionId: () => string | undefined): Promise<boolean> {
+	enqueue(
+		input: CompletionNotificationInput,
+		currentSessionId: () => string | undefined,
+		shouldSend?: () => boolean,
+	): Promise<boolean> {
 		return new Promise((resolve) => {
-			this.pending.push({ input, currentSessionId, resolve });
+			this.pending.push({ input, currentSessionId, shouldSend, resolve });
 			if (this.timer) return;
 			this.timer = setTimeout(() => this.flush(), Math.max(0, this.options.batchWindowMs ?? DEFAULT_COMPLETION_BATCH_WINDOW_MS));
 		});
@@ -142,8 +147,8 @@ class CompletionWaveBroker {
 	private flush(): void {
 		this.timer = undefined;
 		const wave = this.pending.splice(0);
-		const current = wave.filter(({ input, currentSessionId }) =>
-			Boolean(input.sessionId) && currentSessionId() === input.sessionId,
+		const current = wave.filter(({ input, currentSessionId, shouldSend }) =>
+			Boolean(input.sessionId) && currentSessionId() === input.sessionId && (!shouldSend || shouldSend()),
 		);
 		for (const item of wave) {
 			if (!current.includes(item)) item.resolve(false);
@@ -214,12 +219,17 @@ export function queueCompletionNotification(
 export async function queueCompletionAfterCutIn(
 	pi: CompletionMessageSender,
 	input: CompletionNotificationInput,
-	hooks: { waitForCutIn: () => Promise<void>; currentSessionId: () => string | undefined },
+	hooks: {
+		waitForCutIn: () => Promise<void>;
+		currentSessionId: () => string | undefined;
+		shouldSend?: () => boolean;
+	},
 	waveOptions: CompletionWaveOptions = {},
 ): Promise<boolean> {
 	await hooks.waitForCutIn();
 	if (!input.sessionId || hooks.currentSessionId() !== input.sessionId) return false;
-	return completionWaveBroker(pi, waveOptions).enqueue(input, hooks.currentSessionId);
+	if (hooks.shouldSend && !hooks.shouldSend()) return false;
+	return completionWaveBroker(pi, waveOptions).enqueue(input, hooks.currentSessionId, hooks.shouldSend);
 }
 
 /** Parse either a live custom message or its persisted CustomMessageEntry form. */
@@ -273,12 +283,15 @@ export function completionObservationMatches(
  */
 export function completionPersistenceState(
 	entries: readonly unknown[],
-	expected: Pick<CompletionNotificationInput, "sessionId" | "agentId" | "runId" | "obligationId">,
+	expected: Pick<CompletionNotificationInput, "sessionId" | "agentId" | "runId" | "obligationId"> & {
+		acknowledgementRequired?: boolean;
+	},
 ): "absent" | "observed" | "retryable" | "fulfilled" {
 	let state: "absent" | "observed" | "indeterminate" | "retryable" | "fulfilled" = "absent";
 	for (const value of entries) {
 		const observed = completionObservations(value).some((candidate) => completionObservationMatches(candidate, expected));
 		if (observed) {
+			if (expected.acknowledgementRequired) return "observed";
 			// A replay with the same obligation ID begins a new logical delivery
 			// attempt. Only its own first subsequent assistant decides that attempt.
 			state = "observed";

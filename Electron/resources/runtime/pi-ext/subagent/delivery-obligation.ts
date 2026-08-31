@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-export type DeliveryState = "pending" | "attempting" | "failed" | "queued" | "observed" | "fulfilled";
+export type DeliveryState = "pending" | "attempting" | "failed" | "queued" | "observed" | "acknowledged" | "fulfilled";
 
 export interface DeliveryObligation {
 	version: 1;
@@ -17,8 +17,21 @@ export interface DeliveryObligation {
 	createdAt: number;
 	updatedAt: number;
 	lastAttemptAt: number;
+	/** Top-level Boss alarms require an explicit exact-run acknowledgement. */
+	acknowledgementRequired: boolean;
 	ownerPid?: number;
 	ownerToken?: string;
+	acknowledgedAt?: number;
+	acknowledgementNote?: string;
+	alarmRollup?: {
+		version: 1;
+		count: number;
+		firstAt: number;
+		lastAt: number;
+		latestAgentId: string;
+		latestRunId: string;
+		digest: string;
+	};
 }
 
 export interface RecoverableDelivery {
@@ -39,6 +52,8 @@ interface StoreOptions {
 	claimLeaseMs?: number;
 	auxiliaryMaxAgeMs?: number;
 	maxAuxiliaryFiles?: number;
+	maxUnacknowledgedAlarms?: number;
+	maxUnacknowledgedAlarmsPerAgent?: number;
 }
 
 interface DeliveryClaim {
@@ -55,6 +70,10 @@ const DEFAULT_MAX_ATTEMPTS = 5;
 const INVALID_CLAIM_GRACE_MS = 5_000;
 const DEFAULT_CLAIM_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_AUXILIARY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS = 256;
+const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS_PER_AGENT = 16;
+const ALARM_OVERFLOW_AGENT_ID = "alarm-overflow";
+const ALARM_OVERFLOW_RUN_ID = "alarm-overflow";
 
 export function deliveryRetryDue(
 	record: Pick<DeliveryObligation, "state" | "attempts" | "lastAttemptAt">,
@@ -67,6 +86,24 @@ export function deliveryRetryDue(
 	// pending/failed rows and must never duplicate a long-running queued turn.
 	if ((record.state !== "pending" && record.state !== "failed") || record.attempts >= maxAttempts) return false;
 	return record.attempts === 0 || now - record.lastAttemptAt >= minimumIntervalMs;
+}
+
+/** Manual-ack alarm cadence: first repeat after 1m, second after 2m, then every 5m. */
+export function alarmRetryIntervalMs(attempts: number): number {
+	if (attempts <= 1) return 60_000;
+	if (attempts === 2) return 120_000;
+	return 300_000;
+}
+
+export function alarmRetryDue(
+	record: Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts" | "lastAttemptAt">,
+	now: number,
+): boolean {
+	if (!record.acknowledgementRequired) return false;
+	if (record.state !== "pending" && record.state !== "failed" && record.state !== "queued" && record.state !== "observed") {
+		return false;
+	}
+	return record.attempts === 0 || now - record.lastAttemptAt >= alarmRetryIntervalMs(record.attempts);
 }
 
 /** Confirmed [subagent-done] must not enter Pi's follow-up queue during a live
@@ -107,14 +144,26 @@ function isRecord(value: unknown): value is DeliveryObligation {
 		typeof r.runId === "string" && r.runId.length > 0 &&
 		typeof r.payloadHash === "string" && /^[a-f0-9]{64}$/.test(r.payloadHash) &&
 		typeof r.text === "string" &&
-		(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
-		Number.isSafeInteger(r.attempts) && (r.attempts ?? -1) >= 0 &&
+			(persistedState === "pending" || persistedState === "attempting" || persistedState === "failed" || persistedState === "queued" || persistedState === "observed" || persistedState === "acknowledged" || persistedState === "fulfilled" || persistedState === "accepted" || persistedState === "delivered") &&
+			Number.isSafeInteger(r.attempts) && (r.attempts ?? -1) >= 0 &&
 		typeof r.createdAt === "number" && Number.isFinite(r.createdAt) &&
 		typeof r.updatedAt === "number" && Number.isFinite(r.updatedAt) &&
 		typeof r.lastAttemptAt === "number" && Number.isFinite(r.lastAttemptAt) &&
 		(r.ownerPid === undefined || (Number.isSafeInteger(r.ownerPid) && r.ownerPid > 0)) &&
-		(r.ownerToken === undefined || (typeof r.ownerToken === "string" && r.ownerToken.length > 0))
-	);
+			(r.acknowledgementRequired === undefined || typeof r.acknowledgementRequired === "boolean") &&
+			(r.ownerToken === undefined || (typeof r.ownerToken === "string" && r.ownerToken.length > 0)) &&
+			(r.acknowledgedAt === undefined || (typeof r.acknowledgedAt === "number" && Number.isFinite(r.acknowledgedAt))) &&
+			(r.acknowledgementNote === undefined || typeof r.acknowledgementNote === "string") &&
+			(r.alarmRollup === undefined || (
+				r.alarmRollup.version === 1 &&
+				Number.isSafeInteger(r.alarmRollup.count) && r.alarmRollup.count > 0 &&
+				typeof r.alarmRollup.firstAt === "number" && Number.isFinite(r.alarmRollup.firstAt) &&
+				typeof r.alarmRollup.lastAt === "number" && Number.isFinite(r.alarmRollup.lastAt) &&
+				typeof r.alarmRollup.latestAgentId === "string" && r.alarmRollup.latestAgentId.length > 0 &&
+				typeof r.alarmRollup.latestRunId === "string" && r.alarmRollup.latestRunId.length > 0 &&
+				typeof r.alarmRollup.digest === "string" && /^[a-f0-9]{64}$/.test(r.alarmRollup.digest)
+			))
+		);
 }
 
 /**
@@ -135,6 +184,9 @@ export class DeliveryObligationStore {
 	private readonly claimLeaseMs: number;
 	private readonly auxiliaryMaxAgeMs: number;
 	private readonly maxAuxiliaryFiles: number;
+	private readonly maxUnacknowledgedAlarms: number;
+	private readonly maxUnacknowledgedAlarmsPerAgent: number;
+	private readonly alarmCapacityClaimId: string;
 
 	constructor(directory: string, options: StoreOptions = {}) {
 		this.directory = directory;
@@ -150,6 +202,15 @@ export class DeliveryObligationStore {
 		this.claimLeaseMs = Math.max(1, options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS);
 		this.auxiliaryMaxAgeMs = Math.max(1, options.auxiliaryMaxAgeMs ?? DEFAULT_AUXILIARY_MAX_AGE_MS);
 		this.maxAuxiliaryFiles = Math.max(1, options.maxAuxiliaryFiles ?? this.maxRows * 2);
+		this.maxUnacknowledgedAlarms = Math.max(1, options.maxUnacknowledgedAlarms ?? DEFAULT_MAX_UNACKNOWLEDGED_ALARMS);
+		this.maxUnacknowledgedAlarmsPerAgent = Math.max(
+			1,
+			Math.min(
+				options.maxUnacknowledgedAlarmsPerAgent ?? DEFAULT_MAX_UNACKNOWLEDGED_ALARMS_PER_AGENT,
+				this.maxUnacknowledgedAlarms,
+			),
+		);
+		this.alarmCapacityClaimId = sha256(`${this.routingKeyHash}\0alarm-capacity`);
 	}
 
 	static runId(): string {
@@ -160,7 +221,13 @@ export class DeliveryObligationStore {
 		return sha256(routingKey).slice(0, 24);
 	}
 
-	create(agentId: string, runId: string, text: string, identityNamespace?: string): DeliveryObligation {
+	create(
+		agentId: string,
+		runId: string,
+		text: string,
+		identityNamespace?: string,
+		acknowledgementRequired = false,
+	): DeliveryObligation {
 		const payloadHash = sha256(text);
 		// The default keeps existing worker-completion identities byte-for-byte stable.
 		// Named host channels (for example Supervisor escalation) must not consume that
@@ -169,7 +236,66 @@ export class DeliveryObligationStore {
 			? `${this.routingKeyHash}\0${identityNamespace}\0${agentId}\0${runId}`
 			: `${this.routingKeyHash}\0${agentId}\0${runId}`);
 		const existing = this.read(id);
-		if (existing) return existing;
+		if (existing) {
+			if (!acknowledgementRequired || existing.acknowledgementRequired) return existing;
+		}
+		if (acknowledgementRequired) {
+			if (!this.acquireClaim(this.alarmCapacityClaimId)) {
+				throw new Error("Boss alarm capacity is busy; use the stable volatile fallback.");
+			}
+			try {
+				// Re-read inside the serialized capacity section: another process may have
+				// created the exact row while this caller waited for the claim.
+				const current = this.read(id);
+				if (current?.acknowledgementRequired) return current;
+				const unacknowledged = this.readAll().filter((row) =>
+					row.acknowledgementRequired &&
+					row.state !== "acknowledged" &&
+					row.state !== "fulfilled" &&
+					!row.alarmRollup);
+				const perAgent = unacknowledged.filter((row) => row.agentId === agentId).length;
+				if (
+					unacknowledged.length >= this.maxUnacknowledgedAlarms ||
+					perAgent >= this.maxUnacknowledgedAlarmsPerAgent
+				) {
+					return this.upsertAlarmOverflow({ agentId, runId, text, payloadHash });
+				}
+				const now = this.now();
+				if (current) {
+					const upgraded: DeliveryObligation = {
+						...current,
+						acknowledgementRequired: true,
+						state: current.state === "fulfilled" ? "pending" : current.state,
+						payloadHash,
+						text,
+						updatedAt: now,
+					};
+					this.write(upgraded);
+					this.prune(upgraded.id);
+					return upgraded;
+				}
+				const record: DeliveryObligation = {
+					version: 1,
+					id,
+					routingKeyHash: this.routingKeyHash,
+					agentId,
+					runId,
+					payloadHash,
+					text,
+					state: "pending",
+					attempts: 0,
+					createdAt: now,
+					updatedAt: now,
+					lastAttemptAt: 0,
+					acknowledgementRequired: true,
+				};
+				this.write(record);
+				this.prune(id);
+				return record;
+			} finally {
+				this.releaseClaim(this.alarmCapacityClaimId);
+			}
+		}
 		const now = this.now();
 		const record: DeliveryObligation = {
 			version: 1,
@@ -184,16 +310,70 @@ export class DeliveryObligationStore {
 			createdAt: now,
 			updatedAt: now,
 			lastAttemptAt: 0,
+			acknowledgementRequired,
 		};
 		this.write(record);
 		this.prune(id);
 		return record;
 	}
 
+	private upsertAlarmOverflow(input: {
+		agentId: string;
+		runId: string;
+		text: string;
+		payloadHash: string;
+	}): DeliveryObligation {
+		const id = sha256(`${this.routingKeyHash}\0alarm-overflow`);
+		const previous = this.read(id);
+		const now = this.now();
+		const activePrevious = previous?.state !== "acknowledged" ? previous?.alarmRollup : undefined;
+		const priorDigest = activePrevious?.digest ?? sha256("alarm-overflow-v1");
+		const rollup = {
+			version: 1 as const,
+			count: (activePrevious?.count ?? 0) + 1,
+			firstAt: activePrevious?.firstAt ?? now,
+			lastAt: now,
+			latestAgentId: input.agentId,
+			latestRunId: input.runId,
+			digest: sha256(`${priorDigest}\0${input.agentId}\0${input.runId}\0${input.payloadHash}`),
+		};
+		const latest = (input.text.replace(/\0/gu, "").trim().split("\n")[0] ?? "").slice(0, 600);
+		const text = [
+			`[boss-alarm-overflow] ${rollup.count} terminal alarm(s) exceeded the exact-row capacity and were compacted into this durable rollup.`,
+			`Latest exact episode: agentId=${input.agentId} runId=${input.runId}. digest=${rollup.digest}.`,
+			`Latest bounded alarm text: ${latest || "(empty)"}`,
+			`Handle the overflow as one explicit episode, then call subagent_alarm_ack({agentId:"${ALARM_OVERFLOW_AGENT_ID}", runId:"${ALARM_OVERFLOW_RUN_ID}", note:"handled overflow rollup"}). This row remains on the 1m/2m/5m cadence until acknowledged.`,
+		].join("\n");
+		const row: DeliveryObligation = {
+			version: 1,
+			id,
+			routingKeyHash: this.routingKeyHash,
+			agentId: ALARM_OVERFLOW_AGENT_ID,
+			runId: ALARM_OVERFLOW_RUN_ID,
+			payloadHash: sha256(text),
+			text,
+			state: "pending",
+			attempts: activePrevious ? (previous?.attempts ?? 0) : 0,
+			createdAt: activePrevious ? (previous?.createdAt ?? now) : now,
+			updatedAt: now,
+			lastAttemptAt: activePrevious ? (previous?.lastAttemptAt ?? 0) : 0,
+			acknowledgementRequired: true,
+			alarmRollup: rollup,
+		};
+		this.write(row);
+		this.prune(id);
+		return row;
+	}
+
 	beginAttempt(id: string): DeliveryObligation | undefined {
 		if (!this.acquireClaim(id)) return undefined;
 		const record = this.read(id);
-		if (!record || record.state === "fulfilled" || record.attempts >= this.maxAttempts) {
+		if (
+			!record ||
+			record.state === "acknowledged" ||
+			record.state === "fulfilled" ||
+			(!record.acknowledgementRequired && record.attempts >= this.maxAttempts)
+		) {
 			this.releaseClaim(id);
 			return undefined;
 		}
@@ -236,7 +416,7 @@ export class DeliveryObligationStore {
 	markObserved(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
 		if (!record) return undefined;
-		if (record.state === "fulfilled") return record;
+		if (record.state === "acknowledged" || record.state === "fulfilled") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "observed",
@@ -252,6 +432,7 @@ export class DeliveryObligationStore {
 	markFulfilled(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
 		if (!record) return undefined;
+		if (record.state === "acknowledged") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "fulfilled",
@@ -264,10 +445,47 @@ export class DeliveryObligationStore {
 		return next;
 	}
 
+	markAcknowledged(id: string, note?: string): DeliveryObligation | undefined {
+		const record = this.read(id);
+		if (!record || !record.acknowledgementRequired) return undefined;
+		if (record.state === "acknowledged") return record;
+		const normalizedNote = typeof note === "string"
+			? note.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim().replace(/\s+/gu, " ").slice(0, 500)
+			: "";
+		const now = this.now();
+		const next: DeliveryObligation = {
+			...record,
+			state: "acknowledged",
+			updatedAt: now,
+			acknowledgedAt: now,
+			...(normalizedNote ? { acknowledgementNote: normalizedNote } : {}),
+			ownerPid: undefined,
+			ownerToken: undefined,
+		};
+		this.write(next);
+		this.releaseClaim(id);
+		return next;
+	}
+
+	readAlarmEpisode(agentId: string, runId: string): DeliveryObligation | undefined {
+		const matches = this.readAll().filter((record) =>
+			record.acknowledgementRequired && record.agentId === agentId && record.runId === runId);
+		return matches.find((record) => record.state !== "acknowledged") ?? matches[0];
+	}
+
+	markAlarmEpisodeAcknowledged(agentId: string, runId: string, note?: string): DeliveryObligation[] {
+		const matches = this.readAll().filter((record) =>
+			record.acknowledgementRequired && record.agentId === agentId && record.runId === runId);
+		return matches.flatMap((record) => {
+			const acknowledged = this.markAcknowledged(record.id, note);
+			return acknowledged ? [acknowledged] : [];
+		});
+	}
+
 	/** A persisted Boss assistant ended unsuccessfully; retry through normal bounded gates. */
 	markRetryable(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
-		if (!record || record.state === "fulfilled") return record;
+		if (!record || record.state === "acknowledged" || record.state === "fulfilled") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "failed",
@@ -285,8 +503,9 @@ export class DeliveryObligationStore {
 		const now = this.now();
 		const result: RecoverableDelivery[] = [];
 		for (const record of this.readAll()) {
-			if (record.state === "fulfilled" || record.attempts >= this.maxAttempts) continue;
-			if (now - record.createdAt > this.maxAgeMs) continue;
+			if (record.state === "fulfilled" || record.state === "acknowledged") continue;
+			if (!record.acknowledgementRequired && record.attempts >= this.maxAttempts) continue;
+			if (!record.acknowledgementRequired && now - record.createdAt > this.maxAgeMs) continue;
 			if (this.attemptIsLiveRecent(record)) continue;
 			result.push({
 				record,
@@ -310,9 +529,12 @@ export class DeliveryObligationStore {
 			// Older rows used `accepted`/`delivered` for a fire-and-forget call return.
 			// That was not a persistence acknowledgement, so recover them as queued.
 			if ((parsed as { state?: unknown }).state === "accepted" || (parsed as { state?: unknown }).state === "delivered") {
-				return { ...(parsed as DeliveryObligation), state: "queued" };
+				return { ...(parsed as DeliveryObligation), acknowledgementRequired: false, state: "queued" };
 			}
-			return parsed;
+			return {
+				...parsed,
+				acknowledgementRequired: parsed.acknowledgementRequired === true,
+			};
 		} catch {
 			return undefined;
 		}
@@ -348,8 +570,9 @@ export class DeliveryObligationStore {
 		let rows = this.readAll();
 		for (const row of rows) {
 			if (this.attemptIsLiveRecent(row)) continue;
+			if (row.acknowledgementRequired && row.state !== "acknowledged") continue;
 			const expired = now - row.createdAt > this.maxAgeMs;
-			const fulfilledExpired = row.state === "fulfilled" && now - row.updatedAt > this.deliveredRetentionMs;
+			const fulfilledExpired = (row.state === "fulfilled" || row.state === "acknowledged") && now - row.updatedAt > this.deliveredRetentionMs;
 			// Exhausted failures remain as bounded tombstones until age/cap pruning. Removing
 			// them immediately would let a duplicate terminal callback recreate the same run
 			// and silently reset its retry budget.
@@ -359,6 +582,11 @@ export class DeliveryObligationStore {
 		const keep = new Set<string>();
 		if (protectedId && rows.some((row) => row.id === protectedId)) keep.add(protectedId);
 		for (const row of rows) if (this.attemptIsLiveRecent(row)) keep.add(row.id);
+		// Explicit-ack alarms are loss-intolerant. Their count may exceed the legacy
+		// row cap until the Boss acknowledges exact episodes.
+		for (const row of rows) {
+			if (row.acknowledgementRequired && row.state !== "acknowledged") keep.add(row.id);
+		}
 		for (const row of rows) {
 			if (keep.size >= this.maxRows) break;
 			keep.add(row.id);
