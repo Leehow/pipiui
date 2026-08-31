@@ -1,6 +1,6 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
 import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs, type Dirent } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
@@ -76,7 +76,7 @@ import {
   type SpawnFeatures,
   type SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
-import { applyExtensionUpdate, extensionUpdateStoreRoot, type ExtensionUpdateResult } from "./extension-update-engine.js";
+import { applyExtensionUpdate, extensionUpdateStoreRoot, findPackageRoot, installLocalExtensionPackage, type ExtensionUpdateResult } from "./extension-update-engine.js";
 import {
   SEED_MANAGED_EXTENSION_IDS,
   applySeedMountOverrides,
@@ -256,7 +256,8 @@ import { removeExtensionPackageDirectory } from "./extension-uninstall.js";
 import { readProductProfileCatalog } from "./profile-catalog.js";
 import { PRODUCT_PROFILE_MANIFEST_FILENAME, parseProductProfileManifestJson, type ProductProfileManifest } from "./profile-manifest.js";
 import { createCustomProductProfile, updateCustomProductProfileExtensions } from "./project-profile-editor.js";
-import { installFromProductPackArchive, writeProductPackArchive } from "./product-pack-archive.js";
+import { EXTENSION_MANIFEST_FILENAME, parseExtensionManifestJson } from "./extension-manifest.js";
+import { extractZipArchive, installFromProductPackArchive, writeProductPackArchive } from "./product-pack-archive.js";
 import { installLocalProductPack } from "./product-pack-installer.js";
 import { productSpawnFingerprint, resolveProductSpawnPlan } from "./product-spawn-plan.js";
 import {
@@ -3768,7 +3769,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack") {
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack" | "installExtensionZip") {
       case "listProductProfiles":
         return this.listProductProfiles(params[0]);
       case "getProductProfile":
@@ -3783,6 +3784,8 @@ export class PiHostBackend implements HostBackend {
         return this.exportProductPackArchive(params[0], params[1], params[2]);
       case "installProductPackArchive":
         return this.installProductPackArchive(params[0], params[1]);
+      case "installExtensionZip":
+        return this.installExtensionZip(params[0], params[1]);
       case "installLocalProductProfile":
         return this.installLocalProductProfile(params[0], params[1]);
       case "installLocalProductPack":
@@ -7306,6 +7309,47 @@ export class PiHostBackend implements HostBackend {
     const projectId = projectIdValue.trim();
     return installFromProductPackArchive(sourceArchiveValue.trim(), directory =>
       this.installLocalProductPack(projectId, directory));
+  }
+  /**
+   * Install ONE extension from a user-picked ZIP: safe-unpack to staging,
+   * locate the package root (pipiui-extension.json at the root or in the
+   * single top-level folder), promote it into the content-addressed store as
+   * a local receipt, then enable it for the requesting project — installing a
+   * zip implies the user wants it on. Rejections: no manifest, multiple
+   * package roots, or path-traversal entries (see extractZipArchive).
+   */
+  private async installExtensionZip(
+    projectIdValue: unknown,
+    sourceArchiveValue: unknown,
+  ): Promise<ExtensionRecord> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof sourceArchiveValue !== "string" || !sourceArchiveValue.trim()) {
+      throw new Error("扩展 ZIP 路径必须是非空 string");
+    }
+    const root = await this.projectPath(projectIdValue.trim());
+    const extractionRoot = await fs.mkdtemp(join(tmpdir(), "pipiui-extension-zip-"));
+    try {
+      await extractZipArchive(sourceArchiveValue.trim(), extractionRoot);
+      const packageRoot = await findPackageRoot(extractionRoot);
+      const parsed = parseExtensionManifestJson(
+        await fs.readFile(join(packageRoot, EXTENSION_MANIFEST_FILENAME), "utf8"),
+      );
+      if (!parsed.ok) {
+        throw new Error(`扩展清单无效：${parsed.errors.join("; ")}`);
+      }
+      await installLocalExtensionPackage({
+        extensionId: parsed.manifest.id,
+        sourceDirectory: packageRoot,
+        packId: `local-zip-${parsed.manifest.id}`,
+      }, { storeRoot: this.extensionStoreRoot() });
+      // Rescan so the registry sees the freshly installed store package before enable.
+      this.extensionLoader.scan(root);
+      return this.setExtensionEnabled(parsed.manifest.id, true, "project", projectIdValue.trim());
+    } finally {
+      await fs.rm(extractionRoot, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
   private async setProductProfile(projectIdValue: unknown, profileIdValue: unknown): Promise<ProjectProductActivation> {
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {

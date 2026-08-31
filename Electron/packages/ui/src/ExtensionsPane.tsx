@@ -601,7 +601,7 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
   const [memberSelection, setMemberSelection] = useState<Set<string>>(() => new Set())
   const [profileBusy, setProfileBusy] = useState<string | null>(null)
   const [profileError, setProfileError] = useState<string | null>(null)
-  const [archiveBusy, setArchiveBusy] = useState<'export' | 'import' | null>(null)
+  const [archiveBusy, setArchiveBusy] = useState<'export' | 'import' | 'zip' | null>(null)
   const [archiveNotice, setArchiveNotice] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [grantTarget, setGrantTarget] = useState<ExtensionDescriptor | null>(null)
@@ -855,6 +855,24 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
     }
   }
 
+  const importExtensionZip = async () => {
+    if (!resolvedProjectId || !host.pickProductPackArchive || !host.installExtensionZip) return
+    setArchiveBusy('zip')
+    setProfileError(null)
+    setArchiveNotice(null)
+    try {
+      const source = await host.pickProductPackArchive()
+      if (!source) return
+      const installed = await host.installExtensionZip(resolvedProjectId, source)
+      await refresh()
+      setArchiveNotice(`扩展「${installed.name ?? installed.id}」已安装并对当前项目启用，新会话将加载它。`)
+    } catch (error) {
+      setProfileError(`安装扩展包失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArchiveBusy(null)
+    }
+  }
+
   const applyEnable = async (ext: ExtensionDescriptor, enabled: boolean) => {
     if (!host.setExtensionEnabled) return
     setBusyId(ext.id)
@@ -960,6 +978,19 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
           )}
           {host.pickProductPackArchive && host.installProductPackArchive && resolvedProjectId && (
             <button type="button" className="extensions-pack-import" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-import" onClick={() => void importPack()}>{archiveBusy === 'import' ? '正在加载…' : '加载 ZIP'}</button>
+          )}
+          {host.pickProductPackArchive && host.installExtensionZip && resolvedProjectId && (
+            <>
+              <button
+                type="button"
+                className="extensions-pack-import"
+                disabled={archiveBusy !== null || profileBusy !== null}
+                title="安装单个扩展 ZIP：包根（或唯一顶层文件夹）内需包含 pipiui-extension.json 与 agent/ 或 app/ 目录"
+                data-testid="extensions-zip-install"
+                onClick={() => void importExtensionZip()}
+              >{archiveBusy === 'zip' ? '正在安装…' : '安装扩展包 (.zip)'}</button>
+              <p className="extensions-zip-hint" data-testid="extensions-zip-hint">单个扩展 ZIP：包根（或唯一顶层文件夹）内需有 pipiui-extension.json 与 agent/ 或 app/；安装后自动对当前项目启用。</p>
+            </>
           )}
         </div>
       )}
