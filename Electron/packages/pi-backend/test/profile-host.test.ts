@@ -190,6 +190,21 @@ describe("Product Profile host interface", () => {
       "webview-browser-extension",
       "agent-orchestration",
       "git-capability",
+      // Bundled platform layers and provider/utility extensions the Coding
+      // product ships with: a coding project must not lose grok/deepseek
+      // provider contributions (or memory/office/pdf) just because its
+      // ext-enabled.json carries no per-project overrides.
+      "pi-ext",
+      "pi-goal",
+      "pi-philosophy",
+      "built-in-skills",
+      "grok-build-oauth",
+      "deepseek",
+      "memory-extension",
+      "office-extension",
+      "pdf-extension",
+      "cua-extension",
+      "web-search-keys",
     ]) {
       expect(codingExtensions.find(item => item.id === id)?.state).toBe("enabled");
     }
