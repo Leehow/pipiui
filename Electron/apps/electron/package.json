@@ -102,6 +102,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/git-capability",
+        "to": "pipiui-runtime/extensions/git-capability",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/extensions/deepseek",
         "to": "pipiui-runtime/extensions/deepseek",
         "filter": [
