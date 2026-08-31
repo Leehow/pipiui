@@ -29,11 +29,11 @@
   --bp-bg: #e0e0e6;
 }
 
-[data-theme='dark'] .balance-pill {
+[data-scheme='dark'] .balance-pill {
   --bp-text: #c6cbd6;
   --bp-bg: #2a2a2e;
 }
 
-[data-theme='dark'] .balance-pill:hover {
+[data-scheme='dark'] .balance-pill:hover {
   --bp-bg: #34343a;
 }

@@ -1,7 +1,7 @@
 /*
  * SessionStatsPill — self-contained styles. Do not edit app.css; this file
  * carries its own light/dark tokens and only relies on the host app's
- * `[data-theme]` attribute on an ancestor (like `main.pipiui-shell`).
+ * `[data-scheme]` attribute on an ancestor (like `main.pipiui-shell`).
  */
 
 .session-stats-pill {
@@ -33,7 +33,7 @@
   user-select: none;
 }
 
-[data-theme='dark'] .session-stats-pill {
+[data-scheme='dark'] .session-stats-pill {
   --ssp-text: #c7c9d4;
   --ssp-text-muted: #7d7f8c;
   --ssp-accent: #8a9df0;

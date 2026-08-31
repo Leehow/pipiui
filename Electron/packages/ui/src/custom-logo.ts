@@ -6,20 +6,25 @@ export const LOGO_CHANGED_EVENT = 'pipiui:logo-changed'
 const MAX_LOGO_HEIGHT = 96
 
 export function readCustomLogo(): string | null {
-  return localStorage.getItem(LOGO_STORAGE_KEY)
+  try { return localStorage.getItem(LOGO_STORAGE_KEY) } catch { /* storage unavailable: fall back to the default wordmark */ }
+  return null
 }
 
 /** null = 恢复默认。同窗口监听 'pipiui:logo-changed' 即时刷新。 */
 export function writeCustomLogo(dataUrl: string | null): void {
-  if (dataUrl === null) localStorage.removeItem(LOGO_STORAGE_KEY)
-  else localStorage.setItem(LOGO_STORAGE_KEY, dataUrl)
-  window.dispatchEvent(new Event(LOGO_CHANGED_EVENT))
+  try {
+    if (dataUrl === null) localStorage.removeItem(LOGO_STORAGE_KEY)
+    else localStorage.setItem(LOGO_STORAGE_KEY, dataUrl)
+  } catch { /* storage unavailable: keep the in-memory choice */ }
+  window.dispatchEvent(new CustomEvent(LOGO_CHANGED_EVENT, { detail: dataUrl }))
 }
 
 export function useCustomLogo(): string | null {
   const [logo, setLogo] = useState<string | null>(() => readCustomLogo())
   useEffect(() => {
-    const onChange = () => setLogo(readCustomLogo())
+    // Trust the event payload (not a storage re-read) so a broken store cannot
+    // clobber the in-memory logo the writer just broadcast.
+    const onChange = (event: Event) => setLogo((event as CustomEvent<string | null>).detail ?? null)
     window.addEventListener(LOGO_CHANGED_EVENT, onChange)
     return () => window.removeEventListener(LOGO_CHANGED_EVENT, onChange)
   }, [])

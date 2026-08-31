@@ -22,8 +22,8 @@ function ThemeMock() {
   )
 }
 
-/** 主题预览卡。themeId 为具体主题 id 时写在容器 data-theme 上（变量随卡片
- *  主题解析）；null 表示 system 卡，由内部左右半分各自携带 dark/light。 */
+/** 主题预览卡。themeId 为具体主题 id 时写在容器 data-theme/data-scheme 上（变量随卡片
+ *  主题解析，scheme 供暗色组件样式命中）；null 表示 system 卡，由内部左右半分各自携带 dark/light。 */
 function ThemeCard({ themeId, selected, name, description, onPick, children }: {
   themeId: string | null
   selected: boolean
@@ -32,11 +32,12 @@ function ThemeCard({ themeId, selected, name, description, onPick, children }: {
   onPick: () => void
   children: ReactNode
 }) {
+  const scheme = themeId ? BUILTIN_THEMES.find(def => def.id === themeId)?.scheme : undefined
   return (
     <button
       type="button"
       className={`tsp-card${selected ? ' selected' : ''}`}
-      {...(themeId ? { 'data-theme': themeId } : {})}
+      {...(themeId ? { 'data-theme': themeId, 'data-scheme': scheme } : {})}
       data-testid={`theme-card-${themeId ?? SYSTEM_THEME_VALUE}`}
       aria-pressed={selected}
       onClick={onPick}
@@ -95,7 +96,18 @@ function BrandLogoSection() {
             </button>
           </div>
           <p className="tsp-logo-hint">仅替换工作台左上角标志</p>
-          {logoError && <p className="tsp-logo-error" role="alert">{logoError}</p>}
+          {logoError && (
+            <p className="tsp-logo-error" role="alert">
+              <span className="tsp-logo-error-text">{logoError}</span>
+              <button
+                type="button"
+                className="tsp-logo-error-close"
+                aria-label="关闭错误提示"
+                data-testid="theme-logo-error-close"
+                onClick={() => setLogoError(null)}
+              >×</button>
+            </p>
+          )}
         </div>
       </div>
     </section>
@@ -110,7 +122,7 @@ export function ThemeSettingsPane() {
     <div className="tsp-root">
       <section className="tsp-section" data-testid="theme-current-section">
         <h3 className="tsp-section-title">当前主题</h3>
-        <div className="tsp-current" data-theme={theme}>
+        <div className="tsp-current" data-theme={theme} data-scheme={currentDef.scheme}>
           <div className="tsp-current-preview"><ThemeMock /></div>
           <div className="tsp-current-info">
             <div className="tsp-current-name-row">
@@ -133,8 +145,8 @@ export function ThemeSettingsPane() {
             onPick={() => setThemeSelection(SYSTEM_THEME_VALUE)}
           >
             <div className="tsp-sys-split">
-              <div className="tsp-sys-half" data-theme="dark"><ThemeMock /></div>
-              <div className="tsp-sys-half" data-theme="light"><ThemeMock /></div>
+              <div className="tsp-sys-half" data-theme="dark" data-scheme="dark"><ThemeMock /></div>
+              <div className="tsp-sys-half" data-theme="light" data-scheme="light"><ThemeMock /></div>
             </div>
           </ThemeCard>
           {BUILTIN_THEMES.map(def => (

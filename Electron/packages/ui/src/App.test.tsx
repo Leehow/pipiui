@@ -1979,11 +1979,13 @@ describe('PipiUI main layout', () => {
       const view = render(<App host={createMockHost()} />)
       await screen.findAllByText('Electron 三栏界面')
       expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-scheme')).toBe('light')
       // Toggle ON: switches immediately, renames to the reverse action, stores the choice.
       let toggle = screen.getByTestId('sidebar-theme-toggle')
       expect(toggle.getAttribute('aria-label')).toBe('切换到深色模式')
       fireEvent.click(toggle)
       expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('dark')
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-scheme')).toBe('dark')
       toggle = screen.getByTestId('sidebar-theme-toggle')
       expect(toggle.getAttribute('aria-label')).toBe('切换到浅色模式')
       expect(toggle.getAttribute('title')).toBe('切换到浅色模式')
@@ -1992,6 +1994,7 @@ describe('PipiUI main layout', () => {
       // choice must win over the conflicting system resolution.
       fireEvent.click(screen.getByTestId('sidebar-theme-toggle'))
       expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-theme')).toBe('light')
+      expect(view.container.querySelector('.pipiui-shell')?.getAttribute('data-scheme')).toBe('light')
       expect(window.localStorage.getItem('pipiui.theme')).toBe('light')
       Object.defineProperty(media, 'matches', { value: true, configurable: true })
       listener?.({ matches: true } as MediaQueryListEvent)

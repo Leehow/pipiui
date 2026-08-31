@@ -2,7 +2,7 @@
  * MessageQueue — self-contained compact queue strip above the composer.
  * Mirrors Swift `InputBar.queueStrip`: a slim bar (`排队 N 条` + first-item
  * preview) with an expandable per-item list. No dependency on app.css; this
- * file carries its own light/dark tokens and follows the host's `[data-theme]`
+ * file carries its own light/dark tokens and follows the host's `[data-scheme]`
  * attribute (with a standalone prefers-color-scheme fallback).
  */
 
@@ -39,7 +39,7 @@
   overflow: hidden;
 }
 
-[data-theme='dark'] .message-queue {
+[data-scheme='dark'] .message-queue {
   --mq-text: #c7c9d4;
   --mq-text-muted: #7d7f8c;
   --mq-text-strong: #f0f1f5;

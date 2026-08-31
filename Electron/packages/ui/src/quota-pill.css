@@ -29,12 +29,12 @@
   --qp-bg: #e0e0e6;
 }
 
-[data-theme='dark'] .quota-pill {
+[data-scheme='dark'] .quota-pill {
   --qp-text: #c6cbd6;
   --qp-bg: #2a2a2e;
 }
 
-[data-theme='dark'] .quota-pill:hover {
+[data-scheme='dark'] .quota-pill:hover {
   --qp-bg: #34343a;
 }
 

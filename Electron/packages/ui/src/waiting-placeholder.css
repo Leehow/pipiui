@@ -3,7 +3,7 @@
  * Echoes pi's `Working... (esc to interrupt)` and Swift `WaitingPlaceholderView`
  * (small progress indicator + copy + elapsed), upgraded to a deterministic
  * 3-bar waveform with phase-aware copy. Self-contained styles: no app.css
- * dependency; light/dark tokens follow the host `[data-theme]` ancestor with a
+ * dependency; light/dark tokens follow the host `[data-scheme]` ancestor with a
  * standalone prefers-color-scheme fallback. Reduced motion (media query, or the
  * `reduceMotion` prop → `.is-reduce-motion`) drops translation/scale animation
  * and keeps only a static opacity pulse.
@@ -54,7 +54,7 @@
   padding-bottom: var(--waiting-row-reserve);
 }
 
-[data-theme='dark'] .waiting-placeholder {
+[data-scheme='dark'] .waiting-placeholder {
   --wp-text: #c7c9d4;
   --wp-text-muted: #7d7f8c;
   --wp-accent: #8a9df0;
