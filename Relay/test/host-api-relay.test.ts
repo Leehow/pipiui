@@ -144,12 +144,22 @@ async function openHost(
   hostToken: string,
   pairSecret: string,
 ): Promise<WebSocket> {
+  const { socket } = await openHostWithReady(url, roomID, hostToken, pairSecret);
+  return socket;
+}
+
+async function openHostWithReady(
+  url: string,
+  roomID: string,
+  hostToken: string,
+  pairSecret: string,
+): Promise<{ socket: WebSocket; ready: Record<string, unknown> }> {
   const socket = await connect(url);
   socket.send(JSON.stringify(hello(roomID, hostToken, pairSecret)));
   const ready = await nextFrame(socket);
   assert.equal(ready.type, "ready");
   assert.equal(ready.v, 2);
-  return socket;
+  return { socket, ready };
 }
 
 function cookieHeader(setCookie: string | null): string {
@@ -577,7 +587,7 @@ test("wrong direction, version, and over-limit frames are rejected", async () =>
   }
 });
 
-test("TTL expiry and explicit host end close the room", async () => {
+test("attached host survives TTL; the room expires once the host leaves", async () => {
   const roomID = randomUUID();
   const relay = await fixture({ v2TTLMs: 250 });
   const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
@@ -585,13 +595,17 @@ test("TTL expiry and explicit host end close the room", async () => {
   const browser = await connect(relay.browserURL, cookie);
   await nextFrame(host);
   try {
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(host.readyState, WebSocket.OPEN, "attached host was expired mid-session");
+    assert.equal(browser.readyState, WebSocket.OPEN, "browser was expired while host attached");
+    assert.equal(relay.instance.getV2RoomCount(), 1, "active room was dropped");
+    assert.equal((await claim(relay.origin, roomID, secretA)).status, 204);
     const hostClosed = once(host, "close");
-    const browserClosed = once(browser, "close");
+    host.close();
     await hostClosed;
-    await browserClosed;
     await waitUntil(
       () => relay.instance.getV2RoomCount() === 0,
-      "expired room was retained",
+      "hostless room was retained",
     );
     const lateClaim = await claim(relay.origin, roomID, secretA);
     assert.equal(lateClaim.status, 403);
@@ -618,6 +632,30 @@ test("TTL expiry and explicit host end close the room", async () => {
     assert.equal((await claim(relay2.origin, room2, secretA)).status, 403);
   } finally {
     await relay2.close();
+  }
+});
+
+test("host re-hello refreshes the room expiry", async () => {
+  const roomID = randomUUID();
+  const relay = await fixture({ v2TTLMs: 250 });
+  const host1 = await openHostWithReady(relay.hostURL, roomID, hostTokenA, secretA);
+  const firstExpiry = host1.ready.expiresAt;
+  assert.equal(typeof firstExpiry, "number");
+  host1.socket.close();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const host2 = await openHostWithReady(relay.hostURL, roomID, hostTokenA, secretA);
+  try {
+    assert.ok(
+      (host2.ready.expiresAt as number) > (firstExpiry as number),
+      "re-hello did not refresh the room expiry",
+    );
+    host2.socket.close();
+    await waitUntil(
+      () => relay.instance.getV2RoomCount() === 0,
+      "hostless room was retained",
+    );
+  } finally {
+    await relay.close();
   }
 });
 

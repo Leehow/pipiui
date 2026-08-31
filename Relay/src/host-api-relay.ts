@@ -218,6 +218,22 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     room.grantHash = undefined;
   };
 
+  /** (Re)arm the room TTL. The timer re-arms instead of expiring whenever a
+   * host is attached, so an active remote session never expires mid-use. */
+  const armExpiry = (room: Room): void => {
+    clearTimeout(room.expiryTimer);
+    room.expiresAt = now() + ttlMs;
+    const timer = setTimeout(() => {
+      if (rooms.get(room.roomID) === room && room.host) {
+        armExpiry(room);
+        return;
+      }
+      expireRoom(room, "expired");
+    }, ttlMs);
+    timer.unref();
+    room.expiryTimer = timer;
+  };
+
   const expireRoom = (
     room: Room,
     reason: "end" | "expired" | "server_stopped",
@@ -315,6 +331,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       existing.host = peer;
       peer.roomID = existing.roomID;
       peer.hostEpoch = existing.hostEpoch;
+      armExpiry(existing);
       if (previous && previous !== peer) {
         sendControl(previous, { v: 2, type: "replaced", hostEpoch: existing.hostEpoch });
         closePeer(previous, 4001, "replaced");
@@ -348,14 +365,12 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       browser: null,
       hostEpoch: 1,
       browserGeneration: 0,
-      expiresAt: now() + ttlMs,
-      expiryTimer: setTimeout(() => {}, ttlMs),
+      expiresAt: 0,
+      expiryTimer: setTimeout(() => {}),
       inflight: new Set(),
     };
-    clearTimeout(room.expiryTimer);
-    room.expiryTimer = setTimeout(() => expireRoom(room, "expired"), ttlMs);
-    room.expiryTimer.unref();
     rooms.set(room.roomID, room);
+    armExpiry(room);
     peer.roomID = room.roomID;
     peer.hostEpoch = room.hostEpoch;
     sendControl(peer, {
