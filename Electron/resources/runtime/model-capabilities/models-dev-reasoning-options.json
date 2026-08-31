@@ -257,6 +257,101 @@
           }
         }
       }
+    },
+    "openai-codex": {
+      "models": {
+        "gpt-5.6-sol": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.6-sol and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh", "max"],
+            "rejectedValues": ["minimal"],
+            "result": "Accepted values returned HTTP 200 response.created. 'minimal' returned HTTP 400 Unsupported value naming the supported set 'none', 'low', 'medium', 'high', 'xhigh', 'max'. Upstream pi ships a sparse thinkingLevelMap {xhigh, max, minimal:'low'} whose absent keys mean pass-through, so low/medium/high are valid wire values the picker must offer."
+          }
+        },
+        "gpt-5.6-luna": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.6-luna and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh", "max"],
+            "rejectedValues": ["minimal"],
+            "result": "Same probe run as gpt-5.6-sol: accepted values returned HTTP 200; 'minimal' returned HTTP 400 naming the supported set 'none', 'low', 'medium', 'high', 'xhigh', 'max'."
+          }
+        },
+        "gpt-5.6-terra": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh", "max"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.6-terra and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh", "max"],
+            "rejectedValues": ["minimal"],
+            "result": "Same probe run as gpt-5.6-sol: accepted values returned HTTP 200; 'minimal' returned HTTP 400 naming the supported set 'none', 'low', 'medium', 'high', 'xhigh', 'max'."
+          }
+        },
+        "gpt-5.5": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.5 and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh"],
+            "rejectedValues": ["minimal", "max"],
+            "result": "Accepted values returned HTTP 200. 'minimal' and 'max' returned HTTP 400 naming the supported set 'none', 'low', 'medium', 'high', 'xhigh'."
+          }
+        },
+        "gpt-5.4": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.4 and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh"],
+            "rejectedValues": ["minimal", "max"],
+            "result": "Accepted values returned HTTP 200. 'minimal' and 'max' returned HTTP 400 naming the supported set 'none', 'low', 'medium', 'high', 'xhigh'."
+          }
+        },
+        "gpt-5.4-mini": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.4-mini and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh"],
+            "rejectedValues": ["minimal", "max"],
+            "result": "Accepted values returned HTTP 200. 'minimal' and 'max' returned HTTP 400 naming the supported set 'none', 'low', 'medium', 'high', 'xhigh'."
+          }
+        },
+        "gpt-5.3-codex-spark": {
+          "reasoning": true,
+          "reasoningOptions": [
+            { "type": "effort", "values": ["low", "medium", "high", "xhigh"] }
+          ],
+          "verification": {
+            "method": "Authenticated POST https://chatgpt.com/backend-api/codex/responses with model=gpt-5.3-codex-spark and a one-token prompt, varying reasoning.effort.",
+            "verifiedAt": "2026-08-31T13:44:00Z",
+            "acceptedValues": ["low", "medium", "high", "xhigh"],
+            "rejectedValues": ["minimal", "max"],
+            "result": "Accepted values returned HTTP 200. 'minimal' and 'max' returned HTTP 400 naming the supported set 'low', 'medium', 'high', 'xhigh'."
+          }
+        }
+      }
     }
   }
 }

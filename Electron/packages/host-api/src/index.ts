@@ -236,8 +236,12 @@ export function thinkingLevelsForModel(model: Model, reported?: readonly Thinkin
   if (model.reasoning === false || model.thinkingConfigurable === false) return [];
   const thinkingLevelMap = model.thinkingLevelMap;
   if (thinkingLevelMap) {
-    // Sparse maps (openai-codex GPT) define only the effort strings chatgpt.com accepts.
-    // Absent keys are not valid provider values — do not invent STANDARD levels for them.
+    // Full-map dialect: every THINKING_LEVELS key is either a provider value or null
+    // (= unsupported, hidden from the picker). Upstream pi also ships sparse maps
+    // (openai-codex GPT) whose absent keys mean pass-through, not unsupported — those
+    // must be expanded into full maps in the bundled capability snapshot before they
+    // reach here, or valid levels vanish from the picker. See
+    // resources/runtime/model-capabilities/models-dev-reasoning-options.json (openai-codex).
     return THINKING_LEVELS.filter(level => {
       if (Object.prototype.hasOwnProperty.call(thinkingLevelMap, level))
         return typeof thinkingLevelMap[level] === "string";

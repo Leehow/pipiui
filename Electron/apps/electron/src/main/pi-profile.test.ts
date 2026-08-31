@@ -390,6 +390,87 @@ describe('Electron Pi profile', () => {
     expect(offPayload).not.toHaveProperty('reasoning_effort')
   })
 
+  it('expands the sparse openai-codex map so GPT-5.6 offers the efforts chatgpt.com accepts', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-codex-effort-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    await mkdir(profile.agentDir, { recursive: true })
+    // models-store carries the model exactly as upstream pi ships it: a sparse
+    // thinkingLevelMap whose absent keys mean pass-through on the wire, not
+    // unsupported. Without the bundled expansion the picker offered only
+    // off/minimal/xhigh/max and hid the accepted low/medium/high.
+    await writeFile(join(profile.agentDir, 'models-store.json'), JSON.stringify({
+      'openai-codex': {
+        lastModified: 4102444800000,
+        checkedAt: 4102444800000,
+        models: [{
+          provider: 'openai-codex',
+          id: 'gpt-5.6-sol',
+          name: 'GPT-5.6 Sol',
+          api: 'openai-codex-responses',
+          baseUrl: 'https://chatgpt.com/backend-api',
+          reasoning: true,
+          input: ['text', 'image'],
+          cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+          contextWindow: 272000,
+          maxTokens: 128000,
+          thinkingLevelMap: { xhigh: 'xhigh', max: 'max', minimal: 'low' }
+        }]
+      }
+    }))
+    const snapshotPath = join(process.cwd(), 'resources', 'runtime', 'model-capabilities', 'models-dev-reasoning-options.json')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+
+    const { ModelRuntime } = await import('@earendil-works/pi-coding-agent')
+    const runtime = await ModelRuntime.create({
+      modelsPath: join(profile.agentDir, 'models.json'),
+      modelsStorePath: join(profile.agentDir, 'models-store.json'),
+      allowModelNetwork: false
+    })
+    const model = runtime.getModel('openai-codex', 'gpt-5.6-sol')
+    expect(model).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: 'low',
+        medium: 'medium',
+        high: 'high',
+        xhigh: 'xhigh',
+        max: 'max'
+      },
+      compat: { supportsReasoningEffort: true }
+    })
+    expect(model?.thinkingLevelMap?.off).toBeUndefined()
+
+    // UI contract: every effort the backend accepts is selectable (off stays implicit);
+    // 'minimal' stays hidden because the backend rejects it (probe: HTTP 400 Unsupported value).
+    const { thinkingLevelsForModel } = await import('@pipi/host-api')
+    expect(thinkingLevelsForModel(model as any)).toEqual(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
+
+    // The previously hidden levels must actually reach the wire.
+    const { streamSimple } = await import('@earendil-works/pi-ai/api/openai-codex-responses')
+    const codexToken = ['header', Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acc-test' } })).toString('base64'), 'sig'].join('.')
+    const capture = async (reasoning: string): Promise<Record<string, unknown> | undefined> => {
+      let payload: Record<string, unknown> | undefined
+      const stream = streamSimple(model as any, {
+        messages: [{ role: 'user', content: 'probe', timestamp: Date.now() }]
+      }, {
+        apiKey: codexToken,
+        reasoning: reasoning as any,
+        maxTokens: 1,
+        onPayload: value => {
+          payload = value as unknown as Record<string, unknown>
+          throw new Error('payload captured before network')
+        }
+      })
+      await stream.result()
+      return payload
+    }
+    expect(await capture('high')).toMatchObject({ model: 'gpt-5.6-sol', reasoning: { effort: 'high' } })
+    // A stale session 'minimal' clamps to the nearest offered level, not to the
+    // rejected literal 'minimal'.
+    expect(await capture('minimal')).toMatchObject({ reasoning: { effort: 'low' } })
+  })
+
   it('wires a hand-curated deepseek map so thinking levels reach a non-pi-named effort vocabulary', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-profile-deepseek-effort-'))
     const profile = resolveElectronPiProfile(join(root, 'user-data'))
