@@ -48,6 +48,8 @@ export type BridgeHandlers = {
   onHostCapabilityMint?(event: Record<string, unknown>, sessionId: string): Promise<Record<string, unknown>> | Record<string, unknown>;
   /** Forwards existing vault host methods (list/put/mount/unmount/delete). */
   onVaultAction?(event: Record<string, unknown>, sessionId: string): Promise<unknown>;
+  /** Session-scoped open-document registry. Session id comes from the capability, never the body. */
+  onDocumentsList?(sessionId: string): Promise<unknown> | unknown;
   /** One-shot Structured Outputs take. Session id comes from the capability, never the body. */
   onStructuredOutput?(event: Record<string, unknown>, sessionId: string): Promise<unknown> | unknown;
   /**
@@ -257,6 +259,20 @@ export class HostBridge {
             ok: true,
             result: await (this.handlers.onStructuredOutput?.(event as Record<string, unknown>, sessionId)
               ?? Promise.resolve(null)),
+          });
+        } catch (error) {
+          return this.reply(response, 200, {
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      else if (body.action === "documents_list") {
+        try {
+          return this.reply(response, 200, {
+            ok: true,
+            result: await (this.handlers.onDocumentsList?.(sessionId)
+              ?? Promise.reject(new Error("documents list unavailable"))),
           });
         } catch (error) {
           return this.reply(response, 200, {

@@ -249,7 +249,7 @@ describe("session runtime teardown", () => {
       queueWrite: 1,
       sessionFileBarrier: 1,
       extensionMount: 1,
-      documentInjection: 1,
+      documentInjection: 0,
       openedDocuments: 1,
       inputBytes: Buffer.byteLength("attachment bytes"),
       inputUploads: 1,
@@ -371,7 +371,7 @@ describe("session runtime teardown", () => {
     await backend.close();
   });
 
-  it("rejects a late panel document drop and accepts a same-ID recreation", async () => {
+  it("records a panel document drop without pending injection and accepts a same-ID recreation", async () => {
     const setup = await fixture();
     const backend = createPiHostBackend({
       agentDir: setup.agentDir,
@@ -386,27 +386,12 @@ describe("session runtime teardown", () => {
     const internals = backend as any;
     const documentPath = join(setup.project, "late-panel.md");
     await writeFile(documentPath, "# panel document\n");
-    let releaseParser!: () => void;
-    let parserStarted!: () => void;
-    const parserGate = new Promise<void>((resolve) => { releaseParser = resolve; });
-    const parserStartedGate = new Promise<void>((resolve) => { parserStarted = resolve; });
-    let firstParserCall = true;
-    vi.spyOn(internals, "pdfParserMounted").mockImplementation(async () => {
-      if (firstParserCall) {
-        firstParserCall = false;
-        parserStarted();
-        await parserGate;
-      }
-      return false;
-    });
 
-    const lateDrop = backend.handle("notifyDocumentsDropped", ["s1", [documentPath]]);
-    await parserStartedGate;
-    expect(backend.runtimeStateCounts("s1")).toMatchObject({ openedDocuments: 0, documentInjection: 0 });
+    await backend.handle("notifyDocumentsDropped", ["s1", [documentPath]]);
+    expect(backend.runtimeStateCounts("s1")).toMatchObject({ openedDocuments: 1, documentInjection: 0 });
 
     const oldToken = internals.sessionRuntimeToken("s1");
-    const deleting = backend.handle("deleteSession", ["s1"]);
-    await deleting;
+    await backend.handle("deleteSession", ["s1"]);
     await writeFile(
       join(setup.sessionDir, "s1.jsonl"),
       `${JSON.stringify({ type: "session", version: 3, id: "s1", timestamp: "2026-08-28T00:00:00.000Z", cwd: setup.project })}\n`,
@@ -414,13 +399,10 @@ describe("session runtime teardown", () => {
     await backend.handle("resumeSession", ["s1"]);
     const newToken = internals.sessionRuntimeToken("s1");
     expect(newToken).not.toBe(oldToken);
-
-    releaseParser();
-    await expect(lateDrop).rejects.toThrow(/disposed/);
     expect(backend.runtimeStateCounts("s1")).toMatchObject({ openedDocuments: 0, documentInjection: 0 });
 
     await backend.handle("notifyDocumentsDropped", ["s1", [documentPath]]);
-    expect(backend.runtimeStateCounts("s1")).toMatchObject({ openedDocuments: 1, documentInjection: 1 });
+    expect(backend.runtimeStateCounts("s1")).toMatchObject({ openedDocuments: 1, documentInjection: 0 });
     await backend.close();
   });
 

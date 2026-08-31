@@ -33,6 +33,16 @@ describe("context-fold main-session mount", () => {
   });
 });
 
+describe("open documents extension mount", () => {
+  const openDocuments = "/runtime/extensions/pipiui-open-documents.ts";
+
+  it("always mounts the session document registry tool", () => {
+    const output = assemblePiSpawn({ cwd: "/tmp/project", paths: { openDocuments } });
+    expect(output.args).toEqual(["-e", openDocuments]);
+    expect(assemblePiSpawn({ cwd: "/tmp/project", paths: { openDocuments }, bridgePort: 1234 }).args).toEqual(["-e", openDocuments]);
+  });
+});
+
 describe("runtime info extension mount", () => {
   const runtimeInfo = "/runtime/extensions/pipiui-runtime-info.ts";
   const updateCenter = "/runtime/extensions/pipiui-update-center.ts";
@@ -75,6 +85,7 @@ describe("pdf-extension registry mount", () => {
     expect(resolveSpawnPaths(root)).not.toHaveProperty("firecrawlPdf");
     expect(resolveSpawnPaths(root)).not.toHaveProperty("pdfInspector");
     expect(resolveSpawnPaths(root).firecrawlAnydoc).toBe(join(root, "extensions", "pipiui-firecrawl-anydoc.ts"));
+    expect(resolveSpawnPaths(root).openDocuments).toBe(join(root, "extensions", "pipiui-open-documents.ts"));
     expect(resolveSpawnPaths(root).anydoc).toBe(join(root, "anydoc"));
     expect(existsSync(join(root, "extensions", "pipiui-firecrawl-pdf.ts"))).toBe(false);
   });

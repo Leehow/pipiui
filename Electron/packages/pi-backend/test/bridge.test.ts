@@ -109,6 +109,48 @@ describe("HostBridge", () => {
     })).status).toBe(403);
   });
 
+  it("lists open documents only for the capability-mapped session", async () => {
+    const received: Received[] = [];
+    bridge = new HostBridge({
+      onAgentEvent: () => undefined,
+      onDocumentsList: async (sessionId) => {
+        received.push({ channel: "documents", sessionId, payload: {} });
+        return {
+          documents: sessionId === "session-1"
+            ? [{ name: "notes.md", kind: "markdown", path: "/abs/notes.md", size: 4 }]
+            : [],
+        };
+      },
+    });
+    const port = await bridge.listen();
+    const capability = bridge.register("session-1");
+    const other = bridge.register("session-2");
+    const first = await post(port, {
+      schemaVersion: 1,
+      sessionCapability: capability,
+      action: "documents_list",
+      event: { sessionId: "forged" },
+    });
+    expect(await first.json()).toEqual({
+      ok: true,
+      result: { documents: [{ name: "notes.md", kind: "markdown", path: "/abs/notes.md", size: 4 }] },
+    });
+    expect(received.at(-1)).toEqual({ channel: "documents", sessionId: "session-1", payload: {} });
+    const second = await post(port, {
+      schemaVersion: 1,
+      sessionCapability: other,
+      action: "documents_list",
+      event: {},
+    });
+    expect(await second.json()).toEqual({ ok: true, result: { documents: [] } });
+    expect((await post(port, {
+      schemaVersion: 1,
+      sessionCapability: "forged",
+      action: "documents_list",
+      event: {},
+    })).status).toBe(403);
+  });
+
   it("routes vault actions to existing host methods without echoing values", async () => {
     const { port, received, bridge } = await started();
     const capability = bridge.register("session-1");

@@ -144,7 +144,7 @@ describe("explicit local document reads", () => {
     await backend.close();
   });
 
-  it("does not steer a busy live session; the injection stays pending for the next user prompt", async () => {
+  it("does not inject a panel-opened document even when the session is already busy", async () => {
     const backend = await fixture();
     const path = join(root, "notes.md");
     await writeFile(path, "# Busy panel document\n\n幼儿姓名：回归。\n");
@@ -159,10 +159,8 @@ describe("explicit local document reads", () => {
     expect(commandSpy).not.toHaveBeenCalled();
     const injections = (backend as { documentInjections: { takePending(sessionId: string): string | undefined } })
       .documentInjections;
-    const pending = injections.takePending("s1");
-    expect(pending).toContain(path);
-    expect(pending).toContain("Busy panel document");
     expect(injections.takePending("s1")).toBeUndefined();
+    expect(await backend.handle("listDocuments", [])).toMatchObject([{ path, name: "notes.md" }]);
     (backend as { live: Map<string, unknown> }).live.delete("s1");
     await backend.close();
   });
