@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { Model } from '@pipi/host-api'
+import type { Model, SubagentDebugInfo } from '@pipi/host-api'
 import { createMockHost } from './App'
 import { SubagentModelModal } from './SubagentModelModal'
 import type { ModelVisibilityController } from './useModelVisibility'
@@ -25,6 +25,19 @@ function visibility(): ModelVisibilityController {
     setHidden: async () => undefined,
     setProviderHidden: async () => undefined,
     dismissError: () => undefined,
+  }
+}
+
+function liveDebug(sessionId: string, toolName = 'read'): SubagentDebugInfo {
+  return {
+    available: true,
+    source: 'live',
+    sessionId,
+    capturedAt: 1234,
+    bossTools: [{ name: toolName, description: `${toolName} description` }],
+    toolCatalog: [{ name: toolName, description: `${toolName} description` }],
+    skills: [],
+    subagents: [],
   }
 }
 
@@ -79,5 +92,74 @@ describe('SubagentModelModal Debug mode', () => {
     expect(legacy.getByText('grep')).toBeTruthy()
     expect(legacy.getByText('edit')).toBeTruthy()
     expect(legacy.getByText('skill_load')).toBeTruthy()
+  })
+
+  it('opens live Debug even when the model-settings API rejects', async () => {
+    const host = createMockHost()
+    host.getSubagentModels = vi.fn(async () => { throw new Error('model catalog offline') })
+    host.getSubagentDebugInfo = vi.fn(async () => liveDebug('session-live', 'live-only-tool'))
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} sessionId="session-live" />)
+    await screen.findByText(/model catalog offline/)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Debug' }))
+
+    expect(await screen.findByTestId('subagent-debug-view')).toBeTruthy()
+    expect(screen.getByText('live-only-tool')).toBeTruthy()
+    expect(host.getSubagentDebugInfo).toHaveBeenCalledWith('session-live')
+  })
+
+  it('shows the no-session state without inventing a session id', async () => {
+    const host = createMockHost()
+    host.getSubagentDebugInfo = vi.fn(async (): Promise<SubagentDebugInfo> => ({
+      available: false,
+      reason: 'no-session',
+      bossTools: [],
+      toolCatalog: [],
+      skills: [],
+      subagents: [],
+    }))
+    render(<SubagentModelModal host={host} current={null} visibility={visibility()} onClose={() => undefined} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Debug' }))
+
+    expect(await screen.findByText(/当前没有打开的会话/)).toBeTruthy()
+    expect(host.getSubagentDebugInfo).toHaveBeenCalledWith(undefined)
+  })
+
+  it('surfaces a rejected Debug read and refreshes to a live snapshot', async () => {
+    const host = createMockHost()
+    host.getSubagentDebugInfo = vi.fn()
+      .mockRejectedValueOnce(new Error('snapshot transport rejected'))
+      .mockResolvedValueOnce(liveDebug('session-refresh', 'after-refresh-tool'))
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} sessionId="session-refresh" />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Debug' }))
+    expect(await screen.findByText(/snapshot transport rejected/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: '刷新 Debug 信息' }))
+
+    expect(await screen.findByText('after-refresh-tool')).toBeTruthy()
+    expect(host.getSubagentDebugInfo).toHaveBeenCalledTimes(2)
+  })
+
+  it('discards a delayed snapshot after switching sessions', async () => {
+    const host = createMockHost()
+    let resolveFirst!: (value: SubagentDebugInfo) => void
+    const first = new Promise<SubagentDebugInfo>(resolve => { resolveFirst = resolve })
+    host.getSubagentDebugInfo = vi.fn((sessionId?: string) => (
+      sessionId === 'session-a' ? first : Promise.resolve(liveDebug('session-b', 'session-b-tool'))
+    ))
+    const props = { host, current: gpt, visibility: visibility(), onClose: () => undefined }
+    const rendered = render(<SubagentModelModal {...props} sessionId="session-a" />)
+    fireEvent.click(screen.getByRole('button', { name: 'Debug' }))
+    await waitFor(() => expect(host.getSubagentDebugInfo).toHaveBeenCalledWith('session-a'))
+
+    rendered.rerender(<SubagentModelModal {...props} sessionId="session-b" />)
+    expect(await screen.findByText('session-b-tool')).toBeTruthy()
+    resolveFirst(liveDebug('session-a', 'stale-session-a-tool'))
+    await Promise.resolve()
+
+    expect(screen.queryByText('stale-session-a-tool')).toBeNull()
+    expect(screen.getByText('session-b-tool')).toBeTruthy()
+    expect(host.getSubagentDebugInfo).toHaveBeenCalledWith('session-b')
   })
 })

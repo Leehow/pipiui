@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  MAX_RUNTIME_DEBUG_BYTES,
   readSubagentDebugInfo,
   runtimeDebugSidecarPath,
 } from "../src/subagent-debug-info.js";
@@ -68,6 +69,29 @@ describe("subagent debug runtime snapshot", () => {
     });
 
     await writeFile(runtimeDebugSidecarPath(sessionPath), JSON.stringify({ version: 1, sessionId: "other" }));
+    expect(await readSubagentDebugInfo(sessionPath, "session-1")).toMatchObject({
+      available: false,
+      reason: "snapshot-invalid",
+    });
+  });
+
+  it("uses the same 1 MiB hard cap and rejects writer overflow sentinels", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-subagent-debug-budget-"));
+    const sessionPath = join(root, "session.jsonl");
+    expect(MAX_RUNTIME_DEBUG_BYTES).toBe(1024 * 1024);
+
+    await writeFile(runtimeDebugSidecarPath(sessionPath), "x".repeat(MAX_RUNTIME_DEBUG_BYTES + 1));
+    expect(await readSubagentDebugInfo(sessionPath, "session-1")).toMatchObject({
+      available: false,
+      reason: "snapshot-invalid",
+    });
+
+    await writeFile(runtimeDebugSidecarPath(sessionPath), JSON.stringify({
+      version: 1,
+      sessionId: "session-1",
+      unavailable: "snapshot-too-large",
+      capturedAt: 1234,
+    }));
     expect(await readSubagentDebugInfo(sessionPath, "session-1")).toMatchObject({
       available: false,
       reason: "snapshot-invalid",

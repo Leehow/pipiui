@@ -1,4 +1,4 @@
-import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -26,7 +26,13 @@ async function loadRuntimeInfo() {
   };
   const module = await import(EXTENSION);
   module.default(pi as never);
-  return { pi, tool, handlers, runtimeDebugSidecarPath: module.runtimeDebugSidecarPath };
+  return {
+    pi,
+    tool,
+    handlers,
+    runtimeDebugSidecarPath: module.runtimeDebugSidecarPath,
+    maxRuntimeDebugBytes: module.MAX_RUNTIME_DEBUG_BYTES,
+  };
 }
 
 function context(overrides: Record<string, unknown> = {}) {
@@ -208,6 +214,39 @@ describe("pipiui_runtime_info extension", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never writes an oversized runtime Debug snapshot", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-runtime-debug-budget-"));
+    const sessionFile = join(root, "session.jsonl");
+    try {
+      const { handlers, maxRuntimeDebugBytes, pi, runtimeDebugSidecarPath } = await loadRuntimeInfo();
+      expect(maxRuntimeDebugBytes).toBe(1024 * 1024);
+      pi.getAllTools.mockReturnValue(Array.from({ length: 80 }, (_, index) => ({
+        name: `large-tool-${index}`,
+        description: "x".repeat(20_000),
+        sourceInfo: { source: "fixture", scope: "temporary" },
+      })));
+      const ctx = context({
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionName: () => "Current session",
+          getSessionFile: () => sessionFile,
+        },
+      });
+
+      await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+
+      const sidecar = runtimeDebugSidecarPath(sessionFile);
+      expect((await stat(sidecar)).size).toBeLessThanOrEqual(maxRuntimeDebugBytes);
+      expect(JSON.parse(await readFile(sidecar, "utf8"))).toMatchObject({
+        version: 1,
+        sessionId: "session-1",
+        unavailable: "snapshot-too-large",
+      });
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });

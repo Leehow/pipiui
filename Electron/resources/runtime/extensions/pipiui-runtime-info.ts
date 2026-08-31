@@ -28,6 +28,11 @@ type ToolMetadata = {
 };
 
 export const RUNTIME_DEBUG_SIDECAR_SUFFIX = ".pipiui-runtime-debug.json";
+export const MAX_RUNTIME_DEBUG_BYTES = 1024 * 1024;
+const MAX_DEBUG_NAME_CHARS = 200;
+const MAX_DEBUG_DESCRIPTION_CHARS = 20_000;
+const MAX_DEBUG_COLLECTION_ENTRIES = 4_096;
+const MAX_DEBUG_NAMES_PER_SUBAGENT = 4_096;
 
 export function runtimeDebugSidecarPath(sessionFile: string): string {
   return `${sessionFile}${RUNTIME_DEBUG_SIDECAR_SUFFIX}`;
@@ -68,18 +73,89 @@ type RuntimeDebugResources = {
 
 type RuntimeDebugState = { signature: string; resources?: RuntimeDebugResources };
 
-function collectRuntimeDebugResources(pi: ExtensionAPI, ctx: ExtensionContext): RuntimeDebugResources {
+function boundedString(value: unknown, maximum: number): string {
+  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+
+function boundedNames(value: unknown): { names: string[]; oversized: boolean } {
+  const raw = Array.isArray(value) ? value : [];
+  if (raw.length > MAX_DEBUG_NAMES_PER_SUBAGENT) return { names: [], oversized: true };
+  const names = raw.flatMap(item => {
+    const name = boundedString(item, MAX_DEBUG_NAME_CHARS);
+    return name ? [name] : [];
+  });
+  return { names: [...new Set(names)], oversized: false };
+}
+
+function collectRuntimeDebugResources(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): { resources: RuntimeDebugResources; oversized: boolean } {
   const allTools = (pi.getAllTools?.() ?? []) as ToolMetadata[];
-  return {
-    tools: allTools.map(tool => ({
-      name: tool.name,
-      description: tool.description ?? "",
-      ...(tool.sourceInfo?.source ? { source: tool.sourceInfo.source } : {}),
+  const allSkills = listSkillCatalogMetadata();
+  const allSubagents = buildSubagentToolProjection(pi, ctx.cwd);
+  let oversized = allTools.length > MAX_DEBUG_COLLECTION_ENTRIES
+    || allSkills.length > MAX_DEBUG_COLLECTION_ENTRIES
+    || allSubagents.length > MAX_DEBUG_COLLECTION_ENTRIES;
+  const tools = allTools.slice(0, MAX_DEBUG_COLLECTION_ENTRIES).flatMap(tool => {
+    const name = boundedString(tool.name, MAX_DEBUG_NAME_CHARS);
+    if (!name) return [];
+    const source = boundedString(tool.sourceInfo?.source, MAX_DEBUG_NAME_CHARS);
+    return [{
+      name,
+      description: boundedString(tool.description, MAX_DEBUG_DESCRIPTION_CHARS),
+      ...(source ? { source } : {}),
       ...(tool.sourceInfo?.scope ? { scope: tool.sourceInfo.scope } : {}),
-    })),
-    skills: listSkillCatalogMetadata(),
-    subagents: buildSubagentToolProjection(pi, ctx.cwd),
+    }];
+  });
+  const skills = allSkills.slice(0, MAX_DEBUG_COLLECTION_ENTRIES).flatMap(skill => {
+    const name = boundedString(skill.name, MAX_DEBUG_NAME_CHARS);
+    return name ? [{
+      name,
+      description: boundedString(skill.description, MAX_DEBUG_DESCRIPTION_CHARS),
+      userInvoked: skill.userInvoked,
+    }] : [];
+  });
+  const subagents = allSubagents.slice(0, MAX_DEBUG_COLLECTION_ENTRIES).flatMap(subagent => {
+    const name = boundedString(subagent.name, MAX_DEBUG_NAME_CHARS);
+    const tools = boundedNames(subagent.tools);
+    const excludedTools = boundedNames(subagent.excludedTools);
+    oversized ||= tools.oversized || excludedTools.oversized;
+    if (!name || tools.oversized || excludedTools.oversized) return [];
+    return [{
+      name,
+      toolPolicy: subagent.toolPolicy,
+      tools: tools.names,
+      ...(subagent.toolPolicy === "unrestricted" ? { excludedTools: excludedTools.names } : {}),
+    }];
+  });
+  return {
+    resources: { tools, skills, subagents },
+    oversized,
   };
+}
+
+function snapshotFitsBudget(snapshot: {
+  version: 1;
+  sessionId: string;
+  activeTools: string[];
+} & RuntimeDebugResources): boolean {
+  // Measure one bounded item at a time. This avoids constructing a multi-megabyte
+  // JSON string merely to discover that the reader will reject it.
+  let bytes = Buffer.byteLength(JSON.stringify({
+    version: snapshot.version,
+    sessionId: snapshot.sessionId,
+    activeTools: [],
+    tools: [],
+    skills: [],
+    subagents: [],
+    capturedAt: Number.MAX_SAFE_INTEGER,
+  }), "utf8");
+  for (const item of [snapshot.activeTools, snapshot.tools, snapshot.skills, snapshot.subagents].flat()) {
+    bytes += Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
+    if (bytes > MAX_RUNTIME_DEBUG_BYTES) return false;
+  }
+  return true;
 }
 
 function writeRuntimeDebugSnapshot(
@@ -91,18 +167,31 @@ function writeRuntimeDebugSnapshot(
   const sessionFile = ctx.sessionManager.getSessionFile?.();
   if (!sessionFile) return previous;
   try {
-    const resources = refreshResources || !previous.resources
+    const collected = refreshResources || !previous.resources
       ? collectRuntimeDebugResources(pi, ctx)
-      : previous.resources;
-    const snapshot = {
-      version: 1,
+      : { resources: previous.resources, oversized: false };
+    const rawActiveTools = pi.getActiveTools();
+    const activeTools = rawActiveTools.slice(0, MAX_DEBUG_COLLECTION_ENTRIES).flatMap(value => {
+      const name = boundedString(value, MAX_DEBUG_NAME_CHARS);
+      return name ? [name] : [];
+    });
+    const candidate = {
+      version: 1 as const,
       sessionId: ctx.sessionManager.getSessionId(),
-      activeTools: pi.getActiveTools(),
-      ...resources,
+      activeTools,
+      ...collected.resources,
     };
+    const oversized = collected.oversized
+      || rawActiveTools.length > MAX_DEBUG_COLLECTION_ENTRIES
+      || !snapshotFitsBudget(candidate);
+    const snapshot = oversized
+      ? { version: 1 as const, sessionId: candidate.sessionId, unavailable: "snapshot-too-large" as const }
+      : candidate;
     const signature = JSON.stringify(snapshot);
+    const resources = oversized ? undefined : collected.resources;
     if (signature === previous.signature) return { signature, resources };
     const content = Buffer.from(JSON.stringify({ ...snapshot, capturedAt: Date.now() }), "utf8");
+    if (content.byteLength > MAX_RUNTIME_DEBUG_BYTES) return previous;
     const noFollow = (fsConstants as { O_NOFOLLOW?: number }).O_NOFOLLOW ?? 0;
     const fd = openSync(runtimeDebugSidecarPath(sessionFile), fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | noFollow, 0o600);
     try {

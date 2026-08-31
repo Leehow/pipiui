@@ -4,7 +4,7 @@ import { open, rm } from "node:fs/promises";
 import type { AgentDebugSkill, AgentDebugSubagent, AgentDebugTool, SubagentDebugInfo } from "@pipi/host-api";
 
 export const RUNTIME_DEBUG_SIDECAR_SUFFIX = ".pipiui-runtime-debug.json";
-const MAX_RUNTIME_DEBUG_BYTES = 1024 * 1024;
+export const MAX_RUNTIME_DEBUG_BYTES = 1024 * 1024;
 const MAX_NAME_CHARS = 200;
 const MAX_DESCRIPTION_CHARS = 20_000;
 
@@ -97,6 +97,7 @@ export async function readSubagentDebugInfo(sessionPath: string, expectedSession
       await handle.close();
     }
     const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed.unavailable === "snapshot-too-large") return unavailable("snapshot-invalid");
     if (parsed.version !== 1 || parsed.sessionId !== expectedSessionId) return unavailable("snapshot-invalid");
 
     const toolCatalog = uniqueByName((Array.isArray(parsed.tools) ? parsed.tools : []).flatMap(value => {

@@ -143,22 +143,25 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
           <button type="button" className="subagent-debug-toggle" aria-pressed={mode === 'debug'} onClick={() => setMode(value => value === 'debug' ? 'models' : 'debug')}>{mode === 'debug' ? '模型设置' : 'Debug'}</button>
           <button className="subagent-modal-close" aria-label={mode === 'debug' ? '关闭 Subagent Debug' : '关闭 Subagent 模型'} onClick={onClose}>×</button>
         </header>
-        {!available ? (
-          <div className="subagent-modal-state" role="alert">{error ?? '当前连接不支持 Subagent 模型设置。'}</div>
-        ) : loading || (mode === 'models' && visibility.loading) ? (
-          <div className="subagent-modal-state">正在加载 {mode === 'debug' ? 'Subagent Debug 信息' : 'Subagent 模型设置'}…</div>
-        ) : mode === 'models' && visibility.error ? (
-          <div className="subagent-modal-state" role="alert">无法读取模型管理中的已启用模型：{visibility.error}</div>
-        ) : (
+        {mode === 'debug' ? (
           <div className="subagent-modal-body">
-            {mode === 'debug' ? <SubagentDebugView
+            <SubagentDebugView
               agents={agents}
               info={debugInfo}
               loading={debugLoading}
               error={debugError}
               onDismissError={() => setDebugError(null)}
               onRefresh={() => setDebugEpoch(value => value + 1)}
-            /> : <>
+            />
+          </div>
+        ) : !available ? (
+          <div className="subagent-modal-state" role="alert">{error ?? '当前连接不支持 Subagent 模型设置。'}</div>
+        ) : loading || visibility.loading ? (
+          <div className="subagent-modal-state">正在加载 Subagent 模型设置…</div>
+        ) : visibility.error ? (
+          <div className="subagent-modal-state" role="alert">无法读取模型管理中的已启用模型：{visibility.error}</div>
+        ) : (
+          <div className="subagent-modal-body">
             <div className="subagent-main-model">
               {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.provider}/{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
             </div>
@@ -203,7 +206,6 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
             </section>}
             <ProjectSubagentGroup agents={projectAgents} settings={settings} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
-            </>}
           </div>
         )}
       </section>
