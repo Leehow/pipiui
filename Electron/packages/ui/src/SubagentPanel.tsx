@@ -386,10 +386,180 @@ function detailTaskTitle(agent: Agent, result: string): string {
   return identity === 'subagent' ? '子任务' : identity
 }
 
+export type CloseoutListItem = { item: string; reason?: string; verify?: string }
+export type CloseoutSummary = {
+  closeout: string
+  integrationVerify?: string
+  commit?: string
+  committedPaths: string[]
+  remainingDirtyPaths: string[]
+  cleanedBranches: string[]
+  cleanedWorktrees: string[]
+  retained: CloseoutListItem[]
+  needsFixer: CloseoutListItem[]
+  needsUser: CloseoutListItem[]
+  docsUpdated: string[]
+  residualRisks: CloseoutListItem[]
+}
+
+/** Keys the secretary closeout contract (agents/secretary/AGENT.md) emits, one `key=value` per line. */
+const closeoutKeySet = new Set(['closeout', 'integration_verify', 'commit', 'committed_paths', 'remaining_dirty_paths', 'cleaned_branches', 'cleaned_worktrees', 'retained', 'needs_fixer', 'needs_user', 'docs_updated', 'residual_risks'])
+
+function closeoutScalarList(raw: string): string[] {
+  const text = raw.trim()
+  if (!text || text === '[]') return []
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (Array.isArray(parsed)) return parsed.map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry))
+  } catch { /* models may emit non-strict JSON; keep the raw text below */ }
+  return [text]
+}
+
+function closeoutItemList(raw: string): CloseoutListItem[] {
+  const text = raw.trim()
+  if (!text || text === '[]') return []
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (Array.isArray(parsed)) {
+      return parsed.map((entry): CloseoutListItem => {
+        if (typeof entry === 'string') return { item: entry }
+        if (entry && typeof entry === 'object') {
+          const record = entry as Record<string, unknown>
+          const item = String(record.item ?? record.name ?? '').trim()
+          if (!item) return { item: JSON.stringify(entry) }
+          const reason = record.reason === undefined || record.reason === null ? undefined : String(record.reason)
+          const verify = record.verify === undefined || record.verify === null ? undefined : String(record.verify)
+          return reason === undefined && verify === undefined ? { item } : { item, reason, verify }
+        }
+        return { item: String(entry) }
+      }).filter(entry => entry.item)
+    }
+  } catch { /* keep the raw text below */ }
+  return [{ item: text }]
+}
+
+/**
+ * Recognizes the secretary's terminal closeout summary — the machine-readable
+ * `key=value` block its AGENT.md contract requires it to return first — and
+ * splits the surrounding prose so the detail view can render a structured
+ * card instead of a newline-collapsed wall of contract text.
+ */
+export function parseCloseoutSummary(text: string): { summary: CloseoutSummary; preamble: string; remainder: string } | null {
+  const lines = visibleAgentText(text).split(/\r?\n/)
+  // A fenced code block quoting the contract template must not become a card.
+  let fenced = false
+  const keyFlags = lines.map(line => {
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced
+    if (fenced) return null
+    const match = line.match(/^\s*([a-z_]+)\s*=/)
+    return match && closeoutKeySet.has(match[1]) ? match[1] : null
+  })
+  let start = -1
+  let end = -1
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!keyFlags[index]) continue
+    let stop = index
+    while (stop + 1 < lines.length && keyFlags[stop + 1]) stop += 1
+    const blockKeys = new Set(keyFlags.slice(index, stop + 1).filter((key): key is string => Boolean(key)))
+    if (blockKeys.size >= 2 && blockKeys.has('closeout')) { start = index; end = stop; break }
+    index = stop
+  }
+  if (start < 0) return null
+  const fields = new Map<string, string>()
+  for (let cursor = start; cursor <= end; cursor += 1) {
+    const match = lines[cursor].match(/^\s*([a-z_]+)\s*=\s*(.*)$/)
+    if (match) fields.set(match[1], match[2].trim())
+  }
+  // The contract template writes `closeout=pass | needs-action | blocked`; a
+  // literal echo of the template is not a result. Take the concrete value
+  // before any `|`.
+  const firstToken = (raw: string | undefined) => raw?.split('|')[0]?.trim() || ''
+  const closeout = firstToken(fields.get('closeout'))
+  if (!closeout) return null
+  const summary: CloseoutSummary = {
+    closeout,
+    ...(fields.has('integration_verify') ? { integrationVerify: firstToken(fields.get('integration_verify')) } : {}),
+    ...(fields.has('commit') ? { commit: firstToken(fields.get('commit')) } : {}),
+    committedPaths: closeoutScalarList(fields.get('committed_paths') ?? '[]'),
+    remainingDirtyPaths: closeoutScalarList(fields.get('remaining_dirty_paths') ?? '[]'),
+    cleanedBranches: closeoutScalarList(fields.get('cleaned_branches') ?? '[]'),
+    cleanedWorktrees: closeoutScalarList(fields.get('cleaned_worktrees') ?? '[]'),
+    retained: closeoutItemList(fields.get('retained') ?? '[]'),
+    needsFixer: closeoutItemList(fields.get('needs_fixer') ?? '[]'),
+    needsUser: closeoutItemList(fields.get('needs_user') ?? '[]'),
+    docsUpdated: closeoutScalarList(fields.get('docs_updated') ?? '[]'),
+    residualRisks: closeoutItemList(fields.get('residual_risks') ?? '[]'),
+  }
+  return {
+    summary,
+    preamble: lines.slice(0, start).join('\n').trim(),
+    remainder: lines.slice(end + 1).join('\n').trim(),
+  }
+}
+
+const closeoutStateLabel: Record<string, { text: string; tone: 'ok' | 'warn' | 'error' }> = {
+  pass: { text: '收尾通过', tone: 'ok' },
+  'needs-action': { text: '需处理', tone: 'warn' },
+  blocked: { text: '受阻', tone: 'error' },
+}
+const closeoutVerifyLabel: Record<string, string> = { pass: '验证通过', fail: '验证失败', none: '无可执行验证' }
+
+function CloseoutPathGroup({ label, paths }: { label: string; paths: string[] }) {
+  if (!paths.length) return null
+  const list = <ul className="closeout-paths">{paths.map((path, index) => <li key={`${index}-${path}`}><code>{path}</code></li>)}</ul>
+  return <div className="closeout-group">
+    <span className="closeout-group-label">{label} <b>{paths.length}</b></span>
+    {paths.length > 6 ? <details><summary>展开全部</summary>{list}</details> : list}
+  </div>
+}
+
+function CloseoutItemGroup({ label, entries }: { label: string; entries: CloseoutListItem[] }) {
+  if (!entries.length) return null
+  return <div className="closeout-group">
+    <span className="closeout-group-label">{label} <b>{entries.length}</b></span>
+    <ul className="closeout-items">{entries.map((entry, index) => <li key={index}>{entry.item}{entry.reason ? <small> — {entry.reason}</small> : null}{entry.verify ? <small>（验证：{entry.verify}）</small> : null}</li>)}</ul>
+  </div>
+}
+
+function SecretaryCloseoutCard({ summary }: { summary: CloseoutSummary }) {
+  const state = closeoutStateLabel[summary.closeout] ?? { text: summary.closeout, tone: 'warn' as const }
+  const commit = summary.commit ?? ''
+  const commitMatch = commit.match(/^(created|already-clean):([0-9a-f]+)$/i)
+  return <div className={`secretary-closeout ${state.tone}`} data-testid="secretary-closeout-card">
+    <div className="secretary-closeout-head">
+      <span className={`closeout-state ${state.tone}`}>{state.text}</span>
+      {summary.integrationVerify && <span className={`closeout-verify ${summary.integrationVerify}`} title="integration_verify">{closeoutVerifyLabel[summary.integrationVerify] ?? summary.integrationVerify}</span>}
+      {commitMatch && <code className="closeout-commit" title={commitMatch[2]}>{commitMatch[1] === 'created' ? '提交' : '已是干净'} {commitMatch[2].slice(0, 10)}</code>}
+      {commit.startsWith('blocked:') && <span className="closeout-commit-blocked" title={commit}>提交受阻 · {commit.slice('blocked:'.length)}</span>}
+      {commit === 'not-required' && <span className="closeout-commit-na">无需提交</span>}
+    </div>
+    <CloseoutPathGroup label="提交路径" paths={summary.committedPaths} />
+    <CloseoutPathGroup label="保留未提交" paths={summary.remainingDirtyPaths} />
+    <CloseoutPathGroup label="已清理分支" paths={summary.cleanedBranches} />
+    <CloseoutPathGroup label="已清理工作树" paths={summary.cleanedWorktrees} />
+    <CloseoutPathGroup label="已更新文档" paths={summary.docsUpdated} />
+    <CloseoutItemGroup label="保留项" entries={summary.retained} />
+    <CloseoutItemGroup label="需修复" entries={summary.needsFixer} />
+    <CloseoutItemGroup label="需用户决策" entries={summary.needsUser} />
+    <CloseoutItemGroup label="残余风险" entries={summary.residualRisks} />
+  </div>
+}
+
+function SecretaryCloseoutResult({ parsed }: { parsed: { summary: CloseoutSummary; preamble: string; remainder: string } }) {
+  return <>
+    {parsed.preamble ? <AssistantTranscriptContent message={{ content: parsed.preamble }} expandSteps={false} /> : null}
+    <SecretaryCloseoutCard summary={parsed.summary} />
+    {parsed.remainder ? <AssistantTranscriptContent message={{ content: parsed.remainder }} expandSteps={false} /> : null}
+  </>
+}
+
 function agentTranscript(agent: Agent, finalResult: string): AssistantTranscriptMessage[] {
   // Build ONE unified message — exactly like the main agent transcript — so the
   // subagent detail reuses AssistantTranscriptContent verbatim: one "N 个步骤"
   // card containing all thinking + tools, followed by the text content.
+  // When finalResult itself is the secretary closeout contract block, the
+  // detail view renders it as a structured card instead.
+  const closeoutCard = parseCloseoutSummary(visibleAgentText(finalResult))
   const activities: TranscriptActivity[] = []
   const tools: TranscriptTool[] = []
   let nextIndex = 0
@@ -456,9 +626,13 @@ function agentTranscript(agent: Agent, finalResult: string): AssistantTranscript
         nextIndex = Math.max(nextIndex, contentIndex + 1)
       }
     } else if (text) {
-      const contentIndex = activityIndex(log)
-      activities.push({ type: 'text', id: `text:${log.id}`, contentIndex, content: text })
-      nextIndex = Math.max(nextIndex, contentIndex + 1)
+      // The raw closeout block would duplicate the structured card rendered from
+      // finalResult — drop the step copy when the card is coming.
+      if (!(closeoutCard && parseCloseoutSummary(text))) {
+        const contentIndex = activityIndex(log)
+        activities.push({ type: 'text', id: `text:${log.id}`, contentIndex, content: text })
+        nextIndex = Math.max(nextIndex, contentIndex + 1)
+      }
     }
   }
   const messages: AssistantTranscriptMessage[] = []
@@ -1454,9 +1628,16 @@ function AgentDetail({ agent, activeChildCount, aborting, now, projectPath, onOp
         {historyError && <div className="agent-log-scope agent-log-scope-error" data-testid="agent-log-scope-error" role="alert">{historyError}</div>}
         {/* Step groups default collapsed here — explicit false also suppresses the
             streaming auto-expand — so the boss expands each group manually. */}
-        {transcript.map((message, index) => <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}>{finalResultNeedsPlainText && message.content === output
-          ? <pre className="agent-final-result" data-testid="subagent-final-result-plain">{message.content}</pre>
-          : <AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} />}</article>)}
+        {transcript.map((message, index) => {
+          const closeout = message.content ? parseCloseoutSummary(message.content) : null
+          return <article className="message assistant-message" key={`${agent.runId}-transcript-${index}`}>
+            {closeout
+              ? <SecretaryCloseoutResult parsed={closeout} />
+              : finalResultNeedsPlainText && message.content === output
+                ? <pre className="agent-final-result" data-testid="subagent-final-result-plain">{message.content}</pre>
+                : <AssistantTranscriptContent message={message} expandSteps={false} documentBasePath={agent.worktree?.path || projectPath} onOpenDocument={onOpenDocument} />}
+          </article>
+        })}
       </div>
       <details className="agent-technical-details">
       <summary>技术详情</summary>

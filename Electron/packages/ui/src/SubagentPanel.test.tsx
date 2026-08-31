@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
-import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
+import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, parseCloseoutSummary, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
 
 afterEach(() => {
   cleanup()
@@ -1734,6 +1734,53 @@ describe('SubagentPanel', () => {
     expect(await screen.findByText('Final report')).toBeTruthy()
   })
 
+  it('renders the secretary closeout summary as a structured card instead of raw key=value text', async () => {
+    const harness = hostHarness()
+    const finalResult = [
+      'closeout=pass',
+      'integration_verify=pass',
+      'commit=created:a9b6c10959744a0f9b80453e5675c29d2900083',
+      'committed_paths=["Electron/package.json","Electron/packages/pi-backend/src/index.ts"]',
+      'remaining_dirty_paths=["AGENTS.md"]',
+      'cleaned_branches=[]',
+      'cleaned_worktrees=[]',
+      'retained=[]',
+      'needs_fixer=[]',
+      'needs_user=[]',
+      'docs_updated=[]',
+      'residual_risks=[]',
+    ].join('\n')
+    harness.host.listAgents = async () => [{
+      agentId: 'sec', runId: 'r-sec', sessionId: 'session-1', name: 'secretary', task: '提交 Git 扩展重构',
+      state: 'ok', createdAt: 1, endedAt: 2, finalResult,
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} sessionId="session-1" />)
+    // A single finished agent auto-renders its detail; no row click needed.
+    const card = await screen.findByTestId('secretary-closeout-card')
+    expect(card.textContent).toContain('收尾通过')
+    expect(card.textContent).toContain('验证通过')
+    expect(card.textContent).toContain('提交 a9b6c10959')
+    expect(screen.getByText('Electron/package.json')).toBeTruthy()
+    const transcript = document.querySelector('[data-testid="subagent-transcript"]')!
+    expect(transcript.textContent).not.toContain('committed_paths=')
+    expect(transcript.textContent).not.toContain('closeout=pass')
+  })
+
+  it('shows a blocked secretary commit as a warning card with retained items', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'sec2', runId: 'r-sec2', sessionId: 'session-1', name: 'secretary', task: '收尾',
+      state: 'ok', createdAt: 1, endedAt: 2,
+      finalResult: ['closeout=needs-action', 'integration_verify=fail', 'commit=blocked:dirty-index', 'committed_paths=[]', 'remaining_dirty_paths=[]', 'cleaned_branches=[]', 'cleaned_worktrees=[]', 'retained=[{"item":"wt-a","reason":"dirty"}]', 'needs_fixer=[]', 'needs_user=[]', 'docs_updated=[]', 'residual_risks=[]'].join('\n'),
+    } as AgentSummary]
+    render(<SubagentPanel host={harness.host} sessionId="session-1" />)
+    const card = await screen.findByTestId('secretary-closeout-card')
+    expect(card.textContent).toContain('需处理')
+    expect(card.textContent).toContain('验证失败')
+    expect(card.textContent).toContain('提交受阻 · dirty-index')
+    expect(card.textContent).toContain('wt-a — dirty')
+  })
+
   it('renders a runtime-capped terminal tail as plain text', async () => {
     const harness = hostHarness()
     const retainedTail = ('| partial table cell | `unterminated inline code\n'.repeat(220)).slice(0, 8_000)
@@ -2283,5 +2330,57 @@ describe('agentDisplayName identity pollution', () => {
     expect(grepRow.querySelector('strong')?.textContent).toBe('explore')
     expect(grepRow.querySelector('strong')?.textContent).not.toBe('grep')
     expect(grepRow.textContent).toContain('重查 stalled 状态链')
+  })
+})
+
+describe('parseCloseoutSummary', () => {
+  const fullBlock = [
+    'closeout=pass',
+    'integration_verify=pass',
+    'commit=created:a9b6c10959744a0f9b80453e5675c29d2900083',
+    'committed_paths=["a.ts","b.ts"]',
+    'remaining_dirty_paths=[]',
+    'cleaned_branches=["pipiui/wt-a"]',
+    'cleaned_worktrees=[]',
+    'retained=[]',
+    'needs_fixer=[]',
+    'needs_user=[]',
+    'docs_updated=[]',
+    'residual_risks=[]',
+  ].join('\n')
+
+  it('parses the block and splits surrounding prose', () => {
+    const parsed = parseCloseoutSummary(`收尾完成。\n\n${fullBlock}\n\n以上。`)
+    expect(parsed).toBeTruthy()
+    expect(parsed!.preamble).toBe('收尾完成。')
+    expect(parsed!.remainder).toBe('以上。')
+    expect(parsed!.summary.closeout).toBe('pass')
+    expect(parsed!.summary.integrationVerify).toBe('pass')
+    expect(parsed!.summary.commit).toBe('created:a9b6c10959744a0f9b80453e5675c29d2900083')
+    expect(parsed!.summary.committedPaths).toEqual(['a.ts', 'b.ts'])
+    expect(parsed!.summary.cleanedBranches).toEqual(['pipiui/wt-a'])
+  })
+
+  it('ignores a fenced code block quoting the contract template', () => {
+    const parsed = parseCloseoutSummary(['说明：', '', '```', 'closeout=pass | needs-action | blocked', 'integration_verify=pass | fail | none', 'committed_paths=[]', '```'].join('\n'))
+    expect(parsed).toBeNull()
+  })
+
+  it('takes the concrete value when the template alternatives are echoed', () => {
+    const parsed = parseCloseoutSummary(['closeout=needs-action | pass | blocked', 'integration_verify=none | pass | fail', 'commit=not-required', 'committed_paths=[]'].join('\n'))
+    expect(parsed?.summary.closeout).toBe('needs-action')
+    expect(parsed?.summary.integrationVerify).toBe('none')
+    expect(parsed?.summary.commit).toBe('not-required')
+  })
+
+  it('keeps non-JSON list values readable instead of throwing', () => {
+    const parsed = parseCloseoutSummary(['closeout=blocked', 'integration_verify=fail', 'commit=blocked:stage-failed', 'committed_paths=not-json', 'retained=[{item:wt,reason:dirty}]'].join('\n'))
+    expect(parsed?.summary.committedPaths).toEqual(['not-json'])
+    expect(parsed?.summary.retained).toEqual([{ item: '[{item:wt,reason:dirty}]' }])
+  })
+
+  it('returns null for ordinary prose', () => {
+    expect(parseCloseoutSummary('任务已完成，全部测试通过。')).toBeNull()
+    expect(parseCloseoutSummary('')).toBeNull()
   })
 })

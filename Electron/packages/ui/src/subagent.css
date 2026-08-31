@@ -68,5 +68,27 @@
 
 @media (max-width:460px){.subagent-total-spend{display:none}.agent-leader-badge,.stalled-badge,.worktree-badge{max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
 
+/* Secretary closeout verdict rendered as a structured card instead of raw key=value text. */
+.secretary-closeout{margin:4px 0 8px;padding:10px 12px;border:1px solid color-mix(in srgb,var(--success) 26%,var(--border));border-radius:8px;background:color-mix(in srgb,var(--success) 4%,var(--surface))}
+.secretary-closeout.warn{border-color:color-mix(in srgb,var(--warning) 36%,var(--border));background:color-mix(in srgb,var(--warning) 6%,var(--surface))}
+.secretary-closeout.error{border-color:color-mix(in srgb,var(--danger) 40%,var(--border));background:color-mix(in srgb,var(--danger) 6%,var(--surface))}
+.secretary-closeout-head{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:6px}
+.closeout-state{padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.closeout-state.ok{color:var(--success);background:color-mix(in srgb,var(--success) 14%,transparent)}
+.closeout-state.warn{color:var(--warning);background:color-mix(in srgb,var(--warning) 14%,transparent)}
+.closeout-state.error{color:var(--danger);background:color-mix(in srgb,var(--danger) 14%,transparent)}
+.closeout-verify{padding:2px 7px;border-radius:10px;font-size:10px;color:var(--muted);background:var(--surface-hover)}
+.closeout-verify.pass{color:var(--success)}.closeout-verify.fail{color:var(--danger)}.closeout-verify.none{color:var(--warning)}
+.closeout-commit{font-size:11px;color:var(--text-strong)}
+.closeout-commit-blocked{font-size:11px;color:var(--danger);overflow-wrap:anywhere}
+.closeout-commit-na{font-size:11px;color:var(--muted)}
+.closeout-group{margin-top:6px;font-size:11px;line-height:1.5}
+.closeout-group-label{color:var(--muted)}
+.closeout-group-label b{color:var(--text-strong);font-variant-numeric:tabular-nums}
+.closeout-paths,.closeout-items{margin:3px 0 0;padding:0;list-style:none}
+.closeout-paths li{overflow-wrap:anywhere}.closeout-paths code{font-size:10.5px;color:var(--text)}
+.closeout-items li{color:var(--text);overflow-wrap:anywhere}.closeout-items small{color:var(--muted)}
+.closeout-group details summary{cursor:pointer;color:var(--subtle);font-size:10px}
+
 /* Main-chat live subagent tool card (Swift SubagentToolCardView parity). */
 .subagent-tool-card{overflow:hidden;cursor:pointer}.subagent-tool-card:hover{border-color:color-mix(in srgb,var(--accent) 55%,var(--border));background:color-mix(in srgb,var(--surface-hover) 30%,var(--surface))}.subagent-tool-card .subagent-tool-head{display:flex;min-width:0;align-items:center;gap:7px;padding:9px 11px}.subagent-tool-card .subagent-tool-head b{min-width:0;overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace}.subagent-tool-card .activity-meta{margin-left:auto}.subagent-tool-card .subagent-tool-open{flex:0 0 auto;color:var(--subtle);font-size:12px}.subagent-tool-card .subagent-tool-row{display:flex;min-width:0;align-items:center;gap:7px;padding:6px 11px;border-top:1px solid color-mix(in srgb,var(--border) 70%,transparent)}.subagent-tool-card .subagent-tool-row.child{border-left:1.5px solid color-mix(in srgb,var(--accent) 24%,var(--border));border-radius:0 5px 5px 0}.subagent-tool-card .subagent-tool-row .agent-copy strong{overflow:hidden;color:var(--text-strong);text-overflow:ellipsis;white-space:nowrap;font-size:11px}.subagent-tool-card .subagent-tool-row .agent-copy small{color:var(--muted)}.subagent-tool-card .subagent-tool-row .agent-state.running{color:var(--accent)}.subagent-tool-card .subagent-tool-row .agent-state.ok{color:var(--success)}.subagent-tool-card .subagent-tool-row .agent-state.failed{color:var(--danger)}.subagent-tool-card .subagent-tool-more{padding:7px 11px;border-top:1px solid color-mix(in srgb,var(--border) 70%,transparent);color:var(--subtle);font-size:10.5px}
