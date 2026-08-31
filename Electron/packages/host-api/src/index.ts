@@ -1118,6 +1118,8 @@ export interface PipiHostAPI {
   exportProductPackArchive?(projectId: string, profileId: string, destinationArchivePath: string): Promise<ProductPackArchiveResult>;
   /** Validate, extract, transactionally install, and activate a Product Pack ZIP. */
   installProductPackArchive?(projectId: string, sourceArchivePath: string): Promise<ProjectProductActivation>;
+  /** Install ONE extension from a ZIP into the shared store (local receipt) and enable it for this project. */
+  installExtensionZip?(projectId: string, sourceArchivePath: string): Promise<ExtensionDescriptor>;
   /** Electron-only native dialogs. Paths never come from free-form renderer text. */
   pickProductPackArchive?(): Promise<string | null>;
   saveProductPackArchive?(suggestedName: string): Promise<string | null>;
@@ -1435,6 +1437,7 @@ function apiFrom(
     updateProductProfileExtensions: (projectId, profileId, extensionIds) => invoke("updateProductProfileExtensions", projectId, profileId, extensionIds),
     exportProductPackArchive: (projectId, profileId, destinationArchivePath) => invoke("exportProductPackArchive", projectId, profileId, destinationArchivePath),
     installProductPackArchive: (projectId, sourceArchivePath) => invoke("installProductPackArchive", projectId, sourceArchivePath),
+    installExtensionZip: (projectId, sourceArchivePath) => invoke("installExtensionZip", projectId, sourceArchivePath),
     pickProductPackArchive: () => invoke("pickProductPackArchive"),
     saveProductPackArchive: suggestedName => invoke("saveProductPackArchive", suggestedName),
     installLocalProductProfile: (projectId, sourceDirectory) => invoke("installLocalProductProfile", projectId, sourceDirectory),
@@ -1636,6 +1639,7 @@ function apiFrom(
     delete api.installProductPackArchive;
     delete api.pickProductPackArchive;
     delete api.saveProductPackArchive;
+    delete api.installExtensionZip;
   }
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);

@@ -274,6 +274,45 @@ describe('ExtensionsPane package management', () => {
     await waitFor(() => expect(host.updateProductProfileExtensions).toHaveBeenCalledWith('demo', 'lab-tools', ['document-workbench']))
   })
 
+  it('installs a single extension ZIP, enables it for the project, and lists it', async () => {
+    const host = extensionPackHost()
+    let installed = false
+    const baseList = host.listExtensions.bind(host)
+    const installExtensionZip = vi.fn(async (_projectId: string, _archive: string) => {
+      installed = true
+      return { id: 'zip-kit', name: 'Zip Kit', state: 'enabled' } as ExtensionDescriptor
+    })
+    const listExtensions = vi.fn(async (projectId?: string) => {
+      const listed = await baseList(projectId)
+      return installed
+        ? [...listed, pkg({ id: 'zip-kit', name: 'Zip Kit', category: 'foundation', state: 'enabled', source: 'app' })]
+        : listed
+    })
+    Object.assign(host, { installExtensionZip, listExtensions })
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+
+    expect(await screen.findByTestId('extensions-zip-install')).toBeTruthy()
+    expect(screen.getByTestId('extensions-zip-hint').textContent).toContain('pipiui-extension.json')
+    fireEvent.click(screen.getByTestId('extensions-zip-install'))
+    await waitFor(() => expect(installExtensionZip).toHaveBeenCalledWith('demo', '/tmp/coc.pipiui-pack.zip'))
+    expect(await screen.findByTestId('extensions-pkg-zip-kit')).toBeTruthy()
+    const notice = await screen.findByTestId('extensions-archive-notice')
+    expect(notice.textContent).toContain('Zip Kit')
+    expect(notice.textContent).toContain('启用')
+  })
+
+  it('surfaces backend rejection reasons verbatim when a zip is not an extension package', async () => {
+    const host = extensionPackHost()
+    ;(host as PipiHostAPI).installExtensionZip = vi.fn(async () => {
+      throw new Error('unpacked extension artifact has no pipiui-extension.json at its package root')
+    })
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+
+    fireEvent.click(await screen.findByTestId('extensions-zip-install'))
+    expect(await screen.findByText(/unpacked extension artifact has no pipiui-extension\.json/)).toBeTruthy()
+    expect(screen.queryByTestId('extensions-archive-notice')).toBeNull()
+  })
+
   it('keeps out-of-pack extensions visible, searchable, and individually toggleable', async () => {
     const host = extensionPackHost([
       pkg({ id: 'pdf-extension', name: 'PipiUI PDF', category: 'knowledge', state: 'enabled', source: 'builtin' }),
