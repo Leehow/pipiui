@@ -551,7 +551,7 @@ export async function createHermesMemoryBrokerBackend(
   return new HermesMemoryBrokerBackend(bridge);
 }
 
-/** Main-only composition point. Worker/operator never import this module. */
+/** Main-only composition point. Workers never import this module. */
 export async function installHermesMainIntegration(
   pi: unknown,
   env: Record<string, string | undefined> = process.env,

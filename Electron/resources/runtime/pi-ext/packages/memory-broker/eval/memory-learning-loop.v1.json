@@ -45,14 +45,11 @@
       "needsHistory": true
     },
     {
-      "id": "recall-app",
+      "id": "recall-project-record",
       "group": "correct-recall",
-      "query": "remember editor shortcut",
-      "expected": "R07",
-      "needsHistory": true,
-      "app": "com.acme.editor",
-      "role": "operator",
-      "validatedApp": "com.acme.editor"
+      "query": "remember repeatable source run policy",
+      "expected": "R10",
+      "needsHistory": true
     },
     {
       "id": "recall-session",
@@ -158,7 +155,6 @@
       "group": "scope-security",
       "query": "remember editor shortcut",
       "needsHistory": false,
-      "app": "com.acme.terminal",
       "forbid": "R07"
     },
     {
@@ -171,13 +167,10 @@
       "forbid": "R01"
     },
     {
-      "id": "scope-operator-bundle",
+      "id": "scope-retired-app-record",
       "group": "scope-security",
-      "query": "remember editor shortcut",
+      "query": "remember retired desktop recipe",
       "needsHistory": false,
-      "role": "operator",
-      "app": "com.acme.editor",
-      "validatedApp": "com.acme.other",
       "forbid": "R07"
     },
     {

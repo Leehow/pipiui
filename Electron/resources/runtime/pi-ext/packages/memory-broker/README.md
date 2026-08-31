@@ -21,13 +21,10 @@ checkout dependency. It has no Swift, AppStore, BridgeServer, or UI dependency.
   `PIPIUI_MEMORY_BROKER_URL` and `PIPIUI_MEMORY_BROKER_TOKEN` and closes the
   server/native adapter on `session_shutdown`.
 - **worker**: never starts a server or backend; registers only `memory_query`.
-- **operator**: uses the worker client plus app/bundle query scope and exports a
-  metadata-only Computer candidate helper. It never exposes a durable-write
-  tool.
 
 The HTTP child surface accepts only a server-issued capability bound to one
-project root, agent id, run id, and role. The request payload has no role,
-project-root override, desktop grant, or durable authority field.
+project root, agent id, run id, and worker role. The request payload has no role,
+project-root override or durable authority field.
 
 The backend is deliberately pluggable. `InMemoryMemoryBackend` is for tests;
 `UnavailableMemoryBackend` makes memory a fail-closed, non-blocking degraded

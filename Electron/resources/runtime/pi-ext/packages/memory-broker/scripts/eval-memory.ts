@@ -8,7 +8,7 @@ import { MemoryCurator } from "../src/memory-curator.ts";
 import { createCatalogHermesRetrievalPort, RetrievalOrchestrator, type RetrievalCandidate } from "../src/retrieval-orchestrator.ts";
 import { MemoryRuntimeMetricsCollector } from "../src/runtime-metrics.ts";
 
-type Scenario = { id: string; group: string; query: string; expected?: string; forbid?: string; needsHistory: boolean; skip?: boolean; app?: string; validatedApp?: string; role?: "main" | "worker" | "operator"; capability?: boolean };
+type Scenario = { id: string; group: string; query: string; expected?: string; forbid?: string; needsHistory: boolean; skip?: boolean; role?: "main" | "worker"; capability?: boolean };
 const scenarios = corpus.scenarios as Scenario[];
 const expectedByQuery = new Map(scenarios.filter((s) => s.expected).map((s) => [s.query, s.expected!]));
 const hermes = { add: async (r: { id: string }) => ({ id: `fake-hermes-${r.id}` }), verify: async () => true };
@@ -62,7 +62,7 @@ export async function runMemoryLearningEval(options: { jsonPath?: string } = {})
     for (const s of scenarios) {
       let items: string[] = []; let resultCount = 0; let wasAbstain = false;
       if (s.skip) { wasAbstain = true; } else {
-        const out = await orchestrator.recall({runId:`eval-${s.id}`,role:s.role ?? "main",project:"project-a",text:s.query,trigger:"explicit-query",capabilityValid:s.capability ?? true,...(s.app?{bundleId:s.app}:{}),...(s.validatedApp?{validatedBundleId:s.validatedApp}:{validatedBundleId:s.app})});
+        const out = await orchestrator.recall({runId:`eval-${s.id}`,role:s.role ?? "main",project:"project-a",text:s.query,trigger:"explicit-query",capabilityValid:s.capability ?? true});
         items = out.context.items.map(i=>i.reference); resultCount = items.length; wasAbstain = out.telemetry.abstained || out.telemetry.skipped;
       }
       metrics.record({triggered:!s.skip,skipped:!!s.skip,abstain:wasAbstain,resultCount,latencyMs: 2 + (resultCount ? 1 : 0),candidate:0,promotion:0,reject:0,supersede:0,stale:0,delete:0,degraded:false});

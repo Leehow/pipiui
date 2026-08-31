@@ -40,13 +40,12 @@ test("timeout, unavailable, threshold and inactive records abstain", async () =>
   assert.equal(filtered.context.items.length, 0); assert.equal(filtered.telemetry.abstained, true);
 });
 
-test("scope ACL has zero project/app leakage and worker/operator boundaries", async () => {
+test("scope ACL has zero project/app leakage and requires worker capability", async () => {
   const values = [base({ scope: { kind: "project", project: "/other" } }), base({ id: "app", scope: { kind: "app", project: "/p", app: "com.good" } })];
   const o = new RetrievalOrchestrator(port(values));
   assert.equal((await o.recall(request())).context.items.length, 0);
   assert.equal((await o.recall(request({ role: "worker", capabilityValid: false, runId: "worker" }))).telemetry.reason, "scope-or-capability-denied");
-  assert.equal((await o.recall(request({ role: "operator", capabilityValid: true, bundleId: "com.bad", validatedBundleId: "com.good", runId: "operator" }))).telemetry.reason, "scope-or-capability-denied");
-  assert.equal((await o.recall(request({ role: "operator", capabilityValid: true, bundleId: "com.good", validatedBundleId: "com.good", runId: "operator-ok" }))).context.items.length, 1);
+  assert.equal((await o.recall(request({ role: "worker", capabilityValid: true, runId: "worker-ok" }))).context.items.length, 0);
 });
 
 test("injection and secrets are removed and explicit queries bypass automatic debounce", async () => {

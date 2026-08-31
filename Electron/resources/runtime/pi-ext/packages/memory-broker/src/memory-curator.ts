@@ -3,7 +3,7 @@ import { MemoryCatalog, type HermesCatalogPort } from "./memory-catalog.ts";
 import type { MemoryRuntimeMetricsCollector } from "./runtime-metrics.ts";
 
 /** Curator is deliberately a Pi-main service: child packages only submit quarantined candidates. */
-export type CuratorMode = "main" | "worker" | "operator";
+export type CuratorMode = "main" | "worker";
 export type CuratorDecision = "keep_candidate" | "promote" | "merge" | "supersede" | "stale" | "reject" | "delete";
 export type CuratorReview = { decision: CuratorDecision; kind: MemoryRecordKind; claim: string; applicability?: string; confidence: number; reason: string; evidenceRefs: string[]; targetID?: string };
 export type CuratorAudit = { at: number; candidateID: string; decision: CuratorDecision; reason: string; evidenceRefs: string[] };

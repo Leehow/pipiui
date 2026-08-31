@@ -1,14 +1,13 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
 import { Type } from "typebox";
-import { MEMORY_LIMITS, normalizeAppName, normalizeBundleID, normalizeQuery } from "#memory-broker-contract";
+import { MEMORY_LIMITS, normalizeQuery } from "#memory-broker-contract";
 import {
   MemoryBrokerClient,
   createMemoryBrokerClient,
   memoryBrokerClientEnvironment,
 } from "./client.ts";
 import { UnavailableMemoryBackend, type MemoryBrokerBackend } from "./backend.ts";
-import { operatorComputerObservationFromToolResult, type OperatorComputerApplicationScope } from "./operator-computer.ts";
 import { importControlledMemoryIfRequested } from "./controlled-memory-migration.ts";
 import { openMainMemoryCatalog, type HermesCatalogPort, type MemoryCatalog } from "./memory-catalog.ts";
 import { MemoryCurator, MemoryCuratorScheduler, type CuratorReviewer } from "./memory-curator.ts";
@@ -35,7 +34,6 @@ import type {
 } from "./server.ts";
 
 const MAX_QUERY_TOOL_TEXT = 6_000;
-const MAX_OPERATOR_QUERY_TOOL_TEXT = 1_800;
 
 export type MemoryBrokerExtensionOptions = {
   /** Test/host override. Default main mode composes pi-hermes-memory@0.9.6. */
@@ -74,15 +72,12 @@ function envText(env: Record<string, string | undefined>, key: string): string |
   return value || undefined;
 }
 
-/** Explicit mode wins; roles provide a compatibility fallback for bare Pi. */
+/** Explicit current modes win; a retired operator marker degrades to an unprivileged worker. */
 export function memoryBrokerMode(env: Record<string, string | undefined> = process.env): MemoryBrokerMode {
   const explicit = envText(env, "PIPIUI_MEMORY_BROKER_MODE");
-  if (explicit === "main" || explicit === "worker" || explicit === "operator") return explicit;
-  return envText(env, "PIPIUI_AGENT_ROLE") === "operator"
-    ? "operator"
-    : envText(env, "PIPIUI_AGENT_ROLE") === "worker"
-      ? "worker"
-      : "main";
+  if (explicit === "main" || explicit === "worker") return explicit;
+  const role = envText(env, "PIPIUI_AGENT_ROLE");
+  return explicit === "operator" || role === "operator" || role === "worker" ? "worker" : "main";
 }
 
 /**
@@ -158,24 +153,20 @@ function textResult(text: string, details: Record<string, unknown>, isError = fa
   };
 }
 
-function queryParameters(includeApplicationScope: boolean) {
+function queryParameters() {
   return Type.Object({
     query: Type.String({ minLength: 1, maxLength: MEMORY_LIMITS.maximumQueryTextUTF8Bytes }),
     scope: Type.Optional(Type.Union([Type.Literal("project"), Type.Literal("session")])),
     budget: Type.Optional(Type.Integer({ minimum: 1, maximum: MEMORY_LIMITS.maximumQueryBudget })),
-    ...(includeApplicationScope ? {
-      bundleID: Type.Optional(Type.String({ minLength: 1, maxLength: MEMORY_LIMITS.maximumApplicationBundleIDUTF8Bytes })),
-      appName: Type.Optional(Type.String({ minLength: 1, maxLength: MEMORY_LIMITS.maximumApplicationNameUTF8Bytes })),
-    } : {}),
   });
 }
 
 function renderQueryResult(
-  query: { scope: string; budget: number; bundleID?: string; appName?: string },
+  query: { scope: string; budget: number },
   results: Array<{ claim: string; score: number }>,
   maximumText: number,
 ) {
-  let text = `Memory query (${query.scope}; budget ${query.budget}${query.bundleID || query.appName ? "; app-scoped" : ""}):`;
+  let text = `Memory query (${query.scope}; budget ${query.budget}):`;
   if (results.length === 0) return `${text} no matching scoped memory.`;
   for (const result of results) {
     const line = `\n- ${result.claim}${result.score ? ` (score ${result.score.toFixed(3)})` : ""}`;
@@ -187,30 +178,6 @@ function renderQueryResult(
 
 function unavailableToolResult(error: string | undefined) {
   return textResult(`Memory query unavailable: ${error || "broker unavailable"}.`, { ok: false }, true);
-}
-
-function operatorQueryScope(
-  params: { query: string; budget?: number; scope?: "project" | "session"; bundleID?: string; appName?: string },
-  observed: OperatorComputerApplicationScope | undefined,
-): { params?: typeof params; error?: string } {
-  const requestedAppScope = params.bundleID !== undefined || params.appName !== undefined;
-  if (!requestedAppScope) return { params };
-  if (!observed || params.bundleID === undefined) {
-    return { error: "Application-scoped memory query requires the current observed computer application bundleID." };
-  }
-  try {
-    const bundleID = normalizeBundleID(params.bundleID);
-    const appName = params.appName === undefined ? undefined : normalizeAppName(params.appName);
-    if (!bundleID || bundleID !== observed.bundleID) {
-      return { error: "Application-scoped memory query is limited to the current observed computer application." };
-    }
-    if (appName !== undefined && appName.toLocaleLowerCase("en-US") !== observed.appName.toLocaleLowerCase("en-US")) {
-      return { error: "Application-scoped memory query is limited to the current observed computer application." };
-    }
-    return { params: { ...params, bundleID: observed.bundleID, appName: observed.appName } };
-  } catch (error) {
-    return { error: error instanceof Error ? error.message : "Invalid application memory scope." };
-  }
 }
 
 function mainEnvironment(
@@ -309,7 +276,6 @@ export async function installMemoryBrokerExtension(
   }
   let server: MemoryBrokerServer | undefined;
   let publishedEnvironment: Record<string, string> | undefined;
-  let operatorApplicationScope: OperatorComputerApplicationScope | undefined;
   let catalog: MemoryCatalog | undefined;
   let curatorScheduler: MemoryCuratorScheduler | undefined;
   // Publishes whether candidates are actually reaching the catalog. Without it
@@ -320,9 +286,6 @@ export async function installMemoryBrokerExtension(
   let admin: MemoryAdminService | undefined;
   const runtimeMetrics = new MemoryRuntimeMetricsCollector();
   const childClient = mode === "main" ? undefined : createMemoryBrokerClient(env);
-  const operatorComputerMemoryEnabled = mode === "operator"
-    && childClient?.environment.mode === "operator"
-    && envText(env, "PIPIUI_COMPUTER_MEMORY_ENABLED") === "1";
   // Keep Hermes behind a main-only dynamic boundary so children never load its
   // native dependency or review hooks merely by loading this package.
   const configuredBackendFactory = options.backendFactory;
@@ -529,50 +492,19 @@ export async function installMemoryBrokerExtension(
     });
   }
 
-  if (mode === "operator") {
-    // Pi runs this after the real tool execution. Never return a patch: Computer
-    // output remains exactly as produced, while this optional side path retains
-    // only contract-sanitized metadata for the loopback broker.
-    pi.on("tool_result", (event) => {
-      if (!operatorComputerMemoryEnabled || event.toolName !== "computer") return;
-      const observation = operatorComputerObservationFromToolResult(event);
-      if (!observation) {
-        operatorApplicationScope = undefined;
-        return;
-      }
-      operatorApplicationScope = observation.application;
-      void childClient!.submitCandidate(observation.candidate).catch(() => {});
-      if (retrieval) {
-        void retrieval.operatorValidatedBundle({
-          ...retrievalIdentity(),
-          role: "operator",
-          text: "current validated application workflow",
-          bundleId: observation.application.bundleID,
-          validatedBundleId: observation.application.bundleID,
-        }).catch(() => {});
-      }
-    });
-  }
-
-  const includeApplicationScope = mode === "operator";
-  const maximumText = mode === "operator" ? MAX_OPERATOR_QUERY_TOOL_TEXT : MAX_QUERY_TOOL_TEXT;
   if (mode === "main" || childClient) {
     pi.registerTool({
       name: "memory_query",
       label: "Memory Query",
-      description: mode === "operator"
-        ? "Read bounded memory through the loopback broker. Operator queries may narrow by application bundle/name; this tool never durably writes memory."
-        : "Read bounded memory through the loopback broker. This tool never durably writes memory.",
-      parameters: queryParameters(includeApplicationScope),
-      async execute(_toolCallId: string, params: { query: string; scope?: "project" | "session"; budget?: number; bundleID?: string; appName?: string }) {
+      description: "Read bounded memory through the loopback broker. This tool never durably writes memory.",
+      parameters: queryParameters(),
+      async execute(_toolCallId: string, params: { query: string; scope?: "project" | "session"; budget?: number }) {
         // Explicit queries use the same bounded, Catalog-filtered pipeline when
         // configured. They intentionally bypass only automatic debounce.
         if (retrieval) {
-          const bundleId = mode === "operator" ? operatorApplicationScope?.bundleID : undefined;
           const explicit = await retrieval.explicitQuery({
             ...retrievalIdentity(),
             text: params.query,
-            ...(bundleId ? { bundleId, validatedBundleId: bundleId } : {}),
           });
           return textResult(JSON.stringify(explicit.context), {
             ok: true,
@@ -599,14 +531,14 @@ export async function installMemoryBrokerExtension(
           });
           const results = queryFromMainResponse(response);
           if (!results) return unavailableToolResult(response.error);
-          return textResult(renderQueryResult(query, results, maximumText), {
+          return textResult(renderQueryResult(query, results, MAX_QUERY_TOOL_TEXT), {
             ok: true,
             scope: query.scope,
             budget: query.budget,
             returned: results.length,
           });
         }
-        return executeChildQuery(childClient!, params, maximumText, operatorApplicationScope);
+        return executeChildQuery(childClient!, params, MAX_QUERY_TOOL_TEXT);
       },
     });
   }
@@ -659,20 +591,13 @@ export async function installMemoryBrokerExtension(
 
 async function executeChildQuery(
   client: MemoryBrokerClient,
-  params: { query: string; budget?: number; scope?: "project" | "session"; bundleID?: string; appName?: string },
+  params: { query: string; budget?: number; scope?: "project" | "session" },
   maximumText: number,
-  observedOperatorApplication?: OperatorComputerApplicationScope,
 ) {
-  const scoped = client.environment.mode === "operator"
-    ? operatorQueryScope(params, observedOperatorApplication)
-    : { params };
-  if (!scoped.params) return unavailableToolResult(scoped.error);
   const response = await client.query({
-    text: scoped.params.query,
-    ...(scoped.params.budget !== undefined ? { budget: scoped.params.budget } : {}),
-    ...(scoped.params.scope !== undefined ? { scope: scoped.params.scope } : {}),
-    ...(scoped.params.bundleID !== undefined ? { bundleID: scoped.params.bundleID } : {}),
-    ...(scoped.params.appName !== undefined ? { appName: scoped.params.appName } : {}),
+    text: params.query,
+    ...(params.budget !== undefined ? { budget: params.budget } : {}),
+    ...(params.scope !== undefined ? { scope: params.scope } : {}),
   });
   if (!response.available || !response.value) return unavailableToolResult(response.error);
   return textResult(renderQueryResult(response.value.query, response.value.results, maximumText), {
@@ -680,11 +605,10 @@ async function executeChildQuery(
     scope: response.value.query.scope,
     budget: response.value.query.budget,
     returned: response.value.results.length,
-    appScoped: !!response.value.query.bundleID || !!response.value.query.appName,
   });
 }
 
-/** Useful to fixtures without exposing a server from worker/operator mode. */
+/** Useful to fixtures without exposing a server from worker mode. */
 export function extensionClientFromEnvironment(
   env: Record<string, string | undefined> = process.env,
 ): MemoryBrokerClient | undefined {

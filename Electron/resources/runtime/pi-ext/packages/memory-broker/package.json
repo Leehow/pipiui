@@ -1,7 +1,7 @@
 {
   "name": "pipiui-memory-broker",
   "version": "0.1.0",
-  "description": "Loopback-only, host-neutral Pi memory broker extension with bounded worker and operator clients.",
+  "description": "Loopback-only, host-neutral Pi memory broker extension with bounded worker clients.",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": [

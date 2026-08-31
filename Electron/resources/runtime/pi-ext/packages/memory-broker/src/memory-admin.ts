@@ -30,7 +30,7 @@ function dto(record: MemoryRecordV2) {
 }
 function evidence(record: MemoryRecordV2) { return record.evidence.map((e, index) => ({ id: `${record.id}:${index}`, summary: safe(e.summary, 700) ?? "[redacted]", observedAt: e.observedAt, sourceRun: safe(e.sourceRun, 160) })).slice(0, 24); }
 
-/** Main-only domain and loopback admin policy. No worker/operator construction path exists. */
+/** Main-only domain and loopback admin policy. No worker construction path exists. */
 export class MemoryAdminService {
   private session: Session | undefined;
   private readonly metrics: Metrics = { query: { triggered: 0, skipped: 0, abstain: 0, resultCount: 0, latency: 0 }, candidate: 0, promotion: 0, reject: 0 };

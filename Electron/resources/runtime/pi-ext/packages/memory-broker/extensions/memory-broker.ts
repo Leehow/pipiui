@@ -1,5 +1,5 @@
 // PipiUI bundled local Pi package entrypoint. Main mode composes the pinned
-// upstream Hermes package; worker/operator modes remain client-only.
+// upstream Hermes package; worker mode remains client-only.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installMemoryBrokerExtension } from "../src/extension.ts";
 

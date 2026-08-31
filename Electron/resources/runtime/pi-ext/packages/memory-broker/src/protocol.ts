@@ -5,4 +5,4 @@ export const MEMORY_BROKER_TIMEOUT_MS = 3_000;
 export const MEMORY_BROKER_MAX_REQUEST_BYTES = 32 * 1024;
 export const MEMORY_BROKER_MAX_RESPONSE_BYTES = 24 * 1024;
 
-export type MemoryBrokerMode = "main" | "worker" | "operator";
+export type MemoryBrokerMode = "main" | "worker";

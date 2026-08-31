@@ -1,10 +1,8 @@
 import {
   MEMORY_LIMITS,
-  computerCandidateFromDraft,
   containsLikelySecret,
   normalizeExperienceCandidate,
   normalizeQuery,
-  type ComputerMemoryDraft,
   type MemoryExperienceCandidate,
   type MemoryOutcome,
   type MemoryQuery,
@@ -15,12 +13,11 @@ import {
   MEMORY_BROKER_MAX_RESPONSE_BYTES,
   MEMORY_BROKER_PATH,
   MEMORY_BROKER_TIMEOUT_MS,
-  type MemoryBrokerMode,
 } from "./protocol.ts";
 import type { MemoryBrokerWireResponse } from "./server.ts";
 
 export type MemoryBrokerClientEnvironment = {
-  mode: "worker" | "operator";
+  mode: "worker";
   url: string;
   token: string;
   capability: string;
@@ -59,12 +56,12 @@ export function isLoopbackMemoryBrokerURL(value: string): boolean {
   }
 }
 
-/** Worker/operator setup only. Main has an in-process broker, not a child client. */
+/** Worker setup only. Main has an in-process broker, not a child client. */
 export function memoryBrokerClientEnvironment(
   env: Record<string, string | undefined> = process.env,
 ): MemoryBrokerClientEnvironment | undefined {
   const requestedMode = textEnv(env, "PIPIUI_MEMORY_BROKER_MODE") ?? textEnv(env, "PIPIUI_AGENT_ROLE");
-  if (requestedMode !== "worker" && requestedMode !== "operator") return undefined;
+  if (requestedMode !== "worker") return undefined;
   const url = textEnv(env, "PIPIUI_MEMORY_BROKER_URL");
   const token = textEnv(env, "PIPIUI_MEMORY_BROKER_TOKEN");
   const capability = textEnv(env, "PIPIUI_MEMORY_BROKER_CAPABILITY");
@@ -148,20 +145,13 @@ export class MemoryBrokerClient {
     text: string;
     budget?: number;
     scope?: "project" | "session";
-    bundleID?: string;
-    appName?: string;
   }): Promise<MemoryBrokerClientResult<{ query: MemoryQuery; results: MemoryQueryResult[] }>> {
-    if (this.environment.mode !== "operator" && (input.bundleID !== undefined || input.appName !== undefined)) {
-      return { available: false, error: "Application-scoped memory query requires an operator client." };
-    }
     let query: MemoryQuery;
     try {
       query = normalizeQuery({
         text: input.text,
         budget: input.budget ?? MEMORY_LIMITS.defaultQueryBudget,
         scope: input.scope ?? "project",
-        ...(input.bundleID !== undefined ? { bundleID: input.bundleID } : {}),
-        ...(input.appName !== undefined ? { appName: input.appName } : {}),
       });
     } catch (error) {
       return { available: false, error: boundedError(error instanceof Error ? error.message : error) };
@@ -345,17 +335,4 @@ export function submitTerminalExperienceCandidate(
   const flight = client.submitCandidate(candidate).then(() => {}).catch(() => {});
   terminalExperienceFlights.set(key, flight);
   return flight;
-}
-
-/** Operator-only helper. It returns a sanitized, quarantined metadata candidate. */
-export function operatorComputerCandidate(
-  environment: MemoryBrokerClientEnvironment | undefined,
-  draft: ComputerMemoryDraft | Record<string, unknown>,
-): MemoryExperienceCandidate | undefined {
-  if (environment?.mode !== "operator") return undefined;
-  return computerCandidateFromDraft(draft);
-}
-
-export function isWorkerOrOperatorMode(mode: MemoryBrokerMode): mode is "worker" | "operator" {
-  return mode === "worker" || mode === "operator";
 }

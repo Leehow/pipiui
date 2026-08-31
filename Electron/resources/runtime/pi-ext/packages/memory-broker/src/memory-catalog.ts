@@ -68,7 +68,7 @@ export class MemoryCatalog {
 }
 
 /** Explicit main-only entry point. The host supplies its broker state or Hermes memory directory; no checkout path is assumed. */
-export async function openMainMemoryCatalog(options: { mode: "main" | "worker" | "operator"; memoryDir: string }): Promise<MemoryCatalog> {
+export async function openMainMemoryCatalog(options: { mode: "main" | "worker"; memoryDir: string }): Promise<MemoryCatalog> {
   if (options.mode !== "main") throw new MemoryCatalogError("Memory Catalog durable writes are main-only.");
   const catalog = await MemoryCatalog.open(options.memoryDir);
   await catalog.importV1();

@@ -11,7 +11,6 @@ import {
   normalizeMemoryBrokerRequest,
   type MemoryActorContext,
   type MemoryBrokerRequest,
-  type MemoryDesktopGrant,
   type MemoryExperienceCandidate,
   type MemoryRole,
 } from "#memory-broker-contract";
@@ -59,16 +58,14 @@ export type MemoryBrokerServerOptions = {
   maxResponseBytes?: number;
   /** Main-only observer used to admit quarantined child candidates into Catalog. */
   onCandidate?: (candidate: MemoryExperienceCandidate, context: MemoryActorContext) => Promise<void> | void;
-  /** Constructed only by the main extension; worker/operator never receive this route. */
+  /** Constructed only by the main extension; workers never receive this route. */
   adminService?: MemoryAdminService;
 };
 
 export type ChildCapabilityInput = {
   agentID: string;
   runID: string;
-  role: "worker" | "operator";
-  /** Existing dispatch state only; this server cannot mint desktop grants. */
-  hostIssuedDesktopGrant?: MemoryDesktopGrant;
+  role: "worker";
 };
 
 export type MemoryBrokerConnection = {
@@ -337,7 +334,6 @@ export class MemoryBrokerServer {
       agentID: input.agentID,
       runID: input.runID,
       role: input.role,
-      ...(input.hostIssuedDesktopGrant ? { hostIssuedDesktopGrant: input.hostIssuedDesktopGrant } : {}),
     });
     const context = this.registry.validate(capability, input.agentID, input.runID);
     return {
