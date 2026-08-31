@@ -5,5 +5,8 @@
   "category": "workflow",
   "description": "Semantic worker dispatch, nested delegation, progress, and Conversation-scoped worker lifecycle.",
   "capabilities": [],
+  "dependencies": [
+    { "id": "git-capability", "version": ">=1.0.0 <2.0.0" }
+  ],
   "agent": { "extension": "agent/index.ts" }
 }

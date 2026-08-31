@@ -207,7 +207,7 @@ export function ensureResolvableHead(cwd: string): { ok: boolean; error?: string
  * ends ok with verifyExit==0 (or verifyExit absent); verifyExit≠0 keeps pendingReview.
  * failed/aborted/interrupted writable workers → keep pendingReview for续作; GUI merge/discard remains as fallback.
  */
-export function resolveSubagentWorktree(opts: {
+export interface WorktreePlacementOptions {
 	agentId: string;
 	defaultCwd: string;
 	explicitCwd?: string;
@@ -217,7 +217,9 @@ export function resolveSubagentWorktree(opts: {
 	mainCwd?: string;
 	/** Bundled general-purpose isolation cannot be disabled by process-global legacy state. */
 	allowEnvironmentOptOut?: boolean;
-}): WorktreePlacement {
+}
+
+export function resolveSubagentWorktree(opts: WorktreePlacementOptions): WorktreePlacement {
 	const fallbackCwd = opts.explicitCwd ?? opts.defaultCwd;
 
 	if (opts.policy.worktree === "main-session") {

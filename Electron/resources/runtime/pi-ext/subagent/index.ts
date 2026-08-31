@@ -259,7 +259,7 @@ import {
 	acquireAgentLease,
 	releaseAgentLease,
 } from "./agent-lease.ts";
-import { resolveSubagentWorktree } from "./worktree.ts";
+import { requestGitWorktreePlacementV1 } from "../../extensions/git-capability/agent/worktree-service.ts";
 import {
 	type DependencyState,
 	DispatchQueueV1,
@@ -6931,7 +6931,7 @@ async function runSingleAgent(
 		? { ...runtimePolicy, worktree: "direct" as const }
 		: runtimePolicy;
 	const targetBaseCwd = executionPolicy?.worktree === "isolated" ? (cwd ?? defaultCwd) : defaultCwd;
-	const placement = resolveSubagentWorktree({
+	const placement = requestGitWorktreePlacementV1({
 		mainCwd: PIPIUI_MAIN_CWD,
 		agentId: pipiuiAgentId,
 		defaultCwd: targetBaseCwd,
