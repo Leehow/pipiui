@@ -43,6 +43,7 @@ import {
   type SessionPage,
   type SessionPreloadSnapshot,
   type SessionStats,
+  type SubagentDebugInfo,
   type SubagentModelSetting,
   type ThinkingLevel,
   type ThinkingLevelMap,
@@ -84,6 +85,7 @@ import {
   withSeedVersionPriority,
 } from "./extension-seed.js";
 import { attachCatalogDiagnostics, buildAgentCatalog } from "./agent-catalog.js";
+import { readSubagentDebugInfo, removeSubagentDebugInfo } from "./subagent-debug-info.js";
 import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { enrichCapabilitiesForOfficialHostedSearch } from "./hosted-search-capabilities.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
@@ -3825,6 +3827,7 @@ export class PiHostBackend implements HostBackend {
             sessionsRoot: this.root,
             agentDir: this.agentDir,
           });
+          await removeSubagentDebugInfo(s.path);
           this.historyCache.delete(s.path);
           this.indexCache.delete(s.path);
           this.sessionById.delete(s.header.id);
@@ -4037,6 +4040,8 @@ export class PiHostBackend implements HostBackend {
         return this.loadAndMaterializeSubagentModels(true);
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
+      case "getSubagentDebugInfo":
+        return this.getSubagentDebugInfo(params[0]);
       case "getMemoryReviewModel":
         return this.loadMemoryReviewModel();
       case "setMemoryReviewModel":
@@ -5009,6 +5014,7 @@ export class PiHostBackend implements HostBackend {
         sessionsRoot: this.root,
         agentDir: this.agentDir,
       });
+      await removeSubagentDebugInfo(session.path);
       this.indexCache.delete(session.path);
       const moved = await readSessionMeta(session.path);
       const stat = await fs.stat(session.path);
@@ -6961,6 +6967,14 @@ export class PiHostBackend implements HostBackend {
     await this.saveProjectNames(next);
     return this.project(displayPath, next);
   }
+  private async getSubagentDebugInfo(sessionId?: unknown): Promise<SubagentDebugInfo> {
+    if (typeof sessionId !== "string" || !sessionId.trim()) {
+      return { available: false, reason: "no-session", bossTools: [], toolCatalog: [], skills: [], subagents: [] };
+    }
+    const session = await this.findSession(sessionId.trim());
+    return readSubagentDebugInfo(session.path, session.header.id);
+  }
+
   private async listAgentDefinitions(projectId?: unknown): Promise<AgentDefinition[]> {
     const extra: NonNullable<AgentDefinition["catalogDiagnostics"]> = [];
     let projectRoot: string | undefined;

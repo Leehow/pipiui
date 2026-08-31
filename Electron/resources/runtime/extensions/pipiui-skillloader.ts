@@ -22,6 +22,13 @@ interface SkillEntry {
   dir: string;
 }
 
+/** Safe metadata-only view used by the runtime Debug snapshot. Never exposes skill paths or bodies. */
+export interface SkillCatalogMetadata {
+  name: string;
+  description: string;
+  userInvoked: boolean;
+}
+
 function homePath(raw: string): string {
   return raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
 }
@@ -179,6 +186,10 @@ function loadCatalog(): SkillEntry[] {
     }
   }
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function listSkillCatalogMetadata(): SkillCatalogMetadata[] {
+  return loadCatalog().map(({ name, description, userInvoked }) => ({ name, description, userInvoked }));
 }
 
 /** Names only. The description — the expensive part — is what `skill_search` is for. */

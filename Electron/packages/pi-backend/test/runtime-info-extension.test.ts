@@ -1,3 +1,6 @@
+import { link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 const EXTENSION = "../../../resources/runtime/extensions/pipiui-runtime-info.ts";
@@ -10,6 +13,10 @@ async function loadRuntimeInfo() {
   let tool: any;
   const pi = {
     getActiveTools: vi.fn(() => ["read", "pipiui_runtime_info"]),
+    getAllTools: vi.fn(() => [
+      { name: "read", description: "Read file contents", sourceInfo: { source: "builtin", scope: "temporary" } },
+      { name: "pipiui_runtime_info", description: "Read runtime state", sourceInfo: { source: "pipiui-runtime-info", scope: "temporary" } },
+    ]),
     getThinkingLevel: vi.fn(() => "xhigh"),
     getSessionName: vi.fn(() => "Current session"),
     on: vi.fn((event: string, handler: Handler) => {
@@ -17,9 +24,9 @@ async function loadRuntimeInfo() {
     }),
     registerTool: vi.fn((definition: any) => { tool = definition; }),
   };
-  const extension = (await import(EXTENSION)).default;
-  extension(pi as never);
-  return { pi, tool, handlers };
+  const module = await import(EXTENSION);
+  module.default(pi as never);
+  return { pi, tool, handlers, runtimeDebugSidecarPath: module.runtimeDebugSidecarPath };
 }
 
 function context(overrides: Record<string, unknown> = {}) {
@@ -44,6 +51,7 @@ function context(overrides: Record<string, unknown> = {}) {
     sessionManager: {
       getSessionId: () => "session-1",
       getSessionName: () => "Current session",
+      getSessionFile: () => undefined,
     },
     getContextUsage: () => ({ tokens: 1200, contextWindow: 10000, percent: 12 }),
     ...overrides,
@@ -143,6 +151,109 @@ describe("pipiui_runtime_info extension", () => {
     });
     expect(parseResult(await tool.execute("call", {}, undefined, undefined, secondSession)).lastProviderRequest)
       .toEqual({ status: "not_observed" });
+  });
+
+  it("writes a safe tool and Skill snapshot beside the live session file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-runtime-debug-"));
+    const skillRoot = join(root, "skills");
+    const skillDir = join(skillRoot, "tdd");
+    const sessionFile = join(root, "session.jsonl");
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), "---\nname: tdd\ndescription: Test driven development\n---\nbody\n");
+    const envKeys = [
+      "PIPIUI_BUILT_IN_SKILL_ROOT",
+      "PIPIUI_AGENTS_DIR",
+      "PIPIUI_SUBAGENT_EXT",
+      "PIPIUI_CODING_TOOLS_EXT",
+      "PIPIUI_SKILLLOADER_EXT",
+      "PIPIUI_MEMORY_BROKER_MODE",
+    ] as const;
+    const previous = Object.fromEntries(envKeys.map(key => [key, process.env[key]]));
+    process.env.PIPIUI_BUILT_IN_SKILL_ROOT = skillRoot;
+    process.env.PIPIUI_AGENTS_DIR = join(process.cwd(), "resources/runtime/pi-ext/agents");
+    process.env.PIPIUI_SUBAGENT_EXT = join(process.cwd(), "resources/runtime/pi-ext/subagent");
+    process.env.PIPIUI_CODING_TOOLS_EXT = join(process.cwd(), "resources/runtime/extensions/pipiui-coding-tools.ts");
+    process.env.PIPIUI_SKILLLOADER_EXT = join(process.cwd(), "resources/runtime/extensions/pipiui-skillloader.ts");
+    process.env.PIPIUI_MEMORY_BROKER_MODE = "main";
+    try {
+      const { handlers, runtimeDebugSidecarPath } = await loadRuntimeInfo();
+      const ctx = context({
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionName: () => "Current session",
+          getSessionFile: () => sessionFile,
+        },
+      });
+      await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+      const snapshot = JSON.parse(await readFile(runtimeDebugSidecarPath(sessionFile), "utf8"));
+      expect(snapshot).toMatchObject({
+        version: 1,
+        sessionId: "session-1",
+        activeTools: ["read", "pipiui_runtime_info"],
+      });
+      expect(snapshot.tools).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "read", description: "Read file contents", source: "builtin" }),
+      ]));
+      expect(snapshot.skills).toEqual(expect.arrayContaining([
+        { name: "tdd", description: "Test driven development", userInvoked: false },
+      ]));
+      expect(snapshot.subagents).toEqual(expect.arrayContaining([
+        expect.objectContaining({ name: "explore", toolPolicy: "allowlist", tools: expect.arrayContaining(["read", "grep", "skill_load"]) }),
+        expect.objectContaining({ name: "general-purpose", toolPolicy: "allowlist", tools: expect.arrayContaining(["edit", "write", "skill_load"]) }),
+      ]));
+      expect(JSON.stringify(snapshot)).not.toContain("SKILL.md");
+    } finally {
+      for (const key of envKeys) {
+        const value = previous[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to overwrite a symlinked Debug sidecar", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-runtime-debug-symlink-"));
+    const sessionFile = join(root, "session.jsonl");
+    const target = join(root, "target.txt");
+    await writeFile(target, "do not overwrite");
+    try {
+      const { handlers, runtimeDebugSidecarPath } = await loadRuntimeInfo();
+      await symlink(target, runtimeDebugSidecarPath(sessionFile));
+      const ctx = context({
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionName: () => "Current session",
+          getSessionFile: () => sessionFile,
+        },
+      });
+      await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+      expect(await readFile(target, "utf8")).toBe("do not overwrite");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses to overwrite a multiply-linked Debug sidecar", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipi-runtime-debug-hardlink-"));
+    const sessionFile = join(root, "session.jsonl");
+    const target = join(root, "target.txt");
+    await writeFile(target, "do not overwrite");
+    try {
+      const { handlers, runtimeDebugSidecarPath } = await loadRuntimeInfo();
+      await link(target, runtimeDebugSidecarPath(sessionFile));
+      const ctx = context({
+        sessionManager: {
+          getSessionId: () => "session-1",
+          getSessionName: () => "Current session",
+          getSessionFile: () => sessionFile,
+        },
+      });
+      await handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
+      expect(await readFile(target, "utf8")).toBe("do not overwrite");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("instructs the model to verify runtime questions with the tool first", async () => {

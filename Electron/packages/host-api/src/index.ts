@@ -342,6 +342,36 @@ export type AgentDefinition = {
   canonical?: boolean;
   canonicalRole?: AgentCanonicalRole;
 };
+/** Safe runtime tool metadata for the Subagent Debug surface. Never includes schemas or filesystem paths. */
+export type AgentDebugTool = {
+  name: string;
+  description: string;
+  source?: string;
+  scope?: "user" | "project" | "temporary";
+};
+/** Enabled skill metadata shared by the Boss and on-demand Subagent skill loader. */
+export type AgentDebugSkill = {
+  name: string;
+  description: string;
+  userInvoked?: boolean;
+};
+export type AgentDebugSubagent = {
+  name: string;
+  toolPolicy: "allowlist" | "unrestricted";
+  tools: string[];
+  excludedTools?: string[];
+};
+export type SubagentDebugInfo = {
+  available: boolean;
+  source?: "live" | "demo";
+  reason?: "no-session" | "snapshot-not-ready" | "snapshot-invalid";
+  sessionId?: string;
+  capturedAt?: number;
+  bossTools: AgentDebugTool[];
+  toolCatalog: AgentDebugTool[];
+  skills: AgentDebugSkill[];
+  subagents: AgentDebugSubagent[];
+};
 export type AgentState = "running" | "stalled" | "ok" | "failed" | "aborted" | "interrupted";
 /** `cost` remains USD for compatibility; these optional fields select its display unit and USD→CNY rate. */
 export type CostUnit = "USD" | "CNY";
@@ -1131,6 +1161,8 @@ export interface PipiHostAPI {
   /** Optional per-role model fallback chains. Empty chain follows the main Agent model. */
   getSubagentModels?(): Promise<Record<string, SubagentModelSetting[]>>;
   setSubagentModel?(agentName: string, chain: SubagentModelSetting[]): Promise<Record<string, SubagentModelSetting[]>>;
+  /** Safe live Boss tool/Skill snapshot used by the Subagent Debug surface. */
+  getSubagentDebugInfo?(sessionId?: string): Promise<SubagentDebugInfo>;
   /** Missing/null means Hermes resolves the active main model at review time. */
   getMemoryReviewModel?(): Promise<string | null>;
   setMemoryReviewModel?(modelRef: string | null): Promise<string | null>;
@@ -1421,6 +1453,7 @@ function apiFrom(
     setComputerUseEnabled: enabled => invoke("setComputerUseEnabled", enabled),
     getSubagentModels: () => invoke("getSubagentModels"),
     setSubagentModel: (agentName, chain) => invoke("setSubagentModel", agentName, chain),
+    getSubagentDebugInfo: sessionId => sessionId ? invoke("getSubagentDebugInfo", sessionId) : invoke("getSubagentDebugInfo"),
     getMemoryReviewModel: () => invoke("getMemoryReviewModel"),
     setMemoryReviewModel: (modelRef) => invoke("setMemoryReviewModel", modelRef),
     getVisionModel: () => invoke("getVisionModel"),

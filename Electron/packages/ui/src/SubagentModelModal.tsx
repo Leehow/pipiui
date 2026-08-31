@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { thinkingLevelsForModel } from '@pipi/host-api'
-import type { AgentDefinition, Model, PipiHostAPI, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
+import type { AgentDefinition, Model, PipiHostAPI, SubagentDebugInfo, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
 import {
   agentAvailabilityLabel,
   agentSourceLabel,
@@ -15,19 +15,22 @@ import {
 import { DismissibleError } from './DismissibleError'
 import { modelRef } from './model-visibility'
 import { ProviderLogo } from './ProviderLogo'
+import { SubagentDebugView } from './SubagentDebugView'
 import type { ModelVisibilityController } from './useModelVisibility'
 import './subagent-models.css'
 
 /** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
-export function SubagentModelModal({ host, current, visibility, onClose, projectId }: {
+export function SubagentModelModal({ host, current, visibility, onClose, projectId, sessionId }: {
   host: PipiHostAPI
   current: Model | null
   visibility: ModelVisibilityController
   onClose: () => void
   projectId?: string
+  sessionId?: string
 }) {
   const hostMethodsPresent = typeof host.getSubagentModels === 'function' && typeof host.setSubagentModel === 'function' && typeof host.listAgentDefinitions === 'function'
   const memoryMethodsPresent = typeof host.getMemoryReviewModel === 'function' && typeof host.setMemoryReviewModel === 'function'
+  const debugMethodsPresent = typeof host.getSubagentDebugInfo === 'function'
   const [available, setAvailable] = useState(hostMethodsPresent)
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [settings, setSettings] = useState<Record<string, SubagentModelSetting[]>>({})
@@ -37,6 +40,11 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   const [saving, setSaving] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [dismissedDiagnostics, setDismissedDiagnostics] = useState<Set<string>>(() => new Set())
+  const [mode, setMode] = useState<'models' | 'debug'>('models')
+  const [debugInfo, setDebugInfo] = useState<SubagentDebugInfo | null>(null)
+  const [debugLoading, setDebugLoading] = useState(false)
+  const [debugError, setDebugError] = useState<string | null>(null)
+  const [debugEpoch, setDebugEpoch] = useState(0)
   // Use the same candidate stream as the composer quick picker, then remove
   // its one intentional exception: a currently selected but unchecked model.
   // Subagent primary and fallback rows must only offer checked models.
@@ -78,6 +86,25 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
     return () => { active = false }
   }, [host])
 
+  useEffect(() => {
+    if (mode !== 'debug') return
+    if (!debugMethodsPresent || !host.getSubagentDebugInfo) {
+      setDebugInfo({ available: false, reason: 'snapshot-not-ready', bossTools: [], toolCatalog: [], skills: [], subagents: [] })
+      setDebugError('当前连接不支持 Subagent Debug 信息。')
+      return
+    }
+    let active = true
+    setDebugLoading(true)
+    setDebugError(null)
+    void host.getSubagentDebugInfo(sessionId).then(info => {
+      if (active) setDebugInfo(info)
+    }).catch(err => {
+      if (!active) return
+      setDebugError(`无法加载 Subagent Debug 信息：${err instanceof Error ? err.message : String(err)}`)
+    }).finally(() => { if (active) setDebugLoading(false) })
+    return () => { active = false }
+  }, [debugEpoch, debugMethodsPresent, host, mode, sessionId])
+
   const save = async (agentName: string, chain: SubagentModelSetting[]) => {
     if (!host.setSubagentModel) return
     setSaving(agentName)
@@ -107,22 +134,31 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
 
   return (
     <div className="subagent-modal-backdrop" data-testid="subagent-models-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
-      <section className="subagent-modal" role="dialog" aria-modal="true" aria-label="Subagent 模型" data-testid="subagent-model-modal">
+      <section className={`subagent-modal${mode === 'debug' ? ' subagent-modal-debug' : ''}`} role="dialog" aria-modal="true" aria-label={mode === 'debug' ? 'Subagent Debug' : 'Subagent 模型'} data-testid="subagent-model-modal">
         <header className="subagent-modal-header">
           <div>
-            <h2>Subagent 模型</h2>
-            <p>默认「跟随主 Agent」= 底栏当前模型；可为每类 subagent 指定模型、思考强度与有序 fallback 链。</p>
+            <h2>{mode === 'debug' ? 'Subagent Debug' : 'Subagent 模型'}</h2>
+            <p>{mode === 'debug' ? '查看 Boss 与各个 Subagent 实际可见的工具、Skills 和中文说明。' : '默认「跟随主 Agent」= 底栏当前模型；可为每类 subagent 指定模型、思考强度与有序 fallback 链。'}</p>
           </div>
-          <button className="subagent-modal-close" aria-label="关闭 Subagent 模型" onClick={onClose}>×</button>
+          <button type="button" className="subagent-debug-toggle" aria-pressed={mode === 'debug'} onClick={() => setMode(value => value === 'debug' ? 'models' : 'debug')}>{mode === 'debug' ? '模型设置' : 'Debug'}</button>
+          <button className="subagent-modal-close" aria-label={mode === 'debug' ? '关闭 Subagent Debug' : '关闭 Subagent 模型'} onClick={onClose}>×</button>
         </header>
         {!available ? (
           <div className="subagent-modal-state" role="alert">{error ?? '当前连接不支持 Subagent 模型设置。'}</div>
-        ) : loading || visibility.loading ? (
-          <div className="subagent-modal-state">正在加载 Subagent 模型设置…</div>
-        ) : visibility.error ? (
+        ) : loading || (mode === 'models' && visibility.loading) ? (
+          <div className="subagent-modal-state">正在加载 {mode === 'debug' ? 'Subagent Debug 信息' : 'Subagent 模型设置'}…</div>
+        ) : mode === 'models' && visibility.error ? (
           <div className="subagent-modal-state" role="alert">无法读取模型管理中的已启用模型：{visibility.error}</div>
         ) : (
           <div className="subagent-modal-body">
+            {mode === 'debug' ? <SubagentDebugView
+              agents={agents}
+              info={debugInfo}
+              loading={debugLoading}
+              error={debugError}
+              onDismissError={() => setDebugError(null)}
+              onRefresh={() => setDebugEpoch(value => value + 1)}
+            /> : <>
             <div className="subagent-main-model">
               {current ? <><ProviderLogo provider={current.provider} modelId={current.id} size={14} /> 当前主 Agent（底栏）：{current.name}（{current.provider}/{current.id}）</> : '当前无打开会话；「跟随」将在派出时使用当时底栏选中的模型。'}
             </div>
@@ -167,6 +203,7 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
             </section>}
             <ProjectSubagentGroup agents={projectAgents} settings={settings} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
+            </>}
           </div>
         )}
       </section>

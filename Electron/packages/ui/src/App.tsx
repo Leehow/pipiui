@@ -10,6 +10,7 @@ import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
 import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
+import { DEMO_BOSS_TOOL_NAMES, DEMO_SKILL_NAMES } from './subagent-debug-demo'
 import { ModelQuickMenu } from './ModelQuickMenu'
 import { GitBranchMenu } from './GitBranchMenu'
 import { ProviderLogo } from './ProviderLogo'
@@ -970,6 +971,21 @@ export function createMockHost(): PipiHostAPI {
     setScanExternalSessions: async enabled => { scanExternalSessions = enabled; return scanExternalSessions },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
+    getSubagentDebugInfo: async sessionId => sessionId ? {
+      available: true,
+      source: 'demo',
+      sessionId,
+      capturedAt: Date.now(),
+      bossTools: DEMO_BOSS_TOOL_NAMES.map(name => ({ name, description: '' })),
+      toolCatalog: DEMO_BOSS_TOOL_NAMES.map(name => ({ name, description: '' })),
+      skills: DEMO_SKILL_NAMES.map(name => ({ name, description: '' })),
+      subagents: [
+        { name: 'explore', toolPolicy: 'allowlist', tools: ['read', 'bash', 'grep', 'find', 'ls', 'web_search', 'fetch_content', 'source_check', 'get_search_content', 'arxiv_fetch', 'memory_query', 'memory_status', 'session_recall', 'skill_search', 'skill_load'] },
+        { name: 'general-purpose', toolPolicy: 'allowlist', tools: ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'fetch_content', 'source_check', 'get_search_content', 'arxiv_fetch', 'memory_query', 'memory_status', 'session_recall', 'skill_search', 'skill_load', 'subagent', 'subagent_chain', 'subagent_abort', 'subagent_resolve', 'subagent_status'] },
+        { name: 'reviewer', toolPolicy: 'allowlist', tools: ['read', 'bash', 'grep', 'find', 'ls', 'fetch_content', 'source_check', 'get_search_content', 'arxiv_fetch', 'memory_query', 'memory_status', 'session_recall', 'skill_search', 'skill_load'] },
+        { name: 'secretary', toolPolicy: 'allowlist', tools: ['read', 'bash', 'edit', 'write', 'grep', 'find', 'ls', 'skill_search', 'skill_load', 'session_recall', 'secretary_commit'] },
+      ],
+    } : { available: false, reason: 'no-session', bossTools: [], toolCatalog: [], skills: [], subagents: [] },
     getMemoryReviewModel: async () => memoryReviewModel,
     setMemoryReviewModel: async model => { memoryReviewModel = model; return memoryReviewModel },
     listAgentDefinitions: async (_projectId?: string) => agentDefinitions.map(agent => ({ ...agent })),
@@ -3515,7 +3531,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       if (!selectedSession || !host.browser) return
       void host.browser.newTab(selectedSession, { url }).then(() => navigateTool('Browser')).catch(() => undefined)
     }} />}
-    {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} projectId={selectedProject} />}
+    {subagentModelsOpen && <SubagentModelModal host={host} current={modelState?.model ?? null} visibility={modalVisibility} onClose={() => setSubagentModelsOpen(false)} projectId={selectedProject} sessionId={selectedSession || undefined} />}
     <ExtensionUiHost host={host} sessionId={selectedSession || undefined} />
   </main>
 }
