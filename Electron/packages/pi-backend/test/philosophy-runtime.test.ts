@@ -196,6 +196,14 @@ describe("vendored philosophy: delivery", () => {
     expect(result.skipped.find((s) => s.id === "typo")?.reason).toMatch(/names nobody that exists/);
   });
 
+  it("separates lightweight tracking from the formal approval boundary", () => {
+    const planning = layers.find((l) => l.id === "planning")!.body;
+    expect(planning).toMatch(/approvalRequired: false/);
+    expect(planning).toMatch(/active immediately/);
+    expect(planning).toMatch(/approvalRequired: true/);
+    expect(planning).toMatch(/Then stop/);
+  });
+
   it("treats an approved plan as a per-task dispatch manifest", () => {
     const planning = layers.find((l) => l.id === "planning")!.body;
     const orchestration = layers.find((l) => l.id === "orchestration")!.body;

@@ -10,7 +10,7 @@
 
 export const PLAN_TASK_STATES = ["pending", "in_progress", "completed", "failed", "blocked", "skipped"] as const;
 export type PlanTaskState = (typeof PLAN_TASK_STATES)[number];
-export const PLAN_LIFECYCLES = ["draft", "approved", "cancelled"] as const;
+export const PLAN_LIFECYCLES = ["draft", "active", "approved", "cancelled"] as const;
 export type PlanLifecycle = (typeof PLAN_LIFECYCLES)[number];
 export type PlanTask = { id: string; title: string; state: PlanTaskState; note?: string };
 export type PlanSnapshot = {
@@ -73,9 +73,14 @@ export function normalizePlanSnapshot(value: unknown): PlanSnapshot | null {
     const task = normalizeTask(entry);
     if (task) tasks.push(task);
   }
-  const lifecycle = typeof value.lifecycle === "string" && (PLAN_LIFECYCLES as readonly string[]).includes(value.lifecycle)
+  const storedLifecycle = typeof value.lifecycle === "string" && (PLAN_LIFECYCLES as readonly string[]).includes(value.lifecycle)
     ? (value.lifecycle as PlanLifecycle)
     : "draft";
+  // Legacy publishers marked every plan draft even after task execution began. A progressed
+  // draft cannot truthfully be awaiting approval, so present it as ordinary active tracking.
+  const lifecycle: PlanLifecycle = storedLifecycle === "draft" && tasks.some(task => task.state !== "pending")
+    ? "active"
+    : storedLifecycle;
   const stamp = text(value.updatedAt) ?? text(value.createdAt) ?? new Date(0).toISOString();
   const plan: PlanSnapshot = {
     id,

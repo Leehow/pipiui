@@ -54,7 +54,7 @@ function withPlanRepo(fn: (mainCwd: string, planFile: string) => void, plan: unk
 	}
 }
 
-test("readActivePlanTasks: open tasks of an approved plan; everything else is no plan", () => {
+test("readActivePlanTasks: open tasks of an executable plan; everything else is no plan", () => {
 	withPlanRepo((mainCwd) => {
 		assert.deepEqual(readActivePlanTasks(mainCwd, "session-1"), {
 			planId: "plan-alpha",
@@ -66,6 +66,15 @@ test("readActivePlanTasks: open tasks of an approved plan; everything else is no
 		assert.equal(readActivePlanTasks(mainCwd, undefined), undefined);
 	});
 
+	withPlanRepo(
+		(mainCwd) => {
+			assert.deepEqual(readActivePlanTasks(mainCwd, "session-1"), {
+				planId: "plan-alpha",
+				taskIds: ["task-open", "task-active"],
+			});
+		},
+		{ ...PLAN_FIXTURE, plans: { "plan-alpha": { ...PLAN_FIXTURE.plans["plan-alpha"], lifecycle: "active" } } },
+	);
 	withPlanRepo(
 		(mainCwd) => {
 			// Draft plan: not approved, dispatches may drift silently.
@@ -147,7 +156,7 @@ test("planDriftAdvisoryFor: triggers, exemptions, and ring recording", () => {
 
 	// Unknown task id: named in the line, "unknown-task" recorded.
 	const unknown = planDriftAdvisoryFor([{ agentId: "b", planTask: "no-such" }], strict);
-	assert.match(unknown, /\[plan-drift\] agentId=b planTask="no-such" is not a task id of approved plan plan-alpha/);
+	assert.match(unknown, /\[plan-drift\] agentId=b planTask="no-such" is not a task id of executable plan plan-alpha/);
 	const ring = recentPlanDriftSignals();
 	assert.equal(ring.length, 2);
 	assert.equal(ring[1]?.reason, "unknown-task");

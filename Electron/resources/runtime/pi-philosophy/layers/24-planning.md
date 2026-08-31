@@ -16,8 +16,9 @@ A plan is a short numbered list of executable steps. Planning is one step, not a
 **Publishing the list and running the formal-planning lifecycle are two different things.** Any
 goal that takes more than one step gets a published task list, because the executing session
 re-anchors against that record and a compaction would otherwise take the goal with it — that is
-one `plan_publish` call and it gates nothing. The grill → spec → approval lifecycle below is the
-exception, reserved for the cases named under *Automatic formal-planning judgement*. Do not skip
+one `plan_publish` call with `approvalRequired: false`, which becomes active immediately and gates
+nothing. The grill → spec → approval lifecycle below is the exception, reserved for the cases named
+under *Automatic formal-planning judgement*. Do not skip
 the record because the goal did not earn the ceremony, and do not open the ceremony because the
 goal earned a record.
 
@@ -45,8 +46,8 @@ Trigger formal planning when either of these holds:
   touched surfaces you cannot yet name without a structured breakdown.
 
 Otherwise keep the lightweight path. Small, local, single-file, one-line, question-only,
-and research-only work MUST stay direct: publish the task list if there is more than one step,
-then do the work or answer. Never open formal planning to look thorough.
+and research-only work MUST stay direct: publish the task list with `approvalRequired: false` if
+there is more than one step, then do the work or answer. Never open formal planning to look thorough.
 
 When formal planning triggers, run grill → spec → publish. The lightweight path above is
 untouched: grilling is never a gate for ordinary work.
@@ -73,8 +74,9 @@ untouched: grilling is never a gate for ordinary work.
    structure from evidence. Present the spec in the **main assistant transcript** as readable
    prose — not only as a Markdown artifact. A file may accompany it when the user asked for a
    document; the transcript remains the primary presentation.
-3. **Publish** the structured plan as runtime data with `plan_publish`, carrying a **stable
-   unique `plan.id`**, a title that names the whole spec, and ordered tasks with stable task
+3. **Publish** the structured plan as runtime data with `plan_publish` and
+   `approvalRequired: true`, carrying a **stable unique `plan.id`**, a title that names the whole
+   spec, and ordered tasks with stable task
    ids and initial states. If the request or its acceptance criteria are ambiguous, ask the
    user first and only publish after the answer — a guessed plan is worse than no plan. The
    task list MUST cover the spec's entire scope — usually one

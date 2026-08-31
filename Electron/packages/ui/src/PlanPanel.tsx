@@ -19,7 +19,7 @@ const STATE_GLYPH: Record<PlanTaskState, string> = {
   blocked: '!',
   skipped: '–',
 }
-const LIFECYCLE_TEXT: Record<PlanSnapshot['lifecycle'], string> = { draft: '待确认', approved: '已批准', cancelled: '已取消' }
+const LIFECYCLE_TEXT: Record<PlanSnapshot['lifecycle'], string> = { draft: '待确认', active: '直接执行', approved: '已批准', cancelled: '已取消' }
 
 function stamp(value: string | undefined): string {
   if (!value) return ''

@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,8 +7,11 @@ type Tool = {
   name: string;
   description?: string;
   promptSnippet?: string;
+  prepareArguments?: (args: unknown) => unknown;
   execute: (id: string, params: any, signal?: unknown, onUpdate?: unknown, ctx?: { cwd: string }) => Promise<any>;
 };
+type EventHandler = (event: any, ctx: any) => any;
+type LoadedTools = Record<string, Tool> & { __handlers: Map<string, EventHandler> };
 
 /**
  * `sessionId` is read at module load (like the bridge env), so a caller that
@@ -26,11 +29,13 @@ async function loadExtension(sessionId = "", options: { allowBridge?: boolean } 
     vi.stubEnv("PIPIUI_SESSION_CAPABILITY", "");
   }
   const tools: Tool[] = [];
+  const handlers = new Map<string, EventHandler>();
   const extension = (await import("../../../resources/runtime/extensions/pipiui-plan.ts")).default;
   extension({
     registerTool: (definition: Tool) => { tools.push(definition); },
+    on: (eventName: string, handler: EventHandler) => { handlers.set(eventName, handler); },
   } as never);
-  return Object.fromEntries(tools.map((tool) => [tool.name, tool]));
+  return Object.assign(Object.fromEntries(tools.map((tool) => [tool.name, tool])), { __handlers: handlers }) as LoadedTools;
 }
 
 function parse(result: any) {
@@ -64,6 +69,7 @@ describe("pipiui plan tools", () => {
       plan: {
         id: "plan-a",
         title: "Ship plan tools",
+        approvalRequired: true,
         tasks: [{ id: "t1", title: "implement" }, { id: "t2", title: "test" }],
       },
     }, undefined, undefined, ctx));
@@ -71,14 +77,13 @@ describe("pipiui plan tools", () => {
     expect(published.plan.tasks[0].state).toBe("pending");
     expect(published.plan.lifecycle).toBe("draft");
 
-    const updated = parse(await first.plan_task_update.execute("2", {
+    const premature = parse(await first.plan_task_update.execute("2", {
       planId: "plan-a",
       taskId: "t1",
       state: "in_progress",
       note: "started",
     }, undefined, undefined, ctx));
-    expect(updated.ok).toBe(true);
-    expect(updated.plan.tasks[0]).toMatchObject({ state: "in_progress", note: "started" });
+    expect(premature).toMatchObject({ ok: false, error: expect.stringMatching(/awaiting user approval/i) });
 
     const approved = parse(await first.plan_approve.execute("3", { planId: "plan-a" }, undefined, undefined, ctx));
     expect(approved.ok).toBe(true);
@@ -92,12 +97,21 @@ describe("pipiui plan tools", () => {
     expect(approved.plan.lifecycle).toBe("approved");
     expect(approved.plan.approvedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
+    const updated = parse(await first.plan_task_update.execute("4", {
+      planId: "plan-a",
+      taskId: "t1",
+      state: "in_progress",
+      note: "started",
+    }, undefined, undefined, ctx));
+    expect(updated.ok).toBe(true);
+    expect(updated.plan.tasks[0]).toMatchObject({ state: "in_progress", note: "started" });
+
     const disk = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
     expect(disk.activePlanId).toBe("plan-a");
     expect(disk.plans["plan-a"].lifecycle).toBe("approved");
 
     const reloaded = await loadExtension("", { allowBridge: true });
-    const again = parse(await reloaded.plan_task_update.execute("4", {
+    const again = parse(await reloaded.plan_task_update.execute("5", {
       planId: "plan-a",
       taskId: "t1",
       state: "completed",
@@ -114,9 +128,133 @@ describe("pipiui plan tools", () => {
       event: { event: "plan_publish", schemaVersion: 1 },
     });
     expect(posts[0].body.event.plan).toMatchObject({ id: "plan-a", title: "Ship plan tools" });
-    expect(posts[1].body.event.event).toBe("plan_task_update");
-    expect(posts[2].body.event.event).toBe("plan_approve");
-    expect(posts[2].body.event.plan.lifecycle).toBe("approved");
+    expect(posts[1].body.event.event).toBe("plan_approve");
+    expect(posts[1].body.event.plan.lifecycle).toBe("approved");
+    expect(posts[2].body.event.event).toBe("plan_task_update");
+  });
+
+  it("publishes ordinary tracking plans as active without showing an approval state", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-active-"));
+    const tools = await loadExtension();
+    const ctx = { cwd: root };
+    const published = parse(await tools.plan_publish.execute("1", {
+      plan: {
+        id: "plan-active",
+        title: "Track direct work",
+        approvalRequired: false,
+        tasks: [{ id: "t1", title: "implement" }],
+      },
+    }, undefined, undefined, ctx));
+    expect(published).toMatchObject({ ok: true, plan: { lifecycle: "active" } });
+
+    const updated = parse(await tools.plan_task_update.execute("2", {
+      planId: "plan-active", taskId: "t1", state: "in_progress",
+    }, undefined, undefined, ctx));
+    expect(updated).toMatchObject({ ok: true, plan: { tasks: [{ state: "in_progress" }] } });
+    expect(await tools.__handlers.get("tool_call")!(
+      { toolName: "bash", input: { command: "echo allowed" } },
+      { ...ctx, sessionManager: { getBranch: () => [] } },
+    )).toBeUndefined();
+
+    const unnecessaryApproval = parse(await tools.plan_approve.execute("3", {
+      planId: "plan-active",
+    }, undefined, undefined, ctx));
+    expect(unnecessaryApproval).toMatchObject({ ok: false, error: expect.stringMatching(/does not require approval/i) });
+  });
+
+  it("blocks execution for a formal draft, including sibling calls in its publish batch", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-gate-"));
+    const tools = await loadExtension();
+    const ctx = { cwd: root, sessionManager: { getBranch: () => [] } };
+    const alreadyStarted = parse(await tools.plan_publish.execute("0", {
+      plan: {
+        id: "plan-started",
+        title: "Invalid formal progress",
+        approvalRequired: true,
+        tasks: [{ id: "t0", title: "already done", state: "completed" }],
+      },
+    }, undefined, undefined, ctx));
+    expect(alreadyStarted).toMatchObject({ ok: false, error: expect.stringMatching(/every task as pending/i) });
+
+    await tools.plan_publish.execute("1", {
+      plan: {
+        id: "plan-gated",
+        title: "Wait for approval",
+        approvalRequired: true,
+        tasks: [{ id: "t1", title: "implement" }],
+      },
+    }, undefined, undefined, ctx);
+
+    const gate = tools.__handlers.get("tool_call")!;
+    expect(await gate({ toolName: "bash", input: { command: "echo nope" } }, ctx)).toMatchObject({ block: true, terminate: true });
+    expect(await gate({ toolName: "plan_check", input: {} }, ctx)).toBeUndefined();
+
+    const emptyRoot = await mkdtemp(join(tmpdir(), "pipiui-plan-batch-gate-"));
+    const sameBatchCtx = {
+      cwd: emptyRoot,
+      sessionManager: {
+        getBranch: () => [{
+          type: "message",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "toolCall", name: "plan_publish", arguments: { plan: { approvalRequired: true } } },
+              { type: "toolCall", name: "bash", arguments: { command: "echo nope" } },
+            ],
+          },
+        }],
+      },
+    };
+    expect(await gate({ toolName: "bash", input: { command: "echo nope" } }, sameBatchCtx)).toMatchObject({ block: true });
+    await rm(emptyRoot, { recursive: true, force: true });
+  });
+
+  it("turns the approval button prompt into persisted approval before the next agent step", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-input-approve-"));
+    const tools = await loadExtension();
+    const ctx = { cwd: root, sessionManager: { getBranch: () => [] } };
+    await tools.plan_publish.execute("1", {
+      plan: {
+        id: "plan-input",
+        title: "Approve from UI",
+        approvalRequired: true,
+        tasks: [{ id: "t1", title: "implement" }],
+      },
+    }, undefined, undefined, ctx);
+
+    await tools.__handlers.get("input")!({ text: "批准该计划", source: "extension" }, ctx);
+    const beforeHumanApproval = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
+    expect(beforeHumanApproval.plans["plan-input"].lifecycle).toBe("draft");
+
+    await tools.__handlers.get("input")!({ text: "批准该计划", source: "rpc" }, ctx);
+    const disk = JSON.parse(await readFile(join(root, ".pi", "plans", "current.json"), "utf8"));
+    expect(disk.plans["plan-input"]).toMatchObject({ lifecycle: "approved", approvedAt: expect.any(String) });
+    expect(await tools.__handlers.get("tool_call")!({ toolName: "bash", input: { command: "echo ok" } }, ctx)).toBeUndefined();
+  });
+
+  it("migrates a legacy progressed draft to active tracking", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-legacy-progress-"));
+    await mkdir(join(root, ".pi", "plans"), { recursive: true });
+    await writeFile(join(root, ".pi", "plans", "current.json"), JSON.stringify({
+      activePlanId: "legacy-plan",
+      plans: {
+        "legacy-plan": {
+          id: "legacy-plan",
+          title: "Old mixed state",
+          lifecycle: "draft",
+          createdAt: "2026-08-30T00:00:00.000Z",
+          updatedAt: "2026-08-30T00:01:00.000Z",
+          tasks: [{ id: "t1", title: "already running", state: "in_progress" }],
+        },
+      },
+    }), "utf8");
+    const tools = await loadExtension();
+    const ctx = { cwd: root, sessionManager: { getBranch: () => [] } };
+    const checked = parse(await tools.plan_check.execute("1", {}, undefined, undefined, ctx));
+    expect(checked.plan.lifecycle).toBe("active");
+    expect(await tools.__handlers.get("tool_call")!(
+      { toolName: "bash", input: { command: "echo allowed" } }, ctx,
+    )).toBeUndefined();
   });
 
   it("describes plan_publish as a full-spec stable-id tool", async () => {

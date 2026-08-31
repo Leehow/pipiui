@@ -27,13 +27,13 @@ export function PlanApprovalBar({
   host,
   sessionId,
   readOnly,
-  busy,
   lastUser,
   onSend,
 }: {
   host: PipiHostAPI
   sessionId?: string
   readOnly?: boolean
+  /** Kept for callers/tests: a pending approval must remain visible while the agent is busy. */
   busy?: boolean
   lastUser?: PlanApprovalLastUser | null
   onSend: (prompt: string) => void | Promise<boolean | void>
@@ -75,7 +75,7 @@ export function PlanApprovalBar({
   }, [host, apply])
 
   const draft = useMemo(() => newestDraftLivePlan(plans), [plans])
-  const hidden = !sessionId || readOnly || !draft || busy
+  const hidden = !sessionId || readOnly || !draft
     || draft.id === dismissedPlanId
     || userHasApprovedDraft(draft, lastUser)
   if (hidden) return null

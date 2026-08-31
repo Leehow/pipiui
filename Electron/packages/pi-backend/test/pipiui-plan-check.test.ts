@@ -22,6 +22,7 @@ async function loadExtension(sessionId = "") {
   const extension = (await import("../../../resources/runtime/extensions/pipiui-plan.ts")).default;
   extension({
     registerTool: (definition: Tool) => { tools.push(definition); },
+    on: () => undefined,
   } as never);
   return Object.fromEntries(tools.map((tool) => [tool.name, tool]));
 }
@@ -98,6 +99,7 @@ describe("plan_check", () => {
       plan: {
         id: "plan-alpha",
         title: "Alpha",
+        approvalRequired: true,
         tasks: [
           { id: "task-open", title: "Open" },
           { id: "task-active", title: "Active" },
@@ -198,7 +200,7 @@ describe("plan_check", () => {
     const tools = await loadExtension();
     const ctx = { cwd: root };
     expect(parse(await tools.plan_publish.execute("1", {
-      plan: { id: "plan-draft", title: "Draft", tasks: [{ id: "t1", title: "one" }] },
+      plan: { id: "plan-draft", title: "Draft", approvalRequired: true, tasks: [{ id: "t1", title: "one" }] },
     }, undefined, undefined, ctx)).ok).toBe(true);
 
     await publishSeam([

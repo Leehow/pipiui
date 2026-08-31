@@ -45,6 +45,14 @@ describe('PlanPanel', () => {
     expect(screen.getByText('已批准')).toBeTruthy()
   })
 
+  it('labels an ordinary non-gated plan as directly executing instead of awaiting confirmation', async () => {
+    const { host } = hostWith([plan({ lifecycle: 'active' })])
+    render(<PlanPanel host={host} sessionId="s1" />)
+
+    expect(await screen.findByText('直接执行')).toBeTruthy()
+    expect(screen.queryByText('待确认')).toBeNull()
+  })
+
   it('advances a task live from a plan_task_update event', async () => {
     const { host, push } = hostWith([plan()])
     render(<PlanPanel host={host} sessionId="s1" />)

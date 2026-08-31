@@ -110,7 +110,7 @@ export function resetPlanDriftSignalsForTests(): void {
 }
 
 /**
- * Open tasks of the session's approved plan, read straight from `.pi/plans/<sessionId>.json`
+ * Open tasks of the session's executable plan, read straight from `.pi/plans/<sessionId>.json`
  * (the same file extensions/pipiui-plan.ts writes). Any read/parse failure means "no active
  * plan": the advisory must never turn a plan-store hiccup into a dispatch error.
  */
@@ -135,7 +135,7 @@ export function readActivePlanTasks(
 	const plan = (store.plans as Record<string, unknown>)[store.activePlanId];
 	if (typeof plan !== "object" || plan === null) return undefined;
 	const snapshot = plan as { lifecycle?: unknown; tasks?: unknown };
-	if (snapshot.lifecycle !== "approved" || !Array.isArray(snapshot.tasks)) return undefined;
+	if ((snapshot.lifecycle !== "approved" && snapshot.lifecycle !== "active") || !Array.isArray(snapshot.tasks)) return undefined;
 	const taskIds: string[] = [];
 	for (const task of snapshot.tasks) {
 		if (typeof task !== "object" || task === null) continue;
@@ -165,7 +165,7 @@ export interface PlanDriftCheckContext {
 /**
  * `[plan-drift]` lines for one dispatch call. Advisory only: nothing here gates admission.
  * Exempt: secretary closeouts, resumes/re-dispatches of an already-known agentId, and every
- * dispatch when no approved plan has open tasks.
+ * dispatch when no executable plan has open tasks.
  */
 export function planDriftAdvisoryFor(candidates: PlanDriftCandidate[], context: PlanDriftCheckContext): string {
 	if (!context.activePlan) return "";
@@ -189,9 +189,9 @@ export function planDriftAdvisoryFor(candidates: PlanDriftCandidate[], context: 
 		});
 		const detail = reason === "missing"
 			? "does not declare planTask"
-			: `planTask="${planTask}" is not a task id of approved plan ${context.activePlan.planId}`;
+			: `planTask="${planTask}" is not a task id of executable plan ${context.activePlan.planId}`;
 		lines.push(
-			`[plan-drift] agentId=${agentId} ${detail}. Dispatch was not blocked; an approved plan with open tasks exists ` +
+			`[plan-drift] agentId=${agentId} ${detail}. Dispatch was not blocked; an executable plan with open tasks exists ` +
 				"— map this dispatch onto one of them via planTask, or proceed consciously if this is legitimate out-of-plan work " +
 				"(failure recovery, secretary closeout, a new user request) and note the judgment in your ledger.",
 		);

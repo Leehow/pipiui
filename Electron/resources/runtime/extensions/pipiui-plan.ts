@@ -19,7 +19,7 @@ export const TASK_STATES = [
 ] as const;
 
 export type TaskState = (typeof TASK_STATES)[number];
-export type PlanLifecycle = "draft" | "approved" | "cancelled";
+export type PlanLifecycle = "draft" | "active" | "approved" | "cancelled";
 
 export type PlanTask = {
   id: string;
@@ -90,7 +90,15 @@ export function loadStore(cwd: string): Store {
     if (!isRecord(raw) || !isRecord(raw.plans)) return emptyStore();
     const plans: Record<string, PlanSnapshot> = {};
     for (const [id, plan] of Object.entries(raw.plans)) {
-      if (isRecord(plan) && typeof plan.id === "string") plans[id] = plan as PlanSnapshot;
+      if (!isRecord(plan) || typeof plan.id !== "string") continue;
+      const snapshot = plan as PlanSnapshot;
+      const legacyProgressedDraft = snapshot.lifecycle === "draft"
+        && Array.isArray(snapshot.tasks)
+        && snapshot.tasks.some((task) => isRecord(task) && isTaskState(task.state) && task.state !== "pending");
+      // Before approvalRequired existed, every plan was persisted as draft even while its
+      // tasks advanced. Treat that impossible "awaiting approval + already running" state as
+      // ordinary active tracking so old sessions stop showing a retroactive confirmation.
+      plans[id] = legacyProgressedDraft ? { ...snapshot, lifecycle: "active" } : snapshot;
     }
     const active = typeof raw.activePlanId === "string" ? raw.activePlanId : null;
     return { activePlanId: active && plans[active] ? active : null, plans };
@@ -165,7 +173,7 @@ function isPlanTerminal(plan: PlanSnapshot): boolean {
 
 export async function publishPlan(
   cwd: string,
-  input: { id: string; title: string; tasks: Array<{ id: string; title: string; state?: string }> },
+  input: { id: string; title: string; approvalRequired?: boolean; tasks: Array<{ id: string; title: string; state?: string }> },
   emit: typeof emitPlanEvent = emitPlanEvent,
 ): Promise<{ ok: true; plan: PlanSnapshot } | { ok: false; error: string }> {
   if (!input.id?.trim() || !input.title?.trim()) return { ok: false, error: "plan.id and plan.title are required" };
@@ -182,11 +190,14 @@ export async function publishPlan(
     if (task.state !== undefined && !isTaskState(task.state)) return { ok: false, error: `invalid task state "${task.state}"` };
     tasks.push({ id: task.id, title: task.title, state: isTaskState(task.state) ? task.state : "pending" });
   }
+  if (input.approvalRequired === true && tasks.some((task) => task.state !== "pending")) {
+    return { ok: false, error: "a plan awaiting approval must publish every task as pending" };
+  }
   const stamp = now();
   const plan: PlanSnapshot = {
     id: input.id,
     title: input.title,
-    lifecycle: "draft",
+    lifecycle: input.approvalRequired === true ? "draft" : "active",
     tasks,
     createdAt: stamp,
     updatedAt: stamp,
@@ -207,6 +218,9 @@ export async function updateTask(
   const store = loadStore(cwd);
   const active = requireActivePlan(store, input.planId);
   if (!active.ok) return active;
+  if (active.plan.lifecycle === "draft") {
+    return { ok: false, error: `plan "${input.planId}" is awaiting user approval` };
+  }
   const task = active.plan.tasks.find((item) => item.id === input.taskId);
   if (!task) return { ok: false, error: `unknown task "${input.taskId}"` };
   task.state = input.state;
@@ -225,6 +239,10 @@ export async function approvePlan(
   const store = loadStore(cwd);
   const active = requireActivePlan(store, planId);
   if (!active.ok) return active;
+  if (active.plan.lifecycle === "active") {
+    return { ok: false, error: `plan "${planId}" does not require approval` };
+  }
+  if (active.plan.lifecycle === "approved") return { ok: true, plan: active.plan };
   const stamp = now();
   active.plan.lifecycle = "approved";
   active.plan.approvedAt = stamp;
@@ -323,7 +341,7 @@ export function checkPlan(cwd: string): PlanCheckResult {
   const snapshot = getPlanAdherenceSnapshot();
   const plan = store.activePlanId ? store.plans[store.activePlanId] ?? null : null;
   const openTaskIds = new Set(
-    plan && plan.lifecycle === "approved"
+    plan && (plan.lifecycle === "approved" || plan.lifecycle === "active")
       ? plan.tasks.filter(isOpenTask).map((task) => task.id)
       : [],
   );
@@ -400,16 +418,87 @@ function cwdOf(ctx: { cwd?: string } | undefined): string {
   return ctx?.cwd || process.env.PIPIUI_MAIN_CWD || process.cwd();
 }
 
+export const PLAN_APPROVE_PROMPT = "批准该计划";
+const DRAFT_CONTROL_TOOLS = new Set(["plan_publish", "plan_approve", "plan_cancel", "plan_check"]);
+
+function toolCallFromPart(part: unknown): { name: string; arguments: Record<string, unknown> } | undefined {
+  if (!isRecord(part)) return undefined;
+  const nested = isRecord(part.toolCall) ? part.toolCall
+    : isRecord(part.functionCall) ? part.functionCall
+      : isRecord(part.function) ? part.function
+        : undefined;
+  const name = typeof part.name === "string" ? part.name : typeof nested?.name === "string" ? nested.name : undefined;
+  if (!name) return undefined;
+  const raw = part.arguments ?? part.input ?? part.args ?? nested?.arguments ?? nested?.input ?? nested?.args;
+  if (isRecord(raw)) return { name, arguments: raw };
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return { name, arguments: isRecord(parsed) ? parsed : {} };
+    } catch {
+      return { name, arguments: {} };
+    }
+  }
+  return { name, arguments: {} };
+}
+
+function currentAssistantPublishesApprovalRequiredPlan(ctx: { sessionManager?: { getBranch?: () => unknown[] } }): boolean {
+  const branch = ctx.sessionManager?.getBranch?.();
+  if (!Array.isArray(branch)) return false;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index] as { type?: unknown; message?: unknown };
+    if (entry?.type !== "message") continue;
+    const message = entry.message as { role?: unknown; content?: unknown } | undefined;
+    if (message?.role !== "assistant" || !Array.isArray(message.content)) return false;
+    return message.content.some((part) => {
+      const call = toolCallFromPart(part);
+      const plan = call?.arguments.plan;
+      return call?.name === "plan_publish" && isRecord(plan) && plan.approvalRequired === true;
+    });
+  }
+  return false;
+}
+
+export function draftPlanToolCallBlockReason(
+  cwd: string,
+  toolName: string,
+  currentBatchPublishesDraft = false,
+): string | undefined {
+  if (DRAFT_CONTROL_TOOLS.has(toolName)) return undefined;
+  const store = loadStore(cwd);
+  const active = store.activePlanId ? store.plans[store.activePlanId] : undefined;
+  if (!currentBatchPublishesDraft && active?.lifecycle !== "draft") return undefined;
+  const planLabel = active ? `plan "${active.id}"` : "the plan being published";
+  return `${planLabel} is awaiting user approval. Do not execute tools until the user approves it; only plan_approve, plan_cancel, and plan_check are allowed.`;
+}
+
 export default function (pi: ExtensionAPI) {
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension" || event.text.trim() !== PLAN_APPROVE_PROMPT) return;
+    const store = loadStore(ctx.cwd);
+    const active = store.activePlanId ? store.plans[store.activePlanId] : undefined;
+    if (active?.lifecycle === "draft") await approvePlan(ctx.cwd, active.id);
+  });
+
+  pi.on("tool_call", (event, ctx) => {
+    const reason = draftPlanToolCallBlockReason(
+      ctx.cwd,
+      event.toolName,
+      currentAssistantPublishesApprovalRequiredPlan(ctx),
+    );
+    if (reason) return { block: true, reason, terminate: true };
+  });
+
   pi.registerTool({
     name: "plan_publish",
     label: "Plan Publish",
-    description: "Publish the full-spec structured execution plan with one stable unique plan.id and ordered tasks covering the entire spec — usually one top-level task per executable phase or milestone. Replaces transcript-only planning when formal planning is required. Do not publish only the current stage. After approval, keep this plan.id and update tasks; do not publish a stage2/stage3 replacement.",
-    promptSnippet: "Publish the full-spec plan with one stable plan.id; later phases stay on this plan",
+    description: "Publish one full-spec structured execution plan with a stable plan.id. Set approvalRequired=false for ordinary progress tracking (the plan becomes active immediately); set approvalRequired=true only for a formal plan that must wait for explicit user approval. Cover the entire spec. Do not publish only the current stage; do not publish a stage2/stage3 replacement. Keep the same plan.id through later phases.",
+    promptSnippet: "Publish a full task list, explicitly say whether approval is required, and ensure later phases stay on this plan",
     parameters: Type.Object({
       plan: Type.Object({
         id: Type.String({ minLength: 1 }),
         title: Type.String({ minLength: 1 }),
+        approvalRequired: Type.Boolean({ description: "true only for a formal plan that must stop until the user approves; false for ordinary progress tracking" }),
         tasks: Type.Array(Type.Object({
           id: Type.String({ minLength: 1 }),
           title: Type.String({ minLength: 1 }),
@@ -417,6 +506,10 @@ export default function (pi: ExtensionAPI) {
         }), { minItems: 1 }),
       }),
     }),
+    prepareArguments(args) {
+      if (!isRecord(args) || !isRecord(args.plan) || typeof args.plan.approvalRequired === "boolean") return args;
+      return { ...args, plan: { ...args.plan, approvalRequired: false } };
+    },
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const outcome = await publishPlan(cwdOf(ctx), params.plan);
       return result(outcome, !outcome.ok);

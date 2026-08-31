@@ -35,6 +35,13 @@ describe("PlanStore.accept", () => {
     expect(planIsLive(snapshot({ active: false }))).toBe(false);
   });
 
+  it("preserves the active lifecycle used by ordinary non-gated plans", () => {
+    const store = new PlanStore();
+    store.accept({ event: "plan_publish", plan: snapshot({ lifecycle: "active" }) }, "s1");
+    expect(store.list("s1")[0].lifecycle).toBe("active");
+    expect(planIsLive(store.list("s1")[0])).toBe(true);
+  });
+
   it("republishes a publish event and keeps it as the session's plan", () => {
     const store = new PlanStore();
     const event = store.accept({ event: "plan_publish", plan: snapshot() }, "s1");
@@ -113,6 +120,21 @@ describe("readPlanStore", () => {
     expect(plans).toHaveLength(2);
     expect(plans.find(plan => plan.id === "plan-1")!.active).toBe(true);
     expect(plans.find(plan => plan.id === "plan-0")!.active).toBe(false);
+  });
+
+  it("reads a legacy progressed draft as active instead of awaiting retroactive approval", async () => {
+    const cwd = await project();
+    await mkdir(join(cwd, ".pi", "plans"), { recursive: true });
+    await writeFile(planStorePath(cwd), JSON.stringify({
+      activePlanId: "plan-1",
+      plans: {
+        "plan-1": snapshot({
+          lifecycle: "draft",
+          tasks: [{ id: "a", title: "已经开始", state: "in_progress" }],
+        }),
+      },
+    }), "utf8");
+    expect((await readPlanStore(cwd))[0].lifecycle).toBe("active");
   });
 
   it("treats a missing or malformed store as no plans rather than an error", async () => {

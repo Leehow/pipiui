@@ -84,10 +84,9 @@ describe('PlanApprovalBar', () => {
     expect(await screen.findByTestId('plan-approval-bar')).toBeTruthy()
   })
 
-  it('hides the bar while the session is already working on a turn', async () => {
+  it('keeps the approval bar visible while the session is working', async () => {
     const { host } = hostWith([draft()])
     render(<PlanApprovalBar host={host} sessionId="s1" busy onSend={vi.fn()} />)
-    await waitFor(() => expect(host.getPlans).toHaveBeenCalled())
-    expect(screen.queryByTestId('plan-approval-bar')).toBeNull()
+    expect(await screen.findByTestId('plan-approval-bar')).toBeTruthy()
   })
 })
