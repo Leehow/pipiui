@@ -53,6 +53,7 @@ async function importFixture(specifier: string): Promise<unknown> {
       'data-host': String('host' in props),
       'data-workspace': String(props.workspaceId),
       'data-git': String(Boolean(props.git)),
+      'data-open-external': String(Boolean(props.openExternal)),
     }),
   }
   throw new Error(`unknown fixture ${specifier}`)
@@ -204,7 +205,8 @@ describe('loadControlledContributions', () => {
     const header = rendered.getByTestId('ext-controlled-header')
     expect(header.getAttribute('data-host')).toBe('false')
     expect(header.getAttribute('data-workspace')).toBe('workspace-a')
-    expect(header.getAttribute('data-git')).toBe('true')
+    expect(header.getAttribute('data-git')).toBe('false')
+    expect(header.getAttribute('data-open-external')).toBe('false')
     for (const dispose of disposers) dispose()
     expect(listHeaderActions().some(item => item.id === 'quota.header')).toBe(false)
   })

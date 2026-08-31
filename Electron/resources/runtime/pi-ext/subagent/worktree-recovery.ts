@@ -16,10 +16,10 @@
  * Git, timers, or a live session.
  */
 
-import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { requestGitWorktreeServiceProviderV1 } from "../../extensions/git-capability/host/worktree/provider.ts";
 import type { WorktreeFinalizationStateV1 } from "../../extensions/git-capability/host/worktree/schema.ts";
 import {
 	claimAgentCleanupLease,
@@ -361,19 +361,10 @@ export function formatPostMergeVerifyFailedMessage(input: {
 	].join("\n");
 }
 
-/** A dirty main changes the verify-failure guidance, so probe it the way Swift does. */
+/** A dirty main changes the verify-failure guidance, so probe it via the Git provider. */
 export function probeMainDirty(mainCwd: string): boolean {
 	try {
-		const env = { ...process.env };
-		delete env.PIPIUI_COMPUTER_CAPABILITY;
-		const result = spawnSync("git", ["-C", mainCwd, "status", "--porcelain"], {
-			encoding: "utf8",
-			shell: false,
-			env,
-			timeout: 10_000,
-		});
-		if (result.status !== 0 || result.error) return true;
-		return typeof result.stdout === "string" && result.stdout.trim().length > 0;
+		return requestGitWorktreeServiceProviderV1()?.probeMainDirty(mainCwd) ?? true;
 	} catch {
 		return true;
 	}

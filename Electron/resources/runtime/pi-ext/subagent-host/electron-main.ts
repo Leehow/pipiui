@@ -10,6 +10,7 @@
 import { randomBytes } from "node:crypto";
 import { decodeHostCapabilitiesV1, type HostCapabilitiesV1 } from "./contract.ts";
 import { buildSubagentEnvironmentV1, type SubagentEnvironmentV1 } from "./env.ts";
+import { createGitWorktreeServiceProviderV1 } from "../../extensions/git-capability/host/worktree/provider.ts";
 import {
 	createSubagentHostRuntimeV1,
 	type SubagentHostRuntimeCallbacksV1,
@@ -113,9 +114,26 @@ function validatedCapabilities(input: HostCapabilitiesV1): HostCapabilitiesV1 {
  * returned spawn object to Electron's own child_process integration. Subscribe
  * before start() to receive the initial projection and plan load notifications.
  */
+function withLocalWorktreeFinalizationService(
+	runtime: Omit<SubagentHostRuntimeOptionsV1, "sessionCapability">,
+): Omit<SubagentHostRuntimeOptionsV1, "sessionCapability"> {
+	const config = runtime.worktreeFinalization;
+	if (!config || config.enabled !== true || config.service) return runtime;
+	return {
+		...runtime,
+		worktreeFinalization: {
+			...config,
+			service: createGitWorktreeServiceProviderV1().createFinalizationService(),
+		},
+	};
+}
+
 export function createElectronMainSubagentHostV1(options: ElectronMainSubagentHostOptionsV1): ElectronMainSubagentHostV1 {
 	const sessionCapability = options.sessionCapability ?? createElectronMainSessionCapabilityV1();
-	const runtime = createSubagentHostRuntimeV1({ ...options.runtime, sessionCapability });
+	const runtime = createSubagentHostRuntimeV1({
+		...withLocalWorktreeFinalizationService(options.runtime),
+		sessionCapability,
+	});
 	return {
 		sessionCapability,
 		runtime,

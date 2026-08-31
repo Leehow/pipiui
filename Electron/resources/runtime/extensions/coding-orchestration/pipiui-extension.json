@@ -3,6 +3,6 @@
   "name": "PipiUI Coding Orchestration",
   "version": "1.0.0",
   "category": "coding",
-  "description": "Coding worker, worktree, and Subagent workbench ownership marker during the v2 migration.",
+  "description": "Coding-specific workbench ownership marker during the v2 migration.",
   "capabilities": []
 }

@@ -96,7 +96,7 @@ export type EnabledWorktreeFinalizationRuntimeConfigV1 = {
 	mainCwd: string;
 	/** Agent/run identities are filled from the terminal projection, never caller input. */
 	ownership: Pick<WorktreeOwnershipV1, "mode" | "role">;
-	/** Optional host test seam; production requests the mounted git-capability provider. */
+	/** Injected service. Electron-main creates one locally; Pi same-realm falls back to the mounted provider. */
 	service?: WorktreeFinalizationServiceV1;
 	/**
 	 * Optional host-owned verification metadata. A string command remains display
@@ -747,18 +747,18 @@ class SubagentHostRuntime implements SubagentHostRuntimeV1 {
 
 	private async finalizeTerminalWorktreeLocked(event: AgentEventV1): Promise<FinalizationAttempt | undefined> {
 		if (!this.finalizationConfig) return undefined;
-		const provider = requestGitWorktreeServiceProviderV1();
-		if (!provider) {
+		const finalizationService = this.finalizationConfig.service
+			?? requestGitWorktreeServiceProviderV1()?.createFinalizationService();
+		if (!finalizationService) {
 			const diagnostic: ProtocolDiagnostic = {
 				code: "git_worktree_provider_unavailable",
 				path: "$.worktreeFinalization",
-				message: "automatic worktree finalization requires the mounted git-capability provider",
+				message: "automatic worktree finalization requires an injected worktree service or the mounted git-capability provider",
 				severity: "warning",
 			};
 			await this.emitError({ schemaVersion: 1, stage: "worktree_finalization", code: diagnostic.code, message: diagnostic.message, agentId: event.agentId, runId: event.runId });
 			return { diagnostics: [diagnostic] };
 		}
-		const finalizationService = this.finalizationConfig.service ?? provider.createFinalizationService();
 		const key = agentRunKeyV1(event.agentId, event.runId);
 		const existing = this.finalizationRegistry.recordsByRunKey[key];
 		if (existing) return { state: cloneJson(existing), diagnostics: [] };

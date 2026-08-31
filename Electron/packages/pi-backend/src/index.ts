@@ -253,10 +253,14 @@ import { createCustomProductProfile, updateCustomProductProfileExtensions } from
 import { installFromProductPackArchive, writeProductPackArchive } from "./product-pack-archive.js";
 import { installLocalProductPack } from "./product-pack-installer.js";
 import { productSpawnFingerprint, resolveProductSpawnPlan } from "./product-spawn-plan.js";
-import { resolveProductProfile } from "./profile-resolver.js";
+import {
+  formatActivationPlanProblems,
+  overlayFromActivationPlan,
+  projectedProfileExtensionIds,
+  resolveProductProfile,
+} from "./profile-resolver.js";
 import {
   readProjectProductActivation,
-  projectActivationOverlay,
   writeProjectProductActivation,
   DEFAULT_PRODUCT_PROFILE_ID,
   LEGACY_PRODUCT_PROFILE_ID,
@@ -7117,8 +7121,31 @@ export class PiHostBackend implements HostBackend {
       throw new Error("projectId 必须是非空 string");
     }
     const root = await this.projectPath(projectIdValue.trim());
-    return (await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(root)))
-      .map(item => item.descriptor);
+    this.extensionLoader.scan(root);
+    const catalog = await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(root));
+    const activation = await readProjectProductActivation(projectPiAgentDir(root), {
+      defaultProfileId: this.defaultProductProfileId(),
+    });
+    const installed = this.extensionLoader.profileExtensions();
+    return catalog.map(item => {
+      if (!item.profile || item.descriptor.state !== "available") return item.descriptor;
+      if (item.descriptor.id !== activation.profile) return item.descriptor;
+      const plan = resolveProductProfile({
+        profile: item.profile,
+        installed,
+        overrides: activation.overrides,
+      });
+      if (plan.missingRequired.length || plan.conflicts.length) {
+        return {
+          ...item.descriptor,
+          state: "error" as const,
+          error: item.descriptor.error ?? formatActivationPlanProblems(plan),
+          requiredExtensionIds: [],
+          recommendedExtensionIds: [],
+        };
+      }
+      return { ...item.descriptor, ...projectedProfileExtensionIds(plan) };
+    });
   }
   private async createProductProfile(projectIdValue: unknown, nameValue: unknown) {
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
@@ -7274,14 +7301,7 @@ export class PiHostBackend implements HostBackend {
       overrides: next.overrides,
     });
     if (plan.missingRequired.length || plan.conflicts.length) {
-      const detail = [...plan.missingRequired, ...plan.conflicts]
-        .map(issue => issue.code === "extension_conflict"
-          ? `${issue.id} conflicts with ${issue.conflictsWith}`
-          : issue.code === "dependency_cycle"
-            ? `dependency cycle ${issue.cycle.join(" -> ")}`
-            : `${issue.id} ${issue.code}`)
-        .join("; ");
-      throw new Error(`Product Profile ${profileId} cannot activate: ${detail}`);
+      throw new Error(`Product Profile ${profileId} cannot activate: ${formatActivationPlanProblems(plan)}`);
     }
     const grantProblems: string[] = [];
     for (const extension of plan.enabled) {
@@ -8003,17 +8023,24 @@ export class PiHostBackend implements HostBackend {
     const activation = await readProjectProductActivation(projectPiAgentDir(projectRoot), {
       defaultProfileId: this.defaultProductProfileId(),
     });
-    const project = projectActivationOverlay(activation);
-    if (activation.profile === "coding") return { ...app, ...project };
-    const base = Object.fromEntries(this.extensions.list().map(item => [item.id, false]));
+    const extensionIds = this.extensions.list().map(item => item.id);
     const profile = (await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(projectRoot)))
-      .find(item => item.profile?.id === activation.profile)?.profile;
-    if (profile) {
-      for (const dependency of [...profile.extensions.required, ...profile.extensions.recommended]) {
-        base[dependency.id] = true;
-      }
+      .find(item => item.profile?.id === activation.profile)?.profile ?? {
+        schemaVersion: 1 as const,
+        id: activation.profile,
+        name: activation.profile,
+        extensions: { required: [] as { id: string; version: string }[], recommended: [] as { id: string; version: string }[] },
+        layout: {},
+      };
+    const plan = resolveProductProfile({
+      profile,
+      installed: this.extensionLoader.profileExtensions(),
+      overrides: activation.overrides,
+    });
+    if (plan.missingRequired.length || plan.conflicts.length) {
+      console.warn(`[pipiui] Product Profile ${activation.profile} overlay fail-closed: ${formatActivationPlanProblems(plan)}`);
     }
-    return { ...base, ...project };
+    return overlayFromActivationPlan(plan, extensionIds);
   }
   private async readExtensionSettingsSnapshot(id: string, projectRoot?: string): Promise<Record<string, unknown>> {
     const manifest = this.extensions.settingsManifest(id);

@@ -259,7 +259,10 @@ import {
 	acquireAgentLease,
 	releaseAgentLease,
 } from "./agent-lease.ts";
-import { requestGitWorktreePlacementV1 } from "../../extensions/git-capability/agent/worktree-service.ts";
+import {
+	requestGitStatusPorcelainV1,
+	requestGitWorktreePlacementV1,
+} from "../../extensions/git-capability/agent/worktree-service.ts";
 import {
 	type DependencyState,
 	DispatchQueueV1,
@@ -774,10 +777,7 @@ const SUBAGENT_EXT_DIR = path.dirname(fileURLToPath(import.meta.url));
  * Git hiccup returns null and the dispatch proceeds exactly as it did before this existed.
  */
 function currentBossWriteSet() {
-	return bossWriteSet(PIPIUI_MAIN_CWD, (args) => {
-		const r = gitSpawnSync([...args], undefined, 4000);
-		return { ok: r.ok, stdout: r.stdout };
-	});
+	return bossWriteSet(PIPIUI_MAIN_CWD, () => requestGitStatusPorcelainV1(PIPIUI_MAIN_CWD));
 }
 // App-owned search guard; children load the same code and inherit the human-turn grant file.
 const PIPIUI_SEARCH_SCOPE_EXT = process.env.PIPIUI_SEARCH_SCOPE_EXT;
@@ -792,6 +792,13 @@ const PIPIUI_CODING_TOOLS_EXT = process.env.PIPIUI_CODING_TOOLS_EXT;
 // code) silently reaches nobody, along with the model-scoped corrections. The scope markers
 // below (PIPI_PHILOSOPHY_ROLE / _AGENT) address a package that has to be present to read them.
 const PIPIUI_PHILOSOPHY_EXT = process.env.PIPIUI_PHILOSOPHY_EXT;
+// The locked base system prompt. Like philosophy above, a worker runs with `--no-extensions`
+// and builds its arguments here rather than through `assemblePiSpawn`, so the base reaches a
+// child only because this path passes it on. It is the same file the main session gets — a
+// worker-only variant would reopen the "which rule lives where" question the lock exists to
+// close. The architecture half earns its keep here in particular: workers run on a narrowed
+// tool set, so "the tools you were given are the whole truth" is aimed straight at them.
+const PIPIUI_CORE_PROMPT = process.env.PIPIUI_CORE_PROMPT;
 const PIPIUI_OFFICE_DOC_SHOT_GATE_EXT = process.env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT;
 // arXiv remains a specialized local Pi package. Role allowlists decide whether a
 // child may call each mounted package tool.
@@ -7489,6 +7496,9 @@ async function runSingleAgent(
 				throw new Error(`Cannot load bundled private skill ${skillPath}: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
+		// Base first, then the agent's own prompt: the base is the floor every later
+		// instruction is more specific than, and Pi appends these in argument order.
+		if (PIPIUI_CORE_PROMPT) args.push("--append-system-prompt", PIPIUI_CORE_PROMPT);
 		if (promptParts.length > 0) {
 			const tmp = await writePromptToTempFile(
 				agent.name,

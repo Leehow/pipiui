@@ -26,6 +26,7 @@ delete process.env.PIPIUI_AGENT_ID;
 delete process.env.PIPIUI_AGENT_RUN_ID;
 
 import { sanitizeStrictToolArguments } from "../strict-json-schema.ts";
+import { registerGitWorktreePlacementProviderV1 } from "../../../extensions/git-capability/agent/worktree-service.ts";
 import { setAgentLeaseMutationHooksForTests } from "../agent-lease.ts";
 import {
 	getPlanAdherenceSnapshot,
@@ -92,6 +93,9 @@ process.env.PIPIUI_AGENTS_DIR = agentsDir;
 process.env.PIPIUI_NODE_PATH = process.execPath;
 process.env.PIPIUI_SUBAGENT_TEST_CHILD_ENTRY = fileURLToPath(new URL("./fake-pi-worker.ts", import.meta.url));
 process.env.PIPIUI_WORKTREE = "0";
+// The controlled extension loader mounts git-capability before its required consumer.
+// This seam imports only agent-orchestration, so model that mounted provider explicitly.
+registerGitWorktreePlacementProviderV1();
 
 const { default: loadExtension, drainPipiuiTrackedChildren } = await import("../index.ts");
 

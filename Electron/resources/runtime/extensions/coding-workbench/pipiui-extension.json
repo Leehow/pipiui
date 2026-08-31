@@ -3,7 +3,7 @@
   "name": "PipiUI Coding Workbench",
   "version": "1.0.0",
   "category": "coding",
-  "description": "Project/session navigation and Coding header actions.",
+  "description": "Project and session navigation for the Coding Workbench.",
   "capabilities": [],
   "app": {
     "ui": {

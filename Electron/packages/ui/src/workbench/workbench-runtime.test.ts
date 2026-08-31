@@ -19,7 +19,25 @@ describe('Product Workbench runtime seam', () => {
       containers: [{ id: 'coding.sessions', location: 'primarySidebar' }],
     })
     expect(coding.activeProductExtensionsSnapshot()).toContain('coding-workbench')
+    expect(coding.activeProductExtensionsSnapshot()).not.toContain('git-capability')
     expect(base.store.snapshot()).toEqual({ profileId: 'base', containers: [], views: [], layout: { activity: [] } })
     expect(base.activeProductExtensionsSnapshot()).toEqual([])
+  })
+
+  it('projects a resolved required dependency closure into active extensions', () => {
+    const runtime = createProductWorkbenchRuntime()
+    runtime.activateProductWorkbenchProfile({
+      id: 'lab-tools',
+      name: 'Lab Tools',
+      state: 'available',
+      requiredExtensionIds: ['skill-loader-extension', 'git-capability'],
+      recommendedExtensionIds: ['agent-orchestration'],
+    }, { schemaVersion: 2, profile: 'lab-tools', overrides: {} })
+
+    expect(runtime.activeProductExtensionsSnapshot()).toEqual([
+      'agent-orchestration',
+      'git-capability',
+      'skill-loader-extension',
+    ])
   })
 })

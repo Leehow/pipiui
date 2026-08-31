@@ -1,3 +1,4 @@
+import * as ReactRuntime from 'react'
 import { createElement, type ComponentType } from 'react'
 import { createExtensionHostAPI, type ExtensionHostAPI, type HeaderActionProps } from '@pipiui/extension-api'
 import type { PipiHostAPI } from '@pipi/host-api'
@@ -141,6 +142,26 @@ async function loadComponent(
   return component
 }
 
+async function loadHeaderActionComponent(
+  directory: string | undefined,
+  entry: string,
+  importModule: (specifier: string) => Promise<unknown>,
+): Promise<ComponentType<Record<string, unknown>>> {
+  const specifier = resolveEntrySpecifier(directory, entry)
+  const mod = await importModule(specifier)
+  if (mod && typeof mod === 'object') {
+    const factory = (mod as Record<string, unknown>).createHeaderAction
+    if (typeof factory === 'function') {
+      const component = (factory as (react: typeof ReactRuntime) => unknown)(ReactRuntime)
+      if (typeof component === 'function') return component as ComponentType<Record<string, unknown>>
+      throw new Error('createHeaderAction did not return a component')
+    }
+  }
+  const component = componentFromModule(mod)
+  if (!component) throw new Error('header entry did not export createHeaderAction or a component')
+  return component
+}
+
 function createApi(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI): ExtensionHostAPI {
   return createExtensionHostAPI({
     extensionId: descriptor.id,
@@ -178,12 +199,13 @@ export async function loadControlledContributions(
     const entry = action.entry?.trim()
     if (!entry || !action.id) continue
     try {
-      const Component = await loadComponent(directory, entry, importModule)
+      const Component = await loadHeaderActionComponent(directory, entry, importModule)
       disposers.push(registerHeaderAction(descriptor.id, {
         id: action.id,
         ...(action.order !== undefined ? { order: action.order } : {}),
         render: context => {
-          const git = context.hostCapabilities.git && context.workspaceId && context.host.gitStatus && context.host.gitCheckout
+          const isGitProvider = descriptor.id === 'git-capability'
+          const git = isGitProvider && context.hostCapabilities.git && context.workspaceId && context.host.gitStatus && context.host.gitCheckout
             ? {
                 status: () => context.host.gitStatus!(context.workspaceId!),
                 checkout: (branch: string) => context.host.gitCheckout!(context.workspaceId!, branch),
@@ -192,7 +214,7 @@ export async function loadControlledContributions(
           const props: HeaderActionProps = {
             ...(context.workspaceId ? { workspaceId: context.workspaceId } : {}),
             ...(git ? { git } : {}),
-            ...(context.host.openExternal ? { openExternal: (url: string) => context.host.openExternal!(url) } : {}),
+            ...(isGitProvider && context.host.openExternal ? { openExternal: (url: string) => context.host.openExternal!(url) } : {}),
           }
           return createElement(Component, props)
         },

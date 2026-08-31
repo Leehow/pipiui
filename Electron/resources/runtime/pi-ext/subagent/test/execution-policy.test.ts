@@ -15,7 +15,15 @@ import {
 	normalizeGeneralPurposeExecutionPolicy,
 } from "../runtime-policy.ts";
 import { createProviderWaitController, decideProviderStallRecovery, fanoutLayerActive, providerWaitDeadlineMs } from "../index.ts";
-import { classifyInsideWorkTree, resolveSubagentWorktree } from "../worktree.ts";
+import {
+	classifyInsideWorkTree,
+	resolveSubagentWorktree,
+} from "../../../extensions/git-capability/agent/worktree-placement.ts";
+import {
+	registerGitWorktreePlacementProviderV1,
+	requestGitStatusPorcelainV1,
+	requestGitWorktreePlacementV1,
+} from "../../../extensions/git-capability/agent/worktree-service.ts";
 
 const bundledGeneralPurpose = { name: "general-purpose", origin: "bundled" } as const;
 
@@ -656,7 +664,37 @@ test("direct general-purpose placement does not require a branch-shaped agentId"
 	);
 });
 
-test("bundled isolation treats cwd as repo base and ignores PIPIUI_WORKTREE=0", (t) => {
+test("missing placement provider fails closed only for writable isolation", () => {
+	const isolated = requestGitWorktreePlacementV1({
+		agentId: "provider-missing",
+		defaultCwd: tmpdir(),
+		readOnly: false,
+		policy: { worktree: "isolated" },
+		allowEnvironmentOptOut: false,
+	});
+	assert.match(isolated.worktreeError ?? "", /provider is unavailable/);
+	assert.equal(requestGitWorktreePlacementV1({
+		agentId: "provider-direct",
+		defaultCwd: "/direct-cwd",
+		readOnly: false,
+		policy: { worktree: "direct" },
+	}).cwd, "/direct-cwd");
+	assert.equal(requestGitWorktreePlacementV1({
+		agentId: "provider-readonly",
+		defaultCwd: "/readonly-cwd",
+		readOnly: true,
+		policy: { worktree: "isolated" },
+	}).cwd, "/readonly-cwd");
+	assert.equal(requestGitWorktreePlacementV1({
+		agentId: "provider-main",
+		defaultCwd: "/worker-cwd",
+		mainCwd: "/main-cwd",
+		readOnly: false,
+		policy: { worktree: "main-session" },
+	}).cwd, "/main-cwd");
+});
+
+test("registered provider treats cwd as repo base and ignores PIPIUI_WORKTREE=0", (t) => {
 	const root = mkdtempSync(join(tmpdir(), "pipiui-general-purpose-policy-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	execFileSync("git", ["init", "-q", root]);
@@ -667,7 +705,8 @@ test("bundled isolation treats cwd as repo base and ignores PIPIUI_WORKTREE=0", 
 		if (previous === undefined) delete process.env.PIPIUI_WORKTREE;
 		else process.env.PIPIUI_WORKTREE = previous;
 	});
-	const placement = resolveSubagentWorktree({
+	registerGitWorktreePlacementProviderV1();
+	const placement = requestGitWorktreePlacementV1({
 		agentId: "policy-test",
 		defaultCwd: root,
 		readOnly: false,
@@ -677,6 +716,18 @@ test("bundled isolation treats cwd as repo base and ignores PIPIUI_WORKTREE=0", 
 	assert.equal(placement.worktreeError, undefined);
 	assert.equal(placement.worktreePath, join(realpathSync(root), ".pi", "worktrees", "policy-test"));
 	assert.equal(placement.cwd, placement.worktreePath);
+});
+
+test("mounted provider reports the Boss porcelain write set", (t) => {
+	const root = mkdtempSync(join(tmpdir(), "pipiui-boss-write-set-"));
+	t.after(() => rmSync(root, { recursive: true, force: true }));
+	execFileSync("git", ["init", "-q", root]);
+	execFileSync("git", ["-C", root, "-c", "user.name=PipiUI Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "base"]);
+	writeFileSync(join(root, "held.txt"), "dirty\n");
+	registerGitWorktreePlacementProviderV1();
+	const status = requestGitStatusPorcelainV1(root);
+	assert.equal(status.ok, true);
+	assert.match(status.stdout, /held\.txt/);
 });
 
 test("unborn git init bootstraps HEAD so isolated worktrees succeed", (t) => {

@@ -485,8 +485,9 @@ Composer gate 合并规则：
 | App/window/layout/resize/theme | Kernel Workbench |
 | 基础 Transcript/Composer/Queue/Model picker | Kernel PiConversation |
 | Project → Session Sidebar | `coding-workbench` |
-| GitBranchMenu / Git onboarding | `coding-workbench` + `git-capability` |
-| Subagent panel / model modal / worktree disposition | `coding-orchestration` |
+| Git branch menu / Git onboarding | `git-capability`（manifest-controlled header contribution） |
+| Subagent panel / model modal | `coding-orchestration` |
+| worktree disposition 的 Git 操作 | `git-capability` 服务；`agent-orchestration` / `coding-orchestration` 仅请求与呈现结果 |
 | Plan panel / approval bar | `plan-extension`（shared optional） |
 | Terminal panel | `terminal-extension`（shared optional，coding Profile 默认启用） |
 | Browser panel | `webview-browser-extension`（shared optional） |
@@ -661,9 +662,10 @@ foundation -> product -> capability -> project -> session
 |---|---|
 | secret vault bridge / host protocol | Kernel runtime |
 | Pi base RPC/session handling | Kernel runtime |
-| codingTools / git / reload | `coding-runtime` |
-| subagent dispatch core | `agent-orchestration` shared extension |
-| coding agents/worktree/finalizer | `coding-orchestration` |
+| codingTools / reload | `coding-runtime` |
+| structured Git / repository status+checkout / worktree placement+finalizer+recovery | `git-capability` |
+| subagent dispatch core | `agent-orchestration` shared extension；通过 required dependency 请求 `git-capability` worktree 服务 |
+| Coding 产品工作台分组 | `coding-orchestration`；不拥有 Git/worktree 实现 |
 | plan / goal | shared optional extensions |
 | web/browser/CUA/memory | 已有扩展，移除 legacy fallback 后完全 registry-owned |
 | provider server tools | provider extensions |
@@ -671,7 +673,7 @@ foundation -> product -> capability -> project -> session
 | office/pdf/anydoc | document extensions，按 Profile 安装 |
 | context optimization | shared optional extension |
 
-每迁移一项，先使 registry-owned Adapter 成为唯一权威，再删除旧 `SpawnFeatures` 分支；禁止长期双路由。
+每迁移一项，先使 registry-owned Adapter 成为唯一权威，再删除旧 `SpawnFeatures` 分支；禁止长期双路由。其他扩展需要 repository/worktree 能力时必须声明对 `git-capability` 的依赖并请求 provider；不得自行执行 worktree Git 或保留 fallback。
 
 ## 13. Host Capability Broker
 

@@ -11,7 +11,6 @@ const LEGACY_CODING_EXTENSION_IDS = Object.freeze([
   'terminal-extension',
   'webview-browser-extension',
   'document-workbench',
-  'git-capability',
 ])
 
 export type ProductWorkbenchRuntime = {

@@ -2,19 +2,31 @@
 import * as path from "node:path";
 
 import {
+	gitSpawnSync,
 	resolveSubagentWorktree,
 	type WorktreePlacement,
 	type WorktreePlacementOptions,
 } from "./worktree-placement.ts";
 
+export type GitStatusPorcelainResultV1 = { ok: boolean; stdout: string };
+
 export interface GitWorktreePlacementProviderV1 {
 	resolvePlacement(options: WorktreePlacementOptions): WorktreePlacement;
+	statusPorcelain(mainCwd: string): GitStatusPorcelainResultV1;
 }
 
 const PROVIDER_KEY = Symbol.for("pipiui.git-capability.worktree-placement-provider.v1");
 
 const defaultProvider: GitWorktreePlacementProviderV1 = {
 	resolvePlacement: resolveSubagentWorktree,
+	statusPorcelain(mainCwd) {
+		const result = gitSpawnSync(
+			["-C", mainCwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+			undefined,
+			4_000,
+		);
+		return { ok: result.ok, stdout: result.stdout };
+	},
 };
 
 /** Register only from the mounted git-capability agent entry. */
@@ -27,6 +39,15 @@ export function registerGitWorktreePlacementProviderV1(
 /** Consumers request at operation time; undefined means Git capability is unavailable. */
 export function requestGitWorktreePlacementProviderV1(): GitWorktreePlacementProviderV1 | undefined {
 	return (globalThis as Record<PropertyKey, unknown>)[PROVIDER_KEY] as GitWorktreePlacementProviderV1 | undefined;
+}
+
+export function requestGitStatusPorcelainV1(mainCwd: string | undefined): GitStatusPorcelainResultV1 {
+	if (!mainCwd?.trim()) return { ok: false, stdout: "" };
+	try {
+		return requestGitWorktreePlacementProviderV1()?.statusPorcelain(mainCwd) ?? { ok: false, stdout: "" };
+	} catch {
+		return { ok: false, stdout: "" };
+	}
 }
 
 /**

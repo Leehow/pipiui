@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import { parseProductProfileManifestJson } from "../src/profile-manifest.js";
-import { resolveProductProfile } from "../src/profile-resolver.js";
+import {
+  overlayFromActivationPlan,
+  projectedProfileExtensionIds,
+  resolveProductProfile,
+} from "../src/profile-resolver.js";
 
 describe("Product Profile resolution", () => {
   it("resolves a valid profile into one deterministic activation plan", () => {
@@ -162,5 +166,93 @@ describe("Product Profile resolution", () => {
       { code: "dependency_cycle", id: "cycle-a", cycle: ["cycle-a", "cycle-b", "cycle-a"] },
       { code: "extension_conflict", id: "conflict-left", conflictsWith: "conflict-right" },
     ]);
+  });
+
+  it("walks required dependencies of a project-override enabled extension", () => {
+    const parsed = parseProductProfileManifestJson(JSON.stringify({
+      schemaVersion: 1,
+      id: "lab-tools",
+      name: "Lab Tools",
+      extensions: {
+        required: [{ id: "skill-loader-extension", version: "^1.0.0" }],
+        recommended: [],
+      },
+      layout: {},
+    }));
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+
+    const plan = resolveProductProfile({
+      profile: parsed.profile,
+      installed: [
+        { id: "skill-loader-extension", version: "1.0.0" },
+        {
+          id: "agent-orchestration",
+          version: "1.0.0",
+          dependencies: { required: [{ id: "git-capability", version: ">=1.0.0 <2.0.0" }] },
+        },
+        { id: "git-capability", version: "1.0.0" },
+      ],
+      overrides: { "agent-orchestration": "enabled" },
+    });
+
+    expect(plan.enabled).toEqual([
+      { id: "skill-loader-extension", version: "1.0.0", reason: "required" },
+      { id: "git-capability", version: "1.0.0", reason: "dependency" },
+      { id: "agent-orchestration", version: "1.0.0", reason: "project-override" },
+    ]);
+    expect(plan.conflicts).toEqual([]);
+    expect(projectedProfileExtensionIds(plan)).toEqual({
+      requiredExtensionIds: ["skill-loader-extension", "git-capability"],
+      recommendedExtensionIds: ["agent-orchestration"],
+    });
+    expect(overlayFromActivationPlan(plan, [
+      "skill-loader-extension",
+      "agent-orchestration",
+      "git-capability",
+      "coding-runtime",
+    ])).toEqual({
+      "skill-loader-extension": true,
+      "agent-orchestration": true,
+      "git-capability": true,
+      "coding-runtime": false,
+    });
+  });
+
+  it("fails closed when a required dependency is override-disabled", () => {
+    const parsed = parseProductProfileManifestJson(JSON.stringify({
+      schemaVersion: 1,
+      id: "lab-tools",
+      name: "Lab Tools",
+      extensions: {
+        required: [{ id: "agent-orchestration", version: "^1.0.0" }],
+        recommended: [],
+      },
+      layout: {},
+    }));
+    if (!parsed.ok) throw new Error(parsed.errors.join("; "));
+
+    const plan = resolveProductProfile({
+      profile: parsed.profile,
+      installed: [
+        {
+          id: "agent-orchestration",
+          version: "1.0.0",
+          dependencies: { required: [{ id: "git-capability", version: ">=1.0.0 <2.0.0" }] },
+        },
+        { id: "git-capability", version: "1.0.0" },
+      ],
+      overrides: { "git-capability": "disabled" },
+    });
+
+    expect(plan.conflicts).toEqual([{
+      code: "required_disabled",
+      id: "git-capability",
+      range: ">=1.0.0 <2.0.0",
+      installedVersion: "1.0.0",
+    }]);
+    expect(overlayFromActivationPlan(plan, ["agent-orchestration", "git-capability"])).toEqual({
+      "agent-orchestration": false,
+      "git-capability": false,
+    });
   });
 });

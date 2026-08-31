@@ -175,6 +175,7 @@ describe("Product Profile host interface", () => {
     const baseExtensions = await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string; state: string; category?: string }>;
     expect(baseExtensions.find(item => item.id === "skill-loader-extension")).toMatchObject({ state: "enabled", category: "foundation" });
     expect(baseExtensions.filter(item => item.id.startsWith("coding-") && item.state === "enabled")).toEqual([]);
+    expect(baseExtensions.find(item => item.id === "git-capability")?.state).not.toBe("enabled");
     expect(await backend.handle("setProductProfile" as never, [added.id, "coding"])).toMatchObject({
       profile: "coding",
     });
@@ -187,7 +188,8 @@ describe("Product Profile host interface", () => {
       "code-retrieval",
       "document-workbench",
       "webview-browser-extension",
-      "cua-extension",
+      "agent-orchestration",
+      "git-capability",
     ]) {
       expect(codingExtensions.find(item => item.id === id)?.state).toBe("enabled");
     }
@@ -369,6 +371,7 @@ describe("Product Profile host interface", () => {
       "coding-runtime",
       "coding-method",
       "agent-orchestration",
+      "git-capability",
       "plan-extension",
       "goal-extension",
       "terminal-extension",
@@ -376,6 +379,72 @@ describe("Product Profile host interface", () => {
       "skill-loader-extension",
     ]) expect(args).toContain(`/extensions/${id}/agent/index.ts`);
     expect(args).not.toMatch(/extensions\/pipiui-(?:coding-tools|git|reload|plan-runtime|electron-terminal|office-doc-shot-gate|firecrawl-anydoc|open-documents)\.ts/);
+    await backend.close();
+  });
+
+  it("activates git-capability through agent-orchestration dependency closure", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-profile-git-closure-"));
+    const project = join(root, "workspace");
+    await mkdir(project, { recursive: true });
+    const captured: string[][] = [];
+    const backend = createPiHostBackend({
+      agentDir: join(root, "agent"),
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      runtimeAssets: { sourceRoot: runtimeSource },
+      profileMode: "isolated",
+      resourceMode: "explicit",
+      canonicalProjectPaths: async () => undefined,
+      piPath: process.execPath,
+      spawn: (_bin, args, options) => {
+        captured.push([...args]);
+        return spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as never;
+      },
+    });
+    const added = await backend.handle("addProject", [project]) as { id: string };
+
+    expect(await backend.handle("createProductProfile" as never, [added.id, "Lab Tools"])).toMatchObject({
+      id: "lab-tools",
+      recommendedExtensionIds: [],
+    });
+    expect(await backend.handle("updateProductProfileExtensions" as never, [added.id, "lab-tools", ["agent-orchestration"]]))
+      .toMatchObject({ recommendedExtensionIds: ["agent-orchestration"] });
+    expect(await backend.handle("setProductProfile" as never, [added.id, "lab-tools"]))
+      .toMatchObject({ profile: "lab-tools" });
+
+    const listed = await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string; state: string }>;
+    expect(listed.find(item => item.id === "agent-orchestration")?.state).toBe("enabled");
+    expect(listed.find(item => item.id === "git-capability")?.state).toBe("enabled");
+    expect(listed.find(item => item.id === "coding-runtime")?.state).not.toBe("enabled");
+
+    const profiles = await backend.handle("listProductProfiles" as never, [added.id]) as Array<{
+      id: string;
+      requiredExtensionIds?: string[];
+      recommendedExtensionIds?: string[];
+    }>;
+    const lab = profiles.find(item => item.id === "lab-tools");
+    expect(lab?.requiredExtensionIds).toEqual(expect.arrayContaining(["skill-loader-extension", "git-capability"]));
+    expect(lab?.recommendedExtensionIds).toEqual(expect.arrayContaining(["agent-orchestration"]));
+
+    const session = await backend.handle("newSession", [added.id, "Closure conversation"]) as { id: string };
+    await backend.handle("sendPrompt", [session.id, "hello"]);
+    const args = captured[0]!.join("\n");
+    expect(args).toContain("/extensions/agent-orchestration/agent/index.ts");
+    expect(args).toContain("/extensions/git-capability/agent/index.ts");
+    expect(args).not.toContain("/extensions/coding-runtime/agent/index.ts");
+
+    await backend.handle("setExtensionEnabled" as never, ["git-capability", false, "project", added.id]);
+    const afterDisable = await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string; state: string }>;
+    expect(afterDisable.find(item => item.id === "git-capability")?.state).not.toBe("enabled");
+    expect(afterDisable.find(item => item.id === "agent-orchestration")?.state).not.toBe("enabled");
+    const conflicted = (await backend.handle("listProductProfiles" as never, [added.id]) as Array<{
+      id: string;
+      state: string;
+      requiredExtensionIds?: string[];
+    }>).find(item => item.id === "lab-tools");
+    expect(conflicted?.state).toBe("error");
+    expect(conflicted?.requiredExtensionIds ?? []).not.toContain("git-capability");
+
     await backend.close();
   });
 });

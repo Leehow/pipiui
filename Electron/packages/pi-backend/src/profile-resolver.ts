@@ -137,7 +137,7 @@ export function resolveProductProfile(input: ResolveProductProfileInput): Produc
     if (overrides[id] !== "enabled" || selected.has(id)) continue;
     const candidate = byId.get(id);
     if (!candidate) continue;
-    addEnabled(candidate, "project-override");
+    selectOne({ id: candidate.id, version: candidate.version }, "project-override", missingRequired);
   }
   const activeIds = new Set(enabled.map(item => item.id));
   const conflictPairs = new Set<string>();
@@ -162,4 +162,45 @@ export function resolveProductProfile(input: ResolveProductProfileInput): Produc
     layout: input.profile.layout,
   };
   return { ...withoutFingerprint, fingerprint: fingerprint(withoutFingerprint) };
+}
+
+export function formatActivationPlanProblems(plan: Pick<ProductActivationPlan, "missingRequired" | "conflicts">): string {
+  return [...plan.missingRequired, ...plan.conflicts]
+    .map(issue => issue.code === "extension_conflict"
+      ? `${issue.id} conflicts with ${issue.conflictsWith}`
+      : issue.code === "dependency_cycle"
+        ? `dependency cycle ${issue.cycle.join(" -> ")}`
+        : `${issue.id} ${issue.code}`)
+    .join("; ");
+}
+
+export function projectedProfileExtensionIds(plan: ProductActivationPlan): {
+  requiredExtensionIds: string[];
+  recommendedExtensionIds: string[];
+} {
+  const requiredExtensionIds: string[] = [];
+  const recommendedExtensionIds: string[] = [];
+  for (const item of plan.enabled) {
+    if (item.reason === "required" || item.reason === "dependency") {
+      requiredExtensionIds.push(item.id);
+    } else if (
+      item.reason === "recommended"
+      || item.reason === "optional-dependency"
+      || item.reason === "project-override"
+    ) {
+      recommendedExtensionIds.push(item.id);
+    }
+  }
+  return { requiredExtensionIds, recommendedExtensionIds };
+}
+
+export function overlayFromActivationPlan(
+  plan: ProductActivationPlan,
+  extensionIds: readonly string[],
+): Record<string, boolean> {
+  if (plan.missingRequired.length || plan.conflicts.length) {
+    return Object.fromEntries(extensionIds.map(id => [id, false]));
+  }
+  const enabled = new Set(plan.enabled.map(item => item.id));
+  return Object.fromEntries(extensionIds.map(id => [id, enabled.has(id)]));
 }
