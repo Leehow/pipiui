@@ -2090,6 +2090,9 @@ export class PiHostBackend implements HostBackend {
   private externalAuthRuntime?: ExternalAuthRuntime;
   private queue: SessionMessageQueue;
   private stopEscalation: StopEscalationScheduler;
+  /** Immediate-send escalation kills only the unresponsive Boss RPC process.
+   * Worker descendants are independent runs and must survive the cut-in. */
+  private cutInStopEscalation: StopEscalationScheduler;
   private abortAckTimeoutMs: number;
   private extensionInvokeTimeoutMs: number;
   private extensionUi: ExtensionUiChannel;
@@ -2229,14 +2232,21 @@ export class PiHostBackend implements HostBackend {
       isDrainSuppressed: (id) => this.autoRevivalSuppressed(id),
     });
     const stopHooks = options.stopEscalationHooks ?? defaultStopEscalationHooks();
+    const guardedStopHooks: StopEscalationHooks = {
+      ...stopHooks,
+      kill: (pid, signal) => {
+        if (signal === "SIGKILL") this.markLiveExitingByPid(pid);
+        stopHooks.kill(pid, signal);
+      },
+    };
     this.stopEscalation = options.stopEscalation
-      ?? new StopEscalationScheduler({
-        ...stopHooks,
-        kill: (pid, signal) => {
-          if (signal === "SIGKILL") this.markLiveExitingByPid(pid);
-          stopHooks.kill(pid, signal);
-        },
-      }, options.stopEscalationDelays);
+      ?? new StopEscalationScheduler(guardedStopHooks, options.stopEscalationDelays);
+    this.cutInStopEscalation = new StopEscalationScheduler({
+      ...guardedStopHooks,
+      // The Boss process is still force-killed at the last escalation stage;
+      // suppress only descendant TERM/KILL stages so workers survive cut-in.
+      listDescendants: () => [],
+    }, options.stopEscalationDelays);
     this.abortAckTimeoutMs = options.abortAckTimeoutMs ?? 1_500;
     this.extensionInvokeTimeoutMs = options.extensionInvokeTimeoutMs ?? EXT_INVOKE_TIMEOUT_MS;
     this.extensionUi = new ExtensionUiChannel({
@@ -2696,6 +2706,7 @@ export class PiHostBackend implements HostBackend {
     // dispatch acknowledgement so deletion cannot overtake it.
     this.bridge.unregister(id);
     this.stopEscalation.cancel(id);
+    this.cutInStopEscalation.cancel(id);
     this.extensionUi.abortSession(id);
     this.extensions.unmountSession(id);
     this.planStore.forget(id);
@@ -2782,6 +2793,7 @@ export class PiHostBackend implements HostBackend {
     this.persistAgentsNow();
     this.closed = true;
     this.stopEscalation.cancelAll();
+    this.cutInStopEscalation.cancelAll();
     this.stopOrphanReconcileTimer();
     if (this.turnWatchdogTimer) { clearInterval(this.turnWatchdogTimer); this.turnWatchdogTimer = undefined; }
     // Stop the resident external-pi worker if one was spawned during this run.
@@ -3030,7 +3042,8 @@ export class PiHostBackend implements HostBackend {
         if (!current || current.runtimeToken !== runtimeToken
           || !this.sessionRuntimeTokenIsCurrent(sessionId, runtimeToken)
           || !this.childStillRunning(current.process)) return;
-        this.stopEscalation.start(
+        const escalation = options.drain === "cutIn" ? this.cutInStopEscalation : this.stopEscalation;
+        escalation.start(
           sessionId,
           {
             piPid: abortPid,
@@ -3058,9 +3071,11 @@ export class PiHostBackend implements HostBackend {
   ): Promise<QueuedMessage> {
     this.assertSessionRuntimeToken(sessionId, runtimeToken);
     const message = await this.queue.cutInMessage(sessionId, messageId, runtimeToken);
+    const accepted = this.queue.waitForMessageDelivery(sessionId, messageId, runtimeToken);
     if (this.queue.hasPendingCutIn(sessionId)) {
       await this.abortSessionTurn(sessionId, { drain: "cutIn" }, runtimeToken);
     }
+    await accepted;
     return message;
   }
   private async enqueueMessage(
@@ -5055,6 +5070,7 @@ export class PiHostBackend implements HostBackend {
     const inFlight = this.ensureInFlight.get(id);
     if (inFlight) return inFlight;
     this.stopEscalation.cancel(id);
+    this.cutInStopEscalation.cancel(id);
     // Archive = total death: transcript/detail reads use findSession/index
     // paths and never reach here; anything that would implicitly respawn pi
     // for an archived session is refused until the user unarchives it.
@@ -5925,6 +5941,7 @@ export class PiHostBackend implements HostBackend {
     live.pendingFinalReconciliation = undefined;
     this.turnTelemetry.terminal(live.session.id, status);
     this.stopEscalation.cancel(live.session.id);
+    this.cutInStopEscalation.cancel(live.session.id);
     // The durable agent index is authoritative at a terminal boundary. Replay
     // its current session view so a renderer that missed an end event cannot
     // retain a stale running projection. Real live agents remain live here;

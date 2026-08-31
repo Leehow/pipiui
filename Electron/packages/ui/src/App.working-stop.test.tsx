@@ -125,7 +125,7 @@ describe('selected-session working stop control', () => {
     expect(screen.queryByText('停止失败：too late')).toBeNull()
   })
 
-  it('shows stop and queue-submit together for an active sending queue item', async () => {
+  it('shows stop and ordinary queue-submit together for an active sending queue item', async () => {
     const sending: QueuedMessage = { id: 'sending', sessionId: 'welcome', text: '正在发送', attachments: [], state: 'sending', createdAt: 1 }
     const { host, listeners } = controlledHost({ listQueue: async sessionId => sessionId === 'welcome' ? [sending] : [] })
     render(<App host={host} />)
@@ -134,7 +134,7 @@ describe('selected-session working stop control', () => {
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '下一条' } })
     expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('插入当前对话')).toBeTruthy()
+    expect(screen.getByLabelText('发送消息')).toBeTruthy()
   })
 
   it('keeps idle and subagent-only sessions on the ordinary send control', async () => {
@@ -232,7 +232,7 @@ describe('selected-session working stop control', () => {
     const input = screen.getByLabelText('消息输入框')
     fireEvent.change(input, { target: { value: 'keeper-fullrun-terminal' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
-    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalledWith('layout', 'keeper-fullrun-terminal'))
+    await waitFor(() => expect(host.sendPrompt).toHaveBeenCalledWith('layout', 'keeper-fullrun-terminal', undefined, expect.objectContaining({ promptBytes: 23 })))
 
     const running: AgentSummary = {
       agentId: 'computer-root',

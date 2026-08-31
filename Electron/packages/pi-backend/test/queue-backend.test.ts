@@ -368,10 +368,9 @@ describe("PiHostBackend message queue integration", () => {
     await backend.handle("sendPrompt", ["s1", "__hold_stuck__"]);
     const queued = await backend.handle("enqueueMessage", ["s1", "unstick me"]) as any;
     expect(queued.outcome).toBe("queued");
-    await backend.handle("cutInQueuedMessage", ["s1", queued.message.id]);
-    expect(await backend.handle("listQueue", ["s1"])).toEqual([
-      expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "sending" }),
-    ]);
+    const cutIn = backend.handle("cutInQueuedMessage", ["s1", queued.message.id]);
+    await eventually(async () => (await backend.handle("listQueue", ["s1"]) as any[]).some(item =>
+      item.id === queued.message.id && item.text === "unstick me" && item.state === "sending"));
     const started = Date.now();
     await backend.handle("stop", ["s1"]);
     expect(Date.now() - started).toBeLessThan(1_500);
@@ -379,6 +378,7 @@ describe("PiHostBackend message queue integration", () => {
     expect(await backend.handle("listQueue", ["s1"])).toEqual([
       expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "queued" }),
     ]);
+    await expect(cutIn).rejects.toThrow(/remains queued/);
     off();
     await backend.close();
   });
@@ -473,6 +473,22 @@ describe("PiHostBackend message queue integration", () => {
       return items.length === 1 && items[0].id === head.message.id;
     });
     expect((await backend.handle("listQueue", ["s1"]) as any[]).map(item => item.text)).toEqual(["fifo-head"]);
+    await backend.close();
+  });
+
+  it("treats cutIn after an idle enqueue was already accepted as idempotent", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const direct = await backend.handle("enqueueMessage", ["s1", "already accepted"]) as any;
+    expect(direct.outcome).toBe("direct");
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+
+    await expect(backend.handle("cutInQueuedMessage", ["s1", direct.message.id])).resolves.toMatchObject({
+      id: direct.message.id,
+      text: "already accepted",
+      state: "sending",
+    });
+    expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
     await backend.close();
   });
 

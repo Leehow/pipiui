@@ -100,6 +100,9 @@ type SessionState = {
   /** Disposal invalidates late asynchronous delivery continuations before the state leaves the registry. */
   disposed?: boolean;
   items: QueuedMessage[];
+  /** Bounded receipts make a stale immediate-send click idempotent after the
+   * selected row raced from queued/sending to accepted and disappeared. */
+  acceptedMessages: QueuedMessage[];
   /** A turn is running (marked by the host or started by a successful delivery). */
   turnActive: boolean;
   /** Monotonic id for the current turn. Stale `notifyIdle` calls must not clear a newer one. */
@@ -120,6 +123,11 @@ type SessionState = {
   compactionActive: boolean;
 };
 
+type DeliveryWaiter = {
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
+
 /** Deep copy used both for input snapshots and for values returned to callers. */
 const snapshot = <T>(value: T): T => structuredClone(value);
 const freeze = <T extends object>(value: T): T => Object.freeze(value);
@@ -138,6 +146,7 @@ export class SessionMessageQueue {
   private readonly sessions = new Map<string, SessionState>();
   /** Temporary fence while the host waits for late child/restore continuations to settle. */
   private readonly disposedSessions = new Set<string>();
+  private readonly deliveryWaiters = new Map<string, Map<string, Set<DeliveryWaiter>>>();
 
   constructor(options: SessionMessageQueueOptions) {
     this.dispatch = options.dispatch;
@@ -158,6 +167,7 @@ export class SessionMessageQueue {
           ? lifecycleToken
           : this.captureLifecycleToken?.(sessionId),
         items: [],
+        acceptedMessages: [],
         turnActive: false,
         turnEpoch: 0,
         dispatching: false,
@@ -200,7 +210,37 @@ export class SessionMessageQueue {
     // that acknowledgement recreate a queue or persist a deleted session.
     const session = this.sessions.get(sessionId);
     if (!session || !this.isCurrentSession(sessionId, session) || (expected && session !== expected)) return;
-    this.onChange?.(sessionId, this.listQueue(sessionId), session.lifecycleToken);
+    const items = this.listQueue(sessionId);
+    this.settleDeliveryWaiters(sessionId, items);
+    this.onChange?.(sessionId, items, session.lifecycleToken);
+  }
+
+  private settleDeliveryWaiters(sessionId: string, items: QueuedMessage[]): void {
+    const byMessage = this.deliveryWaiters.get(sessionId);
+    if (!byMessage) return;
+    for (const [messageId, waiters] of byMessage) {
+      const item = items.find(candidate => candidate.id === messageId);
+      if (item?.state === "sending") continue;
+      byMessage.delete(messageId);
+      if (!item) {
+        for (const waiter of waiters) waiter.resolve();
+        continue;
+      }
+      const reason = item.state === "failed"
+        ? `immediate send failed: ${item.error ?? "delivery rejected"}`
+        : "immediate send was not accepted; message remains queued";
+      for (const waiter of waiters) waiter.reject(new Error(reason));
+    }
+    if (byMessage.size === 0) this.deliveryWaiters.delete(sessionId);
+  }
+
+  private rejectDeliveryWaiters(sessionId: string, reason: string): void {
+    const byMessage = this.deliveryWaiters.get(sessionId);
+    if (!byMessage) return;
+    this.deliveryWaiters.delete(sessionId);
+    for (const waiters of byMessage.values()) {
+      for (const waiter of waiters) waiter.reject(new Error(reason));
+    }
   }
 
   private trackDispatch(session: SessionState, delivery: Promise<unknown>): Promise<void> {
@@ -262,10 +302,12 @@ export class SessionMessageQueue {
       ? [...session.inflightDispatches, ...(session.dispatchPromise ? [session.dispatchPromise] : [])]
       : [];
     this.disposedSessions.add(sessionId);
+    this.rejectDeliveryWaiters(sessionId, `session ${sessionId} queue is disposed`);
     if (!session) return Promise.resolve();
     session.disposed = true;
     session.deliveryEpoch += 1;
     session.items = [];
+    session.acceptedMessages = [];
     session.pendingCutIn = undefined;
     session.turnActive = false;
     session.dispatching = false;
@@ -288,6 +330,39 @@ export class SessionMessageQueue {
   /** Wait only for acceptance/failure of the currently-starting pi RPC, never for turn settle. */
   async waitForDispatch(sessionId: string, lifecycleToken?: unknown): Promise<void> {
     await this.currentState(sessionId, lifecycleToken)?.dispatchPromise;
+  }
+
+  /**
+   * Wait for one selected queue item to be accepted by pi. A successful queue
+   * dispatch removes the item; failure or cancellation keeps a retryable row
+   * and rejects instead of reporting a false immediate-send success.
+   */
+  async waitForMessageDelivery(sessionId: string, messageId: string, lifecycleToken?: unknown): Promise<void> {
+    const session = this.state(sessionId, lifecycleToken);
+    const current = this.listQueue(sessionId).find(item => item.id === messageId);
+    if (!current) {
+      if (session.acceptedMessages.some(item => item.id === messageId)) return;
+      throw new Error(`unknown queued message ${messageId}`);
+    }
+    if (current.state !== "sending") {
+      const reason = current.state === "failed"
+        ? `immediate send failed: ${current.error ?? "delivery rejected"}`
+        : "immediate send was not accepted; message remains queued";
+      throw new Error(reason);
+    }
+    await new Promise<void>((resolve, reject) => {
+      let byMessage = this.deliveryWaiters.get(sessionId);
+      if (!byMessage) {
+        byMessage = new Map();
+        this.deliveryWaiters.set(sessionId, byMessage);
+      }
+      let waiters = byMessage.get(messageId);
+      if (!waiters) {
+        waiters = new Set();
+        byMessage.set(messageId, waiters);
+      }
+      waiters.add({ resolve, reject });
+    });
   }
 
   /**
@@ -379,6 +454,7 @@ export class SessionMessageQueue {
       state: item.state === "failed" ? ("failed" as const) : ("queued" as const),
       error: item.state === "failed" ? item.error : undefined,
     }));
+    session.acceptedMessages = [];
     session.turnActive = false;
     session.turnEpoch = 0;
     session.dispatching = false;
@@ -512,7 +588,11 @@ export class SessionMessageQueue {
       throw new Error(`session ${sessionId} already has a cut-in in progress`);
     }
     const index = session.items.findIndex((item) => item.id === id);
-    if (index < 0) throw new Error(`unknown queued message ${id}`);
+    if (index < 0) {
+      const accepted = session.acceptedMessages.find(item => item.id === id);
+      if (accepted) return snapshot(accepted);
+      throw new Error(`unknown queued message ${id}`);
+    }
     const current = session.items[index];
     if (current.state === "sending") throw new Error(`message ${id} is already sending`);
     if (session.dispatching) throw new Error(`session ${sessionId} is already delivering a message`);
@@ -704,6 +784,10 @@ export class SessionMessageQueue {
     try {
       await this.dispatch(sessionId, { text: sending.text, attachments: sending.attachments, turnTelemetry: sending.turnTelemetry }, behavior, session.lifecycleToken);
       if (!this.isCurrentSession(sessionId, session) || session.deliveryEpoch !== deliveryEpoch) return false;
+      session.acceptedMessages = [
+        ...session.acceptedMessages.filter(accepted => accepted.id !== sending.id),
+        sending,
+      ].slice(-64);
       if (index >= 0 && session.items[index]?.id === item.id) session.items.splice(index, 1);
       // Mint an epoch only when this delivery is the thing that starts the turn.
       // A cut-in send needs one, so the aborted turn's late idle cannot clear the

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { PipiHostAPI, StreamEvent } from '@pipi/host-api'
+import type { HistoryEntry, PipiHostAPI, StreamEvent } from '@pipi/host-api'
 
 vi.mock('react-virtuoso', async () => {
   const React = await import('react')
@@ -409,7 +409,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '批次仍在处理' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
     await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 300)) })
 
     durableSummaryAvailable = true
@@ -503,13 +503,14 @@ describe('settled turn stays idle after a late streaming status', () => {
     }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).not.toBeNull())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await screen.findByText(initialSummary)
     await waitFor(() => expect(listener).toBeDefined())
 
     act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2, pendingFollowUps: ['Supervisor notification'] }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [staleSending] }) })
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
 
     // The canonical D trace had already rendered the durable final branch by
     // the time the terminal-triggered history pull completed. Secret redaction
@@ -574,7 +575,7 @@ describe('settled turn stays idle after a late streaming status', () => {
 
     expect(screen.getByTestId('waiting-placeholder')).toBeTruthy()
     expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
@@ -665,6 +666,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).not.toBeNull())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -683,7 +685,68 @@ describe('settled turn stays idle after a late streaming status', () => {
     expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
   })
 
-  it('keeps stop and injects send when leftover queued items remain after settle', async () => {
+  it('closes restored observed-running after a durable final followed by compaction', async () => {
+    let background: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const history: HistoryEntry[] = [
+      { id: 'durable-final', role: 'assistant', content: '全部收尾完成。', timestamp: 1 },
+      { id: 'post-final-compaction', role: 'compaction', content: '本轮已完成，所有子任务已收尾。', timestamp: 2 },
+    ]
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async (sessionId, before, limit) => sessionId === 'layout'
+        ? history
+        : base.getSessionHistory(sessionId, before, limit),
+      subscribeAllStreams: listener => { background = listener; return () => { background = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(background).toBeDefined())
+
+    act(() => { background?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 1 }) })
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running'))
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+
+    expect(await screen.findByText('全部收尾完成。')).toBeTruthy()
+    expect(screen.getByTestId('compaction-divider')).toBeTruthy()
+    await waitFor(() => {
+      expect(screen.queryByTestId('waiting-placeholder')).toBeNull()
+      expect(screen.queryByLabelText('停止生成')).toBeNull()
+    })
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).not.toBe('running')
+  })
+
+  it.each(['user', 'tool'] as const)('does not recover a terminal assistant across a later %s boundary', async boundaryRole => {
+    let background: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const boundaryText = `${boundaryRole}-boundary-after-compaction`
+    const history: HistoryEntry[] = [
+      { id: 'old-final', role: 'assistant', content: '上一轮结论。', timestamp: 1 },
+      { id: 'old-compaction', role: 'compaction', content: '压缩完成。', timestamp: 2 },
+      { id: 'new-boundary', role: boundaryRole, content: boundaryText, timestamp: 3 },
+    ]
+    const host: PipiHostAPI = {
+      ...base,
+      getSessionHistory: async (sessionId, before, limit) => sessionId === 'layout'
+        ? history
+        : base.getSessionHistory(sessionId, before, limit),
+      subscribeAllStreams: listener => { background = listener; return () => { background = undefined } },
+    }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(background).toBeDefined())
+
+    act(() => { background?.({ type: 'status', sessionId: 'layout', status: 'started', turnEpoch: 2 }) })
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running'))
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await screen.findByText(boundaryText)
+    await act(async () => { await new Promise(resolve => window.setTimeout(resolve, 300)) })
+
+    expect(screen.getAllByLabelText('停止生成').length).toBeGreaterThan(0)
+    expect(container.querySelector('[data-session-id="layout"]')?.getAttribute('data-status')).toBe('running')
+  })
+
+  it('keeps stop and queues ordinary send when leftover queued items remain after settle', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const leftover = {
       id: 'leftover-q',
@@ -724,14 +787,14 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'status', sessionId: 'welcome', status: 'settled' }) })
 
     await waitFor(() => expect(screen.getByLabelText('停止生成')).toBeTruthy())
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
     fireEvent.click(screen.getByTestId('message-queue-toggle'))
     expect(screen.getByLabelText('立即发送第 1 条')).toBeTruthy()
 
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '所以呢' } })
-    fireEvent.click(screen.getByLabelText('插入当前对话'))
-    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', '所以呢', undefined))
-    await waitFor(() => expect(cutInQueuedMessage).toHaveBeenCalledWith('welcome', 'next-q'))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledWith('welcome', '所以呢', undefined, expect.objectContaining({ promptBytes: 9 })))
+    expect(cutInQueuedMessage).not.toHaveBeenCalled()
     expect(steerQueuedMessage).not.toHaveBeenCalled()
     expect(sendPrompt).not.toHaveBeenCalled()
   })
@@ -769,7 +832,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '是的，pi-coc 的调用方式和普通工具明显不同。' }) })
     act(() => { listener?.({ type: 'queue_update', sessionId: 'layout', queue: [stuck] }) })
     expect(screen.getByLabelText('停止生成')).toBeTruthy()
-    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+    expect(screen.getByLabelText('消息输入框').getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
 
     terminalQueueEmpty = true
     const queueReadsBeforeTerminal = listQueue.mock.calls.length
@@ -824,7 +887,7 @@ describe('settled turn stays idle after a late streaming status', () => {
       expect(screen.getByLabelText('消息输入框')).toBe(input)
       expect(document.activeElement).toBe(input)
       expect(input.value).toBe('批次 E 输入法草稿')
-      expect(input.getAttribute('placeholder')).toBe('当前会话忙碌，发送将终止当前回复并立即插入（后台子任务继续）…')
+      expect(input.getAttribute('placeholder')).toBe('Boss 正在工作，发送将进入队列，待当前回复完成后处理…')
       expect(input.classList.contains('queue-busy')).toBe(true)
       expect(input.getAttribute('aria-busy')).toBeNull()
 
