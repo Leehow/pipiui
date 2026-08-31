@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
@@ -18,6 +18,12 @@ import {
 	runProcessTableSample,
 	sampleDescendantsViaPs,
 } from "../child-exit-probe.ts";
+
+// Production deliberately unrefs every forensic-sample handle. Keep the test
+// process alive while this file awaits those promises, then release exactly
+// once after every case has settled.
+const testFileHold = setInterval(() => {}, 1_000);
+after(() => clearInterval(testFileHold));
 import { createChildExitCloseout } from "../closeout.ts";
 import { recordCloseoutTimeline } from "../closeout-timeline.ts";
 import type { DescendantSample } from "../child-exit-probe.ts";

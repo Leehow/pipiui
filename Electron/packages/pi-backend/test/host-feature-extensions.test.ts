@@ -34,13 +34,14 @@ describe("host-feature builtin extensions", () => {
   async function isolatedBackend(
     ids: string[],
     options: {
-      externalHome?: string;
+      externalHome?: string | ((fixtureRoot: string) => string);
       profileMode?: "default" | "isolated";
       /** Live-session harness: intercept Pi spawns and route them at fake-pi. */
       spawn?: Parameters<typeof createPiHostBackend>[0]["spawn"];
     } = {},
   ) {
     root = await mkdtemp(join(tmpdir(), "pipi-host-feature-"));
+    const externalHome = typeof options.externalHome === "function" ? options.externalHome(root) : options.externalHome;
     const agent = join(root, "agent");
     const sessions = join(root, "sessions");
     const runtime = join(root, "runtime");
@@ -58,8 +59,8 @@ describe("host-feature builtin extensions", () => {
       runtimeRoot: runtime,
       profileMode: options.profileMode ?? "isolated",
       canonicalProjectPaths: async () => undefined,
-      ...(options.externalHome
-        ? { externalSessionRoots: { home: options.externalHome }, env: { ...process.env, HOME: options.externalHome } }
+      ...(externalHome
+        ? { externalSessionRoots: { home: externalHome }, env: { ...process.env, HOME: externalHome } }
         : {}),
       ...(options.spawn ? { spawn: options.spawn, piPath: process.execPath } : {}),
     });
@@ -185,8 +186,11 @@ describe("host-feature builtin extensions", () => {
   });
 
   it("stops listing external sessions when the scan extension is disabled and restores them when re-enabled", async () => {
+    const { backend, project, projectId } = await isolatedBackend([EXTERNAL_SESSION_SCAN_EXTENSION_ID], {
+      externalHome: fixtureRoot => join(fixtureRoot, "external-home"),
+    });
     const home = join(root, "external-home");
-    const { backend, project, projectId } = await isolatedBackend([EXTERNAL_SESSION_SCAN_EXTENSION_ID], { externalHome: home });
+    expect(home.startsWith(root)).toBe(true);
     const claudeDir = join(home, ".claude", "projects", encodeClaudeProjectDir(project));
     await mkdir(claudeDir, { recursive: true });
     await writeFile(join(claudeDir, "claude-keep.jsonl"), `${JSON.stringify({
