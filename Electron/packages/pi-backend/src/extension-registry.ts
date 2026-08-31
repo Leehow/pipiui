@@ -1,6 +1,6 @@
 import {
   PROJECT_EXTENSION_ENABLED_FILE,
-  DEFAULT_PRODUCT_PROFILE_ID,
+  CODING_PRODUCT_PROFILE_ID,
   projectActivationOverlay,
   projectProductActivationPath,
   readProjectProductActivation,
@@ -280,7 +280,9 @@ export function projectExtensionEnabledPath(projectAgentDir: string): string {
 }
 
 export async function readProjectExtensionEnabled(projectAgentDir: string): Promise<Record<string, boolean>> {
-  return projectActivationOverlay(await readProjectProductActivation(projectAgentDir, { defaultProfileId: DEFAULT_PRODUCT_PROFILE_ID }));
+  // Fresh projects default to the shipping Coding edition — a project-scope
+  // toggle must never bake the strict base profile into a new ext-enabled.json.
+  return projectActivationOverlay(await readProjectProductActivation(projectAgentDir, { defaultProfileId: CODING_PRODUCT_PROFILE_ID }));
 }
 
 export async function writeProjectExtensionEnabled(
@@ -288,7 +290,7 @@ export async function writeProjectExtensionEnabled(
   id: string,
   enabled: boolean,
 ): Promise<Record<string, boolean>> {
-  const current = await readProjectProductActivation(projectAgentDir, { defaultProfileId: DEFAULT_PRODUCT_PROFILE_ID });
+  const current = await readProjectProductActivation(projectAgentDir, { defaultProfileId: CODING_PRODUCT_PROFILE_ID });
   const next = await writeProjectProductActivation(projectAgentDir, {
     ...current,
     overrides: { ...current.overrides, [id]: enabled ? "enabled" : "disabled" },

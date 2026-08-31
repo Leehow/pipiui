@@ -137,7 +137,7 @@ describe("Product Profile host interface", () => {
 
     await expect(backend.handle("installLocalProductPack" as never, [added.id, pack]))
       .rejects.toThrow(/Product Profile broken-campaign cannot activate: missing-kit missing/);
-    expect(await backend.handle("getProductProfile" as never, [added.id])).toMatchObject({ profile: "base" });
+    expect(await backend.handle("getProductProfile" as never, [added.id])).toMatchObject({ profile: "coding" });
     expect((await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string }>)
       .some(item => item.id === "campaign-kit")).toBe(false);
     expect(await readExtensionSlot(extensionUpdateStoreRoot(agentDir), "campaign-kit", "active")).toBeUndefined();
@@ -165,7 +165,7 @@ describe("Product Profile host interface", () => {
       expect.objectContaining({ id: "coding", name: "Coding 优化版" }),
     ]);
     expect(await backend.handle("getProductProfile" as never, [added.id])).toMatchObject({
-      profile: "base",
+      profile: "coding",
       overrides: {},
     });
     expect(await backend.handle("setProductProfile" as never, [added.id, "base"])).toMatchObject({

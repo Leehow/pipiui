@@ -72,6 +72,9 @@ describe("pdf-extension end-to-end mount integration", () => {
     expect(existsSync(MIRROR_ENTRY), "generated mirror must exist; run npm run build -w @pipiui/pipiui-pdf-extension").toBe(true);
     const { backend, probe } = await makeBackend();
     const fresh = await addProject(backend, "fresh-project");
+    // The shipping product defaults to the Coding edition; switch explicitly to
+    // the strict base profile, whose whitelist keeps the mirror unmounted.
+    await backend.handle("setProductProfile" as never, [fresh.id, "base"]);
 
     const packages = pdfPackages(await probe.registeredExtensionsForSpawn(fresh.project));
     expect(packages).toHaveLength(1);

@@ -262,8 +262,8 @@ import {
 import {
   readProjectProductActivation,
   writeProjectProductActivation,
-  DEFAULT_PRODUCT_PROFILE_ID,
-  LEGACY_PRODUCT_PROFILE_ID,
+  CODING_PRODUCT_PROFILE_ID,
+  projectActivationOverlay,
   type ProjectProductActivation,
 } from "./profile-store.js";
 import {
@@ -3168,7 +3168,10 @@ export class PiHostBackend implements HostBackend {
     }
   }
   private defaultProductProfileId(): string {
-    return this.profileMode === "isolated" ? DEFAULT_PRODUCT_PROFILE_ID : LEGACY_PRODUCT_PROFILE_ID;
+    // Two-SKU product model (user-confirmed 2026-08-31): the shipping product is
+    // the Coding edition — new projects open its full bundled set. `base` stays
+    // selectable and is the default of the future basic-only edition.
+    return CODING_PRODUCT_PROFILE_ID;
   }
   /** A later user prompt must be able to wake a missed-settled turn and drain. */
   private retryPendingFinalReconciliation(sessionId: string): void {
@@ -8040,7 +8043,15 @@ export class PiHostBackend implements HostBackend {
     if (plan.missingRequired.length || plan.conflicts.length) {
       console.warn(`[pipiui] Product Profile ${activation.profile} overlay fail-closed: ${formatActivationPlanProblems(plan)}`);
     }
-    return overlayFromActivationPlan(plan, extensionIds, activation.overrides);
+    // Priority: project overrides (explicit, most specific) > App-level toggles
+    // (explicit) > the profile plan (curated default). App disable must survive
+    // the project context — with the Coding profile curating nearly every bundled
+    // extension, a bare whitelist shadow would resurrect (and spawn) it again.
+    return {
+      ...overlayFromActivationPlan(plan, extensionIds),
+      ...app,
+      ...projectActivationOverlay(activation),
+    };
   }
   private async readExtensionSettingsSnapshot(id: string, projectRoot?: string): Promise<Record<string, unknown>> {
     const manifest = this.extensions.settingsManifest(id);

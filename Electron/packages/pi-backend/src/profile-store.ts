@@ -5,10 +5,16 @@ import { PRODUCT_PROFILE_ID_RE } from "./profile-manifest.js";
 
 export const PROJECT_EXTENSION_ENABLED_FILE = "ext-enabled.json";
 export const PROJECT_PRODUCT_ACTIVATION_SCHEMA_VERSION = 2 as const;
-/** New projects open the usable general workbench, not a featureless shell. */
+/**
+ * Two-SKU product model (user-confirmed 2026-08-31): the shipping product is the
+ * Coding edition and new projects open its full bundled set. `base` is the strict
+ * minimal profile (skill loader only) that the future basic-only edition ships
+ * with; it stays selectable here as the explicit minimal workspace.
+ */
+export const CODING_PRODUCT_PROFILE_ID = "coding";
 export const DEFAULT_PRODUCT_PROFILE_ID = "base";
 /** A legacy boolean extension table describes the historical Coding product. */
-export const LEGACY_PRODUCT_PROFILE_ID = "coding";
+export const LEGACY_PRODUCT_PROFILE_ID = CODING_PRODUCT_PROFILE_ID;
 /** Pre-release v2 name retained only for migration; it becomes the base product. */
 export const DEPRECATED_EMPTY_PROFILE_ID = "empty";
 
