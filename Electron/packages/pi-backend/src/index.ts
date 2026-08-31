@@ -202,6 +202,12 @@ import {
 } from "./extension-registry.js";
 import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";
 import {
+  ExtensionHotReloader,
+  selectHotRestartTargets,
+  stringSetEquals,
+  type HotReloadRoot,
+} from "./extension-hotreload.js";
+import {
   detectContributionCollisions,
   extensionAuthStatus,
   filterCatalogByContributions,
@@ -822,6 +828,10 @@ type Live = {
   pendingFinalReconciliation?: { epoch: number; identity: FinalAssistantIdentity };
   /** SIGKILL/close in flight: do not write another RPC to this child. */
   exiting?: boolean;
+  /** Extension ids THIS child's spawn mounted (snapshot; the overlay may already differ). */
+  mountedExtensionIds?: Set<string>;
+  /** A hot-reload/state change wants a respawn; deferred while the session was busy. */
+  pendingExtensionRestart?: boolean;
   /** The child is not a settled turn until all spawn initialization has succeeded. */
   spawnInitializing?: boolean;
   /** Monotonic timestamp of the last turn-related event (agent_start, deltas, tool, message_end). */
@@ -1987,6 +1997,10 @@ export class PiHostBackend implements HostBackend {
   private readonly planStore = new PlanStore();
   private readonly extensions: ExtensionRegistry;
   private readonly extensionLoader: ExtensionLoader;
+  /** Watches extension discovery roots; `changed(id)` drives graceful live-session respawns. */
+  private readonly extensionHotReload: ExtensionHotReloader;
+  /** Per-session hot-restart dedup: a burst or a deferred retry never stacks two stops. */
+  private readonly extensionHotRestartInFlight = new Set<string>();
   private readonly headroomRuntime: HeadroomManagedRuntimeLike;
   private planRuntimeMounted: boolean | undefined;
   private leases = new Map<string, LeaseManager>();
@@ -2298,7 +2312,14 @@ export class PiHostBackend implements HostBackend {
       appRoot: join(this.agentDir, "extensions"),
       sharedStoreRoot: this.extensionStoreRoot(),
     });
-    this.extensionLoader.scan();    this.bridge = new HostBridge({
+    this.extensionLoader.scan();
+    this.extensionHotReload = new ExtensionHotReloader({
+      roots: [],
+      onChanged: (extensionId) => this.onExtensionFilesChanged(extensionId),
+      onError: (error) => console.warn(`[pipiui-hotreload] extension watcher: ${error.message}`),
+    });
+    this.extensionHotReload.start();
+    this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
       onPlanEvent: (event, sessionId) => this.planEvent(event, sessionId),
       onBrowserAction: async (event, sessionId) =>
@@ -3035,6 +3056,11 @@ export class PiHostBackend implements HostBackend {
       console.error("[secret-vault] session redaction failed", message);
       if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken))
         this.stream({ type: "error", sessionId: id, content: `secret redaction failed: ${message}` });
+    }
+    // A hot restart deferred while the session was busy applies here, on idle.
+    if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) {
+      const live = this.live.get(id);
+      if (live?.pendingExtensionRestart) this.requestExtensionHotRestart(id, "state");
     }
   }
   /**
@@ -5365,10 +5391,12 @@ export class PiHostBackend implements HostBackend {
       this.assertSessionGeneration(id, generation);
       // Mount cleanup is registered before the write for the same partial-acquisition guarantee.
       rollback.push(() => this.extensions.unmountSession(id));
-      this.extensions.mountSession(
-        id,
+      // Hot-reload mount snapshot: which extension ids THIS child spawned with,
+      // so a later on-disk/state change can find the live sessions to restart.
+      const mountedExtensionIds = new Set(
         productSpawn.registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
       );
+      this.extensions.mountSession(id, [...mountedExtensionIds]);
       // close() may race a cache-first background resume before the child is
       // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
       // process or leave its session lease behind.
@@ -5486,6 +5514,7 @@ export class PiHostBackend implements HostBackend {
       }),
       };
       rollbackLive = live;
+      live.mountedExtensionIds = mountedExtensionIds;
       this.live.set(id, live);
       child.stdout.on("data", (chunk) => this.lines(live!, chunk.toString()));
     child.stderr.on("data", (chunk) => {
@@ -7315,7 +7344,9 @@ export class PiHostBackend implements HostBackend {
     if (grantProblems.length) {
       throw new Error(`Product Profile ${profileId} cannot activate: ${grantProblems.join("; ")}`);
     }
-    return writeProjectProductActivation(projectPiAgentDir(root), next);
+    const activation = await writeProjectProductActivation(projectPiAgentDir(root), next);
+    void this.onExtensionAvailabilityChanged();
+    return activation;
   }
   private async installLocalProductProfile(
     projectIdValue: unknown,
@@ -7344,7 +7375,9 @@ export class PiHostBackend implements HostBackend {
       );
       await fs.rename(staging, destination);
       try {
-        return await this.setProductProfile(projectIdValue, parsed.profile.id);
+        const activation = await this.setProductProfile(projectIdValue, parsed.profile.id);
+        void this.onExtensionAvailabilityChanged();
+        return activation;
       } catch (error) {
         await fs.rm(destination, { recursive: true, force: true });
         throw error;
@@ -7377,6 +7410,8 @@ export class PiHostBackend implements HostBackend {
         restoreProjectActivation: async () => { await writeProjectProductActivation(projectAgentDir, previous); },
         reuseInstalledExtension: extension => installedVersions.get(extension.id) === extension.version,
       });
+      // New mounts reach live sessions only on respawn: restart affected idle ones.
+      void this.onExtensionAvailabilityChanged();
       return result.activation;
     } catch (error) {
       // The installer restored mutable slots; rebuild the in-memory registry so
@@ -7392,11 +7427,15 @@ export class PiHostBackend implements HostBackend {
     if (!paths.includes(value)) await this.saveProjectPaths([value, ...paths]);
     await this.ensureIsolatedProjectHome(value);
     this.extensionLoader.scan(value);
+    void this.refreshExtensionHotReloadRoots();
     await this.loadProjectNames();
     return this.project(value);
   }
   private async listConfiguredProjects(): Promise<Project[]> {
     const paths = await this.loadProjectPaths();
+    // The UI lists projects at startup: ride this read to pick up per-project
+    // extension watch roots (lazily — never write settings at construction).
+    void this.refreshExtensionHotReloadRoots();
     const names = await this.loadProjectNames();
     return paths.map((path) => this.project(path, names));
   }
@@ -7674,6 +7713,7 @@ export class PiHostBackend implements HostBackend {
           });
         }
       }
+      void this.onExtensionAvailabilityChanged(id);
       return record;
     }
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
@@ -7700,6 +7740,7 @@ export class PiHostBackend implements HostBackend {
         await this.headroomRuntime.stopProject(root);
       }
     }
+    void this.onExtensionAvailabilityChanged(id);
     return record;
   }
   private async refreshCatalogAfterExtensionChange(id: string): Promise<void> {
@@ -8018,6 +8059,7 @@ export class PiHostBackend implements HostBackend {
       await this.refreshModelsAfterAuthChange(true, "extension");
       this.fallbackModelIfMissing();
     }
+    void this.onExtensionAvailabilityChanged(id);
     return { id, state: "unloaded" };
   }
   private async mergedExtensionOverlay(projectRoot?: string): Promise<Record<string, boolean>> {
@@ -8128,6 +8170,126 @@ export class PiHostBackend implements HostBackend {
       extensions: out,
     });
   }
+  // ── Extension hot reload ──────────────────────────────────────────────────────
+  // pi's RPC mode has no reload wire command, so an extension change reaches a
+  // live session by stopping its pi child while IDLE; the next send respawns it
+  // with fresh `-e` mounts (established respawn semantics) and the session file
+  // keeps the history.
+
+  private onExtensionFilesChanged(extensionId: string): void {
+    for (const [sessionId, live] of [...this.live]) {
+      if (!live.mountedExtensionIds?.has(extensionId)) continue;
+      // Archived sessions never respawn (ensure refuses); leave them alone.
+      if (this.sidebarArchivedCache.has(sessionId)) continue;
+      this.requestExtensionHotRestart(sessionId, "disk");
+    }
+    this.emitExtensionUpdatedEvent(extensionId, "disk");
+  }
+
+  /**
+   * Enable/disable, install, uninstall, profile activation: availability is
+   * overlaid onto the NEXT spawn, so live children whose mount set would change
+   * get the same graceful restart. Without `extensionId` the whole mount set is
+   * compared (pack/profile installs touch several extensions at once).
+   */
+  private async onExtensionAvailabilityChanged(extensionId?: string): Promise<void> {
+    for (const [sessionId, live] of [...this.live]) {
+      if (!live.mountedExtensionIds || this.sidebarArchivedCache.has(sessionId)) continue;
+      let nextMountedIds: ReadonlySet<string>;
+      try {
+        const registered = await this.registeredExtensionsForSpawn(live.cwd);
+        nextMountedIds = new Set(registered.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id));
+      } catch {
+        continue;
+      }
+      const affected = extensionId
+        ? live.mountedExtensionIds.has(extensionId) !== nextMountedIds.has(extensionId)
+        : !stringSetEquals(live.mountedExtensionIds, nextMountedIds);
+      if (!affected) continue;
+      this.requestExtensionHotRestart(sessionId, "state");
+    }
+    if (extensionId) this.emitExtensionUpdatedEvent(extensionId, "state");
+  }
+
+  private requestExtensionHotRestart(sessionId: string, source: "disk" | "state"): void {
+    const live = this.live.get(sessionId);
+    if (!live?.mountedExtensionIds) return;
+    const plan = selectHotRestartTargets([{
+      sessionId,
+      affected: true,
+      busy: this.sessionBusyForHotRestart(sessionId, live),
+      restartInFlight: this.extensionHotRestartInFlight.has(sessionId) || Boolean(live.pendingExtensionRestart),
+    }]);
+    if (!plan.restart.length) {
+      if (plan.defer.length) live.pendingExtensionRestart = true;
+      return;
+    }
+    live.pendingExtensionRestart = false;
+    this.extensionHotRestartInFlight.add(sessionId);
+    void this.stopLiveChildForExtensionReload(sessionId, live, source).finally(() => {
+      this.extensionHotRestartInFlight.delete(sessionId);
+    });
+  }
+
+  /** Busy = a turn is active, spawn init has not finished, or compaction holds the queue. */
+  private sessionBusyForHotRestart(sessionId: string, live: Live): boolean {
+    if (live.spawnInitializing || live.compactionHoldsQueue) return true;
+    try {
+      return this.queue.isTurnActive(sessionId);
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * Graceful restart: mark the child exiting and drop it from `live`; the
+   * child's close handler takes the quiet path and the next send respawns with
+   * fresh mounts (ensure → spawnLive). Session history lives in the session
+   * file, so nothing the user sees is lost.
+   */
+  private async stopLiveChildForExtensionReload(sessionId: string, live: Live, source: "disk" | "state"): Promise<void> {
+    try {
+      if (this.live.get(sessionId) !== live) return;
+      if (this.sessionBusyForHotRestart(sessionId, live)) {
+        live.pendingExtensionRestart = true;
+        return;
+      }
+      live.exiting = true;
+      if (this.live.get(sessionId) === live) this.live.delete(sessionId);
+      await this.stopLiveProcess(live);
+      console.info(`[pipiui-hotreload] stopped live child session=${sessionId} source=${source}; next send respawns with fresh mounts`);
+    } catch (error) {
+      console.warn(`[pipiui-hotreload] hot restart failed session=${sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** Host-synthetic event on the D4 `ext.<id>` channel; the renderer refreshes contributions / toasts. */
+  private emitExtensionUpdatedEvent(extensionId: string, source: "disk" | "state"): void {
+    emitFrame(this.listeners, {
+      protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+      channel: `ext.${extensionId}`,
+      event: { type: "extension_updated", payload: { extensionId, source } },
+    } as unknown as HostEvent);
+  }
+
+  /** Watched discovery roots: builtin runtime checkout + app dir + shared store + per-project dirs. */
+  private async refreshExtensionHotReloadRoots(): Promise<void> {
+    const roots: HotReloadRoot[] = [
+      { kind: "builtin", path: join(this.runtimeRoot, "extensions") },
+      { kind: "app", path: join(this.agentDir, "extensions") },
+      { kind: "shared-store", path: this.extensionStoreRoot() },
+    ];
+    try {
+      for (const project of await this.loadProjectPaths()) {
+        roots.push({ kind: "project", path: join(projectPiAgentDir(project), "extensions") });
+      }
+    } catch {
+      /* project list unavailable → global roots only */
+    }
+    // fs.watch throws ENOENT on missing dirs; skip them until the next refresh.
+    this.extensionHotReload.setRoots(roots.filter((root) => existsSync(root.path)));
+  }
+
   private notifyExtensionSettingsChanged(id: string, settings: Record<string, unknown>): void {
     for (const [sessionId, live] of this.live) {
       if (!this.liveProcessUsable(live) || !live.process?.stdin) continue;
