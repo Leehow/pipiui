@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import {
 	GENERAL_PURPOSE_SEMANTIC_TURN_CAP,
@@ -107,4 +108,13 @@ test("id-less semantic calls pair only by tool name and missing results settle b
 	const settled = advanceSemanticProgress(decision.state, { type: "settle" });
 	assert.equal(settled.terminate, true);
 	assert.match(settled.state.lastSummary, /missing result|settlement/);
+});
+
+test("production event and closeout seams remain wired to semantic progress", () => {
+	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	assert.match(source, /type: "assistant-turn"[\s\S]{0,300}?toolCalls: semanticToolCalls/);
+	assert.match(source, /onResult: observeSemanticToolResult/);
+	assert.match(source, /advanceSemanticProgress\(semanticProgress, \{ type: "settle" \}\)/);
+	assert.match(source, /currentResult\.stopReason = "semantic_no_progress"/);
+	assert.match(source, /if \(!semanticNoProgress\) \{[\s\S]{0,120}?applyWorktreeRecovery/);
 });

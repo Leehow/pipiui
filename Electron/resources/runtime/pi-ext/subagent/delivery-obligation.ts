@@ -23,6 +23,15 @@ export interface DeliveryObligation {
 	ownerToken?: string;
 	acknowledgedAt?: number;
 	acknowledgementNote?: string;
+	alarmRollup?: {
+		version: 1;
+		count: number;
+		firstAt: number;
+		lastAt: number;
+		latestAgentId: string;
+		latestRunId: string;
+		digest: string;
+	};
 }
 
 export interface RecoverableDelivery {
@@ -43,6 +52,8 @@ interface StoreOptions {
 	claimLeaseMs?: number;
 	auxiliaryMaxAgeMs?: number;
 	maxAuxiliaryFiles?: number;
+	maxUnacknowledgedAlarms?: number;
+	maxUnacknowledgedAlarmsPerAgent?: number;
 }
 
 interface DeliveryClaim {
@@ -59,6 +70,10 @@ const DEFAULT_MAX_ATTEMPTS = 5;
 const INVALID_CLAIM_GRACE_MS = 5_000;
 const DEFAULT_CLAIM_LEASE_MS = 2 * 60 * 1000;
 const DEFAULT_AUXILIARY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS = 256;
+const DEFAULT_MAX_UNACKNOWLEDGED_ALARMS_PER_AGENT = 16;
+const ALARM_OVERFLOW_AGENT_ID = "alarm-overflow";
+const ALARM_OVERFLOW_RUN_ID = "alarm-overflow";
 
 export function deliveryRetryDue(
 	record: Pick<DeliveryObligation, "state" | "attempts" | "lastAttemptAt">,
@@ -138,7 +153,16 @@ function isRecord(value: unknown): value is DeliveryObligation {
 			(r.acknowledgementRequired === undefined || typeof r.acknowledgementRequired === "boolean") &&
 			(r.ownerToken === undefined || (typeof r.ownerToken === "string" && r.ownerToken.length > 0)) &&
 			(r.acknowledgedAt === undefined || (typeof r.acknowledgedAt === "number" && Number.isFinite(r.acknowledgedAt))) &&
-			(r.acknowledgementNote === undefined || typeof r.acknowledgementNote === "string")
+			(r.acknowledgementNote === undefined || typeof r.acknowledgementNote === "string") &&
+			(r.alarmRollup === undefined || (
+				r.alarmRollup.version === 1 &&
+				Number.isSafeInteger(r.alarmRollup.count) && r.alarmRollup.count > 0 &&
+				typeof r.alarmRollup.firstAt === "number" && Number.isFinite(r.alarmRollup.firstAt) &&
+				typeof r.alarmRollup.lastAt === "number" && Number.isFinite(r.alarmRollup.lastAt) &&
+				typeof r.alarmRollup.latestAgentId === "string" && r.alarmRollup.latestAgentId.length > 0 &&
+				typeof r.alarmRollup.latestRunId === "string" && r.alarmRollup.latestRunId.length > 0 &&
+				typeof r.alarmRollup.digest === "string" && /^[a-f0-9]{64}$/.test(r.alarmRollup.digest)
+			))
 		);
 }
 
@@ -160,6 +184,9 @@ export class DeliveryObligationStore {
 	private readonly claimLeaseMs: number;
 	private readonly auxiliaryMaxAgeMs: number;
 	private readonly maxAuxiliaryFiles: number;
+	private readonly maxUnacknowledgedAlarms: number;
+	private readonly maxUnacknowledgedAlarmsPerAgent: number;
+	private readonly alarmCapacityClaimId: string;
 
 	constructor(directory: string, options: StoreOptions = {}) {
 		this.directory = directory;
@@ -175,6 +202,15 @@ export class DeliveryObligationStore {
 		this.claimLeaseMs = Math.max(1, options.claimLeaseMs ?? DEFAULT_CLAIM_LEASE_MS);
 		this.auxiliaryMaxAgeMs = Math.max(1, options.auxiliaryMaxAgeMs ?? DEFAULT_AUXILIARY_MAX_AGE_MS);
 		this.maxAuxiliaryFiles = Math.max(1, options.maxAuxiliaryFiles ?? this.maxRows * 2);
+		this.maxUnacknowledgedAlarms = Math.max(1, options.maxUnacknowledgedAlarms ?? DEFAULT_MAX_UNACKNOWLEDGED_ALARMS);
+		this.maxUnacknowledgedAlarmsPerAgent = Math.max(
+			1,
+			Math.min(
+				options.maxUnacknowledgedAlarmsPerAgent ?? DEFAULT_MAX_UNACKNOWLEDGED_ALARMS_PER_AGENT,
+				this.maxUnacknowledgedAlarms,
+			),
+		);
+		this.alarmCapacityClaimId = sha256(`${this.routingKeyHash}\0alarm-capacity`);
 	}
 
 	static runId(): string {
@@ -202,15 +238,63 @@ export class DeliveryObligationStore {
 		const existing = this.read(id);
 		if (existing) {
 			if (!acknowledgementRequired || existing.acknowledgementRequired) return existing;
-			const now = this.now();
-			const upgraded: DeliveryObligation = {
-				...existing,
-				acknowledgementRequired: true,
-				state: existing.state === "fulfilled" ? "pending" : existing.state,
-				updatedAt: now,
-			};
-			this.write(upgraded);
-			return upgraded;
+		}
+		if (acknowledgementRequired) {
+			if (!this.acquireClaim(this.alarmCapacityClaimId)) {
+				throw new Error("Boss alarm capacity is busy; use the stable volatile fallback.");
+			}
+			try {
+				// Re-read inside the serialized capacity section: another process may have
+				// created the exact row while this caller waited for the claim.
+				const current = this.read(id);
+				if (current?.acknowledgementRequired) return current;
+				const unacknowledged = this.readAll().filter((row) =>
+					row.acknowledgementRequired &&
+					row.state !== "acknowledged" &&
+					row.state !== "fulfilled" &&
+					!row.alarmRollup);
+				const perAgent = unacknowledged.filter((row) => row.agentId === agentId).length;
+				if (
+					unacknowledged.length >= this.maxUnacknowledgedAlarms ||
+					perAgent >= this.maxUnacknowledgedAlarmsPerAgent
+				) {
+					return this.upsertAlarmOverflow({ agentId, runId, text, payloadHash });
+				}
+				const now = this.now();
+				if (current) {
+					const upgraded: DeliveryObligation = {
+						...current,
+						acknowledgementRequired: true,
+						state: current.state === "fulfilled" ? "pending" : current.state,
+						payloadHash,
+						text,
+						updatedAt: now,
+					};
+					this.write(upgraded);
+					this.prune(upgraded.id);
+					return upgraded;
+				}
+				const record: DeliveryObligation = {
+					version: 1,
+					id,
+					routingKeyHash: this.routingKeyHash,
+					agentId,
+					runId,
+					payloadHash,
+					text,
+					state: "pending",
+					attempts: 0,
+					createdAt: now,
+					updatedAt: now,
+					lastAttemptAt: 0,
+					acknowledgementRequired: true,
+				};
+				this.write(record);
+				this.prune(id);
+				return record;
+			} finally {
+				this.releaseClaim(this.alarmCapacityClaimId);
+			}
 		}
 		const now = this.now();
 		const record: DeliveryObligation = {
@@ -231,6 +315,54 @@ export class DeliveryObligationStore {
 		this.write(record);
 		this.prune(id);
 		return record;
+	}
+
+	private upsertAlarmOverflow(input: {
+		agentId: string;
+		runId: string;
+		text: string;
+		payloadHash: string;
+	}): DeliveryObligation {
+		const id = sha256(`${this.routingKeyHash}\0alarm-overflow`);
+		const previous = this.read(id);
+		const now = this.now();
+		const activePrevious = previous?.state !== "acknowledged" ? previous?.alarmRollup : undefined;
+		const priorDigest = activePrevious?.digest ?? sha256("alarm-overflow-v1");
+		const rollup = {
+			version: 1 as const,
+			count: (activePrevious?.count ?? 0) + 1,
+			firstAt: activePrevious?.firstAt ?? now,
+			lastAt: now,
+			latestAgentId: input.agentId,
+			latestRunId: input.runId,
+			digest: sha256(`${priorDigest}\0${input.agentId}\0${input.runId}\0${input.payloadHash}`),
+		};
+		const latest = (input.text.replace(/\0/gu, "").trim().split("\n")[0] ?? "").slice(0, 600);
+		const text = [
+			`[boss-alarm-overflow] ${rollup.count} terminal alarm(s) exceeded the exact-row capacity and were compacted into this durable rollup.`,
+			`Latest exact episode: agentId=${input.agentId} runId=${input.runId}. digest=${rollup.digest}.`,
+			`Latest bounded alarm text: ${latest || "(empty)"}`,
+			`Handle the overflow as one explicit episode, then call subagent_alarm_ack({agentId:"${ALARM_OVERFLOW_AGENT_ID}", runId:"${ALARM_OVERFLOW_RUN_ID}", note:"handled overflow rollup"}). This row remains on the 1m/2m/5m cadence until acknowledged.`,
+		].join("\n");
+		const row: DeliveryObligation = {
+			version: 1,
+			id,
+			routingKeyHash: this.routingKeyHash,
+			agentId: ALARM_OVERFLOW_AGENT_ID,
+			runId: ALARM_OVERFLOW_RUN_ID,
+			payloadHash: sha256(text),
+			text,
+			state: "pending",
+			attempts: activePrevious ? (previous?.attempts ?? 0) : 0,
+			createdAt: activePrevious ? (previous?.createdAt ?? now) : now,
+			updatedAt: now,
+			lastAttemptAt: activePrevious ? (previous?.lastAttemptAt ?? 0) : 0,
+			acknowledgementRequired: true,
+			alarmRollup: rollup,
+		};
+		this.write(row);
+		this.prune(id);
+		return row;
 	}
 
 	beginAttempt(id: string): DeliveryObligation | undefined {
@@ -284,7 +416,7 @@ export class DeliveryObligationStore {
 	markObserved(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
 		if (!record) return undefined;
-		if (record.state === "fulfilled") return record;
+		if (record.state === "acknowledged" || record.state === "fulfilled") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "observed",
@@ -300,6 +432,7 @@ export class DeliveryObligationStore {
 	markFulfilled(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
 		if (!record) return undefined;
+		if (record.state === "acknowledged") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "fulfilled",
@@ -352,7 +485,7 @@ export class DeliveryObligationStore {
 	/** A persisted Boss assistant ended unsuccessfully; retry through normal bounded gates. */
 	markRetryable(id: string): DeliveryObligation | undefined {
 		const record = this.read(id);
-		if (!record || record.state === "fulfilled") return record;
+		if (!record || record.state === "acknowledged" || record.state === "fulfilled") return record;
 		const next: DeliveryObligation = {
 			...record,
 			state: "failed",

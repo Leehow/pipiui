@@ -143,6 +143,7 @@ import {
 import {
 	acknowledgeBossAlarm,
 	formatBossAlarmMessage,
+	VolatileBossAlarmStore,
 } from "./boss-alarm.ts";
 import {
 	decideAdjacentStatusSnapshot,
@@ -5409,6 +5410,7 @@ interface PendingDoneEntry {
 const pendingDone = new Map<string, PendingDoneEntry>();
 let pendingDoneSettledRetryTimer: ReturnType<typeof setTimeout> | undefined;
 let doneDeliveryStore: DeliveryObligationStore | undefined;
+const volatileBossAlarmStore = new VolatileBossAlarmStore();
 /** Present only in a recursive nested RPC worker; its descendants own this process lease. */
 let nestedBackgroundLifecycle: NestedBackgroundLifecycle | undefined;
 /** Bound at session start, then called from every exact lease/obligation transition. */
@@ -5687,13 +5689,17 @@ function createDoneObligation(
 	acknowledgementRequired = false,
 ): DeliveryObligation {
 	if (!doneDeliveryStore) {
-		return { ...volatileObligation(agentId, runId, text, identityNamespace), acknowledgementRequired };
+		return acknowledgementRequired
+			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace)
+			: volatileObligation(agentId, runId, text, identityNamespace);
 	}
 	try {
 		return doneDeliveryStore.create(agentId, runId, text, identityNamespace, acknowledgementRequired);
 	} catch (err) {
 		logDonePersistenceFailure("create", "", err);
-		return { ...volatileObligation(agentId, runId, text, identityNamespace), acknowledgementRequired };
+		return acknowledgementRequired
+			? volatileBossAlarmStore.create(agentId, runId, text, identityNamespace)
+			: volatileObligation(agentId, runId, text, identityNamespace);
 	}
 }
 
@@ -5753,10 +5759,9 @@ function sendDoneWithConfirmation(
 			} else {
 				// The row vanished/corrupted after create: do not suppress the actual completion.
 				logDonePersistenceFailure("missing-before-send", obligation.id, undefined);
-					obligation = {
-						...volatileObligation(obligation.agentId, obligation.runId, obligation.text),
-						acknowledgementRequired: obligation.acknowledgementRequired,
-					};
+					obligation = obligation.acknowledgementRequired
+						? volatileBossAlarmStore.create(obligation.agentId, obligation.runId, obligation.text, obligation.id)
+						: volatileObligation(obligation.agentId, obligation.runId, obligation.text);
 			}
 		} catch (err) {
 			logDonePersistenceFailure("begin", obligation.id, err);
@@ -5800,10 +5805,17 @@ function sendDoneWithConfirmation(
 		runId: obligation.runId,
 		obligationId: obligation.id,
 		text: outText,
-	}, {
-		waitForCutIn: doneDeliverCutInOverride ?? awaitCutInHoldRelease,
-		currentSessionId: () => doneDeliveryPiSessionId,
-	}).catch((err: unknown) => {
+		}, {
+			waitForCutIn: doneDeliverCutInOverride ?? awaitCutInHoldRelease,
+			currentSessionId: () => doneDeliveryPiSessionId,
+			shouldSend: () => {
+				if (pendingDone.get(obligation.id) !== entry) return false;
+				const current = obligation.id.startsWith("volatile-")
+					? volatileBossAlarmStore.read(obligation.id)
+					: doneDeliveryStore?.read(obligation.id);
+				return current?.state !== "acknowledged";
+			},
+		}).catch((err: unknown) => {
 		// A rejected send still closes the enter it opened — then propagates unchanged.
 		logCloseoutProbe("done-deliver", {
 			agent: obligation.agentId,
@@ -6028,7 +6040,10 @@ function initializeDoneDeliveryStore(pi: ExtensionAPI, piSessionId: string, acti
 
 function acknowledgeSubagentAlarm(agentId: string, runId: string, note?: string) {
 	const current = jobRegistry.get(agentId);
-	const result = acknowledgeBossAlarm(doneDeliveryStore, {
+	const alarmStore = doneDeliveryStore?.readAlarmEpisode(agentId, runId)
+		? doneDeliveryStore
+		: volatileBossAlarmStore;
+	const result = acknowledgeBossAlarm(alarmStore, {
 		agentId,
 		runId,
 		...(note ? { note } : {}),

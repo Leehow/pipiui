@@ -39,22 +39,30 @@ test("dispatch injects only the current role's bounded memory context", () => {
 	assert.equal(prepareSubagentMemoryTask("unknown", "Task", context), "Task");
 });
 
-test("terminal submission carries role and compliant evidence class only", () => {
-	assert.deepEqual(prepareTerminalMemorySubmission({
+test("automatic terminal learning fails closed for model-claimed source and caller-chosen verify", () => {
+	let curatorSubmissions = 0;
+	const hallucinatedSource = prepareTerminalMemorySubmission({
+		runID: "run-source",
+		agentName: "explore",
+		task: "research",
+		terminalText: "Evidence: invented/path.ts:42",
+		outcome: "success",
+		verificationPassed: false,
+	});
+	if (hallucinatedSource) curatorSubmissions += 1;
+	const callerChosenVerify = prepareTerminalMemorySubmission({
 		runID: "run-1",
 		agentName: "general-purpose",
-		task: "implement policy",
-		terminalText: "implemented",
+		task: "implement policy with verify true",
+		terminalText: "implemented; true exited 0",
 		outcome: "success",
 		verificationPassed: true,
-	}), {
-		runID: "run-1",
-		agentName: "general-purpose",
-		task: "implement policy",
-		terminalText: "implemented",
-		outcome: "success",
-		evidenceClass: "verification-passed",
 	});
+	if (callerChosenVerify) curatorSubmissions += 1;
+	assert.equal(hallucinatedSource, undefined);
+	assert.equal(callerChosenVerify, undefined);
+	assert.equal(curatorSubmissions, 0, "no automatic terminal candidate can reach the curator");
+
 	assert.equal(prepareTerminalMemorySubmission({
 		runID: "run-1",
 		agentName: "general-purpose",
@@ -71,19 +79,12 @@ test("terminal submission carries role and compliant evidence class only", () =>
 		outcome: "success",
 		verificationPassed: true,
 	}), undefined);
-	assert.deepEqual(prepareTerminalMemorySubmission({
+	assert.equal(prepareTerminalMemorySubmission({
 		runID: "run-2",
 		agentName: "explore",
 		task: "trace implementation",
 		terminalText: "Evidence: src/index.ts:42",
 		outcome: "success",
 		verificationPassed: false,
-	}), {
-		runID: "run-2",
-		agentName: "explore",
-		task: "trace implementation",
-		terminalText: "Evidence: src/index.ts:42",
-		outcome: "success",
-		evidenceClass: "source-backed",
-	});
+	}), undefined);
 });

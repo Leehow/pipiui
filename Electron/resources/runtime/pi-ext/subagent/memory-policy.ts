@@ -95,15 +95,11 @@ export function prepareTerminalMemorySubmission(input: {
 	outcome: "success" | "failure";
 	verificationPassed: boolean;
 }): TerminalMemorySubmission | undefined {
-	const evidenceClass = terminalMemoryEvidence(input);
-	if (!evidenceClass) return undefined;
-	return {
-		runID: input.runID,
-		agentName: input.agentName,
-		task: input.task,
-		...(input.title ? { title: input.title } : {}),
-		terminalText: input.terminalText,
-		outcome: input.outcome,
-		evidenceClass,
-	};
+	// Fail closed: terminal text is model-authored, and the dispatch verify command
+	// is caller-chosen (including vacuous commands such as `true`). Neither is an
+	// independent host attestation, while the downstream curator may promote a
+	// session brief into durable project memory. Automatic terminal learning stays
+	// disabled until an unforgeable host-derived evidence contract exists.
+	void input;
+	return undefined;
 }
