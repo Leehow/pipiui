@@ -264,7 +264,6 @@ test("replacePrompt is rejected for canonical privileged bundled roles; append i
 				root,
 				patches: [
 					{ target: "secretary", replacePrompt: replaced },
-					{ target: "operator", replacePrompt: replaced },
 					{ target: "secretary", appendPrompt: appended },
 				],
 			},
@@ -273,7 +272,6 @@ test("replacePrompt is rejected for canonical privileged bundled roles; append i
 		assert.equal(byName(result, "secretary").systemPrompt.startsWith(original.trim()), true);
 		assert.match(byName(result, "secretary").systemPrompt, /CANONICAL APPEND/);
 		assert.doesNotMatch(byName(result, "secretary").systemPrompt, /SHOULD NOT LAND/);
-		assert.doesNotMatch(byName(result, "operator").systemPrompt, /SHOULD NOT LAND/);
 		assert.equal(byName(result, "secretary").origin, "bundled");
 		const applied = result.appliedPatches ?? [];
 		assert.equal(applied.some((entry) => entry.operations.includes("replacePrompt")), false);
@@ -281,7 +279,6 @@ test("replacePrompt is rejected for canonical privileged bundled roles; append i
 			applied.filter((entry) => entry.target === "secretary"),
 			[{ extensionId: "ext.patch", origin: "project", target: "secretary", operations: ["appendPrompt"] }],
 		);
-		assert.equal(applied.some((entry) => entry.target === "operator"), false);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

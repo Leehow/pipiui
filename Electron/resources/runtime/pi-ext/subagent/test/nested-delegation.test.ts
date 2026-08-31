@@ -83,7 +83,6 @@ test("runtimeRolePolicyForAgent still derives recursive delegation from the capa
 	assert.equal(runtimeRolePolicyForAgent(requireBundled("explore")).allowRecursiveDelegation, false);
 	assert.equal(runtimeRolePolicyForAgent(requireBundled("reviewer")).allowRecursiveDelegation, false);
 	assert.equal(runtimeRolePolicyForAgent(requireBundled("secretary")).allowRecursiveDelegation, false);
-	assert.equal(runtimeRolePolicyForAgent(requireBundled("operator")).allowRecursiveDelegation, false);
 });
 
 test("other built-in roles remain non-delegating", () => {
@@ -94,7 +93,6 @@ test("other built-in roles remain non-delegating", () => {
 		"explore",
 		"reviewer",
 		"secretary",
-		"operator",
 	]) {
 		const agent = requireBundled(name);
 		assert.equal(agent.capabilities.delegation, false, name);
@@ -145,7 +143,6 @@ test("depth-1 general-purpose may dispatch only explore and general-purpose", ()
 	for (const name of [
 		"reviewer",
 		"secretary",
-		"operator",
 	]) {
 		const problem = rejectNestedDelegationTypes({ callerDepth: 1, agentNames: [name] });
 		assert.match(problem ?? "", /not allowed/);

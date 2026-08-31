@@ -154,7 +154,8 @@ describe("explicit sidebar project persistence", () => {
       expect.objectContaining({ name: "explore" }),
     ]));
     const listed = await first.handle("listAgentDefinitions", []) as Array<{ name: string; description?: string }>;
-    expect(listed.map((a) => a.name)).toEqual(expect.arrayContaining(["explore", "general-purpose", "reviewer", "secretary", "operator"]));
+    expect(listed.map((a) => a.name)).toEqual(expect.arrayContaining(["explore", "general-purpose", "reviewer", "secretary"]));
+    expect(listed.map((a) => a.name)).not.toContain("operator");
     expect(listed.map((a) => a.name)).not.toContain("computer-use");
     expect(listed.every((a) => typeof a.name === "string" && typeof a.description === "string")).toBe(true);
     const fresh = backend(fixture.agent, fixture.sessions);

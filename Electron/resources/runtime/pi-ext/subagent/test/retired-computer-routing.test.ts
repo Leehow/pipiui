@@ -27,7 +27,6 @@ test("formatSubagentModelRoutingBlock omits persisted retired computer-use keys"
 	writeFileSync(overridesFile, JSON.stringify({
 		explore: [{ model: "roleprov/explore" }],
 		"general-purpose": [{ model: "roleprov/gp" }],
-		operator: [{ model: "roleprov/operator" }],
 		reviewer: [{ model: "roleprov/reviewer" }],
 		secretary: [{ model: "roleprov/secretary" }],
 		"computer-use": [{ model: "openai-codex/gpt-5.6-terra" }],
@@ -42,7 +41,7 @@ test("formatSubagentModelRoutingBlock omits persisted retired computer-use keys"
 		assert.match(block, /\[Subagent model routing — hot-read\]/);
 		assert.match(block, /^- explore:/m);
 		assert.match(block, /^- general-purpose:/m);
-		assert.match(block, /^- operator:/m);
+		assert.doesNotMatch(block, /^- operator:/m);
 		assert.match(block, /^- reviewer:/m);
 		assert.match(block, /^- secretary:/m);
 		assert.doesNotMatch(block, /^- computer-use:/m);

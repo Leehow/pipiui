@@ -335,7 +335,6 @@ function canonicalRoleFor(
 ): AgentCanonicalRole | undefined {
   if (!isCanonical(name, origin)) return undefined;
   if (name === "secretary") return "secretary";
-  if (name === "operator") return "operator";
   return undefined;
 }
 

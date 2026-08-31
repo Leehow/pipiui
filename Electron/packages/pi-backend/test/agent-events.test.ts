@@ -875,17 +875,17 @@ describe("subagent lifecycle → AgentSummary", () => {
     expect(latest().toolCallId).toBeUndefined();
   });
 
-  it("does not display a private Operator blocked verdict as successful just because Pi exited zero", async () => {
+  it("does not display a private closed-verdict worker's blocked verdict as successful just because Pi exited zero", async () => {
     const { deliver, latest } = await harness();
-    deliver({ ...START, name: "operator" });
+    deliver({ ...START, name: "computer-verifier" });
     deliver({
       ...END,
-      name: "operator",
+      name: "computer-verifier",
       ok: true,
       output: JSON.stringify({ outcome: "blocked", summary: "The document remained inaccessible." }),
     });
     expect(latest()).toMatchObject({
-      name: "operator",
+      name: "computer-verifier",
       state: "failed",
       finalResult: JSON.stringify({ outcome: "blocked", summary: "The document remained inaccessible." }),
     });

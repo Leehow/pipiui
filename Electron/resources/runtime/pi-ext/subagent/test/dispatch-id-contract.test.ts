@@ -168,10 +168,19 @@ test("wiring: abort is exact-run everywhere and the runtime never generates a wo
 	assert.doesNotMatch(source, /agent-\$\{randomBytes/);
 	assert.match(source, /runSingleAgent requires an explicit short semantic agentId/);
 	// Abort requires runId on every route: public schema, tool wrapper, slash command.
-	const abortSchema = source.slice(source.indexOf("const SubagentAbortParams"), source.indexOf("type SubagentExecuteParams"));
+	// The slice spans the three MUTATING schemas (abort/progress/resolve); it ends at
+	// SubagentWatchParams because watch's read-only `list` action legitimately omits the
+	// pair — its start/update/stop still bind the exact runId at the runtime gate below.
+	const abortSchema = source.slice(source.indexOf("const SubagentAbortParams"), source.indexOf("const SubagentWatchParams"));
 	assert.match(abortSchema, /agentId: Type\.String\(/);
 	assert.match(abortSchema, /\trunId: Type\.String\(/);
 	assert.doesNotMatch(abortSchema, /runId: Type\.Optional/);
+	// subagent_watch: strict schema, and its mutating actions bind the exact pair too —
+	// only `list` may omit identity, and a half filter is rejected rather than guessed.
+	const watchSchema = source.slice(source.indexOf("const SubagentWatchParams"), source.indexOf("type SubagentExecuteParams"));
+	assert.match(watchSchema, /additionalProperties: false/);
+	assert.match(source, /requires both agentId and the exact runId/);
+	assert.match(source, /takes either both agentId and runId \(exact filter\) or neither/);
 	assert.match(source, /'action="abort" requires both agentId and the exact runId/);
 	assert.match(source, /Usage: \/subagent_abort <agentId> <runId>/);
 	// No route may suggest omitting runId.

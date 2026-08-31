@@ -4,7 +4,7 @@ import type { LivenessVerdict } from "./worker-liveness.ts";
 
 /** Runtime-only grants that frontmatter is never allowed to manufacture. */
 export interface AgentRuntimeRolePolicy {
-	role: "worker" | "operator" | "closeout-secretary";
+	role: "worker" | "closeout-secretary";
 	/** `main-session` is reserved; `direct` merely honors the caller/default cwd. */
 	worktree: "isolated" | "direct" | "main-session";
 	allowRecursiveDelegation: boolean;
@@ -323,19 +323,9 @@ export function runtimeRolePolicyForAgent(agent: AgentConfig): AgentRuntimeRoleP
 			allowRecursiveDelegation: false,
 		};
 	}
-	// Only the shipped operator carries the operator role marker. A user/project
-	// agent named operator remains an ordinary worker and cannot self-declare
-	// this route.
-	if (agent.origin === "bundled" && agent.name === "operator") {
-		return {
-			role: "operator",
-			// The bundled Operator is declaratively read-only and never edits code.
-			// Giving it an isolated worktree incorrectly classifies its dispatch as a
-			// writable branch-producing worker before model/spawn setup.
-			worktree: "direct",
-			allowRecursiveDelegation: false,
-		};
-	}
+	// Only the shipped operator carried the operator role marker; that bundled
+	// role was removed. A user/project agent named operator remains an ordinary
+	// worker and cannot self-declare a privileged route.
 	return {
 		role: "worker",
 		worktree: agent.worktree === "none" ? "direct" : "isolated",

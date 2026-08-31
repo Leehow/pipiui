@@ -19,6 +19,7 @@ const RETIRED_SUBAGENT_MODEL_KEYS = [
   'computer-use-leader',
   'computer-verifier',
   'computer-terminal',
+  'operator',
 ] as const
 
 describe('Subagent role model settings', () => {
@@ -29,10 +30,9 @@ describe('Subagent role model settings', () => {
     const backend = createPiHostBackend({ agentDir: join(root, 'agent'), env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
     const roles = await backend.handle('listAgentDefinitions', []) as Array<{ name: string; description?: string; canonicalRole?: string }>
     const names = roles.map(role => role.name)
-    expect(names).toEqual(expect.arrayContaining(['explore', 'general-purpose', 'reviewer', 'secretary', 'operator']))
+    expect(names).toEqual(expect.arrayContaining(['explore', 'general-purpose', 'reviewer', 'secretary']))
     for (const name of RETIRED_SUBAGENT_MODEL_KEYS) expect(names).not.toContain(name)
     expect(roles.every(role => typeof role.name === 'string' && typeof role.description === 'string')).toBe(true)
-    expect(roles.find(role => role.name === 'operator')).toMatchObject({ canonicalRole: 'operator' })
     expect(roles.find(role => role.canonicalRole === 'computer')).toBeUndefined()
     await backend.handle('setSubagentModel', ['computer-use', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
     expect(await backend.handle('getSubagentModels', [])).toEqual({})
@@ -48,6 +48,7 @@ describe('Subagent role model settings', () => {
     await writeFile(join(agentDir, 'pipiui-settings.json'), JSON.stringify({
       subagentModels: {
         explore: [{ model: 'xai/grok-4.5', thinking: 'high' }],
+        operator: [{ model: 'xai/grok-4.5', thinking: 'high' }],
         'computer-use': [{ model: 'xai/grok-4.5', thinking: 'high' }],
         'computer-use-leader': [{ model: 'openai-codex/gpt-5.6-terra' }],
         'computer-verifier': [{ model: 'openai-codex/gpt-5.6-terra' }],

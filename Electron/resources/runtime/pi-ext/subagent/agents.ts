@@ -917,7 +917,6 @@ const EXT_AGENT_CONTRIBUTIONS_SIDECAR_SUFFIX = ".ext-agent-contributions.json";
 
 export const CANONICAL_PRIVILEGED_BUNDLED_ROLES = [
 	"secretary",
-	"operator",
 ] as const;
 
 const CANONICAL_PRIVILEGED_BUNDLED_ROLE_SET = new Set<string>(CANONICAL_PRIVILEGED_BUNDLED_ROLES);

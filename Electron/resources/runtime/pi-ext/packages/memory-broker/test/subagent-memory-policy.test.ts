@@ -17,7 +17,7 @@ const context = {
 };
 
 test("all shipped roles have bounded host-enforced recall and write policies", () => {
-  for (const name of ["explore", "general-purpose", "reviewer", "operator", "secretary"]) {
+  for (const name of ["explore", "general-purpose", "reviewer", "secretary"]) {
     const policy = subagentMemoryPolicy(name);
     assert.ok(policy, name);
     assert.ok(policy.recall.maximumItems >= 1 && policy.recall.maximumItems <= 3);

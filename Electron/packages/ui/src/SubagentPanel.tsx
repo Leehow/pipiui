@@ -169,8 +169,7 @@ const profileNames: Record<string, string> = {
   review: '审查',
   plan: '规划',
   secretary: '收尾秘书',
-  'long-test': '长时测试',
-  operator: '操作'
+  'long-test': '长时测试'
 }
 
 const toolNames: Record<string, string> = {

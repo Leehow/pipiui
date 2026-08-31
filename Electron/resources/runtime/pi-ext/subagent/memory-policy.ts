@@ -1,6 +1,6 @@
 export const SUBAGENT_MEMORY_AGENT_NAMES = [
 	"explore", "general-purpose", "reviewer",
-	"operator", "secretary",
+	"secretary",
 ] as const;
 
 export type SubagentMemoryAgentName = typeof SUBAGENT_MEMORY_AGENT_NAMES[number];
@@ -24,7 +24,6 @@ const POLICIES: Record<SubagentMemoryAgentName, SubagentMemoryPolicy> = {
 	explore: { recall: { maximumItems: 3, maximumCharacters: 1_000, allowedKinds: ["semantic", "episodic", "procedural"], allowedScopes: PROJECT }, write: "source-backed" },
 	"general-purpose": { recall: { maximumItems: 2, maximumCharacters: 800, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "verification-passed" },
 	reviewer: { recall: { maximumItems: 1, maximumCharacters: 600, allowedKinds: SEMANTIC_PROCEDURAL, allowedScopes: PROJECT }, write: "source-backed" },
-	operator: { recall: { maximumItems: 1, maximumCharacters: 500, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },
 	secretary: { recall: { maximumItems: 1, maximumCharacters: 400, allowedKinds: ["procedural", "semantic"], allowedScopes: PROJECT }, write: "never" },
 };
 

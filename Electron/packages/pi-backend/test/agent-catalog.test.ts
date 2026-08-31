@@ -167,18 +167,16 @@ describe("dynamic agent catalog", () => {
       "general-purpose",
       "reviewer",
       "secretary",
-      "operator",
     ]));
+    expect(names).not.toContain("operator");
     expect(names).not.toContain("computer-use");
     expect(names).not.toContain("computer-use-leader");
     expect(names).not.toContain("computer-verifier");
     expect(names).not.toContain("computer-terminal");
     expect(catalog?.every((agent) => typeof agent.name === "string" && typeof agent.description === "string")).toBe(true);
     const secretary = catalog?.find((agent) => agent.name === "secretary");
-    const operator = catalog?.find((agent) => agent.name === "operator");
     expect(catalog?.some((agent) => (agent.canonicalRole as string | undefined) === "computer")).toBe(false);
     expect(secretary).toMatchObject({ origin: "bundled", canonical: true, canonicalRole: "secretary" });
-    expect(operator).toMatchObject({ origin: "bundled", canonical: true, canonicalRole: "operator" });
     expect(JSON.stringify(catalog)).not.toContain("systemPrompt");
     expect(JSON.stringify(catalog)).not.toContain(PROMPT_MARKER);
     await backend.close();
@@ -411,7 +409,6 @@ describe("dynamic agent catalog", () => {
       "general-purpose",
       "reviewer",
       "secretary",
-      "operator",
     ]));
     expect(catalog.agents.map((agent) => agent.name)).not.toContain("computer-use");
     expect(JSON.stringify(catalog.agents)).not.toContain("systemPrompt");

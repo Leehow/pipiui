@@ -670,9 +670,6 @@ test("production spawn exposes signed read-only tools and fail-closes negatives"
 		assert.equal(packageSelection.names.includes("memory_query"), false);
 		assert.equal(packageSelection.names.includes("memory_status"), false);
 
-		const operator = bundled.agents.find((item) => item.name === "operator");
-		assert.ok(operator);
-		assert.equal(runtimeRolePolicyForAgent(operator).role, "operator");
 		const roleDenied = diagnoseWorkerReadToolOmissions({
 			hasMemoryBrokerCapability: false,
 			hasSessionRecall: true,

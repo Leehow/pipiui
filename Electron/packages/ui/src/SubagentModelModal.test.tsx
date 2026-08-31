@@ -273,7 +273,6 @@ describe('SubagentModelModal dynamic catalog', () => {
   it('renders ordinary catalog cards without a computer-use hierarchy and folds project-specific agents', async () => {
     const host = catalogHost([
       { name: 'explore', description: 'Research', origin: 'bundled', source: 'bundled' },
-      { name: 'operator', description: 'Desktop escape hatch', origin: 'bundled', source: 'bundled', canonical: true, canonicalRole: 'operator' },
       { name: 'research-helper', description: 'Extra ordinary catalog role', origin: 'bundled', source: 'bundled' },
       {
         name: 'ext-researcher',
@@ -293,9 +292,8 @@ describe('SubagentModelModal dynamic catalog', () => {
     expect(screen.queryByTestId('computer-use-model-hierarchy')).toBeNull()
     expect(screen.queryByTestId('subagent-agent-computer-use')).toBeNull()
     expect(screen.getByTestId('subagent-agent-research-helper')).toBeTruthy()
-    expect(screen.getByTestId('subagent-agent-operator')).toBeTruthy()
+    expect(screen.queryByTestId('subagent-agent-operator')).toBeNull()
     expect(within(screen.getByTestId('subagent-agent-research-helper')).queryByText(/需要查看截图/)).toBeNull()
-    expect(within(screen.getByTestId('subagent-agent-operator')).queryByText(/需要查看截图/)).toBeNull()
 
     const projectGroup = screen.getByTestId('project-subagent-group')
     const toggle = screen.getByTestId('project-subagent-toggle')

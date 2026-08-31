@@ -283,7 +283,7 @@ export type AgentCatalogOrigin = "user" | "project" | "bundled";
 export type AgentCatalogSource = "user" | "project" | "bundled";
 export type AgentCatalogMode = "read-only" | "worker";
 /** Canonical privileged bundled roles identified by metadata, not a UI name list. */
-export type AgentCanonicalRole = "secretary" | "operator";
+export type AgentCanonicalRole = "secretary";
 export type AgentCatalogAvailability = "available" | "degraded" | "unavailable";
 /** Catalog/merge diagnostic. Never carries prompt bodies. */
 export type AgentCatalogDiagnostic = {
