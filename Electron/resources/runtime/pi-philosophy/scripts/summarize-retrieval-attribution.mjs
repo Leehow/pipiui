@@ -38,6 +38,7 @@ const TOOL_GROUPS = {
     "subagent_manage",
     "subagent_resolve",
     "subagent_status",
+    "subagent_watch",
   ],
 };
 

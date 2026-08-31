@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 
 import {
 	BOSS_ESCALATION_MAX_UTF8_BYTES,
+	WATCH_EVIDENCE_REF_MAX_CHARS,
+	WATCH_MAX_EVIDENCE_REFS,
+	WATCH_SUMMARY_MAX_CHARS,
 	createBossEscalation,
 	createFakeSupervisorSession,
 	createJobSnapshot,
@@ -11,6 +14,7 @@ import {
 	createSupervisorDecision,
 	createSupervisorEvent,
 	createSupervisorRouter,
+	isRoutineEventKind,
 	serializeBossEscalation,
 	utf8ByteLength,
 	type ContractResult,
@@ -264,4 +268,76 @@ test("invalid events and oversized Boss payloads are rejected without a Boss sen
 	if (!withTranscript.ok) {
 		assert.match(withTranscript.error, /transcript/i);
 	}
+});
+
+test("watch is a distinct routine kind whose receipts cannot collide with heartbeat", () => {
+	const heartbeat = heartbeatEvent();
+	const watch = unwrap(createSupervisorEvent({
+		kind: "watch",
+		agentId: "worker-a",
+		runId: "run-1",
+		sequence: 1,
+		occurredAt: 1_700_000_000_500,
+		job: unwrap(createJobSnapshot({
+			agentId: "worker-a",
+			runId: "run-1",
+			status: "running",
+			verify: "none",
+			lastActivityAt: 1_700_000_000_500,
+		}), "watch-job"),
+		summary: "status=running phase=generating activity=+128B verify=none",
+		evidenceRefs: ["artifact://status/worker-a/run-1"],
+	}), "watch");
+
+	assert.equal(watch.identity.kind, "watch");
+	assert.notEqual(watch.identity.eventId, heartbeat.identity.eventId);
+	assert.equal(watch.identity.eventId, "watch:worker-a:run-1:-:1");
+	assert.equal(isRoutineEventKind("watch"), true);
+	assert.deepEqual(watch.evidenceRefs, ["artifact://status/worker-a/run-1"]);
+});
+
+type SupervisorEventInput = Parameters<typeof createSupervisorEvent>[0];
+
+function watchInput(overrides: Partial<SupervisorEventInput> = {}): SupervisorEventInput {
+	return {
+		kind: "watch",
+		agentId: "worker-a",
+		runId: "run-1",
+		sequence: 2,
+		occurredAt: 1_700_000_000_600,
+		job: { agentId: "worker-a", runId: "run-1", status: "running", verify: "none" },
+		summary: "status=running phase=generating verify=none",
+		evidenceRefs: ["artifact://status/worker-a/run-1"],
+		...overrides,
+	};
+}
+
+test("watch packets are bounded: summary and evidence refs stay compact", () => {
+	const oversizedSummary = createSupervisorEvent(watchInput({
+		summary: "x".repeat(WATCH_SUMMARY_MAX_CHARS + 1),
+	}));
+	assert.equal(oversizedSummary.ok, false);
+	if (!oversizedSummary.ok) assert.match(oversizedSummary.error, /watch summary exceeds/);
+
+	const tooManyRefs = createSupervisorEvent(watchInput({
+		evidenceRefs: Array.from({ length: WATCH_MAX_EVIDENCE_REFS + 1 }, (_, i) => `artifact://ref/${i}`),
+	}));
+	assert.equal(tooManyRefs.ok, false);
+	if (!tooManyRefs.ok) assert.match(tooManyRefs.error, /watch evidenceRefs exceed/);
+
+	const overlongRef = createSupervisorEvent(watchInput({
+		evidenceRefs: ["artifact://ref/" + "y".repeat(WATCH_EVIDENCE_REF_MAX_CHARS)],
+	}));
+	assert.equal(overlongRef.ok, false);
+	if (!overlongRef.ok) assert.match(overlongRef.error, /watch evidence ref exceeds/);
+
+	const atBounds = createSupervisorEvent(watchInput({
+		summary: "x".repeat(WATCH_SUMMARY_MAX_CHARS),
+		evidenceRefs: Array.from({ length: WATCH_MAX_EVIDENCE_REFS }, (_, i) => `artifact://ref/${i}`),
+	}));
+	assert.equal(atBounds.ok, true, `${atBounds.ok ? "" : atBounds.error}`);
+
+	const withTranscript = createSupervisorEvent(watchInput({ transcript: "full worker log" } as Partial<SupervisorEventInput>));
+	assert.equal(withTranscript.ok, false);
+	if (!withTranscript.ok) assert.match(withTranscript.error, /transcript/i);
 });

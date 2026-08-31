@@ -37,6 +37,7 @@ import {
 	createFileSupervisorStateStore,
 } from "../supervisor/state-store.ts";
 import {
+	WATCH_FORWARD_MAX_UTF8_BYTES,
 	createHostSupervisorDelivery,
 	createSupervisorDelivery,
 	formatSupervisorEscalationText,
@@ -1085,4 +1086,156 @@ test("APPEND_SYSTEM cannot enter the Supervisor resource loader", () => {
 	assert.deepEqual(flags.appendSystemPromptOverride(), []);
 	assert.equal(flags.systemPromptOverride(), "explicit supervisor prompt only");
 	assert.doesNotMatch(flags.systemPromptOverride(), /APPEND_SYSTEM/);
+});
+
+function watchRequest(overrides: Partial<SupervisorDeliveryRequest> = {}): SupervisorDeliveryRequest {
+	return request({
+		kind: "watch",
+		summary: "status=running phase=generating activity=+128B verify=none",
+		evidenceRefs: ["artifact://status/worker-a/run-1"],
+		...overrides,
+	});
+}
+
+test("watch wait and status stay silent with no Boss wake", async () => {
+	const h = harness({
+		decide: (packet) => {
+			const sequence = (packet as { event: { identity: { sequence: number } } }).event.identity.sequence;
+			return sequence === 1 ? { action: "wait", reason: "ordinary progress" } : { action: "status" };
+		},
+	});
+
+	const waitResult = await h.delivery.handle(watchRequest({ sequence: 1 }));
+	const statusResult = await h.delivery.handle(watchRequest({ sequence: 2 }));
+
+	assert.equal(waitResult.outcome, "supervisor");
+	assert.equal(waitResult.bossWakes, 0);
+	assert.equal(waitResult.createBossObligation, false);
+	assert.equal(statusResult.outcome, "supervisor");
+	assert.equal(statusResult.bossWakes, 0);
+	assert.equal(statusResult.createBossObligation, false);
+	assert.equal(h.supervisor.promptCount, 2);
+	assert.equal(h.current.length, 0);
+	assert.equal(h.boss.requestCount, 0);
+	assert.equal(h.delivery.bossWakeCount, 0);
+	const claim = h.store.load().receipts[waitResult.receiptId];
+	assert.ok(claim);
+	assert.equal(claim?.kind, "watch");
+	assert.equal(claim?.action, "wait");
+});
+
+test("watch forward wakes Boss once with the compact text and duplicate receipts stay exact-once", async () => {
+	const h = harness({ decide: () => ({ action: "forward", reason: "important progress" }) });
+	const publicText = "[subagent-watch] agentId=worker-a runId=run-1 status=verifying verify=none";
+	const event = watchRequest({
+		sequence: 3,
+		publicText,
+		summary: "status=running phase=verifying activity=+3.1KB verify=none",
+	});
+
+	const first = await h.delivery.handle(event);
+	const second = await h.delivery.handle(event);
+
+	assert.equal(first.outcome, "boss_direct");
+	assert.equal(first.decisionAction, "forward");
+	assert.equal(first.supervisorPrompts, 1);
+	assert.equal(first.bossWakes, 1);
+	assert.equal(first.createBossObligation, true);
+	assert.equal(h.current.length, 1);
+	assert.equal(h.current[0]?.publicText, publicText);
+	assert.equal(h.boss.requestCount, 0, "watch forward carries compact text, not an escalation envelope");
+
+	assert.equal(second.outcome, "duplicate");
+	assert.equal(h.current.length, 1);
+	assert.equal(h.supervisor.promptCount, 1, "duplicates do not re-prompt the Supervisor");
+
+	const claim = h.store.load().receipts[first.receiptId];
+	assert.ok(claim);
+	assert.equal(claim?.kind, "watch");
+	assert.equal(claim?.action, "forward");
+});
+
+test("watch forward public text is hard-bounded", async () => {
+	const h = harness({ decide: () => ({ action: "forward" }) });
+	const result = await h.delivery.handle(watchRequest({
+		sequence: 4,
+		publicText: "[subagent-watch] agentId=worker-a " + "x".repeat(10_000),
+	}));
+
+	assert.equal(result.outcome, "boss_direct");
+	assert.equal(h.current.length, 1);
+	const delivered = h.current[0]?.publicText ?? "";
+	assert.ok(delivered.startsWith("[subagent-watch] agentId=worker-a"));
+	assert.ok(utf8ByteLength(delivered) <= WATCH_FORWARD_MAX_UTF8_BYTES);
+});
+
+test("watch escalation produces one bounded Boss envelope and stays exact-once", async () => {
+	const h = harness({
+		decide: () => ({
+			action: "escalate",
+			reason: "stall-like quiet during watch",
+			evidenceRefs: ["artifact://stall/worker-a/run-1"],
+		}),
+	});
+	const event = watchRequest({
+		sequence: 5,
+		job: job("stalled"),
+		summary: "status=stalled quiet=120s",
+		evidenceRefs: ["artifact://stall/worker-a/run-1"],
+	});
+
+	const first = await h.delivery.handle(event);
+	const second = await h.delivery.handle(event);
+
+	assert.equal(first.outcome, "escalated");
+	assert.equal(first.bossRequests, 1);
+	assert.equal(first.bossWakes, 1);
+	assert.equal(h.boss.requestCount, 1);
+	const envelope = h.boss.envelopes[0];
+	assert.equal(envelope?.eventId, first.receiptId);
+	assert.equal(envelope?.kind, "escalate");
+	assert.equal(envelope?.reason, "stall-like quiet during watch");
+	assert.deepEqual(envelope?.evidenceRefs, ["artifact://stall/worker-a/run-1"]);
+	const serialized = unwrap(serializeBossEscalation(envelope!), "watch-escalation");
+	assert.ok(serialized.byteLength <= BOSS_ESCALATION_MAX_UTF8_BYTES);
+
+	assert.equal(second.outcome, "duplicate");
+	assert.equal(h.boss.requestCount, 1);
+	assert.equal(h.current.length, 1);
+});
+
+test("zero-active watch with failed verify is escalated even when Supervisor asks to wait", async () => {
+	const h = harness({ active: 0, decide: () => ({ action: "wait", reason: "observe longer" }) });
+	const result = await h.delivery.handle(watchRequest({
+		sequence: 6,
+		job: unwrap(createJobSnapshot({
+			agentId: "worker-a",
+			runId: "run-1",
+			status: "running",
+			verify: "failed",
+		}), "watch-verify-job"),
+		summary: "status=running verify=failed",
+		evidenceRefs: ["artifact://verify/worker-a/run-1"],
+		activeJobs: [],
+	}));
+
+	assert.equal(result.outcome, "escalated");
+	assert.equal(result.supervisorPrompts, 1);
+	assert.equal(result.bossWakes, 1);
+	assert.match(h.boss.envelopes[0]?.reason ?? "", /verify=failed/);
+});
+
+test("zero-active ordinary watch samples are ignored and cannot duplicate the completion receipt", async () => {
+	const h = harness({ active: 0, decide: () => ({ action: "forward" }) });
+	const result = await h.delivery.handle(watchRequest({
+		sequence: 7,
+		summary: "status=completed verify=passed",
+		activeJobs: [job("completed")],
+	}));
+
+	assert.equal(result.outcome, "ignored");
+	assert.equal(result.supervisorPrompts, 0);
+	assert.equal(result.bossWakes, 0);
+	assert.equal(h.current.length, 0);
+	assert.equal(h.supervisor.promptCount, 0);
 });

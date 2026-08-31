@@ -53,6 +53,9 @@ import {
 
 export const SUPERVISOR_FAILURE_FALLBACK_REASON = "supervisor failure; falling back to Boss delivery";
 
+/** Watch forwards wake Boss with a compact text, bounded like a single-worker terminal report. */
+export const WATCH_FORWARD_MAX_UTF8_BYTES = 4_800;
+
 export type SupervisorDeliveryOutcome =
 	| "supervisor"
 	| "escalated"
@@ -843,6 +846,20 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 				"boss_direct",
 				undefined,
 				action.kind === "forward" ? "forward" : action.kind,
+			);
+		}
+
+		if (!abnormalTerminal && request.kind === "watch" && action.kind === "forward") {
+			return acceptBossWake(
+				request,
+				event,
+				receiptId,
+				truncateUtf8(request.publicText, WATCH_FORWARD_MAX_UTF8_BYTES),
+				undefined,
+				routed.supervisorPrompts,
+				"boss_direct",
+				undefined,
+				"forward",
 			);
 		}
 

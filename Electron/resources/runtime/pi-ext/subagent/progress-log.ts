@@ -203,8 +203,69 @@ export function sanitizeProgressReportSecs(raw: number | undefined): { ms: numbe
 	return { ms: raw * 1000 };
 }
 
+/** Single-flight claim state for progress-log reads/deliveries, carried on the run handle slice. */
+export interface ProgressLogClaimState {
+	/** True while one delivery (read + forward) is outstanding; gates a second concurrent attempt. */
+	progressReportInFlight?: boolean;
+	/** Token held by the current claimant; a release must present the exact token. */
+	progressReportClaim?: number;
+	/** Monotonic token source; never reset, so a stale token can never collide with a new claim. */
+	progressReportClaimSeq?: number;
+}
+
+export interface ProgressLogClaim {
+	readonly token: number;
+}
+
+/**
+ * Claim the single right to read the progress log and forward its new bytes.
+ *
+ * The watchdog tick and the watch sampler both want to forward deltas, and a slow Boss
+ * delivery must not let the next tick start a second read of the same range. Only one claim
+ * can be outstanding: a second claim while one is held is refused, not queued — the tick that
+ * was refused simply tries again on its next pass, and bytes are never duplicated or lost.
+ * The returned token must be handed back to `releaseProgressLogReport` exactly once.
+ */
+export function claimProgressLogReport(state: ProgressLogClaimState): ProgressLogClaim | undefined {
+	if (state.progressReportInFlight) return undefined;
+	state.progressReportClaimSeq = (state.progressReportClaimSeq ?? 0) + 1;
+	state.progressReportClaim = state.progressReportClaimSeq;
+	state.progressReportInFlight = true;
+	return { token: state.progressReportClaim };
+}
+
+/**
+ * Free a claim. Only the holder's token releases it — a stale release (a double release, or a
+ * delivery whose claim a retarget already re-armed) is refused and leaves the current claim
+ * intact. Returns whether this call actually freed the claim.
+ */
+export function releaseProgressLogReport(state: ProgressLogClaimState, claim: ProgressLogClaim): boolean {
+	if (!state.progressReportInFlight || state.progressReportClaim !== claim.token) return false;
+	state.progressReportClaim = undefined;
+	state.progressReportInFlight = false;
+	return true;
+}
+
+/**
+ * Read the progress log from the state's single forwarding cursor and commit the new offset.
+ * One cursor per monitored run/path: consumers go through this, never from a private copy, so
+ * two deliveries can only ever hand Boss complementary, non-overlapping byte ranges.
+ */
+export function consumeProgressLogExcerpt(
+	state: { progressLogOffset?: number },
+	input: { path: string; maxBytes?: number },
+): ProgressLogExcerpt {
+	const excerpt = readProgressLogExcerpt({
+		path: input.path,
+		offset: state.progressLogOffset ?? 0,
+		...(input.maxBytes !== undefined ? { maxBytes: input.maxBytes } : {}),
+	});
+	state.progressLogOffset = excerpt.nextOffset;
+	return excerpt;
+}
+
 /** The mutable slice of a running handle this retarget owns. */
-export interface ProgressLogRetargetState {
+export interface ProgressLogRetargetState extends ProgressLogClaimState {
 	progressLogPath?: string;
 	progressLogSetAt?: number;
 	progressLogSample?: ProgressLogSample;
@@ -233,13 +294,15 @@ export interface ProgressLogRetargetResult {
  * re-dispatch with the right path — threw away the very run whose output had just proved it
  * was alive.
  *
- * Three resets make the correction real rather than cosmetic:
+ * Four resets make the correction real rather than cosmetic:
  * `progressLogOffset` starts at the current size, so bytes written before Boss looked are not
  * replayed as if they were new; `lastProgressLogAt` starts the silence clock at this decision,
  * because an idle measurement taken against the wrong file was never evidence about this
- * worker; and the stall-notification budget is returned, since its earlier spend bought a
- * verdict that has just been withdrawn. None of this touches `lastActivityAt` — log bytes
- * still must not masquerade as worker JSONL activity.
+ * worker; the stall-notification budget is returned, since its earlier spend bought a verdict
+ * that has just been withdrawn; and the report claim is re-armed — the token counter keeps
+ * climbing, so the next tick serves the new path immediately and the abandoned delivery's
+ * late release is refused instead of freeing a claim it no longer owns. None of this touches
+ * `lastActivityAt` — log bytes still must not masquerade as worker JSONL activity.
  */
 export function retargetProgressLog(
 	state: ProgressLogRetargetState,
@@ -263,6 +326,8 @@ export function retargetProgressLog(
 	state.lastStallNotifyAt = 0;
 	state.stallNotifyCount = 0;
 	state.stallNotifyInFlight = false;
+	state.progressReportInFlight = false;
+	state.progressReportClaim = undefined;
 	return {
 		...(previousPath ? { previousPath } : {}),
 		baselineBytes: baseline.size,

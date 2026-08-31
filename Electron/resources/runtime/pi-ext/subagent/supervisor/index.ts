@@ -5,6 +5,9 @@ export {
 	SUPERVISOR_EVENT_KINDS,
 	SUPERVISOR_JOB_STATUSES,
 	SUPERVISOR_TASK_STATUSES,
+	WATCH_EVIDENCE_REF_MAX_CHARS,
+	WATCH_MAX_EVIDENCE_REFS,
+	WATCH_SUMMARY_MAX_CHARS,
 	createBossEscalation,
 	createJobSnapshot,
 	SUPERVISOR_WAVE_AGENT_ID,
@@ -89,6 +92,7 @@ export {
 
 export {
 	SUPERVISOR_FAILURE_FALLBACK_REASON,
+	WATCH_FORWARD_MAX_UTF8_BYTES,
 	createHostSupervisorDelivery,
 	createSupervisorDelivery,
 	formatSupervisorEscalationText,

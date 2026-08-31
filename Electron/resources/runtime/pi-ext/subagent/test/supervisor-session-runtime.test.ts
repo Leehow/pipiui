@@ -534,3 +534,54 @@ test("prompt is a bounded compact S1 packet with no transcript fields", async ()
 	assert.doesNotMatch(system, /prefer .*resume|bounded retry/i);
 	assert.equal(countActiveSupervisorJobs(packet.activeJobs), 1);
 });
+
+test("watch packets serialize compactly and the prompt explains watch routing", async () => {
+	const factory = createFakeFactory({ reply: '{"action":"wait"}' });
+	const runtime = createSupervisorSessionRuntime({
+		projectRoot: "/tmp/pipiui-supervisor-s2",
+		factory,
+		models: { generalPurpose: "anthropic/claude-haiku-4" },
+	});
+	const watchEvent = unwrap(createSupervisorEvent({
+		kind: "watch",
+		agentId: "worker-a",
+		runId: "run-1",
+		sequence: 2,
+		occurredAt: 1_700_000_000_500,
+		job: unwrap(createJobSnapshot({
+			agentId: "worker-a",
+			runId: "run-1",
+			status: "running",
+			verify: "none",
+			lastActivityAt: 1_700_000_000_500,
+		}), "watch-job"),
+		summary: "status=running phase=generating activity=+128B verify=none",
+		evidenceRefs: ["artifact://status/worker-a/run-1"],
+	}), "watch");
+	const packet = packetFor(watchEvent);
+
+	await runtime.setActiveWorkerCount(1);
+	const decision = await runtime.prompt(packet);
+	assert.equal(decision.action, "wait");
+
+	const sent = factory.prompts[0] ?? "";
+	assert.equal(sent, serializeSupervisorInputPacket(packet));
+	const parsed = JSON.parse(sent) as {
+		event: { identity: { kind: string }; job: { status: string; verify: string }; evidenceRefs?: string[] };
+	};
+	assert.equal(parsed.event.identity.kind, "watch");
+	assert.equal(parsed.event.job.status, "running");
+	assert.equal(parsed.event.job.verify, "none");
+	assert.deepEqual(parsed.event.evidenceRefs, ["artifact://status/worker-a/run-1"]);
+	assert.equal("transcript" in parsed, false);
+	assert.equal("messages" in parsed, false);
+	assert.equal("findings" in parsed, false);
+	assert.equal("findings" in parsed.event, false);
+	assert.match(sent, /"kind":"watch"/);
+	assert.doesNotMatch(sent, /transcript|messages|findings/);
+
+	const system = factory.created[0]?.systemPrompt ?? "";
+	assert.match(system, /watch events are periodic bounded samples/i);
+	assert.match(system, /For watch, ordinary progress stays silent with wait or status/i);
+	assert.match(system, /escalate abnormal activity, stall-like quiet, or verify\/finalization trouble/i);
+});

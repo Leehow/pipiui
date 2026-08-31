@@ -64,6 +64,7 @@ export const TOOL_GROUPS = {
     "subagent_progress",
     "subagent_resolve",
     "subagent_status",
+    "subagent_watch",
   ],
 } as const;
 

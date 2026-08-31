@@ -13,7 +13,13 @@ export const SUPERVISOR_EVENT_KINDS = [
 	"completion",
 	"wave",
 	"upgrade_failure",
+	"watch",
 ] as const;
+
+/** Compact watch samples are hard-bounded so periodic ticks cannot bloat Supervisor packets. */
+export const WATCH_SUMMARY_MAX_CHARS = 600;
+export const WATCH_EVIDENCE_REF_MAX_CHARS = 200;
+export const WATCH_MAX_EVIDENCE_REFS = 16;
 
 export type SupervisorEventKind = (typeof SUPERVISOR_EVENT_KINDS)[number];
 
@@ -155,7 +161,9 @@ export function isSupervisorActionKind(value: unknown): value is SupervisorActio
 }
 
 export function isRoutineEventKind(kind: SupervisorEventKind): boolean {
-	return kind === "heartbeat" || kind === "completion";
+	// watch is a routine bounded sample: its Boss delivery is decided by the
+	// Supervisor action (wait/status stay silent; forward/escalate wake Boss).
+	return kind === "heartbeat" || kind === "completion" || kind === "watch";
 }
 
 export function requiresBossDelivery(decision: SupervisorDecision): boolean {
@@ -207,6 +215,19 @@ function parseEvidenceRefs(value: unknown, label: string): ContractResult<string
 		return fail(`${label} must be an array of non-empty strings`);
 	}
 	return { ok: true, value: value.map((entry) => entry.trim()) };
+}
+
+function enforceWatchBounds(summary: string, evidenceRefs: string[] | undefined): ContractResult<void> {
+	if (summary.length > WATCH_SUMMARY_MAX_CHARS) {
+		return fail(`watch summary exceeds ${WATCH_SUMMARY_MAX_CHARS} characters`);
+	}
+	if (evidenceRefs && evidenceRefs.length > WATCH_MAX_EVIDENCE_REFS) {
+		return fail(`watch evidenceRefs exceed ${WATCH_MAX_EVIDENCE_REFS} entries`);
+	}
+	if (evidenceRefs?.some((ref) => ref.length > WATCH_EVIDENCE_REF_MAX_CHARS)) {
+		return fail(`watch evidence ref exceeds ${WATCH_EVIDENCE_REF_MAX_CHARS} characters`);
+	}
+	return { ok: true, value: undefined };
 }
 
 export function createReceiptIdentity(input: {
@@ -307,6 +328,10 @@ export function createSupervisorEvent(input: {
 	}
 	const evidenceRefs = parseEvidenceRefs(input.evidenceRefs, "evidenceRefs");
 	if (evidenceRefs.ok === false) return evidenceRefs;
+	if (identity.value.kind === "watch") {
+		const bounds = enforceWatchBounds(summary.value, evidenceRefs.value);
+		if (bounds.ok === false) return bounds;
+	}
 	if (input.wave && identity.value.waveId && input.wave.waveId !== identity.value.waveId) {
 		return fail("wave snapshot must match the receipt waveId");
 	}

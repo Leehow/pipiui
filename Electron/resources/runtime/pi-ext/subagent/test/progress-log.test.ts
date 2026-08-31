@@ -1,22 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
+import { appendFileSync, mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+	claimProgressLogReport,
+	consumeProgressLogExcerpt,
 	describeProgressChannelForStall,
 	effectiveLastProgressAt,
 	formatProgressLogReport,
 	formatProgressLogRetargetReceipt,
 	progressIdleMs,
+	PROGRESS_LOG_EXCERPT_MAX_BYTES,
 	readProgressLogExcerpt,
 	readProgressLogTail,
+	releaseProgressLogReport,
 	resolveProgressLogPath,
 	retargetProgressLog,
 	sampleProgressLog,
 	sanitizeProgressLogInput,
 	sanitizeProgressReportSecs,
+	type ProgressLogClaimState,
+	type ProgressLogRetargetState,
 } from "../progress-log.ts";
 
 test("sanitizeProgressLogInput rejects empty, control, and oversized strings", () => {
@@ -305,4 +311,170 @@ test("readProgressLogTail keeps the end of a long log and is independent of the 
 	assert.ok(tail.tail.length <= 600);
 	assert.equal(tail.size, 5012);
 	assert.equal(readProgressLogTail({ path: join(dir, "absent.log") }), undefined);
+});
+
+test("claimProgressLogReport is single-flight and re-arms only on the holder's release", () => {
+	// Reusable: works on a bare claim state, no retarget fields required.
+	const state: ProgressLogClaimState = {};
+	const first = claimProgressLogReport(state);
+	assert.ok(first);
+	// A concurrent claimant is refused, not queued: it retries on its next tick instead.
+	assert.equal(claimProgressLogReport(state), undefined);
+	assert.equal(state.progressReportInFlight, true);
+
+	// A wrong token is a failed release: the claim stays held by its owner.
+	assert.equal(releaseProgressLogReport(state, { token: first.token + 1 }), false);
+	assert.equal(state.progressReportInFlight, true);
+	assert.equal(claimProgressLogReport(state), undefined);
+
+	// The holder's release succeeds and re-arms the gate for the next delivery.
+	assert.equal(releaseProgressLogReport(state, first), true);
+	assert.equal(state.progressReportInFlight, false);
+	assert.equal(state.progressReportClaim, undefined);
+
+	// Tokens never repeat, so a stale token can never free a later claimant's gate.
+	const second = claimProgressLogReport(state);
+	assert.ok(second);
+	assert.notEqual(second.token, first.token);
+	assert.equal(releaseProgressLogReport(state, second), true);
+	assert.equal(releaseProgressLogReport(state, second), false); // double release refused
+	assert.equal(releaseProgressLogReport(state, first), false); // long-stale release refused
+	assert.equal(claimProgressLogReport({ progressReportInFlight: false, progressReportClaim: 7 })?.token, 1);
+});
+
+test("one cursor, single-flight: no duplicate excerpt and no lost append across concurrent attempts", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-single-flight-"));
+	const file = join(dir, "live.log");
+	const state: ProgressLogRetargetState = { progressLogOffset: 0, lastStallNotifyAt: 0, stallNotifyCount: 0 };
+
+	appendFileSync(file, "one\n");
+	const a = claimProgressLogReport(state);
+	assert.ok(a);
+	const first = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(first.excerpt, "one\n");
+	assert.equal(first.nextOffset, 4);
+	assert.equal(state.progressLogOffset, 4);
+
+	// While that delivery is in flight, a competing attempt cannot start a second read.
+	assert.equal(claimProgressLogReport(state), undefined);
+
+	// The append lands while the delivery is still outstanding — it must not be lost.
+	appendFileSync(file, "two\n");
+	assert.equal(releaseProgressLogReport(state, a), true);
+
+	const b = claimProgressLogReport(state);
+	assert.ok(b);
+	const second = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(second.excerpt, "two\n"); // exactly the new bytes, nothing replayed
+	assert.equal(releaseProgressLogReport(state, b), true);
+
+	// Drained: another attempt is a silent no-op with the cursor intact.
+	const c = claimProgressLogReport(state);
+	assert.ok(c);
+	const drained = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(drained.grew, false);
+	assert.equal(drained.excerpt, "");
+	assert.equal(state.progressLogOffset, 8);
+	assert.equal(releaseProgressLogReport(state, c), true);
+});
+
+test("rotation and truncation restart the cursor deterministically", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-rotation-"));
+	const file = join(dir, "live.log");
+	const state: ProgressLogRetargetState = { progressLogOffset: 0, lastStallNotifyAt: 0, stallNotifyCount: 0 };
+
+	writeFileSync(file, "first-generation-output\n");
+	const gen1 = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(gen1.excerpt, "first-generation-output\n");
+	assert.equal(gen1.nextOffset, 24);
+
+	// Rotation to a shorter log: the size fell below the cursor, so the read restarts at 0
+	// and forwards exactly the replacement's bytes — same replacement, same bytes, every time.
+	writeFileSync(file, "rotated\n");
+	const gen2 = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(gen2.excerpt, "rotated\n");
+	assert.equal(gen2.nextOffset, 8);
+	writeFileSync(file, "cut\n");
+	const gen2b = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(gen2b.excerpt, "cut\n");
+	assert.equal(gen2b.nextOffset, 4);
+
+	// Truncation to empty observes the cursor reset at 0; re-growth then reads the new bytes whole.
+	writeFileSync(file, "");
+	const emptied = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(emptied.grew, false);
+	assert.equal(emptied.nextOffset, 0);
+	appendFileSync(file, "regrown\n");
+	const gen4 = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(gen4.excerpt, "regrown\n");
+	assert.equal(gen4.nextOffset, 8);
+
+	// A replacement larger than the cursor is indistinguishable from an append at this layer
+	// (no inode tracking), so the policy stays consume-on-attempt: suffix only, no replay of
+	// bytes Boss already received.
+	writeFileSync(file, "rotated-again\n");
+	const gen3 = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(gen3.excerpt, "again\n");
+	assert.equal(gen3.nextOffset, 14);
+});
+
+test("retarget resets the baseline without replay and re-arms a held claim", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-retarget-claim-"));
+	const real = join(dir, "harness.log");
+	writeFileSync(real, "pre-existing bytes\n");
+	const now = 9_000_000;
+	const state: ProgressLogRetargetState = {
+		progressLogPath: join(dir, "old.log"),
+		progressLogOffset: 3, // mid-file cursor left over against the old path
+		lastProgressLogAt: now - 600_000,
+		lastStallNotifyAt: now - 60_000,
+		stallNotifyCount: 4,
+		stallNotifyInFlight: true,
+	};
+	const stale = claimProgressLogReport(state);
+	assert.ok(stale);
+
+	const result = retargetProgressLog(state, { path: real, now });
+	assert.equal(result.baselineBytes, 19);
+	assert.equal(state.progressLogOffset, 19); // baseline, not zero: no backlog replay
+	// The retarget re-armed the claim; the abandoned delivery's late release must not take it.
+	assert.equal(state.progressReportInFlight, false);
+	assert.equal(releaseProgressLogReport(state, stale), false);
+
+	appendFileSync(real, "fresh tail\n");
+	const fresh = claimProgressLogReport(state); // immediately claimable again
+	assert.ok(fresh);
+	const excerpt = consumeProgressLogExcerpt(state, { path: real });
+	assert.equal(excerpt.excerpt, "fresh tail\n"); // only appends after the retarget
+	assert.equal(state.progressLogOffset, 30);
+	assert.equal(releaseProgressLogReport(state, fresh), true);
+
+	// The withdrawn verdicts stay withdrawn.
+	assert.equal(state.stallNotifyCount, 0);
+	assert.equal(state.lastStallNotifyAt, 0);
+	assert.equal(state.lastProgressLogAt, now);
+});
+
+test("consume bounds: 4KB cap holds, offsets clamp, and a missing file stays silent", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-bounds-"));
+	const file = join(dir, "live.log");
+	const state: ProgressLogRetargetState = { progressLogOffset: -5, lastStallNotifyAt: 0, stallNotifyCount: 0 };
+
+	// Missing file: silent no-op, and the cursor never goes negative.
+	const absent = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(absent.grew, false);
+	assert.equal(absent.excerpt, "");
+	assert.equal(state.progressLogOffset, 0);
+
+	appendFileSync(file, "x".repeat(5_000));
+	const capped = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(capped.addedBytes, PROGRESS_LOG_EXCERPT_MAX_BYTES);
+	assert.equal(state.progressLogOffset, PROGRESS_LOG_EXCERPT_MAX_BYTES);
+	assert.match(capped.excerpt, /more bytes not forwarded/);
+
+	// The bytes beyond the cap are picked up by the next attempt, in order, exactly once.
+	const rest = consumeProgressLogExcerpt(state, { path: file });
+	assert.equal(rest.addedBytes, 5_000 - PROGRESS_LOG_EXCERPT_MAX_BYTES);
+	assert.equal(state.progressLogOffset, 5_000);
+	assert.doesNotMatch(rest.excerpt, /more bytes not forwarded/);
 });

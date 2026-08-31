@@ -45,6 +45,8 @@ export const SUPERVISOR_SYSTEM_PROMPT = [
 	"resume and retry are not self-service production actions; escalate with evidence when either would be needed.",
 	"For escalation, state the failure cause, safe management actions attempted or why they are unavailable, and the next action the Boss should take.",
 	"Otherwise prefer forward, status, bounded abort/resolve, or start_declared.",
+	"watch events are periodic bounded samples of one subscribed run; unchanged state never emits one, and terminal results still arrive as completion events.",
+	"For watch, ordinary progress stays silent with wait or status; forward only important progress the Boss should see now, and escalate abnormal activity, stall-like quiet, or verify/finalization trouble.",
 ].join("\n");
 
 export const DEFAULT_SUPERVISOR_PROMPT_TIMEOUT_MS = 60_000;
