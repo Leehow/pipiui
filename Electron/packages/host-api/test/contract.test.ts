@@ -1091,6 +1091,36 @@ describe('Electron-native project directory picker extension', () => {
   })
 })
 
+describe('Electron-native Product Pack ZIP extension', () => {
+  it('keeps local archive paths off remote/default hosts and routes opted-in IPC calls', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: '/Users/demo/coding.pipiui-pack.zip' }
+      },
+      on: () => undefined,
+      removeListener: () => undefined
+    }
+
+    const defaultHost = createIpcHost(ipc)
+    expect(defaultHost.pickProductPackArchive).toBeUndefined()
+    expect(defaultHost.saveProductPackArchive).toBeUndefined()
+    expect(defaultHost.exportProductPackArchive).toBeUndefined()
+    expect(defaultHost.installProductPackArchive).toBeUndefined()
+
+    const host = createIpcHost(ipc, undefined, { productPackFileDialogs: true })
+    await expect(host.saveProductPackArchive?.('coding.pipiui-pack.zip')).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
+    await expect(host.pickProductPackArchive?.()).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
+    await expect(host.exportProductPackArchive?.('pipiui', 'coding', '/Users/demo/coding.pipiui-pack.zip')).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
+    expect(calls).toEqual([
+      { method: 'saveProductPackArchive', params: ['coding.pipiui-pack.zip'] },
+      { method: 'pickProductPackArchive', params: [] },
+      { method: 'exportProductPackArchive', params: ['pipiui', 'coding', '/Users/demo/coding.pipiui-pack.zip'] },
+    ])
+  })
+})
+
 describe('Electron-native Computer Use permission opener', () => {
   it('is exposed only when the preload opts into system permission settings', async () => {
     const calls: Array<{ method: string; params: unknown[] }> = []

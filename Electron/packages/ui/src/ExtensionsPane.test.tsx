@@ -194,6 +194,26 @@ function extensionPackHost() {
       profiles = profiles.map(profile => profile.id === profileId ? { ...profile, recommendedExtensionIds: [...extensionIds] } : profile)
       return profiles.find(profile => profile.id === profileId)!
     }),
+    saveProductPackArchive: vi.fn(async () => '/tmp/coding.pipiui-pack.zip'),
+    exportProductPackArchive: vi.fn(async (_projectId: string, profileId: string, destination: string) => ({
+      archivePath: destination,
+      profileId,
+      bytes: 1024,
+      extensionCount: 2,
+    })),
+    pickProductPackArchive: vi.fn(async () => '/tmp/coc.pipiui-pack.zip'),
+    installProductPackArchive: vi.fn(async () => {
+      profiles = [...profiles, {
+        id: 'coc',
+        name: 'COC',
+        state: 'available',
+        source: 'project',
+        requiredExtensionIds: ['skill-loader-extension'],
+        recommendedExtensionIds: ['document-workbench'],
+      }]
+      activation = { schemaVersion: 2, profile: 'coc', overrides: {} }
+      return activation
+    }),
   }
   Object.assign(host, methods)
   return host as typeof host & typeof methods
@@ -208,6 +228,15 @@ describe('ExtensionsPane package management', () => {
     expect(screen.getByTestId('extensions-pack-toggle-coding').getAttribute('aria-checked')).toBe('true')
     expect(screen.getByTestId('extensions-pkg-toggle-coding-runtime')).toHaveProperty('disabled', true)
     expect(screen.getByTestId('extensions-pkg-toggle-document-workbench')).toHaveProperty('disabled', false)
+
+    fireEvent.click(screen.getByTestId('extensions-pack-export'))
+    await waitFor(() => expect(host.saveProductPackArchive).toHaveBeenCalledWith('coding.pipiui-pack.zip'))
+    expect(host.exportProductPackArchive).toHaveBeenCalledWith('demo', 'coding', '/tmp/coding.pipiui-pack.zip')
+    expect((await screen.findByTestId('extensions-archive-notice')).textContent).toContain('已导出 Coding 扩展包')
+
+    fireEvent.click(screen.getByTestId('extensions-pack-import'))
+    await waitFor(() => expect(host.installProductPackArchive).toHaveBeenCalledWith('demo', '/tmp/coc.pipiui-pack.zip'))
+    expect(await screen.findByTestId('extensions-pack-coc')).toBeTruthy()
 
     fireEvent.click(screen.getByTestId('extensions-pack-master-toggle'))
     await waitFor(() => expect(host.setProductProfile).toHaveBeenCalledWith('demo', 'base'))

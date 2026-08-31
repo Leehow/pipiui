@@ -7,7 +7,7 @@ export * from "./profile.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
 import type { ExternalSession, ExternalSessionHistory, SessionAdoptedFrom } from "./external-session.js";
 import type { ModelCapabilities } from "./native-search.js";
-import type { ProductProfileDescriptor, ProjectProductActivation } from "./profile.js";
+import type { ProductPackArchiveResult, ProductProfileDescriptor, ProjectProductActivation } from "./profile.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -1101,6 +1101,13 @@ export interface PipiHostAPI {
   createProductProfile?(projectId: string, name: string): Promise<ProductProfileDescriptor>;
   /** Replace the optional extension membership of a Settings-created Profile while it is inactive. */
   updateProductProfileExtensions?(projectId: string, profileId: string, extensionIds: string[]): Promise<ProductProfileDescriptor>;
+  /** Export one Profile plus every resolved extension package into a portable Product Pack ZIP. */
+  exportProductPackArchive?(projectId: string, profileId: string, destinationArchivePath: string): Promise<ProductPackArchiveResult>;
+  /** Validate, extract, transactionally install, and activate a Product Pack ZIP. */
+  installProductPackArchive?(projectId: string, sourceArchivePath: string): Promise<ProjectProductActivation>;
+  /** Electron-only native dialogs. Paths never come from free-form renderer text. */
+  pickProductPackArchive?(): Promise<string | null>;
+  saveProductPackArchive?(suggestedName: string): Promise<string | null>;
   /** Import a pure local `pipiui-profile.json` into this project's profile jail and activate it. */
   installLocalProductProfile?(projectId: string, sourceDirectory: string): Promise<ProjectProductActivation>;
   /** Install a local Product Pack transaction: shared code objects + project Profile activation. */
@@ -1403,7 +1410,7 @@ function requestId(): string { return `${Date.now()}-${Math.random().toString(36
 function apiFrom(
   call: (method: HostMethod, params: unknown[]) => Promise<unknown>,
   subscribe: (channel: HostEvent["channel"], predicate: (event: HostEvent) => boolean, listener: (event: HostEvent) => void) => Unsubscribe,
-  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean } = {}
+  options: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; productPackFileDialogs?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean } = {}
 ): PipiHostAPI {
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
@@ -1413,6 +1420,10 @@ function apiFrom(
     setProductProfile: (projectId, profileId) => invoke("setProductProfile", projectId, profileId),
     createProductProfile: (projectId, name) => invoke("createProductProfile", projectId, name),
     updateProductProfileExtensions: (projectId, profileId, extensionIds) => invoke("updateProductProfileExtensions", projectId, profileId, extensionIds),
+    exportProductPackArchive: (projectId, profileId, destinationArchivePath) => invoke("exportProductPackArchive", projectId, profileId, destinationArchivePath),
+    installProductPackArchive: (projectId, sourceArchivePath) => invoke("installProductPackArchive", projectId, sourceArchivePath),
+    pickProductPackArchive: () => invoke("pickProductPackArchive"),
+    saveProductPackArchive: suggestedName => invoke("saveProductPackArchive", suggestedName),
     installLocalProductProfile: (projectId, sourceDirectory) => invoke("installLocalProductProfile", projectId, sourceDirectory),
     installLocalProductPack: (projectId, sourceDirectory) => invoke("installLocalProductPack", projectId, sourceDirectory),
     listProjects: () => invoke("listProjects"),
@@ -1607,6 +1618,12 @@ function apiFrom(
     }
   };
   if (!options.projectDirectoryPicker) delete api.pickProjectDirectory;
+  if (!options.productPackFileDialogs) {
+    delete api.exportProductPackArchive;
+    delete api.installProductPackArchive;
+    delete api.pickProductPackArchive;
+    delete api.saveProductPackArchive;
+  }
   if (options.openExternal) api.openExternal = url => invoke("openExternal", url);
   if (options.openDocumentExternally) api.openDocumentExternally = path => invoke("openDocumentExternally", path);
   if (options.computerUsePermissions) api.openComputerUsePermission = kind => invoke("openComputerUsePermission", kind);
@@ -1623,7 +1640,7 @@ function responseError(response: Extract<HostResponse, { ok: false }>): Error & 
   return error;
 }
 
-export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean }): PipiHostAPI {
+export function createIpcHost(ipc: IpcRendererLike, channel = PIPI_HOST_IPC_CHANNEL, options?: { openExternal?: boolean; openDocumentExternally?: boolean; projectDirectoryPicker?: boolean; productPackFileDialogs?: boolean; computerUsePermissions?: boolean; updateCenter?: boolean }): PipiHostAPI {
   const call = async (method: HostMethod, params: unknown[]) => {
     const response = await ipc.invoke(channel, { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: requestId(), type: "request", method, params });
     if (!response.ok) throw responseError(response);

@@ -1,5 +1,5 @@
-import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions } from 'electron'
-import { join } from 'node:path'
+import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
+import { basename, join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
 
@@ -20,6 +20,7 @@ import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import type { ComputerImagePipeline } from './computer-image-pipeline.js'
 import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
+import { withProductPackFileDialogs } from './product-pack-file-dialogs.js'
 import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
 import { EMBEDDED_NODE_VERSION, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
 import { createUpdateCenterService, extensionUpdateCatalogItems, UPDATE_CENTER_FRAMEWORK_VERSIONS, withUpdateCenter, type UpdateCatalogItem } from './update-center.js'
@@ -324,6 +325,30 @@ if (app) {
       const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options)
       return result.canceled ? null : result.filePaths[0] ?? null
     }
+    const pickProductPackArchive = async (): Promise<string | null> => {
+      const options: OpenDialogOptions = {
+        title: '加载扩展包 ZIP',
+        buttonLabel: '加载',
+        properties: ['openFile'],
+        filters: [{ name: 'PipiUI 扩展包', extensions: ['zip'] }],
+      }
+      const owner = BaseWindow.getFocusedWindow() ?? BaseWindow.getAllWindows()[0]
+      const result = owner ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options)
+      return result.canceled ? null : result.filePaths[0] ?? null
+    }
+    const saveProductPackArchive = async (suggestedName: string): Promise<string | null> => {
+      const leaf = basename(suggestedName.trim()) || 'pipiui-extension-pack.zip'
+      const defaultPath = leaf.toLowerCase().endsWith('.zip') ? leaf : `${leaf}.zip`
+      const options: SaveDialogOptions = {
+        title: '导出扩展包 ZIP',
+        buttonLabel: '导出',
+        defaultPath,
+        filters: [{ name: 'PipiUI 扩展包', extensions: ['zip'] }],
+      }
+      const owner = BaseWindow.getFocusedWindow() ?? BaseWindow.getAllWindows()[0]
+      const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      return result.canceled ? null : result.filePath ?? null
+    }
     const updateCatalog: UpdateCatalogItem[] = [
       { id: 'electron', name: 'Electron', category: 'platform', currentVersion: process.versions.electron ?? UPDATE_CENTER_FRAMEWORK_VERSIONS.electron, source: { type: 'npm', packageName: 'electron' } },
       { id: 'node', name: 'Node.js 内置 Pi 运行时', category: 'runtime', currentVersion: EMBEDDED_NODE_VERSION, source: { type: 'nodeDist' } },
@@ -352,7 +377,7 @@ if (app) {
         return updateCatalog
       }
     }
-    const backend = withUpdateCenter(withComputerUsePermissions(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), createElectronComputerUsePermissionHost({
+    const backend = withUpdateCenter(withComputerUsePermissions(withProductPackFileDialogs(withProjectDirectoryPicker(withOpenDocumentExternally(withOpenExternal(withBrowserTabsHost(terminalBackend, browser), url => shell.openExternal(url)), path => shell.openPath(path)), pickProjectDirectory), { pickArchive: pickProductPackArchive, saveArchive: saveProductPackArchive }), createElectronComputerUsePermissionHost({
       getMediaAccessStatus: media => systemPreferences.getMediaAccessStatus(media),
       isTrustedAccessibilityClient: prompt => systemPreferences.isTrustedAccessibilityClient(prompt),
       requestScreenRecording: async () => {

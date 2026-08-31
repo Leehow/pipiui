@@ -588,6 +588,8 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
   const [memberSelection, setMemberSelection] = useState<Set<string>>(() => new Set())
   const [profileBusy, setProfileBusy] = useState<string | null>(null)
   const [profileError, setProfileError] = useState<string | null>(null)
+  const [archiveBusy, setArchiveBusy] = useState<'export' | 'import' | null>(null)
+  const [archiveNotice, setArchiveNotice] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [grantTarget, setGrantTarget] = useState<ExtensionDescriptor | null>(null)
   const [uninstallTarget, setUninstallTarget] = useState<ExtensionDescriptor | null>(null)
@@ -796,6 +798,45 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
     }
   }
 
+  const exportPack = async (profile: ProductProfileDescriptor) => {
+    if (!resolvedProjectId || !host.saveProductPackArchive || !host.exportProductPackArchive) return
+    setArchiveBusy('export')
+    setProfileError(null)
+    setArchiveNotice(null)
+    try {
+      const destination = await host.saveProductPackArchive(`${profile.id}.pipiui-pack.zip`)
+      if (!destination) return
+      const result = await host.exportProductPackArchive(resolvedProjectId, profile.id, destination)
+      const filename = result.archivePath.split(/[\\/]/).pop() ?? result.archivePath
+      setArchiveNotice(`已导出 ${profileDisplayName(profile)} 扩展包：${filename}`)
+    } catch (error) {
+      setProfileError(`导出扩展包失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArchiveBusy(null)
+    }
+  }
+
+  const importPack = async () => {
+    if (!resolvedProjectId || !host.pickProductPackArchive || !host.installProductPackArchive) return
+    setArchiveBusy('import')
+    setProfileError(null)
+    setArchiveNotice(null)
+    try {
+      const source = await host.pickProductPackArchive()
+      if (!source) return
+      const next = await host.installProductPackArchive(resolvedProjectId, source)
+      setActivation(next)
+      setSelectedProfileId(next.profile)
+      setSelectedView('packs')
+      await refresh()
+      setArchiveNotice('扩展包已加载并应用到当前项目。新会话会使用这个扩展包。')
+    } catch (error) {
+      setProfileError(`加载扩展包失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setArchiveBusy(null)
+    }
+  }
+
   const applyEnable = async (ext: ExtensionDescriptor, enabled: boolean) => {
     if (!host.setExtensionEnabled) return
     setBusyId(ext.id)
@@ -900,6 +941,9 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
               {host.createProductProfile && resolvedProjectId && (
                 <button type="button" className="extensions-pack-create" disabled={!activation || profileBusy !== null} title={!activation ? '先选择一个有效项目' : undefined} data-testid="extensions-pack-create" onClick={() => setCreatePackOpen(true)}>＋ 新建扩展包</button>
               )}
+              {host.pickProductPackArchive && host.installProductPackArchive && resolvedProjectId && (
+                <button type="button" className="extensions-pack-import" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-import" onClick={() => void importPack()}>{archiveBusy === 'import' ? '正在加载…' : '加载 ZIP'}</button>
+              )}
             </div>
           )}
           <div className="extensions-pack-sidebar-divider" />
@@ -925,6 +969,7 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
         </aside>
         <div className="extensions-library-content">
           {profileError && <DismissibleError message={profileError} onDismiss={() => setProfileError(null)} />}
+          {archiveNotice && <div className="extensions-archive-notice" data-testid="extensions-archive-notice"><span>{archiveNotice}</span><button type="button" aria-label="关闭扩展包提示" onClick={() => setArchiveNotice(null)}>×</button></div>}
           {visibleCatalogDiagnostics.length > 0 && (
             <div className="extensions-catalog-diagnostics" data-testid="extensions-catalog-diagnostics">
               {visibleCatalogDiagnostics.map(entry => (
@@ -944,6 +989,9 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
                   <h3>{profileDisplayName(selectedProfile)} 扩展包</h3>
                   <p>{selectedProfile.description ?? '组合当前产品所需的界面、工具和运行时扩展。'}</p>
                   <div className="extensions-pack-detail-actions">
+                    {host.saveProductPackArchive && host.exportProductPackArchive && (
+                      <button type="button" className="model-modal-refresh" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-export" onClick={() => void exportPack(selectedProfile)}>{archiveBusy === 'export' ? '正在导出…' : '导出 ZIP'}</button>
+                    )}
                     {selectedProfile.customizable && host.updateProductProfileExtensions && (
                       <button
                         type="button"

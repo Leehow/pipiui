@@ -24,3 +24,10 @@ export type ProjectProductActivation = {
   profile: string;
   overrides: Record<string, "enabled" | "disabled">;
 };
+
+export type ProductPackArchiveResult = {
+  archivePath: string;
+  profileId: string;
+  bytes: number;
+  extensionCount: number;
+};

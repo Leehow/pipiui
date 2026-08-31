@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -231,6 +231,39 @@ describe("Product Profile host interface", () => {
     await backend.handle("setProductProfile" as never, [added.id, "base"]);
     expect(await backend.handle("updateProductProfileExtensions" as never, [added.id, "lab-tools", []]))
       .toMatchObject({ recommendedExtensionIds: [] });
+    await backend.close();
+  });
+
+  it("exports a project extension pack to ZIP and loads it into another project", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-pack-zip-host-"));
+    const sourceProject = join(root, "source-project");
+    const targetProject = join(root, "target-project");
+    const archive = join(root, "lab-tools.pipiui-pack.zip");
+    await mkdir(sourceProject, { recursive: true });
+    await mkdir(targetProject, { recursive: true });
+    const backend = createPiHostBackend({
+      agentDir: join(root, "agent"),
+      runtimeRoot: join(root, "runtime"),
+      runtimeAssets: { sourceRoot: runtimeSource },
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => undefined,
+    });
+    const source = await backend.handle("addProject", [sourceProject]) as { id: string };
+    const target = await backend.handle("addProject", [targetProject]) as { id: string };
+    const created = await backend.handle("createProductProfile" as never, [source.id, "Lab Tools"]) as { id: string };
+
+    expect(await backend.handle("exportProductPackArchive" as never, [source.id, created.id, archive])).toMatchObject({
+      archivePath: archive,
+      profileId: created.id,
+      extensionCount: 1,
+    });
+    expect((await stat(archive)).size).toBeGreaterThan(0);
+    expect(await backend.handle("installProductPackArchive" as never, [target.id, archive])).toMatchObject({
+      profile: created.id,
+    });
+    expect(await backend.handle("getProductProfile" as never, [target.id])).toMatchObject({ profile: created.id });
+    expect((await backend.handle("listProductProfiles" as never, [target.id]) as Array<{ id: string }>)
+      .some(profile => profile.id === created.id)).toBe(true);
     await backend.close();
   });
 

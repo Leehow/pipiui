@@ -1184,6 +1184,30 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
         : profile)
       return { ...mockProductProfiles.find(profile => profile.id === profileId)! }
     },
+    saveProductPackArchive: async suggestedName => `/tmp/${suggestedName}`,
+    exportProductPackArchive: async (_projectId, profileId, destinationArchivePath) => ({
+      archivePath: destinationArchivePath,
+      profileId,
+      bytes: 24_576,
+      extensionCount: mockProductProfiles.find(profile => profile.id === profileId)?.recommendedExtensionIds?.length ?? 0,
+    }),
+    pickProductPackArchive: async () => '/tmp/coc.pipiui-pack.zip',
+    installProductPackArchive: async () => {
+      if (!mockProductProfiles.some(profile => profile.id === 'coc')) {
+        mockProductProfiles = [...mockProductProfiles, {
+          id: 'coc',
+          name: 'COC',
+          description: 'COC 跑团工作台、战役资料与骰子能力。',
+          state: 'available',
+          source: 'project',
+          requiredExtensionIds: ['skill-loader-extension'],
+          recommendedExtensionIds: ['document-workbench'],
+          layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
+        }]
+      }
+      mockProductActivation = { schemaVersion: 2, profile: 'coc', overrides: {} }
+      return { ...mockProductActivation, overrides: {} }
+    },
   } satisfies Partial<PipiHostAPI>)
   return mock
 }

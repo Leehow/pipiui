@@ -39,6 +39,7 @@ import {
   type QueueEnqueueResult,
   type QuotaSnapshot,
   type PlanSnapshot,
+  type ProductPackArchiveResult,
   type Session,
   type SessionPage,
   type SessionPreloadSnapshot,
@@ -247,8 +248,9 @@ import {
 } from "./extension-grants.js";
 import { removeExtensionPackageDirectory } from "./extension-uninstall.js";
 import { readProductProfileCatalog } from "./profile-catalog.js";
-import { PRODUCT_PROFILE_MANIFEST_FILENAME, parseProductProfileManifestJson } from "./profile-manifest.js";
+import { PRODUCT_PROFILE_MANIFEST_FILENAME, parseProductProfileManifestJson, type ProductProfileManifest } from "./profile-manifest.js";
 import { createCustomProductProfile, updateCustomProductProfileExtensions } from "./project-profile-editor.js";
+import { installFromProductPackArchive, writeProductPackArchive } from "./product-pack-archive.js";
 import { installLocalProductPack } from "./product-pack-installer.js";
 import { productSpawnFingerprint, resolveProductSpawnPlan } from "./product-spawn-plan.js";
 import { resolveProductProfile } from "./profile-resolver.js";
@@ -3733,7 +3735,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "installLocalProductProfile" | "installLocalProductPack") {
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack") {
       case "listProductProfiles":
         return this.listProductProfiles(params[0]);
       case "getProductProfile":
@@ -3744,6 +3746,10 @@ export class PiHostBackend implements HostBackend {
         return this.createProductProfile(params[0], params[1]);
       case "updateProductProfileExtensions":
         return this.updateProductProfileExtensions(params[0], params[1], params[2]);
+      case "exportProductPackArchive":
+        return this.exportProductPackArchive(params[0], params[1], params[2]);
+      case "installProductPackArchive":
+        return this.installProductPackArchive(params[0], params[1]);
       case "installLocalProductProfile":
         return this.installLocalProductProfile(params[0], params[1]);
       case "installLocalProductPack":
@@ -7167,6 +7173,79 @@ export class PiHostBackend implements HostBackend {
     }
     return entry.descriptor;
   }
+  private async exportProductPackArchive(
+    projectIdValue: unknown,
+    profileIdValue: unknown,
+    destinationValue: unknown,
+  ): Promise<ProductPackArchiveResult> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof profileIdValue !== "string" || !profileIdValue.trim()) {
+      throw new Error("profileId 必须是非空 string");
+    }
+    if (typeof destinationValue !== "string" || !destinationValue.trim()) {
+      throw new Error("导出路径必须是非空 string");
+    }
+    const projectId = projectIdValue.trim();
+    const profileId = profileIdValue.trim();
+    const root = await this.projectPath(projectId);
+    const projectAgentDir = projectPiAgentDir(root);
+    this.extensionLoader.scan(root);
+    const catalog = await readProductProfileCatalog(this.refreshRuntimeTree(), projectAgentDir);
+    const entry = catalog.find(item => item.descriptor.id === profileId);
+    if (!entry?.profile || entry.descriptor.state !== "available") {
+      throw new Error(`Product Profile ${profileId} is unavailable`);
+    }
+    const installed = this.extensionLoader.profileExtensions();
+    const installedById = new Map(installed.map(item => [item.id, item]));
+    const activation = await readProjectProductActivation(projectAgentDir, { defaultProfileId: this.defaultProductProfileId() });
+    const profile: ProductProfileManifest = structuredClone(entry.profile);
+    if (activation.profile === profileId) {
+      profile.extensions.recommended = profile.extensions.recommended
+        .filter(requirement => activation.overrides[requirement.id] !== "disabled");
+      const declared = new Set([
+        ...profile.extensions.required.map(requirement => requirement.id),
+        ...profile.extensions.recommended.map(requirement => requirement.id),
+      ]);
+      for (const [id, state] of Object.entries(activation.overrides).sort(([left], [right]) => left.localeCompare(right))) {
+        if (state !== "enabled" || declared.has(id)) continue;
+        const extension = installedById.get(id);
+        if (extension) profile.extensions.recommended.push({ id, version: extension.version });
+      }
+    }
+    const plan = resolveProductProfile({ profile, installed });
+    if (plan.missingRequired.length || plan.conflicts.length) {
+      throw new Error(`Product Profile ${profileId} cannot export because its activation plan is incomplete`);
+    }
+    const extensions = plan.enabled.map(extension => {
+      const directory = this.extensionLoader.directoryOf(extension.id);
+      if (!directory) throw new Error(`Product Profile ${profileId} cannot export missing extension source ${extension.id}`);
+      return { id: extension.id, directory };
+    });
+    const written = await writeProductPackArchive({
+      destination: destinationValue.trim(),
+      packId: profile.id,
+      packName: profile.name,
+      profile,
+      extensions,
+    });
+    return { ...written, profileId };
+  }
+  private async installProductPackArchive(
+    projectIdValue: unknown,
+    sourceArchiveValue: unknown,
+  ): Promise<ProjectProductActivation> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof sourceArchiveValue !== "string" || !sourceArchiveValue.trim()) {
+      throw new Error("扩展包 ZIP 路径必须是非空 string");
+    }
+    const projectId = projectIdValue.trim();
+    return installFromProductPackArchive(sourceArchiveValue.trim(), directory =>
+      this.installLocalProductPack(projectId, directory));
+  }
   private async setProductProfile(projectIdValue: unknown, profileIdValue: unknown): Promise<ProjectProductActivation> {
     if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
       throw new Error("projectId 必须是非空 string");
@@ -7263,6 +7342,8 @@ export class PiHostBackend implements HostBackend {
     const source = await this.pickedDirectory(sourceDirectoryValue);
     const root = await this.projectPath(projectId);
     const projectAgentDir = projectPiAgentDir(root);
+    this.extensionLoader.scan(root);
+    const installedVersions = new Map(this.extensionLoader.profileExtensions().map(extension => [extension.id, extension.version]));
     const previous = await readProjectProductActivation(projectAgentDir, { defaultProfileId: this.defaultProductProfileId() });
     try {
       const result = await installLocalProductPack<ProjectProductActivation>({
@@ -7271,6 +7352,7 @@ export class PiHostBackend implements HostBackend {
         projectAgentDir,
         activateProfile: profileId => this.setProductProfile(projectId, profileId),
         restoreProjectActivation: async () => { await writeProjectProductActivation(projectAgentDir, previous); },
+        reuseInstalledExtension: extension => installedVersions.get(extension.id) === extension.version,
       });
       return result.activation;
     } catch (error) {

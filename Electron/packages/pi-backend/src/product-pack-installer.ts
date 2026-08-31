@@ -30,6 +30,7 @@ export type ProductPackInstallReceipt = {
   pack: { id: string; name: string };
   profile: { id: string };
   extensions: Array<{ id: string; version: string; contentHash: string; bytes: number }>;
+  reusedExtensions?: Array<{ id: string; version: string }>;
   installedAt: string;
 };
 
@@ -44,6 +45,8 @@ export type InstallLocalProductPackOptions<TActivation> = {
   activateProfile: (profileId: string) => Promise<TActivation>;
   /** Restores the exact pre-install project activation if a later commit fails. */
   restoreProjectActivation: () => Promise<void>;
+  /** Reuse an already-loaded exact package instead of creating a duplicate slot. */
+  reuseInstalledExtension?: (extension: { id: string; version: string }) => boolean | Promise<boolean>;
   now?: () => number;
 };
 
@@ -87,7 +90,7 @@ async function writeJsonAtomic(path: string, body: unknown): Promise<void> {
   }
 }
 
-async function readPack(sourceDirectory: string): Promise<{ root: string; pack: ProductPackManifest; profile: ProductProfileManifest; extensionDirectories: Array<{ id: string; directory: string }> }> {
+async function readPack(sourceDirectory: string): Promise<{ root: string; pack: ProductPackManifest; profile: ProductProfileManifest; extensionDirectories: Array<{ id: string; version: string; directory: string }> }> {
   const root = await assertRealDirectory(sourceDirectory, "Product Pack sourceDirectory");
   const packManifestPath = await confinedSource(root, PRODUCT_PACK_MANIFEST_FILENAME, "Product Pack manifest", "file");
   const parsedPack = parseProductPackManifestJson(
@@ -98,7 +101,7 @@ async function readPack(sourceDirectory: string): Promise<{ root: string; pack: 
   const parsedProfile = parseProductProfileManifestJson(await readFile(profilePath, "utf8"));
   if (!parsedProfile.ok) throw new Error(`Product Profile manifest invalid: ${parsedProfile.errors.join("; ")}`);
 
-  const extensionDirectories: Array<{ id: string; directory: string }> = [];
+  const extensionDirectories: Array<{ id: string; version: string; directory: string }> = [];
   for (const extension of parsedPack.pack.extensions) {
     const directory = await confinedSource(root, extension.path, `Product Pack extension '${extension.id}'`, "directory");
     const manifestPath = await confinedSource(directory, EXTENSION_MANIFEST_FILENAME, `Product Pack extension '${extension.id}' manifest`, "file");
@@ -107,7 +110,7 @@ async function readPack(sourceDirectory: string): Promise<{ root: string; pack: 
     if (parsed.manifest.id !== extension.id) {
       throw new Error(`Product Pack extension entry '${extension.id}' does not match package id '${parsed.manifest.id}'`);
     }
-    extensionDirectories.push({ id: extension.id, directory });
+    extensionDirectories.push({ id: extension.id, version: parsed.manifest.version, directory });
   }
   return { root, pack: parsedPack.pack, profile: parsedProfile.profile, extensionDirectories };
 }
@@ -130,8 +133,15 @@ export async function installLocalProductPack<TActivation>(
   if (existsSync(profileDestination)) throw new Error(`Product Profile already installed: ${profile.id}`);
   if (existsSync(packDestination)) throw new Error(`Product Pack already installed: ${pack.id}`);
 
-  const slotSnapshots = new Map<string, ExtensionSlotSnapshot>();
+  const reusedExtensions: Array<{ id: string; version: string }> = [];
+  const extensionsToInstall: typeof extensionDirectories = [];
   for (const extension of extensionDirectories) {
+    if (await options.reuseInstalledExtension?.(extension)) reusedExtensions.push({ id: extension.id, version: extension.version });
+    else extensionsToInstall.push(extension);
+  }
+
+  const slotSnapshots = new Map<string, ExtensionSlotSnapshot>();
+  for (const extension of extensionsToInstall) {
     slotSnapshots.set(extension.id, await readExtensionSlotSnapshot(options.storeRoot, extension.id));
   }
 
@@ -150,7 +160,7 @@ export async function installLocalProductPack<TActivation>(
     await rename(profileStaging, profileDestination);
     profileCreated = true;
 
-    for (const extension of extensionDirectories) {
+    for (const extension of extensionsToInstall) {
       installed.push(await installLocalExtensionPackage({
         extensionId: extension.id,
         sourceDirectory: extension.directory,
@@ -167,6 +177,7 @@ export async function installLocalProductPack<TActivation>(
       extensions: installed
         .map(item => ({ id: item.extensionId, version: item.version, contentHash: item.contentHash, bytes: item.bytes }))
         .sort((left, right) => left.id.localeCompare(right.id)),
+      ...(reusedExtensions.length ? { reusedExtensions: reusedExtensions.sort((left, right) => left.id.localeCompare(right.id)) } : {}),
       installedAt: new Date(now()).toISOString(),
     };
     await writeJsonAtomic(join(packDestination, PRODUCT_PACK_RECEIPT_FILENAME), receipt);

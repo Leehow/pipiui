@@ -883,6 +883,19 @@ body{overscroll-behavior:none}
   text-align: left;
 }
 .extensions-pack-create:hover { background: var(--accent-soft); }
+.extensions-pack-import {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  padding: 7px 8px;
+  border-radius: 8px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+  font-size: 9px;
+  text-align: left;
+}
+.extensions-pack-import:hover:not(:disabled) { background: var(--surface-hover); color: var(--text-strong); }
+.extensions-pack-create:disabled, .extensions-pack-import:disabled { cursor: default; opacity: .5; }
 .extensions-pack-sidebar-divider { height: 1px; margin: 12px 8px; background: var(--border); }
 .extensions-pack-sidebar-heading { padding: 0 8px 5px; color: var(--subtle); font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
 .extensions-capability-nav {
@@ -913,6 +926,10 @@ body{overscroll-behavior:none}
 .extensions-pack-detail-copy h3 { margin: 0; color: var(--text-strong); font-size: 16px; line-height: 1.25; }
 .extensions-pack-detail-copy > p { max-width: 560px; margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .extensions-pack-detail-actions { display: flex; align-items: center; gap: 9px; margin-top: 10px; }
+.extensions-archive-notice { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border)); border-radius: 9px; color: var(--text); background: var(--accent-soft); font-size: 10px; }
+.extensions-archive-notice span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.extensions-archive-notice button { flex: none; width: 20px; height: 20px; border-radius: 6px; color: var(--muted); font-size: 13px; }
+.extensions-archive-notice button:hover { background: var(--surface-hover); color: var(--text-strong); }
 .extensions-pack-inactive-note { color: var(--subtle); font-size: 9px; }
 .extensions-pack-master { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
 .extensions-pack-master > span { color: var(--muted); font-size: 9px; }
