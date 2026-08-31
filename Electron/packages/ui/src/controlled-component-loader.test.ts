@@ -15,6 +15,7 @@ import {
   type PanelRenderContext,
   type ToolRenderProps,
 } from './ui-registries'
+import { listWorkbenchContainers, listWorkbenchViews } from './workbench/workbench-contributions'
 
 const EXT = 'quota'
 const fixturesDir = '/tmp/quota-ext'
@@ -124,6 +125,36 @@ describe('loadControlledContributions', () => {
     expect(listPanels().map(panel => panel.id)).toEqual(panelsBefore)
     expect(listSettingsSections().map(section => section.id)).toEqual(settingsBefore)
     expect(listToolRenderers().map(renderer => renderer.toolName)).toEqual(toolsBefore)
+  })
+
+  it('registers lazy Workbench containers and views as one disposable extension group', async () => {
+    const containersBefore = listWorkbenchContainers()
+    const viewsBefore = listWorkbenchViews()
+    const disposers = await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      capabilities: ['invoke.agent'],
+      ui: {
+        viewContainers: [{ id: 'quota.navigator', location: 'primarySidebar', title: 'Quota' }],
+        views: [{ id: 'quota.navigator.main', container: 'quota.navigator', entry: 'panel.ts', activation: 'visible' }],
+      },
+    }, hostStub(), importFixture)
+
+    expect(listWorkbenchContainers()).toEqual([
+      ...containersBefore,
+      { id: 'quota.navigator', location: 'primarySidebar', title: 'Quota', extensionId: EXT },
+    ])
+    expect(listWorkbenchViews().map(view => ({ id: view.id, container: view.container, extensionId: view.extensionId }))).toEqual([
+      ...viewsBefore.map(view => ({ id: view.id, container: view.container, extensionId: view.extensionId })),
+      { id: 'quota.navigator.main', container: 'quota.navigator', extensionId: EXT },
+    ])
+    const view = listWorkbenchViews().find(item => item.id === 'quota.navigator.main')!
+    const rendered = render(view.render({ active: true }))
+    expect(rendered.getByTestId('ext-controlled-panel')).toBeTruthy()
+
+    for (const dispose of disposers) dispose()
+    expect(listWorkbenchContainers()).toEqual(containersBefore)
+    expect(listWorkbenchViews()).toEqual(viewsBefore)
   })
 
   it('shows a readable panel placeholder when entry import fails and does not throw', async () => {

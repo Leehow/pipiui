@@ -1,0 +1,9 @@
+{
+  "id": "goal-extension",
+  "name": "PipiUI Goal",
+  "version": "1.0.0",
+  "category": "workflow",
+  "description": "Goal lifecycle, continuation, and semantic goal tools.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

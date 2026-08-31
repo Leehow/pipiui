@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend, installRuntimeTree } from "../src/index.js";
 
@@ -35,16 +35,14 @@ describe("runtime tree refresh across spawns", () => {
     expect(installRuntimeTree(assets, runtimeRoot).failures).toEqual([]);
 
     let sessionArgs: string[] = [];
-    let sessionEnv: NodeJS.ProcessEnv = {};
     let spawnCount = 0;
     const backend = createPiHostBackend({
-      sessionsRoot, runtimeRoot, piPath: "node", runtimeAssets: assets,
+      agentDir: join(root, "agent"), sessionsRoot, runtimeRoot, piPath: "node", runtimeAssets: assets,
       spawn: (_bin, _args, options) => {
         // Title/vision helpers also spawn; they must not overwrite the session contract.
         spawnCount += 1;
         if (_args.includes("--session")) {
           sessionArgs = _args;
-          sessionEnv = options?.env ?? {};
         }
         return spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as any;
       },
@@ -54,22 +52,15 @@ describe("runtime tree refresh across spawns", () => {
     // Several extensions are mounted with -e and their order is the spawn's business,
     // not this test's: select by path so adding another mount cannot break it.
     const extensions = sessionArgs.flatMap((arg, index) => (arg === "-e" ? [sessionArgs[index + 1]] : []));
-    expect(extensions).toContain(join(runtimeRoot, "pi-philosophy", "philosophy.ts"));
-    // Loader realpath-confinement resolves the mount; match by extension-relative suffix.
-    expect(extensions.find((p) => p.endsWith(join("extensions", "pdf-extension", "agent", "dist", "index.js")))).toBeDefined();
-    expect(extensions).toContain(join(runtimeRoot, "extensions", "pipiui-firecrawl-anydoc.ts"));
-    expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBeUndefined();
-    expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));
-    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).not.toContain(join(runtimeRoot, "pdf-inspector", "node_modules"));
-    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "anydoc", "node_modules"));
+    expect(extensions.find((p) => p.endsWith(join("extensions", "coding-method", "agent", "index.ts")))).toBeDefined();
     const layer = join(runtimeRoot, "pi-philosophy", "layers", "10-foundation.md");
     expect(await readFile(layer, "utf8")).not.toContain("REFRESH-PROBE");
 
     // Edit the source the way a developer would while the app stays up.
     const sourceLayer = join(sources, "pi-philosophy", "layers", "10-foundation.md");
     await writeFile(sourceLayer, `${await readFile(sourceLayer, "utf8")}\n<!-- REFRESH-PROBE -->\n`);
-    const sourceGit = join(sources, "extensions", "pipiui-git.ts");
-    await writeFile(sourceGit, (await readFile(sourceGit, "utf8")).replace("## Git (Pipi UI)", "## Git (REFRESH-PROBE)"));
+    const sourceMethod = join(sources, "extensions", "coding-method", "agent", "index.ts");
+    await writeFile(sourceMethod, `${await readFile(sourceMethod, "utf8")}\n// REFRESH-PROBE\n`);
 
     // Same live backend instance on purpose: the contract is that a spawn (not a
     // relaunch) re-reads the runtime tree. A second, never-spawned session gives
@@ -86,9 +77,7 @@ describe("runtime tree refresh across spawns", () => {
     const installed = await readFile(layer, "utf8");
     const sourceNow = await readFile(join(sources, "pi-philosophy", "layers", "10-foundation.md"), "utf8");
     expect(installed).toContain("REFRESH-PROBE");
-    expect(await readFile(join(runtimeRoot, "extensions", "pipiui-git.ts"), "utf8")).toContain("REFRESH-PROBE");
-    expect(sessionEnv.PIPIUI_PDF_INSPECTOR_ROOT).toBeUndefined();
-    expect(sessionEnv.PIPIUI_ANYDOC_ROOT).toBe(join(runtimeRoot, "anydoc"));
-    expect(String(sessionEnv.NODE_PATH ?? "").split(delimiter)).toContain(join(runtimeRoot, "anydoc", "node_modules"));
+    expect(sourceNow).toContain("REFRESH-PROBE");
+    expect(await readFile(join(runtimeRoot, "extensions", "coding-method", "agent", "index.ts"), "utf8")).toContain("REFRESH-PROBE");
   }, 30_000);
 });

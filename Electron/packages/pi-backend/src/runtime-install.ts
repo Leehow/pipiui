@@ -24,12 +24,58 @@ const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist"
 export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "deepseek", "qoder", "pipiui-headroom", "office-extension", "pdf-extension", "vision-routing", "web-search-keys", "external-session-scan"];
 /** Bundled manifest extensions that ship an owned `node_modules` inside their mirrored tree. */
 const BUNDLED_KEEP_NODE_MODULES: ReadonlySet<string> = new Set(["pdf-extension"]);
+/** Optional packaging-time selection of dist/node_modules-heavy runtime assets. */
+export const RUNTIME_BUNDLE_MANIFEST_FILENAME = "pipiui-runtime-manifest.json";
+export const RUNTIME_BUNDLE_MANIFEST_SCHEMA_VERSION = 1 as const;
 const SIGNATURE_FILE = ".pipiui-install.json";
 let stagingSeq = 0;
 
 export type InstallReport = { installed: string[]; unchanged: string[]; failures: string[] };
 
 const emptyReport = (): InstallReport => ({ installed: [], unchanged: [], failures: [] });
+
+type RuntimeBundleSelection = {
+  bundledExtensions: readonly string[];
+  includeAnydoc: boolean;
+};
+
+/**
+ * Older development trees have no bundle manifest and retain the historical
+ * full Coding payload. A packaged base edition supplies an explicit empty list,
+ * so omitted optional artifacts are not reported as failed Kernel assets.
+ */
+function readRuntimeBundleSelection(sourceRoot: string, report: InstallReport): RuntimeBundleSelection {
+  const manifestPath = join(sourceRoot, RUNTIME_BUNDLE_MANIFEST_FILENAME);
+  if (!existsSync(manifestPath)) {
+    return { bundledExtensions: BUNDLED_MANIFEST_EXTENSIONS, includeAnydoc: true };
+  }
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+      schemaVersion?: unknown;
+      bundledExtensions?: unknown;
+      includeAnydoc?: unknown;
+    };
+    if (parsed.schemaVersion !== RUNTIME_BUNDLE_MANIFEST_SCHEMA_VERSION) {
+      throw new Error(`schemaVersion must be ${RUNTIME_BUNDLE_MANIFEST_SCHEMA_VERSION}`);
+    }
+    if (!Array.isArray(parsed.bundledExtensions) || parsed.bundledExtensions.some(id => typeof id !== "string")) {
+      throw new Error("bundledExtensions must be string[]");
+    }
+    if (typeof parsed.includeAnydoc !== "boolean") {
+      throw new Error("includeAnydoc must be boolean");
+    }
+    const known = new Set(BUNDLED_MANIFEST_EXTENSIONS);
+    const unknown = parsed.bundledExtensions.filter(id => !known.has(id));
+    if (unknown.length) throw new Error(`bundledExtensions contains unknown ids: ${unknown.join(", ")}`);
+    return {
+      bundledExtensions: [...new Set(parsed.bundledExtensions)].sort(),
+      includeAnydoc: parsed.includeAnydoc,
+    };
+  } catch (error) {
+    report.failures.push(`${manifestPath}: invalid runtime bundle manifest: ${error instanceof Error ? error.message : String(error)}`);
+    return { bundledExtensions: [], includeAnydoc: false };
+  }
+}
 
 /**
  * Content signature of a source tree: relative path + size + mtime.
@@ -93,7 +139,7 @@ export function syncTree(source: string, dest: string, report: InstallReport = e
 }
 
 export type RuntimeAssets = {
-  /** Canonical source layout: pi-ext, pi-philosophy, extensions, built-in-skills, browser-dom, auth. */
+  /** Canonical source layout: Kernel runtime, extensions, Product Profiles, browser-dom, and auth. */
   sourceRoot?: string;
 };
 
@@ -111,14 +157,17 @@ export function installRuntimeTree(assets: RuntimeAssets, runtimeRoot: string): 
     report.failures.push("runtime source root: no source path resolved");
     return report;
   }
-  for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal"] as const)
+  for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"] as const)
     syncTree(join(assets.sourceRoot, name), join(runtimeRoot, name), report);
   // Second pass: bundled manifest extensions ship compiled `dist/` halves that the
   // generic extensions sync strips. Re-sync each one over its stripped copy; a missing
   // source directory is a reported failure like any other missing asset.
-  for (const id of BUNDLED_MANIFEST_EXTENSIONS)
+  const selection = readRuntimeBundleSelection(assets.sourceRoot, report);
+  for (const id of selection.bundledExtensions)
     syncTree(join(assets.sourceRoot, "extensions", id), join(runtimeRoot, "extensions", id), report,
       { keepDist: true, ...(BUNDLED_KEEP_NODE_MODULES.has(id) ? { keepNodeModules: true } : {}) });
-  syncTree(join(assets.sourceRoot, "anydoc"), join(runtimeRoot, "anydoc"), report, { keepNodeModules: true });
+  if (selection.includeAnydoc) {
+    syncTree(join(assets.sourceRoot, "anydoc"), join(runtimeRoot, "anydoc"), report, { keepNodeModules: true });
+  }
   return report;
 }

@@ -2,6 +2,7 @@
   "id": "memory-extension",
   "name": "PipiUI Memory",
   "version": "0.1.0",
+  "category": "knowledge",
   "description": "Project-scoped durable memory reads via the loopback memory broker (frozen tools: memory_query / memory_status). Identity binding and capability issuance stay in the Electron host.",
   "capabilities": [],
   "hostApi": ">=1.0.0 <2.0.0",

@@ -2,6 +2,7 @@
   "id": "web-access-extension",
   "name": "PipiUI Web Access",
   "version": "0.1.0",
+  "category": "integration",
   "description": "Web search, page fetch, source checking, and retrieval continuation (frozen tools: web_search / fetch_content / source_check / get_search_content).",
   "capabilities": [],
   "agent": {

@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { useMemo, type ReactNode } from 'react'
 import type { Model, ModelState, PipiHostAPI, TerminalSession } from '@pipi/host-api'
 import { createContributionRegistry, useRegistrySnapshot, type Disposer } from './contribution-registry'
 import type { LiveSubagentProjection } from './live-subagent-projection'
@@ -10,6 +10,9 @@ import type { VisionRoutingController } from './useVisionRouting'
 import { disposeSlashCommands } from './slash-commands'
 import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import type { DocumentRendererProps } from '@pipiui/extension-api'
+import { disposeWorkbenchContributions } from './workbench/workbench-contributions'
+import { useActiveProductExtensions } from './workbench/workbench-runtime'
+import { disposeHeaderActions } from './workbench/header-actions'
 
 export { BUILTIN_EXTENSION_ID }
 export type { Disposer }
@@ -199,7 +202,14 @@ export function listPanels(): readonly PanelContribution[] {
 }
 
 export function usePanels(): readonly PanelContribution[] {
-  return useRegistrySnapshot(panelRegistry)
+  const panels = useRegistrySnapshot(panelRegistry)
+  const active = useActiveProductExtensions()
+  return useMemo(() => {
+    const allowed = new Set(active)
+    return panelRegistry.entries()
+      .filter(entry => allowed.has(entry.extId))
+      .map(entry => entry.contribution)
+  }, [panels, active])
 }
 
 // --- documentRenderers (contract v1; no capability — the enabled manifest entry is the grant) ---
@@ -381,4 +391,6 @@ export function disposeUiContributions(extId: string): void {
   disposePanels(extId)
   disposeDocumentRenderers(extId)
   disposeStatusBarItems(extId)
+  disposeWorkbenchContributions(extId)
+  disposeHeaderActions(extId)
 }

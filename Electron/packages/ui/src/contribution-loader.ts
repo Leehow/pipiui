@@ -119,7 +119,7 @@ async function resolveContributions(
 }
 
 /** Start-up + enable/disable refresh via listExtensions and subscribeExt. */
-export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined): void {
+export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, projectId?: string): void {
   useEffect(() => {
     if (!host) return
     let cancelled = false
@@ -129,7 +129,7 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined):
     const refresh = async () => {
       let list: ExtensionDescriptor[] = []
       try {
-        list = await host.listExtensions?.() ?? []
+        list = await host.listExtensions?.(projectId) ?? []
       } catch {
         list = []
       }
@@ -150,5 +150,5 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined):
       for (const unsubscribe of unsubs) unsubscribe()
       resetDeclarativeContributions()
     }
-  }, [host])
+  }, [host, projectId])
 }

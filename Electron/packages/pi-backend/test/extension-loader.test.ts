@@ -118,6 +118,41 @@ describe("extension manifest D2 validation", () => {
 });
 
 describe("extension loader via listExtensions", () => {
+  it("discovers an active content-addressed shared-store package as an app extension", async () => {
+    await tempRoot("pipi-ext-shared-store-");
+    const storeRoot = join(root, "agent", "extension-store");
+    const contentHash = "a".repeat(64);
+    const objectDir = join(storeRoot, "objects", contentHash);
+    await writeManifest(objectDir, {
+      id: "campaign-kit",
+      name: "Campaign Kit",
+      version: "1.0.0",
+      capabilities: [],
+    });
+    await mkdir(join(storeRoot, "extensions", "campaign-kit"), { recursive: true });
+    await writeFile(join(storeRoot, "extensions", "campaign-kit", "active.json"), JSON.stringify({
+      contentHash,
+      version: "1.0.0",
+      sha256: contentHash,
+      updatedAt: "2026-08-31T00:00:00.000Z",
+    }));
+
+    const registry = createExtensionRegistry([]);
+    const loader = createExtensionLoader({
+      registry,
+      builtinRoot: join(root, "runtime", "extensions"),
+      appRoot: join(root, "agent", "extensions"),
+      sharedStoreRoot: storeRoot,
+    });
+    loader.scan();
+
+    expect(loader.list().find(item => item.id === "campaign-kit")).toMatchObject({
+      source: "app",
+      version: "1.0.0",
+      directory: realpathSync(objectDir),
+    });
+  });
+
   it("loads a legal package and surfaces manifest summary", async () => {
     await tempRoot("pipi-ext-valid-");
     const runtime = join(root, "runtime");

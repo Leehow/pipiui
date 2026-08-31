@@ -1,6 +1,6 @@
 # PipiUI
 
-pi coding agent 的图形界面，Electron 实现，支持 macOS 14+ 与 Linux amd64。历史上的 Swift/SwiftUI 原生版已于 2026-08 退役并从仓库移除。
+可组合的 Pi 应用 Workbench，Electron 实现，默认提供可直接使用的基础版与带全套扩展的 Coding 优化版，并可按项目切换为 TRPG、科研或其它产品。支持 macOS 14+ 与 Linux amd64。历史上的 Swift/SwiftUI 原生版已于 2026-08 退役并从仓库移除。
 
 ### 下载
 
@@ -11,7 +11,53 @@ pi coding agent 的图形界面，Electron 实现，支持 macOS 14+ 与 Linux a
 
 ### 特性概览
 
-多会话并行、流式工具卡片、内置浏览器、Subagent 面板 + Boss 模式、远程接管、Computer Use（opt-in）、Memory 扩展。
+Product Profiles、多会话并行、流式工具卡片、内置浏览器、Subagent 面板 + Boss 模式、远程接管、Computer Use（opt-in）、Memory 扩展。
+
+## Product Profiles / 产品装配
+
+设置 → **产品** 为当前项目选择 Product Profile：
+
+- `base`（基础版，默认）：通用项目/会话左栏、Pi Conversation、模型选择、扩展/Profile 管理与 `create-pipiui-extension` skill；不启用 Coding 专有工具、Git、Subagents、Plan、Terminal 或 Coding prompt；
+- `coding`（Coding 优化版）：在基础版上启用完整的项目/会话侧栏、Git、Subagents、Plan、Terminal、Browser 与 Coding runtime；
+- 项目本地 Profile：放在 `{projectRoot}/.pi/agent/profiles/<slug>/pipiui-profile.json`，或在产品页选择“导入本地 Profile”。
+
+新项目默认进入基础版；历史布尔扩展表会迁为 Coding 优化版以保留旧行为。Profile 切换只影响新会话。旧会话保留自己的 Profile 指纹并只读打开，避免拿另一套工具/提示继续写同一历史；顶栏“＋”可按当前 Profile 新建会话。扩展页按基础能力、工作流、Coding、文档与知识、自动化与设备、模型与外部服务、开发者分类展示。创建模板：
+
+```bash
+cd Electron
+npx create-pipiui-extension --profile "TRPG" ./trpg-profile
+```
+
+架构与实施契约见 [`docs/superpowers/specs/2026-08-31-pipiui-workbench-profiles-v2-design.md`](./docs/superpowers/specs/2026-08-31-pipiui-workbench-profiles-v2-design.md)。
+
+### 本地 Product Pack
+
+产品页的“安装本地 Product Pack”接收一个明确选择的目录；它先校验全部 manifest，再把扩展写入 App-profile 的内容寻址 store、记录 receipt、切换 active/previous slot，并在当前项目激活 Profile。任何依赖或授权失败都会恢复该项目的 Profile 与全部 slot；不可变对象/receipt 作为审计记录保留。
+
+```text
+campaign-starter/
+  pipiui-product-pack.json
+  profile/pipiui-profile.json
+  extensions/campaign-kit/pipiui-extension.json
+  extensions/campaign-kit/agent/…
+  extensions/campaign-kit/app/…
+```
+
+`pipiui-product-pack.json` 只声明组合，不含脚本、设置、secret 或 trust：
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "campaign-starter",
+  "name": "Campaign Starter",
+  "profile": "profile/pipiui-profile.json",
+  "extensions": [
+    { "id": "campaign-kit", "path": "extensions/campaign-kit" }
+  ]
+}
+```
+
+本地 Pack 是开发/私有分发入口，会在 receipt 中明确标为 local；带 native artifact 的 Pack 仍必须走后续官方签名、按架构下载的发布路径。远程 catalog 与官方 bootstrap Pack 仍在 M6 后续切片，当前不会静默联网下载或替换现有 Coding 安装。
 
 ## 功能概览
 

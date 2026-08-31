@@ -1,10 +1,9 @@
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from 'react'
 import { PlanApprovalBar } from './PlanApprovalBar'
 import { makeSubagentStatusCheckPrompt } from './subagent-status-check'
 import { composerDocumentName, consumeFileDropEvent, DEFAULT_COMPOSER_DOCUMENT_PROMPT, fileDragHasFiles, filterSupportedDocumentPaths, ignoreComposerFileDrag, supportedDocumentPathsFromFiles } from './document-drop'
-import './builtin-panels'
 import { documentKindForName, resolveThinkingLevel, thinkingLevelsForHydratedModel, thinkingLevelsForModel, TRANSPORT_DISCONNECTED } from '@pipi/host-api'
-import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExtensionDescriptor, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, Project, PromptAttachment, Session, SessionLease, SessionPreloadSnapshot, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
+import type { AgentDefinition, AgentSummary, BrowserEvent, BrowserHostAPI, BrowserSnapshot, BrowserTab, BrowserTabsSnapshot, BrowserViewBounds, ExtensionDescriptor, ExternalHistoryAvailability, GitStatus, HistoryEntry, Model, ModelState, PipiHostAPI, PlanSnapshot, ProductProfileDescriptor, Project, ProjectProductActivation, PromptAttachment, Session, SessionLease, SessionPreloadSnapshot, SidebarSessionPreferences, StreamEvent, SubagentModelSetting, TerminalEvent, TerminalSession, ThinkingLevel, TurnTelemetryRendererSample } from '@pipi/host-api'
 import { ModelVisibilityModal } from './ModelVisibilityModal'
 import { ExtensionUiHost } from './ExtensionUiHost'
 import { ComputerUsePanel } from './ComputerUsePanel'
@@ -12,9 +11,14 @@ import { RemoteConnectionPanel } from './RemoteConnectionPanel'
 import { SubagentModelModal } from './SubagentModelModal'
 import { DEMO_BOSS_TOOL_NAMES, DEMO_SKILL_NAMES } from './subagent-debug-demo'
 import { ModelQuickMenu } from './ModelQuickMenu'
-import { GitBranchMenu } from './GitBranchMenu'
 import { ProviderLogo } from './ProviderLogo'
-import { Sidebar, type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarSession, type SessionStatus } from './Sidebar'
+import { type ProjectMenuAction, type ProjectMenuUnavailable, type SidebarProject, type SidebarProps, type SidebarSession, type SessionStatus } from './Sidebar'
+import { BaseWorkbenchProvider } from './base-workbench-adapter'
+import { CodingWorkbenchProvider } from './coding-workbench-adapter'
+import { WorkbenchRegion } from './workbench/WorkbenchRegion'
+import { createProductWorkbenchRuntime, ProductWorkbenchProvider, type ProductWorkbenchRuntime, useActiveWorkbenchPlan, useProductExtensionEnabled, useProductWorkbenchRuntime } from './workbench/workbench-runtime'
+import { useHeaderActions } from './workbench/header-actions'
+import { useWorkbenchContainers, useWorkbenchViews } from './workbench/workbench-contributions'
 import { canAdoptExternalHistory, externalHistoryToMessages, isExternalSessionId, loadExternalSessionsForProjects, replaceProjectExternalSessions, sessionSourceLabel, type ProjectExternalSession } from './session-source'
 import { SlashMenu } from './SlashMenu'
 import { ThinkingChip } from './thinking-chip'
@@ -741,6 +745,7 @@ export function createMockHost(): PipiHostAPI {
       id: 'vision-routing',
       name: '识图模型',
       version: '0.1.0',
+      category: 'integration',
       state: 'enabled',
       source: 'builtin',
       capabilities: ['settings.read', 'settings.write'],
@@ -762,6 +767,7 @@ export function createMockHost(): PipiHostAPI {
       id: 'web-search-keys',
       name: 'Web 搜索密钥',
       version: '0.1.0',
+      category: 'integration',
       state: 'enabled',
       source: 'builtin',
       capabilities: ['settings.read', 'settings.write'],
@@ -774,6 +780,7 @@ export function createMockHost(): PipiHostAPI {
       id: 'external-session-scan',
       name: '自动扫描外部会话',
       version: '0.1.0',
+      category: 'workflow',
       state: 'enabled',
       source: 'builtin',
       capabilities: ['settings.read', 'settings.write'],
@@ -782,7 +789,72 @@ export function createMockHost(): PipiHostAPI {
         settingsSections: [{ id: 'external-session-scan', title: '自动扫描外部会话' }],
       },
     },
+    {
+      id: 'skill-loader-extension',
+      name: 'PipiUI Skill Loader',
+      description: '按需搜索和加载当前扩展包提供的 Skills。',
+      version: '1.0.0',
+      category: 'foundation',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: [],
+    },
+    {
+      id: 'coding-runtime',
+      name: 'Coding Runtime',
+      description: 'Coding 工作流的运行时工具。',
+      version: '1.0.0',
+      category: 'coding',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: [],
+    },
+    {
+      id: 'document-workbench',
+      name: 'Document Workbench',
+      description: '文档读取、预览和知识处理。',
+      version: '1.0.0',
+      category: 'knowledge',
+      state: 'enabled',
+      source: 'builtin',
+      capabilities: [],
+    },
   ]
+  let mockProductProfiles: ProductProfileDescriptor[] = [
+    {
+      id: 'base',
+      name: '基础版',
+      description: '通用工作区、会话、模型与扩展管理。',
+      state: 'available',
+      source: 'builtin',
+      requiredExtensionIds: ['skill-loader-extension'],
+      recommendedExtensionIds: [],
+      layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
+    },
+    {
+      id: 'coding',
+      name: 'Coding 优化版',
+      description: '完整 Coding 工作流、文档、搜索与自动化能力。',
+      state: 'available',
+      source: 'builtin',
+      requiredExtensionIds: ['coding-orchestration', 'coding-runtime', 'coding-workbench', 'skill-loader-extension'],
+      recommendedExtensionIds: [
+        'agent-orchestration',
+        'code-retrieval',
+        'document-workbench',
+        'external-session-scan',
+        'git-capability',
+        'goal-extension',
+        'plan-extension',
+        'terminal-extension',
+        'vision-routing',
+        'web-search-keys',
+        'webview-browser-extension',
+      ],
+      layout: { primarySidebar: 'coding.sessions', center: 'pipi.conversation', auxiliarySidebar: 'coding.subagents', activity: ['coding.sessions'] },
+    },
+  ]
+  let mockProductActivation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
   let scanExternalSessions = true
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
   let memoryReviewModel: string | null = null
@@ -966,7 +1038,58 @@ export function createMockHost(): PipiHostAPI {
       }
       return Object.keys(webSearchKeyPresence)
     },
+    listProductProfiles: async () => mockProductProfiles.map(profile => ({
+      ...profile,
+      requiredExtensionIds: [...(profile.requiredExtensionIds ?? [])],
+      recommendedExtensionIds: [...(profile.recommendedExtensionIds ?? [])],
+    })),
+    getProductProfile: async () => ({ ...mockProductActivation, overrides: { ...mockProductActivation.overrides } }),
+    setProductProfile: async (_projectId, profileId) => {
+      const profile = mockProductProfiles.find(item => item.id === profileId)
+      if (!profile) throw new Error(`unknown Product Profile ${profileId}`)
+      mockProductActivation = { schemaVersion: 2, profile: profileId, overrides: {} }
+      const enabledIds = new Set([...(profile.requiredExtensionIds ?? []), ...(profile.recommendedExtensionIds ?? [])])
+      for (const extension of mockExtensions) extension.state = enabledIds.has(extension.id) ? 'enabled' : 'disabled'
+      return { ...mockProductActivation, overrides: {} }
+    },
+    createProductProfile: async (_projectId, name) => {
+      const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'custom-pack'
+      let id = base
+      let suffix = 2
+      while (mockProductProfiles.some(profile => profile.id === id)) id = `${base}-${suffix++}`
+      const created: ProductProfileDescriptor = {
+        id,
+        name,
+        description: '项目自定义扩展包',
+        state: 'available',
+        source: 'project',
+        customizable: true,
+        requiredExtensionIds: ['skill-loader-extension'],
+        recommendedExtensionIds: [],
+        layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
+      }
+      mockProductProfiles = [...mockProductProfiles, created]
+      return { ...created, requiredExtensionIds: [...created.requiredExtensionIds!] }
+    },
+    updateProductProfileExtensions: async (_projectId, profileId, extensionIds) => {
+      const current = mockProductProfiles.find(profile => profile.id === profileId)
+      if (!current?.customizable) throw new Error(`Product Profile ${profileId} is not customizable`)
+      mockProductProfiles = mockProductProfiles.map(profile => profile.id === profileId
+        ? { ...profile, recommendedExtensionIds: [...extensionIds] }
+        : profile)
+      return { ...mockProductProfiles.find(profile => profile.id === profileId)! }
+    },
     listExtensions: async () => mockExtensions.map(item => ({ ...item, contributions: item.contributions ? { ...item.contributions } : undefined })),
+    setExtensionEnabled: async (id, enabled) => {
+      const extension = mockExtensions.find(item => item.id === id)
+      if (!extension) throw new Error(`unknown extension ${id}`)
+      extension.state = enabled ? 'enabled' : 'disabled'
+      mockProductActivation = {
+        ...mockProductActivation,
+        overrides: { ...mockProductActivation.overrides, [id]: enabled ? 'enabled' : 'disabled' },
+      }
+      return { ...extension }
+    },
     getScanExternalSessions: async () => scanExternalSessions,
     setScanExternalSessions: async enabled => { scanExternalSessions = enabled; return scanExternalSessions },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
@@ -1145,12 +1268,18 @@ function retainReceiptOptimisticUser(
 }
 
 export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
+  const productWorkbenchRuntimeRef = useRef<ProductWorkbenchRuntime | null>(null)
+  const productWorkbenchRuntime = productWorkbenchRuntimeRef.current ?? (productWorkbenchRuntimeRef.current = createProductWorkbenchRuntime())
+  return <ProductWorkbenchProvider runtime={productWorkbenchRuntime}><AppContent host={injectedHost} /></ProductWorkbenchProvider>
+}
+
+function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const { theme, toggleTheme } = useShellTheme()
+  const productWorkbench = useProductWorkbenchRuntime()
   // Do not allocate a default mock during every render: its changing identity
   // re-ran all host effects on each composer keystroke.
   const mockHost = useRef<PipiHostAPI>()
   const host = injectedHost ?? (mockHost.current ??= createMockHost())
-  useDeclarativeContributionLoader(host)
   const [projects, setProjects] = useState<Project[]>([])
   const [sessions, setSessions] = useState<Session[]>([])
   const [externalSessions, setExternalSessions] = useState<ProjectExternalSession[]>([])
@@ -1159,6 +1288,27 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [adoptError, setAdoptError] = useState<string | null>(null)
   const [adoptingExternalId, setAdoptingExternalId] = useState<string | null>(null)
   const [selectedProject, setSelectedProject] = useState('')
+  useDeclarativeContributionLoader(host, selectedProject || undefined)
+  const loadedWorkbenchContainers = useWorkbenchContainers()
+  const loadedWorkbenchViews = useWorkbenchViews()
+  useLayoutEffect(() => {
+    if (!selectedProject || !host.listProductProfiles || !host.getProductProfile) {
+      return productWorkbench.activateLegacyCodingWorkbench()
+    }
+    let cancelled = false
+    let dispose: (() => void) | undefined
+    void Promise.all([host.listProductProfiles(selectedProject), host.getProductProfile(selectedProject)]).then(([profiles, activation]) => {
+      if (cancelled) return
+      const profile = profiles.find(item => item.id === activation.profile && item.state === 'available')
+      if (profile) dispose = productWorkbench.activateProductWorkbenchProfile(profile, activation)
+    }).catch(() => {
+      // Older or temporarily unavailable hosts keep the already-active Coding plan.
+    })
+    return () => {
+      cancelled = true
+      dispose?.()
+    }
+  }, [host, selectedProject, loadedWorkbenchContainers, loadedWorkbenchViews, productWorkbench])
   const [selectedSession, setSelectedSession] = useState('')
   const sessionsRef = useRef(sessions)
   sessionsRef.current = sessions
@@ -1498,7 +1648,12 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   closeOpenTurnRef.current = closeOpenTurn
   const canWriteLease = leaseCanWrite(lease)
   const isExternalSelected = isExternalSessionId(selectedSession)
-  const leaseReadOnly = isExternalSelected || (lease !== null && !canWriteLease)
+  const activeWorkbenchPlan = useActiveWorkbenchPlan()
+  const activeProductProfileId = activeWorkbenchPlan.profileId
+  const productHasPrimarySidebar = activeWorkbenchPlan.containers.some(item => item.location === 'primarySidebar')
+  const selectedConversationProfileId = sessions.find(item => item.id === selectedSession)?.productProfile?.id ?? 'coding'
+  const profileSnapshotMismatch = Boolean(selectedSession) && !isExternalSelected && selectedConversationProfileId !== activeProductProfileId
+  const leaseReadOnly = isExternalSelected || profileSnapshotMismatch || (lease !== null && !canWriteLease)
   const leaseConflictError = sessionQueue.items.find(item =>
     item.status === 'failed' && typeof item.error === 'string' && item.error.includes('session is read-only'),
   )?.error
@@ -3444,8 +3599,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [announceOpenedDocuments, navigateTool, rememberOpenedDocument])
 
   const browserWorkspaceActive = activeTab === 'Browser' && !toolsCollapsed
-  const browserFullscreenActive = browserWorkspaceActive && browserWorkspaceFullscreen
-  const shellClass = `pipiui-shell${isElectronChrome() ? ' electron-chrome' : ''}${sidebarCollapsed ? ' sidebar-collapsed' : ''}${toolsCollapsed ? ' tools-collapsed' : ''}${browserWorkspaceActive ? ' browser-workspace' : ''}${browserFullscreenActive ? ' browser-workspace-fullscreen' : ''}`
+  const productPanels = usePanels()
+  const productToolsCollapsed = toolsCollapsed || productPanels.length === 0
+  const productSidebarCollapsed = sidebarCollapsed || !productHasPrimarySidebar
+  const planProductEnabled = useProductExtensionEnabled('plan-extension')
+  const productBrowserWorkspaceActive = browserWorkspaceActive && !productToolsCollapsed
+  const browserFullscreenActive = productBrowserWorkspaceActive && browserWorkspaceFullscreen
+  const shellClass = `pipiui-shell${isElectronChrome() ? ' electron-chrome' : ''}${productSidebarCollapsed ? ' sidebar-collapsed' : ''}${productToolsCollapsed ? ' tools-collapsed' : ''}${productBrowserWorkspaceActive ? ' browser-workspace' : ''}${browserFullscreenActive ? ' browser-workspace-fullscreen' : ''}`
   // The first-response wait (any active main turn) takes precedence at the
   // transcript tail; while it is hidden, a running background subagent keeps the
   // tail alive with a stable-timed phase=tool indicator and no stop button.
@@ -3461,17 +3621,19 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       ? { id: selectedExternalSession.id, projectId: selectedExternalSession.projectId, name: selectedExternalSession.title, updatedAt: selectedExternalSession.updatedAt }
       : undefined)
   const dismissNarrowOverlays = () => setNarrowPanes({ sidebar: false, tools: false })
-  const toolsTrack = browserWorkspaceActive
-    ? fitBrowserToolsWidth(viewportWidth, sidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
+  const toolsTrack = productBrowserWorkspaceActive
+    ? fitBrowserToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
     : widths.tools
+  const baseSidebarProps: SidebarProps = { projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, theme, onToggleTheme: toggleTheme }
+  const codingSidebarProps: SidebarProps = { ...baseSidebarProps, onOpenComputerUse: computerUseAvailable ? () => setComputerUseOpen(true) : undefined, onOpenRemote: () => setRemoteOpen(true), onOpenSubagentModels: () => setSubagentModelsOpen(true) }
   return <main className={shellClass} data-theme={theme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>
-    {narrowViewport && (!sidebarCollapsed || !toolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
-    <Sidebar projects={sidebarProjects} pinnedSessions={pinnedSidebarSessions} archivedSessions={archivedSidebarSessions} expandedIds={sidebarExpandedIds} selectedSessionId={selectedSession || null} searchQuery={sidebarSearch} visibleLimit={sidebarVisibleLimit} collapsed={sidebarCollapsed} onToggleCollapsed={toggleSidebar} onToggleProject={toggleSidebarProject} onSelectSession={selectSidebarSession} onNewSession={projectId => void newSession(projectId)} onProjectMenu={onSidebarProjectMenu} onRenameProject={host.renameProject ? renameSidebarProject : undefined} projectMenuUnavailable={sidebarProjectMenuUnavailable} onMoveProject={host.setProjectPaths ? moveSidebarProject : undefined} onMoveSession={moveSidebarSession} onMoveSessionToPinned={moveSidebarSessionToPinned} onAddProject={addProject} projectAddUnavailable={host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目'} projectError={projectError} onDismissProjectError={() => setProjectError(null)} onSearch={setSidebarSearch} onShowMore={() => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE)} sessionHasMoreByProject={host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined} sessionPageLoadingByProject={host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined} sessionVisibleLimitByProject={host.listSessionPage ? lazyVisibleSessionLimits : undefined} onShowMoreSessions={host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined} onPinSession={pinSidebarSession} onRenameSession={renameSidebarSession} onArchiveSession={archiveSidebarSession} onUnarchiveSession={unarchiveSidebarSession} onViewOriginalSession={viewOriginalExternalSession} onOpenSettings={openModelManager} onOpenComputerUse={computerUseAvailable ? () => setComputerUseOpen(true) : undefined} onOpenRemote={() => setRemoteOpen(true)} onOpenSubagentModels={() => setSubagentModelsOpen(true)} theme={theme} onToggleTheme={toggleTheme} />
-    <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />
+    {narrowViewport && (!productSidebarCollapsed || !productToolsCollapsed) && <div className="pane-overlay-backdrop" data-testid="pane-overlay-backdrop" onMouseDown={dismissNarrowOverlays} />}
+    <BaseWorkbenchProvider sidebar={baseSidebarProps}><CodingWorkbenchProvider sidebar={codingSidebarProps}><WorkbenchRegion store={productWorkbench.store} location="primarySidebar" /></CodingWorkbenchProvider></BaseWorkbenchProvider>
+    {productHasPrimarySidebar && <ResizeHandle label="调整左栏宽度" side="left" onPointerDown={resize('sidebar', widths.sidebar)} />}
     <section className="chat-column">
-      <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={sidebarCollapsed} toolsCollapsed={toolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} canAdoptExternal={Boolean(isExternalSelected && host.adoptExternalSession && externalAdoptableById[selectedSession] === true)} adoptDisabledReason={isExternalSelected && externalAdoptableById[selectedSession] === false ? externalHistoryAvailabilityById[selectedSession] === 'metadata' ? '此外部会话只有元数据，没有可导入的正文' : externalHistoryAvailabilityById[selectedSession] === 'summary' ? '此外部会话只有摘要，没有可导入的正文' : '此外部会话没有可导入的正文' : undefined} adopting={adoptingExternalId === selectedSession} adoptError={adoptError} onDismissAdoptError={() => setAdoptError(null)} onAdoptExternal={() => void adoptExternalSession()} onViewOriginal={headerSession?.adoptedFrom ? () => viewOriginalExternalSession(headerSession.id) : undefined} />
+      <ChatHeader session={headerSession} project={projects.find(item => item.id === selectedProject)} lease={lease} host={host} gitAvailable={gitAvailable} sidebarCollapsed={productSidebarCollapsed} toolsCollapsed={productToolsCollapsed} onToggleSidebar={toggleSidebar} onToggleTools={toggleTools} onOpenSettings={openModelManager} onNewConversation={() => { const projectId = selectedProject || projects[0]?.id; if (projectId) void newSession(projectId) }} onRename={renameSidebarSession} onTakeover={async () => { if (selectedSession && !isExternalSelected) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} externalReadOnly={isExternalSelected} externalSource={selectedExternalSession?.source} canAdoptExternal={Boolean(isExternalSelected && host.adoptExternalSession && externalAdoptableById[selectedSession] === true)} adoptDisabledReason={isExternalSelected && externalAdoptableById[selectedSession] === false ? externalHistoryAvailabilityById[selectedSession] === 'metadata' ? '此外部会话只有元数据，没有可导入的正文' : externalHistoryAvailabilityById[selectedSession] === 'summary' ? '此外部会话只有摘要，没有可导入的正文' : '此外部会话没有可导入的正文' : undefined} adopting={adoptingExternalId === selectedSession} adoptError={adoptError} onDismissAdoptError={() => setAdoptError(null)} onAdoptExternal={() => void adoptExternalSession()} onViewOriginal={headerSession?.adoptedFrom ? () => viewOriginalExternalSession(headerSession.id) : undefined} />
       <div className="chat-viewport" data-testid="chat-viewport">
-        {toolsCollapsed && <ToolQuickRail variant="float" collapsible={narrowViewport} activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
+        {productPanels.length > 0 && productToolsCollapsed && <ToolQuickRail variant="float" collapsible={narrowViewport} activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} />}
         {projectsLoaded && lazyStartupReady && !selectedSession ? (
           <div className="empty-setup-viewport">
             <EmptySetupGuide
@@ -3510,13 +3672,13 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div>
       {selectedSession ? <div className="chat-composer-stack" data-testid="chat-composer-stack">
         {sessionQueue.error && <div className="queue-operation-error" role="alert" data-testid="queue-operation-error"><span>{sessionQueue.error}</span><button aria-label="关闭队列错误" onClick={sessionQueue.dismissError}>×</button></div>}
-        <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} busy={sessionWorking} lastUser={lastUserForPlanApproval} onSend={send} />
+        {planProductEnabled && <PlanApprovalBar host={host} sessionId={selectedSession} readOnly={leaseReadOnly} busy={sessionWorking} lastUser={lastUserForPlanApproval} onSend={send} />}
         <MessageQueue items={sessionQueue.items} expanded={sessionQueue.expanded} pending={sessionQueue.pending} mutationsDisabled={leaseReadOnly} canSteer={sessionQueue.busy || leftoverQueued} onToggle={() => sessionQueue.setExpanded(!sessionQueue.expanded)} onPromote={id => { if (!leaseReadOnly) void sessionQueue.promote(id).catch(() => undefined) }} onEdit={(id, text) => { if (!leaseReadOnly) void sessionQueue.edit(id, text).catch(() => undefined) }} onRemove={id => { if (!leaseReadOnly) void sessionQueue.remove(id).catch(() => undefined) }} onRetry={id => { if (!leaseReadOnly) void sessionQueue.retry(id).catch(() => undefined) }} onSteer={id => { if (!leaseReadOnly) void sessionQueue.cutIn(id).catch(() => undefined) }} />
-        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} compactingLabel={compactingLabel} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
+        <Composer streaming={streaming} working={sessionWorking} stopping={selectedStopping} stopError={stopError?.sessionId === selectedSession ? stopError.message : null} compacting={compacting} compactingLabel={compactingLabel} queueBusy={queueLocksComposer} readOnly={leaseReadOnly} leaseOwner={isExternalSelected || profileSnapshotMismatch ? undefined : (leaseReadOnly ? leaseOwnerLabel(lease) : undefined)} onTakeover={isExternalSelected || profileSnapshotMismatch ? undefined : async () => { if (selectedSession) setLease(await host.forceTakeoverSessionLease(selectedSession)) }} readOnlyMessage={isExternalSelected ? `这是 ${sessionSourceLabel(selectedExternalSession?.source)} 的只读会话。` : profileSnapshotMismatch ? `此会话使用 ${selectedConversationProfileId} Profile；当前项目是 ${activeProductProfileId}。请用当前 Profile 新建会话继续。` : undefined} hideSessionChrome={isExternalSelected} modelState={modelState} host={host} sessionId={selectedSession} initialDraft={selectedSession ? (draftsBySessionRef.current.get(selectedSession) ?? '') : ''} initialAttachments={selectedSession ? (attachmentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_ATTACHMENTS) : EMPTY_COMPOSER_ATTACHMENTS} initialDocuments={selectedSession ? (documentsBySessionRef.current.get(selectedSession) ?? EMPTY_COMPOSER_DOCUMENTS) : EMPTY_COMPOSER_DOCUMENTS} onDraftChange={persistComposerDraft} onAttachmentsChange={persistComposerAttachments} onDocumentsChange={persistComposerDocuments} statsRefreshKey={statsRefreshKey} visibility={modalVisibility} catalogNotice={catalogNotice} onDismissCatalogNotice={() => setCatalogNotice(null)} onOpenModelManager={openModelManager} onCompact={compact} onSend={send} onStop={stopSelectedSession} onDismissStopError={() => setStopError(current => current?.sessionId === selectedSession ? null : current)} onModel={applySelectedModelState} onEnsureSession={ensureSession} onOpenBrowserLogin={selectedSession && host.browser && browserAvailable === true ? () => void openQwenTokenPlanLogin() : undefined} visionEnabled={vision.enabled} visionModelRef={vision.model} />
       </div> : null}
     </section>
-    <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />
-    <ToolPanel activeTab={activeTab} collapsed={toolsCollapsed} onToggleCollapsed={toggleTools} rail={!toolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={toolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />
+    {productPanels.length > 0 && <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />}
+    {productPanels.length > 0 && <ToolPanel activeTab={activeTab} collapsed={productToolsCollapsed} onToggleCollapsed={toggleTools} rail={!productToolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={theme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />}
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
@@ -3637,12 +3799,13 @@ function RightPaneToggleIcon({ expanded }: { expanded: boolean }) {
     ? <svg className="right-pane-toggle-icon" data-pane-icon="collapse" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path className="right-pane-toggle-fill" d="M11 3h4.5a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H11z" /><path d="M9.5 10h5m-2-2 2 2-2 2" /></svg>
     : <svg className="right-pane-toggle-icon" data-pane-icon="expand" aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2" /><path d="M11.5 3v14" /><path d="M14.5 7.5v5" /></svg>
 }
-function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onRename, onTakeover, externalReadOnly, externalSource, canAdoptExternal, adoptDisabledReason, adopting, adoptError, onDismissAdoptError, onAdoptExternal, onViewOriginal }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onRename: (sessionId: string, title: string) => Promise<void> | void; onTakeover: () => void; externalReadOnly?: boolean; externalSource?: string; canAdoptExternal?: boolean; adoptDisabledReason?: string; adopting?: boolean; adoptError?: string | null; onDismissAdoptError?: () => void; onAdoptExternal?: () => void; onViewOriginal?: () => void }) {
+function ChatHeader({ session, project, lease, host, gitAvailable, sidebarCollapsed, toolsCollapsed, onToggleSidebar, onToggleTools, onOpenSettings, onNewConversation, onRename, onTakeover, externalReadOnly, externalSource, canAdoptExternal, adoptDisabledReason, adopting, adoptError, onDismissAdoptError, onAdoptExternal, onViewOriginal }: { session?: Session; project?: Project; lease: SessionLease | null; host: PipiHostAPI; gitAvailable: boolean; sidebarCollapsed: boolean; toolsCollapsed: boolean; onToggleSidebar: () => void; onToggleTools: () => void; onOpenSettings: () => void; onNewConversation: () => void; onRename: (sessionId: string, title: string) => Promise<void> | void; onTakeover: () => void; externalReadOnly?: boolean; externalSource?: string; canAdoptExternal?: boolean; adoptDisabledReason?: string; adopting?: boolean; adoptError?: string | null; onDismissAdoptError?: () => void; onAdoptExternal?: () => void; onViewOriginal?: () => void }) {
   const [renaming, setRenaming] = useState(false)
+  const headerActions = useHeaderActions()
   useEffect(() => setRenaming(false), [session?.id])
   const readOnly = Boolean(externalReadOnly) || (lease !== null && !leaseCanWrite(lease))
   const canRename = Boolean(session) && !externalReadOnly
-  return <header className="chat-header">{sidebarCollapsed && <button className="pane-toggle pane-restore pane-restore-sidebar" data-testid="toggle-sidebar" title="展开左栏" aria-label="展开左栏" aria-expanded="false" onClick={onToggleSidebar}>≡</button>}<div className="chat-header-title">{renaming && canRename && session ? <InlineSessionTitleEditor value={session.name} ariaLabel="会话名称" className="chat-header-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} /> : <strong className="chat-header-title-label" role={canRename ? 'button' : undefined} tabIndex={canRename ? 0 : undefined} title={externalReadOnly ? `${sessionSourceLabel(externalSource)} · 只读` : session ? '双击修改会话名称' : undefined} onDoubleClick={() => { if (canRename) setRenaming(true) }} onKeyDown={event => { if (canRename && (event.key === 'Enter' || event.key === 'F2')) { event.preventDefault(); setRenaming(true) } }}>{session?.name ?? 'PipiUI'}</strong>}{externalReadOnly && <span className="lease-detail" data-testid="external-session-readonly">{sessionSourceLabel(externalSource)} 会话 · 只读{canAdoptExternal && onAdoptExternal ? <button type="button" data-testid="adopt-external-session" disabled={adopting} onClick={onAdoptExternal}>{adopting ? '正在接管…' : '用 Pi 继续'}</button> : adoptDisabledReason ? <span data-testid="adopt-external-unavailable">{adoptDisabledReason}</span> : null}</span>}{session?.adoptedFrom && onViewOriginal && <button type="button" className="lease-detail" data-testid="view-original-record" onClick={onViewOriginal}>查看原始记录</button>}{adoptError && <span className="lease-detail" data-testid="adopt-external-error" role="alert">{adoptError}{onDismissAdoptError && <button type="button" aria-label="关闭接管错误" onClick={onDismissAdoptError}>×</button>}</span>}{readOnly && !externalReadOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><GitBranchMenu host={host} projectId={project?.id} available={gitAvailable} />{toolsCollapsed && <button className="pane-toggle" data-testid="toggle-tools" title="展开右栏" aria-label="展开右栏" aria-expanded="false" onClick={onToggleTools}><RightPaneToggleIcon expanded={false} /></button>}</div></header>
+  return <header className="chat-header">{sidebarCollapsed && <button className="pane-toggle pane-restore pane-restore-sidebar" data-testid="toggle-sidebar" title="展开左栏" aria-label="展开左栏" aria-expanded="false" onClick={onToggleSidebar}>≡</button>}<div className="chat-header-title">{renaming && canRename && session ? <InlineSessionTitleEditor value={session.name} ariaLabel="会话名称" className="chat-header-title-input" onCommit={async title => { await onRename(session.id, title); setRenaming(false) }} onCancel={() => setRenaming(false)} /> : <strong className="chat-header-title-label" role={canRename ? 'button' : undefined} tabIndex={canRename ? 0 : undefined} title={externalReadOnly ? `${sessionSourceLabel(externalSource)} · 只读` : session ? '双击修改会话名称' : undefined} onDoubleClick={() => { if (canRename) setRenaming(true) }} onKeyDown={event => { if (canRename && (event.key === 'Enter' || event.key === 'F2')) { event.preventDefault(); setRenaming(true) } }}>{session?.name ?? 'PipiUI'}</strong>}{externalReadOnly && <span className="lease-detail" data-testid="external-session-readonly">{sessionSourceLabel(externalSource)} 会话 · 只读{canAdoptExternal && onAdoptExternal ? <button type="button" data-testid="adopt-external-session" disabled={adopting} onClick={onAdoptExternal}>{adopting ? '正在接管…' : '用 Pi 继续'}</button> : adoptDisabledReason ? <span data-testid="adopt-external-unavailable">{adoptDisabledReason}</span> : null}</span>}{session?.adoptedFrom && onViewOriginal && <button type="button" className="lease-detail" data-testid="view-original-record" onClick={onViewOriginal}>查看原始记录</button>}{adoptError && <span className="lease-detail" data-testid="adopt-external-error" role="alert">{adoptError}{onDismissAdoptError && <button type="button" aria-label="关闭接管错误" onClick={onDismissAdoptError}>×</button>}</span>}{readOnly && !externalReadOnly && <span className="lease-detail">由 {leaseOwnerLabel(lease)} 运行中 · 只读 <button data-testid="lease-takeover-header" onClick={onTakeover}>强制接管</button></span>}</div><div className="chat-header-actions"><button type="button" className="pane-toggle" data-testid="new-conversation-header" title="新建会话" aria-label="新建会话" onClick={onNewConversation}>＋</button><button type="button" className="pane-toggle" data-testid="open-settings-header" title="设置" aria-label="打开设置" onClick={onOpenSettings}>⚙</button>{headerActions.map(action => <Fragment key={action.id}>{action.render({ host, workspaceId: project?.id, hostCapabilities: { git: gitAvailable } })}</Fragment>)}{toolsCollapsed && <button className="pane-toggle" data-testid="toggle-tools" title="展开右栏" aria-label="展开右栏" aria-expanded="false" onClick={onToggleTools}><RightPaneToggleIcon expanded={false} /></button>}</div></header>
 }
 const MIN_COMPOSER_HEIGHT = 29
 const MAX_COMPOSER_HEIGHT = 150

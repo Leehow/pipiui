@@ -1,0 +1,9 @@
+{
+  "id": "agent-orchestration",
+  "name": "PipiUI Agent Orchestration",
+  "version": "1.0.0",
+  "category": "workflow",
+  "description": "Semantic worker dispatch, nested delegation, progress, and Conversation-scoped worker lifecycle.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

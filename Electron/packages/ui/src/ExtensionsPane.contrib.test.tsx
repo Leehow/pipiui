@@ -214,7 +214,7 @@ describe('ExtensionsPane agent contributions', () => {
     expect(banner.textContent).toContain('agent-catalog-load-failed')
     expect(banner.textContent).not.toContain('/tmp/secret-ext')
     expect(banner.textContent).not.toContain('/Users/haoli/hidden')
-    expect(screen.getByTestId('extensions-packages-empty')).toBeTruthy()
+    expect(screen.getByTestId('extensions-packs-empty')).toBeTruthy()
     fireEvent.click(within(banner).getAllByRole('button', { name: '关闭错误提示' })[0]!)
     expect(screen.queryByText(/extensions-load-failed/)).toBeNull()
   })

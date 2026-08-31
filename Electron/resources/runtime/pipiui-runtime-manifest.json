@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "bundledExtensions": [
+    "grok-build-oauth",
+    "code-retrieval",
+    "deepseek",
+    "qoder",
+    "pipiui-headroom",
+    "office-extension",
+    "pdf-extension",
+    "vision-routing",
+    "web-search-keys",
+    "external-session-scan"
+  ],
+  "includeAnydoc": true
+}

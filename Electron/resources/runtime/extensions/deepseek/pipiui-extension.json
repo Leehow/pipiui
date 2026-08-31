@@ -2,6 +2,7 @@
   "id": "deepseek",
   "name": "DeepSeek Extended",
   "version": "0.1.0",
+  "category": "integration",
   "capabilities": [
     "settings.read",
     "settings.write",

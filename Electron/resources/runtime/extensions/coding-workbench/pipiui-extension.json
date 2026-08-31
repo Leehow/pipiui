@@ -1,0 +1,15 @@
+{
+  "id": "coding-workbench",
+  "name": "PipiUI Coding Workbench",
+  "version": "1.0.0",
+  "category": "coding",
+  "description": "Project/session navigation and Coding header actions.",
+  "capabilities": [],
+  "app": {
+    "ui": {
+      "viewContainers": [
+        { "id": "coding.sessions", "location": "primarySidebar", "title": "项目与会话", "order": 10 }
+      ]
+    }
+  }
+}

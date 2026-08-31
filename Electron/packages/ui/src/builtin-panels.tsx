@@ -1,5 +1,4 @@
 import { BrowserPanel } from './BrowserPanel'
-import { BUILTIN_EXTENSION_ID } from './builtin-extension-id'
 import { DocumentPanel } from './DocumentPanel'
 import { PlanPanel } from './PlanPanel'
 import { SubagentPanel } from './SubagentPanel'
@@ -14,7 +13,7 @@ import terminalIcon from './sf-icons/terminal.png'
  *  checklist stays legible at 13px without shipping another bitmap. */
 const checklistIcon = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 13"><g fill="none" stroke="#000" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M.9 3.1 2.5 4.7 5.5 1.3"/><path d="M.9 9.5 2.5 11.1 5.5 7.7"/><path d="M8.2 3.3h7.9"/><path d="M8.2 9.7h7.9"/></g></svg>')}`
 
-registerPanel(BUILTIN_EXTENSION_ID, {
+registerPanel('coding-orchestration', {
   id: 'Subagents',
   icon: { src: personGroupIcon, ratio: 70 / 49 },
   railBadge: ctx => ctx.subagentsRunningCount > 0
@@ -38,7 +37,7 @@ registerPanel(BUILTIN_EXTENSION_ID, {
   ),
 })
 
-registerPanel(BUILTIN_EXTENSION_ID, {
+registerPanel('plan-extension', {
   id: 'Plan',
   icon: { src: checklistIcon, ratio: 17 / 13 },
   visibleInRail: ctx => ctx.planTabVisible,
@@ -63,7 +62,7 @@ registerPanel(BUILTIN_EXTENSION_ID, {
     ),
 })
 
-registerPanel(BUILTIN_EXTENSION_ID, {
+registerPanel('webview-browser-extension', {
   id: 'Browser',
   icon: { src: globeIcon, ratio: 46 / 46 },
   lazy: true,
@@ -84,7 +83,7 @@ registerPanel(BUILTIN_EXTENSION_ID, {
   ),
 })
 
-registerPanel(BUILTIN_EXTENSION_ID, {
+registerPanel('document-workbench', {
   id: 'Document',
   icon: { src: docTextIcon, ratio: 44 / 49 },
   lazy: true,
@@ -95,7 +94,7 @@ registerPanel(BUILTIN_EXTENSION_ID, {
   ),
 })
 
-registerPanel(BUILTIN_EXTENSION_ID, {
+registerPanel('terminal-extension', {
   id: 'Terminal',
   icon: { src: terminalIcon, ratio: 57 / 43 },
   lazy: true,

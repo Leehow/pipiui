@@ -19,6 +19,12 @@ import {
 } from './ui-registries'
 import './computer-use.css'
 
+const SETTINGS_NAV_HINTS: Record<string, string> = {
+  models: '模型与凭据',
+  extensions: '能力与集成',
+  updates: '运行时版本',
+}
+
 function TrashIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -217,36 +223,63 @@ export function ModelVisibilityModal({ host, visibility, vision, scan, updates, 
   return (
     <div className="model-modal-backdrop" data-testid="model-modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) onClose() }}>
       <section className="model-modal" role="dialog" aria-modal="true" aria-label="设置" data-testid="model-modal">
-        <header>
-          <h2>{title}</h2>
-          <p>{description}</p>
-          <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
-          <div className="model-modal-header-actions">
-            {active?.headerActions?.(ctx)}
+        <aside className="model-modal-sidebar">
+          <div className="model-modal-sidebar-heading">
+            <span className="model-modal-eyebrow">PipiUI</span>
+            <h2>设置</h2>
+            <p>管理这个工作台的模型、能力与运行时。</p>
           </div>
-          <div className="model-modal-tabs" role="tablist" aria-label="设置分类">
+          <div className="model-modal-tabs" role="tablist" aria-label="设置分类" aria-orientation="vertical">
             {sections.map(section => (
               <button
                 key={section.id}
+                id={`settings-tab-${section.id}`}
                 type="button"
                 role="tab"
                 aria-selected={tab === section.id}
+                aria-controls={`settings-panel-${section.id}`}
                 className={`model-modal-tab${tab === section.id ? ' active' : ''}`}
                 data-testid={`model-tab-${section.id}`}
                 onClick={() => {
                   section.onActivate?.({ setView, setExtensionsAddOpen })
                   setTab(section.id)
                 }}
-              >{section.label}</button>
+              >
+                <span className="model-modal-tab-label">{section.label}</span>
+                <span className="model-modal-tab-hint">{SETTINGS_NAV_HINTS[section.id] ?? '相关设置'}</span>
+              </button>
             ))}
           </div>
-        </header>
-        <div className="model-modal-body" data-testid="model-modal-body">
-          {sections.map(section => {
-            const isActive = section.id === tab
-            if (!isActive && section.id !== 'models') return null
-            return <div key={section.id} hidden={!isActive}>{section.render(ctx)}</div>
-          })}
+        </aside>
+        <div className="model-modal-main">
+          <header className="model-modal-header">
+            <div className="model-modal-heading">
+              <h2>{title}</h2>
+              <p>{description}</p>
+            </div>
+            <div className="model-modal-header-actions">
+              {active?.headerActions?.(ctx)}
+            </div>
+            <button className="model-modal-close" aria-label="关闭设置" onClick={onClose}>×</button>
+          </header>
+          <div className="model-modal-body" data-testid="model-modal-body">
+            {sections.map(section => {
+              const isActive = section.id === tab
+              if (!isActive && section.id !== 'models') return null
+              return (
+                <div
+                  key={section.id}
+                  id={`settings-panel-${section.id}`}
+                  role="tabpanel"
+                  aria-labelledby={`settings-tab-${section.id}`}
+                  className="model-modal-panel"
+                  hidden={!isActive}
+                >
+                  {section.render(ctx)}
+                </div>
+              )
+            })}
+          </div>
         </div>
       </section>
     </div>
@@ -280,9 +313,9 @@ registerSettingsSection(BUILTIN_EXTENSION_ID, {
 registerSettingsSection(BUILTIN_EXTENSION_ID, {
   id: 'extensions',
   label: '扩展',
-  title: 'MCP / 扩展',
-  description: '把外部 MCP 或 Pi 扩展加进来。点添加，复制一句话到主界面即可。',
-  headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加</button>,
+  title: '扩展',
+  description: '查看当前项目由哪些能力组成，并管理扩展、MCP 连接与专属设置。',
+  headerActions: ctx => <button className="model-modal-add" data-testid="extensions-add-button" onClick={() => ctx.setExtensionsAddOpen(true)}>＋ 添加扩展</button>,
   render: ctx => <ExtensionsPane host={ctx.host} projectId={ctx.projectId} addOpen={ctx.extensionsAddOpen} onCloseAdd={() => ctx.setExtensionsAddOpen(false)} vision={ctx.vision} visibility={ctx.visibility} scan={ctx.scan} />,
 })
 

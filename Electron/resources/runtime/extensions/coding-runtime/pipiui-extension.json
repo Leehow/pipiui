@@ -1,0 +1,9 @@
+{
+  "id": "coding-runtime",
+  "name": "PipiUI Coding Runtime",
+  "version": "1.0.0",
+  "category": "coding",
+  "description": "Coding file tools, structured Git tools, and the PipiUI reload command.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

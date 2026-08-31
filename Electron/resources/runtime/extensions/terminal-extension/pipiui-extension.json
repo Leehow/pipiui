@@ -1,0 +1,9 @@
+{
+  "id": "terminal-extension",
+  "name": "PipiUI Terminal",
+  "version": "1.0.0",
+  "category": "workflow",
+  "description": "Session-scoped terminal tools over the host terminal bridge.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

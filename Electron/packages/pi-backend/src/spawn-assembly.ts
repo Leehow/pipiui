@@ -38,6 +38,7 @@ export type SpawnContributionDiagnostic = {
 /** Registry-owned agent-half mounts (spec D3). Disabled/error packages must set enabled=false. */
 export type SpawnRegisteredExtension = {
   id: string;
+  version?: string;
   enabled: boolean;
   extensionPath?: string;
   skillRoots?: readonly string[];
@@ -71,6 +72,14 @@ const enabled=(f:SpawnFeatures|undefined,key:Feature)=>Boolean(f?.[key]);
 const ext=(args:string[], path?:string)=>{if(path)args.push("-e",path)};
 const WEB_ACCESS_EXTENSION_ID="web-access-extension";
 const WEBVIEW_BROWSER_EXTENSION_ID="webview-browser-extension";
+const CODING_RUNTIME_EXTENSION_ID="coding-runtime";
+const TERMINAL_EXTENSION_ID="terminal-extension";
+const PLAN_EXTENSION_ID="plan-extension";
+const GOAL_EXTENSION_ID="goal-extension";
+const AGENT_ORCHESTRATION_EXTENSION_ID="agent-orchestration";
+const DOCUMENT_WORKBENCH_EXTENSION_ID="document-workbench";
+const CODING_METHOD_EXTENSION_ID="coding-method";
+const SKILL_LOADER_EXTENSION_ID="skill-loader-extension";
 /** A known migrated package is authoritative even when disabled/error; legacy mounts are absent-only fallbacks. */
 function legacyCoreFallbackAllowed(packages:readonly SpawnRegisteredExtension[]|undefined,id:string):boolean{
   return !(packages??[]).some(pkg=>pkg.id===id);
@@ -121,7 +130,7 @@ export function mergedSpawnEnvironment(
   });
 }
 /** Assemble the Electron host's Pi process contract. */
-export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.managedNodeModulesRoot)env.NODE_PATH=input.managedNodeModulesRoot;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlAnydoc)ext(args,p.firecrawlAnydoc);if(p.openDocuments)ext(args,p.openDocuments);if(p.anydoc){env.PIPIUI_ANYDOC_ROOT=p.anydoc;const anydocModules=join(p.anydoc,"node_modules");env.NODE_PATH=env.NODE_PATH?anydocModules+delimiter+env.NODE_PATH:anydocModules}if(enabled(f,"philosophy")){ext(args,p.philosophy);if(p.philosophy)env.PIPIUI_PHILOSOPHY_EXT=p.philosophy}if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git"))ext(args,p.git);if(enabled(f,"reload"))ext(args,p.reload);if(enabled(f,"webSearch")&&legacyCoreFallbackAllowed(input.registeredExtensions,WEB_ACCESS_EXTENSION_ID)){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){ext(args,p.skillLoader);if(p.skillLoader)env.PIPIUI_SKILLLOADER_EXT=p.skillLoader;if(p.skillLoader&&p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"deepseekServerTools"))ext(args,p.deepseekServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({disabledToolNames:input.disabledToolNames,model:input.model}));
+export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:string[]=[];const env:Record<string,string>={};const f=input.features??{};const p=input.paths;if(input.managedNodeModulesRoot)env.NODE_PATH=input.managedNodeModulesRoot;if(input.resourceMode==="explicit")args.push("--no-extensions","--no-skills","--no-prompt-templates","--no-themes");if(input.agentDir){env.PI_CODING_AGENT_DIR=input.agentDir;env.PIPIUI_ACTIVE_PROJECT_PI_HOME=input.agentDir}if(p.secretVault)ext(args,p.secretVault);if(input.sessionsRoot)env.PI_CODING_AGENT_SESSION_DIR=input.sessionsRoot;if(input.sessionPath)args.push("--session",input.sessionPath);if(p.codingTools&&legacyCoreFallbackAllowed(input.registeredExtensions,CODING_RUNTIME_EXTENSION_ID)){ext(args,p.codingTools);env.PIPIUI_CODING_TOOLS_EXT=p.codingTools}if(p.officeDocShotGate&&legacyCoreFallbackAllowed(input.registeredExtensions,DOCUMENT_WORKBENCH_EXTENSION_ID)){ext(args,p.officeDocShotGate);env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT=p.officeDocShotGate}if(p.firecrawlAnydoc&&legacyCoreFallbackAllowed(input.registeredExtensions,DOCUMENT_WORKBENCH_EXTENSION_ID))ext(args,p.firecrawlAnydoc);if(p.openDocuments&&legacyCoreFallbackAllowed(input.registeredExtensions,DOCUMENT_WORKBENCH_EXTENSION_ID))ext(args,p.openDocuments);if(p.anydoc){env.PIPIUI_ANYDOC_ROOT=p.anydoc;const anydocModules=join(p.anydoc,"node_modules");env.NODE_PATH=env.NODE_PATH?anydocModules+delimiter+env.NODE_PATH:anydocModules}if(enabled(f,"philosophy")&&legacyCoreFallbackAllowed(input.registeredExtensions,CODING_METHOD_EXTENSION_ID)){ext(args,p.philosophy);if(p.philosophy)env.PIPIUI_PHILOSOPHY_EXT=p.philosophy}if(enabled(f,"generateImage"))ext(args,p.media);if(enabled(f,"git")&&legacyCoreFallbackAllowed(input.registeredExtensions,CODING_RUNTIME_EXTENSION_ID))ext(args,p.git);if(enabled(f,"reload")&&legacyCoreFallbackAllowed(input.registeredExtensions,CODING_RUNTIME_EXTENSION_ID))ext(args,p.reload);if(enabled(f,"webSearch")&&legacyCoreFallbackAllowed(input.registeredExtensions,WEB_ACCESS_EXTENSION_ID)){ext(args,p.webSearch);if(p.webSearch)env.PIPIUI_WEB_ACCESS_EXT=p.webSearch}if(enabled(f,"arxivFetch")){ext(args,p.arxivFetchPackage);if(p.arxivFetchPackage)env.PIPIUI_ARXIV_EXT=p.arxivFetchPackage}if(enabled(f,"mcp"))ext(args,p.mcp);if(enabled(f,"skillLoader")){const registered=(input.registeredExtensions??[]).find(pkg=>pkg.id===SKILL_LOADER_EXTENSION_ID);const skillLoaderMount=registered?(registered.enabled?registered.extensionPath:undefined):p.skillLoader;if(!registered)ext(args,p.skillLoader);if(skillLoaderMount){env.PIPIUI_SKILLLOADER_EXT=skillLoaderMount;if(p.builtInSkills)env.PIPIUI_BUILT_IN_SKILL_ROOT=p.builtInSkills}}if(enabled(f,"searchScope")){ext(args,p.searchScope);if(p.searchScope){env.PIPIUI_SEARCH_SCOPE_EXT=p.searchScope;if(input.runtimeRoot)env.PIPIUI_SEARCH_GRANT_FILE=join(input.runtimeRoot,"search-grants",`${input.grantSessionKey??"default"}.json`)}}if(enabled(f,"codexServerTools"))ext(args,p.codexServerTools);if(enabled(f,"claudeServerTools"))ext(args,p.claudeServerTools);if(enabled(f,"openaiServerTools"))ext(args,p.openaiServerTools);if(enabled(f,"geminiServerTools"))ext(args,p.geminiServerTools);if(enabled(f,"xaiServerTools"))ext(args,p.xaiServerTools);if(enabled(f,"deepseekServerTools"))ext(args,p.deepseekServerTools);if(enabled(f,"glmSearchMcp"))ext(args,p.glmSearchMcp);args.push(...mainSessionExcludeToolArgs({disabledToolNames:input.disabledToolNames,model:input.model}));
 /*
  * Subagent orchestration, deliberately mounted before the bridge gate.
  *
@@ -130,7 +139,7 @@ export function assemblePiSpawn(input:SpawnInput):SpawnOutput { const args:strin
  * a reason to crash the worker"). Dispatch, worktree creation and finalization are all decided by
  * env, not by the bridge — so a bridge-less host still gets real workers, just no live panel.
  */
-if(enabled(f,"subagent")&&p.subagentDir){ext(args,p.subagentDir);env.PIPIUI_SUBAGENT_EXT=p.subagentDir;env.PIPI_PHILOSOPHY_LAYER_DIRS=join(p.subagentDir,"layers");env.PIPIUI_MAIN_CWD=input.cwd;
+if(enabled(f,"subagent")&&p.subagentDir){const registered=(input.registeredExtensions??[]).find(pkg=>pkg.id===AGENT_ORCHESTRATION_EXTENSION_ID);const subagentMount=registered?(registered.enabled?registered.extensionPath:undefined):p.subagentDir;if(!registered)ext(args,p.subagentDir);if(subagentMount)env.PIPIUI_SUBAGENT_EXT=subagentMount;env.PIPI_PHILOSOPHY_LAYER_DIRS=join(p.subagentDir,"layers");env.PIPIUI_MAIN_CWD=input.cwd;
 // This host does not directly finalize Git worktrees. Electron hands merge/cleanup/disposition
 // to the audited service in pi so
 // exactly one finalizer ever runs against a repository.
@@ -138,7 +147,7 @@ env.PIPIUI_WORKTREE_FINALIZER="pi";
 if(p.agentsDir)env.PIPIUI_AGENTS_DIR=p.agentsDir;if(input.mainModelId)env.PIPIUI_MAIN_MODEL=input.mainModelId;if(input.subagentModelsFile)env.PIPIUI_SUBAGENT_MODELS_FILE=input.subagentModelsFile;if(input.subagentModelCatalogFile)env.PIPIUI_SUBAGENT_MODEL_CATALOG_FILE=input.subagentModelCatalogFile;if(input.subagentNativeSearchFile)env.PIPIUI_SUBAGENT_NATIVE_SEARCH_FILE=input.subagentNativeSearchFile}
 // The plan store is per conversation, not per project: without this id every session in
 // one work tree would read and overwrite the same `.pi/plans` file.
-if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(input.goalAutoResume==="blocked")env[GOAL_AUTO_RESUME_ENV]="blocked";if(enabled(f,"plan")){ext(args,p.planRuntime)}if(enabled(f,"goal")){ext(args,p.goalRuntime)}if(enabled(f,"contextFold")){ext(args,p.contextFold)}
+if(input.sessionId)env.PIPIUI_SESSION_ID=input.sessionId;if(input.goalAutoResume==="blocked")env[GOAL_AUTO_RESUME_ENV]="blocked";if(enabled(f,"plan")&&legacyCoreFallbackAllowed(input.registeredExtensions,PLAN_EXTENSION_ID)){ext(args,p.planRuntime)}if(enabled(f,"goal")&&legacyCoreFallbackAllowed(input.registeredExtensions,GOAL_EXTENSION_ID)){ext(args,p.goalRuntime)}if(enabled(f,"contextFold")){ext(args,p.contextFold)}
 if(!input.bridgePort){appendUserExtensions(args,input.agentDir);appendRegisteredExtensions(args,env,input.registeredExtensions,input);ext(args,p.updateCenter);ext(args,p.runtimeInfo);if(input.internalEnv)for(const[key,value]of Object.entries(input.internalEnv))env[key]=value;return{args,env};}
 // Genuinely bridge-dependent: the memory broker issues host-scoped capabilities, the webview
 // extension drives the host's browser surface, and an explicitly enabled plan runtime posts events.
@@ -148,7 +157,7 @@ if(enabled(f,"memoryBroker")&&memoryExtensionMountable(input.registeredExtension
 if(enabled(f,"browserSearch")&&legacyCoreFallbackAllowed(input.registeredExtensions,WEBVIEW_BROWSER_EXTENSION_ID))ext(args,p.browserSearch);
 // Browser flow memory replays over the same bridge; bridge-gated like browserSearch.
 if(enabled(f,"browserMemory"))ext(args,p.browserMemory);
-if(enabled(f,"terminal"))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
+if(enabled(f,"terminal")&&legacyCoreFallbackAllowed(input.registeredExtensions,TERMINAL_EXTENSION_ID))ext(args,p.terminal);env.PIPIUI_BRIDGE_PORT=String(input.bridgePort);env.PIPIUI_SESSION_KEY=input.bridgeRoutingKey??"";
 // pi-web-access resolves optional `glimpseui` from this NODE_PATH before falling
 // back to `open`. The shim lives beside the other host extensions.
 {
@@ -593,7 +602,7 @@ function appendRegisteredExtensions(args:string[], env:Record<string,string>, pa
   // exclusively from the broker's issued package identity (role-gated), or a
   // non-memory role would gain failing memory tools merely because the
   // extension is enabled in the main session.
-  const workerRemountPaths=mounted.filter(m=>m.id!==MEMORY_EXTENSION_ID).map(m=>m.path);
+  const workerRemountPaths=mounted.filter(m=>m.id!==MEMORY_EXTENSION_ID&&m.id!==AGENT_ORCHESTRATION_EXTENSION_ID&&m.id!==SKILL_LOADER_EXTENSION_ID).map(m=>m.path);
   if (workerRemountPaths.length) env[REGISTERED_EXTENSION_PATHS_ENV] = workerRemountPaths.join(delimiter);
   if (skillRoots.length) env.PIPIUI_SKILL_ROOTS = skillRoots.join(delimiter);
   applyAgentContributionEnv(env, packages, input);

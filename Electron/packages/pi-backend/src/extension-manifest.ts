@@ -1,5 +1,7 @@
 import type {
   ExtensionOrigin,
+  ExtensionDependencies,
+  ExtensionDependencyRequirement,
   ExtensionSettingsManifest,
   ExtensionSettingsMigration,
   ExtensionSettingsSchema,
@@ -20,6 +22,17 @@ import {
 /** Spec D2. */
 export const EXTENSION_MANIFEST_FILENAME = "pipiui-extension.json";
 export const EXTENSION_ID_RE = /^[a-z][a-z0-9-]*$/;
+/** User-facing catalogue groups. Optional for legacy packages; UI renders those under Other. */
+export const EXTENSION_CATEGORIES = [
+  "foundation",
+  "workflow",
+  "coding",
+  "knowledge",
+  "automation",
+  "integration",
+  "developer",
+] as const;
+export type ExtensionCategory = (typeof EXTENSION_CATEGORIES)[number];
 
 /** Optional top-level manifest `description` length cap (user-facing list summary). */
 export const EXTENSION_DESCRIPTION_MAX_LENGTH = 200;
@@ -125,6 +138,27 @@ export type ExtensionUiDocumentRenderer = {
 };
 export type ExtensionUiSettingsSection = { id: string; title: string; entry?: string };
 export type ExtensionUiSlashCommand = { name: string; description?: string };
+export const EXTENSION_WORKBENCH_LOCATIONS = [
+  "primarySidebar",
+  "center",
+  "auxiliarySidebar",
+  "statusBar",
+  "overlay",
+] as const;
+export type ExtensionWorkbenchLocation = (typeof EXTENSION_WORKBENCH_LOCATIONS)[number];
+export type ExtensionUiViewContainer = {
+  id: string;
+  location: ExtensionWorkbenchLocation;
+  title: string;
+  icon?: string;
+  order?: number;
+};
+export type ExtensionUiView = {
+  id: string;
+  container: string;
+  entry: string;
+  activation: "visible";
+};
 
 export type ExtensionUiSummary = {
   panels?: ExtensionUiPanel[];
@@ -132,6 +166,8 @@ export type ExtensionUiSummary = {
   documentRenderers?: ExtensionUiDocumentRenderer[];
   settingsSections?: ExtensionUiSettingsSection[];
   slashCommands?: ExtensionUiSlashCommand[];
+  viewContainers?: ExtensionUiViewContainer[];
+  views?: ExtensionUiView[];
 };
 
 /** Max contributed AGENT.md paths in one manifest. */
@@ -156,6 +192,7 @@ const AGENT_PATCH_KEYS = new Set([
   "removeTools",
 ]);
 const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F]/;
+const CONTRIBUTION_ID_RE = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
 
 /**
  * Incremental patch against an already-discovered agent.
@@ -183,6 +220,8 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   version: string;
   /** One-line package summary shown in the extension list. */
   description?: string;
+  /** Optional catalogue category; omitted legacy packages remain visible as Other. */
+  category?: ExtensionCategory;
   capabilities: ExtensionCapability[];
   settings?: ExtensionSettingsManifest;
   ui?: ExtensionUiSummary;
@@ -203,6 +242,8 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   nativeResources?: ExtensionNativeResource[];
   /** Extension artifact update discovery (metadata only; the updater acts on it). */
   update?: ExtensionUpdateMetadata;
+  /** Product Profile v2 dependency graph. Empty groups are retained for deterministic snapshots. */
+  dependencies?: ExtensionDependencies;
 };
 
 export type ManifestValidationOk = { ok: true; manifest: ValidatedExtensionManifest };
@@ -525,6 +566,79 @@ function isNamespacedSettingsKey(id: string, key: string): boolean {
   return key.startsWith(prefix) && key.length > prefix.length;
 }
 
+const DEPENDENCY_KEYS = new Set(["required", "optional", "conflicts"]);
+
+function collectDependencyRequirements(
+  value: unknown,
+  label: string,
+  errors: string[],
+): ExtensionDependencyRequirement[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    errors.push(`${label} must be an array`);
+    return [];
+  }
+  const out: ExtensionDependencyRequirement[] = [];
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    if (!isRecord(item)) {
+      errors.push(`${label}[${index}] must be an object`);
+      continue;
+    }
+    rejectUnknownKeys(item, new Set(["id", "version"]), `${label}[${index}]`, errors);
+    const id = asNonEmptyString(item.id);
+    const version = asNonEmptyString(item.version);
+    if (!id || !EXTENSION_ID_RE.test(id)) {
+      errors.push(`${label}[${index}].id must be a semantic slug`);
+      continue;
+    }
+    if (!version || !isValidExtensionHostApiRange(version)) {
+      errors.push(`${label}[${index}].version must be a valid semver range`);
+      continue;
+    }
+    if (seen.has(id)) {
+      errors.push(`${label} contains duplicate extension '${id}'`);
+      continue;
+    }
+    seen.add(id);
+    out.push({ id, version });
+  }
+  return out;
+}
+
+function collectExtensionDependencies(
+  value: unknown,
+  ownerId: string | undefined,
+  errors: string[],
+): ExtensionDependencies | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    errors.push("dependencies must be an object");
+    return undefined;
+  }
+  rejectUnknownKeys(value, DEPENDENCY_KEYS, "dependencies", errors);
+  const required = collectDependencyRequirements(value.required, "dependencies.required", errors);
+  const optional = collectDependencyRequirements(value.optional, "dependencies.optional", errors);
+  const conflicts = collectNonEmptyStrings(value.conflicts, "dependencies.conflicts", errors) ?? [];
+  const seenConflicts = new Set<string>();
+  for (const id of conflicts) {
+    if (!EXTENSION_ID_RE.test(id)) errors.push(`dependencies.conflicts id '${id}' must be a semantic slug`);
+    if (seenConflicts.has(id)) errors.push(`dependencies.conflicts contains duplicate extension '${id}'`);
+    seenConflicts.add(id);
+  }
+  const requiredIds = new Set(required.map(item => item.id));
+  for (const item of optional) {
+    if (requiredIds.has(item.id)) errors.push(`extension '${item.id}' cannot be both required and optional`);
+  }
+  for (const id of [...requiredIds, ...optional.map(item => item.id)]) {
+    if (seenConflicts.has(id)) errors.push(`extension '${id}' cannot be both a dependency and a conflict`);
+  }
+  if (ownerId && (requiredIds.has(ownerId) || optional.some(item => item.id === ownerId) || seenConflicts.has(ownerId))) {
+    errors.push(`extension '${ownerId}' cannot depend on or conflict with itself`);
+  }
+  return { required, optional, conflicts };
+}
+
 function collectSchema(value: unknown): ExtensionSettingsSchema | undefined {
   if (!isRecord(value)) return undefined;
   const schema: ExtensionSettingsSchema = {};
@@ -572,6 +686,15 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
       } else if (trimmedDescription) {
         description = trimmedDescription;
       }
+    }
+  }
+
+  let category: ExtensionCategory | undefined;
+  if (value.category !== undefined && value.category !== null) {
+    if (typeof value.category !== "string" || !(EXTENSION_CATEGORIES as readonly string[]).includes(value.category)) {
+      errors.push("category is unsupported");
+    } else {
+      category = value.category as ExtensionCategory;
     }
   }
 
@@ -628,6 +751,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
 
   const nativeResources = collectNativeResources(value.nativeResources, errors);
   const update = collectUpdateMetadata(value.update, errors);
+  const dependencies = collectExtensionDependencies(value.dependencies, id, errors);
 
   let settings: ExtensionSettingsManifest | undefined;
   const app = value.app;
@@ -686,6 +810,98 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
       errors.push("app.ui must be an object");
     } else {
       const summary: ExtensionUiSummary = {};
+      if (appUi.viewContainers !== undefined) {
+        if (!Array.isArray(appUi.viewContainers)) {
+          errors.push("app.ui.viewContainers must be an array");
+        } else {
+          const containers: ExtensionUiViewContainer[] = [];
+          const seen = new Set<string>();
+          for (const [index, item] of appUi.viewContainers.entries()) {
+            if (!isRecord(item)) {
+              errors.push(`app.ui.viewContainers[${index}] must be an object`);
+              continue;
+            }
+            const itemId = asNonEmptyString(item.id);
+            const title = asNonEmptyString(item.title);
+            const location = item.location;
+            if (!itemId || !CONTRIBUTION_ID_RE.test(itemId)) {
+              errors.push(`app.ui.viewContainers[${index}].id must be a semantic contribution id`);
+              continue;
+            }
+            if (seen.has(itemId)) {
+              errors.push(`duplicate view container id '${itemId}'`);
+              continue;
+            }
+            seen.add(itemId);
+            if (!(EXTENSION_WORKBENCH_LOCATIONS as readonly unknown[]).includes(location)) {
+              errors.push(`app.ui.viewContainers[${index}].location is unsupported`);
+              continue;
+            }
+            if (!title) {
+              errors.push(`app.ui.viewContainers[${index}].title must be a non-empty string`);
+              continue;
+            }
+            const icon = item.icon === undefined
+              ? undefined
+              : collectRelativePath(item.icon, `app.ui.viewContainers[${index}].icon`, errors);
+            let order: number | undefined;
+            if (item.order !== undefined) {
+              if (typeof item.order !== "number" || !Number.isFinite(item.order)) {
+                errors.push(`app.ui.viewContainers[${index}].order must be a finite number`);
+              } else order = item.order;
+            }
+            containers.push({
+              id: itemId,
+              location: location as ExtensionWorkbenchLocation,
+              title,
+              ...(icon ? { icon } : {}),
+              ...(order !== undefined ? { order } : {}),
+            });
+          }
+          if (containers.length) summary.viewContainers = containers;
+        }
+      }
+      if (appUi.views !== undefined) {
+        if (!Array.isArray(appUi.views)) {
+          errors.push("app.ui.views must be an array");
+        } else {
+          const views: ExtensionUiView[] = [];
+          const seen = new Set<string>();
+          for (const [index, item] of appUi.views.entries()) {
+            if (!isRecord(item)) {
+              errors.push(`app.ui.views[${index}] must be an object`);
+              continue;
+            }
+            const viewId = asNonEmptyString(item.id);
+            const container = asNonEmptyString(item.container);
+            const entry = asNonEmptyString(item.entry);
+            const activation = item.activation ?? "visible";
+            if (!viewId || !CONTRIBUTION_ID_RE.test(viewId)) {
+              errors.push(`app.ui.views[${index}].id must be a semantic contribution id`);
+              continue;
+            }
+            if (seen.has(viewId)) {
+              errors.push(`duplicate view id '${viewId}'`);
+              continue;
+            }
+            seen.add(viewId);
+            if (!container || !CONTRIBUTION_ID_RE.test(container)) {
+              errors.push(`app.ui.views[${index}].container must be a semantic contribution id`);
+              continue;
+            }
+            if (!entry) {
+              errors.push(`app.ui.views[${index}].entry must be a path string`);
+              continue;
+            }
+            if (activation !== "visible") {
+              errors.push(`app.ui.views[${index}].activation must be 'visible'`);
+              continue;
+            }
+            views.push({ id: viewId, container, entry, activation: "visible" });
+          }
+          if (views.length) summary.views = views;
+        }
+      }
       if (appUi.panels !== undefined) {
         if (!Array.isArray(appUi.panels)) {
           errors.push("app.ui.panels must be an array");
@@ -901,6 +1117,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     capabilities,
   };
   if (description) manifest.description = description;
+  if (category) manifest.category = category;
   if (settings) manifest.settings = settings;
   if (ui) manifest.ui = ui;
   if (agentExtension) manifest.agentExtension = agentExtension;
@@ -914,6 +1131,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (permissions) manifest.permissions = permissions;
   if (nativeResources) manifest.nativeResources = nativeResources;
   if (update) manifest.update = update;
+  if (dependencies) manifest.dependencies = dependencies;
   return { ok: true, manifest };
 }
 

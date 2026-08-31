@@ -149,9 +149,111 @@ describe("coding tools extension mount", () => {
     expect(sanitizeEnvironment({ PIPIUI_CODING_TOOLS_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 
+  it("lets coding-runtime own coding tools, Git, and reload without legacy duplicates", () => {
+    const codingRuntime = "/runtime/extensions/coding-runtime/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { git: true, reload: true },
+      paths: {
+        codingTools,
+        git: "/runtime/extensions/pipiui-git.ts",
+        reload: "/runtime/extensions/pipiui-reload.ts",
+      },
+      registeredExtensions: [{ id: "coding-runtime", version: "1.0.0", enabled: true, extensionPath: codingRuntime }],
+    });
+    expect(output.args).toEqual(["-e", codingRuntime]);
+    expect(output.env.PIPIUI_CODING_TOOLS_EXT).toBeUndefined();
+  });
+
   it("resolves the shipped wrapper from the source runtime tree", () => {
     const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "resources", "runtime");
     expect(resolveSpawnPaths(root).codingTools).toBe(join(root, "extensions", "pipiui-coding-tools.ts"));
+  });
+});
+
+describe("Product Profile runtime extension ownership", () => {
+  it("uses registered Terminal, Plan, and Goal packages without legacy duplicate mounts", () => {
+    const terminal = "/runtime/extensions/terminal-extension/agent/index.ts";
+    const plan = "/runtime/extensions/plan-extension/agent/index.ts";
+    const goal = "/runtime/extensions/goal-extension/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { terminal: true, plan: true, goal: true },
+      paths: {
+        terminal: "/runtime/extensions/pipiui-electron-terminal.ts",
+        planRuntime: "/runtime/extensions/pipiui-plan-runtime.ts",
+        goalRuntime: "/runtime/pi-goal/src/index.ts",
+      },
+      registeredExtensions: [
+        { id: "terminal-extension", enabled: true, extensionPath: terminal },
+        { id: "plan-extension", enabled: true, extensionPath: plan },
+        { id: "goal-extension", enabled: true, extensionPath: goal },
+      ],
+    });
+    expect(output.args).toEqual(expect.arrayContaining([terminal, plan, goal]));
+    expect(output.args).not.toEqual(expect.arrayContaining([
+      "/runtime/extensions/pipiui-electron-terminal.ts",
+      "/runtime/extensions/pipiui-plan-runtime.ts",
+      "/runtime/pi-goal/src/index.ts",
+    ]));
+  });
+
+  it("mounts agent-orchestration once for both the main Conversation and nested workers", () => {
+    const orchestration = "/runtime/extensions/agent-orchestration/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { subagent: true },
+      paths: { subagentDir: "/runtime/pi-ext/subagent", agentsDir: "/runtime/pi-ext/agents" },
+      registeredExtensions: [{ id: "agent-orchestration", version: "1.0.0", enabled: true, extensionPath: orchestration }],
+    });
+    expect(output.args.filter(value => value === orchestration)).toHaveLength(1);
+    expect(output.args).not.toContain("/runtime/pi-ext/subagent");
+    expect(output.env.PIPIUI_SUBAGENT_EXT).toBe(orchestration);
+    expect(output.env.PIPIUI_EXT_REGISTERED_PATHS).toBeUndefined();
+  });
+
+  it("lets document-workbench replace all three legacy document mounts", () => {
+    const documentWorkbench = "/runtime/extensions/document-workbench/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      paths: {
+        officeDocShotGate: "/runtime/extensions/pipiui-office-doc-shot-gate.ts",
+        firecrawlAnydoc: "/runtime/extensions/pipiui-firecrawl-anydoc.ts",
+        openDocuments: "/runtime/extensions/pipiui-open-documents.ts",
+        anydoc: "/runtime/anydoc",
+      },
+      registeredExtensions: [{ id: "document-workbench", version: "1.0.0", enabled: true, extensionPath: documentWorkbench }],
+    });
+    expect(output.args).toEqual(["-e", documentWorkbench]);
+    expect(output.env.PIPIUI_OFFICE_DOC_SHOT_GATE_EXT).toBeUndefined();
+    expect(output.env.PIPIUI_ANYDOC_ROOT).toBe("/runtime/anydoc");
+  });
+
+  it("uses Profile-owned Coding method and Skill Loader packages for main and worker sessions", () => {
+    const method = "/runtime/extensions/coding-method/agent/index.ts";
+    const skills = "/runtime/extensions/skill-loader-extension/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      features: { philosophy: true, skillLoader: true },
+      paths: {
+        philosophy: "/runtime/pi-philosophy/philosophy.ts",
+        skillLoader: "/runtime/extensions/pipiui-skillloader.ts",
+        builtInSkills: "/runtime/built-in-skills",
+      },
+      registeredExtensions: [
+        { id: "coding-method", enabled: true, extensionPath: method },
+        { id: "skill-loader-extension", enabled: true, extensionPath: skills },
+      ],
+    });
+    expect(output.args).toEqual(expect.arrayContaining([method, skills]));
+    expect(output.args).not.toEqual(expect.arrayContaining([
+      "/runtime/pi-philosophy/philosophy.ts",
+      "/runtime/extensions/pipiui-skillloader.ts",
+    ]));
+    expect(output.env.PIPIUI_SKILLLOADER_EXT).toBe(skills);
+    expect(output.env.PIPIUI_BUILT_IN_SKILL_ROOT).toBe("/runtime/built-in-skills");
+    expect(output.env.PIPIUI_EXT_REGISTERED_PATHS).toBe(method);
   });
 });
 

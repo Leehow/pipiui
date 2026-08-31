@@ -2,6 +2,8 @@
 
 PipiUI dual-half extension (`id`: `__ID__`). Agent half = function; app half = UI/settings; glued by `pipiui-extension.json`.
 
+The template uses Workbench v2 `viewContainers` + lazy `views`; declare `dependencies.required/optional/conflicts` instead of importing another extension's implementation. Set the manifest `category` so users can find the package in 基础能力、工作流、Coding、文档与知识、自动化、外部服务或开发者 groups.
+
 Do not import `@pipi/host-api` or use `window.pipiHost`. Types come from `@pipiui/extension-api`.
 
 ## Install (three locations)

@@ -11,6 +11,7 @@ export const EXTENSION_CAPABILITIES = [
 ] as const;
 
 export type ExtensionCapability = (typeof EXTENSION_CAPABILITIES)[number];
+export type ExtensionCategory = "foundation" | "workflow" | "coding" | "knowledge" | "automation" | "integration" | "developer";
 
 export type ExtEvent = { type: string; payload?: unknown };
 
@@ -65,6 +66,20 @@ export type ExtensionUiDocumentRenderer = {
 };
 export type ExtensionUiSettingsSection = { id: string; title: string; entry?: string };
 export type ExtensionUiSlashCommand = { name: string; description?: string };
+export type ExtensionWorkbenchLocation = "primarySidebar" | "center" | "auxiliarySidebar" | "statusBar" | "overlay";
+export type ExtensionUiViewContainer = {
+  id: string;
+  location: ExtensionWorkbenchLocation;
+  title: string;
+  icon?: string;
+  order?: number;
+};
+export type ExtensionUiView = {
+  id: string;
+  container: string;
+  entry: string;
+  activation?: "visible";
+};
 export type ExtensionUiStatusBar = {
   id: string;
   text?: string;
@@ -108,6 +123,7 @@ export type ExtensionManifest = {
   id: string;
   name: string;
   version: string;
+  category?: ExtensionCategory;
   capabilities: ExtensionCapability[];
   /** Declarative auth/provider contribution. The host owns login and credentials. */
   auth?: ExtensionAuthContribution;
@@ -123,6 +139,8 @@ export type ExtensionManifest = {
       documentRenderers?: ExtensionUiDocumentRenderer[];
       settingsSections?: ExtensionUiSettingsSection[];
       slashCommands?: ExtensionUiSlashCommand[];
+      viewContainers?: ExtensionUiViewContainer[];
+      views?: ExtensionUiView[];
       themes?: unknown[];
       statusBar?: ExtensionUiStatusBar[];
     };

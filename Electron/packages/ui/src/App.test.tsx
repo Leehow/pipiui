@@ -624,6 +624,7 @@ describe('PipiUI main layout', () => {
     await screen.findAllByText('Electron 三栏界面')
     // `site` carries no running-subagent fixture, so the row exposes the
     // main-agent status chain directly.
+    await waitFor(() => expect(container.querySelector('[data-session-id="site"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="site"]')!)
     await waitFor(() => expect(container.querySelector('[data-session-id="site"]')?.getAttribute('aria-current')).toBe('true'))
     const composer = await screen.findByLabelText('消息输入框')
@@ -4042,9 +4043,12 @@ describe('extensions settings tab', () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } })
     await openModelModal(createMockHost())
+    expect(screen.queryByTestId('model-tab-profiles')).toBeNull()
+    expect(screen.getAllByRole('tab')).toHaveLength(3)
     fireEvent.click(screen.getByTestId('model-tab-extensions'))
     expect(await screen.findByTestId('extensions-pane')).toBeTruthy()
-    expect(screen.getByRole('heading', { name: 'MCP / 扩展' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '扩展' })).toBeTruthy()
+    fireEvent.click(screen.getByTestId('extensions-nav-mcp'))
     expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('pi-mcp-extension')
     fireEvent.click(screen.getByTestId('extensions-add-button'))
     expect(await screen.findByTestId('extensions-add-dialog')).toBeTruthy()

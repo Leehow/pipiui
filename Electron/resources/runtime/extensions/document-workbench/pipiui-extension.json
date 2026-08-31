@@ -1,0 +1,9 @@
+{
+  "id": "document-workbench",
+  "name": "PipiUI Document Workbench",
+  "version": "1.0.0",
+  "category": "knowledge",
+  "description": "Document-open injection, local anydoc conversion, and Office screenshot gating.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

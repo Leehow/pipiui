@@ -193,7 +193,6 @@ import { readPaddleocrAccessToken, writePaddleocrAccessToken } from "./paddleocr
 import {
   createExtensionRegistry,
   readAppExtensionEnabled,
-  readProjectExtensionEnabled,
   writeAppExtensionEnabled,
   writeProjectExtensionEnabled,
   type ExtensionEnableScope,
@@ -247,6 +246,20 @@ import {
   type ExtensionGrantRecord,
 } from "./extension-grants.js";
 import { removeExtensionPackageDirectory } from "./extension-uninstall.js";
+import { readProductProfileCatalog } from "./profile-catalog.js";
+import { PRODUCT_PROFILE_MANIFEST_FILENAME, parseProductProfileManifestJson } from "./profile-manifest.js";
+import { createCustomProductProfile, updateCustomProductProfileExtensions } from "./project-profile-editor.js";
+import { installLocalProductPack } from "./product-pack-installer.js";
+import { productSpawnFingerprint, resolveProductSpawnPlan } from "./product-spawn-plan.js";
+import { resolveProductProfile } from "./profile-resolver.js";
+import {
+  readProjectProductActivation,
+  projectActivationOverlay,
+  writeProjectProductActivation,
+  DEFAULT_PRODUCT_PROFILE_ID,
+  LEGACY_PRODUCT_PROFILE_ID,
+  type ProjectProductActivation,
+} from "./profile-store.js";
 import {
   HEADROOM_EXTENSION_ID,
   HEADROOM_MANAGED_SETTINGS,
@@ -1036,6 +1049,7 @@ type SessionMeta = {
   /** Latest persisted Pi thinking level, when the session recorded one. */
   thinkingLevel?: ThinkingLevel;
   adoptedFrom?: SessionAdoptedFrom;
+  productProfile?: { id: string; fingerprint: string };
 };
 type SessionFileCandidate = { path: string; size: number; mtimeMs: number };
 const METADATA_HEAD_BYTES = 64 * 1024,
@@ -1101,6 +1115,7 @@ type LatestSessionMetadata = {
   thinkingLevel?: ThinkingLevel;
   updatedAt?: number;
   adoptedFrom?: SessionAdoptedFrom;
+  productProfile?: { id: string; fingerprint: string };
 };
 
 /**
@@ -1120,6 +1135,7 @@ async function readLatestSessionMetadata(
   let foundThinkingLevel = false;
   let updatedAt: number | undefined;
   let adoptedFrom: SessionAdoptedFrom | undefined;
+  let productProfile: { id: string; fingerprint: string } | undefined;
   while (position > 0) {
     const start = Math.max(0, position - METADATA_TAIL_BYTES);
     const chunk = Buffer.alloc(position - start);
@@ -1160,11 +1176,15 @@ async function readLatestSessionMetadata(
       }
       if (adoptedFrom === undefined && isSessionAdoptedFrom(row.adoptedFrom))
         adoptedFrom = row.adoptedFrom;
+      if (productProfile === undefined && row?.type === "pipiui_product_profile"
+        && typeof row.profileId === "string" && typeof row.fingerprint === "string") {
+        productProfile = { id: row.profileId, fingerprint: row.fingerprint };
+      }
     }
     if (name !== undefined && model !== undefined && foundThinkingLevel && updatedAt !== undefined && adoptedFrom !== undefined) break;
     position = start;
   }
-  return { name, model: model ?? null, thinkingLevel, updatedAt, adoptedFrom };
+  return { name, model: model ?? null, thinkingLevel, updatedAt, adoptedFrom, productProfile };
 }
 
 /** Bounded-memory metadata scan: a small header read plus newest-first chunks. */
@@ -1188,6 +1208,7 @@ async function readSessionMeta(path: string): Promise<SessionMeta> {
       model: latest.model,
       thinkingLevel: latest.thinkingLevel,
       adoptedFrom: latest.adoptedFrom ?? (isSessionAdoptedFrom(headAdopted) ? headAdopted : undefined),
+      productProfile: latest.productProfile,
     };
   } finally {
     await handle.close();
@@ -2269,6 +2290,7 @@ export class PiHostBackend implements HostBackend {
       registry: this.extensions,
       builtinRoot: join(this.runtimeRoot, "extensions"),
       appRoot: join(this.agentDir, "extensions"),
+      sharedStoreRoot: this.extensionStoreRoot(),
     });
     this.extensionLoader.scan();    this.bridge = new HostBridge({
       onAgentEvent: (event, sessionId) => this.mapAgentEvent(event, sessionId),
@@ -3099,6 +3121,7 @@ export class PiHostBackend implements HostBackend {
     rendererTelemetry?: TurnTelemetryRendererSample,
   ): Promise<QueueEnqueueResult> {
     if (isExternalSessionId(id)) throw new Error("external session is read-only");
+    await this.assertSessionProductProfileWritable(id);
     const runtimeToken = this.beginSessionRuntime(id);
     this.assertInputFilesSessionAcceptingWork(id);
     this.structuredOutputs?.assertReadyToSend(id);
@@ -3122,6 +3145,24 @@ export class PiHostBackend implements HostBackend {
       outcome: result.outcome === "dispatched" ? "direct" : "queued",
       message: this.publicQueueItem(result.message),
     };
+  }
+  private async assertSessionProductProfileWritable(sessionId: string): Promise<void> {
+    if (this.profileMode !== "isolated") return;
+    const session = await this.findSession(sessionId);
+    const isolated = await this.ensureIsolatedProjectHome(session.header.cwd, { allowMissing: true, migrate: false });
+    const projectRoot = isolated?.realProjectRoot ?? session.header.cwd;
+    const activation = await readProjectProductActivation(projectPiAgentDir(projectRoot), {
+      defaultProfileId: this.defaultProductProfileId(),
+    });
+    const sessionProfileId = session.productProfile?.id ?? "coding";
+    if (sessionProfileId !== activation.profile) {
+      throw new Error(
+        `Conversation uses Product Profile ${sessionProfileId}; current project uses ${activation.profile}. Create a new Conversation for the current Profile.`,
+      );
+    }
+  }
+  private defaultProductProfileId(): string {
+    return this.profileMode === "isolated" ? DEFAULT_PRODUCT_PROFILE_ID : LEGACY_PRODUCT_PROFILE_ID;
   }
   /** A later user prompt must be able to wake a missed-settled turn and drain. */
   private retryPendingFinalReconciliation(sessionId: string): void {
@@ -3692,7 +3733,22 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension") {      case "listProjects":
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "installLocalProductProfile" | "installLocalProductPack") {
+      case "listProductProfiles":
+        return this.listProductProfiles(params[0]);
+      case "getProductProfile":
+        return this.getProductProfile(params[0]);
+      case "setProductProfile":
+        return this.setProductProfile(params[0], params[1]);
+      case "createProductProfile":
+        return this.createProductProfile(params[0], params[1]);
+      case "updateProductProfileExtensions":
+        return this.updateProductProfileExtensions(params[0], params[1], params[2]);
+      case "installLocalProductProfile":
+        return this.installLocalProductProfile(params[0], params[1]);
+      case "installLocalProductPack":
+        return this.installLocalProductPack(params[0], params[1]);
+      case "listProjects":
         return this.listConfiguredProjects();
       case "listSessionPage":
         return this.listSessionPage(params[0], params[1], params[2]);
@@ -4567,6 +4623,7 @@ export class PiHostBackend implements HostBackend {
       updatedAt: s.updatedAt,
       model: this.sessionModelOf(s),
       ...(s.adoptedFrom ? { adoptedFrom: s.adoptedFrom } : {}),
+      ...(s.productProfile ? { productProfile: s.productProfile } : {}),
     };
   }
   private async adoptionAgentDir(projectPath: string): Promise<string> {
@@ -4924,7 +4981,25 @@ export class PiHostBackend implements HostBackend {
       timestamp: new Date().toISOString(),
       cwd: p.path,
     };
+    const projectRoot = isolated?.realProjectRoot ?? p.path;
+    const productActivation = await readProjectProductActivation(projectPiAgentDir(projectRoot), {
+      defaultProfileId: this.defaultProductProfileId(),
+    });
+    const initialProductProfile = {
+      id: productActivation.profile,
+      fingerprint: productSpawnFingerprint(productActivation.profile, {
+        features: {},
+        paths: {},
+        registeredExtensions: [],
+      }),
+    };
     const lines = [JSON.stringify(header)];
+    lines.push(JSON.stringify({
+      type: "pipiui_product_profile",
+      profileId: initialProductProfile.id,
+      fingerprint: initialProductProfile.fingerprint,
+      extensions: [],
+    }));
     if (name)
       lines.push(
         JSON.stringify({
@@ -4958,6 +5033,7 @@ export class PiHostBackend implements HostBackend {
         thinkingLevel: this.modelState.availableThinkingLevels.includes(inheritedThinking)
           ? inheritedThinking
           : undefined,
+        productProfile: initialProductProfile,
       },
       created.size,
       created.mtimeMs,
@@ -4969,6 +5045,7 @@ export class PiHostBackend implements HostBackend {
       projectId,
       name: name ?? "New session",
       updatedAt: Date.now(),
+      productProfile: initialProductProfile,
     };
   }
   private async renameSession(sessionId: string, name: string): Promise<Session> {
@@ -5211,6 +5288,36 @@ export class PiHostBackend implements HostBackend {
     // pi-goal auto-revival suppression.
     const goalAutoResume = await this.goalAutoResumeForSpawn(id);
     this.assertSessionGeneration(id, generation);
+    const productActivation = await readProjectProductActivation(projectPiAgentDir(spawnCwd), {
+      defaultProfileId: this.defaultProductProfileId(),
+    });
+    const productSpawn = resolveProductSpawnPlan({
+      profileId: productActivation.profile,
+      features: this.features,
+      paths: spawnPaths,
+      registeredExtensions,
+      activeExtensionIds: registeredExtensions.filter(item => item.enabled).map(item => item.id),
+    });
+    const productProfile = {
+      id: productActivation.profile,
+      fingerprint: productSpawnFingerprint(productActivation.profile, productSpawn),
+    };
+    if (found.productProfile?.id !== productProfile.id
+      || found.productProfile.fingerprint !== productProfile.fingerprint) {
+      await fs.appendFile(found.path, `${JSON.stringify({
+        type: "pipiui_product_profile",
+        profileId: productProfile.id,
+        fingerprint: productProfile.fingerprint,
+        extensions: productSpawn.registeredExtensions
+          .filter(item => item.enabled)
+          .map(item => ({ id: item.id, version: item.version ?? "unknown" }))
+          .sort((a, b) => a.id.localeCompare(b.id)),
+      })}\n`, "utf8");
+      found.productProfile = productProfile;
+      const profileStat = await fs.stat(found.path);
+      this.rememberSessionMeta(found, profileStat.size, profileStat.mtimeMs);
+    }
+    this.assertSessionGeneration(id, generation);
     const output = assemblePiSpawn({
       sessionPath: found.path,
       sessionId: id,
@@ -5218,8 +5325,8 @@ export class PiHostBackend implements HostBackend {
       runtimeRoot: this.runtimeRoot,
       ...this.isolatedProjectPaths(found.header.cwd),
       resourceMode: this.resourceMode,
-      features: this.features,
-      paths: spawnPaths,
+      features: productSpawn.features,
+      paths: productSpawn.paths,
       managedNodeModulesRoot: this.managedNodeModulesRoot,
       mainModelId: this.mainModelId(),
       memoryReviewModelId: (await this.loadMemoryReviewModel()) ?? undefined,
@@ -5230,24 +5337,24 @@ export class PiHostBackend implements HostBackend {
       bridgePort,
       bridgeRoutingKey: id,
       sessionCapability,
-      computerCapability,
-      computerDescriptor: computerCapability
+      computerCapability: productSpawn.features.computerUse ? computerCapability : undefined,
+      computerDescriptor: productSpawn.features.computerUse && computerCapability
         ? this.computerDescriptor
         : undefined,
       vaultDir: this.vaultDir,
-      registeredExtensions,
+      registeredExtensions: productSpawn.registeredExtensions,
       internalEnv: {
         ...(await this.mediaCompatFallbackEnv()),
-        ...(goalAutoResume ? { [GOAL_AUTO_RESUME_ENV]: "blocked" } : {}),
+        ...(productSpawn.features.goal && goalAutoResume ? { [GOAL_AUTO_RESUME_ENV]: "blocked" } : {}),
       },
-      goalAutoResume,
+      goalAutoResume: productSpawn.features.goal ? goalAutoResume : undefined,
     });
       this.assertSessionGeneration(id, generation);
       // Mount cleanup is registered before the write for the same partial-acquisition guarantee.
       rollback.push(() => this.extensions.unmountSession(id));
       this.extensions.mountSession(
         id,
-        registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
+        productSpawn.registeredExtensions.filter((pkg) => pkg.enabled && pkg.extensionPath).map((pkg) => pkg.id),
       );
       // close() may race a cache-first background resume before the child is
       // inserted into `live`. Fail closed here so shutdown cannot miss a late Pi
@@ -6989,6 +7096,190 @@ export class PiHostBackend implements HostBackend {
     }
     return [...saved];
   }
+  private async getProductProfile(projectIdValue: unknown): Promise<ProjectProductActivation> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    const root = await this.projectPath(projectIdValue.trim());
+    return readProjectProductActivation(projectPiAgentDir(root), { defaultProfileId: this.defaultProductProfileId() });
+  }
+  private async listProductProfiles(projectIdValue?: unknown) {
+    if (projectIdValue === undefined) {
+      return (await readProductProfileCatalog(this.refreshRuntimeTree())).map(item => item.descriptor);
+    }
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    const root = await this.projectPath(projectIdValue.trim());
+    return (await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(root)))
+      .map(item => item.descriptor);
+  }
+  private async createProductProfile(projectIdValue: unknown, nameValue: unknown) {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof nameValue !== "string") throw new Error("扩展包名称必须是 string");
+    const root = await this.projectPath(projectIdValue.trim());
+    const created = await createCustomProductProfile(projectPiAgentDir(root), nameValue);
+    const entry = (await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(root)))
+      .find(item => item.descriptor.id === created.id);
+    if (!entry || entry.descriptor.state !== "available") {
+      throw new Error(`created Product Profile ${created.id} is unavailable`);
+    }
+    return entry.descriptor;
+  }
+  private async updateProductProfileExtensions(
+    projectIdValue: unknown,
+    profileIdValue: unknown,
+    extensionIdsValue: unknown,
+  ) {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof profileIdValue !== "string" || !profileIdValue.trim()) {
+      throw new Error("profileId 必须是非空 string");
+    }
+    if (!Array.isArray(extensionIdsValue) || extensionIdsValue.some(id => typeof id !== "string" || !id.trim())) {
+      throw new Error("extensionIds 必须是非空 string 数组");
+    }
+    const extensionIds = extensionIdsValue.map(id => String(id).trim());
+    if (new Set(extensionIds).size !== extensionIds.length) throw new Error("extensionIds 不能重复");
+    const projectId = projectIdValue.trim();
+    const profileId = profileIdValue.trim();
+    const root = await this.projectPath(projectId);
+    const projectAgentDir = projectPiAgentDir(root);
+    const activation = await readProjectProductActivation(projectAgentDir, { defaultProfileId: this.defaultProductProfileId() });
+    if (activation.profile === profileId) {
+      throw new Error("请先关闭当前扩展包，再修改包内扩展");
+    }
+    this.extensionLoader.scan(root);
+    const installed = new Map(this.extensionLoader.profileExtensions().map(item => [item.id, item]));
+    const extensions = extensionIds.map(id => {
+      const extension = installed.get(id);
+      if (!extension) throw new Error(`unknown extension ${id}`);
+      return { id: extension.id, version: extension.version };
+    });
+    const updated = await updateCustomProductProfileExtensions(projectAgentDir, profileId, extensions);
+    const entry = (await readProductProfileCatalog(this.refreshRuntimeTree(), projectAgentDir))
+      .find(item => item.descriptor.id === updated.id);
+    if (!entry || entry.descriptor.state !== "available") {
+      throw new Error(`updated Product Profile ${updated.id} is unavailable`);
+    }
+    return entry.descriptor;
+  }
+  private async setProductProfile(projectIdValue: unknown, profileIdValue: unknown): Promise<ProjectProductActivation> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    if (typeof profileIdValue !== "string" || !profileIdValue.trim()) {
+      throw new Error("profileId 必须是非空 string");
+    }
+    const profileId = profileIdValue.trim();
+    const root = await this.projectPath(projectIdValue.trim());
+    this.extensionLoader.scan(root);
+    const catalog = await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(root));
+    const entry = catalog.find(item => item.descriptor.id === profileId);
+    if (!entry) throw new Error(`unknown Product Profile ${profileId}`);
+    if (!entry.profile || entry.descriptor.state !== "available") {
+      throw new Error(`Product Profile ${profileId} is unavailable: ${entry.descriptor.error ?? "invalid manifest"}`);
+    }
+    const current = await readProjectProductActivation(projectPiAgentDir(root), { defaultProfileId: this.defaultProductProfileId() });
+    const next: ProjectProductActivation = {
+      ...current,
+      profile: profileId,
+      overrides: current.profile === profileId ? current.overrides : {},
+    };
+    const plan = resolveProductProfile({
+      profile: entry.profile,
+      installed: this.extensionLoader.profileExtensions(),
+      overrides: next.overrides,
+    });
+    if (plan.missingRequired.length || plan.conflicts.length) {
+      const detail = [...plan.missingRequired, ...plan.conflicts]
+        .map(issue => issue.code === "extension_conflict"
+          ? `${issue.id} conflicts with ${issue.conflictsWith}`
+          : issue.code === "dependency_cycle"
+            ? `dependency cycle ${issue.cycle.join(" -> ")}`
+            : `${issue.id} ${issue.code}`)
+        .join("; ");
+      throw new Error(`Product Profile ${profileId} cannot activate: ${detail}`);
+    }
+    const grantProblems: string[] = [];
+    for (const extension of plan.enabled) {
+      const grant = await this.getCapabilityGrant(extension.id, projectIdValue);
+      if (grant.refused) grantProblems.push(`${extension.id} requests refused host capabilities`);
+      else if (grant.needsConfirmation) grantProblems.push(`${extension.id} requires capability confirmation`);
+    }
+    if (grantProblems.length) {
+      throw new Error(`Product Profile ${profileId} cannot activate: ${grantProblems.join("; ")}`);
+    }
+    return writeProjectProductActivation(projectPiAgentDir(root), next);
+  }
+  private async installLocalProductProfile(
+    projectIdValue: unknown,
+    sourceDirectoryValue: unknown,
+  ): Promise<ProjectProductActivation> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    const source = await this.pickedDirectory(sourceDirectoryValue);
+    const parsed = parseProductProfileManifestJson(
+      await fs.readFile(join(source, PRODUCT_PROFILE_MANIFEST_FILENAME), "utf8"),
+    );
+    if (!parsed.ok) throw new Error(`Product Profile manifest invalid: ${parsed.errors.join("; ")}`);
+    const root = await this.projectPath(projectIdValue.trim());
+    const parent = join(projectPiAgentDir(root), "profiles");
+    const destination = join(parent, parsed.profile.id);
+    if (existsSync(destination)) throw new Error(`Product Profile already installed: ${parsed.profile.id}`);
+    await fs.mkdir(parent, { recursive: true });
+    const staging = join(parent, `.${parsed.profile.id}-${process.pid}-${Date.now()}.staging`);
+    await fs.mkdir(staging, { recursive: false });
+    try {
+      await fs.writeFile(
+        join(staging, PRODUCT_PROFILE_MANIFEST_FILENAME),
+        `${JSON.stringify(parsed.profile, null, 2)}\n`,
+        "utf8",
+      );
+      await fs.rename(staging, destination);
+      try {
+        return await this.setProductProfile(projectIdValue, parsed.profile.id);
+      } catch (error) {
+        await fs.rm(destination, { recursive: true, force: true });
+        throw error;
+      }
+    } catch (error) {
+      await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+  private async installLocalProductPack(
+    projectIdValue: unknown,
+    sourceDirectoryValue: unknown,
+  ): Promise<ProjectProductActivation> {
+    if (typeof projectIdValue !== "string" || !projectIdValue.trim()) {
+      throw new Error("projectId 必须是非空 string");
+    }
+    const projectId = projectIdValue.trim();
+    const source = await this.pickedDirectory(sourceDirectoryValue);
+    const root = await this.projectPath(projectId);
+    const projectAgentDir = projectPiAgentDir(root);
+    const previous = await readProjectProductActivation(projectAgentDir, { defaultProfileId: this.defaultProductProfileId() });
+    try {
+      const result = await installLocalProductPack<ProjectProductActivation>({
+        sourceDirectory: source,
+        storeRoot: this.extensionStoreRoot(),
+        projectAgentDir,
+        activateProfile: profileId => this.setProductProfile(projectId, profileId),
+        restoreProjectActivation: async () => { await writeProjectProductActivation(projectAgentDir, previous); },
+      });
+      return result.activation;
+    } catch (error) {
+      // The installer restored mutable slots; rebuild the in-memory registry so
+      // a failed Pack cannot remain visible until the next project operation.
+      this.extensionLoader.scan(root);
+      throw error;
+    }
+  }
   private async addProject(value: unknown): Promise<Project> {
     if (typeof value !== "string" || !value.length)
       throw new Error("project path 必须是非空 string");
@@ -7627,8 +7918,20 @@ export class PiHostBackend implements HostBackend {
   private async mergedExtensionOverlay(projectRoot?: string): Promise<Record<string, boolean>> {
     const app = readAppExtensionEnabled(await this.readSettings());
     if (!projectRoot) return app;
-    const project = await readProjectExtensionEnabled(projectPiAgentDir(projectRoot));
-    return { ...app, ...project };
+    const activation = await readProjectProductActivation(projectPiAgentDir(projectRoot), {
+      defaultProfileId: this.defaultProductProfileId(),
+    });
+    const project = projectActivationOverlay(activation);
+    if (activation.profile === "coding") return { ...app, ...project };
+    const base = Object.fromEntries(this.extensions.list().map(item => [item.id, false]));
+    const profile = (await readProductProfileCatalog(this.refreshRuntimeTree(), projectPiAgentDir(projectRoot)))
+      .find(item => item.profile?.id === activation.profile)?.profile;
+    if (profile) {
+      for (const dependency of [...profile.extensions.required, ...profile.extensions.recommended]) {
+        base[dependency.id] = true;
+      }
+    }
+    return { ...base, ...project };
   }
   private async readExtensionSettingsSnapshot(id: string, projectRoot?: string): Promise<Record<string, unknown>> {
     const manifest = this.extensions.settingsManifest(id);

@@ -35,6 +35,11 @@ describe("pi spawn env injects the configured profile .env (T17 parity)", () => 
       mkdir(cwd, { recursive: true }),
       mkdir(sessionDir, { recursive: true }),
     ]);
+    if (resourceMode === "explicit") {
+      const projectAgent = join(cwd, ".pi", "agent");
+      await mkdir(projectAgent, { recursive: true });
+      await writeFile(join(projectAgent, "ext-enabled.json"), "{}\n");
+    }
     if (dotEnv !== undefined) await writeFile(join(agent, ".env"), dotEnv);
     await writeFile(
       join(sessionDir, "session.jsonl"),

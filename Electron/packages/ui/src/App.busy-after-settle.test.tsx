@@ -68,6 +68,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -90,6 +91,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -236,6 +238,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 
@@ -402,6 +405,7 @@ describe('settled turn stays idle after a late streaming status', () => {
     }
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(container.querySelector('[data-session-id="layout"]')).toBeTruthy())
     fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
     await waitFor(() => expect(listener).toBeDefined())
 

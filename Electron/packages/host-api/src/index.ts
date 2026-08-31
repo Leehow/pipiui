@@ -3,9 +3,11 @@ export * from "./plan.js";
 export * from "./external-session.js";
 export * from "./native-search.js";
 export * from "./host-capability.js";
+export * from "./profile.js";
 import type { PlanEvent, PlanSnapshot } from "./plan.js";
 import type { ExternalSession, ExternalSessionHistory, SessionAdoptedFrom } from "./external-session.js";
 import type { ModelCapabilities } from "./native-search.js";
+import type { ProductProfileDescriptor, ProjectProductActivation } from "./profile.js";
 export const PIPI_HOST_PROTOCOL_VERSION = 2 as const;
 /** Stable Electron IPC channel for the Pipi host protocol. */
 export const PIPI_HOST_IPC_CHANNEL = "pipi-host:v1";
@@ -25,6 +27,8 @@ export type Session = {
   model?: { provider: string; modelId: string } | null;
   /** Present when this Pi session was adopted from a read-only external record. */
   adoptedFrom?: SessionAdoptedFrom;
+  /** Immutable Product Profile snapshot used by the last Pi child for this Conversation. */
+  productProfile?: { id: string; fingerprint: string };
 };
 /** Opaque-cursor page used by the Electron sidebar's 10-at-a-time lazy loader. */
 export type SessionPage = {
@@ -934,6 +938,7 @@ export type ExtensionLifecycleState =
 /** Spec D10 scan locations. */
 export type ExtensionSource = "builtin" | "app" | "project";
 export type ExtensionEnabledScope = "app" | "project";
+export type ExtensionCategory = "foundation" | "workflow" | "coding" | "knowledge" | "automation" | "integration" | "developer";
 /** JSON Schema subset for D6/D8 settings forms (string/number/boolean/enum + format:secret). */
 export type ExtensionJsonSchema = {
   type?: string;
@@ -962,6 +967,20 @@ export type ExtensionStatusBarDecl = {
   text?: string;
   tooltip?: string;
   alignment?: "left" | "right";
+};
+export type ExtensionWorkbenchLocation = "primarySidebar" | "center" | "auxiliarySidebar" | "statusBar" | "overlay";
+export type ExtensionViewContainerDecl = {
+  id: string;
+  location: ExtensionWorkbenchLocation;
+  title: string;
+  icon?: string;
+  order?: number;
+};
+export type ExtensionViewDecl = {
+  id: string;
+  container: string;
+  entry: string;
+  activation: "visible";
 };
 /** Pi provider `models[]` shape used as the single host-visible model source. */
 export type ExtensionProviderModelContribution = {
@@ -1004,6 +1023,8 @@ export type ExtensionContributions = {
   settingsSections?: readonly ExtensionSettingsSectionDecl[];
   slashCommands?: readonly ExtensionSlashCommandDecl[];
   statusBar?: readonly ExtensionStatusBarDecl[];
+  viewContainers?: readonly ExtensionViewContainerDecl[];
+  views?: readonly ExtensionViewDecl[];
   auth?: ExtensionAuthContribution;
 };
 export type ExtensionDescriptor = {
@@ -1015,6 +1036,8 @@ export type ExtensionDescriptor = {
   version?: string;
   /** One-line package summary from the manifest `description` field. */
   description?: string;
+  /** Optional catalog grouping supplied by the extension manifest. */
+  category?: ExtensionCategory;
   error?: string;
   /** User-visible reason when `state === "error"` (spec D9). */
   errorReason?: string;
@@ -1070,6 +1093,18 @@ export function shouldForwardProjectedHostEvent(frame: HostEvent, selectedSessio
 
 export interface PipiHostAPI {
   readonly protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION;
+  /** Product Profile catalog and project-local activation. Profile changes affect new Conversations only. */
+  listProductProfiles?(projectId?: string): Promise<ProductProfileDescriptor[]>;
+  getProductProfile?(projectId: string): Promise<ProjectProductActivation>;
+  setProductProfile?(projectId: string, profileId: string): Promise<ProjectProductActivation>;
+  /** Create a project-local, user-editable Profile surfaced as a named Extension Pack. */
+  createProductProfile?(projectId: string, name: string): Promise<ProductProfileDescriptor>;
+  /** Replace the optional extension membership of a Settings-created Profile while it is inactive. */
+  updateProductProfileExtensions?(projectId: string, profileId: string, extensionIds: string[]): Promise<ProductProfileDescriptor>;
+  /** Import a pure local `pipiui-profile.json` into this project's profile jail and activate it. */
+  installLocalProductProfile?(projectId: string, sourceDirectory: string): Promise<ProjectProductActivation>;
+  /** Install a local Product Pack transaction: shared code objects + project Profile activation. */
+  installLocalProductPack?(projectId: string, sourceDirectory: string): Promise<ProjectProductActivation>;
   /** Renderer hint: project full stream/log payloads only for this visible session. */
   setEventProjectionSession?(sessionId?: string): Promise<void>;
   listProjects(): Promise<Project[]>; listSessions(projectId: string): Promise<Session[]>;
@@ -1373,6 +1408,13 @@ function apiFrom(
   const invoke = <T>(method: HostMethod, ...params: unknown[]) => call(method, params) as Promise<T>;
   const api: PipiHostAPI = {
     protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+    listProductProfiles: projectId => projectId ? invoke("listProductProfiles", projectId) : invoke("listProductProfiles"),
+    getProductProfile: projectId => invoke("getProductProfile", projectId),
+    setProductProfile: (projectId, profileId) => invoke("setProductProfile", projectId, profileId),
+    createProductProfile: (projectId, name) => invoke("createProductProfile", projectId, name),
+    updateProductProfileExtensions: (projectId, profileId, extensionIds) => invoke("updateProductProfileExtensions", projectId, profileId, extensionIds),
+    installLocalProductProfile: (projectId, sourceDirectory) => invoke("installLocalProductProfile", projectId, sourceDirectory),
+    installLocalProductPack: (projectId, sourceDirectory) => invoke("installLocalProductPack", projectId, sourceDirectory),
     listProjects: () => invoke("listProjects"),
     listSessions: projectId => invoke("listSessions", projectId),
     listSessionPage: (projectId, cursor, limit) => cursor === undefined

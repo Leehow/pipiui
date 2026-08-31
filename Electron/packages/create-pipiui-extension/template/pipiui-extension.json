@@ -3,6 +3,7 @@
   "id": "__ID__",
   "name": "__NAME__",
   "version": "0.1.0",
+  "category": "developer",
   // D8 enum: settings.read | settings.write | bridge.emit | invoke.agent | stream.render | terminal.read | notifications
   // Empty array = L0 only (no agent.extension / no controlled entry).
   "capabilities": [
@@ -12,6 +13,11 @@
     "invoke.agent",
     "stream.render"
   ],
+  "dependencies": {
+    "required": [],
+    "optional": [],
+    "conflicts": []
+  },
   "agent": {
     "extension": "agent/dist/index.js"
     // Optional: contribute schema:1 AGENT.md packages (paths relative to this package).
@@ -38,9 +44,12 @@
       }
     },
     "ui": {
-      // v1 slot must be "toolPanel"; unknown slot = load error, not a silent skip
-      "panels": [
-        { "slot": "toolPanel", "id": "__ID__", "title": "__NAME__", "entry": "app/dist/panel.js" }
+      // v2 Workbench: declare a container first, then lazy views inside it.
+      "viewContainers": [
+        { "id": "__ID__.tools", "location": "auxiliarySidebar", "title": "__NAME__" }
+      ],
+      "views": [
+        { "id": "__ID__.main", "container": "__ID__.tools", "entry": "app/dist/panel.js", "activation": "visible" }
       ],
       "toolRenderers": [
         { "tool": "__ID__", "entry": "app/dist/hello-card.js" }

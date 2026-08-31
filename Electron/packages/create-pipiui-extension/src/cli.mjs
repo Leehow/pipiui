@@ -99,6 +99,10 @@ export function templateRoot(from = import.meta.url) {
   return join(dirname(fileURLToPath(from)), "..", "template");
 }
 
+export function profileTemplateRoot(from = import.meta.url) {
+  return join(dirname(fileURLToPath(from)), "..", "profile-template");
+}
+
 export function createPipiuiExtension(input) {
   const nameArg = input.name;
   const id = legalizeExtensionId(nameArg);
@@ -139,10 +143,37 @@ export function createPipiuiExtension(input) {
   return { id, name, dir: dest };
 }
 
+export function createPipiuiProfile(input) {
+  const id = legalizeExtensionId(input.name);
+  const name = displayNameFrom(input.name, id);
+  const cwd = input.cwd ?? process.cwd();
+  const dest = resolve(cwd, input.dir ?? id);
+  const source = input.templateDir ?? profileTemplateRoot();
+  if (!existsSync(source)) throw new Error(`profile template directory missing: ${source}`);
+  if (existsSync(dest)) {
+    const stat = statSync(dest);
+    if (!stat.isDirectory()) throw new Error(`destination exists and is not a directory: ${dest}`);
+    if (readdirSync(dest).length > 0) throw new Error(`destination is not empty: ${dest}`);
+  } else mkdirSync(dest, { recursive: true });
+  cpSync(source, dest, { recursive: true });
+  walkFiles(dest, (path) => {
+    const buffer = readFileSync(path);
+    if (!isProbablyText(buffer)) return;
+    let text = replacePlaceholders(buffer.toString("utf8"), id, name);
+    if (path.endsWith("pipiui-profile.json")) {
+      JSON.parse(text);
+      if (!text.endsWith("\n")) text += "\n";
+    }
+    writeFileSync(path, text);
+  });
+  return { id, name, dir: dest };
+}
+
 function printHelp() {
-  process.stdout.write(`Usage: create-pipiui-extension <name> [dir]
+  process.stdout.write(`Usage: create-pipiui-extension [--profile] <name> [dir]
 
 Copy the local dual-half template (no network) and fill id/name.
+  --profile  Create a pure Product Profile instead of an extension package.
   name  Display name; legalized to id [a-z][a-z0-9-]*
   dir   Package root (default: ./<id>)
 
@@ -169,8 +200,11 @@ export function runCli(argv, io = { log: console.log, error: console.error }) {
     io.error("too many arguments: create-pipiui-extension <name> [dir]");
     return 1;
   }
-  const result = createPipiuiExtension({ name: positional[0], dir: positional[1] });
-  io.log(`created ${result.id} at ${result.dir}`);
+  const profile = args.includes("--profile");
+  const result = profile
+    ? createPipiuiProfile({ name: positional[0], dir: positional[1] })
+    : createPipiuiExtension({ name: positional[0], dir: positional[1] });
+  io.log(`created ${profile ? "profile " : ""}${result.id} at ${result.dir}`);
   return 0;
 }
 

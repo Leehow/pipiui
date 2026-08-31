@@ -1,5 +1,14 @@
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import {
+  PROJECT_EXTENSION_ENABLED_FILE,
+  DEFAULT_PRODUCT_PROFILE_ID,
+  projectActivationOverlay,
+  projectProductActivationPath,
+  readProjectProductActivation,
+  writeProjectProductActivation,
+} from "./profile-store.js";
+import type { ExtensionCategory } from "./extension-manifest.js";
+
+export { PROJECT_EXTENSION_ENABLED_FILE } from "./profile-store.js";
 
 /** Spec D4/D6 error codes. Duplicated locally so this package typechecks against frozen host-api. */
 export type ExtInvokeErrorCode =
@@ -42,12 +51,24 @@ export type ExtensionSettingsManifest = {
   migrations?: ExtensionSettingsMigration[];
 };
 
+export type ExtensionDependencyRequirement = {
+  id: string;
+  version: string;
+};
+
+export type ExtensionDependencies = {
+  required: ExtensionDependencyRequirement[];
+  optional: ExtensionDependencyRequirement[];
+  conflicts: string[];
+};
+
 export type ExtensionDescriptor = {
   id: string;
   name: string;
   version: string;
   /** One-line package summary shown in the extension list. */
   description?: string;
+  category?: ExtensionCategory;
   origin: ExtensionOrigin;
   /** Bundled runtime layer name (D13). */
   layer?: string;
@@ -56,6 +77,7 @@ export type ExtensionDescriptor = {
   /** Spec D8 capability strings, e.g. `bridge.emit`. */
   capabilities?: readonly string[];
   settings?: ExtensionSettingsManifest;
+  dependencies?: ExtensionDependencies;
 };
 
 export type ExtensionRecord = {
@@ -64,6 +86,7 @@ export type ExtensionRecord = {
   version: string;
   /** One-line package summary shown in the extension list. */
   description?: string;
+  category?: ExtensionCategory;
   origin: ExtensionOrigin;
   state: ExtensionLifecycleState;
   uninstallable: boolean;
@@ -94,10 +117,10 @@ const ID_RE = /^[a-z][a-z0-9-]*$/;
 
 /** Spec § D13 / brief: bundled runtime layers as first-class builtin packages. */
 export const BUILTIN_EXTENSION_PACKAGES: readonly ExtensionDescriptor[] = [
-  { id: "pi-ext", name: "Pi Ext", version: "1.0.0", description: "PipiUI 宿主编排扩展", origin: "builtin", layer: "pi-ext", defaultEnabled: true, uninstallable: false },
-  { id: "pi-philosophy", name: "Pi Philosophy", version: "1.0.0", description: "哲学层系统提示", origin: "builtin", layer: "pi-philosophy", defaultEnabled: true, uninstallable: false },
-  { id: "pi-goal", name: "Pi Goal", version: "1.0.0", description: "目标层系统提示", origin: "builtin", layer: "pi-goal", defaultEnabled: true, uninstallable: false },
-  { id: "built-in-skills", name: "Built-in Skills", version: "1.0.0", description: "内置技能集", origin: "builtin", layer: "built-in-skills", defaultEnabled: true, uninstallable: false },
+  { id: "pi-ext", name: "Pi Ext", version: "1.0.0", description: "PipiUI 宿主编排扩展", category: "foundation", origin: "builtin", layer: "pi-ext", defaultEnabled: true, uninstallable: false },
+  { id: "pi-philosophy", name: "Pi Philosophy", version: "1.0.0", description: "哲学层系统提示", category: "workflow", origin: "builtin", layer: "pi-philosophy", defaultEnabled: true, uninstallable: false },
+  { id: "pi-goal", name: "Pi Goal", version: "1.0.0", description: "目标层系统提示", category: "workflow", origin: "builtin", layer: "pi-goal", defaultEnabled: true, uninstallable: false },
+  { id: "built-in-skills", name: "Built-in Skills", version: "1.0.0", description: "内置技能集", category: "foundation", origin: "builtin", layer: "built-in-skills", defaultEnabled: true, uninstallable: false },
 ];
 
 /**
@@ -177,8 +200,6 @@ export const FROZEN_CORE_CAPABILITY_TOOL_NAMES: readonly string[] = Object.freez
 );
 
 /** Project-home enable overlay. Not a pi `settings.json` key (those are stripped). */
-export const PROJECT_EXTENSION_ENABLED_FILE = "ext-enabled.json";
-
 export class ExtensionLifecycleError extends Error {
   constructor(message: string) {
     super(message);
@@ -239,6 +260,14 @@ export function writeAppExtensionEnabled(
 
 export function parseProjectExtensionEnabled(value: unknown): Record<string, boolean> {
   if (!isRecord(value)) return {};
+  if (value.schemaVersion === 2 && isRecord(value.overrides)) {
+    const out: Record<string, boolean> = {};
+    for (const [id, state] of Object.entries(value.overrides)) {
+      if (state === "enabled") out[id] = true;
+      else if (state === "disabled") out[id] = false;
+    }
+    return out;
+  }
   const out: Record<string, boolean> = {};
   for (const [id, enabled] of Object.entries(value)) {
     if (typeof enabled === "boolean") out[id] = enabled;
@@ -247,16 +276,11 @@ export function parseProjectExtensionEnabled(value: unknown): Record<string, boo
 }
 
 export function projectExtensionEnabledPath(projectAgentDir: string): string {
-  return join(projectAgentDir, PROJECT_EXTENSION_ENABLED_FILE);
+  return projectProductActivationPath(projectAgentDir);
 }
 
 export async function readProjectExtensionEnabled(projectAgentDir: string): Promise<Record<string, boolean>> {
-  try {
-    return parseProjectExtensionEnabled(JSON.parse(await readFile(projectExtensionEnabledPath(projectAgentDir), "utf8")));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw error;
-  }
+  return projectActivationOverlay(await readProjectProductActivation(projectAgentDir, { defaultProfileId: DEFAULT_PRODUCT_PROFILE_ID }));
 }
 
 export async function writeProjectExtensionEnabled(
@@ -264,19 +288,12 @@ export async function writeProjectExtensionEnabled(
   id: string,
   enabled: boolean,
 ): Promise<Record<string, boolean>> {
-  const current = await readProjectExtensionEnabled(projectAgentDir);
-  const next = { ...current, [id]: enabled };
-  await mkdir(projectAgentDir, { recursive: true });
-  const path = projectExtensionEnabledPath(projectAgentDir);
-  const tmp = `${path}.${process.pid}-${Date.now()}.tmp`;
-  await writeFile(tmp, `${JSON.stringify(next, null, 2)}\n`, "utf8");
-  try {
-    await rename(tmp, path);
-  } catch (error) {
-    await rm(tmp, { force: true }).catch(() => undefined);
-    throw error;
-  }
-  return next;
+  const current = await readProjectProductActivation(projectAgentDir, { defaultProfileId: DEFAULT_PRODUCT_PROFILE_ID });
+  const next = await writeProjectProductActivation(projectAgentDir, {
+    ...current,
+    overrides: { ...current.overrides, [id]: enabled ? "enabled" : "disabled" },
+  });
+  return projectActivationOverlay(next);
 }
 
 type Entry = ExtensionRecord & {
@@ -296,6 +313,7 @@ function snapshot(entry: Entry): ExtensionRecord {
     defaultEnabled: entry.defaultEnabled,
   };
   if (entry.description) record.description = entry.description;
+  if (entry.category) record.category = entry.category;
   if (entry.error) record.error = entry.error;
   return record;
 }
@@ -338,6 +356,7 @@ export class ExtensionRegistry {
       name: descriptor.name,
       version: descriptor.version,
       description: descriptor.description,
+      category: descriptor.category,
       origin: descriptor.origin,
       state: "discovered",
       uninstallable,
@@ -479,6 +498,15 @@ export class ExtensionRegistry {
 
   settingsManifest(id: string): ExtensionSettingsManifest | undefined {
     return this.require(id).settings;
+  }
+
+  dependencies(id: string): ExtensionDependencies | undefined {
+    const value = this.require(id).descriptor.dependencies;
+    return value ? {
+      required: value.required.map(item => ({ ...item })),
+      optional: value.optional.map(item => ({ ...item })),
+      conflicts: [...value.conflicts],
+    } : undefined;
   }
 
   /**

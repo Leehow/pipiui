@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import {
   createPipiuiExtension,
+  createPipiuiProfile,
   legalizeExtensionId,
   stripJsonc,
   templateRoot,
+  profileTemplateRoot,
 } from "../src/cli.mjs";
 import { createExtensionLoader } from "../../pi-backend/src/extension-loader.js";
 import { createExtensionRegistry } from "../../pi-backend/src/extension-registry.js";
@@ -101,6 +103,23 @@ describe("create-pipiui-extension CLI", () => {
     const again = await runCli(["My Ext", dest], cwd);
     expect(again.code).toBe(1);
     expect(again.stderr).toMatch(/not empty/);
+  });
+
+  it("creates a project-local Product Profile with --profile", async () => {
+    const cwd = await tempRoot("pipi-create-profile-");
+    const dest = join(cwd, "trpg-profile");
+    const spawned = await runCli(["--profile", "TRPG", dest], cwd);
+    expect(spawned.code, spawned.stderr).toBe(0);
+    expect(spawned.stdout).toMatch(/created profile trpg/);
+    const profile = JSON.parse(await readFile(join(dest, "pipiui-profile.json"), "utf8"));
+    expect(profile).toMatchObject({
+      schemaVersion: 1,
+      id: "trpg",
+      name: "TRPG",
+      extensions: { required: [], recommended: [] },
+    });
+    expect(profileTemplateRoot()).toBe(join(pkgRoot, "profile-template"));
+    expect(createPipiuiProfile({ name: "Lab", dir: join(cwd, "lab"), cwd }).id).toBe("lab");
   });
 });
 

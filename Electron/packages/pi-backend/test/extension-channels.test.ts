@@ -182,7 +182,9 @@ describe("extension settings schema seam", () => {
     for (const descriptor of descriptors) registry.ingest(descriptor);
     const backend = createPiHostBackend({
       agentDir: agent,
-      profileMode: "isolated",
+      // This suite exercises the settings seam itself. Product Profile
+      // filtering has separate isolated-mode coverage.
+      profileMode: "default",
       canonicalProjectPaths: async () => undefined,
       extensionRegistry: registry,
       vaultDir: agent,

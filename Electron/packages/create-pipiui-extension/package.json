@@ -11,7 +11,8 @@
   },
   "files": [
     "src",
-    "template"
+    "template",
+    "profile-template"
   ],
   "scripts": {
     "test": "vitest run"

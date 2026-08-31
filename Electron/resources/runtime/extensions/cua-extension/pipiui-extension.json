@@ -2,6 +2,7 @@
   "id": "cua-extension",
   "name": "PipiUI CUA",
   "version": "0.1.0",
+  "category": "automation",
   "description": "Computer use via the host CuaDriverHost (frozen tools: computer / open_application). TCC/Accessibility, driver lifecycle, pid/window binding, and screenshot cleanup stay in the Electron host.",
   "capabilities": [],
   "hostApi": ">=1.0.0 <2.0.0",

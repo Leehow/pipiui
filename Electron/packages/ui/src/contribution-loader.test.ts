@@ -145,6 +145,14 @@ describe('syncDeclarativeContributions', () => {
 })
 
 describe('useDeclarativeContributionLoader', () => {
+  it('loads the selected project overlay so project-local product extensions can contribute UI', async () => {
+    const host = {
+      listExtensions: vi.fn(async () => []),
+    } as unknown as PipiHostAPI
+    renderHook(() => useDeclarativeContributionLoader(host, 'campaign-project'))
+    await vi.waitFor(() => expect(host.listExtensions).toHaveBeenCalledWith('campaign-project'))
+  })
+
   it('loads from listExtensions and tears down on disable via subscribeExt', async () => {
     const listeners = new Map<string, Set<(event: ExtEvent) => void>>()
     let current: ExtensionDescriptor[] = [quotaDescriptor('enabled')]

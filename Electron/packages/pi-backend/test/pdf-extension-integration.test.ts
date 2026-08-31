@@ -10,8 +10,8 @@ import { resetInMemoryVault } from "../src/secret-vault.js";
 
 /**
  * End-to-end integration over the real generated runtime mirror: the bundled
- * `pdf-extension` loads as a default-enabled registry package (no lifecycle call
- * needed), new sessions mount its compiled entry exactly once through `-e`,
+ * `pdf-extension` loads as an optional registry package, explicit project enablement
+ * mounts its compiled entry exactly once through `-e`,
  * disabling the extension for a project removes the mount, and the superseded
  * dedicated core settings APIs stay absent.
  */
@@ -68,15 +68,14 @@ function pdfPackages(list: SpawnPackage[]) {
 }
 
 describe("pdf-extension end-to-end mount integration", () => {
-  it("loads the generated mirror as default-enabled and mounts its parser exactly once for a brand-new project", async () => {
+  it("keeps the optional generated mirror unmounted for a brand-new base project", async () => {
     expect(existsSync(MIRROR_ENTRY), "generated mirror must exist; run npm run build -w @pipiui/pipiui-pdf-extension").toBe(true);
     const { backend, probe } = await makeBackend();
     const fresh = await addProject(backend, "fresh-project");
 
-    // No setExtensionEnabled call anywhere: bundled builtins are enabled by default.
     const packages = pdfPackages(await probe.registeredExtensionsForSpawn(fresh.project));
     expect(packages).toHaveLength(1);
-    expect(packages[0]).toMatchObject({ id: "pdf-extension", enabled: true, extensionPath: MIRROR_ENTRY });
+    expect(packages[0]).toMatchObject({ id: "pdf-extension", enabled: false, extensionPath: MIRROR_ENTRY });
 
     // The spawn assembly carries that single registry mount — never a duplicate
     // registration and never the removed direct spawn path.
@@ -85,7 +84,7 @@ describe("pdf-extension end-to-end mount integration", () => {
       paths: {},
       registeredExtensions: await probe.registeredExtensionsForSpawn(fresh.project),
     }).args;
-    expect(args.filter((arg) => arg === MIRROR_ENTRY)).toHaveLength(1);
+    expect(args).not.toContain(MIRROR_ENTRY);
     expect(args.join("\n")).not.toContain("pipiui-firecrawl-pdf.ts");
   });
 
@@ -98,10 +97,13 @@ describe("pdf-extension end-to-end mount integration", () => {
     expect(tools.map((tool) => tool.name)).toEqual(["pipiui_firecrawl_pdf"]);
   });
 
-  it("drops the default-enabled mount when the project disables the extension", async () => {
+  it("mounts once after explicit enable and drops the mount after disable", async () => {
     const { backend, probe } = await makeBackend();
     const fixture = await addProject(backend, "opt-out");
-    expect(pdfPackages(await probe.registeredExtensionsForSpawn(fixture.project))).toHaveLength(1);
+    await backend.handle("setExtensionEnabled" as never, ["pdf-extension", true, "project", fixture.id]);
+    expect(pdfPackages(await probe.registeredExtensionsForSpawn(fixture.project))).toEqual([
+      expect.objectContaining({ id: "pdf-extension", enabled: true, extensionPath: MIRROR_ENTRY }),
+    ]);
 
     const updated = (await backend.handle("setExtensionEnabled" as never, [
       "pdf-extension",

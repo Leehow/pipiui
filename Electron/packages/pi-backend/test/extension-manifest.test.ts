@@ -50,6 +50,65 @@ describe("agent.extension / agent.skills compatibility", () => {
   });
 });
 
+describe("extension dependencies", () => {
+  it("parses required, optional, and conflicting extension ids", () => {
+    const result = validateExtensionManifest(manifest(undefined, {
+      dependencies: {
+        required: [{ id: "agent-orchestration", version: "^1.0.0" }],
+        optional: [{ id: "web-access-extension", version: "^0.1.0" }],
+        conflicts: ["legacy-coding-tools"],
+      },
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.dependencies).toEqual({
+      required: [{ id: "agent-orchestration", version: "^1.0.0" }],
+      optional: [{ id: "web-access-extension", version: "^0.1.0" }],
+      conflicts: ["legacy-coding-tools"],
+    });
+  });
+});
+
+describe("extension category metadata", () => {
+  it("preserves a supported category for the Extensions catalog", () => {
+    const result = validateExtensionManifest(manifest(undefined, { category: "coding" }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.category).toBe("coding");
+  });
+
+  it("rejects an unknown category instead of silently misclassifying a package", () => {
+    expect(errorsOf(manifest(undefined, { category: "mystery" }))).toMatch(/category is unsupported/);
+  });
+});
+
+describe("Workbench contributions", () => {
+  it("parses primary, center, and auxiliary view containers without executing app code", () => {
+    const result = validateExtensionManifest(manifest(undefined, {
+      app: {
+        ui: {
+          viewContainers: [
+            { id: "coding.sessions", location: "primarySidebar", title: "项目与会话", order: 10 },
+            { id: "coding.subagents", location: "auxiliarySidebar", title: "Subagents" },
+          ],
+          views: [
+            { id: "coding.sessions.tree", container: "coding.sessions", entry: "app/dist/sessions.js", activation: "visible" },
+          ],
+        },
+      },
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.ui?.viewContainers).toEqual([
+      { id: "coding.sessions", location: "primarySidebar", title: "项目与会话", order: 10 },
+      { id: "coding.subagents", location: "auxiliarySidebar", title: "Subagents" },
+    ]);
+    expect(result.manifest.ui?.views).toEqual([
+      { id: "coding.sessions.tree", container: "coding.sessions", entry: "app/dist/sessions.js", activation: "visible" },
+    ]);
+  });
+});
+
 describe("agent.agents / agent.agentPatches", () => {
   it("parses legal contributions and keeps relative paths", () => {
     const result = validateExtensionManifest(

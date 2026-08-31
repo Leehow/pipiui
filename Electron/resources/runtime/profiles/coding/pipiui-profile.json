@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "coding",
+  "name": "Coding 优化版",
+  "description": "在基础版上启用完整 Coding 工作流、工具面板与相关扩展。",
+  "extensions": {
+    "required": [
+      { "id": "coding-orchestration", "version": "^1.0.0" },
+      { "id": "coding-method", "version": "^1.0.0" },
+      { "id": "coding-runtime", "version": "^1.0.0" },
+      { "id": "coding-workbench", "version": "^1.0.0" }
+    ],
+    "recommended": [
+      { "id": "agent-orchestration", "version": "^1.0.0" },
+      { "id": "code-retrieval", "version": "^1.0.0" },
+      { "id": "document-workbench", "version": "^1.0.0" },
+      { "id": "external-coding-sessions", "version": "^1.0.0" },
+      { "id": "goal-extension", "version": "^1.0.0" },
+      { "id": "git-capability", "version": "^1.0.0" },
+      { "id": "plan-extension", "version": "^1.0.0" },
+      { "id": "skill-loader-extension", "version": "^1.0.0" },
+      { "id": "terminal-extension", "version": "^1.0.0" },
+      { "id": "web-access-extension", "version": "^0.1.0" },
+      { "id": "webview-browser-extension", "version": "^0.1.0" }
+    ]
+  },
+  "layout": {
+    "primarySidebar": "coding.sessions",
+    "center": "pipi.conversation",
+    "auxiliarySidebar": "coding.subagents",
+    "activity": [
+      "coding.sessions",
+      "coding.search",
+      "shared.documents"
+    ]
+  }
+}

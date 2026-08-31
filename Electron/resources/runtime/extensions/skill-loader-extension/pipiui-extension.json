@@ -1,0 +1,9 @@
+{
+  "id": "skill-loader-extension",
+  "name": "PipiUI Skill Loader",
+  "version": "1.0.0",
+  "category": "foundation",
+  "description": "On-demand skill_search and skill_load for Profile-selected skill roots.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

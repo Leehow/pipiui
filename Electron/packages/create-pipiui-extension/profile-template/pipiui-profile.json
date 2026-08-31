@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "__ID__",
+  "name": "__NAME__",
+  "description": "Product Profile for __NAME__",
+  "extensions": {
+    "required": [],
+    "recommended": []
+  },
+  "layout": {
+    "center": "pipi.conversation",
+    "activity": []
+  }
+}

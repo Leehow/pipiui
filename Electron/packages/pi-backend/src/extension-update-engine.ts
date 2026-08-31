@@ -6,7 +6,9 @@ import {
   mkdir,
   mkdtemp,
   open,
+  cp,
   readdir,
+  realpath,
   readFile,
   rename,
   rm,
@@ -15,7 +17,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { Readable } from "node:stream";
 import {
   EXTENSION_HOST_API_VERSION,
@@ -744,11 +746,16 @@ export type ExtensionSlotPointer = {
 
 export type ExtensionInstallReceipt = ExtensionSlotPointer & {
   extensionId: string;
-  source: ExtensionUpdateComponentSource;
-  channel: "stable";
-  signature: "ed25519";
+  source: ExtensionUpdateComponentSource | { type: "localProductPack"; packId: string };
+  channel: "stable" | "local";
+  signature: "ed25519" | "local";
   hostApi: string;
   installedAt: string;
+};
+
+export type ExtensionSlotSnapshot = {
+  active?: ExtensionSlotPointer;
+  previous?: ExtensionSlotPointer;
 };
 
 function assertExtensionId(id: string): string {
@@ -817,6 +824,33 @@ export async function readExtensionSlot(storeRoot: string, extensionId: string, 
   } catch {
     return undefined;
   }
+}
+
+/** Capture both mutable slot pointers so a higher-level Product Pack transaction can restore them exactly. */
+export async function readExtensionSlotSnapshot(storeRoot: string, extensionId: string): Promise<ExtensionSlotSnapshot> {
+  const [active, previous] = await Promise.all([
+    readExtensionSlot(storeRoot, extensionId, "active"),
+    readExtensionSlot(storeRoot, extensionId, "previous"),
+  ]);
+  return {
+    ...(active ? { active } : {}),
+    ...(previous ? { previous } : {}),
+  };
+}
+
+/** Restore a previously captured active/previous pair. Receipts and immutable objects intentionally remain durable. */
+export async function restoreExtensionSlotSnapshot(
+  storeRoot: string,
+  extensionId: string,
+  snapshot: ExtensionSlotSnapshot,
+): Promise<void> {
+  const root = slotsDir(storeRoot, extensionId);
+  const active = join(root, ACTIVE_SLOT_FILENAME);
+  const previous = join(root, PREVIOUS_SLOT_FILENAME);
+  if (snapshot.previous) await writeJsonAtomic(previous, snapshot.previous);
+  else await rm(previous, { force: true });
+  if (snapshot.active) await writeJsonAtomic(active, snapshot.active);
+  else await rm(active, { force: true });
 }
 
 export async function readExtensionReceipt(storeRoot: string, extensionId: string, contentHash: string): Promise<ExtensionInstallReceipt | undefined> {
@@ -1281,6 +1315,183 @@ export async function applyExtensionUpdate(request: ExtensionUpdateRequest, opti
       };
     } finally {
       await rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+    }
+  });
+}
+
+export type LocalExtensionPackageInstallRequest = {
+  /** Extension identity declared by the enclosing Product Pack. */
+  extensionId: string;
+  /** Absolute directory containing `pipiui-extension.json`; never an archive or symlink. */
+  sourceDirectory: string;
+  /** Semantic Product Pack identity recorded in the local receipt. */
+  packId: string;
+};
+
+export type LocalExtensionPackageInstallResult = ExtensionUpdateResult & {
+  bytes: number;
+};
+
+/**
+ * Hash a package tree after it has entered our staging directory. The digest is
+ * over type, normalized relative path, byte length, and bytes, so two identical
+ * directories share one immutable object regardless of their original location.
+ * Symlinks and non-regular filesystem nodes are rejected before promotion.
+ */
+async function hashRegularPackageTree(root: string): Promise<{ contentHash: string; bytes: number }> {
+  const digest = createHash("sha256");
+  let bytes = 0;
+  const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const path = join(directory, entry.name);
+      const rel = relativeDirectory ? `${relativeDirectory}/${entry.name}` : entry.name;
+      const info = await lstat(path);
+      if (info.isSymbolicLink()) {
+        throw new ExtensionUpdateError("invalid_input", `local extension package contains a symlink: ${rel}`);
+      }
+      if (info.isDirectory()) {
+        digest.update(`d\0${rel}\0`);
+        await walk(path, rel);
+        continue;
+      }
+      if (!info.isFile()) {
+        throw new ExtensionUpdateError("invalid_input", `local extension package contains a non-regular entry: ${rel}`);
+      }
+      const file = await readFile(path);
+      bytes += file.byteLength;
+      digest.update(`f\0${rel}\0${file.byteLength}\0`);
+      digest.update(file);
+    }
+  };
+  const rootInfo = await lstat(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw new ExtensionUpdateError("invalid_input", "local extension package must be a real directory");
+  }
+  digest.update("pipiui-local-extension-package-v1\0");
+  await walk(root, "");
+  return { contentHash: digest.digest("hex"), bytes };
+}
+
+/**
+ * Install an explicitly user-selected local package into the same
+ * content-addressed store used by official updates. Local packages are clearly
+ * receipted as local and may not carry native resources; signed, arch-specific
+ * artifacts remain the official update-engine path.
+ */
+export async function installLocalExtensionPackage(
+  request: LocalExtensionPackageInstallRequest,
+  options: Pick<ExtensionUpdateEngineOptions, "storeRoot" | "now" | "lockTimeoutMs" | "heartbeatMs" | "initGraceMs" | "pidAlive" | "pid" | "token">,
+): Promise<LocalExtensionPackageInstallResult> {
+  const extensionId = assertExtensionId(request.extensionId);
+  const packId = assertExtensionId(request.packId);
+  if (!isAbsolute(request.sourceDirectory)) {
+    throw new ExtensionUpdateError("invalid_input", "local extension package sourceDirectory must be absolute");
+  }
+  const storeRoot = options.storeRoot;
+  if (typeof storeRoot !== "string" || !isAbsolute(storeRoot)) {
+    throw new ExtensionUpdateError("invalid_input", "extension update storeRoot must be an explicit absolute path");
+  }
+  let sourceRoot: string;
+  try {
+    const sourceInfo = await lstat(request.sourceDirectory);
+    if (!sourceInfo.isDirectory() || sourceInfo.isSymbolicLink()) {
+      throw new ExtensionUpdateError("invalid_input", "local extension package must be a real directory");
+    }
+    sourceRoot = await realpath(request.sourceDirectory);
+  } catch (error) {
+    if (error instanceof ExtensionUpdateError) throw error;
+    throw new ExtensionUpdateError("invalid_input", `local extension package is unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  return withUpdateLock(lockDirFor(storeRoot, extensionId), options, async () => {
+    await mkdir(tmpRoot(storeRoot), { recursive: true });
+    const staging = await mkdtemp(join(tmpRoot(storeRoot), `local-${extensionId}-`));
+    try {
+      const stagedPackage = join(staging, "package");
+      await cp(sourceRoot, stagedPackage, { recursive: true, dereference: false, force: false, errorOnExist: true });
+      const { contentHash, bytes } = await hashRegularPackageTree(stagedPackage);
+      const manifestPath = join(stagedPackage, EXTENSION_MANIFEST_FILENAME);
+      let manifestText: string;
+      try {
+        manifestText = await readFile(manifestPath, "utf8");
+      } catch (error) {
+        throw new ExtensionUpdateError("manifest_invalid", `local extension package manifest is unreadable: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const parsed = parseExtensionManifestJson(manifestText);
+      if (!parsed.ok) {
+        throw new ExtensionUpdateError("manifest_invalid", `local extension package manifest is invalid: ${parsed.errors.join("; ")}`);
+      }
+      if (parsed.manifest.id !== extensionId) {
+        throw new ExtensionUpdateError("id_mismatch", `local extension package id '${parsed.manifest.id}' does not match Product Pack entry '${extensionId}'`);
+      }
+      if (!parsed.manifest.hostApi) {
+        throw new ExtensionUpdateError("host_api_incompatible", `local extension ${extensionId} declares no hostApi range`);
+      }
+      if (!satisfiesExtensionHostApiRange(parsed.manifest.hostApi, EXTENSION_HOST_API_VERSION)) {
+        throw new ExtensionUpdateError(
+          "host_api_incompatible",
+          `local extension ${extensionId} ${parsed.manifest.version} requires hostApi ${parsed.manifest.hostApi}, host is ${EXTENSION_HOST_API_VERSION}`,
+        );
+      }
+      if (parsed.manifest.nativeResources?.length) {
+        throw new ExtensionUpdateError("arch_mismatch", "local Product Pack extensions with nativeResources must use the signed official artifact path");
+      }
+
+      const objectDir = objectDirFor(storeRoot, contentHash);
+      if (!(await exists(join(objectDir, MANIFEST_COPY_FILENAME)))) {
+        const promote = join(staging, "promote", contentHash);
+        await mkdir(dirname(promote), { recursive: true });
+        await rename(stagedPackage, promote);
+        await mkdir(objectsRoot(storeRoot), { recursive: true });
+        try {
+          await rename(promote, objectDir);
+        } catch (error) {
+          if (!(await exists(join(objectDir, MANIFEST_COPY_FILENAME)))) throw error;
+        }
+      }
+
+      const now = options.now ?? Date.now;
+      const receiptPath = receiptPathFor(storeRoot, extensionId, contentHash);
+      if (!(await readExtensionReceipt(storeRoot, extensionId, contentHash))) {
+        await writeJsonAtomic(receiptPath, {
+          extensionId,
+          version: parsed.manifest.version,
+          contentHash,
+          sha256: contentHash,
+          bytes,
+          source: { type: "localProductPack", packId },
+          channel: "local",
+          signature: "local",
+          hostApi: parsed.manifest.hostApi,
+          installedAt: new Date(now()).toISOString(),
+          updatedAt: new Date(now()).toISOString(),
+        } satisfies ExtensionInstallReceipt);
+      }
+
+      const oldActive = await readExtensionSlot(storeRoot, extensionId, "active");
+      const pointer: ExtensionSlotPointer = {
+        contentHash,
+        version: parsed.manifest.version,
+        sha256: contentHash,
+        bytes,
+        updatedAt: new Date(now()).toISOString(),
+      };
+      if (oldActive) await writeJsonAtomic(join(slotsDir(storeRoot, extensionId), PREVIOUS_SLOT_FILENAME), oldActive);
+      await writeJsonAtomic(join(slotsDir(storeRoot, extensionId), ACTIVE_SLOT_FILENAME), pointer);
+
+      return {
+        extensionId,
+        version: parsed.manifest.version,
+        contentHash,
+        objectDir,
+        receiptPath,
+        bytes,
+        ...(oldActive ? { previousContentHash: oldActive.contentHash } : {}),
+      };
+    } finally {
       await rm(staging, { recursive: true, force: true }).catch(() => undefined);
     }
   });

@@ -1,0 +1,9 @@
+{
+  "id": "coding-method",
+  "name": "PipiUI Coding Method",
+  "version": "1.0.0",
+  "category": "coding",
+  "description": "The current PipiUI philosophy layers for Coding work.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

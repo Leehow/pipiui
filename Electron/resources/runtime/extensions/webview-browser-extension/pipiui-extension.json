@@ -2,6 +2,7 @@
   "id": "webview-browser-extension",
   "name": "PipiUI WebView Browser",
   "version": "0.1.0",
+  "category": "automation",
   "description": "Managed browser sessions: browser_search / browser_fetch plus the full browser automation tool. WebContentsView, partition, session, and the DOM bridge stay in the Electron host.",
   "capabilities": [],
   "agent": {

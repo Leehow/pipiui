@@ -1,0 +1,9 @@
+{
+  "id": "plan-extension",
+  "name": "PipiUI Plan",
+  "version": "1.0.0",
+  "category": "workflow",
+  "description": "Conversation-scoped plan tools and Workbench projection.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" }
+}

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "base",
+  "name": "基础版",
+  "description": "通用工作区、会话、模型与扩展管理；可用技能创建自己的产品扩展。",
+  "extensions": {
+    "required": [
+      { "id": "skill-loader-extension", "version": "^1.0.0" }
+    ],
+    "recommended": []
+  },
+  "layout": {
+    "primarySidebar": "pipi.sessions",
+    "center": "pipi.conversation",
+    "activity": ["pipi.sessions"]
+  }
+}

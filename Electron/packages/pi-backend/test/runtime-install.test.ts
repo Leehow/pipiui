@@ -70,6 +70,27 @@ describe("treeSignature", () => {
 });
 
 describe("installRuntimeTree", () => {
+  it("honors an empty runtime bundle manifest without demanding omitted optional packages", async () => {
+    const root = await temp();
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      for (const name of ["pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"]) {
+        await mkdir(join(source, name), { recursive: true });
+      }
+      await writeFile(join(source, "pipiui-runtime-manifest.json"), JSON.stringify({
+        schemaVersion: 1,
+        bundledExtensions: [],
+        includeAnydoc: false,
+      }));
+
+      const report = installRuntimeTree({ sourceRoot: source }, destination);
+      expect(report.failures).toEqual([]);
+      expect(existsSync(join(destination, "extensions", "office-extension"))).toBe(false);
+      expect(existsSync(join(destination, "anydoc"))).toBe(false);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
   it("installs the whole shipped tree the way resolveSpawnPaths expects to find it", async () => {
     const root = await temp();
     try {
@@ -82,7 +103,14 @@ describe("installRuntimeTree", () => {
       expect(entries).toContain("pi-philosophy");
       expect(entries).toContain("extensions");
       expect(entries).toContain("built-in-skills");
+      expect(entries).toContain("profiles");
       expect(entries).toContain("anydoc");
+      const profileIds = await readdir(join(root, "profiles"));
+      expect(profileIds).toEqual(expect.arrayContaining(["coding", "base"]));
+      for (const id of ["coding", "base"]) {
+        const profile = JSON.parse(await readFile(join(root, "profiles", id, "pipiui-profile.json"), "utf8"));
+        expect(profile).toMatchObject({ schemaVersion: 1, id });
+      }
       // The pdf parser ships as a bundled manifest extension with its owned vendored deps.
       expect(await readdir(join(root, "extensions", "pdf-extension"))).toEqual(expect.arrayContaining(["agent", "pipiui-extension.json", "vendor"]));
       expect(existsSync(join(root, "extensions", "pdf-extension", "vendor", "pdf-inspector", "node_modules", "@firecrawl"))).toBe(true);

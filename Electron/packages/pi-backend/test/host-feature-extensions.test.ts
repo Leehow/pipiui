@@ -48,6 +48,9 @@ describe("host-feature builtin extensions", () => {
     const project = join(root, "project");
     await mkdir(agent, { recursive: true });
     await mkdir(project, { recursive: true });
+    const projectAgent = projectPiAgentDir(project);
+    await mkdir(projectAgent, { recursive: true });
+    await writeFile(join(projectAgent, "ext-enabled.json"), `${JSON.stringify(Object.fromEntries(ids.map(id => [id, true])))}\n`);
     for (const id of ids) {
       const dest = join(runtime, "extensions", id);
       await mkdir(dest, { recursive: true });
@@ -80,7 +83,7 @@ describe("host-feature builtin extensions", () => {
     }
   });
 
-  it("lists all three as enabled builtins by default", async () => {
+  it("lists all three as enabled builtins when the fixture explicitly opts in", async () => {
     const { backend, projectId } = await isolatedBackend([VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID, EXTERNAL_SESSION_SCAN_EXTENSION_ID]);
     const listed = await backend.handle("listExtensions", [projectId]) as Array<{ id: string; state: string; source: string }>;
     for (const id of [VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID, EXTERNAL_SESSION_SCAN_EXTENSION_ID]) {

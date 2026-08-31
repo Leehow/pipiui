@@ -37,6 +37,8 @@ describe("secret vault host/spawn contract", () => {
       mkdir(project, { recursive: true }),
       mkdir(sessions, { recursive: true }),
     ]);
+    await mkdir(projectPiAgentDir(project), { recursive: true });
+    await writeFile(join(projectPiAgentDir(project), "ext-enabled.json"), "{}\n");
     await writeFile(
       join(sessions, "session.jsonl"),
       `${JSON.stringify({

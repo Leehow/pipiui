@@ -72,6 +72,7 @@ describe("extension lifecycle state machine", () => {
       expect(item.origin).toBe("builtin");
       expect(item.state).toBe("enabled");
       expect(item.uninstallable).toBe(false);
+      expect(item.category).toBeDefined();
     }
     expect(() => registry.unload("pi-ext")).toThrow(/illegal extension transition: enabled → unloaded/);
     expect(registry.get("pi-ext")?.state).toBe("enabled");

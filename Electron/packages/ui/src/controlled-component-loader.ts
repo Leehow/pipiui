@@ -3,6 +3,7 @@ import { createExtensionHostAPI, type ExtensionHostAPI } from '@pipiui/extension
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { Disposer } from './contribution-registry'
 import { registerDocumentRenderer, registerPanel, registerSettingsSection, registerToolRenderer } from './ui-registries'
+import { registerWorkbenchContainer, registerWorkbenchView } from './workbench/workbench-contributions'
 
 const EXTENSION_PANEL_ICON = {
   src: `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="#000" stroke-width="1.6"/></svg>')}`,
@@ -20,6 +21,14 @@ export type ControlledUiDocumentRenderer = {
   priority?: number
 }
 export type ControlledUiSettingsSection = { id: string; title?: string; description?: string; entry?: string }
+export type ControlledUiViewContainer = {
+  id: string
+  location: 'primarySidebar' | 'center' | 'auxiliarySidebar' | 'statusBar' | 'overlay'
+  title: string
+  icon?: string
+  order?: number
+}
+export type ControlledUiView = { id: string; container: string; entry?: string; activation?: 'visible' }
 
 export type LoadableExtensionDescriptor = {
   id: string
@@ -35,11 +44,15 @@ export type LoadableExtensionDescriptor = {
     settingsSections?: readonly ControlledUiSettingsSection[]
     slashCommands?: readonly { name: string; description?: string }[]
     statusBar?: readonly { id: string; text?: string; tooltip?: string; alignment?: 'left' | 'right' }[]
+    viewContainers?: readonly ControlledUiViewContainer[]
+    views?: readonly ControlledUiView[]
   }
   contributions?: {
     panels?: readonly ControlledUiPanel[]
     toolRenderers?: readonly ControlledUiToolRenderer[]
     settingsSections?: readonly ControlledUiSettingsSection[]
+    viewContainers?: readonly ControlledUiViewContainer[]
+    views?: readonly ControlledUiView[]
   }
 }
 
@@ -147,12 +160,43 @@ export async function loadControlledContributions(
   const panels = [...(ui?.panels ?? []), ...(contrib?.panels ?? [])]
   const renderers = [...(ui?.toolRenderers ?? []), ...(contrib?.toolRenderers ?? [])]
   const sections = [...(ui?.settingsSections ?? []), ...(contrib?.settingsSections ?? [])]
+  const containers = [...(ui?.viewContainers ?? []), ...(contrib?.viewContainers ?? [])]
+  const views = [...(ui?.views ?? []), ...(contrib?.views ?? [])]
   const disposers: Disposer[] = []
   const seenPanel = new Set<string>()
   const seenTool = new Set<string>()
   const seenSection = new Set<string>()
   const seenDocumentRenderer = new Set<string>()
   const api = createApi(descriptor, host)
+
+  for (const container of containers) {
+    disposers.push(registerWorkbenchContainer(descriptor.id, {
+      id: container.id,
+      location: container.location,
+      title: container.title,
+      ...(container.icon ? { icon: container.icon } : {}),
+      ...(container.order !== undefined ? { order: container.order } : {}),
+    }))
+  }
+
+  for (const view of views) {
+    const entry = view.entry?.trim()
+    if (!entry) continue
+    try {
+      const Component = await loadComponent(directory, entry, importModule)
+      disposers.push(registerWorkbenchView(descriptor.id, {
+        id: view.id,
+        container: view.container,
+        render: context => createElement(Component, { api, id: view.id, active: context.active }),
+      }))
+    } catch (error) {
+      disposers.push(registerWorkbenchView(descriptor.id, {
+        id: view.id,
+        container: view.container,
+        render: () => errorPlaceholder(`扩展视图「${view.id}」加载失败：${errorMessage(error)}`),
+      }))
+    }
+  }
 
   for (const panel of panels) {
     const entry = panel.entry?.trim()
@@ -237,8 +281,8 @@ export function hasControlledEntry(descriptor: LoadableExtensionDescriptor): boo
   const contrib = descriptor.contributions
   const has = (items: ReadonlyArray<{ entry?: string }> | undefined) =>
     (items ?? []).some(item => Boolean(item.entry?.trim()))
-  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections)
-    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections)
+  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections) || has(ui?.views)
+    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections) || has(contrib?.views)
 }
 
 export function settingsSectionHasEntry(section: unknown): boolean {

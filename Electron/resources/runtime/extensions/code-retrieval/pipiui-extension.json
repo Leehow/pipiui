@@ -2,6 +2,7 @@
   "id": "code-retrieval",
   "name": "Code Retrieval",
   "version": "1.0.0",
+  "category": "knowledge",
   "agent": {
     "extension": "agent/dist/index.js"
   },

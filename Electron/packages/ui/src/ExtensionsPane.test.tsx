@@ -2,7 +2,7 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
-import type { ExtensionDescriptor, PipiHostAPI, UserMcpServer } from '@pipi/host-api'
+import type { ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, UserMcpServer } from '@pipi/host-api'
 import { ExtensionsPane } from './ExtensionsPane'
 import { CAPABILITY_LABELS } from './extension-capabilities'
 
@@ -150,7 +150,127 @@ function managementHost(initial: ExtensionDescriptor[]) {
   return host as unknown as PipiHostAPI & typeof host
 }
 
+function extensionPackHost() {
+  const host = managementHost([
+    pkg({ id: 'skill-loader-extension', name: 'Skill Loader', category: 'foundation', state: 'enabled', source: 'builtin' }),
+    pkg({ id: 'coding-runtime', name: 'Coding Runtime', category: 'coding', state: 'enabled', source: 'builtin' }),
+    pkg({ id: 'document-workbench', name: 'Documents', category: 'knowledge', state: 'enabled', source: 'builtin' }),
+  ])
+  let activation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
+  let profiles: ProductProfileDescriptor[] = [
+    { id: 'base', name: '基础版', state: 'available', source: 'builtin', requiredExtensionIds: ['skill-loader-extension'], recommendedExtensionIds: [] },
+    {
+      id: 'coding',
+      name: 'Coding 优化版',
+      description: '完整 Coding 工作流',
+      state: 'available',
+      source: 'builtin',
+      requiredExtensionIds: ['coding-runtime'],
+      recommendedExtensionIds: ['document-workbench', 'skill-loader-extension'],
+    },
+  ]
+  const methods = {
+    listProductProfiles: vi.fn(async () => profiles.map(profile => ({ ...profile }))),
+    getProductProfile: vi.fn(async () => ({ ...activation, overrides: { ...activation.overrides } })),
+    setProductProfile: vi.fn(async (_projectId: string, profileId: string) => {
+      activation = { schemaVersion: 2, profile: profileId, overrides: {} }
+      return activation
+    }),
+    createProductProfile: vi.fn(async (_projectId: string, name: string) => {
+      const created: ProductProfileDescriptor = {
+        id: 'lab-tools',
+        name,
+        description: '项目自定义扩展包',
+        state: 'available',
+        source: 'project',
+        customizable: true,
+        requiredExtensionIds: ['skill-loader-extension'],
+        recommendedExtensionIds: [],
+      }
+      profiles = [...profiles, created]
+      return created
+    }),
+    updateProductProfileExtensions: vi.fn(async (_projectId: string, profileId: string, extensionIds: string[]) => {
+      profiles = profiles.map(profile => profile.id === profileId ? { ...profile, recommendedExtensionIds: [...extensionIds] } : profile)
+      return profiles.find(profile => profile.id === profileId)!
+    }),
+  }
+  Object.assign(host, methods)
+  return host as typeof host & typeof methods
+}
+
 describe('ExtensionsPane package management', () => {
+  it('shows Product Profiles as extension packs, supports whole-pack switching, custom membership, and a dedicated Skills view', async () => {
+    const host = extensionPackHost()
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+
+    expect(await screen.findByTestId('extensions-pack-coding')).toBeTruthy()
+    expect(screen.getByTestId('extensions-pack-toggle-coding').getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByTestId('extensions-pkg-toggle-coding-runtime')).toHaveProperty('disabled', true)
+    expect(screen.getByTestId('extensions-pkg-toggle-document-workbench')).toHaveProperty('disabled', false)
+
+    fireEvent.click(screen.getByTestId('extensions-pack-master-toggle'))
+    await waitFor(() => expect(host.setProductProfile).toHaveBeenCalledWith('demo', 'base'))
+
+    fireEvent.click(screen.getByTestId('extensions-nav-skills'))
+    expect(await screen.findByTestId('extensions-skills-hub')).toBeTruthy()
+    expect(screen.getByTestId('extensions-skill-create').textContent).toContain('create-pipiui-extension')
+
+    fireEvent.click(screen.getByTestId('extensions-pack-create'))
+    fireEvent.change(screen.getByTestId('extensions-pack-name'), { target: { value: 'Lab Tools' } })
+    fireEvent.click(screen.getByTestId('extensions-pack-create-confirm'))
+    await waitFor(() => expect(host.createProductProfile).toHaveBeenCalledWith('demo', 'Lab Tools'))
+    const memberList = await screen.findByTestId('extensions-pack-member-list')
+    fireEvent.click(within(memberList).getByText('Documents'))
+    fireEvent.click(screen.getByTestId('extensions-pack-members-confirm'))
+    await waitFor(() => expect(host.updateProductProfileExtensions).toHaveBeenCalledWith('demo', 'lab-tools', ['document-workbench']))
+  })
+
+  it('groups packages into readable categories while keeping uncategorized packages visible', async () => {
+    const host = managementHost([
+      pkg({ id: 'skill-loader', name: 'Skill Loader', category: 'foundation' }),
+      pkg({ id: 'code-nav', name: 'Code Navigation', category: 'coding' }),
+      pkg({ id: 'custom', name: 'Custom Extension' }),
+    ])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+    const foundation = await screen.findByTestId('extensions-category-foundation')
+    const coding = screen.getByTestId('extensions-category-coding')
+    const other = screen.getByTestId('extensions-category-other')
+    expect(foundation.textContent).toContain('基础能力')
+    expect(coding.textContent).toContain('Coding')
+    expect(other.textContent).toContain('其它扩展')
+    expect(within(foundation).getByTestId('extensions-pkg-skill-loader')).toBeTruthy()
+    expect(within(coding).getByTestId('extensions-pkg-code-nav')).toBeTruthy()
+    expect(within(other).getByTestId('extensions-pkg-custom')).toBeTruthy()
+  })
+
+  it('summarizes the current project and filters packages by category, status, and search', async () => {
+    const host = managementHost([
+      pkg({ id: 'skill-loader', name: 'Skill Loader', category: 'foundation', state: 'enabled' }),
+      pkg({ id: 'code-nav', name: 'Code Navigation', category: 'coding', state: 'disabled' }),
+      pkg({ id: 'docs', name: 'Document Tools', category: 'knowledge', state: 'enabled' }),
+    ])
+    render(<ExtensionsPane host={host} addOpen={false} onCloseAdd={() => undefined} />)
+
+    expect((await screen.findByTestId('extensions-stat-total')).textContent).toContain('3')
+    expect(screen.getByTestId('extensions-stat-enabled').textContent).toContain('2')
+    expect(screen.getByTestId('extensions-stat-categories').textContent).toContain('3')
+
+    fireEvent.click(screen.getByTestId('extensions-category-filter-coding'))
+    expect(await screen.findByTestId('extensions-pkg-code-nav')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-skill-loader')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('extensions-category-filter-all'))
+    fireEvent.click(screen.getByTestId('extensions-status-filter-enabled'))
+    expect(screen.getByTestId('extensions-pkg-skill-loader')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-code-nav')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('extensions-status-filter-all'))
+    fireEvent.change(screen.getByTestId('extensions-search'), { target: { value: 'document' } })
+    expect(screen.getByTestId('extensions-pkg-docs')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-pkg-skill-loader')).toBeNull()
+  })
+
   it('renders name, version, source, state, and capability badges', async () => {
     const host = managementHost([
       pkg({ id: 'quota', name: 'Quota Monitor', version: '1.2.0', source: 'builtin', state: 'enabled', capabilities: ['bridge.emit', 'settings.read'] }),
@@ -565,7 +685,7 @@ describe('ExtensionsPane agent contributions', () => {
     expect(banner.textContent).toContain('agent-catalog-load-failed')
     expect(banner.textContent).not.toContain('/tmp/secret-ext')
     expect(banner.textContent).not.toContain('/Users/haoli/hidden')
-    expect(screen.getByTestId('extensions-packages-empty')).toBeTruthy()
+    expect(screen.getByTestId('extensions-packs-empty')).toBeTruthy()
     fireEvent.click(within(banner).getAllByRole('button', { name: '关闭错误提示' })[0]!)
     expect(screen.queryByText(/extensions-load-failed/)).toBeNull()
   })

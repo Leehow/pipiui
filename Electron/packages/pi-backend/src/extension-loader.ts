@@ -2,6 +2,7 @@ import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   EXTENSION_L2_CAPABILITIES,
+  EXTENSION_ID_RE,
   EXTENSION_MANIFEST_FILENAME,
   originPrecedence,
   parseExtensionManifestJson,
@@ -36,6 +37,7 @@ import type {
   SpawnContributionDiagnostic,
   SpawnRegisteredExtension,
 } from "./spawn-assembly.js";
+import type { InstalledProfileExtension } from "./profile-resolver.js";
 
 export const EXTENSIONS_DIRNAME = "extensions";
 
@@ -325,6 +327,62 @@ export function scanExtensionDirectory(root: string, origin: ExtensionOrigin, ja
   return out.sort((a, b) => a.directoryName.localeCompare(b.directoryName));
 }
 
+/**
+ * Discover App-profile content-addressed packages selected by their active
+ * slot. The store is trusted only as far as a pointer resolves to a regular
+ * package tree inside its own objects root; malformed pointers and escaped
+ * paths are ignored fail-closed.
+ *
+ * This is intentionally a discovery adapter, not a second extension format:
+ * after resolving the object directory, the normal manifest parser and
+ * registry own every subsequent validation and lifecycle decision.
+ */
+export function scanActiveSharedExtensionStore(storeRoot: string): DiscoveredExtensionPackage[] {
+  if (!storeRoot || !existsSync(storeRoot)) return [];
+  const objectsRoot = join(storeRoot, "objects");
+  const slotsRoot = join(storeRoot, "extensions");
+  const objectsJail = confinedRealpath(objectsRoot, storeRoot);
+  const slotsJail = confinedRealpath(slotsRoot, storeRoot);
+  if (!objectsJail || !slotsJail) return [];
+  const out: DiscoveredExtensionPackage[] = [];
+
+  for (const extensionId of readDirSafe(slotsJail)) {
+    if (!EXTENSION_ID_RE.test(extensionId)) continue;
+    const slotDir = confinedRealpath(join(slotsJail, extensionId), slotsJail);
+    if (!slotDir) continue;
+    for (const slot of ["active.json", "previous.json"]) {
+      let contentHash: string | undefined;
+      try {
+        const pointer = JSON.parse(readFileSync(join(slotDir, slot), "utf8")) as { contentHash?: unknown };
+        if (typeof pointer.contentHash === "string" && /^[0-9a-f]{64}$/.test(pointer.contentHash)) {
+          contentHash = pointer.contentHash;
+        }
+      } catch {
+        /* missing/corrupt slot falls through to the previous recovery slot */
+      }
+      if (!contentHash) continue;
+      const directory = confinedRealpath(join(objectsJail, contentHash), objectsJail);
+      if (!directory) continue;
+      try {
+        if (!lstatSync(directory).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      const manifestPath = confinedRealpath(join(directory, EXTENSION_MANIFEST_FILENAME), directory);
+      if (!manifestPath) continue;
+      try {
+        const parsed = parseExtensionManifestJson(readFileSync(manifestPath, "utf8"));
+        if (!parsed.ok || parsed.manifest.id !== extensionId) continue;
+      } catch {
+        continue;
+      }
+      out.push({ origin: "app", directory, manifestPath, directoryName: extensionId });
+      break;
+    }
+  }
+  return out.sort((a, b) => a.directoryName.localeCompare(b.directoryName));
+}
+
 export function builtinExtensionsRoot(runtimeRoot: string): string {
   return join(runtimeRoot, EXTENSIONS_DIRNAME);
 }
@@ -344,11 +402,14 @@ export function projectExtensionsRoot(projectRoot: string): string {
 export function scanExtensionLocations(input: {
   builtinRoot?: string;
   appRoot?: string;
+  /** App-profile content-addressed objects addressed by active/previous slots. */
+  sharedStoreRoot?: string;
   projectRoot?: string;
 }): DiscoveredExtensionPackage[] {
   const found: DiscoveredExtensionPackage[] = [];
   if (input.builtinRoot) found.push(...scanExtensionDirectory(input.builtinRoot, "builtin"));
   if (input.appRoot) found.push(...scanExtensionDirectory(input.appRoot, "app"));
+  if (input.sharedStoreRoot) found.push(...scanActiveSharedExtensionStore(input.sharedStoreRoot));
   if (input.projectRoot) {
     const jail = projectPiAgentDir(input.projectRoot);
     found.push(...scanExtensionDirectory(projectExtensionsRoot(input.projectRoot), "project", jail));
@@ -409,11 +470,13 @@ function descriptorFrom(
     name: manifest?.name ?? pkg.directoryName,
     version: manifest?.version ?? "0.0.0",
     description: manifest?.description,
+    category: manifest?.category,
     origin: pkg.origin,
     uninstallable: pkg.origin !== "builtin",
     defaultEnabled: pkg.origin === "builtin",
     capabilities: manifest?.capabilities ?? [],
     settings: manifest?.settings,
+    dependencies: manifest?.dependencies,
   };
 }
 
@@ -472,12 +535,15 @@ export type ExtensionLoaderOptions = {
   registry: ExtensionRegistry;
   builtinRoot: string;
   appRoot: string;
+  /** App-profile content-addressed store; active slots overlay the app extension root. */
+  sharedStoreRoot?: string;
 };
 
 export class ExtensionLoader {
   private readonly registry: ExtensionRegistry;
   private readonly builtinRoot: string;
   private readonly appRoot: string;
+  private readonly sharedStoreRoot?: string;
   private readonly ui = new Map<string, ExtensionUiSummary>();
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly auth = new Map<string, ExtensionAuthContribution>();
@@ -492,6 +558,7 @@ export class ExtensionLoader {
     this.registry = options.registry;
     this.builtinRoot = options.builtinRoot;
     this.appRoot = options.appRoot;
+    this.sharedStoreRoot = options.sharedStoreRoot;
     this.reservedBuiltinIds = new Set(
       options.registry.list().filter((item) => item.origin === "builtin").map((item) => item.id),
     );
@@ -505,14 +572,23 @@ export class ExtensionLoader {
     const discovered = scanExtensionLocations({
       builtinRoot: this.builtinRoot,
       appRoot: this.appRoot,
+      sharedStoreRoot: this.sharedStoreRoot,
       projectRoot,
     });
     const resolved = resolveExtensionInstances(discovered, this.reservedBuiltinIds);
     const desired = new Set(resolved.map((pkg) => packageId(pkg)));
 
     for (const rec of this.registry.list()) {
-      if (rec.origin !== "project") continue;
-      if (!projectRoot || !desired.has(rec.id)) this.drop(rec.id);
+      // Builtin layers are host-owned. Every non-builtin package, including a
+      // content-addressed shared-store object, must converge to the current
+      // scan result so a failed Pack rollback cannot leave a ghost extension
+      // registered in memory.
+      if (rec.origin === "builtin") continue;
+      // A registry supplied by the host/test may contain entries this loader
+      // never discovered. Only scanner-owned directory records participate in
+      // scan convergence; injected entries remain owned by their caller.
+      if (!this.directories.has(rec.id)) continue;
+      if (!desired.has(rec.id)) this.drop(rec.id);
     }
 
     const records: ExtensionRecord[] = [];
@@ -605,7 +681,7 @@ export class ExtensionLoader {
     const out: SpawnRegisteredExtension[] = [];
     for (const record of this.registry.list(overlay)) {
       const info = this.agent.get(record.id);
-      const item: SpawnRegisteredExtension = { id: record.id, enabled: record.state === "enabled" };
+      const item: SpawnRegisteredExtension = { id: record.id, version: record.version, enabled: record.state === "enabled" };
       if (info?.extensionPath) item.extensionPath = info.extensionPath;
       if (info?.skillRoots.length) item.skillRoots = info.skillRoots;
       if (item.enabled && info && !this.contributionRefused(record)) {
@@ -715,6 +791,17 @@ export class ExtensionLoader {
 
   list(overlay?: Record<string, boolean>): ExtensionListItem[] {
     return this.registry.list(overlay).map((record) => this.summarize(record));
+  }
+
+  profileExtensions(): InstalledProfileExtension[] {
+    return this.registry.list().map(record => {
+      const dependencies = this.registry.dependencies(record.id);
+      return {
+        id: record.id,
+        version: record.version,
+        ...(dependencies ? { dependencies } : {}),
+      };
+    });
   }
 
   private summarize(record: ExtensionRecord): ExtensionListItem {
