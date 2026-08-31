@@ -37,11 +37,11 @@ export function visionHostMethods(host: PipiHostAPI): VisionHostMethods {
 }
 
 /**
- * 识图路由（设置 > 通用 tab）状态：开关 + 已选识图模型。挂载时读取
+ * 识图路由（设置 > 扩展 tab）状态：开关 + 已选识图模型。挂载时读取
  * getVisionEnabled/getVisionModel，切换/选择时乐观更新、主机持久化，
  * 失败回滚（仿 ComputerUsePanel 的乐观开关模式）。关闭开关时同时清空
  * 已选识图模型（setVisionModel(null)）。Composer 的图片发送门槛与
- * 通用 tab 共享这份状态。
+ * 扩展 tab 共享这份状态。
  */
 export function useVisionRouting(host: PipiHostAPI): VisionRoutingController {
   const methods = visionHostMethods(host)
