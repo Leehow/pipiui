@@ -192,6 +192,21 @@ describe('RemoteConnectionPanel', () => {
     await waitFor(() => expect(screen.getByTestId('remote-control-status').textContent).toBe('断线重连中'))
   })
 
+  it('shows the rotation notice next to the pair url', async () => {
+    const api = mockApi(idle({ enabled: true, status: 'reconnecting', pairUrl: PAIR }))
+    render(<RemoteConnectionPanel onClose={() => undefined} remoteControl={api} />)
+    await screen.findByRole('switch')
+    expect(screen.queryByTestId('remote-rotation-notice')).toBeNull()
+    api.listeners[0]?.(idle({
+      enabled: true,
+      status: 'reconnecting',
+      pairUrl: PAIR,
+      rotationNotice: '远程链接已到期并自动更换，旧配对链接已失效；请把面板上的新链接重新发给浏览器。'
+    }))
+    const notice = await screen.findByTestId('remote-rotation-notice')
+    expect(notice.textContent).toContain('旧配对链接已失效')
+  })
+
   it('reads window.pipiRemoteControl when prop omitted', async () => {
     const api = mockApi()
     ;(window as Window & { pipiRemoteControl?: PipiRemoteControlAPI }).pipiRemoteControl = api

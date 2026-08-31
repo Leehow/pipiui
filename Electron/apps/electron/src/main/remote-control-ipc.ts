@@ -28,6 +28,7 @@ export type RemoteControlState = {
   hostEpoch: number | null
   generation: number | null
   error?: string
+  rotationNotice?: string | null
   debugEnabled?: boolean
   debugUrl?: string | null
   debugError?: string

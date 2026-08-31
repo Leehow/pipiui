@@ -29,6 +29,7 @@ export type RemoteControlState = {
   hostEpoch: number | null
   generation: number | null
   error?: string
+  rotationNotice?: string | null
   debugEnabled?: boolean
   debugUrl?: string | null
   debugError?: string
@@ -388,6 +389,9 @@ export function RemoteConnectionPanel({
             {state.status === 'ready' && <p className="computer-use-description">已连上 Relay，等待浏览器扫描或打开配对链接。</p>}
             {state.pairUrl && (
               <div className="remote-pair-block">
+                {state.rotationNotice && (
+                  <p className="remote-link-check failed" data-testid="remote-rotation-notice" role="alert">{state.rotationNotice}</p>
+                )}
                 {qr && (
                   <div
                     className="remote-pair-qr"

@@ -102,6 +102,7 @@ async function startRelay(options: { browserUIDir?: string; ttlMs?: number } = {
   const origin = `http://127.0.0.1:${address.port}`
   return {
     origin,
+    roomCount: () => relay.getRoomCount(),
     async close() {
       await relay.close()
       await new Promise<void>(resolve => server.close(() => resolve()))
@@ -121,6 +122,51 @@ async function claim(origin: string, roomID: string, secret: string): Promise<Re
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ secret })
   })
+}
+
+type FakeSocket = {
+  readyState: number
+  sent: string[]
+  on(type: string, listener: (...args: any[]) => void): void
+  off(type: string, listener: (...args: any[]) => void): void
+  send(data: string): void
+  close(code?: number, reason?: string): void
+  fireOpen(): void
+  fireMessage(text: string): void
+}
+
+function makeFakeSocket(): FakeSocket {
+  const listeners = new Map<string, Set<(...args: any[]) => void>>()
+  const emit = (type: string, ...args: unknown[]) => {
+    for (const listener of listeners.get(type) ?? []) listener(...args)
+  }
+  const socket: FakeSocket = {
+    readyState: 0,
+    sent: [],
+    on(type, listener) {
+      if (!listeners.has(type)) listeners.set(type, new Set())
+      listeners.get(type)!.add(listener)
+    },
+    off(type, listener) {
+      listeners.get(type)?.delete(listener)
+    },
+    send(data) {
+      socket.sent.push(data)
+    },
+    close() {
+      if (socket.readyState >= 2) return
+      socket.readyState = 3
+      emit('close')
+    },
+    fireOpen() {
+      socket.readyState = 1
+      emit('open')
+    },
+    fireMessage(text) {
+      emit('message', text)
+    }
+  }
+  return socket
 }
 
 function mockBackend(handle = vi.fn(async (method: string) => {
@@ -303,7 +349,7 @@ describe('createRemoteControlService', () => {
     browser.close()
   }, 15_000)
 
-  it('serves the authenticated browser UI, upgrades /ws, then rotates an expired room and reconnects', async () => {
+  it('serves the authenticated browser UI, upgrades /ws, and keeps the pair identity across an attached TTL firing and a hostless expiry', async () => {
     const dir = await userData()
     const ui = join(dir, 'browser-ui')
     await mkdir(join(ui, 'assets'), { recursive: true })
@@ -313,13 +359,15 @@ describe('createRemoteControlService', () => {
       'utf8'
     )
     await writeFile(join(ui, 'assets/app.js'), 'window.__PIPIUI_REMOTE_UI__=true;', 'utf8')
-    const relay = await startRelay({ browserUIDir: ui, ttlMs: 800 })
+    const relay = await startRelay({ browserUIDir: ui, ttlMs: 400 })
     relays.push(relay)
     const service = createRemoteControlService({
       backend: mockBackend(),
       userDataDir: dir,
       relayOrigin: relay.origin,
-      backoffMs: () => 10,
+      // After a drop, stay offline past one TTL firing so the hostless room
+      // really expires before the next hello.
+      backoffMs: (attempt: number) => (attempt === 0 ? 600 : 10),
       pingIntervalMs: 100,
       connect: url => new WebSocket(url) as unknown as WebSocket
     })
@@ -364,18 +412,78 @@ describe('createRemoteControlService', () => {
       ok: true
     })
 
-    await waitFor(() => service.getState().roomID !== expiredRoom, 'expired room identity was not rotated')
-    await waitFor(() => service.getState().status === 'ready', 'rotated room did not reconnect')
+    // TTL re-arms while the host is attached: the room must survive several
+    // TTL windows mid-session without rotating the identity.
+    await new Promise(resolve => setTimeout(resolve, 1_000))
+    expect(['ready', 'paired']).toContain(service.getState().status)
+    expect(service.getState().roomID).toBe(expiredRoom)
+    expect(relay.roomCount()).toBe(1)
+
+    // Hostless expiry (drop, TTL fires with no host) must also keep the
+    // identity: the next hello silently re-creates the same room.
+    service.dropConnection()
+    await waitFor(() => relay.roomCount() === 0, 'hostless room was never expired', 3_000)
+    await waitFor(() => service.getState().status === 'ready', 'service did not reconnect after hostless expiry')
+    expect(service.getState().roomID).toBe(expiredRoom)
+    expect(service.getState().pairUrl).toBe(expiredUrl)
+    expect(service.getState().rotationNotice).toBeFalsy()
     const after = JSON.parse(await readFile(join(dir, REMOTE_CONTROL_STORE_FILE), 'utf8')) as RemoteControlStored
     expect(after.enabled).toBe(true)
-    expect(after.roomID).not.toBe(before.roomID)
-    expect(after.pairSecret).not.toBe(before.pairSecret)
-    expect(service.getState().pairUrl).not.toBe(expiredUrl)
-    expect(service.getState().pairUrl).toBe(pairUrlFor(relay.origin, after.roomID, after.pairSecret))
-    expect((await claim(relay.origin, before.roomID, before.pairSecret)).status).toBe(403)
-    expect((await claim(relay.origin, after.roomID, after.pairSecret)).status).toBe(204)
+    expect(after.roomID).toBe(before.roomID)
+    expect(after.pairSecret).toBe(before.pairSecret)
+    expect((await claim(relay.origin, before.roomID, before.pairSecret)).status).toBe(204)
     browser.close()
-  }, 10_000)
+  }, 15_000)
+
+  it('surfaces a rotation notice when the relay expires the room, and reset clears it', async () => {
+    const dir = await userData()
+    const sockets: FakeSocket[] = []
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: 'http://relay.test',
+      backoffMs: () => 5,
+      pingIntervalMs: 60_000,
+      connect: () => {
+        const socket = makeFakeSocket()
+        sockets.push(socket)
+        return socket
+      }
+    })
+    services.push(service)
+
+    await service.start()
+    const first = sockets[0]
+    expect(first).toBeTruthy()
+    first.fireOpen()
+    await waitFor(() => first.sent.some(text => text.includes('"hello"')), 'first hello not sent')
+    first.fireMessage(JSON.stringify({ v: 2, type: 'ready', hostEpoch: 1, browserAttached: false }))
+    await waitFor(() => service.getState().status === 'ready', 'never became ready')
+    const originalRoom = service.getState().roomID
+    const originalUrl = service.getState().pairUrl
+    expect(originalRoom).toBeTruthy()
+
+    first.fireMessage(JSON.stringify({ v: 2, type: 'expired' }))
+    const secondHello = () => {
+      const second = sockets[1]
+      if (second && second.readyState === 0) second.fireOpen()
+      return Boolean(second?.sent.some(text => {
+        try { return (JSON.parse(text) as Record<string, unknown>).type === 'hello' } catch { return false }
+      }))
+    }
+    await waitFor(secondHello, 'second hello not sent', 2_000)
+    await waitFor(() => service.getState().roomID !== originalRoom, 'identity was not rotated')
+    const second = sockets[1]
+    expect(service.getState().rotationNotice).toBeTruthy()
+    expect(service.getState().pairUrl).not.toBe(originalUrl)
+
+    second.fireMessage(JSON.stringify({ v: 2, type: 'ready', hostEpoch: 1, browserAttached: false }))
+    await waitFor(() => service.getState().status === 'ready', 'rotated room never became ready')
+    expect(service.getState().rotationNotice).toBeTruthy()
+
+    await service.reset()
+    expect(service.getState().rotationNotice).toBeUndefined()
+  })
 
   it('does not close the shared backend when the remote socket drops', async () => {
     const relay = await startRelay()
@@ -569,7 +677,9 @@ describe('remote pair link check', () => {
 
     const expiredRoom = live.roomID
     const expiredSecret = live.pairSecret
-    await waitFor(() => service.getState().roomID !== expiredRoom, 'expired room identity was not rotated')
+    // Stop the host and let the hostless room expire, then probe the dead room.
+    await service.stop()
+    await waitFor(() => relay.roomCount() === 0, 'hostless room was never expired', 3_000)
     const expired = await probeRemotePairLink({
       origin: relay.origin,
       roomID: expiredRoom,

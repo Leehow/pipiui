@@ -323,7 +323,10 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
           hostEpoch = 0
           generation = 0
           reconnectAttempt = 0
-          publishIdentity('reconnecting', { error: undefined })
+          publishIdentity('reconnecting', {
+            error: undefined,
+            rotationNotice: '远程链接已到期并自动更换，旧配对链接已失效；请把面板上的新链接重新发给浏览器。'
+          })
           void persist().catch(error => {
             emit({ error: error instanceof Error ? error.message : String(error) })
           })
@@ -521,6 +524,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     const previousUrl = pairUrl()
     stored = { ...ensureStored(relayOrigin), enabled: true }
     if (pairUrl() !== previousUrl) invalidateChecks({ status: 'idle', pairUrl: null })
+    emit({ rotationNotice: undefined })
     await persist()
     reconnectAttempt = 0
     void runLoop()
@@ -535,7 +539,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     if (stored) stored = { ...stored, enabled: false }
     await persist()
     await clearTransport()
-    publishIdentity('stopped')
+    publishIdentity('stopped', { rotationNotice: undefined })
     return getState()
   }
 
@@ -553,6 +557,7 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     hostEpoch = 0
     generation = 0
     reconnectAttempt = 0
+    emit({ rotationNotice: undefined })
     await persist()
     stopping = false
     void runLoop()
