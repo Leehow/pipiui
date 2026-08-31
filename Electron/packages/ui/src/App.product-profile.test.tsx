@@ -7,9 +7,8 @@ import { App, createMockHost } from './App'
 afterEach(() => cleanup())
 
 describe('App Product Profile projection', () => {
-  it('keeps a generic primary sidebar and Kernel settings in the base Profile without Coding surfaces', async () => {
+  it('keeps a generic primary sidebar in the base Profile without Coding surfaces', async () => {
     const host = createMockHost()
-    host.newSession = vi.fn(host.newSession)
     host.listProductProfiles = vi.fn(async () => [{
       id: 'base',
       name: '基础版',
@@ -23,7 +22,8 @@ describe('App Product Profile projection', () => {
     const rendered = render(<App host={host} />)
     await waitFor(() => expect(rendered.container.querySelector('[data-workbench-container="pipi.sessions"]')).toBeTruthy())
     expect(rendered.getByTestId('sidebar')).toBeTruthy()
-    expect(rendered.getByTestId('open-settings-header')).toBeTruthy()
+    expect(rendered.queryByTestId('open-settings-header')).toBeNull()
+    expect(rendered.queryByTestId('new-conversation-header')).toBeNull()
     expect(rendered.queryByTestId('git-branch-button')).toBeNull()
     expect(rendered.queryByTestId('tool-quick-rail')).toBeNull()
     expect(rendered.container.querySelector('.pipiui-shell')?.className).not.toContain('sidebar-collapsed')
@@ -31,7 +31,5 @@ describe('App Product Profile projection', () => {
     expect(rendered.queryByText('Subagents')).toBeNull()
     expect(rendered.getByTestId('sidebar-footer')).toBeTruthy()
     expect(rendered.getByTestId('composer-read-only').textContent).toContain('此会话使用 coding Profile')
-    rendered.getByTestId('new-conversation-header').click()
-    await waitFor(() => expect(host.newSession).toHaveBeenCalled())
   })
 })

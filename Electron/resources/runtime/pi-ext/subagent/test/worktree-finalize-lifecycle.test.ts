@@ -7,11 +7,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { evaluateAutoMergeReadinessV1 } from "../../subagent-host/worktree/policy.ts";
-import { NodeGitWorktreeAdapter } from "../../subagent-host/worktree/adapter.ts";
-import { WorktreeFinalizationServiceV1 } from "../../subagent-host/worktree/service.ts";
-import { sweepLeftoverWorktreesV1 } from "../../subagent-host/worktree/sweep.ts";
-import type { WorktreeFinalizationInputV1, WorktreeFinalizationStateV1 } from "../../subagent-host/worktree/schema.ts";
+import { evaluateAutoMergeReadinessV1 } from "../../../extensions/git-capability/host/worktree/policy.ts";
+import { NodeGitWorktreeAdapter } from "../../../extensions/git-capability/host/worktree/adapter.ts";
+import { WorktreeFinalizationServiceV1 } from "../../../extensions/git-capability/host/worktree/service.ts";
+import { sweepLeftoverWorktreesV1 } from "../../../extensions/git-capability/host/worktree/sweep.ts";
+import { registerGitWorktreeServiceProviderV1 } from "../../../extensions/git-capability/host/worktree/provider.ts";
+import type { WorktreeFinalizationInputV1, WorktreeFinalizationStateV1 } from "../../../extensions/git-capability/host/worktree/schema.ts";
 import {
 	acquireAgentLease,
 	agentLeaseFile,
@@ -26,6 +27,9 @@ import {
 	reenterFinalizeOnBossAccept,
 	resetRememberedFinalizationsForTests,
 } from "../worktree-finalize.ts";
+
+// The finalizer consumes the registered git-capability provider at operation time.
+registerGitWorktreeServiceProviderV1();
 
 function git(cwd: string, args: string[]): void {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8", shell: false });

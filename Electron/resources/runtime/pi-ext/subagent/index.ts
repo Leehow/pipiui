@@ -295,16 +295,16 @@ import {
 	worktreeRecoveryStorePath,
 	type WorktreeRecoveryAction,
 } from "./worktree-recovery.ts";
-import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
-import type { WorktreeMergedEventV1 } from "../subagent-host/worktree/service.ts";
-import { resolveVerifyTimeoutMs } from "../subagent-host/worktree/deadlines.ts";
+import type { WorktreeFinalizationStateV1 } from "../../extensions/git-capability/host/worktree/schema.ts";
+import type { WorktreeMergedEventV1 } from "../../extensions/git-capability/host/worktree/service.ts";
+import { resolveVerifyTimeoutMs } from "../../extensions/git-capability/host/worktree/deadlines.ts";
 import {
 	BaseAdvanceDeduper,
 	createTipPreflightTracker,
 	evaluateBaseAdvanceAlerts,
 	formatBaseAdvancedSignal,
 	formatPreflightConflictSignal,
-} from "../subagent-host/worktree/preflight.ts";
+} from "../../extensions/git-capability/host/worktree/preflight.ts";
 import {
 	advanceSemanticProgress,
 	childReceivesDelegationTools,
@@ -5246,11 +5246,13 @@ function worktreeRecoveryContext(
 		retryFinalization: async (retained: WorktreeFinalizationStateV1) => {
 			// Re-run the audited service with the shell runner attached, then feed the settled
 			// state back into the loop so a retry outcome still escalates or clears correctly.
-			const [{ WorktreeFinalizationServiceV1 }, { piPostMergeVerifyRunner }] = await Promise.all([
-				import("../subagent-host/worktree/index.ts"),
+			const [{ requestGitWorktreeServiceProviderV1 }, { piPostMergeVerifyRunner }] = await Promise.all([
+				import("../../extensions/git-capability/host/worktree/provider.ts"),
 				import("./worktree-finalize.ts"),
 			]);
-			const next = await new WorktreeFinalizationServiceV1({
+			const provider = requestGitWorktreeServiceProviderV1();
+			if (!provider) throw new Error("git-capability worktree provider is unavailable; finalization retry is retained");
+			const next = await provider.createFinalizationService({
 				postMergeVerify: piPostMergeVerifyRunner,
 				onMerged: (event) => notifyInflightWorkersOfBaseAdvance(event),
 			}).retry(retained);

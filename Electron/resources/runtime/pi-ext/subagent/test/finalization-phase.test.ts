@@ -13,8 +13,8 @@ import {
 	snapshotFinalizationFields,
 	type FinalizationFields,
 } from "../finalization-phase.ts";
-import { WorktreeFinalizationServiceV1 } from "../../subagent-host/worktree/service.ts";
-import type { WorktreeFinalizationInputV1 } from "../../subagent-host/worktree/schema.ts";
+import { WorktreeFinalizationServiceV1 } from "../../../extensions/git-capability/host/worktree/service.ts";
+import type { WorktreeFinalizationInputV1 } from "../../../extensions/git-capability/host/worktree/schema.ts";
 
 test("summary then delayed verify records phaseSince and verify elapsed only after leave", () => {
 	const state: FinalizationFields = {};
@@ -107,7 +107,10 @@ test("runtime emits phases at real verify/worktree/done boundaries", () => {
 	assert.doesNotMatch(source, /finalizationPhase[\s\S]{0,40}prompt/);
 	assert.doesNotMatch(source, /error: "job-finalize-error"[\s\S]{0,400}throw error/);
 	assert.match(source, /pipiuiReportQueue\.beginRun\(/);
-	const worktree = readFileSync(new URL("../../subagent-host/worktree/service.ts", import.meta.url), "utf8");
+	const worktree = readFileSync(new URL("../../../extensions/git-capability/host/worktree/service.ts", import.meta.url), "utf8");
+	const compatibilityShim = readFileSync(new URL("../../subagent-host/worktree/service.ts", import.meta.url), "utf8");
+	assert.match(compatibilityShim, /^\/\*\* @deprecated Compatibility shim/);
+	assert.match(compatibilityShim, /export \* from "\.\.\/\.\.\/\.\.\/extensions\/git-capability\/host\/worktree\/service\.ts"/);
 	assert.match(worktree, /this\.emitProgress\("reconciling"\)/);
 	assert.match(worktree, /this\.emitProgress\("merging"\)/);
 	const cleaningAt = worktree.indexOf('this.emitProgress("cleaning")');

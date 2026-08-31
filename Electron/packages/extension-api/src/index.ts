@@ -46,6 +46,8 @@ export type ExtensionUiPanel = {
 };
 
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };
+/** Controlled chat-header action. `id` is a semantic contribution slug. */
+export type ExtensionUiHeaderAction = { id: string; entry: string; order?: number };
 
 /**
  * Manifest `app.ui.documentRenderers[]` item: a controlled renderer for the
@@ -136,6 +138,7 @@ export type ExtensionManifest = {
     ui?: {
       panels?: ExtensionUiPanel[];
       toolRenderers?: ExtensionUiToolRenderer[];
+      headerActions?: ExtensionUiHeaderAction[];
       documentRenderers?: ExtensionUiDocumentRenderer[];
       settingsSections?: ExtensionUiSettingsSection[];
       slashCommands?: ExtensionUiSlashCommand[];
@@ -150,6 +153,33 @@ export type ExtensionManifest = {
 };
 
 /** Tool card props delivered to a controlled `toolRenderer` (spec D5/D8). */
+/** Git state exposed to the Git header-action surface; no host API leaks through it. */
+export type ExtensionGitStatus = {
+  isRepo: boolean;
+  currentBranch?: string;
+  localBranches: string[];
+  isDetached: boolean;
+  shortSHA?: string;
+  isDirty: boolean;
+  staged: number;
+  unstaged: number;
+  untracked: number;
+  upstream?: string;
+  ahead: number;
+  behind: number;
+  githubURL?: string;
+};
+
+/** Restricted props injected into an `app.ui.headerActions` entry. */
+export type HeaderActionProps = {
+  workspaceId?: string;
+  git?: {
+    status: () => Promise<ExtensionGitStatus>;
+    checkout: (branch: string) => Promise<ExtensionGitStatus>;
+  };
+  openExternal?: (url: string) => void | Promise<void>;
+};
+
 export type ToolRenderProps = {
   content: string;
   details?: unknown;

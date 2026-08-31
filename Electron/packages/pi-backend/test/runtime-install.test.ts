@@ -119,7 +119,7 @@ describe("installRuntimeTree", () => {
       expect(existsSync(join(root, "pi-ext", "packages", "context-fold", "index.ts"))).toBe(true);
       expect(await readFile(join(root, "pi-ext", "packages", "context-fold", "VENDORED.md"), "utf8")).toContain("4881382bc6a5acaaf8e346a5f36a4c62cf0d3ae3");
       expect(await readdir(join(root, "pi-philosophy"))).toContain("philosophy.ts");
-      expect(await readFile(join(root, "extensions", "pipiui-git.ts"), "utf8")).toContain("git_status");
+      expect(await readFile(join(root, "extensions", "git-capability", "agent", "git-tools.ts"), "utf8")).toContain('name: "git"');
       expect(await readFile(join(root, "extensions", "pipiui-runtime-info.ts"), "utf8")).toContain("pipiui_runtime_info");
       expect(await readFile(join(root, "extensions", "pipiui-coding-tools.ts"), "utf8")).toContain("readPathIfDirectory");
       expect(await readFile(join(root, "extensions", "pipiui-office-doc-shot-gate.ts"), "utf8")).toContain("triggerTurn: true");

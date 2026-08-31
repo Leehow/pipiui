@@ -1,0 +1,16 @@
+{
+  "id": "git-capability",
+  "name": "PipiUI Git",
+  "version": "1.0.0",
+  "category": "coding",
+  "description": "Git branch status and checkout controls.",
+  "capabilities": [],
+  "agent": { "extension": "agent/index.ts" },
+  "app": {
+    "ui": {
+      "headerActions": [
+        { "id": "git.branch", "entry": "app/dist/branch-menu.js", "order": 20 }
+      ]
+    }
+  }
+}

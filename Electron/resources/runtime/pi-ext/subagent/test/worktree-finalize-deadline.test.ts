@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { GitWorktreeAdapter, GitWorktreeInspectionV1 } from "../../subagent-host/worktree/adapter.ts";
+import type { GitWorktreeAdapter, GitWorktreeInspectionV1 } from "../../../extensions/git-capability/host/worktree/adapter.ts";
 import {
 	DEFAULT_FINALIZATION_DEADLINE_MS,
 	DEFAULT_GIT_TIMEOUT_MS,
@@ -14,15 +14,15 @@ import {
 	DEFAULT_QUEUE_WAIT_TIMEOUT_MS,
 	DEFAULT_VERIFY_TIMEOUT_MS,
 	resolveVerifyTimeoutMs,
-} from "../../subagent-host/worktree/deadlines.ts";
+} from "../../../extensions/git-capability/host/worktree/deadlines.ts";
 import {
 	PerMainRepoSerialQueueV1,
 	SerialQueueTimeoutError,
 	consumeLateSettlement,
-} from "../../subagent-host/worktree/queue.ts";
-import { runSpawnV1 } from "../../subagent-host/worktree/adapter.ts";
-import { WorktreeFinalizationServiceV1 } from "../../subagent-host/worktree/service.ts";
-import type { WorktreeFinalizationInputV1 } from "../../subagent-host/worktree/schema.ts";
+} from "../../../extensions/git-capability/host/worktree/queue.ts";
+import { runSpawnV1 } from "../../../extensions/git-capability/host/worktree/adapter.ts";
+import { WorktreeFinalizationServiceV1 } from "../../../extensions/git-capability/host/worktree/service.ts";
+import type { WorktreeFinalizationInputV1 } from "../../../extensions/git-capability/host/worktree/schema.ts";
 import {
 	applyFinalizationTransition,
 	type FinalizationFields,

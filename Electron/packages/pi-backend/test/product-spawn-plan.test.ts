@@ -17,7 +17,6 @@ describe("Product Profile Pi spawn plan", () => {
         builtInSkills: "/runtime/skills",
         philosophy: "/runtime/philosophy.ts",
         codingTools: "/runtime/coding-tools.ts",
-        git: "/runtime/git.ts",
         subagentDir: "/runtime/subagent",
         planRuntime: "/runtime/plan.ts",
         goalRuntime: "/runtime/goal.ts",
@@ -82,7 +81,6 @@ describe("Product Profile Pi spawn plan", () => {
       paths: {
         secretVault: "/runtime/secret-vault.ts",
         codingTools: "/runtime/coding-tools.ts",
-        git: "/runtime/git.ts",
         subagentDir: "/runtime/subagent",
         webview: "/runtime/browser.ts",
         browserSearch: "/runtime/browser-search.ts",

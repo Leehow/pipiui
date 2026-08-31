@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { AGENT_CONTRIBUTIONS_ENV, AGENT_CONTRIBUTIONS_ENV_MAX_BYTES, AGENT_CONTRIBUTIONS_FILE_ENV, AGENT_CONTRIBUTIONS_HOST_MAX_BYTES, AGENT_CONTRIBUTIONS_SESSION_ROOT_ENV, assemblePiSpawn, buildVersionedAgentContributionSnapshot, contributionSidecarName, contributionSidecarTempPattern, extensionSettingsEnvName, GOAL_AUTO_RESUME_ENV, isElectronNodeShim, MEDIA_COMPAT_FALLBACK_ENV, mergedSpawnEnvironment, MOUNTED_EXTENSIONS_ENV, REGISTERED_EXTENSION_PATHS_ENV, removeContributionSnapshotSidecar, resolveContributionSnapshotFile, resolveSpawnPaths, sanitizeEnvironment, serializeAgentContributions, userExtensionMounts, workerAgentContributionsSnapshot, workerRegisteredExtensionArgs, withToolPath } from "../src/spawn-assembly.js";
 import { applySessionMountsToMainEnv, applySessionMountsToWorkerEnv } from "../src/secret-vault.js";
 import { DEFAULT_FEATURES } from "../src/features.js";
+import gitCapability from "../../../resources/runtime/extensions/git-capability/agent/index.ts";
 
 describe("context-fold main-session mount", () => {
   const contextFold = "/runtime/pi-ext/packages/context-fold/index.ts";
@@ -149,20 +150,43 @@ describe("coding tools extension mount", () => {
     expect(sanitizeEnvironment({ PIPIUI_CODING_TOOLS_EXT: "/stale.ts", PATH: "/usr/bin" })).toEqual({ PATH: "/usr/bin" });
   });
 
-  it("lets coding-runtime own coding tools, Git, and reload without legacy duplicates", () => {
+  it("mounts git-capability once while coding-runtime owns only coding and reload", () => {
     const codingRuntime = "/runtime/extensions/coding-runtime/agent/index.ts";
+    const gitCapabilityEntry = "/runtime/extensions/git-capability/agent/index.ts";
     const output = assemblePiSpawn({
       cwd: "/tmp/project",
       features: { git: true, reload: true },
-      paths: {
-        codingTools,
-        git: "/runtime/extensions/pipiui-git.ts",
-        reload: "/runtime/extensions/pipiui-reload.ts",
-      },
-      registeredExtensions: [{ id: "coding-runtime", version: "1.0.0", enabled: true, extensionPath: codingRuntime }],
+      paths: { codingTools, reload: "/runtime/extensions/pipiui-reload.ts" },
+      registeredExtensions: [
+        { id: "coding-runtime", version: "1.0.0", enabled: true, extensionPath: codingRuntime },
+        { id: "git-capability", version: "1.0.0", enabled: true, extensionPath: gitCapabilityEntry },
+      ],
     });
-    expect(output.args).toEqual(["-e", codingRuntime]);
+    expect(output.args).toEqual(["-e", codingRuntime, "-e", gitCapabilityEntry]);
+    expect(output.args.filter(value => value === gitCapabilityEntry)).toHaveLength(1);
+    expect(output.args).not.toContain("/runtime/extensions/pipiui-git.ts");
     expect(output.env.PIPIUI_CODING_TOOLS_EXT).toBeUndefined();
+  });
+
+  it("does not resurrect the removed legacy Git fallback", () => {
+    expect(assemblePiSpawn({ cwd: "/tmp/project", features: { git: true }, paths: {} }).args).toEqual([]);
+  });
+
+  it("keeps the Git provider's public tool and snapshot contract", () => {
+    const tools: any[] = [];
+    let beforeAgentStart: (() => any) | undefined;
+    gitCapability({
+      registerTool: (tool: any) => tools.push(tool),
+      on: (event: string, handler: () => any) => {
+        if (event === "before_agent_start") beforeAgentStart = handler;
+      },
+    } as any);
+    expect(tools).toHaveLength(1);
+    expect(tools[0].name).toBe("git");
+    expect(Object.keys(tools[0].parameters.properties)).toEqual(["action", "staged", "path", "n", "ref", "full"]);
+    const snapshot = beforeAgentStart?.();
+    expect(snapshot?.message.customType).toBe("pipiui-git-snapshot");
+    expect(snapshot?.message.content[0].text).toContain("## Git (Pipi UI)");
   });
 
   it("resolves the shipped wrapper from the source runtime tree", () => {
@@ -371,12 +395,13 @@ describe("explicit Pi resource mode", () => {
       agentDir: "/electron/pi-agent",
       sessionsRoot: "/electron/pi-agent/sessions",
       resourceMode: "explicit",
-      features: { philosophy: true, git: true },
-      paths: { philosophy: "/runtime/philosophy.ts", git: "/runtime/git.ts" },
+      features: { philosophy: true },
+      paths: { philosophy: "/runtime/philosophy.ts" },
+      registeredExtensions: [{ id: "git-capability", enabled: true, extensionPath: "/runtime/extensions/git-capability/agent/index.ts" }],
     });
     expect(args).toEqual(expect.arrayContaining([
       "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes",
-      "-e", "/runtime/philosophy.ts", "/runtime/git.ts",
+      "-e", "/runtime/philosophy.ts", "/runtime/extensions/git-capability/agent/index.ts",
     ]));
     expect(env).toMatchObject({
       PI_CODING_AGENT_DIR: "/electron/pi-agent",
@@ -384,9 +409,9 @@ describe("explicit Pi resource mode", () => {
     });
   });
 
-  it("keeps generic callers on Pi's default discovery behavior", () => {
-    const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: { git: true }, paths: { git: "/runtime/git.ts" } });
-    expect(args).toEqual(["-e", "/runtime/git.ts"]);
+  it("keeps generic callers on Pi's default discovery behavior without a Git fallback", () => {
+    const { args, env } = assemblePiSpawn({ cwd: "/tmp/project", features: { git: true }, paths: {} });
+    expect(args).toEqual([]);
     expect(env.PI_CODING_AGENT_DIR).toBeUndefined();
     expect(env.PI_CODING_AGENT_SESSION_DIR).toBeUndefined();
   });
@@ -678,7 +703,6 @@ describe("installed runtime tree", () => {
     await mkdir(join(root, "extensions"), { recursive: true });
     await mkdir(join(root, "built-in-skills", "create-subagent"), { recursive: true });
     await mkdir(join(root, "pi-philosophy"), { recursive: true });
-    await writeFile(join(root, "extensions", "pipiui-git.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-skillloader.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-runtime-info.ts"), "//\n");
     await writeFile(join(root, "extensions", "pipiui-coding-tools.ts"), "//\n");
@@ -688,7 +712,6 @@ describe("installed runtime tree", () => {
     await writeFile(join(root, "pi-philosophy", "philosophy.ts"), "//\n");
 
     const paths = resolveSpawnPaths(root);
-    expect(paths.git).toBe(join(root, "extensions", "pipiui-git.ts"));
     expect(paths.runtimeInfo).toBe(join(root, "extensions", "pipiui-runtime-info.ts"));
     expect(paths.codingTools).toBe(join(root, "extensions", "pipiui-coding-tools.ts"));
     expect(paths.updateCenter).toBe(join(root, "extensions", "pipiui-update-center.ts"));

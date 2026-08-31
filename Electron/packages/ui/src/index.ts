@@ -9,7 +9,6 @@ export type {
   SidebarSession
 } from './Sidebar'
 export { BrowserPanel } from './BrowserPanel'
-export { GitBranchMenu, branchHelpText, displayBranchName, orderedBranches, toolbarTitle } from './GitBranchMenu'
 export { SessionStatsPill } from './SessionStatsPill'
 export type { SessionStatsPillProps } from './SessionStatsPill'
 export { QuotaPill } from './QuotaPill'

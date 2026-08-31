@@ -4,8 +4,8 @@
  * Creating a worker's worktree has always been pi's job (`worktree.ts`). Finishing with it —
  * auto-merge, removing the tree, safely deleting the branch, post-merge verify, and deciding
  * `retained` / `needs-fixer` / `needs-user` — was not: other hosts may carry their own
- * implementation, and a portable one with the same semantics has been sitting unused in
- * `subagent-host/worktree/`. This is the wire between that portable service and the extension's
+ * implementation, and a portable one with the same semantics now belongs to the mounted
+ * `git-capability` provider. This is the wire between that provider and the extension's
  * terminal path, so a frontend does not have to own Git in order to run workers.
  *
  * Off unless `PIPIUI_WORKTREE_FINALIZER=pi`. Two finalizers racing on one repository is worse
@@ -21,12 +21,12 @@ import type {
 	WorktreeFinalizationStateV1,
 	WorktreeOwnerRoleV1,
 	WorktreeTerminalStateV1,
-} from "../subagent-host/worktree/schema.ts";
+} from "../../extensions/git-capability/host/worktree/schema.ts";
 import type {
 	PostMergeVerifyRequestV1,
 	PostMergeVerifyResultV1,
 	WorktreeMergedEventV1,
-} from "../subagent-host/worktree/index.ts";
+} from "../../extensions/git-capability/host/worktree/service.ts";
 
 let onMergedHook: ((event: WorktreeMergedEventV1) => void | Promise<void>) | undefined;
 
@@ -60,7 +60,7 @@ export async function piPostMergeVerifyRunner(
 		return { ok: false, error: "no verify command to run" };
 	}
 	// Lazy: hosts that never opt in pay nothing; several test harnesses copy only this dir.
-	const { runSpawnV1 } = await import("../subagent-host/worktree/index.ts");
+	const { runSpawnV1 } = await import("../../extensions/git-capability/host/worktree/adapter.ts");
 	const outcome = await runSpawnV1("bash", ["-lc", command], {
 		cwd: request.mainCwd,
 		timeoutMs: request.timeoutMs,
@@ -142,8 +142,11 @@ export async function finalizeWorktreeIfOwned(
 	if (!mainCwd || !worktreePath || !worktreeBranch) return undefined;
 	rememberFinalization(request);
 
-	// Lazy: the audited Git service loads only for a host that asked pi to run it.
-	const { finalizeWorktreeV1 } = await import("../subagent-host/worktree/index.ts");
+	// Lazy: finalization asks the mounted Git provider; a disabled provider must not
+	// silently turn writable isolated closeout into a host fallback.
+	const { requestGitWorktreeServiceProviderV1 } = await import("../../extensions/git-capability/host/worktree/provider.ts");
+	const provider = requestGitWorktreeServiceProviderV1();
+	if (!provider) throw new Error("git-capability worktree provider is unavailable; refusing isolated worktree finalization");
 	const {
 		inspectAgentLease,
 		reapStaleAgentLease,
@@ -184,12 +187,11 @@ export async function finalizeWorktreeIfOwned(
 		previous &&
 		(previous.result.merge === "merged" || previous.result.merge === "already-integrated")
 	) {
-		const { WorktreeFinalizationServiceV1 } = await import("../subagent-host/worktree/index.ts");
-		const state = await new WorktreeFinalizationServiceV1(options).retry(previous);
+		const state = await provider.createFinalizationService(options).retry(previous);
 		rememberedStates.set(rememberKey(request.agentId, request.runId), state);
 		return state;
 	}
-	const state = await finalizeWorktreeV1(
+	const state = await provider.finalizeWorktree(
 		{
 			schemaVersion: 1,
 			agentId: request.agentId,

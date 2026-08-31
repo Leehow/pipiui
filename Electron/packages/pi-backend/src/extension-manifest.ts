@@ -119,6 +119,8 @@ export type ExtensionPanelSlot = (typeof EXTENSION_PANEL_SLOTS)[number];
 
 export type ExtensionUiPanel = { slot: ExtensionPanelSlot; id: string; title: string; entry?: string };
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };
+/** Controlled chat-header action declared by `app.ui.headerActions`. */
+export type ExtensionUiHeaderAction = { id: string; entry: string; order?: number };
 
 /**
  * Manifest `app.ui.documentRenderers[]` item (document renderer contract v1).
@@ -168,6 +170,7 @@ export type ExtensionUiSummary = {
   slashCommands?: ExtensionUiSlashCommand[];
   viewContainers?: ExtensionUiViewContainer[];
   views?: ExtensionUiView[];
+  headerActions?: ExtensionUiHeaderAction[];
 };
 
 /** Max contributed AGENT.md paths in one manifest. */
@@ -900,6 +903,40 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
             views.push({ id: viewId, container, entry, activation: "visible" });
           }
           if (views.length) summary.views = views;
+        }
+      }
+      if (appUi.headerActions !== undefined) {
+        if (!Array.isArray(appUi.headerActions)) {
+          errors.push("app.ui.headerActions must be an array");
+        } else {
+          const actions: ExtensionUiHeaderAction[] = [];
+          const seen = new Set<string>();
+          for (const [index, item] of appUi.headerActions.entries()) {
+            const label = `app.ui.headerActions[${index}]`;
+            if (!isRecord(item)) {
+              errors.push(`${label} must be an object`);
+              continue;
+            }
+            const actionId = asNonEmptyString(item.id);
+            if (!actionId || !CONTRIBUTION_ID_RE.test(actionId)) {
+              errors.push(`${label}.id must be a semantic contribution id`);
+              continue;
+            }
+            if (seen.has(actionId)) {
+              errors.push(`duplicate header action id '${actionId}'`);
+              continue;
+            }
+            seen.add(actionId);
+            const entry = collectRelativePath(item.entry, `${label}.entry`, errors);
+            let order: number | undefined;
+            if (item.order !== undefined) {
+              if (typeof item.order !== "number" || !Number.isFinite(item.order)) {
+                errors.push(`${label}.order must be a finite number`);
+              } else order = item.order;
+            }
+            if (entry) actions.push({ id: actionId, entry, ...(order !== undefined ? { order } : {}) });
+          }
+          if (actions.length) summary.headerActions = actions;
         }
       }
       if (appUi.panels !== undefined) {

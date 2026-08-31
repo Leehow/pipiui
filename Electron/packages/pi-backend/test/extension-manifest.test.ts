@@ -109,6 +109,30 @@ describe("Workbench contributions", () => {
   });
 });
 
+describe("header action contributions", () => {
+  it("validates and preserves semantic id, entry, and order", () => {
+    const result = validateExtensionManifest(manifest(undefined, {
+      app: { ui: { headerActions: [{ id: "git.branch", entry: "app/branch-menu.js", order: 20 }] } },
+    }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.ui?.headerActions).toEqual([
+      { id: "git.branch", entry: "app/branch-menu.js", order: 20 },
+    ]);
+  });
+
+  it("rejects non-semantic ids, path escapes, and non-finite order", () => {
+    expect(errorsOf(manifest(undefined, {
+      app: { ui: { headerActions: [{ id: "Git branch", entry: "app/branch-menu.js" }] } },
+    }))).toMatch(/headerActions\[0\]\.id must be a semantic contribution id/);
+    const errors = errorsOf(manifest(undefined, {
+      app: { ui: { headerActions: [{ id: "git.branch", entry: "../branch-menu.js", order: Number.NaN }] } },
+    }));
+    expect(errors).toMatch(/headerActions\[0\]\.entry must not contain/);
+    expect(errors).toMatch(/headerActions\[0\]\.order must be a finite number/);
+  });
+});
+
 describe("agent.agents / agent.agentPatches", () => {
   it("parses legal contributions and keeps relative paths", () => {
     const result = validateExtensionManifest(

@@ -1,9 +1,10 @@
 import { createElement, type ComponentType } from 'react'
-import { createExtensionHostAPI, type ExtensionHostAPI } from '@pipiui/extension-api'
+import { createExtensionHostAPI, type ExtensionHostAPI, type HeaderActionProps } from '@pipiui/extension-api'
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { Disposer } from './contribution-registry'
 import { registerDocumentRenderer, registerPanel, registerSettingsSection, registerToolRenderer } from './ui-registries'
 import { registerWorkbenchContainer, registerWorkbenchView } from './workbench/workbench-contributions'
+import { registerHeaderAction } from './workbench/header-actions'
 
 const EXTENSION_PANEL_ICON = {
   src: `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2" fill="none" stroke="#000" stroke-width="1.6"/></svg>')}`,
@@ -12,6 +13,7 @@ const EXTENSION_PANEL_ICON = {
 
 export type ControlledUiPanel = { id: string; title?: string; slot?: string; entry?: string }
 export type ControlledUiToolRenderer = { tool: string; entry?: string }
+export type ControlledUiHeaderAction = { id: string; entry?: string; order?: number }
 export type ControlledUiDocumentRenderer = {
   id: string
   entry?: string
@@ -46,6 +48,7 @@ export type LoadableExtensionDescriptor = {
     statusBar?: readonly { id: string; text?: string; tooltip?: string; alignment?: 'left' | 'right' }[]
     viewContainers?: readonly ControlledUiViewContainer[]
     views?: readonly ControlledUiView[]
+    headerActions?: readonly ControlledUiHeaderAction[]
   }
   contributions?: {
     panels?: readonly ControlledUiPanel[]
@@ -53,6 +56,7 @@ export type LoadableExtensionDescriptor = {
     settingsSections?: readonly ControlledUiSettingsSection[]
     viewContainers?: readonly ControlledUiViewContainer[]
     views?: readonly ControlledUiView[]
+    headerActions?: readonly ControlledUiHeaderAction[]
   }
 }
 
@@ -81,7 +85,7 @@ function componentFromModule(mod: unknown): ComponentType<Record<string, unknown
   if (typeof mod === 'function') return mod as ComponentType<Record<string, unknown>>
   if (mod && typeof mod === 'object') {
     const record = mod as Record<string, unknown>
-    for (const key of ['default', 'render', 'Panel', 'SettingsSection', 'ToolRenderer', 'DocumentRenderer']) {
+    for (const key of ['default', 'render', 'Panel', 'SettingsSection', 'ToolRenderer', 'DocumentRenderer', 'HeaderAction']) {
       if (typeof record[key] === 'function') return record[key] as ComponentType<Record<string, unknown>>
     }
   }
@@ -162,12 +166,41 @@ export async function loadControlledContributions(
   const sections = [...(ui?.settingsSections ?? []), ...(contrib?.settingsSections ?? [])]
   const containers = [...(ui?.viewContainers ?? []), ...(contrib?.viewContainers ?? [])]
   const views = [...(ui?.views ?? []), ...(contrib?.views ?? [])]
+  const headerActions = [...(ui?.headerActions ?? []), ...(contrib?.headerActions ?? [])]
   const disposers: Disposer[] = []
   const seenPanel = new Set<string>()
   const seenTool = new Set<string>()
   const seenSection = new Set<string>()
   const seenDocumentRenderer = new Set<string>()
   const api = createApi(descriptor, host)
+
+  for (const action of headerActions) {
+    const entry = action.entry?.trim()
+    if (!entry || !action.id) continue
+    try {
+      const Component = await loadComponent(directory, entry, importModule)
+      disposers.push(registerHeaderAction(descriptor.id, {
+        id: action.id,
+        ...(action.order !== undefined ? { order: action.order } : {}),
+        render: context => {
+          const git = context.hostCapabilities.git && context.workspaceId && context.host.gitStatus && context.host.gitCheckout
+            ? {
+                status: () => context.host.gitStatus!(context.workspaceId!),
+                checkout: (branch: string) => context.host.gitCheckout!(context.workspaceId!, branch),
+              }
+            : undefined
+          const props: HeaderActionProps = {
+            ...(context.workspaceId ? { workspaceId: context.workspaceId } : {}),
+            ...(git ? { git } : {}),
+            ...(context.host.openExternal ? { openExternal: (url: string) => context.host.openExternal!(url) } : {}),
+          }
+          return createElement(Component, props)
+        },
+      }))
+    } catch {
+      // A broken optional header contribution must not take down the App.
+    }
+  }
 
   for (const container of containers) {
     disposers.push(registerWorkbenchContainer(descriptor.id, {
@@ -281,8 +314,8 @@ export function hasControlledEntry(descriptor: LoadableExtensionDescriptor): boo
   const contrib = descriptor.contributions
   const has = (items: ReadonlyArray<{ entry?: string }> | undefined) =>
     (items ?? []).some(item => Boolean(item.entry?.trim()))
-  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections) || has(ui?.views)
-    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections) || has(contrib?.views)
+  return has(ui?.panels) || has(ui?.toolRenderers) || has(ui?.documentRenderers) || has(ui?.settingsSections) || has(ui?.views) || has(ui?.headerActions)
+    || has(contrib?.panels) || has(contrib?.toolRenderers) || has(contrib?.settingsSections) || has(contrib?.views) || has(contrib?.headerActions)
 }
 
 export function settingsSectionHasEntry(section: unknown): boolean {

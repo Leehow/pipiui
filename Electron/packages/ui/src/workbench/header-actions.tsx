@@ -12,6 +12,7 @@ export type HeaderActionContext = {
 
 export type HeaderActionContribution = {
   id: string
+  order?: number
   render: (context: HeaderActionContext) => ReactNode
 }
 
@@ -26,10 +27,18 @@ export function useHeaderActions(): readonly HeaderActionContribution[] {
   const active = useActiveProductExtensions()
   return useMemo(() => {
     const allowed = new Set(active)
-    return registry.entries().filter(entry => allowed.has(entry.extId)).map(entry => entry.contribution)
+    return registry.entries()
+      .filter(entry => allowed.has(entry.extId))
+      .map(entry => entry.contribution)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.id.localeCompare(b.id))
   }, [snapshot, active])
 }
 
 export function disposeHeaderActions(extensionId: string): void {
   registry.disposeExtension(extensionId)
+}
+
+/** Test-only inspection of registered actions; visibility remains profile-controlled. */
+export function listHeaderActions(): readonly HeaderActionContribution[] {
+  return registry.list()
 }

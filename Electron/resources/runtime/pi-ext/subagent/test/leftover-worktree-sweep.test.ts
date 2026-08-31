@@ -12,12 +12,16 @@ import {
 	reapStaleAgentLease,
 	releaseAgentCleanupLease,
 } from "../agent-lease.ts";
-import { NodeGitWorktreeAdapter } from "../../subagent-host/worktree/adapter.ts";
+import { NodeGitWorktreeAdapter } from "../../../extensions/git-capability/host/worktree/adapter.ts";
+import { registerGitWorktreeServiceProviderV1 } from "../../../extensions/git-capability/host/worktree/provider.ts";
 import {
 	setLeftoverSweepHooksForTests,
 	sweepLeftoverWorktreesV1,
-} from "../../subagent-host/worktree/sweep.ts";
+} from "../../../extensions/git-capability/host/worktree/sweep.ts";
 import { resetLeftoverWorktreeSweepForTests, WorktreeRecoveryStoreV1 } from "../worktree-recovery.ts";
+
+// The provider is mounted before recovery starts, as it is in the production agent entry.
+registerGitWorktreeServiceProviderV1();
 
 function git(cwd: string, args: string[]): void {
 	const result = spawnSync("git", args, { cwd, encoding: "utf8", shell: false });

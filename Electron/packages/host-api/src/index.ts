@@ -982,6 +982,12 @@ export type ExtensionViewDecl = {
   entry: string;
   activation: "visible";
 };
+/** Controlled chat-header action declared by `app.ui.headerActions`. */
+export type ExtensionHeaderActionDecl = {
+  id: string;
+  entry: string;
+  order?: number;
+};
 /** Pi provider `models[]` shape used as the single host-visible model source. */
 export type ExtensionProviderModelContribution = {
   id: string;
@@ -1025,6 +1031,7 @@ export type ExtensionContributions = {
   statusBar?: readonly ExtensionStatusBarDecl[];
   viewContainers?: readonly ExtensionViewContainerDecl[];
   views?: readonly ExtensionViewDecl[];
+  headerActions?: readonly ExtensionHeaderActionDecl[];
   auth?: ExtensionAuthContribution;
 };
 export type ExtensionDescriptor = {
@@ -1047,6 +1054,8 @@ export type ExtensionDescriptor = {
   grantedCapabilities?: readonly string[];
   /** Declarative app-half contributions (schema / slash / settings tabs / statusBar). */
   contributions?: ExtensionContributions;
+  /** Controlled entries resolved against the extension package directory. */
+  ui?: { headerActions?: readonly ExtensionHeaderActionDecl[] };
 };
 /** Current capability grant snapshot (spec D11 / M4). */
 export type ExtensionCapabilityGrant = {

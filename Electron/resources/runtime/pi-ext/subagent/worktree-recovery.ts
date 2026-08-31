@@ -20,7 +20,7 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { WorktreeFinalizationStateV1 } from "../subagent-host/worktree/schema.ts";
+import type { WorktreeFinalizationStateV1 } from "../../extensions/git-capability/host/worktree/schema.ts";
 import {
 	claimAgentCleanupLease,
 	inspectAgentLease,
@@ -212,8 +212,10 @@ async function runLeftoverWorktreeSweep(store: WorktreeRecoveryStoreV1): Promise
 	const mainCwd = recoveryStoreMainCwd(store);
 	if (!mainCwd) return;
 	try {
-		const { WorktreeFinalizationServiceV1 } = await import("../subagent-host/worktree/index.ts");
-		await new WorktreeFinalizationServiceV1({
+		const { requestGitWorktreeServiceProviderV1 } = await import("../../extensions/git-capability/host/worktree/provider.ts");
+		const provider = requestGitWorktreeServiceProviderV1();
+		if (!provider) throw new Error("git-capability worktree provider is unavailable; leftover sweep skipped");
+		await provider.createFinalizationService({
 			logger: {
 				info(event, fields) {
 					console.info(`[pipiui-subagent] ${event}`, fields ?? {});

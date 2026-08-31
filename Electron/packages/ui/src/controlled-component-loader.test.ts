@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, render, within } from '@testing-library/react'
+import { readFile } from 'node:fs/promises'
+import { createElement } from 'react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI } from '@pipi/host-api'
 import {
@@ -16,9 +18,28 @@ import {
   type ToolRenderProps,
 } from './ui-registries'
 import { listWorkbenchContainers, listWorkbenchViews } from './workbench/workbench-contributions'
+import { disposeHeaderActions, listHeaderActions, type HeaderActionContext } from './workbench/header-actions'
 
 const EXT = 'quota'
 const fixturesDir = '/tmp/quota-ext'
+const gitManifest = (await import('../../../resources/runtime/extensions/git-capability/pipiui-extension.json')).default
+const gitExtensionDirectory = new URL('../../../resources/runtime/extensions/git-capability/', import.meta.url).pathname
+
+const gitRepoStatus = {
+  isRepo: true,
+  currentBranch: 'main',
+  isDetached: false,
+  shortSHA: undefined,
+  localBranches: ['main'],
+  upstream: undefined,
+  ahead: 0,
+  behind: 0,
+  isDirty: false,
+  staged: 0,
+  unstaged: 0,
+  untracked: 0,
+  githubURL: undefined,
+}
 
 async function importFixture(specifier: string): Promise<unknown> {
   const file = specifier.slice(specifier.lastIndexOf('/') + 1)
@@ -26,6 +47,14 @@ async function importFixture(specifier: string): Promise<unknown> {
   if (file === 'panel.ts' || file === 'panel.js') return import('./fixtures/controlled/panel')
   if (file === 'tool-card.ts' || file === 'tool-card.js') return import('./fixtures/controlled/tool-card')
   if (file === 'settings.ts' || file === 'settings.js') return import('./fixtures/controlled/settings')
+  if (file === 'header.ts' || file === 'header.js') return {
+    default: (props: Record<string, unknown>) => createElement('div', {
+      'data-testid': 'ext-controlled-header',
+      'data-host': String('host' in props),
+      'data-workspace': String(props.workspaceId),
+      'data-git': String(Boolean(props.git)),
+    }),
+  }
   throw new Error(`unknown fixture ${specifier}`)
 }
 
@@ -59,6 +88,7 @@ function panelCtx(): PanelRenderContext {
 
 afterEach(() => {
   disposeUiContributions(EXT)
+  disposeHeaderActions(EXT)
   cleanup()
   Reflect.deleteProperty(window, 'pipiHost')
 })
@@ -157,6 +187,28 @@ describe('loadControlledContributions', () => {
     expect(listWorkbenchViews()).toEqual(viewsBefore)
   })
 
+  it('registers a restricted header action and disposes it with the extension', async () => {
+    const disposers = await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { headerActions: [{ id: 'quota.header', entry: 'header.ts', order: 2 }] },
+    }, hostStub(), importFixture)
+    const action = listHeaderActions().find(item => item.id === 'quota.header')
+    expect(action?.order).toBe(2)
+    const context: HeaderActionContext = {
+      host: { gitStatus: vi.fn(), gitCheckout: vi.fn(), openExternal: vi.fn() } as unknown as PipiHostAPI,
+      workspaceId: 'workspace-a',
+      hostCapabilities: { git: true },
+    }
+    const rendered = render(action!.render(context))
+    const header = rendered.getByTestId('ext-controlled-header')
+    expect(header.getAttribute('data-host')).toBe('false')
+    expect(header.getAttribute('data-workspace')).toBe('workspace-a')
+    expect(header.getAttribute('data-git')).toBe('true')
+    for (const dispose of disposers) dispose()
+    expect(listHeaderActions().some(item => item.id === 'quota.header')).toBe(false)
+  })
+
   it('shows a readable panel placeholder when entry import fails and does not throw', async () => {
     const panelsBefore = listPanels().map(panel => panel.id)
     await loadControlledContributions({
@@ -187,5 +239,50 @@ describe('loadControlledContributions', () => {
     const { container } = render(panel!.render(panelCtx()))
     expect(window.pipiHost).toBeUndefined()
     expect(container.querySelector('[data-testid="ext-controlled-panel"]')?.getAttribute('data-pipi-host')).toBe('undefined')
+  })
+
+  it('loads the real git-capability manifest header action and removes it on dispose', async () => {
+    const disposers = await loadControlledContributions({
+      id: gitManifest.id,
+      directory: gitExtensionDirectory,
+      ui: gitManifest.app.ui,
+    }, hostStub(), async specifier => {
+      expect(specifier).toBe(resolveEntrySpecifier(gitExtensionDirectory, 'app/dist/branch-menu.js'))
+      return import('../../../resources/runtime/extensions/git-capability/app/branch-menu')
+    })
+
+    const action = listHeaderActions().find(item => item.id === 'git.branch')
+    expect(action?.order).toBe(20)
+    render(action!.render({
+      host: {
+        gitStatus: vi.fn(async () => gitRepoStatus),
+        gitCheckout: vi.fn(),
+        openExternal: vi.fn(),
+      } as unknown as PipiHostAPI,
+      workspaceId: 'git-workspace',
+      hostCapabilities: { git: true },
+    }))
+    await waitFor(() => expect(screen.getByTestId('git-branch-button')).toBeTruthy())
+
+    for (const dispose of disposers) dispose()
+    expect(listHeaderActions().some(item => item.id === 'git.branch')).toBe(false)
+  })
+
+  it('fails soft when the real git-capability header entry cannot import', async () => {
+    await expect(loadControlledContributions({
+      id: gitManifest.id,
+      directory: gitExtensionDirectory,
+      ui: gitManifest.app.ui,
+    }, hostStub(), async () => { throw new Error('missing Git entry') })).resolves.toEqual([])
+    expect(listHeaderActions().some(item => item.id === 'git.branch')).toBe(false)
+  })
+
+  it('keeps legacy Git UI and coding-workbench header registration out of core UI', async () => {
+    const [index, adapter] = await Promise.all([
+      readFile('packages/ui/src/index.ts', 'utf8'),
+      readFile('packages/ui/src/coding-workbench-adapter.tsx', 'utf8'),
+    ])
+    expect(index).not.toContain('GitBranchMenu')
+    expect(adapter).not.toContain('registerHeaderAction')
   })
 })

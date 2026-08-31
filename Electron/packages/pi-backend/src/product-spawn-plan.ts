@@ -23,7 +23,7 @@ const FEATURE_OWNERS: Partial<Record<keyof SpawnFeatures, readonly string[]>> = 
   subagent: ["agent-orchestration", "coding-orchestration"],
   memoryBroker: ["memory-extension"],
   contextFold: ["pipiui-headroom"],
-  git: ["coding-runtime"],
+  git: ["git-capability"],
   reload: ["coding-runtime"],
   webSearch: ["web-access-extension"],
   browserSearch: ["webview-browser-extension"],
@@ -48,7 +48,6 @@ const FEATURE_OWNERS: Partial<Record<keyof SpawnFeatures, readonly string[]>> = 
 
 const PATH_OWNERS: Partial<Record<keyof SpawnPaths, readonly string[]>> = {
   codingTools: ["coding-runtime"],
-  git: ["coding-runtime"],
   reload: ["coding-runtime"],
   philosophy: ["pi-foundation"],
   skillLoader: ["skill-loader-extension"],

@@ -54,13 +54,14 @@ import {
 } from "./state/index.ts";
 import {
 	decodeWorktreeFinalizationStateV1,
-	WorktreeFinalizationServiceV1,
 	type WorktreeFinalizationInputV1,
 	type WorktreeFinalizationStateV1,
 	type WorktreeOwnershipV1,
 	type WorktreeTerminalStateV1,
 	type WorktreeVerifyMetadataV1,
-} from "./worktree/index.ts";
+} from "../../extensions/git-capability/host/worktree/schema.ts";
+import { requestGitWorktreeServiceProviderV1 } from "../../extensions/git-capability/host/worktree/provider.ts";
+import type { WorktreeFinalizationServiceV1 } from "../../extensions/git-capability/host/worktree/service.ts";
 
 export const SUBAGENT_HOST_RUNTIME_VERSION = 1 as const;
 export const DEFAULT_RUNTIME_CALLBACK_TIMEOUT_MS = 5_000;
@@ -95,7 +96,7 @@ export type EnabledWorktreeFinalizationRuntimeConfigV1 = {
 	mainCwd: string;
 	/** Agent/run identities are filled from the terminal projection, never caller input. */
 	ownership: Pick<WorktreeOwnershipV1, "mode" | "role">;
-	/** Defaults to the audited portable service only after enabled:true was supplied. */
+	/** Optional host test seam; production requests the mounted git-capability provider. */
 	service?: WorktreeFinalizationServiceV1;
 	/**
 	 * Optional host-owned verification metadata. A string command remains display
@@ -379,7 +380,6 @@ class SubagentHostRuntime implements SubagentHostRuntimeV1 {
 	private readonly maxSubscribers: number;
 	private readonly agentOptions: Pick<AgentProjectionLoadOptionsV1, "maxLogs" | "reconcileRunning">;
 	private readonly finalizationConfig?: EnabledWorktreeFinalizationRuntimeConfigV1;
-	private readonly finalizationService?: WorktreeFinalizationServiceV1;
 	private readonly subscribers = new Set<SubagentHostRuntimeCallbacksV1>();
 	private readonly bridge: SubagentHostServerV1;
 	private queue: Promise<void> = Promise.resolve();
@@ -422,7 +422,6 @@ class SubagentHostRuntime implements SubagentHostRuntimeV1 {
 				throw new Error("worktreeFinalization.mainCwd must be an explicit non-empty host path");
 			}
 			this.finalizationConfig = options.worktreeFinalization;
-			this.finalizationService = options.worktreeFinalization.service ?? new WorktreeFinalizationServiceV1();
 		}
 		if (options.callbacks) this.subscribers.add(options.callbacks);
 
@@ -747,7 +746,19 @@ class SubagentHostRuntime implements SubagentHostRuntimeV1 {
 	}
 
 	private async finalizeTerminalWorktreeLocked(event: AgentEventV1): Promise<FinalizationAttempt | undefined> {
-		if (!this.finalizationConfig || !this.finalizationService) return undefined;
+		if (!this.finalizationConfig) return undefined;
+		const provider = requestGitWorktreeServiceProviderV1();
+		if (!provider) {
+			const diagnostic: ProtocolDiagnostic = {
+				code: "git_worktree_provider_unavailable",
+				path: "$.worktreeFinalization",
+				message: "automatic worktree finalization requires the mounted git-capability provider",
+				severity: "warning",
+			};
+			await this.emitError({ schemaVersion: 1, stage: "worktree_finalization", code: diagnostic.code, message: diagnostic.message, agentId: event.agentId, runId: event.runId });
+			return { diagnostics: [diagnostic] };
+		}
+		const finalizationService = this.finalizationConfig.service ?? provider.createFinalizationService();
 		const key = agentRunKeyV1(event.agentId, event.runId);
 		const existing = this.finalizationRegistry.recordsByRunKey[key];
 		if (existing) return { state: cloneJson(existing), diagnostics: [] };
@@ -799,7 +810,7 @@ class SubagentHostRuntime implements SubagentHostRuntimeV1 {
 
 		let state: WorktreeFinalizationStateV1;
 		try {
-			state = await this.finalizationService.finalize(input);
+			state = await finalizationService.finalize(input);
 		} catch (error) {
 			const diagnostic: ProtocolDiagnostic = {
 				code: "worktree_finalization_failed",

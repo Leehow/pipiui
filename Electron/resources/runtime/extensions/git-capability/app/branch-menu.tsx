@@ -1,76 +1,66 @@
+import * as React from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { GitStatus, PipiHostAPI } from '@pipi/host-api'
-import './git-branch.css'
+import type { ExtensionGitStatus, HeaderActionProps } from '@pipiui/extension-api'
+import gitBranchCss from './git-branch.css?raw'
 
-/** Swift GitRepo.toolbarTitle uses the same cap, so both toolbars truncate alike. */
+const GIT_BRANCH_STYLE_ID = 'pipiui-git-branch-style'
+if (typeof document !== 'undefined' && !document.getElementById(GIT_BRANCH_STYLE_ID)) {
+  const style = document.createElement('style')
+  style.id = GIT_BRANCH_STYLE_ID
+  style.textContent = gitBranchCss
+  document.head.append(style)
+}
+
 const MAX_TITLE_CHARS = 24
-/** Wait out a title-bar drag that started on the same click that focused the window. */
 export const GIT_FOCUS_REFRESH_MS = 800
 
-export function displayBranchName(status: GitStatus): string {
+export function displayBranchName(status: ExtensionGitStatus): string {
   if (status.isDetached) return status.shortSHA ? `detached @ ${status.shortSHA}` : 'detached'
   return status.currentBranch?.trim() || 'unknown'
 }
 
-/** Toolbar label; a dirty work tree appends `*`. */
-export function toolbarTitle(status: GitStatus): string {
+export function toolbarTitle(status: ExtensionGitStatus): string {
   const name = displayBranchName(status)
   return (name.length <= MAX_TITLE_CHARS ? name : name.slice(0, MAX_TITLE_CHARS)) + (status.isDirty ? '*' : '')
 }
 
-export function branchHelpText(status: GitStatus): string {
+export function branchHelpText(status: ExtensionGitStatus): string {
   let text = `Git 分支：${displayBranchName(status)}`
   if (status.isDirty) text += `*（staged=${status.staged} unstaged=${status.unstaged} untracked=${status.untracked}）`
   if (status.upstream) text += ` · upstream ${status.upstream} +${status.ahead} -${status.behind}`
   return text
 }
 
-/** Current branch first (it carries the checkmark), then the rest case-insensitively sorted. */
-export function orderedBranches(status: GitStatus): string[] {
+export function orderedBranches(status: ExtensionGitStatus): string[] {
   const current = status.currentBranch
   const rest = status.localBranches.filter(branch => branch !== current).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }))
   return current && status.localBranches.includes(current) ? [current, ...rest] : rest
 }
 
-/**
- * Chat-header git control: branch name, local-branch checkout and an optional
- * GitHub link — the Electron counterpart of Swift `GitBranchMenu`. It renders
- * nothing until a host confirms the project is a work tree.
- */
-export function GitBranchMenu({ host, projectId, available }: { host: PipiHostAPI; projectId?: string; available: boolean }) {
-  const [status, setStatus] = useState<GitStatus | null>(null)
+/** Controlled Git extension entry. It only receives the scoped Git callbacks below. */
+export function GitBranchHeaderAction({ workspaceId, git, openExternal }: HeaderActionProps) {
+  const [status, setStatus] = useState<ExtensionGitStatus | null>(null)
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  // Bumped per probe so a slow response for an earlier project cannot land late.
   const epoch = useRef(0)
 
   const refresh = useCallback(() => {
-    if (!available || !projectId || !host.gitStatus) { setStatus(null); return }
+    if (!workspaceId || !git) { setStatus(null); return }
     const current = ++epoch.current
-    void host.gitStatus(projectId)
+    void git.status()
       .then(next => { if (current === epoch.current) { setStatus(next); setError(null) } })
       .catch(() => { if (current === epoch.current) setStatus(null) })
-  }, [host, projectId, available])
+  }, [workspaceId, git])
 
   useEffect(() => { refresh() }, [refresh])
-  // Mirrors the Swift store: re-probe when the window regains focus, never poll.
-  // Defer past the click that focused a background window — that click is also
-  // how a title-bar drag starts, and git(1) on this repo contends with the move.
   useEffect(() => {
     let timer = 0
-    const onFocus = () => {
-      window.clearTimeout(timer)
-      timer = window.setTimeout(refresh, GIT_FOCUS_REFRESH_MS)
-    }
+    const onFocus = () => { window.clearTimeout(timer); timer = window.setTimeout(refresh, GIT_FOCUS_REFRESH_MS) }
     const onBlur = () => window.clearTimeout(timer)
     window.addEventListener('focus', onFocus)
     window.addEventListener('blur', onBlur)
-    return () => {
-      window.clearTimeout(timer)
-      window.removeEventListener('focus', onFocus)
-      window.removeEventListener('blur', onBlur)
-    }
+    return () => { window.clearTimeout(timer); window.removeEventListener('focus', onFocus); window.removeEventListener('blur', onBlur) }
   }, [refresh])
   useEffect(() => {
     if (!open) return
@@ -82,12 +72,12 @@ export function GitBranchMenu({ host, projectId, available }: { host: PipiHostAP
   if (!status?.isRepo) return null
 
   const checkout = async (branch: string) => {
-    if (!projectId || !host.gitCheckout) return
+    if (!git) return
     if (branch === status.currentBranch) { setOpen(false); return }
     setBusy(true)
     setError(null)
     try {
-      const next = await host.gitCheckout(projectId, branch)
+      const next = await git.checkout(branch)
       epoch.current += 1
       setStatus(next)
       setOpen(false)
@@ -112,9 +102,9 @@ export function GitBranchMenu({ host, projectId, available }: { host: PipiHostAP
           <span className="git-menu-check" aria-hidden="true">{branch === status.currentBranch ? '✓' : ''}</span>
           <span className="git-menu-name">{branch}</span>
         </button>)}
-        {status.githubURL && host.openExternal && <>
+        {status.githubURL && openExternal && <>
           <div className="git-menu-divider" />
-          <button role="menuitem" className="git-menu-row" onClick={() => { setOpen(false); void host.openExternal?.(status.githubURL!) }}>
+          <button role="menuitem" className="git-menu-row" onClick={() => { setOpen(false); void openExternal(status.githubURL!) }}>
             <span className="git-menu-check" aria-hidden="true" />
             <span className="git-menu-name">在 GitHub 打开</span>
           </button>
@@ -123,3 +113,5 @@ export function GitBranchMenu({ host, projectId, available }: { host: PipiHostAP
     </>}
   </div>
 }
+
+export default GitBranchHeaderAction
