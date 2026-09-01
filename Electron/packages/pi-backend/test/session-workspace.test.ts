@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createPiHostBackend } from "../src/index.js";
 import {
   assertWorkspaceCwdAllowed,
   clearSessionWorkspaceFile,
@@ -27,7 +28,21 @@ async function fixture(): Promise<{ sessionsDir: string; projectRoot: string; wo
 }
 
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  // createPiHostBackend fire-and-forgets a model-catalog probe whose helper child
+  // briefly writes cache files into agentDir after close() returns; retry so the
+  // teardown doesn't flap on that benign race (same as agent-events.test.ts).
+  await Promise.all(roots.splice(0).map(async (root) => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rm(root, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if ((code !== "ENOTEMPTY" && code !== "EPERM") || attempt >= 20) throw error;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+  }));
 });
 
 function binding(sessionId: string, workspaceCwd: string): SessionWorkspaceBinding {
@@ -111,5 +126,31 @@ describe("workspace validation", () => {
     await writeSessionWorkspace(sessionsDir, binding("s1", join(worktreeArea, "session-fix")));
     const raw = JSON.parse(await readFile(sessionWorkspaceSidecarPath(sessionsDir, "s1"), "utf8"));
     expect(raw).toMatchObject({ version: 1, sessionId: "s1", branch: "pipiui/session-fix" });
+  });
+});
+
+describe("session workspace change notice", () => {
+  // Wire contract the renderer's `subscribeExt(host, "git-capability")` consumer depends on:
+  // channel, event type, and the sessionId/op payload. Bind/unbind fire this mid-session so
+  // the header dual-branch pair repaints without an app restart.
+  it("announces bind/unbind on the ext.git-capability channel", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipiui-session-workspace-notify-"));
+    roots.push(root);
+    const backend = createPiHostBackend({ agentDir: join(root, "agent"), sessionsRoot: join(root, "sessions") });
+    try {
+      const events: Array<{ type: string; payload?: unknown }> = [];
+      backend.subscribe(frame => {
+        if (frame.channel === "ext.git-capability") events.push((frame as { event: { type: string; payload?: unknown } }).event);
+      });
+      const notify = (backend as unknown as { emitSessionWorkspaceChanged(sessionId: string, op: "bind" | "unbind"): void }).emitSessionWorkspaceChanged.bind(backend);
+      notify("session-1", "bind");
+      notify("session-1", "unbind");
+      expect(events).toEqual([
+        { type: "session_workspace_changed", payload: { sessionId: "session-1", op: "bind" } },
+        { type: "session_workspace_changed", payload: { sessionId: "session-1", op: "unbind" } },
+      ]);
+    } finally {
+      await backend.close();
+    }
   });
 });

@@ -27,6 +27,7 @@ import { StreamEventCoalescer } from './StreamEventCoalescer'
 import { freezeProbe, freezeProbeHistoryIpcEnd, freezeProbeHistoryIpcStart } from './freeze-probe'
 import { QuotaPill, QWEN_TOKEN_PLAN_LOGIN_URL } from './QuotaPill'
 import { SessionBranchHeader } from './session-workspace-ui'
+import { subscribeExt } from './subscribe-ext'
 import { BalancePill } from './BalancePill'
 import { SessionStatsPill } from './SessionStatsPill'
 import { MessageQueue } from './MessageQueue'
@@ -1868,6 +1869,17 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   }, [beginSessionListRequest, cacheSessionPreload, host, isCurrentSessionListRequest, warmInitialSessionPages])
 
   useEffect(() => { void refreshProjects().catch(error => setProjectError(`加载项目失败：${error instanceof Error ? error.message : String(error)}`)); void host.capabilities().then(capabilities => { setCanRevealInFinder(capabilities.revealInFinder && typeof host.revealProject === 'function'); setBrowserAvailable(Boolean(capabilities.browser && host.browser)); setTerminalAvailable(Boolean(capabilities.terminal && host.terminal)); setGitAvailable(Boolean(capabilities.git && host.gitStatus)); setRetainedWorktreeDispositionAvailable(Boolean(capabilities.retainedWorktreeDisposition)); setPlanAvailable(Boolean(capabilities.plan && host.getPlans)); setComputerUseAvailable(Boolean(capabilities.computerUse && host.getComputerUseState)) }).catch(() => { setCanRevealInFinder(false); setBrowserAvailable(false); setTerminalAvailable(false); setGitAvailable(false); setRetainedWorktreeDispositionAvailable(false); setPlanAvailable(false); setComputerUseAvailable(false) }); if (!host.probeGitBinary) { setGitBinary('unknown'); return } void host.probeGitBinary().then(installed => setGitBinary(Boolean(installed))).catch(() => setGitBinary('unknown')) }, [host, refreshProjects])
+  // Session-workspace bind/unbind lands mid-session (boss's first write); the
+  // host announces it on the git-capability channel so the header dual-branch
+  // pair appears without an app restart. One refresh per notice; reloads merge by id.
+  const refreshProjectsForWorkspaceRef = useRef(refreshProjects)
+  refreshProjectsForWorkspaceRef.current = refreshProjects
+  const workspaceNoticeInFlightRef = useRef(false)
+  useEffect(() => subscribeExt(host, 'git-capability', event => {
+    if (event?.type !== 'session_workspace_changed' || workspaceNoticeInFlightRef.current) return
+    workspaceNoticeInFlightRef.current = true
+    void refreshProjectsForWorkspaceRef.current().catch(() => undefined).finally(() => { workspaceNoticeInFlightRef.current = false })
+  }), [host])
   useEffect(() => {
     if (!host.setEventProjectionSession) return
     void host.setEventProjectionSession(selectedSession || undefined).catch(() => undefined)

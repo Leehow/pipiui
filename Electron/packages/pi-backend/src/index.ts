@@ -8592,6 +8592,19 @@ export class PiHostBackend implements HostBackend {
     } as unknown as HostEvent);
   }
 
+  /**
+   * Bind/unbind lands mid-session (first write → ext.emit), but `session.workspace` only
+   * travels to the renderer on listSessions/lazy-page reads. Without this notice the header
+   * dual-branch pair and the sidebar unmerged badge stay stale until the next full reload.
+   */
+  private emitSessionWorkspaceChanged(sessionId: string, op: "bind" | "unbind"): void {
+    emitFrame(this.listeners, {
+      protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
+      channel: "ext.git-capability",
+      event: { type: "session_workspace_changed", payload: { sessionId, op } },
+    } as unknown as HostEvent);
+  }
+
   /** Watched discovery roots: builtin runtime checkout + app dir + shared store + per-project dirs. */
   private async refreshExtensionHotReloadRoots(): Promise<void> {
     const roots: HotReloadRoot[] = [
@@ -11333,6 +11346,7 @@ export class PiHostBackend implements HostBackend {
     }
     await writeSessionWorkspace(isolated.sessionsDir, binding);
     if (this.live.has(sessionId)) this.requestExtensionHotRestart(sessionId, "state");
+    this.emitSessionWorkspaceChanged(sessionId, "bind");
     return this.sessionWorkspaceStatus(sessionId);
   }
 
@@ -11343,6 +11357,7 @@ export class PiHostBackend implements HostBackend {
     const isolated = await this.ensureIsolatedProjectHome(meta.header.cwd, { allowMissing: true });
     if (isolated) await clearSessionWorkspaceFile(isolated.sessionsDir, sessionId);
     if (this.live.has(sessionId)) this.requestExtensionHotRestart(sessionId, "state");
+    this.emitSessionWorkspaceChanged(sessionId, "unbind");
     return { bound: false };
   }
 
