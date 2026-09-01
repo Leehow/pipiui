@@ -319,6 +319,7 @@ import {
 	decideDispatchBackground,
 	decideRuntimeBudgetExpiry,
 	decideStallWatchdogAction,
+	GENERAL_PURPOSE_SEMANTIC_TURN_CAP,
 	normalizeGeneralPurposeExecutionPolicy,
 	rejectDispatchAtDepth,
 	rejectNestedDelegationTypes,
@@ -7557,7 +7558,8 @@ async function runSingleAgent(
 					: Math.max(0, Math.floor((now - firstChildSpawnedAt) / 1000));
 				currentResult.stopReason = "semantic_no_progress";
 				currentResult.errorMessage = [
-					"semantic_no_progress:",
+					"semantic_no_progress: inspect-stall watchdog stopped this worker after",
+					`${GENERAL_PURPOSE_SEMANTIC_TURN_CAP} consecutive turns of repeated read-only actions with no write/validation progress.`,
 					`elapsed=${elapsedSec}s`,
 					`turns=${semanticProgress.completedTurns}`,
 					`inspectOnlyStreak=${semanticProgress.inspectOnlyStreak}`,

@@ -8,18 +8,39 @@ import {
 	createSemanticProgressState,
 } from "../runtime-policy.ts";
 
-test("inspection-only general-purpose turns terminate at the bounded semantic cap", () => {
+test("inspection-only turns terminate at the spin cap only when targets repeat", () => {
 	let state = createSemanticProgressState();
-	for (let turn = 1; turn <= GENERAL_PURPOSE_SEMANTIC_TURN_CAP; turn++) {
+	// Alternating two empty-argument calls: each first occurrence is novel recon, every
+	// later one is spin. Termination lands at two novel turns plus the spin cap.
+	let terminatedAt = 0;
+	for (let turn = 1; turn <= GENERAL_PURPOSE_SEMANTIC_TURN_CAP + 3; turn++) {
 		const decision = advanceSemanticProgress(state, {
 			type: "assistant-turn",
 			toolCalls: [{ id: `read-${turn}`, name: turn % 2 ? "read" : "grep", arguments: {} }],
 		});
 		state = decision.state;
-		assert.equal(decision.terminate, turn === GENERAL_PURPOSE_SEMANTIC_TURN_CAP);
+		if (decision.terminate) { terminatedAt = turn; break; }
 	}
+	assert.equal(terminatedAt, GENERAL_PURPOSE_SEMANTIC_TURN_CAP + 2);
 	assert.equal(state.inspectOnlyStreak, 12);
 	assert.equal(state.progressEvents, 0);
+});
+
+test("recon over changing targets is not a stall and never approaches the cap", () => {
+	let state = createSemanticProgressState();
+	for (let turn = 1; turn <= 30; turn++) {
+		const decision = advanceSemanticProgress(state, {
+			type: "assistant-turn",
+			toolCalls: [
+				{ id: `read-${turn}`, name: "read", arguments: { path: `src/file-${turn}.ts` } },
+				{ id: `grep-${turn}`, name: "grep", arguments: { pattern: `symbol${turn}` } },
+			],
+		});
+		state = decision.state;
+		assert.equal(decision.terminate, false, `recon turn ${turn} must not terminate`);
+	}
+	assert.equal(state.inspectOnlyStreak, 0);
+	assert.equal(state.progressEvents, 0, "recon earns no progress credit — it just is not a stall");
 });
 
 test("only successful mutation or validation resets semantic no-progress", () => {
@@ -68,12 +89,47 @@ test("only successful mutation or validation resets semantic no-progress", () =>
 	assert.equal(decision.state.progressEvents, 0);
 });
 
-test("inspection shell commands never masquerade as validation", () => {
-	const decision = advanceSemanticProgress(createSemanticProgressState({ inspectOnlyStreak: 11 }), {
+test("node --test — the repo's mandated worker verify command — counts as validation", () => {
+	for (const command of [
+		"node --test",
+		"node --test test/a.test.ts",
+		"node --experimental-strip-types --test test/a.test.ts",
+		"cd Electron && node --test resources/runtime/pi-ext/subagent/test/semantic-progress.test.ts",
+	]) {
+		const id = `test-${command.length}`;
+		let decision = advanceSemanticProgress(createSemanticProgressState({ inspectOnlyStreak: 11 }), {
+			type: "assistant-turn",
+			toolCalls: [{ id, name: "bash", arguments: { command } }],
+		});
+		assert.equal(decision.terminate, false, command);
+		decision = advanceSemanticProgress(decision.state, {
+			type: "tool-result",
+			toolCallId: id,
+			toolName: "bash",
+			isError: false,
+		});
+		assert.equal(decision.state.inspectOnlyStreak, 0, command);
+		assert.equal(decision.state.progressEvents, 1, command);
+	}
+});
+
+test("inspection shell commands earn no validation credit, and repeating them spins out", () => {
+	const call = (id: string) => ({ id, name: "bash", arguments: { command: "NODE_OPTIONS=x git status --short" } });
+	// First occurrence: novel recon — no validation credit, but also no stall increment.
+	let decision = advanceSemanticProgress(createSemanticProgressState({ inspectOnlyStreak: 11 }), {
 		type: "assistant-turn",
-		toolCalls: [{ id: "status-1", name: "bash", arguments: { command: "NODE_OPTIONS=x git status --short" } }],
+		toolCalls: [call("status-1")],
 	});
-	assert.equal(decision.terminate, true);
+	assert.equal(decision.terminate, false, "one novel recon command is not a stall");
+	assert.equal(decision.state.progressEvents, 0, "git status is not validation evidence");
+	assert.equal(decision.state.inspectOnlyStreak, 11);
+	// Repeating the identical command is the stall the cap exists for.
+	decision = advanceSemanticProgress(decision.state, {
+		type: "assistant-turn",
+		toolCalls: [call("status-2")],
+	});
+	assert.equal(decision.terminate, true, "repeating the identical inspection command hits the spin cap");
+	assert.equal(decision.state.progressEvents, 0);
 });
 
 test("id-less semantic calls pair only by tool name and missing results settle boundedly", () => {

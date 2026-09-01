@@ -87,8 +87,11 @@ export interface GeneralPurposeExecutionPolicy {
 /** Default GP budget: producing workers extend silently; a stalled one can be aborted. */
 export const DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS = 600_000;
 
-/** Independent semantic safety limit for the exact bundled writable worker route. */
+/** Stall cap for repeated inspect-only turns: same targets, no writes/validation. Novel recon does not count. */
 export const GENERAL_PURPOSE_SEMANTIC_TURN_CAP = 12;
+
+/** Bounded ring of recent inspect-call signatures used to tell spinning from advancing recon. */
+const INSPECT_SIGNATURE_RING_SIZE = 24;
 
 export interface SemanticProgressState {
 	completedTurns: number;
@@ -96,6 +99,7 @@ export interface SemanticProgressState {
 	progressEvents: number;
 	pendingToolIds: string[];
 	pendingAnonymousTools: string[];
+	recentInspectSignatures: string[];
 	lastSummary: string;
 }
 
@@ -121,13 +125,20 @@ const MUTATION_TOOL_NAMES = new Set([
 function isRecognizableValidationCommand(command: string): boolean {
 	const normalized = command.trim().replace(/\s+/g, " ");
 	if (!normalized) return false;
-	const executable = normalized.replace(
-		/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/,
-		"",
-	);
+	const executable = normalized
+		// Briefs routinely prefix the verify command with `cd <dir> &&`; strip those hops before
+		// judging, otherwise a mandated `cd Electron && node --test` earns no progress credit.
+		.replace(/^(?:cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*&&\s*)+/, "")
+		.replace(
+			/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/,
+			"",
+		);
 	return [
-		/^(?:npm|pnpm|yarn|bun) (?:test|run (?:test|build|check|verify)(?::[\w.-]+)?)(?: |$)/,
+		/^(?:npm|pnpm|yarn|bun) (?:test|run (?:test|build|check|verify|typecheck)(?::[\w.-]+)?)(?: |$)/,
 		/^npx (?:--[\w-]+ )*(?:tsx|vitest|jest|tsc)(?: |$).*(?:--test| test|--run|--noEmit| run)(?: |$)/,
+		// `node --test` is this repo's mandated worker verify command; without it the guard
+		// kills workers for following their own brief.
+		/^node(?:\.js)? (?:--[\w-]+(?:=[^\s]*)? )*--test(?:\s|$)/,
 		/^(?:cargo|swift) (?:test|build|check)(?: |$)/,
 		/^go test(?: |$)/,
 		/^(?:python(?:3)? -m )?pytest(?: |$)/,
@@ -151,9 +162,24 @@ export function createSemanticProgressState(
 		progressEvents: 0,
 		pendingToolIds: [],
 		pendingAnonymousTools: [],
+		recentInspectSignatures: [],
 		lastSummary: "no completed assistant turn",
 		...overrides,
 	};
+}
+
+/**
+ * What a non-semantic call was aimed at. Repeating the same signature is the stall this
+ * guard exists to catch; a changing target is recon advancing, which the wall-clock
+ * timeout — not a turn counter — is responsible for bounding.
+ */
+function inspectSignature(call: { name: string; arguments: Record<string, unknown> }): string {
+	const args = call.arguments ?? {};
+	const primary =
+		args.path ?? args.command ?? args.pattern ?? args.query ?? args.url ??
+		Object.values(args).find((value) => typeof value === "string");
+	const normalized = typeof primary === "string" ? primary.trim().replace(/\s+/g, " ").slice(0, 120) : "";
+	return `${call.name.trim().toLowerCase()}:${normalized}`;
 }
 
 /** Pure semantic-progress transition; transport liveness remains a separate policy. */
@@ -199,7 +225,20 @@ export function advanceSemanticProgress(
 		if (pendingToolIds.length > 0 || pendingAnonymousTools.length > 0) {
 			return { state: next, terminate: false };
 		}
+		// No semantic tool this turn. Only aimless repetition counts toward the stall cap:
+		// a turn inspecting something new is recon advancing — legitimate progress the old
+		// blind turn counter killed mid-work (verification/check tasks never write files).
+		const signatures = event.toolCalls
+			.filter((call) => !isSemanticToolCall(call))
+			.map(inspectSignature);
+		const novel = signatures.filter((sig) => !next.recentInspectSignatures.includes(sig));
+		if (signatures.length > 0 && novel.length > 0) {
+			next.recentInspectSignatures = [...next.recentInspectSignatures, ...novel].slice(-INSPECT_SIGNATURE_RING_SIZE);
+			next.lastSummary = `${next.lastSummary} (recon: ${novel.length} new target${novel.length === 1 ? "" : "s"})`;
+			return { state: next, terminate: false };
+		}
 		next.inspectOnlyStreak += 1;
+		if (signatures.length > 0) next.lastSummary = `${next.lastSummary} (spin: repeated inspect targets)`;
 		return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
 	}
 
@@ -225,6 +264,7 @@ export function advanceSemanticProgress(
 			progressEvents: state.progressEvents + 1,
 			pendingToolIds: [],
 			pendingAnonymousTools: [],
+			recentInspectSignatures: [],
 			lastSummary: `${state.lastSummary}; semantic tool ${matchedLabel} succeeded`,
 		};
 		return { state: next, terminate: false };
