@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI, QuotaSnapshot } from '@pipi/host-api'
-import { QuotaPill, quotaSnapshotMatchesProvider } from './QuotaPill'
+import { formatQuotaReset, QuotaPill, quotaSnapshotMatchesProvider } from './QuotaPill'
 
 beforeEach(() => {
   vi.useRealTimers()
@@ -48,6 +48,25 @@ describe('quotaSnapshotMatchesProvider', () => {
     expect(quotaSnapshotMatchesProvider({ provider: 'cursor', accountLabel: '', windows: [] }, 'cursor-relay')).toBe(false)
     // OpenCode Go may arrive as the opencode provider plus a plan model id.
     expect(quotaSnapshotMatchesProvider({ provider: 'opencodeGo', accountLabel: '', windows: [] }, 'opencode', 'opencode-go')).toBe(true)
+  })
+})
+
+describe('formatQuotaReset', () => {
+  // Local-time construction keeps calendar-day assertions timezone-independent.
+  const at = (iso: string) => new Date(iso).getTime()
+  const now = at('2026-09-01T08:00:00')
+
+  it('formats today / tomorrow / later dates with a relative hint', () => {
+    expect(formatQuotaReset(at('2026-09-01T11:30:00'), now)).toBe('重置于 今天 11:30（4小时后）')
+    expect(formatQuotaReset(at('2026-09-01T08:20:00'), now)).toBe('重置于 今天 08:20（20分钟后）')
+    expect(formatQuotaReset(at('2026-09-02T09:00:00'), now)).toBe('重置于 明天 09:00（1天后）')
+    expect(formatQuotaReset(at('2026-09-04T22:55:00'), now)).toBe('重置于 9/4 22:55（4天后）')
+  })
+
+  it('renders nothing for missing or already-past timestamps', () => {
+    expect(formatQuotaReset(undefined, now)).toBeUndefined()
+    expect(formatQuotaReset(Number.NaN, now)).toBeUndefined()
+    expect(formatQuotaReset(now - 60_000, now)).toBeUndefined()
   })
 })
 
@@ -96,6 +115,35 @@ describe('QuotaPill', () => {
     expect((screen.getByTestId('quota-row-window0') as HTMLButtonElement).getAttribute('aria-checked')).toBe('false')
     expect(screen.getByTestId('quota-row-window1').textContent).toContain('✓')
     expect(screen.getByTestId('quota-row-window0').textContent).not.toContain('✓')
+  })
+
+  it('shows a CodexBar-style reset line per window when the host reports resetsAt', async () => {
+    const { host } = quotaHost({
+      provider: 'kimi',
+      accountLabel: 'Kimi 账号额度',
+      windows: [
+        { id: 'weekly', usedPercent: 68, resetsAt: Date.now() + 3.5 * 3_600_000, label: '周', title: '周额度' },
+        { id: 'fiveHour', usedPercent: 23, label: '5h', title: '5小时额度' }
+      ]
+    })
+    render(<QuotaPill host={host} provider="kimi-coding" />)
+    fireEvent.click(await screen.findByTestId('quota-pill'))
+    const reset = await screen.findByTestId('quota-reset-weekly')
+    expect(reset.textContent).toMatch(/^重置于 .+（.+后）$/)
+    // A window without resetsAt stays a plain percent row.
+    expect(screen.queryByTestId('quota-reset-fiveHour')).toBeNull()
+  })
+
+  it('hides a stale (already past) resetsAt instead of showing a wrong countdown', async () => {
+    const { host } = quotaHost({
+      provider: 'kimi',
+      accountLabel: 'Kimi 账号额度',
+      windows: [{ id: 'weekly', usedPercent: 68, resetsAt: Date.now() - 60_000, label: '周', title: '周额度' }]
+    })
+    render(<QuotaPill host={host} provider="kimi-coding" />)
+    fireEvent.click(await screen.findByTestId('quota-pill'))
+    expect(await screen.findByTestId('quota-menu')).toBeTruthy()
+    expect(screen.queryByTestId('quota-reset-weekly')).toBeNull()
   })
 
   it('switches the capsule immediately on pick, persists the pick per provider, and keeps the popover open', async () => {

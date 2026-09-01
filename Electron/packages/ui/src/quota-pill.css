@@ -63,6 +63,15 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* CodexBar-style reset line under the row title (QuotaPill popover only). */
+.quota-menu-reset {
+  display: block;
+  margin-top: 2px;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 400;
+}
+
 .quota-menu .quick-menu-check {
   margin-left: 8px;
 }

@@ -85,6 +85,29 @@ export function quotaMenuPortalRoot(): Element {
 }
 
 /**
+ * CodexBar-style reset line for a popover row — `重置于 明天 09:00（11小时后）`.
+ * Missing or already-past timestamps (stale snapshot awaiting the next poll)
+ * render nothing instead of a wrong countdown.
+ */
+export function formatQuotaReset(resetsAt: number | undefined, now: number = Date.now()): string | undefined {
+  if (resetsAt === undefined || !Number.isFinite(resetsAt)) return undefined
+  const deltaMs = resetsAt - now
+  if (deltaMs <= 0) return undefined
+  const date = new Date(resetsAt)
+  const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+  const dayStart = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime()
+  // Math.round absorbs DST-shortened/lengthened days (23h/25h).
+  const dayDelta = Math.round((dayStart(date) - dayStart(new Date(now))) / 86_400_000)
+  const day = dayDelta === 0 ? '今天' : dayDelta === 1 ? '明天' : `${date.getMonth() + 1}/${date.getDate()}`
+  const relative = deltaMs < 3_600_000
+    ? `${Math.max(1, Math.round(deltaMs / 60_000))}分钟后`
+    : deltaMs < 86_400_000
+      ? `${Math.max(1, Math.round(deltaMs / 3_600_000))}小时后`
+      : `${Math.max(1, Math.round(deltaMs / 86_400_000))}天后`
+  return `重置于 ${day} ${time}（${relative}）`
+}
+
+/**
  * Mirrors Swift `QuotaSnapshot.capsule`: the user's persisted window when it
  * still exists in the snapshot, else the highest-usage window.
  */
@@ -236,6 +259,7 @@ export function QuotaPill({ host, sessionId, provider, modelId, refreshKey, onOp
             )}
             {windows.map(window => {
               const current = window.id === currentId
+              const resetText = formatQuotaReset(window.resetsAt)
               return (
                 <button
                   key={window.id}
@@ -246,7 +270,14 @@ export function QuotaPill({ host, sessionId, provider, modelId, refreshKey, onOp
                   data-testid={`quota-row-${window.id}`}
                   onClick={() => selectWindow(window.id)}
                 >
-                  <span className="quick-menu-name">{window.title || window.label}</span>
+                  <span className="quick-menu-name">
+                    {window.title || window.label}
+                    {resetText && (
+                      <span className="quota-menu-reset" data-testid={`quota-reset-${window.id}`}>
+                        {resetText}
+                      </span>
+                    )}
+                  </span>
                   <span className="quota-menu-percent">{Math.round(window.usedPercent)}%</span>
                   {current && <span className="quick-menu-check">✓</span>}
                 </button>
