@@ -32,7 +32,7 @@ describe('slash command registry', () => {
   it('registers selfdev with the send-selfdev action and a Chinese description', () => {
     expect(slashCommandByName('selfdev')).toMatchObject({
       name: 'selfdev',
-      description: '用自然语言修改扩展并热重载',
+      description: '用自然语言改扩展或加新功能并热重载',
       action: { kind: 'send-selfdev' }
     })
   })

@@ -50,7 +50,7 @@ export function planPromptFromArgs(args: string): string {
 }
 
 export const SELFDEV_PROMPT_WITH_ARGS =
-  '[selfdev] 用户要用自然语言修改当前产品的已安装扩展并立即热重载生效。先 skill_load(\'selfdev\') 加载流程与护栏并严格遵循（定位→投影→修改→热重载→回执），然后完成以下需求：'
+  '[selfdev] 用户要用自然语言修改当前产品的已安装扩展、或给产品加新功能（落到某个扩展上），并立即热重载生效。先 skill_load(\'selfdev\') 加载流程与护栏并严格遵循（定位/落点→投影→修改→热重载→回执），然后完成以下需求：'
 export const SELFDEV_PROMPT_BARE =
   '[selfdev] 用户想用自然语言修改当前产品的已安装扩展并立即热重载生效。先 skill_load(\'selfdev\') 加载流程与护栏，然后用一句话询问要改哪个扩展、改成什么样。'
 
@@ -83,7 +83,7 @@ export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandDef[] = [
   { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } },
   { name: 'plan', description: '为目标制定正式计划', action: { kind: 'send-plan' } },
   { name: 'goal', description: '设定自主完成的目标', action: { kind: 'send-prompt' } },
-  { name: 'selfdev', description: '用自然语言修改扩展并热重载', action: { kind: 'send-selfdev' } }
+  { name: 'selfdev', description: '用自然语言改扩展或加新功能并热重载', action: { kind: 'send-selfdev' } }
 ]
 
 for (const command of BUILTIN_SLASH_COMMANDS) {
