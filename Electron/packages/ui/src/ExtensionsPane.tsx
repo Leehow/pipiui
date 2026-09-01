@@ -1194,9 +1194,9 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
         <strong>基础工具</strong>
         <span>网页 · 浏览器 · 电脑 · 记忆</span>
       </button>
-      <div className="extensions-core-soon" data-testid="extensions-nav-theme" title="主题扩展实现后在这里管理">
-        <strong>主题扩展</strong>
-        <span>即将推出</span>
+      <div className="extensions-core-soon" data-testid="extensions-nav-theme" title="主题的预览与选用在 设置 → 主题">
+        <strong>主题包</strong>
+        <span>设置 → 主题</span>
       </div>
       <div className="extensions-pack-sidebar-divider" />
       <div className="extensions-pack-sidebar-heading">其他扩展</div>

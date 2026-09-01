@@ -152,7 +152,8 @@ describe('ExtensionsPane', () => {
     expect(screen.getByTestId('extensions-nav-skills').textContent).toContain('Skill Loader')
     expect(screen.getByTestId('extensions-nav-mcp').textContent).toContain('pi-mcp-extension')
     expect(screen.getByTestId('extensions-nav-tools').textContent).toContain('基础工具')
-    expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('即将推出')
+    expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('主题包')
+    expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('设置 → 主题')
     expect((screen.getByTestId('extensions-nav-theme') as HTMLElement).tagName).toBe('DIV')
   })
 

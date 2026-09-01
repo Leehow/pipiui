@@ -891,6 +891,10 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
       return sessions[index]
     },
     deleteSession: async () => undefined,
+    // Session-workspace extension point: the dev mock has no worktree binding to enforce.
+    setSessionWorkspace: async () => undefined,
+    clearSessionWorkspace: async () => undefined,
+    sessionWorkspaceStatus: async () => null,
     moveSession: async (sessionId, targetProjectId) => {
       const index = sessions.findIndex(session => session.id === sessionId)
       if (index < 0) throw new Error(`unknown session ${sessionId}`)
