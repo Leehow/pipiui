@@ -75,6 +75,10 @@ body{overscroll-behavior:none}
 .chat-header-title-label:focus-visible{outline:2px solid color-mix(in srgb,var(--accent) 60%,transparent);outline-offset:3px;border-radius:3px}
 .chat-header-title-input{width:min(420px,55vw);height:30px;padding:3px 8px;border:1px solid var(--accent);border-radius:6px;outline:0;color:var(--text-strong);background:var(--surface-input);font-weight:650;box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 16%,transparent)}
 .chat-header-actions{display:flex;flex:none;align-items:center;gap:6px;margin-left:auto}
+.session-branch-pair{display:flex;align-items:center;gap:5px;max-width:220px;min-width:0;height:26px;padding:0 7px;border-radius:6px;color:var(--muted);font-size:11px;-webkit-app-region:no-drag}
+.session-branch-icon{flex:none;font-size:12px;line-height:1}
+.session-branch-name,.main-branch-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.session-branch-sep{flex:none;color:var(--subtle)}
 .pane-toggle{display:grid;width:28px;height:28px;flex:0 0 28px;place-items:center;border-radius:6px;color:var(--muted);font-size:17px;line-height:1;-webkit-app-region:no-drag}.pane-toggle:hover{background:var(--surface-hover);color:var(--text-strong)}
 .right-pane-toggle-icon{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.45;stroke-linecap:round;stroke-linejoin:round}.right-pane-toggle-fill{fill:currentColor;fill-opacity:.16;stroke:none}
 .tool-panel-header{display:flex;min-width:0;flex:0 0 50px;align-items:center;gap:8px;padding:0 8px 0 10px;border-bottom:1px solid var(--border);background:var(--surface)}.tool-panel-header .pane-toggle{margin-left:0;flex:0 0 auto}.tool-panel-header-slot{flex:1 1 auto;min-width:0;display:flex;align-items:center;overflow:hidden}.tool-panel-back{display:flex;min-width:0;flex:0 0 auto;align-items:center;gap:4px;height:26px;padding:0 8px;border-radius:6px;color:var(--text);font-size:12px;font-weight:600}.tool-panel-back:hover{background:var(--surface-hover);color:var(--text-strong)}
@@ -345,7 +349,7 @@ body{overscroll-behavior:none}
 .pipiui-shell{position:relative}
 .electron-chrome .sb-topbar,.electron-chrome .chat-header,.electron-chrome .tool-panel-header{-webkit-app-region:drag;user-select:none}
 .electron-chrome .sb-topbar{padding-left:88px}
-.electron-chrome .sb-topbar button,.electron-chrome .chat-header button,.electron-chrome .chat-header input,.electron-chrome .chat-header select,.electron-chrome .tool-panel-header button{-webkit-app-region:no-drag}
+.electron-chrome .sb-topbar button,.electron-chrome .chat-header button,.electron-chrome .chat-header input,.electron-chrome .chat-header select,.electron-chrome .chat-header .session-branch-pair,.electron-chrome .tool-panel-header button{-webkit-app-region:no-drag}
 .electron-chrome .chat-header-title{-webkit-app-region:drag}
 .electron-chrome .chat-header-title-label{-webkit-app-region:no-drag;user-select:none;cursor:default}
 .electron-chrome .pane-restore-sidebar{left:78px}

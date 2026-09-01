@@ -3,6 +3,7 @@ import { ProviderLogo } from './ProviderLogo'
 import { SessionSourceIcon } from './SessionSourceIcon'
 import { adoptedSourceBadge, isExternalSidebarSource, sessionRowLabel, sessionSourceLabel, type SessionSource } from './session-source'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
+import { UnmergedAheadBadge } from './session-workspace-ui'
 import { useCustomLogo } from './custom-logo'
 import './sidebar.css'
 import gearIcon from './sf-icons/gearshape.png'
@@ -112,6 +113,8 @@ export interface SidebarSession {
   subagentCount?: number
   /** Last-modified epoch ms — rendered as relative time for idle rows. */
   updatedAt: number
+  /** Isolated worktree commits ahead of main; absent when no workspace. */
+  aheadOfMain?: number | null
 }
 
 export interface SidebarProject {
@@ -363,6 +366,7 @@ function SessionRow({ session, selected, onSelect, isPinned, onPin, onRename, on
         : <span className="sb-session-title-line">
             <span className="sb-session-title">{session.title}</span>
             {!external && session.adoptedFromSource ? <span className="sb-adopted-badge" data-testid="adopted-source-badge">{adoptedSourceBadge(session.adoptedFromSource)}</span> : null}
+            <UnmergedAheadBadge aheadOfMain={session.aheadOfMain} />
           </span>}
       <span className="sb-status" data-status={session.status} aria-label={statusCaption(session)} hidden={renaming}>
         <StatusGlyph status={session.status} count={session.subagentCount ?? 0} />
