@@ -177,6 +177,8 @@ describe("coding tools extension mount", () => {
     let beforeAgentStart: (() => any) | undefined;
     gitCapability({
       registerTool: (tool: any) => tools.push(tool),
+      // git-capability also registers /session_merge; the contract below only cares about tools.
+      registerCommand: () => {},
       on: (event: string, handler: () => any) => {
         if (event === "before_agent_start") beforeAgentStart = handler;
       },
