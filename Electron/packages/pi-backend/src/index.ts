@@ -6586,14 +6586,28 @@ export class PiHostBackend implements HostBackend {
     for (const live of this.live.values()) {
       seen.add(live.session.id);
       const epoch = live.turnEpoch;
-      if (epoch === undefined || live.terminalEpoch === epoch) continue;
       const active = live.lastTurnActivityAt ?? 0;
       if (now - active < TURN_WATCHDOG_TIMEOUT_MS) continue;
       // Must not trigger while queue thinks idle but live still shows busy phantom — check turnActive via queue
       if (!this.queue.isBusy(live.session.id)) continue;
+      const turnOpen = epoch !== undefined && live.terminalEpoch !== epoch;
+      // Live already closed this turn (or none ever started), yet the queue
+      // gate is still held: the settle's queue-side release was lost (notifyIdle
+      // fenced out by a lifecycle/current-session check). projectTurnTerminal
+      // would return on the terminalEpoch fence and never re-release, and the
+      // orphan sweep below skips sessions that still have a live entry —
+      // without this branch the gate leaks forever: every later prompt parks
+      // behind it ("queued") and nothing ever drains. Require a quiet RPC
+      // surface so a genuinely in-flight dispatch is never released.
+      if (!turnOpen && live.pending.size > 0) continue;
       const tailTerminal = await this.isSessionTailTerminal(live.path);
       if (!tailTerminal) {
         console.warn(`[pipi-backend] turn watchdog no tail terminal session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
+        continue;
+      }
+      if (!turnOpen) {
+        console.warn(`[pipi-backend] turn watchdog releasing leaked queue gate session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch} idleMs=${now - active}`);
+        await this.queue.notifyIdle(live.session.id);
         continue;
       }
       console.warn(`[pipi-backend] turn watchdog firing session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch} idleMs=${now - active}`);

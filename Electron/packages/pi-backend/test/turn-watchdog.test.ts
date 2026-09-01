@@ -151,6 +151,42 @@ describe("turn watchdog (fix 3)", () => {
     await backend.close();
   });
 
+  it("releases a leaked queue gate when live is already terminal (settle's queue-side release was lost)", async () => {
+    const { backend, sessionPath } = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
+
+    // A normal completed turn: live projected terminal (epoch is fenced off),
+    // so projectTurnTerminal can never run again for it.
+    await backend.handle("sendPrompt", ["s1", "hello"]);
+    await eventually(() => statuses.includes("settled"));
+
+    // Durable terminal tail so the watchdog's tail gate passes.
+    await appendFile(sessionPath, JSON.stringify({
+      type: "message", id: "tail-stop", parentId: null,
+      message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    }) + "\n");
+
+    // The settle's queue-side release was lost: the FIFO still holds turnActive
+    // even though live says no turn is open. Every later prompt parks forever.
+    (backend as any).queue.markBusy("s1");
+    const enqueued = await backend.handle("enqueueMessage", ["s1", "typed-behind-leak"]) as any;
+    expect(enqueued.outcome).toBe("queued");
+
+    const live = (backend as any).live.get("s1");
+    expect(live).toBeTruthy();
+    live.lastTurnActivityAt = Date.now() - (TURN_WATCHDOG_TIMEOUT_MS + 5_000);
+    await (backend as any).checkTurnWatchdogs();
+
+    // The leaked gate is released and the parked prompt drains as a new turn.
+    await eventually(async () => ((await backend.handle("listQueue", ["s1"]) as any[]).length === 0));
+    await eventually(() => statuses.filter(s => s === "started").length >= 2);
+
+    off();
+    await backend.close();
+  });
+
   it("isSessionTailTerminal distinguishes stop vs tool_use", async () => {
     const { backend, sessionPath } = await fixture();
     // Write stop tail
