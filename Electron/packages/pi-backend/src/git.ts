@@ -41,6 +41,14 @@ async function gitStrict(cwd: string, args: string[], timeout = GIT_TIMEOUT_MS):
   }
 }
 
+/** Commits `branch` is ahead of the checkout at `cwd` HEAD; null when git cannot answer. */
+export async function aheadOfHeadCount(cwd: string, branch: string): Promise<number | null> {
+  if (!branch || branch.startsWith("-") || branch.includes("..")) return null;
+  const out = await git(cwd, ["rev-list", "--count", `HEAD..${branch}`]);
+  const count = Number(out?.trim());
+  return Number.isInteger(count) && count >= 0 ? count : null;
+}
+
 async function headResolves(cwd: string): Promise<boolean> {
   return Boolean((await git(cwd, ["rev-parse", "--verify", "HEAD"]))?.trim());
 }

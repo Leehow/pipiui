@@ -42,6 +42,7 @@ import {
   type ProductPackArchiveResult,
   type Session,
   type SessionPage,
+  type SessionWorkspace,
   type SessionPreloadSnapshot,
   type SessionStats,
   type SubagentDebugInfo,
@@ -59,6 +60,15 @@ import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.j
 import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
 import { ThinkingControlReporter } from "./thinking-control.js";
 import { PlanStore, readPlanStore } from "./plan-store.js";
+import {
+  assertWorkspaceCwdAllowed,
+  clearSessionWorkspaceFile,
+  isValidWorkspaceBranch,
+  readSessionWorkspace,
+  usableSessionWorkspace,
+  writeSessionWorkspace,
+  type SessionWorkspaceBinding,
+} from "./session-workspace.js";
 import { readUserMcpServers, removeUserMcpServer as removeUserMcpServerEntry, writeUserMcpServer as writeUserMcpServerEntry } from "./user-mcp-servers.js";
 import {
   assemblePiSpawn,
@@ -98,7 +108,7 @@ import {
   type LeaseAcquisitionMetadata,
   type LeaseStatus,
 } from "./lease.js";
-import { checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
+import { aheadOfHeadCount, checkoutBranch, ensureLocalGitForWorktrees, probeGit, probeGitBinary } from "./git.js";
 import { HostBridge, type ModelPinValidateDecisionV1, type ModelPinValidateRequestV1 } from "./bridge.js";
 import { DEFAULT_FEATURES } from "./features.js";
 import { DocumentFileWatcher } from "./document-watch.js";
@@ -837,6 +847,8 @@ type Live = {
   spawnInitializing?: boolean;
   /** Monotonic timestamp of the last turn-related event (agent_start, deltas, tool, message_end). */
   lastTurnActivityAt?: number;
+  /** Canonical project root. `cwd` may be a session-bound workspace/worktree; identity never follows it. */
+  projectRoot?: string;
 };
 const PI_STDERR_TAIL_LIMIT = 16 * 1024;
 /** Custom-message type pi-ext's idle-fold timer uses for its nudge turn. */
@@ -2360,6 +2372,7 @@ export class PiHostBackend implements HostBackend {
         const result = handleExtEmit(this.extensions, input, sessionId);
         if (!result.ok) return result;
         emitFrame(this.listeners, result.event as unknown as HostEvent);
+        this.maybeApplySessionWorkspaceEmit(input, sessionId);
         return { ok: true as const };
       },
     });
@@ -3885,8 +3898,16 @@ export class PiHostBackend implements HostBackend {
         if (!paths.some((path) => dirId(path) === pid))
           throw new Error(`unknown project ${pid}`);
         const all = await this.index();
-        return all
-          .filter((s) => dirId(s.header.cwd) === pid)
+        const projectSessions = all.filter((s) => dirId(s.header.cwd) === pid);
+        const projectHome = this.lookupIsolatedHome(paths.find((path) => dirId(path) === pid) ?? "");
+        const workspaces = new Map<string, SessionWorkspace>();
+        if (projectHome) {
+          await Promise.all(projectSessions.map(async (s) => {
+            const workspace = await this.sessionWorkspaceDto(s.header.id, projectHome.realProjectRoot, projectHome.sessionsDir);
+            if (workspace) workspaces.set(s.header.id, workspace);
+          }));
+        }
+        return projectSessions
           .map((s) => {
             // A running Pi owns the newest in-memory session metadata. Its
             // set_session_name acknowledgement can arrive before the JSONL
@@ -3900,6 +3921,7 @@ export class PiHostBackend implements HostBackend {
               updatedAt: Math.max(s.updatedAt, live?.updatedAt ?? 0),
               model: this.sessionModelOf(s),
               ...(s.adoptedFrom ? { adoptedFrom: s.adoptedFrom } : {}),
+              ...(workspaces.has(s.header.id) ? { workspace: workspaces.get(s.header.id) } : {}),
             };
           })
           .sort((a, b) => b.updatedAt - a.updatedAt);
@@ -3972,6 +3994,8 @@ export class PiHostBackend implements HostBackend {
             agentDir: this.agentDir,
           });
           await removeSubagentDebugInfo(s.path);
+          // The workspace binding sidecar is session-owned: it must not outlive the session.
+          await clearSessionWorkspaceFile(dirname(s.path), s.header.id);
           this.historyCache.delete(s.path);
           this.indexCache.delete(s.path);
           this.sessionById.delete(s.header.id);
@@ -3984,6 +4008,12 @@ export class PiHostBackend implements HostBackend {
       }
       case "moveSession":
         return this.moveSession(params[0] as string, params[1] as string);
+      case "setSessionWorkspace":
+        return this.setSessionWorkspace(params[0], params[1]);
+      case "clearSessionWorkspace":
+        return this.clearSessionWorkspace(params[0]);
+      case "sessionWorkspaceStatus":
+        return this.sessionWorkspaceStatus(params[0]);
       case "getSessionHistory": {
         const session = await this.findSession(params[0] as string);
         const requestedBefore = params[1];
@@ -5185,6 +5215,8 @@ export class PiHostBackend implements HostBackend {
         agentDir: this.agentDir,
       });
       await removeSubagentDebugInfo(session.path);
+      // A moved session's binding points into the old project's worktree area; drop it.
+      await clearSessionWorkspaceFile(dirname(session.path), sessionId);
       this.indexCache.delete(session.path);
       const moved = await readSessionMeta(session.path);
       const stat = await fs.stat(session.path);
@@ -5313,8 +5345,10 @@ export class PiHostBackend implements HostBackend {
       ? await this.ensureIsolatedProjectHome(found.header.cwd)
       : undefined;
     this.assertSessionGeneration(id, generation);
-    const spawnCwd = isolated?.realProjectRoot ?? found.header.cwd;
-    const registeredExtensions = await this.registeredExtensionsForSpawn(spawnCwd);
+    // Identity anchor: always the canonical project root, even when a capability has bound
+    // this session to a workspace/worktree. Extension discovery stays rooted here.
+    const canonicalRoot = isolated?.realProjectRoot ?? found.header.cwd;
+    const registeredExtensions = await this.registeredExtensionsForSpawn(canonicalRoot);
     // Keep the memory broker's legacy mount channel pointing at the same object
     // as the registry mount: both channels must resolve to one path or pi loads
     // the broker twice.
@@ -5338,7 +5372,7 @@ export class PiHostBackend implements HostBackend {
     // pi-goal auto-revival suppression.
     const goalAutoResume = await this.goalAutoResumeForSpawn(id);
     this.assertSessionGeneration(id, generation);
-    const productActivation = await readProjectProductActivation(projectPiAgentDir(spawnCwd), {
+    const productActivation = await readProjectProductActivation(projectPiAgentDir(canonicalRoot), {
       defaultProfileId: this.defaultProductProfileId(),
     });
     const productSpawn = resolveProductSpawnPlan({
@@ -5368,10 +5402,16 @@ export class PiHostBackend implements HostBackend {
       this.rememberSessionMeta(found, profileStat.size, profileStat.mtimeMs);
     }
     this.assertSessionGeneration(id, generation);
+    // A capability-bound workspace (session worktree) redirects only the tool cwd;
+    // identity state stays at the canonical root via `projectRoot` → PIPIUI_PROJECT_ROOT.
+    const sessionWorkspace = await this.readUsableSessionWorkspace(id, canonicalRoot, isolated?.sessionsDir);
+    this.assertSessionGeneration(id, generation);
+    const spawnCwd = sessionWorkspace?.workspaceCwd ?? canonicalRoot;
     const output = assemblePiSpawn({
       sessionPath: found.path,
       sessionId: id,
       cwd: spawnCwd,
+      projectRoot: canonicalRoot,
       runtimeRoot: this.runtimeRoot,
       ...this.isolatedProjectPaths(found.header.cwd),
       resourceMode: this.resourceMode,
@@ -5467,6 +5507,7 @@ export class PiHostBackend implements HostBackend {
         spawnInitializing: true,
       path: found.path,
       cwd: spawnCwd,
+      projectRoot: canonicalRoot,
       process: child,
       exit,
       buffer: "",
@@ -9551,10 +9592,12 @@ export class PiHostBackend implements HostBackend {
     attachments: PromptAttachment[],
     userText?: string,
   ): Promise<string | undefined> {
-    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(live.cwd);
+    const visionRoot = live.projectRoot ?? live.cwd;
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(visionRoot);
     const isolated = assemblePiSpawn({
       cwd: live.cwd,
-      ...this.isolatedProjectPaths(live.cwd),
+      projectRoot: visionRoot,
+      ...this.isolatedProjectPaths(visionRoot),
       resourceMode: "explicit",
       features: {},
       paths: {},
@@ -9791,10 +9834,12 @@ export class PiHostBackend implements HostBackend {
   }
 
   private async refineAutomaticSessionTitle(live: Live, userMessage: string): Promise<void> {
-    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(live.cwd);
+    const titleRoot = live.projectRoot ?? live.cwd;
+    if (this.profileMode === "isolated") await this.ensureIsolatedProjectHome(titleRoot);
     const isolated = assemblePiSpawn({
       cwd: live.cwd,
-      ...this.isolatedProjectPaths(live.cwd),
+      projectRoot: titleRoot,
+      ...this.isolatedProjectPaths(titleRoot),
       resourceMode: "explicit",
       features: {},
       paths: {},
@@ -10996,15 +11041,127 @@ export class PiHostBackend implements HostBackend {
     }
     return this.planStore.list(id);
   }
-  /** Work tree a session's plan file lives in: the running cwd, else the JSONL header. */
+  /** Project root a session's plan file lives in: identity state never follows a bound workspace. */
   private async planCwd(sessionId: string): Promise<string | null> {
     const live = this.live.get(sessionId);
-    if (live) return live.cwd;
+    if (live) return live.projectRoot ?? live.cwd;
     try {
       return (await this.findSession(sessionId)).header.cwd;
     } catch {
       return null;
     }
+  }
+
+  /**
+   * A session's workspace binding for spawn/status: only a still-usable binding (contained
+   * in the project's worktree area, directory present) counts. A stale binding is cleared
+   * here so a cleaned-up worktree never strands the session outside the project root.
+   */
+  private async readUsableSessionWorkspace(
+    sessionId: string,
+    canonicalRoot: string,
+    sessionsDir?: string,
+  ): Promise<SessionWorkspaceBinding | null> {
+    if (!sessionsDir) return null;
+    const binding = await readSessionWorkspace(sessionsDir, sessionId);
+    if (!binding) return null;
+    const usable = await usableSessionWorkspace(binding, canonicalRoot);
+    if (!usable) await clearSessionWorkspaceFile(sessionsDir, sessionId);
+    return usable;
+  }
+
+  /** Sidebar/header DTO. `aheadOfMain` is null when git cannot answer (badge degrades, never lies). */
+  private async sessionWorkspaceDto(
+    sessionId: string,
+    canonicalRoot: string,
+    sessionsDir?: string,
+  ): Promise<SessionWorkspace | undefined> {
+    const binding = await this.readUsableSessionWorkspace(sessionId, canonicalRoot, sessionsDir);
+    if (!binding) return undefined;
+    return {
+      branch: binding.branch,
+      worktreePath: binding.worktreePath,
+      aheadOfMain: await aheadOfHeadCount(canonicalRoot, binding.branch),
+    };
+  }
+
+  /**
+   * Generic session-workspace extension point — capability-agnostic by design: the host
+   * validates containment and persistence, knowing nothing about git. Applying a binding
+   * uses the established graceful-respawn semantics (extension hot reload): an idle child
+   * stops now and the next send respawns it on the workspace; a busy session defers.
+   */
+  private async setSessionWorkspace(sessionIdValue: unknown, bindingValue: unknown): Promise<unknown> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
+    const sessionId = sessionIdValue.trim();
+    const meta = await this.locate(sessionId);
+    const isolated = await this.ensureIsolatedProjectHome(meta.header.cwd, { allowMissing: true });
+    if (!isolated) throw new Error(`project home unavailable for ${meta.header.cwd}`);
+    const input = (bindingValue ?? {}) as Record<string, unknown>;
+    const workspaceCwd = typeof input.workspaceCwd === "string" ? input.workspaceCwd : "";
+    const worktreePath = typeof input.worktreePath === "string" && input.worktreePath ? input.worktreePath : workspaceCwd;
+    if (!workspaceCwd) throw new Error("workspaceCwd is required");
+    if (!isValidWorkspaceBranch(input.branch)) throw new Error("branch must look like pipiui/session-<slug>");
+    assertWorkspaceCwdAllowed(isolated.realProjectRoot, workspaceCwd);
+    const binding: SessionWorkspaceBinding = {
+      version: 1,
+      sessionId,
+      workspaceCwd: resolve(workspaceCwd),
+      branch: input.branch,
+      worktreePath: resolve(worktreePath),
+      boundAt: new Date().toISOString(),
+    };
+    if (!(await usableSessionWorkspace(binding, isolated.realProjectRoot))) {
+      throw new Error(`session workspace ${workspaceCwd} is not an existing directory in the project worktree area`);
+    }
+    await writeSessionWorkspace(isolated.sessionsDir, binding);
+    if (this.live.has(sessionId)) this.requestExtensionHotRestart(sessionId, "state");
+    return this.sessionWorkspaceStatus(sessionId);
+  }
+
+  private async clearSessionWorkspace(sessionIdValue: unknown): Promise<unknown> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
+    const sessionId = sessionIdValue.trim();
+    const meta = await this.locate(sessionId);
+    const isolated = await this.ensureIsolatedProjectHome(meta.header.cwd, { allowMissing: true });
+    if (isolated) await clearSessionWorkspaceFile(isolated.sessionsDir, sessionId);
+    if (this.live.has(sessionId)) this.requestExtensionHotRestart(sessionId, "state");
+    return { bound: false };
+  }
+
+  private async sessionWorkspaceStatus(sessionIdValue: unknown): Promise<unknown> {
+    if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) return { bound: false };
+    try {
+      const meta = await this.locate(sessionIdValue.trim());
+      const isolated = await this.ensureIsolatedProjectHome(meta.header.cwd, { allowMissing: true, migrate: false });
+      if (!isolated) return { bound: false };
+      const workspace = await this.sessionWorkspaceDto(meta.header.id, isolated.realProjectRoot, isolated.sessionsDir);
+      return workspace ? { bound: true, workspace } : { bound: false };
+    } catch {
+      return { bound: false };
+    }
+  }
+
+  /**
+   * `git-capability` session-workspace requests arrive on the authenticated ext.emit channel
+   * (`event: "session-workspace"`, payload `{ op: "bind" | "unbind", ... }`). The capability
+   * check already proved the session; bind/unbind still goes through the host's own validation.
+   * Best-effort like every bridge handler: failures are logged, never reported back.
+   */
+  private maybeApplySessionWorkspaceEmit(
+    input: { extensionId: string; event: string; payload?: unknown },
+    sessionId: string,
+  ): void {
+    if (input.extensionId !== "git-capability" || input.event !== "session-workspace") return;
+    const payload = (input.payload ?? {}) as Record<string, unknown>;
+    const work = payload.op === "unbind"
+      ? this.clearSessionWorkspace(sessionId)
+      : payload.op === "bind"
+        ? this.setSessionWorkspace(sessionId, payload)
+        : Promise.resolve();
+    void Promise.resolve(work).catch((error: unknown) => {
+      console.warn(`[pipiui] session-workspace ${String(payload.op)} failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
   }
 	private waitForAgentTerminal(agentId: string, sessionId: string, runId: string, timeoutMs = 15_000): Promise<void> {
 		const key = this.agentKey(agentId, sessionId, runId);

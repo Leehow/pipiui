@@ -415,7 +415,10 @@ export function checkPlan(cwd: string): PlanCheckResult {
 }
 
 function cwdOf(ctx: { cwd?: string } | undefined): string {
-  return ctx?.cwd || process.env.PIPIUI_MAIN_CWD || process.cwd();
+  // Plans are conversation state, not work-tree state: when the host binds this session to
+  // a workspace/worktree, the plan file stays at the canonical project root so merging and
+  // removing the tree can never take the session's plan with it.
+  return process.env.PIPIUI_PROJECT_ROOT || ctx?.cwd || process.env.PIPIUI_MAIN_CWD || process.cwd();
 }
 
 export const PLAN_APPROVE_PROMPT = "批准该计划";
@@ -475,14 +478,14 @@ export function draftPlanToolCallBlockReason(
 export default function (pi: ExtensionAPI) {
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension" || event.text.trim() !== PLAN_APPROVE_PROMPT) return;
-    const store = loadStore(ctx.cwd);
+    const store = loadStore(cwdOf(ctx));
     const active = store.activePlanId ? store.plans[store.activePlanId] : undefined;
-    if (active?.lifecycle === "draft") await approvePlan(ctx.cwd, active.id);
+    if (active?.lifecycle === "draft") await approvePlan(cwdOf(ctx), active.id);
   });
 
   pi.on("tool_call", (event, ctx) => {
     const reason = draftPlanToolCallBlockReason(
-      ctx.cwd,
+      cwdOf(ctx),
       event.toolName,
       currentAssistantPublishesApprovalRequiredPlan(ctx),
     );

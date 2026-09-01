@@ -1760,3 +1760,30 @@ describe("secret vault spawn contract", () => {
     expect(resolveSpawnPaths(root).secretVault).toBe(join(root, "extensions", "pipiui-secret-vault.ts"));
   });
 });
+
+describe("session workspace project-root contract", () => {
+  const paths = { subagentDir: "/ext/subagent", agentsDir: "/ext/agents", memoryBroker: "/ext/memory" };
+
+  it("anchors PIPIUI_PROJECT_ROOT at the canonical root while cwd and MAIN_CWD follow the workspace", () => {
+    const { env } = assemblePiSpawn({
+      cwd: "/tmp/project/.pi/worktrees/session-x",
+      projectRoot: "/tmp/project",
+      features: { subagent: true, memoryBroker: true },
+      paths,
+      bridgePort: 4321,
+    });
+    expect(env.PIPIUI_MAIN_CWD).toBe("/tmp/project/.pi/worktrees/session-x");
+    expect(env.PIPIUI_PROJECT_ROOT).toBe("/tmp/project");
+    expect(env.PIPIUI_MEMORY_PROJECT_ROOT).toBe("/tmp/project");
+  });
+
+  it("defaults PIPIUI_PROJECT_ROOT to cwd for unbound sessions", () => {
+    const { env } = assemblePiSpawn({ cwd: "/tmp/project", features: { subagent: true }, paths });
+    expect(env.PIPIUI_PROJECT_ROOT).toBe("/tmp/project");
+  });
+
+  it("strips an inherited PIPIUI_PROJECT_ROOT so only the host-minted value survives", () => {
+    const merged = mergedSpawnEnvironment({ PATH: "/usr/bin", PIPIUI_PROJECT_ROOT: "/evil" }, {}, {});
+    expect(merged.PIPIUI_PROJECT_ROOT).toBeUndefined();
+  });
+});
