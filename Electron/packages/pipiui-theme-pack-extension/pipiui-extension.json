@@ -1,0 +1,95 @@
+{
+  "id": "pipiui-theme-pack",
+  "name": "主题包",
+  "version": "1.0.0",
+  "description": "内置配色主题包：护眼绿、赛博紫、暖米白。在 设置 → 主题 中预览并选用。",
+  "capabilities": [],
+  "app": {
+    "ui": {
+      "panels": [],
+      "settingsSections": [],
+      "slashCommands": [],
+      "themes": [
+        {
+          "id": "forest",
+          "name": "护眼绿",
+          "description": "深绿基底的低饱和深色主题，长时间阅读更舒适。",
+          "scheme": "dark",
+          "tokens": {
+            "--bg": "#141a16",
+            "--surface": "#1b231d",
+            "--surface-raised": "#202922",
+            "--surface-hover": "#263127",
+            "--surface-input": "#232c24",
+            "--border": "#2c372e",
+            "--border-strong": "#354237",
+            "--text": "#dde6dd",
+            "--text-strong": "#f0f5f0",
+            "--muted": "#9aab9c",
+            "--subtle": "#708073",
+            "--selection": "#2e4434",
+            "--accent": "#479863",
+            "--accent-soft": "#26382b",
+            "--danger": "#b5636c",
+            "--warning": "#e5c07b",
+            "--success": "#7fc99b"
+          }
+        },
+        {
+          "id": "neon",
+          "name": "赛博紫",
+          "description": "深紫夜色底配霓虹紫点缀的赛博朋克主题。",
+          "scheme": "dark",
+          "tokens": {
+            "--bg": "#16121f",
+            "--surface": "#1e1829",
+            "--surface-raised": "#241d31",
+            "--surface-hover": "#2b2239",
+            "--surface-input": "#271f34",
+            "--border": "#322844",
+            "--border-strong": "#3b2f50",
+            "--text": "#e6e1f2",
+            "--text-strong": "#f4f0fb",
+            "--muted": "#a89fc0",
+            "--subtle": "#7d7396",
+            "--selection": "#3c2f5e",
+            "--accent": "#8b5cf6",
+            "--accent-soft": "#34285a",
+            "--danger": "#c76072",
+            "--warning": "#ecc76f",
+            "--success": "#6fd0a8"
+          }
+        },
+        {
+          "id": "paper",
+          "name": "暖米白",
+          "description": "温暖米白纸感的浅色主题，柔和不刺眼。",
+          "scheme": "light",
+          "tokens": {
+            "--bg": "#f7f3ea",
+            "--surface": "#efe9dc",
+            "--surface-raised": "#fffdf7",
+            "--surface-hover": "#e6dfcf",
+            "--surface-input": "#fffdf7",
+            "--border": "#ddd4c2",
+            "--border-strong": "#ccc2ad",
+            "--text": "#3d3a33",
+            "--text-strong": "#26241f",
+            "--muted": "#77715f",
+            "--subtle": "#948d7b",
+            "--selection": "#eee5cd",
+            "--accent": "#96622a",
+            "--accent-soft": "#f5e5c2",
+            "--danger": "#b05a4e",
+            "--warning": "#9a6b16",
+            "--success": "#4f7d54"
+          }
+        }
+      ],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": { "onDisable": "dispose-app-immediate; unmount-agent-on-next-session" }
+}

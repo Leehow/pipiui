@@ -50,11 +50,16 @@ import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEn
 import { DismissibleError } from './DismissibleError'
 import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
-import { BUILTIN_THEMES } from './theme-registry'
+import { useExtensionThemeSync } from './theme-contribution-loader'
+import { installThemeCss } from './theme-css'
 import { useShellTheme } from './useShellTheme'
 import './app.css'
 import './message-actions.css'
 import './subagent.css'
+
+// Install runtime-generated theme token rules (core + extension packs) before
+// the first render; first paint itself is covered by the index.html boot cache.
+installThemeCss()
 
 type PaneWidths = { sidebar: number; tools: number; browserTools: number; sidebarCollapsed: boolean; toolsCollapsed: boolean }
 type SidebarPreferences = { expandedIds: string[]; pinnedSessionIds: string[]; archivedSessionIds: string[]; archivedSessionTimestamps?: Record<string, number>; visibleLimit: number }
@@ -1255,10 +1260,7 @@ export function App({ host: injectedHost }: { host?: PipiHostAPI }) {
 }
 
 function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
-  const { theme, toggleTheme } = useShellTheme()
-  // Light/dark-only consumers (sidebar toggle glyph, terminal colors) key off the
-  // resolved theme's scheme: forest/neon are dark, paper is light.
-  const themeScheme = BUILTIN_THEMES.find(themeDefinition => themeDefinition.id === theme)?.scheme ?? 'dark'
+  const { theme, scheme: themeScheme, toggleTheme } = useShellTheme()
   const productWorkbench = useProductWorkbenchRuntime()
   // Do not allocate a default mock during every render: its changing identity
   // re-ran all host effects on each composer keystroke.
@@ -1273,6 +1275,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const [adoptingExternalId, setAdoptingExternalId] = useState<string | null>(null)
   const [selectedProject, setSelectedProject] = useState('')
   useDeclarativeContributionLoader(host, selectedProject || undefined)
+  useExtensionThemeSync(host, selectedProject || undefined)
   const loadedWorkbenchContainers = useWorkbenchContainers()
   const loadedWorkbenchViews = useWorkbenchViews()
   useLayoutEffect(() => {

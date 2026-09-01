@@ -68,6 +68,24 @@ export type ExtensionUiDocumentRenderer = {
 };
 export type ExtensionUiSettingsSection = { id: string; title: string; entry?: string };
 export type ExtensionUiSlashCommand = { name: string; description?: string };
+
+/** The 17 color tokens every shell theme must define (see app.css `.pipiui-shell`). */
+export const THEME_TOKEN_KEYS = [
+  "--bg", "--surface", "--surface-raised", "--surface-hover", "--surface-input",
+  "--border", "--border-strong", "--text", "--text-strong", "--muted", "--subtle",
+  "--selection", "--accent", "--accent-soft", "--danger", "--warning", "--success",
+] as const;
+export type ThemeTokenKey = (typeof THEME_TOKEN_KEYS)[number];
+/** Declarative theme contribution (`app.ui.themes`). The manifest validator only
+ *  checks the array shape and passes entries through verbatim; per-theme content
+ *  validation is fail-closed in the renderer theme registry. */
+export type ThemeContribution = {
+  id: string;
+  name: string;
+  description: string;
+  scheme: "dark" | "light";
+  tokens: Record<ThemeTokenKey, string>;
+};
 export type ExtensionWorkbenchLocation = "primarySidebar" | "center" | "auxiliarySidebar" | "statusBar" | "overlay";
 export type ExtensionUiViewContainer = {
   id: string;
@@ -144,7 +162,7 @@ export type ExtensionManifest = {
       slashCommands?: ExtensionUiSlashCommand[];
       viewContainers?: ExtensionUiViewContainer[];
       views?: ExtensionUiView[];
-      themes?: unknown[];
+      themes?: ThemeContribution[];
       statusBar?: ExtensionUiStatusBar[];
     };
   };

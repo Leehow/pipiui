@@ -5,25 +5,49 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PipiUI</title>
     <style>
-      /* Pre-React base color: matches each builtin theme's --bg in app.css so
-         the window never shows the white system background before first paint
-         or behind heavy remounts. Keep in sync with BUILTIN_THEMES. */
+      /* Pre-React base color: dark default + light class fallback. When a theme
+         has been applied at least once, useShellTheme persists the resolved
+         --bg (pipiui.theme-bg) and full token map (pipiui.theme-tokens), which
+         this boot script prefers — that covers extension-contributed themes. */
       html { background: #17181c }
       html.pipiui-theme-light { background: #f5f5f7 }
-      html.pipiui-theme-forest { background: #141a16 }
-      html.pipiui-theme-neon { background: #16121f }
-      html.pipiui-theme-paper { background: #f7f3ea }
     </style>
     <script>
-      // Resolve the same theme useShellTheme resolves (explicit builtin theme
-      // id wins; 'system', missing, unreadable or unknown values follow
-      // prefers-color-scheme) before any paint, synchronously.
+      // First paint, synchronously. An explicit stored theme id wins; 'system',
+      // missing, unreadable or unknown values follow prefers-color-scheme.
       var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches
-      var stored = null
-      try { stored = localStorage.getItem('pipiui.theme') } catch (e) { /* unreadable storage: follow system */ }
-      var ids = { dark: 1, light: 1, forest: 1, neon: 1, paper: 1 }
-      var id = stored && Object.prototype.hasOwnProperty.call(ids, stored) ? stored : (prefersDark ? 'dark' : 'light')
-      if (id !== 'dark') document.documentElement.classList.add('pipiui-theme-' + id)
+      var stored = null, bg = null, tokens = null
+      try {
+        stored = localStorage.getItem('pipiui.theme')
+        bg = localStorage.getItem('pipiui.theme-bg')
+        try { tokens = JSON.parse(localStorage.getItem('pipiui.theme-tokens') || 'null') } catch (e) { tokens = null }
+      } catch (e) { /* unreadable storage: follow system */ }
+      // Same acceptance as readStoredSelection: only 'system' or a well-formed
+      // theme id is explicit; anything else follows the system resolution.
+      if (!stored || stored === 'system' || !/^[a-z][a-z0-9-]*$/.test(stored)) stored = null
+      // The bg cache always holds the last *resolved* theme's --bg, so it stays
+      // correct even when the stored id's pack is gone. The class fallback only
+      // knows the two core themes; any other uncached id follows the system.
+      var id = stored === 'dark' || stored === 'light' ? stored : (prefersDark ? 'dark' : 'light')
+      if (stored && typeof bg === 'string' && bg) document.documentElement.style.background = bg
+      else if (id === 'light') document.documentElement.classList.add('pipiui-theme-light')
+      // Inject the cached token map for an explicit theme so even an
+      // extension-contributed theme paints correctly before React boots.
+      if (stored && tokens && typeof tokens === 'object' && /^[a-z][a-z0-9-]*$/.test(stored)) {
+        var css = '[data-theme="' + stored + '"]{'
+        for (var k in tokens) {
+          if (!/^--[a-z-]+$/.test(k)) continue
+          var v = tokens[k]
+          // Same denylist as validateThemeContribution: no rule-block or
+          // element breakout, even from a tampered localStorage cache.
+          if (typeof v !== 'string' || v.length > 128 || /[;{}<>\\"']/.test(v)) continue
+          css += k + ':' + v + ';'
+        }
+        var el = document.createElement('style')
+        el.id = 'pipiui-boot-theme'
+        el.textContent = css + '}'
+        document.head.appendChild(el)
+      }
     </script>
   </head>
   <body>

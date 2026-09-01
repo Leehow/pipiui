@@ -171,6 +171,9 @@ export type ExtensionUiSummary = {
   viewContainers?: ExtensionUiViewContainer[];
   views?: ExtensionUiView[];
   headerActions?: ExtensionUiHeaderAction[];
+  /** Theme pack entries pass through verbatim; per-theme content validation is
+   *  fail-closed in the renderer theme registry (see ThemeContribution). */
+  themes?: unknown[];
 };
 
 /** Max contributed AGENT.md paths in one manifest. */
@@ -1083,6 +1086,7 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
         }
       }
       if (appUi.themes !== undefined && !Array.isArray(appUi.themes)) errors.push("app.ui.themes must be an array");
+      if (Array.isArray(appUi.themes) && appUi.themes.length > 0) summary.themes = appUi.themes;
       if (appUi.statusBar !== undefined && !Array.isArray(appUi.statusBar)) errors.push("app.ui.statusBar must be an array");
       if (Object.keys(summary).length) ui = summary;
     }

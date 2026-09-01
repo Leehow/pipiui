@@ -21,7 +21,7 @@ const SKIP_ENTRIES = new Set(["node_modules", ".git", ".DS_Store", "out", "dist"
  * compiled agent resolves the pdf-inspector native/WASM engine relative to
  * itself instead of through a host path contract.
  */
-export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "git-capability", "deepseek", "qoder", "pipiui-headroom", "office-extension", "pdf-extension", "vision-routing", "web-search-keys", "external-session-scan"];
+export const BUNDLED_MANIFEST_EXTENSIONS: readonly string[] = ["grok-build-oauth", "code-retrieval", "git-capability", "deepseek", "qoder", "pipiui-headroom", "office-extension", "pdf-extension", "vision-routing", "web-search-keys", "external-session-scan", "pipiui-theme-pack"];
 /** Bundled manifest extensions that ship an owned `node_modules` inside their mirrored tree. */
 const BUNDLED_KEEP_NODE_MODULES: ReadonlySet<string> = new Set(["pdf-extension"]);
 /** Optional packaging-time selection of dist/node_modules-heavy runtime assets. */

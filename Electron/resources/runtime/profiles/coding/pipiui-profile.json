@@ -29,6 +29,7 @@
       { "id": "pi-goal", "version": "^1.0.0" },
       { "id": "pi-philosophy", "version": "^1.0.0" },
       { "id": "pipiui-headroom", "version": "^0.1.0" },
+      { "id": "pipiui-theme-pack", "version": "^1.0.0" },
       { "id": "plan-extension", "version": "^1.0.0" },
       { "id": "skill-loader-extension", "version": "^1.0.0" },
       { "id": "terminal-extension", "version": "^1.0.0" },

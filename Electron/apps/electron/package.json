@@ -162,6 +162,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/pipiui-theme-pack",
+        "to": "pipiui-runtime/extensions/pipiui-theme-pack",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/extensions/external-session-scan",
         "to": "pipiui-runtime/extensions/external-session-scan",
         "filter": [

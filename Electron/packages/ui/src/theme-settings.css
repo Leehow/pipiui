@@ -1,10 +1,5 @@
 /* 设置-主题页（ThemeSettingsPane）样式。独立文件，不改 app.css。
- *
- * `.pipiui-shell` 上的暗色基线 token 只作用于壳元素；预览卡靠 app.css 的
- * `[data-theme="light|forest|neon|paper"]` 块拿到变量。这里补一个等值的
- * `[data-theme="dark"]` 块（取值与 .pipiui-shell 基线逐项一致），让暗夜
- * 预览卡和 system 卡的暗色半分在任意壳主题下都解析到正确变量。 */
-[data-theme="dark"] { --bg:#17181c;--surface:#202126;--surface-raised:#25262c;--surface-hover:#2c2d34;--surface-input:#2a2b31;--border:#303137;--border-strong:#373941;--text:#e5e7eb;--text-strong:#f3f4f6;--muted:#9da2ad;--subtle:#747a86;--selection:#353750;--accent:#6578ea;--accent-soft:#33354c;--danger:#a75b63;--warning:#f5c76e;--success:#76c59b; }
+   预览卡的主题变量由 theme-css.ts 运行时生成的 [data-theme] 规则供给。 */
 
 .tsp-root { display:flex; flex-direction:column; gap:22px; max-width:860px; }
 

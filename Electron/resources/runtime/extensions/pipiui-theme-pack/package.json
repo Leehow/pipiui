@@ -1,0 +1,15 @@
+{
+  "name": "@pipiui/theme-pack-extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "内置配色主题包：以 app.ui.themes 清单贡献 forest/neon/paper 三套主题（纯清单，无代码）",
+  "scripts": {
+    "build": "node ../../scripts/sync-bundled-extension.mjs pipiui-theme-pack-extension",
+    "test": "vitest run",
+    "pretest": "npm run build"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}

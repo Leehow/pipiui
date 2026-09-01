@@ -11,7 +11,8 @@
     "pdf-extension",
     "vision-routing",
     "web-search-keys",
-    "external-session-scan"
+    "external-session-scan",
+    "pipiui-theme-pack"
   ],
   "includeAnydoc": true
 }

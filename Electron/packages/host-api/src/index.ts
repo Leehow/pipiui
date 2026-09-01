@@ -18,6 +18,14 @@ export const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low
 const STANDARD_THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 export type Project = { id: string; name: string; path: string };
+/** A session's isolated workspace (git-capability session worktree). Absent = ordinary session at the project root. */
+export type SessionWorkspace = {
+  /** Branch the session's tree is on (e.g. `pipiui/session-<slug>`). */
+  branch: string;
+  worktreePath: string;
+  /** Commits the session branch is ahead of the main checkout HEAD; null when not computable. */
+  aheadOfMain: number | null;
+};
 export type Session = {
   id: string;
   projectId: string;
@@ -29,6 +37,8 @@ export type Session = {
   adoptedFrom?: SessionAdoptedFrom;
   /** Immutable Product Profile snapshot used by the last Pi child for this Conversation. */
   productProfile?: { id: string; fingerprint: string };
+  /** Bound isolated workspace (session worktree), when a capability has attached one. */
+  workspace?: SessionWorkspace;
 };
 /** Opaque-cursor page used by the Electron sidebar's 10-at-a-time lazy loader. */
 export type SessionPage = {
@@ -1038,6 +1048,17 @@ export type ExtensionContributions = {
   headerActions?: readonly ExtensionHeaderActionDecl[];
   auth?: ExtensionAuthContribution;
 };
+/** Theme pack entry from an extension manifest's `app.ui.themes`, passed through
+ *  validation verbatim. Content is validated fail-closed by the renderer theme
+ *  registry before it can reach the shell. */
+export type ExtensionThemeDecl = {
+  id: string;
+  name: string;
+  description: string;
+  scheme: "dark" | "light";
+  tokens: Record<string, string>;
+};
+
 export type ExtensionDescriptor = {
   id: string;
   state: ExtensionLifecycleState;
@@ -1059,7 +1080,7 @@ export type ExtensionDescriptor = {
   /** Declarative app-half contributions (schema / slash / settings tabs / statusBar). */
   contributions?: ExtensionContributions;
   /** Controlled entries resolved against the extension package directory. */
-  ui?: { headerActions?: readonly ExtensionHeaderActionDecl[] };
+  ui?: { headerActions?: readonly ExtensionHeaderActionDecl[]; themes?: readonly ExtensionThemeDecl[] };
 };
 /** Current capability grant snapshot (spec D11 / M4). */
 export type ExtensionCapabilityGrant = {
@@ -1173,6 +1194,10 @@ export interface PipiHostAPI {
   /** Session-scoped one-shot Structured Outputs request for the next provider turn. `null` clears. */
   setStructuredOutput?(sessionId: string, request: StructuredOutputRequest | null): Promise<void>;
   newSession(projectId: string, name?: string): Promise<Session>; resumeSession(sessionId: string): Promise<Session>; renameSession(sessionId: string, name: string): Promise<Session>; deleteSession(sessionId: string): Promise<void>; moveSession(sessionId: string, targetProjectId: string): Promise<Session>;
+  /** Generic session-workspace extension point: bind/clear one session's isolated tool cwd (git-capability session worktree). */
+  setSessionWorkspace(sessionId: string, binding: { workspaceCwd: string; branch: string; worktreePath?: string }): Promise<unknown>;
+  clearSessionWorkspace(sessionId: string): Promise<unknown>;
+  sessionWorkspaceStatus(sessionId: string): Promise<unknown>;
   /** Newest-first paging cursor: an entry id is stable/exclusive; numeric newest-relative offsets remain supported for compatibility. */
   getSessionHistory(sessionId: string, before?: number | string, limit?: number): Promise<HistoryEntry[]>;
   /**
@@ -1485,6 +1510,9 @@ function apiFrom(
     renameSession: (sessionId, name) => invoke("renameSession", sessionId, name),
     deleteSession: sessionId => invoke("deleteSession", sessionId),
     moveSession: (sessionId, targetProjectId) => invoke("moveSession", sessionId, targetProjectId),
+    setSessionWorkspace: (sessionId, binding) => invoke("setSessionWorkspace", sessionId, binding),
+    clearSessionWorkspace: (sessionId) => invoke("clearSessionWorkspace", sessionId),
+    sessionWorkspaceStatus: (sessionId) => invoke("sessionWorkspaceStatus", sessionId),
     getSessionHistory: (sessionId, before, limit) => before === undefined
       ? invoke("getSessionHistory", sessionId)
       : invoke("getSessionHistory", sessionId, before, limit),

@@ -1,74 +1,145 @@
-import { describe, expect, it } from 'vitest'
-import { BUILTIN_THEMES, DEFAULT_THEME_ID, SYSTEM_THEME_VALUE, THEME_STORAGE_KEY, isBuiltinThemeId, resolveThemeSelection } from './theme-registry'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import {
+  CORE_THEMES,
+  DEFAULT_THEME_ID,
+  SYSTEM_THEME_VALUE,
+  THEME_STORAGE_KEY,
+  THEME_TOKEN_KEYS,
+  getAllThemes,
+  isThemeId,
+  resolveThemeSelection,
+  setContributedThemes,
+  subscribeThemes,
+  validateThemeContribution,
+  type ThemeDefinition,
+  type ThemeTokenKey,
+} from './theme-registry'
 
-const EXPECTED_IDS = ['dark', 'light', 'forest', 'neon', 'paper']
+const tokens = (value = '#112233'): Record<ThemeTokenKey, string> =>
+  Object.fromEntries(THEME_TOKEN_KEYS.map(key => [key, value])) as Record<ThemeTokenKey, string>
 
-describe('theme registry', () => {
-  it('has 5 builtin themes with unique ids', () => {
-    expect(BUILTIN_THEMES).toHaveLength(5)
-    const ids = BUILTIN_THEMES.map(theme => theme.id)
-    expect(new Set(ids).size).toBe(ids.length)
-    expect([...ids].sort()).toEqual([...EXPECTED_IDS].sort())
-  })
+const makeTheme = (id: string, scheme: 'dark' | 'light' = 'dark'): ThemeDefinition => ({
+  id,
+  name: `主题 ${id}`,
+  description: `${id} 的描述`,
+  scheme,
+  tokens: tokens(),
+})
 
-  it('defines display metadata and a scheme for every theme', () => {
-    for (const theme of BUILTIN_THEMES) {
-      expect(theme.name.length).toBeGreaterThan(0)
-      expect(theme.description.length).toBeGreaterThan(0)
-      expect(['dark', 'light']).toContain(theme.scheme)
+afterEach(() => {
+  setContributedThemes([])
+})
+
+describe('core themes', () => {
+  it('核心默认只有 dark/light，id 唯一且各自带满 17 个 token', () => {
+    expect(CORE_THEMES.map(theme => theme.id)).toEqual(['dark', 'light'])
+    for (const theme of CORE_THEMES) {
+      expect(Object.keys(theme.tokens).sort()).toEqual([...THEME_TOKEN_KEYS].sort())
+      for (const value of Object.values(theme.tokens)) expect(typeof value).toBe('string')
     }
-    expect(BUILTIN_THEMES.find(t => t.id === 'dark')?.scheme).toBe('dark')
-    expect(BUILTIN_THEMES.find(t => t.id === 'light')?.scheme).toBe('light')
-    expect(BUILTIN_THEMES.find(t => t.id === 'forest')?.scheme).toBe('dark')
-    expect(BUILTIN_THEMES.find(t => t.id === 'neon')?.scheme).toBe('dark')
-    expect(BUILTIN_THEMES.find(t => t.id === 'paper')?.scheme).toBe('light')
+    expect(CORE_THEMES.find(theme => theme.id === 'dark')?.scheme).toBe('dark')
+    expect(CORE_THEMES.find(theme => theme.id === 'light')?.scheme).toBe('light')
   })
 
-  it('pins the cross-file storage contract (index.html boot script reads the same key)', () => {
+  it('pins the cross-file storage contract (index.html boot script reads the same keys)', () => {
     expect(THEME_STORAGE_KEY).toBe('pipiui.theme')
     expect(SYSTEM_THEME_VALUE).toBe('system')
     expect(DEFAULT_THEME_ID).toBe('dark')
-    expect(isBuiltinThemeId(DEFAULT_THEME_ID)).toBe(true)
   })
 })
 
-describe('resolveThemeSelection', () => {
-  it('resolves null (no stored choice) to the system scheme', () => {
+describe('validateThemeContribution', () => {
+  it('接受合法贡献并原样归一化', () => {
+    const theme = validateThemeContribution(makeTheme('forest'))
+    expect(theme?.id).toBe('forest')
+    expect(theme?.scheme).toBe('dark')
+  })
+
+  it('拒绝：非对象、坏 id、保留 id、空文案、坏 scheme', () => {
+    expect(validateThemeContribution(null)).toBeNull()
+    expect(validateThemeContribution('forest')).toBeNull()
+    expect(validateThemeContribution(makeTheme('Dark'))).toBeNull()
+    expect(validateThemeContribution(makeTheme('1bad'))).toBeNull()
+    expect(validateThemeContribution(makeTheme('dark'))).toBeNull()
+    expect(validateThemeContribution(makeTheme('light'))).toBeNull()
+    expect(validateThemeContribution(makeTheme('system'))).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), name: '' })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), description: ' ' })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), scheme: 'auto' })).toBeNull()
+  })
+
+  it('拒绝：tokens 缺 key、多 key、非 string 值、非对象', () => {
+    const missing = tokens(); delete (missing as Record<string, string>)['--bg']
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: missing })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: { ...tokens(), '--x': '#000' } })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: { ...tokens(), '--bg': 42 } })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: ['#000'] })).toBeNull()
+  })
+  it('拒绝：token 值可逃逸规则块（CSS 注入）或超长', () => {
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: tokens('#000;}body{display:none}') })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: tokens('#000;background:url(x)') })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: tokens('#000</style>') })).toBeNull()
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: tokens('x'.repeat(129)) })).toBeNull()
+    // 合法的函数式颜色值不受影响。
+    expect(validateThemeContribution({ ...makeTheme('ok'), tokens: tokens('color-mix(in srgb, #000 50%, transparent)') })).not.toBeNull()
+  })
+})
+
+describe('contributed themes store', () => {
+  it('热更新：同 id 但 tokens 变化会通知订阅者（同 id/name 则不会）', () => {
+    const listener = vi.fn()
+    const unsubscribe = subscribeThemes(listener)
+    setContributedThemes([makeTheme('forest')])
+    expect(listener).toHaveBeenCalledTimes(1)
+    setContributedThemes([{ ...makeTheme('forest'), tokens: tokens('#aabbcc') }])
+    expect(listener).toHaveBeenCalledTimes(2)
+    expect(getAllThemes().find(theme => theme.id === 'forest')?.tokens['--bg']).toBe('#aabbcc')
+    unsubscribe()
+  })
+
+  it('getAllThemes = core 在前 + 贡献在后；setContributedThemes 按 id 去重（先来先得）', () => {
+    setContributedThemes([makeTheme('forest'), makeTheme('neon'), makeTheme('forest')])
+    expect(getAllThemes().map(theme => theme.id)).toEqual(['dark', 'light', 'forest', 'neon'])
+  })
+
+  it('内容变化才通知订阅者', () => {
+    const listener = vi.fn()
+    const unsubscribe = subscribeThemes(listener)
+    setContributedThemes([makeTheme('forest')])
+    setContributedThemes([makeTheme('forest')])
+    expect(listener).toHaveBeenCalledTimes(1)
+    setContributedThemes([])
+    expect(listener).toHaveBeenCalledTimes(2)
+    unsubscribe()
+    setContributedThemes([makeTheme('neon')])
+    expect(listener).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('resolveThemeSelection（可用性感知）', () => {
+  it('null/system/非法值 → 跟随系统 scheme', () => {
     expect(resolveThemeSelection(null, 'dark')).toBe('dark')
-    expect(resolveThemeSelection(null, 'light')).toBe('light')
-  })
-
-  it("resolves 'system' to the system scheme", () => {
-    expect(resolveThemeSelection(SYSTEM_THEME_VALUE, 'dark')).toBe('dark')
     expect(resolveThemeSelection(SYSTEM_THEME_VALUE, 'light')).toBe('light')
-  })
-
-  it('passes builtin theme ids through unchanged', () => {
-    for (const theme of BUILTIN_THEMES) {
-      expect(resolveThemeSelection(theme.id, 'light')).toBe(theme.id)
-      expect(resolveThemeSelection(theme.id, 'dark')).toBe(theme.id)
-    }
-  })
-
-  it('resolves invalid values to the system scheme', () => {
     expect(resolveThemeSelection('retro', 'dark')).toBe('dark')
-    expect(resolveThemeSelection('retro', 'light')).toBe('light')
-    expect(resolveThemeSelection('', 'dark')).toBe('dark')
-    expect(resolveThemeSelection('Dark', 'light')).toBe('light')
+  })
+
+  it('核心 id 原样通过；贡献主题在可用时通过、不可用时落回系统（存储值不动）', () => {
+    expect(resolveThemeSelection('light', 'dark')).toBe('light')
+    setContributedThemes([makeTheme('forest')])
+    expect(resolveThemeSelection('forest', 'light')).toBe('forest')
+    setContributedThemes([])
+    expect(resolveThemeSelection('forest', 'light')).toBe('light')
   })
 })
 
-describe('isBuiltinThemeId', () => {
-  it('accepts exactly the builtin theme ids', () => {
-    for (const theme of BUILTIN_THEMES) expect(isBuiltinThemeId(theme.id)).toBe(true)
-  })
-
-  it("rejects 'system' and non-theme values", () => {
-    expect(isBuiltinThemeId(SYSTEM_THEME_VALUE)).toBe(false)
-    expect(isBuiltinThemeId('retro')).toBe(false)
-    expect(isBuiltinThemeId('')).toBe(false)
-    expect(isBuiltinThemeId(null)).toBe(false)
-    expect(isBuiltinThemeId(undefined)).toBe(false)
-    expect(isBuiltinThemeId(42)).toBe(false)
+describe('isThemeId', () => {
+  it('按可用列表判定；system/非字符串拒绝', () => {
+    expect(isThemeId('dark')).toBe(true)
+    expect(isThemeId('forest')).toBe(false)
+    setContributedThemes([makeTheme('forest')])
+    expect(isThemeId('forest')).toBe(true)
+    expect(isThemeId(SYSTEM_THEME_VALUE)).toBe(false)
+    expect(isThemeId(null)).toBe(false)
+    expect(isThemeId('forest', [])).toBe(false)
   })
 })

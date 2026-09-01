@@ -1,7 +1,7 @@
 import { useRef, useState, type ReactNode } from 'react'
-import { BUILTIN_THEMES, SYSTEM_THEME_VALUE } from './theme-registry'
+import { SYSTEM_THEME_VALUE } from './theme-registry'
 import { fileToLogoDataUrl, useCustomLogo, writeCustomLogo } from './custom-logo'
-import { useShellTheme } from './useShellTheme'
+import { useAllThemes, useShellTheme } from './useShellTheme'
 import './theme-settings.css'
 
 /** 设置-主题页的迷你界面 mock：左侧窄侧栏条 + 用户气泡 + 两行助手文本 +
@@ -24,15 +24,16 @@ function ThemeMock() {
 
 /** 主题预览卡。themeId 为具体主题 id 时写在容器 data-theme/data-scheme 上（变量随卡片
  *  主题解析，scheme 供暗色组件样式命中）；null 表示 system 卡，由内部左右半分各自携带 dark/light。 */
-function ThemeCard({ themeId, selected, name, description, onPick, children }: {
+function ThemeCard({ themeId, selected, name, description, scheme, onPick, children }: {
   themeId: string | null
   selected: boolean
   name: string
   description: string
+  /** 具体主题卡的明暗（供 data-scheme）；system 卡（themeId=null）不需要。 */
+  scheme?: 'dark' | 'light'
   onPick: () => void
   children: ReactNode
 }) {
-  const scheme = themeId ? BUILTIN_THEMES.find(def => def.id === themeId)?.scheme : undefined
   return (
     <button
       type="button"
@@ -117,7 +118,8 @@ function BrandLogoSection() {
 /** 设置-主题页：当前主题大卡 / 全部主题网格（含 system 卡）/ 品牌 Logo。 */
 export function ThemeSettingsPane() {
   const { theme, selection, setThemeSelection } = useShellTheme()
-  const currentDef = BUILTIN_THEMES.find(def => def.id === theme) ?? BUILTIN_THEMES[0]
+  const allThemes = useAllThemes()
+  const currentDef = allThemes.find(def => def.id === theme) ?? allThemes[0]
   return (
     <div className="tsp-root">
       <section className="tsp-section" data-testid="theme-current-section">
@@ -149,13 +151,14 @@ export function ThemeSettingsPane() {
               <div className="tsp-sys-half" data-theme="light" data-scheme="light"><ThemeMock /></div>
             </div>
           </ThemeCard>
-          {BUILTIN_THEMES.map(def => (
+          {allThemes.map(def => (
             <ThemeCard
               key={def.id}
               themeId={def.id}
               selected={selection === def.id}
               name={def.name}
               description={def.description}
+              scheme={def.scheme}
               onPick={() => setThemeSelection(def.id)}
             >
               <ThemeMock />

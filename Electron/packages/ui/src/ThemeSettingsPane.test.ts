@@ -1,16 +1,33 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import { ThemeSettingsPane } from './ThemeSettingsPane'
-import { SYSTEM_THEME_VALUE, THEME_STORAGE_KEY } from './theme-registry'
+import {
+  SYSTEM_THEME_VALUE,
+  THEME_STORAGE_KEY,
+  THEME_TOKEN_KEYS,
+  setContributedThemes,
+  type ThemeDefinition,
+  type ThemeTokenKey,
+} from './theme-registry'
 import { useShellTheme } from './useShellTheme'
+
+const PACK_TOKENS = Object.fromEntries(THEME_TOKEN_KEYS.map(key => [key, '#112233'])) as Record<ThemeTokenKey, string>
+const PACK: ThemeDefinition[] = [
+  { id: 'forest', name: '护眼绿', description: '绿', scheme: 'dark', tokens: PACK_TOKENS },
+  { id: 'neon', name: '赛博紫', description: '紫', scheme: 'dark', tokens: PACK_TOKENS },
+  { id: 'paper', name: '暖米白', description: '米', scheme: 'light', tokens: PACK_TOKENS },
+]
 
 beforeEach(() => {
   localStorage.clear()
+  // 主题包内容来自扩展贡献：测试里显式注入。
+  act(() => { setContributedThemes(PACK) })
 })
 afterEach(() => {
   cleanup()
+  act(() => { setContributedThemes([]) })
   localStorage.clear()
 })
 
@@ -22,13 +39,20 @@ describe('ThemeSettingsPane', () => {
     expect(screen.getByText('品牌 Logo')).toBeTruthy()
   })
 
-  it('主题网格包含 system + 5 套内置主题共 6 张卡', () => {
+  it('主题网格包含 system + 核心 dark/light + 3 套贡献主题共 6 张卡', () => {
     render(createElement(ThemeSettingsPane))
     const ids = ['system', 'dark', 'light', 'forest', 'neon', 'paper']
     for (const id of ids) {
       expect(screen.getByTestId(`theme-card-${id}`), `缺少卡片 ${id}`).toBeTruthy()
     }
     expect(screen.getAllByTestId(/^theme-card-/)).toHaveLength(ids.length)
+  })
+
+  it('主题包未启用（无贡献）时只有 system + dark/light 三张卡', () => {
+    act(() => { setContributedThemes([]) })
+    render(createElement(ThemeSettingsPane))
+    expect(screen.getAllByTestId(/^theme-card-/)).toHaveLength(3)
+    expect(screen.queryByTestId('theme-card-forest')).toBeNull()
   })
 
   it('点击主题卡后 localStorage[pipiui.theme] 变为对应 id，点 system 卡恢复 system', () => {
