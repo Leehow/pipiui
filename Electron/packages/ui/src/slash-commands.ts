@@ -17,6 +17,8 @@ export type SlashAction =
   | { kind: 'compact' }
   /** Transform then send as a normal user prompt (formal-planning trigger). */
   | { kind: 'send-plan' }
+  /** Transform then send as a normal user prompt (selfdev: NL extension edit + hot reload). */
+  | { kind: 'send-selfdev' }
   /** Send the raw composer text as a normal prompt (runtime /goal extension). */
   | { kind: 'send-prompt' }
   /** Reserved for future rounds: /thinking, /new … */
@@ -47,6 +49,17 @@ export function planPromptFromArgs(args: string): string {
   return goal ? `${PLAN_PROMPT_WITH_ARGS}${goal}` : PLAN_PROMPT_BARE
 }
 
+export const SELFDEV_PROMPT_WITH_ARGS =
+  '[selfdev] 用户要用自然语言修改当前产品的已安装扩展并立即热重载生效。先 skill_load(\'selfdev\') 加载流程与护栏并严格遵循（定位→投影→修改→热重载→回执），然后完成以下需求：'
+export const SELFDEV_PROMPT_BARE =
+  '[selfdev] 用户想用自然语言修改当前产品的已安装扩展并立即热重载生效。先 skill_load(\'selfdev\') 加载流程与护栏，然后用一句话询问要改哪个扩展、改成什么样。'
+
+/** Priming prompt for /selfdev: hands the agent the flow+guardrails skill plus the request. */
+export function selfdevPromptFromArgs(args: string): string {
+  const request = args.trim()
+  return request ? `${SELFDEV_PROMPT_WITH_ARGS}${request}` : SELFDEV_PROMPT_BARE
+}
+
 const slashCommandRegistry = createContributionRegistry<SlashCommandDef>()
 
 export function registerSlashCommand(extId: string, contribution: SlashCommandDef) {
@@ -69,7 +82,8 @@ export const BUILTIN_SLASH_COMMANDS: readonly SlashCommandDef[] = [
   { name: 'model', description: '管理模型可见性', action: { kind: 'open-model-manager' } },
   { name: 'compact', description: '压缩上下文', action: { kind: 'compact' } },
   { name: 'plan', description: '为目标制定正式计划', action: { kind: 'send-plan' } },
-  { name: 'goal', description: '设定自主完成的目标', action: { kind: 'send-prompt' } }
+  { name: 'goal', description: '设定自主完成的目标', action: { kind: 'send-prompt' } },
+  { name: 'selfdev', description: '用自然语言修改扩展并热重载', action: { kind: 'send-selfdev' } }
 ]
 
 for (const command of BUILTIN_SLASH_COMMANDS) {

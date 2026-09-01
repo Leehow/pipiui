@@ -33,7 +33,7 @@ import { useSessionQueue } from './useSessionQueue'
 import { InlineSessionTitleEditor } from './InlineSessionTitleEditor'
 export { parseSubagentNotice } from './subagent-notice'
 import { compactionNotice, compactionPillLabel } from './compaction-notice'
-import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, slashCommandByName, slashPaletteQuery, useSlashCommands, type SlashCommandDef } from './slash-commands'
+import { filterSlashCommands, parseSlashInvocation, planPromptFromArgs, selfdevPromptFromArgs, slashCommandByName, slashPaletteQuery, useSlashCommands, type SlashCommandDef } from './slash-commands'
 import { useDeclarativeContributionLoader } from './contribution-loader'
 import { DEFAULT_PANEL_TAB, usePanels, type PanelRailContext, type PanelTab } from './ui-registries'
 import { useModelVisibility, type ModelVisibilityController } from './useModelVisibility'
@@ -3869,12 +3869,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
     } else if (command.action.kind === 'compact') {
       onCompact()
       persistDraft('')
-    } else if (command.action.kind === 'send-plan' || command.action.kind === 'send-prompt') {
+    } else if (command.action.kind === 'send-plan' || command.action.kind === 'send-prompt' || command.action.kind === 'send-selfdev') {
       const invocation = parseSlashInvocation(draft)
       const args = invocation?.name === command.name ? invocation.args : ''
       const outgoing = command.action.kind === 'send-plan'
         ? planPromptFromArgs(args)
-        : (draft.trim() || `/${command.name}`)
+        : command.action.kind === 'send-selfdev'
+          ? selfdevPromptFromArgs(args)
+          : (draft.trim() || `/${command.name}`)
       void dispatchSend(outgoing)
     }
   }

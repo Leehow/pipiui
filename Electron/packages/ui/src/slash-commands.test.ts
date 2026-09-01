@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest'
 import {
   PLAN_PROMPT_BARE,
   PLAN_PROMPT_WITH_ARGS,
+  SELFDEV_PROMPT_BARE,
+  SELFDEV_PROMPT_WITH_ARGS,
   filterSlashCommands,
   parseSlashInvocation,
   planPromptFromArgs,
+  selfdevPromptFromArgs,
   slashCommandByName,
   slashCommands
 } from './slash-commands'
@@ -23,7 +26,15 @@ describe('slash command registry', () => {
       description: '设定自主完成的目标',
       action: { kind: 'send-prompt' }
     })
-    expect(slashCommands.map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal'])
+    expect(slashCommands.map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal', 'selfdev'])
+  })
+
+  it('registers selfdev with the send-selfdev action and a Chinese description', () => {
+    expect(slashCommandByName('selfdev')).toMatchObject({
+      name: 'selfdev',
+      description: '用自然语言修改扩展并热重载',
+      action: { kind: 'send-selfdev' }
+    })
   })
 
   it('surfaces plan and goal in the autocomplete list', () => {
@@ -32,6 +43,18 @@ describe('slash command registry', () => {
     expect(names).toContain('goal')
     expect(filterSlashCommands('pl')[0]?.name).toBe('plan')
     expect(filterSlashCommands('go')[0]?.name).toBe('goal')
+  })
+})
+
+describe('selfdevPromptFromArgs', () => {
+  it('primes the agent with the selfdev skill plus the request', () => {
+    expect(selfdevPromptFromArgs('把 grok 上下文窗口改成 700')).toBe(`${SELFDEV_PROMPT_WITH_ARGS}把 grok 上下文窗口改成 700`)
+    expect(selfdevPromptFromArgs('  改主题色  ')).toBe(`${SELFDEV_PROMPT_WITH_ARGS}改主题色`)
+  })
+
+  it('uses the bare ask-what-to-change prompt when args are empty', () => {
+    expect(selfdevPromptFromArgs('')).toBe(SELFDEV_PROMPT_BARE)
+    expect(selfdevPromptFromArgs('   ')).toBe(SELFDEV_PROMPT_BARE)
   })
 })
 
