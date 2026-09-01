@@ -660,6 +660,22 @@ export type AuthLoginEvent =
   | { kind: "completed"; providerId: string }
   | { kind: "failed"; error: string }
   | { kind: "cancelled" };
+/** Model-id candidate from an OpenAI-compatible endpoint's GET {baseUrl}/models. */
+export type OpenAICompatibleModelInfo = { id: string; contextWindow?: number };
+/** Result of a streaming connectivity probe against one OpenAI-compatible model. */
+export type OpenAICompatibleModelTestResult = {
+  ok: true;
+  /** Request start → first generated content token, in ms. */
+  firstTokenMs: number;
+  /** Request start → stream end, in ms. */
+  totalMs: number;
+  /** Content deltas received (approximate token count). */
+  tokens: number;
+  /** tokens / generation seconds, one decimal. */
+  tokensPerSecond: number;
+  /** First ~80 chars of generated content. */
+  preview: string;
+};
 /** Stable, transport-neutral snapshot of a session's cumulative usage. `cost`
  * is always USD; unknown/missing fields are omitted by producers, never guessed.
  */
@@ -884,6 +900,16 @@ export type StreamEvent =
    * error text. Old clients may safely ignore it.
    */
   | { type: "error"; sessionId: string; content: string }
+  /**
+   * pi is auto-retrying a failed provider call inside the running turn
+   * (`phase: "start"`), or that retry loop finished (`phase: "end"`). The turn
+   * is NOT over during a retry — queued messages correctly keep waiting for its
+   * settle — so surfacing this prevents a silent backoff window from reading as
+   * a wedged send. `attempt`/`maxAttempts`/`delayMs` are start-only; `success`
+   * is end-only; `error` is the redacted provider/retry error text. Old clients
+   * may safely ignore this new event type.
+   */
+  | { type: "auto_retry"; sessionId: string; phase: "start" | "end"; attempt?: number; maxAttempts?: number; delayMs?: number; success?: boolean; error?: string }
   /** Snapshot after every queue mutation; old clients may safely ignore this new event type. */
   | { type: "queue_update"; sessionId: string; queue: QueuedMessage[]; pendingFollowUps?: string[] }
   /**
@@ -1325,6 +1351,10 @@ export interface PipiHostAPI {
     modelId: string;
     contextWindow?: number;
   }): Promise<{ providerId: string }>;
+  /** Model-id candidates for the add-model dropdown: GET {baseUrl}/models with the entered key. Optional: older hosts omit it and the panel falls back to manual input. */
+  listOpenAICompatibleModels?(input: { baseUrl: string; apiKey: string }): Promise<{ models: OpenAICompatibleModelInfo[] }>;
+  /** Streaming connectivity probe (first-token latency + generation throughput) for one OpenAI-compatible model. Optional: older hosts omit it and the panel hides the test button. */
+  testOpenAICompatibleModel?(input: { baseUrl: string; apiKey: string; modelId: string }): Promise<OpenAICompatibleModelTestResult>;
   /** Electron-only: open an auth URL in the user's browser (safe http/https only). */
   openExternal?(url: string): Promise<void>;
   /** Electron-only: open one validated local supported document in the OS default app. */
@@ -1552,6 +1582,8 @@ function apiFrom(
     cancelProviderLogin: loginId => invoke("cancelProviderLogin", loginId),
     removeProviderCredentials: providerId => invoke("removeProviderCredentials", providerId),
     addOpenAICompatibleProvider: input => invoke("addOpenAICompatibleProvider", input),
+    listOpenAICompatibleModels: input => invoke("listOpenAICompatibleModels", input),
+    testOpenAICompatibleModel: input => invoke("testOpenAICompatibleModel", input),
     getHiddenModelIds: () => invoke("getHiddenModelIds"),
     setHiddenModelIds: ids => invoke("setHiddenModelIds", ids),
     getSidebarSessionPreferences: () => invoke("getSidebarSessionPreferences"),

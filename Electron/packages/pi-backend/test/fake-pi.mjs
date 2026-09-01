@@ -345,6 +345,21 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__auto_retry__") {
+      // Provider hiccup inside the turn: pi auto-retries with backoff, then
+      // recovers. The host must forward auto_retry_start/end so the UI can
+      // show the retrying wait instead of a silent gap.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 50, errorMessage: "Codex error: transient 500" });
+      setTimeout(() => {
+        send({ type: "auto_retry_end", success: true, attempt: 1 });
+        send({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "recovered" } });
+        send({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "recovered" }], stopReason: "stop" } });
+        send({ type: "agent_settled" });
+      }, 80);
+      return;
+    }
     if (command.message === "__fail_turn__") {
       // Provider failure: the assistant message ends with stopReason "error",
       // an errorMessage, and no content. Real Pi can omit agent_settled here;

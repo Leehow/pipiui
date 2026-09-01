@@ -52,6 +52,45 @@ describe('active-turn waiting placeholder', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: /1 个步骤/ }).getAttribute('aria-expanded')).toBe('false'))
   })
 
+  it('surfaces pi auto-retry as the retrying wait and reverts when the retry finishes', async () => {
+    let listener: ((event: StreamEvent) => void) | undefined
+    const base = createMockHost()
+    const host: PipiHostAPI = { ...base, subscribeStream: (_sessionId, callback) => { listener = callback; return () => { listener = undefined } } }
+    const { container } = render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+    await waitFor(() => expect(listener).toBeDefined())
+
+    // Select the layout session (no fixture subagent tail) and open a live turn.
+    fireEvent.click(container.querySelector('[data-session-id="layout"]')!)
+    await waitFor(() => expect(listener).toBeDefined())
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'started', pendingFollowUps: ['queued'] }) })
+    expect(await screen.findByTestId('waiting-placeholder')).toBeTruthy()
+
+    // Visible text hides the first-token wait…
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '第一步答复' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+
+    // …then the provider call fails and pi backs off: the retrying wait appears
+    // with the attempt span and redacted provider error, instead of a silent gap.
+    act(() => { listener?.({ type: 'auto_retry', sessionId: 'layout', phase: 'start', attempt: 2, maxAttempts: 5, delayMs: 4000, error: 'Codex error: transient 500' }) })
+    const retrying = await screen.findByTestId('waiting-placeholder')
+    expect(retrying.getAttribute('data-phase')).toBe('retrying')
+    expect(retrying.textContent).toContain('连接中断，正在重试')
+    expect(retrying.textContent).toContain('第 2/5 次重试')
+    expect(retrying.textContent).toContain('Codex error: transient 500')
+
+    // The retry succeeds: the model restarts, so the wait reverts to thinking.
+    act(() => { listener?.({ type: 'auto_retry', sessionId: 'layout', phase: 'end', success: true, attempt: 2 }) })
+    await waitFor(() => expect(screen.getByTestId('waiting-placeholder').getAttribute('data-phase')).toBe('thinking'))
+    expect(screen.getByTestId('waiting-placeholder').textContent).not.toContain('正在重试')
+
+    // The recovered completion streams and settles cleanly.
+    act(() => { listener?.({ type: 'text', sessionId: 'layout', contentIndex: 0, delta: '重试后的答复' }) })
+    await waitFor(() => expect(screen.queryByTestId('waiting-placeholder')).toBeNull())
+    act(() => { listener?.({ type: 'status', sessionId: 'layout', status: 'settled' }) })
+    await waitFor(() => expect(screen.queryAllByLabelText('停止生成')).toHaveLength(0))
+  })
+
   it('shows the first-response wait for host-driven turns, keeps it through thinking/tool, hides on first text, and cleans up on settle', async () => {
     let listener: ((event: StreamEvent) => void) | undefined
     const base = createMockHost()

@@ -1910,7 +1910,7 @@ function extractContextWindowFromModelEntry(entry: unknown): number | undefined 
   return undefined;
 }
 
-async function fetchCompatModelsCatalog(baseUrl: string, apiKey: string): Promise<unknown[]> {
+async function fetchCompatModelsCatalogStrict(baseUrl: string, apiKey: string): Promise<unknown[]> {
   const url = `${baseUrl.replace(/\/+$/, "")}/models`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 8000);
@@ -1919,7 +1919,7 @@ async function fetchCompatModelsCatalog(baseUrl: string, apiKey: string): Promis
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: controller.signal,
     });
-    if (!response.ok) return [];
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const json: unknown = await response.json();
     return Array.isArray(json)
       ? json
@@ -1927,10 +1927,20 @@ async function fetchCompatModelsCatalog(baseUrl: string, apiKey: string): Promis
         ? (json as { data: unknown[] }).data
         : [];
   } catch (error) {
-    console.warn("compat provider context probe failed", error);
-    return [];
+    if (error instanceof Error && error.name === "AbortError") throw new Error("请求超时（8 秒）");
+    throw error instanceof Error ? error : new Error(String(error));
   } finally {
     clearTimeout(timer);
+  }
+}
+
+/** Lenient probe variant: context-window backfill only cares about success. */
+async function fetchCompatModelsCatalog(baseUrl: string, apiKey: string): Promise<unknown[]> {
+  try {
+    return await fetchCompatModelsCatalogStrict(baseUrl, apiKey);
+  } catch (error) {
+    console.warn("compat provider context probe failed", error);
+    return [];
   }
 }
 
@@ -1946,6 +1956,130 @@ function contextWindowFromCompatList(list: unknown[], modelId: string): number |
 async function probeCompatContextWindow(baseUrl: string, apiKey: string, modelId: string): Promise<number | undefined> {
   const list = await fetchCompatModelsCatalog(baseUrl, apiKey);
   return contextWindowFromCompatList(list, modelId);
+}
+
+/** Normalized model-id candidate for the add-model panel's dropdown. */
+export type CompatModelEntry = { id: string; contextWindow?: number };
+
+function compatModelsFromCatalog(list: unknown[]): CompatModelEntry[] {
+  const models = new Map<string, CompatModelEntry>();
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const id = typeof rec.id === "string" && rec.id.trim()
+      ? rec.id.trim()
+      : typeof rec.name === "string" && rec.name.trim()
+        ? rec.name.trim()
+        : undefined;
+    if (!id || models.has(id)) continue;
+    const contextWindow = extractContextWindowFromModelEntry(rec);
+    models.set(id, contextWindow !== undefined ? { id, contextWindow } : { id });
+  }
+  return [...models.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/** The probe asks for a tiny reply and stops early; it must never cost a full generation. */
+const COMPAT_TEST_TIMEOUT_MS = 30_000;
+
+export type CompatModelTestResult = {
+  ok: true;
+  /** Request start → first generated content token, in ms. */
+  firstTokenMs: number;
+  /** Request start → stream end, in ms. */
+  totalMs: number;
+  /** Content deltas received (approximate token count). */
+  tokens: number;
+  /** tokens / generation seconds, one decimal. */
+  tokensPerSecond: number;
+  /** First ~80 chars of generated content. */
+  preview: string;
+};
+
+async function runCompatModelTest(baseUrl: string, apiKey: string, modelId: string): Promise<CompatModelTestResult> {
+  const url = `${baseUrl.replace(/\/+$/, "")}/chat/completions`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), COMPAT_TEST_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({
+        model: modelId,
+        stream: true,
+        messages: [{ role: "user", content: "Hi, reply with exactly: OK" }],
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      const body = (await response.text().catch(() => "")).slice(0, 300);
+      throw new Error(`HTTP ${response.status}${body ? `：${body}` : ""}`);
+    }
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/event-stream")) {
+      // Non-streaming fallback: some gateways ignore stream:true and answer JSON.
+      const json: unknown = await response.json();
+      const totalMs = Date.now() - startedAt;
+      const usage = (json as { usage?: { completion_tokens?: unknown } })?.usage;
+      const tokens = parsePositiveInt(usage?.completion_tokens) ?? 1;
+      return {
+        ok: true,
+        firstTokenMs: totalMs,
+        totalMs,
+        tokens,
+        tokensPerSecond: Math.round((tokens / (Math.max(totalMs, 1) / 1000)) * 10) / 10,
+        preview: "",
+      };
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error("响应没有可读内容");
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let firstTokenMs = 0;
+    let tokens = 0;
+    let preview = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep = buffer.indexOf("\n");
+      while (sep >= 0) {
+        const line = buffer.slice(0, sep).trim();
+        buffer = buffer.slice(sep + 1);
+        sep = buffer.indexOf("\n");
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const chunk = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: unknown } }> };
+          const text = chunk.choices?.[0]?.delta?.content;
+          if (typeof text === "string" && text.length > 0) {
+            if (firstTokenMs === 0) firstTokenMs = Date.now() - startedAt;
+            tokens += 1;
+            if (preview.length < 80) preview += text;
+          }
+        } catch {
+          // Skip malformed chunks; the stream continues.
+        }
+      }
+    }
+    const totalMs = Date.now() - startedAt;
+    if (tokens === 0) throw new Error("连接成功但未收到任何生成内容");
+    const generationMs = Math.max(totalMs - firstTokenMs, 1);
+    return {
+      ok: true,
+      firstTokenMs,
+      totalMs,
+      tokens,
+      tokensPerSecond: Math.round((tokens / (generationMs / 1000)) * 10) / 10,
+      preview: preview.slice(0, 80),
+    };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw new Error(`测试超时（${COMPAT_TEST_TIMEOUT_MS / 1000} 秒）`);
+    throw error instanceof Error ? error : new Error(String(error));
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 type IsolatedProjectHome = {
@@ -2400,6 +2534,7 @@ export class PiHostBackend implements HostBackend {
           // authority flips shut right here and only a settled canonical rebuild reopens it
           // (ProviderAuthBackend awaits refreshModelsAfterAuthChange BEFORE 'completed').
           this.invalidateModelCatalog();
+          this.auth.invalidateProvidersCache();
           return (await this.modelRuntime()).login(p, t, i);
         },
         logout: async (p) => (await this.modelRuntime()).logout(p),
@@ -2409,8 +2544,15 @@ export class PiHostBackend implements HostBackend {
         // Awaited by ProviderAuthBackend.runLogin BEFORE the terminal 'completed' event:
         // the model catalog (load + invalidate/publish/tombstone) must settle while the
         // login is still in flight. A rejection becomes that login's explicit failure.
-        this.refreshModelsAfterAuthChange().then(() => undefined),
+        this.refreshModelsAfterAuthChange().then(() => {
+          // Credential state changed: drop the provider cache so panels re-warm from the
+          // runtime. The re-warm runs in the background and never blocks the login path.
+          this.auth.invalidateProvidersCache();
+        }),
     });
+    // Warm the provider catalog in the background so the first open of the add-model
+    // panel does not wait on a cold pi runtime boot (the panel reads the cache).
+    this.auth.prefetchProviders();
     // The bridge callback is synchronous, so finish the small durable-index read before this
     // backend can receive any live event. An async constructor load could otherwise overwrite a
     // newer same-key run or persist an incomplete map when START arrived immediately.
@@ -4186,7 +4328,7 @@ export class PiHostBackend implements HostBackend {
       case "setSidebarSessionPreferences":
         return this.saveSidebarSessionPreferences(params[0]);
       case "authProviders":
-        return this.auth.listProviders();
+        return this.auth.listProvidersCached();
       case "beginProviderLogin":
         return {
           loginId: this.auth.beginLogin(
@@ -4206,6 +4348,10 @@ export class PiHostBackend implements HostBackend {
         return this.removeProviderCredentials(params[0] as string);
       case "addOpenAICompatibleProvider":
         return this.addOpenAICompatibleProvider(params[0]);
+      case "listOpenAICompatibleModels":
+        return this.listOpenAICompatibleModels(params[0]);
+      case "testOpenAICompatibleModel":
+        return this.testOpenAICompatibleModel(params[0]);
       case "getComputerUseState":
         return { enabled: await this.loadComputerUseEnabled() };
       case "setComputerUseEnabled":
@@ -5740,6 +5886,27 @@ export class PiHostBackend implements HostBackend {
     } else if (e.type === "agent_stopped" || e.type === "agent_error") {
       this.requestSessionRedact(id, live.runtimeToken);
       this.projectTurnTerminal(live, "stopped");
+    } else if (e.type === "auto_retry_start" || e.type === "auto_retry_end") {
+      // pi is retrying a failed provider call inside the running turn (or the
+      // retry loop just finished). Forward it: a silent backoff window — minutes
+      // with no visible output while queued messages correctly wait for the
+      // settle — otherwise reads to the user as a wedged queue. Redact the
+      // provider error text, matching the message_end error path.
+      const start = e.type === "auto_retry_start";
+      const retryError = redactText(
+        String(start ? (e.errorMessage ?? "") : (e.finalError ?? "")).slice(0, 200),
+        this.sessionSecrets(id),
+      );
+      this.stream({
+        type: "auto_retry",
+        sessionId: id,
+        phase: start ? "start" : "end",
+        ...(start && typeof e.attempt === "number" ? { attempt: e.attempt } : {}),
+        ...(start && typeof e.maxAttempts === "number" ? { maxAttempts: e.maxAttempts } : {}),
+        ...(start && typeof e.delayMs === "number" ? { delayMs: e.delayMs } : {}),
+        ...(start ? {} : { success: e.success === true }),
+        ...(retryError ? { error: retryError } : {}),
+      });
     } else if (e.type === "compaction_start") {
       live.compaction.compactionStarted();
       // Must be synchronous: `loadQueue().then(markBusy)` raced enqueue/drain
@@ -9350,7 +9517,35 @@ export class PiHostBackend implements HostBackend {
     } catch (error) {
       throw new Error(`自定义 provider 已保存，但模型目录刷新失败：${error instanceof Error ? error.message : String(error)}`);
     }
+    this.auth.invalidateProvidersCache();
     return { providerId: providerIdCommitted };
+  }
+
+  /** Model-id candidates for the add-model dropdown: GET {baseUrl}/models with the entered key. */
+  private async listOpenAICompatibleModels(raw: unknown): Promise<{ models: CompatModelEntry[] }> {
+    if (!raw || typeof raw !== "object") throw new Error("参数无效");
+    const input = raw as Record<string, unknown>;
+    const baseUrl = typeof input.baseUrl === "string" ? input.baseUrl.trim() : "";
+    const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+    if (!baseUrl) throw new Error("URL 不能为空");
+    if (!/^https?:\/\//i.test(baseUrl)) throw new Error("URL 必须是 http(s) 地址");
+    if (!apiKey) throw new Error("Key 不能为空");
+    const list = await fetchCompatModelsCatalogStrict(baseUrl, apiKey);
+    return { models: compatModelsFromCatalog(list) };
+  }
+
+  /** Streaming connectivity probe for one OpenAI-compatible model (first-token latency + throughput). */
+  private async testOpenAICompatibleModel(raw: unknown): Promise<CompatModelTestResult> {
+    if (!raw || typeof raw !== "object") throw new Error("参数无效");
+    const input = raw as Record<string, unknown>;
+    const baseUrl = typeof input.baseUrl === "string" ? input.baseUrl.trim() : "";
+    const apiKey = typeof input.apiKey === "string" ? input.apiKey.trim() : "";
+    const modelId = typeof input.modelId === "string" ? input.modelId.trim() : "";
+    if (!baseUrl) throw new Error("URL 不能为空");
+    if (!/^https?:\/\//i.test(baseUrl)) throw new Error("URL 必须是 http(s) 地址");
+    if (!apiKey) throw new Error("Key 不能为空");
+    if (!modelId) throw new Error("模型 id 不能为空");
+    return runCompatModelTest(baseUrl, apiKey, modelId);
   }
 
   private scheduleCompatContextBackfill(): void {
@@ -9506,6 +9701,7 @@ export class PiHostBackend implements HostBackend {
       throw error;
     }
     const models = await this.refreshModelsAfterAuthChange(false);
+    this.auth.invalidateProvidersCache();
     if (this.modelState.model.provider === providerId) {
       const next = models[0] ?? {
         provider: "unknown",

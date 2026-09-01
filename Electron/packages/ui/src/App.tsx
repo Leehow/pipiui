@@ -1012,6 +1012,15 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
       mockAuthCredentials.set(id, 'api_key')
       return { providerId: id }
     },
+    listOpenAICompatibleModels: async input => {
+      if (!/^https?:\/\//i.test(input.baseUrl.trim()) || !input.apiKey.trim()) throw new Error('参数无效')
+      return { models: [{ id: 'gpt-4o-mini', contextWindow: 128000 }, { id: 'gpt-4o' }] }
+    },
+    testOpenAICompatibleModel: async input => {
+      if (!/^https?:\/\//i.test(input.baseUrl.trim()) || !input.apiKey.trim() || !input.modelId.trim()) throw new Error('参数无效')
+      await new Promise(resolve => setTimeout(resolve, 50))
+      return { ok: true, firstTokenMs: 320, totalMs: 1450, tokens: 8, tokensPerSecond: 42.3, preview: 'OK' }
+    },
     removeProviderCredentials: async providerId => {
       mockAuthCredentials.delete(providerId)
       mockModels = mockModels.filter(model => model.provider !== providerId)
@@ -2807,6 +2816,23 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
           setWaitingDetail(undefined)
         } else {
           setWaitingPhase('tool')
+        }
+      } else if (event.type === 'auto_retry') {
+        // pi is backing off and retrying a failed provider call inside the open
+        // turn. The turn is NOT over (queued messages correctly keep waiting for
+        // its settle); surface the retry so the silence never reads as a wedged
+        // send. End reverts to thinking: the model restarts, or the turn's error
+        // message lands right after retries are exhausted.
+        if (event.phase === 'start') {
+          setWaitingVisible(true)
+          const span = event.attempt !== undefined && event.maxAttempts !== undefined
+            ? `第 ${event.attempt}/${event.maxAttempts} 次重试`
+            : undefined
+          setWaitingDetail([span, event.error].filter(Boolean).join(' · ') || undefined)
+          setWaitingPhase('retrying')
+        } else {
+          setWaitingPhase('thinking')
+          setWaitingDetail(undefined)
         }
       }
     } })
