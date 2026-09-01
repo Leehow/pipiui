@@ -137,8 +137,64 @@ describe('ExtensionsPane', () => {
     expect(screen.getByTestId('extensions-pack-list').contains(screen.getByTestId('extensions-zip-install'))).toBe(false)
     expect(screen.getByTestId('extensions-pack-list').textContent).toContain('加载 ZIP')
     const sidebar = screen.getByTestId('extensions-zip-install').closest('aside')
+    expect(sidebar?.textContent).toContain('核心扩展')
     expect(sidebar?.textContent).toContain('其他扩展')
-    expect(sidebar?.textContent).toContain('能力')
+    expect(sidebar?.textContent).toContain('扩展包')
+  })
+
+  it('shows the core group with skills, MCP, tools, and an upcoming theme slot', async () => {
+    const host = {
+      listExtensions: async () => [],
+      listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
+    } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-nav-skills')).toBeTruthy()
+    expect(screen.getByTestId('extensions-nav-skills').textContent).toContain('Skill Loader')
+    expect(screen.getByTestId('extensions-nav-mcp').textContent).toContain('pi-mcp-extension')
+    expect(screen.getByTestId('extensions-nav-tools').textContent).toContain('基础工具')
+    expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('即将推出')
+    expect((screen.getByTestId('extensions-nav-theme') as HTMLElement).tagName).toBe('DIV')
+  })
+
+  it('lists the frozen basic tool extensions with toggles in the tools view', async () => {
+    const tool = (id: string, state: 'enabled' | 'disabled'): ExtensionDescriptor => ({
+      id,
+      name: id,
+      version: '0.1.0',
+      source: 'builtin',
+      state,
+      capabilities: [],
+      description: `${id} 描述`,
+    })
+    const items = [
+      tool('web-access-extension', 'enabled'),
+      tool('webview-browser-extension', 'disabled'),
+      tool('cua-extension', 'disabled'),
+      tool('memory-extension', 'enabled'),
+      tool('plan-extension', 'enabled'),
+    ]
+    const setExtensionEnabled = vi.fn(async (id: string, enabled: boolean) => {
+      items.find(item => item.id === id)!.state = enabled ? 'enabled' : 'disabled'
+      return items.find(item => item.id === id)!
+    })
+    const host = {
+      listExtensions: async () => items.map(item => ({ ...item })),
+      setExtensionEnabled,
+      getCapabilityGrant: async () => ({ capabilities: [] }),
+      listUserMcpServers: async () => [],
+      listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
+    } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('extensions-nav-tools'))
+    expect(screen.getByTestId('extensions-tools-hub').textContent).toContain('基础工具')
+    // Only the frozen core-capability tool packages are listed, not plan-extension.
+    for (const id of ['web-access-extension', 'webview-browser-extension', 'cua-extension', 'memory-extension']) {
+      expect(screen.getByTestId(`extensions-tool-${id}`)).toBeTruthy()
+    }
+    expect(screen.queryByTestId('extensions-tool-plan-extension')).toBeNull()
+    expect(screen.getByTestId('extensions-tool-toggle-web-access-extension').getAttribute('aria-checked')).toBe('true')
+    fireEvent.click(screen.getByTestId('extensions-tool-toggle-web-access-extension'))
+    await waitFor(() => expect(setExtensionEnabled).toHaveBeenCalledWith('web-access-extension', false, 'project', 'demo'))
   })
 
   it('opens the add dialog with copy-paste prompts the main session can handle', async () => {

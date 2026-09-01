@@ -942,6 +942,16 @@ body{overscroll-behavior:none}
 .extensions-capability-nav.active { background: var(--selection); }
 .extensions-capability-nav strong { color: var(--text-strong); font-size: 10px; }
 .extensions-capability-nav span { color: var(--subtle); font-size: 8px; }
+.extensions-core-soon { display: flex; flex-direction: column; gap: 2px; margin-top: 3px; padding: 8px; border-radius: 8px; opacity: .72; }
+.extensions-core-soon strong { color: var(--text); font-size: 10px; }
+.extensions-core-soon span { color: var(--subtle); font-size: 8px; }
+.extensions-tools-list { display: flex; flex-direction: column; gap: 8px; }
+.extensions-tool-row { display: flex; align-items: center; gap: 12px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-raised); }
+.extensions-tool-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.extensions-tool-copy strong { color: var(--text-strong); font-size: 10px; }
+.extensions-tool-copy span { color: var(--subtle); font-size: 9px; line-height: 1.45; }
+.extensions-tool-row .computer-use-switch { flex: none; transform: scale(.85); }
+.extensions-hub-card-title + .extensions-hub-card-title { margin-top: 6px; }
 .extensions-library-content { padding: 16px; }
 .extensions-pack-detail {
   display: grid;

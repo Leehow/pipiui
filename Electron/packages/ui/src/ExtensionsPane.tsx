@@ -26,16 +26,18 @@ import {
   L2_CAPABILITY_HINT,
 } from './extension-capabilities'
 import { ExtensionAuthCard } from './ExtensionAuthCard'
+import { CORE_SKILLS_EXTENSION_IDS, CORE_TOOL_EXTENSION_IDS } from './core-extensions'
 import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, HOST_FEATURE_SETTINGS_EXTENSION_IDS, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from './host-feature-extensions'
 import { MCP_IMPORT_EXAMPLE, mcpServerSummary, mcpServerTransport, parseMcpServersJson } from './mcp-import'
 import { ScanExternalSessionsPane } from './ScanExternalSessionsPane'
 import { SchemaSettingsForm } from './schema-settings-form'
 
 /**
- * DOM node hosting the pack sub-nav (扩展包 / Skills / MCP) when ExtensionsPane
- * is embedded in the settings modal — ModelVisibilityModal provides the slot
- * under its 扩展 tab so the sub-nav indents into the main sidebar. Null (tests,
- * standalone usage) → the sub-nav renders inline as a second column.
+ * DOM node hosting the pack sub-nav (核心扩展 / 其他扩展 / 扩展包) when
+ * ExtensionsPane is embedded in the settings modal — ModelVisibilityModal
+ * provides the slot under its 扩展 tab so the sub-nav indents into the main
+ * sidebar. Null (tests, standalone usage) → the sub-nav renders inline as a
+ * second column.
  */
 export const ExtensionsSubnavSlotContext = createContext<HTMLElement | null>(null)
 import type { ModelVisibilityController } from './useModelVisibility'
@@ -517,12 +519,14 @@ function ExtensionPackageRow({
 }
 
 function SkillsHub({ items }: { items: ExtensionDescriptor[] }) {
-  const loader = items.find(item => item.id === 'skill-loader-extension')
+  const builtIn = items.find(item => item.id === CORE_SKILLS_EXTENSION_IDS[0])
+  const loader = items.find(item => item.id === CORE_SKILLS_EXTENSION_IDS[1])
+  const builtInEnabled = builtIn?.state === 'enabled'
   const loaderEnabled = loader?.state === 'enabled'
   return (
     <section className="extensions-skills-hub" data-testid="extensions-skills-hub">
       <div className="extensions-hub-hero">
-        <span className="extensions-overview-eyebrow">按需加载的专业知识</span>
+        <span className="extensions-overview-eyebrow">核心扩展</span>
         <h3>Skills</h3>
         <p>Skill 是 Agent 在需要时加载的说明、流程和资源。它们随扩展包进入项目，不会把所有领域知识一次塞进上下文。</p>
       </div>
@@ -530,10 +534,14 @@ function SkillsHub({ items }: { items: ExtensionDescriptor[] }) {
         <article className="extensions-hub-card">
           <span className="extensions-support-kicker">运行状态</span>
           <div className="extensions-hub-card-title">
-            <h4>Skill Loader</h4>
-            <span className={`extensions-state-pill state-${loaderEnabled ? 'enabled' : 'disabled'}`}>{loaderEnabled ? '已启用' : '未启用'}</span>
+            <h4>Built-in Skills</h4>
+            <span className={`extensions-state-pill state-${builtInEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-builtin-state">{builtInEnabled ? '已启用' : '未启用'}</span>
           </div>
-          <p>由 <code>skill-loader-extension</code> 提供 Skill 搜索与按需加载。每个扩展包可以带自己的 Skill 根目录。</p>
+          <div className="extensions-hub-card-title">
+            <h4>Skill Loader</h4>
+            <span className={`extensions-state-pill state-${loaderEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-loader-state">{loaderEnabled ? '已启用' : '未启用'}</span>
+          </div>
+          <p>内置技能集由 <code>built-in-skills</code> 提供；搜索与按需加载由 <code>skill-loader-extension</code> 提供。每个扩展包可以带自己的 Skill 根目录。</p>
         </article>
         <article className="extensions-hub-card extensions-hub-card-accent" data-testid="extensions-skill-create">
           <span className="extensions-support-kicker">内置创建工具</span>
@@ -629,6 +637,61 @@ function McpImportDialog({ host, projectId, existing, onClose, onDone }: {
   )
 }
 
+function BasicToolsHub({ items, busyId, onToggle }: {
+  items: ExtensionDescriptor[]
+  busyId: string | null
+  onToggle: (ext: ExtensionDescriptor) => void
+}) {
+  const byId = useMemo(() => new Map(items.map(item => [item.id, item])), [items])
+  return (
+    <section className="extensions-mcp-hub" data-testid="extensions-tools-hub">
+      <div className="extensions-hub-hero">
+        <span className="extensions-overview-eyebrow">核心扩展</span>
+        <h3>基础工具</h3>
+        <p>pi 自带工具之外、随产品内置的基础工具包：网页检索、浏览器、电脑控制与项目记忆。更复杂的工具由扩展包和其他扩展带来。</p>
+      </div>
+      <div className="extensions-tools-list" data-testid="extensions-tools-list">
+        {CORE_TOOL_EXTENSION_IDS.map(id => {
+          const ext = byId.get(id)
+          if (!ext) {
+            return (
+              <div className="extensions-tool-row" key={id} data-testid={`extensions-tool-${id}`}>
+                <div className="extensions-tool-copy">
+                  <strong>{id}</strong>
+                  <span>未随当前运行时提供</span>
+                </div>
+                <span className="extensions-membership-pill outside">未提供</span>
+              </div>
+            )
+          }
+          const enabled = ext.state === 'enabled'
+          const errorText = readableError(ext)
+          return (
+            <div className="extensions-tool-row" key={id} data-testid={`extensions-tool-${id}`}>
+              <div className="extensions-tool-copy">
+                <strong>{ext.name ?? ext.id}</strong>
+                {ext.description && <span>{ext.description}</span>}
+                {errorText && <span className="model-modal-error" role="alert">{errorText}</span>}
+              </div>
+              <span className={`extensions-state-pill state-${ext.state}`}>{EXTENSION_STATE_LABEL[ext.state] ?? ext.state}</span>
+              <button
+                type="button"
+                role="switch"
+                className={`computer-use-switch${enabled ? ' enabled' : ''}`}
+                aria-checked={enabled}
+                aria-label={enabled ? `禁用 ${ext.name ?? ext.id}` : `启用 ${ext.name ?? ext.id}`}
+                disabled={busyId === ext.id || ext.state === 'error'}
+                data-testid={`extensions-tool-toggle-${id}`}
+                onClick={() => onToggle(ext)}
+              ><span /></button>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
 function McpHub({ host, projectId, servers, onChanged }: {
   host?: PipiHostAPI
   projectId?: string
@@ -659,7 +722,7 @@ function McpHub({ host, projectId, servers, onChanged }: {
   return (
     <section className="extensions-mcp-hub" data-testid="extensions-mcp-hub">
       <div className="extensions-hub-hero">
-        <span className="extensions-overview-eyebrow">外部能力</span>
+        <span className="extensions-overview-eyebrow">核心扩展</span>
         <h3>MCP 连接</h3>
         <p>PipiUI 内置 MCP 宿主；第三方服务作为当前项目的连接显示在这里。</p>
       </div>
@@ -757,7 +820,7 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
   const [profiles, setProfiles] = useState<ProductProfileDescriptor[]>([])
   const [activation, setActivation] = useState<ProjectProductActivation | null>(null)
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null)
-  const [selectedView, setSelectedView] = useState<'packs' | 'skills' | 'mcp'>('packs')
+  const [selectedView, setSelectedView] = useState<'packs' | 'skills' | 'mcp' | 'tools'>('packs')
   const [packsOpen, setPacksOpen] = useState(true)
   const [createPackOpen, setCreatePackOpen] = useState(false)
   const [createPackName, setCreatePackName] = useState('')
@@ -1103,6 +1166,54 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
   const subnavSlot = useContext(ExtensionsSubnavSlotContext)
   const packSubnav = (
     <aside className="extensions-pack-sidebar">
+      <div className="extensions-pack-sidebar-heading">核心扩展</div>
+      <button
+        type="button"
+        className={`extensions-capability-nav${selectedView === 'skills' ? ' active' : ''}`}
+        data-testid="extensions-nav-skills"
+        onClick={() => setSelectedView('skills')}
+      >
+        <strong>Skills</strong>
+        <span>内置技能集 · Skill Loader</span>
+      </button>
+      <button
+        type="button"
+        className={`extensions-capability-nav${selectedView === 'mcp' ? ' active' : ''}`}
+        data-testid="extensions-nav-mcp"
+        onClick={() => setSelectedView('mcp')}
+      >
+        <strong>MCP 连接</strong>
+        <span>pi-mcp-extension · {servers.length} 个项目连接</span>
+      </button>
+      <button
+        type="button"
+        className={`extensions-capability-nav${selectedView === 'tools' ? ' active' : ''}`}
+        data-testid="extensions-nav-tools"
+        onClick={() => setSelectedView('tools')}
+      >
+        <strong>基础工具</strong>
+        <span>网页 · 浏览器 · 电脑 · 记忆</span>
+      </button>
+      <div className="extensions-core-soon" data-testid="extensions-nav-theme" title="主题扩展实现后在这里管理">
+        <strong>主题扩展</strong>
+        <span>即将推出</span>
+      </div>
+      <div className="extensions-pack-sidebar-divider" />
+      <div className="extensions-pack-sidebar-heading">其他扩展</div>
+      {host.pickProductPackArchive && host.installExtensionZip && resolvedProjectId && (
+        <>
+          <button
+            type="button"
+            className="extensions-pack-import"
+            disabled={archiveBusy !== null || profileBusy !== null}
+            title="安装单个扩展 ZIP：包根（或唯一顶层文件夹）内需包含 pipiui-extension.json 与 agent/ 或 app/ 目录"
+            data-testid="extensions-zip-install"
+            onClick={() => void importExtensionZip()}
+          >{archiveBusy === 'zip' ? '正在安装…' : '安装扩展 ZIP'}</button>
+          <p className="extensions-zip-hint" data-testid="extensions-zip-hint">单个扩展 ZIP：包根（或唯一顶层文件夹）内需有 pipiui-extension.json 与 agent/ 或 app/；安装后自动对当前项目启用。</p>
+        </>
+      )}
+      <div className="extensions-pack-sidebar-divider" />
       <button
         type="button"
         className="extensions-pack-dropdown"
@@ -1145,41 +1256,6 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
           )}
         </div>
       )}
-      <div className="extensions-pack-sidebar-divider" />
-      <div className="extensions-pack-sidebar-heading">其他扩展</div>
-      {host.pickProductPackArchive && host.installExtensionZip && resolvedProjectId && (
-        <>
-          <button
-            type="button"
-            className="extensions-pack-import"
-            disabled={archiveBusy !== null || profileBusy !== null}
-            title="安装单个扩展 ZIP：包根（或唯一顶层文件夹）内需包含 pipiui-extension.json 与 agent/ 或 app/ 目录"
-            data-testid="extensions-zip-install"
-            onClick={() => void importExtensionZip()}
-          >{archiveBusy === 'zip' ? '正在安装…' : '安装扩展 ZIP'}</button>
-          <p className="extensions-zip-hint" data-testid="extensions-zip-hint">单个扩展 ZIP：包根（或唯一顶层文件夹）内需有 pipiui-extension.json 与 agent/ 或 app/；安装后自动对当前项目启用。</p>
-        </>
-      )}
-      <div className="extensions-pack-sidebar-divider" />
-      <div className="extensions-pack-sidebar-heading">能力</div>
-      <button
-        type="button"
-        className={`extensions-capability-nav${selectedView === 'skills' ? ' active' : ''}`}
-        data-testid="extensions-nav-skills"
-        onClick={() => setSelectedView('skills')}
-      >
-        <strong>Skills</strong>
-        <span>按需知识与创建工具</span>
-      </button>
-      <button
-        type="button"
-        className={`extensions-capability-nav${selectedView === 'mcp' ? ' active' : ''}`}
-        data-testid="extensions-nav-mcp"
-        onClick={() => setSelectedView('mcp')}
-      >
-        <strong>MCP 连接</strong>
-        <span>{servers.length} 个项目连接</span>
-      </button>
     </aside>
   )
   return (
@@ -1203,6 +1279,8 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
           )}
           {selectedView === 'skills' ? <SkillsHub items={items} /> : selectedView === 'mcp' ? (
             <McpHub host={host} projectId={resolvedProjectId} servers={servers} onChanged={onServersChanged} />
+          ) : selectedView === 'tools' ? (
+            <BasicToolsHub items={items} busyId={busyId} onToggle={ext => { void onToggle(ext) }} />
           ) : selectedProfile ? (
             <>
               <div className="extensions-pack-detail">
