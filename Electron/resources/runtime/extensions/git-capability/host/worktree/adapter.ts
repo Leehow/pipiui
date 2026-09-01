@@ -413,6 +413,34 @@ export class NodeGitWorktreeAdapter implements GitWorktreeAdapter {
 	}
 
 	/**
+	 * Create a worktree. `createBranch` (default true) is `git worktree add -b`;
+	 * false attaches an existing branch. Session worktrees go through this so they
+	 * share the adapter's argv/timeout/abort path instead of spawning git again.
+	 */
+	addWorktree(
+		mainCwd: string,
+		worktreePath: string,
+		branch: string,
+		options: { createBranch?: boolean; startPoint?: string } = {},
+	): Promise<GitOperationResultV1> {
+		if (!safeBranch(branch)) return Promise.resolve(invalidOperation("branch is invalid"));
+		if (!safeAbsolutePath(worktreePath)) return Promise.resolve(invalidOperation("worktree path is invalid"));
+		const startPoint = options.startPoint ?? "HEAD";
+		if (
+			startPoint !== "HEAD"
+			&& !safeBranch(startPoint)
+			&& !/^[0-9a-fA-F]{7,40}$/.test(startPoint)
+		) {
+			return Promise.resolve(invalidOperation("startPoint is invalid"));
+		}
+		const createBranch = options.createBranch !== false;
+		const args = createBranch
+			? ["worktree", "add", "-b", branch, worktreePath, startPoint]
+			: ["worktree", "add", worktreePath, branch];
+		return this.runGit(mainCwd, args);
+	}
+
+	/**
 	 * The sole automatic branch deletion path. It requires runtime ownership,
 	 * no registered worktree, and reachability from main HEAD, then uses the
 	 * non-force branch deletion command.
