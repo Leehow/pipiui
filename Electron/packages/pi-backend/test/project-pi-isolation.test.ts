@@ -417,6 +417,14 @@ describe("isolated project Pi homes", () => {
     const mcp = await backend.handle("listUserMcpServers", [added.id]) as Array<{ name: string }>;
     expect(mcp.map((server) => server.name)).toEqual(["local"]);
 
+    // addUserMcpServer must land in the real project root, never through the alias.
+    await backend.handle("addUserMcpServer", [added.id, "remote", { url: "https://mcp.example.com/mcp" }]);
+    const mcpAfter = await backend.handle("listUserMcpServers", [added.id]) as Array<{ name: string }>;
+    expect(mcpAfter.map((server) => server.name)).toEqual(["local", "remote"]);
+    const writtenDoc = JSON.parse(await readFile(join(realRoot, ".pi", "mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(writtenDoc.mcpServers.remote).toEqual({ url: "https://mcp.example.com/mcp" });
+    expect(await readFile(join(otherProject, "SENTINEL"), "utf8")).toBe("external-sentinel\n");
+
     await backend.handle("sendPrompt", [created.id, "go"]);
     const spawned = captured.find((item) => item.env.PIPIUI_SESSION_KEY === created.id) ?? captured.at(-1);
     expect(spawned?.cwd).toBe(realRoot);

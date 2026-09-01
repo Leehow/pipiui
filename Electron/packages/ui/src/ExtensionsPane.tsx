@@ -27,6 +27,7 @@ import {
 } from './extension-capabilities'
 import { ExtensionAuthCard } from './ExtensionAuthCard'
 import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, HOST_FEATURE_SETTINGS_EXTENSION_IDS, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from './host-feature-extensions'
+import { MCP_IMPORT_EXAMPLE, mcpServerSummary, mcpServerTransport, parseMcpServersJson } from './mcp-import'
 import { ScanExternalSessionsPane } from './ScanExternalSessionsPane'
 import { SchemaSettingsForm } from './schema-settings-form'
 
@@ -132,7 +133,7 @@ async function loadUserMcpServers(host: PipiHostAPI | undefined, preferredProjec
   return await host.listUserMcpServers(projectId)
 }
 
-type CopiedKey = 'mcp' | 'pi' | null
+type CopiedKey = 'mcp' | 'pi' | 'selfdev' | null
 
 async function copyText(text: string): Promise<boolean> {
   try {
@@ -158,6 +159,9 @@ function CopyRow({ label, text, copied, onCopy }: {
     </div>
   )
 }
+
+/** Copy prompt for tweaking an already-installed extension via /selfdev. Keep in sync with the add-extension skill. */
+export const SELFDEV_MODIFY_PROMPT = '/selfdev 把【扩展名】的【某项】改成【值】'
 
 export function ExtensionsAddDialog({ onClose }: { onClose: () => void }) {
   const [copied, setCopied] = useState<CopiedKey>(null)
@@ -192,14 +196,19 @@ export function ExtensionsAddDialog({ onClose }: { onClose: () => void }) {
         <div className="extensions-add-body">
           <p>不用在这里填命令、URL 或密钥。</p>
           <p>PipiUI 已经接好了 Pi 的 MCP 能力。要加某家的 MCP，或某个 Pi 插件，回到主界面直接说就行——可以说厂商和名字，也可以贴官网、npm 包名或配置链接。</p>
+          <p>手里已经有 <code>{'{"mcpServers": {…}}'}</code> 配置的话，不用绕这一步：到左侧「MCP 连接」点“粘贴 JSON 导入”即可。</p>
           <ul className="extensions-add-examples">
             <li>请把 Context7 的 MCP 加到 PipiUI</li>
             <li>请把 Notion 家的这个 MCP 加进来，链接我贴下面</li>
             <li>请把这个 Pi 扩展加到 PipiUI：https://pi.dev/packages/xxx</li>
+            <li>用 /selfdev 把 grok build 的上下文窗口改成 700</li>
           </ul>
           <p>复制下面一句，改成你要的名字或链接，贴到主界面发送。PipiUI 会去查该怎么装，并写到本机配置里。</p>
           <CopyRow label="mcp" text={MCP_ADD_PROMPT} copied={copied === 'mcp'} onCopy={() => copy('mcp', MCP_ADD_PROMPT)} />
           <CopyRow label="pi" text={PI_EXTENSION_ADD_PROMPT} copied={copied === 'pi'} onCopy={() => copy('pi', PI_EXTENSION_ADD_PROMPT)} />
+          <p>想改某个已装扩展的行为，或给它加功能？直接说，或打 /selfdev 开头——改完自动热重载，下一条消息即生效，改崩了可一键还原。</p>
+          <CopyRow label="selfdev" text={SELFDEV_MODIFY_PROMPT} copied={copied === 'selfdev'} onCopy={() => copy('selfdev', SELFDEV_MODIFY_PROMPT)} />
+          <p>手里已经有 .zip 扩展包？不用填任何配置，点左侧「安装扩展包 (.zip)」选文件直接装，装好即对当前项目启用。</p>
           {copied && <p className="extensions-add-copied" data-testid="extensions-add-copied">已复制。关掉设置，贴到主界面发送即可。</p>}
         </div>
       </section>
@@ -542,7 +551,111 @@ function SkillsHub({ items }: { items: ExtensionDescriptor[] }) {
   )
 }
 
-function McpHub({ servers }: { servers: UserMcpServer[] }) {
+function McpImportDialog({ host, projectId, existing, onClose, onDone }: {
+  host: PipiHostAPI
+  projectId: string
+  existing: UserMcpServer[]
+  onClose: () => void
+  onDone: (notice: string) => void
+}) {
+  const [text, setText] = useState('')
+  const [fallbackName, setFallbackName] = useState('custom-mcp')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const parsed = useMemo(() => parseMcpServersJson(text, fallbackName), [text, fallbackName])
+  const existingNames = useMemo(() => new Set(existing.map(server => server.name)), [existing])
+
+  const doImport = async () => {
+    const addUser = host.addUserMcpServer
+    if (!addUser || busy || parsed.servers.length === 0) return
+    setBusy(true)
+    setError(null)
+    try {
+      for (const { name, spec } of parsed.servers) {
+        await addUser(projectId, name, spec)
+      }
+      const overwritten = parsed.servers.filter(server => existingNames.has(server.name)).length
+      const suffix = overwritten > 0 ? `其中 ${overwritten} 个为同名覆盖。` : ''
+      onDone(`已导入 ${parsed.servers.length} 个 MCP 连接到当前项目，新会话生效。${suffix}`)
+    } catch (importError) {
+      setError(`导入失败：${importError instanceof Error ? importError.message : String(importError)}`)
+      setBusy(false)
+    }
+  }
+
+  return (
+    <ConfirmDialog
+      testId="extensions-mcp-import"
+      title="粘贴 JSON 导入 MCP"
+      confirmLabel={busy ? '导入中…' : `导入 ${parsed.servers.length} 个连接`}
+      confirmTestId="extensions-mcp-import-confirm"
+      cancelTestId="extensions-mcp-import-cancel"
+      confirmDisabled={busy || parsed.servers.length === 0}
+      onConfirm={() => { void doImport() }}
+      onCancel={() => { if (!busy) onClose() }}
+    >
+      <p>把 Claude、Cursor、Cline 等客户端的 <code>mcpServers</code> JSON 原样贴进来，也支持只贴一个服务器。</p>
+      <textarea
+        className="extensions-mcp-json"
+        data-testid="extensions-mcp-json-input"
+        rows={11}
+        spellCheck={false}
+        placeholder={MCP_IMPORT_EXAMPLE}
+        value={text}
+        onChange={event => setText(event.target.value)}
+      />
+      {parsed.shape === 'bare' && (
+        <label className="extensions-pack-name-field">
+          <span>连接名称</span>
+          <input value={fallbackName} maxLength={128} data-testid="extensions-mcp-name" onChange={event => setFallbackName(event.target.value)} />
+        </label>
+      )}
+      {parsed.error && <p className="model-modal-error" role="alert" data-testid="extensions-mcp-import-error">{parsed.error}</p>}
+      {parsed.servers.length > 0 && (
+        <div className="extensions-mcp-preview" data-testid="extensions-mcp-preview">
+          {parsed.servers.map(server => (
+            <div className="extensions-user-row" key={server.name} data-testid={`extensions-mcp-preview-${server.name}`}>
+              <strong>
+                {server.name}
+                {existingNames.has(server.name) && <span className="extensions-membership-pill outside">覆盖同名</span>}
+              </strong>
+              <span>{mcpServerTransport(server.spec)} · {mcpServerSummary(server.spec)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      <p className="extensions-mcp-json-hint">写入当前项目的 <code>.pi/mcp.json</code>，对新会话生效；密钥只保存在这份本机文件里。</p>
+    </ConfirmDialog>
+  )
+}
+
+function McpHub({ host, projectId, servers, onChanged }: {
+  host?: PipiHostAPI
+  projectId?: string
+  servers: UserMcpServer[]
+  onChanged: () => void
+}) {
+  const [importOpen, setImportOpen] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [removeTarget, setRemoveTarget] = useState<UserMcpServer | null>(null)
+  const canImport = Boolean(host?.addUserMcpServer && projectId)
+  const canRemove = Boolean(host?.removeUserMcpServer && projectId)
+
+  const confirmRemove = async () => {
+    const target = removeTarget
+    const removeUser = host?.removeUserMcpServer
+    if (!target || !removeUser || !projectId) return
+    setRemoveTarget(null)
+    try {
+      await removeUser(projectId, target.name)
+      setNotice(`已移除 MCP 连接「${target.name}」，新会话生效。`)
+      onChanged()
+    } catch (removeError) {
+      setError(`移除失败：${removeError instanceof Error ? removeError.message : String(removeError)}`)
+    }
+  }
+
   return (
     <section className="extensions-mcp-hub" data-testid="extensions-mcp-hub">
       <div className="extensions-hub-hero">
@@ -550,6 +663,13 @@ function McpHub({ servers }: { servers: UserMcpServer[] }) {
         <h3>MCP 连接</h3>
         <p>PipiUI 内置 MCP 宿主；第三方服务作为当前项目的连接显示在这里。</p>
       </div>
+      {notice && (
+        <div className="extensions-archive-notice" data-testid="extensions-mcp-notice">
+          <span>{notice}</span>
+          <button type="button" aria-label="关闭 MCP 提示" onClick={() => setNotice(null)}>×</button>
+        </div>
+      )}
+      {error && <DismissibleError message={error} onDismiss={() => setError(null)} />}
       <div className="extensions-mcp-builtin" data-testid="extensions-builtin">
         <div data-testid="extensions-item-pi-mcp">
           <strong>pi-mcp-extension</strong>
@@ -561,28 +681,72 @@ function McpHub({ servers }: { servers: UserMcpServer[] }) {
         <div className="extensions-user-connections-heading">
           <strong>项目连接</strong>
           <span>{servers.length} 项</span>
+          {canImport && (
+            <button type="button" className="model-modal-refresh" data-testid="extensions-mcp-import-open" onClick={() => setImportOpen(true)}>粘贴 JSON 导入</button>
+          )}
         </div>
         {servers.length === 0
-          ? <p className="extensions-user-empty" data-testid="extensions-user-empty">还没有额外添加的 MCP 或 Pi 扩展。使用右上角“添加扩展”即可开始。</p>
+          ? (
+            <p className="extensions-user-empty" data-testid="extensions-user-empty">
+              {canImport
+                ? '还没有添加的 MCP。点击「粘贴 JSON 导入」，把主流客户端的 mcpServers 配置贴进来即可。'
+                : '还没有额外添加的 MCP 或 Pi 扩展。使用右上角“添加扩展”即可开始。'}
+            </p>
+          )
           : (
             <div className="extensions-user-list" data-testid="extensions-user-list">
               {servers.map(server => (
                 <div className="extensions-user-row" key={server.name} data-testid={`extensions-item-mcp-${server.name}`}>
                   <strong>{server.name}</strong>
                   <span>{server.transport} · {server.summary}</span>
+                  {canRemove && (
+                    <button
+                      type="button"
+                      className="extensions-mcp-remove"
+                      data-testid={`extensions-mcp-remove-${server.name}`}
+                      onClick={() => setRemoveTarget(server)}
+                    >移除</button>
+                  )}
                 </div>
               ))}
             </div>
           )}
       </div>
+      {importOpen && host && projectId && (
+        <McpImportDialog
+          host={host}
+          projectId={projectId}
+          existing={servers}
+          onClose={() => setImportOpen(false)}
+          onDone={message => {
+            setImportOpen(false)
+            setNotice(message)
+            onChanged()
+          }}
+        />
+      )}
+      {removeTarget && (
+        <ConfirmDialog
+          testId="extensions-mcp-remove"
+          title={`移除 ${removeTarget.name}`}
+          confirmLabel="确认移除"
+          confirmTestId="extensions-mcp-remove-confirm"
+          cancelTestId="extensions-mcp-remove-cancel"
+          onConfirm={() => { void confirmRemove() }}
+          onCancel={() => setRemoveTarget(null)}
+        >
+          <p>会从当前项目的 <code>.pi/mcp.json</code> 删除这条连接。新会话不再加载它的工具。</p>
+        </ConfirmDialog>
+      )}
     </section>
   )
 }
 
-function ExtensionPackagesSection({ host, projectId, servers, vision, visibility, scan }: {
+function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, vision, visibility, scan }: {
   host: PipiHostAPI
   projectId?: string
   servers: UserMcpServer[]
+  onServersChanged: () => void
   vision?: VisionRoutingController
   visibility?: ModelVisibilityController
   scan?: ScanExternalSessionsController
@@ -979,20 +1143,22 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
           {host.pickProductPackArchive && host.installProductPackArchive && resolvedProjectId && (
             <button type="button" className="extensions-pack-import" disabled={archiveBusy !== null || profileBusy !== null} data-testid="extensions-pack-import" onClick={() => void importPack()}>{archiveBusy === 'import' ? '正在加载…' : '加载 ZIP'}</button>
           )}
-          {host.pickProductPackArchive && host.installExtensionZip && resolvedProjectId && (
-            <>
-              <button
-                type="button"
-                className="extensions-pack-import"
-                disabled={archiveBusy !== null || profileBusy !== null}
-                title="安装单个扩展 ZIP：包根（或唯一顶层文件夹）内需包含 pipiui-extension.json 与 agent/ 或 app/ 目录"
-                data-testid="extensions-zip-install"
-                onClick={() => void importExtensionZip()}
-              >{archiveBusy === 'zip' ? '正在安装…' : '安装扩展包 (.zip)'}</button>
-              <p className="extensions-zip-hint" data-testid="extensions-zip-hint">单个扩展 ZIP：包根（或唯一顶层文件夹）内需有 pipiui-extension.json 与 agent/ 或 app/；安装后自动对当前项目启用。</p>
-            </>
-          )}
         </div>
+      )}
+      <div className="extensions-pack-sidebar-divider" />
+      <div className="extensions-pack-sidebar-heading">其他扩展</div>
+      {host.pickProductPackArchive && host.installExtensionZip && resolvedProjectId && (
+        <>
+          <button
+            type="button"
+            className="extensions-pack-import"
+            disabled={archiveBusy !== null || profileBusy !== null}
+            title="安装单个扩展 ZIP：包根（或唯一顶层文件夹）内需包含 pipiui-extension.json 与 agent/ 或 app/ 目录"
+            data-testid="extensions-zip-install"
+            onClick={() => void importExtensionZip()}
+          >{archiveBusy === 'zip' ? '正在安装…' : '安装扩展 ZIP'}</button>
+          <p className="extensions-zip-hint" data-testid="extensions-zip-hint">单个扩展 ZIP：包根（或唯一顶层文件夹）内需有 pipiui-extension.json 与 agent/ 或 app/；安装后自动对当前项目启用。</p>
+        </>
       )}
       <div className="extensions-pack-sidebar-divider" />
       <div className="extensions-pack-sidebar-heading">能力</div>
@@ -1035,7 +1201,9 @@ function ExtensionPackagesSection({ host, projectId, servers, vision, visibility
               ))}
             </div>
           )}
-          {selectedView === 'skills' ? <SkillsHub items={items} /> : selectedView === 'mcp' ? <McpHub servers={servers} /> : selectedProfile ? (
+          {selectedView === 'skills' ? <SkillsHub items={items} /> : selectedView === 'mcp' ? (
+            <McpHub host={host} projectId={resolvedProjectId} servers={servers} onChanged={onServersChanged} />
+          ) : selectedProfile ? (
             <>
               <div className="extensions-pack-detail">
                 <div className="extensions-pack-detail-copy">
@@ -1280,7 +1448,7 @@ export function ExtensionsPane({
   const [servers, setServers] = useState<UserMcpServer[]>([])
   const resolvedHost = host ?? hostFromWindow()
 
-  useEffect(() => {
+  const reloadServers = useCallback(() => {
     let cancelled = false
     void loadUserMcpServers(resolvedHost, projectId).then(rows => {
       if (!cancelled) setServers(rows)
@@ -1290,11 +1458,15 @@ export function ExtensionsPane({
     return () => { cancelled = true }
   }, [resolvedHost, projectId])
 
+  useEffect(() => reloadServers(), [reloadServers])
+
+  const resolvedProjectId = projectId || lastProjectId()
+
   return (
     <div className="extensions-pane" data-testid="extensions-pane">
       {resolvedHost?.listExtensions
-        ? <ExtensionPackagesSection host={resolvedHost} projectId={projectId} servers={servers} vision={vision} visibility={visibility} scan={scan} />
-        : <McpHub servers={servers} />}
+        ? <ExtensionPackagesSection host={resolvedHost} projectId={projectId} servers={servers} onServersChanged={reloadServers} vision={vision} visibility={visibility} scan={scan} />
+        : <McpHub host={resolvedHost} projectId={resolvedProjectId} servers={servers} onChanged={reloadServers} />}
       {addOpen && <ExtensionsAddDialog onClose={onCloseAdd} />}
     </div>
   )

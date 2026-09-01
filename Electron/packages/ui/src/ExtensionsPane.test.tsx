@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MCP_ADD_PROMPT, PI_EXTENSION_ADD_PROMPT } from './extension-add-copy'
 import type { ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, UserMcpServer } from '@pipi/host-api'
-import { ExtensionsPane, ExtensionsSubnavSlotContext } from './ExtensionsPane'
+import { ExtensionsPane, ExtensionsSubnavSlotContext, SELFDEV_MODIFY_PROMPT } from './ExtensionsPane'
 import { CAPABILITY_LABELS } from './extension-capabilities'
 
 let originalClipboard: PropertyDescriptor | undefined
@@ -63,6 +63,84 @@ describe('ExtensionsPane', () => {
     expect(listUserMcpServers).toHaveBeenCalled()
   })
 
+  it('imports pasted mainstream mcpServers JSON into the project and refreshes the list', async () => {
+    const stored = new Map<string, Record<string, unknown>>()
+    const addUserMcpServer = vi.fn(async (_projectId: string, name: string, spec: Record<string, unknown>) => {
+      stored.set(name, spec)
+      return [{ name, transport: 'stdio', summary: 'npx' }]
+    })
+    const listUserMcpServers = vi.fn(async (): Promise<UserMcpServer[]> => [...stored.keys()].map(name => ({ name, transport: 'stdio', summary: 'npx' })))
+    const host = { listUserMcpServers, addUserMcpServer, listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }] } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('extensions-mcp-import-open'))
+    fireEvent.change(screen.getByTestId('extensions-mcp-json-input'), {
+      target: {
+        value: JSON.stringify({
+          mcpServers: {
+            context7: { command: 'npx', args: ['-y', '@upstash/context7-mcp'] },
+            notion: { type: 'http', url: 'https://mcp.notion.com/mcp' },
+          },
+        }),
+      },
+    })
+    expect(screen.getByTestId('extensions-mcp-preview-notion').textContent).toContain('streamable-http')
+    fireEvent.click(screen.getByTestId('extensions-mcp-import-confirm'))
+    await waitFor(() => expect(addUserMcpServer).toHaveBeenCalledTimes(2))
+    expect(addUserMcpServer).toHaveBeenCalledWith('demo', 'context7', expect.objectContaining({ command: 'npx', lifecycle: 'eager' }))
+    expect(addUserMcpServer).toHaveBeenCalledWith('demo', 'notion', expect.objectContaining({ transport: 'streamable-http', url: 'https://mcp.notion.com/mcp' }))
+    expect(await screen.findByTestId('extensions-mcp-notice')).toBeTruthy()
+    expect(screen.getByTestId('extensions-mcp-notice').textContent).toContain('已导入 2 个')
+    expect(await screen.findByTestId('extensions-item-mcp-context7')).toBeTruthy()
+    expect(screen.queryByTestId('extensions-mcp-import')).toBeNull()
+  })
+
+  it('rejects unparsable pasted JSON without calling the host', async () => {
+    const addUserMcpServer = vi.fn()
+    const host = { listUserMcpServers: async () => [], addUserMcpServer, listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }] } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('extensions-mcp-import-open'))
+    const input = screen.getByTestId('extensions-mcp-json-input')
+    fireEvent.change(input, { target: { value: '{oops' } })
+    expect(screen.getByTestId('extensions-mcp-import-error').textContent).toContain('不是有效的 JSON')
+    fireEvent.change(input, { target: { value: JSON.stringify({ mcpServers: { broken: { args: ['x'] } } }) } })
+    expect(screen.getByTestId('extensions-mcp-import-error').textContent).toContain('broken')
+    expect((screen.getByTestId('extensions-mcp-import-confirm') as HTMLButtonElement).disabled).toBe(true)
+    expect(addUserMcpServer).not.toHaveBeenCalled()
+  })
+
+  it('removes a project MCP connection after confirmation', async () => {
+    const removeUserMcpServer = vi.fn(async (): Promise<UserMcpServer[]> => [])
+    const host = {
+      listUserMcpServers: async (): Promise<UserMcpServer[]> => [{ name: 'sample-mcp', transport: 'stdio', summary: 'sample-mcp serve' }],
+      removeUserMcpServer,
+      listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
+    } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('extensions-mcp-remove-sample-mcp'))
+    expect(screen.getByTestId('extensions-mcp-remove').textContent).toContain('.pi/mcp.json')
+    fireEvent.click(screen.getByTestId('extensions-mcp-remove-confirm'))
+    await waitFor(() => expect(removeUserMcpServer).toHaveBeenCalledWith('demo', 'sample-mcp'))
+    expect(await screen.findByTestId('extensions-mcp-notice')).toBeTruthy()
+    expect(screen.getByTestId('extensions-mcp-notice').textContent).toContain('已移除')
+  })
+
+  it('keeps single-extension zip install outside the extension-pack group', async () => {
+    const host = {
+      listExtensions: async () => [],
+      listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
+      pickProductPackArchive: async () => '/tmp/pack.zip',
+      installProductPackArchive: async () => { throw new Error('unused') },
+      installExtensionZip: async () => { throw new Error('unused') },
+    } as unknown as PipiHostAPI
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    expect(await screen.findByTestId('extensions-zip-install')).toBeTruthy()
+    expect(screen.getByTestId('extensions-pack-list').contains(screen.getByTestId('extensions-zip-install'))).toBe(false)
+    expect(screen.getByTestId('extensions-pack-list').textContent).toContain('加载 ZIP')
+    const sidebar = screen.getByTestId('extensions-zip-install').closest('aside')
+    expect(sidebar?.textContent).toContain('其他扩展')
+    expect(sidebar?.textContent).toContain('能力')
+  })
+
   it('opens the add dialog with copy-paste prompts the main session can handle', async () => {
     const onCloseAdd = vi.fn()
     render(<ExtensionsPane addOpen={true} onCloseAdd={onCloseAdd} />)
@@ -76,6 +154,13 @@ describe('ExtensionsPane', () => {
     expect(screen.getByTestId('extensions-add-copied').textContent).toContain('贴到主界面发送即可')
     fireEvent.click(screen.getByTestId('extensions-copy-btn-pi'))
     await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith(PI_EXTENSION_ADD_PROMPT))
+    expect(dialog.textContent).toContain('用 /selfdev 把 grok build 的上下文窗口改成 700')
+    expect(dialog.textContent).toContain('自动热重载')
+    expect(screen.getByTestId('extensions-copy-selfdev').textContent).toContain(SELFDEV_MODIFY_PROMPT)
+    fireEvent.click(screen.getByTestId('extensions-copy-btn-selfdev'))
+    await waitFor(() => expect(navigator.clipboard.writeText).toHaveBeenCalledWith(SELFDEV_MODIFY_PROMPT))
+    expect(dialog.textContent).toContain('安装扩展包 (.zip)')
+    expect(dialog.textContent).toContain('点左侧「安装扩展包 (.zip)」')
     fireEvent.click(screen.getByRole('button', { name: '关闭添加说明' }))
     expect(onCloseAdd).toHaveBeenCalledTimes(1)
   })

@@ -59,7 +59,7 @@ import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.j
 import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
 import { ThinkingControlReporter } from "./thinking-control.js";
 import { PlanStore, readPlanStore } from "./plan-store.js";
-import { readUserMcpServers } from "./user-mcp-servers.js";
+import { readUserMcpServers, removeUserMcpServer as removeUserMcpServerEntry, writeUserMcpServer as writeUserMcpServerEntry } from "./user-mcp-servers.js";
 import {
   assemblePiSpawn,
   defaultRuntimeRoot,
@@ -3814,6 +3814,10 @@ export class PiHostBackend implements HostBackend {
         return this.revealProject(params[0] as string);
       case "listUserMcpServers":
         return this.listUserMcpServers(params[0]);
+      case "addUserMcpServer":
+        return this.addUserMcpServer(params[0], params[1], params[2]);
+      case "removeUserMcpServer":
+        return this.removeUserMcpServer(params[0], params[1]);
       case "listExtensions":
         return this.listExtensions(params[0]);
       case "setExtensionEnabled":
@@ -8458,6 +8462,18 @@ export class PiHostBackend implements HostBackend {
       return [];
     }
     return readUserMcpServers(join(root, ".pi", "mcp.json"));
+  }
+  private async addUserMcpServer(projectId: unknown, name: unknown, spec: unknown): Promise<UserMcpServer[]> {
+    const root = await this.requireProjectRoot(projectId);
+    return writeUserMcpServerEntry(join(root, ".pi", "mcp.json"), name, spec);
+  }
+  private async removeUserMcpServer(projectId: unknown, name: unknown): Promise<UserMcpServer[]> {
+    const root = await this.requireProjectRoot(projectId);
+    return removeUserMcpServerEntry(join(root, ".pi", "mcp.json"), name);
+  }
+  private async requireProjectRoot(projectId: unknown): Promise<string> {
+    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("缺少有效的项目");
+    return await this.projectPath(projectId);
   }
   private async revealProject(projectId: string): Promise<void> {
     const path = await this.projectPath(projectId);

@@ -1364,6 +1364,14 @@ export interface PipiHostAPI {
   revealProject?(projectId: string): Promise<void>;
   /** Read-only project `.pi/mcp.json` servers for Settings → 扩展. */
   listUserMcpServers?(projectId: string): Promise<UserMcpServer[]>;
+  /**
+   * Merge one server entry into project `.pi/mcp.json` (the mainstream
+   * `mcpServers` shape pasted from Claude/Cursor-style configs). Returns the
+   * refreshed server list. Electron-only; old hosts omit it.
+   */
+  addUserMcpServer?(projectId: string, name: string, spec: Record<string, unknown>): Promise<UserMcpServer[]>;
+  /** Remove one named server from project `.pi/mcp.json`; returns the refreshed list. Electron-only; old hosts omit it. */
+  removeUserMcpServer?(projectId: string, name: string): Promise<UserMcpServer[]>;
   /** Electron-only, read-only version discovery. It never installs or mutates packages. */
   checkForUpdates?(): Promise<UpdateCenterSnapshot>;
   /** 更新中心 one-click update for a transactional extension component. Electron-only; old hosts omit it. */
@@ -1565,6 +1573,8 @@ function apiFrom(
     probeGitBinary: () => invoke("probeGitBinary"),
     revealProject: projectId => invoke("revealProject", projectId),
     listUserMcpServers: projectId => invoke("listUserMcpServers", projectId),
+    addUserMcpServer: (projectId, name, spec) => invoke("addUserMcpServer", projectId, name, spec),
+    removeUserMcpServer: (projectId, name) => invoke("removeUserMcpServer", projectId, name),
     checkForUpdates: () => invoke("checkForUpdates"),
     updateExtensionComponent: (extensionId, componentId) => componentId === undefined
       ? invoke("updateExtensionComponent", extensionId)
