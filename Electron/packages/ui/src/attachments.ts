@@ -143,17 +143,22 @@ export function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
   })
 }
 
-/** Extract image files from a clipboard paste event payload. */
-export function imageFilesFromClipboard(clipboardData: DataTransfer | null): File[] {
+/** Extract any file items from a clipboard paste event payload. */
+export function filesFromClipboard(clipboardData: DataTransfer | null): File[] {
+  if (!clipboardData) return []
+  if (clipboardData.files && clipboardData.files.length > 0) return Array.from(clipboardData.files)
   const files: File[] = []
-  if (!clipboardData) return files
-  for (const item of Array.from(clipboardData.items)) {
-    if (item.kind === 'file' && item.type.startsWith('image/')) {
-      const file = item.getAsFile()
-      if (file) files.push(file)
-    }
+  for (const item of Array.from(clipboardData.items ?? [])) {
+    if (item.kind !== 'file') continue
+    const file = item.getAsFile()
+    if (file) files.push(file)
   }
   return files
+}
+
+/** Extract image files from a clipboard paste event payload. */
+export function imageFilesFromClipboard(clipboardData: DataTransfer | null): File[] {
+  return filesFromClipboard(clipboardData).filter(file => file.type.startsWith('image/') || imageMimeForFile(file))
 }
 
 /** Extract image files from a drag-and-drop FileList payload. */

@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
+import { createRef, type RefObject } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { InputFileAttachment, InputFileStageRequest, Model, PipiHostAPI } from '@pipi/host-api'
 import {
   blockingInputFileReason,
   composerInputFileGate,
+  composerInputFilesFromList,
   fileToBase64,
   formatInputFileSize,
   InputFileAttachments,
@@ -18,6 +20,7 @@ import {
   unsentComposerInputFiles,
   unsupportedInputFilesMessage,
   validateComposerInputFile,
+  type InputFileAttachmentsHandle,
 } from './InputFileAttachments'
 
 afterEach(() => {
@@ -44,15 +47,9 @@ function pdfFile(name = 'notes.pdf', size = 2048): File {
   return new File([new Uint8Array(size)], name, { type: 'application/pdf' })
 }
 
-function fileListOf(...files: File[]): FileList {
-  return Object.assign(files, {
-    length: files.length,
-    item: (index: number) => files[index] ?? null,
-  }) as unknown as FileList
-}
-
-function pickFiles(input: HTMLInputElement, ...files: File[]) {
-  fireEvent.change(input, { target: { files: fileListOf(...files) } })
+function pickFiles(api: RefObject<InputFileAttachmentsHandle | null>, ...files: File[]) {
+  if (!api.current) throw new Error('stageFiles handle missing')
+  void api.current.stageFiles(files)
 }
 
 function attachment(partial: Partial<InputFileAttachment> & Pick<InputFileAttachment, 'id' | 'name'>): InputFileAttachment {
@@ -178,20 +175,30 @@ describe('composer input-file helpers', () => {
 })
 
 describe('InputFileAttachments', () => {
-  it('hides the picker unless the live model declares inputFiles === true', () => {
+  it('never shows a file picker or add-file button, even when the live model declares inputFiles', () => {
     const host = hostStub()
-    const { rerender } = render(<InputFileAttachments host={host} sessionId="welcome" model={claude} onEnsureSession={async () => 'welcome'} />)
+    const { rerender, container } = render(<InputFileAttachments host={host} sessionId="welcome" model={claude} onEnsureSession={async () => 'welcome'} />)
     expect(screen.queryByTestId('composer-attach-file')).toBeNull()
-    expect(screen.queryByTestId('composer-input-file-picker')).toBeNull()
+    expect(screen.queryByRole('button', { name: '添加文件' })).toBeNull()
+    expect(container.querySelector('input[type="file"]')).toBeNull()
     rerender(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    expect(screen.getByRole('button', { name: '添加文件' })).toBeTruthy()
-    expect(screen.getByTestId('composer-input-file-picker')).toBeTruthy()
+    expect(screen.queryByTestId('composer-attach-file')).toBeNull()
+    expect(screen.queryByRole('button', { name: '添加文件' })).toBeNull()
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+  })
+
+  it('keeps images on the clipboard path and only stages non-image document bytes', () => {
+    const pdf = pdfFile('notes.pdf', 16)
+    const png = new File([new Uint8Array(8)], 'shot.png', { type: 'image/png' })
+    expect(composerInputFilesFromList([pdf, png])).toEqual([pdf])
+    expect(composerInputFilesFromList([png])).toEqual([])
   })
 
   it('stages selected bytes with safe metadata and shows basename/size/status only', async () => {
     const host = hostStub()
-    render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, pdfFile('/Users/haoli/secret/notes.pdf', 16))
+    const api = createRef<InputFileAttachmentsHandle>()
+    render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
+    pickFiles(api, pdfFile('/Users/haoli/secret/notes.pdf', 16))
     const chip = await screen.findByTestId('composer-input-file-0')
     expect(chip.textContent).toContain('notes.pdf')
     await waitFor(() => expect(screen.getByTestId('composer-input-file-0').textContent).toContain('就绪'))
@@ -209,20 +216,18 @@ describe('InputFileAttachments', () => {
     expect(request).not.toHaveProperty('fileId')
   })
 
-  it('uploads multiple selected files and resets the input so the same file can be chosen again', async () => {
+  it('uploads multiple selected files and can stage the same file again', async () => {
     const host = hostStub()
-    render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    const input = screen.getByTestId('composer-input-file-picker') as HTMLInputElement
+    const api = createRef<InputFileAttachmentsHandle>()
+    render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
     const same = pdfFile('notes.pdf', 8)
-    pickFiles(input, pdfFile('a.pdf', 8), pdfFile('b.pdf', 12))
+    pickFiles(api, pdfFile('a.pdf', 8), pdfFile('b.pdf', 12))
     await screen.findByTestId('composer-input-file-1')
     expect(host.stageInputFile).toHaveBeenCalledTimes(2)
-    expect(input.value).toBe('')
-    pickFiles(input, same)
+    pickFiles(api, same)
     await waitFor(() => expect(host.stageInputFile).toHaveBeenCalledTimes(3))
     expect(vi.mocked(host.stageInputFile!).mock.calls[2][1]).toEqual(expect.objectContaining({ name: 'notes.pdf', size: 8 }))
-    expect(input.value).toBe('')
-    pickFiles(input, same)
+    pickFiles(api, same)
     await waitFor(() => expect(host.stageInputFile).toHaveBeenCalledTimes(4))
     expect(vi.mocked(host.stageInputFile!).mock.calls[3][0]).toBe('welcome')
   })
@@ -230,8 +235,9 @@ describe('InputFileAttachments', () => {
   it('shows client-side type and size errors without creating a chip', async () => {
     const host = hostStub()
     const onNotice = vi.fn()
-    render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} onNotice={onNotice} />)
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, new File([new Uint8Array(12)], 'payload.exe', { type: 'application/x-msdownload' }))
+    const api = createRef<InputFileAttachmentsHandle>()
+    render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} onNotice={onNotice} />)
+    pickFiles(api, new File([new Uint8Array(12)], 'payload.exe', { type: 'application/x-msdownload' }))
     await waitFor(() => expect(onNotice).toHaveBeenCalledWith(expect.stringContaining('不支持的文件类型')))
     expect(screen.queryByTestId('composer-input-files')).toBeNull()
     expect(host.stageInputFile).not.toHaveBeenCalled()
@@ -242,8 +248,9 @@ describe('InputFileAttachments', () => {
     const host = hostStub({
       stageInputFile: vi.fn(() => new Promise<InputFileAttachment>(resolve => { resolveStage = resolve })),
     })
-    render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, pdfFile('notes.pdf', 20))
+    const api = createRef<InputFileAttachmentsHandle>()
+    render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
+    pickFiles(api, pdfFile('notes.pdf', 20))
     const chip = await screen.findByTestId('composer-input-file-0')
     expect(chip.textContent).toContain('上传中')
     fireEvent.click(screen.getByRole('button', { name: '取消上传 notes.pdf' }))
@@ -299,10 +306,11 @@ describe('InputFileAttachments', () => {
         void file
       })),
     })
-    const { rerender } = render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, pdfFile('/Users/haoli/secret/notes.pdf', 20))
+    const api = createRef<InputFileAttachmentsHandle>()
+    const { rerender } = render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
+    pickFiles(api, pdfFile('/Users/haoli/secret/notes.pdf', 20))
     expect((await screen.findByTestId('composer-input-file-0')).textContent).toContain('上传中')
-    rerender(<InputFileAttachments host={host} sessionId="layout" model={grok} onEnsureSession={async () => 'layout'} />)
+    rerender(<InputFileAttachments ref={api} host={host} sessionId="layout" model={grok} onEnsureSession={async () => 'layout'} />)
     await waitFor(() => expect(screen.getByTestId('composer-input-file-0').textContent).toContain('layout.pdf'))
     await waitFor(() => expect(resolveStage).toBeDefined())
     resolveStage?.(attachment({ id: 'stale', name: 'notes.pdf', status: 'ready', fileId: 'file-stale' }))
@@ -343,8 +351,9 @@ describe('InputFileAttachments', () => {
     const host = hostStub({
       listInputFiles: vi.fn(() => new Promise<InputFileAttachment[]>(resolve => { resolveList = resolve })),
     })
-    render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, pdfFile('notes.pdf', 16))
+    const api = createRef<InputFileAttachmentsHandle>()
+    render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
+    pickFiles(api, pdfFile('notes.pdf', 16))
     expect((await screen.findByTestId('composer-input-file-0')).textContent).toContain('notes.pdf')
     await waitFor(() => expect(host.stageInputFile).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(resolveList).toBeDefined())
@@ -427,10 +436,11 @@ describe('InputFileAttachments', () => {
       listInputFiles: vi.fn(async () => [attachment({ id: 'lost', name: 'failed.pdf', status: 'failed' })]),
       stageInputFile: vi.fn(() => new Promise<InputFileAttachment>(resolve => { resolveStage = resolve })),
     })
-    const { rerender } = render(<InputFileAttachments host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
+    const api = createRef<InputFileAttachmentsHandle>()
+    const { rerender } = render(<InputFileAttachments ref={api} host={host} sessionId="welcome" model={grok} onEnsureSession={async () => 'welcome'} />)
     expect((await screen.findByTestId('composer-input-file-0')).textContent).toContain('failed.pdf')
     expect(screen.getByRole('button', { name: '重试上传 failed.pdf' })).toBeTruthy()
-    pickFiles(screen.getByTestId('composer-input-file-picker') as HTMLInputElement, pdfFile('notes.pdf', 20))
+    pickFiles(api, pdfFile('notes.pdf', 20))
     await waitFor(() => expect(screen.getByTestId('composer-input-file-1').textContent).toContain('上传中'))
     fireEvent.click(screen.getByRole('button', { name: '取消上传 notes.pdf' }))
     await waitFor(() => expect(screen.getByTestId('composer-input-file-1').textContent).toContain('已取消'))

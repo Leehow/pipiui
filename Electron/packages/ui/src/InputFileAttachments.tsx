@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import type { InputFileAttachment, InputFileStageRequest, InputFileStatus, Model, PipiHostAPI } from '@pipi/host-api'
 
 /** Conservative xAI request-body aligned cap. */
@@ -28,8 +28,6 @@ const ALLOWED_MIME_PREFIXES = [
   'image/webp',
   'image/gif',
 ]
-
-export const INPUT_FILE_ACCEPT = [...ALLOWED_EXTENSIONS].join(',')
 
 /** Stable, localizable prompt used when sending ready attachments with an empty draft. */
 export const DEFAULT_COMPOSER_INPUT_FILES_PROMPT = '请分析这些附件。'
@@ -84,7 +82,7 @@ export function unsupportedInputFilesMessage(modelName?: string): string {
 }
 
 export function retryWithoutCacheMessage(): string {
-  return '请重新选择该文件后再试'
+  return '请重新粘贴或拖入该文件后再试'
 }
 
 export function extensionOf(name: string): string {
@@ -197,17 +195,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-export function InputFileAttachments({
-  host,
-  sessionId,
-  model,
-  readOnly = false,
-  working = false,
-  refreshKey = 0,
-  onEnsureSession,
-  onGateChange,
-  onNotice,
-}: {
+export type InputFileAttachmentsHandle = {
+  stageFiles: (files: File[]) => Promise<void>
+}
+
+/** Non-image files the Chat-with-Files path accepts. Images stay on the clipboard/drop thumb path. */
+export function composerInputFilesFromList(files: ArrayLike<File> | File[]): File[] {
+  return Array.from(files).filter(file => {
+    if (file.type.startsWith('image/')) return false
+    const ext = extensionOf(file.name)
+    if (ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp' || ext === '.gif') return false
+    return isAllowedComposerInputFileType(file.name, file.type)
+  })
+}
+
+export const InputFileAttachments = forwardRef<InputFileAttachmentsHandle, {
   host: PipiHostAPI
   sessionId: string
   model?: Model | null
@@ -217,7 +219,17 @@ export function InputFileAttachments({
   onEnsureSession: () => Promise<string | null>
   onGateChange?: (gate: InputFileGate) => void
   onNotice?: (message: string | null) => void
-}) {
+}>(function InputFileAttachments({
+  host,
+  sessionId,
+  model,
+  readOnly = false,
+  working = false,
+  refreshKey = 0,
+  onEnsureSession,
+  onGateChange,
+  onNotice,
+}, ref) {
   const [files, setFiles] = useState<ComposerInputFile[]>([])
   const filesRef = useRef(files)
   filesRef.current = files
@@ -232,8 +244,7 @@ export function InputFileAttachments({
   onGateChangeRef.current = onGateChange
   const onNoticeRef = useRef(onNotice)
   onNoticeRef.current = onNotice
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const enabled = modelHasInputFiles(model) && typeof host.stageInputFile === 'function'
+  const stageSelectedFilesRef = useRef<(selected: File[]) => Promise<void>>(async () => {})
   const canMutate = !readOnly && typeof host.stageInputFile === 'function'
 
   const bumpScope = () => {
@@ -298,6 +309,8 @@ export function InputFileAttachments({
     return () => { active = false }
   }, [host, sessionId, working])
 
+  useImperativeHandle(ref, () => ({ stageFiles: (selected: File[]) => stageSelectedFilesRef.current(selected) }))
+
   const stageSelectedFiles = async (selected: File[]) => {
     if (!canMutate || !selected.length) return
     if (!modelHasInputFiles(model)) {
@@ -360,6 +373,7 @@ export function InputFileAttachments({
     }
     if (stillHere()) onNoticeRef.current?.(firstError)
   }
+  stageSelectedFilesRef.current = stageSelectedFiles
 
   const removeFile = async (id: string) => {
     if (readOnly) return
@@ -466,33 +480,6 @@ export function InputFileAttachments({
           {unsupportedInputFilesMessage(model?.name)}，请移除附件或切换支持的模型后再发送
         </div>
       )}
-      {enabled && <div className="composer-input-file-actions">
-        <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          hidden
-          accept={INPUT_FILE_ACCEPT}
-          aria-hidden="true"
-          tabIndex={-1}
-          data-testid="composer-input-file-picker"
-          onChange={event => {
-            const selected = Array.from(event.currentTarget.files ?? [])
-            event.currentTarget.value = ''
-            void stageSelectedFiles(selected)
-          }}
-        />
-        <button
-          type="button"
-          className="composer-input-file-add"
-          data-testid="composer-attach-file"
-          aria-label="添加文件"
-          disabled={readOnly}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          添加文件
-        </button>
-      </div>}
     </>
   )
-}
+})

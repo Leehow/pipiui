@@ -48,8 +48,30 @@ function fileListOf(...files: File[]): FileList {
   }) as unknown as FileList
 }
 
-function pickComposerFiles(...files: File[]) {
-  fireEvent.change(screen.getByTestId('composer-input-file-picker'), { target: { files: fileListOf(...files) } })
+function fileDataTransfer(...files: File[]) {
+  return {
+    types: ['Files'],
+    files: fileListOf(...files),
+    items: files.map(file => ({ kind: 'file', type: file.type, getAsFile: () => file })),
+    dropEffect: 'none',
+    effectAllowed: 'all',
+  }
+}
+
+function dropOnComposer(...files: File[]) {
+  const footer = document.querySelector('footer.composer') as HTMLElement
+  const dataTransfer = fileDataTransfer(...files)
+  fireEvent.dragOver(footer, { dataTransfer })
+  fireEvent.drop(footer, { dataTransfer })
+}
+
+function pasteOnComposer(...files: File[]) {
+  fireEvent.paste(screen.getByLabelText('消息输入框'), {
+    clipboardData: {
+      files: fileListOf(...files),
+      items: files.map(file => ({ kind: 'file', type: file.type, getAsFile: () => file })),
+    },
+  })
 }
 
 function makeImageFile(name = 'shot.png', type = 'image/png', size = 1024): File {
@@ -122,17 +144,19 @@ describe('composer input files', () => {
     expect(container.querySelector('input[type="file"]')).toBeNull()
   })
 
-  it('shows the picker only after switching to a model with live inputFiles and stages selected files', async () => {
+  it('does not show an add-file button; dropping a file stages it after switching to a model with live inputFiles', async () => {
     const host = hostWithInputFiles()
     host.getModelState = createMockHost().getModelState
-    render(<App host={host} />)
+    const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    expect(screen.queryByTestId('composer-attach-file')).toBeNull()
+    expect(screen.queryByRole('button', { name: '添加文件' })).toBeNull()
+    expect(container.querySelector('input[type="file"]')).toBeNull()
     fireEvent.click(await screen.findByTestId('model-chip'))
     fireEvent.click(await screen.findByTestId(`quick-row-${grok.provider}-${grok.id}`))
     await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain(grok.name))
-    expect(screen.getByRole('button', { name: '添加文件' })).toBeTruthy()
-    pickComposerFiles(pdfFile('/abs/notes.pdf'))
+    expect(screen.queryByRole('button', { name: '添加文件' })).toBeNull()
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    dropOnComposer(pdfFile('/abs/notes.pdf'))
     const chip = await screen.findByTestId('composer-input-file-0')
     expect(chip.textContent).toContain('notes.pdf')
     expect(chip.textContent).toContain('就绪')
@@ -150,7 +174,7 @@ describe('composer input files', () => {
     const sendPrompt = vi.spyOn(host, 'sendPrompt')
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    pickComposerFiles(pdfFile('notes.pdf'))
+    dropOnComposer(pdfFile('notes.pdf'))
     await screen.findByTestId('composer-input-file-0')
     fireEvent.click(await screen.findByTestId('model-chip'))
     fireEvent.click(await screen.findByTestId('quick-row-anthropic-claude-sonnet-4'))
@@ -174,7 +198,7 @@ describe('composer input files', () => {
     const sendPrompt = vi.spyOn(host, 'sendPrompt')
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    pickComposerFiles(pdfFile('notes.pdf'))
+    dropOnComposer(pdfFile('notes.pdf'))
     await screen.findByTestId('composer-input-file-0')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '先发' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
@@ -193,7 +217,7 @@ describe('composer input files', () => {
     const sendPrompt = vi.spyOn(host, 'sendPrompt')
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    pickComposerFiles(pdfFile('notes.pdf'))
+    pasteOnComposer(pdfFile('notes.pdf'))
     await screen.findByTestId('composer-input-file-0')
     expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).value).toBe('')
     fireEvent.click(screen.getByLabelText('发送消息'))
@@ -219,7 +243,7 @@ describe('composer input files', () => {
     host.sendPrompt = sendPrompt
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
-    pickComposerFiles(pdfFile('notes.pdf'))
+    dropOnComposer(pdfFile('notes.pdf'))
     await screen.findByTestId('composer-input-file-0')
     fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '分析这份文件' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
@@ -260,7 +284,9 @@ describe('composer input files', () => {
       clipboardData: { items: [{ kind: 'file', type: 'image/png', getAsFile: () => makeImageFile('pasted.png') }] },
     })
     expect(await screen.findByTestId('composer-thumb-0')).toBeTruthy()
-    expect(screen.getByRole('button', { name: '添加文件' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '添加文件' })).toBeNull()
+    expect(screen.queryByTestId('composer-input-files')).toBeNull()
+    expect(host.stageInputFile).not.toHaveBeenCalled()
     fireEvent.change(textarea, { target: { value: '看图' } })
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '看图', [

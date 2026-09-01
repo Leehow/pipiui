@@ -496,13 +496,10 @@ body{overscroll-behavior:none}
 .composer-input-file-meta{color:var(--muted);font-size:11px}
 .composer-input-file-error{flex:1 1 100%;color:var(--danger);font-size:11px}
 .composer-input-file-retry,.composer-input-file-cancel{padding:1px 7px;border-radius:999px;color:var(--accent);background:var(--accent-soft);font-size:11px}
-.composer-input-file-retry:disabled,.composer-input-file-cancel:disabled,.composer-input-file-remove:disabled,.composer-input-file-add:disabled{cursor:not-allowed;opacity:.45}
+.composer-input-file-retry:disabled,.composer-input-file-cancel:disabled,.composer-input-file-remove:disabled{cursor:not-allowed;opacity:.45}
 .composer-input-file-remove{margin-left:auto;width:16px;height:16px;border-radius:50%;color:#fff;background:var(--danger);font-size:11px;line-height:1}
-.composer-input-file-actions{padding:0 0 8px}
-.composer-input-file-add{padding:4px 8px;border-radius:999px;color:var(--text);background:color-mix(in srgb,var(--text) 6%,transparent);font-size:12px}
-.composer-input-file-add:hover:not(:disabled){background:color-mix(in srgb,var(--text) 12%,transparent)}
 .composer-input-files-warning{margin:0 0 8px;padding:5px 7px;border:1px solid color-mix(in srgb,var(--warning) 42%,var(--border));border-radius:7px;color:var(--warning);background:color-mix(in srgb,var(--warning) 9%,var(--surface-raised));font-size:11px}
-@media (max-width:899px){.composer-input-files,.composer-input-file-actions{padding-bottom:6px}}
+@media (max-width:899px){.composer-input-files{padding-bottom:6px}}
 
 /* Desktop settings workspace — stable navigation on the left, active pane on the right. */
 .model-modal-backdrop {

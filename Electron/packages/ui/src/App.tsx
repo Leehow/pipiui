@@ -41,8 +41,8 @@ import { useModelVisibility, type ModelVisibilityController } from './useModelVi
 import { useVisionRouting, type VisionHostMethods } from './useVisionRouting'
 import { useScanExternalSessions } from './useScanExternalSessions'
 import { useUpdateCenter } from './useUpdateCenter'
-import { chatImagesFromAttachments, fileToPromptAttachment, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
-import { DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, type InputFileGate } from './InputFileAttachments'
+import { chatImagesFromAttachments, fileToPromptAttachment, filesFromClipboard, imageFilesFromClipboard, imageFilesFromFileList, stripAttachmentPathsForDisplay, validateAttachment } from './attachments'
+import { composerInputFilesFromList, DEFAULT_COMPOSER_INPUT_FILES_PROMPT, EMPTY_INPUT_FILE_GATE, InputFileAttachments, modelHasInputFiles, type InputFileAttachmentsHandle, type InputFileGate } from './InputFileAttachments'
 import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
@@ -3820,6 +3820,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
   const [slashIndex, setSlashIndex] = useState(0)
   const [slashHidden, setSlashHidden] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const inputFilesApiRef = useRef<InputFileAttachmentsHandle>(null)
 
   // Session switch resets composer chrome only. Attachments (and their object
   // URLs) belong to the session in the parent's attachmentsBySessionRef; they
@@ -3916,8 +3917,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
   }
   const onPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
     if (readOnly) return
-    const files = imageFilesFromClipboard(event.clipboardData)
-    if (files.length) { event.preventDefault(); setAttachError(null); addFiles(files) }
+    const pasted = filesFromClipboard(event.clipboardData)
+    const imageFiles = imageFilesFromClipboard(event.clipboardData)
+    const grokFiles = modelHasInputFiles(modelState?.model) ? composerInputFilesFromList(pasted) : []
+    if (!imageFiles.length && !grokFiles.length) return
+    event.preventDefault()
+    setAttachError(null)
+    if (imageFiles.length) addFiles(imageFiles)
+    if (grokFiles.length) void inputFilesApiRef.current?.stageFiles(grokFiles)
   }
   const addDocuments = (paths: string[]) => {
     if (readOnly || !paths.length) return
@@ -3949,11 +3956,14 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
       ignoreComposerFileDrag(event)
       return
     }
-    const imageFiles = imageFilesFromFileList(event.dataTransfer?.files)
-    if (imageFiles.length) {
+    const dropped = event.dataTransfer?.files
+    const imageFiles = imageFilesFromFileList(dropped)
+    const grokFiles = modelHasInputFiles(modelState?.model) ? composerInputFilesFromList(dropped ?? []) : []
+    if (imageFiles.length || grokFiles.length) {
       consumeFileDropEvent(event)
       setAttachError(null)
-      addFiles(imageFiles)
+      if (imageFiles.length) addFiles(imageFiles)
+      if (grokFiles.length) void inputFilesApiRef.current?.stageFiles(grokFiles)
       return
     }
     const getPath = typeof window !== 'undefined' ? window.pipiPathForFile : undefined
@@ -3961,7 +3971,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
       ignoreComposerFileDrag(event)
       return
     }
-    const paths = supportedDocumentPathsFromFiles(event.dataTransfer?.files ?? [], getPath)
+    const paths = supportedDocumentPathsFromFiles(dropped ?? [], getPath)
     if (!paths.length) {
       ignoreComposerFileDrag(event)
       return
@@ -4096,7 +4106,7 @@ function Composer({ streaming, working, stopping, stopError, compacting, compact
         </div>
       ))}
     </div>}
-    <InputFileAttachments host={host} sessionId={sessionId} model={modelState?.model} readOnly={readOnly} working={working} refreshKey={inputFilesEpoch} onEnsureSession={onEnsureSession} onGateChange={setInputFileGate} onNotice={setAttachError} />
+    <InputFileAttachments ref={inputFilesApiRef} host={host} sessionId={sessionId} model={modelState?.model} readOnly={readOnly} working={working} refreshKey={inputFilesEpoch} onEnsureSession={onEnsureSession} onGateChange={setInputFileGate} onNotice={setAttachError} />
     {catalogNotice && onDismissCatalogNotice && (
       <div data-testid="catalog-fallback-notice">
         <DismissibleError className="composer-catalog-notice" message={catalogNotice} onDismiss={onDismissCatalogNotice} />
