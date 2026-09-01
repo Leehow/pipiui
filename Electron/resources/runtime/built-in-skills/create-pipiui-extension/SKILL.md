@@ -91,9 +91,9 @@ description: 创建或编写 PipiUI 扩展包（双半包 / extension package）
 
 ### 6. 开发循环
 
-1. 把包装进 **项目级** `{project}/.pi/agent/extensions/<id>`（开发默认位置；三位置扫描见 spec D10）。
-2. 启用。**已运行会话不热挂 agent 半** — 必须开**新会话**才 `-e` 挂载（spec D9）。
-3. 迭代。每次改 agent 半同样要新会话。
+1. 项目内（cwd 位于含 `.git` 的项目树）用 `create-pipiui-extension <name> --install`：包直接落在 `{project}/.pi/agent/extensions/<id>`，随即被宿主扫描发现并对本项目**默认启用** — 无需手工拷贝，无需去 UI 开关。显式 `[dir]` 仍然优先；项目外（找不到 `.git` 祖先）该 flag 报错退出，绝不写全局 `~/.pi`。
+2. **新会话生效。** 脚手架后的 agent 半需先构建出清单声明的 `agent/dist/index.js`（缺失入口会在加载时进 `error`）；之后开**新会话**才 `-e` 挂载（spec D9）。已运行会话不热挂 agent 半，后续每次改 agent 半同样要新会话。
+3. 禁用仍以显式记录为准：UI 关闭写入 enable 表后，重扫不会把包拉回启用；删除记录则回到项目默认启用。
 4. 禁用必须零残留：每个 `register*` 返回 disposer，按扩展 ID 归集；禁用 = 整组 dispose。
 
 禁止写入全局 `~/.pi`。`PI_CODING_AGENT_DIR` 始终是当前项目 agent 家。

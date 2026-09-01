@@ -1108,15 +1108,18 @@ describe('Electron-native Product Pack ZIP extension', () => {
     expect(defaultHost.saveProductPackArchive).toBeUndefined()
     expect(defaultHost.exportProductPackArchive).toBeUndefined()
     expect(defaultHost.installProductPackArchive).toBeUndefined()
+    expect(defaultHost.installExtensionZip).toBeUndefined()
 
     const host = createIpcHost(ipc, undefined, { productPackFileDialogs: true })
     await expect(host.saveProductPackArchive?.('coding.pipiui-pack.zip')).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
     await expect(host.pickProductPackArchive?.()).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
     await expect(host.exportProductPackArchive?.('pipiui', 'coding', '/Users/demo/coding.pipiui-pack.zip')).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
+    await expect(host.installExtensionZip?.('pipiui', '/Users/demo/tool.zip')).resolves.toBe('/Users/demo/coding.pipiui-pack.zip')
     expect(calls).toEqual([
       { method: 'saveProductPackArchive', params: ['coding.pipiui-pack.zip'] },
       { method: 'pickProductPackArchive', params: [] },
       { method: 'exportProductPackArchive', params: ['pipiui', 'coding', '/Users/demo/coding.pipiui-pack.zip'] },
+      { method: 'installExtensionZip', params: ['pipiui', '/Users/demo/tool.zip'] },
     ])
   })
 })

@@ -169,13 +169,29 @@ export function createPipiuiProfile(input) {
   return { id, name, dir: dest };
 }
 
+/** Nearest ancestor (inclusive) containing .git; undefined when not inside a project checkout. */
+export function findProjectRoot(from) {
+  let current = resolve(from);
+  for (;;) {
+    if (existsSync(join(current, ".git"))) return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
 function printHelp() {
-  process.stdout.write(`Usage: create-pipiui-extension [--profile] <name> [dir]
+  process.stdout.write(`Usage: create-pipiui-extension [--profile] [--install] <name> [dir]
 
 Copy the local dual-half template (no network) and fill id/name.
   --profile  Create a pure Product Profile instead of an extension package.
+  --install  Scaffold straight into {projectRoot}/.pi/agent/extensions/<id>: the
+             extension is discovered and enabled for the current project (an
+             explicit [dir] still wins). Requires cwd to be inside a project
+             (a .git ancestor); errors out otherwise. Never writes outside the
+             project or to a global ~/.pi.
   name  Display name; legalized to id [a-z][a-z0-9-]*
-  dir   Package root (default: ./<id>)
+  dir   Package root (default: ./<id>, or the project extensions dir with --install)
 
 Install the generated folder in one of:
   {project}/.pi/agent/extensions/<id>
@@ -201,10 +217,28 @@ export function runCli(argv, io = { log: console.log, error: console.error }) {
     return 1;
   }
   const profile = args.includes("--profile");
+  const install = args.includes("--install");
+  if (profile && install) {
+    io.error("--install applies to extension packages, not --profile");
+    return 1;
+  }
+  let installTarget = false;
+  let dir = positional[1];
+  if (install && dir === undefined) {
+    const projectRoot = findProjectRoot(process.cwd());
+    if (!projectRoot) {
+      io.error("--install requires the current directory to be inside a project (no .git ancestor found)");
+      return 1;
+    }
+    dir = join(projectRoot, ".pi", "agent", "extensions", legalizeExtensionId(positional[0]));
+    installTarget = true;
+  }
   const result = profile
     ? createPipiuiProfile({ name: positional[0], dir: positional[1] })
-    : createPipiuiExtension({ name: positional[0], dir: positional[1] });
-  io.log(`created ${profile ? "profile " : ""}${result.id} at ${result.dir}`);
+    : createPipiuiExtension({ name: positional[0], dir });
+  io.log(installTarget
+    ? `installed ${result.id} at ${result.dir} (discovered and enabled for this project; new sessions pick it up)`
+    : `created ${profile ? "profile " : ""}${result.id} at ${result.dir}`);
   return 0;
 }
 

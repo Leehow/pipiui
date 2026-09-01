@@ -95,7 +95,13 @@ function openEntry(zip: ReadZipFile, entry: Entry): Promise<Readable> {
   });
 }
 
-async function extractArchive(archivePath: string, destination: string): Promise<void> {
+/**
+ * Safe unzip shared by Product Pack and single-extension ZIP installs: rejects
+ * traversal, symlink, encrypted, duplicate and oversized entries, caps total
+ * entry count and uncompressed size. Requires an absolute .zip source path but
+ * no manifest at the destination root — callers validate package layout.
+ */
+export async function extractZipArchive(archivePath: string, destination: string): Promise<void> {
   assertArchivePath(archivePath);
   const archiveInfo = await lstat(archivePath);
   if (!archiveInfo.isFile() || archiveInfo.isSymbolicLink()) {
@@ -160,6 +166,10 @@ async function extractArchive(archivePath: string, destination: string): Promise
   } finally {
     zip.close();
   }
+}
+
+async function extractArchive(archivePath: string, destination: string): Promise<void> {
+  await extractZipArchive(archivePath, destination);
   await access(join(destination, PRODUCT_PACK_MANIFEST_FILENAME));
 }
 

@@ -1039,7 +1039,7 @@ function releaseAssetUrl(baseUrl: string, entry: ExtensionUpdateAssetEntry): str
 }
 
 /** Locate the package root (dir containing pipiui-extension.json) after unpack. */
-async function findPackageRoot(stagingDir: string): Promise<string> {
+export async function findPackageRoot(stagingDir: string): Promise<string> {
   if (await exists(join(stagingDir, EXTENSION_MANIFEST_FILENAME))) return stagingDir;
   const entries = await readdir(stagingDir, { withFileTypes: true });
   const dirs = entries.filter(entry => entry.isDirectory() && !entry.name.startsWith("."));
