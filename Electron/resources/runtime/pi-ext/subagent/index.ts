@@ -259,6 +259,7 @@ import {
 	acquireAgentLease,
 	releaseAgentLease,
 } from "./agent-lease.ts";
+import { resolveAgentSessionRoot } from "./agent-session-root.ts";
 import {
 	requestGitStatusPorcelainV1,
 	requestGitWorktreePlacementV1,
@@ -751,8 +752,10 @@ const PIPIUI_NESTED_RPC_PARENT = process.env.PIPIUI_NESTED_RPC_PARENT === "1";
 /** Attempt-private transport token; never enters a prompt, report, or persisted state. */
 const PIPIUI_RESIDENT_RPC_WAKE_TOKEN = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN || undefined;
 // App-owned authoritative session root. Nested agents inherit it even when their own
-// process cwd is an isolated worktree.
+// process cwd is an isolated worktree. When a Boss session is bound to a worktree this
+// is that workspace; the canonical project root is PIPIUI_PROJECT_ROOT.
 const PIPIUI_MAIN_CWD = process.env.PIPIUI_MAIN_CWD;
+const PIPIUI_PROJECT_ROOT = process.env.PIPIUI_PROJECT_ROOT;
 // Closeout timeline lives next to this project's own pi state, never the global ~/.pi.
 // Disabled until here: workers without a main cwd stay silent by default.
 setCloseoutTimelineDir(PIPIUI_MAIN_CWD ? path.join(PIPIUI_MAIN_CWD, ".pi", "agent") : undefined);
@@ -4056,9 +4059,8 @@ function currentInFlightWorkersSnapshot(now: number): string | null {
  * context that is still perfectly good. This is what lets the boss find those again.
  */
 function resumableAgentIds(): string[] {
-	const dir = PIPIUI_MAIN_CWD
-		? path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions")
-		: undefined;
+	const root = resolveAgentSessionRoot(PIPIUI_PROJECT_ROOT, PIPIUI_MAIN_CWD);
+	const dir = root ? path.join(root, ".pi", "agent-sessions") : undefined;
 	if (!dir) return [];
 	try {
 		return fs
@@ -4816,8 +4818,12 @@ function pruneAgentSessions(dir: string, trigger: "access" | "completed"): void 
 
 
 function agentSessionDir(): string | undefined {
-	if (!PIPIUI_MAIN_CWD) return undefined;
-	const dir = path.join(PIPIUI_MAIN_CWD, ".pi", "agent-sessions");
+	// Survive worktree cleanup: pin worker JSONL at the canonical project root, not
+	// the session workspace (MAIN_CWD). Fall back to MAIN_CWD when PROJECT_ROOT is
+	// unset — same intent as the original MAIN_CWD pin, never the worker's own cwd.
+	const root = resolveAgentSessionRoot(PIPIUI_PROJECT_ROOT, PIPIUI_MAIN_CWD);
+	if (!root) return undefined;
+	const dir = path.join(root, ".pi", "agent-sessions");
 	try {
 		fs.mkdirSync(dir, { recursive: true });
 		pruneAgentSessions(dir, "access");

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -244,6 +244,32 @@ test("the gate is still closed to a non-secretary role and a failed closeout", (
 			runSecretaryCommit(input({ closeout: "needs-action" }), context(root)).commit,
 			"blocked:closeout-not-pass",
 		);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("secretary commits onto a session worktree branch; main checkout is untouched", () => {
+	const root = makeRepo();
+	try {
+		mkdirSync(join(root, ".pi", "worktrees"), { recursive: true });
+		const session = join(root, ".pi", "worktrees", "session-docs");
+		git(root, ["worktree", "add", "-b", "pipiui/session-docs", session, "HEAD"]);
+		dirty(session);
+		const result = runSecretaryCommit(input(), context(session));
+		assert.notEqual(
+			result.commit,
+			"blocked:main-cwd-is-not-canonical-git-root",
+			"linked worktree toplevel equals the worktree path, so canonicalGitRoot must pass",
+		);
+		assert.match(result.commit, /^created:[0-9a-f]{40}$/);
+		assert.deepEqual(result.committedPaths, ["docs.md"]);
+		assert.deepEqual(result.remainingDirtyPaths, []);
+		assert.equal(git(session, ["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "pipiui/session-docs");
+		assert.match(git(session, ["log", "-1", "--pretty=%s"]), /docs: update the closeout note/);
+		assert.equal(existsSync(join(root, "docs.md")), false);
+		assert.match(git(root, ["log", "-1", "--pretty=%s"]), /base/);
+		assert.equal(git(root, ["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
