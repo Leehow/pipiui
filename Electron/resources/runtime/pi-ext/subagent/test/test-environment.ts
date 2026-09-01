@@ -5,6 +5,8 @@ const HOST_EXACT_KEYS = new Set([
 	"PIPIUI_SESSION_ID",
 	"PIPIUI_HOST_PROTOCOL",
 	"PIPIUI_FANOUT_ACTIVE",
+	// Inherited canonical root would pin worker JSONL into the live project.
+	"PIPIUI_PROJECT_ROOT",
 ]);
 
 const HOST_CAPABILITY_PREFIXES = [

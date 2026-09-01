@@ -55,6 +55,7 @@ test("real-seam test bootstrap removes live host/session capabilities and preser
 		PATH: "/test/bin",
 		PIPIUI_MAIN_CWD: "/tmp/suite",
 		PIPIUI_NODE_PATH: "/test/node",
+		PIPIUI_PROJECT_ROOT: "/live/project",
 		PIPIUI_BRIDGE_PORT: "12345",
 		PIPIUI_SESSION_KEY: "live-session",
 		PIPIUI_SESSION_CAPABILITY: "live-capability",
