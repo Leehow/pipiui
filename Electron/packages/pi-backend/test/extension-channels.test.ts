@@ -6,6 +6,7 @@ import { PIPI_HOST_PROTOCOL_VERSION, type HostEvent } from "@pipi/host-api";
 import { HostBridge } from "../src/bridge.js";
 import { handleExtEmit, toolResultDetailsField } from "../src/extension-channels.js";
 import { createExtensionRegistry, type ExtensionDescriptor } from "../src/extension-registry.js";
+import { validateExtensionManifest } from "../src/extension-manifest.js";
 import { projectExtensionSettingsPath } from "../src/extension-settings.js";
 import { listSecretMeta, resetInMemoryVault } from "../src/secret-vault.js";
 import { createPiHostBackend } from "../src/index.js";
@@ -64,6 +65,35 @@ const post = (port: number, body: unknown) =>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+
+describe("shipped git-capability manifest", () => {
+  // Regression: the manifest shipped with `capabilities: []`, so every
+  // session-workspace bind POST (first write → ext.emit bind) was denied with
+  // capability_denied and no session ever got a bound worktree — the header's
+  // session-branch pair had no data to render. The manifest must declare
+  // bridge.emit for the bind channel to stay authorized.
+  it("declares bridge.emit so session-workspace binds authorize", async () => {
+    const manifestUrl = new URL("../../../resources/runtime/extensions/git-capability/pipiui-extension.json", import.meta.url);
+    const manifest = JSON.parse(await readFile(manifestUrl, "utf8")) as Record<string, unknown>;
+    const validation = validateExtensionManifest(manifest);
+    expect(validation.ok).toBe(true);
+    const registry = createExtensionRegistry([{
+      id: "git-capability",
+      name: String(manifest.name ?? "git-capability"),
+      version: String(manifest.version ?? "0.0.0"),
+      origin: "app",
+      defaultEnabled: true,
+      capabilities: (manifest.capabilities ?? []) as ExtensionDescriptor["capabilities"],
+    }]);
+    registry.mountSession("session-1", ["git-capability"]);
+    const result = handleExtEmit(
+      registry,
+      { extensionId: "git-capability", event: "session-workspace", payload: { op: "bind" } },
+      "session-1",
+    );
+    expect(result.ok).toBe(true);
+  });
+});
 
 describe("ext.emit HostBridge seam", () => {
   async function started(registry = createExtensionRegistry([])) {

@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "category": "coding",
   "description": "Git branch status and checkout controls.",
-  "capabilities": [],
+  "capabilities": ["bridge.emit"],
   "agent": { "extension": "agent/index.ts" },
   "app": {
     "ui": {
