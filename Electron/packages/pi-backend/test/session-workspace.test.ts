@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createPiHostBackend } from "../src/index.js";
+import { projectPiAgentDir } from "../src/project-pi-home.js";
 import {
   assertWorkspaceCwdAllowed,
   clearSessionWorkspaceFile,
@@ -149,6 +150,46 @@ describe("session workspace change notice", () => {
         { type: "session_workspace_changed", payload: { sessionId: "session-1", op: "bind" } },
         { type: "session_workspace_changed", payload: { sessionId: "session-1", op: "unbind" } },
       ]);
+    } finally {
+      await backend.close();
+    }
+  });
+
+  // The Electron sidebar reads lazy pages (listSessionPage), not listSessions: without
+  // the workspace on page rows the header dual-branch pair never renders, even after
+  // a restart. The page must carry it exactly like the full list does.
+  it("listSessionPage rows carry the bound workspace", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pipiui-session-workspace-page-"));
+    roots.push(root);
+    // macOS /var is a symlink: the host validates containment against the
+    // realpath'd project root, so the fixture must register the real path.
+    const project = await realpath(root);
+    const host = join(project, "host-profile");
+    const sessionsDir = join(projectPiAgentDir(project), "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    await mkdir(join(project, ".pi", "worktrees", "session-fix"), { recursive: true });
+    await mkdir(join(host), { recursive: true });
+    await writeFile(join(host, "models.json"), '{"capabilityInstalled":true,"providers":{}}');
+    const sessionId = "session-page-1";
+    await writeFile(
+      join(sessionsDir, `2026-09-01T00-00-00-000Z_${sessionId}.jsonl`),
+      `${JSON.stringify({ type: "session", version: 3, id: sessionId, timestamp: "2026-09-01T00:00:00.000Z", cwd: project })}\n`,
+    );
+    await writeSessionWorkspace(sessionsDir, binding(sessionId, join(project, ".pi", "worktrees", "session-fix")));
+    const backend = createPiHostBackend({
+      agentDir: host,
+      sessionsRoot: join(root, "sessions"),
+      profileMode: "isolated",
+      canonicalProjectPaths: async () => [project],
+    });
+    try {
+      const projects = await backend.handle("listProjects", []) as Array<{ id: string; path: string }>;
+      expect(projects.some(entry => entry.path === project)).toBe(true);
+      const page = await backend.handle("listSessionPage", [projects[0].id, undefined, 10]) as {
+        sessions: Array<{ id: string; workspace?: { branch: string; worktreePath: string } }>;
+      };
+      const row = page.sessions.find(entry => entry.id === sessionId);
+      expect(row?.workspace).toMatchObject({ branch: "pipiui/session-fix" });
     } finally {
       await backend.close();
     }

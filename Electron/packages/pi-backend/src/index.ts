@@ -3385,7 +3385,7 @@ export class PiHostBackend implements HostBackend {
    * pre-migration continuity. Deliberately do not recurse into `sessions/spool`
    * or unrelated historical project directories.
    */
-  private async projectSessionCandidates(projectId: unknown): Promise<{ project: Project; files: SessionFileCandidate[] }> {
+  private async projectSessionCandidates(projectId: unknown): Promise<{ project: Project; files: SessionFileCandidate[]; isolatedHome?: IsolatedProjectHome }> {
     if (typeof projectId !== "string" || !projectId.trim()) throw new Error("缺少项目");
     const project = await this.configuredProject(projectId);
     const directories: string[] = [];
@@ -3416,7 +3416,7 @@ export class PiHostBackend implements HostBackend {
       }
     }))).filter((entry): entry is SessionFileCandidate => Boolean(entry));
     files.sort((left, right) => right.mtimeMs - left.mtimeMs || basename(right.path).localeCompare(basename(left.path)));
-    return { project, files };
+    return { project, files, ...(isolated ? { isolatedHome: isolated } : {}) };
   }
   private async sessionMetaFromCandidate(candidate: SessionFileCandidate): Promise<SessionMeta> {
     const cached = this.indexCache.get(candidate.path);
@@ -3426,7 +3426,7 @@ export class PiHostBackend implements HostBackend {
     return meta;
   }
   private async listSessionPage(projectId: unknown, cursorValue: unknown, limitValue: unknown): Promise<SessionPage> {
-    const { project, files } = await this.projectSessionCandidates(projectId);
+    const { project, files, isolatedHome } = await this.projectSessionCandidates(projectId);
     const parsedCursor = cursorValue === undefined || cursorValue === null || cursorValue === ""
       ? 0
       : Number(cursorValue);
@@ -3447,6 +3447,14 @@ export class PiHostBackend implements HostBackend {
         /* incomplete/corrupt rows are skipped without widening beyond this project */
       }
     }
+    // The sidebar reads pages, not listSessions: without this the header dual-branch
+    // pair and unmerged badge never see a bound workspace, even after a restart.
+    if (isolatedHome && sessions.length) {
+      await Promise.all(sessions.map(async (session, index) => {
+        const workspace = await this.sessionWorkspaceDto(session.id, isolatedHome.realProjectRoot, isolatedHome.sessionsDir);
+        if (workspace) sessions[index] = { ...session, workspace };
+      }));
+    }
     return {
       sessions,
       ...(candidateIndex < files.length ? { nextCursor: String(candidateIndex) } : {}),
@@ -3456,15 +3464,23 @@ export class PiHostBackend implements HostBackend {
   private async getProjectSession(projectId: unknown, sessionIdValue: unknown): Promise<Session> {
     if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
     const sessionId = sessionIdValue.trim();
-    const { project, files } = await this.projectSessionCandidates(projectId);
+    const { project, files, isolatedHome } = await this.projectSessionCandidates(projectId);
     const known = this.sessionById.get(sessionId);
-    if (known && dirId(known.header.cwd) === project.id) return this.toSession(known);
+    if (known && dirId(known.header.cwd) === project.id) {
+      const withWorkspace = isolatedHome
+        ? await this.sessionWorkspaceDto(sessionId, isolatedHome.realProjectRoot, isolatedHome.sessionsDir)
+        : undefined;
+      return withWorkspace ? { ...this.toSession(known), workspace: withWorkspace } : this.toSession(known);
+    }
     const suffix = `_${sessionId}.jsonl`;
     const candidate = files.find(entry => basename(entry.path).endsWith(suffix));
     if (!candidate) throw new Error(`unknown session ${sessionId}`);
     const meta = await this.sessionMetaFromCandidate(candidate);
     if (meta.header.id !== sessionId || dirId(meta.header.cwd) !== project.id) throw new Error(`unknown session ${sessionId}`);
-    return this.toSession(meta);
+    const base = this.toSession(meta);
+    if (!isolatedHome) return base;
+    const workspace = await this.sessionWorkspaceDto(sessionId, isolatedHome.realProjectRoot, isolatedHome.sessionsDir);
+    return workspace ? { ...base, workspace } : base;
   }
   private async preloadSession(sessionIdValue: unknown): Promise<SessionPreloadSnapshot> {
     if (typeof sessionIdValue !== "string" || !sessionIdValue.trim()) throw new Error("缺少会话");
