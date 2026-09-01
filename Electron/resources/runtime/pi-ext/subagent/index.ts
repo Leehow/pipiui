@@ -7199,6 +7199,11 @@ async function runSingleAgent(
 	const pipiuiExtensionRouting = resolvePipiUIExtensionRouting({
 		webAccessExtension: PIPIUI_WEB_ACCESS_EXT,
 		arxivExtension: PIPIUI_ARXIV_EXT,
+		// Registry-mounted extensions reach workers through PIPIUI_EXT_REGISTERED_PATHS,
+		// not a legacy route export: when web-access-extension is in that snapshot, the
+		// bare arxiv-fetch package must not mount too (duplicate arxiv_fetch kills the
+		// worker's pi process at extension load).
+		mountedExtensionIds: mountedExtensionIdsFromEnv(),
 	});
 	const hideGenericWebSearch = hideGenericWebSearchForModelRef(
 		resolvedModel ? stripModelThinkingSuffix(resolvedModel) : undefined,

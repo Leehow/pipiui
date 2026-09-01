@@ -66,23 +66,52 @@ function envPath(value) {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-/** Resolve the usable PipiUI extension routes exported by the main process. */
+/** Registry id of the extension that owns arxiv_fetch and the fetch trio in the
+ * new architecture (assemblePiSpawn leaves PIPIUI_WEB_ACCESS_EXT unset when it
+ * mounts through the registered-extension snapshot instead). */
+export const WEB_ACCESS_EXTENSION_ID = "web-access-extension";
+
+const WEB_ACCESS_FETCH_TOOL_NAMES = Object.freeze([
+	"fetch_content",
+	"source_check",
+	"get_search_content",
+]);
+
+/**
+ * Resolve the usable PipiUI extension routes exported by the main process.
+ *
+ * `mountedExtensionIds` is the PIPIUI_MOUNTED_EXTENSIONS snapshot: the ids the
+ * main session mounted through the registered-extension registry channel.
+ * web-access-extension may reach a worker through that snapshot even when the
+ * legacy PIPIUI_WEB_ACCESS_EXT export is absent. In that world the bare
+ * arxiv-fetch package must NOT also mount — pi aborts extension loading when
+ * two mounted extensions register `arxiv_fetch` — while the owner's tool names
+ * still count as extension-only so the `--tools` allowlist keeps them.
+ */
 export function resolvePipiUIExtensionRouting({
 	webAccessExtension,
 	arxivExtension,
+	mountedExtensionIds,
 } = {}) {
 	const routes = [];
 	const web = envPath(webAccessExtension);
 	const arxiv = envPath(arxivExtension);
+	const mountedIds = Array.isArray(mountedExtensionIds)
+		? mountedExtensionIds.filter((id) => typeof id === "string" && id.trim())
+		: [];
+	const webViaRegistry = mountedIds.includes(WEB_ACCESS_EXTENSION_ID);
 
 	if (web) {
 		routes.push({
 			path: web,
-			toolNames: ["web_search", "fetch_content", "source_check", "get_search_content"],
-			extensionOnlyToolNames: ["fetch_content", "source_check", "get_search_content"],
+			toolNames: ["web_search", ...WEB_ACCESS_FETCH_TOOL_NAMES],
+			extensionOnlyToolNames: [...WEB_ACCESS_FETCH_TOOL_NAMES],
 		});
 	}
-	if (arxiv) {
+	// arxiv_fetch is owned by the registry-mounted web-access-extension; the bare
+	// package still mounts beside the LEGACY managed web route (that package does
+	// not register arxiv_fetch), so only the registry channel suppresses it.
+	if (arxiv && !webViaRegistry) {
 		routes.push({
 			path: arxiv,
 			toolNames: ["arxiv_fetch"],
@@ -90,9 +119,17 @@ export function resolvePipiUIExtensionRouting({
 		});
 	}
 
+	const extensionOnlyTools = new Set(routes.flatMap((route) => route.extensionOnlyToolNames));
+	if (webViaRegistry) {
+		for (const name of WEB_ACCESS_FETCH_TOOL_NAMES) extensionOnlyTools.add(name);
+		// The bare package path is exported only while the arxivFetch feature is
+		// on, so its presence — not the registry snapshot — gates this name.
+		if (arxiv) extensionOnlyTools.add("arxiv_fetch");
+	}
+
 	return {
 		routes,
-		extensionOnlyTools: routes.flatMap((route) => route.extensionOnlyToolNames),
+		extensionOnlyTools: [...extensionOnlyTools],
 	};
 }
 
