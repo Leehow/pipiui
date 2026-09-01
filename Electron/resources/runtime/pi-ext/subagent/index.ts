@@ -299,6 +299,7 @@ import {
 	worktreeRecoveryStorePath,
 	type WorktreeRecoveryAction,
 } from "./worktree-recovery.ts";
+import { maybeMergeBoundSessionAfterSecretary } from "./session-merge-trigger.ts";
 import type { WorktreeFinalizationStateV1 } from "../../extensions/git-capability/host/worktree/schema.ts";
 import type { WorktreeMergedEventV1 } from "../../extensions/git-capability/host/worktree/service.ts";
 import { resolveVerifyTimeoutMs } from "../../extensions/git-capability/host/worktree/deadlines.ts";
@@ -8908,6 +8909,19 @@ async function runSingleAgent(
 			projectFinalizationPhase(pipiuiAgentId, runId, handleForRun(pipiuiAgentId, runId)?.diagnostics.finalizationPhase ?? "reconciling", {
 				error: "finalization-error",
 			});
+		}
+		try {
+			const sessionMerge = await maybeMergeBoundSessionAfterSecretary({
+				isCloseoutSecretary: Boolean(agent && agent.origin === "bundled" && agentName === "secretary"),
+				terminalOk: endOk,
+				escalate: escalateWorktreeFailureToBoss,
+			});
+			if (sessionMerge) {
+				const summary = `session-merge ${summarizeFinalization(sessionMerge)}`;
+				finalization = finalization ? `${finalization}; ${summary}` : summary;
+			}
+		} catch {
+			/* session merge must not lose the secretary terminal report */
 		}
 		if (placement.worktreePath && placement.worktreeBranch) {
 			const integrationState: SubagentIntegrationState = worktreeLifecycle ?? "pendingReview";
