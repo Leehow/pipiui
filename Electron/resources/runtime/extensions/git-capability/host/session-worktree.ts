@@ -114,7 +114,9 @@ function isSessionBranch(branch: string | undefined): boolean {
 
 async function currentBranch(cwd: string, fallback: string): Promise<string> {
 	const br = await git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-	if (br.ok && br.stdout && br.stdout !== "HEAD") return br.stdout;
+	// runGit keeps stdout raw (whitespace-significant porcelain); trim at the consumer.
+	const name = br.stdout.trim();
+	if (br.ok && name && name !== "HEAD") return name;
 	return fallback;
 }
 
