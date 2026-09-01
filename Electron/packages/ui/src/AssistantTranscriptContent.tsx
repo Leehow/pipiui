@@ -35,15 +35,12 @@ function displayFileSourceUrl(url: string | undefined): string | undefined {
 
 function elapsed(startedAt: number, endedAt = Date.now()) { return `${Math.max(0, Math.round((endedAt - startedAt) / 1000))}s` }
 function toolRunSummary(steps: number, thinking: string | null, tools: { name: string }[]): string {
-  const labels = [thinking, ...tools.map(tool => tool.name)].filter((label): label is string => Boolean(label))
-  if (labels.length <= 1) return `${steps} 个步骤${labels.length ? ` · ${labels[0]}` : ''}`
   const counts = new Map<string, number>()
   for (const tool of tools) counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1)
-  let primary = tools[0].name
-  let primaryCount = 1
-  for (const [name, count] of counts) if (count > primaryCount) { primary = name; primaryCount = count }
-  const label = primaryCount > 1 ? `${primary} ×${primaryCount}` : primary
-  return `${steps} 个步骤 · ${[thinking, label].filter((part): part is string => Boolean(part)).join(' · ')}`
+  const toolLabels = [...counts].map(([name, count]) => count > 1 ? `${name} ×${count}` : name)
+  const labels = [thinking, ...toolLabels].filter((label): label is string => Boolean(label))
+  if (labels.length === 0) return `${steps} 个步骤`
+  return `${steps} 个步骤 · ${labels.join(' · ')}`
 }
 
 function toolFailed(tool: TranscriptTool): boolean {
@@ -67,8 +64,11 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool }: { tool: Tr
   const delta = stats && tool.finished ? finishedFileChangeDeltaLabel(stats) : undefined
   const live = stats && !tool.finished ? liveTokenLabel(stats.payloadChars) : undefined
   const baseMeta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
-  const meta: ReactNode = delta
-    ? <span>{baseMeta} · <span className="tok-add tok-del-wrap">{delta.split(' ').map((part, i) => <span key={i} className={part.startsWith('+') ? 'tok-add' : 'tok-del'}>{i ? ` ${part}` : part}</span>)}</span></span>
+  const deltaNode = delta
+    ? <span className="tok-delta-wrap">{delta.split(' ').map((part, i) => <span key={i} className={part.startsWith('+') ? 'tok-add' : 'tok-del'}>{i ? ` ${part}` : part}</span>)}</span>
+    : null
+  const meta: ReactNode = deltaNode
+    ? <span>{deltaNode} · {baseMeta}</span>
     : live ? `${baseMeta} · ${live}` : baseMeta
   return <ActivityCard kind="tool" summary={summary} meta={meta} error={Boolean(tool.error || (subagentNotice && !subagentNotice.ok))} defaultExpanded={false}>
     {tool.images && tool.images.length > 0 && <div className="tool-images">{tool.images.map((img, i) => <img key={i} className="tool-screenshot" src={`data:${img.mimeType};base64,${img.data}`} alt="工具截图" loading="lazy" />)}</div>}
