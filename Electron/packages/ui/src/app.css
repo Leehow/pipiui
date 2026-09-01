@@ -611,10 +611,13 @@ body{overscroll-behavior:none}
 }
 .model-modal-tabs {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 5px;
+  min-height: 0;
   margin: 0;
   padding: 0;
+  overflow-y: auto;
   background: transparent;
 }
 /* Indented sub-nav slot under the 扩展 tab; ExtensionsPane portals into it. */
