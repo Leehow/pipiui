@@ -26,7 +26,7 @@ import {
   L2_CAPABILITY_HINT,
 } from './extension-capabilities'
 import { ExtensionAuthCard } from './ExtensionAuthCard'
-import { CORE_SKILLS_EXTENSION_IDS, CORE_TOOL_EXTENSION_IDS } from './core-extensions'
+import { CORE_SKILLS_EXTENSION_IDS } from './core-extensions'
 import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, HOST_FEATURE_SETTINGS_EXTENSION_IDS, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from './host-feature-extensions'
 import { MCP_IMPORT_EXAMPLE, mcpServerSummary, mcpServerTransport, parseMcpServersJson } from './mcp-import'
 import { ScanExternalSessionsPane } from './ScanExternalSessionsPane'
@@ -528,7 +528,7 @@ function SkillsHub({ items }: { items: ExtensionDescriptor[] }) {
       <div className="extensions-hub-hero">
         <span className="extensions-overview-eyebrow">核心扩展</span>
         <h3>Skills</h3>
-        <p>Skill 是 Agent 在需要时加载的说明、流程和资源。它们随扩展包进入项目，不会把所有领域知识一次塞进上下文。</p>
+        <p>Skill 是 Agent 在需要时加载的说明、流程和资源。基础版只启用 Built-in Skills 与 Skill Loader；Coding 等扩展包再带上各自领域的 Skills。</p>
       </div>
       <div className="extensions-hub-grid">
         <article className="extensions-hub-card">
@@ -634,61 +634,6 @@ function McpImportDialog({ host, projectId, existing, onClose, onDone }: {
       )}
       <p className="extensions-mcp-json-hint">写入当前项目的 <code>.pi/mcp.json</code>，对新会话生效；密钥只保存在这份本机文件里。</p>
     </ConfirmDialog>
-  )
-}
-
-function BasicToolsHub({ items, busyId, onToggle }: {
-  items: ExtensionDescriptor[]
-  busyId: string | null
-  onToggle: (ext: ExtensionDescriptor) => void
-}) {
-  const byId = useMemo(() => new Map(items.map(item => [item.id, item])), [items])
-  return (
-    <section className="extensions-mcp-hub" data-testid="extensions-tools-hub">
-      <div className="extensions-hub-hero">
-        <span className="extensions-overview-eyebrow">核心扩展</span>
-        <h3>基础工具</h3>
-        <p>pi 自带工具之外、随产品内置的基础工具包：网页检索、浏览器、电脑控制与项目记忆。更复杂的工具由扩展包和其他扩展带来。</p>
-      </div>
-      <div className="extensions-tools-list" data-testid="extensions-tools-list">
-        {CORE_TOOL_EXTENSION_IDS.map(id => {
-          const ext = byId.get(id)
-          if (!ext) {
-            return (
-              <div className="extensions-tool-row" key={id} data-testid={`extensions-tool-${id}`}>
-                <div className="extensions-tool-copy">
-                  <strong>{id}</strong>
-                  <span>未随当前运行时提供</span>
-                </div>
-                <span className="extensions-membership-pill outside">未提供</span>
-              </div>
-            )
-          }
-          const enabled = ext.state === 'enabled'
-          const errorText = readableError(ext)
-          return (
-            <div className="extensions-tool-row" key={id} data-testid={`extensions-tool-${id}`}>
-              <div className="extensions-tool-copy">
-                <strong>{ext.name ?? ext.id}</strong>
-                {ext.description && <span>{ext.description}</span>}
-                {errorText && <span className="model-modal-error" role="alert">{errorText}</span>}
-              </div>
-              <span className={`extensions-state-pill state-${ext.state}`}>{EXTENSION_STATE_LABEL[ext.state] ?? ext.state}</span>
-              <button
-                type="button"
-                role="switch"
-                className={`computer-use-switch${enabled ? ' enabled' : ''}`}
-                aria-checked={enabled}
-                aria-label={enabled ? `禁用 ${ext.name ?? ext.id}` : `启用 ${ext.name ?? ext.id}`}
-                disabled={busyId === ext.id || ext.state === 'error'}
-                data-testid={`extensions-tool-toggle-${id}`}
-                onClick={() => onToggle(ext)}
-              ><span /></button>
-            </div>
-          )
-        })}
-      </div>
-    </section>
   )
 }
 
@@ -820,7 +765,7 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
   const [profiles, setProfiles] = useState<ProductProfileDescriptor[]>([])
   const [activation, setActivation] = useState<ProjectProductActivation | null>(null)
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null)
-  const [selectedView, setSelectedView] = useState<'packs' | 'skills' | 'mcp' | 'tools'>('packs')
+  const [selectedView, setSelectedView] = useState<'packs' | 'skills' | 'mcp'>('packs')
   const [packsOpen, setPacksOpen] = useState(true)
   const [createPackOpen, setCreatePackOpen] = useState(false)
   const [createPackName, setCreatePackName] = useState('')
@@ -1185,15 +1130,6 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
         <strong>MCP 连接</strong>
         <span>pi-mcp-extension · {servers.length} 个项目连接</span>
       </button>
-      <button
-        type="button"
-        className={`extensions-capability-nav${selectedView === 'tools' ? ' active' : ''}`}
-        data-testid="extensions-nav-tools"
-        onClick={() => setSelectedView('tools')}
-      >
-        <strong>基础工具</strong>
-        <span>网页 · 浏览器 · 电脑 · 记忆</span>
-      </button>
       <div className="extensions-core-soon" data-testid="extensions-nav-theme" title="主题的预览与选用在 设置 → 主题">
         <strong>主题包</strong>
         <span>设置 → 主题</span>
@@ -1279,8 +1215,6 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
           )}
           {selectedView === 'skills' ? <SkillsHub items={items} /> : selectedView === 'mcp' ? (
             <McpHub host={host} projectId={resolvedProjectId} servers={servers} onChanged={onServersChanged} />
-          ) : selectedView === 'tools' ? (
-            <BasicToolsHub items={items} busyId={busyId} onToggle={ext => { void onToggle(ext) }} />
           ) : selectedProfile ? (
             <>
               <div className="extensions-pack-detail">

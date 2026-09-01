@@ -835,7 +835,7 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
       description: '通用工作区、会话、模型与扩展管理。',
       state: 'available',
       source: 'builtin',
-      requiredExtensionIds: ['skill-loader-extension'],
+      requiredExtensionIds: ['skill-loader-extension', 'built-in-skills'],
       recommendedExtensionIds: [],
       layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
     },

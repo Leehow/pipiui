@@ -8,8 +8,8 @@ export const PROJECT_PRODUCT_ACTIVATION_SCHEMA_VERSION = 2 as const;
 /**
  * Two-SKU product model (user-confirmed 2026-08-31): the shipping product is the
  * Coding edition and new projects open its full bundled set. `base` is the strict
- * minimal profile (skill loader only) that the future basic-only edition ships
- * with; it stays selectable here as the explicit minimal workspace.
+ * minimal profile (skill-loader + built-in-skills) that the future basic-only
+ * edition ships with; it stays selectable here as the explicit minimal workspace.
  */
 export const CODING_PRODUCT_PROFILE_ID = "coding";
 export const DEFAULT_PRODUCT_PROFILE_ID = "base";

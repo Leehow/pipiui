@@ -63,7 +63,7 @@ describe("locked base system prompt", () => {
   });
 
   it("names no extension that only ships in one product profile", () => {
-    // `profiles/base` requires skill-loader alone; git, terminal, plan, goal, web access,
+    // `profiles/base` requires skill-loader and built-in-skills; git, terminal, plan, goal, web access,
     // the browser and even the method extension are `profiles/coding`. Enumerating any of
     // them here would be false in every other product — and the roster is meant to grow,
     // so the base states the shape and lets the tool list carry the contents.

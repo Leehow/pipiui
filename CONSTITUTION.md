@@ -102,7 +102,7 @@ A 与 B 都禁止 opaque randomness，区别只在提供方；暴露 A/B 类 ID 
 架构已经完全扩展化：常驻核心只剩 pi 运行时、宿主进程，以及唯一一份基础提示词
 `Electron/resources/runtime/pi-core-prompt/SYSTEM_BASE.md`。其余一切能力，连同**工作方法
 本身**，都是可按项目开关的扩展，且**随产品包变化**——`profiles/base` 只 required
-`skill-loader-extension`，git / 终端 / 计划 / 目标 / Web / 浏览器 / 代码检索乃至哲学扩展
+`skill-loader-extension` 与 `built-in-skills`，git / 终端 / 计划 / 目标 / Web / 浏览器 / 代码检索乃至哲学扩展
 （`coding-method`）都只在 `profiles/coding` 里。
 
 - 该文件无条件下发，没有 feature flag，任何扩展都无法移除。它是所有扩展关闭后唯一还在

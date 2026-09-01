@@ -54,7 +54,7 @@ A candidate rule that is not one of those three has a home in the table above.
 ### Never enumerate extensions or capabilities
 
 Point 2 is the *shape*, never the roster. The roster is per product profile:
-`profiles/base` requires `skill-loader-extension` alone, while git, the terminal, plans,
+`profiles/base` requires `skill-loader-extension` and `built-in-skills` only, while git, the terminal, plans,
 goals, web access, the browser, code retrieval — and the method extension that carries the
 philosophy — are all `profiles/coding`. A list written here is therefore false in every
 other product, and it grows as products are added. v1 shipped with that list; it was

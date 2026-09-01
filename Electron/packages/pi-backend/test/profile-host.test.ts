@@ -161,7 +161,11 @@ describe("Product Profile host interface", () => {
     const added = await backend.handle("addProject", [project]) as { id: string };
 
     expect(await backend.handle("listProductProfiles" as never, [])).toEqual([
-      expect.objectContaining({ id: "base", name: "基础版" }),
+      expect.objectContaining({
+        id: "base",
+        name: "基础版",
+        requiredExtensionIds: ["skill-loader-extension", "built-in-skills"],
+      }),
       expect.objectContaining({ id: "coding", name: "Coding 优化版" }),
     ]);
     expect(await backend.handle("getProductProfile" as never, [added.id])).toMatchObject({
@@ -174,8 +178,12 @@ describe("Product Profile host interface", () => {
     });
     const baseExtensions = await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string; state: string; category?: string }>;
     expect(baseExtensions.find(item => item.id === "skill-loader-extension")).toMatchObject({ state: "enabled", category: "foundation" });
+    expect(baseExtensions.find(item => item.id === "built-in-skills")).toMatchObject({ state: "enabled", category: "foundation" });
     expect(baseExtensions.filter(item => item.id.startsWith("coding-") && item.state === "enabled")).toEqual([]);
     expect(baseExtensions.find(item => item.id === "git-capability")?.state).not.toBe("enabled");
+    for (const id of ["web-access-extension", "webview-browser-extension", "cua-extension", "memory-extension"]) {
+      expect(baseExtensions.find(item => item.id === id)?.state).not.toBe("enabled");
+    }
     expect(await backend.handle("setProductProfile" as never, [added.id, "coding"])).toMatchObject({
       profile: "coding",
     });

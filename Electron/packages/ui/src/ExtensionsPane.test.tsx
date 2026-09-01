@@ -142,7 +142,7 @@ describe('ExtensionsPane', () => {
     expect(sidebar?.textContent).toContain('扩展包')
   })
 
-  it('shows the core group with skills, MCP, tools, and an upcoming theme slot', async () => {
+  it('shows the core group with skills, MCP, and an upcoming theme slot, without a basic-tools hub', async () => {
     const host = {
       listExtensions: async () => [],
       listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
@@ -151,51 +151,11 @@ describe('ExtensionsPane', () => {
     expect(await screen.findByTestId('extensions-nav-skills')).toBeTruthy()
     expect(screen.getByTestId('extensions-nav-skills').textContent).toContain('Skill Loader')
     expect(screen.getByTestId('extensions-nav-mcp').textContent).toContain('pi-mcp-extension')
-    expect(screen.getByTestId('extensions-nav-tools').textContent).toContain('基础工具')
+    expect(screen.queryByTestId('extensions-nav-tools')).toBeNull()
+    expect(screen.queryByTestId('extensions-tools-hub')).toBeNull()
     expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('主题包')
     expect(screen.getByTestId('extensions-nav-theme').textContent).toContain('设置 → 主题')
     expect((screen.getByTestId('extensions-nav-theme') as HTMLElement).tagName).toBe('DIV')
-  })
-
-  it('lists the frozen basic tool extensions with toggles in the tools view', async () => {
-    const tool = (id: string, state: 'enabled' | 'disabled'): ExtensionDescriptor => ({
-      id,
-      name: id,
-      version: '0.1.0',
-      source: 'builtin',
-      state,
-      capabilities: [],
-      description: `${id} 描述`,
-    })
-    const items = [
-      tool('web-access-extension', 'enabled'),
-      tool('webview-browser-extension', 'disabled'),
-      tool('cua-extension', 'disabled'),
-      tool('memory-extension', 'enabled'),
-      tool('plan-extension', 'enabled'),
-    ]
-    const setExtensionEnabled = vi.fn(async (id: string, enabled: boolean) => {
-      items.find(item => item.id === id)!.state = enabled ? 'enabled' : 'disabled'
-      return items.find(item => item.id === id)!
-    })
-    const host = {
-      listExtensions: async () => items.map(item => ({ ...item })),
-      setExtensionEnabled,
-      getCapabilityGrant: async () => ({ capabilities: [] }),
-      listUserMcpServers: async () => [],
-      listProjects: async () => [{ id: 'demo', name: 'demo', path: '/tmp/demo' }],
-    } as unknown as PipiHostAPI
-    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
-    fireEvent.click(await screen.findByTestId('extensions-nav-tools'))
-    expect(screen.getByTestId('extensions-tools-hub').textContent).toContain('基础工具')
-    // Only the frozen core-capability tool packages are listed, not plan-extension.
-    for (const id of ['web-access-extension', 'webview-browser-extension', 'cua-extension', 'memory-extension']) {
-      expect(screen.getByTestId(`extensions-tool-${id}`)).toBeTruthy()
-    }
-    expect(screen.queryByTestId('extensions-tool-plan-extension')).toBeNull()
-    expect(screen.getByTestId('extensions-tool-toggle-web-access-extension').getAttribute('aria-checked')).toBe('true')
-    fireEvent.click(screen.getByTestId('extensions-tool-toggle-web-access-extension'))
-    await waitFor(() => expect(setExtensionEnabled).toHaveBeenCalledWith('web-access-extension', false, 'project', 'demo'))
   })
 
   it('opens the add dialog with copy-paste prompts the main session can handle', async () => {
@@ -319,7 +279,7 @@ function extensionPackHost(extra: ExtensionDescriptor[] = []) {
   ])
   let activation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
   let profiles: ProductProfileDescriptor[] = [
-    { id: 'base', name: '基础版', state: 'available', source: 'builtin', requiredExtensionIds: ['skill-loader-extension'], recommendedExtensionIds: [] },
+    { id: 'base', name: '基础版', state: 'available', source: 'builtin', requiredExtensionIds: ['skill-loader-extension', 'built-in-skills'], recommendedExtensionIds: [] },
     {
       id: 'coding',
       name: 'Coding 优化版',
@@ -414,6 +374,33 @@ describe('ExtensionsPane package management', () => {
     fireEvent.click(within(memberList).getByText('Documents'))
     fireEvent.click(screen.getByTestId('extensions-pack-members-confirm'))
     await waitFor(() => expect(host.updateProductProfileExtensions).toHaveBeenCalledWith('demo', 'lab-tools', ['document-workbench']))
+  })
+
+  it('lists web, browser, CUA and memory inside the Coding pack, not a core tools hub', async () => {
+    const tools = [
+      pkg({ id: 'web-access-extension', name: 'Web Access', category: 'automation', state: 'enabled', source: 'builtin' }),
+      pkg({ id: 'webview-browser-extension', name: 'WebView Browser', category: 'automation', state: 'disabled', source: 'builtin' }),
+      pkg({ id: 'cua-extension', name: 'CUA', category: 'automation', state: 'disabled', source: 'builtin' }),
+      pkg({ id: 'memory-extension', name: 'Memory', category: 'knowledge', state: 'enabled', source: 'builtin' }),
+    ]
+    const host = extensionPackHost(tools)
+    const originalList = host.listProductProfiles
+    host.listProductProfiles = vi.fn(async () => {
+      const profiles = await originalList()
+      return profiles.map(profile => profile.id === 'coding'
+        ? { ...profile, recommendedExtensionIds: [...(profile.recommendedExtensionIds ?? []), ...tools.map(item => item.id)] }
+        : profile)
+    })
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    expect(screen.queryByTestId('extensions-nav-tools')).toBeNull()
+    expect(screen.queryByTestId('extensions-tools-hub')).toBeNull()
+    expect(await screen.findByTestId('extensions-pkg-web-access-extension')).toBeTruthy()
+    for (const id of tools.map(item => item.id)) {
+      expect(screen.getByTestId(`extensions-pkg-${id}`)).toBeTruthy()
+      expect(screen.queryByTestId(`extensions-tool-${id}`)).toBeNull()
+    }
+    fireEvent.click(screen.getByTestId('extensions-pkg-toggle-web-access-extension'))
+    await waitFor(() => expect(host.setExtensionEnabled).toHaveBeenCalledWith('web-access-extension', false, 'project', 'demo'))
   })
 
   it('installs a single extension ZIP, enables it for the project, and lists it', async () => {
