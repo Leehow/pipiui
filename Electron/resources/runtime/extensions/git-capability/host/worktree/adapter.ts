@@ -605,7 +605,9 @@ export function runSpawnV1(
 			return {
 				ok: false,
 				exitCode,
-				stdout: stdout.trim(),
+				// stdout stays raw: porcelain -z records are whitespace-significant (` M file`
+				// loses its staged-column space under trim() and parses as staged+truncated).
+				stdout,
 				stderr: stderr.trim(),
 				...(termination === "timeout" ? { timedOut: true } : {}),
 				...(termination === "aborted" ? { aborted: true } : {}),
@@ -690,7 +692,7 @@ export function runSpawnV1(
 				finish(terminationResult(null, null, error.message));
 				return;
 			}
-			finish({ ok: false, exitCode: null, stdout: stdout.trim(), stderr: stderr.trim(), error: error.message });
+			finish({ ok: false, exitCode: null, stdout, stderr: stderr.trim(), error: error.message });
 		}
 		function onClose(exitCode: number | null, signal: string | null): void {
 			if (termination) {
@@ -700,7 +702,7 @@ export function runSpawnV1(
 			finish({
 				ok: exitCode === 0,
 				exitCode,
-				stdout: stdout.trim(),
+				stdout,
 				stderr: stderr.trim(),
 				...(signal ? { signal, error: `process exited from signal ${signal}` } : {}),
 			});
