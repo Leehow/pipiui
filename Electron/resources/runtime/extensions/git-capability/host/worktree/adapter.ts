@@ -382,6 +382,14 @@ export class NodeGitWorktreeAdapter implements GitWorktreeAdapter {
 	}
 
 	/**
+	 * Session merge-back only. Worker finalize deliberately leaves MERGE_HEAD so a
+	 * fixer can resolve in place; a session checkout must not keep that residue.
+	 */
+	abortMerge(mainCwd: string): Promise<GitOperationResultV1> {
+		return this.runGit(mainCwd, ["merge", "--abort"]);
+	}
+
+	/**
 	 * Accident-recovery anchor: `git reset --hard refs/pipiui/checkpoints/<agentId>`
 	 * restores main to the pre-merge SHA captured by slice 1.
 	 */
