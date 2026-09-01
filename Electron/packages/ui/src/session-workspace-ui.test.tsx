@@ -58,11 +58,11 @@ describe('SessionBranchPair', () => {
     const { container } = render(<SessionBranchPair sessionBranch="main" mainBranch="main" />)
     expect(container.querySelector('[data-testid="session-branch-pair"]')).toBeNull()
   })
-  it('shows both names when the session branch differs from main', () => {
+  it('shows only the session branch when it differs from main (main is the adjacent git control)', () => {
     render(<SessionBranchPair sessionBranch="pipiui/session-foo" mainBranch="main" />)
     const pair = screen.getByTestId('session-branch-pair')
     expect(screen.getByTestId('session-branch-name').textContent).toBe('pipiui/session-foo')
-    expect(screen.getByTestId('main-branch-name').textContent).toBe('main')
+    expect(screen.queryByTestId('main-branch-name')).toBeNull()
     expect(pair.getAttribute('title')).toBe('会话分支：pipiui/session-foo · 主树：main')
   })
 })
@@ -82,14 +82,14 @@ describe('SessionBranchHeader', () => {
     await waitFor(() => expect(gitStatus).toHaveBeenCalledWith('p1'))
     expect(container.querySelector('[data-testid="session-branch-pair"]')).toBeNull()
   })
-  it('shows both branches when workspace.branch differs from GitStatus.currentBranch', async () => {
+  it('shows the session branch when workspace.branch differs from GitStatus.currentBranch', async () => {
     const { host, gitStatus } = gitHost(REPO)
     render(
       <SessionBranchHeader host={host} projectId="p1" workspace={{ branch: 'pipiui/session-foo' }} gitAvailable />,
     )
     await waitFor(() => expect(gitStatus).toHaveBeenCalledWith('p1'))
     expect(screen.getByTestId('session-branch-name').textContent).toBe('pipiui/session-foo')
-    expect(screen.getByTestId('main-branch-name').textContent).toBe('main')
+    expect(screen.queryByTestId('main-branch-name')).toBeNull()
   })
 })
 

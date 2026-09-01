@@ -17,7 +17,11 @@ function truncateBranch(name: string): string {
   return name.length <= MAX_TITLE_CHARS ? name : name.slice(0, MAX_TITLE_CHARS)
 }
 
-/** Header companion to the git-capability main-tree control: session branch when it differs. */
+/**
+ * Header companion to the git-capability main-tree control beside it: shows only the
+ * session branch (and only when it differs from the main tree) — repeating the main
+ * branch in the pair duplicates the adjacent git-branch button.
+ */
 export function SessionBranchPair({ sessionBranch, mainBranch }: { sessionBranch?: string | null; mainBranch?: string | null }) {
   if (!shouldShowDualBranch(sessionBranch, mainBranch)) return null
   const session = sessionBranch!.trim()
@@ -27,8 +31,6 @@ export function SessionBranchPair({ sessionBranch, mainBranch }: { sessionBranch
     <span className="session-branch-pair" data-testid="session-branch-pair" title={title} aria-label={title}>
       <span className="session-branch-icon" aria-hidden="true">⑂</span>
       <span className="session-branch-name" data-testid="session-branch-name">{truncateBranch(session)}</span>
-      <span className="session-branch-sep" aria-hidden="true">·</span>
-      <span className="main-branch-name" data-testid="main-branch-name">{truncateBranch(main)}</span>
     </span>
   )
 }
