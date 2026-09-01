@@ -310,6 +310,13 @@
   color:var(--sb-muted);
   background:color-mix(in srgb, var(--sb-muted) 14%, transparent);
 }
+.sb-unmerged-badge{
+  flex:none;
+  display:inline-flex;
+  align-items:center;
+  color:var(--sb-accent);
+}
+.sb-unmerged-icon{display:block}
 .sb-session-title-input{
   min-width:0;
   width:100%;
