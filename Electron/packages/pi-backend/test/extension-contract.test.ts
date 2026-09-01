@@ -27,8 +27,8 @@ const runtimeExtensionsDir = join(
 );
 
 const EXPECTED_TOOL_CONTRACT: Record<string, string[]> = {
-  "web-access-extension": ["web_search", "fetch_content", "source_check", "get_search_content"],
-  "webview-browser-extension": ["browser_search", "browser_fetch", "browser"],
+  "web-access-extension": ["web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
+  "webview-browser-extension": ["browser_search", "browser_fetch", "browser", "browser_flow"],
   "cua-extension": ["computer", "open_application"],
   "memory-extension": ["memory_query", "memory_status"],
 };
@@ -71,9 +71,11 @@ describe("frozen core-capability tool contract", () => {
       "fetch_content",
       "source_check",
       "get_search_content",
+      "arxiv_fetch",
       "browser_search",
       "browser_fetch",
       "browser",
+      "browser_flow",
       "computer",
       "open_application",
       "memory_query",

@@ -21,7 +21,6 @@
       { "id": "goal-extension", "version": "^1.0.0" },
       { "id": "git-capability", "version": "^1.0.0" },
       { "id": "grok-build-oauth", "version": "^0.2.0" },
-      { "id": "hello-pipiui", "version": "^0.1.0" },
       { "id": "memory-extension", "version": "^0.1.0" },
       { "id": "office-extension", "version": "^0.1.0" },
       { "id": "pdf-extension", "version": "^0.1.0" },

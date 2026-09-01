@@ -1,13 +1,16 @@
 /**
  * web-access-extension agent half.
  *
- * Mounts the four frozen Web Access tools — `web_search` / `fetch_content` /
- * `source_check` / `get_search_content` — under this package's manifest
- * contract. Tool names, schemas, wire behavior, and the session transcript
- * renderer are unchanged: the provider adapters, DOM extraction/compression,
- * and result formatting come from the version-pinned `pi-web-access`
- * implementation, wrapped (not reimplemented) so the extension boundary owns
- * the mounting while behavior stays byte-identical.
+ * Mounts the frozen Web Access tools — `web_search` / `fetch_content` /
+ * `source_check` / `get_search_content` — plus the claimed `arxiv_fetch`,
+ * under this package's manifest contract. Tool names, schemas, wire behavior,
+ * and the session transcript renderer are unchanged: the provider adapters,
+ * DOM extraction/compression, and result formatting come from the
+ * version-pinned `pi-web-access` implementation, wrapped (not reimplemented)
+ * so the extension boundary owns the mounting while behavior stays
+ * byte-identical. `arxiv_fetch` was claimed from the bare
+ * `pi-ext/packages/arxiv-fetch` mount; that loose mount now only serves as
+ * the legacy fallback for hosts that do not register this extension.
  *
  * Seed note: this wave only ships the package as a bundled seed. Switching the
  * mounted source from the managed `pi-web-access` mount to this extension is
@@ -17,7 +20,9 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import webAccess from "pi-web-access";
+import arxivFetch from "../../../pi-ext/packages/arxiv-fetch/extensions/arxiv-fetch.ts";
 
 export default function webAccessExtension(pi: ExtensionAPI): void {
 	webAccess(pi);
+	arxivFetch(pi);
 }

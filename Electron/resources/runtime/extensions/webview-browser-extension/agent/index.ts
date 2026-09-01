@@ -1,6 +1,6 @@
 /**
  * webview-browser-extension agent half (frozen core-capability tools:
- * `browser` / `browser_search` / `browser_fetch`).
+ * `browser` / `browser_search` / `browser_fetch`, plus `browser_flow`).
  *
  * Tool names, schemas, wire actions, the watch protocol, per-session partition
  * semantics, and transcript rendering are unchanged from the pre-migration
@@ -13,6 +13,10 @@
  * Watch delivery keeps the frozen `[browser-watch]` follow-up contract: the
  * pi-ext callback server + durable delivery obligations stay the wake channel,
  * and the subscribe now travels as a `browser.watch` capability op.
+ *
+ * `browser_flow` (browser flow memory) was claimed from the bare
+ * `pipiui-browser-memory.ts` mount; the loose file now only serves as the
+ * legacy fallback for hosts that do not register this extension.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { startBrowserWatchCallbackServer } from "../../../pi-ext/subagent/browser-watch-callback.ts";
@@ -20,6 +24,7 @@ import { registerBrowserWatchDelivery } from "../../../pi-ext/subagent/browser-w
 import { capabilityCall } from "./capability-bridge.ts";
 import registerBrowserTool from "./browser-tool.ts";
 import registerBrowserSearchTools from "./browser-search-tools.ts";
+import registerBrowserFlowMemory from "../../pipiui-browser-memory.ts";
 
 export {
   BROWSER_TOOL_DECLARED_ACTIONS,
@@ -59,4 +64,5 @@ export default function webviewBrowserExtension(pi: ExtensionAPI): void {
 
   registerBrowserTool(pi);
   registerBrowserSearchTools(pi);
+  registerBrowserFlowMemory(pi);
 }

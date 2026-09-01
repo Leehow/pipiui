@@ -150,7 +150,7 @@ export const CORE_CAPABILITY_EXTENSION_PACKAGES: readonly CoreCapabilityExtensio
     origin: "builtin",
     defaultEnabled: true,
     uninstallable: false,
-    ownedTools: ["web_search", "fetch_content", "source_check", "get_search_content"],
+    ownedTools: ["web_search", "fetch_content", "source_check", "get_search_content", "arxiv_fetch"],
   },
   {
     id: "webview-browser-extension",
@@ -160,7 +160,7 @@ export const CORE_CAPABILITY_EXTENSION_PACKAGES: readonly CoreCapabilityExtensio
     origin: "builtin",
     defaultEnabled: true,
     uninstallable: false,
-    ownedTools: ["browser_search", "browser_fetch", "browser"],
+    ownedTools: ["browser_search", "browser_fetch", "browser", "browser_flow"],
   },
   {
     id: "cua-extension",

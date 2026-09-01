@@ -254,6 +254,50 @@ describe("Product Profile runtime extension ownership", () => {
     expect(output.env.PIPIUI_ANYDOC_ROOT).toBe("/runtime/anydoc");
   });
 
+  it("lets web-access and webview-browser claim arxiv_fetch and browser_flow from the bare mounts", () => {
+    const webAccess = "/runtime/extensions/web-access-extension/agent/index.ts";
+    const webview = "/runtime/extensions/webview-browser-extension/agent/index.ts";
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { webSearch: true, arxivFetch: true, browserSearch: true, browserMemory: true },
+      paths: {
+        webSearch: "/runtime/managed-npm/pi-web-access/dist/index.js",
+        arxivFetchPackage: "/runtime/pi-ext/packages/arxiv-fetch",
+        browserSearch: "/runtime/extensions/pipiui-browser-search.ts",
+        browserMemory: "/runtime/extensions/pipiui-browser-memory.ts",
+      },
+      registeredExtensions: [
+        { id: "web-access-extension", version: "0.1.0", enabled: true, extensionPath: webAccess },
+        { id: "webview-browser-extension", version: "0.1.0", enabled: true, extensionPath: webview },
+      ],
+    });
+    expect(output.args).toEqual(expect.arrayContaining([webAccess, webview]));
+    expect(output.args).not.toEqual(expect.arrayContaining([
+      "/runtime/pi-ext/packages/arxiv-fetch",
+      "/runtime/extensions/pipiui-browser-memory.ts",
+    ]));
+    // Worker tool routing still learns where the arxiv package lives even though
+    // web-access-extension now mounts it.
+    expect(output.env.PIPIUI_ARXIV_EXT).toBe("/runtime/pi-ext/packages/arxiv-fetch");
+  });
+
+  it("keeps the arxiv and browser-memory bare mounts as legacy fallbacks without the owning extensions", () => {
+    const output = assemblePiSpawn({
+      cwd: "/tmp/project",
+      bridgePort: 1234,
+      features: { arxivFetch: true, browserMemory: true },
+      paths: {
+        arxivFetchPackage: "/runtime/pi-ext/packages/arxiv-fetch",
+        browserMemory: "/runtime/extensions/pipiui-browser-memory.ts",
+      },
+    });
+    expect(output.args).toEqual(expect.arrayContaining([
+      "/runtime/pi-ext/packages/arxiv-fetch",
+      "/runtime/extensions/pipiui-browser-memory.ts",
+    ]));
+  });
+
   it("uses Profile-owned Coding method and Skill Loader packages for main and worker sessions", () => {
     const method = "/runtime/extensions/coding-method/agent/index.ts";
     const skills = "/runtime/extensions/skill-loader-extension/agent/index.ts";

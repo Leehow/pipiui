@@ -89,12 +89,14 @@ function mountBothWays() {
 }
 
 describe("web-access-extension schema snapshot", () => {
-  it("mounts exactly the four frozen tools through the extension agent half", () => {
+  it("mounts exactly the four frozen tools plus claimed arxiv_fetch through the extension agent half", () => {
     const { viaExtension, extensionByName } = mountBothWays();
-    expect(viaExtension.tools.map((tool) => tool.name).sort()).toEqual([...FROZEN_TOOLS].sort());
+    expect(viaExtension.tools.map((tool) => tool.name).sort()).toEqual([...FROZEN_TOOLS, "arxiv_fetch"].sort());
     for (const name of FROZEN_TOOLS) {
       expect(extensionByName.get(name), `tool ${name} mounted`).toBeDefined();
     }
+    // Claimed from the bare pi-ext/packages/arxiv-fetch mount (no package twin to snapshot).
+    expect(extensionByName.get("arxiv_fetch"), "claimed arxiv_fetch mounted").toBeDefined();
   });
 
   it("extension-mounted schemas are identical to the pinned package and snapshotted", () => {
