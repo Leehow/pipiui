@@ -74,7 +74,7 @@ export interface BrowserShellWindowLike extends BrowserViewNativeHostLike {
 
 export type BrowserTabRecord = BrowserTab & { history: string[]; historyIndex: number }
 export type NavigationKind = 'push' | 'history' | 'restore' | 'reload'
-export type PendingNavigation = { tabId: string; kind: NavigationKind; url: string }
+export type PendingNavigation = { tabId: string; kind: NavigationKind; url: string; startedAt: number }
 
 /**
  * Electron emits `certificate-error` from the `app` object, never from
@@ -116,4 +116,6 @@ export type ViewPane = {
   pending?: PendingNavigation
   /** This pane's own webContents is mid-load. Tab-level isLoading is shared by both panes, so per-pane guards must read this instead. */
   loading?: boolean
+  /** When `loading` became true without a pending record (organic start-loading). */
+  loadingStartedAt?: number
 }

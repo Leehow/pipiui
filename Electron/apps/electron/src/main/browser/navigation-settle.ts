@@ -1,8 +1,40 @@
 import type { BrowserViewLike, ViewPane } from './types.js'
 
-/** Bound for the reload() settle wait: native reload() has no promise, so the lifecycle completion is awaited via pane state with this ceiling. */
-export const BROWSER_RELOAD_SETTLE_TIMEOUT_MS = 10_000
+/** Bound for loadURL / reload settle waits: a hung Chromium commit must not pin the caller or the session action queue. */
+export const BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS = 10_000
+/** Alias kept for reload() call sites and existing tests. */
+export const BROWSER_RELOAD_SETTLE_TIMEOUT_MS = BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS
 const BROWSER_NAVIGATION_SETTLE_POLL_HINT_MS = 50
+
+/**
+ * Await Electron `webContents.loadURL()`, which resolves on did-finish-load.
+ * If that never comes, resolve `'timedOut'` at the bound so showPane / tool
+ * navigate (and the per-session action queue sitting behind them) can continue.
+ * A rejection that lands before the bound still rejects; a late failure after
+ * timeout is swallowed so it cannot become an unhandled rejection.
+ */
+export function awaitLoadURL(
+  load: Promise<unknown>,
+  timeoutMs: number = BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS,
+): Promise<'loaded' | 'timedOut'> {
+  return new Promise((resolve, reject) => {
+    let finished = false
+    const finish = (action: () => void) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      action()
+    }
+    const timer = setTimeout(() => finish(() => resolve('timedOut')), timeoutMs)
+    Promise.resolve(load).then(
+      () => finish(() => resolve('loaded')),
+      (error: unknown) => {
+        if (finished) return
+        finish(() => reject(error))
+      },
+    )
+  })
+}
 
 /**
  * Navigation settle coordination for the promise-less native reload(): waits

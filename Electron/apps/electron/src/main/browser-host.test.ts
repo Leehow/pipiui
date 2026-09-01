@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
-import { BrowserSessionHost, BrowserTabsHost, BROWSER_HOST_TOOL_ACTIONS, browserDeviceEmulationFor, browserPartitionForSession, installBrowserNativeTrace, mountBrowserShellView, normalizeBrowserToolTarget, normalizeBrowserURL, parseBrowserSnapshotTarget, routeBrowserView, shouldOpenBrowserDevTools, withBrowserTabsHost, type BrowserViewLike } from './browser-host.js'
+import { BrowserSessionHost, BrowserTabsHost, BROWSER_HOST_TOOL_ACTIONS, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, browserDeviceEmulationFor, browserPartitionForSession, installBrowserNativeTrace, mountBrowserShellView, normalizeBrowserToolTarget, normalizeBrowserURL, parseBrowserSnapshotTarget, routeBrowserView, shouldOpenBrowserDevTools, withBrowserTabsHost, type BrowserViewLike } from './browser-host.js'
+import { awaitLoadURL } from './browser/navigation-settle.js'
 import { BROWSER_DEBUG_MAX_OUTPUT, BROWSER_SCRIPT_MAX_INPUT, remapScriptStack, safeSerialize, TabConsoleBuffer, truncateEnvelope } from './browser-debug.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -22,6 +23,7 @@ class FakeWebContents {
   snapshotSeq = 0
   loadURLRejects?: string
   deferCommit = false
+  hangLoadURL = false
   waitReady = true
   scriptResult: Record<string, unknown> | undefined
   pageRuntime: { evaluate(code: string): unknown } | null = null
@@ -32,6 +34,7 @@ class FakeWebContents {
     if (this.loadURLRejects) throw new Error(this.loadURLRejects)
     this.url = url
     this.emit('did-start-loading')
+    if (this.hangLoadURL) return new Promise(() => {})
     if (!this.deferCommit) this.commitNavigation(url)
   })
   commitNavigation(url = this.url) {
@@ -125,6 +128,27 @@ function browserHarness() {
   host.attachToWindow(attach)
   return { host, contents, view, createView, attach }
 }
+
+describe('awaitLoadURL', () => {
+  it('resolves loaded when the promise settles before the bound', async () => {
+    await expect(awaitLoadURL(Promise.resolve('ok'), 50)).resolves.toBe('loaded')
+  })
+
+  it('resolves timedOut when the promise never settles', async () => {
+    vi.useFakeTimers()
+    try {
+      const pending = awaitLoadURL(new Promise(() => {}), BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      await vi.advanceTimersByTimeAsync(BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      await expect(pending).resolves.toBe('timedOut')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('rejects when load fails before the bound', async () => {
+    await expect(awaitLoadURL(Promise.reject(new Error('ERR_FAILED')), 50)).rejects.toThrow('ERR_FAILED')
+  })
+})
 
 describe('BrowserTabsHost', () => {
   it('records native bounds and visibility readback after presentation', async () => {
@@ -475,6 +499,50 @@ describe('BrowserTabsHost', () => {
     }
   })
 
+  it('bounds a hung loadURL so navigate returns within the settle ceiling', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('ok.example')
+    contents.hangLoadURL = true
+    contents.pageText = 'partial document'
+    vi.useFakeTimers()
+    try {
+      const navigating = host.toolAction({ action: 'navigate', url: 'hung.example' }, { reveal: false })
+      await vi.advanceTimersByTimeAsync(BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      await expect(navigating).resolves.toMatchObject({ ok: true })
+      // Guard expires at the same bound, so a later observe is not stuck in browser_navigating.
+      await expect(host.toolAction({ action: 'observe' }, { reveal: false })).resolves.toMatchObject({ ok: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('swallows a late loadURL rejection after the settle bound without unhandled rejection', async () => {
+    const { host, contents } = browserHarness()
+    await host.setViewBounds({ x: 0, y: 0, width: 800, height: 600, visible: true })
+    await host.loadURL('ok.example')
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on('unhandledRejection', onUnhandled)
+    vi.useFakeTimers()
+    try {
+      contents.loadURL.mockImplementationOnce(async url => {
+        contents.url = url
+        contents.emit('did-start-loading')
+        await new Promise<void>(resolve => setTimeout(resolve, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS * 2))
+        throw new Error('late fail')
+      })
+      const navigating = host.toolAction({ action: 'navigate', url: 'late-fail.example' }, { reveal: false })
+      await vi.advanceTimersByTimeAsync(BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      await expect(navigating).resolves.toMatchObject({ ok: true })
+      await vi.advanceTimersByTimeAsync(BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      vi.useRealTimers()
+    }
+  })
+
   it('reveals and embeds the physical browser for a Pi action from another tool tab', async () => {
     const { host, contents, view, createView, attach } = browserHarness()
     contents.pageText = '无需人工打开面板'
@@ -625,6 +693,29 @@ describe('BrowserSessionHost', () => {
     releaseA()
     await Promise.all([blockedA, queuedA])
     expect(created[0].contents.loadURL.mock.calls.some(([url]) => url === 'https://queued-a.example')).toBe(true)
+  })
+
+  it('unblocks the session action queue when loadURL never settles', async () => {
+    const { host, created } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    created[0].contents.hangLoadURL = true
+    vi.useFakeTimers()
+    try {
+      const hung = host.toolAction('session-a', { action: 'navigate', url: 'hung.example' })
+      let consoleDone = false
+      const queuedConsole = host.toolAction('session-a', { action: 'console' }).then(result => {
+        consoleDone = true
+        return result
+      })
+      await Promise.resolve()
+      expect(consoleDone).toBe(false)
+      await vi.advanceTimersByTimeAsync(BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS)
+      await expect(hung).resolves.toMatchObject({ ok: true })
+      await expect(queuedConsole).resolves.toMatchObject({ ok: true })
+      expect(consoleDone).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('applies visible bounds while the same-session navigation is still unresolved', async () => {

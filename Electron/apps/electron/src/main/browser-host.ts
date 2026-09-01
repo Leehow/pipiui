@@ -10,7 +10,7 @@
  *   - redaction.ts        page-world sanitization of bypass results
  *   - debug-envelope.ts   envelope assembly with page context
  *   - console-pipeline.ts console buffering + js-dialog notice fan-out
- *   - navigation-settle.ts reload() settle coordination
+ *   - navigation-settle.ts loadURL/reload settle bound (hung commit must not pin the queue)
  *   - tabs-host.ts        BrowserTabsHost (tabs, panes, navigation, tools)
  *   - session-host.ts     BrowserSessionHost (per-session spaces + queues)
  *   - bridge.ts           HostBackend extension (withBrowserTabsHost)
@@ -46,6 +46,7 @@ export type {
 } from './browser/types.js'
 
 export { BROWSER_HOST_TOOL_ACTIONS, shouldOpenBrowserDevTools } from './browser-debug.js'
+export { BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS } from './browser/navigation-settle.js'
 export {
   WATCHER_DEFAULT_INTERVAL_MS,
   WatcherRegistry,

@@ -35,7 +35,7 @@ import type { WatchWaitCheckRequest } from '../watcher-registry.js'
 import { createConsoleEntryListener, installJsDialogReporter, newDialogNonce } from './console-pipeline.js'
 import { controllerPrelude, observePayload, requestElementToken, requestTarget, hasStructuredLocator, tagObservation, untaggedRequest } from './dom-bridge.js'
 import { buildBrowserDebugEnvelope } from './debug-envelope.js'
-import { BROWSER_RELOAD_SETTLE_TIMEOUT_MS, NavigationSettle } from './navigation-settle.js'
+import { awaitLoadURL, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, NavigationSettle } from './navigation-settle.js'
 import { nativeViewUsable, traceBrowserAction, traceBrowserNative } from './native-view.js'
 import { sanitizeWithController } from './redaction.js'
 import type {
@@ -297,7 +297,7 @@ export class BrowserTabsHost {
     if (!this.isVisible() || !pane?.view) return copyTab(tab)
     tab.isLoading = true
     this.emit()
-    pane.pending = { tabId: tab.id, kind: 'reload', url: tab.url || 'about:blank' }
+    this.markPending(pane, { tabId: tab.id, kind: 'reload', url: tab.url || 'about:blank' })
     pane.view.webContents.reload()
     // Unlike loadURL/back/forward (which await the loadURL promise), native
     // reload() returns immediately. Await the same navigation-lifecycle settle
@@ -430,7 +430,16 @@ export class BrowserTabsHost {
     // sibling pane finishing its load must not clear this pane's navigation
     // window, and this pane's load must not block the sibling's actions.
     const pane = this.panes[kind]
-    return Boolean(pane.view && pane.pending) || pane.loading === true
+    if (!pane.view || (!pane.pending && pane.loading !== true)) return false
+    // Same bound as loadURL/reload settle: a commit that never lands must not
+    // keep every later tool action in browser_navigating forever.
+    const startedAt = pane.pending?.startedAt ?? pane.loadingStartedAt
+    if (startedAt != null && Date.now() - startedAt >= BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS) return false
+    return true
+  }
+
+  private markPending(pane: ViewPane, pending: { tabId: string; kind: NavigationKind; url: string }): void {
+    pane.pending = { ...pending, startedAt: Date.now() }
   }
 
   private debugEnvelope(request: BrowserToolRequest, extra: Record<string, unknown> = {}, options?: { truncate?: boolean }): BrowserDebugEnvelope {
@@ -1174,6 +1183,7 @@ export class BrowserTabsHost {
       pane.attachedVisible = undefined
       pane.pending = undefined
       pane.loading = undefined
+      pane.loadingStartedAt = undefined
       return
     }
     const contents = this.beginViewRetirement(pane, view)
@@ -1189,6 +1199,7 @@ export class BrowserTabsHost {
     pane.attachedVisible = undefined
     pane.pending = undefined
     pane.loading = undefined
+    pane.loadingStartedAt = undefined
     if (!this.attach) throw new Error('browser window is unavailable')
     const view = this.createView({ webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, partition: this.partition } })
     pane.view = view
@@ -1382,11 +1393,11 @@ export class BrowserTabsHost {
     pane.shownTabId = tab.id
     this.pendingDocumentOwnerTabIds[pane.kind] = tab.id
     this.navigationGeneration += 1
-    pane.pending = { tabId: tab.id, kind, url }
+    this.markPending(pane, { tabId: tab.id, kind, url })
     tab.isLoading = true
     this.emit()
     try {
-      await Promise.resolve(view.webContents.loadURL(url))
+      await awaitLoadURL(Promise.resolve(view.webContents.loadURL(url)))
       pane.loadedUrl = url
     } catch (error) {
       if (pane.pending?.tabId === tab.id) pane.pending = undefined
@@ -1402,11 +1413,11 @@ export class BrowserTabsHost {
         this.presentPane(retry, presented)
         retry.shownTabId = tab.id
         this.pendingDocumentOwnerTabIds[pane.kind] = tab.id
-        retry.pending = { tabId: tab.id, kind, url }
+        this.markPending(retry, { tabId: tab.id, kind, url })
         tab.isLoading = true
         this.emit()
         try {
-          await Promise.resolve(retry.view.webContents.loadURL(url))
+          await awaitLoadURL(Promise.resolve(retry.view.webContents.loadURL(url)))
           retry.loadedUrl = url
         } catch (retryError) {
           if (retry.pending?.tabId === tab.id) retry.pending = undefined
@@ -1452,6 +1463,8 @@ export class BrowserTabsHost {
     // Per-pane load state first: tab.isLoading is shared by both panes, so it
     // must never gate per-pane navigation guards.
     pane.loading = isLoading
+    if (isLoading) pane.loadingStartedAt ??= Date.now()
+    else pane.loadingStartedAt = undefined
     const tab = this.navigationTab(pane)
     if (!tab) return
     tab.isLoading = isLoading
@@ -1492,7 +1505,7 @@ export class BrowserTabsHost {
       if (pane.kind === source.kind || !pane.view) continue
       const current = pane.view.webContents.getURL?.() || pane.loadedUrl
       if (current === url) continue
-      pane.pending = { tabId: tab.id, kind: 'restore', url }
+      this.markPending(pane, { tabId: tab.id, kind: 'restore', url })
       void Promise.resolve(pane.view.webContents.loadURL(url)).then(() => {
         pane.loadedUrl = url
         pane.shownTabId = tab.id
@@ -1508,7 +1521,7 @@ export class BrowserTabsHost {
     this.applyMobileUserAgent(pane)
     const url = pane.loadedUrl || this.active?.url
     if (!url || url === 'about:blank') return
-    pane.pending = { tabId: this.active?.id ?? pane.shownTabId ?? '', kind: 'reload', url }
+    this.markPending(pane, { tabId: this.active?.id ?? pane.shownTabId ?? '', kind: 'reload', url })
     pane.view.webContents.reload()
   }
 
