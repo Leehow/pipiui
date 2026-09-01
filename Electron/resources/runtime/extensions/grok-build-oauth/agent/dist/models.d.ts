@@ -71,5 +71,6 @@ export declare function grokBuildManifestModels(): Array<{
     api: typeof GROK_BUILD_CHAT_API;
     input: string[];
     reasoning: boolean;
+    contextWindow: number;
     capabilities: GrokBuildModelCapabilities;
 }>;

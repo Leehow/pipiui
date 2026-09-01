@@ -40,6 +40,8 @@ describe("grok-build conversation catalog gating", () => {
     expect(grokBuildManifestModels().map((model) => model.id)).toEqual([
       ...GROK_BUILD_CONVERSATION_MODEL_IDS,
     ]);
+    expect(grokBuildManifestModels().find((model) => model.id === "grok-4.6")?.contextWindow).toBe(500000);
+    expect(claim.contribution.provider.models.find((model) => model.id === "grok-4.6")?.contextWindow).toBe(500000);
     expect(GROK_BUILD_CONVERSATION_MODEL_IDS).not.toContain("grok-imagine-image-quality");
     expect(grokBuildManifestModels().every((model) => model.api === "openai-responses")).toBe(true);
     expect(grokBuildManifestModels().every((model) => (

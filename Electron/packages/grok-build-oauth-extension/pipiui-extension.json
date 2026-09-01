@@ -20,6 +20,7 @@
           "api": "openai-responses",
           "input": ["text", "image"],
           "reasoning": true,
+          "contextWindow": 500000,
           "capabilities": {
             "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
             "structuredOutputs": true,
@@ -33,6 +34,7 @@
           "api": "openai-responses",
           "input": ["text"],
           "reasoning": false,
+          "contextWindow": 256000,
           "capabilities": {
             "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
             "structuredOutputs": true,
@@ -46,6 +48,7 @@
           "api": "openai-responses",
           "input": ["text"],
           "reasoning": false,
+          "contextWindow": 256000,
           "capabilities": {
             "hostedTools": { "tools": ["web_search", "x_search", "code_interpreter"] },
             "structuredOutputs": true,

@@ -20,6 +20,7 @@ describe("grok-build conversation request adapter", () => {
     expect(provider.baseUrl).toBe("https://api.x.ai/v1");
     expect(provider.authHeader).toBe(true);
     expect(provider.models.map((model) => model.id)).toEqual([...GROK_BUILD_CONVERSATION_MODEL_IDS]);
+    expect(provider.models.find((model) => model.id === "grok-4.6")?.contextWindow).toBe(500000);
     expect(provider.models.every((model) => model.capabilities?.nativeSearch.tools.includes("web_search"))).toBe(true);
     expect(provider.models.every((model) => model.capabilities?.nativeSearch.tools.includes("x_search"))).toBe(true);
     expect(provider.models.every((model) => model.capabilities?.hostedTools.tools.includes("code_interpreter"))).toBe(true);

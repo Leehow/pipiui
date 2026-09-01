@@ -40,7 +40,7 @@ export const GROK_BUILD_CONVERSATION_MODELS = [
         reasoning: true,
         input: ["text", "image"],
         cost: { ...ZERO_COST },
-        contextWindow: 256000,
+        contextWindow: 500000,
         maxTokens: 16384,
         thinkingLevelMap: {
             off: null,
@@ -85,6 +85,7 @@ export function grokBuildManifestModels() {
         api: model.api,
         input: [...model.input],
         reasoning: model.reasoning,
+        contextWindow: model.contextWindow,
         capabilities: {
             hostedTools: {
                 tools: [...(model.capabilities?.hostedTools.tools ?? GROK_BUILD_HOSTED_TOOLS.tools)],
