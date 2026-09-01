@@ -140,6 +140,18 @@ describe("pi spawn env injects the configured profile .env (T17 parity)", () => 
     expect(env().PATH?.split(":" ).slice(0, 2)).toEqual(["/bundle/node/bin", "/bundle/pi/bin"]);
   });
 
+  it("does not import the host-global legacy project registry into a HOME-less sandbox", async () => {
+    // The host env below deliberately has no HOME. The legacy Swift registry is
+    // user-scoped, so nothing may be imported from the real homedir: a leaked
+    // import used to register the developer's real projects in this sandbox and
+    // then repoint their on-disk credential files at this temp fixture.
+    const { backend } = await fixture(undefined, {});
+    const projects = await backend.handle("listProjects", []) as Array<{ path: string }>;
+    for (const project of projects) {
+      expect(project.path.startsWith(root)).toBe(true);
+    }
+  });
+
   it("pins isolated Pi paths and explicit resource flags above conflicting inherited values", async () => {
     const { backend, env, command } = await fixture(
       "PI_CODING_AGENT_DIR=/global-dotenv\nPI_CODING_AGENT_SESSION_DIR=/global-dotenv/sessions\n",

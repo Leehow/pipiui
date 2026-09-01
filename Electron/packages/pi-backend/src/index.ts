@@ -753,7 +753,14 @@ export type PiBackendOptions = {
 
 async function swiftCanonicalProjectPaths(env: NodeJS.ProcessEnv): Promise<string[] | undefined> {
   if (process.platform !== "darwin") return undefined;
-  const home = env.HOME || homedir();
+  // The legacy Swift registry is user-scoped: a host whose env injects no HOME
+  // (sandboxed tests) has no user to import from. Falling back to homedir()
+  // made such hosts read the REAL developer's plist, migrate the real project
+  // list into the sandbox profile, and then isolated-home seeding repointed the
+  // real projects' credential files at test temp dirs that vanish when the test
+  // ends — every provider call in the running app then failed with ENOENT.
+  const home = env.HOME;
+  if (!home) return undefined;
   const plist = join(home, "Library", "Preferences", "com.leehow.pipiui.plist");
   return new Promise(resolveValue => {
     execFile("/usr/bin/plutil", ["-extract", "pipiui\\.projects", "json", "-o", "-", plist], { env }, (error, stdout) => {
