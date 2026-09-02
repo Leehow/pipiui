@@ -3104,6 +3104,20 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
 
   const newSession = async (projectId = selectedProject) => {
     if (!projectId) return
+    if (projectId.startsWith('pending-project:')) {
+      // Adding a project inserts a `pending-project:<path>` optimistic sidebar entry
+      // until the backend confirms and the refresh swaps in the real dirId-derived
+      // id. A session on the placeholder always fails backend-side (`unknown
+      // project`), so resolve the real entry first; while the add is still in
+      // flight, say so instead of surfacing the raw backend error.
+      const pendingPath = projectId.slice('pending-project:'.length)
+      const real = projects.find(project => project.path === pendingPath && !project.id.startsWith('pending-project:'))
+      if (!real) {
+        setProjectError('项目正在添加中，请等它出现在列表后再新建会话')
+        return
+      }
+      projectId = real.id
+    }
     if (selectedSession) messagesBySessionRef.current.set(selectedSession, messagesRef.current)
     let session
     try {
