@@ -7,6 +7,7 @@ import WebSocket from 'ws'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
 import { createHostAPIRelay } from '../../../../../Relay/src/host-api-relay.js'
 import {
+  bindRemoteControlSleepPrevention,
   createRemoteControlService,
   pairUrlFor,
   probeRemotePairLink,
@@ -792,4 +793,53 @@ describe('remote pair link check', () => {
     const checked = await handler?.({ sender: { send() {} } }, { type: 'checkLink' })
     expect(checked?.linkCheck?.status).toBe('ok')
   }, 15_000)
+})
+
+describe('bindRemoteControlSleepPrevention', () => {
+  function makeService(initialEnabled: boolean) {
+    let listeners: Array<(state: RemoteControlState) => void> = []
+    let state = { enabled: initialEnabled }
+    return {
+      service: {
+        getState: () => state,
+        subscribe(listener: (state: RemoteControlState) => void) {
+          listeners.push(listener)
+          return () => { listeners = listeners.filter(item => item !== listener) }
+        }
+      },
+      setEnabled(enabled: boolean) {
+        state = { ...state, enabled }
+        for (const listener of [...listeners]) listener(state as RemoteControlState)
+      }
+    }
+  }
+
+  it('holds a blocker while enabled and releases it when disabled', () => {
+    const start = vi.fn(() => 7)
+    const stop = vi.fn()
+    const { service, setEnabled } = makeService(false)
+    const unbind = bindRemoteControlSleepPrevention(service as never, { start, stop })
+    expect(start).not.toHaveBeenCalled()
+    setEnabled(true)
+    expect(start).toHaveBeenCalledWith('prevent-app-suspension')
+    expect(start).toHaveBeenCalledTimes(1)
+    setEnabled(true)
+    expect(start).toHaveBeenCalledTimes(1)
+    setEnabled(false)
+    expect(stop).toHaveBeenCalledWith(7)
+    expect(stop).toHaveBeenCalledTimes(1)
+    setEnabled(true)
+    expect(start).toHaveBeenCalledTimes(2)
+    unbind()
+    setEnabled(false)
+    expect(stop).toHaveBeenCalledTimes(1)
+  })
+
+  it('acquires immediately when the room is already enabled', () => {
+    const start = vi.fn(() => 3)
+    const stop = vi.fn()
+    const { service } = makeService(true)
+    bindRemoteControlSleepPrevention(service as never, { start, stop })
+    expect(start).toHaveBeenCalledTimes(1)
+  })
 })

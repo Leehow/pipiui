@@ -606,6 +606,37 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
 
 export type RemoteControlService = ReturnType<typeof createRemoteControlService>
 
+export type SleepPreventerLike = {
+  start(type: 'prevent-app-suspension' | 'prevent-display-sleep'): number
+  stop(id: number): void
+}
+
+/**
+ * Holds a system power assertion while the remote-control room is enabled.
+ * A sleeping host drops the relay socket and becomes unreachable, so idle
+ * sleep must be blocked for as long as remote control is on; the display
+ * may still sleep ('prevent-app-suspension' maps to NoIdleSleepAssertion
+ * on macOS). Returns an unsubscribe function.
+ */
+export function bindRemoteControlSleepPrevention(
+  service: Pick<RemoteControlService, 'getState' | 'subscribe'>,
+  power: SleepPreventerLike
+): () => void {
+  let blockerId: number | null = null
+  const sync = (enabled: boolean) => {
+    if (enabled && blockerId === null) {
+      blockerId = power.start('prevent-app-suspension')
+      return
+    }
+    if (!enabled && blockerId !== null) {
+      power.stop(blockerId)
+      blockerId = null
+    }
+  }
+  sync(service.getState().enabled)
+  return service.subscribe(state => sync(state.enabled))
+}
+
 function mergeRemoteState(relay: RemoteControlState, debug?: RemoteDebugState): RemoteControlState {
   return {
     ...relay,
