@@ -1548,6 +1548,30 @@ async function readHistoryFallback(
     return entry ? [entry] : [];
   });
 }
+/**
+ * Serialize a host-owned `pipiui_product_profile` session row. Every row the host
+ * writes into a session JSONL MUST carry `id`/`parentId`: pi's SessionManager
+ * indexes every non-header row and makes it the leaf, so an id-less row sets the
+ * leaf to undefined, the next child-written entry loses its parentId, and every
+ * earlier entry (e.g. an adopted external session's imported history) is orphaned
+ * from the model context while the UI still displays it.
+ */
+export function pipiuiProductProfileRow(input: {
+  profileId: string;
+  fingerprint: string;
+  extensions: readonly { id: string; version: string }[];
+  parentId: string | null;
+}): string {
+  return JSON.stringify({
+    type: "pipiui_product_profile",
+    id: crypto.randomUUID(),
+    parentId: input.parentId,
+    timestamp: new Date().toISOString(),
+    profileId: input.profileId,
+    fingerprint: input.fingerprint,
+    extensions: input.extensions,
+  });
+}
 async function lastJsonlEntryId(path: string): Promise<string | null> {
   const stat = await fs.stat(path);
   const length = Math.min(stat.size, 256 * 1024);
@@ -5243,11 +5267,11 @@ export class PiHostBackend implements HostBackend {
       }),
     };
     const lines = [JSON.stringify(header)];
-    lines.push(JSON.stringify({
-      type: "pipiui_product_profile",
+    lines.push(pipiuiProductProfileRow({
       profileId: initialProductProfile.id,
       fingerprint: initialProductProfile.fingerprint,
       extensions: [],
+      parentId: null,
     }));
     if (name)
       lines.push(
@@ -5557,15 +5581,18 @@ export class PiHostBackend implements HostBackend {
     };
     if (found.productProfile?.id !== productProfile.id
       || found.productProfile.fingerprint !== productProfile.fingerprint) {
-      await fs.appendFile(found.path, `${JSON.stringify({
-        type: "pipiui_product_profile",
+      const productProfileRow = pipiuiProductProfileRow({
         profileId: productProfile.id,
         fingerprint: productProfile.fingerprint,
         extensions: productSpawn.registeredExtensions
           .filter(item => item.enabled)
           .map(item => ({ id: item.id, version: item.version ?? "unknown" }))
           .sort((a, b) => a.id.localeCompare(b.id)),
-      })}\n`, "utf8");
+        // Chain onto the current last row so the pi child that loads this file
+        // keeps every earlier entry reachable from the leaf (adopted history).
+        parentId: await lastJsonlEntryId(found.path),
+      });
+      await fs.appendFile(found.path, `${productProfileRow}\n`, "utf8");
       found.productProfile = productProfile;
       const profileStat = await fs.stat(found.path);
       this.rememberSessionMeta(found, profileStat.size, profileStat.mtimeMs);

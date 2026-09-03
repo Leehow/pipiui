@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createPiHostBackend } from "../src/index.js";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { createPiHostBackend, pipiuiProductProfileRow } from "../src/index.js";
 import {
   buildAdoptedPiSessionJsonl,
   canAdoptExternalHistory,
@@ -21,6 +22,19 @@ afterEach(async () => {
 
 function jsonl(rows: unknown[]): string {
   return rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+}
+
+async function findSessionFile(rootDir: string, sessionId: string): Promise<string> {
+  const stack = [rootDir];
+  while (stack.length) {
+    const dir = stack.pop()!;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) stack.push(path);
+      else if (entry.isFile() && entry.name.endsWith(`_${sessionId}.jsonl`)) return path;
+    }
+  }
+  throw new Error(`session file for ${sessionId} not found under ${rootDir}`);
 }
 
 describe("adopt converter", () => {
@@ -137,6 +151,59 @@ describe("adoptExternalSession API", () => {
       await backend.handle("deleteSession", [first.id]);
       const restored = await backend.handle("listExternalSessions", [projectId]) as { id: string }[];
       expect(restored.some((item) => item.id === "ext:claude:claude-keep")).toBe(true);
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("keeps adopted history reachable from the pi context after a product-profile append", async () => {
+    // Regression: a host-written session row without id/parentId made pi's
+    // SessionManager take it as the leaf, so the child's next append lost its
+    // parentId and orphaned every imported message from the model context.
+    root = await mkdtemp(join(tmpdir(), "pipi-adopt-chain-"));
+    const home = join(root, "home");
+    const project = join(root, "proj");
+    const claudeDir = join(home, ".claude", "projects", encodeClaudeProjectDir(project));
+    await mkdir(project, { recursive: true });
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(join(claudeDir, "claude-keep.jsonl"), jsonl([
+      { type: "user", cwd: project, sessionId: "claude-keep", uuid: "cu1", timestamp: "2026-08-01T00:00:00.000Z", message: { role: "user", content: "keep claude" } },
+      { type: "assistant", cwd: project, sessionId: "claude-keep", uuid: "ca1", timestamp: "2026-08-01T00:01:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "ok claude" }] } },
+    ]));
+
+    const backend = createPiHostBackend({
+      agentDir: join(root, "agent"),
+      sessionsRoot: join(root, "sessions"),
+      canonicalProjectPaths: async () => undefined,
+      externalSessionRoots: { home },
+      env: { ...process.env, HOME: home },
+    });
+    try {
+      await backend.handle("setProjectPaths", [[project]]);
+      const adopted = await backend.handle("adoptExternalSession", ["ext:claude:claude-keep"]) as { id: string };
+      const file = await findSessionFile(root, adopted.id);
+
+      // The host appends a product-profile row before each child spawn; it must
+      // chain onto the file's last row exactly like the production writer does.
+      const lines = (await readFile(file, "utf8")).trim().split("\n");
+      const lastId = JSON.parse(lines[lines.length - 1]!).id as string;
+      const row = JSON.parse(pipiuiProductProfileRow({
+        profileId: "coding",
+        fingerprint: "test",
+        extensions: [],
+        parentId: lastId,
+      }));
+      expect(typeof row.id).toBe("string");
+      expect(row.parentId).toBe(lastId);
+      await appendFile(file, JSON.stringify(row) + "\n");
+
+      // What the pi child does on load: index the file, then append on top.
+      const manager = SessionManager.open(file);
+      manager.appendModelChange("provider", "model");
+      const context = manager.buildSessionContext();
+      const contents = context.messages.map((message: { content?: unknown }) => JSON.stringify(message.content));
+      expect(contents.some((text: string) => text.includes("keep claude"))).toBe(true);
+      expect(contents.some((text: string) => text.includes("ok claude"))).toBe(true);
     } finally {
       await backend.close();
     }
