@@ -3332,7 +3332,18 @@ export class PiHostBackend implements HostBackend {
     if (this.queue.hasPendingCutIn(sessionId)) {
       await this.abortSessionTurn(sessionId, { drain: "cutIn" }, runtimeToken);
     }
-    await accepted;
+    try {
+      await accepted;
+    } catch (error) {
+      // A cut-in that ends still queued (compaction gate holding it, user Stop
+      // restoring it) is not a failure: the item stays deliverable and drains
+      // on the next idle edge. Only a genuinely failed delivery throws.
+      const current = this.queue
+        .listQueue(sessionId)
+        .find(item => item.id === messageId);
+      if (current && current.state !== "failed") return current;
+      throw error;
+    }
     return message;
   }
   private async enqueueMessage(

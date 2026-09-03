@@ -3063,11 +3063,14 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       // message must never abort or steer the current Boss turn.
       // The message stays in the queue panel only; it enters the transcript
       // when the queue actually sends it and the real user echo lands.
+      // Pre-enqueue failures (attachment conversion) bubble up to the composer
+      // error bar; enqueue failures return false so the draft is restored while
+      // useSessionQueue surfaces the reason in its own queue-operation-error bar.
+      telemetry.preflightStartedAt = Date.now()
+      const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
+      if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
+      finishRendererPreflight(telemetry, payload)
       try {
-        telemetry.preflightStartedAt = Date.now()
-        const payload = attachments?.length ? await Promise.all(attachments.map(toPromptAttachment)) : undefined
-        if (documentPaths.length) await host.notifyComposerDocumentsDropped?.(targetSession, documentPaths)?.catch(error => console.warn('[composer-docs]', error))
-        finishRendererPreflight(telemetry, payload)
         await sessionQueue.enqueue(prompt, payload, telemetry)
         return true
       } catch {

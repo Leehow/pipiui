@@ -2737,6 +2737,28 @@ describe('PipiUI main layout', () => {
     expect(sendPrompt).toHaveBeenCalledTimes(1)
   })
 
+  it('surfaces enqueue failure while busy instead of silently restoring the draft', async () => {
+    const base = createMockHost()
+    const sendPrompt = vi.fn(async () => undefined)
+    const enqueueMessage = vi.fn(async () => { throw new Error('队列写入失败') })
+    const host: PipiHostAPI = { ...base, sendPrompt, enqueueMessage, listQueue: async () => [] }
+    render(<App host={host} />)
+    await screen.findAllByText('Electron 三栏界面')
+
+    const composer = screen.getByLabelText('消息输入框')
+    fireEvent.change(composer, { target: { value: '第一条直发' } })
+    await waitFor(() => expect((screen.getByLabelText('发送消息') as HTMLButtonElement).disabled).toBe(false))
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(sendPrompt).toHaveBeenCalledWith('welcome', '第一条直发', undefined, rendererTelemetryMatcher()))
+
+    fireEvent.change(screen.getByLabelText('消息输入框'), { target: { value: '第二条被拒' } })
+    await waitFor(() => expect(screen.getByLabelText('发送消息')).toBeTruthy())
+    fireEvent.click(screen.getByLabelText('发送消息'))
+    await waitFor(() => expect(enqueueMessage).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('queue-operation-error').textContent).toContain('队列写入失败'))
+    expect((screen.getByLabelText('消息输入框') as HTMLTextAreaElement).value).toBe('第二条被拒')
+  })
+
   it('keeps a busy queued message out of the transcript until the queue drains it', async () => {
     const base = createMockHost()
     let listener: ((event: StreamEvent) => void) | undefined

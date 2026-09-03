@@ -378,7 +378,10 @@ describe("PiHostBackend message queue integration", () => {
     expect(await backend.handle("listQueue", ["s1"])).toEqual([
       expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "queued" }),
     ]);
-    await expect(cutIn).rejects.toThrow(/remains queued/);
+    // A stop-unwound cut-in is not a failure: the RPC reports the restored,
+    // still-deliverable item instead of rejecting with "remains queued".
+    const restored = await cutIn as any;
+    expect(restored).toEqual(expect.objectContaining({ id: queued.message.id, text: "unstick me", state: "queued" }));
     off();
     await backend.close();
   });

@@ -75,6 +75,10 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
   const sessionRef = useRef(sessionId)
   const queueRef = useRef<QueuedMessage[]>(queue)
   const pendingRef = useRef(false)
+  const pendingCountRef = useRef(0)
+  // Overlapping queue mutations serialize on this chain instead of rejecting:
+  // a burst of sends or strip actions must never silently drop the later one.
+  const mutationChainRef = useRef<Promise<unknown>>(Promise.resolve())
   const loadGenerationRef = useRef(0)
   const resyncGenerationRef = useRef(0)
   const snapshotGenerationRef = useRef(0)
@@ -86,6 +90,7 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
     resyncGenerationRef.current += 1
     const snapshotGeneration = snapshotGenerationRef.current
     pendingRef.current = false
+    pendingCountRef.current = 0
     setPending(false)
     setError(null)
     setExpanded(false)
@@ -138,17 +143,20 @@ export function useSessionQueue(host: PipiHostAPI, sessionId: string, streaming:
   const mutate = useCallback(async <T,>(operation: (activeSessionId: string) => Promise<T>): Promise<T> => {
     const activeSessionId = sessionRef.current
     if (!activeSessionId) throw new Error('未选择会话')
-    if (pendingRef.current) throw new Error('队列操作进行中')
+    pendingCountRef.current += 1
     pendingRef.current = true
     setPending(true)
     setError(null)
+    const run = mutationChainRef.current.then(() => operation(activeSessionId))
+    mutationChainRef.current = run.then(() => undefined, () => undefined)
     try {
-      return await operation(activeSessionId)
+      return await run
     } catch (error) {
       if (sessionRef.current === activeSessionId) setError(`队列操作失败：${queueError(error)}`)
       throw error
     } finally {
-      if (sessionRef.current === activeSessionId) {
+      pendingCountRef.current = Math.max(0, pendingCountRef.current - 1)
+      if (sessionRef.current === activeSessionId && pendingCountRef.current === 0) {
         pendingRef.current = false
         setPending(false)
       }
