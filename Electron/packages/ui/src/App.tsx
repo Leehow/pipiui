@@ -2624,6 +2624,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (event.type === 'compaction') {
+        if (event.sessionId !== selectedSessionRef.current) return
         // Notice-only events (compaction check / idle-fold nudge / skip) never
         // ran anything: no transcript line, no pill — and never “已压缩”.
         if (event.executed === false) return
@@ -2646,6 +2647,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (event.type === 'secret_redact') {
+        if (event.sessionId !== selectedSessionRef.current) return
         const next = applySecretRedact(messagesRef.current, event.messages)
         if (next !== messagesRef.current) {
           transcriptLiveRevisionRef.current += 1
@@ -2656,6 +2658,14 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (event.type === 'user_message') {
+        // Background-projected lifecycle events arrive for EVERY session so the
+        // sidebar stays correct; only the selected session may touch the
+        // visible transcript or turn state. A foreign user echo landing here
+        // is exactly the cross-session transcript bleed this guard prevents.
+        if (event.sessionId !== selectedSessionRef.current) {
+          applyObservedStatus(event.sessionId, 'running')
+          return
+        }
         const pendingEcho = pendingLocalUserRef.current
         pendingLocalUserRef.current = null
         const next = appendLiveUserMessage(messagesRef.current, event, pendingEcho ?? undefined)
@@ -2695,6 +2705,17 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       }
       if (event.type === 'status') {
         const terminal = event.status === 'settled' || event.status === 'stopped'
+        if (event.sessionId !== selectedSessionRef.current) {
+          // Another session's lifecycle: sidebar status and recency only. A
+          // foreign started/streaming must not open this window's turn or wait
+          // pill, and a foreign terminal must not reconcile this transcript.
+          const foreignStatus: SessionStatus = event.status === 'started' || event.status === 'streaming'
+            ? 'running'
+            : event.status === 'settled' ? 'completed' : 'interrupted'
+          applyObservedStatus(event.sessionId, foreignStatus)
+          setSessions(current => current.map(session => session.id === event.sessionId ? { ...session, updatedAt: Date.now() } : session))
+          return
+        }
         const openedTurnEpoch = openedTurnEpochBySessionRef.current.get(event.sessionId)
         // Durable history recovery is independent of whether this terminal is
         // allowed to mutate the currently open turn. A renderer which missed
@@ -2755,6 +2776,10 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       // finishes, openai-completions providers often generate the next step
       // with no thinking/text deltas — reopen a thinking wait so the tail
       // does not look idle while the composer still says 生成中.
+      // Content deltas (thinking/text/tool_call/…) are projected only for the
+      // selected session host-side; keep the renderer correct even if a
+      // transport or projection change ever leaks a foreign one.
+      if (event.sessionId !== selectedSessionRef.current) return
       const turnClosed = !mainTurnOpenRef.current && (
         observedSessionStatusesRef.current[event.sessionId] === 'completed'
         || observedSessionStatusesRef.current[event.sessionId] === 'interrupted'
