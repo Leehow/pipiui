@@ -1,4 +1,5 @@
 import { ChildProcessWithoutNullStreams, execFile, spawn } from "node:child_process";
+import { createExtensionHostWorkers, type ExtensionHostWorkers } from "./extension-host-workers.js";
 import { closeSync, constants as fsConstants, createReadStream, createWriteStream, existsSync, lstatSync, openSync, readFileSync, realpathSync, watch, writeSync, promises as fs, type Dirent } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -2148,6 +2149,7 @@ export class PiHostBackend implements HostBackend {
   private projectionDebugProvenance = new Map<string, string>();
   private projectionDebugFilePath: string | null | undefined;
   private live = new Map<string, Live>();
+  private readonly extensionHostWorkers: ExtensionHostWorkers;
   /** A close/delete race may reach the same child through both teardown and spawn. */
   private readonly liveStopPromises = new WeakMap<Live, Promise<void>>();
   /** Active, deduplicated session runtime teardown operations. */
@@ -2498,6 +2500,15 @@ export class PiHostBackend implements HostBackend {
       sharedStoreRoot: this.extensionStoreRoot(),
     });
     this.extensionLoader.scan();
+    this.extensionHostWorkers = createExtensionHostWorkers({
+      onEvent: (event) =>
+        console.info(
+          `[pipiui-host-worker] ${event.type} ${event.extensionId}` +
+            ("pid" in event ? ` pid=${event.pid}` : "") +
+            ("code" in event ? ` code=${event.code}` : "") +
+            ("message" in event ? ` ${event.message}` : ""),
+        ),
+    });
     this.extensionHotReload = new ExtensionHotReloader({
       roots: [],
       onChanged: (extensionId) => this.onExtensionFilesChanged(extensionId),
@@ -3048,6 +3059,8 @@ export class PiHostBackend implements HostBackend {
 
   /** Graceful connection teardown for hosts that allocate one backend per client. */
   async close(): Promise<void> {
+    // 宿主 worker 的生命周期就是"项目开着"，宿主关掉它们就该结束。
+    this.extensionHostWorkers.stopAll();
     if (this.closed) return;
     // Sweep before closed=true: abortSessionTurn no longer stops workers, so host
     // exit is the remaining path that must reap leftover subagent processes.
@@ -4001,7 +4014,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack" | "installExtensionZip") {
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "listExtensionData" | "readExtensionData" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack" | "installExtensionZip") {
       case "listProductProfiles":
         return this.listProductProfiles(params[0]);
       case "getProductProfile":
@@ -4078,6 +4091,10 @@ export class PiHostBackend implements HostBackend {
         return this.logoutExtension(params[0]);
       case "invokeExtension":
         return this.invokeExtension(params[0], params[1], params[2], params[3]);
+      case "listExtensionData":
+        return this.listExtensionData(params[0], params[1], params[2]);
+      case "readExtensionData":
+        return this.readExtensionData(params[0], params[1], params[2], params[3]);
       case "extensionUiResponse":
         return this.extensionUiResponse(params[0], params[1], params[2]);      case "listDocuments":
         return this.listOpenedDocuments();
@@ -8028,6 +8045,72 @@ export class PiHostBackend implements HostBackend {
       return this.extensionLoader.readUiEntrySource(id, entryValue);
     });
   }
+  /**
+   * Start a host worker for every enabled extension that declares one, stop the rest.
+   * Idempotent: a rescan that changes nothing spawns nothing. `host.worker` is a declared
+   * capability, so an enabled package without it never runs here.
+   */
+  private async reconcileHostWorkers(projectRoot?: string): Promise<void> {
+    if (!projectRoot) {
+      this.extensionHostWorkers.stopAll();
+      return;
+    }
+    // 必须用与别处一致的启用视图：registry 自己的记录在没套 overlay 时是 disabled，
+    // 用它判断会得出"一个都没启用"，worker 永远起不来。
+    const overlay = await this.mergedExtensionOverlay(projectRoot);
+    const specs = [];
+    for (const item of this.extensionLoader.list(overlay)) {
+      if (item.state !== "enabled") continue;
+      if (!this.extensions.hasCapability(item.id, "host.worker")) continue;
+      const entry = this.extensionLoader.hostWorkerEntry(item.id);
+      if (!entry) continue;
+      specs.push({ extensionId: item.id, entry, projectRoot });
+    }
+    this.extensionHostWorkers.reconcile(specs);
+  }
+
+  private async listExtensionData(
+    idValue: unknown,
+    dirValue: unknown,
+    projectId?: unknown,
+  ): Promise<{ name: string; bytes: number; mtime: number }[]> {
+    const { id, projectRoot } = await this.resolveExtensionDataAccess(idValue, projectId);
+    if (typeof dirValue !== "string" || !dirValue.trim()) throw new Error("data dir 必须是 string");
+    return this.extensionLoader.listDataFiles(id, projectRoot, dirValue);
+  }
+
+  /** Read the tail of one declared data file. Same gates as `listExtensionData`. */
+  private async readExtensionData(
+    idValue: unknown,
+    pathValue: unknown,
+    optionsValue?: unknown,
+    projectId?: unknown,
+  ): Promise<{ content: string; bytes: number; truncated: boolean }> {
+    const { id, projectRoot } = await this.resolveExtensionDataAccess(idValue, projectId);
+    if (typeof pathValue !== "string" || !pathValue.trim()) throw new Error("data path 必须是 string");
+    const tail = isRecord(optionsValue) && typeof optionsValue.tailBytes === "number" ? optionsValue.tailBytes : undefined;
+    return this.extensionLoader.readDataFile(id, projectRoot, pathValue, tail);
+  }
+
+  private async resolveExtensionDataAccess(
+    idValue: unknown,
+    projectId?: unknown,
+  ): Promise<{ id: string; projectRoot: string }> {
+    if (typeof idValue !== "string" || !idValue.trim()) throw new Error("extension id 必须是 string");
+    const id = idValue.trim();
+    if (typeof projectId !== "string" || !projectId.trim()) throw new Error("data 读取需要 projectId");
+    const projectRoot = await this.projectPath(projectId);
+    if (!projectRoot) throw new Error(`unknown project ${projectId}`);
+    return this.withStableExtensionScan(projectRoot, async () => {
+      const overlay = await this.extensionEnableOverlay(projectId);
+      const item = this.extensionLoader.list(overlay).find((entry) => entry.id === id);
+      if (!item) throw new Error(`unknown extension ${id}`);
+      if (item.state !== "enabled") throw new Error(`extension ${id} is not enabled`);
+      if (!this.extensions.hasCapability(id, "data.read")) throw new Error("capability_denied");
+      return { id, projectRoot };
+    });
+  }
+
   private async getExtensionAuthStatus(
     idValue: unknown,
     projectId?: unknown,

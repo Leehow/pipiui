@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   EXTENSION_L2_CAPABILITIES,
@@ -7,6 +7,8 @@ import {
   originPrecedence,
   parseExtensionManifestJson,
   type ExtensionAgentPatch,
+  type ExtensionDataSummary,
+  type ExtensionHostSummary,
   type ExtensionUiSummary,
   type ManifestValidation,
   type ValidatedExtensionManifest,
@@ -97,6 +99,11 @@ function confinedRealpath(path: string, jail: string): string | undefined {
 }
 
 const EXTENSION_UI_ENTRY_MAX_BYTES = 2 * 1024 * 1024;
+/** A panel reads a tail, not a corpus: one read is capped, and so is the default. */
+const EXTENSION_DATA_MAX_BYTES = 512 * 1024;
+const EXTENSION_DATA_DEFAULT_TAIL = 128 * 1024;
+/** A declared directory is for shards, not a tree: one flat listing, bounded. */
+const EXTENSION_DATA_MAX_ENTRIES = 200;
 
 function declaredUiEntryPaths(ui: ExtensionUiSummary | undefined): Set<string> {
   if (!ui) return new Set();
@@ -566,6 +573,8 @@ export class ExtensionLoader {
   private readonly appRoot: string;
   private readonly sharedStoreRoot?: string;
   private readonly ui = new Map<string, ExtensionUiSummary>();
+  private readonly data = new Map<string, ExtensionDataSummary>();
+  private readonly host = new Map<string, ExtensionHostSummary>();
   private readonly settings = new Map<string, ExtensionSettingsManifest>();
   private readonly auth = new Map<string, ExtensionAuthContribution>();
   private readonly updateComponents = new Map<string, ExtensionUpdateComponent[]>();
@@ -646,6 +655,8 @@ export class ExtensionLoader {
   private drop(id: string): void {
     unloadSafe(this.registry, id);
     this.ui.delete(id);
+    this.data.delete(id);
+    this.host.delete(id);
     this.settings.delete(id);
     this.auth.delete(id);
     this.updateComponents.delete(id);
@@ -746,6 +757,10 @@ export class ExtensionLoader {
       }
       if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
       else this.ui.delete(descriptor.id);
+      if (manifest?.data) this.data.set(descriptor.id, manifest.data);
+      else this.data.delete(descriptor.id);
+      if (manifest?.host) this.host.set(descriptor.id, manifest.host);
+      else this.host.delete(descriptor.id);
       if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
       if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
       else this.auth.delete(descriptor.id);
@@ -764,6 +779,10 @@ export class ExtensionLoader {
     this.directories.set(descriptor.id, pkg.directory);
     if (manifest?.ui) this.ui.set(descriptor.id, manifest.ui);
     else this.ui.delete(descriptor.id);
+    if (manifest?.data) this.data.set(descriptor.id, manifest.data);
+    else this.data.delete(descriptor.id);
+    if (manifest?.host) this.host.set(descriptor.id, manifest.host);
+    else this.host.delete(descriptor.id);
     if (manifest?.settings) this.settings.set(descriptor.id, manifest.settings);
     else this.settings.delete(descriptor.id);
     if (manifest?.auth) this.auth.set(descriptor.id, manifest.auth);
@@ -806,6 +825,95 @@ export class ExtensionLoader {
       return readFileSync(real, "utf8");
     } catch {
       throw new Error(`extension ${id} UI entry is unavailable`);
+    }
+  }
+
+  /** Absolute path of a declared `host.worker`, confined to the package. */
+  hostWorkerEntry(id: string): string | undefined {
+    const declared = this.host.get(id)?.worker;
+    const directory = this.directories.get(id);
+    if (!declared || !directory) return undefined;
+    const candidate = confinedJoin(directory, declared);
+    return candidate ? confinedRealpath(candidate, directory) : undefined;
+  }
+
+  /** `app.data.read` roots, project-relative. Empty when the package declares none. */
+  dataRoots(id: string): string[] {
+    return this.data.get(id)?.read ?? [];
+  }
+
+  /**
+   * Resolve a project-relative path against this package's declared data roots.
+   *
+   * Two jails, both required: the path must sit under one declared root, and the realpath
+   * must stay inside the project. A symlink that points out of the project resolves to
+   * undefined rather than to its target.
+   */
+  private confinedDataPath(id: string, projectRoot: string, requested: string): string | undefined {
+    const rel = (requested || "").trim();
+    if (!rel || rel.includes("..")) return undefined;
+    const roots = this.dataRoots(id);
+    if (!roots.length) return undefined;
+    const normalized = rel.replace(/\\/g, "/").replace(/^\/+/, "");
+    const declared = roots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+    if (!declared) return undefined;
+    const candidate = confinedJoin(projectRoot, normalized);
+    return candidate ? confinedRealpath(candidate, projectRoot) : undefined;
+  }
+
+  /** Flat listing of one declared directory: name, size, mtime. Never recursive. */
+  listDataFiles(id: string, projectRoot: string, dir: string): { name: string; bytes: number; mtime: number }[] {
+    const real = this.confinedDataPath(id, projectRoot, dir);
+    if (!real) throw new Error(`extension ${id} has no declared data path '${dir}'`);
+    let names: string[];
+    try {
+      if (!lstatSync(real).isDirectory()) throw new Error("not a directory");
+      names = readdirSync(real);
+    } catch {
+      throw new Error(`extension ${id} data path is unavailable`);
+    }
+    const out: { name: string; bytes: number; mtime: number }[] = [];
+    for (const name of names.sort()) {
+      if (name.startsWith(".")) continue;
+      try {
+        const stat = lstatSync(join(real, name));
+        if (!stat.isFile()) continue;
+        out.push({ name, bytes: stat.size, mtime: Math.round(stat.mtimeMs) });
+      } catch {
+        continue;
+      }
+      if (out.length >= EXTENSION_DATA_MAX_ENTRIES) break;
+    }
+    return out;
+  }
+
+  /**
+   * Read the tail of one declared file. Tail, not head: these are append-only logs and the
+   * panel wants what just happened. Truncation is reported, never silent.
+   */
+  readDataFile(id: string, projectRoot: string, path: string, tailBytes?: number): { content: string; bytes: number; truncated: boolean } {
+    const real = this.confinedDataPath(id, projectRoot, path);
+    if (!real) throw new Error(`extension ${id} has no declared data path '${path}'`);
+    const cap = Math.min(Math.max(1024, Math.floor(tailBytes ?? EXTENSION_DATA_DEFAULT_TAIL)), EXTENSION_DATA_MAX_BYTES);
+    try {
+      const stat = lstatSync(real);
+      if (!stat.isFile()) throw new Error("not a regular file");
+      if (stat.size <= cap) {
+        return { content: readFileSync(real, "utf8"), bytes: stat.size, truncated: false };
+      }
+      const handle = openSync(real, "r");
+      try {
+        const buffer = Buffer.alloc(cap);
+        readSync(handle, buffer, 0, cap, stat.size - cap);
+        // 从第一个换行之后开始，避免把一行 JSONL 从中间切开交给面板。
+        const text = buffer.toString("utf8");
+        const newline = text.indexOf("\n");
+        return { content: newline >= 0 ? text.slice(newline + 1) : text, bytes: stat.size, truncated: true };
+      } finally {
+        closeSync(handle);
+      }
+    } catch {
+      throw new Error(`extension ${id} data file is unavailable`);
     }
   }
 

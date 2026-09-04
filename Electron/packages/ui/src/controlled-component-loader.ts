@@ -220,11 +220,16 @@ async function loadHeaderActionComponent(
   return component
 }
 
-function createApi(descriptor: LoadableExtensionDescriptor, host: PipiHostAPI): ExtensionHostAPI {
+function createApi(
+  descriptor: LoadableExtensionDescriptor,
+  host: PipiHostAPI,
+  projectId?: string,
+): ExtensionHostAPI {
   return createExtensionHostAPI({
     extensionId: descriptor.id,
     capabilities: descriptor.capabilities ?? [],
     host,
+    ...(projectId !== undefined ? { projectId } : {}),
   })
 }
 
@@ -267,7 +272,7 @@ export async function loadControlledContributions(
   const seenTool = new Set<string>()
   const seenSection = new Set<string>()
   const seenDocumentRenderer = new Set<string>()
-  const api = createApi(descriptor, host)
+  const api = createApi(descriptor, host, projectId)
 
   for (const action of headerActions) {
     const entry = action.entry?.trim()

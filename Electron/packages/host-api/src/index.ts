@@ -1491,6 +1491,14 @@ export interface PipiHostAPI {
   getExtensionContributions?(id: string): Promise<ExtensionContributions | undefined>;
   /** Read one manifest-declared controlled UI module without exposing its filesystem path to Chromium. */
   getExtensionUiEntrySource?(id: string, entry: string, projectId?: string): Promise<string>;
+  /** `app.data.read`: session-independent, read-only, confined to the project. */
+  listExtensionData?(id: string, dir: string, projectId?: string): Promise<{ name: string; bytes: number; mtime: number }[]>;
+  readExtensionData?(
+    id: string,
+    path: string,
+    options?: { tailBytes?: number },
+    projectId?: string,
+  ): Promise<{ content: string; bytes: number; truncated: boolean }>;
   /** Host-owned secret-free status for an extension auth contribution. */
   getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
   /** Start login for the extension's contributed provider. Credentials stay in the host. */
@@ -1706,6 +1714,8 @@ function apiFrom(
     getExtensionUiEntrySource: (id, entry, projectId) => projectId === undefined
       ? invoke("getExtensionUiEntrySource", id, entry)
       : invoke("getExtensionUiEntrySource", id, entry, projectId),
+    listExtensionData: (id, dir, projectId) => invoke("listExtensionData", id, dir, projectId),
+    readExtensionData: (id, path, options, projectId) => invoke("readExtensionData", id, path, options, projectId),
     getExtensionAuthStatus: id => invoke("getExtensionAuthStatus", id),
     beginExtensionLogin: (id, authType) => authType === undefined
       ? invoke("beginExtensionLogin", id)

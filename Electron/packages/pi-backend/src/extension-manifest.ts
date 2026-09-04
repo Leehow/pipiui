@@ -46,6 +46,10 @@ export const EXTENSION_CAPABILITIES = [
   "stream.render",
   "terminal.read",
   "notifications",
+  /** Read the project-relative files this package declares in `app.data.read`. */
+  "data.read",
+  /** Run this package's declared `host.worker` for as long as its project is open. */
+  "host.worker",
 ] as const;
 /** Spec D11 L2 host privileges — recognized so they can be refused, never granted. */
 export const EXTENSION_L2_CAPABILITIES = ["host.main", "host.decorator", "host.api", "native.driver"] as const;
@@ -163,6 +167,27 @@ export type ExtensionUiView = {
   activation: "visible";
 };
 
+/**
+ * `app.data.read`: project-relative files or directories a panel may read.
+ *
+ * A panel's only data channels are the session-scoped ones (`ext.emit`, `invoke`), so a
+ * dashboard shows nothing until a conversation happens to be running. Declared data paths
+ * give it a session-independent source: read-only, confined to the project, size-capped.
+ */
+export type ExtensionDataSummary = { read: string[] };
+
+/** Cap on declared data paths; a package that needs more is doing something else. */
+export const EXTENSION_DATA_PATH_MAX = 8;
+
+/**
+ * `host.worker`: a package-relative module the host runs once per open project.
+ *
+ * The agent half lives only inside a session and the app half only inside the renderer, so
+ * nothing an extension owns can keep running while the app is merely open. This is that
+ * third lifetime — and it is why it needs its own capability.
+ */
+export type ExtensionHostSummary = { worker: string };
+
 export type ExtensionUiSummary = {
   panels?: ExtensionUiPanel[];
   toolRenderers?: ExtensionUiToolRenderer[];
@@ -232,6 +257,10 @@ export type ValidatedExtensionManifest = ExtensionAgentContributions & {
   capabilities: ExtensionCapability[];
   settings?: ExtensionSettingsManifest;
   ui?: ExtensionUiSummary;
+  /** `app.data.read`: project-relative paths a panel may read without a session. */
+  data?: ExtensionDataSummary;
+  /** `host.worker`: package-relative module run per open project. */
+  host?: ExtensionHostSummary;
   agentExtension?: string;
   agentSkills?: string[];
   /** Optional stable host library entry for cross-host consumers (e.g. pi-coc);
@@ -810,6 +839,31 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     }
   }
 
+  let data: ExtensionDataSummary | undefined;
+  const appData = appRecord?.data;
+  if (appData !== undefined && appData !== null) {
+    if (!isRecord(appData)) {
+      errors.push("app.data must be an object");
+    } else {
+      rejectUnknownKeys(appData, new Set(["read"]), "app.data", errors);
+      const declared = appData.read;
+      if (declared !== undefined) {
+        if (!Array.isArray(declared)) {
+          errors.push("app.data.read must be an array of project-relative paths");
+        } else if (declared.length > EXTENSION_DATA_PATH_MAX) {
+          errors.push(`app.data.read must have at most ${EXTENSION_DATA_PATH_MAX} entries`);
+        } else {
+          const paths: string[] = [];
+          for (const [index, item] of declared.entries()) {
+            const path = collectRelativePath(item, `app.data.read[${index}]`, errors);
+            if (path && !paths.includes(path)) paths.push(path);
+          }
+          if (paths.length) data = { read: paths };
+        }
+      }
+    }
+  }
+
   let ui: ExtensionUiSummary | undefined;
   const appUi = appRecord?.ui;
   if (appUi !== undefined && appUi !== null) {
@@ -1136,13 +1190,27 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   // receipt (`pipiui-host-receipt.json`) so resolvers can verify both hosts
   // consume the same build artifact.
   let hostEntry: string | undefined;
+  let host: ExtensionHostSummary | undefined;
   if (value.host !== undefined && value.host !== null) {
     if (!isRecord(value.host)) {
       errors.push("host must be an object");
     } else {
-      const entry = asNonEmptyString(value.host.entry);
-      if (!entry) errors.push("host.entry must be a path string");
-      else hostEntry = entry;
+      // `entry` 是给跨宿主消费者的库入口；`worker` 是随项目跑的后台。两者含义不同，
+      // 但都属于"这个包的宿主侧"，所以并在同一个对象里，各自可选、互不排斥。
+      // `description` 是既有已发布包在用的说明字段，不能因为收紧这里而把它们判成非法。
+      rejectUnknownKeys(value.host, new Set(["entry", "worker", "description"]), "host", errors);
+      if (value.host.entry !== undefined) {
+        const entry = asNonEmptyString(value.host.entry);
+        if (!entry) errors.push("host.entry must be a path string");
+        else hostEntry = entry;
+      }
+      if (value.host.worker !== undefined) {
+        const worker = collectRelativePath(value.host.worker, "host.worker", errors);
+        if (worker) host = { worker };
+      }
+      if (value.host.entry === undefined && value.host.worker === undefined) {
+        errors.push("host must declare entry or worker");
+      }
     }
   }
 
@@ -1172,6 +1240,8 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
   if (category) manifest.category = category;
   if (settings) manifest.settings = settings;
   if (ui) manifest.ui = ui;
+  if (data) manifest.data = data;
+  if (host) manifest.host = host;
   if (agentExtension) manifest.agentExtension = agentExtension;
   if (agentSkills) manifest.agentSkills = agentSkills;
   if (agents) manifest.agents = agents;

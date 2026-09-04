@@ -283,12 +283,30 @@ export type ExtensionAuthAPI = {
   status: () => Promise<ExtensionAuthStatus>;
 };
 
+export type ExtensionDataFile = { name: string; bytes: number; mtime: number };
+export type ExtensionDataRead = { content: string; bytes: number; truncated: boolean };
+
+/**
+ * Read-only access to the project-relative paths this package declares in `app.data.read`.
+ *
+ * This is the one channel that does not go through a session: `subscribeExt` and `invoke`
+ * both need a live agent, so a panel that only has those shows nothing until a
+ * conversation happens to be running. A dashboard needs to be readable the moment the app
+ * opens, so it reads its own data instead of waiting to be told.
+ */
+export type ExtensionDataAPI = {
+  list: (dir: string) => Promise<ExtensionDataFile[]>;
+  read: (path: string, options?: { tailBytes?: number }) => Promise<ExtensionDataRead>;
+};
+
 export type ExtensionHostAPI = {
   subscribeExt: (listener: (event: ExtEvent) => void) => () => void;
   settings?: ExtensionSettingsAPI;
   invoke?: (method: string, params: unknown) => Promise<ExtInvokeResult>;
   notify?: (title: string, body: string) => void | Promise<void>;
   auth?: ExtensionAuthAPI;
+  /** Present only with the `data.read` capability and a declared `app.data.read`. */
+  data?: ExtensionDataAPI;
 };
 
 /** Structural backing host. Intentionally not `PipiHostAPI`. */
@@ -302,12 +320,21 @@ export type ExtensionHostBacking = {
   invokeExtension?(id: string, method: string, params: unknown): Promise<ExtInvokeResult>;
   notify?(title: string, body: string): void | Promise<void>;
   getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
+  listExtensionData?(id: string, dir: string, projectId?: string): Promise<ExtensionDataFile[]>;
+  readExtensionData?(
+    id: string,
+    path: string,
+    options?: { tailBytes?: number },
+    projectId?: string,
+  ): Promise<ExtensionDataRead>;
 };
 
 export type CreateExtensionHostAPIOptions = {
   extensionId: string;
   capabilities?: readonly string[];
   host: ExtensionHostBacking;
+  /** Which project's files the data API reads; the host resolves the root from it. */
+  projectId?: string;
 };
 
 function denied(capability: string): ExtInvokeResult<never> {
@@ -341,6 +368,20 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
       };
     },
   };
+
+  if (caps.has("data.read")) {
+    const projectId = options.projectId;
+    api.data = {
+      list: dir => {
+        if (!host.listExtensionData) return Promise.reject(new Error("capability 'data.read' is not available"));
+        return host.listExtensionData(id, dir, projectId);
+      },
+      read: (path, readOptions) => {
+        if (!host.readExtensionData) return Promise.reject(new Error("capability 'data.read' is not available"));
+        return host.readExtensionData(id, path, readOptions, projectId);
+      },
+    };
+  }
 
   if (caps.has("settings.read") || caps.has("settings.write")) {
     const settings: ExtensionSettingsAPI = {};
