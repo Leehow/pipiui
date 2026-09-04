@@ -77,6 +77,27 @@ export async function routeHostSupervisorDelivery(
 	return classifySupervisorHostAdmission(await delivery.handle(request));
 }
 
+/**
+ * Whether a Supervisor delivery to the Boss becomes an armed alarm — one that
+ * keeps re-waking the Boss (1m, 2m, then every 5m) until it is explicitly
+ * acknowledged.
+ *
+ * That relentlessness is right for something the Boss must act on and would
+ * otherwise drop: a terminal episode, or an escalation asking for a decision.
+ * It is wrong for a periodic status summary. A `wave` line reports what is
+ * running; the correct response to it is often "nothing, keep waiting", and
+ * there is no acknowledgement that fits — so arming it produced a notice that
+ * re-woke the Boss every minute forever, and, because a confirmed delivery is
+ * held while the Boss is busy, kept real completion receipts queued behind it.
+ */
+export function supervisorDeliveryArmsAlarm(input: {
+	kind: SupervisorEventKind;
+	envelope?: BossEscalationEnvelope;
+}): boolean {
+	if (input.envelope) return true;
+	return input.kind !== "wave";
+}
+
 /** Stable namespaces keep a Supervisor escalation from consuming a worker's final receipt. */
 export function supervisorBossObligationNamespace(input: {
 	kind: SupervisorEventKind;
