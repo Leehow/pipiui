@@ -2117,6 +2117,49 @@ if (mode === "serve") {
     expect(calls[1].args).toEqual({ session: "win", capture_scope: "window" });
   });
 
+  it("revives a session-less call by extracting the dead session id from the rejection", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-sessionless-revive-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    const calls: Array<{ name: string; args: any }> = [];
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1440, height: 900 });
+    host.proxy = { killed: false, exitCode: null, stdin: { writable: true, write: () => true } };
+    host.daemon = { killed: false, exitCode: null };
+    let driverEnded = true;
+    let revived = false;
+    host.rpc = async (_method: string, params: any) => {
+      const { name, arguments: args } = params;
+      calls.push({ name, args });
+      if (name === "start_session") {
+        if (driverEnded) revived = true;
+        return { result: { content: [], structuredContent: {} } };
+      }
+      if (name === "launch_app") {
+        if (driverEnded && !revived) {
+          // launch_app carries no session argument; the driver still names the
+          // dead lifecycle session in its fixed rejection.
+          return { result: {
+            isError: true,
+            content: [{ type: "text", text: "session 'mcp-42-123' has ended; tool call 'launch_app' was rejected. Call start_session with this id to revive it before issuing further actions, or use a new session id." }],
+          } };
+        }
+        return { result: { structuredContent: { pid: 42, window_id: 77 } } };
+      }
+      return { result: { content: [], structuredContent: {} } };
+    };
+
+    await expect(host.call("launch_app", { name: "Pipi Paper" }))
+      .resolves.toMatchObject({ structuredContent: { pid: 42 } });
+    expect(calls.map((call) => call.name)).toEqual([
+      "launch_app",
+      "start_session",
+      "launch_app",
+    ]);
+    expect(calls[1].args).toEqual({ session: "mcp-42-123", capture_scope: "window" });
+  });
+
   it("surfaces non-session tool failures without a revive attempt", async () => {
     const root = await mkdtemp(join(tmpdir(), "cua-no-revive-"));
     roots.push(root);

@@ -304,6 +304,16 @@ export function isDriverSessionEndedError(error: unknown): boolean {
     /has ended; tool call '[^']+' was rejected/i.test(error.message);
 }
 
+/** The session id named by an ended-session rejection. Session-less calls
+ * (launch_app, list_windows, bring_to_front) carry no `session` argument, yet
+ * the driver names the dead session in its rejection; reviving that id is the
+ * only way the retry can succeed. */
+export function endedSessionIdOf(error: unknown): string {
+  if (!(error instanceof Error)) return "";
+  const match = /^session '([^']+)' has ended/i.exec(error.message.trim());
+  return match ? match[1] : "";
+}
+
 /** Fixed transient rejection while the daemon closes the preceding operation. */
 export function isDriverActiveOperationError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -1310,11 +1320,16 @@ export class CuaDriverHost {
     try {
       return await this.invokeWithActiveOperationJoin(name, args, generation);
     } catch (error) {
-      const session = typeof args.session === "string" ? args.session : "";
-      if (!session || name === "start_session" || !isDriverSessionEndedError(error))
+      if (name === "start_session" || !isDriverSessionEndedError(error))
         throw error;
       // The driver ends idle lifecycle sessions and ordinary actions never
       // revive them; re-issue start_session with the same id, then retry once.
+      // Session-less calls (launch_app et al.) still name the dead session in
+      // the rejection — revive that id instead of surfacing the error.
+      const session = typeof args.session === "string" && args.session
+        ? args.session
+        : endedSessionIdOf(error);
+      if (!session) throw error;
       const scope = this.sessionScopes.get(session) ??
         (session.startsWith("pipiui-desktop-") ? "desktop" : "window");
       await this.invoke("start_session", { session, capture_scope: scope });
