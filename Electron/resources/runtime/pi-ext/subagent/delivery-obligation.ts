@@ -91,6 +91,22 @@ export function deliveryRetryDue(
 	return record.attempts === 0 || now - record.lastAttemptAt >= minimumIntervalMs;
 }
 
+/**
+ * How many times an armed alarm may wake the Boss before it goes quiet.
+ *
+ * The alarm is deliberately relentless — a text-only reply does not stop it —
+ * because a terminal episode nobody handles is worse than a repeated message.
+ * But relentless is not the same as unbounded: every wake costs a Boss turn,
+ * and while that turn runs `holdConfirmedDoneDelivery` holds every other
+ * confirmed delivery, so an alarm the Boss will never acknowledge taxes the
+ * whole queue forever. Six attempts is 1m + 2m + 5m x 4 ≈ 23 minutes of
+ * nagging: long past the point where more repetition is going to work.
+ *
+ * Going quiet is not the same as being handled. The row stays unacknowledged,
+ * and `formatUnacknowledgedAlarmLines` keeps it visible where the Boss looks.
+ */
+export const ALARM_MAX_WAKE_ATTEMPTS = 6;
+
 /** Manual-ack alarm cadence: first repeat after 1m, second after 2m, then every 5m. */
 export function alarmRetryIntervalMs(attempts: number): number {
 	if (attempts <= 1) return 60_000;
@@ -105,11 +121,24 @@ export function alarmRetryIntervalMs(attempts: number): number {
  */
 export const QUEUED_ALARM_STALL_GRACE_MS = 10 * 60_000;
 
+/** True once an armed alarm has spent its wake budget; it stays unacknowledged either way. */
+export function alarmWakeExhausted(
+	record: Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts">,
+	maxAttempts = ALARM_MAX_WAKE_ATTEMPTS,
+): boolean {
+	if (!record.acknowledgementRequired) return false;
+	if (record.state === "acknowledged" || record.state === "fulfilled") return false;
+	return record.attempts >= maxAttempts;
+}
+
 export function alarmRetryDue(
 	record: Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts" | "lastAttemptAt">,
 	now: number,
+	maxAttempts = ALARM_MAX_WAKE_ATTEMPTS,
 ): boolean {
 	if (!record.acknowledgementRequired) return false;
+	// Spent its budget: stop waking, stay unacknowledged, stay visible in status.
+	if (record.attempts >= maxAttempts) return false;
 	if (record.state === "queued") {
 		// Re-attempting while the prior copy still waits in Pi's queue stacks
 		// duplicates that keep surfacing one per Boss turn even after an ack.
@@ -121,6 +150,35 @@ export function alarmRetryDue(
 		return false;
 	}
 	return record.attempts === 0 || now - record.lastAttemptAt >= alarmRetryIntervalMs(record.attempts);
+}
+
+/**
+ * One line per armed alarm still waiting for acknowledgement, for the status
+ * view. An alarm that has gone quiet is otherwise invisible: nothing else in
+ * the status output mentions the obligation store, so the Boss would have no
+ * way to discover what it never answered.
+ */
+export function formatUnacknowledgedAlarmLines(
+	records: readonly Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts" | "alarmId" | "agentId" | "runId">[],
+	maxAttempts = ALARM_MAX_WAKE_ATTEMPTS,
+): string[] {
+	const armed = records.filter(
+		(record) =>
+			record.acknowledgementRequired &&
+			record.state !== "acknowledged" &&
+			record.state !== "fulfilled" &&
+			Boolean(record.alarmId),
+	);
+	if (armed.length === 0) return [];
+	return [
+		`${armed.length} Boss alarm(s) still unacknowledged:`,
+		...armed.map((record) => {
+			const quiet = record.attempts >= maxAttempts
+				? " (no longer re-waking you; it will not repeat again)"
+				: "";
+			return `- ${record.agentId} alarmId=${record.alarmId}${quiet} — subagent_alarm_ack({alarmId:"${record.alarmId}"}) after handling it.`;
+		}),
+	];
 }
 
 /** Confirmed [subagent-done] must not enter Pi's follow-up queue during a live

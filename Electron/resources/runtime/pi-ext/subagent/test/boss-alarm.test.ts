@@ -13,7 +13,9 @@ import {
 } from "../boss-alarm.ts";
 import { completionPersistenceState, queueCompletionAfterCutIn } from "../completion-notification.ts";
 import {
+	ALARM_MAX_WAKE_ATTEMPTS,
 	alarmRetryDue,
+	alarmWakeExhausted,
 	alarmRetryIntervalMs,
 	DeliveryObligationStore,
 	QUEUED_ALARM_STALL_GRACE_MS,
@@ -53,12 +55,19 @@ test("a normal Boss assistant response observes but never disarms an exact-run a
 	assert.equal(alarmRetryDue(observed, now + 60_000), true);
 });
 
-test("alarm cadence is one minute, two minutes, then five minutes without an attempt cap", () => {
+test("alarm cadence is one minute, two minutes, then five minutes, bounded by a wake budget", () => {
 	assert.equal(alarmRetryIntervalMs(1), 60_000);
 	assert.equal(alarmRetryIntervalMs(2), 120_000);
 	assert.equal(alarmRetryIntervalMs(3), 300_000);
 	assert.equal(alarmRetryIntervalMs(400), 300_000);
-	assert.equal(alarmRetryDue({ acknowledgementRequired: true, state: "observed", attempts: 400, lastAttemptAt: 1_000 }, 301_000), true);
+	// The cadence itself is still unbounded; what is bounded is how many wakes it
+	// gets to spend. An alarm the Boss will never answer used to tax every other
+	// delivery forever, because each wake holds the rest of the queue behind it.
+	assert.equal(alarmRetryDue({ acknowledgementRequired: true, state: "observed", attempts: ALARM_MAX_WAKE_ATTEMPTS - 1, lastAttemptAt: 1_000 }, 301_000), true);
+	assert.equal(alarmRetryDue({ acknowledgementRequired: true, state: "observed", attempts: 400, lastAttemptAt: 1_000 }, 301_000), false);
+	// Quiet is not handled: the row is still owed an acknowledgement, and status
+	// keeps it findable (see alarm-wake-budget.test.ts).
+	assert.equal(alarmWakeExhausted({ acknowledgementRequired: true, state: "observed", attempts: 400 }), true);
 });
 
 test("a queued Boss alarm is not cadence-retried while its copy may still sit in Pi's queue", () => {
