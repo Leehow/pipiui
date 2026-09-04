@@ -1396,6 +1396,116 @@ test("non-RPC explore still arms on first assistant final", { timeout: 40_000 },
 	while (alive(pid) && Date.now() < deadline) await delay(20);
 	assert.equal(alive(pid), false, "print-mode workers must still arm on first assistant final");
 });
+// ── Routing advisories: continuity, findings handoff, fork availability ─────────────────
+
+/**
+ * These fire at dispatch acceptance, so a queued item that never spawns is enough to observe
+ * them — and is the only honest way to observe them, since the point is that they reach the
+ * Boss *before* any worker runs.
+ */
+async function queuedRoutingDispatch(
+	subagent: RegisteredTool,
+	args: Record<string, unknown>,
+): Promise<{ text: string; runId: string }> {
+	const out = (await subagent.execute("route", prepared(subagent, {
+		description: "routing probe",
+		subagent_type: "general-purpose",
+		run_in_background: true,
+		blockedBy: ["route-never-dispatched-dep"],
+		...args,
+	}), undefined, undefined, { cwd: tmpdir(), model: undefined })) as {
+		content: Array<{ type: string; text: string }>;
+		isError?: boolean;
+	};
+	assert.equal(out.isError === true, false, JSON.stringify(out.content));
+	const text = out.content[0]!.text;
+	return { text, runId: text.match(/runId=([^\s]+)/)?.[1] ?? "" };
+}
+
+function seedReport(agentId: string, agentName: string, body: string): void {
+	const dir = join(suiteMainCwd, ".pi", "findings");
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(
+		join(dir, `${agentId}.md`),
+		`# ${agentId}\n\n- agent: \`${agentName}\` (agentId \`${agentId}\`)\n\n---\n\n${body}\n`,
+		"utf8",
+	);
+}
+
+function clearReports(): void {
+	rmSync(join(suiteMainCwd, ".pi", "findings"), { recursive: true, force: true });
+}
+
+test("routing: an explore report covering the brief's files reaches the receipt as [findings-available]", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		clearReports();
+	});
+	clearReports();
+	seedReport("pill-recon", "explore", "## Evidence index\n\n| `packages/ui/src/QuotaPill.tsx:12-40` | pill |\n| `packages/ui/src/store.ts:80-96` | width |");
+
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+
+	const { text, runId } = await queuedRoutingDispatch(subagent, {
+		prompt: "Make the pill wrap: edit `packages/ui/src/QuotaPill.tsx` and `packages/ui/src/store.ts`.",
+		agentId: "route-nofind",
+	});
+	assert.match(text, /\[findings-available\]/);
+	assert.match(text, /pill-recon\.md/);
+
+	// Naming the report is the whole point: a brief that already has it earns silence.
+	const named = await queuedRoutingDispatch(subagent, {
+		prompt: "Read `.pi/findings/pill-recon.md` first. Then edit `packages/ui/src/QuotaPill.tsx` and `packages/ui/src/store.ts`.",
+		agentId: "route-named",
+	});
+	assert.doesNotMatch(named.text, /\[findings-available\]/);
+
+	await abort.execute("route-a1", { agentId: "route-nofind", runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("route-a2", { agentId: "route-named", runId: named.runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
+test("routing: a finished writable worker's ground reaches the receipt as [worker-continuity]", async (t) => {
+	const cleanup = setupSuiteEnv();
+	t.after(() => {
+		cleanup();
+		clearReports();
+	});
+	clearReports();
+	seedReport(
+		"quota-pill",
+		"general-purpose",
+		"## Files Changed\n- `packages/ui/src/QuotaPill.tsx` - wraps\n- `packages/ui/src/store.ts` - width",
+	);
+
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const abort = tools.get("subagent_abort")!;
+
+	const fresh = await queuedRoutingDispatch(subagent, {
+		prompt: "Fix the wrap regression in `packages/ui/src/QuotaPill.tsx` and `packages/ui/src/store.ts`.",
+		agentId: "pill-width",
+	});
+	assert.match(fresh.text, /\[worker-continuity\]/);
+	assert.match(fresh.text, /quota-pill/);
+	// Continuity names that worker's own report, so the handoff line must not repeat it.
+	assert.doesNotMatch(fresh.text, /\[findings-available\]/);
+
+	// Re-dispatching the named id IS the continuation: advising it would be noise.
+	const continued = await queuedRoutingDispatch(subagent, {
+		prompt: "Fix the wrap regression in `packages/ui/src/QuotaPill.tsx` and `packages/ui/src/store.ts`.",
+		agentId: "quota-pill",
+	});
+	assert.doesNotMatch(continued.text, /\[worker-continuity\]/);
+
+	await abort.execute("route-a3", { agentId: "pill-width", runId: fresh.runId }, undefined, undefined, { cwd: tmpdir() });
+	await abort.execute("route-a4", { agentId: "quota-pill", runId: continued.runId }, undefined, undefined, { cwd: tmpdir() });
+});
+
 after(async () => {
 	const drained = await drainPipiuiTrackedChildren(250, 2_000);
 	assert.deepEqual(drained.remainingPids, [], "all dispatch-seam worker children were reaped");

@@ -147,13 +147,23 @@ export function writeFindingsArtifact(
 /**
  * The done-message line that turns the artifact into a handoff.
  *
- * It is addressed at the Boss's next dispatch decision rather than at the Boss's
- * understanding: the Boss is explicitly told not to read this file, because reading it is
- * exactly the context spend fan-out exists to avoid. Its job is to copy one path into the
- * next brief.
+ * This line used to say, flatly, "do NOT read it yourself". That was written for one case —
+ * routing a wave's output onward without pulling raw artifacts into the Boss's context — and
+ * it is right for that case. But it is the strongest instruction the Boss receives at the
+ * exact moment it decides what to do next, and stated unconditionally it also forbids the
+ * opposite case: the Boss turning an `explore` report into its own implementation brief.
+ * Fan-out's own rule is narrower and correct ("keep the sidecars' noise out, not their
+ * results"), and orchestration says outright that a report you are about to act on is
+ * understanding, and understanding is not delegated. The observed behaviour followed the
+ * receipt rather than the layers, which is what a receipt at the point of decision does: the
+ * Boss briefed implementers from a 2500-char TLDR and they re-derived the rest.
+ *
+ * So the line carries both routes and lets the next move pick between them. Handing the whole
+ * question on is still one path, still the cheap one; deciding from the evidence yourself is
+ * the other, and it is not a violation of anything.
  */
 export function formatFindingsLine(file: string): string {
-	return `Findings: ${file} — this worker's full report, on disk. Do NOT read it yourself; put this exact path in the next worker's brief ("read <path> first; it is the recon for this task, do not re-explore") so the implementer starts from the evidence instead of re-deriving it.`;
+	return `Findings: ${file} — this worker's full report, on disk. Two routes, and the next move picks: if the next step on this belongs to a WORKER, do not read it — put this exact path in that worker's brief ("read <path> first; it is the recon for this task, do not re-explore") so the implementer starts from the evidence instead of re-deriving it. If the next step is YOURS — you are about to write an implementation brief from it, decide what the change is, or answer the user out of it — open the file and read it. The TLDR above is a pointer, not the evidence, and a decision taken from the pointer is exactly the rediscovery this file exists to prevent.`;
 }
 
 /**

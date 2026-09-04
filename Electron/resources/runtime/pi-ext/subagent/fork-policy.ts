@@ -130,3 +130,101 @@ export function resolveFork(input: ForkRequest): ForkDecision {
 export function forkSpawnArgs(decision: ForkDecision): string[] {
 	return decision.fork ? ["--fork", decision.sourcePath] : [];
 }
+
+/**
+ * The other half of the fork decision: noticing that this dispatch wanted one.
+ *
+ * `resolveFork` answers a fork that was asked for. Nothing answers the far more common case —
+ * the fork that should have been asked for and was not. The layer's own test for that is
+ * "if you are writing the third paragraph of background, fork instead", which is a real test
+ * the Boss cannot apply to itself: at the moment it is writing paragraph three it is thinking
+ * about the content, not about the boundary it is paying to write across.
+ *
+ * Brief length alone is the wrong measure, and getting this wrong would be actively harmful:
+ * a long implementation brief dense with `file.ts:120-168` anchors is exactly the good cold
+ * brief the layer asks for, and nudging it toward a fork would trade a precise cheap worker
+ * for an expensive vague one. What distinguishes reconstruction from a directive is not size
+ * but what the size is made of — background prose carries almost no anchors, because the code
+ * has not been located yet or the point is what the user wants rather than where the code is.
+ *
+ * So: long, and thin on anchors. That is the shape of a brief restating a conversation, and
+ * a fork hands that conversation over for the price of a cache hit instead.
+ */
+
+/**
+ * Two thresholds, because anchors and length are not independent evidence.
+ *
+ * The first cut used one length (2000 chars) with an anchor ceiling, and three real sessions
+ * showed why that misses: the same Boss, given the same background-heavy request, wrote briefs
+ * of 2280, 1802 and 864 characters. All three named zero or one file. Only the first cleared
+ * 2000, so the check fired on a third of the cases it was built for — and the 864-char one was
+ * the *clearest* reconstruction of the three, a page of the user's trade-offs with no code in
+ * it at all.
+ *
+ * What that says is that length was standing in for the wrong thing. A brief naming NO file has
+ * not located the code, so whatever its size it is carrying intent rather than instructions,
+ * and a fork carries intent better than any restatement — the length floor there only needs to
+ * exclude a genuine one-liner. A brief naming one or two files has started to locate the work,
+ * so it takes real bulk before the prose outweighs the anchors.
+ *
+ * Calibrated on three samples from one model on one shape of task. Both numbers are a judgement
+ * about where prose stops being a directive, not a measurement of anything fundamental.
+ */
+
+/** Floor for a brief that names no file at all: enough to exclude a one-line directive. */
+export const FORK_NUDGE_MIN_BRIEF_CHARS = 700;
+
+/** Floor for a brief that has begun naming files: bulk must outweigh the anchors. */
+export const FORK_NUDGE_ANCHORED_MIN_BRIEF_CHARS = 2_000;
+
+/** Above this many distinct file anchors, the brief is located code, never a fork candidate. */
+export const FORK_NUDGE_MAX_ANCHORS = 2;
+
+export interface ForkOpportunityInput {
+	/** Whether the caller already asked for a fork on this dispatch. */
+	fork?: boolean;
+	agentId: string;
+	agentName: string;
+	readOnly: boolean;
+	depth: number;
+	/** True when this dispatch reopens a stored conversation — it already has continuity. */
+	resuming?: boolean;
+	/** The brief as written. */
+	brief: string;
+	/** Distinct path anchors the brief names, measured by the continuity check. */
+	anchorCount: number;
+	/** Absent when this session has no forkable session file; then there is nothing to advise. */
+	sessionFile?: string;
+}
+
+export interface ForkOpportunity {
+	agentId: string;
+	briefChars: number;
+	anchorCount: number;
+}
+
+/** The dispatches where a fork was available, unasked for, and probably right. */
+export function detectForkOpportunity(input: ForkOpportunityInput): ForkOpportunity | undefined {
+	if (input.fork === true) return undefined;
+	if (input.resuming) return undefined;
+	if (input.depth > 0) return undefined;
+	if (input.readOnly || COLD_START_ONLY_AGENTS.includes(input.agentName)) return undefined;
+	if (!input.sessionFile?.trim()) return undefined;
+	if (input.anchorCount > FORK_NUDGE_MAX_ANCHORS) return undefined;
+	const briefChars = input.brief.trim().length;
+	const floor = input.anchorCount === 0
+		? FORK_NUDGE_MIN_BRIEF_CHARS
+		: FORK_NUDGE_ANCHORED_MIN_BRIEF_CHARS;
+	if (briefChars < floor) return undefined;
+	return { agentId: input.agentId, briefChars, anchorCount: input.anchorCount };
+}
+
+export function formatForkOpportunityAdvisory(opportunities: readonly ForkOpportunity[]): string {
+	if (opportunities.length === 0) return "";
+	const blocks = opportunities.map((o) => [
+		`[fork-available] \`${o.agentId}\` is a cold dispatch carrying ${o.briefChars} chars of brief naming ${o.anchorCount} file path(s). Length without anchors is restated background — the reconstruction a fork removes.`,
+		"`fork: true` starts this worker from a copy of THIS conversation: it has already read what you read and heard what the user asked, so the brief becomes a directive (what to do) instead of a briefing (what the situation is). It runs on your model against the cached prefix and lands in its own worktree like any other worker.",
+		"Send it cold only if the brief is genuinely complete without your session's context — a precise, anchored brief is still the cheaper worker.",
+	].join("\n"));
+	return blocks.join("\n\n");
+}

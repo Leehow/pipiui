@@ -30,7 +30,25 @@ import {
 	stringifyCompactFileChange,
 } from "./file-change-bridge.ts";
 import { checkedSubagentOverrideModel } from "./model-ref.ts";
-import { forkSpawnArgs, resolveFork } from "./fork-policy.ts";
+import {
+	detectForkOpportunity,
+	forkSpawnArgs,
+	formatForkOpportunityAdvisory,
+	resolveFork,
+	type ForkOpportunity,
+} from "./fork-policy.ts";
+import {
+	ContinuityAdvisoryLedger,
+	detectContinuityTarget,
+	detectFindingsHandoff,
+	extractPathAnchors,
+	formatContinuityAdvisory,
+	formatFindingsHandoffAdvisory,
+	summarizeFindingsHead,
+	type ContinuityMatch,
+	type ContinuityPrior,
+	type FindingsHandoff,
+} from "./worker-continuity.ts";
 import { bossWriteSet, formatBossWriteOverlapWarning } from "./boss-write-set.ts";
 import { applySessionMountsToWorkerEnv } from "../../extensions/secret-vault-core.ts";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -136,6 +154,7 @@ import {
 import {
 	alarmRetryDue,
 	deliveryRetryDue,
+	formatUnacknowledgedAlarmLines,
 	holdConfirmedDoneDelivery,
 	DeliveryObligationStore,
 	type DeliveryObligation,
@@ -153,6 +172,11 @@ import {
 	UNFILTERED_RESUMABLE_CAP,
 } from "./job-status-list.ts";
 import { isUnfilteredStatusQuery, StatusPollGuard } from "./status-poll-guard.ts";
+import {
+	formatOrphanRecoveryNotice,
+	selectOrphanedSlices,
+	SUBAGENT_ORPHANED_CUSTOM_TYPE,
+} from "./orphan-recovery.ts";
 import {
 	admitSignal,
 	classifyRuntimeSignal,
@@ -186,6 +210,7 @@ import {
 	classifySupervisorHostAdmission,
 	createSupervisorOwnedTerminalCloseout,
 	supervisorBossObligationNamespace,
+	supervisorDeliveryArmsAlarm,
 	type SupervisorHostAdmission,
 } from "./supervisor/host-seam.ts";
 import { SupervisorWaveIdentityTracker, summarizeSupervisorRuntimeWave } from "./supervisor/wave-identity.ts";
@@ -696,6 +721,8 @@ function recordSubagentDispatchStats(
 // ---- Pipi UI 集成：向 App 桥接服务上报 subagent 生命周期（无环境变量时完全静默） ----
 const PIPIUI_PORT = process.env.PIPIUI_BRIDGE_PORT;
 const PIPIUI_SESSION = process.env.PIPIUI_SESSION_KEY;
+/** Host conversation id. Scopes durable slice rows to the session that dispatched them. */
+const PIPIUI_SESSION_ID = process.env.PIPIUI_SESSION_ID;
 const PIPIUI_SESSION_CAPABILITY = process.env.PIPIUI_SESSION_CAPABILITY;
 const PIPIUI_HOST_PROTOCOL = process.env.PIPIUI_HOST_PROTOCOL;
 
@@ -3503,6 +3530,88 @@ function jobPrune(): void {
 	}
 }
 
+/** Matches worker-continuity's report-head window; bytes here, characters there. */
+const FINDINGS_HEAD_BYTES = 16_000;
+
+/**
+ * Head of a findings report, or nothing. Bounded and never throwing: this runs inside dispatch
+ * acceptance, where a slow or missing file must cost the dispatch nothing at all.
+ */
+function readFindingsHead(file: string): string | undefined {
+	try {
+		const fd = fs.openSync(file, "r");
+		try {
+			const buffer = Buffer.alloc(FINDINGS_HEAD_BYTES);
+			const read = fs.readSync(fd, buffer, 0, FINDINGS_HEAD_BYTES, 0);
+			return buffer.subarray(0, read).toString("utf-8");
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+/** One per session process: a continuity overlap is stated once, never re-raised. */
+const continuityLedger = new ContinuityAdvisoryLedger();
+
+/**
+ * The finished workers a new dispatch could be continuing instead.
+ *
+ * Two sources, because neither alone covers the case. The in-process job registry knows the
+ * declared scope, the role and the terminal state, but dies with the process; the reports
+ * under `.pi/findings/` survive a restart and carry the file evidence a 200-char task summary
+ * cannot. Merged by agentId, registry facts winning where both have an opinion.
+ */
+function continuityPriorsFor(
+	agents: readonly AgentConfig[],
+	mainCwd: string | undefined,
+	excludeIds: ReadonlySet<string>,
+): ContinuityPrior[] {
+	const now = Date.now();
+	const readOnlyFor = (name: string | undefined): boolean =>
+		name ? agents.find((agent) => agent.name === name)?.traits.readOnly === true : false;
+	const priors = new Map<string, ContinuityPrior>();
+
+	for (const job of jobRegistry.values()) {
+		if (excludeIds.has(job.agentId)) continue;
+		priors.set(job.agentId, {
+			agentId: job.agentId,
+			agentName: job.name,
+			title: job.title,
+			state: job.state,
+			anchors: extractPathAnchors(job.task ?? ""),
+			scope: job.scope,
+			ageMs: now - (job.endedAt ?? job.startedAt),
+			readOnly: readOnlyFor(job.name),
+		});
+	}
+
+	for (const entry of listFindings(mainCwd, undefined, now)) {
+		if (excludeIds.has(entry.agentId)) continue;
+		const summary = summarizeFindingsHead(readFindingsHead(entry.file));
+		const existing = priors.get(entry.agentId);
+		const agentName = existing?.agentName ?? summary.agentName;
+		priors.set(entry.agentId, {
+			agentId: entry.agentId,
+			agentName,
+			title: existing?.title ?? entry.title,
+			// A report exists only for a terminal episode; a live re-dispatch of the same id
+			// overwrites the registry row above, and that row's state wins.
+			state: existing?.state,
+			// The report is the better anchor source whenever it has any: the registry holds a
+			// 200-char summary, the report holds the file list the worker actually touched.
+			anchors: summary.anchors.length > 0 ? summary.anchors : (existing?.anchors ?? []),
+			scope: existing?.scope,
+			findingsFile: entry.file,
+			ageMs: Math.min(existing?.ageMs ?? Number.POSITIVE_INFINITY, entry.ageMs),
+			readOnly: existing ? existing.readOnly : readOnlyFor(agentName),
+		});
+	}
+
+	return [...priors.values()];
+}
+
 function jobUpsertRunning(
 	agentId: string,
 	name: string,
@@ -4084,6 +4193,8 @@ interface AgentSliceMetadata {
 	title?: string;
 	runId?: string;
 	state?: JobState;
+	/** Conversation that dispatched this worker; absent on rows written before the field existed. */
+	sessionId?: string;
 	resultSummary?: string;
 	worktreePath?: string;
 	worktreeBranch?: string;
@@ -4139,9 +4250,34 @@ function writeAgentSliceMetadata(slices: AgentSliceMetadata[]): void {
 function rememberAgentSlice(agentId: string, name: string, task: string, title: string | undefined, runId: string): void {
 	const all = readAgentSliceMetadata();
 	writeAgentSliceMetadata([
-		{ agentId, name, task: task.slice(0, 12_000), ...(title ? { title: title.slice(0, 500) } : {}), runId, state: "running", updatedAt: Date.now() },
+		{ agentId, name, task: task.slice(0, 12_000), ...(title ? { title: title.slice(0, 500) } : {}), runId, state: "running", ...(PIPIUI_SESSION_ID ? { sessionId: PIPIUI_SESSION_ID } : {}), updatedAt: Date.now() },
 		...all.filter((item) => item.agentId !== agentId),
 	]);
+}
+
+/**
+ * Set when this process starts and finds workers its own session left persisted
+ * as running. Consumed by the next turn's before_agent_start.
+ */
+let pendingOrphanNotice: string | undefined;
+
+/** Only the Boss reports these; a worker has no business announcing its siblings. */
+function armOrphanRecoveryNotice(): void {
+	if (PIPIUI_DEPTH !== 0) return;
+	const live = new Set(
+		[...jobRegistry.values()].filter((job) => job.state === "running").map((job) => job.agentId),
+	);
+	const orphaned = selectOrphanedSlices(readAgentSliceMetadata(), {
+		sessionId: PIPIUI_SESSION_ID,
+		liveAgentIds: live,
+	});
+	pendingOrphanNotice = orphaned.length ? formatOrphanRecoveryNotice(orphaned) : undefined;
+}
+
+function takePendingOrphanNotice(): string | undefined {
+	const notice = pendingOrphanNotice;
+	pendingOrphanNotice = undefined;
+	return notice;
 }
 
 function rememberAgentSliceTerminal(agentId: string, runId: string, job: JobRecord): void {
@@ -4390,7 +4526,19 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		...formatQueuedSection(now),
 		...formatResumableSection(listedIds, opts.full),
 		...formatUnfilteredOmissionNote(selected.omittedEnded, historicalWorkerCount(listedIds)),
+		...formatUnacknowledgedAlarmSection(),
 	].join("\n");
+}
+
+/**
+ * Armed alarms nobody answered. An alarm that spent its wake budget stops
+ * re-waking the Boss, which makes status the only place it can still be found.
+ */
+function formatUnacknowledgedAlarmSection(): string[] {
+	const lines = formatUnacknowledgedAlarmLines(
+		[...pendingDone.values()].map((entry) => entry.obligation),
+	);
+	return lines.length ? ["", ...lines] : [];
 }
 
 /**
@@ -5858,6 +6006,12 @@ async function deliverConfirmedDoneToBossAsync(
 	runId: string,
 	text: string,
 	identityNamespace?: string,
+	/**
+	 * Arm the Boss alarm (repeat until acknowledged). Terminal episodes and
+	 * escalations do; a periodic status summary must not, or it re-wakes the Boss
+	 * forever over a line that has no acknowledgement to give.
+	 */
+	armAlarm = true,
 ): Promise<boolean> {
 	// The durable channel can only address a bound Pi session. A nested leader (depth > 0)
 	// and a terminal-only pi never bind one, and sendDoneWithConfirmation refuses an entry
@@ -5865,7 +6019,7 @@ async function deliverConfirmedDoneToBossAsync(
 	if (!doneDeliveryPiSessionId) {
 		return trySendUserMessage(pi, text);
 	}
-	const acknowledgementRequired = PIPIUI_DEPTH === 0;
+	const acknowledgementRequired = PIPIUI_DEPTH === 0 && armAlarm;
 	const obligation = createDoneObligation(
 		agentId,
 		runId,
@@ -6486,6 +6640,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 						runId,
 						publicText,
 						supervisorBossObligationNamespace({ kind, envelope }),
+						supervisorDeliveryArmsAlarm({ kind, envelope }),
 					);
 				}
 				if (kind === "stall") {
@@ -9530,6 +9685,9 @@ export default function (pi: ExtensionAPI) {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
 		statusPollGuard.reset();
+		// A fresh process owns no jobs, so any of this session's slices still marked
+		// running belong to a process that died without finalizing them.
+		armOrphanRecoveryNotice();
 		// A new session inherits nothing: old subscriptions point at runs that no longer
 		// exist here, and a resurrected one would leak stale-run events into this session.
 		watchSessionGeneration += 1;
@@ -9771,6 +9929,16 @@ export default function (pi: ExtensionAPI) {
 				customType: "pipiui-inflight-workers",
 				content: [{ type: "text", text: injection.text }],
 				display: false,
+			};
+		}
+		const orphanNotice = takePendingOrphanNotice();
+		if (orphanNotice) {
+			// One-shot and rare, and it outranks the routine in-flight snapshot: a fresh
+			// process has no in-flight workers, so the two do not realistically collide.
+			result.message = {
+				customType: SUBAGENT_ORPHANED_CUSTOM_TYPE,
+				content: [{ type: "text", text: orphanNotice }],
+				display: true,
 			};
 		}
 		if (!result.systemPrompt && !result.message) return;
@@ -10666,6 +10834,103 @@ export default function (pi: ExtensionAPI) {
 					|| dispatchQueue.snapshot().some((item) => item.agentId === agentId),
 				isResumable: dispatchResumableLookup,
 			});
+			// Routing advisories, measured at the same acceptance boundary as [plan-drift] and
+			// for the same reason: the Boss composes a dispatch from what it is holding, and the
+			// two facts it is most often missing — that a finished worker already owns this
+			// ground, and that this brief is a reconstruction a fork would carry for free — are
+			// cheap to measure right here and impossible to remember three turns later.
+			// Chain mode is exempt like the shape validator: an ordered chain names its own
+			// continuity, and fork is not one of its parameters.
+			const routingAdvisory = ((): string => {
+				if (hasChain || PIPIUI_DEPTH !== 0) return "";
+				const items: Array<{
+					agentId: string;
+					agentName?: string;
+					brief: string;
+					scope?: string[];
+					fork?: boolean;
+					fresh?: boolean;
+				}> = hasTasks
+					? (params.tasks ?? []).map((t) => ({
+						agentId: String(t.agentId ?? "").trim(),
+						agentName: t.agent,
+						brief: t.task ?? "",
+						scope: t.scope,
+						fork: t.fork,
+						fresh: t.fresh,
+					}))
+					: [{
+						agentId: String(params.agentId ?? "").trim(),
+						agentName: params.agent,
+						brief: params.task ?? "",
+						scope: params.scope,
+						fork: params.fork,
+						fresh: params.fresh,
+					}];
+				const dispatchedIds = new Set(items.map((item) => item.agentId).filter(Boolean));
+				const isKnownId = (agentId: string, agentName?: string): boolean =>
+					jobRegistry.has(agentId)
+					|| localAgentReservations.has(agentId)
+					|| dispatchQueue.snapshot().some((item) => item.agentId === agentId)
+					|| dispatchResumableLookup(agentId, agentName);
+				const priors = continuityPriorsFor(agents, PIPIUI_MAIN_CWD, dispatchedIds);
+				const matches: ContinuityMatch[] = [];
+				const handoffs: FindingsHandoff[] = [];
+				const forkOpportunities: ForkOpportunity[] = [];
+				for (const item of items) {
+					if (!item.agentId || !item.brief) continue;
+					const config = item.agentName
+						? agents.find((agent) => agent.name === item.agentName)
+						: undefined;
+					const readOnly = config?.traits.readOnly === true;
+					const known = isKnownId(item.agentId, item.agentName) && item.fresh !== true;
+					const candidate = {
+						agentId: item.agentId,
+						agentName: item.agentName,
+						brief: item.brief,
+						scope: item.scope,
+						readOnly,
+						known,
+					};
+					const found = detectContinuityTarget(candidate, priors);
+					// One statement per pair for the life of this session: the second telling is
+					// how a true measurement became a dispatch loop (see ContinuityAdvisoryLedger).
+					const match = found && continuityLedger.claim(found.candidateAgentId, found.priorAgentId)
+						? found
+						: undefined;
+					if (match) matches.push(match);
+					// The continuity line already names its own worker's report; this one covers the
+					// reports nothing else would mention — an `explore` above all, which is never a
+					// continuation target and is exactly the role whose report must travel onward.
+					const handoff = detectFindingsHandoff(
+						candidate,
+						priors,
+						new Set(match ? [match.priorAgentId] : []),
+					);
+					if (handoff) handoffs.push(handoff);
+					const opportunity = detectForkOpportunity({
+						fork: item.fork,
+						agentId: item.agentId,
+						agentName: item.agentName ?? "",
+						readOnly,
+						depth: PIPIUI_DEPTH,
+						resuming: known,
+						brief: item.brief,
+						anchorCount: extractPathAnchors(item.brief).length,
+						sessionFile: forkSourceFile,
+					});
+					if (opportunity) forkOpportunities.push(opportunity);
+				}
+				return [
+					formatContinuityAdvisory(matches),
+					formatFindingsHandoffAdvisory(handoffs),
+					formatForkOpportunityAdvisory(forkOpportunities),
+				]
+					.filter(Boolean)
+					.join("\n\n");
+			})();
+			/** Every acceptance-time advisory this dispatch earned, in one prefix. */
+			const acceptanceAdvisory = [planDriftAdvisory, routingAdvisory].filter(Boolean).join("\n\n");
 			const pendingAcceptanceToken = Symbol("dispatch-acceptance");
 			const pendingAcceptanceIds = pendingDispatchIdTargets.map((target) => target.agentId!.trim());
 			for (const agentId of pendingAcceptanceIds) {
@@ -11029,7 +11294,7 @@ export default function (pi: ExtensionAPI) {
 								// formatStartedMessage already prefixes bgIgnoredWarning — adding it here
 								// duplicated the warning/note on one-step-chain receipts.
 								text:
-									(planDriftAdvisory ? `${planDriftAdvisory}\n\n` : "") +
+									(acceptanceAdvisory ? `${acceptanceAdvisory}\n\n` : "") +
 									dispatchNudgePrefix +
 									formatStartedMessage([
 										{ agentId, runId: stepRunId, name: agentName, task, title: step.title, fresh: step.fresh },
@@ -11155,7 +11420,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
-								(planDriftAdvisory ? `${planDriftAdvisory}\n\n` : "") +
+								(acceptanceAdvisory ? `${acceptanceAdvisory}\n\n` : "") +
 								bgIgnoredWarning + formatChainVerifyPrefix(results) + chainOutput,
 						},
 					],
@@ -11286,7 +11551,7 @@ export default function (pi: ExtensionAPI) {
 						dispatchQueue.snapshot(),
 					);
 					const bossOverlapNotice = formatBossWriteOverlapWarning(incomingScopes, currentBossWriteSet());
-					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
+					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, acceptanceAdvisory].filter(Boolean).join("\n\n");
 					dispatchQueue.enqueueBatch(
 						params.tasks.map((t, index) => ({
 							agentId: agentIds[index],
@@ -11439,7 +11704,7 @@ export default function (pi: ExtensionAPI) {
 						[{ agentId, scope: cleanScope(params.scope) }],
 						currentBossWriteSet(),
 					);
-					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, planDriftAdvisory].filter(Boolean).join("\n\n");
+					const acceptanceNotices = [scopeOverlapNotice, bossOverlapNotice, acceptanceAdvisory].filter(Boolean).join("\n\n");
 					if (params.blockedBy && params.blockedBy.length > 0) {
 						// A blocked receipt is already an accepted descendant obligation.
 						registerResidentDescendant(agentId, runId);

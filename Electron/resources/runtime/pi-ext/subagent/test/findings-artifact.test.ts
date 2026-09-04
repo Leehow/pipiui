@@ -133,15 +133,21 @@ test("the done message carries the handoff path only when one was written", () =
 		findingsFile: "/repo/.pi/findings/quota-pill.md",
 	});
 	assert.match(withFile, /Findings: \/repo\/\.pi\/findings\/quota-pill\.md/);
-	assert.match(withFile, /Do NOT read it yourself/);
+	assert.match(withFile, /do not read it — put this exact path in that worker's brief/);
 
 	assert.doesNotMatch(formatSubagentDoneMessage(minimalResult()), /^Findings:/m);
 });
 
-test("the handoff line tells the boss to forward the path, not to read it", () => {
+test("the handoff line carries both routes: forward it, or read it when the next move is yours", () => {
 	const line = formatFindingsLine("/repo/.pi/findings/x.md");
-	assert.match(line, /next worker's brief/);
+	// Forwarding stays the named path for work that is going onward.
+	assert.match(line, /worker's brief/);
 	assert.match(line, /do not re-explore/);
+	// …and the Boss acting on it itself is explicitly permitted, which the old blanket
+	// "do NOT read it yourself" forbade — the defect this line existed to cause.
+	assert.match(line, /If the next step is YOURS/);
+	assert.match(line, /open the file and read it/);
+	assert.doesNotMatch(line, /Do NOT read it yourself/);
 });
 
 function seedFindings(root: string, entries: Array<{ id: string; title: string; ageMs: number }>): void {
