@@ -121,6 +121,34 @@ export function selectHotRestartTargets(
   return { restart, defer };
 }
 
+export type HotRestartBusyInput = {
+  /** A turn is running for this session. */
+  turnActive: boolean;
+  spawnInitializing: boolean;
+  compactionHoldsQueue: boolean;
+  /**
+   * Background workers this session dispatched are still running or queued.
+   *
+   * They are children of the session's Pi child, so restarting it kills them
+   * mid-flight, and a worker killed that way never emits its completion — the
+   * Boss waits for a signal that no longer has a sender. An idle session with a
+   * live wave is therefore busy, not idle: the restart defers until the wave is
+   * done, the same way `closeQuietSessionWriter` refuses to close a writer that
+   * still owns live agents.
+   */
+  liveBackgroundAgents: boolean;
+};
+
+/** Pure busy predicate for hot restart; see HotRestartBusyInput for why a live wave counts. */
+export function hotRestartBusy(input: HotRestartBusyInput): boolean {
+  return (
+    input.turnActive ||
+    input.spawnInitializing ||
+    input.compactionHoldsQueue ||
+    input.liveBackgroundAgents
+  );
+}
+
 /** Set equality for mount-snapshot comparison (availability-diff mode). */
 export function stringSetEquals(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
   if (a.size !== b.size) return false;
