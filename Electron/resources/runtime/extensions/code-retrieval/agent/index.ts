@@ -320,12 +320,13 @@ export default function (pi: ExtensionAPI): void {
   pi.registerTool({
     name: "code_search",
     label: "Code search",
-    promptSnippet: "Search code from a description when grep would need a keyword guess",
+    promptSnippet: "First tool for locating code by description; grep is for an exact token",
     promptGuidelines: [
+      "An open location question starts here even when a keyword guess is available — a guess is not a name.",
       "When a grep pattern would carry several alternative keywords, that alternation is the weighing code_search does properly — send the description instead of the arms.",
     ],
     description:
-      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Open/semantic queries go through a local zvec BM25+vector index under the project .pi/agent home, then fall back to weighted term match if that index is down. Returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap); never full file bodies — pull those with read_spans. Exact identifiers still belong to grep. An empty result means those words are not in the tree: change vocabulary, not tool.",
+      "Locate code from a description — \"where the session token gets refreshed\", \"what handles retry on a 429\". First tool for that question, even if you can guess a keyword; grep is for an exact identifier you already know. Open queries go through a local zvec BM25+vector index under the project .pi/agent home, then fall back to weighted term match if that index is down. Returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap); never full file bodies — pull those with read_spans. An empty result means those words are not in the tree: change vocabulary, not tool.",
     parameters: {
       type: "object",
       properties: {

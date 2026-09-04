@@ -31,6 +31,14 @@ test("an alternation below the threshold is left alone", () => {
   assert.equal(budget.consider({ pattern: "SomeSymbol" }), undefined);
 });
 
+test("a grep pattern with spaces is already a description", () => {
+  const budget = new GrepTellBudget();
+  const tell = budget.consider({ pattern: "session token refresh" });
+  assert.equal(tell?.kind, "description");
+  assert.match(tell!.line, /description, not a token/);
+  assert.match(tell!.line, /code_search is the first tool/);
+});
+
 test("regex debris is counted but not quoted back", () => {
   const budget = new GrepTellBudget();
   const tell = budget.consider({ pattern: "^foo.*|\\s+bar$|baz(" });

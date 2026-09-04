@@ -19,8 +19,8 @@ shell is not a shortcut: a runtime cannot render, attribute or verify a result i
 saw a call for, so the work lands as unreviewable text.
 
 - Reading files: `read`. Listing directories: `ls`. Searching for a string you can name:
-  `grep` / `find`. Editing: `edit` / `write`. Do not rebuild those with `cat`, `sed`, `head`,
-  `grep -r`, or a heredoc.
+  `grep` / `find`. Locating by description: {{code_search}}. Editing: `edit` / `write`. Do not
+  rebuild those with `cat`, `sed`, `head`, `grep -r`, or a heredoc.
 - Sending work to a worker: the dispatch tool (prompt/description/subagent_type, or task/agent).
   Do not substitute your own read/grep sweep for a dispatch the user asked for.
 - Fetching a page or looking something up: use {{fetch}}, {{search}} or {{browser}}.

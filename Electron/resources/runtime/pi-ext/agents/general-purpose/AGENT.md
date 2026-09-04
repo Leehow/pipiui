@@ -73,9 +73,10 @@ Neither file replaces your own judgement about the code you are changing. They r
 search for where that code is.
 
 When your brief names neither, that search is yours — and it is a choice, not a reflex.
-`grep` / `find` are right for a string you can name; `code_search` is right for an intent you
-cannot spell, and `repo_map` for a tree whose layout you cannot yet name. An empty result means
-change the kind of search, not the keyword: a second synonym is the strategy that just failed.
+`grep` / `find` are right for a token you already know is in the tree; `code_search` is the
+first tool for locating by description, even if a keyword guess is sitting there; `repo_map`
+for a tree whose layout you cannot yet name. An empty result means change the kind of search,
+not the keyword: a second synonym is the strategy that just failed.
 Pull span bodies with `read_spans` from what a search ranked rather than reopening whole files.
 
 ## PipiUI host lifecycle (binding)

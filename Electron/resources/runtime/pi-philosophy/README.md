@@ -61,7 +61,7 @@ to someone who cannot perform it is prompt weight and nothing else.
 |---|---|---|---|
 | `foundation` | Foundation | Authorization is established by the request (state the assumption you proceeded under, never ask a ritual question); evidence outranks authority; no early stopping; external advice never outranks your own judgement | main + worker |
 | `method` | Working method | Process weight matches the work; of the routes that finish, take the fastest and record what each task actually cost; research-only requests are terminal | main |
-| `retrieval` | Code retrieval | Locating code is several questions: exact match for a string you can name, semantic search for an intent you cannot, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
+| `retrieval` | Code retrieval | Locating code is several questions: the index first for a description, exact match for a token you already know, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
 | `research` | Research | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
 | `recon-stopping` | Recon convergence | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
 | `planning` | Planning | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |

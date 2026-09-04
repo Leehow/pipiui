@@ -276,11 +276,14 @@ describe("vendored philosophy: delivery", () => {
     const retrieval = layers.find((l) => l.id === "retrieval")!.body;
     expect(retrieval).toMatch(/second keyword is the tell/);
     expect(retrieval).toMatch(/Refs before bodies/);
+    expect(retrieval).toMatch(/Start with \{\{code_search\}\}/);
+    expect(retrieval).toMatch(/a guess is not a name/);
     // Nothing else may re-define searching as the exact matcher alone; that framing in
     // `toolcall` is what kept the index unused after it shipped.
-    expect(layers.find((l) => l.id === "toolcall")!.body).toMatch(
-      /Searching for a string you can name/,
-    );
+    const toolcall = layers.find((l) => l.id === "toolcall")!.body;
+    expect(toolcall).toMatch(/Searching for a string you can name/);
+    expect(toolcall).toMatch(/Locating by description/);
+    expect(toolcall).toMatch(/\{\{code_search\}\}/);
   });
 
   it("makes review and empirical acceptance concurrent rather than sequential", () => {

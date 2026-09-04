@@ -88,7 +88,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     if (hits.length === 0 && useLexicalFallback) {
       if (open && !semanticAvailable) {
         notes.push(
-          "Ranked by weighted term match inside symbol spans, not by meaning (semantic retrieval is not enabled in this build): these hits are as good as the words you chose.",
+          "Ranked by weighted term match inside symbol spans (zvec missed or is not in this process). A route note is not a failure: these hits are as good as the words you chose.",
         );
       }
       const terms = extractLexicalTerms(query);

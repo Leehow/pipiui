@@ -1,7 +1,7 @@
 ---
 id: retrieval
 name: Code retrieval
-summary: Exact match for a token you can name, weighted search for one you can only describe; refs before bodies; a map before a guess; coverage ends the search.
+summary: Locate by description with the index first; exact tokens still go to grep; refs before bodies; a map before a guess; coverage ends the search.
 order: 21
 requires: []
 requires-capabilities: [code_search]
@@ -12,17 +12,18 @@ scope: [main, explore, plan, general-purpose, reviewer, secretary]
 Locating code is not one question, and the tool that answers one kind returns noise for the
 other. Decide which kind you are holding before you search.
 
-**You can name the string.** A symbol, an error message, a config key, an import path —
-something that appears literally in the file you want. Match it literally: `grep` and `find`
-are exact, complete and instant, and reaching past them for something cleverer is the same
-mistake as running a heavy workflow on a one-line fix.
+**You are looking for where something lives.** *Where the login state gets invalidated. What
+handles retry on a 429. Which layer owns the merge.* Start with {{code_search}}, even if a
+keyword guess is sitting there — a guess is not a name. A literal matcher needs the exact
+word the author chose; one wrong guess returns nothing and one broad guess returns the whole
+repository. {{code_search}} runs a local zvec BM25+vector index on the sentence you already
+have and hands back ranked spans. Grep-first on that question is the fifteen-call loop the
+index exists to skip.
 
-**You can describe it in several words but cannot name the one token.** *Where the login
-state gets invalidated. What handles retry on a 429. Which layer owns the merge.* A literal
-matcher needs you to guess the exact word the author chose, and one wrong guess returns
-nothing while one broad guess returns the whole repository. {{code_search}} runs a local zvec
-BM25+vector index on that sentence and hands back ranked spans, so the wording you already
-have does the work a second grep keyword was doing.
+**You already know the exact token.** A symbol, an error message, a config key, an import
+path — something that appears literally in the file you want. Match it with `grep` / `find`.
+They are exact, complete and instant. Do not send an identifier to {{code_search}} to feel
+thorough.
 
 Be exact about what that is and is not. It does not read your mind. The index stays in the
 project `.pi/agent` home (no cloud embedding). If it is down, the same tool falls back to
@@ -34,7 +35,8 @@ Your own second keyword is the tell, and it counts whether you reach for it in t
 pack it into this one. `retry|recover|classify|failure` is not one exact match — it is four
 guesses weighed by whichever happens to appear most, which is the weighing one {{code_search}}
 call does properly, on the sentence those four words were groping for. An alternation of
-candidate words means you already have the description; send that instead of the arms.
+candidate words, or a grep pattern with spaces, means you already have the description; send
+that instead of the arms.
 
 **Relationships are their own question**: where a symbol is defined, who calls it, what
 implements it. Text search flattens the definition, every call, and every mention in a comment

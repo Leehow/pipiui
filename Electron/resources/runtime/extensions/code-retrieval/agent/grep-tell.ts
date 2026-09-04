@@ -31,7 +31,7 @@ const STATE_BOUND = 64;
 /** Arms echoed back to the model, when they are clean enough to quote. */
 const ARM_ECHO_BOUND = 5;
 
-export type GrepTellKind = "packed" | "retry";
+export type GrepTellKind = "packed" | "retry" | "description";
 
 export type GrepTell = {
   kind: GrepTellKind;
@@ -113,6 +113,18 @@ function retryLine(): string {
   );
 }
 
+function descriptionLine(): string {
+  return (
+    `[code-retrieval] That grep pattern is a description, not a token. ` +
+    `code_search is the first tool for locating by description — send it the sentence.`
+  );
+}
+
+/** Whitespace means the caller already had a sentence, not a symbol. */
+function looksLikeDescription(pattern: string): boolean {
+  return /\s/.test(pattern);
+}
+
 /**
  * Per-session tell detector. One instance per agent session; `reset()` on
  * session_start, `silence()` once the session uses indexed retrieval.
@@ -173,6 +185,8 @@ export class GrepTellBudget {
     let tell: GrepTell | undefined;
     if (arms.length >= PACKED_ARMS_THRESHOLD) {
       tell = { kind: "packed", arms: arms.length, line: packedLine(arms) };
+    } else if (looksLikeDescription(pattern)) {
+      tell = { kind: "description", arms: arms.length, line: descriptionLine() };
     } else if (
       previous !== undefined &&
       previous.pattern !== pattern &&
