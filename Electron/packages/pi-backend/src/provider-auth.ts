@@ -211,8 +211,58 @@ export interface ProviderAuthOptions {
 export class ProviderAuthBackend {
   private sessions = new Map<string, ProviderLoginSession>();
   private seq = 0;
+  private providersCache: { value: AuthProviderInfo[]; at: number } | null = null;
+  private providersInFlight: Promise<AuthProviderInfo[]> | null = null;
 
   constructor(private options: ProviderAuthOptions) {}
+
+  /** How long a cached provider listing is served before a background refresh is kicked. */
+  private static readonly PROVIDERS_CACHE_TTL_MS = 60_000;
+
+  /**
+   * Cached provider listing for UI panels. The backend prefetches it at startup so the
+   * add-model panel paints instantly; reads never block on the runtime once warm, and a
+   * stale entry refreshes in the background (stale-while-revalidate). Auth mutations
+   * invalidate explicitly via invalidateProvidersCache.
+   */
+  async listProvidersCached(): Promise<AuthProviderInfo[]> {
+    const cached = this.providersCache;
+    if (cached) {
+      if (Date.now() - cached.at > ProviderAuthBackend.PROVIDERS_CACHE_TTL_MS) {
+        void this.refreshProvidersCache().catch(() => undefined);
+      }
+      return cached.value;
+    }
+    return this.refreshProvidersCache();
+  }
+
+  /** Drop the cache and re-warm it in the background; used after auth mutations. */
+  invalidateProvidersCache(): void {
+    this.providersCache = null;
+    void this.refreshProvidersCache().catch(() => undefined);
+  }
+
+  /** Fire-and-forget startup warm-up: never throws, never blocks construction. */
+  prefetchProviders(): void {
+    if (!this.providersCache) void this.refreshProvidersCache().catch(() => undefined);
+  }
+
+  private refreshProvidersCache(): Promise<AuthProviderInfo[]> {
+    if (this.providersInFlight) return this.providersInFlight;
+    const load = this.listProviders();
+    this.providersInFlight = load;
+    return load.then(
+      value => {
+        if (this.providersInFlight === load) this.providersInFlight = null;
+        this.providersCache = { value, at: Date.now() };
+        return value;
+      },
+      error => {
+        if (this.providersInFlight === load) this.providersInFlight = null;
+        throw error;
+      },
+    );
+  }
 
   /** Metadata-only lookup of one stored provider. Never returns token/key values. */
   async getStoredAuthStatus(providerId: string): Promise<StoredAuthStatus> {

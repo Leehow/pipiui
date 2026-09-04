@@ -274,6 +274,18 @@ body{overscroll-behavior:none}
 .provider-login-form-actions{display:flex;gap:6px}
 .provider-login-submit{padding:3px 10px;border-radius:6px;color:#fff;background:var(--accent);font-size:11px}
 .provider-login-submit:disabled{opacity:.5;cursor:default}
+.provider-compat-toggle{display:flex;width:100%;align-items:center;gap:8px;padding:8px 4px;border-bottom:1px solid var(--border);text-align:left}
+.provider-compat-toggle:hover .provider-row-name{color:var(--text)}
+.provider-compat-toggle .provider-row-status{flex:1}
+.provider-compat-chevron{flex:none;color:var(--subtle);font-size:10px}
+.provider-compat-model-picker{display:flex;gap:6px}
+.provider-compat-model-picker select{min-width:0;flex:1;height:28px;padding:0 6px;border:1px solid var(--border-strong);border-radius:6px;outline:0;color:var(--text);background:var(--surface-input);font-size:12px}
+.provider-compat-model-picker select:focus{border-color:var(--accent)}
+.provider-compat-manual{flex:none;padding:3px 8px;border-radius:6px;color:var(--muted);background:var(--surface-hover);font-size:11px}
+.provider-compat-manual:hover{color:var(--text)}
+.provider-compat-hint{font-size:11px;color:var(--subtle)}
+.provider-compat-hint-error{color:var(--danger)}
+.provider-compat-test-result{font-size:11px;color:var(--success)}
 .provider-login-options{display:flex;flex-wrap:wrap;gap:6px}
 .provider-login-auth{display:flex;flex-direction:column;gap:6px;padding:8px 0 0;font-size:11px;color:var(--text)}
 .provider-login-code b{color:var(--text-strong);font-family:ui-monospace,SFMono-Regular,Menlo,monospace}

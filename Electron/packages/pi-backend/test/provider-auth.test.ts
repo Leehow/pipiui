@@ -79,6 +79,11 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     const backend = createPiHostBackend({ agentDir: root, authRuntime: runtime });
     expect((await backend.handle("authProviders", []) as any[]).map(provider => provider.id)).toEqual(["deepseek"]);
     runtime.getProviders = async () => { throw new Error("registry offline") };
+    // The panel reads the cached listing instantly while a background refresh re-checks
+    // the runtime; a broken registry must NOT blank the panel on its own.
+    expect((await backend.handle("authProviders", []) as any[]).map(provider => provider.id)).toEqual(["deepseek"]);
+    // Once the cache is invalidated (auth mutation path), the failure surfaces loudly.
+    (backend as unknown as { auth: { invalidateProvidersCache(): void } }).auth.invalidateProvidersCache();
     await expect(backend.handle("authProviders", [])).rejects.toThrow("无法读取 pi provider 目录：registry offline");
   });
 
@@ -535,5 +540,180 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(snap.version).toBe(SUBAGENT_MODEL_CATALOG_SNAPSHOT_VERSION);
     expect(snap.available).not.toBe(false);
     expect(snap.models.map((m: { id: string }) => m.id)).toContain("deepseek/d1");
+  });
+});
+
+describe("provider catalog cache", () => {
+  let root = "";
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    root = "";
+  });
+
+  it("prefetch warms the cache and later reads never re-query the runtime", async () => {
+    root = await tempAgent();
+    const runtime = fakeAuthRuntime();
+    let getProvidersCalls = 0;
+    const countingRuntime: AuthRuntimeLike = {
+      ...runtime,
+      getProviders: async () => {
+        getProvidersCalls += 1;
+        return runtime.getProviders();
+      },
+    };
+    const backend = new ProviderAuthBackend({ runtime: countingRuntime, authPath: join(root, "auth.json") });
+    backend.prefetchProviders();
+    const first = await backend.listProvidersCached();
+    expect(first.map(provider => provider.id)).toContain("anthropic");
+    expect(getProvidersCalls).toBe(1);
+    const second = await backend.listProvidersCached();
+    expect(second).toEqual(first);
+    expect(getProvidersCalls).toBe(1);
+  });
+
+  it("invalidateProvidersCache re-warms in the background and reflects new credential state", async () => {
+    root = await tempAgent();
+    let credentialed = false;
+    const runtime: AuthRuntimeLike = {
+      getProviders: async () => [{ id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } }],
+      getAvailable: async () => (credentialed ? [{ provider: "deepseek", id: "d1" }] : []),
+      login: async () => undefined,
+      logout: async () => undefined,
+    };
+    const backend = new ProviderAuthBackend({ runtime, authPath: join(root, "auth.json") });
+    expect((await backend.listProvidersCached())[0]?.authenticated).toBe(false);
+    credentialed = true;
+    backend.invalidateProvidersCache();
+    const fresh = await backend.listProvidersCached();
+    expect(fresh[0]?.authenticated).toBe(true);
+  });
+
+  it("serves a stale entry immediately while refreshing it in the background", async () => {
+    vi.useFakeTimers();
+    root = await tempAgent();
+    let credentialed = false;
+    const runtime: AuthRuntimeLike = {
+      getProviders: async () => [{ id: "deepseek", name: "DeepSeek", auth: { apiKey: { login: {} } } }],
+      getAvailable: async () => (credentialed ? [{ provider: "deepseek", id: "d1" }] : []),
+      login: async () => undefined,
+      logout: async () => undefined,
+    };
+    const backend = new ProviderAuthBackend({ runtime, authPath: join(root, "auth.json") });
+    const loaded = await backend.listProvidersCached();
+    expect(loaded[0]?.authenticated).toBe(false);
+    credentialed = true;
+    vi.setSystemTime(Date.now() + 61_000); // older than the 60s TTL
+    const stale = await backend.listProvidersCached();
+    expect(stale[0]?.authenticated).toBe(false); // stale value served without blocking
+    // The kicked background refresh settles asynchronously (fs roundtrip); reads after
+    // it lands observe the fresh credential state.
+    await vi.waitFor(async () => {
+      const refreshed = await backend.listProvidersCached();
+      expect(refreshed[0]?.authenticated).toBe(true);
+    }, { timeout: 2000 });
+  });
+});
+
+describe("openai-compatible model catalog + connectivity RPCs", () => {
+  let root = "";
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    root = "";
+  });
+
+  it("listOpenAICompatibleModels returns sorted model ids with probed context windows", async () => {
+    root = await tempAgent();
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe("https://proxy.example/v1/models");
+      expect(init?.headers).toMatchObject({ Authorization: "Bearer sk-live" });
+      return new Response(JSON.stringify({ data: [
+        { id: "zeta" },
+        { id: "alpha", context_length: 8192 },
+        { name: "beta", max_model_len: 4096 },
+      ] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    const result = await backend.handle("listOpenAICompatibleModels", [{
+      baseUrl: "https://proxy.example/v1/",
+      apiKey: "sk-live",
+    }]) as { models: { id: string; contextWindow?: number }[] };
+    expect(result.models).toEqual([
+      { id: "alpha", contextWindow: 8192 },
+      { id: "beta", contextWindow: 4096 },
+      { id: "zeta" },
+    ]);
+  });
+
+  it("listOpenAICompatibleModels surfaces HTTP failures with the status", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("denied", { status: 401 })));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await expect(backend.handle("listOpenAICompatibleModels", [{
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk",
+    }])).rejects.toThrow("HTTP 401");
+  });
+
+  it("testOpenAICompatibleModel measures first-token latency and throughput from an SSE stream", async () => {
+    root = await tempAgent();
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "OK" } }] })}`,
+      "",
+      `data: ${JSON.stringify({ choices: [{ delta: { content: "!" } }] })}`,
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n");
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      expect(url).toBe("https://proxy.example/v1/chat/completions");
+      const body = JSON.parse(String(init?.body));
+      expect(body).toMatchObject({ model: "m1", stream: true });
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    const result = await backend.handle("testOpenAICompatibleModel", [{
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk",
+      modelId: "m1",
+    }]) as { ok: boolean; tokens: number; preview: string; firstTokenMs: number; totalMs: number; tokensPerSecond: number };
+    expect(result.ok).toBe(true);
+    expect(result.tokens).toBe(2);
+    expect(result.preview).toBe("OK!");
+    expect(result.firstTokenMs).toBeGreaterThanOrEqual(0);
+    expect(result.totalMs).toBeGreaterThanOrEqual(result.firstTokenMs);
+    expect(result.tokensPerSecond).toBeGreaterThan(0);
+  });
+
+  it("testOpenAICompatibleModel falls back to non-stream JSON responses using usage tokens", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ choices: [{ message: { content: "hi" } }], usage: { completion_tokens: 7 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    const result = await backend.handle("testOpenAICompatibleModel", [{
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk",
+      modelId: "m1",
+    }]) as { ok: boolean; tokens: number; firstTokenMs: number };
+    expect(result.ok).toBe(true);
+    expect(result.tokens).toBe(7);
+    expect(result.firstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("testOpenAICompatibleModel propagates HTTP errors with the status", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("quota exceeded", { status: 429 })));
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await expect(backend.handle("testOpenAICompatibleModel", [{
+      baseUrl: "https://proxy.example/v1",
+      apiKey: "sk",
+      modelId: "m1",
+    }])).rejects.toThrow(/HTTP 429/);
   });
 });

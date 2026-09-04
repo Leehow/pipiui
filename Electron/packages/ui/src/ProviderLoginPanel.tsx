@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AuthLoginEvent, AuthProviderInfo, AuthType, PipiHostAPI } from '@pipi/host-api'
+import type { AuthLoginEvent, AuthProviderInfo, AuthType, OpenAICompatibleModelInfo, OpenAICompatibleModelTestResult, PipiHostAPI } from '@pipi/host-api'
 
 const PROVIDER_LOAD_TIMEOUT_MS = 8_000
 
@@ -70,6 +70,7 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
   const [providersLoading, setProvidersLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [session, setSession] = useState<LoginSessionState | null>(null)
+  const [compatOpen, setCompatOpen] = useState(false)
   const [compatName, setCompatName] = useState('')
   const [compatUrl, setCompatUrl] = useState('')
   const [compatKey, setCompatKey] = useState('')
@@ -77,9 +78,17 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
   const [compatContextWindow, setCompatContextWindow] = useState('')
   const [compatBusy, setCompatBusy] = useState(false)
   const [compatError, setCompatError] = useState<string | null>(null)
+  const [compatModels, setCompatModels] = useState<OpenAICompatibleModelInfo[] | null>(null)
+  const [compatModelsLoading, setCompatModelsLoading] = useState(false)
+  const [compatModelsError, setCompatModelsError] = useState<string | null>(null)
+  const [manualModelInput, setManualModelInput] = useState(false)
+  const [compatTest, setCompatTest] = useState<OpenAICompatibleModelTestResult | null>(null)
+  const [compatTestBusy, setCompatTestBusy] = useState(false)
+  const [compatTestError, setCompatTestError] = useState<string | null>(null)
   const mountedRef = useRef(false)
   const providerRequestRef = useRef(0)
   const loginRequestRef = useRef(0)
+  const compatModelsRequestRef = useRef(0)
   const providerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const clearProviderTimer = useCallback(() => {
@@ -211,6 +220,60 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
     }
   }, [host, session])
 
+  const listCompatModels = useCallback(async (baseUrl: string, apiKey: string) => {
+    if (!host.listOpenAICompatibleModels) return
+    const request = ++compatModelsRequestRef.current
+    setCompatModelsLoading(true)
+    setCompatModelsError(null)
+    try {
+      const result = await host.listOpenAICompatibleModels({ baseUrl, apiKey })
+      if (!mountedRef.current || request !== compatModelsRequestRef.current) return
+      if (!result || !Array.isArray(result.models)) throw new Error('主机返回了无效的模型列表')
+      setCompatModels(result.models)
+      setManualModelInput(false)
+    } catch (err) {
+      if (!mountedRef.current || request !== compatModelsRequestRef.current) return
+      setCompatModels(null)
+      setCompatModelsError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (mountedRef.current && request === compatModelsRequestRef.current) setCompatModelsLoading(false)
+    }
+  }, [host])
+
+  // Auto-fetch the model-id candidates once URL + Key are both filled (debounced);
+  // providers without a /models endpoint fall back to the manual input.
+  useEffect(() => {
+    compatModelsRequestRef.current += 1
+    setCompatModels(null)
+    setCompatModelsError(null)
+    setCompatModelsLoading(false)
+    const baseUrl = compatUrl.trim()
+    const apiKey = compatKey.trim()
+    if (!host.listOpenAICompatibleModels || !baseUrl || !apiKey || !/^https?:\/\//i.test(baseUrl)) return
+    const timer = setTimeout(() => { void listCompatModels(baseUrl, apiKey) }, 600)
+    return () => clearTimeout(timer)
+  }, [compatKey, compatUrl, host, listCompatModels])
+
+  const runCompatTest = useCallback(async () => {
+    const baseUrl = compatUrl.trim()
+    const apiKey = compatKey.trim()
+    const modelId = compatModelId.trim()
+    if (!baseUrl || !apiKey || !modelId || compatTestBusy || !host.testOpenAICompatibleModel) return
+    setCompatTestBusy(true)
+    setCompatTestError(null)
+    setCompatTest(null)
+    try {
+      const result = await host.testOpenAICompatibleModel({ baseUrl, apiKey, modelId })
+      if (!mountedRef.current) return
+      setCompatTest(result)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setCompatTestError(err instanceof Error ? err.message : String(err))
+    } finally {
+      if (mountedRef.current) setCompatTestBusy(false)
+    }
+  }, [compatKey, compatModelId, compatTestBusy, compatUrl, host])
+
   const saveCompat = useCallback(async () => {
     const name = compatName.trim()
     const baseUrl = compatUrl.trim()
@@ -234,6 +297,8 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
       setCompatKey('')
       setCompatModelId('')
       setCompatContextWindow('')
+      setCompatTest(null)
+      setCompatTestError(null)
       onAdded()
       loadProviders()
     } catch (err) {
@@ -246,6 +311,12 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
   const activeProvider = providers?.find(provider => provider.id === session?.providerId)
   const retry = () => loadProviders()
   const canSaveCompat = Boolean(compatName.trim() && compatUrl.trim() && compatKey.trim() && compatModelId.trim()) && !compatBusy
+  const canTestCompat = Boolean(compatUrl.trim() && compatKey.trim() && compatModelId.trim()) && !compatTestBusy && !compatBusy
+  const selectCompatModel = (id: string) => {
+    setCompatModelId(id)
+    const entry = compatModels?.find(model => model.id === id)
+    if (entry?.contextWindow) setCompatContextWindow(String(entry.contextWindow))
+  }
 
   return (
     <div className="provider-add" data-testid="provider-add">
@@ -287,10 +358,12 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
         </section>
       )}
       <section className="provider-compat" data-testid="provider-compat">
-        <div className="provider-row-main">
+        <button type="button" className="provider-compat-toggle" data-testid="provider-compat-toggle" aria-expanded={compatOpen} onClick={() => setCompatOpen(open => !open)}>
           <span className="provider-row-name">OpenAI 兼容</span>
           <span className="provider-row-status">自定义名称、URL 与 Key</span>
-        </div>
+          <span className="provider-compat-chevron" aria-hidden="true">{compatOpen ? '▾' : '▸'}</span>
+        </button>
+        {compatOpen && (
         <form className="provider-login-form" data-testid="provider-compat-form" onSubmit={event => { event.preventDefault(); void saveCompat() }}>
           <label htmlFor="provider-compat-name">名称</label>
           <input id="provider-compat-name" data-testid="provider-compat-name" value={compatName} onChange={e => setCompatName(e.target.value)} placeholder="例如 my-proxy" autoComplete="off" />
@@ -299,14 +372,39 @@ export function ProviderLoginPanel({ host, onAdded }: { host: PipiHostAPI; onAdd
           <label htmlFor="provider-compat-key">Key</label>
           <input id="provider-compat-key" data-testid="provider-compat-key" type="password" value={compatKey} onChange={e => setCompatKey(e.target.value)} placeholder="sk-…" autoComplete="off" />
           <label htmlFor="provider-compat-model">模型 id</label>
-          <input id="provider-compat-model" data-testid="provider-compat-model" value={compatModelId} onChange={e => setCompatModelId(e.target.value)} placeholder="gpt-4o-mini" autoComplete="off" />
-          <label htmlFor="provider-compat-context">上下文窗口（可选）</label>
+          {compatModels && compatModels.length > 0 && !manualModelInput ? (
+            <div className="provider-compat-model-picker">
+              <select
+                id="provider-compat-model"
+                data-testid="provider-compat-model-select"
+                value={compatModels.some(model => model.id === compatModelId) ? compatModelId : ''}
+                onChange={event => selectCompatModel(event.target.value)}
+              >
+                <option value="" disabled>{compatModelId ? `当前：${compatModelId}` : '选择模型…'}</option>
+                {compatModels.map(model => (
+                  <option key={model.id} value={model.id}>{model.id}{model.contextWindow ? `（上下文 ${model.contextWindow}）` : ''}</option>
+                ))}
+              </select>
+              <button type="button" className="provider-compat-manual" data-testid="provider-compat-manual-toggle" onClick={() => setManualModelInput(true)}>手动输入</button>
+            </div>
+          ) : (
+            <input id="provider-compat-model" data-testid="provider-compat-model" value={compatModelId} onChange={e => setCompatModelId(e.target.value)} placeholder="gpt-4o-mini" autoComplete="off" />
+          )}
+          {compatModelsLoading && <div className="provider-compat-hint" data-testid="provider-compat-models-loading">正在获取模型列表…</div>}
+          {compatModelsError && <div className="provider-compat-hint provider-compat-hint-error" data-testid="provider-compat-models-error">无法获取模型列表：{compatModelsError}（可手动输入）</div>}
+          <label htmlFor="provider-compat-context">上下文窗口（可选，自动获取）</label>
           <input id="provider-compat-context" data-testid="provider-compat-context" inputMode="numeric" value={compatContextWindow} onChange={e => setCompatContextWindow(e.target.value)} placeholder="131072" autoComplete="off" />
           {compatError && <div className="provider-login-error" data-testid="provider-compat-error">{compatError}</div>}
+          {compatTest && <div className="provider-compat-test-result" data-testid="provider-compat-test-result" title={compatTest.preview}>首字 {compatTest.firstTokenMs} ms · 生成 {compatTest.tokensPerSecond} tok/s · 共 {compatTest.totalMs} ms</div>}
+          {compatTestError && <div className="provider-login-error" data-testid="provider-compat-test-error">{compatTestError}</div>}
           <div className="provider-login-form-actions">
+            {host.testOpenAICompatibleModel && (
+              <button type="button" className="provider-login-btn" data-testid="provider-compat-test" disabled={!canTestCompat} onClick={() => void runCompatTest()}>{compatTestBusy ? '测试中…' : '测试连通性'}</button>
+            )}
             <button type="submit" className="provider-login-submit" data-testid="provider-compat-save" disabled={!canSaveCompat}>{compatBusy ? '保存中…' : '保存'}</button>
           </div>
         </form>
+        )}
       </section>
       {loadError && <div className="model-modal-error" data-testid="provider-add-error"><span>{loadError}</span><button aria-label="关闭 provider 错误" data-testid="provider-add-error-close" onClick={() => setLoadError(null)}>×</button><button data-testid="provider-add-retry" onClick={retry}>重试</button></div>}
       {providers === null && providersLoading && !loadError && <div className="model-modal-state" data-testid="provider-add-loading">正在加载 provider…</div>}
