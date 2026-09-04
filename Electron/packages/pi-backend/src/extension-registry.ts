@@ -260,7 +260,7 @@ export function writeAppExtensionEnabled(
 
 export function parseProjectExtensionEnabled(value: unknown): Record<string, boolean> {
   if (!isRecord(value)) return {};
-  if (value.schemaVersion === 2 && isRecord(value.overrides)) {
+  if ((value.schemaVersion === 2 || value.schemaVersion === 3) && isRecord(value.overrides)) {
     const out: Record<string, boolean> = {};
     for (const [id, state] of Object.entries(value.overrides)) {
       if (state === "enabled") out[id] = true;

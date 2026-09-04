@@ -32,6 +32,43 @@ describe("project Product Profile storage", () => {
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
   });
 
+  it("atomically migrates a schema 3 overlay that omits profile into the product default", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-profile-store-v3-"));
+    const path = join(root, PROJECT_EXTENSION_ENABLED_FILE);
+    await writeFile(path, JSON.stringify({
+      schemaVersion: 3,
+      overrides: { "hydra-workbench": "enabled" },
+    }), "utf8");
+
+    const activation = await readProjectProductActivation(root, { defaultProfileId: "coding" });
+
+    expect(activation).toEqual({
+      schemaVersion: 2,
+      profile: "coding",
+      overrides: { "hydra-workbench": "enabled" },
+    });
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
+    expect(await readProjectExtensionEnabled(root)).toEqual({ "hydra-workbench": true });
+  });
+
+  it("keeps an explicit schema 3 profile when migrating to v2", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-profile-store-v3-profile-"));
+    const path = join(root, PROJECT_EXTENSION_ENABLED_FILE);
+    await writeFile(path, JSON.stringify({
+      schemaVersion: 3,
+      profile: "base",
+      overrides: { "skill-loader-extension": "disabled" },
+    }), "utf8");
+
+    const activation = await readProjectProductActivation(root, { defaultProfileId: "coding" });
+    expect(activation).toEqual({
+      schemaVersion: 2,
+      profile: "base",
+      overrides: { "skill-loader-extension": "disabled" },
+    });
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual(activation);
+  });
+
   it("atomically migrates a legacy extension overlay into the coding profile", async () => {
     root = await mkdtemp(join(tmpdir(), "pipi-profile-store-"));
     const path = join(root, PROJECT_EXTENSION_ENABLED_FILE);

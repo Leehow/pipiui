@@ -64,6 +64,25 @@ function parseV2(value: unknown): ProjectProductActivation | undefined {
   };
 }
 
+/** Hydra-style activation: overrides only, profile implied by the shipping product. */
+function parseV3(value: unknown, defaultProfileId: string): ProjectProductActivation | undefined {
+  if (!isRecord(value) || value.schemaVersion !== 3) return undefined;
+  let profile = defaultProfileId;
+  if (value.profile !== undefined) {
+    if (typeof value.profile !== "string" || !PRODUCT_PROFILE_ID_RE.test(value.profile)) {
+      throw new Error("project Product Profile id must be a semantic slug");
+    }
+    profile = value.profile;
+  }
+  const overrides = value.overrides === undefined ? {} : parseOverrides(value.overrides);
+  if (!overrides) throw new Error("project Product Profile overrides are invalid");
+  return {
+    schemaVersion: PROJECT_PRODUCT_ACTIVATION_SCHEMA_VERSION,
+    profile,
+    overrides,
+  };
+}
+
 function parseLegacy(value: unknown, defaultProfileId: string): ProjectProductActivation | undefined {
   if (!isRecord(value)) return undefined;
   const overrides: Record<string, ProjectExtensionOverride> = {};
@@ -135,6 +154,8 @@ export async function readProjectProductActivation(
     }
     return current;
   }
+  const v3 = parseV3(raw, defaultProfileId);
+  if (v3) return writeProjectProductActivation(projectAgentDir, v3);
   const migrated = parseLegacy(raw, options.legacyProfileId ?? LEGACY_PRODUCT_PROFILE_ID);
   if (!migrated) throw new Error("project extension activation file is invalid");
   return writeProjectProductActivation(projectAgentDir, migrated);
