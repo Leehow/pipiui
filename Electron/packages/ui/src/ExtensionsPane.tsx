@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionCategory, ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, UserMcpServer } from '@pipi/host-api'
+import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionCategory, ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, SkillCatalogItem, UserMcpServer } from '@pipi/host-api'
 import {
   agentAvailabilityLabel,
   agentSourceLabel,
@@ -45,6 +45,7 @@ import type { ScanExternalSessionsController } from './useScanExternalSessions'
 import type { VisionRoutingController } from './useVisionRouting'
 import { VisionRoutingPane } from './VisionRoutingPane'
 import { WebSearchKeysPane } from './WebSearchKeysPane'
+import { knownSkillDescriptionZh } from './subagent-debug-copy'
 import { useOptionalProductWorkbenchRuntime } from './workbench/workbench-runtime'
 
 const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
@@ -518,43 +519,137 @@ function ExtensionPackageRow({
   )
 }
 
-function SkillsHub({ items }: { items: ExtensionDescriptor[] }) {
+function skillSourceLabel(item: Pick<SkillCatalogItem, 'origin' | 'sourceName'>): string {
+  if (item.origin === 'builtin') return '内置技能集'
+  if (item.origin === 'project') return '当前项目'
+  return item.sourceName
+}
+
+function skillCardDescription(item: SkillCatalogItem): string {
+  return knownSkillDescriptionZh(item.name) ?? item.description
+}
+
+function SkillCatalogCard({ item }: { item: SkillCatalogItem }) {
+  return (
+    <article
+      className={`extensions-skill-card${item.available ? '' : ' unavailable'}`}
+      data-testid={`extensions-skill-${item.name}`}
+    >
+      <div className="extensions-skill-card-title">
+        <h5>{item.name}</h5>
+        <span className={`extensions-state-pill state-${item.available ? 'enabled' : 'disabled'}`}>
+          {item.available ? (item.userInvoked ? '较重' : '按需') : '未启用'}
+        </span>
+      </div>
+      <p>{skillCardDescription(item)}</p>
+    </article>
+  )
+}
+
+function SkillCatalogGroup({ items }: { items: SkillCatalogItem[] }) {
+  const lead = items[0]
+  if (!lead) return null
+  const auto = items.filter(item => !item.userInvoked)
+  const heavy = items.filter(item => item.userInvoked)
+  return (
+    <section className="extensions-skill-group" data-testid={`extensions-skill-group-${lead.sourceId}`}>
+      <header className="extensions-skill-group-header">
+        <h4>{skillSourceLabel(lead)}</h4>
+        <span>{items.length} 个</span>
+      </header>
+      {auto.length > 0 && (
+        <div className="extensions-skill-subgroup" data-testid={`extensions-skill-auto-${lead.sourceId}`}>
+          <span className="extensions-support-kicker">按需加载</span>
+          <p>Agent 可自行 <code>skill_search</code> / <code>skill_load</code>。</p>
+          <div className="extensions-skill-grid">
+            {auto.map(item => <SkillCatalogCard key={`${item.sourceId}:${item.name}`} item={item} />)}
+          </div>
+        </div>
+      )}
+      {heavy.length > 0 && (
+        <div className="extensions-skill-subgroup" data-testid={`extensions-skill-heavy-${lead.sourceId}`}>
+          <span className="extensions-support-kicker">较重流程</span>
+          <p>多步过程或文档产出，按需加载或使用 <code>/skill:名称</code>。</p>
+          <div className="extensions-skill-grid">
+            {heavy.map(item => <SkillCatalogCard key={`${item.sourceId}:${item.name}`} item={item} />)}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function SkillsHub({ items, host, projectId }: {
+  items: ExtensionDescriptor[]
+  host: PipiHostAPI
+  projectId?: string
+}) {
   const builtIn = items.find(item => item.id === CORE_SKILLS_EXTENSION_IDS[0])
   const loader = items.find(item => item.id === CORE_SKILLS_EXTENSION_IDS[1])
   const builtInEnabled = builtIn?.state === 'enabled'
   const loaderEnabled = loader?.state === 'enabled'
+  const [catalog, setCatalog] = useState<SkillCatalogItem[] | null>(null)
+  const [catalogError, setCatalogError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!host.listSkillCatalog) {
+      setCatalog([])
+      setCatalogError(null)
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const listed = projectId
+          ? await host.listSkillCatalog!(projectId)
+          : await host.listSkillCatalog!()
+        if (cancelled) return
+        setCatalog(listed)
+        setCatalogError(null)
+      } catch (error) {
+        if (cancelled) return
+        setCatalog([])
+        setCatalogError(`无法加载 Skill 目录：${error instanceof Error ? error.message : String(error)}`)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [host, projectId])
+
+  const groups = useMemo(() => {
+    const grouped: SkillCatalogItem[][] = []
+    const index = new Map<string, SkillCatalogItem[]>()
+    for (const item of catalog ?? []) {
+      const key = `${item.origin}:${item.sourceId}`
+      let bucket = index.get(key)
+      if (!bucket) {
+        bucket = []
+        index.set(key, bucket)
+        grouped.push(bucket)
+      }
+      bucket.push(item)
+    }
+    return grouped
+  }, [catalog])
+
   return (
     <section className="extensions-skills-hub" data-testid="extensions-skills-hub">
       <div className="extensions-hub-hero">
         <span className="extensions-overview-eyebrow">核心扩展</span>
         <h3>Skills</h3>
-        <p>Skill 是 Agent 在需要时加载的说明、流程和资源。基础版只启用 Built-in Skills 与 Skill Loader；Coding 等扩展包再带上各自领域的 Skills。</p>
+        <p>Skill 是 Agent 在需要时加载的说明、流程和资源。下面按来源列出当前能发现的全部 Skill：内置技能集、各扩展 <code>agent.skills</code> 根目录，以及当前项目 <code>.pi/agent/skills</code>。</p>
+        <div className="extensions-hub-card-title extensions-skills-status">
+          <span>Built-in Skills</span>
+          <span className={`extensions-state-pill state-${builtInEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-builtin-state">{builtInEnabled ? '已启用' : '未启用'}</span>
+          <span>Skill Loader</span>
+          <span className={`extensions-state-pill state-${loaderEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-loader-state">{loaderEnabled ? '已启用' : '未启用'}</span>
+        </div>
       </div>
-      <div className="extensions-hub-grid">
-        <article className="extensions-hub-card">
-          <span className="extensions-support-kicker">运行状态</span>
-          <div className="extensions-hub-card-title">
-            <h4>Built-in Skills</h4>
-            <span className={`extensions-state-pill state-${builtInEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-builtin-state">{builtInEnabled ? '已启用' : '未启用'}</span>
-          </div>
-          <div className="extensions-hub-card-title">
-            <h4>Skill Loader</h4>
-            <span className={`extensions-state-pill state-${loaderEnabled ? 'enabled' : 'disabled'}`} data-testid="extensions-skills-loader-state">{loaderEnabled ? '已启用' : '未启用'}</span>
-          </div>
-          <p>内置技能集由 <code>built-in-skills</code> 提供；搜索与按需加载由 <code>skill-loader-extension</code> 提供。每个扩展包可以带自己的 Skill 根目录。</p>
-        </article>
-        <article className="extensions-hub-card extensions-hub-card-accent" data-testid="extensions-skill-create">
-          <span className="extensions-support-kicker">内置创建工具</span>
-          <h4>创建 PipiUI 扩展</h4>
-          <p><code>create-pipiui-extension</code> Skill 可以生成扩展、Profile 和 Product Pack 骨架。</p>
-          <div className="extensions-skill-prompt">在主会话里直接说：创建一个包含左栏、工具和结果卡片的扩展。</div>
-        </article>
-        <article className="extensions-hub-card">
-          <span className="extensions-support-kicker">组织方式</span>
-          <h4>Skill 跟随扩展包</h4>
-          <p>启用 Coding、COC 或 ET 扩展包时，对应领域的 Skills 一起可用；关闭扩展包后不会污染其它项目。</p>
-        </article>
-      </div>
+      {catalogError && <p className="model-modal-error" role="alert" data-testid="extensions-skills-error">{catalogError}</p>}
+      {catalog === null && <p className="extensions-skills-empty" data-testid="extensions-skills-loading">正在加载 Skill 目录…</p>}
+      {groups.map(group => <SkillCatalogGroup key={`${group[0]?.origin}:${group[0]?.sourceId}`} items={group} />)}
+      {catalog && catalog.length === 0 && !catalogError && (
+        <p className="extensions-skills-empty" data-testid="extensions-skills-empty">还没有发现 Skill。启用 Built-in Skills 后会出现内置技能集；扩展可通过 agent.skills 贡献自己的 Skill 根目录。</p>
+      )}
     </section>
   )
 }
@@ -1213,7 +1308,7 @@ function ExtensionPackagesSection({ host, projectId, servers, onServersChanged, 
               ))}
             </div>
           )}
-          {selectedView === 'skills' ? <SkillsHub items={items} /> : selectedView === 'mcp' ? (
+          {selectedView === 'skills' ? <SkillsHub items={items} host={host} projectId={resolvedProjectId} /> : selectedView === 'mcp' ? (
             <McpHub host={host} projectId={resolvedProjectId} servers={servers} onChanged={onServersChanged} />
           ) : selectedProfile ? (
             <>

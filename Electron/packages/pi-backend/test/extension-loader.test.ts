@@ -841,6 +841,10 @@ describe("extension loader agent contributions snapshot", () => {
     expect(spawned?.extensionPath).toMatch(/quota\/agent\/dist\/index\.js$/);
     expect(spawned?.skillRoots?.some((path) => path.endsWith("skills/hello"))).toBe(true);
     expect(spawned?.agentContribution).toBeUndefined();
+    expect(loader.skillRootEntries({ quota: true })).toEqual([
+      expect.objectContaining({ id: "quota", name: "quota", enabled: true }),
+    ]);
+    expect(loader.skillRootEntries({ quota: true })[0]?.skillRoots.some((path) => path.endsWith("skills/hello"))).toBe(true);
   });
 
   it("resolves confined agent and patch paths from the validated manifest, not raw JSON", async () => {

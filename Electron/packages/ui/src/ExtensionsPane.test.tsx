@@ -322,6 +322,44 @@ function extensionPackHost(extra: ExtensionDescriptor[] = []) {
       bytes: 1024,
       extensionCount: 2,
     })),
+    listSkillCatalog: vi.fn(async () => [
+      {
+        name: 'create-pipiui-extension',
+        description: 'Create a PipiUI extension package.',
+        userInvoked: false,
+        origin: 'builtin' as const,
+        sourceId: 'built-in-skills',
+        sourceName: 'Built-in Skills',
+        available: true,
+      },
+      {
+        name: 'tdd',
+        description: 'Test-driven development.',
+        userInvoked: false,
+        origin: 'builtin' as const,
+        sourceId: 'built-in-skills',
+        sourceName: 'Built-in Skills',
+        available: true,
+      },
+      {
+        name: 'to-spec',
+        description: 'Turn the conversation into a spec.',
+        userInvoked: true,
+        origin: 'builtin' as const,
+        sourceId: 'built-in-skills',
+        sourceName: 'Built-in Skills',
+        available: true,
+      },
+      {
+        name: 'hello',
+        description: 'Quota hello skill.',
+        userInvoked: false,
+        origin: 'extension' as const,
+        sourceId: 'quota',
+        sourceName: 'Quota',
+        available: false,
+      },
+    ]),
     pickProductPackArchive: vi.fn(async () => '/tmp/coc.pipiui-pack.zip'),
     installProductPackArchive: vi.fn(async () => {
       profiles = [...profiles, {
@@ -364,7 +402,8 @@ describe('ExtensionsPane package management', () => {
 
     fireEvent.click(screen.getByTestId('extensions-nav-skills'))
     expect(await screen.findByTestId('extensions-skills-hub')).toBeTruthy()
-    expect(screen.getByTestId('extensions-skill-create').textContent).toContain('create-pipiui-extension')
+    expect(await screen.findByTestId('extensions-skill-create-pipiui-extension')).toBeTruthy()
+    expect(screen.getByTestId('extensions-skill-create-pipiui-extension').textContent).toContain('create-pipiui-extension')
 
     fireEvent.click(screen.getByTestId('extensions-pack-create'))
     fireEvent.change(screen.getByTestId('extensions-pack-name'), { target: { value: 'Lab Tools' } })
@@ -374,6 +413,22 @@ describe('ExtensionsPane package management', () => {
     fireEvent.click(within(memberList).getByText('Documents'))
     fireEvent.click(screen.getByTestId('extensions-pack-members-confirm'))
     await waitFor(() => expect(host.updateProductProfileExtensions).toHaveBeenCalledWith('demo', 'lab-tools', ['document-workbench']))
+  })
+
+  it('lists every catalog skill grouped by source and invocation, with descriptions', async () => {
+    const host = extensionPackHost()
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(screen.getByTestId('extensions-nav-skills'))
+    expect(await screen.findByTestId('extensions-skill-group-built-in-skills')).toBeTruthy()
+    expect(host.listSkillCatalog).toHaveBeenCalledWith('demo')
+    expect(screen.getByTestId('extensions-skill-auto-built-in-skills').textContent).toContain('tdd')
+    expect(screen.getByTestId('extensions-skill-tdd').textContent).toContain('按测试驱动开发')
+    expect(screen.getByTestId('extensions-skill-heavy-built-in-skills').textContent).toContain('to-spec')
+    expect(screen.getByTestId('extensions-skill-to-spec').textContent).toContain('把已澄清需求整理成可执行规格')
+    expect(screen.getByTestId('extensions-skill-group-quota').textContent).toContain('Quota')
+    expect(screen.getByTestId('extensions-skill-hello').textContent).toContain('未启用')
+    expect(screen.getByTestId('extensions-skill-hello').textContent).toContain('Quota hello skill.')
+    expect(screen.queryByTestId('extensions-skill-create')).toBeNull()
   })
 
   it('lists web, browser, CUA and memory inside the Coding pack, not a core tools hub', async () => {

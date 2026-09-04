@@ -828,6 +828,27 @@ export class ExtensionLoader {
     this.drop(id);
   }
 
+  /** Declared `agent.skills` roots for catalog listing. Paths stay host-side. */
+  skillRootEntries(overlay?: Record<string, boolean>): Array<{
+    id: string;
+    name: string;
+    enabled: boolean;
+    skillRoots: readonly string[];
+  }> {
+    const out: Array<{ id: string; name: string; enabled: boolean; skillRoots: readonly string[] }> = [];
+    for (const record of this.registry.list(overlay)) {
+      const roots = this.agent.get(record.id)?.skillRoots ?? [];
+      if (!roots.length) continue;
+      out.push({
+        id: record.id,
+        name: record.name,
+        enabled: record.state === "enabled",
+        skillRoots: roots,
+      });
+    }
+    return out;
+  }
+
   list(overlay?: Record<string, boolean>): ExtensionListItem[] {
     return this.registry.list(overlay).map((record) => this.summarize(record));
   }

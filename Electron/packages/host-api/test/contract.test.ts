@@ -1407,4 +1407,32 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'logoutExtension', params: ['quota'] },
     ])
   })
+
+  it('passthrough-invokes listSkillCatalog over pipi-host:v1', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const catalog = [{
+      name: 'tdd',
+      description: 'Test-driven development.',
+      userInvoked: false,
+      origin: 'builtin' as const,
+      sourceId: 'built-in-skills',
+      sourceName: 'Built-in Skills',
+      available: true,
+    }]
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: catalog }
+      },
+      on: () => undefined,
+      removeListener: () => undefined,
+    }
+    const host = createIpcHost(ipc)
+    await expect(host.listSkillCatalog?.()).resolves.toEqual(catalog)
+    await expect(host.listSkillCatalog?.('project-1')).resolves.toEqual(catalog)
+    expect(calls).toEqual([
+      { method: 'listSkillCatalog', params: [] },
+      { method: 'listSkillCatalog', params: ['project-1'] },
+    ])
+  })
 })

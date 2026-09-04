@@ -132,6 +132,10 @@ export function toolDescriptionZh(name: string): string {
   return TOOL_DESCRIPTIONS_ZH[name] ?? `运行时提供的「${name}」工具，用于完成对应的专项操作。`
 }
 
+export function knownSkillDescriptionZh(name: string): string | undefined {
+  return SKILL_DESCRIPTIONS_ZH[name]
+}
+
 export function skillDescriptionZh(name: string): string {
   return SKILL_DESCRIPTIONS_ZH[name] ?? `按需加载的「${name}」Skill，用于提供对应任务的专项流程。`
 }

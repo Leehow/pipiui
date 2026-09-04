@@ -55,6 +55,7 @@ import {
   isExternalSessionId,
   isSessionAdoptedFrom,
   type SessionAdoptedFrom,
+  type SkillCatalogItem,
 } from "@pipi/host-api";
 import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.js";
 import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
@@ -211,6 +212,7 @@ import {
   type ExtensionRegistry,
 } from "./extension-registry.js";
 import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";
+import { collectSkillCatalog, type SkillCatalogSource } from "./skill-catalog.js";
 import {
   ExtensionHotReloader,
   hotRestartBusy,
@@ -4034,6 +4036,8 @@ export class PiHostBackend implements HostBackend {
         return this.removeUserMcpServer(params[0], params[1]);
       case "listExtensions":
         return this.listExtensions(params[0]);
+      case "listSkillCatalog":
+        return this.listSkillCatalog(params[0]);
       case "setExtensionEnabled":
         return this.setExtensionEnabled(params[0], params[1], params[2], params[3]);
       case "getExtensionSettings":
@@ -7939,6 +7943,44 @@ export class PiHostBackend implements HostBackend {
       const grant = grants[item.id];
       if (!grant) return item;
       return { ...item, grantedCapabilities: grant.grantedCapabilities };
+    });
+  }
+  private async listSkillCatalog(projectId: unknown): Promise<SkillCatalogItem[]> {
+    const projectRoot =
+      typeof projectId === "string" && projectId.trim() ? await this.projectPath(projectId) : undefined;
+    const overlay = await this.extensionEnableOverlay(projectId);
+    return this.withStableExtensionScan(projectRoot, () => {
+      const listed = this.extensionLoader.list(overlay);
+      const sources: SkillCatalogSource[] = [];
+      const builtinExt = listed.find((item) => item.id === "built-in-skills");
+      sources.push({
+        origin: "builtin",
+        sourceId: "built-in-skills",
+        sourceName: builtinExt?.name ?? "Built-in Skills",
+        root: join(this.runtimeRoot, "built-in-skills"),
+        available: builtinExt ? builtinExt.state === "enabled" : true,
+      });
+      for (const entry of this.extensionLoader.skillRootEntries(overlay)) {
+        for (const root of entry.skillRoots) {
+          sources.push({
+            origin: "extension",
+            sourceId: entry.id,
+            sourceName: entry.name,
+            root,
+            available: entry.enabled,
+          });
+        }
+      }
+      if (projectRoot) {
+        sources.push({
+          origin: "project",
+          sourceId: "project",
+          sourceName: "当前项目",
+          root: join(projectPiAgentDir(projectRoot), "skills"),
+          available: true,
+        });
+      }
+      return collectSkillCatalog(sources);
     });
   }
   private async getExtensionContributions(

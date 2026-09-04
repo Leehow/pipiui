@@ -1112,6 +1112,20 @@ export type ExtensionDescriptor = {
 export type ExtensionCapabilityGrant = {
   capabilities: readonly string[];
 };
+/** Settings → Skills catalog entry. Never includes filesystem paths or SKILL.md bodies. */
+export type SkillCatalogOrigin = "builtin" | "extension" | "project";
+export type SkillCatalogItem = {
+  name: string;
+  description: string;
+  /** `disable-model-invocation: true` — heavier, user/slash invoked. */
+  userInvoked: boolean;
+  origin: SkillCatalogOrigin;
+  /** `built-in-skills` / extension id / `project`. */
+  sourceId: string;
+  sourceName: string;
+  /** False when the contributing extension is discovered but not enabled. */
+  available: boolean;
+};
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
@@ -1445,6 +1459,8 @@ export interface PipiHostAPI {
   /** Reserved: M2 wires this to the session's pi RPC. */
   invokeExtension?(id: string, method: string, params: unknown, opts?: { sessionId?: string }): Promise<ExtInvokeResult>;
   listExtensions?(projectId?: string): Promise<ExtensionDescriptor[]>;
+  /** Flattened Skill catalog from built-in, enabled-extension, and project skill roots. */
+  listSkillCatalog?(projectId?: string): Promise<SkillCatalogItem[]>;
   setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope, projectId?: string): Promise<ExtensionDescriptor>;
   /** Remove a non-builtin package (spec D9). Builtins are not uninstallable. */
   uninstallExtension?(id: string): Promise<void>;
@@ -1659,6 +1675,7 @@ function apiFrom(
       ? invoke("invokeExtension", id, method, params)
       : invoke("invokeExtension", id, method, params, opts),
     listExtensions: projectId => projectId === undefined ? invoke("listExtensions") : invoke("listExtensions", projectId),
+    listSkillCatalog: projectId => projectId === undefined ? invoke("listSkillCatalog") : invoke("listSkillCatalog", projectId),
     setExtensionEnabled: (id, enabled, scope, projectId) => projectId === undefined
       ? invoke("setExtensionEnabled", id, enabled, scope)
       : invoke("setExtensionEnabled", id, enabled, scope, projectId),
