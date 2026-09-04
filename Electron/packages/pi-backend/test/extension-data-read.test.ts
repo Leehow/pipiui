@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createExtensionLoader } from "../src/extension-loader.js";
@@ -42,8 +42,38 @@ describe("app.data.read manifest", () => {
 
   it("refuses a non-array and unknown keys", () => {
     expect(withData("telemetry").ok).toBe(false);
-    const unknown = validateExtensionManifest(manifest({ app: { data: { write: ["x"] } } }));
+    const unknown = validateExtensionManifest(manifest({ app: { data: { execute: ["x"] } } }));
     expect(unknown.ok).toBe(false);
+  });
+
+  it("accepts app.data.write as its own list", () => {
+    // 读一份日志和改一个项目的文件不是同一种权限，所以是两份声明而不是一个开关：
+    // 用户看到的授权里得点出是哪个目录。
+    const result = validateExtensionManifest(
+      manifest({ app: { data: { read: ["telemetry/data"], write: ["telemetry/data"] } } }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.data).toEqual({ read: ["telemetry/data"], write: ["telemetry/data"] });
+  });
+
+  it("accepts a package that only writes", () => {
+    const result = validateExtensionManifest(manifest({ app: { data: { write: ["telemetry/data"] } } }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.manifest.data).toEqual({ read: [], write: ["telemetry/data"] });
+  });
+
+  it("refuses a write path that escapes the project", () => {
+    const result = validateExtensionManifest(manifest({ app: { data: { write: ["../../etc"] } } }));
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.errors.join("; ")).toMatch(/app\.data\.write\[0\]/);
+  });
+
+  it("recognises data.write as a capability", () => {
+    const result = validateExtensionManifest(manifest({ capabilities: ["data.write"] }));
+    expect(result.ok).toBe(true);
   });
 
   it("recognises data.read as a capability", () => {
@@ -143,5 +173,105 @@ describe("host.worker manifest", () => {
     });
     // 清单本身合法；能不能真的跑由 capability 决定，宿主在 reconcile 时才判。
     expect(undeclared.ok).toBe(true);
+  });
+});
+
+describe("confined data writes", () => {
+  /**
+   * 面板只能留一张纸条，不能自己动手。这一组守的是那张纸条落在哪、有多大、以及
+   * 它落不下去的时候必须报错而不是落到别处。
+   */
+  async function writable() {
+    root = await mkdtemp(join(tmpdir(), "pipiui-write-"));
+    const project = join(root, "project");
+    const extDir = join(project, ".pi", "agent", "extensions", "probe");
+    await mkdir(extDir, { recursive: true });
+    await writeFile(
+      join(extDir, "pipiui-extension.json"),
+      JSON.stringify(
+        manifest({
+          capabilities: ["data.read", "data.write"],
+          app: { data: { read: ["telemetry/data"], write: ["telemetry/data"] } },
+        }),
+        null,
+        2,
+      ),
+    );
+    await mkdir(join(project, "telemetry", "data"), { recursive: true });
+    await writeFile(join(project, "secret.txt"), "not yours");
+    const registry = createExtensionRegistry();
+    const loader = createExtensionLoader({ registry, appRoot: join(root, "app-extensions") });
+    loader.scan(project);
+    return { loader, project };
+  }
+
+  it("creates a file under a declared writable root and replaces it", async () => {
+    const { loader, project } = await writable();
+    loader.writeDataFile("probe", project, "telemetry/data/request.json", '{"a":1}');
+    expect(loader.readDataFile("probe", project, "telemetry/data/request.json").content).toBe('{"a":1}');
+    loader.writeDataFile("probe", project, "telemetry/data/request.json", '{"a":2}');
+    expect(loader.readDataFile("probe", project, "telemetry/data/request.json").content).toBe('{"a":2}');
+  });
+
+  it("refuses a path outside the declared writable roots", async () => {
+    const { loader, project } = await writable();
+    expect(() => loader.writeDataFile("probe", project, "secret.txt", "x")).toThrow(/no declared writable/);
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/../../secret.txt", "x")).toThrow(
+      /no declared writable/,
+    );
+    expect(await readFile(join(project, "secret.txt"), "utf8")).toBe("not yours");
+  });
+
+  it("refuses the declared root itself", async () => {
+    const { loader, project } = await writable();
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data", "x")).toThrow(/no declared writable/);
+  });
+
+  it("refuses a dotfile", async () => {
+    const { loader, project } = await writable();
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/.hidden", "x")).toThrow(
+      /no declared writable/,
+    );
+  });
+
+  it("refuses to follow a symlink out of the project", async () => {
+    const { loader, project } = await writable();
+    await symlink(join(root, "elsewhere"), join(project, "telemetry", "data", "away"));
+    await mkdir(join(root, "elsewhere"), { recursive: true });
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/away/escape.json", "x")).toThrow(
+      /no declared writable/,
+    );
+  });
+
+  it("refuses to overwrite something that is not a regular file", async () => {
+    const { loader, project } = await writable();
+    await mkdir(join(project, "telemetry", "data", "adir"));
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/adir", "x")).toThrow(/not writable/);
+  });
+
+  it("caps how much a request may be", async () => {
+    const { loader, project } = await writable();
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/big.json", "x".repeat(64 * 1024 + 1))).toThrow(
+      /over the/,
+    );
+  });
+
+  it("gives no write path to a package that declared only reads", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-readonly-"));
+    const project = join(root, "project");
+    const extDir = join(project, ".pi", "agent", "extensions", "probe");
+    await mkdir(extDir, { recursive: true });
+    await writeFile(
+      join(extDir, "pipiui-extension.json"),
+      JSON.stringify(manifest({ app: { data: { read: ["telemetry/data"] } } }), null, 2),
+    );
+    await mkdir(join(project, "telemetry", "data"), { recursive: true });
+    const registry = createExtensionRegistry();
+    const loader = createExtensionLoader({ registry, appRoot: join(root, "app-extensions") });
+    loader.scan(project);
+    expect(loader.writeDataRoots("probe")).toEqual([]);
+    expect(() => loader.writeDataFile("probe", project, "telemetry/data/request.json", "{}")).toThrow(
+      /no declared writable/,
+    );
   });
 });

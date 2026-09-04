@@ -48,6 +48,16 @@ export const EXTENSION_CAPABILITIES = [
   "notifications",
   /** Read the project-relative files this package declares in `app.data.read`. */
   "data.read",
+  /**
+   * Replace files under `app.data.write`.
+   *
+   * A panel with this can leave a request where something that already had the power to
+   * act will find it -- switch what a collector polls, ask for one expensive read -- with
+   * no live session. It is a separate capability from `data.read` because reading a log
+   * and changing a project's files are different permissions, and separately declared so
+   * the grant names the directory.
+   */
+  "data.write",
   /** Run this package's declared `host.worker` for as long as its project is open. */
   "host.worker",
 ] as const;
@@ -174,7 +184,7 @@ export type ExtensionUiView = {
  * dashboard shows nothing until a conversation happens to be running. Declared data paths
  * give it a session-independent source: read-only, confined to the project, size-capped.
  */
-export type ExtensionDataSummary = { read: string[] };
+export type ExtensionDataSummary = { read: string[]; write?: string[] };
 
 /** Cap on declared data paths; a package that needs more is doing something else. */
 export const EXTENSION_DATA_PATH_MAX = 8;
@@ -845,21 +855,29 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
     if (!isRecord(appData)) {
       errors.push("app.data must be an object");
     } else {
-      rejectUnknownKeys(appData, new Set(["read"]), "app.data", errors);
-      const declared = appData.read;
-      if (declared !== undefined) {
+      rejectUnknownKeys(appData, new Set(["read", "write"]), "app.data", errors);
+      const collectPaths = (declared: unknown, field: string): string[] | undefined => {
+        if (declared === undefined) return undefined;
         if (!Array.isArray(declared)) {
-          errors.push("app.data.read must be an array of project-relative paths");
-        } else if (declared.length > EXTENSION_DATA_PATH_MAX) {
-          errors.push(`app.data.read must have at most ${EXTENSION_DATA_PATH_MAX} entries`);
-        } else {
-          const paths: string[] = [];
-          for (const [index, item] of declared.entries()) {
-            const path = collectRelativePath(item, `app.data.read[${index}]`, errors);
-            if (path && !paths.includes(path)) paths.push(path);
-          }
-          if (paths.length) data = { read: paths };
+          errors.push(`${field} must be an array of project-relative paths`);
+          return undefined;
         }
+        if (declared.length > EXTENSION_DATA_PATH_MAX) {
+          errors.push(`${field} must have at most ${EXTENSION_DATA_PATH_MAX} entries`);
+          return undefined;
+        }
+        const paths: string[] = [];
+        for (const [index, item] of declared.entries()) {
+          const path = collectRelativePath(item, `${field}[${index}]`, errors);
+          if (path && !paths.includes(path)) paths.push(path);
+        }
+        return paths.length ? paths : undefined;
+      };
+      const read = collectPaths(appData.read, "app.data.read");
+      const write = collectPaths(appData.write, "app.data.write");
+      if (read || write) {
+        data = { read: read ?? [] };
+        if (write) data.write = write;
       }
     }
   }

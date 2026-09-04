@@ -1499,6 +1499,13 @@ export interface PipiHostAPI {
     options?: { tailBytes?: number },
     projectId?: string,
   ): Promise<{ content: string; bytes: number; truncated: boolean }>;
+  /** Replace one file under the package's declared `app.data.write` roots. */
+  writeExtensionData?(
+    id: string,
+    path: string,
+    content: string,
+    projectId?: string,
+  ): Promise<{ bytes: number }>;
   /** Host-owned secret-free status for an extension auth contribution. */
   getExtensionAuthStatus?(id: string): Promise<ExtensionAuthStatus>;
   /** Start login for the extension's contributed provider. Credentials stay in the host. */
@@ -1716,6 +1723,7 @@ function apiFrom(
       : invoke("getExtensionUiEntrySource", id, entry, projectId),
     listExtensionData: (id, dir, projectId) => invoke("listExtensionData", id, dir, projectId),
     readExtensionData: (id, path, options, projectId) => invoke("readExtensionData", id, path, options, projectId),
+    writeExtensionData: (id, path, content, projectId) => invoke("writeExtensionData", id, path, content, projectId),
     getExtensionAuthStatus: id => invoke("getExtensionAuthStatus", id),
     beginExtensionLogin: (id, authType) => authType === undefined
       ? invoke("beginExtensionLogin", id)

@@ -297,6 +297,15 @@ export type ExtensionDataRead = { content: string; bytes: number; truncated: boo
 export type ExtensionDataAPI = {
   list: (dir: string) => Promise<ExtensionDataFile[]>;
   read: (path: string, options?: { tailBytes?: number }) => Promise<ExtensionDataRead>;
+  /**
+   * Replace one declared writable file. Present only with the `data.write` capability.
+   *
+   * This is how a panel asks for something to happen without a live session: it leaves a
+   * request where a process that already had the power to act will find it. The panel does
+   * not gain that power -- it gains a way to be heard while nobody is having a conversation
+   * with the agent.
+   */
+  write?: (path: string, content: string) => Promise<{ bytes: number }>;
 };
 
 export type ExtensionHostAPI = {
@@ -327,6 +336,12 @@ export type ExtensionHostBacking = {
     options?: { tailBytes?: number },
     projectId?: string,
   ): Promise<ExtensionDataRead>;
+  writeExtensionData?(
+    id: string,
+    path: string,
+    content: string,
+    projectId?: string,
+  ): Promise<{ bytes: number }>;
 };
 
 export type CreateExtensionHostAPIOptions = {
@@ -369,7 +384,7 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
     },
   };
 
-  if (caps.has("data.read")) {
+  if (caps.has("data.read") || caps.has("data.write")) {
     const projectId = options.projectId;
     api.data = {
       list: dir => {
@@ -381,6 +396,12 @@ export function createExtensionHostAPI(options: CreateExtensionHostAPIOptions): 
         return host.readExtensionData(id, path, readOptions, projectId);
       },
     };
+    if (caps.has("data.write")) {
+      api.data.write = (path, content) => {
+        if (!host.writeExtensionData) return Promise.reject(new Error("capability 'data.write' is not available"));
+        return host.writeExtensionData(id, path, content, projectId);
+      };
+    }
   }
 
   if (caps.has("settings.read") || caps.has("settings.write")) {

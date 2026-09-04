@@ -4014,7 +4014,7 @@ export class PiHostBackend implements HostBackend {
     return this.modelsLoaded;
   }
   async handle(method: HostMethod, params: unknown[]): Promise<unknown> {
-    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "listExtensionData" | "readExtensionData" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack" | "installExtensionZip") {
+    switch (method as HostMethod | "listExtensions" | "setExtensionEnabled" | "getExtensionSettings" | "updateExtensionSettings" | "invokeExtension" | "listExtensionData" | "readExtensionData" | "writeExtensionData" | "extensionUiResponse" | "uninstallExtension" | "getCapabilityGrant" | "confirmCapabilityGrant" | "getExtensionContributions" | "getExtensionUiEntrySource" | "getExtensionAuthStatus" | "beginExtensionLogin" | "logoutExtension" | "listProductProfiles" | "getProductProfile" | "setProductProfile" | "createProductProfile" | "updateProductProfileExtensions" | "exportProductPackArchive" | "installProductPackArchive" | "installLocalProductProfile" | "installLocalProductPack" | "installExtensionZip") {
       case "listProductProfiles":
         return this.listProductProfiles(params[0]);
       case "getProductProfile":
@@ -4095,6 +4095,8 @@ export class PiHostBackend implements HostBackend {
         return this.listExtensionData(params[0], params[1], params[2]);
       case "readExtensionData":
         return this.readExtensionData(params[0], params[1], params[2], params[3]);
+      case "writeExtensionData":
+        return this.writeExtensionData(params[0], params[1], params[2], params[3]);
       case "extensionUiResponse":
         return this.extensionUiResponse(params[0], params[1], params[2]);      case "listDocuments":
         return this.listOpenedDocuments();
@@ -8090,6 +8092,29 @@ export class PiHostBackend implements HostBackend {
     if (typeof pathValue !== "string" || !pathValue.trim()) throw new Error("data path 必须是 string");
     const tail = isRecord(optionsValue) && typeof optionsValue.tailBytes === "number" ? optionsValue.tailBytes : undefined;
     return this.extensionLoader.readDataFile(id, projectRoot, pathValue, tail);
+  }
+
+  /**
+   * Replace one declared writable file.
+   *
+   * Same two gates as the read side (installed for this project, path under a declared
+   * root), plus the capability: a package that declares only `app.data.read` cannot reach
+   * this. What it buys a panel is the ability to leave a request for something that
+   * already had the power to act -- it is not a way to do the thing itself.
+   */
+  private async writeExtensionData(
+    idValue: unknown,
+    pathValue: unknown,
+    contentValue: unknown,
+    projectId?: unknown,
+  ): Promise<{ bytes: number }> {
+    const { id, projectRoot } = await this.resolveExtensionDataAccess(idValue, projectId);
+    if (!this.extensions.hasCapability(id, "data.write")) {
+      throw new Error(`extension ${id} does not declare capability 'data.write'`);
+    }
+    if (typeof pathValue !== "string" || !pathValue.trim()) throw new Error("data path 必须是 string");
+    if (typeof contentValue !== "string") throw new Error("data content 必须是 string");
+    return this.extensionLoader.writeDataFile(id, projectRoot, pathValue, contentValue);
   }
 
   private async resolveExtensionDataAccess(

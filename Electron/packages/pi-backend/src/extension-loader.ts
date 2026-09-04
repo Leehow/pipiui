@@ -1,4 +1,16 @@
-import { closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import {
   EXTENSION_L2_CAPABILITIES,
@@ -104,6 +116,16 @@ const EXTENSION_DATA_MAX_BYTES = 512 * 1024;
 const EXTENSION_DATA_DEFAULT_TAIL = 128 * 1024;
 /** A declared directory is for shards, not a tree: one flat listing, bounded. */
 const EXTENSION_DATA_MAX_ENTRIES = 200;
+/**
+ * A panel writes a request, not a document.
+ *
+ * The write channel exists so a panel can ask for something to happen -- switch what a
+ * collector is polling, trigger one expensive read -- without a live session. The thing
+ * that acts on the request is a process that already had that power; the panel only gets
+ * to leave a note. A cap this small is part of saying so: anything that needs more than
+ * this is not a request.
+ */
+const EXTENSION_DATA_WRITE_MAX_BYTES = 64 * 1024;
 
 function declaredUiEntryPaths(ui: ExtensionUiSummary | undefined): Set<string> {
   if (!ui) return new Set();
@@ -843,6 +865,17 @@ export class ExtensionLoader {
   }
 
   /**
+   * `app.data.write` roots. A separate list from `read`, and deliberately so.
+   *
+   * Reading a log and changing a project's files are not the same permission. Almost every
+   * panel wants only the first, and a package that wants the second has to say which
+   * directory -- so the grant a user sees names it.
+   */
+  writeDataRoots(id: string): string[] {
+    return this.data.get(id)?.write ?? [];
+  }
+
+  /**
    * Resolve a project-relative path against this package's declared data roots.
    *
    * Two jails, both required: the path must sit under one declared root, and the realpath
@@ -859,6 +892,69 @@ export class ExtensionLoader {
     if (!declared) return undefined;
     const candidate = confinedJoin(projectRoot, normalized);
     return candidate ? confinedRealpath(candidate, projectRoot) : undefined;
+  }
+
+  /**
+   * Resolve a writable path. The file need not exist yet, so the *parent* is what gets
+   * confined: realpathing a path that is about to be created cannot work, and resolving
+   * the parent is what actually stops a symlinked directory from redirecting the write.
+   *
+   * The name must be an ordinary visible filename. A dotfile is refused because the
+   * listing channel hides dotfiles -- a panel must not be able to write something it
+   * cannot then see.
+   */
+  private confinedWritePath(id: string, projectRoot: string, requested: string): string | undefined {
+    const rel = (requested || "").trim();
+    if (!rel || rel.includes("..")) return undefined;
+    const roots = this.writeDataRoots(id);
+    if (!roots.length) return undefined;
+    const normalized = rel.replace(/\\/g, "/").replace(/^\/+/, "");
+    // Strictly *under* a declared root: the root itself is a directory, not a target.
+    if (!roots.some((root) => normalized.startsWith(`${root}/`))) return undefined;
+    const slash = normalized.lastIndexOf("/");
+    const name = normalized.slice(slash + 1);
+    if (!name || name.startsWith(".")) return undefined;
+    const parent = confinedJoin(projectRoot, normalized.slice(0, slash));
+    const realParent = parent ? confinedRealpath(parent, projectRoot) : undefined;
+    if (!realParent) return undefined;
+    return join(realParent, name);
+  }
+
+  /**
+   * Replace one declared file with `content`.
+   *
+   * Written to a sibling temp file and renamed, so a reader polling the same path never
+   * sees half a request. An existing target must be an ordinary file: a symlink is refused
+   * rather than followed, which is the same rule the read side applies.
+   */
+  writeDataFile(id: string, projectRoot: string, path: string, content: string): { bytes: number } {
+    const real = this.confinedWritePath(id, projectRoot, path);
+    if (!real) throw new Error(`extension ${id} has no declared writable data path '${path}'`);
+    const bytes = Buffer.byteLength(content, "utf8");
+    if (bytes > EXTENSION_DATA_WRITE_MAX_BYTES) {
+      throw new Error(`write is ${bytes} bytes, over the ${EXTENSION_DATA_WRITE_MAX_BYTES} cap`);
+    }
+    try {
+      const existing = lstatSync(real);
+      if (!existing.isFile()) throw new Error("not a regular file");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`extension ${id} data path is not writable`);
+      }
+    }
+    const temp = `${real}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temp, content, { encoding: "utf8", mode: 0o600 });
+      renameSync(temp, real);
+    } catch {
+      try {
+        unlinkSync(temp);
+      } catch {
+        /* nothing to clean up */
+      }
+      throw new Error(`extension ${id} data path is not writable`);
+    }
+    return { bytes };
   }
 
   /** Flat listing of one declared directory: name, size, mtime. Never recursive. */
