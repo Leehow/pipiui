@@ -89,18 +89,30 @@ export function leaseOwnerLabel(lease: SessionLease | null): string {
 
 export const PANE_HANDLE_TRACKS = 12
 export const CHAT_MIN_WIDTH = 360
+export const TOOLS_MIN = 270
+export const TOOLS_MAX = 900
 export const BROWSER_TOOLS_MIN = 320
 export const BROWSER_TOOLS_PREFERRED_MIN = 520
 export const BROWSER_TOOLS_MAX = 920
 
-/** Shrink a remembered/preferred browser pane so the chat column stays usable.
- *  An overflowing --tools-w is clipped by CSS, but the native WebContentsView
- *  still paints the unclipped rect and covers the transcript. */
-export function fitBrowserToolsWidth(viewportWidth: number, sidebar: number, requested: number): number {
+/** Shrink a remembered/preferred right pane so the chat column stays usable.
+ *  An overflowing --tools-w is clipped by CSS, but the browser tab's native
+ *  WebContentsView still paints the unclipped rect and covers the transcript. */
+function fitRightPaneWidth(viewportWidth: number, sidebar: number, requested: number, hardMin: number, preferredMin: number, hardMax: number): number {
   const maxFit = viewportWidth - sidebar - PANE_HANDLE_TRACKS - CHAT_MIN_WIDTH
-  const ceiling = Math.min(BROWSER_TOOLS_MAX, Math.max(BROWSER_TOOLS_MIN, maxFit))
-  const floor = Math.min(BROWSER_TOOLS_PREFERRED_MIN, ceiling)
+  const ceiling = Math.min(hardMax, Math.max(hardMin, maxFit))
+  const floor = Math.min(preferredMin, ceiling)
   return clamp(requested, floor, ceiling)
+}
+
+export function fitBrowserToolsWidth(viewportWidth: number, sidebar: number, requested: number): number {
+  return fitRightPaneWidth(viewportWidth, sidebar, requested, BROWSER_TOOLS_MIN, BROWSER_TOOLS_PREFERRED_MIN, BROWSER_TOOLS_MAX)
+}
+
+/** The tool panel may grow to TOOLS_MAX, but never past what leaves the chat
+ *  column its CHAT_MIN_WIDTH — a flat cap would starve chat on small windows. */
+export function fitToolsWidth(viewportWidth: number, sidebar: number, requested: number): number {
+  return fitRightPaneWidth(viewportWidth, sidebar, requested, TOOLS_MIN, TOOLS_MIN, TOOLS_MAX)
 }
 
 function initialBrowserToolsWidth(sidebar = 258): number {
@@ -414,7 +426,7 @@ function readWidths(): PaneWidths {
     const parsed = JSON.parse(localStorage.getItem(storageKey) ?? '') as Partial<PaneWidths>
     return {
       sidebar: clamp(parsed.sidebar ?? defaultWidths.sidebar, 190, 440),
-      tools: clamp(parsed.tools ?? defaultWidths.tools, 270, 620),
+      tools: fitToolsWidth(typeof window === 'undefined' ? 1280 : window.innerWidth, parsed.sidebar ?? defaultWidths.sidebar, parsed.tools ?? defaultWidths.tools),
       browserTools: clamp(parsed.browserTools ?? initialBrowserToolsWidth(parsed.sidebar ?? defaultWidths.sidebar), BROWSER_TOOLS_PREFERRED_MIN, BROWSER_TOOLS_MAX),
       sidebarCollapsed: parsed.sidebarCollapsed === true,
       toolsCollapsed: parsed.toolsCollapsed === true
@@ -3531,7 +3543,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
     if (isExternalSessionId(sessionId)) return
     setPinnedSessionIds(current => current.includes(sessionId) ? current : [...current, sessionId])
   }
-  const resize = (pane: keyof PaneWidths, start: number) => (event: React.PointerEvent) => { const origin = event.clientX; const onMove = (move: PointerEvent) => setWidths(current => ({ ...current, [pane]: clamp(start + (pane === 'sidebar' ? move.clientX - origin : origin - move.clientX), pane === 'sidebar' ? 190 : 270, pane === 'sidebar' ? 440 : 620) })); const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }; window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', done) }
+  const resize = (pane: keyof PaneWidths, start: number) => (event: React.PointerEvent) => { const origin = event.clientX; const onMove = (move: PointerEvent) => setWidths(current => ({ ...current, [pane]: clamp(start + (pane === 'sidebar' ? move.clientX - origin : origin - move.clientX), pane === 'sidebar' ? 190 : TOOLS_MIN, pane === 'sidebar' ? 440 : TOOLS_MAX) })); const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }; window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', done) }
   const resizeTools = (event: React.PointerEvent) => {
     const origin = event.clientX
     const browser = activeTab === 'Browser'
@@ -3539,8 +3551,8 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
     const start = widths[key]
     const onMove = (move: PointerEvent) => setWidths(current => {
       const sidebar = current.sidebarCollapsed ? 0 : current.sidebar
-      const fittedMax = browser ? fitBrowserToolsWidth(window.innerWidth, sidebar, BROWSER_TOOLS_MAX) : 620
-      const fittedMin = browser ? Math.min(BROWSER_TOOLS_PREFERRED_MIN, fittedMax) : 270
+      const fittedMax = browser ? fitBrowserToolsWidth(window.innerWidth, sidebar, BROWSER_TOOLS_MAX) : fitToolsWidth(window.innerWidth, sidebar, TOOLS_MAX)
+      const fittedMin = browser ? Math.min(BROWSER_TOOLS_PREFERRED_MIN, fittedMax) : Math.min(TOOLS_MIN, fittedMax)
       return { ...current, [key]: clamp(start + origin - move.clientX, fittedMin, fittedMax) }
     })
     const done = () => { window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', done) }
@@ -3656,7 +3668,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
   const dismissNarrowOverlays = () => setNarrowPanes({ sidebar: false, tools: false })
   const toolsTrack = productBrowserWorkspaceActive
     ? fitBrowserToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.browserTools)
-    : widths.tools
+    : fitToolsWidth(viewportWidth, productSidebarCollapsed ? 0 : widths.sidebar, widths.tools)
   const baseSidebarProps: SidebarProps = { projects: sidebarProjects, pinnedSessions: pinnedSidebarSessions, archivedSessions: archivedSidebarSessions, expandedIds: sidebarExpandedIds, selectedSessionId: selectedSession || null, searchQuery: sidebarSearch, visibleLimit: sidebarVisibleLimit, collapsed: sidebarCollapsed, onToggleCollapsed: toggleSidebar, onToggleProject: toggleSidebarProject, onSelectSession: selectSidebarSession, onNewSession: projectId => void newSession(projectId), onProjectMenu: onSidebarProjectMenu, onRenameProject: host.renameProject ? renameSidebarProject : undefined, projectMenuUnavailable: sidebarProjectMenuUnavailable, onMoveProject: host.setProjectPaths ? moveSidebarProject : undefined, onMoveSession: moveSidebarSession, onMoveSessionToPinned: moveSidebarSessionToPinned, onAddProject: addProject, projectAddUnavailable: host.pickProjectDirectory && host.addProject ? undefined : '当前连接不支持添加项目', projectError, onDismissProjectError: () => setProjectError(null), onSearch: setSidebarSearch, onShowMore: () => setSidebarVisibleLimit(limit => limit + SIDEBAR_PROJECT_PAGE_SIZE), sessionHasMoreByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.hasMore])) : undefined, sessionPageLoadingByProject: host.listSessionPage ? Object.fromEntries(Object.entries(lazySessionPages).map(([id, page]) => [id, page.loading])) : undefined, sessionVisibleLimitByProject: host.listSessionPage ? lazyVisibleSessionLimits : undefined, onShowMoreSessions: host.listSessionPage ? projectId => { const page = lazySessionPagesRef.current[projectId]; if (page?.hasMore && page.nextCursor) void loadLazySessionPage(projectId, page.nextCursor); else setLazyVisibleSessionLimits(current => ({ ...current, [projectId]: (current[projectId] ?? 10) + 10 })) } : undefined, onPinSession: pinSidebarSession, onRenameSession: renameSidebarSession, onArchiveSession: archiveSidebarSession, onUnarchiveSession: unarchiveSidebarSession, onViewOriginalSession: viewOriginalExternalSession, onOpenSettings: openModelManager, theme: themeScheme, onToggleTheme: toggleTheme }
   const codingSidebarProps: SidebarProps = { ...baseSidebarProps, onOpenComputerUse: computerUseAvailable ? () => setComputerUseOpen(true) : undefined, onOpenRemote: () => setRemoteOpen(true), onOpenSubagentModels: () => setSubagentModelsOpen(true) }
   return <main className={shellClass} data-theme={theme} data-scheme={themeScheme} style={{ '--sidebar-w': `${widths.sidebar}px`, '--tools-w': `${toolsTrack}px` } as React.CSSProperties}>

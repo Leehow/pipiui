@@ -89,7 +89,7 @@ vi.mock('@xterm/xterm', () => {
 
 vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
 
-import { App, createMockHost, fitBrowserToolsWidth, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, CHAT_MIN_WIDTH, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY, PANE_HANDLE_TRACKS } from './App'
+import { App, createMockHost, fitBrowserToolsWidth, fitToolsWidth, mergeAgentSnapshot, mergeAgentSummary, mergeSessionSnapshot, sidebarPreferencesKey, sidebarModelForSession, sidebarStatusForSession, normalizeArchiveTimestamps, expiredArchivedSessionIds, ARCHIVE_RETENTION_MS, CHAT_MIN_WIDTH, DEMO_MODEL_STORAGE_KEY, DEMO_SESSION_MODELS_STORAGE_KEY, PANE_HANDLE_TRACKS } from './App'
 
 describe('PipiUI main layout', () => {
   it('keeps archive timestamps stable, grants legacy archives a fresh window, and expires at 24 hours', () => {
@@ -847,6 +847,16 @@ describe('PipiUI main layout', () => {
     expect(fitBrowserToolsWidth(1600, 258, 920)).toBe(920)
     expect(fitBrowserToolsWidth(800, 0, 920)).toBe(428)
     expect(fitBrowserToolsWidth(2000, 258, 400)).toBe(520)
+  })
+
+  it('lets the tool panel reach 900px but never past the chat column minimum', () => {
+    expect(fitToolsWidth(1800, 258, 900)).toBe(900)
+    expect(fitToolsWidth(1800, 258, 1200)).toBe(900)
+    expect(fitToolsWidth(1280, 258, 900)).toBe(650)
+    expect(fitToolsWidth(1024, 258, 900)).toBe(394)
+    // Chat can never squeeze the panel below its own 270px floor.
+    expect(fitToolsWidth(600, 258, 900)).toBe(270)
+    expect(fitToolsWidth(1800, 258, 100)).toBe(270)
   })
 
   it('opens Browser as a wide adjustable IDE split while keeping chat visible', async () => {
