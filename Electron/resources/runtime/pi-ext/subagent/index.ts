@@ -5493,6 +5493,8 @@ function retryPendingDoneAfterSessionSettled(pi: ExtensionAPI): void {
 	pendingDoneSettledRetryTimer.unref?.();
 }
 let doneDeliveryPiSessionId: string | undefined;
+/** Captured at session_start: live active-branch source for done-delivery reconcile. */
+let doneDeliveryBranchProvider: (() => readonly unknown[]) | undefined;
 
 /**
  * Host-stop quiet gate. The backend stop sweep sends /subagent_abort_all; from that moment
@@ -9538,6 +9540,7 @@ export default function (pi: ExtensionAPI) {
 			};
 		}
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
+		doneDeliveryBranchProvider = () => ctx.sessionManager.getBranch();
 		initializeDoneDeliveryStore(pi, piSessionId, ctx.sessionManager.getBranch());
 	});
 	pi.on("session_shutdown", async () => {
@@ -9804,6 +9807,9 @@ export default function (pi: ExtensionAPI) {
 	// ---- 统一轮询（30s）：承载五条按节奏补推的路径 ——
 	// 1) done 重投：仅 Pi 明确拒绝/抛错或首个 Boss assistant 失败后的 pending/failed；
 	//    queued/observed 可能仍在健康长 turn 中，当前进程绝不按墙钟重复。
+	//    Boss alarm 例外：observed（已浮出未 ack）按 1m/2m/5m 复推；queued 副本在
+	//    Pi 队列里等待浮出，宽限期内绝不重投叠副本（重投前先用活动分支对账，
+	//    把已浮出的 queued 提升为 observed）。
 	// 2) vanished 即时检测：pid 已死但没人报告 → 立刻推，推一次后从 runningAgents 删除。
 		// 3) stall 复推 / 预裁决：idle ≥ 120s 时，同步等待立刻 abort（否则信号被 hold 形成死锁）；
 		//    后台 worker 先推 [subagent-stalled]，同一无活动片段最多 STALL_RENOTIFY_MAX 次，
@@ -9822,7 +9828,15 @@ export default function (pi: ExtensionAPI) {
 		// (vanished/aborted workers whose completion hook was missed) so handles cannot leak.
 		idleFoldRegistry?.sweepOrphans(new Set(runningAgents.keys()));
 
-		// (1) done 重投
+		// (1) done 重投——先对账：把已浮出到活动分支的副本从 queued 提升为 observed，
+		// 已 ack 的行从 pendingDone 移除，避免凭陈旧内存状态叠投副本。
+		if (doneDeliveryStore && doneDeliveryPiSessionId && pendingDone.size > 0 && doneDeliveryBranchProvider) {
+			try {
+				reconcilePersistedDone(doneDeliveryPiSessionId, doneDeliveryBranchProvider());
+			} catch {
+				// Reconcile is best-effort; the retry gates below stay authoritative.
+			}
+		}
 		for (const [obligationId, entry] of [...pendingDone]) {
 			if (doneDeliverySettled(entry.obligation)) { clearDoneHoldOnForget(entry); pendingDone.delete(obligationId); continue; }
 			if (!doneDeliveryRetryDue(entry.obligation, now)) continue;

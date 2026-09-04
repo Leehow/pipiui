@@ -98,12 +98,26 @@ export function alarmRetryIntervalMs(attempts: number): number {
 	return 300_000;
 }
 
+/**
+ * A `queued` Boss-alarm copy is presumed alive in Pi's followUp queue, waiting
+ * for the next turn boundary to surface. Only a copy that failed to surface for
+ * this whole window is presumed lost and becomes retryable.
+ */
+export const QUEUED_ALARM_STALL_GRACE_MS = 10 * 60_000;
+
 export function alarmRetryDue(
 	record: Pick<DeliveryObligation, "acknowledgementRequired" | "state" | "attempts" | "lastAttemptAt">,
 	now: number,
 ): boolean {
 	if (!record.acknowledgementRequired) return false;
-	if (record.state !== "pending" && record.state !== "failed" && record.state !== "queued" && record.state !== "observed") {
+	if (record.state === "queued") {
+		// Re-attempting while the prior copy still waits in Pi's queue stacks
+		// duplicates that keep surfacing one per Boss turn even after an ack.
+		// Live reconcile promotes surfaced copies to `observed`; only a copy that
+		// never surfaced for the whole grace window is treated as lost.
+		return record.attempts > 0 && now - record.lastAttemptAt >= QUEUED_ALARM_STALL_GRACE_MS;
+	}
+	if (record.state !== "pending" && record.state !== "failed" && record.state !== "observed") {
 		return false;
 	}
 	return record.attempts === 0 || now - record.lastAttemptAt >= alarmRetryIntervalMs(record.attempts);

@@ -16,6 +16,7 @@ import {
 	alarmRetryDue,
 	alarmRetryIntervalMs,
 	DeliveryObligationStore,
+	QUEUED_ALARM_STALL_GRACE_MS,
 } from "../delivery-obligation.ts";
 
 function tempStore(
@@ -58,6 +59,19 @@ test("alarm cadence is one minute, two minutes, then five minutes without an att
 	assert.equal(alarmRetryIntervalMs(3), 300_000);
 	assert.equal(alarmRetryIntervalMs(400), 300_000);
 	assert.equal(alarmRetryDue({ acknowledgementRequired: true, state: "observed", attempts: 400, lastAttemptAt: 1_000 }, 301_000), true);
+});
+
+test("a queued Boss alarm is not cadence-retried while its copy may still sit in Pi's queue", () => {
+	// The prior copy is waiting in Pi's live followUp queue; re-attempting would
+	// stack duplicates that surface one per Boss turn even after an ack. Only the
+	// stall grace window (presumed lost) may re-arm it.
+	const queued = { acknowledgementRequired: true, state: "queued" as const, attempts: 1, lastAttemptAt: 1_000 };
+	assert.equal(alarmRetryDue(queued, 1_000 + 60_000), false);
+	assert.equal(alarmRetryDue(queued, 1_000 + 300_000), false);
+	assert.equal(alarmRetryDue(queued, 1_000 + QUEUED_ALARM_STALL_GRACE_MS - 1), false);
+	assert.equal(alarmRetryDue({ ...queued, lastAttemptAt: 1_000, attempts: 1 }, 1_000 + QUEUED_ALARM_STALL_GRACE_MS), true);
+	// An acknowledged or fulfilled row never retries, whatever its prior state was.
+	assert.equal(alarmRetryDue({ acknowledgementRequired: true, state: "acknowledged" as const, attempts: 1, lastAttemptAt: 1_000 }, 1_000 + 999_999_000), false);
 });
 
 test("exact terminal-run acknowledgement is durable and idempotent", (t) => {
