@@ -152,6 +152,7 @@ import {
 	selectUnfilteredJobs,
 	UNFILTERED_RESUMABLE_CAP,
 } from "./job-status-list.ts";
+import { isUnfilteredStatusQuery, StatusPollGuard } from "./status-poll-guard.ts";
 import {
 	admitSignal,
 	classifyRuntimeSignal,
@@ -9464,6 +9465,10 @@ function registerContextManageTool(pi: ExtensionAPI): void {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Blocks a repeat whole-board subagent_status while nothing terminal has moved.
+	// See status-poll-guard.ts: the prose "do not busy-loop poll" rule never held,
+	// because a progressing worker changes turns/preview on every read.
+	const statusPollGuard = new StatusPollGuard();
 	// This module is mounted inside the recursive worker itself. Its background
 	// descendants remain owned by that worker, so only this explicit RPC marker
 	// may create a lease that defers ctx.shutdown().
@@ -9524,6 +9529,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		restoreNudgeThinking(pi);
 		disposeAllIdleFoldTimers();
+		statusPollGuard.reset();
 		// A new session inherits nothing: old subscriptions point at runs that no longer
 		// exist here, and a resurrected one would leak stale-run events into this session.
 		watchSessionGeneration += 1;
@@ -9628,6 +9634,8 @@ export default function (pi: ExtensionAPI) {
 	// 同一条真实消息也解除 host-stop 静默：用户的下一条输入是会话重新活动的唯一开关。
 	pi.on("input", (event) => {
 		if (event.source !== "extension") {
+			// The user asking what is going on deserves a current read, not a refusal.
+			statusPollGuard.reset();
 			releaseCutInHold();
 			const text = typeof (event as { text?: unknown }).text === "string"
 				? (event as { text: string }).text.trim()
@@ -9772,11 +9780,18 @@ export default function (pi: ExtensionAPI) {
 	// Prompt text is not a security boundary. The runtime-owned closeout secretary
 	// may write only its state records and may not perform destructive cleanup.
 	pi.on("tool_call", (event) => {
-		return secretaryToolCallBlock(
+		const secretaryBlock = secretaryToolCallBlock(
 			PIPIUI_AGENT_ROLE,
 			{ toolName: event.toolName, input: event.input },
 			PIPIUI_MAIN_CWD,
 		);
+		if (secretaryBlock) return secretaryBlock;
+		if (event.toolName !== "subagent_status" || !isUnfilteredStatusQuery(event.input)) return;
+		const decision = statusPollGuard.decide([...jobRegistry.values()]);
+		// `terminate` only ends the turn when every call in the batch asks for it, so a
+		// turn that also does real work is untouched; a turn whose only act was the
+		// redundant poll is the one that stops.
+		if (!decision.allow) return { block: true, reason: decision.reason, terminate: true };
 	});
 
 	pi.registerTool({
@@ -10230,7 +10245,7 @@ export default function (pi: ExtensionAPI) {
 			"An interrupted worker is not a failed one: re-dispatch its agentId to continue where it left off instead of starting someone cold.",
 			"Before a user-facing conclusion, one unfiltered status call per turn is enough for the current wave. Do not call again for each [subagent-done]. While related work remains running or stalled, the gate is on the final closeout only: do not claim final completion or summarize the goal as finished until status confirms the whole related goal is terminal. This is not a silence rule — when the user directly asks about progress or what is going on, when an important diagnostic or route decision must be reported, or when you need to explain what you are waiting for, answer with a brief factual natural-language update grounded in this tool's output. Never fabricate results, never emit one update per done event, and never send an empty assistant message to comply with the waiting protocol.",
 			"Prefer reading finished results via this tool or [subagent-done] over spawning a new agent for the same work.",
-			"Do not busy-loop poll; one unfiltered check per turn is enough.",
+			"Do not busy-loop poll; one unfiltered check per turn is enough. This is enforced, not advised: a repeat unfiltered call is blocked while no worker's identity or state has changed, and the block carries the current states so a closeout gate can still be satisfied from it. A per-worker subagent_status({agentId}) is never blocked.",
 		].join(" "),
 		parameters: Type.Object({
 			agentId: Type.Optional(Type.String({ description: "If set, return this job only with fuller Result text." })),
