@@ -12,7 +12,7 @@ const EXTENSION_PANEL_ICON = {
   ratio: 1,
 }
 
-export type ControlledUiPanel = { id: string; title?: string; slot?: string; entry?: string }
+export type ControlledUiPanel = { id: string; title?: string; slot?: string; entry?: string; icon?: string }
 export type ControlledUiToolRenderer = { tool: string; entry?: string }
 export type ControlledUiHeaderAction = { id: string; entry?: string; order?: number }
 export type ControlledUiDocumentRenderer = {
@@ -115,10 +115,15 @@ function errorPlaceholder(message: string) {
   }, message)
 }
 
-function registerPanelError(extId: string, panel: ControlledUiPanel, message: string): Disposer {
+function registerPanelError(
+  extId: string,
+  panel: ControlledUiPanel,
+  message: string,
+  icon: { src: string; ratio: number } = EXTENSION_PANEL_ICON,
+): Disposer {
   return registerPanel(extId, {
     id: panel.id,
-    icon: EXTENSION_PANEL_ICON,
+    icon,
     render: ctx => createElement('div', { className: 'tool-page', hidden: !ctx.active },
       errorPlaceholder(`扩展面板「${panel.title ?? panel.id}」加载失败：${message}`),
     ),
@@ -138,14 +143,63 @@ function registerSettingsError(extId: string, section: ControlledUiSettingsSecti
 
 type EntryModuleLoader = (entry: string) => Promise<unknown>
 
+/**
+ * Controlled entries are imported as file:// / data: modules where a bare `react`
+ * import cannot resolve (the renderer has no import map), so — like
+ * `createHeaderAction` — an entry may export `createComponent(React)` and build its
+ * component from the host's single React instance. A plain component export keeps
+ * working for entries whose build already externalised React.
+ */
 async function loadComponent(
   entry: string,
   loadEntryModule: EntryModuleLoader,
 ): Promise<ComponentType<Record<string, unknown>>> {
   const mod = await loadEntryModule(entry)
+  if (mod && typeof mod === 'object') {
+    const factory = (mod as Record<string, unknown>).createComponent
+    if (typeof factory === 'function') {
+      const component = (factory as (react: typeof ReactRuntime) => unknown)(ReactRuntime)
+      if (typeof component === 'function') return component as ComponentType<Record<string, unknown>>
+      throw new Error('createComponent did not return a component')
+    }
+  }
   const component = componentFromModule(mod)
   if (!component) throw new Error('entry module did not export a component')
   return component
+}
+
+/**
+ * A panel's rail icon, read through the same confined host RPC as an entry and inlined
+ * as a data: URL (the rail masks the shape, so only geometry survives). `ratio` comes
+ * from the SVG's own viewBox so a wide glyph is not squeezed into a square.
+ *
+ * Every failure — no host method, undeclared path, unreadable file, unparseable SVG —
+ * falls back to the generic icon: an extension must never lose its panel over artwork.
+ */
+async function loadPanelIcon(
+  extensionId: string,
+  icon: string | undefined,
+  readSource: ((entry: string) => Promise<string>) | undefined,
+): Promise<{ src: string; ratio: number } | undefined> {
+  const path = icon?.trim()
+  if (!path || !readSource) return undefined
+  try {
+    const source = await readSource(path)
+    if (!source.trim().startsWith('<')) return undefined
+    return { src: `data:image/svg+xml,${encodeURIComponent(source)}`, ratio: svgRatio(source) }
+  } catch {
+    return undefined
+  }
+}
+
+/** width/height from `viewBox`; 1 when it is absent or degenerate. */
+export function svgRatio(source: string): number {
+  const match = /viewBox\s*=\s*["']\s*[-\d.]+[,\s]+[-\d.]+[,\s]+([\d.]+)[,\s]+([\d.]+)/.exec(source)
+  if (!match) return 1
+  const width = Number(match[1])
+  const height = Number(match[2])
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return 1
+  return width / height
 }
 
 async function loadHeaderActionComponent(
@@ -188,6 +242,11 @@ export async function loadControlledContributions(
   const resolvedImportModule = importModule ?? importExtensionEntry
   const loadFileEntryModule: EntryModuleLoader = entry =>
     resolvedImportModule(resolveEntrySpecifier(directory, entry))
+  // Unlike an entry, an icon has no module path to fall back to, so it uses the host
+  // reader whenever there is one — including under an injected `importModule`.
+  const readUiEntrySource = host.getExtensionUiEntrySource
+    ? (entry: string) => host.getExtensionUiEntrySource!(descriptor.id, entry, projectId)
+    : undefined
   const loadHeaderEntryModule: EntryModuleLoader = async entry => {
     if (!importModule && host.getExtensionUiEntrySource) {
       const source = await host.getExtensionUiEntrySource(descriptor.id, entry, projectId)
@@ -272,18 +331,19 @@ export async function loadControlledContributions(
     const entry = panel.entry?.trim()
     if (!entry || !panel.id || seenPanel.has(panel.id)) continue
     seenPanel.add(panel.id)
+    const railIcon = (await loadPanelIcon(descriptor.id, panel.icon, readUiEntrySource)) ?? EXTENSION_PANEL_ICON
     try {
       const Component = await loadComponent(entry, loadFileEntryModule)
       const title = panel.title ?? panel.id
       disposers.push(registerPanel(descriptor.id, {
         id: panel.id,
-        icon: EXTENSION_PANEL_ICON,
+        icon: railIcon,
         render: ctx => createElement('div', { className: 'tool-page', hidden: !ctx.active },
           createElement(Component, { api, id: panel.id, title }),
         ),
       }))
     } catch (error) {
-      disposers.push(registerPanelError(descriptor.id, panel, errorMessage(error)))
+      disposers.push(registerPanelError(descriptor.id, panel, errorMessage(error), railIcon))
     }
   }
 

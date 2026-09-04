@@ -102,6 +102,9 @@ function declaredUiEntryPaths(ui: ExtensionUiSummary | undefined): Set<string> {
   if (!ui) return new Set();
   const entries = [
     ...(ui.panels ?? []).map(item => item.entry),
+    // The rail icon is read through the same confined RPC as an entry, so it has to be
+    // declared here too — otherwise readUiEntrySource refuses it.
+    ...(ui.panels ?? []).map(item => item.icon),
     ...(ui.toolRenderers ?? []).map(item => item.entry),
     ...(ui.documentRenderers ?? []).map(item => item.entry),
     ...(ui.settingsSections ?? []).map(item => item.entry),

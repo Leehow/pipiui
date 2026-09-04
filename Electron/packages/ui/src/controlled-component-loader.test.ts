@@ -7,6 +7,7 @@ import type { PipiHostAPI } from '@pipi/host-api'
 import {
   loadControlledContributions,
   resolveEntrySpecifier,
+  svgRatio,
 } from './controlled-component-loader'
 import {
   disposeUiContributions,
@@ -45,6 +46,11 @@ async function importFixture(specifier: string): Promise<unknown> {
   const file = specifier.slice(specifier.lastIndexOf('/') + 1)
   if (file === 'throws.ts' || file === 'throws.js') throw new Error('cannot load entry')
   if (file === 'panel.ts' || file === 'panel.js') return import('./fixtures/controlled/panel')
+  if (file === 'panel-factory.ts') return {
+    createComponent: (React: typeof import('react')) => (props: Record<string, unknown>) =>
+      React.createElement('div', { 'data-testid': 'ext-factory-panel', 'data-title': String(props.title) }),
+  }
+  if (file === 'factory-not-a-component.ts') return { createComponent: () => 'nope' }
   if (file === 'tool-card.ts' || file === 'tool-card.js') return import('./fixtures/controlled/tool-card')
   if (file === 'settings.ts' || file === 'settings.js') return import('./fixtures/controlled/settings')
   if (file === 'header.ts' || file === 'header.js') return {
@@ -315,5 +321,120 @@ describe('loadControlledContributions', () => {
     ])
     expect(index).not.toContain('GitBranchMenu')
     expect(adapter).not.toContain('registerHeaderAction')
+  })
+})
+
+const SQUARE_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M2 8h12"/></svg>'
+const WIDE_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 12"><path d="M2 6h20"/></svg>'
+
+function hostWithIcons(sources: Record<string, string>): PipiHostAPI {
+  return {
+    invokeExtension: vi.fn(async () => ({ ok: true, data: null })),
+    getExtensionSettings: vi.fn(async () => ({})),
+    getExtensionUiEntrySource: vi.fn(async (_id: string, entry: string) => {
+      const source = sources[entry]
+      if (source === undefined) throw new Error(`extension has no declared UI entry '${entry}'`)
+      return source
+    }),
+  } as unknown as PipiHostAPI
+}
+
+describe('svgRatio', () => {
+  it('reads width/height from the viewBox', () => {
+    expect(svgRatio(WIDE_SVG)).toBe(2)
+    expect(svgRatio(SQUARE_SVG)).toBe(1)
+  })
+
+  it('falls back to square when the viewBox is missing or degenerate', () => {
+    expect(svgRatio('<svg></svg>')).toBe(1)
+    expect(svgRatio('<svg viewBox="0 0 0 10"></svg>')).toBe(1)
+  })
+})
+
+describe('panel rail icons', () => {
+  afterEach(() => {
+    disposeUiContributions(EXT)
+  })
+
+  it('uses the panel\'s own icon so two extension panels are distinguishable in the rail', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'panel.ts', icon: 'app/icon.svg' }] },
+    }, hostWithIcons({ 'app/icon.svg': WIDE_SVG }), importFixture)
+
+    const panel = listPanels().find(item => item.id === 'quota')
+    expect(panel?.icon.src).toContain(encodeURIComponent('viewBox="0 0 24 12"'))
+    expect(panel?.icon.ratio).toBe(2)
+  })
+
+  it('keeps the panel when its icon cannot be read', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'panel.ts', icon: 'app/missing.svg' }] },
+    }, hostWithIcons({}), importFixture)
+
+    const panel = listPanels().find(item => item.id === 'quota')
+    expect(panel).toBeTruthy()
+    expect(panel?.icon.ratio).toBe(1)
+    // 回落到通用图标（它自己也是一张 SVG），而不是这个包声明的那张
+    expect(panel?.icon.src).not.toContain(encodeURIComponent('viewBox="0 0 24 12"'))
+  })
+
+  it('ignores a declared icon whose content is not SVG', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'panel.ts', icon: 'app/icon.svg' }] },
+    }, hostWithIcons({ 'app/icon.svg': 'not markup' }), importFixture)
+
+    expect(listPanels().find(item => item.id === 'quota')?.icon.src).not.toContain('not%20markup')
+    expect(listPanels().find(item => item.id === 'quota')?.icon.ratio).toBe(1)
+  })
+
+  it('a panel that fails to load still shows its own icon in the rail', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'throws.ts', icon: 'app/icon.svg' }] },
+    }, hostWithIcons({ 'app/icon.svg': WIDE_SVG }), importFixture)
+
+    const panel = listPanels().find(item => item.id === 'quota')
+    expect(panel?.icon.ratio).toBe(2)
+    const { container } = render(panel!.render(panelCtx()))
+    expect(container.querySelector('[data-testid="ext-contribution-error"]')).toBeTruthy()
+  })
+})
+
+describe('createComponent factory entries', () => {
+  afterEach(() => {
+    disposeUiContributions(EXT)
+  })
+
+  it('builds the component from the host React so an entry needs no react import', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'panel-factory.ts' }] },
+    }, hostStub(), importFixture)
+
+    const panel = listPanels().find(item => item.id === 'quota')
+    const { container } = render(panel!.render(panelCtx()))
+    const node = container.querySelector('[data-testid="ext-factory-panel"]')
+    expect(node).toBeTruthy()
+    expect(node?.getAttribute('data-title')).toBe('用量')
+  })
+
+  it('reports a factory that does not return a component instead of rendering nothing', async () => {
+    await loadControlledContributions({
+      id: EXT,
+      directory: fixturesDir,
+      ui: { panels: [{ id: 'quota', title: '用量', entry: 'factory-not-a-component.ts' }] },
+    }, hostStub(), importFixture)
+
+    const panel = listPanels().find(item => item.id === 'quota')
+    const { container } = render(panel!.render(panelCtx()))
+    expect(container.textContent).toContain('createComponent did not return a component')
   })
 })

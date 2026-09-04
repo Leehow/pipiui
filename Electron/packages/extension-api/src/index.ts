@@ -43,6 +43,13 @@ export type ExtensionUiPanel = {
   id: string;
   title: string;
   entry?: string;
+  /**
+   * Package-relative SVG for the tool rail. The rail masks the shape, so the artwork
+   * must be a single-colour silhouette — the mask takes its geometry, never its colours.
+   * Absent, the panel gets the generic extension icon and is indistinguishable from
+   * every other extension panel in the rail.
+   */
+  icon?: string;
 };
 
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };

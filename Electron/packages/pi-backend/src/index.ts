@@ -2538,8 +2538,20 @@ export class PiHostBackend implements HostBackend {
         if (op !== "take") throw new Error("unsupported structured_output op");
         return this.structuredOutputs?.take(sessionId) ?? null;
       },
-      onExtEmit: (input, sessionId) => {
-        const result = handleExtEmit(this.extensions, input, sessionId);
+      onExtEmit: async (input, sessionId) => {
+        let result = handleExtEmit(this.extensions, input, sessionId);
+        if (!result.ok && result.errorCode === "not_found") {
+          // A project-less rescan drops project-origin records (they must not leak across
+          // projects), but a session that mounted one keeps running — and its emits were
+          // then refused as "unknown extension". Re-resolve against that session's own
+          // project before refusing; authorization still runs on real, current data.
+          const projectRoot = this.live.get(sessionId)?.cwd;
+          if (projectRoot) {
+            result = await this.withStableExtensionScan(projectRoot, () =>
+              handleExtEmit(this.extensions, input, sessionId),
+            );
+          }
+        }
         if (!result.ok) return result;
         emitFrame(this.listeners, result.event as unknown as HostEvent);
         this.maybeApplySessionWorkspaceEmit(input, sessionId);

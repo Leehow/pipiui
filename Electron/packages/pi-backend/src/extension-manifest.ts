@@ -117,7 +117,8 @@ export function isValidExtensionHostApiRange(value: unknown): value is string {
 export const EXTENSION_PANEL_SLOTS = ["toolPanel"] as const;
 export type ExtensionPanelSlot = (typeof EXTENSION_PANEL_SLOTS)[number];
 
-export type ExtensionUiPanel = { slot: ExtensionPanelSlot; id: string; title: string; entry?: string };
+/** `icon` is a package-relative SVG silhouette for the tool rail (optional). */
+export type ExtensionUiPanel = { slot: ExtensionPanelSlot; id: string; title: string; entry?: string; icon?: string };
 export type ExtensionUiToolRenderer = { tool: string; entry?: string };
 /** Controlled chat-header action declared by `app.ui.headerActions`. */
 export type ExtensionUiHeaderAction = { id: string; entry: string; order?: number };
@@ -965,7 +966,17 @@ export function validateExtensionManifest(value: unknown): ManifestValidation {
             if (!title) errors.push(`app.ui.panels[${index}] missing title`);
             if (panelId && title) {
               const entry = asNonEmptyString(panel.entry);
-              panels.push(entry ? { slot, id: panelId, title, entry } : { slot, id: panelId, title });
+              const icon =
+                panel.icon === undefined
+                  ? undefined
+                  : collectRelativePath(panel.icon, `app.ui.panels[${index}].icon`, errors);
+              panels.push({
+                slot,
+                id: panelId,
+                title,
+                ...(entry ? { entry } : {}),
+                ...(icon ? { icon } : {}),
+              });
             }
           }
           if (panels.length) summary.panels = panels;
