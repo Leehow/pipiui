@@ -184,5 +184,8 @@ describe("formatForkOpportunityAdvisory", () => {
 		assert.match(text, /\[fork-available\]/);
 		assert.match(text, /`pill-width`/);
 		assert.match(text, /fork: true/);
+		// The line lands after acceptance; without a named escape a real session read it as
+		// "the brief is already written" and let the cold worker run.
+		assert.match(text, /subagent_abort/);
 	});
 });

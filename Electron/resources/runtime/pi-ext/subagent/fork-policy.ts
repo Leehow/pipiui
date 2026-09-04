@@ -224,6 +224,11 @@ export function formatForkOpportunityAdvisory(opportunities: readonly ForkOpport
 	const blocks = opportunities.map((o) => [
 		`[fork-available] \`${o.agentId}\` is a cold dispatch carrying ${o.briefChars} chars of brief naming ${o.anchorCount} file path(s). Length without anchors is restated background — the reconstruction a fork removes.`,
 		"`fork: true` starts this worker from a copy of THIS conversation: it has already read what you read and heard what the user asked, so the brief becomes a directive (what to do) instead of a briefing (what the situation is). It runs on your model against the cached prefix and lands in its own worktree like any other worker.",
+		// Same failure the continuity line had: this arrives on the acceptance receipt, so the
+		// worker is already running when it is read. A measured session answered it with "取舍
+		// 已完整写进 brief" and waited — treating "I already wrote the brief" as the reason not
+		// to act, when the length of that brief is the entire finding. Name the escape.
+		`\`${o.agentId}\` has only just started and has produced nothing, so switching now is cheap: subagent_abort({agentId:"${o.agentId}", runId}) with the runId below, then re-dispatch the same agentId with fork: true and a short directive instead of the ${o.briefChars}-char restatement. "The brief is already written" is not a reason to keep it — its size is what this line is about.`,
 		"Send it cold only if the brief is genuinely complete without your session's context — a precise, anchored brief is still the cheaper worker.",
 	].join("\n"));
 	return blocks.join("\n\n");
