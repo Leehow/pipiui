@@ -20,14 +20,15 @@ mistake as running a heavy workflow on a one-line fix.
 **You can describe it in several words but cannot name the one token.** *Where the login
 state gets invalidated. What handles retry on a 429. Which layer owns the merge.* A literal
 matcher needs you to guess the exact word the author chose, and one wrong guess returns
-nothing while one broad guess returns the whole repository. {{code_search}} weighs your terms
-against each other inside symbol boundaries and hands back ranked spans, so the sentence you
-can already say does the work the guess was doing.
+nothing while one broad guess returns the whole repository. {{code_search}} runs a local zvec
+BM25+vector index on that sentence and hands back ranked spans, so the wording you already
+have does the work a second grep keyword was doing.
 
-Be exact about what that is and is not. It ranks the words you gave it; it does not read your
-mind, and this build carries no semantic index. If the answer is written in vocabulary you did
-not use, it comes back empty — and that emptiness is worth more than a miss, because it tells
-you your words are wrong rather than that the code is absent. Change vocabulary, not tool.
+Be exact about what that is and is not. It does not read your mind. The index stays in the
+project `.pi/agent` home (no cloud embedding). If it is down, the same tool falls back to
+weighted terms and says so. If the answer is written in vocabulary you did not use, it comes
+back empty — that emptiness is worth more than a miss, because it tells you your words are
+wrong rather than that the code is absent. Change vocabulary, not tool.
 
 Your own second keyword is the tell, and it counts whether you reach for it in the next call or
 pack it into this one. `retry|recover|classify|failure` is not one exact match — it is four
@@ -60,9 +61,9 @@ in the first place.
 
 ## A note about the route is not a verdict on the answer
 
-*"Ranked by term match, not by meaning"* says how an answer was produced, not that it is
-wrong; a real degradation states itself separately and plainly — the index is down, the
-symbol layer is vacant, nothing matched. Reading the first as the second is how a correct
+*"Ranked by local zvec BM25 + vectors"* or *"Ranked by term match, not by meaning"* says how
+an answer was produced, not that it is wrong; a real degradation states itself separately and
+plainly — the index is down, the symbol layer is vacant, nothing matched. Reading the first as the second is how a correct
 set of spans gets thrown away. These tools fall back on their own when they degrade, so a
 degraded answer is still the one you would have gotten; trying costs nothing over the search
 you were about to run, and the call is how you find out.

@@ -31,6 +31,7 @@ import {
 import type { SidecarConnection, ToolResult } from "./types.js";
 import { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
 import { installSymbolLayer } from "./symbol/hooks-adapter.js";
+import { rebuildZvecIndex } from "./zvec-semantic.js";
 
 export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
 export { GrepTellBudget, alternationArms } from "./grep-tell.js";
@@ -324,7 +325,7 @@ export default function (pi: ExtensionAPI): void {
       "When a grep pattern would carry several alternative keywords, that alternation is the weighing code_search does properly — send the description instead of the arms.",
     ],
     description:
-      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Weighs your terms against each other inside symbol boundaries and returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap), so one call is enough to reject or choose candidates; never full file bodies — pull those with read_spans. It is the right call the moment grep would need a second keyword guess. It ranks the words you give it and has no semantic index in this build, so a query whose answer uses none of your words comes back empty — that means change vocabulary, not tool. Falls back to text search by itself when the index sidecar is down, so an attempt never costs more than the grep it replaces.",
+      "Find code from a description when you cannot name the one token it contains — \"where the session token gets refreshed\", \"what handles retry on a 429\". Open/semantic queries go through a local zvec BM25+vector index under the project .pi/agent home, then fall back to weighted term match if that index is down. Returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap); never full file bodies — pull those with read_spans. Exact identifiers still belong to grep. An empty result means those words are not in the tree: change vocabulary, not tool.",
     parameters: {
       type: "object",
       properties: {
@@ -558,14 +559,18 @@ export default function (pi: ExtensionAPI): void {
             ? record.name
             : "status";
       if (method === "reindex") {
+        const settings = await loadRetrievalSettings(runtime.projectRoot);
+        const rebuilt = await rebuildZvecIndex(runtime.projectRoot, {
+          excludeGlobs: settings.excludeGlobs,
+        });
         return {
-          ok: true,
+          ok: rebuilt.ok,
           data: {
             ...(await runtime.sidecarStatus()),
-            accepted: Boolean(runtime.sidecar),
-            message: runtime.sidecar
-              ? "reindex accepted (v1 sidecar is a query shell; no persistent index to rebuild)"
-              : "no sidecar to rebuild; tools will keep using grep fallback",
+            accepted: rebuilt.ok,
+            message: rebuilt.ok
+              ? "zvec semantic index rebuilt under .pi/agent/code-retrieval/zvec/"
+              : `zvec reindex skipped: ${rebuilt.reason ?? "unavailable"}; exact search still uses grep/sidecar`,
           },
         };
       }

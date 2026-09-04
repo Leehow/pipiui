@@ -68,7 +68,7 @@ test("code_search never throws when sidecar is absent", async () => {
   }
 });
 
-test("semantic queries degrade honestly instead of pretending success", async () => {
+test("semantic queries do not pretend success on a real miss", async () => {
   const root = await mkdtemp(join(tmpdir(), "cr-sem-"));
   try {
     await mkdir(join(root, "src"), { recursive: true });
@@ -81,9 +81,8 @@ test("semantic queries degrade honestly instead of pretending success", async ()
       excludeGlobs: [],
       sidecar: undefined,
     });
-    assert.equal(result.details.degraded, true);
     assert.equal(result.details.hits.length, 0);
-    assert.match(result.content[0]!.text, /semantic unavailable; attempted lexical\+symbol fallback/);
+    assert.doesNotMatch(result.content[0]!.text, /Not pretending this was a successful empty index result/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

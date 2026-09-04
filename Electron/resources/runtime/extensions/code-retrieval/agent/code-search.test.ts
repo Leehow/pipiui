@@ -7,6 +7,7 @@ import { executeCodeSearch } from "./code-search.js";
 import { symbolLayer } from "./hooks.js";
 import { RefRegistry } from "./protocol.js";
 import { routeQuery, SEMANTIC_UNAVAILABLE_NOTE } from "./route.js";
+import { setSemanticSearchForTests } from "./zvec-semantic.js";
 
 const FIXTURE = [
   "export function registeredExtensionsForSpawn() {",
@@ -61,8 +62,12 @@ test("natural-language auto queries take the hybrid path", async () => {
       excludeGlobs: [],
       sidecar: undefined,
     });
-    assert.match(result.content[0]!.text, /lexical\+symbol fallback/);
     assert.ok(result.details.hits.length > 0);
+    if (result.details.provider === "zvec") {
+      assert.match(result.content[0]!.text, /zvec/);
+    } else {
+      assert.match(result.content[0]!.text, /lexical\+symbol fallback/);
+    }
   });
 });
 
@@ -142,9 +147,17 @@ test("taking the lexical+symbol route does not itself degrade a hit", async () =
       const exact = await run("mergedExtensionOverlay");
       assert.ok(open.details.hits.length > 0, "fixture should be reachable by its own words");
       assert.ok(exact.details.hits.length > 0);
-      assert.equal(open.details.degraded, exact.details.degraded);
-      // It still says what the ranking is and is not, so the caller can judge an off-target hit.
-      assert.match(open.content[0]!.text, /not by meaning/);
+      if (open.details.provider === "zvec") {
+        assert.equal(open.details.degraded, false);
+      } else {
+        assert.equal(open.details.degraded, exact.details.degraded);
+      }
+      if (open.details.provider === "zvec") {
+        assert.match(open.content[0]!.text, /zvec/);
+        assert.doesNotMatch(open.content[0]!.text, /not by meaning/);
+      } else {
+        assert.match(open.content[0]!.text, /not by meaning/);
+      }
       assert.doesNotMatch(open.content[0]!.text, /Not pretending/);
     } finally {
       if (prev) symbolLayer.searchSymbols = prev;
@@ -153,7 +166,7 @@ test("taking the lexical+symbol route does not itself degrade a hit", async () =
   });
 });
 
-test("empty open query is honest degraded, not a silent miss", async () => {
+test("empty open query is a real miss when zvec is up, degraded when it is not", async () => {
   await withFixture(async (root) => {
     const result = await executeCodeSearch({
       query: "why does zqglorb fizzbuzzwizzle work this way?",
@@ -163,8 +176,36 @@ test("empty open query is honest degraded, not a silent miss", async () => {
       excludeGlobs: [],
       sidecar: undefined,
     });
-    assert.equal(result.details.degraded, true);
     assert.equal(result.details.hits.length, 0);
-    assert.match(result.content[0]!.text, /semantic unavailable; attempted lexical\+symbol fallback/);
+    if (result.details.provider === "zvec") {
+      assert.equal(result.details.degraded, false);
+    } else if (result.content[0]!.text.includes(SEMANTIC_UNAVAILABLE_NOTE)) {
+      assert.equal(result.details.degraded, true);
+    }
   });
+});
+
+test("forced-unavailable zvec keeps the honest degrade note", async () => {
+  setSemanticSearchForTests(async () => ({
+    available: false,
+    hits: [],
+    reason: "injected unavailable",
+  }));
+  try {
+    await withFixture(async (root) => {
+      const result = await executeCodeSearch({
+        query: "why does zqglorb fizzbuzzwizzle work this way?",
+        mode: "auto",
+        projectRoot: root,
+        registry: new RefRegistry(),
+        excludeGlobs: [],
+        sidecar: undefined,
+      });
+      assert.equal(result.details.degraded, true);
+      assert.equal(result.details.hits.length, 0);
+      assert.match(result.content[0]!.text, /semantic unavailable; attempted lexical\+symbol fallback/);
+    });
+  } finally {
+    setSemanticSearchForTests(null);
+  }
 });

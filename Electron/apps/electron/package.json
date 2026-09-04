@@ -102,6 +102,14 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/code-retrieval/node_modules/@zvec",
+        "to": "pipiui-runtime/extensions/code-retrieval/node_modules/@zvec"
+      },
+      {
+        "from": "../../resources/runtime/extensions/code-retrieval/node_modules/detect-libc",
+        "to": "pipiui-runtime/extensions/code-retrieval/node_modules/detect-libc"
+      },
+      {
         "from": "../../resources/runtime/extensions/git-capability",
         "to": "pipiui-runtime/extensions/git-capability",
         "filter": [

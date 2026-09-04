@@ -7,5 +7,8 @@
   "scripts": {
     "build": "tsc -p agent/tsconfig.json && tsc -p app/tsconfig.json",
     "clean": "rm -rf agent/dist app/dist"
+  },
+  "dependencies": {
+    "@zvec/zvec": "^0.7.0"
   }
 }

@@ -257,15 +257,13 @@ describe("vendored philosophy: delivery", () => {
   });
 
   it("promises only the retrieval this build actually has", () => {
-    // The first version of this layer told workers `code_search` was for questions they
-    // "cannot spell" — semantic retrieval, which is not enabled here. They obeyed, sent it the
-    // one shape it cannot answer, got "No hits", and went back to grep 22:1. Prose that
-    // oversells a tool trains the model out of using it, so the layer has to state the ranking
-    // it really does and what an empty result means.
+    // Overselling a tool trains the model out of using it. This build has a local zvec
+    // BM25+vector index for open queries, with an honest fallback when that index is down.
     const retrieval = layers.find((l) => l.id === "retrieval")!.body;
     expect(retrieval).toMatch(/does not read your\s*\n?mind/);
-    expect(retrieval).toMatch(/no semantic index/);
+    expect(retrieval).toMatch(/zvec/);
     expect(retrieval).toMatch(/Change vocabulary, not tool/);
+    expect(retrieval).not.toMatch(/no semantic index/);
     expect(retrieval).not.toMatch(/what that question has always needed/);
     // A route note and a failure are different claims; conflating them is what discarded
     // correct spans.

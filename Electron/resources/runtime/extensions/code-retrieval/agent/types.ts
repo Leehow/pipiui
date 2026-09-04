@@ -32,7 +32,7 @@ export type RetrievalDetails = {
   hits: Array<Omit<RetrievalHit, "text">>;
   resultsPath: string;
   degraded: boolean;
-  /** Exact-layer provider that actually served indexed hits ("rg" | "tantivy"). */
+  /** Provider that actually served indexed hits ("rg" | "tantivy" | "zvec"). */
   provider?: string;
 };
 

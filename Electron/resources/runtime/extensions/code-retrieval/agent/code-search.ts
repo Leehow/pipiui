@@ -13,6 +13,7 @@ import {
 } from "./route.js";
 import { sidecarSearch } from "./sidecar-lifecycle.js";
 import type { RetrievalHit, SidecarConnection, ToolResult, UnassignedHit } from "./types.js";
+import { searchSemantic } from "./zvec-semantic.js";
 
 export type CodeSearchArgs = {
   query: string;
@@ -60,19 +61,45 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     let hits: UnassignedHit[] = [];
     const open = looksLikeOpenQuery(query) || routed === "semantic";
     const useLexicalFallback = routed === "hybrid" || routed === "semantic";
-
-    if (open) {
-      notes.push(
-        "Ranked by weighted term match inside symbol spans, not by meaning (semantic retrieval is not enabled in this build): these hits are as good as the words you chose.",
-      );
-    }
+    let semanticAvailable = false;
 
     if (useLexicalFallback) {
+      const semantic = await searchSemantic({
+        query,
+        projectRoot: args.projectRoot,
+        path: args.path,
+        glob: args.glob,
+        topK: args.topK,
+        excludeGlobs: args.excludeGlobs,
+        signal: args.signal,
+      });
+      semanticAvailable = semantic.available;
+      if (semantic.hits.length > 0) {
+        hits = semantic.hits;
+        servingProvider = semantic.provider ?? "zvec";
+        notes.push("Ranked by local zvec BM25 + vectors.");
+      } else if (semantic.available) {
+        notes.push("zvec semantic index had no hits above threshold; tried lexical+symbol fallback.");
+      } else if (semantic.reason) {
+        notes.push(`${SEMANTIC_UNAVAILABLE_NOTE} (${semantic.reason}).`);
+      }
+    }
+
+    if (hits.length === 0 && useLexicalFallback) {
+      if (open && !semanticAvailable) {
+        notes.push(
+          "Ranked by weighted term match inside symbol spans, not by meaning (semantic retrieval is not enabled in this build): these hits are as good as the words you chose.",
+        );
+      }
       const terms = extractLexicalTerms(query);
       if (terms.length === 0) {
-        degraded = true;
-        notes.push(SEMANTIC_UNAVAILABLE_NOTE);
-        return emptySearchResult(args, query, routed, notes, degraded);
+        if (!semanticAvailable) {
+          degraded = true;
+          if (!notes.includes(SEMANTIC_UNAVAILABLE_NOTE) && !notes.some((note) => note.startsWith(SEMANTIC_UNAVAILABLE_NOTE))) {
+            notes.push(SEMANTIC_UNAVAILABLE_NOTE);
+          }
+        }
+        return emptySearchResult(args, query, routed, notes, degraded || !semanticAvailable);
       }
       const lexical = await runLexicalSymbol(args, terms);
       hits = lexical.hits;
@@ -83,7 +110,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       for (const note of lexical.notes) {
         if (!notes.includes(note)) notes.push(note);
       }
-    } else {
+    } else if (hits.length === 0) {
       if (routed === "symbol") {
         const symbolHits = await trySymbolSearch(args, [query]);
         if (symbolHits) {
@@ -111,9 +138,11 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     }
 
     if (hits.length === 0) {
-      if (useLexicalFallback || open) {
+      if (!semanticAvailable && (useLexicalFallback || open)) {
         degraded = true;
-        if (!notes.includes(SEMANTIC_UNAVAILABLE_NOTE)) notes.push(SEMANTIC_UNAVAILABLE_NOTE);
+        if (!notes.some((note) => note.includes(SEMANTIC_UNAVAILABLE_NOTE))) {
+          notes.push(SEMANTIC_UNAVAILABLE_NOTE);
+        }
       }
       const message = [
         `No hits for ${JSON.stringify(query)} (mode ${routed}).`,
