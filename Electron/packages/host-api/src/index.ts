@@ -1126,6 +1126,23 @@ export type SkillCatalogItem = {
   /** False when the contributing extension is discovered but not enabled. */
   available: boolean;
 };
+/** Settings → MCP catalog entry. Never includes env, URLs with credentials, or filesystem paths. */
+export type McpCatalogOrigin = "builtin" | "extension" | "project";
+export type McpCatalogTool = {
+  name: string;
+  description: string;
+};
+export type McpCatalogItem = {
+  name: string;
+  description: string;
+  origin: McpCatalogOrigin;
+  sourceId: string;
+  sourceName: string;
+  available: boolean;
+  transport?: string;
+  summary?: string;
+  tools: readonly McpCatalogTool[];
+};
 export type HostEvent =
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "stream"; event: StreamEvent }
   | { protocolVersion: typeof PIPI_HOST_PROTOCOL_VERSION; channel: "agents"; event: AgentEvent }
@@ -1461,6 +1478,8 @@ export interface PipiHostAPI {
   listExtensions?(projectId?: string): Promise<ExtensionDescriptor[]>;
   /** Flattened Skill catalog from built-in, enabled-extension, and project skill roots. */
   listSkillCatalog?(projectId?: string): Promise<SkillCatalogItem[]>;
+  /** MCP host, bundled MCP clients, and project `.pi/mcp.json` connections. */
+  listMcpCatalog?(projectId?: string): Promise<McpCatalogItem[]>;
   setExtensionEnabled?(id: string, enabled: boolean, scope: ExtensionEnabledScope, projectId?: string): Promise<ExtensionDescriptor>;
   /** Remove a non-builtin package (spec D9). Builtins are not uninstallable. */
   uninstallExtension?(id: string): Promise<void>;
@@ -1676,6 +1695,7 @@ function apiFrom(
       : invoke("invokeExtension", id, method, params, opts),
     listExtensions: projectId => projectId === undefined ? invoke("listExtensions") : invoke("listExtensions", projectId),
     listSkillCatalog: projectId => projectId === undefined ? invoke("listSkillCatalog") : invoke("listSkillCatalog", projectId),
+    listMcpCatalog: projectId => projectId === undefined ? invoke("listMcpCatalog") : invoke("listMcpCatalog", projectId),
     setExtensionEnabled: (id, enabled, scope, projectId) => projectId === undefined
       ? invoke("setExtensionEnabled", id, enabled, scope)
       : invoke("setExtensionEnabled", id, enabled, scope, projectId),

@@ -1435,4 +1435,32 @@ describe('extension architecture M1 host-api contract', () => {
       { method: 'listSkillCatalog', params: ['project-1'] },
     ])
   })
+
+  it('passthrough-invokes listMcpCatalog over pipi-host:v1', async () => {
+    const calls: Array<{ method: string; params: unknown[] }> = []
+    const catalog = [{
+      name: 'pi-mcp-extension',
+      description: '内置 MCP 宿主',
+      origin: 'builtin' as const,
+      sourceId: 'pi-mcp-extension',
+      sourceName: 'MCP 宿主',
+      available: true,
+      tools: [],
+    }]
+    const ipc: IpcRendererLike = {
+      invoke: async (_channel, request) => {
+        calls.push({ method: request.method, params: request.params })
+        return { protocolVersion: 2, id: request.id, type: 'response', ok: true, result: catalog }
+      },
+      on: () => undefined,
+      removeListener: () => undefined,
+    }
+    const host = createIpcHost(ipc)
+    await expect(host.listMcpCatalog?.()).resolves.toEqual(catalog)
+    await expect(host.listMcpCatalog?.('project-1')).resolves.toEqual(catalog)
+    expect(calls).toEqual([
+      { method: 'listMcpCatalog', params: [] },
+      { method: 'listMcpCatalog', params: ['project-1'] },
+    ])
+  })
 })

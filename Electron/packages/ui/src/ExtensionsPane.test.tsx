@@ -431,6 +431,53 @@ describe('ExtensionsPane package management', () => {
     expect(screen.queryByTestId('extensions-skill-create')).toBeNull()
   })
 
+  it('lists MCP host, bundled clients, and project connections with tool descriptions', async () => {
+    const host = extensionPackHost()
+    const listMcpCatalog = vi.fn(async () => [
+        {
+          name: 'pi-mcp-extension',
+          description: '内置 MCP 宿主。读取当前项目 mcp.json。',
+          origin: 'builtin' as const,
+          sourceId: 'pi-mcp-extension',
+          sourceName: 'MCP 宿主',
+          available: true,
+          tools: [],
+        },
+        {
+          name: 'zhipu_search',
+          description: 'GLM 主会话自动连接智谱 web_search_prime MCP。',
+          origin: 'extension' as const,
+          sourceId: 'glm-search-mcp',
+          sourceName: 'GLM Search MCP',
+          available: true,
+          transport: 'streamable-http',
+          tools: [{ name: 'mcp_zhipu_search_*', description: '动态注册的检索工具' }],
+        },
+        {
+          name: 'sample-mcp',
+          description: '当前项目 MCP 连接（stdio）：sample-mcp serve',
+          origin: 'project' as const,
+          sourceId: 'project',
+          sourceName: '项目连接',
+          available: true,
+          transport: 'stdio',
+          summary: 'sample-mcp serve',
+          tools: [],
+        },
+      ])
+    Object.assign(host, { listMcpCatalog })
+    render(<ExtensionsPane host={host} projectId="demo" addOpen={false} onCloseAdd={() => undefined} />)
+    fireEvent.click(screen.getByTestId('extensions-nav-mcp'))
+    expect(await screen.findByTestId('extensions-item-pi-mcp')).toBeTruthy()
+    expect(listMcpCatalog).toHaveBeenCalledWith('demo')
+    expect(screen.getByTestId('extensions-item-pi-mcp').textContent).toContain('内置 MCP 宿主')
+    expect(screen.getByTestId('extensions-mcp-glm-search-mcp').textContent).toContain('web_search_prime')
+    expect(screen.getByTestId('extensions-mcp-tools-zhipu_search').textContent).toContain('mcp_zhipu_search_*')
+    expect(screen.getByTestId('extensions-mcp-tools-zhipu_search').textContent).toContain('动态注册的检索工具')
+    expect(screen.getByTestId('extensions-item-mcp-sample-mcp').textContent).toContain('sample-mcp serve')
+    expect(screen.getByTestId('extensions-mcp-group-project').textContent).toContain('项目连接')
+  })
+
   it('lists web, browser, CUA and memory inside the Coding pack, not a core tools hub', async () => {
     const tools = [
       pkg({ id: 'web-access-extension', name: 'Web Access', category: 'automation', state: 'enabled', source: 'builtin' }),

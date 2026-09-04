@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionCategory, ExtensionDescriptor, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, SkillCatalogItem, UserMcpServer } from '@pipi/host-api'
+import type { AgentCatalogDiagnostic, AgentDefinition, ExtensionCategory, ExtensionDescriptor, McpCatalogItem, PipiHostAPI, ProductProfileDescriptor, ProjectProductActivation, SkillCatalogItem, UserMcpServer } from '@pipi/host-api'
 import {
   agentAvailabilityLabel,
   agentSourceLabel,
@@ -732,6 +732,84 @@ function McpImportDialog({ host, projectId, existing, onClose, onDone }: {
   )
 }
 
+function mcpSourceLabel(item: Pick<McpCatalogItem, 'origin' | 'sourceName'>): string {
+  if (item.origin === 'builtin') return 'MCP 宿主'
+  if (item.origin === 'project') return '项目连接'
+  return item.sourceName
+}
+
+function fallbackMcpCatalog(servers: UserMcpServer[]): McpCatalogItem[] {
+  return [
+    {
+      name: 'pi-mcp-extension',
+      description: '内置 MCP 宿主。读取当前项目 `.pi/mcp.json`，把第三方 MCP 的工具挂进会话，名称形如 mcp_<连接名>_<工具名>。',
+      origin: 'builtin',
+      sourceId: 'pi-mcp-extension',
+      sourceName: 'MCP 宿主',
+      available: true,
+      tools: [],
+    },
+    ...servers.map(server => ({
+      name: server.name,
+      description: `当前项目 MCP 连接（${server.transport}）：${server.summary}`,
+      origin: 'project' as const,
+      sourceId: 'project',
+      sourceName: '项目连接',
+      available: true,
+      transport: server.transport,
+      summary: server.summary,
+      tools: [],
+    })),
+  ]
+}
+
+function mcpCardTestId(item: McpCatalogItem): string {
+  if (item.origin === 'builtin') return 'extensions-item-pi-mcp'
+  if (item.origin === 'project') return `extensions-item-mcp-${item.name}`
+  return `extensions-mcp-${item.sourceId}`
+}
+
+function McpCatalogCard({ item, canRemove, onRemove }: {
+  item: McpCatalogItem
+  canRemove: boolean
+  onRemove: (name: string) => void
+}) {
+  return (
+    <article
+      className={`extensions-skill-card${item.available ? '' : ' unavailable'}`}
+      data-testid={mcpCardTestId(item)}
+    >
+      <div className="extensions-skill-card-title">
+        <h5>{item.name}</h5>
+        <span className={`extensions-state-pill state-${item.available ? 'enabled' : 'disabled'}`}>
+          {item.available ? (item.origin === 'builtin' ? '已内置' : item.transport ?? 'MCP') : '未启用'}
+        </span>
+      </div>
+      <p>{item.description}</p>
+      {item.tools.length > 0 ? (
+        <ul className="extensions-mcp-tools" data-testid={`extensions-mcp-tools-${item.name}`}>
+          {item.tools.map(tool => (
+            <li key={tool.name}>
+              <code>{tool.name}</code>
+              <span>{tool.description}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="extensions-mcp-tools-empty">工具在新会话启动时由宿主从该连接加载。</p>
+      )}
+      {item.origin === 'project' && canRemove && (
+        <button
+          type="button"
+          className="extensions-mcp-remove"
+          data-testid={`extensions-mcp-remove-${item.name}`}
+          onClick={() => onRemove(item.name)}
+        >移除</button>
+      )}
+    </article>
+  )
+}
+
 function McpHub({ host, projectId, servers, onChanged }: {
   host?: PipiHostAPI
   projectId?: string
@@ -742,8 +820,44 @@ function McpHub({ host, projectId, servers, onChanged }: {
   const [notice, setNotice] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [removeTarget, setRemoveTarget] = useState<UserMcpServer | null>(null)
+  const [catalog, setCatalog] = useState<McpCatalogItem[] | null>(null)
   const canImport = Boolean(host?.addUserMcpServer && projectId)
   const canRemove = Boolean(host?.removeUserMcpServer && projectId)
+
+  useEffect(() => {
+    if (!host?.listMcpCatalog) {
+      setCatalog(fallbackMcpCatalog(servers))
+      return
+    }
+    let cancelled = false
+    void (async () => {
+      try {
+        const listed = projectId
+          ? await host.listMcpCatalog!(projectId)
+          : await host.listMcpCatalog!()
+        if (!cancelled) setCatalog(listed)
+      } catch {
+        if (!cancelled) setCatalog(fallbackMcpCatalog(servers))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [host, projectId, servers])
+
+  const groups = useMemo(() => {
+    const grouped: McpCatalogItem[][] = []
+    const index = new Map<string, McpCatalogItem[]>()
+    for (const item of catalog ?? fallbackMcpCatalog(servers)) {
+      const key = `${item.origin}:${item.sourceId}`
+      let bucket = index.get(key)
+      if (!bucket) {
+        bucket = []
+        index.set(key, bucket)
+        grouped.push(bucket)
+      }
+      bucket.push(item)
+    }
+    return grouped
+  }, [catalog, servers])
 
   const confirmRemove = async () => {
     const target = removeTarget
@@ -764,7 +878,7 @@ function McpHub({ host, projectId, servers, onChanged }: {
       <div className="extensions-hub-hero">
         <span className="extensions-overview-eyebrow">核心扩展</span>
         <h3>MCP 连接</h3>
-        <p>PipiUI 内置 MCP 宿主；第三方服务作为当前项目的连接显示在这里。</p>
+        <p>按来源列出 MCP 宿主、捆绑 MCP 客户端，以及当前项目 <code>.pi/mcp.json</code> 里的连接。每条写出用途和工具；项目连接可导入或移除。</p>
       </div>
       {notice && (
         <div className="extensions-archive-notice" data-testid="extensions-mcp-notice">
@@ -773,48 +887,57 @@ function McpHub({ host, projectId, servers, onChanged }: {
         </div>
       )}
       {error && <DismissibleError message={error} onDismiss={() => setError(null)} />}
-      <div className="extensions-mcp-builtin" data-testid="extensions-builtin">
-        <div data-testid="extensions-item-pi-mcp">
-          <strong>pi-mcp-extension</strong>
-          <span>连接外部 MCP · 1 项</span>
-        </div>
-        <span className="extensions-state-pill state-enabled">已内置</span>
-      </div>
-      <div className="extensions-user-connections" data-testid="extensions-user">
-        <div className="extensions-user-connections-heading">
-          <strong>项目连接</strong>
-          <span>{servers.length} 项</span>
-          {canImport && (
-            <button type="button" className="model-modal-refresh" data-testid="extensions-mcp-import-open" onClick={() => setImportOpen(true)}>粘贴 JSON 导入</button>
-          )}
-        </div>
-        {servers.length === 0
-          ? (
-            <p className="extensions-user-empty" data-testid="extensions-user-empty">
-              {canImport
-                ? '还没有添加的 MCP。点击「粘贴 JSON 导入」，把主流客户端的 mcpServers 配置贴进来即可。'
-                : '还没有额外添加的 MCP 或 Pi 扩展。使用右上角“添加扩展”即可开始。'}
-            </p>
-          )
-          : (
-            <div className="extensions-user-list" data-testid="extensions-user-list">
-              {servers.map(server => (
-                <div className="extensions-user-row" key={server.name} data-testid={`extensions-item-mcp-${server.name}`}>
-                  <strong>{server.name}</strong>
-                  <span>{server.transport} · {server.summary}</span>
-                  {canRemove && (
-                    <button
-                      type="button"
-                      className="extensions-mcp-remove"
-                      data-testid={`extensions-mcp-remove-${server.name}`}
-                      onClick={() => setRemoveTarget(server)}
-                    >移除</button>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-      </div>
+      {groups.map(group => {
+        const lead = group[0]
+        if (!lead) return null
+        const isProject = lead.origin === 'project'
+        return (
+          <section
+            key={`${lead.origin}:${lead.sourceId}`}
+            className="extensions-skill-group"
+            data-testid={lead.origin === 'builtin' ? 'extensions-builtin' : `extensions-mcp-group-${lead.sourceId}`}
+          >
+            <header className="extensions-skill-group-header">
+              <h4>{mcpSourceLabel(lead)}</h4>
+              <span>{group.length} {lead.origin === 'builtin' ? '项' : '个'}</span>
+              {isProject && canImport && (
+                <button type="button" className="model-modal-refresh" data-testid="extensions-mcp-import-open" onClick={() => setImportOpen(true)}>粘贴 JSON 导入</button>
+              )}
+            </header>
+            {isProject && group.length === 0 ? null : (
+              <div className="extensions-skill-grid">
+                {group.map(item => (
+                  <McpCatalogCard
+                    key={`${item.sourceId}:${item.name}`}
+                    item={item}
+                    canRemove={canRemove}
+                    onRemove={name => {
+                      const server = servers.find(entry => entry.name === name)
+                      if (server) setRemoveTarget(server)
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        )
+      })}
+      {!groups.some(group => group[0]?.origin === 'project') && (
+        <section className="extensions-skill-group" data-testid="extensions-user">
+          <header className="extensions-skill-group-header">
+            <h4>项目连接</h4>
+            <span>0 个</span>
+            {canImport && (
+              <button type="button" className="model-modal-refresh" data-testid="extensions-mcp-import-open" onClick={() => setImportOpen(true)}>粘贴 JSON 导入</button>
+            )}
+          </header>
+          <p className="extensions-user-empty" data-testid="extensions-user-empty">
+            {canImport
+              ? '还没有添加的 MCP。点击「粘贴 JSON 导入」，把主流客户端的 mcpServers 配置贴进来即可。'
+              : '还没有额外添加的 MCP 或 Pi 扩展。使用右上角“添加扩展”即可开始。'}
+          </p>
+        </section>
+      )}
       {importOpen && host && projectId && (
         <McpImportDialog
           host={host}

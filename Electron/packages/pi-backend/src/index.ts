@@ -56,6 +56,7 @@ import {
   isSessionAdoptedFrom,
   type SessionAdoptedFrom,
   type SkillCatalogItem,
+  type McpCatalogItem,
 } from "@pipi/host-api";
 import { isActivityOnlyAgentEvent, mergeAgentActivity } from "./agent-activity.js";
 import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "./agent-diagnostics.js";
@@ -213,6 +214,7 @@ import {
 } from "./extension-registry.js";
 import { ExtensionLoader, type ExtensionListItem } from "./extension-loader.js";
 import { collectSkillCatalog, type SkillCatalogSource } from "./skill-catalog.js";
+import { collectMcpCatalog } from "./mcp-catalog.js";
 import {
   ExtensionHotReloader,
   hotRestartBusy,
@@ -4030,6 +4032,8 @@ export class PiHostBackend implements HostBackend {
         return this.revealProject(params[0] as string);
       case "listUserMcpServers":
         return this.listUserMcpServers(params[0]);
+      case "listMcpCatalog":
+        return this.listMcpCatalog(params[0]);
       case "addUserMcpServer":
         return this.addUserMcpServer(params[0], params[1], params[2]);
       case "removeUserMcpServer":
@@ -8809,6 +8813,11 @@ export class PiHostBackend implements HostBackend {
       return [];
     }
     return readUserMcpServers(join(root, ".pi", "mcp.json"));
+  }
+  private async listMcpCatalog(projectId: unknown): Promise<McpCatalogItem[]> {
+    const projectServers =
+      typeof projectId === "string" && projectId.trim() ? await this.listUserMcpServers(projectId) : [];
+    return collectMcpCatalog({ runtimeRoot: this.runtimeRoot, projectServers });
   }
   private async addUserMcpServer(projectId: unknown, name: unknown, spec: unknown): Promise<UserMcpServer[]> {
     const root = await this.requireProjectRoot(projectId);
