@@ -114,11 +114,12 @@ describe('DocumentPanel', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('keeps the PDF search toolbar inside the tools pane instead of the window width', () => {
+  it('replaces the PDF toolbar row with a floating zoom pill', () => {
     const css = readFileSync(join(import.meta.dirname, 'document-panel.css'), 'utf8')
-    expect(css).toMatch(/\.document-file-viewer::part\(toolbar\)\{[^}]*max-width:100%/)
-    expect(css).toMatch(/\.document-file-viewer::part\(toolbar\)\{[^}]*flex-wrap:wrap/)
-    expect(css).toMatch(/\.document-file-viewer::part\(input\)\{[^}]*max-width:100%/)
+    expect(css).not.toContain('::part(toolbar)')
+    expect(css).not.toContain('::part(input)')
+    expect(css).toMatch(/\.document-pdf-preview\{[^}]*position:relative/)
+    expect(css).toMatch(/\.pdf-zoom-pill\{[^}]*position:absolute/)
     expect(css).not.toContain('document-office-preview')
   })
 

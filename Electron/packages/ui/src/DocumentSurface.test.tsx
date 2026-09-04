@@ -4,7 +4,7 @@ import {
   resolveFileViewerPdfAssetUrls,
   setDefaultFileViewerAssetBaseUrl,
 } from '@file-viewer/core'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { PipiHostAPI } from '@pipi/host-api'
 import type { DocumentRendererProps } from '@pipiui/extension-api'
@@ -16,16 +16,24 @@ import { disposeDocumentRenderers, registerDocumentRenderer } from './ui-registr
 vi.mock('@file-viewer/preset-office', () => ({ default: { id: 'office' } }))
 vi.mock('@file-viewer/react', async () => {
   const React = await import('react')
-  type ViewerStateSink = (state: { error?: unknown }) => void
+  type MockZoomState = { label: string; scale: number; canZoomIn: boolean; canZoomOut: boolean }
+  type ViewerStateSink = (state: { error?: unknown; zoom?: MockZoomState | null }) => void
+  type MockHandle = {
+    zoomIn: ReturnType<typeof vi.fn>
+    zoomOut: ReturnType<typeof vi.fn>
+    resetZoom: ReturnType<typeof vi.fn>
+  }
   const sinksByName = new Map<string, Set<ViewerStateSink>>()
-  const MockViewer = ({ buffer, name, type, className, onStateChange, options }: {
+  const optionsByName = new Map<string, Record<string, unknown>>()
+  const handlesByName = new Map<string, MockHandle>()
+  const MockViewer = React.forwardRef(function MockViewer({ buffer, name, type, className, onStateChange, options }: {
     buffer: ArrayBuffer
     name: string
     type: string
     className?: string
     onStateChange?: ViewerStateSink
-    options?: { pdf?: { assetBaseUrl?: string; workerUrl?: string } }
-  }) => {
+    options?: { toolbar?: unknown; pdf?: { assetBaseUrl?: string; workerUrl?: string; toolbar?: boolean } }
+  }, ref: React.Ref<MockHandle>) {
     React.useEffect(() => {
       if (!onStateChange) return
       let sinks = sinksByName.get(name)
@@ -36,18 +44,30 @@ vi.mock('@file-viewer/react', async () => {
       sinks.add(onStateChange)
       return () => { sinks!.delete(onStateChange) }
     }, [name, onStateChange])
+    React.useImperativeHandle(ref, () => {
+      const handle: MockHandle = {
+        zoomIn: vi.fn(async () => null),
+        zoomOut: vi.fn(async () => null),
+        resetZoom: vi.fn(async () => null),
+      }
+      handlesByName.set(name, handle)
+      return handle
+    }, [name])
+    optionsByName.set(name, options ?? {})
     const assetBase = options?.pdf?.assetBaseUrl ?? ''
     const workerUrl = options?.pdf?.workerUrl ?? ''
     return <div className={className} data-testid="office-viewer" data-name={name} data-type={type} data-size={buffer.byteLength} data-pdf-asset-base={assetBase} data-pdf-worker={workerUrl} />
-  }
+  })
   return {
     default: MockViewer,
     __emitViewerState: (state: { error?: unknown }) => {
       for (const sinks of sinksByName.values()) for (const sink of sinks) sink(state)
     },
-    __emitViewerStateFor: (name: string, state: { error?: unknown }) => {
+    __emitViewerStateFor: (name: string, state: { error?: unknown; zoom?: MockZoomState | null }) => {
       for (const sink of sinksByName.get(name) ?? []) sink(state)
     },
+    __optionsFor: (name: string) => optionsByName.get(name),
+    __handleFor: (name: string) => handlesByName.get(name),
   }
 })
 vi.mock('@file-viewer/renderer-pdf', () => ({ pdfRenderer: { id: 'pdf' } }))
@@ -462,5 +482,66 @@ describe('core PDF asset base vs Office global lease', () => {
     expect(pdfAfter!.getAttribute('data-pdf-worker')).toContain('vendor/pdf')
     expect(pdfAfter!.getAttribute('data-pdf-worker')).not.toContain('office-lease.test')
     expect(resolveFileViewerPdfAssetUrls().workerUrl).toContain('office-lease.test')
+  })
+})
+
+describe('builtin PDF minimal floating zoom', () => {
+  const ZOOM_SHOWN = { label: '67%', scale: 0.67, canZoomIn: true, canZoomOut: true }
+
+  async function renderBuiltinPdf(name = 'paper.pdf') {
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name, path, kind: 'pdf' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]) }))
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath={`/work/${name}`} />)
+    await screen.findByTestId('office-viewer')
+    return name
+  }
+
+  type ViewerModule = {
+    __emitViewerStateFor: (name: string, state: { error?: unknown; zoom?: typeof ZOOM_SHOWN | null }) => void
+    __optionsFor: (name: string) => { toolbar?: unknown; pdf?: { toolbar?: boolean } } | undefined
+    __handleFor: (name: string) => { zoomIn: ReturnType<typeof vi.fn>; zoomOut: ReturnType<typeof vi.fn>; resetZoom: ReturnType<typeof vi.fn> } | undefined
+  }
+
+  it('hides both built-in toolbars (generic + pdf-specific)', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as ViewerModule
+    const name = await renderBuiltinPdf()
+    const options = viewerModule.__optionsFor(name)
+    expect(options?.toolbar).toBe(false)
+    expect(options?.pdf?.toolbar).toBe(false)
+  })
+
+  it('shows the floating pill only after the viewer reports zoom state', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as ViewerModule
+    const name = await renderBuiltinPdf()
+    expect(screen.queryByRole('group', { name: '缩放' })).toBeNull()
+    act(() => { viewerModule.__emitViewerStateFor(name, { zoom: ZOOM_SHOWN }) })
+    expect(screen.getByRole('group', { name: '缩放' }).textContent).toContain('67%')
+  })
+
+  it('drops the pill when the document switches before the next viewer reports', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as ViewerModule
+    const readDocument = vi.fn(async (path: string) => path.endsWith('.md')
+      ? { id: path, name: 'notes.md', path, kind: 'markdown' as const, size: 7, content: '# notes' }
+      : { id: path, name: 'paper.pdf', path, kind: 'pdf' as const, size: 4, bytes: new Uint8Array([1, 2, 3, 4]) })
+    const host = documentHost(readDocument)
+    const view = render(<DocumentPanel host={host} documentPath="/work/paper.pdf" />)
+    await screen.findByTestId('office-viewer')
+    act(() => { viewerModule.__emitViewerStateFor('paper.pdf', { zoom: ZOOM_SHOWN }) })
+    expect(screen.getByRole('group', { name: '缩放' })).toBeTruthy()
+    view.rerender(<DocumentPanel host={host} documentPath="/work/notes.md" />)
+    await screen.findByRole('heading', { name: 'notes' })
+    expect(screen.queryByRole('group', { name: '缩放' })).toBeNull()
+  })
+
+  it('wires the pill buttons to the viewer zoom API', async () => {
+    const viewerModule = await import('@file-viewer/react') as unknown as ViewerModule
+    const name = await renderBuiltinPdf()
+    act(() => { viewerModule.__emitViewerStateFor(name, { zoom: ZOOM_SHOWN }) })
+    const handle = viewerModule.__handleFor(name)
+    fireEvent.click(screen.getByRole('button', { name: '缩小' }))
+    fireEvent.click(screen.getByRole('button', { name: '放大' }))
+    fireEvent.click(screen.getByRole('button', { name: '重置缩放' }))
+    expect(handle?.zoomOut).toHaveBeenCalledTimes(1)
+    expect(handle?.zoomIn).toHaveBeenCalledTimes(1)
+    expect(handle?.resetZoom).toHaveBeenCalledTimes(1)
   })
 })

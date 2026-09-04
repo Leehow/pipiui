@@ -1,11 +1,11 @@
-import { Component, useMemo, type ReactNode } from 'react'
+import { Component, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   DEFAULT_FILE_VIEWER_PDF_CMAP_PATH,
   DEFAULT_FILE_VIEWER_PDF_STANDARD_FONT_PATH,
   DEFAULT_FILE_VIEWER_PDF_WASM_PATH,
   DEFAULT_FILE_VIEWER_PDF_WORKER_PATH,
 } from '@file-viewer/core'
-import FileViewer, { type ViewerState } from '@file-viewer/react'
+import FileViewer, { type FileViewerHandle, type ViewerState } from '@file-viewer/react'
 import { pdfRenderer } from '@file-viewer/renderer-pdf'
 import type { BinaryDocumentContent, DocumentContent } from '@pipi/host-api'
 import type { DocumentRendererActions, DocumentRendererDescriptor, DocumentRendererProps } from '@pipiui/extension-api'
@@ -33,6 +33,8 @@ export function corePdfAssetBaseUrl(
   }
 }
 
+type PdfZoomState = NonNullable<ViewerState['zoom']>
+
 /** Builtin PDF-only viewer config. Office preset/format policy lives in office-extension. */
 const PDF_VIEWER_OPTIONS = {
   preset: {
@@ -43,7 +45,10 @@ const PDF_VIEWER_OPTIONS = {
   rendererMode: 'replace' as const,
   locale: 'zh-CN' as const,
   ui: { density: 'compact' as const },
-  toolbar: { download: false, print: false, exportHtml: false, theme: false, position: 'top' as const },
+  // 极简预览：内置工具栏（搜索行 + 缩放组）和 PDF 专属工具条（页码/旋转/侧栏）
+  // 都不渲染，缩放由文档区右下角的悬浮 pill 提供（见 .pdf-zoom-pill）。
+  toolbar: false as const,
+  pdf: { toolbar: false },
 }
 
 function pdfAssetUrl(base: string, path: string): string {
@@ -58,6 +63,7 @@ function pdfViewerOptions() {
   return {
     ...PDF_VIEWER_OPTIONS,
     pdf: {
+      toolbar: false,
       assetBaseUrl,
       workerUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_WORKER_PATH),
       cMapUrl: pdfAssetUrl(assetBaseUrl, DEFAULT_FILE_VIEWER_PDF_CMAP_PATH),
@@ -134,6 +140,9 @@ export function DocumentSurface({
   viewerError, onViewerError, onDismissViewerError, fallbackMarkdown, fallbackPending, genericFallback,
 }: DocumentSurfaceProps) {
   useDocumentRenderers() // re-render when renderer registrations change
+  const pdfViewerRef = useRef<FileViewerHandle | null>(null)
+  // key 关联缩放状态和文档实例：换文档后旧缩放不显示，等新 viewer 上报。
+  const [pdfZoom, setPdfZoom] = useState<{ key: string; zoom: PdfZoomState } | null>(null)
   const builtinBuffer = useMemo(() => {
     if (!document || !isBinaryDocument(document) || document.kind !== 'pdf') return null
     return binaryBuffer(document)
@@ -151,17 +160,38 @@ export function DocumentSurface({
       return <pre className="document-plain-text" aria-label={`文档内容 ${document.name}`}>{document.content}</pre>
     }
     if (document.kind === 'pdf' && isBinaryDocument(document) && builtinBuffer) {
+      const viewerKey = `${document.path}:${document.updatedAt ?? document.size ?? 0}`
+      const noteZoom = (state: ViewerState) => {
+        setPdfZoom((prev) => {
+          const next = state.zoom
+          if (!next || !(next.scale > 0)) return null
+          if (prev && prev.key === viewerKey
+            && prev.zoom.label === next.label
+            && prev.zoom.canZoomIn === next.canZoomIn
+            && prev.zoom.canZoomOut === next.canZoomOut) return prev
+          return { key: viewerKey, zoom: next }
+        })
+        if (state.error) onViewerError(state.error)
+      }
       return <div className="document-pdf-preview" aria-label={`文档内容 ${document.name}`}>
         <FileViewer
+          ref={pdfViewerRef}
           className="document-file-viewer"
-          key={`${document.path}:${document.updatedAt ?? document.size ?? 0}`}
+          key={viewerKey}
           buffer={builtinBuffer}
           name={document.name}
           type="pdf"
           size={document.size}
           options={pdfViewerOptions()}
-          onStateChange={(state: ViewerState) => { if (state.error) onViewerError(state.error) }}
+          onStateChange={noteZoom}
         />
+        {pdfZoom?.key === viewerKey && (
+          <div className="pdf-zoom-pill" role="group" aria-label="缩放">
+            <button type="button" aria-label="缩小" disabled={!pdfZoom.zoom.canZoomOut} onClick={() => { void pdfViewerRef.current?.zoomOut() }}>−</button>
+            <button type="button" className="pdf-zoom-value" aria-label="重置缩放" title="重置缩放" onClick={() => { void pdfViewerRef.current?.resetZoom() }}>{pdfZoom.zoom.label}</button>
+            <button type="button" aria-label="放大" disabled={!pdfZoom.zoom.canZoomIn} onClick={() => { void pdfViewerRef.current?.zoomIn() }}>+</button>
+          </div>
+        )}
       </div>
     }
     return <div className="document-empty" role="status">没有可用的预览器</div>
