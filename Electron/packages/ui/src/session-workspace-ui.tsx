@@ -65,12 +65,15 @@ export function SessionBranchHeader({
   return <SessionBranchPair sessionBranch={sessionBranch} mainBranch={mainBranch} />
 }
 
+/** Git-branch glyph: trunk with its branch tip diverging from a fork — reads as git, not as "move up". */
 function UnmergedGlyph() {
   return (
     <svg className="sb-unmerged-icon" width="10" height="10" viewBox="0 0 12 12" aria-hidden="true">
-      <path d="M6 1.4v5.6" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
-      <path d="M3.7 3.6 6 1.3l2.3 2.3" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="6" cy="9.2" r="1.55" fill="currentColor" />
+      <path d="M3.2 4.1v3.8" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <path d="M3.2 6.4c0 2 5.6 1.2 5.6 -2.2" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="3.2" cy="2.6" r="1.45" fill="currentColor" />
+      <circle cx="8.8" cy="2.6" r="1.45" fill="currentColor" />
+      <circle cx="3.2" cy="9.4" r="1.45" fill="currentColor" />
     </svg>
   )
 }
