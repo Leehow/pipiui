@@ -23,3 +23,34 @@ test("a bare wave summary is not armed", () => {
   // completion receipts behind it while the Boss stayed busy.
   assert.equal(supervisorDeliveryArmsAlarm({ kind: "wave" }), false);
 });
+
+import { fallbackReachesBoss } from "../supervisor/delivery.ts";
+import type { SupervisorDeliveryRequest } from "../supervisor/delivery.ts";
+
+function request(kind: SupervisorDeliveryRequest["kind"]): SupervisorDeliveryRequest {
+  return {
+    kind,
+    agentId: "coc-build",
+    runId: "run-1",
+    sequence: 1,
+    summary: "two drivers streaming",
+    publicText: "[wave] 2 running",
+    job: { agentId: "coc-build", runId: "run-1", status: "running" },
+  } as SupervisorDeliveryRequest;
+}
+
+test("a supervisor failure still hands the Boss what it must not miss", () => {
+  assert.equal(fallbackReachesBoss(request("completion"), 2), true);
+  assert.equal(fallbackReachesBoss(request("stall"), 2), true);
+  assert.equal(fallbackReachesBoss(request("upgrade_failure"), 2), true);
+});
+
+test("a wave that closes the generation still reaches the Boss", () => {
+  assert.equal(fallbackReachesBoss(request("wave"), 0), true);
+});
+
+test("a wave about workers that are still running is absorbed, not queued at the Boss", () => {
+  // It has no acknowledgement to give, and it shares the follow-up queue with
+  // the user's own messages. The next wave restates the same state anyway.
+  assert.equal(fallbackReachesBoss(request("wave"), 2), false);
+});

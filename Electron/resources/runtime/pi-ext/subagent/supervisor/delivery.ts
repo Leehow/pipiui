@@ -186,6 +186,29 @@ export function isTerminalWaveRequest(request: SupervisorDeliveryRequest, active
 	return request.kind === "wave";
 }
 
+/**
+ * Whether a request the Supervisor could not handle still deserves the Boss.
+ *
+ * The fallback exists so nothing the Boss must act on is lost when the
+ * Supervisor session fails. It was forwarding every kind, including a wave
+ * summary of workers that are still running — a line whose only honest response
+ * is "keep waiting". Sent to the Boss it becomes an armed alarm nobody can
+ * acknowledge, and it sits in the same follow-up queue as the user's own
+ * messages, so machine status delays a person's question.
+ *
+ * A non-terminal wave is exactly what the Supervisor exists to absorb: dropping
+ * it loses nothing, because the next wave carries the same state. Everything
+ * else — terminal receipts, escalations, the terminal wave that closes a
+ * generation — still reaches the Boss.
+ */
+export function fallbackReachesBoss(
+	request: SupervisorDeliveryRequest,
+	activeWorkerCount: number,
+): boolean {
+	if (request.kind !== "wave") return true;
+	return isTerminalWaveRequest(request, activeWorkerCount);
+}
+
 export function coalesceTerminalWaveRequest(
 	request: SupervisorDeliveryRequest,
 	activeWorkerCount: number,
@@ -569,6 +592,22 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 				bossWakes: 0,
 				createBossObligation: false,
 				useCurrentPath: false,
+			};
+			results.push(result);
+			return result;
+		}
+		if (!fallbackReachesBoss(request, deps.activeWorkerCount())) {
+			// Absorbed here rather than queued at the Boss; the next wave restates it.
+			remember(receiptId);
+			const result: SupervisorDeliveryResult = {
+				outcome: "ignored",
+				receiptId,
+				supervisorPrompts,
+				bossRequests: 0,
+				bossWakes: 0,
+				createBossObligation: false,
+				useCurrentPath: false,
+				...(error ? { error } : {}),
 			};
 			results.push(result);
 			return result;
