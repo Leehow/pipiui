@@ -8,6 +8,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { encodePlanEventBridgeRequestV1 } from "../pi-ext/subagent/host-bridge.ts";
 import { getPlanAdherenceSnapshot, type PlanAdherenceJob } from "../pi-ext/subagent/plan-drift.ts";
+import { registerPlanDrive } from "./plan-drive.ts";
 
 export const TASK_STATES = [
   "pending",
@@ -476,6 +477,16 @@ export function draftPlanToolCallBlockReason(
 }
 
 export default function (pi: ExtensionAPI) {
+  // The store only records the plan; this is what keeps the session working
+  // through it instead of ending a turn with tasks still open.
+  registerPlanDrive(pi, {
+    readActivePlan: (ctx) => {
+      const store = loadStore(cwdOf(ctx));
+      return store.activePlanId ? store.plans[store.activePlanId] : undefined;
+    },
+    hasLiveWorkers: () => getPlanAdherenceSnapshot().jobs.some(isLiveJob),
+  });
+
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension" || event.text.trim() !== PLAN_APPROVE_PROMPT) return;
     const store = loadStore(cwdOf(ctx));
@@ -522,7 +533,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_task_update",
     label: "Plan Task Update",
-    description: "Update one task on the active plan. Always pass the same planId published earlier; never invent a new plan id mid-execution, including when starting the next phase.",
+    description: "Update one task on the active plan. Always pass the same planId published earlier; never invent a new plan id mid-execution, including when starting the next phase. When one task needs a user decision, set that task to \"blocked\" with a note naming the decision instead of stopping the whole plan, then keep working the tasks that do not depend on that answer.",
     promptSnippet: "Update a published plan task state",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
