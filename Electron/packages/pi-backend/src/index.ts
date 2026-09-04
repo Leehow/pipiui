@@ -101,7 +101,6 @@ import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { enrichCapabilitiesForOfficialHostedSearch } from "./hosted-search-capabilities.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
-import { OrphanNoticeStore } from "./orphan-notice.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
 import {
   LEASE_ACQUISITION_METADATA,
@@ -2130,8 +2129,6 @@ export class PiHostBackend implements HostBackend {
   /** Panel drops are session-owned and must leave with their session. */
   private readonly openedDocumentPathsBySession = new Map<string, Set<string>>();
   private readonly documentInjections = new DocumentInjectionStore();
-  /** Host-side worker closeouts owed to a session; delivered on its next prompt. */
-  private readonly orphanNotices = new OrphanNoticeStore();
   private readonly documentWatcher = new DocumentFileWatcher((path) => {
     emitFrame(this.listeners, {
       protocolVersion: PIPI_HOST_PROTOCOL_VERSION,
@@ -2972,7 +2969,6 @@ export class PiHostBackend implements HostBackend {
     const redaction = this.sessionRedact.waitForSession(id);
     const envRefresh = this.sessionEnvRefresh.waitForSession(id);
     this.documentInjections.clearSession(id);
-    this.orphanNotices.clearSession(id);
     this.openedDocumentPathsBySession.delete(id);
     this.structuredOutputs?.clear(id);
     this.unconfirmedSteers.delete(id);
@@ -3070,7 +3066,6 @@ export class PiHostBackend implements HostBackend {
     this.queue.disposeAll();
     this.extensions.unmountAllSessions();
     this.documentInjections.clearAll();
-    this.orphanNotices.clearAll();
     this.openedDocumentPathsBySession.clear();
     this.openedDocumentPaths = [];
     this.structuredOutputs?.clearAll();
@@ -3731,23 +3726,8 @@ export class PiHostBackend implements HostBackend {
   private interruptSessionLiveAgents(sessionId: string, reason: string): void {
     for (const agent of [...this.agents.values()]) {
       if (agent.sessionId !== sessionId || !this.isLiveAgentState(agent.state)) continue;
-      const aborted = this.forceAbortAgent(agent, reason);
-      // Same debt as the orphan sweep: the wave died by host decision, so the
-      // session must be told rather than left waiting on a dead sender.
-      if (aborted) this.recordOrphanNotice(aborted);
+      this.forceAbortAgent(agent, reason);
     }
-  }
-
-  /** Queue one host-side closeout for delivery on this session's next prompt. */
-  private recordOrphanNotice(agent: AgentSummary): void {
-    const state = agent.state === "aborted" ? "aborted" : "interrupted";
-    this.orphanNotices.record(agent.sessionId, {
-      agentId: agent.agentId,
-      runId: agent.runId,
-      ...(agent.title ? { title: agent.title } : {}),
-      state,
-      closeout: agent.closeout ?? `worker closed out by the host as ${state}`,
-    });
   }
   private async closeQuietSessionWriter(sessionId: string): Promise<boolean> {
     const live = this.live.get(sessionId);
@@ -10010,10 +9990,7 @@ export class PiHostBackend implements HostBackend {
         ? await this.visionDescribePlan(live)
         : { active: false, visionRef: null };
       this.assertSessionGeneration(id, generation);
-      // Order: host closeout notice, then any document injection, then the user's
-      // own text — the notice explains state the rest of the turn depends on.
-      const withDocuments = prependDocumentInjection(payload.text, this.documentInjections.takePending(id));
-      const promptText = prependDocumentInjection(withDocuments, this.orphanNotices.takePending(id));
+      const promptText = prependDocumentInjection(payload.text, this.documentInjections.takePending(id));
       const message = attachments.length
         ? await this.prepareImageMessage(live, promptText, attachments, plan.active)
         : promptText;
@@ -11129,9 +11106,6 @@ export class PiHostBackend implements HostBackend {
       this.agentProjectionChanged(next.sessionId);
       this.agent({ type: "agent", agent: next });
       this.retainOrphanWorktree(next);
-      // The projection and the UI now know this worker is dead. The session that
-      // dispatched it does not, and is still waiting for its completion signal.
-      this.recordOrphanNotice(next);
       changed = true;
     }
     if (changed) this.persistAgents();
@@ -11146,11 +11120,11 @@ export class PiHostBackend implements HostBackend {
     );
     for (const sessionId of sessionIds) this.reconcileOrphanedNow(sessionId, now);
   }
-  private forceAbortAgent(agent: AgentSummary, reason: string): AgentSummary | undefined {
+  private forceAbortAgent(agent: AgentSummary, reason: string): void {
     const key = this.agentKey(agent.agentId, agent.sessionId, agent.runId);
     const current = this.agents.get(key);
-    if (!current || current.runId !== agent.runId) return undefined;
-    if (current.state !== "running" && current.state !== "stalled") return undefined;
+    if (!current || current.runId !== agent.runId) return;
+    if (current.state !== "running" && current.state !== "stalled") return;
     const next: AgentSummary = {
       ...current,
       state: "aborted",
