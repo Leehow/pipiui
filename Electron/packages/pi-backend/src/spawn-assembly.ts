@@ -689,6 +689,8 @@ export function resolvePiExecutable(env:NodeJS.ProcessEnv=process.env):string{
   return candidates.find(candidate=>{try{accessSync(candidate,constants.X_OK);return true}catch{return false}})??"pi";
 }
 const NODE_BIN = process.platform === "win32" ? "node.exe" : "node";
+/** The Electron-backed shim is a `.cmd` on Windows and an extensionless script elsewhere. */
+const NODE_SHIM_BIN = process.platform === "win32" ? "node.cmd" : "node";
 
 /**
  * Process-wide memoization for the shim scan. A real Node binary is 100+ MB, and reading
@@ -722,7 +724,8 @@ export function isElectronNodeShim(executable: string): boolean {
         const buffer = Buffer.alloc(400);
         const bytesRead = readSync(fd, buffer, 0, 400, 0);
         const head = buffer.toString("utf8", 0, bytesRead);
-        isShim = head.startsWith("#!") && head.includes("ELECTRON_RUN_AS_NODE");
+        // POSIX writes a `#!/bin/sh` script, Windows an `@echo off` batch file.
+        isShim = (head.startsWith("#!") || head.startsWith("@echo")) && head.includes("ELECTRON_RUN_AS_NODE");
       } finally {
         closeSync(fd);
       }
@@ -740,6 +743,11 @@ export function isElectronNodeShim(executable: string): boolean {
 
 function nodeBinaryIn(dir: string): string {
   return join(dir, NODE_BIN);
+}
+
+/** Where the shim would live in `dir`; on Windows that is never the `node.exe` a real install ships. */
+function nodeShimIn(dir: string): string {
+  return join(dir, NODE_SHIM_BIN);
 }
 
 function isRealNodeDir(dir: string): boolean {
@@ -765,11 +773,11 @@ export function withToolPath(env:Record<string,string>, piExecutable:string):Rec
   const fallbackDirs=["/opt/homebrew/bin","/usr/local/bin",join(homedir(),".local","bin"),join(homedir(),".npm-global","bin"),"/usr/bin","/bin"];
   const existing=(env.PATH??"").split(delimiter).filter(Boolean);
   const candidates=[...new Set([dirname(piExecutable),...existing,...fallbackDirs].filter(Boolean))];
-  const hasShim=candidates.some(dir=>isElectronNodeShim(nodeBinaryIn(dir)));
+  const hasShim=candidates.some(dir=>isElectronNodeShim(nodeShimIn(dir)));
   if(!hasShim)return {...env,PATH:candidates.join(delimiter)};
   const realNodeDirs=candidates.filter(isRealNodeDir);
   if(realNodeDirs.length===0)return {...env,PATH:candidates.join(delimiter)};
-  const withoutShim=candidates.filter(dir=>!isElectronNodeShim(nodeBinaryIn(dir)));
+  const withoutShim=candidates.filter(dir=>!isElectronNodeShim(nodeShimIn(dir)));
   return {...env,PATH:[...new Set([...realNodeDirs,...withoutShim])].join(delimiter)};
 }
 /** Host-independent fallback for tests/embedders. The Electron app injects app.getPath('userData'). */

@@ -120,6 +120,20 @@ describe('persistent embedded Pi runtime CLI', () => {
     expect(source).toContain('node_modules/electron/dist/Electron.app/Contents/MacOS/Electron')
   })
 
+  it('never names the Windows Node shim .exe (CreateProcessW rejects batch text)', async () => {
+    const source = await readFile(new URL('./fetch-pi-runtime.mjs', import.meta.url), 'utf8')
+    // A `.exe` holding `@echo off` cannot be started by CreateProcessW, and libuv
+    // reports that unmapped Win32 error as `spawn UNKNOWN` — every packaged
+    // Windows build failed that way for pi, the auth helper and every worker.
+    expect(source).toContain("join('node', 'node.cmd')")
+    expect(source).not.toContain("join('node', 'node.exe')")
+    // pi.cmd must `call` the shim, or control never returns to it.
+    expect(source).toContain('call "%~dp0..\\\\..\\\\node\\\\node.cmd"')
+    // %errorlevel% inside a parenthesized block expands at parse time, not run time.
+    expect(source).toContain('if not defined PIPIUI_ELECTRON_BINARY goto :no_electron')
+    expect(source).toContain("!node.endsWith('.cmd')")
+  })
+
   it('caps npm concurrency on the staged install, which --prefix puts outside the repo .npmrc', async () => {
     const source = await readFile(new URL('./fetch-pi-runtime.mjs', import.meta.url), 'utf8')
     // npm's default of 15 sockets deadlocks behind a local HTTP proxy and strands

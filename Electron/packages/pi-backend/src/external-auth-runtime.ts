@@ -34,7 +34,11 @@ async function resolveNode(explicit: string | undefined, env: NodeJS.ProcessEnv)
   const piSibling = env.PIPIUI_PI_PATH ? join(dirname(env.PIPIUI_PI_PATH), executable) : undefined;
   const currentNode = basename(process.execPath).toLowerCase().startsWith("node") ? process.execPath : undefined;
   const pathNodes = (env.PATH ?? "").split(delimiter).filter(Boolean).map(dir => join(dir, executable));
-  for (const candidate of [explicit, env.PIPIUI_NODE_PATH, piSibling, ...pathNodes, "/opt/homebrew/bin/node", "/usr/local/bin/node", currentNode]) {
+  // PIPIUI_ELECTRON_BINARY is the host's own Electron executable, which runs as Node
+  // under ELECTRON_RUN_AS_NODE. On Windows it is the only spawnable Node host the
+  // bundle has: the embedded `node.cmd` shim needs cmd.exe, and CreateProcessW
+  // reports a direct spawn of it as the unmapped `spawn UNKNOWN`.
+  for (const candidate of [explicit, env.PIPIUI_NODE_PATH, env.PIPIUI_ELECTRON_BINARY, piSibling, ...pathNodes, "/opt/homebrew/bin/node", "/usr/local/bin/node", currentNode]) {
     if (!candidate) continue;
     try { await access(candidate); return candidate; } catch { /* next */ }
   }

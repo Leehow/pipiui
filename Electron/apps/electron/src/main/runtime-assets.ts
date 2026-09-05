@@ -148,6 +148,13 @@ function resolveEmbeddedPi(
   const node = platform === 'darwin'
     ? materializeDetachedDarwinHost(bundledNode, userData ? join(userData, 'detached-hosts') : undefined, 'node')
     : bundledNode
+  // Only darwin ships a real Node binary. Elsewhere `node` is the Electron-backed
+  // shim, and on Windows that shim is a `.cmd` — CreateProcessW cannot start it,
+  // so spawning it produced `spawn UNKNOWN` for pi, the auth helper and every
+  // worker alike. Spawn this already-running Electron binary in Node mode instead;
+  // the shim stays on PATH for the cmd.exe consumers that can run it. The POSIX
+  // shim keeps its shebang, so execve still handles it directly.
+  const spawnHost = platform === 'win32' ? electronNodeHost(platform) : node
   const piCli = requireFile(root, manifest.piCli, 'CLI')
   const piLauncher = requireFile(root, manifest.piLauncher, 'launcher')
   const nodeModules = requireDirectory(confinedPath(root, manifest.nodeModules, 'node_modules'), 'embedded Pi node_modules')
@@ -160,12 +167,12 @@ function resolveEmbeddedPi(
   }
   const commandEnv = {
     PATH: [dirname(node), dirname(piLauncher), env.PATH].filter(Boolean).join(delimiter),
-    PIPIUI_NODE_PATH: node,
+    PIPIUI_NODE_PATH: spawnHost,
     PIPIUI_PI_PATH: piLauncher,
     PIPIUI_ELECTRON_BINARY: electronNodeHost(platform)
   }
   return {
-    piCommand: { executable: node, prefixArgs: [piCli], piPath: piLauncher, env: commandEnv },
+    piCommand: { executable: spawnHost, prefixArgs: [piCli], piPath: piLauncher, env: commandEnv },
     managedNodeModulesRoot: nodeModules
   }
 }

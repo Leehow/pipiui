@@ -1,6 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CUA_DRIVER_HELPER_APP, MANAGED_RUNTIME_PACKAGE_VERSIONS, resolveCuaDriverLaunchPath, resolveRuntimeAssets, UPDATE_CENTER_RUNTIME_PACKAGE_VERSIONS } from './runtime-assets.js'
@@ -27,7 +27,7 @@ describe('resolveRuntimeAssets', () => {
   })
 
   async function seedEmbeddedRuntime(embedded: string, platform: NodeJS.Platform = 'darwin', arch = 'arm64'): Promise<void> {
-    const node = join(embedded, 'node', 'bin', platform === 'win32' ? 'node.exe' : 'node')
+    const node = join(embedded, 'node', 'bin', platform === 'win32' ? 'node.cmd' : 'node')
     const piCli = join(embedded, 'pi', 'lib', 'node_modules', '@earendil-works', 'pi-coding-agent', 'dist', 'cli.js')
     const launcher = join(embedded, 'pi', 'bin', platform === 'win32' ? 'pi.cmd' : 'pi')
     const nodeModules = join(embedded, 'pi', 'lib', 'node_modules')
@@ -58,7 +58,7 @@ describe('resolveRuntimeAssets', () => {
       platform,
       arch,
       nodeVersion: '24.19.0',
-      nodeExecutable: platform === 'win32' ? 'node/bin/node.exe' : 'node/bin/node',
+      nodeExecutable: platform === 'win32' ? 'node/bin/node.cmd' : 'node/bin/node',
       piCli: 'pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js',
       piLauncher: platform === 'win32' ? 'pi/bin/pi.cmd' : 'pi/bin/pi',
       nodeModules: 'pi/lib/node_modules',
@@ -147,6 +147,17 @@ describe('resolveRuntimeAssets', () => {
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
     expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.6')
+  })
+
+  it('spawns the Electron host, never the unspawnable Windows .cmd shim', async () => {
+    const { resourcesPath } = await seedPackagedRuntime('win32', 'x64')
+    const assets = resolveRuntimeAssets({ packaged: true, resourcesPath, dirname: builtMainDir, env: { PATH: 'C:\\Windows' }, platform: 'win32', arch: 'x64' })
+    // CreateProcessW rejects batch text in any name it is given, and libuv reports
+    // that unmapped Win32 error as `spawn UNKNOWN` — the packaged Windows failure.
+    expect(assets.piCommand?.executable).toBe(process.execPath)
+    expect(assets.piCommand?.env?.PIPIUI_NODE_PATH).toBe(process.execPath)
+    // The shim still ships and stays first on PATH for cmd.exe consumers.
+    expect(assets.piCommand?.env?.PATH.split(delimiter)[0]).toBe(join(resourcesPath, 'pipiui-embedded/node/bin'))
   })
 
   it('fails closed when a packaged runtime is absent or for another architecture', async () => {
