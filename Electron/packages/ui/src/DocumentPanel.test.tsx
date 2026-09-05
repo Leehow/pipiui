@@ -12,8 +12,14 @@ vi.mock('@file-viewer/react', async () => {
   const React = await import('react')
   type ViewerStateSink = (state: { error?: unknown }) => void
   const sinks = new Set<ViewerStateSink>()
-  const MockViewer = ({ buffer, name, type, className, onStateChange }: { buffer: ArrayBuffer; name: string; type: string; className?: string; onStateChange?: ViewerStateSink }) => {
+  // 回归观测：记录每次渲染收到的 options/onStateChange 身份。@file-viewer/react 把二者放
+  // 进 viewerOptions memo 依赖，身份漂移会触发 controller.update() 用已 detach 的 buffer 重载。
+  const seenViewerOptions: unknown[] = []
+  const seenStateHandlers: unknown[] = []
+  const MockViewer = ({ buffer, name, type, className, onStateChange, options }: { buffer: ArrayBuffer; name: string; type: string; className?: string; onStateChange?: ViewerStateSink; options?: unknown }) => {
     const [generations, setGenerations] = React.useState(0)
+    seenViewerOptions.push(options)
+    seenStateHandlers.push(onStateChange)
     React.useEffect(() => { setGenerations(count => count + 1) }, [buffer])
     React.useEffect(() => {
       if (!onStateChange) return
@@ -25,7 +31,9 @@ vi.mock('@file-viewer/react', async () => {
   return {
     default: MockViewer,
     // Tests simulate FileViewer failures by broadcasting a ViewerState.
-    __emitViewerState: (state: { error?: unknown }) => { for (const sink of [...sinks]) sink(state) }
+    __emitViewerState: (state: { error?: unknown }) => { for (const sink of [...sinks]) sink(state) },
+    __seenViewerOptions: seenViewerOptions,
+    __seenStateHandlers: seenStateHandlers,
   }
 })
 vi.mock('@file-viewer/renderer-pdf', () => ({ pdfRenderer: { id: 'pdf' } }))
@@ -208,6 +216,31 @@ describe('DocumentPanel', () => {
     expect(screen.getByTestId('office-viewer')).toBe(viewer)
     expect(screen.getByTestId('office-viewer').getAttribute('data-generations')).toBe('1')
     expect(readDocument).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps viewer options and state-handler identity stable across zoom state reports', async () => {
+    const bytes = new Uint8Array([1, 2, 3, 4])
+    const readDocument = vi.fn(async (path: string) => ({ id: path, name: 'report.pdf', path, kind: 'pdf' as const, size: 4, bytes }))
+    render(<DocumentPanel host={documentHost(readDocument)} documentPath="/tmp/report.pdf" />)
+    await screen.findByTestId('office-viewer')
+    const viewerModule = await import('@file-viewer/react') as unknown as {
+      __emitViewerState: (state: { zoom?: { scale: number; label: string; canZoomIn: boolean; canZoomOut: boolean }; error?: unknown }) => void
+      __seenViewerOptions: unknown[]
+      __seenStateHandlers: unknown[]
+    }
+    const optionsBefore = viewerModule.__seenViewerOptions.length
+    const handlersBefore = viewerModule.__seenStateHandlers.length
+    // 首次缩放状态上报 → setState → 重渲染。回归：重渲染不得更换 options/onStateChange 身份，
+    // 否则 viewer 会 controller.update() 用已被 pdf.js detach 的同一 buffer 重载文档并崩溃。
+    viewerModule.__emitViewerState({ zoom: { scale: 1, label: '100%', canZoomIn: true, canZoomOut: true } })
+    expect(await screen.findByRole('group', { name: '缩放' })).toBeTruthy()
+    viewerModule.__emitViewerState({ zoom: { scale: 1.25, label: '125%', canZoomIn: true, canZoomOut: true } })
+    expect(await screen.findByText('125%')).toBeTruthy()
+    const optionsSeen = viewerModule.__seenViewerOptions.slice(optionsBefore)
+    const handlersSeen = viewerModule.__seenStateHandlers.slice(handlersBefore)
+    expect(optionsSeen.length).toBeGreaterThan(1)
+    expect(new Set(optionsSeen).size).toBe(1)
+    expect(new Set(handlersSeen).size).toBe(1)
   })
 })
 

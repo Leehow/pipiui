@@ -1,4 +1,4 @@
-import { Component, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Component, useCallback, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   DEFAULT_FILE_VIEWER_PDF_CMAP_PATH,
   DEFAULT_FILE_VIEWER_PDF_STANDARD_FONT_PATH,
@@ -143,6 +143,24 @@ export function DocumentSurface({
   const pdfViewerRef = useRef<FileViewerHandle | null>(null)
   // key 关联缩放状态和文档实例：换文档后旧缩放不显示，等新 viewer 上报。
   const [pdfZoom, setPdfZoom] = useState<{ key: string; zoom: PdfZoomState } | null>(null)
+  const viewerKey = document ? `${document.path}:${document.updatedAt ?? document.size ?? 0}` : ''
+  // @file-viewer/react 把 options/onStateChange 放进 viewerOptions 的 memo 依赖，身份一变就
+  // controller.update() 重载文档；而 pdf.js 首次加载已把 buffer 转移进 worker（detach）。所以
+  // 这两个 prop 必须身份稳定，否则每次状态上报 → 重渲染 → 用 detached buffer 重载 →
+  // "Cannot perform Construct on a detached ArrayBuffer"。zoom 状态本身仍走 setState。
+  const pdfOptions = useMemo(() => pdfViewerOptions(), [])
+  const noteZoom = useCallback((state: ViewerState) => {
+    setPdfZoom((prev) => {
+      const next = state.zoom
+      if (!next || !(next.scale > 0)) return null
+      if (prev && prev.key === viewerKey
+        && prev.zoom.label === next.label
+        && prev.zoom.canZoomIn === next.canZoomIn
+        && prev.zoom.canZoomOut === next.canZoomOut) return prev
+      return { key: viewerKey, zoom: next }
+    })
+    if (state.error) onViewerError(state.error)
+  }, [viewerKey, onViewerError])
   const builtinBuffer = useMemo(() => {
     if (!document || !isBinaryDocument(document) || document.kind !== 'pdf') return null
     return binaryBuffer(document)
@@ -160,19 +178,6 @@ export function DocumentSurface({
       return <pre className="document-plain-text" aria-label={`文档内容 ${document.name}`}>{document.content}</pre>
     }
     if (document.kind === 'pdf' && isBinaryDocument(document) && builtinBuffer) {
-      const viewerKey = `${document.path}:${document.updatedAt ?? document.size ?? 0}`
-      const noteZoom = (state: ViewerState) => {
-        setPdfZoom((prev) => {
-          const next = state.zoom
-          if (!next || !(next.scale > 0)) return null
-          if (prev && prev.key === viewerKey
-            && prev.zoom.label === next.label
-            && prev.zoom.canZoomIn === next.canZoomIn
-            && prev.zoom.canZoomOut === next.canZoomOut) return prev
-          return { key: viewerKey, zoom: next }
-        })
-        if (state.error) onViewerError(state.error)
-      }
       return <div className="document-pdf-preview" aria-label={`文档内容 ${document.name}`}>
         <FileViewer
           ref={pdfViewerRef}
@@ -182,7 +187,7 @@ export function DocumentSurface({
           name={document.name}
           type="pdf"
           size={document.size}
-          options={pdfViewerOptions()}
+          options={pdfOptions}
           onStateChange={noteZoom}
         />
         {pdfZoom?.key === viewerKey && (
