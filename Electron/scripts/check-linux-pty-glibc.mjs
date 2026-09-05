@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { readdirSync, statSync } from 'node:fs'
+import { closeSync, openSync, readdirSync, readSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 export const MAX_GLIBC = { major: 2, minor: 35 }
@@ -53,6 +53,27 @@ function collectPtyNodes(root, acc = []) {
   return acc
 }
 
+/**
+ * node-pty ships prebuilt `pty.node` for darwin and win32 alongside the Linux
+ * build, and electron-builder copies the whole package into the Linux app. A
+ * Mach-O or PE binary has no glibc requirement to check, so it is skipped —
+ * readelf failing on one is not a packaging defect. A file that IS an ELF but
+ * cannot be read still fails loudly.
+ */
+export function isElf(file) {
+  let fd
+  try {
+    fd = openSync(file, 'r')
+    const magic = Buffer.alloc(4)
+    const read = readSync(fd, magic, 0, 4, 0)
+    return read === 4 && magic[0] === 0x7f && magic[1] === 0x45 && magic[2] === 0x4c && magic[3] === 0x46
+  } catch {
+    return false
+  } finally {
+    if (fd !== undefined) closeSync(fd)
+  }
+}
+
 function dumpSymbols(file) {
   const readelf = spawnSync('readelf', ['-V', file], { encoding: 'utf8' })
   if (readelf.status === 0) return `${readelf.stdout}\n${readelf.stderr}`
@@ -93,7 +114,13 @@ function main(argv = process.argv.slice(2)) {
     return
   }
   let failed = false
+  let inspected = 0
   for (const file of files) {
+    if (!isElf(file)) {
+      console.log(`${file} skipped (not an ELF binary)`)
+      continue
+    }
+    inspected += 1
     const text = dumpSymbols(file)
     const versions = parseGlibcVersions(text)
     const tooNew = findTooNew(versions)
@@ -103,6 +130,10 @@ function main(argv = process.argv.slice(2)) {
     } else {
       console.log(`${file} ok (${versions.join(', ') || 'no GLIBC_* symbols'})`)
     }
+  }
+  if (inspected === 0) {
+    console.error(`no ELF pty.node found under ${root}; a Linux package must carry one`)
+    failed = true
   }
   if (failed) process.exitCode = 1
 }
