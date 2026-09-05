@@ -8,7 +8,7 @@ import {
 } from './controlled-component-loader'
 import type { Disposer } from './contribution-registry'
 import { registerSlashCommand } from './slash-commands'
-import { subscribeExt } from './subscribe-ext'
+import { subscribeExt, type ExtEvent } from './subscribe-ext'
 import { registerStatusBarItem } from './ui-registries'
 
 const loaded = new Map<string, Disposer[]>()
@@ -119,6 +119,19 @@ async function resolveContributions(
   }
 }
 
+/**
+ * Did this notice mean the extension's own files moved on disk?
+ *
+ * The host emits `extension_updated` for two different things: `state` (enable,
+ * disable, install, profile) and `disk` (its hot-reload watcher saw an edit).
+ * Only the second one invalidates what we already imported.
+ */
+function isDiskUpdate(event: ExtEvent | undefined): boolean {
+  if (event?.type !== 'extension_updated') return false
+  const payload = event.payload as { source?: unknown } | undefined
+  return payload?.source === 'disk'
+}
+
 /** Start-up + enable/disable refresh via listExtensions and subscribeExt. */
 export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, projectId?: string): void {
   const refreshGeneration = useRef(0)
@@ -145,7 +158,18 @@ export function useDeclarativeContributionLoader(host: PipiHostAPI | undefined, 
       for (const descriptor of list) {
         if (subscribed.has(descriptor.id)) continue
         subscribed.add(descriptor.id)
-        unsubs.push(subscribeExt(host, descriptor.id, () => { void refresh() }))
+        unsubs.push(subscribeExt(host, descriptor.id, event => {
+          // The controlled (app-half) entry is imported once per renderer lifetime and
+          // memoised in `controlledLoaded`, so a plain refresh short-circuits and an
+          // edited panel keeps rendering the module we imported at start-up. The host
+          // already tells us when the files themselves changed; drop this extension's
+          // group on that notice so the refresh below re-imports it from disk.
+          //
+          // The agent half was already hot: the watcher respawns the idle pi child with
+          // fresh mounts. This is the same reload reaching the half that renders.
+          if (isDiskUpdate(event)) unloadDeclarative(descriptor.id)
+          void refresh()
+        }))
       }
     }
 

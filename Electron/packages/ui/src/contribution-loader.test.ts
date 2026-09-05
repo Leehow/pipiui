@@ -264,6 +264,47 @@ describe('useDeclarativeContributionLoader', () => {
     expect(listeners.get(EXT)?.size ?? 0).toBe(0)
   })
 
+  it('re-imports the app half when the host reports the extension changed on disk', async () => {
+    // 热更新原本只到 agent 半边：watcher 让空闲的 pi 子进程带新挂载重启。面板组件是
+    // 每个渲染进程只 import 一次并记住的，所以改了 app/*.js 之后界面照旧显示旧模块，
+    // 直到整窗重载——这条守住"改盘上的文件，界面跟着变"。
+    const listeners = new Set<(event: ExtEvent) => void>()
+    const source = (marker: string) => [
+      'export function createHeaderAction(React) {',
+      `  return function Header() { return React.createElement('span', null, '${marker}') }`,
+      '}',
+    ].join('\n')
+    let onDisk = 'BEFORE'
+    const host = {
+      listExtensions: vi.fn(async () => [descriptorWithHeader]),
+      getExtensionUiEntrySource: vi.fn(async () => source(onDisk)),
+      subscribeExt: (_extensionId: string, listener: (event: ExtEvent) => void) => {
+        listeners.add(listener)
+        return () => { listeners.delete(listener) }
+      },
+    } as unknown as PipiHostAPI
+    const descriptorWithHeader = {
+      ...quotaDescriptor('enabled'),
+      directory: '/hot-reload-app-half',
+      ui: { headerActions: [{ id: 'quota.hot', entry: 'app/dist/header.js' }] },
+    } as ExtensionDescriptor
+
+    renderHook(() => useDeclarativeContributionLoader(host))
+    await vi.waitFor(() => expect(listHeaderActions().filter(item => item.id === 'quota.hot')).toHaveLength(1))
+    expect(host.getExtensionUiEntrySource).toHaveBeenCalledTimes(1)
+
+    // 状态变更（启用/停用/安装）不该让已经 import 的东西作废
+    for (const listener of listeners) listener({ type: 'extension_updated', payload: { extensionId: EXT, source: 'state' } })
+    await vi.waitFor(() => expect(host.listExtensions).toHaveBeenCalledTimes(2))
+    expect(host.getExtensionUiEntrySource).toHaveBeenCalledTimes(1)
+
+    // 盘上的文件变了才作废，并重新读一次源码
+    onDisk = 'AFTER'
+    for (const listener of listeners) listener({ type: 'extension_updated', payload: { extensionId: EXT, source: 'disk' } })
+    await vi.waitFor(() => expect(host.getExtensionUiEntrySource).toHaveBeenCalledTimes(2))
+    expect(listHeaderActions().filter(item => item.id === 'quota.hot')).toHaveLength(1)
+  })
+
   it('fills contributions from getExtensionContributions when the descriptor omits them', async () => {
     const descriptor = quotaDescriptor('enabled')
     const contributions = descriptor.contributions
