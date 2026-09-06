@@ -26,7 +26,7 @@ export type DriveTaskState =
   | "blocked"
   | "skipped";
 
-export type DriveTask = { id: string; title: string; state: DriveTaskState; note?: string };
+export type DriveTask = { id: string; title: string; state: DriveTaskState; note?: string; blockedBy?: string[] };
 
 /** Structural subset of the plan store's snapshot; keeps this module free of a store import. */
 export type DrivePlan = {
@@ -109,49 +109,56 @@ function taskLines(plan: DrivePlan): string {
   return plan.tasks
     .map((task, index) => {
       const note = task.note ? ` - ${task.note.replace(/\s+/gu, " ").trim()}` : "";
-      return `${index + 1}. [${task.state}] ${task.title}${note}`;
+      const deps = task.blockedBy?.length ? ` (after ${task.blockedBy.join(", ")})` : "";
+      return `${index + 1}. [${task.state}] ${task.id}: ${task.title}${deps}${note}`;
     })
     .join("\n");
 }
 
+/** Pending tasks whose blockers are all completed or skipped. Mirrors readyTaskIds in the store. */
+export function readyTasks(plan: DrivePlan): DriveTask[] {
+  const settled = new Set(plan.tasks.filter((task) => task.state === "completed" || task.state === "skipped").map((task) => task.id));
+  return plan.tasks.filter((task) => task.state === "pending" && (task.blockedBy ?? []).every((dep) => settled.has(dep)));
+}
+
 function planStatusBlock(plan: DrivePlan): string {
   const settled = plan.tasks.length - openTasks(plan).length;
-  return `<plan_status>\nPlan "${plan.title}" (id ${plan.id}) - ${settled}/${plan.tasks.length} tasks settled.\n${taskLines(plan)}\n</plan_status>`;
+  const ready = readyTasks(plan).map((task) => task.id);
+  const readyLine = ready.length > 0 ? `Ready now (blockers settled): ${ready.join(", ")}` : "Ready now: none";
+  return `<plan_status>\nPlan "${plan.title}" (id ${plan.id}) - ${settled}/${plan.tasks.length} tasks settled.\n${taskLines(plan)}\n${readyLine}\n</plan_status>`;
 }
 
 /**
- * The rule the observed failure needed: a blocker belongs to the task it
- * blocks, not to the whole turn.
+ * What the driver itself does — stated as facts about this runtime, not as
+ * working method. How to work a plan (per-task blocking, what counts as
+ * evidence, when to hand control back) is the philosophy planning layer's job.
  */
-function planModeRules(): string {
+function planDriveFacts(): string {
   return [
-    "Plan-mode rules:",
-    "- The published plan is the deliverable. Do not end a turn leaving open tasks just because the turn's immediate work is done.",
-    '- A blocker belongs to the task it blocks. When one task needs a user decision, call plan_task_update with state "blocked" and a note naming the decision, then keep working every task that does not depend on that answer.',
-    "- Never convert one task's blocker into a stop for the whole plan, and never replace remaining work with a status report or a list of next steps.",
-    "- Hand control back only when every remaining task is completed, skipped, failed, or blocked. Then say in one place which decisions you are waiting on.",
-    "- Treat the work tree, command output, tests and runtime behavior as authoritative; earlier conversation and summaries are context, not proof.",
-    "- Automatic continuation re-enters this session while open tasks remain, so continue from the current state instead of restating status.",
+    "Plan continuation (runtime facts):",
+    `- While the active plan has tasks in pending or in_progress, this session is re-entered automatically after each turn; it stops after ${PLAN_AUTOMATIC_TURN_LIMIT} automatic turns, or after ${PLAN_NO_PROGRESS_LIMIT} consecutive automatic turns that changed no task state.`,
+    "- Tasks in blocked, failed, completed or skipped are settled for the driver: a plan whose remaining tasks are all settled is not re-entered, and a blocked task waits for the user rather than for this loop.",
+    "- Ready now = pending tasks whose blockedBy list is fully completed or skipped.",
   ].join("\n");
 }
 
 export function buildPlanSystemPrompt(plan: DrivePlan): string {
-  return `Active plan:\n${planStatusBlock(plan)}\n\n${planModeRules()}`;
+  return `Active plan:\n${planStatusBlock(plan)}\n\n${planDriveFacts()}`;
 }
 
 export function buildPlanContinuePrompt(plan: DrivePlan, marker: string, iteration: number): string {
   const blocked = plan.tasks.filter((task) => task.state === "blocked");
   const blockedLine = blocked.length
-    ? `\n\n${blocked.length} task(s) are marked blocked. Do not re-ask about them; work the tasks that are not blocked.`
+    ? `\n\n${blocked.length} task(s) are marked blocked and are waiting on the user; they are outside this continuation.`
     : "";
   return [
     "Continue the active plan until every task is settled:",
     "",
     planStatusBlock(plan),
     "",
-    `This is automatic plan continuation #${iteration}. The open tasks above are still yours; pick up the next one that is not waiting on the user and do the work.${blockedLine}`,
+    `This is automatic plan continuation #${iteration}. The open tasks above are still yours; pick up the ready ones and do the work.${blockedLine}`,
     "",
-    planModeRules(),
+    planDriveFacts(),
     "",
     `<!-- ${PLAN_CONTINUATION_MARKER_PREFIX}${marker} -->`,
   ].join("\n");

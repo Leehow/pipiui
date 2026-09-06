@@ -71,10 +71,10 @@ describe("plan_check", () => {
     expect(tools.plan_check.description).toMatch(/never changes dispatch/i);
     expect(tools.plan_check.description!.length).toBeLessThan(240);
     expect(tools.plan_check.promptSnippet).toMatch(/snapshot/i);
-    expect(tools.plan_publish.description).toMatch(/full-spec/);
-    expect(tools.plan_task_update.description).toMatch(/including when starting the next phase/);
-    expect(tools.plan_approve.description).toMatch(/Mark the published plan approved/);
-    expect(tools.plan_cancel.description).toMatch(/Cancel the published plan/);
+    expect(tools.plan_publish.description).toMatch(/stable plan\.id/);
+    expect(tools.plan_task_update.description).toMatch(/active plan/);
+    expect(tools.plan_approve.description).toMatch(/Mark a draft plan approved/);
+    expect(tools.plan_cancel.description).toMatch(/Cancel the active plan/);
   });
 
   it("returns an empty snapshot when there is no plan and no seam", async () => {

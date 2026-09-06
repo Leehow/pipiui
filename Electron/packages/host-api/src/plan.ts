@@ -12,7 +12,14 @@ export const PLAN_TASK_STATES = ["pending", "in_progress", "completed", "failed"
 export type PlanTaskState = (typeof PLAN_TASK_STATES)[number];
 export const PLAN_LIFECYCLES = ["draft", "active", "approved", "cancelled"] as const;
 export type PlanLifecycle = (typeof PLAN_LIFECYCLES)[number];
-export type PlanTask = { id: string; title: string; state: PlanTaskState; note?: string };
+export type PlanTask = {
+  id: string;
+  title: string;
+  state: PlanTaskState;
+  note?: string;
+  /** Task ids that must be completed or skipped before this task is ready. */
+  blockedBy?: string[];
+};
 export type PlanSnapshot = {
   id: string;
   title: string;
@@ -59,6 +66,10 @@ function normalizeTask(value: unknown): PlanTask | null {
   const task: PlanTask = { id, title, state: isPlanTaskState(value.state) ? value.state : "pending" };
   const note = text(value.note);
   if (note) task.note = note;
+  if (Array.isArray(value.blockedBy)) {
+    const deps = [...new Set(value.blockedBy.filter((dep): dep is string => typeof dep === "string" && dep.trim().length > 0))];
+    if (deps.length > 0) task.blockedBy = deps;
+  }
   return task;
 }
 

@@ -28,11 +28,13 @@ function stamp(value: string | undefined): string {
   return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-function TaskRow({ task, index }: { task: PlanTask; index: number }) {
+function TaskRow({ task, index, order }: { task: PlanTask; index: number; order: ReadonlyMap<string, number> }) {
+  const deps = task.blockedBy?.map(id => order.has(id) ? `#${order.get(id)}` : id) ?? []
   return <li className={`plan-task plan-task-${task.state}`} data-testid="plan-task" data-state={task.state}>
     <span className="plan-task-mark" aria-hidden="true">{STATE_GLYPH[task.state]}</span>
     <div className="plan-task-body">
       <div className="plan-task-title"><span className="plan-task-index">{index + 1}.</span>{task.title}</div>
+      {deps.length > 0 && <div className="plan-task-note" data-testid="plan-task-deps">依赖 {deps.join('、')}</div>}
       {task.note && <div className="plan-task-note">{task.note}</div>}
     </div>
     <span className="plan-task-state">{STATE_TEXT[task.state]}</span>
@@ -48,6 +50,7 @@ function ProgressBar({ plan }: { plan: PlanSnapshot }) {
 
 export function PlanCard({ plan, defaultOpen }: { plan: PlanSnapshot; defaultOpen: boolean }) {
   const progress = useMemo(() => planProgress(plan), [plan])
+  const order = useMemo(() => new Map(plan.tasks.map((task, i) => [task.id, i + 1] as const)), [plan])
   // Controlled `open={defaultOpen}` with no toggle state snaps the card back
   // closed (or open) on every click. Desktop live plans stay forced-open so
   // the full task list is visible; on touch the native <details> toggle plus
@@ -92,7 +95,7 @@ export function PlanCard({ plan, defaultOpen }: { plan: PlanSnapshot; defaultOpe
       <ProgressBar plan={plan} />
     </summary>
     {plan.cancelReason && <p className="plan-cancel-reason">取消原因：{plan.cancelReason}</p>}
-    <ol className="plan-task-list">{plan.tasks.map((task, index) => <TaskRow key={task.id} task={task} index={index} />)}</ol>
+    <ol className="plan-task-list">{plan.tasks.map((task, index) => <TaskRow key={task.id} task={task} index={index} order={order} />)}</ol>
   </details>
 }
 

@@ -74,6 +74,20 @@ describe('PlanPanel', () => {
     expect(screen.getAllByTestId('plan-card')).toHaveLength(1)
   })
 
+  it('renders blocking edges as ordinal references to the tasks they name', async () => {
+    const { host } = hostWith([plan({ tasks: [
+      { id: 'expand', title: '扩展', state: 'completed' },
+      { id: 'migrate', title: '迁移', state: 'pending', blockedBy: ['expand'] },
+      { id: 'contract', title: '收缩', state: 'pending', blockedBy: ['migrate', 'ghost'] },
+    ] })])
+    render(<PlanPanel host={host} sessionId="s1" />)
+    await screen.findByTestId('plan-card')
+    const deps = screen.getAllByTestId('plan-task-deps')
+    expect(deps).toHaveLength(2)
+    expect(deps[0].textContent).toBe('依赖 #1')
+    expect(deps[1].textContent).toBe('依赖 #2、ghost')
+  })
+
   it('ignores plan events belonging to another session', async () => {
     const { host, push } = hostWith([plan()])
     render(<PlanPanel host={host} sessionId="s1" />)

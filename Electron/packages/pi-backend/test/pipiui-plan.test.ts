@@ -87,13 +87,9 @@ describe("pipiui plan tools", () => {
 
     const approved = parse(await first.plan_approve.execute("3", { planId: "plan-a" }, undefined, undefined, ctx));
     expect(approved.ok).toBe(true);
-    expect(approved.guidance).toMatch(/Never hand the whole plan to a single general-purpose worker/);
-    expect(approved.guidance).toMatch(/dispatch one worker per independent task in the SAME turn/);
-    expect(approved.guidance).toMatch(/1\. implement/);
-    expect(approved.guidance).toMatch(/2\. test/);
-    expect(approved.guidance).toMatch(/plan_task_update/);
-    expect(approved.guidance).toMatch(/same plan\.id through later phases/);
-    expect(approved.guidance).toMatch(/do not publish a stage2\/stage3 replacement plan/);
+    // Working method lives in the philosophy planning layer; the tool returns state only.
+    expect(approved.guidance).toBeUndefined();
+    expect(approved.ready).toEqual(["t1", "t2"]);
     expect(approved.plan.lifecycle).toBe("approved");
     expect(approved.plan.approvedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
 
@@ -257,14 +253,59 @@ describe("pipiui plan tools", () => {
     )).toBeUndefined();
   });
 
-  it("describes plan_publish as a full-spec stable-id tool", async () => {
+  it("describes the tools as contracts, leaving working method to the philosophy layer", async () => {
     const tools = await loadExtension();
-    expect(tools.plan_publish.description).toMatch(/full-spec/);
-    expect(tools.plan_publish.description).toMatch(/entire spec/);
-    expect(tools.plan_publish.description).toMatch(/Do not publish only the current stage/);
-    expect(tools.plan_publish.description).toMatch(/do not publish a stage2\/stage3 replacement/);
-    expect(tools.plan_publish.promptSnippet).toMatch(/later phases stay on this plan/);
-    expect(tools.plan_task_update.description).toMatch(/including when starting the next phase/);
+    expect(tools.plan_publish.description).toMatch(/stable plan\.id/);
+    expect(tools.plan_publish.description).toMatch(/blockedBy/);
+    expect(tools.plan_publish.description).toMatch(/approvalRequired=true/);
+    for (const tool of [tools.plan_publish, tools.plan_task_update, tools.plan_approve, tools.plan_cancel, tools.plan_check]) {
+      const text = `${tool.description ?? ""} ${tool.promptSnippet ?? ""}`;
+      // Method words that used to live here now belong to the `planning` layer.
+      expect(text).not.toMatch(/stage2|Do not publish only|never invent|keep working|one worker per|hand the whole plan/i);
+    }
+  });
+
+  it("stores blockedBy edges, rejects broken graphs, and reports the ready frontier", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipiui-plan-graph-"));
+    const tools = await loadExtension();
+    const ctx = { cwd: root, sessionManager: { getBranch: () => [] } };
+    const publish = (tasks: unknown, id = "graph") => tools.plan_publish.execute("1", {
+      plan: { id, title: "graph", approvalRequired: false, tasks },
+    }, undefined, undefined, ctx);
+
+    expect(parse(await publish([{ id: "a", title: "A", blockedBy: ["zz"] }]))).toMatchObject({ ok: false, error: /unknown task "zz"/ });
+    expect(parse(await publish([{ id: "a", title: "A", blockedBy: ["a"] }]))).toMatchObject({ ok: false, error: /blocked by itself/ });
+    expect(parse(await publish([
+      { id: "a", title: "A", blockedBy: ["b"] },
+      { id: "b", title: "B", blockedBy: ["a"] },
+    ]))).toMatchObject({ ok: false, error: /cycle/ });
+    expect(parse(await publish([{ id: "a", title: "A" }, { id: "a", title: "A again" }]))).toMatchObject({ ok: false, error: /duplicate task id/ });
+
+    const published = parse(await publish([
+      { id: "expand", title: "expand" },
+      { id: "migrate", title: "migrate", blockedBy: ["expand", "expand"] },
+      { id: "contract", title: "contract", blockedBy: ["migrate"] },
+      { id: "docs", title: "docs" },
+    ]));
+    expect(published.ok).toBe(true);
+    expect(published.plan.tasks[1].blockedBy).toEqual(["expand"]);
+    expect(published.plan.tasks[0].blockedBy).toBeUndefined();
+
+    let checked = parse(await tools.plan_check.execute("2", {}, undefined, undefined, ctx));
+    expect(checked.plan.ready).toEqual(["expand", "docs"]);
+    expect(checked.plan.tasks[1].blockedBy).toEqual(["expand"]);
+
+    await tools.plan_task_update.execute("3", { planId: "graph", taskId: "expand", state: "completed" }, undefined, undefined, ctx);
+    checked = parse(await tools.plan_check.execute("4", {}, undefined, undefined, ctx));
+    expect(checked.plan.ready).toEqual(["migrate", "docs"]);
+
+    // A skipped blocker unblocks; a failed or blocked one does not.
+    await tools.plan_task_update.execute("5", { planId: "graph", taskId: "migrate", state: "failed" }, undefined, undefined, ctx);
+    checked = parse(await tools.plan_check.execute("6", {}, undefined, undefined, ctx));
+    expect(checked.plan.ready).toEqual(["docs"]);
+    await tools.plan_task_update.execute("7", { planId: "graph", taskId: "migrate", state: "skipped" }, undefined, undefined, ctx);
+    checked = parse(await tools.plan_check.execute("8", {}, undefined, undefined, ctx));
+    expect(checked.plan.ready).toEqual(["contract", "docs"]);
   });
 
   it("rejects duplicate plan ids, wrong planId, and unknown taskId", async () => {

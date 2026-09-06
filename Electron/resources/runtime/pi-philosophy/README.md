@@ -64,7 +64,7 @@ to someone who cannot perform it is prompt weight and nothing else.
 | `retrieval` | Code retrieval | Locating code is several questions: the index first for a description, exact match for a token you already know, symbol graph for relationships; refs before bodies; a map before a guess | main + every code-reading agent |
 | `research` | Research | Form your own read *first*, then cross-validate outside; who does the searching; third-party repos are cloned to `/tmp` | main + `explore` |
 | `recon-stopping` | Recon convergence | Convergence by named evidence dimensions — one file:line anchor per required dimension; a four-line checkpoint after a sustained read/search burst; coverage decides the stop, breadth scales with the brief, no hard cap | `explore` + `reviewer` |
-| `planning` | Planning | Plans are lists; the publish → approval → execute lifecycle; an approved plan is a dispatch manifest | main + `plan` |
+| `planning` | Planning | Plans are task graphs, not documents; a large goal is shaped first — facts then decisions, design against the code, tracer-bullet slices sized to the executor — then one `plan.id` carries it through approval and frontier-driven execution | main + `plan` |
 | `craft` | Craft | Define the success criterion before starting; write the minimum that solves it; change only what the task requires; done is a stopping point | main + `general-purpose` |
 | `debugloop` | Debug loop | The boss holds the only observation surfaces: reproduce before dispatching, carry evidence verbatim, re-check by hand after the merge — and do it while the reviewer reads | main |
 | `domain` | Domain memory | Project vocabulary and the ADR gate: what must be looked up rather than re-derived | main |

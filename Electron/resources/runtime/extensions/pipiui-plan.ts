@@ -27,6 +27,8 @@ export type PlanTask = {
   title: string;
   state: TaskState;
   note?: string;
+  /** Task ids that must settle (completed or skipped) before this one is ready. */
+  blockedBy?: string[];
 };
 
 export type PlanSnapshot = {
@@ -172,9 +174,52 @@ function isPlanTerminal(plan: PlanSnapshot): boolean {
     || (plan.tasks.length > 0 && plan.tasks.every((task) => task.state === "completed" || task.state === "skipped"));
 }
 
+/** Unknown ids, self-references and cycles make a task graph that can never drain; refuse them at publish. */
+export function validateTaskGraph(tasks: readonly PlanTask[]): string | undefined {
+  const ids = new Set(tasks.map((task) => task.id));
+  for (const task of tasks) {
+    for (const dep of task.blockedBy ?? []) {
+      if (dep === task.id) return `task "${task.id}" is blocked by itself`;
+      if (!ids.has(dep)) return `task "${task.id}" is blocked by unknown task "${dep}"`;
+    }
+  }
+  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const state = new Map<string, 1 | 2>();
+  const visit = (id: string, trail: string[]): string | undefined => {
+    const mark = state.get(id);
+    if (mark === 2) return undefined;
+    if (mark === 1) return `task dependencies form a cycle: ${[...trail, id].join(" -> ")}`;
+    state.set(id, 1);
+    for (const dep of byId.get(id)?.blockedBy ?? []) {
+      const found = visit(dep, [...trail, id]);
+      if (found) return found;
+    }
+    state.set(id, 2);
+    return undefined;
+  };
+  for (const task of tasks) {
+    const found = visit(task.id, []);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** Pending tasks whose every blocker is completed or skipped: what can be dispatched right now. */
+export function readyTaskIds(tasks: readonly PlanTask[]): string[] {
+  const settled = new Set(tasks.filter((task) => task.state === "completed" || task.state === "skipped").map((task) => task.id));
+  return tasks
+    .filter((task) => task.state === "pending" && (task.blockedBy ?? []).every((dep) => settled.has(dep)))
+    .map((task) => task.id);
+}
+
 export async function publishPlan(
   cwd: string,
-  input: { id: string; title: string; approvalRequired?: boolean; tasks: Array<{ id: string; title: string; state?: string }> },
+  input: {
+    id: string;
+    title: string;
+    approvalRequired?: boolean;
+    tasks: Array<{ id: string; title: string; state?: string; blockedBy?: string[] }>;
+  },
   emit: typeof emitPlanEvent = emitPlanEvent,
 ): Promise<{ ok: true; plan: PlanSnapshot } | { ok: false; error: string }> {
   if (!input.id?.trim() || !input.title?.trim()) return { ok: false, error: "plan.id and plan.title are required" };
@@ -189,8 +234,19 @@ export async function publishPlan(
   for (const task of input.tasks) {
     if (!task?.id?.trim() || !task.title?.trim()) return { ok: false, error: "each task needs id and title" };
     if (task.state !== undefined && !isTaskState(task.state)) return { ok: false, error: `invalid task state "${task.state}"` };
-    tasks.push({ id: task.id, title: task.title, state: isTaskState(task.state) ? task.state : "pending" });
+    if (tasks.some((existing) => existing.id === task.id)) return { ok: false, error: `duplicate task id "${task.id}"` };
+    const entry: PlanTask = { id: task.id, title: task.title, state: isTaskState(task.state) ? task.state : "pending" };
+    if (task.blockedBy !== undefined) {
+      if (!Array.isArray(task.blockedBy) || task.blockedBy.some((dep) => typeof dep !== "string" || !dep.trim())) {
+        return { ok: false, error: `task "${task.id}" has a malformed blockedBy list` };
+      }
+      const deps = [...new Set(task.blockedBy)];
+      if (deps.length > 0) entry.blockedBy = deps;
+    }
+    tasks.push(entry);
   }
+  const edges = validateTaskGraph(tasks);
+  if (edges) return { ok: false, error: edges };
   if (input.approvalRequired === true && tasks.some((task) => task.state !== "pending")) {
     return { ok: false, error: "a plan awaiting approval must publish every task as pending" };
   }
@@ -289,6 +345,7 @@ export type PlanCheckTask = {
   title: string;
   state: TaskState;
   note?: string;
+  blockedBy?: string[];
   workers: PlanCheckTaskWorker[];
 };
 
@@ -317,6 +374,8 @@ export type PlanCheckResult = {
     title: string;
     lifecycle: PlanLifecycle;
     tasks: PlanCheckTask[];
+    /** Pending task ids whose blockers have all settled. */
+    ready: string[];
     updatedAt: string;
     approvedAt?: string;
   } | null;
@@ -380,6 +439,7 @@ export function checkPlan(cwd: string): PlanCheckResult {
         title: task.title,
         state: task.state,
         ...(task.note ? { note: task.note } : {}),
+        ...(task.blockedBy ? { blockedBy: task.blockedBy } : {}),
         workers: liveJobs
           .filter((job) => job.planTask === task.id)
           .map((job) => ({
@@ -399,6 +459,7 @@ export function checkPlan(cwd: string): PlanCheckResult {
           title: plan.title,
           lifecycle: plan.lifecycle,
           tasks,
+          ready: readyTaskIds(plan.tasks),
           updatedAt: plan.updatedAt,
           ...(plan.approvedAt ? { approvedAt: plan.approvedAt } : {}),
         }
@@ -506,17 +567,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_publish",
     label: "Plan Publish",
-    description: "Publish one full-spec structured execution plan with a stable plan.id. Set approvalRequired=false for ordinary progress tracking (the plan becomes active immediately); set approvalRequired=true only for a formal plan that must wait for explicit user approval. Cover the entire spec. Do not publish only the current stage; do not publish a stage2/stage3 replacement. Keep the same plan.id through later phases.",
-    promptSnippet: "Publish a full task list, explicitly say whether approval is required, and ensure later phases stay on this plan",
+    description: "Publish this conversation's plan: a stable plan.id, a title, and an ordered task list. Each task may name the task ids it is blockedBy; unknown ids, self-references and cycles are rejected. approvalRequired=false makes the plan active immediately; approvalRequired=true stores it as a draft that blocks every other tool call until the user approves it. Only one unfinished plan exists at a time.",
+    promptSnippet: "Publish the plan's task list (optionally a dependency graph) and whether it waits for approval",
     parameters: Type.Object({
       plan: Type.Object({
         id: Type.String({ minLength: 1 }),
         title: Type.String({ minLength: 1 }),
-        approvalRequired: Type.Boolean({ description: "true only for a formal plan that must stop until the user approves; false for ordinary progress tracking" }),
+        approvalRequired: Type.Boolean({ description: "true: stored as a draft that blocks other tool calls until the user approves; false: active immediately" }),
         tasks: Type.Array(Type.Object({
           id: Type.String({ minLength: 1 }),
           title: Type.String({ minLength: 1 }),
           state: Type.Optional(Type.String()),
+          blockedBy: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Task ids that must be completed or skipped before this task is ready" })),
         }), { minItems: 1 }),
       }),
     }),
@@ -533,8 +595,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_task_update",
     label: "Plan Task Update",
-    description: "Update one task on the active plan. Always pass the same planId published earlier; never invent a new plan id mid-execution, including when starting the next phase. When one task needs a user decision, set that task to \"blocked\" with a note naming the decision instead of stopping the whole plan, then keep working the tasks that do not depend on that answer.",
-    promptSnippet: "Update a published plan task state",
+    description: "Set one task's state (and optionally its note) on the active plan. planId must be the active plan's id and taskId one of its tasks; a draft plan rejects updates until approved.",
+    promptSnippet: "Update one task's state on the active plan",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
       taskId: Type.String({ minLength: 1 }),
@@ -550,36 +612,22 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_approve",
     label: "Plan Approve",
-    description: "Mark the published plan approved after the user accepts it. Call with the same plan.id from plan_publish.",
-    promptSnippet: "Approve the published plan after the user clicks 批准 or clearly approves",
+    description: "Mark a draft plan approved, lifting the tool-call block. Call with the plan.id from plan_publish. Idempotent on an already approved plan; rejected for a plan that never required approval.",
+    promptSnippet: "Approve the draft plan",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const outcome = await approvePlan(cwdOf(ctx), params.planId);
       if (!outcome.ok) return result(outcome, true);
-      const listed = outcome.plan.tasks
-        .map((task, index) => `${index + 1}. ${task.title}`)
-        .join("\n");
-      return result({
-        ...outcome,
-        guidance: [
-          "Never hand the whole plan to a single general-purpose worker.",
-          "dispatch one worker per independent task in the SAME turn.",
-          "Drive plan_task_update as each task's worker starts and ends.",
-          "Keep this same plan.id through later phases; do not publish a stage2/stage3 replacement plan.",
-          "Refine leftover slices with worker briefs and dependencies, not a new plan.",
-          "Tasks:",
-          listed,
-        ].join(" "),
-      });
+      return result({ ...outcome, ready: readyTaskIds(outcome.plan.tasks) });
     },
   });
 
   pi.registerTool({
     name: "plan_cancel",
     label: "Plan Cancel",
-    description: "Cancel the published plan (Adjust or Ignore). Optionally record a reason.",
+    description: "Cancel the active plan, optionally recording a reason. The store keeps the cancelled snapshot; a new plan may be published afterwards.",
     promptSnippet: "Cancel the published plan",
     parameters: Type.Object({
       planId: Type.String({ minLength: 1 }),
@@ -594,7 +642,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "plan_check",
     label: "Plan Check",
-    description: "Read-only snapshot of the active plan: task status, bound workers, recent plan-drift and scope-drift. Advisory; never changes dispatch.",
+    description: "Read-only advisory snapshot of the active plan: task states, which tasks are ready (all blockers settled), the workers bound to each task, and recent plan-drift / scope-drift signals. Never changes dispatch or plan state.",
     promptSnippet: "Read-only plan × worker × drift snapshot",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {

@@ -229,6 +229,24 @@ describe("vendored philosophy: delivery", () => {
     expect(orchestration).not.toMatch(/plan_publish/);
   });
 
+  it("shapes a large goal before publishing and sizes slices to the executor", () => {
+    const planning = layers.find((l) => l.id === "planning")!.body;
+    // The four moves, in order, and the swarm-facing rules that make the slices dispatchable.
+    expect(planning).toMatch(/facts then decisions → design against the code → spec and slice →\s*publish/);
+    expect(planning).toMatch(/frontier rounds/);
+    expect(planning).toMatch(/Name the \*\*seams\*\*/);
+    expect(planning).toMatch(/Prefactor/);
+    expect(planning).toMatch(/tracer bullets/);
+    expect(planning).toMatch(/blocking edges/);
+    expect(planning).toMatch(/Size to the executor, not to yourself/);
+    expect(planning).toMatch(/stronger pinned model/);
+    expect(planning).toMatch(/The frontier is what dispatches/);
+    // The per-task blocking rule moved here from the plan-drive runtime prompt.
+    expect(planning).toMatch(/A blocker belongs to the task it blocks/);
+    // Skills stay advice: no tracker, no labels, no ticket files.
+    expect(planning).toMatch(/no issue tracker, no triage labels and no ticket files/);
+  });
+
   it("states the plan lifecycle in exactly one layer", () => {
     // Two copies drifted before this guard existed: orchestration required `plan_cancel` plus
     // a fresh `plan.id` on Adjust, while planning said only "revises and republishes". A

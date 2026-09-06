@@ -11,6 +11,7 @@ import {
   extractPlanContinuationMarker,
   goalDrivesSession,
   planIsDrivable,
+  readyTasks,
   type DriveContext,
   type DriveDeps,
   type DrivePlan,
@@ -372,19 +373,36 @@ describe("plan drive fuses", () => {
 });
 
 describe("plan drive prompts", () => {
-  it("teaches per-task blocking rather than stopping the whole plan", () => {
+  it("states the driver's own behaviour as facts and leaves working method to the philosophy layer", () => {
     const text = buildPlanSystemPrompt(plan());
-    expect(text).toContain("A blocker belongs to the task it blocks");
-    expect(text).toContain('plan_task_update with state "blocked"');
-    expect(text).toContain("keep working every task that does not depend on that answer");
-    expect(text).toContain("Hand control back only when every remaining task is completed, skipped, failed, or blocked");
+    expect(text).toContain("re-entered automatically");
+    expect(text).toContain(`${PLAN_AUTOMATIC_TURN_LIMIT} automatic turns`);
+    expect(text).toContain("a blocked task waits for the user rather than for this loop");
     expect(text).toContain("1/3 tasks settled");
+    // Method sentences moved to `planning`; the runtime prompt must not grow them back.
+    expect(text).not.toMatch(/A blocker belongs to the task|Hand control back|status report|authoritative/);
   });
 
-  it("lists open tasks with their state so a wake-up is never information-free", () => {
+  it("lists open tasks with id and state so a wake-up is never information-free", () => {
     const text = buildPlanSystemPrompt(plan());
-    expect(text).toContain("[completed] 宿主无关驱动循环");
-    expect(text).toContain("[pending] B: 多节并发派 subagent");
+    expect(text).toContain("[completed] t1: 宿主无关驱动循环");
+    expect(text).toContain("[pending] t2: B: 多节并发派 subagent");
+    expect(text).toContain("Ready now (blockers settled): t2, t3");
+  });
+
+  it("shows blocking edges and names only the unblocked tasks as ready", () => {
+    const graph = plan({
+      tasks: [
+        { id: "expand", title: "expand", state: "completed" },
+        { id: "migrate", title: "migrate", state: "pending", blockedBy: ["expand"] },
+        { id: "contract", title: "contract", state: "pending", blockedBy: ["migrate"] },
+        { id: "docs", title: "docs", state: "pending" },
+      ],
+    });
+    expect(readyTasks(graph).map((task) => task.id)).toEqual(["migrate", "docs"]);
+    const text = buildPlanSystemPrompt(graph);
+    expect(text).toContain("[pending] contract: contract (after migrate)");
+    expect(text).toContain("Ready now (blockers settled): migrate, docs");
   });
 
   it("tells the model not to re-ask about tasks already marked blocked", () => {
@@ -397,7 +415,7 @@ describe("plan drive prompts", () => {
     const text = buildPlanContinuePrompt(blocked, "m1", 4);
     expect(text).toContain("automatic plan continuation #4");
     expect(text).toContain("1 task(s) are marked blocked");
-    expect(text).toContain("Do not re-ask about them");
+    expect(text).toContain("waiting on the user; they are outside this continuation");
     expect(text).toContain("需要用户拍板");
     expect(extractPlanContinuationMarker(text)).toBe("m1");
   });
@@ -454,7 +472,7 @@ describe("plan extension wiring", () => {
       ctx,
     );
     expect(injected.systemPrompt).toContain("BASE");
-    expect(injected.systemPrompt).toContain("[pending] 第二步");
+    expect(injected.systemPrompt).toContain("[pending] b: 第二步");
 
     handlers.get("agent_end")?.({ messages: assistant() }, ctx);
     handlers.get("agent_settled")?.({}, ctx);
