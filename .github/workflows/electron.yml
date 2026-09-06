@@ -107,6 +107,28 @@ jobs:
         working-directory: Electron/apps/electron
         run: npx --maxsockets 3 electron-builder ${{ matrix.args }} --config.directories.output=../../../build
 
+      # Electron 44's V8 headers do not compile with GCC at all. A class head like
+      # `class [[deprecated(...)]] __attribute__((visibility("default"))) Value`
+      # (v8-primitive.h) is a GNU attribute after a C++11 attribute, which every
+      # GCC rejects — 11 and 12 alike, so bumping GCC does not help. clang 14 gets
+      # past that but has no __builtin_source_location, which libstdc++'s
+      # <source_location> needs for v8-source-location.h. clang-15 with an explicit
+      # -std=c++20 is the combination that builds (clang-15 at c++17 still fails).
+      # Applied after install-app-deps so node-pty keeps the GCC build this job has
+      # always shipped; only the embedded runtime's better-sqlite3 needs clang.
+      - name: Select clang for the Linux embedded runtime
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-15
+          {
+            echo "CC=clang-15"
+            echo "CXX=clang++-15"
+            echo "CC_host=clang-15"
+            echo "CXX_host=clang++-15"
+            echo "CXXFLAGS=-std=c++20"
+          } >> "$GITHUB_ENV"
+
       - name: Prepare Linux embedded runtime
         if: matrix.platform == 'linux'
         working-directory: Electron
