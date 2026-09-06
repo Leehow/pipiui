@@ -53,22 +53,33 @@ this project has no issue tracker, no triage labels and no ticket files, so anyt
 publishes to a tracker becomes tasks on the plan you publish, and a missing skill is never
 BLOCKED — write the same structure from evidence.
 
-### 1. Facts first, then the decisions
+### 1. Facts first, then only the decisions that would collide
 
 Never ask the user something the environment can answer. Recon comes before the first
 question: the modules the change touches, how the existing seams are tested, what the
 vocabulary and ADRs already decided — looked up, delegated to `explore` at the cheap tier
 when you cannot yet name the files, never guessed and never asked.
 
-What remains after recon are **decisions**, and decisions belong to the user. Grill them in
-**frontier rounds**: every question whose prerequisites are already settled goes out together
-in one round, numbered, each with your recommended answer; a question that depends on another
-still open in this round belongs to the next round. Confirm with `skill_search("grilling")`
-(or `"grill-me"`) and `skill_load` the skill when present — it owns the interview mechanics,
-never restate them from memory. Skip grilling entirely when the goal is already pinned;
+Most of what remains after recon is **design, and design is yours.** A choice with one
+defensible answer given the code and the stated goal is not a question; take it, write it
+into the design as a decision, and let the approval boundary catch it if you read the user
+wrong. **Ask only where reasonable answers genuinely collide** and the evidence cannot
+break the tie: a trade-off the user would weigh differently than you (speed against
+correctness, scope against schedule, cost), a hard-to-reverse choice that binds them (a
+schema, a public contract, a dependency), or a goal that reads two ways with materially
+different work behind each. Everything else is a stated assumption, not a question.
+
+The questions that survive that filter go out in **frontier rounds**: every question whose
+prerequisites are already settled goes out together, numbered, each with your recommended
+answer; a question that depends on another still open waits for the next round. One round
+is the norm, zero is common, and a session that opens a third round is designing by
+interview instead of designing. Confirm with `skill_search("grilling")` (or `"grill-me"`)
+and `skill_load` the skill when present — it owns the question format; its *relentless*
+posture and its habit of visiting every branch of the design tree do not override the filter
+above, which is this project's. Skip grilling entirely when the goal is already pinned;
 grilling is never a gate for ordinary work. A question with a *runnable* answer — does this
 state model feel right, what should this screen look like — is answered faster by a throwaway
-prototype than by another round; keep the prototype as evidence, not as code to ship.
+prototype than by a round; keep the prototype as evidence, not as code to ship.
 
 ### 2. Design against the code as it is
 
@@ -78,9 +89,11 @@ A design is a statement about this codebase, not about software in general.
   already exist; take the highest seam you can; the ideal number across a change is one. A
   seam nobody agreed to becomes a review finding later, so the seams are part of what the
   user approves.
-- Where the design genuinely forks, lay out two or three approaches with their trade-offs and
-  recommend one — in one round, in the transcript. Do not manufacture forks the codebase has
-  already closed, and remove from every approach what this goal does not need.
+- Where the design forks on a choice that passes the filter in step 1, lay out two or three
+  approaches with their trade-offs and recommend one — in the same round as the other
+  questions, in the transcript. A fork you can settle yourself is settled, named as a
+  decision in the spec, and not presented as a choice. Do not manufacture forks the codebase
+  has already closed, and remove from every approach what this goal does not need.
 - **Prefactor**: when the change would be easy after a small mechanical move — an extraction,
   a rename, an expand–contract on a shared symbol — that move is the first slice, not a
   remark. Make the change easy, then make the easy change.
@@ -123,9 +136,9 @@ Then **slice** the spec into tracer bullets:
   pointer plus its acceptance criteria; a weaker one needs a narrower slice, the seam named,
   file:line anchors, and an acceptance command it can run itself. A slice you could finish is
   not the measure; the worker that will run it is.
-- Present the breakdown once as a numbered list — title, blocked by, what it delivers — and
-  let the user say whether granularity and edges are right. When the breakdown is obviously
-  right, fold this into the approval below instead of adding a round.
+- The breakdown — title, blocked by, what it delivers — is shown once, as part of the
+  approval below, not as its own round. Granularity and edges are design; the user corrects
+  them by replying to the plan, not by being quizzed on them first.
 
 ### 4. Publish and stop
 

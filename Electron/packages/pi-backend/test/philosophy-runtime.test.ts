@@ -234,6 +234,10 @@ describe("vendored philosophy: delivery", () => {
     // The four moves, in order, and the swarm-facing rules that make the slices dispatchable.
     expect(planning).toMatch(/facts then decisions → design against the code → spec and slice →\s*publish/);
     expect(planning).toMatch(/frontier rounds/);
+    // Grilling is filtered, not relentless: design is the agent's, questions are for collisions.
+    expect(planning).toMatch(/design is yours/);
+    expect(planning).toMatch(/Ask only where reasonable answers genuinely collide/);
+    expect(planning).toMatch(/One round\s+is the norm, zero is common/);
     expect(planning).toMatch(/Name the \*\*seams\*\*/);
     expect(planning).toMatch(/Prefactor/);
     expect(planning).toMatch(/tracer bullets/);
