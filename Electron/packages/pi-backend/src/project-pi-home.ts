@@ -1,10 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   constants as fsConstants,
+  copyFileSync,
+  linkSync,
   lstatSync,
   readlinkSync,
+  renameSync,
+  rmSync,
   symlinkSync,
-  unlinkSync,
   type Stats,
 } from "node:fs";
 import {
@@ -224,27 +227,77 @@ async function copyRegularFileIfMissing(sourceDir: string | undefined, destDir: 
 }
 
 /**
+ * Windows creates symlinks only for an elevated process or with Developer Mode
+ * enabled; an ordinary account gets EPERM. That must not fail opening a project.
+ */
+function symlinkDenied(error: unknown): boolean {
+  const code = errnoCode(error);
+  return code === "EPERM" || code === "EACCES" || code === "ENOSYS" || code === "UNKNOWN";
+}
+
+/** A hard link is indistinguishable from the original file: same device, same index. */
+function sameFile(left: Stats, right: Stats): boolean {
+  return left.ino !== 0 && left.ino === right.ino && left.dev === right.dev;
+}
+
+/**
  * Login identity lives in the host profile. Every opened project points at the
  * same regular file so an OAuth refresh in one session is visible in all of them.
  * A seed that is itself a symlink is left untouched.
+ *
+ * A hard link carries that same one-file guarantee without any privilege, so it
+ * is the fallback wherever a symlink is refused. It can only fail across volumes
+ * (project on D:, profile on C:), and there nothing can share one file — the
+ * project then gets its own copy, seeded once. Never re-copied: overwriting would
+ * throw away a token this project had refreshed.
+ *
+ * The link is built at a temporary name and renamed into place, so a refused
+ * symlink never leaves the project without its credential.
  */
 function linkSharedCredential(sourceDir: string | undefined, destDir: string, name: string): void {
   if (!sourceDir) return;
   const source = resolve(sourceDir, name);
   const dest = resolve(destDir, name);
+  let sourceStat: Stats;
   try {
-    if (!lstatSync(source).isFile()) return;
+    sourceStat = lstatSync(source);
+    if (!sourceStat.isFile()) return;
   } catch {
     return;
   }
+  let destStat: Stats | undefined;
   try {
-    const destStat = lstatSync(dest);
-    if (destStat.isSymbolicLink() && readlinkSync(dest) === source) return;
-    unlinkSync(dest);
+    destStat = lstatSync(dest);
   } catch {
     /* dest missing */
   }
-  symlinkSync(source, dest);
+  if (destStat) {
+    if (destStat.isSymbolicLink() && readlinkSync(dest) === source) return;
+    if (destStat.isFile() && sameFile(sourceStat, destStat)) return;
+  }
+  const staging = join(destDir, `.${name}.pipiui-link-${process.pid}`);
+  rmSync(staging, { force: true });
+  let linked = false;
+  try {
+    symlinkSync(source, staging);
+    linked = true;
+  } catch (error) {
+    if (!symlinkDenied(error)) throw error;
+  }
+  if (!linked) {
+    try {
+      linkSync(source, staging);
+      linked = true;
+    } catch (error) {
+      if (errnoCode(error) !== "EXDEV") throw error;
+    }
+  }
+  if (linked) {
+    renameSync(staging, dest);
+    return;
+  }
+  rmSync(staging, { force: true });
+  if (!destStat) copyFileSync(source, dest);
 }
 
 function isObject(value: JsonValue): value is { [key: string]: JsonValue } {

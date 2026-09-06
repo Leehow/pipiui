@@ -1,7 +1,28 @@
 import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, readdir, realpath, rename, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * ESM exports cannot be spied on, so `node:fs` is mocked with a pass-through that
+ * only refuses the two shared-credential symlinks while the toggle is on — exactly
+ * what Windows does to an unprivileged account.
+ */
+const symlinkDenial = vi.hoisted(() => ({ active: false }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    default: actual,
+    symlinkSync: (target: Parameters<typeof actual.symlinkSync>[0], path: Parameters<typeof actual.symlinkSync>[1], type?: Parameters<typeof actual.symlinkSync>[2]) => {
+      const name = String(path);
+      if (symlinkDenial.active && (name.includes("auth.json") || name.includes(".env"))) {
+        throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+      }
+      return actual.symlinkSync(target, path, type);
+    },
+  };
+});
 import { rm } from "node:fs/promises";
 import {
   ensureProjectPiHome,
@@ -45,6 +66,37 @@ describe("project Pi home", () => {
     expect((await lstat(join(home.agentDir, "models-store.json"))).isSymbolicLink()).toBe(false);
     expect(await readFile(join(home.agentDir, "models-store.json"), "utf8")).toContain("cached");
     await expect(readFile(join(home.agentDir, "trust.json"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("falls back to a hard link when the platform refuses symlinks (Windows EPERM)", async () => {
+    // Windows without Developer Mode or elevation answers EPERM to every symlink,
+    // which used to abort opening a project entirely.
+    root = await mkdtemp(join(tmpdir(), "pipi-project-home-nosymlink-"));
+    const project = join(root, "project");
+    const seed = join(root, "host-profile");
+    await mkdir(project, { recursive: true });
+    await mkdir(seed, { recursive: true });
+    await writeFile(join(seed, "auth.json"), '{"xai":{"type":"api_key"}}\n');
+    await writeFile(join(seed, ".env"), "XAI_API_KEY=seed\n");
+    await writeFile(join(seed, "models.json"), '{"providers":{}}\n');
+
+    let home: Awaited<ReturnType<typeof ensureProjectPiHome>>;
+    symlinkDenial.active = true;
+    try {
+      home = await ensureProjectPiHome({ projectRoot: project, credentialSeedDir: seed });
+    } finally {
+      symlinkDenial.active = false;
+    }
+
+    for (const name of ["auth.json", ".env"]) {
+      const linked = join(home.agentDir, name);
+      expect((await lstat(linked)).isSymbolicLink()).toBe(false);
+      // A hard link is the same file: one inode, so an OAuth refresh still propagates.
+      expect((await stat(linked)).ino).toBe((await stat(join(seed, name))).ino);
+      expect(await readFile(linked, "utf8")).toBe(await readFile(join(seed, name), "utf8"));
+    }
+    // No staging artifact left behind.
+    expect((await readdir(home.agentDir)).filter((entry) => entry.includes("pipiui-link-"))).toEqual([]);
   });
 
   it("keeps existing settings, trust, and models-store project-local", async () => {
