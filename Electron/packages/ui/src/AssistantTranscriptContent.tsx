@@ -63,7 +63,7 @@ const TranscriptToolCard = memo(function TranscriptToolCard({ tool }: { tool: Tr
   const stats = !tool.error ? fileChangeTokenStats(tool.name, tool.input ?? '') : null
   const delta = stats && tool.finished ? finishedFileChangeDeltaLabel(stats) : undefined
   const live = stats && !tool.finished ? liveTokenLabel(stats.payloadChars) : undefined
-  const baseMeta = tool.error ? `失败 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
+  const baseMeta = tool.error ? `失败 · ${completedElapsed}` : tool.interrupted ? `已中断 · ${completedElapsed}` : subagentNotice ? `${subagentNotice.ok ? '成功' : '失败'} · ${subagentNotice.cost} · ${completedElapsed}` : tool.dispatched ? `已派发 · ${completedElapsed}` : tool.finished ? `完成 · ${completedElapsed}` : `运行中 · ${elapsed(tool.startedAt)}`
   const deltaNode = delta
     ? <span className="tok-delta-wrap">{delta.split(' ').map((part, i) => <span key={i} className={part.startsWith('+') ? 'tok-add' : 'tok-del'}>{i ? ` ${part}` : part}</span>)}</span>
     : null

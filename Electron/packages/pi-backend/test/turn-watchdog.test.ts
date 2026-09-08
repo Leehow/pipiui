@@ -92,6 +92,9 @@ describe("turn watchdog (fix 3)", () => {
     }) + "\n");
 
     const live = (backend as any).live.get("s1");
+    // The tail shape alone is not proof: a real long tool also left its
+    // `tool_execution_start` in the host, which is what the watchdog now reads.
+    live.toolNames.set("t1", "bash");
     live.lastTurnActivityAt = Date.now() - (TURN_WATCHDOG_TIMEOUT_MS + 5_000);
 
     await (backend as any).checkTurnWatchdogs();
@@ -182,6 +185,91 @@ describe("turn watchdog (fix 3)", () => {
     // The leaked gate is released and the parked prompt drains as a new turn.
     await eventually(async () => ((await backend.handle("listQueue", ["s1"]) as any[]).length === 0));
     await eventually(() => statuses.filter(s => s === "started").length >= 2);
+
+    off();
+    await backend.close();
+  });
+
+  it("settles a wedged turn whose tail is a tool result when no tool is executing", async () => {
+    const { backend, sessionPath } = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
+
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    await eventually(() => statuses.includes("started"));
+
+    // The wedge: a tool result is durable, the model hop that follows never
+    // produced anything, and nothing is executing. Tail shape is not terminal.
+    await appendFile(sessionPath, JSON.stringify({
+      type: "message", id: "tail-tool-result", parentId: null,
+      message: { role: "toolResult", toolCallId: "t1", toolName: "grep", content: [{ type: "text", text: "hits" }], timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    }) + "\n");
+
+    const live = (backend as any).live.get("s1");
+    expect(live).toBeTruthy();
+    expect(live.toolNames.size).toBe(0);
+    live.lastTurnActivityAt = Date.now() - (TURN_WATCHDOG_TIMEOUT_MS + 5_000);
+
+    await (backend as any).checkTurnWatchdogs();
+    await eventually(() => statuses.includes("settled"));
+
+    off();
+    await backend.close();
+  });
+
+  it("does not settle a non-terminal tail while a tool is still executing", async () => {
+    const { backend, sessionPath } = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
+
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    await eventually(() => statuses.includes("started"));
+
+    await appendFile(sessionPath, JSON.stringify({
+      type: "message", id: "tail-tool-result-2", parentId: null,
+      message: { role: "toolResult", toolCallId: "t2", toolName: "bash", content: [{ type: "text", text: "still running" }], timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    }) + "\n");
+
+    const live = (backend as any).live.get("s1");
+    live.toolNames.set("t2", "bash");
+    live.lastTurnActivityAt = Date.now() - (TURN_WATCHDOG_TIMEOUT_MS + 5_000);
+
+    await (backend as any).checkTurnWatchdogs();
+    await new Promise(r => setTimeout(r, 100));
+    expect(statuses).toEqual(["started"]);
+    expect((backend as any).queue.isBusy("s1")).toBe(true);
+
+    off();
+    await backend.close();
+  });
+
+  it("does not settle a non-terminal tail while a compaction is in flight", async () => {
+    const { backend, sessionPath } = await fixture();
+    const statuses: string[] = [];
+    const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
+
+    await backend.handle("sendPrompt", ["s1", "__hold__"]);
+    await eventually(() => statuses.includes("started"));
+
+    await appendFile(sessionPath, JSON.stringify({
+      type: "message", id: "tail-tool-result-3", parentId: null,
+      message: { role: "toolResult", toolCallId: "t3", toolName: "grep", content: [{ type: "text", text: "hits" }], timestamp: Date.now() },
+      timestamp: new Date().toISOString(),
+    }) + "\n");
+
+    const live = (backend as any).live.get("s1");
+    expect(live.toolNames.size).toBe(0);
+    // Compaction is model work that never enters toolNames; it must not be
+    // mistaken for a wedged model hop.
+    live.activeCompaction = { operation: "context_compaction" };
+    live.lastTurnActivityAt = Date.now() - (TURN_WATCHDOG_TIMEOUT_MS + 5_000);
+
+    await (backend as any).checkTurnWatchdogs();
+    await new Promise(r => setTimeout(r, 100));
+    expect(statuses).toEqual(["started"]);
+    expect((backend as any).queue.isBusy("s1")).toBe(true);
 
     off();
     await backend.close();

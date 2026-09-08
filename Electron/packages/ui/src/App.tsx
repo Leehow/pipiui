@@ -48,7 +48,7 @@ import { LiveSubagentBindingProvider } from './LiveSubagentBinding'
 import { Transcript } from './Transcript'
 import { EmptySetupGuide } from './EmptySetupGuide'
 import { parseSubagentSignal } from './subagent-signal'
-import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finalizeOpenTools, finishStreamingMessage, historySnapshotAheadOfLive, reopenAssistantForNextCompletion, reconcileHistorySnapshot, transcriptFingerprint, type ChatMessage } from './transcript-model'
 import { DismissibleError } from './DismissibleError'
 import { displaySecretPlaceholders } from './secret-display'
 import { toolDisplaySummary } from './tool-summary'
@@ -127,6 +127,11 @@ const sidebarSemanticMigrationKey = 'pipiui:eui:sidebar-semantic-host:v1'
 export const LAST_SESSION_STORAGE_KEY = 'pipiui:eui:last-session:v1'
 const TOOL_QUICK_RAIL_COLLAPSED_KEY = 'pipiui:eui:tool-quick-rail-collapsed:v1'
 const HISTORY_PAGE_SIZE = 500
+/** A discarded stale read may still be retried while a turn is open, but only a
+ *  few times and never back-to-back: re-reading JSONL per delta stacked
+ *  overlapping full-file scans and pinned the main process on large sessions. */
+const STALE_RETRIES_WHILE_TURN_OPEN = 3
+const STALE_RETRY_OPEN_TURN_DELAY_MS = 500
 
 /** Only measurements cross the renderer→host telemetry boundary; never bodies or paths. */
 function base64ByteLength(value: string): number | undefined {
@@ -1557,6 +1562,9 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
    *  so a session whose JSONL page stayed empty (21MB+ files that parse to no
    *  visible rows, or a wedged host) rescanned forever and pinned the main process. */
   const emptyPageRetriesBySessionRef = useRef(new Map<string, number>())
+  /** Per-session budget for re-reading history after a stale discard while the
+   *  turn is still open. Cleared on context change and on every accepted apply. */
+  const staleRetriesBySessionRef = useRef(new Map<string, number>())
   /** Send from the empty "新会话" state creates the session first; the pending
    *  prompt is dispatched by the auto-send effect once the new session's history
    *  load and stream subscription are live (a direct sendPrompt would race them). */
@@ -1641,7 +1649,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
     setStatsRefreshKey(key => key + 1)
     void sessionQueue.resync()
     transcriptLiveRevisionRef.current += 1
-    const next = finishStreamingMessage(messagesRef.current)
+    const next = finalizeOpenTools(finishStreamingMessage(messagesRef.current))
     messagesRef.current = next
     setMessages(next)
     activeUserTurnRef.current = false
@@ -2183,7 +2191,10 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
     const previousContext = historyContextRef.current
     const contextChanged = previousContext?.host !== host || previousContext.sessionId !== selectedSession
     historyContextRef.current = { host, sessionId: selectedSession }
-    if (contextChanged && selectedSession) emptyPageRetriesBySessionRef.current.delete(selectedSession)
+    if (contextChanged && selectedSession) {
+      emptyPageRetriesBySessionRef.current.delete(selectedSession)
+      staleRetriesBySessionRef.current.delete(selectedSession)
+    }
     if (!selectedSession) {
       setMessages([])
       setLease(null)
@@ -2276,7 +2287,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       setWaitingDetail(undefined)
       applyObservedStatus(selectedSession, 'completed')
       void sessionQueue.resync()
-      const settled = finishStreamingMessage(messagesRef.current)
+      const settled = finalizeOpenTools(finishStreamingMessage(messagesRef.current))
       if (settled !== messagesRef.current) {
         transcriptLiveRevisionRef.current += 1
         messagesRef.current = settled
@@ -2356,17 +2367,24 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       if (reconciliation.status === 'stale-request') {
-        // A stream mutation supersedes this request generation. While a turn is
-        // open its terminal event owns the retry; otherwise schedule one bounded
-        // exact-context retry instead of letting the old response win.
-        // Exception: an empty (or user-less) live pane must still accept durable
-        // history. Otherwise a lost settle / stale running resume keeps the
-        // middle column blank forever because mainTurnOpen blocks the retry.
-        const liveLacksUser = !messagesRef.current.some(message => message.role === 'user')
-        const historyHasUser = reconciliation.messages.some(message => message.role === 'user')
-        if (!(liveLacksUser && historyHasUser)) {
-          if (!mainTurnOpenRef.current && !staleRetryScheduled) {
+        // A stream mutation supersedes this request generation. Every content
+        // delta bumps the live revision, so on a streaming session practically
+        // every read lands here — discarding it must therefore never be able to
+        // lose durable turns.
+        // Exception: a live pane missing turns the snapshot already has must
+        // accept it. Otherwise a lost settle / stale running resume keeps the
+        // middle column blank (or stuck on a fragment) for the whole turn,
+        // because mainTurnOpen blocks the retry below.
+        if (!historySnapshotAheadOfLive(reconciliation.messages, messagesRef.current)) {
+          // A turn holds its scans down: the terminal event owns the retry, and
+          // only a bounded number of extra reads may run before it arrives.
+          const openTurnRetries = staleRetriesBySessionRef.current.get(selectedSession) ?? 0
+          const mayRetry = mainTurnOpenRef.current
+            ? openTurnRetries < STALE_RETRIES_WHILE_TURN_OPEN
+            : true
+          if (mayRetry && !staleRetryScheduled) {
             staleRetryScheduled = true
+            if (mainTurnOpenRef.current) staleRetriesBySessionRef.current.set(selectedSession, openTurnRetries + 1)
             staleRetryTimer = window.setTimeout(() => {
               if (historyLoadRef.current === request
                 && historyContextRef.current?.host === host
@@ -2374,8 +2392,15 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
                 freezeProbe('history_refresh', { reason: 'stale_request_retry', session: selectedSession })
                 setHistoryRefreshKey(key => key + 1)
               }
-            }, 0)
+            }, mainTurnOpenRef.current ? STALE_RETRY_OPEN_TURN_DELAY_MS : 0)
           }
+          freezeProbe('history_stale_discard', {
+            session: selectedSession,
+            live: messagesRef.current.length,
+            history: reconciliation.messages.length,
+            turnOpen: mainTurnOpenRef.current,
+            retry: staleRetryScheduled,
+          })
           return
         }
       }
@@ -2385,6 +2410,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         return
       }
       const next = reconciliation.messages
+      staleRetriesBySessionRef.current.delete(selectedSession)
       historyFingerprintBySessionRef.current.set(selectedSession, reconciliation.fingerprint)
       if (transcriptFingerprint(messagesRef.current) === reconciliation.fingerprint) {
         resumeOrCloseLostSettle(next)

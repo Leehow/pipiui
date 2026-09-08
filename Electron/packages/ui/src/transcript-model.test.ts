@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finishStreamingMessage, historyMessages, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, safeHttpsFileUrl, type ChatMessage } from './transcript-model'
+import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finalizeOpenTools, finishStreamingMessage, historyMessages, historySnapshotAheadOfLive, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, safeHttpsFileUrl, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
   it('copies user history images onto ChatMessage without rewriting content', () => {
@@ -97,6 +97,62 @@ describe('transcript model', () => {
     expect(result.messages[1]).toMatchObject({ id: 'a-done', content: 'done' })
   })
 
+  it('does not report an unchanged file as unchanged when the pane lost the turns it holds', () => {
+    const entries = [
+      { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: 'one', timestamp: 2 },
+    ]
+    const fingerprint = reconcileHistorySnapshot(entries, 4, 4).fingerprint
+    // Same bytes on disk, but the transcript on screen went blank: the snapshot
+    // must be applied, not skipped, or the pane stays empty until the file moves.
+    const blank = reconcileHistorySnapshot(entries, 4, 4, fingerprint, [])
+    expect(blank.status).toBe('accepted')
+    expect(blank.messages.map(message => message.id)).toEqual(['u1', 'a1'])
+    // A pane left holding only the newest turn is the same loss, just partial.
+    const fragment = reconcileHistorySnapshot(entries, 4, 4, fingerprint, [
+      { id: 'a1', role: 'assistant', content: 'one', timestamp: 2 },
+    ])
+    expect(fragment.status).toBe('accepted')
+    expect(fragment.messages.map(message => message.id)).toEqual(['u1', 'a1'])
+  })
+
+  it('still reports unchanged when the pane already holds every persisted turn', () => {
+    const entries = [
+      { id: 'u1', role: 'user' as const, content: 'first', timestamp: 1 },
+      { id: 'a1', role: 'assistant' as const, content: 'one', timestamp: 2 },
+    ]
+    const fingerprint = reconcileHistorySnapshot(entries, 4, 4).fingerprint
+    const live: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'first', timestamp: 1 },
+      { id: 'a-live', role: 'assistant', content: 'partial', timestamp: 2, streaming: true },
+    ]
+    // A live streaming assistant carries a synthetic id its persisted twin never
+    // matches; that alone must not force a mid-turn replacement.
+    expect(reconcileHistorySnapshot(entries, 4, 4, fingerprint, live).status).toBe('unchanged')
+  })
+
+  it('sees a live pane as behind when it is missing a persisted user turn', () => {
+    const snapshot: ChatMessage[] = [
+      { id: 'u1', role: 'user', content: 'first', timestamp: 1 },
+      { id: 'u2', role: 'user', content: 'second', timestamp: 3 },
+    ]
+    expect(historySnapshotAheadOfLive(snapshot, [])).toBe(true)
+    expect(historySnapshotAheadOfLive(snapshot, [snapshot[1]])).toBe(true)
+    expect(historySnapshotAheadOfLive(snapshot, snapshot)).toBe(false)
+    // A re-sent prompt persists under a new id; content pairing keeps it matched.
+    expect(historySnapshotAheadOfLive(snapshot, [
+      { id: 'live-1', role: 'user', content: 'first', timestamp: 1 },
+      { id: 'live-2', role: 'user', content: 'second', timestamp: 3 },
+    ])).toBe(false)
+    // A history page with no user turns cannot tell us the pane is behind.
+    expect(historySnapshotAheadOfLive([{ id: 'a1', role: 'assistant', content: 'one', timestamp: 2 }], [])).toBe(false)
+    // A live pane holding only a local optimistic prompt shares nothing with the
+    // snapshot: that is a read the prompt predates, not a pane that lost turns.
+    expect(historySnapshotAheadOfLive(snapshot, [
+      { id: 'local-1', role: 'user', content: '刚发出去的这一条', timestamp: 9 },
+    ])).toBe(false)
+  })
+
   it('rejects an async history response when a live stream changed after request start', () => {
     const result = reconcileHistorySnapshot([
       { id: 'old', role: 'assistant', content: 'old snapshot', timestamp: 10 },
@@ -163,6 +219,38 @@ describe('transcript model', () => {
       expect(messages[0].tools?.[0]).toMatchObject({ finished: true, finishedAt: 11_400 })
       expect(finishStreamingMessage(messages)[0].streaming).toBe(false)
     } finally { vi.useRealTimers() }
+  })
+
+  it('closes a tool left without a result when the turn ends, and keeps identity when nothing is open', () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(20_000)
+      let messages = applyStreamEvent([], { type: 'tool_call', sessionId: 's', toolCallId: 'grep', name: 'grep', delta: '{"pattern":"x"}' })
+      expect(messages[0].tools?.[0]?.finished).toBeFalsy()
+
+      messages = finalizeOpenTools(messages)
+      expect(messages[0].tools?.[0]).toMatchObject({ id: 'grep', finished: true, finishedAt: 20_000, interrupted: true })
+      const activity = messages[0].activities?.find(item => item.type === 'tool')
+      expect(activity?.type === 'tool' && activity.tool).toMatchObject({ finished: true, interrupted: true })
+
+      // A turn that left nothing open is a no-op, so callers keep comparing identity.
+      expect(finalizeOpenTools(messages)).toBe(messages)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('lets a late tool_result land on a card already closed as interrupted', () => {
+    let messages = applyStreamEvent([], { type: 'tool_call', sessionId: 's', toolCallId: 'grep', name: 'grep', delta: '{}' })
+    messages = finalizeOpenTools(finishStreamingMessage(messages))
+    expect(messages[0].streaming).toBe(false)
+    expect(messages[0].tools?.[0]?.interrupted).toBe(true)
+
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'grep', content: '3 hits' })
+    expect(messages).toHaveLength(1)
+    expect(messages[0].tools?.[0]).toMatchObject({ finished: true, result: '3 hits' })
+    expect(messages[0].tools?.[0]?.interrupted).toBeFalsy()
+    const activity = messages[0].activities?.find(item => item.type === 'tool')
+    expect(activity?.type === 'tool' && activity.tool.interrupted).toBeFalsy()
+    expect(messages[0].activities?.some(item => item.type === 'thinking' && item.id === PENDING_THINKING_ID)).toBe(false)
   })
 
   it('opens a pending thinking block after the last tool so a silent next completion stays visible', () => {

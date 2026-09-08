@@ -2298,6 +2298,9 @@ export class PiHostBackend implements HostBackend {
   private manualThinkingLevelLoaded?: Promise<void>;
   private hiddenIds: string[] = [];
   private hiddenIdsLoaded?: Promise<void>;
+  /** Providers the user removed that the catalog keeps supplying anyway (pi builtins). */
+  private removedProviderIds: string[] = [];
+  private removedProviderIdsLoaded?: Promise<void>;
   /** Selected vision model (full "provider/id" ref) mirrored into vision.json for @getpipher/vision. */
   private visionModel: string | null = null;
   private visionModelLoaded?: Promise<void>;
@@ -2594,7 +2597,11 @@ export class PiHostBackend implements HostBackend {
           // (ProviderAuthBackend awaits refreshModelsAfterAuthChange BEFORE 'completed').
           this.invalidateModelCatalog();
           this.auth.invalidateProvidersCache();
-          return (await this.modelRuntime()).login(p, t, i);
+          const credential = await (await this.modelRuntime()).login(p, t, i);
+          // Logging back into a provider the user had removed un-removes it;
+          // otherwise the login "succeeds" into an invisible row.
+          await this.unsuppressProvider(p);
+          return credential;
         },
         logout: async (p) => (await this.modelRuntime()).logout(p),
       },
@@ -4421,6 +4428,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadHiddenModelIds();
       case "setHiddenModelIds":
         return this.saveHiddenModelIds(params[0]);
+      case "getRemovedProviderIds":
+        return this.loadRemovedProviderIds();
+      case "setRemovedProviderIds":
+        return this.saveRemovedProviderIds(params[0]);
       case "getSidebarSessionPreferences":
         return this.loadSidebarSessionPreferences();
       case "setSidebarSessionPreferences":
@@ -4524,14 +4535,26 @@ export class PiHostBackend implements HostBackend {
       }
       case "listAgentDefinitions":
         return this.listAgentDefinitions(params[0]);
-      case "listModels":
+      case "listModels": {
         // Never straddle an in-flight canonical models write (project
         // migration): hold on the write-queue tail first, then serve the
         // (possibly refreshed) catalog. When the queue is idle this is a
         // no-op turn and the loadModelCatalog cache shortcut still applies.
         await this.awaitCanonicalModelsIdle();
         await this.loadModelCatalog();
-        return this.models;
+        const removed = new Set(await this.loadRemovedProviderIds());
+        if (!removed.size) return this.models;
+        // `this.models` stays whole: suppression is a rendering decision, not a
+        // catalog edit, so pin validation and model resolution keep seeing every
+        // row. The selected model always survives its provider's removal — the
+        // renderer must never be left with nothing selected.
+        const selected = this.modelState.model;
+        return this.models.filter(
+          (model) =>
+            !removed.has(model.provider) ||
+            (model.provider === selected.provider && model.id === selected.id),
+        );
+      }
       case "getModelState":
         return this.getModelState(params[0] as string | undefined);
       case "setModel":
@@ -6032,6 +6055,8 @@ export class PiHostBackend implements HostBackend {
         busy: this.queue.isTurnActive(id),
       });
       live.activeCompaction = { operation: "context_compaction", trigger };
+      // A compaction is model work the watchdog must not read as a wedged turn.
+      this.touchTurnActivity(live);
       live.compactionIntent = undefined;
       const diagnosticsId = `${id}:${++this.compactionOperationSeq}`;
       const knownContext = this.sessionContextLastKnown.get(id);
@@ -6080,6 +6105,10 @@ export class PiHostBackend implements HostBackend {
               busy: this.queue.isTurnActive(id),
             });
       live.activeCompaction = undefined;
+      // A long summarizer run must not leave the watchdog's clock stale: the
+      // next sweep would read "no work in flight, no progress" and abort the
+      // turn the compaction just resumed.
+      this.touchTurnActivity(live);
       const diagnostics = live.activeCompactionDiagnostics;
       live.activeCompactionDiagnostics = undefined;
       if (live.compactionDiagnosticsClosedBySettle) {
@@ -6508,6 +6537,9 @@ export class PiHostBackend implements HostBackend {
         errorKind: "settled_without_end",
       });
     }
+    // A compaction whose end event was missed must not keep exempting the next
+    // turn from the watchdog forever.
+    live.activeCompaction = undefined;
     live.compaction.settleTurn();
     if (pushStats) void this.pushSessionStats(live.session.id);
     else this.turnTelemetry.flushTerminal(live.session.id);
@@ -6701,8 +6733,14 @@ export class PiHostBackend implements HostBackend {
       // behind it ("queued") and nothing ever drains. Require a quiet RPC
       // surface so a genuinely in-flight dispatch is never released.
       if (!turnOpen && live.pending.size > 0) continue;
+      // Only real work in flight justifies a non-terminal tail. The tail shape is
+      // a proxy for that and is wrong after a tool result: the model hop that
+      // follows writes nothing until it completes, so a stalled stream used to
+      // wedge the turn forever. Compaction is model work too and never enters
+      // toolNames, so it must be exempted explicitly.
+      const workInFlight = live.toolNames.size > 0 || Boolean(live.activeCompaction);
       const tailTerminal = await this.isSessionTailTerminal(live.path);
-      if (!tailTerminal) {
+      if (!tailTerminal && workInFlight) {
         console.warn(`[pipi-backend] turn watchdog no tail terminal session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch}`);
         continue;
       }
@@ -6712,6 +6750,11 @@ export class PiHostBackend implements HostBackend {
         continue;
       }
       console.warn(`[pipi-backend] turn watchdog firing session=${this.projectionDebugSessionTag(live.session.id)} epoch=${epoch} idleMs=${now - active}`);
+      // A non-terminal tail means pi may still be parked on a dead stream; stop it
+      // before projectTurnTerminal releases the queue and dispatches the next prompt.
+      if (!tailTerminal) {
+        void this.command(live.session.id, { type: "abort" }, false, live.runtimeToken).catch(() => undefined);
+      }
       this.projectTurnTerminal(live, "settled", true);
     }
     // Writer already gone: the loop above never sees these. JSONL may already
@@ -9045,6 +9088,70 @@ export class PiHostBackend implements HostBackend {
     return [...sorted];
   }
   /**
+   * Providers the user removed from the model list.
+   *
+   * Deleting credentials is enough for a provider whose definition lives in
+   * `models.json` — pruning that definition removes the row. A pi built-in
+   * provider is compiled into `@earendil-works/pi-ai/dist/providers`, so it
+   * reappears no matter what the credential store says; the only honest
+   * "removed" for those is a suppression list the served catalog is filtered
+   * through. Membership is decided empirically in `removeProviderCredentials`
+   * (did the provider survive its own deletion?), never from a hardcoded
+   * builtin roster that would rot with every pi upgrade.
+   */
+  private async loadRemovedProviderIds(): Promise<string[]> {
+    if (!this.removedProviderIdsLoaded) {
+      const attempt = (async () => {
+        const raw = await this.readSettings();
+        const value = raw.removedProviderIds;
+        if (value === undefined) {
+          this.removedProviderIds = [];
+          return;
+        }
+        if (!Array.isArray(value) || !value.every((id: unknown) => typeof id === "string"))
+          throw new Error("removedProviderIds 必须是 string[]");
+        this.removedProviderIds = [...new Set(value)].sort();
+      })();
+      // Same self-healing memo as the visibility store: one bad read must not
+      // poison every later one.
+      attempt.catch(() => {
+        if (this.removedProviderIdsLoaded === attempt) this.removedProviderIdsLoaded = undefined;
+      });
+      this.removedProviderIdsLoaded = attempt;
+    }
+    await this.removedProviderIdsLoaded;
+    return [...this.removedProviderIds];
+  }
+  private async saveRemovedProviderIds(value: unknown): Promise<string[]> {
+    if (!Array.isArray(value) || !value.every((id) => typeof id === "string"))
+      throw new Error("removedProviderIds 必须是 string[]");
+    const sorted = [...new Set(value.map((id) => id.trim()).filter(Boolean))].sort();
+    await this.updateSettings((settings) => {
+      settings.removedProviderIds = [...sorted];
+    });
+    this.removedProviderIds = [...sorted];
+    this.removedProviderIdsLoaded = Promise.resolve();
+    this.scheduleSubagentModelCatalogRefresh();
+    return [...sorted];
+  }
+  /**
+   * A provider that is logged into, or re-defined through add-model, is no
+   * longer removed. Without this a deleted provider that the user later brings
+   * back would stay invisible with nothing in the UI explaining why.
+   */
+  private async unsuppressProvider(providerId: unknown): Promise<void> {
+    const id = typeof providerId === "string" ? providerId.trim() : "";
+    if (!id) return;
+    try {
+      const current = await this.loadRemovedProviderIds();
+      if (!current.includes(id)) return;
+      await this.saveRemovedProviderIds(current.filter((entry) => entry !== id));
+    } catch (error) {
+      // Never fail a login over the suppression bookkeeping.
+      console.warn(`[pipiui] unsuppressProvider(${id}) failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  /**
    * Selected vision model (full `provider/id` ref). Stored in
    * pipiui-settings.json and mirrored atomically into vision.json as the
    * `{ provider, model }` bridge consumed by @getpipher/vision.
@@ -9780,6 +9887,7 @@ export class PiHostBackend implements HostBackend {
       await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
       return uniqueId;
     });
+    await this.unsuppressProvider(providerIdCommitted);
     try {
       await this.refreshModelsAfterAuthChange(false);
     } catch (error) {
@@ -9928,6 +10036,16 @@ export class PiHostBackend implements HostBackend {
   private async removeProviderCredentials(
     providerId: string,
   ): Promise<ModelState> {
+    // An extension re-registers its provider on every mount, so removing it here
+    // would only produce "extension enabled, provider invisible". Point at the
+    // one control that actually owns it instead of faking a deletion.
+    const claim = this.extensionLoader
+      .contributionClaims()
+      .find((entry) => entry.enabled && entry.contribution.provider?.id === providerId);
+    if (claim)
+      throw new Error(
+        `${providerId} 由「${claim.extensionId}」扩展提供，请到「扩展」页停用该扩展来移除它。`,
+      );
     const rt = await this.modelRuntime();
     try {
       await rt.logout(providerId);
@@ -9969,9 +10087,25 @@ export class PiHostBackend implements HostBackend {
       throw error;
     }
     const models = await this.refreshModelsAfterAuthChange(false);
+    // Did the provider survive its own deletion? Credentials are gone and any
+    // models.json definition is pruned, so anything still standing is supplied by
+    // pi itself (a compiled-in builtin) and no amount of credential work will
+    // remove it. Suppress it instead — decided by observation, so a pi upgrade
+    // that adds or drops builtins needs no change here.
+    if (models.some((model) => model.provider === providerId)) {
+      try {
+        await this.saveRemovedProviderIds([...(await this.loadRemovedProviderIds()), providerId]);
+      } catch (error) {
+        // Credentials really are gone; only the row lingers. Say so rather than
+        // reporting a clean delete.
+        throw new Error(
+          `${providerId} 的凭据已删除，但它是 pi 内置 provider，从列表中移除失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
     this.auth.invalidateProvidersCache();
     if (this.modelState.model.provider === providerId) {
-      const next = models[0] ?? {
+      const next = models.find((model) => model.provider !== providerId) ?? {
         provider: "unknown",
         id: "unknown",
         name: "无可用模型",

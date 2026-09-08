@@ -69,4 +69,11 @@ describe('expandSteps accordion', () => {
     expect(screen.getByRole('button', { name: /个步骤/ }).getAttribute('aria-expanded')).toBe('false')
     expect(screen.queryByText(/confluence-core/)).toBeNull()
   })
+
+  it('shows an interrupted tool as 已中断 instead of 运行中', () => {
+    const interrupted: TranscriptTool = { id: 'grep', name: 'grep', input: '{"pattern":"x"}', startedAt: 1, finishedAt: 5, finished: true, interrupted: true }
+    render(<AssistantTranscriptContent expandSteps message={{ content: '', streaming: false, activities: [{ type: 'tool', contentIndex: 0, tool: interrupted }], tools: [interrupted] }} />)
+    expect(screen.getByText(/已中断/)).toBeTruthy()
+    expect(screen.queryByText(/运行中/)).toBeNull()
+  })
 })

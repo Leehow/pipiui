@@ -11,6 +11,8 @@ export type TranscriptTool = {
   startedAt: number
   finishedAt?: number
   finished?: boolean
+  /** Turn closed with no result for this call (interrupt, stop, lost result). */
+  interrupted?: boolean
   dispatched?: boolean
   images?: { data: string; mimeType: string }[]
   /** Structured `details` projected from the pi tool result (metadata only, never image base64). */
@@ -298,6 +300,36 @@ export function retainLiveUserTail(snapshot: ChatMessage[], live?: readonly Chat
   return extraUsers.length ? [...snapshot, ...extraUsers] : snapshot
 }
 
+/** Is the displayed transcript missing durable turns this snapshot already has?
+ *  Matched on user messages only, by id or content (the same pairing
+ *  `retainLiveUserTail` uses): a live streaming assistant row carries a
+ *  synthetic `stream-*` id that never matches its persisted twin, so assistant
+ *  rows cannot tell "live is behind" apart from "live is mid-turn".
+ *
+ *  A snapshot only counts as ahead of a live pane that is on its branch — one
+ *  with no user turns at all (nothing to contradict), or one sharing at least
+ *  one message with it. A live pane holding only an unshared row is a local
+ *  optimistic prompt the snapshot predates, and replacing it would drop the
+ *  user's own message. A true answer means the pane is showing less
+ *  conversation than the file holds, which no fingerprint or revision check may
+ *  then conclude is fine. */
+export function historySnapshotAheadOfLive(
+  snapshot: readonly ChatMessage[],
+  live?: readonly ChatMessage[],
+): boolean {
+  const snapshotUsers = snapshot.filter(message => message.role === 'user')
+  if (snapshotUsers.length === 0) return false
+  if (!live?.length) return true
+  const liveIds = new Set(live.map(message => message.id))
+  const liveUserContents = new Set(live.filter(message => message.role === 'user').map(message => message.content))
+  if (!snapshotUsers.some(message => !liveIds.has(message.id) && !liveUserContents.has(message.content))) return false
+  if (!live.some(message => message.role === 'user')) return true
+  const snapshotIds = new Set(snapshot.map(message => message.id))
+  const snapshotUserContents = new Set(snapshotUsers.map(message => message.content))
+  return live.some(message => snapshotIds.has(message.id)
+    || (message.role === 'user' && snapshotUserContents.has(message.content)))
+}
+
 export function reconcileHistorySnapshot(
   entries: HistoryEntry[],
   requestLiveRevision: number,
@@ -308,7 +340,13 @@ export function reconcileHistorySnapshot(
   const messages = historyMessages(entries)
   const fingerprint = transcriptFingerprint(messages)
   if (requestLiveRevision !== currentLiveRevision) return { status: 'stale-request', messages, fingerprint }
-  if (fingerprint === previousFingerprint) return { status: 'unchanged', messages, fingerprint }
+  // An unchanged file is not proof the pane is already correct. `unchanged`
+  // skips the apply entirely, so it may only be reported when the transcript on
+  // screen still holds every turn this snapshot has; otherwise a pane that lost
+  // its messages stays lost until the file happens to change again.
+  if (fingerprint === previousFingerprint && !historySnapshotAheadOfLive(messages, liveMessages)) {
+    return { status: 'unchanged', messages, fingerprint }
+  }
   // Only block an empty first-page snapshot from wiping a non-empty live
   // transcript. Shorter non-empty history is a legitimate branch/retry.
   if (liveMessages && liveMessages.length > 0 && messages.length === 0) {
@@ -561,7 +599,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     || event.type === 'server_side_usage'
   // Late hosted code-interpreter events after settle still update the last
   // assistant in place so the virtual card appears immediately.
-  const reuseSettled = (event.type === 'hosted_code_interpreter' || event.type === 'input_file_sources') && index >= 0
+  const reuseSettled = (event.type === 'tool_result' || event.type === 'hosted_code_interpreter' || event.type === 'input_file_sources') && index >= 0
   const canUpdate = index >= 0
     && (index === previous.length - 1 || mayCrossUserBoundary)
     && (previous[index].streaming || reuseSettled)
@@ -687,6 +725,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         ...tool,
         finished: true,
         finishedAt: Date.now(),
+        interrupted: false,
         error: event.status === 'failed' || tool.error,
       }
       nextTools[toolIndex] = completed
@@ -736,6 +775,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         input: event.query || event.sources?.length || event.error ? delta : previousTool.input || delta,
         finished,
         finishedAt: finished ? Date.now() : previousTool.finishedAt,
+        interrupted: finished ? false : previousTool.interrupted,
         error: event.phase === 'failed' ? true : previousTool.error,
         result: event.phase === 'failed' ? (event.error?.message ?? previousTool.result) : previousTool.result,
       }
@@ -850,7 +890,7 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
     if (toolIndex >= 0) {
       const nextTools = ownTools()
       const tool = nextTools[toolIndex]
-      const completed = { ...tool, result: event.content, error: event.isError, finishedAt: Date.now(), finished: true, dispatched: tool.name === 'subagent' && !event.isError && isBackgroundSubagentAck(event.content), images: event.images, details: event.details }
+      const completed = { ...tool, result: event.content, error: event.isError, finishedAt: Date.now(), finished: true, interrupted: false, dispatched: tool.name === 'subagent' && !event.isError && isBackgroundSubagentAck(event.content), images: event.images, details: event.details }
       nextTools[toolIndex] = completed
       changed = true
       const activityIndex = (activities ?? []).findIndex(activity => activity.type === 'tool' && activity.tool.id === event.toolCallId)
@@ -859,7 +899,9 @@ export function applyStreamEvent(previous: ChatMessage[], event: Exclude<StreamE
         nextActivities[activityIndex] = { ...nextActivities[activityIndex], tool: completed } as TranscriptActivity
       }
     }
-    if (allToolsFinished(tools) && openPendingThinking(ownActivities())) changed = true
+    // A late result on an already settled card must not open a live thinking
+    // placeholder: there is no next model hop to fill it.
+    if (updated.streaming && allToolsFinished(tools) && openPendingThinking(ownActivities())) changed = true
   }
   if (!changed) return previous
   if (tools !== undefined) updated.tools = tools
@@ -912,6 +954,27 @@ export function finishStreamingMessage(messages: ChatMessage[]): ChatMessage[] {
   const activities = message.activities ? stripPendingThinking(message.activities) : message.activities
   next[index] = { ...message, streaming: false, ...(activities ? { activities } : {}) }
   return next
+}
+
+/** Close every tool a finished turn left without a result. A `tool_call` whose
+ *  `tool_result` never arrived (interrupted turn, lost result) would otherwise
+ *  render as 「运行中」 forever; the turn is over, so it is interrupted, not live. */
+export function finalizeOpenTools(messages: ChatMessage[]): ChatMessage[] {
+  let changed = false
+  const next = messages.map(message => {
+    const openTools = message.tools
+    if (!openTools?.some(tool => !tool.finished)) return message
+    changed = true
+    const tools = openTools.map(tool => tool.finished
+      ? tool
+      : { ...tool, finished: true, finishedAt: tool.finishedAt ?? Date.now(), interrupted: true })
+    const toolsById = new Map(tools.map(tool => [tool.id, tool]))
+    const activities = message.activities
+      ? stripPendingThinking(message.activities).map(activity => cloneActivity(activity, toolsById))
+      : message.activities
+    return { ...message, tools, ...(activities ? { activities } : {}) }
+  })
+  return changed ? next : messages
 }
 
 /** Last durable activity is a finished tool (or the live pending-thinking
