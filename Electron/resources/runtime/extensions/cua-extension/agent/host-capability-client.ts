@@ -46,7 +46,8 @@ export type NativeCuaClientOptions = {
   requestTimeoutMs?: number;
   cancelTimeoutMs?: number;
   /** One-time token source. Defaults to the loopback `host_capability_token` mint op. */
-  tokenProvider?: () => string | Promise<string>;
+  /** Receives the call's abort signal so the mint hop is bounded like the action hop. */
+  tokenProvider?: (signal?: AbortSignal) => string | Promise<string>;
   fetchImpl?: typeof fetch;
 };
 
@@ -59,7 +60,7 @@ export type NativeCuaClient = {
    */
   call(params: Record<string, unknown>, externalSignal?: AbortSignal): Promise<Record<string, unknown>>;
   /** Mint a fresh one-time capability token (host side). Exposed for tests. */
-  mintToken(): Promise<string>;
+  mintToken(signal?: AbortSignal): Promise<string>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -67,11 +68,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /** Default token source: ask the host to mint one token per call. Fails closed. */
-function createMintingTokenProvider(options: Required<Pick<NativeCuaClientOptions, "bridgePort" | "sessionCapability" | "extensionId" | "projectRoot">> & { fetchImpl: typeof fetch }): () => Promise<string> {
-  return async () => {
+function createMintingTokenProvider(options: Required<Pick<NativeCuaClientOptions, "bridgePort" | "sessionCapability" | "extensionId" | "projectRoot">> & { fetchImpl: typeof fetch }): (signal?: AbortSignal) => Promise<string> {
+  return async (signal?: AbortSignal) => {
     const response = await options.fetchImpl(`http://127.0.0.1:${options.bridgePort}/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      // The mint is a host round trip and hangs the same ways the action hop does;
+      // unsignalled it sits outside every deadline, including the user's Stop.
+      ...(signal ? { signal } : {}),
       body: JSON.stringify({
         schemaVersion: HOST_CAPABILITY_WIRE_VERSION,
         sessionCapability: options.sessionCapability,
@@ -142,8 +146,8 @@ export function createNativeCuaClient(options: NativeCuaClientOptions): NativeCu
     }
   }
 
-  async function mintToken(): Promise<string> {
-    const token = await tokenProvider();
+  async function mintToken(signal?: AbortSignal): Promise<string> {
+    const token = await tokenProvider(signal);
     if (typeof token !== "string" || !token) {
       throw new HostCapabilityError(
         `host capability token for '${extensionId}' is not configured; the host has not minted a capability token for this session`,
@@ -190,14 +194,15 @@ export function createNativeCuaClient(options: NativeCuaClientOptions): NativeCu
     const label = params.action === "computer_open_application"
       ? "open_application"
       : "computer";
-    const token = await mintToken();
     let brokerResponse: Record<string, unknown>;
+    // Armed before the mint: one budget and one signal cover both host hops.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     const forwardAbort = () => controller.abort();
     if (externalSignal?.aborted) controller.abort();
     else externalSignal?.addEventListener("abort", forwardAbort, { once: true });
     try {
+      const token = await mintToken(controller.signal);
       const response = await fetchImpl(`http://127.0.0.1:${bridgePort}/rpc`, {
         method: "POST",
         headers: { "content-type": "application/json" },

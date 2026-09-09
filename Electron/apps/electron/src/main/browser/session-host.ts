@@ -25,6 +25,7 @@ import {
   type WatchUnwatchResult,
   type WatchWaitCheckRequest,
 } from '../watcher-registry.js'
+import { advanceQueueTail } from './navigation-settle.js'
 import { BrowserTabsHost } from './tabs-host.js'
 import { browserPartitionForSession } from './tab-model.js'
 import type { BrowserCertificateErrorAppLike, BrowserSessionViewAttach, BrowserViewFactory } from './types.js'
@@ -320,7 +321,11 @@ export class BrowserSessionHost implements BrowserHostAPI {
 
   private enqueue<T>(record: BrowserSessionRecord, operation: () => Promise<T>): Promise<T> {
     const result = record.tail.then(operation)
-    record.tail = result.then(() => undefined, () => undefined)
+    // The tail advances on a ceiling, not only on settlement. Each operation is bounded on
+    // its own now, but this is the backstop that matters: if any one of them ever fails to
+    // settle, the queue must not pin every later action for this session behind it forever.
+    // The caller still awaits the real `result`; only the queue moves on.
+    record.tail = advanceQueueTail(result)
     return result
   }
 }

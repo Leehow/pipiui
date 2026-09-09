@@ -912,6 +912,32 @@ describe("host capability gates (the extension cannot bypass the broker)", () =>
       configureDefaultCapabilityClient();
     }
   });
+
+  // The token mint is a host round trip of its own. It used to run before the call's
+  // AbortController existed, so a host that accepted the connection and never answered
+  // parked the tool call outside every deadline — including the user's Stop button.
+  it("bounds the token mint so a host that accepts but never answers cannot hang the call", async () => {
+    const sockets: Array<{ destroy(): void }> = [];
+    const silent = createServer(() => {
+      // Accept the request and never write a response.
+    });
+    silent.on("connection", (socket) => sockets.push(socket));
+    await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+    const port = (silent.address() as { port: number }).port;
+    try {
+      configureWebviewBrowserHost({ port, sessionCapability: "silent-capability", projectRoot: PROJECT_ROOT });
+      const { capabilityCall } = await import(pathToFileURL(join(extensionDir, "agent", "capability-bridge.ts")).href);
+      const startedAt = Date.now();
+      await expect(capabilityCall("browser.action", { action: "navigate", url: "https://example.com/" }, undefined, 250))
+        .rejects.toThrow("browser request timed out or was cancelled");
+      // 250ms call budget + the bounded best-effort cancel; the point is that it returns at all.
+      expect(Date.now() - startedAt).toBeLessThan(10_000);
+    } finally {
+      sockets.forEach((socket) => socket.destroy());
+      await new Promise<void>((resolve) => silent.close(() => resolve()));
+      configureDefaultCapabilityClient();
+    }
+  }, 20_000);
 });
 
 describe("registration path (manifest → loader → spawn -e)", () => {

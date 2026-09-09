@@ -35,7 +35,7 @@ import type { WatchWaitCheckRequest } from '../watcher-registry.js'
 import { createConsoleEntryListener, installJsDialogReporter, newDialogNonce } from './console-pipeline.js'
 import { controllerPrelude, observePayload, requestElementToken, requestTarget, hasStructuredLocator, tagObservation, untaggedRequest } from './dom-bridge.js'
 import { buildBrowserDebugEnvelope } from './debug-envelope.js'
-import { awaitLoadURL, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, NavigationSettle } from './navigation-settle.js'
+import { awaitLoadURL, awaitPageEvaluate, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_PAGE_EVALUATE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, BrowserPageUnresponsiveError, NavigationSettle } from './navigation-settle.js'
 import { nativeViewUsable, traceBrowserAction, traceBrowserNative } from './native-view.js'
 import { sanitizeWithController } from './redaction.js'
 import type {
@@ -188,7 +188,7 @@ export class BrowserTabsHost {
     }, pane.kind)
     const source = `if(!globalThis.__pipiBrowserDOM){${browserDOMControllerSource}}\n;globalThis.__pipiBrowserDOM.dispatch(${JSON.stringify(dispatched)})`
     try {
-      const result = await execute.call(pane.view!.webContents, source)
+      const result = await this.evaluatePage(pane, source)
       if (!result || typeof result !== 'object') return { unavailable: true }
       const rec = result as { ok?: boolean; ready?: boolean }
       return { ready: rec.ok !== false && rec.ready === true }
@@ -202,7 +202,7 @@ export class BrowserTabsHost {
     const pane = this.primaryPaneIfCreated()
     const execute = pane?.view?.webContents.executeJavaScript
     if (!execute) return undefined
-    return execute.call(pane.view!.webContents, expression)
+    return this.evaluatePage(pane, expression).catch(() => undefined)
   }
 
   /** A later BrowserWindow can become the sole owner after the prior one closes. */
@@ -394,6 +394,13 @@ export class BrowserTabsHost {
         if (request.action === 'observe') return this.observeTargets(resolved.kinds, request)
         return this.domActionOn(request, resolved.kinds[0])
       }
+      // The agent sends this on its own request timeout. There is no per-request handle to
+      // cancel here — the operation it wants stopped is bounded by its own deadline and by
+      // the session queue ceiling — but it is a real action, not an unknown one, and
+      // answering it as `unknown_action` turned every client timeout into a spurious error.
+      if (request.action === 'browser_cancel') {
+        return this.debugEnvelope(request, { ok: true, cancelled: false, note: 'the request is bounded by its own deadline; nothing to cancel' } as unknown as BrowserToolResult)
+      }
       return this.debugEnvelope(request, { ok: false, code: 'unknown_action', error: `unknown browser action: ${request.action}` })
     } catch (error) {
       const failed = this.debugEnvelope(request, { ok: false, startedAt, error: error instanceof Error ? error.message : String(error) })
@@ -542,7 +549,7 @@ export class BrowserTabsHost {
     if (!execute || !this.active || pane.shownTabId !== this.active.id) return { ok: false, error: 'browser page is unavailable' }
     if (typeof request.js !== 'string' || request.js.length === 0) return { ok: false, error: 'browser eval requires js' }
     try {
-      const result = await execute.call(pane.view!.webContents, request.js)
+      const result = await this.evaluatePage(pane, request.js)
       return sanitizeWithController(pane, kind, { ok: true, result, viewportTarget: kind })
     } catch (error) {
       return sanitizeWithController(pane, kind, { ok: false, error: error instanceof Error ? error.message : String(error), viewportTarget: kind })
@@ -594,7 +601,7 @@ export class BrowserTabsHost {
       return packed.value as BrowserToolResult
     }
     try {
-      const raw = await execute.call(pane.view!.webContents, source) as Record<string, unknown> | undefined
+      const raw = await this.evaluatePage<Record<string, unknown> | undefined>(pane, source, BROWSER_SCRIPT_DEADLINE_MS + 10_000)
       const drift = this.contextDrift(ctx)
       if (drift) {
         return finish({
@@ -858,7 +865,7 @@ export class BrowserTabsHost {
     // only interpolated value and it is a validated boolean.
     const source = `(() => { const html = ${JSON.stringify(htmlMode)}; return { title: document.title, url: location.href, content: html ? document.documentElement.outerHTML : (document.body ? document.body.innerText : "") }; })()`
     try {
-      const raw = await execute.call(pane.view!.webContents, source) as { content?: unknown } | undefined
+      const raw = await this.evaluatePage<{ content?: unknown } | undefined>(pane, source)
       const full = typeof raw?.content === 'string' ? raw.content : ''
       const sanitized = await sanitizeWithController(pane, kind, {
         ok: true,
@@ -884,12 +891,34 @@ export class BrowserTabsHost {
     return this.domActionOnPane(request, kind, pane)
   }
 
+  /**
+   * The one place a page evaluate is awaited. Bounded, because an unbounded one pins the
+   * per-session action queue and every later browser action with it. On expiry the pending
+   * load is stopped best-effort — that clears the commonest blocked-renderer case — and a
+   * typed error is thrown for the surrounding action to render as a structured failure.
+   */
+  private evaluatePage<T = unknown>(pane: ViewPane, source: string, timeoutMs = BROWSER_PAGE_EVALUATE_TIMEOUT_MS): Promise<T> {
+    const contents = pane.view?.webContents
+    const execute = contents?.executeJavaScript
+    if (!contents || !execute) return Promise.reject(new Error('browser page is unavailable'))
+    return awaitPageEvaluate(execute.call(contents, source) as Promise<T>, timeoutMs).catch((error: unknown) => {
+      if (error instanceof BrowserPageUnresponsiveError) {
+        try {
+          contents.stop?.()
+        } catch {
+          // Best effort: a renderer that ignores stop() still returns this error to the caller.
+        }
+      }
+      throw error
+    })
+  }
+
   private async domActionOnPane(request: Record<string, unknown>, kind: BrowserViewportKind, pane: ViewPane): Promise<BrowserToolResult> {
     const execute = pane.view?.webContents.executeJavaScript
     if (!execute || !this.active || pane.shownTabId !== this.active.id) return { ok: false, error: 'browser page is unavailable' }
     const dispatched = untaggedRequest(request, kind)
     const source = `if(!globalThis.__pipiBrowserDOM){${browserDOMControllerSource}}\n;globalThis.__pipiBrowserDOM.dispatch(${JSON.stringify(dispatched)})`
-    const result = await execute.call(pane.view!.webContents, source)
+    const result = await this.evaluatePage(pane, source)
     if (!result || typeof result !== 'object') return { ok: false, error: 'browser action returned no result' }
     return tagObservation(result as BrowserToolResult, kind)
   }
@@ -926,7 +955,7 @@ export class BrowserTabsHost {
     const action = JSON.stringify(request.action)
     const code = `${controllerPrelude()}(()=>{const api=globalThis.__pipiBrowserDOM;const e=document.querySelector(${selector});if(!e)return {ok:false,error:'selector not found'};if(api&&typeof api.isSensitive==='function'&&api.isSensitive(e))return {ok:false,error:'This sensitive field requires user input.',code:'user_handoff_required',requiresUserInput:true};if(${action}==='click'){e.click();return {ok:true}};const p=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;p?p.call(e,${append ? `String(e.value??'')+${text}` : text}):e.value=${text};e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return {ok:true}})()`
     try {
-      const result = await execute.call(pane.view!.webContents, code)
+      const result = await this.evaluatePage(pane, code)
       if (!result || typeof result !== 'object' || !(result as any).ok) {
         return sanitizeWithController(pane, kind, (result && typeof result === 'object' ? result : { ok: false, error: 'selector not found' }) as BrowserToolResult)
       }

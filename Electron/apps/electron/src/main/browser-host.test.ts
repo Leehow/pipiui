@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
 import { BrowserSessionHost, BrowserTabsHost, BROWSER_HOST_TOOL_ACTIONS, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, browserDeviceEmulationFor, browserPartitionForSession, installBrowserNativeTrace, mountBrowserShellView, normalizeBrowserToolTarget, normalizeBrowserURL, parseBrowserSnapshotTarget, routeBrowserView, shouldOpenBrowserDevTools, withBrowserTabsHost, type BrowserViewLike } from './browser-host.js'
-import { awaitLoadURL } from './browser/navigation-settle.js'
+import { advanceQueueTail, awaitLoadURL, BROWSER_PAGE_EVALUATE_TIMEOUT_MS } from './browser/navigation-settle.js'
 import { BROWSER_DEBUG_MAX_OUTPUT, BROWSER_SCRIPT_MAX_INPUT, remapScriptStack, safeSerialize, TabConsoleBuffer, truncateEnvelope } from './browser-debug.js'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -713,6 +713,88 @@ describe('BrowserSessionHost', () => {
       await expect(hung).resolves.toMatchObject({ ok: true })
       await expect(queuedConsole).resolves.toMatchObject({ ok: true })
       expect(consoleDone).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // executeJavaScript has no deadline of its own. A renderer blocked by a dialog, a long
+  // synchronous script, or a torn-down target never settles it — the same failure the
+  // loadURL bound above was written for, on the other half of the host.
+  it('bounds a hung page evaluate so the action returns instead of hanging forever', async () => {
+    const { host, created } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    // Only the content evaluate hangs: the redaction pass that runs on the error path is
+    // bounded by the same helper, and letting it hang too would just re-prove that bound.
+    created[0].contents.executeJavaScript.mockImplementationOnce(() => new Promise(() => {}))
+    vi.useFakeTimers()
+    try {
+      const hung = host.toolAction('session-a', { action: 'content' })
+      await vi.advanceTimersByTimeAsync(BROWSER_PAGE_EVALUATE_TIMEOUT_MS)
+      const result = await hung
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toContain('did not answer')
+      // Best effort recovery: the pending load is stopped so a navigation-blocked
+      // renderer is released rather than left to fail every later action too.
+      expect(created[0].contents.stop).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('unblocks the session action queue when a page evaluate never settles', async () => {
+    const { host, created } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    const realExecute = created[0].contents.executeJavaScript.getMockImplementation()!
+    created[0].contents.executeJavaScript.mockImplementationOnce(() => new Promise(() => {}))
+    vi.useFakeTimers()
+    try {
+      const hung = host.toolAction('session-a', { action: 'content' })
+      let queuedDone = false
+      const queued = host.toolAction('session-a', { action: 'console' }).then(result => {
+        queuedDone = true
+        return result
+      })
+      await Promise.resolve()
+      expect(queuedDone).toBe(false)
+      await vi.advanceTimersByTimeAsync(BROWSER_PAGE_EVALUATE_TIMEOUT_MS)
+      await expect(hung).resolves.toMatchObject({ ok: false })
+      await expect(queued).resolves.toMatchObject({ ok: true })
+      expect(queuedDone).toBe(true)
+      created[0].contents.executeJavaScript.mockImplementation(realExecute)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // The agent sends browser_cancel on its own request timeout; answering `unknown_action`
+  // turned every client timeout into a spurious error in the log.
+  it('answers browser_cancel as a known action', async () => {
+    const { host } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    const result = await host.toolAction('session-a', { action: 'browser_cancel', requestID: 'req-1' } as never)
+    expect(result.ok).toBe(true)
+    expect(result.code).not.toBe('unknown_action')
+  })
+
+  it('advanceQueueTail releases the queue at its ceiling and swallows a late settle', async () => {
+    vi.useFakeTimers()
+    try {
+      let released = false
+      void advanceQueueTail(new Promise(() => {}), 1_000).then(() => { released = true })
+      await vi.advanceTimersByTimeAsync(999)
+      expect(released).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(released).toBe(true)
+      // A rejection landing after the ceiling must not surface as an unhandled rejection.
+      let late!: (reason: unknown) => void
+      const lateWork = new Promise((_resolve, reject) => { late = reject })
+      let secondReleased = false
+      void advanceQueueTail(lateWork, 10).then(() => { secondReleased = true })
+      await vi.advanceTimersByTimeAsync(10)
+      expect(secondReleased).toBe(true)
+      late(new Error('too late'))
+      await vi.advanceTimersByTimeAsync(1)
     } finally {
       vi.useRealTimers()
     }

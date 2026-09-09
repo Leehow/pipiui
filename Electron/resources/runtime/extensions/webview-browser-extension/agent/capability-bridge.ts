@@ -69,12 +69,17 @@ type MintOutcome = { ok: true; token: string } | { ok: false; error: string; cod
  * comes back as `{ ok:false, error, code }` for the callers to pass through
  * fail-closed; a transport failure throws.
  */
-async function mintHostCapabilityToken(): Promise<MintOutcome> {
+async function mintHostCapabilityToken(signal?: AbortSignal): Promise<MintOutcome> {
   let res: Response;
   try {
     res = await fetch(`http://127.0.0.1:${currentPort()}/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      // The mint is a real hop to the host and can hang exactly like the action hop:
+      // a main process busy in a nested run loop (a native dialog, a long synchronous
+      // operation) answers neither. Unsignalled, it was the one await in this file that
+      // the caller's timeout and the user's Stop button could not reach.
+      ...(signal ? { signal } : {}),
       body: JSON.stringify({
         schemaVersion: 1,
         sessionCapability: currentCapability(),
@@ -107,11 +112,17 @@ async function mintHostCapabilityToken(): Promise<MintOutcome> {
 /** Best-effort token for the disconnect cancel: "" on any mint failure (the broker denies an empty token without a session touch). */
 async function cancelToken(): Promise<string> {
   if (override?.tokenProvider) return (await override.tokenProvider()) ?? "";
+  // The cancel path exists to unblock a caller that already timed out; its own mint must
+  // therefore be bounded too, or cancelling inherits the hang it was sent to clear.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CANCEL_TIMEOUT_MS);
   try {
-    const mint = await mintHostCapabilityToken();
+    const mint = await mintHostCapabilityToken(controller.signal);
     return mint.ok ? mint.token : "";
   } catch {
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -128,34 +139,37 @@ export async function capabilityCall(
   timeoutMs = 35_000,
 ): Promise<any> {
   const requestID = randomUUID();
-  // A params-level requestID (the disconnect cancel for another call) wins.
-  // Token: the injected provider (test seam) may hand back "" and let the
-  // broker deny `token_required`; the default path mints a fresh one-time
-  // token per call, passing a mint deny through fail-closed.
-  let token: string;
-  if (override?.tokenProvider) {
-    token = (await override.tokenProvider()) ?? "";
-  } else {
-    const mint = await mintHostCapabilityToken();
-    if (!mint.ok) return { ok: false, error: mint.error, code: mint.code ?? "token_required" };
-    token = mint.token;
-  }
-  const event = {
-    schemaVersion: 1,
-    extensionId: WEBVIEW_BROWSER_EXTENSION_ID,
-    hostApi: WEBVIEW_BROWSER_HOST_API,
-    permission: WEBVIEW_BROWSER_PERMISSION,
-    projectRoot: currentProjectRoot(),
-    token,
-    op,
-    params: { requestID, ...params },
-  };
+  // One budget and one signal for the whole call, armed BEFORE the mint. The mint is a
+  // host round trip of its own, so arming afterwards left it outside every deadline and
+  // outside the user's Stop: a call parked there could never be interrupted at all.
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const forwardAbort = () => controller.abort();
   if (externalSignal?.aborted) controller.abort();
   else externalSignal?.addEventListener("abort", forwardAbort, { once: true });
   try {
+    // A params-level requestID (the disconnect cancel for another call) wins.
+    // Token: the injected provider (test seam) may hand back "" and let the
+    // broker deny `token_required`; the default path mints a fresh one-time
+    // token per call, passing a mint deny through fail-closed.
+    let token: string;
+    if (override?.tokenProvider) {
+      token = (await override.tokenProvider()) ?? "";
+    } else {
+      const mint = await mintHostCapabilityToken(controller.signal);
+      if (!mint.ok) return { ok: false, error: mint.error, code: mint.code ?? "token_required" };
+      token = mint.token;
+    }
+    const event = {
+      schemaVersion: 1,
+      extensionId: WEBVIEW_BROWSER_EXTENSION_ID,
+      hostApi: WEBVIEW_BROWSER_HOST_API,
+      permission: WEBVIEW_BROWSER_PERMISSION,
+      projectRoot: currentProjectRoot(),
+      token,
+      op,
+      params: { requestID, ...params },
+    };
     const res = await fetch(`http://127.0.0.1:${currentPort()}/rpc`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -213,8 +227,9 @@ export async function cancelCapabilityRequest(requestID: string, timeoutMs = CAN
       }),
     });
   } catch {
-    // Disconnect cancellation is best-effort; the driver also drops the
-    // session queue on its own deadlines.
+    // Disconnect cancellation is best-effort. It is allowed to be: every host operation
+    // is bounded on its own, and the per-session action queue advances at its ceiling
+    // whether or not this cancel lands. (That was stated here before it was true.)
   } finally {
     clearTimeout(timer);
   }

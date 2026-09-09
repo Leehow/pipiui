@@ -6,6 +6,7 @@
  */
 import type { BrowserToolResult } from '@pipi/host-api'
 import { controllerPrelude } from './dom-bridge.js'
+import { awaitPageEvaluate } from './navigation-settle.js'
 import type { BrowserViewportKind, ViewPane } from './types.js'
 
 export function redactionClosed(kind: BrowserViewportKind): BrowserToolResult {
@@ -30,7 +31,9 @@ export async function sanitizeWithController(pane: ViewPane, kind: BrowserViewpo
   }
   const source = `${controllerPrelude()}globalThis.__pipiBrowserDOM.dispatch(${serialized})`
   try {
-    const sanitized = await execute.call(pane.view!.webContents, source)
+    // Bounded like every other page evaluate: this pass runs on the error path too, so an
+    // unbounded await here would re-hang on the very renderer that just failed to answer.
+    const sanitized = await awaitPageEvaluate(execute.call(pane.view!.webContents, source))
     if (!sanitized || typeof sanitized !== 'object') return redactionClosed(kind)
     const result = sanitized as BrowserToolResult
     return result.viewportTarget == null ? { ...result, viewportTarget: kind } : result
