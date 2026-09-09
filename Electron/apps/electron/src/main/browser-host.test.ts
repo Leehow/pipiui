@@ -769,6 +769,59 @@ describe('BrowserSessionHost', () => {
 
   // The agent sends browser_cancel on its own request timeout; answering `unknown_action`
   // turned every client timeout into a spurious error in the log.
+  // One unanswered evaluate can be a navigation commit that stop() clears. Two on the same
+  // surface means the renderer is not coming back — stop(), reload and navigate all have to
+  // reach the same wedged renderer — so the surface itself is replaced.
+  it('discards a twice-unresponsive page and serves the next action from a fresh one', async () => {
+    const { host, created, createView } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    const wedged = created[0]
+    const viewsBefore = createView.mock.calls.length
+    vi.useFakeTimers()
+    try {
+      // Strike one: stop() the pending load, keep the surface.
+      wedged.contents.executeJavaScript.mockImplementationOnce(() => new Promise(() => {}))
+      const first = host.toolAction('session-a', { action: 'content' })
+      await vi.advanceTimersByTimeAsync(BROWSER_PAGE_EVALUATE_TIMEOUT_MS)
+      const firstResult = await first
+      expect(firstResult.ok).toBe(false)
+      expect(String(firstResult.error)).toContain('did not answer')
+      expect(wedged.contents.stop).toHaveBeenCalled()
+      expect(createView.mock.calls.length).toBe(viewsBefore)
+      expect(wedged.contents.close).not.toHaveBeenCalled()
+
+      // Strike two on the same surface: retire it.
+      wedged.contents.executeJavaScript.mockImplementationOnce(() => new Promise(() => {}))
+      const second = host.toolAction('session-a', { action: 'content' })
+      await vi.advanceTimersByTimeAsync(BROWSER_PAGE_EVALUATE_TIMEOUT_MS)
+      const secondResult = await second
+      expect(secondResult.ok).toBe(false)
+      expect(String(secondResult.error)).toContain('discarded')
+      expect(wedged.contents.close).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+
+    // The next action builds a fresh surface through the ordinary ensurePane path.
+    const recovered = await host.toolAction('session-a', { action: 'content' })
+    expect(recovered.ok).toBe(true)
+    expect(createView.mock.calls.length).toBeGreaterThan(viewsBefore)
+    expect(created.length).toBeGreaterThan(1)
+  })
+
+  it('a page exception is not a strike: only silence retires a surface', async () => {
+    const { host, created, createView } = sessionsHarness()
+    await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })
+    const viewsBefore = createView.mock.calls.length
+    // Two page exceptions in a row prove the renderer is alive and must not retire it.
+    created[0].contents.executeJavaScript.mockImplementationOnce(async () => { throw new Error('boom') })
+    await host.toolAction('session-a', { action: 'eval', js: '1' })
+    created[0].contents.executeJavaScript.mockImplementationOnce(async () => { throw new Error('boom') })
+    await host.toolAction('session-a', { action: 'eval', js: '1' })
+    expect(createView.mock.calls.length).toBe(viewsBefore)
+    expect(created[0].contents.close).not.toHaveBeenCalled()
+  })
+
   it('answers browser_cancel as a known action', async () => {
     const { host } = sessionsHarness()
     await host.toolAction('session-a', { action: 'navigate', url: 'ok.example' })

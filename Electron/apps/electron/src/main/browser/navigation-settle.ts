@@ -49,6 +49,9 @@ export function awaitLoadURL(
  */
 export const BROWSER_PAGE_EVALUATE_TIMEOUT_MS = 15_000
 
+/** Unanswered evaluates on one surface before it is discarded rather than retried forever. */
+export const BROWSER_PAGE_EVALUATE_STRIKES = 2
+
 export class BrowserPageUnresponsiveError extends Error {
   readonly code = 'page_unresponsive'
   constructor(timeoutMs: number) {
@@ -56,6 +59,23 @@ export class BrowserPageUnresponsiveError extends Error {
       `browser page did not answer within ${timeoutMs}ms; the renderer is blocked (a dialog, a long synchronous script, or a torn-down target). Navigate or reload the page before retrying this action.`,
     )
     this.name = 'BrowserPageUnresponsiveError'
+  }
+}
+
+/**
+ * The second unanswered evaluate on the same surface. One can be a navigation commit that
+ * `stop()` clears; two means the renderer is not coming back — an in-page infinite loop
+ * cannot be reached by `stop()`, by a reload, or by anything else short of replacing the
+ * surface. The page is discarded here so the next action starts on a live one instead of
+ * inheriting a wedge that would fail every call from now on.
+ */
+export class BrowserPageDiscardedError extends Error {
+  readonly code = 'page_discarded'
+  constructor(timeoutMs: number) {
+    super(
+      `browser page did not answer within ${timeoutMs}ms twice in a row, so the wedged page was discarded. Its tab and URL are kept: the next browser action loads a fresh page. Any unsaved page state is gone.`,
+    )
+    this.name = 'BrowserPageDiscardedError'
   }
 }
 

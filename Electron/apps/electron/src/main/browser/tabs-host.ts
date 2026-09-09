@@ -35,7 +35,7 @@ import type { WatchWaitCheckRequest } from '../watcher-registry.js'
 import { createConsoleEntryListener, installJsDialogReporter, newDialogNonce } from './console-pipeline.js'
 import { controllerPrelude, observePayload, requestElementToken, requestTarget, hasStructuredLocator, tagObservation, untaggedRequest } from './dom-bridge.js'
 import { buildBrowserDebugEnvelope } from './debug-envelope.js'
-import { awaitLoadURL, awaitPageEvaluate, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_PAGE_EVALUATE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, BrowserPageUnresponsiveError, NavigationSettle } from './navigation-settle.js'
+import { awaitLoadURL, awaitPageEvaluate, BROWSER_NAVIGATION_SETTLE_TIMEOUT_MS, BROWSER_PAGE_EVALUATE_STRIKES, BROWSER_PAGE_EVALUATE_TIMEOUT_MS, BROWSER_RELOAD_SETTLE_TIMEOUT_MS, BrowserPageDiscardedError, BrowserPageUnresponsiveError, NavigationSettle } from './navigation-settle.js'
 import { nativeViewUsable, traceBrowserAction, traceBrowserNative } from './native-view.js'
 import { sanitizeWithController } from './redaction.js'
 import type {
@@ -94,6 +94,12 @@ export class BrowserTabsHost {
   private readonly revealWaiters = new Set<() => void>()
   private readonly failedLoadViews = new WeakSet<BrowserViewLike>()
   private readonly retiredViews = new WeakSet<BrowserViewLike>()
+  /**
+   * Consecutive unanswered page evaluates per live surface. Any settle — a value or a page
+   * exception, both of which prove the renderer is alive — clears it; the entry is dropped
+   * with the view itself, so a replacement always starts at zero. See `evaluatePage`.
+   */
+  private readonly evaluateTimeouts = new WeakMap<BrowserViewLike, number>()
   private readonly panes: Record<BrowserViewportKind, ViewPane> = {
     desktop: { kind: 'desktop' },
     mobile: { kind: 'mobile' }
@@ -552,7 +558,8 @@ export class BrowserTabsHost {
       const result = await this.evaluatePage(pane, request.js)
       return sanitizeWithController(pane, kind, { ok: true, result, viewportTarget: kind })
     } catch (error) {
-      return sanitizeWithController(pane, kind, { ok: false, error: error instanceof Error ? error.message : String(error), viewportTarget: kind })
+      return this.pageBridgeFailure(error, kind)
+        ?? sanitizeWithController(pane, kind, { ok: false, error: error instanceof Error ? error.message : String(error), viewportTarget: kind })
     }
   }
 
@@ -878,7 +885,7 @@ export class BrowserTabsHost {
       }
       return sanitized
     } catch (error) {
-      return sanitizeWithController(pane, kind, {
+      return this.pageBridgeFailure(error, kind) ?? sanitizeWithController(pane, kind, {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
         viewportTarget: kind,
@@ -892,25 +899,59 @@ export class BrowserTabsHost {
   }
 
   /**
-   * The one place a page evaluate is awaited. Bounded, because an unbounded one pins the
-   * per-session action queue and every later browser action with it. On expiry the pending
-   * load is stopped best-effort — that clears the commonest blocked-renderer case — and a
-   * typed error is thrown for the surrounding action to render as a structured failure.
+   * The one place a page evaluate is awaited, and the escalation that follows an expiry.
+   *
+   * Unbounded, it pins the per-session action queue and every later browser action with it.
+   * Bounded but never escalating, a renderer wedged by an in-page loop answers nothing ever
+   * again and every action just fails slowly instead of hanging — better, still useless. So:
+   * the first expiry stops the pending load, which is what a navigation-commit block needs;
+   * a second expiry on the same surface retires it, and the next action builds a fresh one
+   * from the tab's URL through the ordinary `ensurePane` path.
    */
+  /**
+   * The bridge's own failures carry no page-derived content, so they skip the redaction pass.
+   * They have to: redaction is itself a page evaluate, so routing them through it means asking
+   * the surface that just failed to answer — and after a retirement there is no surface at all,
+   * which replaced the real reason with "redaction closed" and told the caller something false.
+   */
+  private pageBridgeFailure(error: unknown, kind: BrowserViewportKind): BrowserToolResult | undefined {
+    if (error instanceof BrowserPageDiscardedError || error instanceof BrowserPageUnresponsiveError) {
+      return { ok: false, code: error.code, error: error.message, viewportTarget: kind }
+    }
+    return undefined
+  }
+
   private evaluatePage<T = unknown>(pane: ViewPane, source: string, timeoutMs = BROWSER_PAGE_EVALUATE_TIMEOUT_MS): Promise<T> {
-    const contents = pane.view?.webContents
+    const view = pane.view
+    const contents = view?.webContents
     const execute = contents?.executeJavaScript
-    if (!contents || !execute) return Promise.reject(new Error('browser page is unavailable'))
-    return awaitPageEvaluate(execute.call(contents, source) as Promise<T>, timeoutMs).catch((error: unknown) => {
-      if (error instanceof BrowserPageUnresponsiveError) {
-        try {
-          contents.stop?.()
-        } catch {
-          // Best effort: a renderer that ignores stop() still returns this error to the caller.
+    if (!view || !contents || !execute) return Promise.reject(new Error('browser page is unavailable'))
+    return awaitPageEvaluate(execute.call(contents, source) as Promise<T>, timeoutMs).then(
+      value => {
+        this.evaluateTimeouts.delete(view)
+        return value
+      },
+      (error: unknown) => {
+        if (!(error instanceof BrowserPageUnresponsiveError)) {
+          // The page threw, which proves the renderer is alive; it owes no strike.
+          this.evaluateTimeouts.delete(view)
+          throw error
         }
-      }
-      throw error
-    })
+        const strikes = (this.evaluateTimeouts.get(view) ?? 0) + 1
+        this.evaluateTimeouts.set(view, strikes)
+        if (strikes < BROWSER_PAGE_EVALUATE_STRIKES) {
+          try {
+            contents.stop?.()
+          } catch {
+            // Best effort: a renderer that ignores stop() gets replaced on the next strike.
+          }
+          throw error
+        }
+        // The WeakMap entry goes with the retired view, so a replacement starts at zero.
+        if (pane.view === view) this.retireView(pane, view)
+        throw new BrowserPageDiscardedError(timeoutMs)
+      },
+    )
   }
 
   private async domActionOnPane(request: Record<string, unknown>, kind: BrowserViewportKind, pane: ViewPane): Promise<BrowserToolResult> {
@@ -962,7 +1003,7 @@ export class BrowserTabsHost {
       const observed = await this.domActionOnPane({ action: 'observe', scope: request.scope ?? 'viewport' }, kind, pane)
       return sanitizeWithController(pane, kind, observed)
     } catch (error) {
-      return sanitizeWithController(pane, kind, {
+      return this.pageBridgeFailure(error, kind) ?? sanitizeWithController(pane, kind, {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
         viewportTarget: kind,

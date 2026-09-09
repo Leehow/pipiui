@@ -35,20 +35,32 @@
 
 **H4**：`browser_cancel` 成为已知动作，返回 `{ ok: true, cancelled: false }` 并说明原因。它确实取消不了什么（宿主没有 per-request handle），但客户端每次超时都产生一条 `unknown_action` 错误是纯噪音。
 
-## 5. 没做的
+## 5. 卡死的 pane 会被销毁重建
 
-- **不自动销毁卡住的 pane。** `beginViewRetirement` 存在，理论上能让下一次动作拿到全新 view，从而从页内死循环里恢复。但在动作中途销毁一个正显示在 UI 里的 pane 风险不小。当前每次调用会在 15 秒后返回结构化错误，模型可以据此 navigate 或 reload——这已经满足「起得来」。真正的渲染进程回收留作后续。
+只加界还不够：被页内死循环卡住的渲染进程从此什么都不回，`stop()`、reload、navigate 全都要经过同一个卡住的渲染进程。那样每次调用只是「慢慢失败」而不是「挂住」——好一点，但仍然没用。
+
+所以按同一个 view 的连续无应答次数分级（`BROWSER_PAGE_EVALUATE_STRIKES = 2`）：
+
+- **第一次**：`stop()` 掉在飞的加载（这正是「卡在导航提交」那一类需要的），保留 surface，抛 `page_unresponsive`。
+- **同一 surface 第二次**：调既有的 `retireView()` 退休它，抛 `page_discarded`。下一次动作走平常的 `ensurePane` 路径新建 view 并按 tab 的 URL 重新加载，恢复是自动的。
+
+计数放在以 view 为键的 `WeakMap` 里：任何一次 settle（返回值**或**页面抛异常，两者都证明渲染进程活着）都清零，条目随 view 一起消失，所以替换出来的 surface 永远从零开始。页面自己抛异常不算一次 strike。
+
+连带修掉一个真问题：这两类桥接错误现在**跳过净化步骤**。净化本身是一次页面求值，把它们送进去等于再问一次刚刚没回应的那个 surface；而退休之后根本没有 surface，结果真实原因被替换成「redaction capacity exceeded」，等于对模型说了假话。这两类错误的文本是我们自己生成的、不含任何页面内容，跳过是安全且正确的。
+
+## 6. 没做的
+
 - **不给主会话工具调用加通用超时。** pi 的 `tool.execute` 没有 per-call deadline，turn watchdog 也刻意豁免在飞的工具（两条测试钉住），因为一次 8 分钟的 build 不该被杀。正确的边界在工具自己身上，本次就是这么做的。
 
-## 6. 验证
+## 7. 验证
 
 | 套件 | 结果 |
 |---|---|
-| `browser-host.test.ts`（含新增 4 例） | 150 全过 |
-| browser-tool-extension / watch-e2e / mobile-window | 186 全过 |
-| `webview-browser-extension.test.ts`（含新增 mint 边界例） | 67 全过 |
-| `cua-extension.test.ts` | 与上合计 85 全过 |
+| `browser-host.test.ts`（含新增 6 例） | 152 全过 |
+| 其余浏览器相关七个套件合计 | 136 全过 |
 
-新增用例：hung page evaluate 在上界返回结构化错误并调用 `stop()`；hung evaluate 不再钉住会话队列；`browser_cancel` 不再是 `unknown_action`；`advanceQueueTail` 在上限释放且吞掉迟到 rejection；token mint 面对「接受连接但永不回应」的宿主时按预算返回而不是挂死（无此修复时该用例会在 vitest 超时里失败）。
+新增用例：hung page evaluate 在上界返回结构化错误并调用 `stop()`；hung evaluate 不再钉住会话队列；同一 surface 第二次无应答被销毁、下一次动作从新建的 surface 上成功返回；页面抛异常不算 strike、不会销毁 surface；`browser_cancel` 不再是 `unknown_action`；`advanceQueueTail` 在上限释放且吞掉迟到 rejection；token mint 面对「接受连接但永不回应」的宿主时按预算返回而不是挂死（无此修复时该用例会在 vitest 超时里失败）。
+
+销毁重建那条用例同时钉住了净化旁路：没有它，第二次超时返回的是误导性的「redaction capacity exceeded」而不是真实原因。
 
 全量 vitest 的其余失败与本次无关：`ui-registries` 在干净 HEAD 快照上同样失败，`extension-invoke` / `App.test.tsx` 属于树上其他写者正在改的文件，`turn-watchdog` 单独跑通过（并行满载时的时序 flake）。
