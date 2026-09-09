@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
 	BLOCK_ALL,
 	DEFAULT_TOOL_BUDGET_BLOCK,
+	USAGE_BUDGET_SAFE_POINT_GRACE_MS,
 	createToolBudgetTracker,
 	decodeToolBudgetEnv,
 	encodeToolBudgetEnv,
@@ -106,12 +108,32 @@ test("evaluateUsageBudget: reported usage only; hard on either metric exhausts, 
 	assert.equal(hardCost.exhausted, true);
 	assert.equal(hardCost.reason, "costUsd");
 	const line = formatUsageBudgetLine(hardCost);
-	assert.equal(line, "Usage budget: tokens 200 of 1.0k/2.0k (within-budget); cost $0.50 of $0.10/$0.50 (hard-exceeded) → aborted on costUsd");
-	assert.match(formatUsageBudgetAbortReason(hardCost), /^usage_budget: reported costUsd \$0\.50 reached hard limit \$0\.50/);
+	// Exhausted but the abort has not fired (or the worker finished first): say so, never claim an abort.
+	assert.equal(line, "Usage budget: tokens 200 of 1.0k/2.0k (within-budget); cost $0.50 of $0.10/$0.50 (hard-exceeded) → hard limit on costUsd reached; the worker finished before the abort landed");
+	assert.equal(
+		formatUsageBudgetLine({ ...hardCost, aborted: true }),
+		"Usage budget: tokens 200 of 1.0k/2.0k (within-budget); cost $0.50 of $0.10/$0.50 (hard-exceeded) → aborted on costUsd at the next safe point",
+	);
+	assert.match(formatUsageBudgetAbortReason(hardCost), /^usage_budget: reported costUsd \$0\.50 reached hard limit \$0\.50; the worker was aborted at the next safe point/);
 	const notice = formatUsageBudgetSoftNotice("w", "r", soft);
 	assert.ok(notice.startsWith("[subagent-budget] agentId=w runId=r\n"));
 	assert.ok(notice.includes("advisory"));
 	const tokensOnly = evaluateUsageBudget({ tokens: { hard: 100 } }, { input: 60, output: 50, cost: 0 });
 	assert.equal(tokensOnly.reason, "tokens");
-	assert.equal(formatUsageBudgetLine(tokensOnly), "Usage budget: tokens 110 of 100 (hard-exceeded) → aborted on tokens");
+	assert.equal(formatUsageBudgetLine({ ...tokensOnly, aborted: true }), "Usage budget: tokens 110 of 100 (hard-exceeded) → aborted on tokens at the next safe point");
+});
+
+test("runtime wiring: a hard usage cap aborts at the next safe point, never mid-tool, bounded by a grace", () => {
+	const src = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+	// The abort waits for the in-flight tool (ask_boss excepted) and fires from the tool-end seam.
+	assert.match(src, /const mutationCapableToolInFlight = \(\) => pipiuiActiveTools\.some\(\(tool\) => tool\.name !== ASK_BOSS_TOOL_NAME\);/);
+	const finish = src.slice(src.indexOf("const finishActiveTool = "), src.indexOf("const clearActiveTools = "));
+	assert.match(finish, /if \(usageBudgetAbortPending && !usageBudgetAborted && !mutationCapableToolInFlight\(\)\) abortForUsageBudget\(\);/);
+	// Exhaustion mid-tool arms the grace timer instead of aborting; the grace uses the shared constant.
+	const note = src.slice(src.indexOf("const noteUsageBudget = "), src.indexOf("const usageEmitter = createUsageEmitter("));
+	assert.match(note, /if \(!mutationCapableToolInFlight\(\)\) \{\s*abortForUsageBudget\(\);\s*return;/);
+	assert.match(note, /setTimeout\(abortForUsageBudget, USAGE_BUDGET_SAFE_POINT_GRACE_MS\)/);
+	assert.equal(USAGE_BUDGET_SAFE_POINT_GRACE_MS, 120_000);
+	// The abort marks the state so the done line can tell "aborted" from "finished first".
+	assert.match(src, /usageBudgetAborted = true;\s*usageBudgetState\.aborted = true;\s*currentResult\.stopReason = "usage_budget";/);
 });

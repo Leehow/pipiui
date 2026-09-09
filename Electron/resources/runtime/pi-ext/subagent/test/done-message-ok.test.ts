@@ -76,6 +76,24 @@ test("failed result prefers assistant text over session-start stderr", () => {
 	assert.equal(getResultOutput(result), "I edited the asset card renderer");
 });
 
+test("runtime-measured extras: budgets, fork sanitizing, and ask_boss tally appear only when set", () => {
+	const plain = formatSubagentDoneMessage(minimalResult(), { runId: "run-x" });
+	assert.doesNotMatch(plain, /Tool budget:|Usage budget:|^Fork:|Questions to you:/m);
+	const full = formatSubagentDoneMessage(
+		minimalResult({
+			toolBudget: { count: 4, soft: 2, hard: 3, block: ["read"], outcome: "hard-reached", blockedCalls: 1 },
+			usageBudget: { tokens: { used: 110, hard: 100, outcome: "hard-exceeded" }, exhausted: true, reason: "tokens", softExceeded: true, aborted: true },
+			forkSanitized: { removedBlocks: 1, touchedMessages: 1, thinkingOff: false },
+			bossQuestions: { asked: 2, answered: 1, unanswered: 1 },
+		}),
+		{ runId: "run-x" },
+	);
+	assert.match(full, /^Tool budget: 4 call\(s\) \(soft 2, hard 3\) → hard-reached, 1 refused$/m);
+	assert.match(full, /^Usage budget: tokens 110 of 100 \(hard-exceeded\) → aborted on tokens at the next safe point$/m);
+	assert.match(full, /^Fork: 1 signed Anthropic thinking block\(s\) stripped from 1 message\(s\) before copying$/m);
+	assert.match(full, /^Questions to you: asked 2, answered 1 — 1 went unanswered/m);
+});
+
 test("scope-drift attestation: none / listed / omitted when unmeasured", () => {
 	const omitted = formatSubagentDoneMessage(minimalResult(), { runId: "run-sd" });
 	assert.doesNotMatch(omitted, /Scope-drift:/);

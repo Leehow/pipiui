@@ -367,9 +367,12 @@ import {
 	registerSubagentReplyTool,
 	removeQuestionRun,
 	resolveAskBossTimeoutMs,
+	summarizeQuestionRun,
+	type QuestionRunSummary,
 } from "./boss-question.ts";
 import {
 	TOOL_BUDGET_ENV,
+	USAGE_BUDGET_SAFE_POINT_GRACE_MS,
 	createToolBudgetTracker,
 	decodeToolBudgetEnv,
 	encodeToolBudgetEnv,
@@ -1425,6 +1428,8 @@ interface SingleResult {
 	usageBudget?: UsageBudgetState;
 	/** The fork source needed signed Anthropic thinking stripped; absent for cold or clean forks. */
 	forkSanitized?: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean };
+	/** ask_boss tally for the run; absent when the worker never asked. */
+	bossQuestions?: QuestionRunSummary;
 	/** Delivery state is orthogonal to the worker process outcome. */
 	integrationState?: SubagentIntegrationState;
 	worktreePath?: string;
@@ -4257,18 +4262,31 @@ function inFlightWorkerTitle(handle: RunningAgentHandle): string {
 function inFlightWorkerKind(handle: RunningAgentHandle, now: number): InFlightWorkerView["kind"] {
 	if (handle.finalizing) return "finalizing";
 	if (isHandleVanished(handle, now)) return "vanished";
+	// Blocked on the Boss's answer: silence that is ours, and the one state the Boss must act on.
+	if (workerWaitingOnBoss(handle)) return "waiting";
 	if (progressIdleMs(now, handle) >= STALL_THRESHOLD_MS) return "stalled";
 	return "running";
+}
+
+/** The oldest pending question, quantized for the prompt tail: id and bounded text, no clocks. */
+function inFlightWorkerQuestion(agentId: string, handle: RunningAgentHandle): InFlightWorkerView["question"] {
+	const dir = questionDirFor(agentId, handle.runId);
+	const pending = dir ? pendingQuestions(dir) : [];
+	const first = pending[0];
+	return first ? { id: first.id, runId: handle.runId, text: first.question.replace(/\s+/g, " ").slice(0, 160) } : undefined;
 }
 
 /** Quantized live snapshot for a tail custom message. Null when nothing is in flight. */
 function currentInFlightWorkersSnapshot(now: number): string | null {
 	const workers: InFlightWorkerView[] = [];
 	for (const [agentId, handle] of runningAgents) {
+		const kind = inFlightWorkerKind(handle, now);
+		const question = kind === "waiting" ? inFlightWorkerQuestion(agentId, handle) : undefined;
 		workers.push({
 			agentId,
 			title: inFlightWorkerTitle(handle),
-			kind: inFlightWorkerKind(handle, now),
+			kind,
+			...(question ? { question } : {}),
 		});
 	}
 	return formatInFlightWorkersBlock(workers, dispatchQueue.snapshot());
@@ -7148,6 +7166,9 @@ async function runSingleAgent(
 	let usageBudgetNoticeSent = false;
 	let usageBudgetAborted = false;
 	let forkSanitizedSummary: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean } | undefined;
+	// A hard usage cap waits for the in-flight tool call to return (mutation-safe cut), bounded by a grace.
+	let usageBudgetAbortPending = false;
+	let usageBudgetGraceTimer: ReturnType<typeof setTimeout> | undefined;
 	const identityProblem = agentResumeIdentityProblem({
 		agentId: pipiuiAgentId,
 		requestedName: agentName,
@@ -7683,9 +7704,28 @@ async function runSingleAgent(
 		pipiuiActiveTools = upsertActiveTool(pipiuiActiveTools, tool);
 		projectActiveTool(emit);
 	};
+	/** The usage-budget abort itself; callers decide when it is safe (see noteUsageBudget). */
+	const abortForUsageBudget = () => {
+		if (usageBudgetAborted || !usageBudgetState) return;
+		if (usageBudgetGraceTimer) {
+			clearTimeout(usageBudgetGraceTimer);
+			usageBudgetGraceTimer = undefined;
+		}
+		usageBudgetAborted = true;
+		usageBudgetState.aborted = true;
+		currentResult.stopReason = "usage_budget";
+		currentResult.errorMessage = formatUsageBudgetAbortReason(usageBudgetState);
+		pipiuiActivity = currentResult.errorMessage;
+		pipiuiUpdate(true);
+		handleForRun(pipiuiAgentId, runId)?.controller.abort();
+	};
+	/** True while a tool other than ask_boss is in flight: not a safe point to cut. */
+	const mutationCapableToolInFlight = () => pipiuiActiveTools.some((tool) => tool.name !== ASK_BOSS_TOOL_NAME);
 	const finishActiveTool = (ref: { toolCallId?: string; name?: string }) => {
 		pipiuiActiveTools = removeActiveTool(pipiuiActiveTools, ref);
 		projectActiveTool(true);
+		// The safe point a pending usage-budget abort was waiting for.
+		if (usageBudgetAbortPending && !usageBudgetAborted && !mutationCapableToolInFlight()) abortForUsageBudget();
 	};
 	const clearActiveTools = () => {
 		pipiuiActiveTools = [];
@@ -8211,13 +8251,19 @@ async function runSingleAgent(
 						usageBudgetNoticeSent = true;
 						if (bossPi) void sendUserMessageAfterCutIn(bossPi, formatUsageBudgetSoftNotice(pipiuiAgentId, runId, usageBudgetState));
 					}
-					if (usageBudgetState.exhausted) {
-						usageBudgetAborted = true;
-						currentResult.stopReason = "usage_budget";
-						currentResult.errorMessage = formatUsageBudgetAbortReason(usageBudgetState);
-						pipiuiActivity = currentResult.errorMessage;
+					if (usageBudgetState.exhausted && !usageBudgetAbortPending) {
+						usageBudgetAbortPending = true;
+						if (!mutationCapableToolInFlight()) {
+							abortForUsageBudget();
+							return;
+						}
+						// Mid-tool: cut after it returns. A tool that never returns is not a safe
+						// point that is coming, so the grace timer aborts anyway.
+						const inFlight = currentActiveTool()?.name ?? "tool";
+						pipiuiActivity = `usage_budget: hard limit reached; aborting after the current ${inFlight} call returns`;
 						pipiuiUpdate(true);
-						handleForRun(pipiuiAgentId, runId)?.controller.abort();
+						usageBudgetGraceTimer = setTimeout(abortForUsageBudget, USAGE_BUDGET_SAFE_POINT_GRACE_MS);
+						usageBudgetGraceTimer.unref?.();
 					}
 				};
 				const usageEmitter = createUsageEmitter({
@@ -9032,6 +9078,13 @@ async function runSingleAgent(
 		if (toolBudget) currentResult.toolBudget = summarizeToolBudget(toolBudget, parentToolCalls);
 		if (usageBudgetState) currentResult.usageBudget = usageBudgetState;
 		if (forkSanitizedSummary) currentResult.forkSanitized = forkSanitizedSummary;
+		// Tally before the terminal cleanup removes the run's question directory.
+		const bossQuestions = questionDir ? summarizeQuestionRun(questionDir) : undefined;
+		if (bossQuestions) currentResult.bossQuestions = bossQuestions;
+		if (usageBudgetGraceTimer) {
+			clearTimeout(usageBudgetGraceTimer);
+			usageBudgetGraceTimer = undefined;
+		}
 		// Failure classification + optional evidence-derived checkpoint (fresh-episode routing).
 		let recoveryClassification: RecoveryDecision | undefined;
 		let recoveryCheckpointFile: string | undefined;

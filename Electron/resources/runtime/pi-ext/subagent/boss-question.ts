@@ -148,6 +148,28 @@ export function pendingQuestions(dir: string): WorkerQuestion[] {
 	return questionStatuses(dir).filter((entry) => entry.state === "pending").map((entry) => entry.question);
 }
 
+export interface QuestionRunSummary {
+	asked: number;
+	answered: number;
+	/** Timed out, or still pending when the run ended: the worker went on without an answer. */
+	unanswered: number;
+}
+
+/** Terminal tally for [subagent-done]; undefined when the worker never asked. */
+export function summarizeQuestionRun(dir: string): QuestionRunSummary | undefined {
+	const statuses = questionStatuses(dir);
+	if (statuses.length === 0) return undefined;
+	const answered = statuses.filter((entry) => entry.state === "answered").length;
+	return { asked: statuses.length, answered, unanswered: statuses.length - answered };
+}
+
+export function formatBossQuestionsLine(summary: QuestionRunSummary): string {
+	const tail = summary.unanswered > 0
+		? ` — ${summary.unanswered} went unanswered, so the worker proceeded on its own assumption there; check its report for the assumption it states`
+		: "";
+	return `Questions to you: asked ${summary.asked}, answered ${summary.answered}${tail}`;
+}
+
 export interface AskInput {
 	agentId: string;
 	runId: string;

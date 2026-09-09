@@ -60,6 +60,37 @@ test("stall and vanish are state changes without idle-second noise", () => {
 	);
 });
 
+test("a worker blocked on ask_boss reads as waiting with its question, and the next action is a reply", () => {
+	const block = formatInFlightWorkersBlock(
+		[
+			{ ...running, kind: "waiting", question: { id: 2, runId: "run-exp-1", text: "Keep the legacy endpoint?" } },
+			{ agentId: "gp-2", title: "wire the flag", kind: "running" },
+		],
+		[],
+	);
+	assert.equal(
+		block,
+		[
+			"## Background workers in flight (live this turn)",
+			"- `exp-1` (查 drop 样式) — WAITING FOR YOUR ANSWER: qid=2 runId=run-exp-1 \"Keep the legacy endpoint?\"",
+			"- `gp-2` (wire the flag) — running",
+			"A worker waiting on you is blocked, not working, and gives up after its timeout. Answer it with `subagent_reply({ agentId, runId, answer })` before anything else; if the decision is the user's, ask them now and relay it.",
+		].join("\n"),
+	);
+	// Waiting is not a stall, and the generic "all still running" hint yields to the reply hint.
+	assert.doesNotMatch(block ?? "", /STALLED|All still running/);
+	// No clocks: the same question a minute later is byte-identical.
+	assert.equal(
+		formatInFlightWorkersBlock([{ ...running, kind: "waiting", question: { id: 2, runId: "run-exp-1", text: "Keep the legacy endpoint?" } }], []),
+		formatInFlightWorkersBlock([{ ...running, kind: "waiting", question: { id: 2, runId: "run-exp-1", text: "Keep the legacy endpoint?" } }], []),
+	);
+	// A stalled sibling still triggers the stall warning alongside the reply hint.
+	assert.match(
+		formatInFlightWorkersBlock([{ ...running, kind: "waiting" }, { agentId: "gp-3", title: "t", kind: "stalled" }], []) ?? "",
+		/WAITING FOR YOUR ANSWER[\s\S]*A stalled or vanished worker is NOT fine/,
+	);
+});
+
 test("queued-only work still appears, because handed-over tasks are in flight to the boss", () => {
 	const text = formatInFlightWorkersBlock([], [
 		queued({ agentId: "held-1", title: "fix after review", heldReason: "reviewer failed" }),

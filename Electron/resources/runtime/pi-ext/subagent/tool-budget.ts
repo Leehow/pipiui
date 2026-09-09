@@ -190,7 +190,16 @@ export interface UsageBudgetState {
 	exhausted: boolean;
 	reason?: "tokens" | "costUsd";
 	softExceeded: boolean;
+	/** Set by the runtime once the abort actually fired; an exhausted run that finished first keeps this unset. */
+	aborted?: boolean;
 }
+
+/**
+ * A hard usage cap is enforced at the next safe point: after any in-flight tool
+ * call returns, so an edit or a test run is never cut in half. A tool that does
+ * not return within this grace is not a safe point that is coming; abort anyway.
+ */
+export const USAGE_BUDGET_SAFE_POINT_GRACE_MS = 120_000;
 
 function positiveNumber(value: unknown, label: string): ParseResult<number> {
 	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return { ok: false, problem: `${label} must be a positive number.` };
@@ -270,7 +279,12 @@ export function formatUsageBudgetLine(state: UsageBudgetState): string {
 	const parts: string[] = [];
 	if (state.tokens) parts.push(formatMetric("tokens", state.tokens, false));
 	if (state.costUsd) parts.push(formatMetric("cost", state.costUsd, true));
-	return `Usage budget: ${parts.join("; ")}${state.exhausted ? ` → aborted on ${state.reason}` : ""}`;
+	const tail = state.exhausted
+		? state.aborted
+			? ` → aborted on ${state.reason} at the next safe point`
+			: ` → hard limit on ${state.reason} reached; the worker finished before the abort landed`
+		: "";
+	return `Usage budget: ${parts.join("; ")}${tail}`;
 }
 
 /** Boss-facing soft notice; sent once per run. */
@@ -282,5 +296,5 @@ export function formatUsageBudgetAbortReason(state: UsageBudgetState): string {
 	const metric = state.reason === "costUsd" ? state.costUsd : state.tokens;
 	const used = state.reason === "costUsd" ? `$${(metric?.used ?? 0).toFixed(2)}` : formatTokens(metric?.used ?? 0);
 	const hard = state.reason === "costUsd" ? `$${(metric?.hard ?? 0).toFixed(2)}` : formatTokens(metric?.hard ?? 0);
-	return `usage_budget: reported ${state.reason} ${used} reached hard limit ${hard}; the worker was aborted at the next event. Resume the same agentId with a narrower brief, or raise the budget deliberately.`;
+	return `usage_budget: reported ${state.reason} ${used} reached hard limit ${hard}; the worker was aborted at the next safe point (after any in-flight tool call). Resume the same agentId with a narrower brief, or raise the budget deliberately.`;
 }

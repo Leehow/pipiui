@@ -15,13 +15,25 @@ import {
 	type QueuedDispatchV1,
 } from "./dispatch-queue.ts";
 
-export type InFlightWorkerKind = "running" | "finalizing" | "stalled" | "vanished";
+export type InFlightWorkerKind = "running" | "finalizing" | "stalled" | "vanished" | "waiting";
+
+/** A pending ask_boss question, quantized: id and bounded text only, no clocks. */
+export type InFlightWorkerQuestion = {
+	id: number;
+	runId: string;
+	text: string;
+};
 
 export type InFlightWorkerView = {
 	agentId: string;
 	title: string;
 	kind: InFlightWorkerKind;
+	/** Present while the worker is blocked on the Boss; `kind` is then `waiting`. */
+	question?: InFlightWorkerQuestion;
 };
+
+const WAITING_HINT =
+	"A worker waiting on you is blocked, not working, and gives up after its timeout. Answer it with `subagent_reply({ agentId, runId, answer })` before anything else; if the decision is the user's, ask them now and relay it.";
 
 export const IN_FLIGHT_HEADING = "## Background workers in flight (live this turn)";
 
@@ -41,9 +53,16 @@ function stateLabel(kind: InFlightWorkerKind): string {
 			return "VANISHED — process gone with no report";
 		case "stalled":
 			return "STALLED";
+		case "waiting":
+			return "WAITING FOR YOUR ANSWER";
 		default:
 			return "running";
 	}
+}
+
+function questionSuffix(question: InFlightWorkerQuestion | undefined): string {
+	if (!question) return "";
+	return `: qid=${question.id} runId=${question.runId} "${question.text}"`;
 }
 
 /** Compact live snapshot. Null when nothing is running or queued. */
@@ -54,13 +73,17 @@ export function formatInFlightWorkersBlock(
 	if (workers.length === 0 && queued.length === 0) return null;
 	const lines: string[] = [IN_FLIGHT_HEADING];
 	let anyStalledOrVanished = false;
+	let anyWaiting = false;
 	for (const worker of workers) {
 		if (worker.kind === "stalled" || worker.kind === "vanished") anyStalledOrVanished = true;
-		lines.push(`- \`${worker.agentId}\` (${worker.title}) — ${stateLabel(worker.kind)}`);
+		if (worker.kind === "waiting") anyWaiting = true;
+		lines.push(`- \`${worker.agentId}\` (${worker.title}) — ${stateLabel(worker.kind)}${questionSuffix(worker.question)}`);
 	}
+	// Waiting outranks the running hint: the next action is a reply, not a status call.
+	if (anyWaiting) lines.push(WAITING_HINT);
 	if (anyStalledOrVanished) {
 		lines.push(STALL_VANISH_WARNING);
-	} else if (workers.length > 0) {
+	} else if (workers.length > 0 && !anyWaiting) {
 		lines.push(RUNNING_HINT);
 	}
 	lines.push(...formatQueuedPromptSections(queued));

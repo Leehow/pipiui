@@ -11,6 +11,7 @@ import {
 	MIN_ASK_BOSS_TIMEOUT_MS,
 	QUESTION_MESSAGE_PREFIX,
 	SUBAGENT_REPLY_TOOL_NAME,
+	formatBossQuestionsLine,
 	formatQuestionForBoss,
 	listQuestions,
 	markQuestionTimedOut,
@@ -23,6 +24,7 @@ import {
 	removeQuestionRun,
 	replyToWorkerQuestion,
 	resolveAskBossTimeoutMs,
+	summarizeQuestionRun,
 	writeAnswer,
 	writeQuestion,
 } from "../boss-question.ts";
@@ -73,6 +75,24 @@ test("file contract: ids are monotonic, pending excludes answered and timed-out"
 	assert.equal(readdirSync(dir).some((entry) => entry.endsWith(".tmp")), false);
 	removeQuestionRun(dir);
 	assert.equal(existsSync(dir), false);
+});
+
+test("terminal tally: answered vs unanswered (timed out or still pending), absent when never asked", () => {
+	const dir = questionRunDir(tempRoot(), "w", "run-t");
+	assert.equal(summarizeQuestionRun(dir), undefined);
+	writeQuestion(dir, { agentId: "w", runId: "run-t", question: "one" });
+	writeQuestion(dir, { agentId: "w", runId: "run-t", question: "two" });
+	writeQuestion(dir, { agentId: "w", runId: "run-t", question: "three" });
+	writeAnswer(dir, 1, "yes");
+	markQuestionTimedOut(dir, 2);
+	// qid 3 is still pending at the run's end: the worker was cut off waiting, so it counts as unanswered.
+	const summary = summarizeQuestionRun(dir);
+	assert.deepEqual(summary, { asked: 3, answered: 1, unanswered: 2 });
+	assert.equal(
+		formatBossQuestionsLine(summary!),
+		"Questions to you: asked 3, answered 1 — 2 went unanswered, so the worker proceeded on its own assumption there; check its report for the assumption it states",
+	);
+	assert.equal(formatBossQuestionsLine({ asked: 1, answered: 1, unanswered: 0 }), "Questions to you: asked 1, answered 1");
 });
 
 test("question sizes are clamped and the Boss message carries the machine-readable line first", () => {

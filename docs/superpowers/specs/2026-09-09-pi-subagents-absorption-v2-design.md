@@ -89,4 +89,8 @@ B（agent 定义导入）：PipiUI 没有任何外来格式导入路径；现有
 
 全套 917 用例 915 通过；两条失败与本次无关且在 HEAD 快照上同样复现：`dispatch-model` 的「bare tasks[] wave」需要 git-capability worktree placement provider（测试环境缺）；`nested-background-lifecycle` 的三条 real-seam 用例在并行全量跑时偶发超时，单独运行 6/6 通过。宿主侧 vitest（packaging-contract、agent-catalog、agent-frontmatter-policy）36/36。
 
-未做、留给后续：`[subagent-done]` 里汇总本次 run 提了几个问题/几个超时；`inflight-prompt` 的 Boss 回合尾块显示待答问题；`usageBudget` 的「下一安全点」而非立即 abort。
+同日补齐的三个尾巴：
+
+- `[subagent-done]` 加一行 `Questions to you: asked N, answered M`，未答（超时或 run 结束时仍待答）会点名让 Boss 去报告里找 worker 写明的假设（`summarizeQuestionRun` / `formatBossQuestionsLine`）。
+- Boss 回合尾块（`inflight-prompt.ts`）新增 `waiting` 状态：阻塞在 `ask_boss` 的 worker 显示 `WAITING FOR YOUR ANSWER: qid runId "问题"`，配一条「先回答再做别的」提示，不再被当成 stalled；快照仍无时钟，同一问题逐字节稳定。
+- `usageBudget` hard 改为「下一安全点」abort：有非 `ask_boss` 的工具在飞就等它返回（`finishActiveTool` 是触发点），`USAGE_BUDGET_SAFE_POINT_GRACE_MS`（120s）兜底；abort 真正发生才在状态上打 `aborted`，done 行区分「已 abort」与「worker 先跑完了」。
