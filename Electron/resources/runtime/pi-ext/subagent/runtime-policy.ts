@@ -339,7 +339,14 @@ export function decideDispatchBackground(input: {
 export function decideStallWatchdogAction(input: {
 	idleMs: number;
 	stallThresholdMs: number;
+	/** Wakes the Boss confirmably received. */
 	notifyCount: number;
+	/**
+	 * Wakes attempted, delivered or not. When given, the abort valve counts attempts: a stall
+	 * signal that is held by a busy Boss or absorbed by the Supervisor every time must still
+	 * end in an abort, or the worker hangs for as long as nobody happens to be listening.
+	 */
+	attemptCount?: number;
 	maxNotifies: number;
 	msSinceLastNotify: number;
 	notifyIntervalMs: number;
@@ -352,8 +359,9 @@ export function decideStallWatchdogAction(input: {
 		if (input.syncRecoveryGraceMs !== undefined && input.idleMs < input.syncRecoveryGraceMs) return "ignore";
 		return "abort";
 	}
-	if (input.notifyCount >= input.maxNotifies) return "abort";
-	if (input.notifyCount > 0 && input.msSinceLastNotify < input.notifyIntervalMs) return "ignore";
+	const strikes = Math.max(input.notifyCount, input.attemptCount ?? 0);
+	if (strikes >= input.maxNotifies) return "abort";
+	if (strikes > 0 && input.msSinceLastNotify < input.notifyIntervalMs) return "ignore";
 	return "notify";
 }
 

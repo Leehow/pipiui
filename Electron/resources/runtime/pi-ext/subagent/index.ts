@@ -218,7 +218,9 @@ import {
 	claimStallNotification,
 	confirmStallNotification,
 	deliverStallWake as deliverStallWakeThrough,
+	LONG_TOOL_NOTICE_MS,
 	formatBlockedMessage,
+	formatLongToolMessage,
 	formatStallMessage,
 	planHeldSignalFlush,
 } from "./stall-notification.ts";
@@ -1430,6 +1432,8 @@ interface SingleResult {
 	forkSanitized?: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean };
 	/** ask_boss tally for the run; absent when the worker never asked. */
 	bossQuestions?: QuestionRunSummary;
+	/** Who decided an aborted terminal; absent unless the run was aborted. */
+	abortedBy?: AbortIntent;
 	/** Delivery state is orthogonal to the worker process outcome. */
 	integrationState?: SubagentIntegrationState;
 	worktreePath?: string;
@@ -2323,6 +2327,8 @@ interface JobRecord {
 	/** A watchdog-only interrupted result may be corrected by this same run's real terminal callback. */
 	interruptedProvisional?: boolean;
 	/** Boss/user closeout for this failed/aborted/interrupted episode; state and verify stay intact. */
+	/** Who decided an aborted terminal. `boss` finalizes as handled; `runtime` arms the alarm. */
+	abortedBy?: AbortIntent;
 	closeoutDisposition?: "cleaned";
 	closeoutReason?: string;
 	closeoutAt?: number;
@@ -2660,6 +2666,12 @@ interface RunningAgentHandle {
 	runId: string;
 	/** 外部中止入口（action=abort / subagent_abort 命令）；走 killProc SIGTERM→SIGKILL。 */
 	controller: AbortController;
+	/**
+	 * Who decided this abort. `boss` (the Boss's tool/command, the user's panel or stop) already
+	 * knows and owes nothing: one receipt, no alarm, no reminder, episode auto-handled. `runtime`
+	 * (stall watchdog, timeout, usage budget, Supervisor) is news the Boss must acknowledge.
+	 */
+	abortedBy?: AbortIntent;
 	name: string;
 	task: string;
 	title?: string;
@@ -2671,6 +2683,13 @@ interface RunningAgentHandle {
 	stallNotifyCount: number;
 	/** One in-flight stall wake; failed/held sends leave stallNotifyCount unchanged. */
 	stallNotifyInFlight?: boolean;
+	/**
+	 * Stall wakes attempted this silent stretch, delivered or not. The abort valve counts these,
+	 * so a signal that is held or absorbed every time still ends in an abort instead of a hang.
+	 */
+	stallAttemptCount?: number;
+	/** The toolWaitSince a long-running-tool heads-up was already sent for; one notice per call. */
+	longToolNoticedFor?: number;
 	/** Successful wall-clock check-ins delivered for this dispatch. */
 	checkinCount?: number;
 	/** One in-flight follow-up; failed sends leave checkinCount unchanged so the 30s poll retries. */
@@ -2911,6 +2930,7 @@ function noteAgentActivity(agentId: string, runId?: string): void {
 	handle.lastActivityAt = Date.now();
 	handle.lastStallNotifyAt = 0;
 	handle.stallNotifyCount = 0;
+	handle.stallAttemptCount = 0;
 	handle.stallNotifyInFlight = false;
 	// Output after a tool request is the tool results coming back. The stdout handler
 	// notes activity before the scanner parses the chunk, so the message_end that opens
@@ -3388,9 +3408,12 @@ export function runSubagentWatch(input: {
  * runId 必填：queued 与 running 都按 {agentId, runId} 精确匹配，stale runId 拒绝而不是
  * 误杀同名 agentId 的新队列/新 run；成功取消 queued 项时同步释放 localAgentReservations。
  */
+/** See RunningAgentHandle.abortedBy. */
+type AbortIntent = "boss" | "runtime";
+
 function abortRunningAgent(
 	agentId: string,
-	options: { reportTerminalToSupervisor?: boolean; runId: string },
+	options: { reportTerminalToSupervisor?: boolean; runId: string; abortedBy: AbortIntent },
 ): { ok: boolean; message: string } {
 	const runId = options.runId.trim();
 	if (!runId) {
@@ -3450,7 +3473,10 @@ function abortRunningAgent(
 			message: `Cannot abort agentId=${agentId}: child process already exited and is already finalizing closeout.`,
 		};
 	}
-	noteDiagnosticsAbort(handle.diagnostics, options.reportTerminalToSupervisor ? "stall" : "user");
+	// Intent is recorded on the handle before the signal fires, so the terminal path can tell
+	// "the Boss asked for this" from "the runtime did this to the Boss's worker".
+	handle.abortedBy = options.abortedBy;
+	noteDiagnosticsAbort(handle.diagnostics, options.abortedBy === "boss" ? "user" : "stall");
 	const abortExactRun = () => handle.controller.abort();
 	if (options.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
 		supervisorAbortTerminalCloseout.requestExternal(
@@ -3460,9 +3486,12 @@ function abortRunningAgent(
 	} else {
 		abortExactRun();
 	}
+	const followUp = options.abortedBy === "boss"
+		? "Because you asked for this, one [subagent-aborted] receipt arrives when the process is gone and nothing else follows: no Boss alarm, no reminders, and the episode is marked handled. Its worktree and branch are retained, so re-dispatching the same agentId continues it."
+		: "A [subagent-aborted] receipt with a Boss alarm follows once the process is gone.";
 	return {
 		ok: true,
-		message: `Abort requested for agentId=${agentId} runId=${runId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). Aborted jobs do not push a [subagent-done] follow-up; check subagent_status.`,
+		message: `Abort requested for agentId=${agentId} runId=${runId} (${handle.name}). SIGTERM sent (SIGKILL after 5s if still alive). ${followUp}`,
 	};
 }
 
@@ -3478,7 +3507,7 @@ function abortAllRunningAgents(): { aborted: string[] } {
 	for (const [agentId, handle] of runningAgents) targets.set(agentId, handle.runId);
 	const aborted: string[] = [];
 	for (const [agentId, runId] of targets) {
-		if (abortRunningAgent(agentId, { runId }).ok) aborted.push(agentId);
+		if (abortRunningAgent(agentId, { runId, abortedBy: "boss" }).ok) aborted.push(agentId);
 	}
 	return { aborted };
 }
@@ -3520,11 +3549,12 @@ function resolveSubagentEpisode(
 	}
 	if (isHandledJob(job)) {
 		cancelInterruptedReminders(agentId, runId);
+		const acked = acknowledgeAlarmsForRun(agentId, runId, reason);
 		return {
 			ok: true,
 			job,
 			idempotent: true,
-			message: `agentId=${agentId} runId=${runId} is already resolved/handled; state remains "${job.state}".`,
+			message: `agentId=${agentId} runId=${runId} is already resolved/handled; state remains "${job.state}".${acked > 0 ? ` ${acked} Boss alarm(s) acknowledged.` : ""}`,
 		};
 	}
 	if (job.state === "running") {
@@ -3552,10 +3582,12 @@ function resolveSubagentEpisode(
 	);
 	job.closeoutAt = Date.now();
 	cancelInterruptedReminders(agentId, runId);
+	// Handling the episode is handling its alarm: one act, not two acknowledgement systems.
+	const acked = acknowledgeAlarmsForRun(agentId, runId, reason);
 	return {
 		ok: true,
 		job,
-		message: `Resolved agentId=${agentId} runId=${runId}: state remains "${job.state}" and verification was not changed; interrupted reminders cancelled.`,
+		message: `Resolved agentId=${agentId} runId=${runId}: state remains "${job.state}" and verification was not changed; interrupted reminders cancelled${acked > 0 ? ` and ${acked} Boss alarm(s) acknowledged` : ""}.`,
 	};
 }
 
@@ -3829,11 +3861,14 @@ type JobFinalizeFields = {
 	provisional?: boolean;
 	/** Completion scope-drift attestation (see plan-drift.ts). */
 	scopeDrift?: string[];
+	/** Who decided an aborted terminal; a Boss-decided abort finalizes as already handled. */
+	abortedBy?: AbortIntent;
 };
 
 function mergeTerminalJobFields(existing: JobRecord, fields: JobFinalizeFields): void {
 	if (!existing.resultText && fields.resultText)
 		existing.resultText = truncateTextHead(fields.resultText, JOB_RESULT_STORE_CAP);
+	if (!existing.abortedBy && fields.abortedBy) existing.abortedBy = fields.abortedBy;
 	if (existing.cost === undefined && fields.cost !== undefined) existing.cost = fields.cost;
 	if (existing.turns === undefined && fields.turns !== undefined) existing.turns = fields.turns;
 	if (!existing.activity && fields.activity) existing.activity = fields.activity;
@@ -3907,13 +3942,22 @@ function jobFinalize(agentId: string, runId: string, fields: JobFinalizeFields):
 		...(fields.recoveryCheckpoint || existing?.recoveryCheckpoint
 			? { recoveryCheckpoint: fields.recoveryCheckpoint ?? existing?.recoveryCheckpoint }
 			: {}),
+		...(fields.abortedBy ? { abortedBy: fields.abortedBy } : (existing?.abortedBy ? { abortedBy: existing.abortedBy } : {})),
 		...(existing?.closeoutDisposition === "cleaned"
 			? {
 					closeoutDisposition: existing.closeoutDisposition,
 					closeoutReason: existing.closeoutReason,
 					closeoutAt: existing.closeoutAt,
 				}
-			: {}),
+			: fields.state === "aborted" && fields.abortedBy === "boss"
+				? {
+						// The Boss decided this abort, so there is no episode left for it to handle:
+						// no interrupted reminders, and status reads it as closed out, not pending.
+						closeoutDisposition: "cleaned" as const,
+						closeoutReason: "aborted at the Boss's request",
+						closeoutAt: now,
+					}
+				: {}),
 		...(fields.state === "interrupted" && fields.provisional ? { interruptedProvisional: true } : {}),
 	});
 	jobPrune();
@@ -4218,6 +4262,7 @@ function ensureJobTerminalFromResult(
 		integrationState: result.integrationState,
 		worktreeFinalization: result.worktreeFinalization,
 		...(result.scopeDrift ? { scopeDrift: result.scopeDrift } : {}),
+		...(result.abortedBy ? { abortedBy: result.abortedBy } : {}),
 	});
 	return runId;
 }
@@ -5407,7 +5452,8 @@ async function trySendUserMessage(
 	await awaitCutInHoldRelease();
 	if (shouldSend && !shouldSend()) return false;
 	const routed = await routeRuntimeSignalThroughSupervisor(text);
-	if (routed === "accepted") return true;
+	// A heartbeat the Supervisor absorbed is a heartbeat handled: the Boss did not need it.
+	if (routed === "accepted" || routed === "absorbed") return true;
 	// The Supervisor has retained a pending durable receipt. Do not fall through
 	// to a second Boss admission attempt, and let heartbeat/stall callers retry.
 	if (routed === "pending") return false;
@@ -5877,7 +5923,9 @@ function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 async function deliverStallWake(pi: ExtensionAPI, text: string): Promise<boolean> {
 	const routed = await routeRuntimeSignalThroughSupervisor(text);
 	if (routed === "accepted") return true;
-	if (routed === "pending") return false;
+	// Absorbed means the Supervisor chose to wait or act itself. The Boss saw nothing, so this
+	// is not a delivered notification; the attempt still counts toward the abort valve.
+	if (routed === "pending" || routed === "absorbed") return false;
 	return deliverStallWakeToBoss(pi, text);
 }
 
@@ -6307,7 +6355,41 @@ function acknowledgeSubagentAlarm(alarmId: string, note?: string) {
 		clearDoneHoldOnForget(entry);
 		pendingDone.delete(obligationId);
 	}
+	// Acknowledging the alarm is handling the episode: close it so the interrupted reminders
+	// and the status "unresolved" reading stop too, instead of demanding a second call.
+	if (record && current && current.runId === record.runId && current.state !== "running"
+		&& isInterruptedReminderState(current.state) && !isHandledJob(current)) {
+		current.closeoutDisposition = "cleaned";
+		current.closeoutReason = taskSummary(note?.replace(/\s+/g, " ").trim() || "Boss acknowledged the terminal alarm", 500);
+		current.closeoutAt = Date.now();
+		cancelInterruptedReminders(current.agentId, current.runId);
+	}
 	return result;
+}
+
+/**
+ * Acknowledge every armed alarm of one exact run (durable store, volatile store, and the
+ * in-memory retry table). Returns how many were acknowledged; already-settled rows count 0.
+ */
+function acknowledgeAlarmsForRun(agentId: string, runId: string, note?: string): number {
+	const alarmIds = new Set<string>();
+	for (const store of [doneDeliveryStore, volatileBossAlarmStore]) {
+		const episode = store?.readAlarmEpisode(agentId, runId);
+		if (episode?.alarmId && episode.acknowledgementRequired && episode.state !== "acknowledged" && episode.state !== "fulfilled") {
+			alarmIds.add(episode.alarmId);
+		}
+	}
+	for (const entry of pendingDone.values()) {
+		const obligation = entry.obligation;
+		if (obligation.agentId === agentId && obligation.runId === runId && obligation.alarmId && obligation.acknowledgementRequired) {
+			alarmIds.add(obligation.alarmId);
+		}
+	}
+	let acknowledged = 0;
+	for (const alarmId of alarmIds) {
+		if (acknowledgeSubagentAlarm(alarmId, note).ok) acknowledged += 1;
+	}
+	return acknowledged;
 }
 
 function supervisorAgentDir(): string {
@@ -6356,7 +6438,13 @@ function supervisorWaveFromRuntime(): SupervisorDeliveryRequest["wave"] {
 		supervisorWaveIdentity = new SupervisorWaveIdentityTracker(directory, sessionId);
 		supervisorWaveIdentitySessionId = sessionId;
 	}
-	return summarizeSupervisorRuntimeWave(supervisorWaveIdentity, jobs);
+	// A Boss-handled episode (its own abort, a resolve, an ack) is terminal but not a failure
+	// the Supervisor gets to raise: otherwise a sibling's normal completion would read as an
+	// abnormal wave because of an abort the Boss asked for.
+	return summarizeSupervisorRuntimeWave(
+		supervisorWaveIdentity,
+		jobs.map((job) => ({ agentId: job.agentId, runId: job.runId, state: job.state, handled: isHandledJob(job) })),
+	);
 }
 
 function supervisorTerminalReports(wave: NonNullable<SupervisorDeliveryRequest["wave"]>): SupervisorTerminalReport[] {
@@ -6412,7 +6500,9 @@ function supervisorRequestFromStall(text: string): SupervisorDeliveryRequest | u
 		kind,
 		agentId,
 		runId,
-		sequence: (handle?.stallNotifyCount ?? 0) + 1,
+		// Attempts, not confirmed deliveries: an absorbed stall must not look like the same
+		// receipt again and be deduplicated into silence.
+		sequence: (handle?.stallAttemptCount ?? handle?.stallNotifyCount ?? 0) + 1,
 		publicText: text,
 		job: supervisorJobSnapshot(agentId, runId, kind === "stall" ? "stalled" : "failed"),
 		summary: text.split("\n")[0]?.slice(0, 400) || kind,
@@ -6714,7 +6804,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 			mutate(id) {
 				const job = jobRegistry.get(id.agentId);
 				if (!job || job.runId !== id.runId) throw new Error("abort run identity mismatch");
-				const result = abortRunningAgent(id.agentId, { runId: id.runId });
+				const result = abortRunningAgent(id.agentId, { runId: id.runId, abortedBy: "runtime" });
 				if (!result.ok) throw new Error(result.message);
 			},
 		});
@@ -6822,7 +6912,15 @@ function notifySubagentDone(
 	// abort has no [subagent-done] wake by existing contract and releases directly.
 	if (terminalAgentId && runId) nestedBackgroundLifecycle?.noteTerminal(terminalAgentId, runId, !aborted);
 	if (aborted) {
-		const text = `[subagent-aborted] agentId=${terminalAgentId} runId=${runId}; this exact run reached aborted terminal state.`;
+		const bossAborted = result.abortedBy === "boss";
+		const text = bossAborted
+			? `[subagent-aborted] agentId=${terminalAgentId} runId=${runId}; aborted at your request and now terminal. No alarm or reminder follows; the episode is marked handled. Its worktree and branch are retained: re-dispatch the same agentId to continue, or leave it. Do not treat this receipt as a new user request.`
+			: `[subagent-aborted] agentId=${terminalAgentId} runId=${runId}; this exact run reached aborted terminal state.`;
+		if (bossAborted && terminalAgentId && runId) {
+			// The Boss already knows. One receipt, no Supervisor closeout, no armed alarm.
+			void deliverConfirmedDoneToBossAsync(pi, terminalAgentId, runId, text, undefined, false);
+			return;
+		}
 		if (terminalAgentId && runId && supervisorAbortTerminalCloseout) {
 			void supervisorAbortTerminalCloseout.terminalize(
 				{ agentId: terminalAgentId, runId },
@@ -8800,6 +8898,12 @@ async function runSingleAgent(
 				if (effectiveSignal) {
 					const killProc = () => {
 						wasAborted = true;
+						// The tool's own signal firing means the Boss turn was stopped (user stop or
+						// turn abort): principal-initiated, so it owes no alarm either. A controller
+						// abort already carries its intent from abortRunningAgent; anything else
+						// (timeout, usage budget) is the runtime's doing.
+						const intentHandle = handleForRun(pipiuiAgentId, runId);
+						if (intentHandle && !intentHandle.abortedBy) intentHandle.abortedBy = signal?.aborted ? "boss" : "runtime";
 						providerWait.dispose();
 						childExitCloseout.cancel();
 						terminateAttempt();
@@ -9078,6 +9182,9 @@ async function runSingleAgent(
 		if (toolBudget) currentResult.toolBudget = summarizeToolBudget(toolBudget, parentToolCalls);
 		if (usageBudgetState) currentResult.usageBudget = usageBudgetState;
 		if (forkSanitizedSummary) currentResult.forkSanitized = forkSanitizedSummary;
+		// An abort's intent rides on the handle; the result carries it into the job record and
+		// the receipt so the Boss is never alarmed about an abort it asked for.
+		if (wasAborted) currentResult.abortedBy = handleForRun(pipiuiAgentId, runId)?.abortedBy ?? "runtime";
 		// Tally before the terminal cleanup removes the run's question directory.
 		const bossQuestions = questionDir ? summarizeQuestionRun(questionDir) : undefined;
 		if (bossQuestions) currentResult.bossQuestions = bossQuestions;
@@ -10446,6 +10553,7 @@ export default function (pi: ExtensionAPI) {
 				idleMs,
 				stallThresholdMs: STALL_THRESHOLD_MS,
 				notifyCount: handle.stallNotifyCount,
+				attemptCount: handle.stallAttemptCount ?? 0,
 				maxNotifies: STALL_RENOTIFY_MAX,
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
@@ -10501,12 +10609,28 @@ export default function (pi: ExtensionAPI) {
 			// notification — nor march toward the auto-abort. Crying wolf on every long build
 			// is what taught the Boss to discount the signal in the first place.
 			const stallInfo = stalledInfoFor(agentId, now);
+			// Measured progress excuses a long tool call from the stall rule, forever. It does not
+			// excuse it from being mentioned: one heads-up per call once it has run this long, so a
+			// runaway loop that burns CPU is at least visible to the Boss.
+			if (stallInfo.inTool && !stallInfo.stalled && handle.toolWaitSince !== undefined
+				&& now - handle.toolWaitSince >= LONG_TOOL_NOTICE_MS && handle.longToolNoticedFor !== handle.toolWaitSince) {
+				handle.longToolNoticedFor = handle.toolWaitSince;
+				void deliverStallWakeToBoss(pi, formatLongToolMessage({
+					agentId,
+					runId: handle.runId,
+					title: inFlightWorkerTitle(handle),
+					tool: stallInfo.inTool.names.join("+"),
+					forSec: stallInfo.inTool.forSec,
+					...(cpuEvidenceFor(agentId) ? { liveness: cpuEvidenceFor(agentId) as string } : {}),
+				}));
+			}
 			if (stallInfo.inTool && !stallInfo.stalled) continue;
 			const idleMs = progressIdleMs(now, handle);
 			const action = decideStallWatchdogAction({
 				idleMs,
 				stallThresholdMs: STALL_THRESHOLD_MS,
 				notifyCount: handle.stallNotifyCount,
+				attemptCount: handle.stallAttemptCount ?? 0,
 				maxNotifies: STALL_RENOTIFY_MAX,
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
@@ -10520,7 +10644,7 @@ export default function (pi: ExtensionAPI) {
 			const activityRaw = job?.activity?.trim() || "";
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			if (action === "abort") {
-				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId: handle.runId });
+				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId: handle.runId, abortedBy: "runtime" });
 				if (!aborted.ok) continue;
 				logStallProbe("abort", {
 					agent: agentId,
@@ -10530,7 +10654,9 @@ export default function (pi: ExtensionAPI) {
 					childPid: handle.pid,
 				});
 				if (handle.syncWait !== true) {
-					void deliverStallWake(pi, formatBlockedMessage({ agentId, runId: handle.runId, title, idleSec, lastLine }));
+					// A terminal receipt goes straight to the Boss; the Supervisor already received the
+					// terminal itself through the abort's closeout, and must not absorb the text too.
+					void deliverStallWakeToBoss(pi, formatBlockedMessage({ agentId, runId: handle.runId, title, idleSec, lastLine }));
 				}
 				pipiuiReport(attachDiagnostics({
 					kind: "stalled",
@@ -10658,7 +10784,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /subagent_abort <agentId> <runId>", "error");
 				return;
 			}
-			const result = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId });
+			// The user (panel) or the Boss (slash form) asked: no Supervisor closeout, no alarm.
+			const result = abortRunningAgent(agentId, { runId, abortedBy: "boss" });
 			ctx.ui.notify(result.message, result.ok ? "info" : "error");
 		},
 	});
@@ -10918,10 +11045,9 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
-				const abortResult = abortRunningAgent(target, {
-					reportTerminalToSupervisor: true,
-					runId,
-				});
+				// The Boss decided this. It bypasses the Supervisor's abnormal-terminal closeout and
+				// arms nothing: the Boss is the one party that cannot be surprised by its own abort.
+				const abortResult = abortRunningAgent(target, { runId, abortedBy: "boss" });
 				return {
 					content: [{ type: "text", text: abortResult.message }],
 					details: makeDetails("single")([]),
@@ -12670,8 +12796,11 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_abort",
 		label: "Subagent Abort",
-		description:
+		description: [
 			"Abort one background worker (running or queued). Required: agentId and the exact runId from the dispatch receipt or subagent_status. A stale runId is rejected instead of aborting a newer run under the same agentId.",
+			"You decided this, so the runtime treats it as handled: one [subagent-aborted] receipt arrives when the process is gone, and no Boss alarm or reminder follows. The worktree and branch pipiui/<agentId> are retained; re-dispatch the same agentId to continue from its stored conversation. Only runtime-initiated aborts (stall, timeout, usage budget) arm an alarm.",
+		].join(" "),
+		promptSnippet: "Stop a worker you no longer want; your own abort arms no alarm and needs no follow-up call.",
 		parameters: SubagentAbortParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentAbortParams),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -12735,7 +12864,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "subagent_resolve",
 		label: "Subagent Resolve",
-		description: "Close one terminal failed/aborted/interrupted episode. Required: agentId, runId.",
+		description: "Close one terminal failed/aborted/interrupted episode as handled: its interrupted reminders stop and its Boss alarm is acknowledged in the same call (no separate subagent_alarm_ack needed). Required: agentId, runId.",
 		parameters: SubagentResolveParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentResolveParams),
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -12769,7 +12898,7 @@ export default function (pi: ExtensionAPI) {
 	if (PIPIUI_DEPTH === 0) pi.registerTool({
 		name: "subagent_alarm_ack",
 		label: "Subagent Alarm Ack",
-		description: "Stop the recurring Boss alarm for one handled terminal episode. Requires the semantic alarmId printed by the alarm; internal runId is never model-facing here. This does not verify, resolve, or clean up the job.",
+		description: "Stop the recurring Boss alarm for one handled terminal episode. Requires the semantic alarmId printed by the alarm; internal runId is never model-facing here. Acknowledging also marks that terminal episode handled (reminders stop); it does not verify, merge, or clean up the worktree. subagent_resolve({agentId, runId}) does the same from the other direction.",
 		promptSnippet: "After handling a terminal worker alarm, acknowledge its semantic alarmId; text replies do not stop alarms.",
 		parameters: SubagentAlarmAckParams,
 		prepareArguments: bindSanitizeStrictToolArguments(SubagentAlarmAckParams),

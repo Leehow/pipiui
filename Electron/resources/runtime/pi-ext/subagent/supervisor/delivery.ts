@@ -888,6 +888,24 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			);
 		}
 
+		// A stall is the one signal the Boss must see: it holds the brief and the user, the
+		// Supervisor holds neither. `forward` and `status` therefore deliver the stall text
+		// itself; `wait` and a bounded `abort` stay Supervisor-owned (and are reported as
+		// absorbed to the host, so they never count as a delivered notification).
+		if (!abnormalTerminal && request.kind === "stall" && (action.kind === "forward" || action.kind === "status")) {
+			return acceptBossWake(
+				request,
+				event,
+				receiptId,
+				request.publicText,
+				undefined,
+				routed.supervisorPrompts,
+				"boss_direct",
+				undefined,
+				action.kind,
+			);
+		}
+
 		if (!abnormalTerminal && request.kind === "watch" && action.kind === "forward") {
 			return acceptBossWake(
 				request,

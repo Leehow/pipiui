@@ -23,6 +23,11 @@ export interface SupervisorRuntimeWaveJob {
 	agentId: string;
 	runId: string;
 	state: string;
+	/**
+	 * The Boss already closed this episode (its own abort, or an explicit resolve/ack). It is
+	 * still terminal for wave membership, but it is not a failure the Supervisor should raise.
+	 */
+	handled?: boolean;
 }
 
 function validKeys(value: unknown): value is string[] {
@@ -169,7 +174,7 @@ export function summarizeSupervisorRuntimeWave(
 		waveId: observed.waveId,
 		running: batchJobs.filter((job) => !terminalState(job.state)).length,
 		completed: batchJobs.filter((job) => job.state === "ok").length,
-		failed: batchJobs.filter((job) => failedState(job.state)).length,
+		failed: batchJobs.filter((job) => failedState(job.state) && job.handled !== true).length,
 		agentIds: [...new Set(batchJobs.map((job) => job.agentId))].sort(),
 	};
 }

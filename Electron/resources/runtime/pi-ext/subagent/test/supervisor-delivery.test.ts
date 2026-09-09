@@ -48,6 +48,7 @@ import {
 import {
 	SupervisorSessionRuntimeError,
 } from "../supervisor/session-runtime.ts";
+import { classifySupervisorHostAdmission } from "../supervisor/host-seam.ts";
 import {
 	createPiSupervisorSessionFactory,
 	extractAssistantTextFromSession,
@@ -1238,4 +1239,34 @@ test("zero-active ordinary watch samples are ignored and cannot duplicate the co
 	assert.equal(result.bossWakes, 0);
 	assert.equal(h.current.length, 0);
 	assert.equal(h.supervisor.promptCount, 0);
+});
+
+test("a stall the Supervisor forwards or reports as status reaches the Boss verbatim; wait and duplicates are absorbed", async () => {
+	for (const action of ["forward", "status"] as const) {
+		const h = harness({ decide: () => ({ action, reason: "boss decides" }), active: 1 });
+		const result = await h.delivery.handle(request({
+			kind: "stall",
+			job: job("stalled"),
+			sequence: 1,
+			publicText: "[subagent-stalled] agentId=worker-a runId=run-1 idle=130s",
+		}));
+		assert.equal(result.outcome, "boss_direct", action);
+		assert.equal(result.bossWakes, 1, action);
+		assert.equal(h.current.length, 1, action);
+		assert.equal(h.current[0]?.publicText, "[subagent-stalled] agentId=worker-a runId=run-1 idle=130s", "the stall text itself, with its handling instructions, is what the Boss gets");
+		assert.equal(h.boss.requestCount, 0, "no escalation envelope is needed for a forwarded stall");
+		assert.equal(classifySupervisorHostAdmission(result), "accepted");
+	}
+	const waited = harness({ decide: () => ({ action: "wait", reason: "measured busy" }), active: 1 });
+	const absorbed = await waited.delivery.handle(request({ kind: "stall", job: job("stalled"), sequence: 1 }));
+	assert.equal(absorbed.outcome, "supervisor");
+	assert.equal(waited.current.length, 0);
+	assert.equal(classifySupervisorHostAdmission(absorbed), "absorbed", "the Boss saw nothing, so the host must not count a notification");
+	const again = await waited.delivery.handle(request({ kind: "stall", job: job("stalled"), sequence: 1 }));
+	assert.equal(again.outcome, "duplicate");
+	assert.equal(classifySupervisorHostAdmission(again), "absorbed");
+	// A fresh attempt carries a fresh sequence and is analyzed again rather than deduplicated.
+	const next = await waited.delivery.handle(request({ kind: "stall", job: job("stalled"), sequence: 2 }));
+	assert.equal(next.outcome, "supervisor");
+	assert.equal(waited.supervisor.promptCount, 2);
 });

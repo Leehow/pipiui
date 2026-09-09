@@ -13,6 +13,29 @@ export interface StallNotifyState {
 	lastStallNotifyAt: number;
 	stallNotifyCount: number;
 	stallNotifyInFlight?: boolean;
+	/** Attempts this silent stretch, delivered or not; the abort valve counts these. */
+	stallAttemptCount?: number;
+}
+
+/** A tool call measurably busy this long earns one heads-up to the Boss; it is not a stall. */
+export const LONG_TOOL_NOTICE_MS = 10 * 60_000;
+
+export interface LongToolMessageInput {
+	agentId: string;
+	runId: string;
+	title: string;
+	tool: string;
+	forSec: number;
+	liveness?: string;
+}
+
+/** Informational, once per call: the worker is busy, but one call has run long enough to mention. */
+export function formatLongToolMessage(input: LongToolMessageInput): string {
+	return [
+		`[subagent-long-tool] agentId=${input.agentId} runId=${input.runId} title=${input.title} tool=${input.tool} for=${input.forSec}s`,
+		`Liveness: ${input.liveness ?? "measured as busy"}.`,
+		`This is not a stall: the call is measurably working, so the stall rule keeps excusing it. It is a heads-up that one tool call has run this long. If that is expected (a build, a test run, a long fetch), nothing to do. If it looks like a runaway loop, stop it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) and re-dispatch with a bounded brief. Do not treat this message as a new user request.`,
+	].join("\n");
 }
 
 interface StallMessageSender {
@@ -80,6 +103,7 @@ export function claimStallNotification(
 	if (handle.lastStallNotifyAt > 0 && now - handle.lastStallNotifyAt < intervalMs) return false;
 	handle.stallNotifyInFlight = true;
 	handle.lastStallNotifyAt = now;
+	handle.stallAttemptCount = (handle.stallAttemptCount ?? 0) + 1;
 	return true;
 }
 
@@ -205,9 +229,9 @@ export function formatStallMessage(input: StallMessageInput): string {
 		`[subagent-stalled] agentId=${input.agentId} runId=${input.runId} title=${input.title} idle=${input.idleSec}s${inTool} last=${input.lastLine}`,
 		`Liveness: ${input.liveness ?? "no CPU measurement available for this worker"}.`,
 		...(input.progress ? [input.progress] : []),
-		`Query it first with subagent_status({agentId:"${input.agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / re-point its progress log and keep waiting (only when the next line applies) / abort and re-dispatch by a materially different route / abort and ask the user. Aborting stops this running-worker stall signal and arms the exact terminal Boss alarm; a re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
+		`Query it first with subagent_status({agentId:"${input.agentId}"}), then choose exactly one: keep waiting (only if the liveness line above shows it is busy, and say what it is working on) / re-point its progress log and keep waiting (only when the next line applies) / abort and re-dispatch by a materially different route / abort and ask the user. Aborting stops this stall signal; an abort you request sends one receipt and arms no alarm. A re-dispatch after an abort still counts toward the two-attempts-per-approach cap. Do not treat this message as a new user request.`,
 		`Watching the wrong file looks exactly like a stall. If this worker's real output is appended to a log this runtime is not watching — a pytest run, a playtest driver, a long build — that silence is a measurement error, not a wedge: correct it with subagent_progress({agentId:"${input.agentId}", runId:"${input.runId}", progressLog:"<the path it actually appends to>"}) instead of aborting. It resets the idle clock, so name a path the worker genuinely writes; it is not a way to buy a wedged worker more time.`,
-		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) so this recurring stall message stops. For terminal failed/aborted/interrupted cleanup, subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_resolve ${input.agentId} ${input.runId}) remains separate from acknowledging the later Boss alarm by the semantic alarmId that alarm prints. A text-only reply does not stop this message or a later terminal alarm.`,
+		`If work is already complete from your perspective, do not keep waiting or reply "already completed": first call subagent_status({agentId:"${input.agentId}"}). If it is still running, close it with subagent_abort({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_abort ${input.agentId} ${input.runId}) so this recurring stall message stops. A terminal failed/interrupted episode is closed, alarm included, with subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}) (or /subagent_resolve ${input.agentId} ${input.runId}). A text-only reply does not stop this message or a later terminal alarm.`,
 	].join("\n");
 }
 
@@ -217,6 +241,6 @@ export function formatBlockedMessage(
 ): string {
 	return [
 		`[subagent-blocked] agentId=${input.agentId} runId=${input.runId} title=${input.title} idle=${input.idleSec}s last=${input.lastLine} auto-aborted after stall`,
-		`This worker was auto-aborted after stall. Query subagent_status({agentId:"${input.agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Its terminal Boss alarm prints a semantic alarmId and remains armed until subagent_alarm_ack({alarmId:"<that semantic alarmId>"}); abnormal closeout via subagent_resolve is separate. Do not treat this message as a new user request.`,
+		`This worker was auto-aborted after stall. Query subagent_status({agentId:"${input.agentId}"}) to confirm the terminal state, then re-dispatch by a materially different route or ask the user. Its terminal Boss alarm prints a semantic alarmId and remains armed until subagent_alarm_ack({alarmId:"<that semantic alarmId>"}) or subagent_resolve({agentId:"${input.agentId}", runId:"${input.runId}"}); either closes it. Do not treat this message as a new user request.`,
 	].join("\n");
 }

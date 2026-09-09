@@ -47,6 +47,7 @@ export const SUPERVISOR_SYSTEM_PROMPT = [
 	"Otherwise prefer forward, status, bounded abort/resolve, or start_declared.",
 	"watch events are periodic bounded samples of one subscribed run; unchanged state never emits one, and terminal results still arrive as completion events.",
 	"For watch, ordinary progress stays silent with wait or status; forward only important progress the Boss should see now, and escalate abnormal activity, stall-like quiet, or verify/finalization trouble.",
+	"For stall, the Boss holds the brief and the user, and you hold neither: forward the first stall of a run so the Boss decides. Use wait only when the packet shows measured liveness that explains the quiet; use a bounded abort only after the Boss has already been forwarded an earlier stall of the same run and the worker is still quiet.",
 ].join("\n");
 
 export const DEFAULT_SUPERVISOR_PROMPT_TIMEOUT_MS = 60_000;

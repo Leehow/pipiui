@@ -6,7 +6,14 @@ import type {
 import type { BossEscalationEnvelope, SupervisorEventKind } from "./contract.ts";
 
 /** What the host must do after the Supervisor has inspected a runtime signal. */
-export type SupervisorHostAdmission = "accepted" | "pending" | "unhandled";
+/**
+ * `accepted`: the seam delivered Boss-facing text (or an escalation). `absorbed`: the
+ * Supervisor handled it without waking the Boss (wait, bounded abort/resolve, duplicate);
+ * a stall caller must not count that as a notification the Boss received. `pending`: a
+ * durable receipt exists but Boss delivery has not admitted it. `unhandled`: no
+ * Supervisor path applied; the host delivers through its own channel.
+ */
+export type SupervisorHostAdmission = "accepted" | "absorbed" | "pending" | "unhandled";
 
 export interface SupervisorOwnedRunIdentity {
 	agentId: string;
@@ -63,10 +70,12 @@ export function createSupervisorOwnedTerminalCloseout(deps: {
  * durable receipt, but the Boss-facing delivery has not admitted it yet.
  */
 export function classifySupervisorHostAdmission(
-	result: Pick<SupervisorDeliveryResult, "outcome" | "useCurrentPath">,
+	result: Pick<SupervisorDeliveryResult, "outcome" | "useCurrentPath"> & Partial<Pick<SupervisorDeliveryResult, "bossWakes">>,
 ): SupervisorHostAdmission {
 	if (result.outcome === "pending") return "pending";
-	return result.useCurrentPath ? "unhandled" : "accepted";
+	if (result.useCurrentPath) return "unhandled";
+	if ((result.outcome === "supervisor" || result.outcome === "duplicate") && (result.bossWakes ?? 0) === 0) return "absorbed";
+	return "accepted";
 }
 
 export async function routeHostSupervisorDelivery(

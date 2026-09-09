@@ -126,10 +126,12 @@ export function formatBossAlarmMessage(input: {
 	agentId: string;
 	alarmId: string;
 }): string {
+	// The opaque runId stays out of this text on purpose (the alarmId is the model-facing
+	// identity); the resolve door is named with the id subagent_status prints.
 	return [
 		input.text,
 		`[boss-alarm] This exact terminal episode remains armed until explicit acknowledgement. Inspect it with subagent_status({agentId:"${input.agentId}"}), then handle, integrate, resume, re-dispatch, or escalate as appropriate.`,
-		`Alarm identity: ${input.alarmId}. After handling, call subagent_alarm_ack({alarmId:"${input.alarmId}", note:"what you did"}) (or /subagent_alarm_ack ${input.alarmId} what-you-did). A text-only reply does not stop this alarm. subagent_resolve remains separate for abnormal closeout and worktree cleanup.`,
+		`Alarm identity: ${input.alarmId}. After handling, call subagent_alarm_ack({alarmId:"${input.alarmId}", note:"what you did"}) (or /subagent_alarm_ack ${input.alarmId} what-you-did). Closing the episode with subagent_resolve for this agentId and the run subagent_status shows acknowledges this alarm in the same call. A text-only reply does not stop this alarm.`,
 	].join("\n");
 }
 
