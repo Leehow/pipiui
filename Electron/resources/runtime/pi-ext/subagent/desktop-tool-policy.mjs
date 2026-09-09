@@ -32,6 +32,13 @@ export const SKILL_LOADER_TOOL_NAMES = Object.freeze(["skill_search", "skill_loa
  */
 export const SESSION_RECALL_TOOL_NAME = "session_recall";
 
+/**
+ * One blocking question to the Boss. Issued by the dispatch (not frontmatter) to a
+ * Boss's direct workers only: nested parents cannot answer, so their children
+ * never see the tool. Registered by boss-question.ts in the child extension.
+ */
+export const ASK_BOSS_TOOL_NAME = "ask_boss";
+
 // Desktop control lives only in the main session; a dispatched child never
 // receives these tools, whatever its frontmatter or the denylist says.
 const RESERVED_DESKTOP_TOOLS = new Set(RESERVED_DESKTOP_TOOL_NAMES);
@@ -244,6 +251,7 @@ export function resolveSubagentToolSelection({
 	hasMemoryBrokerCapability = false,
 	hasSessionRecall = false,
 	hasSkillLoader = false,
+	hasAskBoss = false,
 	allowRecursiveDelegation,
 	availableExtensionTools = [],
 	hideGenericWebSearch = false,
@@ -283,6 +291,11 @@ export function resolveSubagentToolSelection({
 		allowed.delete(SESSION_RECALL_TOOL_NAME);
 		if (hasSessionRecall && !disabled.has(SESSION_RECALL_TOOL_NAME)) {
 			allowed.add(SESSION_RECALL_TOOL_NAME);
+		}
+		// Host-issued as well: the dispatching Boss decides whether it can be asked.
+		allowed.delete(ASK_BOSS_TOOL_NAME);
+		if (hasAskBoss && !disabled.has(ASK_BOSS_TOOL_NAME)) {
+			allowed.add(ASK_BOSS_TOOL_NAME);
 		}
 		// Explicit skillloader mount only. Automatic skill bootstrap stays off.
 		for (const name of SKILL_LOADER_TOOL_NAMES) allowed.delete(name);

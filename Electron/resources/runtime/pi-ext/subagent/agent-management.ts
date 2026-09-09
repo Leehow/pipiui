@@ -12,11 +12,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { CONFIG_DIR_NAME, getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { makeStrictJsonSchema, omitNulls } from "./strict-json-schema.ts";
+import { convertPiSubagentDefinition, renderPackageDraft, type PiSubagentImportResult } from "./agent-import.ts";
 import {
 	discoverAgents,
 	summarizeAgentPermissions,
@@ -32,7 +34,7 @@ const CONTRACT_VERSION = 1 as const;
 const PACKAGE_FILE = "AGENT.md";
 const SAFE_AGENT_NAME = /^[a-z][a-z0-9-]{0,62}$/;
 
-type ManageAction = "list" | "inspect" | "validate" | "scaffold" | "install";
+type ManageAction = "list" | "inspect" | "validate" | "scaffold" | "install" | "import";
 type MutableScope = "user" | "project";
 
 type ManageResult = {
@@ -68,6 +70,14 @@ type ManageParams = {
 	path?: string;
 	format?: "legacy" | "package";
 	overwrite?: boolean;
+	/** import: a pi-subagents-format file or directory, absolute or relative to the session cwd. */
+	source?: string;
+	/** import: a vendored upstream sample name, or `*` for every sample. */
+	sample?: string;
+	/** import: install under this name (single file/sample only). */
+	as?: string;
+	/** import: convert and report without writing anything. */
+	dryRun?: boolean;
 };
 
 const ScopeParam = Type.Optional(
@@ -88,8 +98,8 @@ const CapabilitiesParams = Type.Optional(
 );
 
 const SubagentManageParams = Type.Object({
-	action: StringEnum(["list", "inspect", "validate", "scaffold", "install"] as const, {
-		description: "list definitions, inspect one definition, validate a draft/path, scaffold a v1 package, or safely install a validated scaffold/draft.",
+	action: StringEnum(["list", "inspect", "validate", "scaffold", "install", "import"] as const, {
+		description: "list definitions, inspect one definition, validate a draft/path, scaffold a v1 package, safely install a validated scaffold/draft, or import pi-subagents-format agent files (source path or vendored sample) as v1 packages.",
 	}),
 	scope: ScopeParam,
 	name: Type.Optional(Type.String({ maxLength: 64, description: "Agent name. Required by inspect/scaffold/install; lower-kebab-case for scaffold/install." })),
@@ -104,7 +114,11 @@ const SubagentManageParams = Type.Object({
 	draft: Type.Optional(Type.String({ maxLength: 80_000, description: "AGENT.md content for validate/install. install never accepts an arbitrary output path." })),
 	path: Type.Optional(Type.String({ maxLength: 1_000, description: "For validate only: root-relative existing candidate file (`name.md` or `name/AGENT.md`). Absolute and traversal paths are rejected." })),
 	format: Type.Optional(StringEnum(["legacy", "package"] as const, { description: "Draft format for validate; package is the default." })),
-	overwrite: Type.Optional(Type.Boolean({ description: "install only: false by default. True atomically replaces an existing regular AGENT.md file." })),
+	overwrite: Type.Optional(Type.Boolean({ description: "install/import: false by default. True atomically replaces an existing regular AGENT.md file." })),
+	source: Type.Optional(Type.String({ maxLength: 1_000, description: "import only: a pi-subagents-format agent file (`<name>.md`, frontmatter + prompt) or a directory of them, absolute or relative to the session cwd. Mutually exclusive with sample." })),
+	sample: Type.Optional(Type.String({ maxLength: 64, description: "import only: a vendored upstream sample (scout, researcher, worker, reviewer, oracle, delegate) or `*` for all six." })),
+	as: Type.Optional(Type.String({ maxLength: 64, description: "import only: install a single file/sample under this lower-kebab-case name, e.g. when the upstream name collides with a bundled role." })),
+	dryRun: Type.Optional(Type.Boolean({ description: "import only: convert and return the drafts, mappings and dropped fields without writing anything." })),
 }, { additionalProperties: false });
 
 function parserIdentity(scope: MutableScope): { source: AgentSource; origin: AgentOrigin } {
@@ -252,10 +266,6 @@ function existingCandidate(
 	throw new Error("Candidate path must be a legacy .md file or package AGENT.md.");
 }
 
-function yamlString(value: string): string {
-	return JSON.stringify(value);
-}
-
 function renderScaffold(params: ManageParams, scope: MutableScope, cwd: string): {
 	name: string;
 	targetPath: string;
@@ -281,31 +291,17 @@ function renderScaffold(params: ManageParams, scope: MutableScope, cwd: string):
 	const root = managedRoot(scope, cwd);
 	const targetPath = resolveWithinRoot(root, path.join(name, PACKAGE_FILE));
 
-	const lines = [
-		"---",
-		"schema: 1",
-		`name: ${name}`,
-		`description: ${yamlString(description)}`,
-		...(typeof params.model === "string" && params.model.trim() ? [`model: ${yamlString(params.model.trim())}`] : []),
-		`mode: ${mode}`,
-		"capabilities:",
-		`  filesystem: ${filesystem}`,
-		`  shell: ${shell}`,
-		`  web: ${web}`,
-		...(mcpTools.length === 0
-			? ["  mcp: false"]
-			: ["  mcp:", "    tools:", ...mcpTools.map((tool) => `      - ${yamlString(String(tool))}`)]),
-		`  desktop: ${desktop}`,
-		`  delegation: ${delegation}`,
-		`worktree: ${worktree}`,
-		`deliverable: ${deliverable}`,
-		...(Array.isArray(params.tools) ? ["tools:", ...params.tools.map((tool) => `  - ${yamlString(String(tool))}`)] : []),
-		"---",
-		"",
+	const content = renderPackageDraft({
+		name,
+		description,
+		...(typeof params.model === "string" && params.model.trim() ? { model: params.model.trim() } : {}),
+		mode,
+		capabilities: { filesystem, shell, web, mcpTools: mcpTools.map(String), desktop, delegation },
+		worktree,
+		deliverable,
+		...(Array.isArray(params.tools) ? { tools: params.tools.map(String) } : {}),
 		prompt,
-		"",
-	];
-	const content = lines.join("\n");
+	});
 	const identity = parserIdentity(scope);
 	const validation = validateAgentDefinition({
 		filePath: targetPath,
@@ -442,7 +438,199 @@ function installDraft(params: ManageParams, scope: MutableScope, cwd: string): M
 	}
 }
 
-function executeManage(params: ManageParams, cwd: string): ManageResult {
+// --- import: pi-subagents-format files → validated v1 packages ------------------
+
+/** Vendored upstream agents; see ../agent-samples/PI_SUBAGENTS_UPSTREAM.md. */
+const SAMPLES_DIR = fileURLToPath(new URL("../agent-samples/pi-subagents/", import.meta.url));
+const PROVENANCE_FILE = "IMPORT.json";
+
+class ManageError extends Error {
+	readonly code: string;
+	constructor(code: string, message: string) {
+		super(message);
+		this.code = code;
+	}
+}
+
+function listSamples(): string[] {
+	try {
+		return fs.readdirSync(SAMPLES_DIR)
+			.filter((entry) => entry.endsWith(".md"))
+			.map((entry) => entry.replace(/\.md$/, ""))
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+type ImportSource = { label: string; content: string };
+
+/** Resolve `sample` or `source` into file contents. Reads only; never writes. */
+function collectImportSources(params: ManageParams, cwd: string): { sources: ImportSource[]; single: boolean } {
+	const sample = typeof params.sample === "string" ? params.sample.trim() : "";
+	const source = typeof params.source === "string" ? params.source.trim() : "";
+	if (sample && source) throw new ManageError("conflicting-source", "import accepts either source or sample, not both.");
+	if (sample) {
+		const available = listSamples();
+		const names = sample === "*" ? available : [sample];
+		const sources: ImportSource[] = [];
+		for (const name of names) {
+			if (!available.includes(name)) {
+				throw new ManageError("unknown-sample", `No vendored sample named \`${name}\`. Available: ${available.join(", ") || "(none)"}.`);
+			}
+			sources.push({ label: `sample:${name}`, content: fs.readFileSync(path.join(SAMPLES_DIR, `${name}.md`), "utf8") });
+		}
+		return { sources, single: sample !== "*" };
+	}
+	if (source) {
+		const resolved = path.resolve(safeContextCwd(cwd), source);
+		if (!fs.existsSync(resolved)) throw new ManageError("source-not-found", `No file or directory at ${resolved}.`);
+		const stat = fs.statSync(resolved);
+		if (stat.isDirectory()) {
+			const files = fs.readdirSync(resolved)
+				.filter((entry) => entry.endsWith(".md") && !entry.endsWith(".chain.md") && !entry.startsWith("."))
+				.sort();
+			return {
+				sources: files.map((entry) => {
+					const file = path.join(resolved, entry);
+					return { label: file, content: fs.readFileSync(file, "utf8") };
+				}),
+				single: false,
+			};
+		}
+		if (!stat.isFile()) throw new ManageError("source-not-found", `${resolved} is neither a file nor a directory.`);
+		return { sources: [{ label: resolved, content: fs.readFileSync(resolved, "utf8") }], single: true };
+	}
+	throw new ManageError("missing-source", "import requires `source` (a pi-subagents-format file or directory) or `sample` (a vendored sample name, `*` for all).");
+}
+
+function writeImportProvenance(
+	root: string,
+	name: string,
+	converted: PiSubagentImportResult,
+	source: ImportSource,
+): string {
+	const provenancePath = resolveWithinRoot(root, path.join(name, PROVENANCE_FILE));
+	const payload = {
+		version: 1,
+		format: converted.provenance.format,
+		converter: converted.provenance.converter,
+		source: converted.provenance.source,
+		...(converted.provenance.upstreamName ? { upstreamName: converted.provenance.upstreamName } : {}),
+		sha256: createHash("sha256").update(source.content).digest("hex"),
+		importedAt: new Date().toISOString(),
+		mapping: converted.mapping,
+		droppedFields: converted.droppedFields,
+		droppedTools: converted.droppedTools,
+	};
+	fs.writeFileSync(provenancePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+	return provenancePath;
+}
+
+/**
+ * Convert every source, refuse catalog collisions, then install through the same
+ * validated atomic path `install` uses. Provenance lands beside the package so a
+ * later sync can tell an imported file from a hand-written one.
+ */
+function importDefinitions(params: ManageParams, scope: MutableScope, cwd: string): ManageResult {
+	let collected: { sources: ImportSource[]; single: boolean };
+	try {
+		collected = collectImportSources(params, cwd);
+	} catch (error) {
+		const code = error instanceof ManageError ? error.code : "import-failed";
+		return result("import", false, [errorDiagnostic(code, error instanceof Error ? error.message : String(error))], { scope });
+	}
+	const { sources, single } = collected;
+	const as = typeof params.as === "string" && params.as.trim() ? params.as.trim() : undefined;
+	if (as && !single) {
+		return result("import", false, [errorDiagnostic("invalid-as", "`as` renames a single file or sample; import a directory without it.")], { scope });
+	}
+	const dryRun = params.dryRun === true;
+	const sessionCwd = safeContextCwd(cwd);
+	const discovery = discoverAgents(sessionCwd, "both");
+	const diagnostics: AgentDiagnostic[] = [];
+	const imported: Record<string, unknown>[] = [];
+	const skipped: Record<string, unknown>[] = [];
+
+	for (const source of sources) {
+		const converted = convertPiSubagentDefinition(source.content, {
+			source: source.label,
+			...(as ? { name: as } : {}),
+			...(params.mode ? { mode: params.mode } : {}),
+			...(params.deliverable ? { deliverable: params.deliverable } : {}),
+		});
+		const entryDiagnostics = converted.diagnostics.map((entry) => ({ ...entry, filePath: source.label }));
+		diagnostics.push(...entryDiagnostics);
+		if (!converted.ok || !converted.name || !converted.draft) {
+			skipped.push({ source: source.label, diagnostics: entryDiagnostics });
+			continue;
+		}
+		const name = converted.name;
+		const existing = discovery.agents.find((agent) => agent.name === name);
+		if (existing?.origin === "bundled") {
+			const conflict = errorDiagnostic(
+				"name-conflict-bundled",
+				`\`${name}\` is a bundled PipiUI role, and bundled roles shadow every user/project definition; import it under another name with \`as\`.`,
+				source.label,
+			);
+			diagnostics.push(conflict);
+			skipped.push({ source: source.label, diagnostics: [conflict] });
+			continue;
+		}
+		if (existing && existing.origin !== scope) {
+			diagnostics.push({
+				severity: "warning",
+				code: "shadowed-name",
+				message: `\`${name}\` also exists in ${existing.origin} scope; discovery overlays user → project, so the project copy wins when both are visible.`,
+				filePath: source.label,
+			});
+		}
+		const record: Record<string, unknown> = {
+			name,
+			source: source.label,
+			upstreamName: converted.provenance.upstreamName ?? null,
+			mapping: converted.mapping,
+			droppedFields: converted.droppedFields,
+			droppedTools: converted.droppedTools,
+			...(dryRun ? { draft: converted.draft } : {}),
+		};
+		if (dryRun) {
+			imported.push(record);
+			continue;
+		}
+		const install = installDraft({ action: "install", name, draft: converted.draft, overwrite: params.overwrite }, scope, cwd);
+		diagnostics.push(...install.diagnostics);
+		if (!install.success) {
+			skipped.push({ source: source.label, diagnostics: install.diagnostics });
+			continue;
+		}
+		let provenancePath: string | null = null;
+		try {
+			provenancePath = writeImportProvenance(managedRoot(scope, cwd), name, converted, source);
+		} catch (error) {
+			diagnostics.push({
+				severity: "warning",
+				code: "provenance-not-written",
+				message: `Installed, but ${PROVENANCE_FILE} could not be written: ${error instanceof Error ? error.message : String(error)}`,
+				filePath: String(install.data.targetPath),
+			});
+		}
+		imported.push({ ...record, targetPath: install.data.targetPath, provenancePath });
+	}
+
+	const success = imported.length > 0 && (!single || skipped.length === 0);
+	return result("import", success, diagnostics, {
+		scope,
+		dryRun,
+		imported,
+		skipped,
+		...(imported.length > 0 && !dryRun
+			? { next: `Dispatch with subagent_type: "<name>" and agentScope: "${scope}". Bundled roles still shadow same-named imports.` }
+			: {}),
+	});
+}
+
+export function executeManage(params: ManageParams, cwd: string): ManageResult {
 	const action = params.action;
 	if (action === "list" || action === "inspect") {
 		const scope = params.scope ?? "user";
@@ -502,6 +690,7 @@ function executeManage(params: ManageParams, cwd: string): ManageResult {
 			return result("scaffold", false, [errorDiagnostic("scaffold-failed", error instanceof Error ? error.message : String(error))], { scope });
 		}
 	}
+	if (action === "import") return importDefinitions(params, scope, cwd);
 	return installDraft(params, scope, cwd);
 }
 
@@ -514,6 +703,7 @@ export function registerSubagentManagementTool(pi: ExtensionAPI): void {
 			"UI-independent management API for PipiUI agent definitions. It never dispatches or starts an agent.",
 			"list returns current user/project/bundled definitions with origin, format, diagnostics and static permission summaries.",
 			"inspect returns one definition; validate uses the runtime agents.ts parser; scaffold produces a least-privilege schema:1 package; install safely writes only a validated user/project package.",
+			"import converts pi-subagents-format agent files (the community Pi subagent format: `<name>.md` with frontmatter + prompt) into schema:1 packages and installs them: pass source (file or directory) or sample (vendored upstream agents: scout, researcher, worker, reviewer, oracle, delegate; `*` for all). Tools map to capabilities mechanically; every upstream field or tool without a PipiUI home is listed in droppedFields/droppedTools and recorded in IMPORT.json beside the package. Use dryRun:true to preview, as to rename (bundled role names are refused), mode/deliverable to override the mechanical defaults. External-CLI runners (codex-exec, claude-code, cursor-agent) are refused.",
 			"Every result is structured JSON `{version:1, success, action, diagnostics, data}`. Runtime dispatch still applies disabled-tools, extension availability, role/depth limits, and project confirmation separately.",
 		].join(" "),
 		parameters: makeStrictJsonSchema(SubagentManageParams),

@@ -6,6 +6,8 @@
 import type { Message } from "@earendil-works/pi-ai";
 
 import { formatFindingsLine } from "./findings-artifact.ts";
+import { formatToolBudgetLine, formatUsageBudgetLine, type ToolBudgetState, type UsageBudgetState } from "./tool-budget.ts";
+import { formatForkSanitizedLine } from "./fork-sanitize.ts";
 
 // Done-message caps (clean-context orchestration):
 // - Injected [subagent-done] Result body is a TLDR slice (TLDR_DONE_CAP); full text
@@ -51,6 +53,12 @@ export interface DoneMessageResult {
 	scopeDrift?: string[];
 	reportsInFull?: boolean;
 	resumed?: boolean;
+	/** Parent-side tool-call tally against the dispatch's toolBudget; absent when none was set. */
+	toolBudget?: ToolBudgetState;
+	/** Last usageBudget evaluation; absent when none was set. */
+	usageBudget?: UsageBudgetState;
+	/** The fork source needed signed Anthropic thinking stripped; absent for cold or clean forks. */
+	forkSanitized?: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean };
 }
 
 
@@ -220,6 +228,10 @@ export function formatSubagentDoneMessage(
 			lines.push(`  ${tailLine}`);
 		}
 	}
+	// Budgets are runtime-measured like verify: the Boss set them, the runtime reports against them.
+	if (result.toolBudget) lines.push(formatToolBudgetLine(result.toolBudget));
+	if (result.usageBudget) lines.push(formatUsageBudgetLine(result.usageBudget));
+	if (result.forkSanitized) lines.push(formatForkSanitizedLine(result.forkSanitized));
 	// Attested scope drift, same nature as the verify exit code: machine-measured, not worker-claimed.
 	// No line at all when the dispatch declared no scope or the branch diff was not measurable —
 	// an unmeasured run must never read as "none".

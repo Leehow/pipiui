@@ -357,6 +357,36 @@ import {
 import { prepareSubagentMemoryTask } from "./memory-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
 import {
+	ASK_BOSS_GUIDANCE,
+	ASK_BOSS_TOOL_NAME,
+	QUESTION_DIR_ENV,
+	formatQuestionForBoss,
+	pendingQuestions,
+	questionRunDir,
+	registerAskBossTool,
+	registerSubagentReplyTool,
+	removeQuestionRun,
+	resolveAskBossTimeoutMs,
+} from "./boss-question.ts";
+import {
+	TOOL_BUDGET_ENV,
+	createToolBudgetTracker,
+	decodeToolBudgetEnv,
+	encodeToolBudgetEnv,
+	evaluateUsageBudget,
+	formatToolBudgetSoftNudge,
+	formatUsageBudgetAbortReason,
+	formatUsageBudgetSoftNotice,
+	parseToolBudget,
+	parseUsageBudget,
+	summarizeToolBudget,
+	type ToolBudget,
+	type ToolBudgetState,
+	type UsageBudget,
+	type UsageBudgetState,
+} from "./tool-budget.ts";
+import { isAnthropicModelRef, prepareSanitizedForkSource } from "./fork-sanitize.ts";
+import {
 	encodeAgentEventBridgeRequestV1,
 	encodeModelPinValidateBridgeRequestV1,
 	parseModelPinValidateDecisionV1,
@@ -1389,6 +1419,12 @@ interface SingleResult {
 	reportsInFull?: boolean;
 	/** Continued an existing worker's conversation instead of starting it cold. */
 	resumed?: boolean;
+	/** Parent-side tool-call count against the dispatch's toolBudget; absent when none was set. */
+	toolBudget?: ToolBudgetState;
+	/** Last evaluation of the dispatch's usageBudget against reported usage; absent when none was set. */
+	usageBudget?: UsageBudgetState;
+	/** The fork source needed signed Anthropic thinking stripped; absent for cold or clean forks. */
+	forkSanitized?: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean };
 	/** Delivery state is orthogonal to the worker process outcome. */
 	integrationState?: SubagentIntegrationState;
 	worktreePath?: string;
@@ -1464,6 +1500,10 @@ interface RunSingleAgentOptions {
 	heartbeatSecs?: number;
 	/** Bundled general-purpose absolute wall-clock runtime limit from first child spawn. */
 	timeoutSecs?: number;
+	/** Raw per-dispatch tool-call budget; parsed (fail-closed) in runSingleAgent. See tool-budget.ts. */
+	toolBudget?: unknown;
+	/** Raw per-dispatch reported-usage budget; parsed (fail-closed) in runSingleAgent. See tool-budget.ts. */
+	usageBudget?: unknown;
 	/** Host-selected episode generation, used to bind runtime receipts to the visible child run. */
 	runId?: string;
 	/** Explicit bundled private skills; additive under --no-skills. */
@@ -2698,6 +2738,78 @@ interface RunningAgentHandle {
 
 /** Every live child is externally abortable; parent cancellation is composed separately. */
 const runningAgents = new Map<string, RunningAgentHandle>();
+
+// --- Child → Boss question channel (ask_boss / subagent_reply) -------------------
+// The question file is the authority; these maps only keep the Boss from being told
+// twice and let the parent's stream reader hurry delivery along. See boss-question.ts.
+let bossPi: ExtensionAPI | undefined;
+const deliveredBossQuestions = new Set<string>();
+const bossQuestionScans = new Map<string, ReturnType<typeof setTimeout>>();
+
+function questionDirFor(agentId: string, runId: string): string | undefined {
+	const root = resolveAgentSessionRoot(PIPIUI_PROJECT_ROOT, PIPIUI_MAIN_CWD);
+	return root ? questionRunDir(root, agentId, runId) : undefined;
+}
+
+/** A worker blocked inside ask_boss is waiting on us, not stalled. */
+function workerWaitingOnBoss(handle: RunningAgentHandle | undefined): boolean {
+	return handle?.toolWaitNames?.includes(ASK_BOSS_TOOL_NAME) === true;
+}
+
+/** Deliver every pending, not-yet-delivered question of one run. Returns how many are pending. */
+function deliverPendingBossQuestions(agentId: string, runId: string, dir: string): number {
+	const pending = pendingQuestions(dir);
+	const pi = bossPi;
+	if (!pi) return pending.length;
+	for (const question of pending) {
+		const key = `${agentId}:${runId}:${question.id}`;
+		if (deliveredBossQuestions.has(key)) continue;
+		const handle = handleForRun(agentId, runId);
+		if (!handle) continue;
+		deliveredBossQuestions.add(key);
+		const text = formatQuestionForBoss(question, { workerName: handle.name, timeoutMs: resolveAskBossTimeoutMs() });
+		void sendUserMessageAfterCutIn(pi, text).then((ok) => {
+			// Not delivered (host-stop quiet, cut-in hold): let the watchdog tick try again.
+			if (!ok) deliveredBossQuestions.delete(key);
+		});
+	}
+	return pending.length;
+}
+
+/** The child writes its question a beat after the parent sees the tool call; retry briefly. The watchdog tick is the net. */
+function scheduleBossQuestionScan(agentId: string, runId: string, dir: string): void {
+	const key = `${agentId}:${runId}`;
+	const existing = bossQuestionScans.get(key);
+	if (existing) clearTimeout(existing);
+	const delays = [300, 1_000, 2_500, 5_000];
+	let attempt = 0;
+	const tick = () => {
+		bossQuestionScans.delete(key);
+		if (!handleForRun(agentId, runId)) return;
+		const found = deliverPendingBossQuestions(agentId, runId, dir);
+		if (found > 0 || attempt >= delays.length) return;
+		const timer = setTimeout(tick, delays[attempt++]);
+		timer.unref?.();
+		bossQuestionScans.set(key, timer);
+	};
+	const timer = setTimeout(tick, delays[attempt++]);
+	timer.unref?.();
+	bossQuestionScans.set(key, timer);
+}
+
+/** Terminal event: questions are transient, so the run's directory goes with it. */
+function forgetBossQuestions(agentId: string, runId: string, dir: string | undefined): void {
+	const key = `${agentId}:${runId}`;
+	const timer = bossQuestionScans.get(key);
+	if (timer) {
+		clearTimeout(timer);
+		bossQuestionScans.delete(key);
+	}
+	for (const entry of [...deliveredBossQuestions]) {
+		if (entry.startsWith(`${key}:`)) deliveredBossQuestions.delete(entry);
+	}
+	if (dir) removeQuestionRun(dir);
+}
 
 /**
  * Process-local `subagent_watch` subscriptions (Boss-side monitoring of exact runs).
@@ -4426,6 +4538,10 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 		}
 		if (job.state === "running") {
 			lines.push(`activity: ${job.activity || "(starting/idle)"}`);
+			const questionDir = questionDirFor(job.agentId, job.runId);
+			for (const pending of questionDir ? pendingQuestions(questionDir) : []) {
+				lines.push(`question pending: qid=${pending.id} "${pending.question.slice(0, 160)}" — answer with subagent_reply({agentId, runId, answer})`);
+			}
 			// The measurement the Boss otherwise has to go improvise in a terminal.
 			const evidence = cpuEvidenceFor(job.agentId);
 			if (evidence) lines.push(`liveness: ${evidence}`);
@@ -6992,6 +7108,46 @@ async function runSingleAgent(
 		releaseAgentReservation(pipiuiAgentId);
 		return fail;
 	}
+	// Budgets are parsed once, fail-closed, before any placement or spawn: a budget the
+	// runtime cannot honor is a dispatch error, never a silently unbounded run.
+	const toolBudgetParsed = options?.toolBudget !== undefined ? parseToolBudget(options.toolBudget) : undefined;
+	const usageBudgetParsed = options?.usageBudget !== undefined ? parseUsageBudget(options.usageBudget) : undefined;
+	const budgetProblem = toolBudgetParsed && !toolBudgetParsed.ok
+		? toolBudgetParsed.problem
+		: usageBudgetParsed && !usageBudgetParsed.ok
+			? usageBudgetParsed.problem
+			: undefined;
+	if (budgetProblem) {
+		const fail: SingleResult = {
+			agent: agentName,
+			agentSource: "unknown",
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: `Invalid budget: ${budgetProblem}`,
+			usage: emptyUsage(),
+			step,
+			agentId: pipiuiAgentId,
+			runId,
+			stopReason: "error",
+			errorMessage: `Invalid budget: ${budgetProblem}`,
+		};
+		jobFinalize(pipiuiAgentId, runId, {
+			name: agentName,
+			task,
+			state: "failed",
+			resultText: fail.stderr,
+		});
+		releaseAgentReservation(pipiuiAgentId);
+		return fail;
+	}
+	const toolBudget: ToolBudget | undefined = toolBudgetParsed?.ok ? toolBudgetParsed.value : undefined;
+	const usageBudget: UsageBudget | undefined = usageBudgetParsed?.ok ? usageBudgetParsed.value : undefined;
+	let parentToolCalls = 0;
+	let usageBudgetState: UsageBudgetState | undefined;
+	let usageBudgetNoticeSent = false;
+	let usageBudgetAborted = false;
+	let forkSanitizedSummary: { removedBlocks: number; touchedMessages: number; thinkingOff: boolean } | undefined;
 	const identityProblem = agentResumeIdentityProblem({
 		agentId: pipiuiAgentId,
 		requestedName: agentName,
@@ -7336,7 +7492,19 @@ async function runSingleAgent(
 		// `--fork <src>` mints a NEW session carrying the copied entries; pi treats the
 		// `--session-id` beside it as that new session's id and refuses a collision, which is
 		// why fork-policy makes a resume win outright rather than reaching this pair.
-		args.push(...forkSpawnArgs(forkDecision));
+		// Signed Anthropic thinking cannot be replayed into a branch; fork from a sanitized
+		// copy when the Boss session carries any, and start an Anthropic child with thinking off.
+		const forkSanitized = forkDecision.fork
+			? prepareSanitizedForkSource(forkDecision.sourcePath, path.join(sessionDir, "forks"), { agentId: pipiuiAgentId, runId })
+			: undefined;
+		if (forkSanitized) {
+			forkSanitizedSummary = {
+				removedBlocks: forkSanitized.removedBlocks,
+				touchedMessages: forkSanitized.touchedMessages,
+				thinkingOff: isAnthropicModelRef(resolvedModel),
+			};
+		}
+		args.push(...forkSpawnArgs(forkSanitized && forkDecision.fork ? { ...forkDecision, sourcePath: forkSanitized.path } : forkDecision));
 		args.push("--session-id", sessionId, "--session-dir", sessionDir);
 	} else {
 		args.push("--no-session");
@@ -7394,7 +7562,11 @@ async function runSingleAgent(
 		mountedExtensionIds,
 		extensionToolOwnership(),
 	);
+	// Child → Boss question channel: only a Boss (depth 0) can answer, so only its direct
+	// workers get the tool. A nested parent has no subagent_reply and would let it time out.
+	const questionDir = PIPIUI_DEPTH === 0 ? questionDirFor(pipiuiAgentId, runId) : undefined;
 	const toolSelection = resolveSubagentToolSelection({
+		hasAskBoss: Boolean(questionDir),
 		// Keep the role-local guard explicit at the caller as well as in the
 		// shared resolver: a secretary may never regain recursive delegation.
 		// Depth-gated: a child at/above PIPIUI_MAX_DEPTH must not even see the tools.
@@ -7447,8 +7619,10 @@ async function runSingleAgent(
 	for (const skillPath of options?.privateSkillPaths ?? []) args.push("--skill", skillPath);
 	// A new explicit thinking override wins over Pi's older `model:thinking` shorthand.
 	// Strip only a recognized shorthand suffix, preserving other colon-containing model ids.
-	if (resolvedModel) args.push("--model", resolvedThinking ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
-	if (resolvedThinking) args.push("--thinking", resolvedThinking);
+	const forceThinkingOff = forkSanitizedSummary?.thinkingOff === true;
+	if (resolvedModel) args.push("--model", resolvedThinking || forceThinkingOff ? stripModelThinkingSuffix(resolvedModel) : resolvedModel);
+	if (forceThinkingOff) args.push("--thinking", "off");
+	else if (resolvedThinking) args.push("--thinking", resolvedThinking);
 	if (toolSelection.flag === "--no-tools") {
 		args.push("--no-tools");
 	} else {
@@ -7769,6 +7943,8 @@ async function runSingleAgent(
 				const childEnvironmentInput = {
 					PIPIUI_AGENT_ID: pipiuiAgentId,
 					PIPIUI_AGENT_RUN_ID: runId,
+					...(questionDir ? { [QUESTION_DIR_ENV]: questionDir } : {}),
+					...(toolBudget ? { [TOOL_BUDGET_ENV]: encodeToolBudgetEnv(toolBudget) } : {}),
 					PIPIUI_AGENT_DEPTH: String(childDepth),
 					PIPIUI_AGENT_TREE_DEPTH: String(childDepth),
 					// Marks only recursive nested parents. A leaf never enters resident mode,
@@ -7860,7 +8036,8 @@ async function runSingleAgent(
 							// delegated is silent on its own stream while the grandchild works,
 							// and without this it was killed for its child's silence.
 							const budgetVerdict = stalledInfoFor(pipiuiAgentId, now).verdict;
-							const expiry = decideRuntimeBudgetExpiry({
+							// Blocked on the Boss's answer: that silence is ours, not the worker's.
+							const expiry = workerWaitingOnBoss(handle) ? "extend-silent" : decideRuntimeBudgetExpiry({
 								idleMs,
 								progressGraceMs: STALL_THRESHOLD_MS,
 								notified: runtimeTimeoutNotified,
@@ -8025,6 +8202,24 @@ async function runSingleAgent(
 				// Throttle state and the openai-completions output estimate live in the emitter
 				// now (streaming-usage.ts), where the read→fallback→combine→throttle sequence is
 				// covered by behavior tests instead of source-text assertions.
+				// usageBudget rides the same reported-usage stream the host sees: no reservations,
+				// no estimates. Soft is one notice to the Boss; hard takes the timeoutSecs abort path.
+				const noteUsageBudget = (usage: { input: number; output: number; cost: number }) => {
+					if (!usageBudget || usageBudgetAborted) return;
+					usageBudgetState = evaluateUsageBudget(usageBudget, usage);
+					if (usageBudgetState.softExceeded && !usageBudgetNoticeSent) {
+						usageBudgetNoticeSent = true;
+						if (bossPi) void sendUserMessageAfterCutIn(bossPi, formatUsageBudgetSoftNotice(pipiuiAgentId, runId, usageBudgetState));
+					}
+					if (usageBudgetState.exhausted) {
+						usageBudgetAborted = true;
+						currentResult.stopReason = "usage_budget";
+						currentResult.errorMessage = formatUsageBudgetAbortReason(usageBudgetState);
+						pipiuiActivity = currentResult.errorMessage;
+						pipiuiUpdate(true);
+						handleForRun(pipiuiAgentId, runId)?.controller.abort();
+					}
+				};
 				const usageEmitter = createUsageEmitter({
 					session: () => ({ usage: currentResult.usage, model: currentResult.model }),
 					report: (payload) => {
@@ -8037,6 +8232,7 @@ async function runSingleAgent(
 							tools: payload.tools,
 							usage: payload.usage,
 						});
+						noteUsageBudget(payload.usage);
 					},
 				});
 				const countLiveEstimate = (delta: string) => usageEmitter.countDelta(delta);
@@ -8271,6 +8467,12 @@ async function runSingleAgent(
 									startedAt: Date.now(),
 									summary: boundActivitySummary(toolName, summarizeToolArgsForUI(toolName, args)),
 								});
+								if (toolName === ASK_BOSS_TOOL_NAME && questionDir) {
+									scheduleBossQuestionScan(pipiuiAgentId, runId, questionDir);
+								} else {
+									// Same events the child's own tool_call hook counts; the two tallies agree.
+									parentToolCalls += 1;
+								}
 								if (toolName !== "write" && toolName !== "edit") {
 									upsertStreamPart(contentIndex, "tool", "", toolName, summarizeToolArgsForUI(toolName, args));
 									if (toolCallId) {
@@ -8827,6 +9029,9 @@ async function runSingleAgent(
 			currentResult.verifySkipped = true;
 		}
 		const endOk = isHostEndOk(currentResult, { aborted: wasAborted });
+		if (toolBudget) currentResult.toolBudget = summarizeToolBudget(toolBudget, parentToolCalls);
+		if (usageBudgetState) currentResult.usageBudget = usageBudgetState;
+		if (forkSanitizedSummary) currentResult.forkSanitized = forkSanitizedSummary;
 		// Failure classification + optional evidence-derived checkpoint (fresh-episode routing).
 		let recoveryClassification: RecoveryDecision | undefined;
 		let recoveryCheckpointFile: string | undefined;
@@ -9101,6 +9306,7 @@ async function runSingleAgent(
 		}
 		const endHandle = handleForRun(pipiuiAgentId, runId);
 		clearActiveTools();
+		forgetBossQuestions(pipiuiAgentId, runId, questionDir);
 		if (endHandle) projectFinalizationPhase(pipiuiAgentId, runId, "done-await-host");
 		await postTerminalPipiuiReport(attachDiagnostics({
 			kind: "end",
@@ -9272,6 +9478,33 @@ const ProgressLogParam = Type.Optional(
 	}),
 );
 
+const ToolBudgetParam = Type.Optional(
+	Type.Object({
+		soft: Type.Optional(Type.Integer({ minimum: 1, description: "Tool-call count at which the worker is nudged once (steer) to finalize." })),
+		hard: Type.Integer({ minimum: 1, description: "Tool-call count after which `block` tools are refused. The final answer is never blocked and the run does not end." }),
+		block: Type.Optional(Type.Array(Type.String(), {
+			minItems: 1,
+			description: "Tools refused past hard; default read/grep/find/ls (browsing, not mutation). [\"*\"] refuses every tool.",
+		})),
+	}, {
+		additionalProperties: false,
+		description: "Per-dispatch tool-call budget enforced inside the worker. Fit for read-only recon and review; do not hard-cap a writer mid-edit.",
+	}),
+);
+const UsageBudgetLimitParam = Type.Object({
+	soft: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+	hard: Type.Number({ exclusiveMinimum: 0 }),
+}, { additionalProperties: false });
+const UsageBudgetParam = Type.Optional(
+	Type.Object({
+		tokens: Type.Optional(UsageBudgetLimitParam),
+		costUsd: Type.Optional(UsageBudgetLimitParam),
+	}, {
+		additionalProperties: false,
+		description: "Per-dispatch reported-usage budget (input+output tokens, cost in USD). soft: one [subagent-budget] notice to you; hard: the worker is aborted (stopReason usage_budget) — read-only roles only; an abort is not a safe cut for a writer.",
+	}),
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
@@ -9291,6 +9524,8 @@ const TaskItem = Type.Object({
 	agentId: Type.String({ description: AGENT_ID_DESCRIPTION }),
 	fresh: Type.Optional(Type.Boolean({ description: FRESH_DESCRIPTION })),
 	fork: Type.Optional(Type.Boolean({ description: FORK_DESCRIPTION })),
+	toolBudget: ToolBudgetParam,
+	usageBudget: UsageBudgetParam,
 }, { additionalProperties: false });
 
 // Chain items speak the same Grok Build / Claude-family dispatch contract as the
@@ -9323,6 +9558,8 @@ const ChainItem = Type.Object({
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
+	toolBudget: ToolBudgetParam,
+	usageBudget: UsageBudgetParam,
 	scope: ScopeParam,
 	planTask: PlanTaskParam,
 }, { additionalProperties: false });
@@ -9401,6 +9638,8 @@ const SubagentParams = Type.Object({
 	heartbeatSecs: HeartbeatSecsParam,
 	timeoutSecs: TimeoutSecsParam,
 	progressLog: ProgressLogParam,
+	toolBudget: ToolBudgetParam,
+	usageBudget: UsageBudgetParam,
 	scope: ScopeParam,
 	planTask: PlanTaskParam,
 	tasks: Type.Optional(Type.Array(TaskItem, {
@@ -9803,6 +10042,35 @@ export default function (pi: ExtensionAPI) {
 			if (!text.startsWith("/subagent_")) releaseHostStopQuiet(pi);
 		}
 	});
+	// Worker side of the question channel. The Boss issues the directory only to its own
+	// direct workers; without it the tool does not exist and the prompt says nothing.
+	const askBossDir = PIPIUI_DEPTH > 0 ? process.env[QUESTION_DIR_ENV] : undefined;
+	const askBossAgentId = process.env.PIPIUI_AGENT_ID;
+	const askBossRunId = process.env.PIPIUI_AGENT_RUN_ID;
+	const askBossEnabled = Boolean(askBossDir && askBossAgentId && askBossRunId);
+	if (askBossEnabled) {
+		registerAskBossTool(pi, {
+			dir: askBossDir!,
+			agentId: askBossAgentId!,
+			runId: askBossRunId!,
+			timeoutMs: resolveAskBossTimeoutMs(),
+		});
+	}
+	// Worker side of toolBudget: count every tool call, nudge once at soft, refuse the
+	// `block` list past hard. The parent keeps its own tally for the done message.
+	const childToolBudget = PIPIUI_DEPTH > 0 ? decodeToolBudgetEnv(process.env[TOOL_BUDGET_ENV]) : undefined;
+	if (childToolBudget) {
+		const tracker = createToolBudgetTracker(childToolBudget);
+		pi.on("tool_call", (event) => {
+			const verdict = tracker.note(event.toolName);
+			if (verdict.softReached) {
+				// Advisory: a nudge that cannot be delivered is not worth failing the call over.
+				void pi.sendUserMessage(formatToolBudgetSoftNudge(verdict.count, childToolBudget), { deliverAs: "steer" }).catch(() => undefined);
+			}
+			if (verdict.block) return { block: true, reason: verdict.block };
+			return undefined;
+		});
+	}
 	if (PIPIUI_SUBAGENT_SKILL_ISOLATION) {
 		// Pi still accepts extension-contributed skillPaths under --no-skills. Remove the
 		// generated model-visible skill catalog and make this child extension the sole
@@ -9821,7 +10089,10 @@ export default function (pi: ExtensionAPI) {
 			// leave out, since it is the file this run is about to overwrite.
 			const findingsIndex = formatFindingsIndexBlock(listFindings(PIPIUI_MAIN_CWD, PIPIUI_PARENT));
 			return {
-				systemPrompt: [systemPrompt, isolation, findingsIndex].filter(Boolean).join("\n\n"),
+				// The question-channel note rides last: it is a runtime suffix like the others,
+				// and the definition prompt must stay ahead of every one of them.
+				systemPrompt: [systemPrompt, isolation, findingsIndex].filter(Boolean).join("\n\n")
+					+ (askBossEnabled ? `\n\n${ASK_BOSS_GUIDANCE}` : ""),
 			};
 		});
 
@@ -10166,6 +10437,13 @@ export default function (pi: ExtensionAPI) {
 		// (3) stall 推送 / 复推 / 预裁决 abort
 		for (const [agentId, handle] of runningAgents) {
 			if (handle.finalizing || handle.residentIdleWait) continue;
+			// A worker blocked in ask_boss is waiting on the Boss; nagging the Boss about a
+			// stall it caused, or aborting the worker for it, would be exactly backwards.
+			if (workerWaitingOnBoss(handle)) {
+				const questionDir = handle.runId ? questionDirFor(agentId, handle.runId) : undefined;
+				if (questionDir && handle.runId) deliverPendingBossQuestions(agentId, handle.runId, questionDir);
+				continue;
+			}
 			// Explained, measurably-progressing silence is not a stall and must not spend a
 			// notification — nor march toward the auto-abort. Crying wolf on every long build
 			// is what taught the Boss to discount the signal in the first place.
@@ -10456,7 +10734,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Dispatch a worker: recon you do not want to run yourself (explore), an implementation sidecar, or a review. Several in one message run concurrently.",
 		description: [
 			"Dispatch one worker. A single dispatch requires prompt (the full brief), description (3-5 word label), and agentId — a short semantic id you choose for this worker, e.g. \"quota-pill\" (2-24 chars: lowercase letters, digits, \"-\", \"_\"). No id is generated for you; re-dispatching the same agentId resumes that worker, and fresh:true starts the same id cold.",
-			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, heartbeatSecs, timeoutSecs, progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
+			"Optional: subagent_type (default general-purpose), title, isolation (worktree|none), cwd, verify, thinking, model (exact provider/modelId pin for THIS dispatch only), blockedBy, heartbeatSecs, timeoutSecs, toolBudget ({soft?, hard, block?}: tool-call cap enforced in the worker; for recon/review), usageBudget ({tokens?/costUsd?: {soft?, hard}}: soft notifies you, hard aborts the worker; read-only roles only), progressLog, scope, planTask (semantic slug of the approved-plan task this dispatch implements; when an approved plan has open tasks, omitting it or naming an unknown task gets an advisory [plan-drift] line — never blocked), run_in_background. resume_from is a deprecated alias of agentId.",
 			"Parallel mode: pass tasks[] (each item: task, agentId, and the same optional fields including its own model) instead of prompt/description. Independent workers: call this tool multiple times in the same response. Do not serialize them across turns.",
 			"Ordered steps use subagent_chain (each step carries its own unique agentId). Stop a job with subagent_abort({agentId, runId}). Close a failed episode with subagent_resolve({agentId, runId}). Inspect with subagent_status before re-dispatching.",
 		].join(" "),
@@ -11361,6 +11639,8 @@ export default function (pi: ExtensionAPI) {
 								noWorktreeReason: step.noWorktreeReason,
 								heartbeatSecs: step.heartbeatSecs,
 								timeoutSecs: step.timeoutSecs,
+								toolBudget: step.toolBudget,
+								usageBudget: step.usageBudget,
 								progressLog: step.progressLog,
 								scope: step.scope,
 								planTask: step.planTask,
@@ -11808,7 +12088,7 @@ export default function (pi: ExtensionAPI) {
 												sessionShutdownAbort.signal,
 												undefined,
 												makeDetails("single", { background: true, agentIds: [agentId] }),
-												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, fork: params.fork, forkSourceFile, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, progressLog: params.progressLog },
+												{ toolCallId, background: true, agentId, runId, title: params.title, sessionModel, contextWindow, verify: params.verify, thinking: params.thinking, model: params.model, modelPin: releasedModelPin, fresh: params.fresh, fork: params.fork, forkSourceFile, scope: params.scope, planTask: params.planTask, worktree: params.worktree, noWorktreeReason: params.noWorktreeReason, heartbeatSecs: params.heartbeatSecs, timeoutSecs: params.timeoutSecs, toolBudget: params.toolBudget, usageBudget: params.usageBudget, progressLog: params.progressLog },
 											)
 											.then((result) => {
 												clearRunningDispatchScope(agentId);
@@ -11906,6 +12186,8 @@ export default function (pi: ExtensionAPI) {
 						noWorktreeReason: params.noWorktreeReason,
 						heartbeatSecs: params.heartbeatSecs,
 						timeoutSecs: params.timeoutSecs,
+						toolBudget: params.toolBudget,
+						usageBudget: params.usageBudget,
 						progressLog: params.progressLog,
 					},
 				);
@@ -12422,6 +12704,15 @@ export default function (pi: ExtensionAPI) {
 			);
 		},
 	});
+	if (PIPIUI_DEPTH === 0) {
+		// The Boss answers its direct workers' ask_boss questions; nested parents never
+		// get the tool, and their children never get ask_boss (see questionDir at dispatch).
+		bossPi = pi;
+		registerSubagentReplyTool(pi, {
+			dirFor: questionDirFor,
+			currentRunId: (agentId) => runningAgents.get(agentId)?.runId,
+		});
+	}
 	if (PIPIUI_DEPTH === 0) pi.registerTool({
 		name: "subagent_alarm_ack",
 		label: "Subagent Alarm Ack",

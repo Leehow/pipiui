@@ -46,6 +46,8 @@ export function summarizeActiveToolArgs(
 			return cleanBounded(args.name, MAX_PATH);
 		case "skill_search":
 			return cleanBounded(args.query, MAX_COMMAND);
+		case "ask_boss":
+			return cleanBounded(args.question, MAX_COMMAND);
 		default:
 			return undefined;
 	}
