@@ -15,6 +15,8 @@ export interface StallNotifyState {
 	stallNotifyInFlight?: boolean;
 	/** Attempts this silent stretch, delivered or not; the abort valve counts these. */
 	stallAttemptCount?: number;
+	/** Attempts across the whole run; activity resets the two above but never this one. */
+	stallStrikesTotal?: number;
 }
 
 /** A tool call measurably busy this long earns one heads-up to the Boss; it is not a stall. */
@@ -27,6 +29,55 @@ export interface LongToolMessageInput {
 	tool: string;
 	forSec: number;
 	liveness?: string;
+}
+
+/**
+ * Why the runtime killed this run, written for whoever reads the result rather than the
+ * chat: a foreground dispatch never receives the stall messages (the Boss is blocked inside
+ * the tool call), so the returned result is the only place it can learn what happened.
+ */
+export function formatStallAbortReason(input: {
+	idleSec: number;
+	syncWait: boolean;
+	runStrikes: number;
+	lastLine: string;
+}): string {
+	const cause = input.syncWait
+		? `no output for ${input.idleSec}s while you waited on it in the foreground`
+		: input.runStrikes >= 3
+			? `it went quiet ${input.runStrikes} times in this run (last stretch ${input.idleSec}s) without finishing`
+			: `no output for ${input.idleSec}s across repeated unanswered stall notices`;
+	return [
+		`runtime_stall: aborted because ${cause}. Last activity: ${input.lastLine}.`,
+		"Its stored conversation and worktree are intact: re-dispatch the same agentId to continue, or fresh:true to start it cold.",
+		"If the silence was a measurement error — the real output goes to a log this runtime does not watch — name that path with progressLog on the next dispatch instead of expecting a different result.",
+	].join(" ");
+}
+
+/**
+ * A closeout that has outlived every budget it should respect. The worker's process is gone;
+ * what is hanging is merge/verify/cleanup, so this is not a stall and not the worker's fault.
+ */
+export function formatFinalizingMessage(input: {
+	agentId: string;
+	runId: string;
+	title: string;
+	phase: string;
+	elapsedSec: number;
+	forced: boolean;
+}): string {
+	const head = `[subagent-finalizing] agentId=${input.agentId} runId=${input.runId} title=${input.title} phase=${input.phase} for=${input.elapsedSec}s`;
+	return input.forced
+		? [
+			head,
+			"Its child process already exited; closeout (merge, verify, or cleanup) has now exceeded its ceiling and the runtime recorded the run as interrupted so it stops occupying a worker slot.",
+			`Its worktree and branch are NOT cleaned up — inspect them before re-dispatching, with subagent_status({agentId:"${input.agentId}"}). If the closeout later completes on its own, it replaces this provisional record.`,
+		].join("\n")
+		: [
+			head,
+			"Its child process already exited; the runtime is still finishing closeout (merge, verify, or cleanup) and that is taking unusually long. Nothing is required from you yet — this is a heads-up, not a stall, and no worker output is being lost.",
+			"Do not re-dispatch this agentId while closeout is in flight; wait for its terminal receipt. Do not treat this message as a new user request.",
+		].join("\n");
 }
 
 /** Informational, once per call: the worker is busy, but one call has run long enough to mention. */
@@ -104,6 +155,7 @@ export function claimStallNotification(
 	handle.stallNotifyInFlight = true;
 	handle.lastStallNotifyAt = now;
 	handle.stallAttemptCount = (handle.stallAttemptCount ?? 0) + 1;
+	handle.stallStrikesTotal = (handle.stallStrikesTotal ?? 0) + 1;
 	return true;
 }
 

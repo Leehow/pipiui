@@ -220,7 +220,9 @@ import {
 	deliverStallWake as deliverStallWakeThrough,
 	LONG_TOOL_NOTICE_MS,
 	formatBlockedMessage,
+	formatFinalizingMessage,
 	formatLongToolMessage,
+	formatStallAbortReason,
 	formatStallMessage,
 	planHeldSignalFlush,
 } from "./stall-notification.ts";
@@ -2605,6 +2607,34 @@ const STALL_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
 /** 同一无活动片段最多推送首次 + 两次复推；有新活动后重新武装。 */
 const STALL_RENOTIFY_MAX = 3;
 /**
+ * Run-scoped strike ceiling, never reset by activity.
+ *
+ * Any byte of output resets the per-stretch strike count, and that is right: output is
+ * progress for the question "is this silent". But it also meant a worker that emits one
+ * line every ninety seconds while getting nowhere — a retry loop, a poll that never
+ * succeeds — could never accumulate three strikes and so could never reach the auto-abort.
+ * Strikes across the whole run are counted separately and survive the reset, so a flapping
+ * worker still terminates. The ceiling is deliberately looser than the per-stretch one: a
+ * long legitimate run may pass through a few quiet stretches without being wedged.
+ */
+const STALL_RUN_STRIKE_MAX = 6;
+/**
+ * A foreground (sync) worker is aborted on its first stall because the Boss is blocked
+ * inside the tool call and cannot receive a notification. 120s of silence is not evidence
+ * of a wedge, though — one slow model turn clears it — so the sync path gets its own,
+ * much longer window before that unannounced kill. Override with PIPIUI_SYNC_STALL_SECS.
+ */
+const SYNC_STALL_GRACE_MS = envPositiveSecs("PIPIUI_SYNC_STALL_SECS", 10 * 60) * 1000;
+/**
+ * Closeout watchdog. A handle in `finalizing` is skipped by the stall pass, the vanish
+ * sweep, CPU sampling and the heartbeat, so a closeout that wedges (a merge waiting on a
+ * lock, a verify that never returns, an unsettled promise) left the worker invisible and
+ * its job stuck in `running` forever. Notice once, then force the terminal so the job
+ * leaves `running`; a real closeout that finishes later still corrects the provisional row.
+ */
+const FINALIZE_NOTICE_MS = envPositiveSecs("PIPIUI_FINALIZE_NOTICE_SECS", 5 * 60) * 1000;
+const FINALIZE_FORCE_MS = envPositiveSecs("PIPIUI_FINALIZE_FORCE_SECS", 15 * 60) * 1000;
+/**
  * Terminal interrupted/aborted/failed jobs that still hold stored context: first boss reminder
  * after this many seconds idle in that state, then one re-nudge at the renudge threshold.
  * Override via PIPIUI_INTERRUPTED_NUDGE_SECS / PIPIUI_INTERRUPTED_RENUDGE_SECS.
@@ -2688,6 +2718,12 @@ interface RunningAgentHandle {
 	 * so a signal that is held or absorbed every time still ends in an abort instead of a hang.
 	 */
 	stallAttemptCount?: number;
+	/** Strikes across the whole run; activity never clears it (see STALL_RUN_STRIKE_MAX). */
+	stallStrikesTotal?: number;
+	/** Why the runtime aborted this run, carried into the result so a sync caller learns it. */
+	abortReason?: string;
+	/** `finalizing` elapsed notice already sent for this closeout; one per run. */
+	finalizeNoticedAt?: number;
 	/** The toolWaitSince a long-running-tool heads-up was already sent for; one notice per call. */
 	longToolNoticedFor?: number;
 	/** Successful wall-clock check-ins delivered for this dispatch. */
@@ -2931,6 +2967,8 @@ function noteAgentActivity(agentId: string, runId?: string): void {
 	handle.lastStallNotifyAt = 0;
 	handle.stallNotifyCount = 0;
 	handle.stallAttemptCount = 0;
+	// `stallStrikesTotal` is deliberately NOT reset: it is the run-scoped memory that a
+	// worker which keeps going quiet is not made healthy by the noise in between.
 	handle.stallNotifyInFlight = false;
 	// Output after a tool request is the tool results coming back. The stdout handler
 	// notes activity before the scanner parses the chunk, so the message_end that opens
@@ -3413,7 +3451,13 @@ type AbortIntent = "boss" | "runtime";
 
 function abortRunningAgent(
 	agentId: string,
-	options: { reportTerminalToSupervisor?: boolean; runId: string; abortedBy: AbortIntent },
+	options: {
+		reportTerminalToSupervisor?: boolean;
+		runId: string;
+		abortedBy: AbortIntent;
+		/** Carried into the run's result, so a caller blocked in the tool learns why it died. */
+		reason?: string;
+	},
 ): { ok: boolean; message: string } {
 	const runId = options.runId.trim();
 	if (!runId) {
@@ -3476,6 +3520,7 @@ function abortRunningAgent(
 	// Intent is recorded on the handle before the signal fires, so the terminal path can tell
 	// "the Boss asked for this" from "the runtime did this to the Boss's worker".
 	handle.abortedBy = options.abortedBy;
+	if (options.reason) handle.abortReason = options.reason;
 	noteDiagnosticsAbort(handle.diagnostics, options.abortedBy === "boss" ? "user" : "stall");
 	const abortExactRun = () => handle.controller.abort();
 	if (options.reportTerminalToSupervisor && supervisorAbortTerminalCloseout) {
@@ -9183,8 +9228,16 @@ async function runSingleAgent(
 		if (usageBudgetState) currentResult.usageBudget = usageBudgetState;
 		if (forkSanitizedSummary) currentResult.forkSanitized = forkSanitizedSummary;
 		// An abort's intent rides on the handle; the result carries it into the job record and
-		// the receipt so the Boss is never alarmed about an abort it asked for.
-		if (wasAborted) currentResult.abortedBy = handleForRun(pipiuiAgentId, runId)?.abortedBy ?? "runtime";
+		// the receipt so the Boss is never alarmed about an abort it asked for. A runtime abort
+		// also carries its reason: a foreground caller is blocked inside this tool call and the
+		// returned result is the only channel it can hear about the kill on.
+		if (wasAborted) {
+			const abortHandle = handleForRun(pipiuiAgentId, runId);
+			currentResult.abortedBy = abortHandle?.abortedBy ?? "runtime";
+			if (abortHandle?.abortReason && !currentResult.errorMessage) {
+				currentResult.errorMessage = abortHandle.abortReason;
+			}
+		}
 		// Tally before the terminal cleanup removes the run's question directory.
 		const bossQuestions = questionDir ? summarizeQuestionRun(questionDir) : undefined;
 		if (bossQuestions) currentResult.bossQuestions = bossQuestions;
@@ -10493,6 +10546,45 @@ export default function (pi: ExtensionAPI) {
 			else deliverSubagentDone(pi, text);
 		}
 
+		// (2a) Closeout watchdog. `finalizing` handles are skipped by every other pass in this
+		// tick, which is right while closeout is progressing and wrong once it wedges: the
+		// child is gone, nothing will ever emit again, and the job sits in `running` forever.
+		for (const [agentId, handle] of [...runningAgents]) {
+			if (!handle.finalizing) continue;
+			const since = handle.diagnostics.childExitedAt ?? handle.diagnostics.phaseSince;
+			if (since === undefined) continue;
+			const elapsedMs = now - since;
+			if (elapsedMs < FINALIZE_NOTICE_MS) continue;
+			const phase = handle.diagnostics.finalizationPhase ?? "finalizing";
+			const elapsedSec = Math.floor(elapsedMs / 1000);
+			const title = inFlightWorkerTitle(handle);
+			if (elapsedMs >= FINALIZE_FORCE_MS) {
+				const runId = handle.runId;
+				const reason = `closeout exceeded ${Math.round(FINALIZE_FORCE_MS / 60_000)} minutes in phase ${phase}; recorded as interrupted so the slot is released`;
+				// Provisional, exactly like the vanished sweep: a closeout that finishes later
+				// still replaces this row through the normal terminal callback.
+				if (!markWorkerInterrupted(agentId, reason)) continue;
+				logStallProbe("finalize-forced", {
+					agent: agentId,
+					run: runId,
+					seq: handle.diagnostics.eventSeq,
+					reason: phase,
+				});
+				// The worker has just left `runningAgents`, so the advisory channel would drop
+				// this (admission requires a running worker). A terminal the runtime decided on
+				// is exactly what the durable receipt channel is for.
+				deliverConfirmedDoneToBoss(pi, agentId, runId, formatFinalizingMessage({
+					agentId, runId, title, phase, elapsedSec, forced: true,
+				}));
+				continue;
+			}
+			if (handle.finalizeNoticedAt !== undefined) continue;
+			handle.finalizeNoticedAt = now;
+			void deliverStallWakeToBoss(pi, formatFinalizingMessage({
+				agentId, runId: handle.runId, title, phase, elapsedSec, forced: false,
+			}));
+		}
+
 		// (2b) Progress evidence for every quiet worker, from one shared `ps` table.
 		// Sampled before the stall pass so `stalledInfoFor` can let measured progress
 		// excuse a long tool call and, just as importantly, refuse to excuse a wedge.
@@ -10554,10 +10646,13 @@ export default function (pi: ExtensionAPI) {
 				stallThresholdMs: STALL_THRESHOLD_MS,
 				notifyCount: handle.stallNotifyCount,
 				attemptCount: handle.stallAttemptCount ?? 0,
+				runStrikes: handle.stallStrikesTotal ?? 0,
 				maxNotifies: STALL_RENOTIFY_MAX,
+				maxRunStrikes: STALL_RUN_STRIKE_MAX,
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
+				syncRecoveryGraceMs: SYNC_STALL_GRACE_MS,
 			});
 			const probe = classifyWatchdogProbe({
 				inTool: Boolean(stallInfo.inTool),
@@ -10631,10 +10726,13 @@ export default function (pi: ExtensionAPI) {
 				stallThresholdMs: STALL_THRESHOLD_MS,
 				notifyCount: handle.stallNotifyCount,
 				attemptCount: handle.stallAttemptCount ?? 0,
+				runStrikes: handle.stallStrikesTotal ?? 0,
 				maxNotifies: STALL_RENOTIFY_MAX,
+				maxRunStrikes: STALL_RUN_STRIKE_MAX,
 				msSinceLastNotify: handle.lastStallNotifyAt > 0 ? now - handle.lastStallNotifyAt : idleMs,
 				notifyIntervalMs: STALL_RENOTIFY_INTERVAL_MS,
 				syncWait: handle.syncWait === true,
+				syncRecoveryGraceMs: SYNC_STALL_GRACE_MS,
 			});
 			if (action === "ignore") continue;
 			const idleSec = Math.floor(idleMs / 1000);
@@ -10644,7 +10742,17 @@ export default function (pi: ExtensionAPI) {
 			const activityRaw = job?.activity?.trim() || "";
 			const lastLine = (activityRaw.split("\n").pop() ?? "").trim().slice(0, 120) || "(no activity)";
 			if (action === "abort") {
-				const aborted = abortRunningAgent(agentId, { reportTerminalToSupervisor: true, runId: handle.runId, abortedBy: "runtime" });
+				const aborted = abortRunningAgent(agentId, {
+					reportTerminalToSupervisor: true,
+					runId: handle.runId,
+					abortedBy: "runtime",
+					reason: formatStallAbortReason({
+						idleSec,
+						syncWait: handle.syncWait === true,
+						runStrikes: handle.stallStrikesTotal ?? 0,
+						lastLine,
+					}),
+				});
 				if (!aborted.ok) continue;
 				logStallProbe("abort", {
 					agent: agentId,

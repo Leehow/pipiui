@@ -20,22 +20,22 @@ test("every abort entry point declares its intent", () => {
 	assert.match(source, /const result = abortRunningAgent\(agentId, \{ runId, abortedBy: "boss" \}\);/);
 	assert.match(source, /if \(abortRunningAgent\(agentId, \{ runId, abortedBy: "boss" \}\)\.ok\) aborted\.push\(agentId\);/);
 	// Runtime-decided: the stall watchdog and the Supervisor-owned closeout.
-	assert.match(source, /abortRunningAgent\(agentId, \{ reportTerminalToSupervisor: true, runId: handle\.runId, abortedBy: "runtime" \}\)/);
+	assert.match(source, /abortRunningAgent\(agentId, \{\s*reportTerminalToSupervisor: true,\s*runId: handle\.runId,\s*abortedBy: "runtime",/);
 	assert.match(source, /abortRunningAgent\(id\.agentId, \{ runId: id\.runId, abortedBy: "runtime" \}\)/);
 	// No call site is left without an intent: the option is mandatory in the signature.
-	assert.match(source, /options: \{ reportTerminalToSupervisor\?: boolean; runId: string; abortedBy: AbortIntent \}/);
+	assert.match(source, /options: \{\s*reportTerminalToSupervisor\?: boolean;\s*runId: string;\s*abortedBy: AbortIntent;/);
 	const calls = source.match(/abortRunningAgent\([^)]*\)/g) ?? [];
 	for (const call of calls) {
-		if (call.startsWith("abortRunningAgent(\n")) continue;
+		if (call.includes("options:")) continue; // the declaration, not a call
 		assert.match(call, /abortedBy: "(boss|runtime)"/, `call without intent: ${call}`);
 	}
 });
 
 test("intent is recorded before the signal fires and survives into the result and the job record", () => {
-	assert.match(source, /handle\.abortedBy = options\.abortedBy;\s*noteDiagnosticsAbort\(handle\.diagnostics, options\.abortedBy === "boss" \? "user" : "stall"\);/);
+	assert.match(source, /handle\.abortedBy = options\.abortedBy;\s*if \(options\.reason\) handle\.abortReason = options\.reason;\s*noteDiagnosticsAbort\(handle\.diagnostics, options\.abortedBy === "boss" \? "user" : "stall"\);/);
 	// A stopped Boss turn (the tool's own signal) is principal-initiated; a bare controller abort is the runtime's.
 	assert.match(source, /if \(intentHandle && !intentHandle\.abortedBy\) intentHandle\.abortedBy = signal\?\.aborted \? "boss" : "runtime";/);
-	assert.match(source, /if \(wasAborted\) currentResult\.abortedBy = handleForRun\(pipiuiAgentId, runId\)\?\.abortedBy \?\? "runtime";/);
+	assert.match(source, /if \(wasAborted\) \{\s*const abortHandle = handleForRun\(pipiuiAgentId, runId\);\s*currentResult\.abortedBy = abortHandle\?\.abortedBy \?\? "runtime";/);
 	assert.match(source, /\.\.\.\(result\.abortedBy \? \{ abortedBy: result\.abortedBy \} : \{\}\),/);
 });
 

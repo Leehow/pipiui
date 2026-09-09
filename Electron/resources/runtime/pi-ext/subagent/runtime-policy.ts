@@ -347,7 +347,15 @@ export function decideStallWatchdogAction(input: {
 	 * end in an abort, or the worker hangs for as long as nobody happens to be listening.
 	 */
 	attemptCount?: number;
+	/**
+	 * Strikes across the whole run, which activity never clears. A worker that goes quiet,
+	 * emits a line, and goes quiet again forever resets `attemptCount` every time and would
+	 * otherwise never reach the valve; this counts the pattern instead of the stretch.
+	 */
+	runStrikes?: number;
 	maxNotifies: number;
+	/** Ceiling for `runStrikes`; looser than maxNotifies, since a long run may have quiet stretches. */
+	maxRunStrikes?: number;
 	msSinceLastNotify: number;
 	notifyIntervalMs: number;
 	syncWait: boolean;
@@ -361,6 +369,7 @@ export function decideStallWatchdogAction(input: {
 	}
 	const strikes = Math.max(input.notifyCount, input.attemptCount ?? 0);
 	if (strikes >= input.maxNotifies) return "abort";
+	if (input.maxRunStrikes !== undefined && (input.runStrikes ?? 0) >= input.maxRunStrikes) return "abort";
 	if (strikes > 0 && input.msSinceLastNotify < input.notifyIntervalMs) return "ignore";
 	return "notify";
 }

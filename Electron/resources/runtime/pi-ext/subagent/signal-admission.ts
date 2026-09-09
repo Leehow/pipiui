@@ -20,7 +20,14 @@ export type RuntimeSignalKind =
 	| "stall"
 	| "done"
 	| "reminder"
-	| "blocked";
+	| "blocked"
+	/**
+	 * Advisory facts about a worker that is still running and still believed healthy: a tool
+	 * call that has run a long time, a closeout that is taking a long time. They are worth
+	 * saying once, never worth interrupting a live turn or outliving their worker, so they
+	 * ride the same gate as `stall` rather than bypassing admission as unknown text.
+	 */
+	| "notice";
 
 export interface SignalAdmissionInput {
 	kind: RuntimeSignalKind;
@@ -44,6 +51,7 @@ export function classifyRuntimeSignal(text: string): RuntimeSignalKind | undefin
 	if (text.startsWith("[subagent-done]")) return "done";
 	if (text.startsWith("[subagent-interrupted-reminder]")) return "reminder";
 	if (text.startsWith("[subagent-blocked]")) return "blocked";
+	if (text.startsWith("[subagent-long-tool]") || text.startsWith("[subagent-finalizing]")) return "notice";
 	return undefined;
 }
 
@@ -55,6 +63,7 @@ export function admitSignal(input: SignalAdmissionInput): Admission {
 	switch (input.kind) {
 		case "heartbeat":
 		case "stall":
+		case "notice":
 			return input.workerRunning ? "send" : "drop";
 		case "reminder":
 			return input.episodeOpen ? "send" : "drop";
