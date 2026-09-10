@@ -304,10 +304,15 @@ export function completionPersistenceState(
 			// later terminal assistant. It is activity, not this attempt's outcome.
 			if (entry.message.stopReason === "toolUse") continue;
 			if (entry.message.stopReason === "stop") state = "fulfilled";
+			// `length` is not a lost delivery: the message surfaced and the Boss
+			// answered until it ran out of output budget. Redelivering the same
+			// payload only truncates the same way again, so a bounded retry
+			// budget burns down without ever changing the outcome. Treat it as
+			// observed — the completion stays visible in status and transcript.
+			else if (entry.message.stopReason === "length") state = "observed";
 			else if (
 				entry.message.stopReason === "error" ||
-				entry.message.stopReason === "aborted" ||
-				entry.message.stopReason === "length"
+				entry.message.stopReason === "aborted"
 			) state = "retryable";
 			// Unknown/pending/deferred states are not proven terminal here. Keep the
 			// attempt observed rather than inventing success or failure.

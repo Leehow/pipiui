@@ -37,6 +37,7 @@ const EXTENSION_TOOL_CLAIMS: Readonly<Record<string, readonly string[]>> = Objec
     "subagent_chain",
     "subagent_abort",
     "subagent_alarm_ack",
+    "subagent_done_ack",
     "ledger_note",
     "context_doc",
     "context_manage",

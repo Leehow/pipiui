@@ -558,3 +558,53 @@ test("settle flush sends held confirmed dones even after the first receipt flips
 	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: false }), false);
 	assert.equal(holdConfirmedDoneDelivery({ quiet: false, busy: false }, { flushAfterSettle: true }), false);
 });
+
+test("a truncated Boss turn is observed, not a lost delivery to redeliver", () => {
+	const exact = {
+		type: "custom_message",
+		customType: "pipiui-subagent-complete-v1",
+		details: { version: 1, sessionId: "session-a", agentId: "agent-a", runId: "run-a", obligationId: "row-a" },
+	};
+	// The Boss read the completion and answered until it ran out of output
+	// budget. Redelivering the same payload truncates the same way, so a
+	// `length` stop must not spend the retry budget on an unchangeable outcome.
+	const branch = [exact, { type: "message", message: { role: "assistant", stopReason: "length" } }];
+	assert.equal(completionPersistenceState(branch, exact.details), "observed");
+	assert.equal(
+		deliveryRetryDue({ state: "observed", attempts: 1, lastAttemptAt: 0 }, 10_000_000, 60_000, 5),
+		false,
+	);
+});
+
+test("a plain completion has a Boss-callable door out of the redelivery loop", (t) => {
+	const directory = mkdtempSync(join(tmpdir(), "pipiui-done-ack-"));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	let now = 1_000_000;
+	const store = new DeliveryObligationStore(directory, { routingKey: "session-a", now: () => now });
+	const row = store.create("agent-a", "run-a", "[subagent-done] shipped");
+	store.beginAttempt(row.id);
+	store.finishAttempt(row.id, false);
+	assert.equal(store.read(row.id)?.state, "failed");
+	now += 120_000;
+	assert.equal(deliveryRetryDue(store.read(row.id)!, now, 60_000, 5), true);
+
+	// The Boss closes it by an act, keyed on the obligationId the re-delivery
+	// line prints — one run's one delivery, so it cannot reach a newer run.
+	const acknowledged = store.markAcknowledged(row.id, "already verified via git log");
+	assert.equal(acknowledged?.state, "acknowledged");
+	assert.equal(store.read(row.id)?.acknowledgementNote, "already verified via git log");
+	assert.equal(deliveryRetryDue(store.read(row.id)!, now, 60_000, 5), false);
+	assert.deepEqual(store.recoverable().map(({ record }) => record.id), []);
+});
+
+test("the done door and the alarm door stay separate rows", (t) => {
+	const directory = mkdtempSync(join(tmpdir(), "pipiui-done-ack-alarm-"));
+	t.after(() => rmSync(directory, { recursive: true, force: true }));
+	const store = new DeliveryObligationStore(directory, { routingKey: "session-a" });
+	const alarm = store.create("agent-a", "run-a", "[subagent-done] aborted", undefined, true);
+	assert.equal(alarm.acknowledgementRequired, true);
+	// An armed alarm is still reachable only through the alarm door; the done
+	// door refuses it in index.ts before it ever gets here.
+	assert.equal(store.readAlarmEpisode("agent-a", "run-a")?.id, alarm.id);
+	assert.deepEqual(store.markAlarmEpisodeAcknowledged("agent-a", "run-a").map((r) => r.state), ["acknowledged"]);
+});

@@ -6131,10 +6131,17 @@ function sendDoneWithConfirmation(
 		state: "enter",
 		elapsedMs: 0,
 	});
+	// A re-delivery must also say how to stop itself. Without this the Boss can
+	// recognise the duplicate, state that it already handled it, and still be
+	// woken by the identical payload until the retry budget runs out — prose
+	// never settles an obligation. See acknowledgeSubagentDone.
+	const doneAckDoor = obligation.acknowledgementRequired
+		? ""
+		: ` If you already handled this event, call subagent_done_ack({obligationId:"${obligation.id}"}) to stop the re-delivery; a text-only reply does not.`;
 	const prefix = entry.recoveredAmbiguous
-		? `(recovered delivery: this completion may already have been queued or persisted before restart; obligationId=${obligation.id}; treat it as the same event.)`
+		? `(recovered delivery: this completion may already have been queued or persisted before restart; obligationId=${obligation.id}; treat it as the same event.${doneAckDoor})`
 		: isRetry
-			? `(re-delivery #${obligation.attempts}: Pi did not confirm the prior completion; obligationId=${obligation.id}; treat it as the same event.)`
+			? `(re-delivery #${obligation.attempts}: Pi did not confirm the prior completion; obligationId=${obligation.id}; treat it as the same event.${doneAckDoor})`
 			: "";
 	const outText = prefix ? `${prefix}\n${obligation.text}` : obligation.text;
 	return queueCompletionAfterCutIn(pi, {
@@ -6435,6 +6442,79 @@ function acknowledgeAlarmsForRun(agentId: string, runId: string, note?: string):
 		if (acknowledgeSubagentAlarm(alarmId, note).ok) acknowledged += 1;
 	}
 	return acknowledged;
+}
+
+/**
+ * The Boss's door out of a completion redelivery loop.
+ *
+ * A plain completion settles on its own when the Boss's turn after the wake
+ * ends cleanly; a turn that ends `error`/`aborted` is read as "never handled"
+ * and the whole payload is re-delivered. That inference is right when the Boss
+ * really never got to act, and wrong when it acted and the turn merely died
+ * afterwards — and in the wrong case nothing the Boss can say makes it stop,
+ * because prose is not evidence here. An alarm has `subagent_alarm_ack` for
+ * exactly this; a successful worker's completion had no door at all, so the
+ * only exit was the retry budget running out over five Boss turns.
+ *
+ * Keyed on the obligationId the re-delivery prefix prints, never on agentId:
+ * one obligation names one run's one delivery, so this door cannot cross into
+ * a newer run the way an agentId lookup would. Unlike an alarm it is not a
+ * demand for handling — it is the Boss declaring the event consumed. It
+ * settles delivery only: verification, worktree state and the job's own
+ * closeout are untouched.
+ */
+function acknowledgeSubagentDone(
+	obligationId: string,
+	note?: string,
+): { ok: boolean; message: string; idempotent?: boolean } {
+	const entry = pendingDone.get(obligationId);
+	const durable = obligationId.startsWith("volatile-") ? undefined : doneDeliveryStore?.read(obligationId);
+	const record = durable ?? entry?.obligation;
+	if (!record) {
+		return {
+			ok: false,
+			message: `Cannot acknowledge completion delivery ${obligationId}: no such obligation in the active Pi session.`,
+		};
+	}
+	if (record.acknowledgementRequired) {
+		return {
+			ok: false,
+			message: `${obligationId} is an armed Boss alarm, not a plain completion. Handle the episode, then call subagent_alarm_ack({alarmId:"${record.alarmId ?? `${record.agentId}.legacy`}"}).`,
+		};
+	}
+	const job = jobRegistry.get(record.agentId);
+	if (job && job.runId === record.runId && job.state === "running") {
+		return {
+			ok: false,
+			message: `Cannot acknowledge the completion of agentId=${record.agentId} while that exact run is still running.`,
+		};
+	}
+	const alreadySettled = record.state === "acknowledged" || record.state === "fulfilled";
+	if (durable) {
+		try {
+			doneDeliveryStore?.markAcknowledged(obligationId, note);
+		} catch (err) {
+			logDonePersistenceFailure("done-ack", obligationId, err);
+		}
+	}
+	// Volatile rows (persistence unavailable) live only in pendingDone; dropping
+	// the entry is their whole settle. Durable rows are dropped here too so a
+	// resend cannot race the next watchdog tick off stale in-memory state.
+	if (entry) {
+		clearDoneHoldOnForget(entry);
+		pendingDone.delete(obligationId);
+	}
+	if (alreadySettled && !entry) {
+		return {
+			ok: true,
+			idempotent: true,
+			message: `Completion ${obligationId} was already settled; nothing was re-delivering.`,
+		};
+	}
+	return {
+		ok: true,
+		message: `Acknowledged the completion of agentId=${record.agentId}; re-delivery stopped. Verification, worktree state and closeout are unchanged.`,
+	};
 }
 
 function supervisorAgentDir(): string {
@@ -9904,6 +9984,10 @@ const SubagentAlarmAckParams = Type.Object({
 	alarmId: Type.String({ minLength: 3, description: "Semantic alarm identity named by the Boss alarm, for example quota-pill.2. Internal opaque runId is never required." }),
 	note: Type.Optional(Type.String({ maxLength: 500, description: "Optional short handling note. Acknowledgement stops only this exact episode's recurring alarm." })),
 }, { additionalProperties: false });
+const SubagentDoneAckParams = Type.Object({
+	obligationId: Type.String({ minLength: 1, description: "Exact obligationId printed by the re-delivery line that is waking you. It names one run's one delivery, so this can never settle a newer run's completion." }),
+	note: Type.Optional(Type.String({ maxLength: 500, description: "Optional short note on how the event was handled." })),
+}, { additionalProperties: false });
 const SubagentWatchParams = Type.Object({
 	action: StringEnum(WATCH_ACTIONS, {
 		description: "start arms sampling of one exact live run (baseline first: an unchanged run emits nothing); update re-arms cadence or re-points the progress channel of an existing subscription; stop removes the exact pair; list shows every subscription, or one exact pair when agentId and runId are both given.",
@@ -10943,6 +11027,20 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				const result = acknowledgeSubagentAlarm(alarmId, parts.join(" ") || undefined);
+				ctx.ui.notify(result.message, result.ok ? "info" : "error");
+			},
+		});
+
+		if (PIPIUI_DEPTH === 0) pi.registerCommand("subagent_done_ack", {
+			description: "Stop re-delivery of one handled worker completion: /subagent_done_ack <obligationId> [note] (PipiUI)",
+			handler: async (args, ctx) => {
+				const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+				const obligationId = parts.shift();
+				if (!obligationId) {
+					ctx.ui.notify("Usage: /subagent_done_ack <obligationId> [note]", "error");
+					return;
+				}
+				const result = acknowledgeSubagentDone(obligationId, parts.join(" ") || undefined);
 				ctx.ui.notify(result.message, result.ok ? "info" : "error");
 			},
 		});
@@ -13023,6 +13121,31 @@ export default function (pi: ExtensionAPI) {
 			return new Text(
 				theme.fg("toolTitle", theme.bold("subagent_alarm_ack ")) +
 					theme.fg("accent", args.alarmId || "?"),
+				0,
+				0,
+			);
+		},
+	});
+	if (PIPIUI_DEPTH === 0) pi.registerTool({
+		name: "subagent_done_ack",
+		label: "Subagent Done Ack",
+		description: "Stop the re-delivery of one worker completion you already handled. A completion normally settles by itself; it is re-delivered when the Boss turn after the wake ended badly, which cannot distinguish 'never handled' from 'handled, then the turn died'. This is the door out of that loop: it settles delivery only and changes nothing about verification, the worktree, or the job's closeout. For a terminal alarm use subagent_alarm_ack instead.",
+		promptSnippet: "If a worker completion is re-delivered after you already handled it, acknowledge it; text replies do not stop re-delivery.",
+		parameters: SubagentDoneAckParams,
+		prepareArguments: bindSanitizeStrictToolArguments(SubagentDoneAckParams),
+		async execute(_toolCallId, params) {
+			const clean = omitNulls(params);
+			const result = acknowledgeSubagentDone(clean.obligationId.trim(), clean.note);
+			return {
+				content: [{ type: "text", text: result.message }],
+				details: null,
+				isError: !result.ok,
+			};
+		},
+		renderCall(args, theme) {
+			return new Text(
+				theme.fg("toolTitle", theme.bold("subagent_done_ack ")) +
+					theme.fg("accent", args.obligationId || "?"),
 				0,
 				0,
 			);

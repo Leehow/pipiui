@@ -550,9 +550,15 @@ export class DeliveryObligationStore {
 		return next;
 	}
 
+	/**
+	 * Boss-declared close of one row. An alarm reaches this through the alarm
+	 * door; a plain completion reaches it through the done door. Both mean the
+	 * same thing — the Boss closed this by an act, not by prose — so the state
+	 * is the same and the row stops being redelivered either way.
+	 */
 	markAcknowledged(id: string, note?: string): DeliveryObligation | undefined {
 		const record = this.read(id);
-		if (!record || !record.acknowledgementRequired) return undefined;
+		if (!record) return undefined;
 		if (record.state === "acknowledged") return record;
 		const normalizedNote = typeof note === "string"
 			? note.replace(/[\u0000-\u001f\u007f-\u009f]+/gu, " ").trim().replace(/\s+/gu, " ").slice(0, 500)
