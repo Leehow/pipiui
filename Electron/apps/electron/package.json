@@ -240,6 +240,7 @@
     },
     "mac": {
       "icon": "build/icon.icns",
+      "timestamp": "none",
       "extendInfo": {
         "CFBundleDisplayName": "PipiUI",
         "CFBundleName": "PipiUI"
