@@ -80,6 +80,47 @@ describe("installOwnedRuntimeShutdown", () => {
     expect(app.quit).not.toHaveBeenCalled();
   });
 
+  it("force-reaps the Computer runtime before the watchdog exits", async () => {
+    vi.useFakeTimers();
+    const { app, getBeforeQuit } = createApp();
+    const shutdown = vi.fn(() => new Promise<void>(() => {}));
+    const killNow = vi.fn();
+    installOwnedRuntimeShutdown(
+      app,
+      { closeAll: vi.fn() },
+      { shutdown, killNow },
+      { close: () => Promise.resolve() },
+    );
+
+    getBeforeQuit()?.({ preventDefault: vi.fn() });
+    await vi.advanceTimersByTimeAsync(OWNED_RUNTIME_SHUTDOWN_WATCHDOG_MS);
+
+    // An exit that outruns the teardown is exactly how a driver generation is orphaned.
+    expect(killNow).toHaveBeenCalledOnce();
+    expect(killNow.mock.invocationCallOrder[0]).toBeLessThan(
+      app.exit.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("still exits when the force-reap itself throws", async () => {
+    vi.useFakeTimers();
+    const { app, getBeforeQuit } = createApp();
+    const killNow = vi.fn(() => { throw new Error("reap failed"); });
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    installOwnedRuntimeShutdown(
+      app,
+      { closeAll: vi.fn() },
+      { shutdown: () => new Promise<void>(() => {}), killNow },
+      { close: () => Promise.resolve() },
+    );
+
+    getBeforeQuit()?.({ preventDefault: vi.fn() });
+    await vi.advanceTimersByTimeAsync(OWNED_RUNTIME_SHUTDOWN_WATCHDOG_MS);
+
+    expect(app.exit).toHaveBeenCalledWith(0);
+    error.mockRestore();
+  });
+
   it("ignores a later before-quit after the watchdog has already exited", async () => {
     vi.useFakeTimers();
     const { app, getBeforeQuit } = createApp();

@@ -1,9 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { accessSync, constants, existsSync, rmSync, statSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  execFile,
+  spawn,
+  spawnSync,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
 import { resolveCuaDriverLaunchPath } from "./runtime-assets.js";
 import {
@@ -206,6 +222,92 @@ export function cuaSocketPath(
   const root = platform === "win32" ? temporaryDirectory : "/tmp";
   const compactNonce = nonce.replace(/[^A-Za-z0-9]/g, "").slice(0, 32);
   return join(root, `pcua-${pid}-${compactNonce}.sock`);
+}
+
+/** macOS `O_CLOEXEC`. Node never exposes it, and the liveness writer must not leak into sibling children. */
+const O_CLOEXEC_DARWIN = 0x1000000;
+
+export type DaemonLiveness = { path: string; writeFd: number; childFd: number };
+
+export function closeFd(fd: number | undefined): void {
+  if (typeof fd !== "number") return;
+  try { closeSync(fd); } catch { /* already closed */ }
+}
+
+/**
+ * The daemon only learns that its host died by reading EOF from a real pipe. Node's
+ * `stdio: "pipe"` is a unix socketpair, and the driver's watcher stays silent when that
+ * peer dies — which is how an abrupt quit leaves an immortal daemon behind. A FIFO whose
+ * only writer is this process (CLOEXEC, so no sibling child can hold it open) turns every
+ * host death, graceful or not, into EOF on the daemon's stdin.
+ */
+export function openDaemonLiveness(
+  socket: string,
+  platform: NodeJS.Platform = process.platform,
+): DaemonLiveness | undefined {
+  if (platform !== "darwin" || !socket) return undefined;
+  const path = `${socket}.liveness`;
+  try {
+    rmSync(path, { force: true });
+    if (spawnSync("/usr/bin/mkfifo", ["-m", "600", path]).status !== 0) return undefined;
+    // A non-blocking reader first, so opening the writer cannot block; the child's own
+    // descriptor is then opened blocking, which now returns at once because a writer exists.
+    const opener = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const writeFd = openSync(path, constants.O_WRONLY | O_CLOEXEC_DARWIN);
+      const childFd = openSync(path, constants.O_RDONLY);
+      return { path, writeFd, childFd };
+    } finally {
+      closeFd(opener);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Endpoint files name the host that made them. A host killed outright unlinks nothing, so
+ * sweep the sockets, liveness FIFOs and logs whose owner is gone rather than letting /tmp
+ * collect one trail per crash.
+ */
+export function sweepAbandonedEndpoints(
+  directory = "/tmp",
+  alive: (pid: number) => boolean = processIsAlive,
+): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(directory);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const match = /^pcua-(\d+)-[A-Za-z0-9]+\.sock(\.liveness|\.log)?$/.exec(entry);
+    if (!match) continue;
+    const owner = Number(match[1]);
+    if (owner === process.pid || (owner > 1 && alive(owner))) continue;
+    try { rmSync(join(directory, entry), { force: true }); } catch { /* raced with another host */ }
+  }
+}
+
+/** `ppid` for each pid still visible to `ps`; a missing entry means the process is already gone. */
+async function parentPidsOf(pids: number[]): Promise<Map<number, number>> {
+  const parents = new Map<number, number>();
+  if (process.platform === "win32" || !pids.length) return parents;
+  try {
+    const { stdout } = await execFileAsync(
+      "/bin/ps",
+      ["-p", pids.join(","), "-o", "pid=,ppid="],
+      { encoding: "utf8", timeout: 2_000 },
+    );
+    for (const line of stdout.split("\n")) {
+      const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+      if (!match) continue;
+      parents.set(Number(match[1]), Number(match[2]));
+    }
+  } catch {
+    // A failed lookup leaves every pid unclassified, which the caller treats as unowned.
+  }
+  return parents;
 }
 
 const sleep = (ms: number) =>
@@ -464,7 +566,7 @@ export function buildActionCall(
 
 /** Main-process-only owner of the embedded Cua daemon and its stdio MCP proxy. */
 export class CuaDriverHost {
-  private daemon?: ChildProcessWithoutNullStreams;
+  private daemon?: ChildProcess;
   private proxy?: ChildProcessWithoutNullStreams;
   private lines?: Interface;
   private socket?: string;
@@ -492,9 +594,12 @@ export class CuaDriverHost {
   private teardowns = new Set<Promise<void>>();
   private shutdownRequested = false;
   private activeLaunchPath?: string;
+  private liveness?: DaemonLiveness;
+  private daemonLog?: string;
   private lastGenerationPids: number[] = [];
   private leftoverSettleMs = 3_000;
   private listExactLaunchPathPids = pidsWithExactLaunchPath;
+  private readParentPids = parentPidsOf;
 
   constructor(
     readonly driverPath: string,
@@ -979,9 +1084,12 @@ export class CuaDriverHost {
     const proxy = this.proxy;
     const daemon = this.daemon;
     const socket = this.socket;
+    const channels = { liveness: this.liveness, logPath: this.daemonLog };
     this.proxy = undefined;
     this.daemon = undefined;
     this.socket = undefined;
+    this.liveness = undefined;
+    this.daemonLog = undefined;
     this.starting = undefined;
     this.targets.clear();
     this.rootTargets.clear();
@@ -989,7 +1097,7 @@ export class CuaDriverHost {
     this.applicationIdentities.clear();
     this.sessionScopes.clear();
     this.scales.clear();
-    const teardown = this.terminateGeneration(proxy, daemon, socket);
+    const teardown = this.terminateGeneration(proxy, daemon, socket, channels);
     this.teardowns.add(teardown);
     void teardown.catch(() => {}).finally(() => this.teardowns.delete(teardown));
   }
@@ -1022,6 +1130,70 @@ export class CuaDriverHost {
     };
   }
 
+  /**
+   * Last resort for a quit that force-exits before the async teardown can finish.
+   * Must stay synchronous: nothing it awaits would run before `app.exit`.
+   */
+  killNow(): void {
+    closeFd(this.liveness?.writeFd);
+    this.liveness = undefined;
+    const pids = [this.proxy?.pid, this.daemon?.pid, ...this.lastGenerationPids];
+    for (const pid of pids) {
+      if (typeof pid !== "number" || pid <= 1 || pid === process.pid) continue;
+      try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+    }
+  }
+
+  /**
+   * Descriptors for one daemon generation. Piped stdout/stderr are socketpairs whose dead
+   * peer wedges the driver's own shutdown, so the log goes to a file the host can still read
+   * back for startup diagnostics. Any failure falls back to the plain pipes.
+   */
+  private prepareDaemonIO(socket: string): {
+    stdio: Array<number | "pipe">;
+    liveness?: DaemonLiveness;
+    logPath?: string;
+    release(): void;
+  } {
+    const plain = { stdio: ["pipe", "pipe", "pipe"] as Array<number | "pipe">, release: () => {} };
+    const liveness = openDaemonLiveness(socket);
+    if (!liveness) return plain;
+    const logPath = `${socket}.log`;
+    let logFd: number | undefined;
+    try {
+      logFd = openSync(logPath, "a");
+    } catch {
+      logFd = undefined;
+    }
+    if (logFd === undefined) {
+      closeFd(liveness.writeFd);
+      closeFd(liveness.childFd);
+      rmSync(liveness.path, { force: true });
+      return plain;
+    }
+    const openedLogFd = logFd;
+    return {
+      stdio: [liveness.childFd, openedLogFd, openedLogFd],
+      liveness,
+      logPath,
+      // The child holds its own copies once spawned; this process must not keep the
+      // read end open, or the daemon would never see EOF.
+      release: () => {
+        closeFd(liveness.childFd);
+        closeFd(openedLogFd);
+      },
+    };
+  }
+
+  private daemonDiagnostics(streamed: string): string {
+    if (!this.daemonLog) return streamed.trim();
+    try {
+      return readFileSync(this.daemonLog, "utf8").slice(-8192).trim();
+    } catch {
+      return streamed.trim();
+    }
+  }
+
   private async ensureStarted(): Promise<void> {
     if (this.shutdownRequested)
       throw new Error("Cua Driver host is shutting down");
@@ -1034,7 +1206,7 @@ export class CuaDriverHost {
     )
       return;
     if (this.starting) return this.starting;
-    await this.assertNoLeftoverGeneration();
+    await this.reconcileLeftoverGeneration();
     // Another caller may have completed startup while the leftover check was
     // awaiting process discovery. Re-check before creating a generation.
     if (
@@ -1052,16 +1224,18 @@ export class CuaDriverHost {
   }
 
   private async start(): Promise<void> {
-    await this.assertNoLeftoverGeneration();
+    await this.reconcileLeftoverGeneration();
     this.socket = cuaSocketPath();
     const launchPath = this.launchPath();
     this.activeLaunchPath = launchPath;
+    const io = this.prepareDaemonIO(this.socket);
+    this.liveness = io.liveness;
+    this.daemonLog = io.logPath;
     const daemon = this.spawnDriver(
       launchPath,
       [
         "serve",
         "--embedded",
-        "--parent-liveness-stdio",
         "--no-permissions-gate",
         "--socket",
         this.socket,
@@ -1071,12 +1245,18 @@ export class CuaDriverHost {
         "unrestricted",
         "--dangerously-bypass-approvals",
       ],
-      { stdio: ["pipe", "pipe", "pipe"] },
+      {
+        stdio: io.stdio,
+        // The flag this host used to pass does not exist; `serve` ignores unknown
+        // arguments in silence, so liveness was never armed. The env var is the real switch.
+        env: { ...process.env, CUA_DRIVER_PARENT_LIVENESS_STDIN: "1" },
+      },
     );
+    io.release();
     this.daemon = daemon;
     this.rememberGenerationPid(daemon.pid);
     let stderr = "";
-    daemon.stderr.on("data", (chunk) => {
+    daemon.stderr?.on("data", (chunk) => {
       stderr = `${stderr}${chunk}`.slice(-8192);
     });
     const deadline = Date.now() + 10_000;
@@ -1084,7 +1264,7 @@ export class CuaDriverHost {
       if (this.shutdownRequested)
         throw new Error("Cua Driver host is shutting down");
       if (daemon.exitCode !== null)
-        throw new Error(`Cua Driver daemon exited: ${stderr.trim()}`);
+        throw new Error(`Cua Driver daemon exited: ${this.daemonDiagnostics(stderr)}`);
       if (Date.now() >= deadline)
         throw new Error(`Cua Driver startup timed out at ${this.socket}`);
       await sleep(25);
@@ -1141,13 +1321,16 @@ export class CuaDriverHost {
 
   private async terminateGeneration(
     proxy: ChildProcessWithoutNullStreams | undefined,
-    daemon: ChildProcessWithoutNullStreams | undefined,
+    daemon: ChildProcess | undefined,
     socket: string | undefined,
+    channels: { liveness?: DaemonLiveness; logPath?: string } = {},
   ): Promise<void> {
     const ownedPids = [proxy?.pid, daemon?.pid].filter(
       (pid): pid is number => typeof pid === "number" && pid > 1,
     );
     for (const pid of ownedPids) this.rememberGenerationPid(pid);
+    // Dropping the only writer is the daemon's own exit signal; signals are the backstop.
+    closeFd(channels.liveness?.writeFd);
     await Promise.all([
       this.terminateOwnedChild(proxy),
       this.terminateOwnedChild(daemon),
@@ -1156,9 +1339,10 @@ export class CuaDriverHost {
       this.activeLaunchPath ?? this.launchPath(),
       ownedPids,
     );
-    if (socket) {
+    for (const path of [socket, channels.liveness?.path, channels.logPath]) {
+      if (!path) continue;
       try {
-        rmSync(socket, { force: true });
+        rmSync(path, { force: true });
       } catch {
         // The child or OS may already have removed the private socket.
       }
@@ -1166,10 +1350,10 @@ export class CuaDriverHost {
   }
 
   private async terminateOwnedChild(
-    child: ChildProcessWithoutNullStreams | undefined,
+    child: ChildProcess | undefined,
   ): Promise<void> {
     if (!child) return;
-    try { child.stdin.end(); } catch { /* already closed */ }
+    try { child.stdin?.end(); } catch { /* already closed */ }
     const gracefulExit = this.waitForChildExit(child, 400);
     try { child.kill("SIGTERM"); } catch { /* already exited */ }
     if (await gracefulExit) return;
@@ -1188,6 +1372,12 @@ export class CuaDriverHost {
     return new Error(`Cua Driver previous generation is still running: ${pids.join(", ")}`);
   }
 
+  private claimedError(pids: number[]): Error {
+    return new Error(
+      `Cua Driver is owned by another running PipiUI: ${pids.join(", ")}`,
+    );
+  }
+
   private async collectLeftoverPids(launchPath: string, knownPids: number[]): Promise<number[]> {
     const found = new Set(await this.listExactLaunchPathPids(launchPath));
     for (const pid of knownPids) {
@@ -1197,12 +1387,41 @@ export class CuaDriverHost {
     return [...found];
   }
 
-  private async assertNoLeftoverGeneration(): Promise<void> {
-    const leftovers = await this.collectLeftoverPids(
-      this.activeLaunchPath ?? this.launchPath(),
-      this.lastGenerationPids,
-    );
-    if (leftovers.length) throw this.leftoverError(leftovers);
+  /**
+   * Two drivers must never fight over the desktop, but an orphan from a dead host is not a
+   * second driver — it is litter, and refusing to start over it bricks Computer Use for every
+   * PipiUI that shares this launch path until someone kills it by hand. Reap what no live host
+   * owns; refuse only when another running host still owns the process.
+   */
+  private async reconcileLeftoverGeneration(): Promise<void> {
+    const launchPath = this.activeLaunchPath ?? this.launchPath();
+    // A host killed outright leaves its endpoint files behind even when the daemon exited
+    // on its own, so the sweep cannot hang off the leftover-process path.
+    if (process.platform !== "win32") sweepAbandonedEndpoints();
+    const leftovers = await this.collectLeftoverPids(launchPath, this.lastGenerationPids);
+    if (!leftovers.length) return;
+    const { adopted, claimed } = await this.classifyLeftovers(leftovers);
+    if (claimed.length) throw this.claimedError(claimed);
+    await this.reapLaunchPathLeftovers(launchPath, adopted);
+  }
+
+  /** Orphans (reparented to init, or whose parent is gone) are ours to reap; live-owned ones are not. */
+  private async classifyLeftovers(
+    pids: number[],
+  ): Promise<{ adopted: number[]; claimed: number[] }> {
+    const parents = await this.readParentPids(pids);
+    const adopted: number[] = [];
+    const claimed: number[] = [];
+    for (const pid of pids) {
+      const parent = parents.get(pid);
+      const owned =
+        typeof parent === "number" &&
+        parent > 1 &&
+        parent !== process.pid &&
+        processIsAlive(parent);
+      (owned ? claimed : adopted).push(pid);
+    }
+    return { adopted, claimed };
   }
 
   private async reapLaunchPathLeftovers(
@@ -1210,6 +1429,9 @@ export class CuaDriverHost {
     knownPids: number[],
   ): Promise<void> {
     const collect = () => this.collectLeftoverPids(launchPath, knownPids);
+    // A live host's daemon at the same launch path belongs to that host. Sweeping it would
+    // kill another PipiUI's Computer Use mid-task, so the reap only ever claims orphans.
+    const unowned = async () => (await this.classifyLeftovers(await collect())).adopted;
     const signalAll = (pids: number[], signal: NodeJS.Signals) => {
       for (const pid of pids) {
         try { process.kill(pid, signal); } catch { /* already exited */ }
@@ -1218,11 +1440,11 @@ export class CuaDriverHost {
     const waitUntilGone = async (timeoutMs: number) => {
       const deadline = Date.now() + timeoutMs;
       while (Date.now() < deadline) {
-        const leftovers = await collect();
+        const leftovers = await unowned();
         if (!leftovers.length) return leftovers;
         await sleep(25);
       }
-      return collect();
+      return unowned();
     };
     const waitForPids = async (pids: number[], timeoutMs: number) => {
       const deadline = Date.now() + timeoutMs;
@@ -1246,15 +1468,15 @@ export class CuaDriverHost {
     await escalate(owned);
     const swept = (await this.listExactLaunchPathPids(launchPath))
       .filter((pid) => pid > 1 && pid !== process.pid && !owned.includes(pid));
-    await escalate(swept);
-    let leftovers = await collect();
+    await escalate((await this.classifyLeftovers(swept)).adopted);
+    let leftovers = await unowned();
     if (!leftovers.length) return;
     leftovers = await waitUntilGone(this.leftoverSettleMs);
     if (leftovers.length) throw this.leftoverError(leftovers);
   }
 
   private waitForChildExit(
-    child: ChildProcessWithoutNullStreams,
+    child: ChildProcess,
     timeoutMs: number,
   ): Promise<boolean> {
     if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);

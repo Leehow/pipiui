@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,7 @@ import {
   isDriverActiveOperationError,
   isDriverSessionEndedError,
   selectLaunchWindow,
+  sweepAbandonedEndpoints,
 } from "./cua-driver-host.js";
 
 describe("CuaDriverHost", () => {
@@ -807,6 +808,163 @@ if (mode === "serve") {
       action: "computer_runtime_capabilities",
     })).rejects.toThrow(/still running/);
     expect(spawned).toBe(0);
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "hands the daemon an armed liveness pipe instead of a flag the driver ignores",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "cua-host-liveness-"));
+      roots.push(root);
+      const helper = join(root, "cua-driver");
+      const trace = join(root, "spawn.jsonl");
+      await writeFile(helper, `#!/usr/bin/env node
+const fs = require("node:fs");
+const net = require("node:net");
+const readline = require("node:readline");
+const mode = process.argv[2];
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify({
+  mode,
+  args: process.argv.slice(2),
+  stdinIsFifo: fs.fstatSync(0).isFIFO(),
+  liveness: process.env.CUA_DRIVER_PARENT_LIVENESS_STDIN ?? null,
+}) + "\\n");
+if (mode === "serve") {
+  net.createServer(() => {}).listen(process.argv[process.argv.indexOf("--socket") + 1]);
+  setInterval(() => {}, 1000);
+} else {
+  const lines = readline.createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const result = message.method === "initialize"
+      ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } }
+      : { content: [], structuredContent: {}, isError: false };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  });
+  setInterval(() => {}, 1000);
+}
+`);
+      await chmod(helper, 0o755);
+      const host = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 });
+      try {
+        await expect(host.handle({
+          protocolVersion: 1,
+          action: "computer_runtime_capabilities",
+        })).resolves.toMatchObject({ ok: true });
+        const records = (await readFile(trace, "utf8"))
+          .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+        const serve = records.find((record) => record.mode === "serve");
+        // A real pipe on fd 0 is the only channel the driver reads host death from;
+        // Node's default "pipe" is a socketpair, which stays silent when the host dies.
+        expect(serve?.stdinIsFifo).toBe(true);
+        expect(serve?.liveness).toBe("1");
+        expect(serve?.args).not.toContain("--parent-liveness-stdio");
+      } finally {
+        await host.shutdown();
+      }
+    },
+  );
+
+  it("reaps an orphaned generation instead of refusing to start", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-orphan-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, `#!/usr/bin/env node
+const net = require("node:net");
+const readline = require("node:readline");
+if (process.argv[2] === "serve") {
+  net.createServer(() => {}).listen(process.argv[process.argv.indexOf("--socket") + 1]);
+  setInterval(() => {}, 1000);
+} else {
+  const lines = readline.createInterface({ input: process.stdin });
+  lines.on("line", (line) => {
+    const message = JSON.parse(line);
+    if (!message.id) return;
+    const result = message.method === "initialize"
+      ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake", version: "1" } }
+      : { content: [], structuredContent: {}, isError: false };
+    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }) + "\\n");
+  });
+  setInterval(() => {}, 1000);
+}
+`);
+    await chmod(helper, 0o755);
+    // Double fork: the intermediate shell exits, so `sleep` is reparented to init —
+    // exactly the shape a crashed PipiUI leaves behind.
+    const orphan = Number(
+      execFileSync("/bin/sh", ["-c", "sleep 60 >/dev/null 2>&1 & echo $!"], { encoding: "utf8" }).trim(),
+    );
+    const alive = (pid: number) => {
+      try { process.kill(pid, 0); return true; } catch { return false; }
+    };
+    for (let attempt = 0; attempt < 40 && !alive(orphan); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const host: any = new CuaDriverHost(helper, { displayID: 1, width: 1, height: 1 });
+    host.listExactLaunchPathPids = async () => (alive(orphan) ? [orphan] : []);
+    try {
+      await expect(host.handle({
+        protocolVersion: 1,
+        action: "computer_runtime_capabilities",
+      })).resolves.toMatchObject({ ok: true });
+      expect(alive(orphan)).toBe(false);
+    } finally {
+      try { process.kill(orphan, "SIGKILL"); } catch { /* already reaped */ }
+      await host.shutdown();
+    }
+  });
+
+  it("refuses to start while a live host still owns the leftover", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-claimed-"));
+    roots.push(root);
+    const helper = join(root, "cua-driver");
+    await writeFile(helper, "#!/bin/sh\n");
+    await chmod(helper, 0o755);
+    // A grandchild under a still-running shell stands in for a second PipiUI that is
+    // still driving: its parent is alive and is not this process.
+    const otherHost = spawn("/bin/sh", ["-c", "sleep 60 & echo $!; wait"], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const ownedPid = await new Promise<number>((resolve) => {
+      otherHost.stdout.once("data", (chunk) => resolve(Number(String(chunk).trim())));
+    });
+    let spawned = 0;
+    const host: any = new CuaDriverHost(
+      helper,
+      { displayID: 1, width: 1, height: 1 },
+      (command, args, options) => {
+        spawned += 1;
+        return spawn(command, args, options);
+      },
+    );
+    host.listExactLaunchPathPids = async () => [ownedPid];
+    try {
+      await expect(host.handle({
+        protocolVersion: 1,
+        action: "computer_runtime_capabilities",
+      })).rejects.toThrow(/owned by another running PipiUI/);
+      expect(spawned).toBe(0);
+      // The other host's driver must survive our refusal untouched.
+      expect(() => process.kill(ownedPid, 0)).not.toThrow();
+    } finally {
+      try { process.kill(ownedPid, "SIGKILL"); } catch { /* already gone */ }
+      otherHost.kill("SIGKILL");
+      host.listExactLaunchPathPids = async () => [];
+      await host.shutdown();
+    }
+  });
+
+  it("sweeps endpoint files whose owning host is gone and spares live ones", async () => {
+    const root = await mkdtemp(join(tmpdir(), "cua-host-sweep-"));
+    roots.push(root);
+    const dead = ["pcua-4242-aaaa.sock", "pcua-4242-aaaa.sock.liveness", "pcua-4242-aaaa.sock.log"];
+    const kept = ["pcua-99-bbbb.sock", "pcua-99-bbbb.sock.liveness", "unrelated.sock", "pcua-nope.sock"];
+    await Promise.all([...dead, ...kept].map((name) => writeFile(join(root, name), "")));
+
+    sweepAbandonedEndpoints(root, (pid) => pid === 99);
+
+    const remaining = (await readdir(root)).sort();
+    expect(remaining).toEqual([...kept].sort());
   });
 
   it("extracts only closed structured codes and preserves target-window text codes", () => {
