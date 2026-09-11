@@ -207,7 +207,7 @@ if(enabled(f,"computerUse")&&input.computerCapability&&input.computerDescriptor)
 // which reaches the CuaDriverHost only via the host-capability broker. Export
 // the per-session capability and display geometry the broker's desktop-grant
 // check verifies against.
-env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.22.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
+env.PIPIUI_COMPUTER_CAPABILITY=input.computerCapability;env.PIPIUI_COMPUTER_RUNTIME_PROTOCOL="1";env.PIPIUI_CUA_DRIVER_VERSION="0.28.0";env.PIPIUI_COMPUTER_DISPLAY_ID=String(input.computerDescriptor.displayID);env.PIPIUI_COMPUTER_WIDTH=String(input.computerDescriptor.width);env.PIPIUI_COMPUTER_HEIGHT=String(input.computerDescriptor.height)}
 // The update-center input transformer is a main-session policy seam, independent of the bridge.
 // runtimeInfo stays last so its read-only request observer sees the final provider payload after all
 // PipiUI rewriters. The isolated title helper passes no runtimeInfo path and remains tool-free.

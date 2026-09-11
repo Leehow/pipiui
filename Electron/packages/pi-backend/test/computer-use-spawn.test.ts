@@ -57,7 +57,7 @@ describe("fresh Pi session Computer Use spawn contract", () => {
     expect(sessionSpawn!.env.PIPIUI_COMPUTER_CAPABILITY).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(sessionSpawn!.env).toMatchObject({
       PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1",
-      PIPIUI_CUA_DRIVER_VERSION: "0.22.0",
+      PIPIUI_CUA_DRIVER_VERSION: "0.28.0",
       PIPIUI_COMPUTER_DISPLAY_ID: "7",
       PIPIUI_COMPUTER_WIDTH: "1440",
       PIPIUI_COMPUTER_HEIGHT: "900",

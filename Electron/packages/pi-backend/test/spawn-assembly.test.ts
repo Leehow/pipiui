@@ -515,7 +515,7 @@ describe("Computer Agent host contract", () => {
     });
     expect(env.PIPIUI_ACTIVE_PROJECT_PI_HOME).toBe("/tmp/project/.pi/agent");
     expect(env.PIPIUI_COMPUTER_PROCEDURE_STORE).toBeUndefined();
-    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.22.0");
+    expect(env.PIPIUI_CUA_DRIVER_VERSION).toBe("0.28.0");
   });
 
   it("exports the enabled browser route for the single Computer Use Agent child", () => {
@@ -816,7 +816,7 @@ describe("default feature set", () => {
 
   it("exports computer runtime routing with feature, capability and descriptor — no extension path or subagent required", () => {
     const ready = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: {}, bridgePort: 1234, bridgeRoutingKey: "session-id", computerCapability: "computer-secret", computerDescriptor: { displayID: 7, width: 1440, height: 900 } });
-    expect(ready.env).toMatchObject({ PIPIUI_COMPUTER_CAPABILITY: "computer-secret", PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1", PIPIUI_CUA_DRIVER_VERSION: "0.22.0", PIPIUI_COMPUTER_DISPLAY_ID: "7", PIPIUI_COMPUTER_WIDTH: "1440", PIPIUI_COMPUTER_HEIGHT: "900" });
+    expect(ready.env).toMatchObject({ PIPIUI_COMPUTER_CAPABILITY: "computer-secret", PIPIUI_COMPUTER_RUNTIME_PROTOCOL: "1", PIPIUI_CUA_DRIVER_VERSION: "0.28.0", PIPIUI_COMPUTER_DISPLAY_ID: "7", PIPIUI_COMPUTER_WIDTH: "1440", PIPIUI_COMPUTER_HEIGHT: "900" });
     // The legacy reviewed-strategy twin is deleted; its env path must never be exported.
     expect(ready.env.PIPIUI_COMPUTER_EXT).toBeUndefined();
     const noCapability = assemblePiSpawn({ cwd: "/tmp/project", features: { computerUse: true }, paths: {}, bridgePort: 1234, computerDescriptor: { displayID: 7, width: 1440, height: 900 } });

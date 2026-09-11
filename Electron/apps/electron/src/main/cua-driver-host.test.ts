@@ -1014,7 +1014,7 @@ if (process.argv[2] === "serve") {
     );
   });
 
-  it("constructs 0.22.0 target-scoped action arguments", () => {
+  it("constructs 0.28.0 target-scoped action arguments", () => {
     const target = { session: "session-a", pid: 42, window_id: 77 };
     expect(
       buildActionCall({ type: "click", coordinate: [10, 20] }, target),

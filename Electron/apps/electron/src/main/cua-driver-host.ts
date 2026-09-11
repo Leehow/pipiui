@@ -27,7 +27,7 @@ import {
   type ComputerImagePipeline,
 } from "./computer-image-pipeline.js";
 
-export const CUA_DRIVER_VERSION = "0.22.0";
+export const CUA_DRIVER_VERSION = "0.28.0";
 /** Model-delivered screenshots never exceed this long edge (Anthropic tool_result image budget). */
 export const MAX_SCREENSHOT_LONG_EDGE = 1568;
 /** The complete set of batch action types this host can execute — the model-facing schema must match. */
