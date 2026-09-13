@@ -135,7 +135,12 @@ export const AssistantTranscriptContent = memo(function AssistantTranscriptConte
       const groupRunning = running && index === lastStepsIndex
       const groupExpanded = expandSteps ? index === lastStepsIndex && !activeTool : stepsExpanded
       const groupFailed = failedToolCount(segment.activities)
-      const groupError = !running && (groupFailed > 0 || (linkedFailed && index === lastStepsIndex))
+      const lastActivity = segment.activities[segment.activities.length - 1]
+      const lastTool = lastActivity?.type === 'tool' ? lastActivity.tool : undefined
+      const lastFailed = Boolean(lastTool && (toolFailed(lastTool) || (linkedFailed && index === lastStepsIndex && (liveByTool.get(lastTool.id)?.failedCount ?? 0) > 0)))
+      // The group indicator reports the batch's final step only: a failure the turn
+      // recovered from is already counted in meta (`N 失败 · M 成功`).
+      const groupError = !running && lastFailed
       const groupMeta = !running && groupFailed > 0
         ? `${groupFailed} 失败 · ${segment.activities.length - groupFailed} 成功`
         : !running && linkedFailed && groupFailed === 0 && index === lastStepsIndex ? '失败' : undefined

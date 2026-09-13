@@ -425,8 +425,26 @@ describe('subagent tool card stays live while linked workers run', () => {
 
     render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
     const outer = screen.getByRole('button', { name: /3 个步骤/ })
-    expect(outer.querySelector('.activity-status')?.textContent).toBe('×')
+    // The batch ended on a succeeding step, so it checks out; the counts carry the
+    // recovered failure instead of painting the whole batch as failed.
+    expect(outer.querySelector('.activity-status')?.textContent).toBe('✓')
+    expect(outer.closest('[data-activity-status]')?.getAttribute('data-activity-status')).toBe('ok')
     expect(outer.textContent).toContain('1 失败 · 2 成功')
+  })
+
+  it('marks the batch failed only when its last step failed', () => {
+    let messages: ChatMessage[] = []
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-ok', name: 'bash', delta: '{"command":"echo hi"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-ok', content: 'hi' })
+    messages = applyStreamEvent(messages, { type: 'tool_call', sessionId: 's', toolCallId: 'bash-bad', name: 'bash', delta: '{"command":"exit 1"}' })
+    messages = applyStreamEvent(messages, { type: 'tool_result', sessionId: 's', toolCallId: 'bash-bad', content: 'boom', isError: true })
+    messages = finishStreamingMessage(messages)
+
+    render(<MessageView message={messages[0]} onCopy={() => Promise.resolve()} onResend={() => undefined} resendDisabled={false} copied={false} />)
+    const outer = screen.getByRole('button', { name: /2 个步骤/ })
+    expect(outer.querySelector('.activity-status')?.textContent).toBe('×')
+    expect(outer.closest('[data-activity-status]')?.getAttribute('data-activity-status')).toBe('error')
+    expect(outer.textContent).toContain('1 失败 · 1 成功')
   })
 
   it('renders a standalone compact failed notice with a failure indicator', () => {
