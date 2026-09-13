@@ -13,12 +13,15 @@
  */
 import { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, DEEPSEEK_PROVIDER_NAME, type DeepSeekConversationModel } from "./models.js";
 export { AUTH_PROVIDER_ID, DEEPSEEK_PROVIDER_ID, DEEPSEEK_PROVIDER_NAME };
-export { DEEPSEEK_BASE_URL, DEEPSEEK_CHAT_API, DEEPSEEK_CONVERSATION_MODEL_IDS, DEEPSEEK_CONVERSATION_MODELS, DEEPSEEK_VISION_MODEL_ID, deepseekManifestModels, } from "./models.js";
+export { DEEPSEEK_BASE_URL, DEEPSEEK_CHAT_API, DEEPSEEK_CONVERSATION_MODEL_IDS, DEEPSEEK_CONVERSATION_MODELS, DEEPSEEK_CURATED_MODELS, DEEPSEEK_FLASH_MODEL_ID, DEEPSEEK_PRO_MODEL_ID, DEEPSEEK_RETIRED_MODEL_IDS, DEEPSEEK_VISION_MODEL_ID, deepseekManifestModels, } from "./models.js";
+export { effectiveCatalog, refreshDeepSeekCatalog, scheduleCatalogRefresh, } from "./catalog-runtime.js";
 export { apiKeyFromCredentials, buildConversationRequest, conversationProviderTransport, resolveDeepSeekApiKey, } from "./conversation.js";
 export type DeepSeekProviderOptions = {
     baseUrl?: string;
     /** Test / explicit settings fallback. Never read from ~/.pi. */
     apiKey?: string;
+    /** Test seam: read the catalog cache from here instead of the shared path. */
+    cachePath?: string;
 };
 /**
  * Build the provider registration payload. The shape matches pi's extension

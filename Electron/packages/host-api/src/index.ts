@@ -891,6 +891,14 @@ export type StreamEvent =
   | { type: "input_file_sources"; sessionId: string; sources: TranscriptFileSource[] }
   | { type: "server_side_usage"; sessionId: string; usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; totalTokens: number; serverSideToolUsage?: Record<string, number> } }
   | { type: "tool_result"; sessionId: string; toolCallId: string; content: string; isError?: boolean; images?: TranscriptImage[]; details?: unknown }
+  /**
+   * Mid-execution partial output from a tool's `onUpdate` callback (pi
+   * `tool_execution_update`). `text` is the latest cumulative text already
+   * reduced to its last non-empty line and truncated, so a long-running tool
+   * reads as alive in the waiting bar. Old clients may safely ignore this new
+   * event type.
+   */
+  | { type: "tool_update"; sessionId: string; toolCallId: string; name?: string; text: string }
   | { type: "session_title"; sessionId: string; title: string; source: "provisional" | "model" | "manual" }
   | { type: "status"; sessionId: string; status: "started" | "streaming" | "settled" | "stopped"; pendingFollowUps?: string[]; turnEpoch?: number }
   /**
@@ -1290,6 +1298,12 @@ export interface PipiHostAPI {
    * Persisted by the host (Electron: ~/.pi/agent/pipiui-settings.json), atomic.
    */
   getHiddenModelIds(): Promise<string[]>; setHiddenModelIds(ids: string[]): Promise<string[]>;
+  /**
+   * Providers removed from the model list. Only providers the host cannot
+   * delete outright end up here — a pi built-in survives credential deletion,
+   * so suppression is the only real removal. Restoring is `set` minus the id.
+   */
+  getRemovedProviderIds?(): Promise<string[]>; setRemovedProviderIds?(ids: string[]): Promise<string[]>;
   getSidebarSessionPreferences?(): Promise<SidebarSessionPreferences>;
   setSidebarSessionPreferences?(preferences: SidebarSessionPreferences): Promise<SidebarSessionPreferences>;
   /** Optional desktop-control preference; permission probes are unavailable on some hosts. */
@@ -1636,6 +1650,8 @@ function apiFrom(
     testOpenAICompatibleModel: input => invoke("testOpenAICompatibleModel", input),
     getHiddenModelIds: () => invoke("getHiddenModelIds"),
     setHiddenModelIds: ids => invoke("setHiddenModelIds", ids),
+    getRemovedProviderIds: () => invoke("getRemovedProviderIds"),
+    setRemovedProviderIds: ids => invoke("setRemovedProviderIds", ids),
     getSidebarSessionPreferences: () => invoke("getSidebarSessionPreferences"),
     setSidebarSessionPreferences: preferences => invoke("setSidebarSessionPreferences", preferences),
     getComputerUseState: () => invoke("getComputerUseState"),

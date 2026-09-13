@@ -11,7 +11,14 @@ import {
 	queueCompletionAfterCutIn,
 	queueCompletionNotification,
 } from "../completion-notification.ts";
-import { deliveryRetryDue, holdConfirmedDoneDelivery, DeliveryObligationStore } from "../delivery-obligation.ts";
+import {
+	bossWakeOutstanding,
+	deliveryRetryDue,
+	holdConfirmedDoneDelivery,
+	QUEUED_WAKE_MERGE_GRACE_MS,
+	DeliveryObligationStore,
+	type DeliveryObligation,
+} from "../delivery-obligation.ts";
 
 test("completion notification is a quiet exact-run custom message that wakes the Boss", () => {
 	const calls: unknown[][] = [];
@@ -548,6 +555,39 @@ test("runtime finalizes status before using the custom completion channel", () =
 	assert.match(source, /retryPendingDoneAfterSessionSettled[\s\S]*?flushAfterSettle:\s*true/);
 	assert.match(source, /const existing = pendingDone\.get\(obligation\.id\);[\s\S]*?doneDeliveryRetryDue\(existing\.obligation/);
 	assert.match(source, /for \(const observed of completionObservations\(value\)\)/);
+});
+
+test("only an unconsumed queued wake blocks the channel, and only for a bounded window", () => {
+	const row = (id: string, state: DeliveryObligation["state"], lastAttemptAt: number) =>
+		({ id, state, lastAttemptAt });
+	const now = 1_000_000;
+	// A sibling mid-flight is on its way into this same envelope, not ahead of it.
+	assert.equal(bossWakeOutstanding([row("a", "attempting", now)], now), false);
+	assert.equal(bossWakeOutstanding([row("a", "queued", now)], now), true);
+	// The row asking the question never blocks itself.
+	assert.equal(bossWakeOutstanding([row("a", "queued", now)], now, "a"), false);
+	assert.equal(bossWakeOutstanding([row("a", "observed", now), row("b", "fulfilled", now)], now), false);
+	// A copy that never surfaced must not wedge the channel forever.
+	assert.equal(bossWakeOutstanding([row("a", "queued", now - QUEUED_WAKE_MERGE_GRACE_MS)], now), false);
+	assert.equal(bossWakeOutstanding([], now), false);
+});
+
+test("an unconsumed wake holds the next receipt even during the settle flush", () => {
+	// Pi drains follow-ups one per turn and the user's own messages share that
+	// queue, so a second machine entry costs the user a turn. The settle-flush
+	// exception covers a live turn, never an already-queued wake.
+	assert.equal(
+		holdConfirmedDoneDelivery({ quiet: false, busy: false, wakeOutstanding: true }),
+		true,
+	);
+	assert.equal(
+		holdConfirmedDoneDelivery({ quiet: false, busy: true, wakeOutstanding: true }, { flushAfterSettle: true }),
+		true,
+	);
+	assert.equal(
+		holdConfirmedDoneDelivery({ quiet: false, busy: false, wakeOutstanding: false }),
+		false,
+	);
 });
 
 test("settle flush sends held confirmed dones even after the first receipt flips busy", () => {

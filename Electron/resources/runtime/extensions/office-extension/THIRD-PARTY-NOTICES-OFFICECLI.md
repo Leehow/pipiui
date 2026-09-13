@@ -9,7 +9,7 @@ Full attribution ships next to this file:
 - `NOTICE` — upstream NOTICE (must be retained)
 - `licenses/officecli/` — LICENSE, NOTICE, THIRD-PARTY-NOTICES.txt
 
-Native `officecli` v1.0.144 binaries are acquired from the immutable GitHub
+Native `officecli` v1.0.147 binaries are acquired from the immutable GitHub
 release (not npm postinstall, not `latest`, not the d.officecli.ai mirror) into
 `Electron/.officecli/<platform>-<arch>/extensions/office-extension/bin/<platform>-<arch>/`
 and packaged at `bin/<platform>-<arch>/officecli`. Direct integration uses the SDK resident

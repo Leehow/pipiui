@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  contributedAuthProviderModules,
   contributedProviderModulePath,
   loadContributedAuthProvider,
   registerContributedAuthProviders,
@@ -94,6 +95,41 @@ export function createAuthProvider() {
       directoryOf: () => dir,
     });
     expect(registered).toEqual(["acme-chat"]);
+  });
+
+  it("computes the provider module list the external helper cannot discover", async () => {
+    const dir = await writeFakeProvider();
+    const empty = join(root, "empty");
+    await mkdir(empty, { recursive: true });
+    const list = contributedAuthProviderModules({
+      claims: [
+        {
+          extensionId: "acme",
+          enabled: true,
+          contribution: { provider: { id: "acme-chat", name: "Acme", models: [] } },
+        },
+        {
+          // Same provider id via a second package: deduped.
+          extensionId: "acme-mirror",
+          enabled: true,
+          contribution: { provider: { id: "acme-chat", name: "Acme", models: [] } },
+        },
+        {
+          // No provider module on disk: skipped.
+          extensionId: "empty",
+          enabled: true,
+          contribution: { provider: { id: "empty", name: "Empty", models: [] } },
+        },
+        {
+          // Directory unresolvable: skipped.
+          extensionId: "gone",
+          enabled: true,
+          contribution: { provider: { id: "gone-chat", name: "Gone", models: [] } },
+        },
+      ],
+      directoryOf: (id) => (id === "acme" || id === "acme-mirror" ? dir : id === "empty" ? empty : undefined),
+    });
+    expect(list).toEqual([{ id: "acme-chat", module: join(dir, "agent", "dist", "provider.js") }]);
   });
 
   it("does not write models.json while registering", async () => {

@@ -181,15 +181,57 @@ export function formatUnacknowledgedAlarmLines(
 	];
 }
 
+/**
+ * The presumption window for a `queued` copy, shared with the alarm cadence: a
+ * wake that never surfaced for this long is presumed lost rather than pending.
+ */
+export const QUEUED_WAKE_MERGE_GRACE_MS = QUEUED_ALARM_STALL_GRACE_MS;
+
+/**
+ * Whether a wake this extension already queued is still waiting in Pi's
+ * follow-up queue, unconsumed.
+ *
+ * Pi drains that queue one entry per turn, and the user's own typed messages
+ * share it. So every extra machine entry is not just an extra Boss turn — it is
+ * one more turn the user waits behind for an answer they asked for. Three
+ * workers finishing minutes apart used to mean three entries; a question typed
+ * after them came fourth.
+ *
+ * At most one may be outstanding. While one is, later receipts wait and merge
+ * into the next envelope instead of claiming their own turn.
+ *
+ * Only `queued` counts. `attempting` is a sibling mid-flight in this same flush,
+ * on its way into the *same* batch envelope — treating it as outstanding would
+ * block the very merge this rule exists to produce.
+ */
+export function bossWakeOutstanding(
+	rows: Iterable<Pick<DeliveryObligation, "id" | "state" | "lastAttemptAt">>,
+	now: number,
+	exceptId?: string,
+	graceMs = QUEUED_WAKE_MERGE_GRACE_MS,
+): boolean {
+	for (const row of rows) {
+		if (row.id === exceptId || row.state !== "queued") continue;
+		// A copy that never surfaced must not wedge the channel forever.
+		if (now - row.lastAttemptAt < graceMs) return true;
+	}
+	return false;
+}
+
 /** Confirmed [subagent-done] must not enter Pi's follow-up queue during a live
  *  Boss turn (2026-08-15 receipt storm). The idle settle flush is the one
  *  exception: the first receipt immediately sets busy, and later siblings in
- *  the same flush must still go out. */
+ *  the same flush must still go out.
+ *
+ *  `wakeOutstanding` has no such exception, and that is the point: the settle
+ *  flush may put one merged envelope into Pi's queue, never a second one behind
+ *  an unconsumed first. */
 export function holdConfirmedDoneDelivery(
-	activity: { quiet: boolean; busy: boolean },
+	activity: { quiet: boolean; busy: boolean; wakeOutstanding?: boolean },
 	options?: { flushAfterSettle?: boolean },
 ): boolean {
 	if (activity.quiet) return true;
+	if (activity.wakeOutstanding) return true;
 	if (activity.busy && !options?.flushAfterSettle) return true;
 	return false;
 }

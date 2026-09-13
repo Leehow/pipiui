@@ -21,7 +21,7 @@
     "@pipi/account-usage-core": "file:../account-usage-core",
     "@pipi/host-api": "file:../host-api",
     "pi-mcp-extension": "1.5.0",
-    "pi-web-access": "0.23.0",
+    "pi-web-access": "0.28.0",
     "yauzl": "^3.4.0",
     "yazl": "^3.3.1"
   },

@@ -460,10 +460,11 @@ test("held completions flush after a delivery restart from durable wait receipts
 			{ agentId: "worker-b", runId: "run-2", status: "completed", findings: "UNIQUE-RESTART-LAST-findings", statusRef: "artifact://status/worker-b/run-2" },
 		],
 	}));
-	assert.equal(current.length, 2);
-	assert.equal(current[0], "[subagent-done] agentId=worker-b UNIQUE-RESTART-LAST");
-	assert.match(current[1] ?? "", /UNIQUE-RESTART-HELD-findings/);
-	assert.doesNotMatch(current[1] ?? "", /UNIQUE-RESTART-LAST-findings/);
+	// One wake, not two: the last worker's receipt rides the same flush as the
+	// sibling that was held before the restart.
+	assert.equal(current.length, 1);
+	assert.match(current[0] ?? "", /UNIQUE-RESTART-HELD-findings/);
+	assert.match(current[0] ?? "", /UNIQUE-RESTART-LAST-findings/);
 });
 
 test("wave close flushes only held completions and does not resend forwarded ones", async () => {
@@ -504,11 +505,58 @@ test("wave close flushes only held completions and does not resend forwarded one
 		],
 	}));
 	assert.equal(last.outcome, "boss_direct");
-	assert.equal(h.current.length, 2, "last done plus held flush");
-	assert.equal(h.current[0]?.publicText, "[subagent-done] agentId=worker-b UNIQUE-FORWARDED; Wave: 0 other workers still running");
-	assert.match(h.current[1]?.publicText ?? "", /\[subagent-supervisor\]/);
-	assert.match(h.current[1]?.publicText ?? "", /UNIQUE-HELD-findings/);
-	assert.doesNotMatch(h.current[1]?.publicText ?? "", /UNIQUE-FORWARDED-findings/);
+	assert.equal(h.current.length, 1, "the whole wave arrives as one wake");
+	const wave = h.current[0]?.publicText ?? "";
+	assert.match(wave, /\[subagent-supervisor\]/);
+	assert.match(wave, /UNIQUE-HELD-findings/);
+	assert.match(wave, /UNIQUE-FORWARDED-findings/);
+	// Each worker is reported exactly once, not once alone and once in the wave.
+	assert.equal(wave.match(/UNIQUE-HELD-findings/g)?.length, 1);
+	assert.equal(wave.match(/UNIQUE-FORWARDED-findings/g)?.length, 1);
+});
+
+test("a merge the envelope cannot hold still delivers the closing receipt exactly once", async () => {
+	let active = 1;
+	const h = harness({
+		active: () => active,
+		decide: () => ({ action: "wait", reason: "must compare designs" }),
+	});
+	await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-a", runId: "run-1", status: "completed" }), "held-job"),
+		wave: { waveId: "wave-huge", running: 1, completed: 1, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-huge",
+		publicText: "[subagent-done] agentId=worker-a UNIQUE-HELD",
+		activeJobs: [unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "running" }), "running-b")],
+	}));
+	assert.equal(h.current.length, 0);
+
+	// Evidence refs alone blow past the 8 KiB escalation envelope, so the merged
+	// wave summary cannot be built at all.
+	const bloated = `artifact://status/worker-a/run-1?${"x".repeat(9_000)}`;
+	active = 0;
+	const last = await h.delivery.handle(request({
+		kind: "completion",
+		job: unwrap(createJobSnapshot({ agentId: "worker-b", runId: "run-2", status: "completed" }), "last-job"),
+		agentId: "worker-b",
+		runId: "run-2",
+		wave: { waveId: "wave-huge", running: 0, completed: 2, failed: 0, agentIds: ["worker-a", "worker-b"] },
+		waveId: "wave-huge",
+		publicText: "[subagent-done] agentId=worker-b UNIQUE-LAST",
+		activeJobs: [],
+		terminalReports: [
+			{ agentId: "worker-a", runId: "run-1", status: "completed", findings: "UNIQUE-HELD-findings", statusRef: bloated },
+			{ agentId: "worker-b", runId: "run-2", status: "completed", findings: "UNIQUE-LAST-findings", statusRef: bloated },
+		],
+	}));
+
+	assert.equal(last.outcome, "boss_direct");
+	const texts = h.current.map((item) => item.publicText);
+	// Held siblings went back on the queue rather than being consumed by the
+	// envelope that could not be built, so nothing is delivered twice here.
+	assert.equal(h.current.length, 1);
+	assert.equal(texts.filter((text) => text.includes("UNIQUE-LAST")).length, 1, "closing receipt is neither swallowed nor doubled");
+	assert.equal(texts[0], "[subagent-done] agentId=worker-b UNIQUE-LAST");
 });
 
 test("escalation yields exactly one bounded Boss request", async () => {

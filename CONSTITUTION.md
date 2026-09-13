@@ -55,8 +55,8 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 
 ## 3. 禁止「半完成」话术
 
-- **Do not** tell the user "done / ready to open app" if only the Electron workspace build succeeded and `build/PipiUI.app` is older than sources.
-- 仅 Electron 工作区 build/test 成功而 `.app` 仍旧时，**不得**说「完成 / 可以打开 App 了」。
+- 仅代码/文档任务在相应验证通过后可以报告该范围完成；提交仅在已获授权时进行，不主动打包或重启。
+- 用户要求交付、安装或真实 App 验收时，仅 workspace build/test 成功不能报告 App 已更新或可验收；必须验证 canonical 包及所要求的真实流程。
 
 ## 4. 开发 vs 交付
 
@@ -68,7 +68,7 @@ stat -f '%Sm %N' -t '%Y-%m-%d %H:%M:%S' \
 ## 5. 其它质量底线（简）
 
 - 改动业务逻辑 / 解析 / 状态机时：在 `Electron/` 跑 `npm test`（vitest 工作区）。
-- 声称完成前：有命令级证据（构建/打包输出 + `build/PipiUI.app` 时间戳），禁止口头「应该好了」。
+- 声称完成前：有与范围对应的证据（代码/文档检查；要求打包时再加打包输出与 `build/PipiUI.app` 时间戳；要求真实验收时再加对应流程），禁止口头「应该好了」。
 
 ## 6. Pi 按项目完全隔离（强制）
 

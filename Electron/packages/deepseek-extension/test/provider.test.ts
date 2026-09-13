@@ -1,12 +1,23 @@
 import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import agent from "../agent/index.js";
 import { deepseekManifestModels } from "../agent/models.js";
+import { CATALOG_CACHE_PATH_ENV } from "../agent/catalog-cache.js";
 import { DEEPSEEK_PROVIDER_ID, createDeepSeekProvider } from "../agent/provider.js";
 
 describe("deepseek extension entry", () => {
+  // Point the catalog cache at a path that cannot exist so these assertions
+  // describe the shipped floor, never whatever a developer's app cached.
+  beforeAll(() => {
+    process.env[CATALOG_CACHE_PATH_ENV] = join(tmpdir(), "pipiui-deepseek-absent-catalog.json");
+  });
+  afterAll(() => {
+    delete process.env[CATALOG_CACHE_PATH_ENV];
+  });
+
   it("registers the deepseek provider via the shared factory", () => {
     const providers = new Map<string, unknown>();
     const hooks: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
@@ -25,8 +36,8 @@ describe("deepseek extension entry", () => {
     expect(registered.name).toBe("DeepSeek Extended");
     expect(registered.api).toBe("openai-responses");
     expect(registered.models.map((model) => model.id)).toEqual([
-      "deepseek-v4-flash-vision-exp",
-      "deepseek-v4-flash",
+      "deepseek-flash",
+      "deepseek-v4-pro",
     ]);
     expect(hooks.some((hook) => hook.event === "before_provider_request")).toBe(true);
   });
@@ -60,9 +71,22 @@ describe("deepseek extension entry", () => {
     expect(manifest.auth.provider.id).toBe("deepseek-extended");
     expect(manifest.auth.provider.name).toBe("DeepSeek Extended");
     expect(manifest.auth.provider.api).toBe("openai-responses");
-    expect(manifest.auth.provider.models.map((model) => model.id)).toEqual(deepseekManifestModels().map((model) => model.id));
+    // Deep equality, not just ids: the manifest is what the host overlays when
+    // the Pi runtime catalog is empty, so a drifted price or context window
+    // there is a wrong number shown to the user, not a cosmetic mismatch.
+    expect(manifest.auth.provider.models).toEqual(JSON.parse(JSON.stringify(deepseekManifestModels())));
     expect(manifest.auth.provider.models.every((model) => model.api === "openai-responses")).toBe(true);
     expect(manifest.auth.provider.models.every((model) => model.capabilities?.hostedTools?.tools?.includes("web_search"))).toBe(true);
+  });
+
+  it("exposes the official effort set: low/high/max, minimal and medium hidden", () => {
+    // api-docs.deepseek.com/guides/thinking_mode: the API takes low/high/max and
+    // folds minimal→low, medium→high, xhigh→high, ultra→max server-side. low is
+    // a real tier (cheaper reasoning) and must not be hidden again.
+    const expected = { minimal: null, low: "low", medium: null, high: "high", max: "max" };
+    for (const model of deepseekManifestModels()) {
+      expect(model.thinkingLevelMap).toEqual(expected);
+    }
   });
 
   it("declares exactly hosted web_search and nothing else in the manifest capabilities", () => {

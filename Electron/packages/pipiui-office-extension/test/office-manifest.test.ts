@@ -70,7 +70,7 @@ describe('office-extension manifest contract', () => {
     expect(existsSync(join(runtimeRoot, 'LICENSE-OFFICECLI'))).toBe(true)
     expect(existsSync(join(runtimeRoot, 'bin/README.md'))).toBe(true)
     expect(OFFICECLI_PROVENANCE.binaryStatus).toBe('shipped-via-target-cache')
-    expect(OFFICECLI_PROVENANCE.cliVersion).toBe('1.0.144')
+    expect(OFFICECLI_PROVENANCE.cliVersion).toBe('1.0.147')
     expect(OFFICECLI_PROVENANCE.binaryReceipt).toBe('receipt.json')
     const assets = JSON.parse(readFileSync(join(pkgRoot, '../../officecli-assets.json'), 'utf8')) as { version: string }
     expect(assets.version).toBe(OFFICECLI_PROVENANCE.cliVersion)

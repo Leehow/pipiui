@@ -2819,13 +2819,101 @@ var require_jsx_runtime = __commonJS({
   }
 });
 
+// agent/models.ts
+var DEEPSEEK_CHAT_API = "openai-responses";
+var DEEPSEEK_FLASH_MODEL_ID = "deepseek-flash";
+var DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro";
+var DEEPSEEK_RETIRED_MODEL_IDS = [
+  "deepseek-v4-flash",
+  "deepseek-v4-flash-vision-exp"
+];
+var V4_THINKING = {
+  minimal: null,
+  low: "low",
+  medium: null,
+  high: "high",
+  max: "max"
+};
+var V4_COMPAT = {
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  requiresReasoningContentOnAssistantMessages: true,
+  thinkingFormat: "deepseek"
+};
+var DEEPSEEK_HOSTED_TOOLS = {
+  tools: ["web_search"]
+};
+var DEEPSEEK_CAPABILITIES = {
+  hostedTools: { tools: [...DEEPSEEK_HOSTED_TOOLS.tools] },
+  structuredOutputs: true,
+  nativeSearch: { tools: [...DEEPSEEK_HOSTED_TOOLS.tools] }
+};
+var DEEPSEEK_FAMILY_DEFAULTS = {
+  api: DEEPSEEK_CHAT_API,
+  reasoning: true,
+  input: ["text"],
+  contextWindow: 1e6,
+  maxTokens: 384e3,
+  thinkingLevelMap: { ...V4_THINKING },
+  compat: { ...V4_COMPAT },
+  capabilities: { ...DEEPSEEK_CAPABILITIES }
+};
+var FLASH_COST = { input: 0.15, output: 0.6, cacheRead: 3e-3, cacheWrite: 0 };
+var PRO_COST = { input: 0.66, output: 1.98, cacheRead: 0.022, cacheWrite: 0 };
+function model(id, name, overrides) {
+  return {
+    id,
+    name,
+    api: DEEPSEEK_FAMILY_DEFAULTS.api,
+    reasoning: DEEPSEEK_FAMILY_DEFAULTS.reasoning,
+    input: [...DEEPSEEK_FAMILY_DEFAULTS.input],
+    contextWindow: DEEPSEEK_FAMILY_DEFAULTS.contextWindow,
+    maxTokens: DEEPSEEK_FAMILY_DEFAULTS.maxTokens,
+    thinkingLevelMap: { ...DEEPSEEK_FAMILY_DEFAULTS.thinkingLevelMap },
+    compat: { ...DEEPSEEK_FAMILY_DEFAULTS.compat },
+    capabilities: {
+      hostedTools: { tools: [...DEEPSEEK_FAMILY_DEFAULTS.capabilities.hostedTools.tools] },
+      structuredOutputs: true,
+      nativeSearch: { tools: [...DEEPSEEK_FAMILY_DEFAULTS.capabilities.nativeSearch.tools] }
+    },
+    ...overrides,
+    cost: { ...overrides.cost }
+  };
+}
+var DEEPSEEK_CURATED_MODELS = [
+  model(DEEPSEEK_FLASH_MODEL_ID, "DeepSeek Flash", {
+    input: ["text", "image"],
+    cost: { ...FLASH_COST }
+  }),
+  model(DEEPSEEK_PRO_MODEL_ID, "DeepSeek V4 Pro", {
+    // Vision is explicitly unsupported on Pro; from 2026-09-14 its requests are
+    // routed to V4.1 Flash and billed at the Flash price, but the id stays.
+    input: ["text"],
+    cost: { ...PRO_COST }
+  }),
+  model("deepseek-v4-flash", "DeepSeek V4 Flash (retired alias)", {
+    input: ["text"],
+    cost: { ...FLASH_COST }
+  }),
+  model("deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision (retired alias)", {
+    input: ["text", "image"],
+    cost: { ...FLASH_COST }
+  })
+];
+var DEEPSEEK_CONVERSATION_MODELS = DEEPSEEK_CURATED_MODELS.filter(
+  (candidate) => !DEEPSEEK_RETIRED_MODEL_IDS.includes(candidate.id)
+);
+var DEEPSEEK_CONVERSATION_MODEL_IDS = DEEPSEEK_CONVERSATION_MODELS.map(
+  (item) => item.id
+);
+
 // app/usage-panel.tsx
 var import_jsx_runtime = __toESM(require_jsx_runtime(), 1);
-var VISION_MODEL = "deepseek-v4-flash-vision-exp";
+var FLASH = DEEPSEEK_CURATED_MODELS.find((model2) => model2.id === DEEPSEEK_FLASH_MODEL_ID);
 var TIERS = [
-  { id: "cached", label: "\u7F13\u5B58\u8F93\u5165", price: "$0.007" },
-  { id: "miss", label: "\u672A\u547D\u4E2D\u8F93\u5165", price: "$0.22" },
-  { id: "output", label: "\u8F93\u51FA", price: "$0.66" }
+  { id: "cached", label: "\u7F13\u5B58\u8F93\u5165", price: FLASH?.cost.cacheRead },
+  { id: "miss", label: "\u672A\u547D\u4E2D\u8F93\u5165", price: FLASH?.cost.input },
+  { id: "output", label: "\u8F93\u51FA", price: FLASH?.cost.output }
 ];
 function UsagePanel(props) {
   const title = props.title?.trim() || "\u7528\u91CF";
@@ -2840,9 +2928,9 @@ function UsagePanel(props) {
             "DeepSeek ",
             title
           ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { style: { fontWeight: 400, opacity: 0.6, fontSize: 12 }, children: VISION_MODEL })
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { style: { fontWeight: 400, opacity: 0.6, fontSize: 12 }, children: DEEPSEEK_FLASH_MODEL_ID })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { style: { margin: "0 0 8px", opacity: 0.8, fontSize: 13 }, children: "1M ctx / 384K out \xB7 \u4EF7\u76EE\u6309\u6BCF 1M tokens\uFF08\u4E0E V4 Flash \u975E\u9AD8\u5CF0\u6863\u4E00\u81F4\uFF09" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { style: { margin: "0 0 8px", opacity: 0.8, fontSize: 13 }, children: "1M ctx / 384K out \xB7 \u4EF7\u76EE\u6309\u6BCF 1M tokens\uFF08\u79BB\u5CF0\u6863\uFF1B\u9AD8\u5CF0\u6863\u4E3A\u4E24\u500D\uFF09" }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { style: { display: "flex", flexWrap: "wrap", gap: 8 }, children: TIERS.map((tier) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(
           "div",
           {
@@ -2854,7 +2942,10 @@ function UsagePanel(props) {
             },
             children: [
               /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { style: { fontSize: 12, opacity: 0.7 }, children: tier.label }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { style: { fontWeight: 600, marginTop: 2 }, children: tier.price }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { style: { fontWeight: 600, marginTop: 2 }, children: [
+                "$",
+                tier.price
+              ] }),
               /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { style: { fontSize: 11, opacity: 0.45 }, children: "/ 1M tokens" })
             ]
           },
@@ -2869,7 +2960,7 @@ function UsagePanel(props) {
           ] }),
           "\uFF1B\u53EF\u7528 ",
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: `tool_choice: { "type": "web_search" }` }),
-          " \u5F3A\u5236\u3002\u4E00\u671F\u4EC5\u5C55\u793A\u9759\u6001\u4EF7\u76EE\uFF0C\u975E\u5B9E\u65F6\u8BA1\u8D39\u3002"
+          " \u5F3A\u5236\u3002\u5C55\u793A\u968F\u7248\u672C\u53D1\u5E03\u7684\u79BB\u5CF0\u4EF7\u76EE\uFF0C\u975E\u5B9E\u65F6\u8BA1\u8D39\u3002"
         ] })
       ]
     }

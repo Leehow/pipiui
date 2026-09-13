@@ -24,7 +24,7 @@ cua-extension（主 Pi 会话进程内）
      （Host Capability API broker：`native.cua` op + 一次性 capability token；
      desktop-grant `computerCapability` 随每个请求的 params 传递）
   -> CuaDriverHost（Electron 主进程，apps/electron/src/main/cua-driver-host.ts）
-  -> Rust cua-driver v0.22.0（embedded daemon + stdio MCP proxy）
+  -> Rust cua-driver v0.23.2（embedded daemon + stdio MCP proxy）
 ```
 
 扩展每次调用先经 loopback `host_capability_token` op 让宿主铸一枚一次性 token，
@@ -177,7 +177,7 @@ fail closed，下一次调用启动全新 generation。
 ## 固定 helper 与签名
 
 打包侧由 `Electron/scripts/fetch-cua-driver.mjs` +
-`Electron/cua-driver-assets.json`（tag + sha256 固定，当前 v0.22.0）拉取各架构
+`Electron/cua-driver-assets.json`（tag + sha256 固定，当前 v0.23.2）拉取各架构
 cua-driver slice；macOS universal 二进制按目标架构 `lipo -thin` 出单架构
 slice，打包进 `Contents/Resources/cua-driver/cua-driver`（刻意裸 Mach-O，不包
 Helper.app，避免重新触发 Gatekeeper），运行时物化为 userData 下的 detached

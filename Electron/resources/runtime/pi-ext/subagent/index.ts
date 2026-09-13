@@ -153,6 +153,7 @@ import {
 } from "./desktop-tool-policy.mjs";
 import {
 	alarmRetryDue,
+	bossWakeOutstanding,
 	deliveryRetryDue,
 	formatUnacknowledgedAlarmLines,
 	holdConfirmedDoneDelivery,
@@ -181,6 +182,7 @@ import {
 	admitSignal,
 	classifyRuntimeSignal,
 	sessionActivity,
+	type SessionActivity,
 } from "./signal-admission.ts";
 import {
 	completionObservations,
@@ -356,8 +358,10 @@ import {
 	resolveEffectiveSubagentDepth,
 	resolveSubagentMaxDepth,
 	runtimeRolePolicyForAgent,
+	type SemanticProgressEvent,
 	type SemanticProgressState,
 } from "./runtime-policy.ts";
+import { workerWriteFingerprint } from "./write-evidence.ts";
 import { prepareSubagentMemoryTask } from "./memory-policy.ts";
 import { registerSubagentManagementTool } from "./agent-management.ts";
 import {
@@ -5880,6 +5884,28 @@ let doneDeliveryBranchProvider: (() => readonly unknown[]) | undefined;
 let hostStopQuiet = false;
 /** True between before_agent_start and agent_settled. Signals must not enter Pi's follow-up queue while this is set. */
 let bossTurnBusy = false;
+
+/**
+ * True while a wake this extension queued still sits unconsumed in Pi's
+ * follow-up queue.
+ *
+ * That queue drains one entry per turn and the user's own messages are in it,
+ * so a second machine entry costs the user a turn. Everything Boss-facing —
+ * completion receipts, stall wakes, watch forwards — reads this and waits,
+ * which is what lets the settle flush merge them all into a single envelope.
+ */
+function bossWakeQueued(exceptObligationId?: string): boolean {
+	const now = Date.now();
+	const rows: DeliveryObligation[] = [];
+	for (const entry of pendingDone.values()) rows.push(entry.obligation);
+	return bossWakeOutstanding(rows, now, exceptObligationId);
+}
+
+/** Any Boss-facing automatic message is blocked by a live turn and by an unconsumed wake alike. */
+function bossDeliveryActivity(): SessionActivity {
+	return sessionActivity({ quiet: hostStopQuiet, busy: bossTurnBusy || bossWakeQueued() });
+}
+
 type HeldRuntimeSignal = { text: string; shouldSend?: () => boolean };
 const heldRuntimeSignals: HeldRuntimeSignal[] = [];
 
@@ -5918,7 +5944,7 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boo
 	if (!kind) return true;
 	const decision = admitSignal({
 		kind,
-		activity: sessionActivity({ quiet: hostStopQuiet, busy: bossTurnBusy }),
+		activity: bossDeliveryActivity(),
 		workerRunning: workerRunningForSignal(text),
 		episodeOpen: reminderOpenForSignal(text),
 		alreadyDelivered: false,
@@ -5931,7 +5957,7 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boo
 }
 
 function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
-	if (hostStopQuiet || bossTurnBusy) return;
+	if (bossDeliveryActivity() !== "idle") return;
 	const held = heldRuntimeSignals.splice(0).filter((entry) => !entry.shouldSend || entry.shouldSend());
 	const byText = new Map(held.map((entry) => [entry.text, entry]));
 	const plan = planHeldSignalFlush({
@@ -6059,7 +6085,10 @@ function sendDoneWithConfirmation(
 	// Host-stop quiet always holds. A live Boss turn also holds, except the
 	// just-idle settle flush which must send every sibling before the first
 	// receipt flips bossTurnBusy and would otherwise stall the rest.
-	const held = holdConfirmedDoneDelivery({ quiet: hostStopQuiet, busy: bossTurnBusy }, options);
+	const held = holdConfirmedDoneDelivery(
+		{ quiet: hostStopQuiet, busy: bossTurnBusy, wakeOutstanding: bossWakeQueued(obligation.id) },
+		options,
+	);
 	if (held) {
 		if (entry.holdSince === undefined) {
 			entry.holdSince = Date.now();
@@ -8164,26 +8193,60 @@ async function runSingleAgent(
 					`turns=${semanticProgress.completedTurns}`,
 					`inspectOnlyStreak=${semanticProgress.inspectOnlyStreak}`,
 					`progressEvents=${semanticProgress.progressEvents}`,
+					// Says whether the tree itself was consulted, so a kill can never be read as
+					// "the guard did not recognise my tools" without evidence either way.
+					`writeEvidence=${semanticProgress.writeFingerprint === null ? "unavailable" : "tree unchanged"}`,
 					`last=${semanticProgress.lastSummary.slice(0, 240)}`,
 				].join(" ");
 				pipiuiActivity = currentResult.errorMessage;
 				pipiuiUpdate(true);
 				dispatchAbort.abort();
 			};
+			/**
+			 * Every semantic-progress transition goes through here so the stall verdict is never
+			 * taken on tool names alone. When a turn ticks the stall counter, the worker tree is
+			 * asked directly whether anything changed; only a tree that also says "nothing" lets
+			 * the counter stand. The Git call is therefore paid at the decision point and nowhere
+			 * else, and when Git cannot answer the guard behaves exactly as it did before.
+			 */
+			const applySemanticProgress = (event: SemanticProgressEvent): void => {
+				if (!semanticGuardActive || semanticNoProgress) return;
+				const streakBefore = semanticProgress.inspectOnlyStreak;
+				let decision = advanceSemanticProgress(semanticProgress, event);
+				if (decision.state.inspectOnlyStreak > streakBefore) {
+					const fingerprint = workerWriteFingerprint(
+						spawnCwd,
+						() => requestGitStatusPorcelainV1(spawnCwd),
+						(absolutePath) => {
+							const info = fs.statSync(absolutePath, { throwIfNoEntry: false });
+							return info ? { mtimeMs: info.mtimeMs, size: info.size } : null;
+						},
+					);
+					if (fingerprint !== undefined) {
+						const evidence = advanceSemanticProgress(decision.state, {
+							type: "write-evidence",
+							fingerprint,
+						});
+						decision = {
+							state: evidence.state,
+							terminate: evidence.state.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP,
+						};
+					}
+				}
+				semanticProgress = decision.state;
+				if (decision.terminate) abortForSemanticNoProgress();
+			};
 			const observeSemanticToolResult = (result: {
 				toolCallId: string;
 				toolName?: string;
 				isError: boolean;
 			}): void => {
-				if (!semanticGuardActive || semanticNoProgress) return;
-				const decision = advanceSemanticProgress(semanticProgress, {
+				applySemanticProgress({
 					type: "tool-result",
 					toolCallId: result.toolCallId,
 					...(result.toolName ? { toolName: result.toolName } : {}),
 					isError: result.isError,
 				});
-				semanticProgress = decision.state;
-				if (decision.terminate) abortForSemanticNoProgress();
 			};
 
 		for (;;) {
@@ -8884,14 +8947,10 @@ async function runSingleAgent(
 									pipiuiItems.push({ itemType: "thinking", text: thinking.slice(0, 600), charCount: thinking.length });
 									}
 								}
-								if (semanticGuardActive && !semanticNoProgress) {
-									const decision = advanceSemanticProgress(semanticProgress, {
-										type: "assistant-turn",
-										toolCalls: semanticToolCalls,
-									});
-									semanticProgress = decision.state;
-									if (decision.terminate) abortForSemanticNoProgress();
-								}
+								applySemanticProgress({
+									type: "assistant-turn",
+									toolCalls: semanticToolCalls,
+								});
 								providerWait.noteToolBatch(toolCallIds);
 						runtimePendingTools = toolNames;
 						// Tool calls without ids cannot be matched against their results, so the
@@ -9042,11 +9101,7 @@ async function runSingleAgent(
 			});
 
 				currentResult.exitCode = exitCode;
-				if (semanticGuardActive && !semanticNoProgress) {
-					const decision = advanceSemanticProgress(semanticProgress, { type: "settle" });
-					semanticProgress = decision.state;
-					if (decision.terminate) abortForSemanticNoProgress();
-				}
+				applySemanticProgress({ type: "settle" });
 
 				// Decide whether to auto-resume before verify/end (those run once, after the loop).
 			if (wasAborted) break;

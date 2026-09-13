@@ -10,7 +10,11 @@ import {
   createAuthProvider,
   createDeepSeekProvider,
   DEEPSEEK_CONVERSATION_MODEL_IDS,
+  DEEPSEEK_CURATED_MODELS,
   DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_FLASH_MODEL_ID,
+  DEEPSEEK_PRO_MODEL_ID,
+  DEEPSEEK_RETIRED_MODEL_IDS,
   DEEPSEEK_VISION_MODEL_ID,
 } from "../agent/provider.js";
 import { JSON_CONSTRAINT_TEXT } from "../agent/json-output.js";
@@ -55,6 +59,39 @@ describe("deepseek conversation request adapter", () => {
     expect(request.body.model).toBe(DEEPSEEK_VISION_MODEL_ID);
     expect(request.body.input).toEqual([{ role: "user", content: "hi" }]);
     expect(JSON.stringify(request.body)).not.toContain("sk-secret");
+  });
+
+  it("keeps retired ids priced and callable without offering them as defaults", () => {
+    const provider = createAuthProvider();
+    // Retired names are still accepted by DeepSeek (served by V4.1 Flash and
+    // billed at the Flash price), so they keep curated metadata — but a fresh
+    // install must not advertise them, and neither can become the default.
+    for (const retired of DEEPSEEK_RETIRED_MODEL_IDS) {
+      expect(provider.models.some((model) => model.id === retired)).toBe(false);
+      const curated = DEEPSEEK_CURATED_MODELS.find((model) => model.id === retired);
+      expect(curated?.cost).toEqual({ input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 });
+      expect(curated?.api).toBe("openai-responses");
+      expect(curated?.compat?.thinkingFormat).toBe("deepseek");
+    }
+
+    const request = buildConversationRequest({
+      modelId: DEEPSEEK_RETIRED_MODEL_IDS[0],
+      credentials: { type: "api_key", key: "sk-secret" },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(request.url).toBe("https://api.deepseek.com/responses");
+    expect(request.body.model).toBe("deepseek-v4-flash");
+  });
+
+  it("prices the floor from DeepSeek's published off-peak table", () => {
+    const provider = createAuthProvider();
+    const flash = provider.models.find((model) => model.id === DEEPSEEK_FLASH_MODEL_ID);
+    const pro = provider.models.find((model) => model.id === DEEPSEEK_PRO_MODEL_ID);
+    expect(flash?.cost).toEqual({ input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 });
+    expect(pro?.cost).toEqual({ input: 0.66, output: 1.98, cacheRead: 0.022, cacheWrite: 0 });
+    // Vision is a Flash feature; Pro does not accept images.
+    expect(flash?.input).toEqual(["text", "image"]);
+    expect(pro?.input).toEqual(["text"]);
   });
 
   it("builds a stateless Responses request and drops previous_response_id", () => {

@@ -296,4 +296,68 @@ describe('startup-first lazy session warming', () => {
     await waitFor(() => expect(container.querySelector('[data-session-id="vision-search"]')?.getAttribute('data-status')).not.toBe('subagents-running'))
     expect(preloadSession.mock.calls.map(([id]) => id)).toEqual([remembered.id])
   })
+
+  it('hydrates earlier turns a live pane is missing even when the read raced a delta', async () => {
+    const project = { id: 'alpha', name: 'Alpha', path: '/tmp/alpha' }
+    const remembered = { id: 'raced', projectId: project.id, name: '被抢跑的会话', updatedAt: 100 }
+    const history = deferred<HistoryEntry[]>()
+    const durableHistory: HistoryEntry[] = [
+      { id: 'u1', role: 'user', content: '第一个问题', timestamp: 1 },
+      { id: 'a1', role: 'assistant', content: '第一个回答', timestamp: 2 },
+      { id: 'u2', role: 'user', content: '第二个问题', timestamp: 3 },
+    ]
+    let stream: ((event: StreamEvent) => void) | undefined
+    let reads = 0
+    const base = createMockHost()
+    const host: PipiHostAPI = {
+      ...base,
+      listProjects: vi.fn(async () => [project]),
+      getProjectPaths: vi.fn(async () => [project.path]),
+      listSessionPage: vi.fn(async () => ({ sessions: [remembered], hasMore: false })),
+      getSession: vi.fn(async () => remembered),
+      preloadSession: vi.fn(async (): Promise<SessionPreloadSnapshot> => ({ history: [], agents: [], agentLogs: [] })),
+      getSessionHistory: vi.fn(async sessionId => {
+        if (sessionId !== remembered.id) return []
+        reads += 1
+        const page = await history.promise
+        // A content delta lands while the read is still in flight, exactly as it
+        // does on a streaming session: the response arrives against a bumped
+        // live revision and is therefore stale on delivery.
+        stream?.({ type: 'thinking', sessionId, contentIndex: 0, delta: '·' })
+        return page
+      }),
+      listAgents: vi.fn(async () => []),
+      subscribeStream: (sessionId, callback) => {
+        if (sessionId === remembered.id) stream = callback
+        return () => { if (stream === callback) stream = undefined }
+      },
+      subscribeAgents: () => () => undefined,
+      listExternalSessions: vi.fn(async () => []),
+    }
+    localStorage.setItem(LAST_SESSION_STORAGE_KEY, JSON.stringify({ projectId: project.id, sessionId: remembered.id }))
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    render(<App host={host} />)
+    await waitFor(() => expect(stream).toBeDefined())
+    // The live pane holds the newest turn only, and a delta bumps the live
+    // revision while the read is still in flight — so the response comes back
+    // stale with the turn still open, which is where earlier turns used to be
+    // dropped on the floor with no retry until the turn ended.
+    act(() => {
+      stream?.({ type: 'status', sessionId: remembered.id, status: 'started' })
+      stream?.({ type: 'user_message', sessionId: remembered.id, content: '第二个问题' })
+      stream?.({ type: 'thinking', sessionId: remembered.id, contentIndex: 0, delta: '思考中' })
+    })
+    expect(await screen.findByText('第二个问题')).toBeTruthy()
+    expect(screen.queryByText('第一个问题')).toBeNull()
+
+    await act(async () => history.resolve(durableHistory))
+    expect(await screen.findByText('第一个问题')).toBeTruthy()
+    expect(screen.getByText('第一个回答')).toBeTruthy()
+    expect(screen.getByText('第二个问题')).toBeTruthy()
+    // The read did arrive stale (a delta raced it). It must have been applied on
+    // arrival — not dropped on the floor and recovered by a later re-read.
+    expect(warn.mock.calls.map(args => String(args[0])).filter(line => line.includes('history_stale_discard'))).toEqual([])
+    expect(reads).toBe(1)
+  })
 })

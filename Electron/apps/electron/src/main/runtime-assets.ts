@@ -63,9 +63,9 @@ export function materializeDetachedDarwinHost(source: string, destDir: string | 
 export const EMBEDDED_NODE_VERSION = '24.19.0'
 export const MANAGED_RUNTIME_PACKAGE_VERSIONS = {
   '@earendil-works/pi-coding-agent': '0.84.2',
-  'pi-web-access': '0.23.0',
+  'pi-web-access': '0.28.0',
   'pi-mcp-extension': '1.5.0',
-  'pi-hermes-memory': '0.9.6',
+  'pi-hermes-memory': '0.9.8',
   'better-sqlite3': '12.11.1'
 } as const
 /** User-facing Pi packages with meaningful independent upstream release channels. */

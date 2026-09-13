@@ -29,6 +29,8 @@ function visibility(overrides: Partial<ModelVisibilityController> = {}): ModelVi
     quickGroups: [],
     refresh: async () => undefined,
     catalogEpoch: 0,
+    removedProviders: [],
+    restoreProvider: async () => undefined,
     setHidden: async () => undefined,
     setProviderHidden: async () => undefined,
     dismissError: () => undefined,

@@ -12,9 +12,23 @@ description: Drive the built-in WebView with the browser tool. Use when navigati
 ## 操作节奏
 
 - `navigate` / `back` / `forward` / `reload` 之后必再 `observe`（或用返回的新观察）；旧 token 作废。
-- `click` / `input` / `select` / `scroll` 会返回新观察和 `mutation` 摘要。若弹出菜单、下拉、dialog、新 URL，先读这次 `mutation`；摘要不够或 UI 未出现 → `wait`（`idle` 或目标 `selector`）再 `observe`，然后才点下一步。
+- `click` / `input` / `select` / `scroll` 会返回新观察和 `mutation` 摘要。若弹出菜单、下拉、dialog、新 URL，先读这次 `mutation`；摘要不够或 UI 未出现 → `wait`（`idle` 或目标 `selector`）再 `observe`，然后才点下一步。`wait` 只管 25s 以内；等待时间由对面决定的一律走下节的 `watch`。
 - 无限滚动 / 懒加载：先 `scroll`，等加载，再 `observe`。不要对着未进入视口的旧快照操作。
 - 一次只推进一个可见状态变化。禁止「同一组参数再点一次碰运气」。
+
+## 超过 25s 的等待：注册 watch，不要把等待写成计划
+
+`wait` 最长阻塞 25s，超时只回 `code=timeout`。**等多久由对面决定**的场景——等另一个 AI 把回复生成完、等构建 / 上传 / 长任务跑完、等轮询出结果——不要用 `wait` 硬扛，更不要写一句「等 X 出来我再继续」然后结束回合：没有任何机制会因为页面变了把你叫回来，任务就停在那儿，用户看到的就是你自己收工了。
+
+正确节奏：
+
+1. 触发动作（发消息、点提交）之后，同一批里 `watch {timeoutSecs, 条件}` 注册一次长等待，立刻拿到 `watchId` 返回，不阻塞。`timeoutSecs` 必填（1..1800），按对面真实耗时给足。
+2. 条件四选一，不给条件就是到点闹钟：`selector` 元素可见 / `idle` 网络空闲 / `url_matches` URL 正则 / `expression` 页面 JS 严格 `=== true`。
+   「新回复生成完了」这类没有现成 selector 的完成条件，用 `expression` 把「完成」写成布尔式（流式指示器消失、停止按钮变回发送按钮、末条消息出现只有完成后才渲染的元素）。`expression` 每 ~2s 在页面里重新求值一次，是无状态判断；要比较「两次采样没变」得自己把上次的值挂到 `window` 上，**不要拿一个刚开始生成就为真的 selector 冒充完成**——那等于没等。
+3. 注册完可以接着干别的，也可以**直接结束回合**。条件命中 / 超时 / 页面销毁时会有一条 `[browser-watch]`（`watchId` + `reason` + `waitedMs` + URL/title）把你叫回来；那不是新的用户请求，收到后先 `observe` 再推进下一步。
+4. 不再需要就 `unwatch {watchId}`；`watches` 列本会话活跃的 watch。忘了收的 watch 会在超时后自己回来一条 `reason=timeout`。
+
+禁止：连发多个 `wait` 拼时长；用 `eval` / 空 `script` 保活；把「还在等对面」当作已完成的一步写进给用户的总结里。
 
 ## 区域优先观察
 

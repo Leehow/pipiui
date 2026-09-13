@@ -1,5 +1,6 @@
 import type { AgentConfig } from "./agents.ts";
 import { sanitizeProgressLogInput } from "./progress-log.ts";
+import { stableDigest } from "./stable-digest.ts";
 import type { LivenessVerdict } from "./worker-liveness.ts";
 
 /** Runtime-only grants that frontmatter is never allowed to manufacture. */
@@ -87,7 +88,17 @@ export interface GeneralPurposeExecutionPolicy {
 /** Default GP budget: producing workers extend silently; a stalled one can be aborted. */
 export const DEFAULT_GENERAL_PURPOSE_TIMEOUT_MS = 600_000;
 
-/** Stall cap for repeated inspect-only turns: same targets, no writes/validation. Novel recon does not count. */
+/**
+ * Stall cap for *consecutive* inspect-only turns: same targets, no writes, no validation, and
+ * nothing changed on disk. Novel recon resets it, as does any evidence of a write.
+ *
+ * It used to be a lifetime tally wearing the word "consecutive": novel recon merely declined to
+ * increment, and only a built-in mutation tool could reset it. A worker whose writes went through
+ * an extension tool or a shell redirect could therefore never reset it at all, so twelve
+ * scattered repeat-target turns anywhere in a long run were fatal — a 56-turn worker died on
+ * repeats at turns 3, 4, 6, 20, 23, 26, 32, 35, 47, 48, 55 and 56, with forty turns of real work
+ * in between.
+ */
 export const GENERAL_PURPOSE_SEMANTIC_TURN_CAP = 12;
 
 /** Bounded ring of recent inspect-call signatures used to tell spinning from advancing recon. */
@@ -100,6 +111,8 @@ export interface SemanticProgressState {
 	pendingToolIds: string[];
 	pendingAnonymousTools: string[];
 	recentInspectSignatures: string[];
+	/** Last observed worktree write fingerprint; `null` until the host first samples one. */
+	writeFingerprint: string | null;
 	lastSummary: string;
 }
 
@@ -109,6 +122,12 @@ export type SemanticProgressEvent =
 			toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
 	  }
 	| { type: "tool-result"; toolCallId: string; toolName?: string; isError: boolean }
+	/**
+	 * Authoritative, tool-name-independent evidence that the worker changed its tree. The host
+	 * samples this only on turns that already look like a stall, so the subprocess cost is paid
+	 * at the decision point and nowhere else.
+	 */
+	| { type: "write-evidence"; fingerprint: string }
 	| { type: "settle" };
 
 const MUTATION_TOOL_NAMES = new Set([
@@ -163,6 +182,7 @@ export function createSemanticProgressState(
 		pendingToolIds: [],
 		pendingAnonymousTools: [],
 		recentInspectSignatures: [],
+		writeFingerprint: null,
 		lastSummary: "no completed assistant turn",
 		...overrides,
 	};
@@ -172,14 +192,42 @@ export function createSemanticProgressState(
  * What a non-semantic call was aimed at. Repeating the same signature is the stall this
  * guard exists to catch; a changing target is recon advancing, which the wall-clock
  * timeout — not a turn counter — is responsible for bounding.
+ *
+ * Every argument is in the signature, because guessing one "primary" field made whole classes
+ * of legitimate work indistinguishable from spinning. `path` outranked `pattern`, so twelve
+ * different greps under one root collapsed onto one signature. `offset` was ignored, so paging
+ * through a long file collapsed. An extension tool carrying none of the known field names fell
+ * back to its first string value — a document id — so reading that document section by section,
+ * the workflow its own skill mandates, read as re-reading the same thing.
  */
 function inspectSignature(call: { name: string; arguments: Record<string, unknown> }): string {
 	const args = call.arguments ?? {};
+	const parts: string[] = [];
+	for (const key of Object.keys(args).sort()) {
+		const value = args[key];
+		let rendered: string;
+		if (typeof value === "string") rendered = value;
+		else {
+			try {
+				rendered = JSON.stringify(value) ?? String(value);
+			} catch {
+				rendered = String(value);
+			}
+		}
+		parts.push(`${key}=${rendered.trim().replace(/\s+/g, " ").slice(0, 2000)}`);
+	}
+	return `${call.name.trim().toLowerCase()}:${stableDigest(parts.join("\u0000").slice(0, 20000))}`;
+}
+
+/** Readable target for the stall report. Never compared — that is `inspectSignature`'s job. */
+function inspectHint(call: { name: string; arguments: Record<string, unknown> }): string {
+	const args = call.arguments ?? {};
+	const name = call.name.trim().toLowerCase();
 	const primary =
-		args.path ?? args.command ?? args.pattern ?? args.query ?? args.url ??
+		args.path ?? args.file_path ?? args.command ?? args.pattern ?? args.query ?? args.url ??
 		Object.values(args).find((value) => typeof value === "string");
-	const normalized = typeof primary === "string" ? primary.trim().replace(/\s+/g, " ").slice(0, 120) : "";
-	return `${call.name.trim().toLowerCase()}:${normalized}`;
+	const normalized = typeof primary === "string" ? primary.trim().replace(/\s+/g, " ").slice(0, 60) : "";
+	return normalized ? `${name} ${normalized}` : name;
 }
 
 /** Pure semantic-progress transition; transport liveness remains a separate policy. */
@@ -199,6 +247,27 @@ export function advanceSemanticProgress(
 			lastSummary: `${state.lastSummary}; semantic tool missing result at process settlement`,
 		};
 		return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
+	}
+
+	if (event.type === "write-evidence") {
+		// The first sample is only a baseline: with nothing to compare against it can neither
+		// clear the stall nor confirm it. Every later sample that differs is proof the worker
+		// moved the world — whatever tool it used, and whether or not this guard can name that
+		// tool. That is the point: `MUTATION_TOOL_NAMES` can only recognise the built-ins, so an
+		// extension tool that commits to disk, or a shell redirect, used to score nothing at all.
+		if (state.writeFingerprint === null) {
+			return { state: { ...state, writeFingerprint: event.fingerprint }, terminate: false };
+		}
+		if (state.writeFingerprint === event.fingerprint) return { state, terminate: false };
+		const next: SemanticProgressState = {
+			...state,
+			inspectOnlyStreak: 0,
+			progressEvents: state.progressEvents + 1,
+			recentInspectSignatures: [],
+			writeFingerprint: event.fingerprint,
+			lastSummary: `${state.lastSummary}; worktree changed since the last check (write evidence)`,
+		};
+		return { state: next, terminate: false };
 	}
 
 	if (event.type === "assistant-turn") {
@@ -228,17 +297,24 @@ export function advanceSemanticProgress(
 		// No semantic tool this turn. Only aimless repetition counts toward the stall cap:
 		// a turn inspecting something new is recon advancing — legitimate progress the old
 		// blind turn counter killed mid-work (verification/check tasks never write files).
-		const signatures = event.toolCalls
-			.filter((call) => !isSemanticToolCall(call))
-			.map(inspectSignature);
+		const inspectCalls = event.toolCalls.filter((call) => !isSemanticToolCall(call));
+		const signatures = inspectCalls.map(inspectSignature);
 		const novel = signatures.filter((sig) => !next.recentInspectSignatures.includes(sig));
 		if (signatures.length > 0 && novel.length > 0) {
+			// Consecutive means consecutive. Reaching a target this worker has not touched before
+			// clears the counter outright; recon that genuinely wanders is the wall-clock
+			// timeout's problem. Declining to increment — the old behaviour — left the counter a
+			// lifetime tally that no amount of real work could ever wind back.
+			if (!hadUnsettledSemanticTool) next.inspectOnlyStreak = 0;
 			next.recentInspectSignatures = [...next.recentInspectSignatures, ...novel].slice(-INSPECT_SIGNATURE_RING_SIZE);
 			next.lastSummary = `${next.lastSummary} (recon: ${novel.length} new target${novel.length === 1 ? "" : "s"})`;
 			return { state: next, terminate: false };
 		}
 		next.inspectOnlyStreak += 1;
-		if (signatures.length > 0) next.lastSummary = `${next.lastSummary} (spin: repeated inspect targets)`;
+		if (signatures.length > 0) {
+			const repeated = [...new Set(inspectCalls.map(inspectHint))].slice(0, 3).join(", ");
+			next.lastSummary = `${next.lastSummary} (spin ${next.inspectOnlyStreak}/${GENERAL_PURPOSE_SEMANTIC_TURN_CAP}: repeated ${repeated})`;
+		}
 		return { state: next, terminate: next.inspectOnlyStreak >= GENERAL_PURPOSE_SEMANTIC_TURN_CAP };
 	}
 

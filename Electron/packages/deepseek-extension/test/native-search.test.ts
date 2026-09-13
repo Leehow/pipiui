@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import agent from "../agent/index.js";
 import {
+  applyThinkingCap,
   buildResponsesBody,
   DEEPSEEK_WEB_SEARCH_BUILTIN,
   mergeHostedWebSearchTool,
   responsesUrl,
+  THINKING_CAP_DIRECTIVE,
 } from "../agent/client.js";
-import { modelSupportsHostedWebSearch } from "../agent/models.js";
+import { DEEPSEEK_CURATED_MODELS, modelSupportsHostedWebSearch } from "../agent/models.js";
 
 function clientWebSearchTool() {
   return { type: "function", name: "web_search", description: "local search", parameters: { type: "object" } };
@@ -51,8 +53,20 @@ describe("DeepSeek Extended server-native web_search", () => {
   });
 
   it("derives hosted web_search support from declared model capabilities only", () => {
+    expect(modelSupportsHostedWebSearch("deepseek-flash")).toBe(true);
+    expect(modelSupportsHostedWebSearch("deepseek-v4-pro")).toBe(true);
+    // Retired aliases keep curated metadata, so they answer from it too.
     expect(modelSupportsHostedWebSearch("deepseek-v4-flash")).toBe(true);
     expect(modelSupportsHostedWebSearch("deepseek-v4-flash-vision-exp")).toBe(true);
+    // Curated ids are exact, never prefixes: an unlisted neighbour is unknown.
+    expect(modelSupportsHostedWebSearch("deepseek-flash-preview")).toBe(false);
+    // A live catalog overrides the curated default, so a model discovered at
+    // runtime answers from what was actually registered.
+    expect(
+      modelSupportsHostedWebSearch("deepseek-v9-experimental", [
+        { ...DEEPSEEK_CURATED_MODELS[0]!, id: "deepseek-v9-experimental" },
+      ]),
+    ).toBe(true);
     // Not our catalog: reserved official provider ids never inherit the capability.
     expect(modelSupportsHostedWebSearch("deepseek-chat")).toBe(false);
     expect(modelSupportsHostedWebSearch("deepseek-reasoner")).toBe(false);
@@ -180,13 +194,36 @@ describe("DeepSeek Extended server-native web_search", () => {
     expect(rewritten.tools.filter((tool) => (tool as Record<string, unknown>).type === "web_search")).toHaveLength(1);
     expect(toolSummaries(rewritten.tools)).toEqual(["function:bash", "function:read", "custom", "web_search"]);
     expect(rewritten.tools).toContainEqual({ type: "custom", name: "web_search" });
+    // Thinking cap lands on the default/low path.
+    expect((rewritten.input[0] as { role?: string }).role).toBe("developer");
+    expect((rewritten.input[0] as { content?: Array<{ text?: string }> }).content?.[0]?.text).toBe(THINKING_CAP_DIRECTIVE);
 
-    // A model outside our catalog gets no hosted tool and no drops.
+    // A model outside our catalog gets no hosted tool and no drops — but the
+    // thinking cap is provider-level policy and applies regardless.
     const other = (await hook!.handler(
       { type: "before_provider_request", payload },
       { model: { provider: "deepseek-extended", id: "unknown-future-model" } },
     )) as typeof payload;
-    expect(other).toEqual(payload);
+    expect(other.tools).toEqual(payload.tools);
     expect(other.tools.some((tool) => (tool as Record<string, unknown>).type === "web_search")).toBe(false);
+    expect((other.input[0] as { role?: string }).role).toBe("developer");
+    expect(JSON.stringify(other.input[0])).toContain("internal reasoning must stay under");
+  });
+
+  it("caps thinking on the default/low path and leaves none/high/max alone", () => {
+    const plain = applyThinkingCap({ model: "deepseek-v4-flash", input: [{ role: "user", content: "hi" }] });
+    expect((plain.input[0] as { role?: string }).role).toBe("developer");
+    expect((plain.input[0] as { content?: Array<{ text?: string }> }).content?.[0]?.text).toBe(THINKING_CAP_DIRECTIVE);
+    expect(plain.input[1]).toEqual({ role: "user", content: "hi" });
+    const fromString = applyThinkingCap({ input: "hi" });
+    expect((fromString.input[0] as { role?: string }).role).toBe("developer");
+    expect(fromString.input[1]).toEqual({ role: "user", content: [{ type: "input_text", text: "hi" }] });
+    const low = applyThinkingCap({ input: [], reasoning: { effort: "low" } });
+    expect((low.input[0] as { role?: string }).role).toBe("developer");
+    for (const effort of ["none", "high", "max"]) {
+      const body = { input: [{ role: "user", content: "hi" }], reasoning: { effort } };
+      expect(applyThinkingCap(body)).toBe(body);
+    }
+    expect(applyThinkingCap(plain)).toBe(plain);
   });
 });

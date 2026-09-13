@@ -32,10 +32,10 @@ describe("pipiui-pdf-extension manifest + generated runtime mirror", () => {
 
   it("keeps the vendored pdf-inspector tree pinned (the legacy runtime copy is removed after the cutover)", () => {
     const vendorVersion = JSON.parse(readFileSync(join(packageRoot, "vendor/pdf-inspector/node_modules/@firecrawl/pdf-inspector/package.json"), "utf8")).version;
-    expect(vendorVersion).toBe("1.15.0");
+    expect(vendorVersion).toBe("1.17.0");
     expect(existsSync(join(runtimeRoot, "pdf-inspector"))).toBe(false);
     const wasmManifest = JSON.parse(readFileSync(join(packageRoot, "vendor/pdf-inspector/node_modules/@firecrawl/pdf-inspector-wasm/package.json"), "utf8"));
-    expect(wasmManifest.version).toBe("1.15.0");
+    expect(wasmManifest.version).toBe("1.17.0");
     expect(existsSync(join(packageRoot, "vendor/pdf-inspector/node_modules/@firecrawl/pdf-inspector-darwin-arm64"))).toBe(true);
   });
 
@@ -47,7 +47,7 @@ describe("pipiui-pdf-extension manifest + generated runtime mirror", () => {
       {
         id: "firecrawl-pdf-inspector",
         name: "@firecrawl/pdf-inspector",
-        version: "1.15.0",
+        version: "1.17.0",
         source: { type: "npm", packageName: "@firecrawl/pdf-inspector" },
         upstream: "https://github.com/firecrawl/pdf-inspector",
         license: "MIT",

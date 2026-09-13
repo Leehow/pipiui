@@ -27,29 +27,55 @@ async function registerBundledAuthProviders(rt) {
     if (typeof rt.registerProvider !== "function") return;
     // Same home precedence as extension agent halves: PI_COC_AGENT_DIR >
     // PI_CODING_AGENT_DIR; never a global ~/.pi/agent fallback (fail closed —
-    // registration is skipped when no home is resolved).
+    // registration is skipped when no home is resolved). The spawner pins
+    // PI_CODING_AGENT_DIR to the backend's auth home, so a miss here means the
+    // helper was launched outside the host: say so, don't vanish.
     const agentDir = process.env.PI_COC_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
-    if (!agentDir) return;
+    if (!agentDir) {
+      console.warn("[pi-auth-helper] no PI_COC_AGENT_DIR/PI_CODING_AGENT_DIR resolved; bundled auth providers will not be registered");
+      return;
+    }
+    const seen = new Set();
+    const registerModule = async (providerModule, fallbackId, origin) => {
+      if (!providerModule || !existsSync(providerModule)) return;
+      try {
+        const mod = await import(pathToFileURL(providerModule).href);
+        const factory = mod.createAuthProvider ?? mod.createGrokBuildProvider;
+        const id = typeof mod.AUTH_PROVIDER_ID === "string" && mod.AUTH_PROVIDER_ID.trim()
+          ? mod.AUTH_PROVIDER_ID.trim()
+          : typeof mod.GROK_BUILD_PROVIDER_ID === "string" && mod.GROK_BUILD_PROVIDER_ID.trim()
+            ? mod.GROK_BUILD_PROVIDER_ID.trim()
+            : fallbackId;
+        if (typeof factory !== "function" || !id || seen.has(id)) return;
+        if (typeof rt.getProvider === "function" && rt.getProvider(id)) { seen.add(id); return; }
+        seen.add(id);
+        rt.registerProvider(id, factory());
+      } catch (error) {
+        console.warn(`[pi-auth-helper] auth provider registration failed (${origin}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    // Host-supplied claims first: enabled extensions' provider modules,
+    // including user-installed ones this script cannot discover from
+    // its own tree. Serialized by ExternalAuthRuntime at spawn time.
+    let hostModules = [];
+    try { hostModules = JSON.parse(process.env.PIPIUI_EXTENSION_AUTH_PROVIDERS ?? "[]"); } catch { hostModules = []; }
+    if (Array.isArray(hostModules)) {
+      for (const entry of hostModules) {
+        if (!entry || typeof entry.module !== "string") continue;
+        await registerModule(entry.module, typeof entry.id === "string" ? entry.id.trim() : "", `host:${entry.id ?? entry.module}`);
+      }
+    }
     const here = dirname(fileURLToPath(import.meta.url));
     const extensionsRoot = join(here, "..", "extensions");
     if (!existsSync(extensionsRoot)) return;
     let names = [];
     try { names = readdirSync(extensionsRoot); } catch { return; }
     for (const name of names) {
-      const providerModule = join(extensionsRoot, name, "agent", "dist", "provider.js");
-      if (!existsSync(providerModule)) continue;
-      try {
-        const mod = await import(pathToFileURL(providerModule).href);
-        const factory = mod.createAuthProvider ?? mod.createGrokBuildProvider;
-        const id = typeof mod.AUTH_PROVIDER_ID === "string" && mod.AUTH_PROVIDER_ID.trim()
-          ? mod.AUTH_PROVIDER_ID.trim()
-          : typeof mod.GROK_BUILD_PROVIDER_ID === "string" ? mod.GROK_BUILD_PROVIDER_ID.trim() : "";
-        if (typeof factory !== "function" || !id) continue;
-        if (typeof rt.getProvider === "function" && rt.getProvider(id)) continue;
-        rt.registerProvider(id, factory());
-      } catch { /* optional package — never break the auth surface */ }
+      await registerModule(join(extensionsRoot, name, "agent", "dist", "provider.js"), "", `bundled:${name}`);
     }
-  } catch { /* auth surface must never break on optional bundled extensions */ }
+  } catch (error) {
+    console.warn(`[pi-auth-helper] bundled auth provider scan failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 async function runtime() {
   const root = moduleRoot(); const require = createRequire(join(root, "package.json")); let mod;

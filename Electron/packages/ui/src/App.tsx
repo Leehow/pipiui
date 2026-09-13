@@ -2828,7 +2828,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         // Apply them to the live transcript only. Reloading JSONL on every
         // thinking/text delta stacked overlapping full-file scans on large
         // sessions and froze the main process.
-        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_result' || event.type === 'hosted_search' || event.type === 'hosted_code_interpreter' || event.type === 'citations' || event.type === 'input_file_sources' || event.type === 'error'
+        const isLiveContent = event.type === 'text' || event.type === 'thinking' || event.type === 'tool_call' || event.type === 'tool_update' || event.type === 'tool_result' || event.type === 'hosted_search' || event.type === 'hosted_code_interpreter' || event.type === 'citations' || event.type === 'input_file_sources' || event.type === 'error'
         if (isLiveContent) {
           const lateNext = applyStreamEvent(messagesRef.current, event)
           if (lateNext !== messagesRef.current) {
@@ -2839,6 +2839,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
           if (event.type === 'text' && event.delta.trim()) setWaitingVisible(false)
           else if (event.type === 'thinking') { setWaitingVisible(true); setWaitingPhase('thinking'); setWaitingDetail(undefined) }
           else if (event.type === 'tool_call') { setWaitingVisible(true); setWaitingPhase('tool'); if (event.name === 'subagent') setWaitingDetail('子任务执行中'); else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? '')) }
+          else if (event.type === 'tool_update') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(event.name ? `${event.name} · ${event.text}` : event.text) }
           else if (event.type === 'hosted_search') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary(event.kind, JSON.stringify({ query: event.query, phase: event.phase }))) }
           else if (event.type === 'hosted_code_interpreter' && event.phase !== 'completed' && event.phase !== 'failed') { setWaitingVisible(true); setWaitingPhase('tool'); setWaitingDetail(toolDisplaySummary('code_interpreter', JSON.stringify({ code: event.code, phase: event.phase }))) }
           else if (event.type === 'tool_result') { if (streamingAssistantToolsAllFinished(messagesRef.current)) { setWaitingVisible(true); setWaitingStartedAt(Date.now()); setWaitingPhase('thinking'); setWaitingDetail(undefined) } else setWaitingPhase('tool') }
@@ -2864,6 +2865,10 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
         setWaitingPhase('tool')
         if (event.name === 'subagent') setWaitingDetail('子任务执行中')
         else setWaitingDetail(toolDisplaySummary(event.name, event.delta ?? ''))
+      } else if (event.type === 'tool_update') {
+        setWaitingVisible(true)
+        setWaitingPhase('tool')
+        setWaitingDetail(event.name ? `${event.name} · ${event.text}` : event.text)
       } else if (event.type === 'hosted_search') {
         setWaitingVisible(true)
         setWaitingPhase('tool')

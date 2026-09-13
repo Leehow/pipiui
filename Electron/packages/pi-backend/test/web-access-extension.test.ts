@@ -133,7 +133,12 @@ describe("web-access-extension result formatting", () => {
     expect(result.details).toEqual({ error: "Not found", responseId: "probe-missing-response-id" });
   });
 
-  it("get_search_content rejects incompatible find options", async () => {
+  // pi-web-access 0.25.0 dropped the "findText cannot be combined with offset or
+  // limit" rejection so bridge-supplied pagination defaults stop breaking a
+  // findText lookup. The combination now falls through to the ordinary
+  // stored-results lookup; this pins that the wrapper does not reintroduce the
+  // old rejection.
+  it("get_search_content tolerates findText alongside pagination defaults", async () => {
     const { extensionByName } = mountBothWays();
     const result = (await extensionByName.get("get_search_content")!.execute!("probe", {
       responseId: "probe",
@@ -141,9 +146,9 @@ describe("web-access-extension result formatting", () => {
       offset: 1,
     })) as ToolResult;
     expect(resultText(result)).toBe(
-      "findText cannot be combined with offset or limit. Received offset=1, limit=undefined; omit offset and limit when using findText.",
+      'Error: No stored results for responseId "probe". Use a responseId returned by web_search, source_check, or fetch_content.',
     );
-    expect(result.details).toEqual({ error: "Incompatible find options" });
+    expect(result.details).toEqual({ error: "Not found", responseId: "probe" });
   });
 });
 

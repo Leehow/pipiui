@@ -82,6 +82,8 @@ const visibility = {
   refresh: async () => undefined,
   toggle: async () => undefined,
   toggleProvider: async () => undefined,
+  removedProviders: [] as string[],
+  restoreProvider: async () => undefined,
   dismissError: () => undefined,
 }
 
@@ -189,5 +191,53 @@ describe('settings modal has no secret vault entry', () => {
     expect(screen.queryByText('添加密钥')).toBeNull()
     expect(screen.queryByText('重试检测')).toBeNull()
     expect(screen.queryByText('保存并挂载')).toBeNull()
+  })
+})
+
+describe('removed providers are recoverable', () => {
+  it('lists them behind a collapsed section and restores one on click', async () => {
+    const restored: string[] = []
+    const withRemoved = {
+      ...visibility,
+      removedProviders: ['deepseek', 'opencode'],
+      restoreProvider: async (provider: string) => { restored.push(provider) },
+    }
+    render(
+      <ModelVisibilityModal
+        host={hostStub()}
+        visibility={withRemoved as never}
+        vision={vision as never}
+        scan={scan as never}
+        updates={updates as never}
+        current={null}
+        onRequestUpdate={() => undefined}
+        onClose={() => undefined}
+        projectId="project-1"
+      />,
+    )
+    // Removing a provider must never be a one-way door: the count is visible
+    // even while the section is collapsed.
+    expect(screen.getByTestId('removed-providers-count').textContent).toBe('2')
+    expect(screen.queryByTestId('restore-provider-deepseek')).toBeNull()
+    fireEvent.click(screen.getByText('已移除的供应商'))
+    fireEvent.click(screen.getByTestId('restore-provider-deepseek'))
+    await waitFor(() => expect(restored).toEqual(['deepseek']))
+  })
+
+  it('renders no removed section when nothing was removed', () => {
+    render(
+      <ModelVisibilityModal
+        host={hostStub()}
+        visibility={{ ...visibility, removedProviders: [], restoreProvider: async () => undefined } as never}
+        vision={vision as never}
+        scan={scan as never}
+        updates={updates as never}
+        current={null}
+        onRequestUpdate={() => undefined}
+        onClose={() => undefined}
+        projectId="project-1"
+      />,
+    )
+    expect(screen.queryByTestId('removed-providers')).toBeNull()
   })
 })

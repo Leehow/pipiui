@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   ELECTRON_USER_DATA_DIRNAME,
   PI_PROFILE_MIGRATION_MARKER,
+  hasExplicitUserDataDirSwitch,
   installBundledModelCapabilityOverrides,
   importLegacyPiProfile,
   resolveElectronPiProfile,
@@ -44,7 +45,32 @@ describe('Electron Pi profile', () => {
     )
     const main = readFileSync(join(import.meta.dirname, 'index.ts'), 'utf8')
     expect(main).toContain("app.setName('PipiUI')")
+    expect(main).toContain("if (!hasExplicitUserDataDirSwitch(process.argv))")
     expect(main).toContain("app.setPath('userData', resolveStableElectronUserDataPath(app.getPath('appData')))")
+  })
+
+  // scripts/electron-cleanroom.sh depends on this: on macOS `appData` comes from
+  // NSSearchPathForDirectoriesInDomains and ignores $HOME, so --user-data-dir is the only
+  // way a clean-room launch can stay out of the developer's real profile. Pinning
+  // unconditionally made every such run reconcile against the live profile instead.
+  it('stands the userData pin down for an explicit --user-data-dir', () => {
+    expect(hasExplicitUserDataDirSwitch([
+      '/Applications/PipiUI.app/Contents/MacOS/PipiUI',
+      '--user-data-dir=/tmp/pipiui-cleanroom',
+      '--remote-debugging-port=9223'
+    ])).toBe(true)
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '-user-data-dir=/tmp/pipiui-cleanroom'])).toBe(true)
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '--user-data-dir=relative/sandbox'])).toBe(true)
+  })
+
+  it('keeps pinning when no userData directory was chosen', () => {
+    expect(hasExplicitUserDataDirSwitch(['/Applications/PipiUI.app/Contents/MacOS/PipiUI'])).toBe(false)
+    // Chromium's `--switch value` form leaves the switch valueless: not a relocation.
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '--user-data-dir', '/tmp/sandbox'])).toBe(false)
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '--user-data-dir='])).toBe(false)
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '--enable-user-data-dir=/tmp/sandbox'])).toBe(false)
+    // Arguments after a bare `--` are operands, not switches, for Chromium too.
+    expect(hasExplicitUserDataDirSwitch(['PipiUI', '--', '--user-data-dir=/tmp/sandbox'])).toBe(false)
   })
 
   it('copies only continuity state, preserves the source, and is idempotent', async () => {
@@ -635,6 +661,74 @@ describe('Electron Pi profile', () => {
     expect(await captureQwen('high')).toMatchObject({ reasoning_effort: 'high' })
     expect(await captureQwen('off')).not.toHaveProperty('reasoning_effort')
     expect(await captureQwen('off')).not.toHaveProperty('thinking')
+  })
+
+  it('restores low for opencode-go deepseek-v4.1-flash, which the pi.dev catalog marks low:null', async () => {
+    root = await mkdtemp(join(tmpdir(), 'pipi-profile-opencode-go-effort-'))
+    const profile = resolveElectronPiProfile(join(root, 'user-data'))
+    await mkdir(profile.agentDir, { recursive: true })
+    // models-store carries the model exactly as the pi.dev remote catalog ships it:
+    // low: null hides the level from the picker even though models.dev and the
+    // DeepSeek thinking-mode contract both list low|high|max — sibling
+    // deepseek-v4-flash on the same relay carries low: "low".
+    await writeFile(join(profile.agentDir, 'models-store.json'), JSON.stringify({
+      'opencode-go': {
+        lastModified: 4102444800000,
+        checkedAt: 4102444800000,
+        models: [{
+          provider: 'opencode-go',
+          id: 'deepseek-v4.1-flash',
+          name: 'DeepSeek V4.1 Flash',
+          api: 'openai-completions',
+          baseUrl: 'https://opencode.ai/zen/go/v1',
+          reasoning: true,
+          input: ['text', 'image'],
+          cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+          contextWindow: 1000000,
+          maxTokens: 384000,
+          compat: {
+            supportsStore: false,
+            supportsDeveloperRole: false,
+            maxTokensField: 'max_tokens',
+            requiresReasoningContentOnAssistantMessages: true,
+            thinkingFormat: 'deepseek'
+          },
+          thinkingLevelMap: { minimal: null, low: null, medium: null, high: 'high', max: 'max' }
+        }]
+      }
+    }))
+    const snapshotPath = join(process.cwd(), 'resources', 'runtime', 'model-capabilities', 'models-dev-reasoning-options.json')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('updated')
+    expect(await installBundledModelCapabilityOverrides(profile, snapshotPath)).toBe('unchanged')
+
+    const { ModelRuntime } = await import('@earendil-works/pi-coding-agent')
+    const runtime = await ModelRuntime.create({
+      modelsPath: join(profile.agentDir, 'models.json'),
+      modelsStorePath: join(profile.agentDir, 'models-store.json'),
+      allowModelNetwork: false
+    })
+    const model = runtime.getModel('opencode-go', 'deepseek-v4.1-flash')
+    expect(model).toMatchObject({
+      reasoning: true,
+      thinkingLevelMap: {
+        minimal: null,
+        low: 'low',
+        medium: null,
+        high: 'high',
+        max: 'max'
+      }
+    })
+    expect(model?.thinkingLevelMap?.off).toBeUndefined()
+    // The override merges over the upstream compat instead of replacing it.
+    expect(model?.compat).toMatchObject({
+      supportsStore: false,
+      thinkingFormat: 'deepseek'
+    })
+
+    // UI contract: low is selectable again, medium/minimal/xhigh stay hidden,
+    // off stays implicit — identical to sibling deepseek-v4-flash on this relay.
+    const { thinkingLevelsForModel } = await import('@pipi/host-api')
+    expect(thinkingLevelsForModel(model as any)).toEqual(['off', 'low', 'high', 'max'])
   })
 
   it('installs hand-curated gemini thinkingLevelMaps so official Google models expose selectable thinking levels', async () => {

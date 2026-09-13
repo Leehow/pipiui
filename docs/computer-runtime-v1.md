@@ -48,7 +48,7 @@ all of them as trusted.
 | `PIPIUI_COMPUTER_CAPABILITY` | Desktop-grant capability, presented inside `params` and verified per session. |
 | `PIPIUI_COMPUTER_RUNTIME_PROTOCOL` | Requested major protocol version (`1`). |
 | `PIPIUI_COMPUTER_DISPLAY_ID` / `PIPIUI_COMPUTER_WIDTH` / `PIPIUI_COMPUTER_HEIGHT` | Initialization hints for the synchronous Anthropic typed-tool hook; runtime negotiation remains authoritative and a mismatch is rejected. |
-| `PIPIUI_CUA_DRIVER_VERSION` | Pinned driver version (currently `0.22.0`). |
+| `PIPIUI_CUA_DRIVER_VERSION` | Pinned driver version (currently `0.23.2`). |
 
 Capabilities are per session, remain in process memory, and must not be
 written to disk or logs. Closing a session terminates its Pi process.

@@ -18,7 +18,7 @@ import { installOwnedRuntimeShutdown } from './app-lifecycle.js'
 import { resolveSystemProxyEnvironment } from './system-proxy.js'
 import { CUA_DRIVER_VERSION, CuaDriverHost } from './cua-driver-host.js'
 import type { ComputerImagePipeline } from './computer-image-pipeline.js'
-import { installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
+import { hasExplicitUserDataDirSwitch, installBundledModelCapabilityOverrides, resolveElectronPiProfile, resolveStableElectronUserDataPath } from './pi-profile.js'
 import { withProjectDirectoryPicker } from './project-directory-picker.js'
 import { withProductPackFileDialogs } from './product-pack-file-dialogs.js'
 import { createQuotaCookieReader, createQuotaCookiePersister, readCursorAccessToken } from './quota-capabilities.js'
@@ -163,9 +163,13 @@ if (app) {
   // productName stays "PipiUI" so the artifact folder does not collide
   // with the frozen Swift app. Override the process name so Dock / About / menus
   // show PipiUI. setName also changes the default userData folder, so pin it
-  // back to the historical Electron profile immediately.
+  // back to the historical Electron profile immediately — unless the launcher
+  // passed --user-data-dir, which is a deliberate relocation (the clean-room
+  // script's only way to escape the real profile on macOS, where appData ignores
+  // $HOME). Pinning over it would silently drag such a run back into ~/Library.
   app.setName('PipiUI')
-  app.setPath('userData', resolveStableElectronUserDataPath(app.getPath('appData')))
+  if (!hasExplicitUserDataDirSwitch(process.argv))
+    app.setPath('userData', resolveStableElectronUserDataPath(app.getPath('appData')))
   app.whenReady().then(async () => {
     const browserDebugPath = process.env.PIPIUI_BROWSER_NATIVE_DEBUG
     let browserDebugCaptureSequence = 0

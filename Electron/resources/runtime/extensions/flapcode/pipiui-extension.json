@@ -1,0 +1,199 @@
+{
+  "id": "flapcode",
+  "name": "Flapcode",
+  "version": "0.1.0",
+  "capabilities": [
+    "settings.read",
+    "settings.write",
+    "bridge.emit",
+    "invoke.agent",
+    "stream.render"
+  ],
+  "auth": {
+    "provider": {
+      "id": "flapcode",
+      "name": "Flapcode",
+      "api": "openai-responses",
+      "oauth": false,
+      "models": [
+        {
+          "id": "gpt-5.6-sol",
+          "name": "GPT-5.6 Sol (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 272000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 5,
+            "output": 30,
+            "cacheRead": 0.5,
+            "cacheWrite": 6.25
+          },
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max",
+            "minimal": "low"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false
+          }
+        },
+        {
+          "id": "gpt-5.6-luna",
+          "name": "GPT-5.6 Luna (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 272000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 0.2,
+            "output": 1.2,
+            "cacheRead": 0.02,
+            "cacheWrite": 0.25
+          },
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max",
+            "minimal": "low"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false
+          }
+        },
+        {
+          "id": "gpt-5.6-terra",
+          "name": "GPT-5.6 Terra (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 272000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 2,
+            "output": 12,
+            "cacheRead": 0.2,
+            "cacheWrite": 2.5
+          },
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "max": "max",
+            "minimal": "low"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false
+          }
+        },
+        {
+          "id": "gpt-6-astra",
+          "name": "GPT-6 Astra (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 272000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 10,
+            "output": 50,
+            "cacheRead": 1,
+            "cacheWrite": 12.5
+          },
+          "thinkingLevelMap": {
+            "off": null,
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "high",
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false
+          }
+        },
+        {
+          "id": "gpt-5.5",
+          "name": "GPT-5.5 (Flapcode)",
+          "api": "openai-responses",
+          "input": [
+            "text",
+            "image"
+          ],
+          "reasoning": true,
+          "contextWindow": 272000,
+          "maxTokens": 128000,
+          "cost": {
+            "input": 5,
+            "output": 30,
+            "cacheRead": 0.5,
+            "cacheWrite": 0
+          },
+          "thinkingLevelMap": {
+            "xhigh": "xhigh",
+            "minimal": "low"
+          },
+          "compat": {
+            "supportsLongCacheRetention": false
+          }
+        }
+      ]
+    }
+  },
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "host": {
+    "entry": "agent/dist/host.js",
+    "description": "Stable host library entry; same createAuthProvider as the agent half."
+  },
+  "app": {
+    "settings": {
+      "scope": "app",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.flapcode.apiKey": {
+            "type": "string",
+            "format": "secret",
+            "title": "API Key"
+          },
+          "ext.flapcode.baseUrl": {
+            "type": "string",
+            "default": "https://codex.takemoon.com/v1",
+            "title": "Base URL"
+          }
+        }
+      }
+    },
+    "ui": {
+      "panels": [],
+      "settingsSections": [
+        {
+          "id": "flapcode",
+          "title": "Flapcode"
+        }
+      ],
+      "slashCommands": [],
+      "themes": [],
+      "statusBar": []
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": [],
+  "lifecycle": {
+    "onDisable": "dispose-app-immediate; unmount-agent-on-next-session"
+  }
+}

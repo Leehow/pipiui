@@ -21,6 +21,13 @@ export interface ModelVisibilityController {
   setHidden(model: Model, hidden: boolean): Promise<void>
   /** Hide/show every model of one provider in a single atomic save. */
   setProviderHidden(provider: string, hidden: boolean): Promise<void>
+  /**
+   * Providers the host is serving but suppressing. A hidden model still lists
+   * its provider in the manager; a removed one does not appear at all, so this
+   * list is the only way back.
+   */
+  removedProviders: string[]
+  restoreProvider(provider: string): Promise<void>
   dismissError(): void
 }
 
@@ -33,6 +40,18 @@ function hostContractError(method: string): HostVisibilityContractError {
 function parseHiddenIds(value: unknown, method: string): Set<string> {
   if (!Array.isArray(value) || !value.every(id => typeof id === 'string')) throw hostContractError(method)
   return new Set(value)
+}
+
+function optionalHostMethod(
+  host: PipiHostAPI,
+  name: 'getRemovedProviderIds' | 'setRemovedProviderIds',
+): ((...args: unknown[]) => Promise<unknown>) | undefined {
+  const method = (host as unknown as Record<string, unknown>)[name]
+  return typeof method === 'function' ? (method.bind(host) as (...args: unknown[]) => Promise<unknown>) : undefined
+}
+
+function parseProviderIds(value: unknown): string[] {
+  return Array.isArray(value) && value.every(id => typeof id === 'string') ? [...value] : []
 }
 
 function hostMethod(host: PipiHostAPI, name: 'getHiddenModelIds' | 'setHiddenModelIds'): (...args: unknown[]) => Promise<unknown> {
@@ -53,6 +72,7 @@ function hostMethod(host: PipiHostAPI, name: 'getHiddenModelIds' | 'setHiddenMod
 export function useModelVisibility(host: PipiHostAPI, current?: Model | null): ModelVisibilityController {
   const [models, setModels] = useState<Model[]>([])
   const [hiddenIds, setHiddenIds] = useState<ReadonlySet<string>>(new Set())
+  const [removedProviders, setRemovedProviders] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [catalogEpoch, setCatalogEpoch] = useState(0)
@@ -76,10 +96,18 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
     const generation = ++generationRef.current
     try {
       const getHidden = hostMethod(host, 'getHiddenModelIds')
-      const [list, rawHidden] = await Promise.all([host.listModels(), getHidden()])
+      const getRemoved = optionalHostMethod(host, 'getRemovedProviderIds')
+      const [list, rawHidden, rawRemoved] = await Promise.all([
+        host.listModels(),
+        getHidden(),
+        // Absent on an older host: no removals can exist there, so an empty list
+        // is the correct answer rather than a contract error.
+        getRemoved ? getRemoved().catch(() => []) : Promise.resolve([]),
+      ])
       const persisted = parseHiddenIds(rawHidden, 'getHiddenModelIds')
       if (generation !== generationRef.current || pendingSavesRef.current > 0) return
       setModels(list)
+      setRemovedProviders(parseProviderIds(rawRemoved).sort())
       persistedRef.current = persisted
       applyHidden(persisted)
       setError(null)
@@ -154,6 +182,21 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
     await persist(next)
   }, [models, persist])
 
+  const restoreProvider = useCallback(async (provider: string) => {
+    const setRemoved = optionalHostMethod(host, 'setRemovedProviderIds')
+    if (!setRemoved) {
+      setError('当前主进程不支持恢复已移除的供应商；请手动退出并重新打开 PipiUI。')
+      return
+    }
+    try {
+      const ack = await setRemoved(removedProviders.filter(id => id !== provider))
+      setRemovedProviders(parseProviderIds(ack).sort())
+      await refresh()
+    } catch (err) {
+      setError(`恢复供应商失败：${err instanceof Error ? err.message : String(err)}`)
+    }
+  }, [host, refresh, removedProviders])
+
   const dismissError = useCallback(() => setError(null), [])
 
   const visibleModels = useMemo(() => models.filter(model => !hiddenIds.has(modelRef(model))), [models, hiddenIds])
@@ -161,5 +204,5 @@ export function useModelVisibility(host: PipiHostAPI, current?: Model | null): M
   const quickProviders = useMemo(() => pickerProviders(models, hiddenIds, current), [models, hiddenIds, current])
   const quickGroups = useMemo(() => groupByProvider(quickModels), [quickModels])
 
-  return { models, hiddenIds, loading, error, visibleModels, quickModels, quickProviders, quickGroups, refresh, catalogEpoch, setHidden, setProviderHidden, dismissError }
+  return { models, hiddenIds, loading, error, visibleModels, quickModels, quickProviders, quickGroups, refresh, catalogEpoch, setHidden, setProviderHidden, removedProviders, restoreProvider, dismissError }
 }

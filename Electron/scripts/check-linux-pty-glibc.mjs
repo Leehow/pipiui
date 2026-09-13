@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process'
 import { closeSync, openSync, readdirSync, readSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { describeFailure, scanCommandLines } from './scan-command-lines.mjs'
 
 export const MAX_GLIBC = { major: 2, minor: 35 }
 
@@ -74,13 +74,26 @@ export function isElf(file) {
   }
 }
 
-function dumpSymbols(file) {
-  const readelf = spawnSync('readelf', ['-V', file], { encoding: 'utf8' })
-  if (readelf.status === 0) return `${readelf.stdout}\n${readelf.stderr}`
-  const objdump = spawnSync('objdump', ['-T', file], { encoding: 'utf8' })
-  if (objdump.status === 0) return `${objdump.stdout}\n${objdump.stderr}`
-  const err = readelf.stderr || objdump.stderr || readelf.error?.message || objdump.error?.message
-  throw new Error(`failed to inspect ${file}: ${err || 'readelf/objdump unavailable'}`)
+/**
+ * Stream the symbol dump instead of buffering it. A symbol table has no size
+ * bound, and spawnSync's 1 MB maxBuffer reports an overflow the same way it
+ * reports a missing tool — an ENOBUFS on readelf would silently fall through to
+ * objdump and then be blamed on "readelf/objdump unavailable".
+ */
+async function dumpGlibcVersions(file) {
+  const versions = new Set()
+  const collect = (line) => {
+    for (const version of parseGlibcVersions(line)) versions.add(version)
+  }
+  const readelf = await scanCommandLines('readelf', ['-V', file], collect)
+  if (readelf.code === 0) return [...versions].sort()
+  versions.clear()
+  const objdump = await scanCommandLines('objdump', ['-T', file], collect)
+  if (objdump.code === 0) return [...versions].sort()
+  throw new Error(
+    `failed to inspect ${file}: readelf: ${describeFailure('readelf', readelf)}; ` +
+    `objdump: ${describeFailure('objdump', objdump)}`
+  )
 }
 
 function parseSearchArg(argv) {
@@ -91,7 +104,7 @@ function parseSearchArg(argv) {
   return next
 }
 
-function main(argv = process.argv.slice(2)) {
+async function main(argv = process.argv.slice(2)) {
   const search = parseSearchArg(argv)
   if (!search) {
     console.error('usage: node scripts/check-linux-pty-glibc.mjs --search <dir>')
@@ -121,8 +134,7 @@ function main(argv = process.argv.slice(2)) {
       continue
     }
     inspected += 1
-    const text = dumpSymbols(file)
-    const versions = parseGlibcVersions(text)
+    const versions = await dumpGlibcVersions(file)
     const tooNew = findTooNew(versions)
     if (tooNew.length > 0) {
       failed = true
@@ -141,7 +153,7 @@ function main(argv = process.argv.slice(2)) {
 const isDirectRun = process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)
 if (isDirectRun) {
   try {
-    main()
+    await main()
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error))
     process.exitCode = 1

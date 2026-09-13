@@ -104,7 +104,7 @@ import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { enrichCapabilitiesForOfficialHostedSearch } from "./hosted-search-capabilities.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
-import { registerContributedAuthProviders as registerExtensionAuthProviders } from "./extension-auth-providers.js";
+import { registerContributedAuthProviders as registerExtensionAuthProviders, contributedAuthProviderModules } from "./extension-auth-providers.js";
 import {
   LEASE_ACQUISITION_METADATA,
   LeaseManager,
@@ -1995,6 +1995,24 @@ async function probeCompatContextWindow(baseUrl: string, apiKey: string, modelId
   return contextWindowFromCompatList(list, modelId);
 }
 
+/**
+ * Request-shape flags PipiUI pins for a user-added OpenAI-compatible provider.
+ *
+ * pi's openai-completions client guesses these from the base URL (`detectCompat` in
+ * @earendil-works/pi-ai): an unrecognized host is assumed to accept the `developer` role, so a
+ * `reasoning: true` model sends its system prompt as `role:"developer"` on the first real turn.
+ * Relays that forward to Gemini or Claude answer that with a bare HTTP 400, and the connectivity
+ * test never sees it because it sends one plain user message.
+ *
+ * This is pinned rather than probed. The `developer` role is only an alias for the system prompt
+ * on providers that accept it, so `system` is never worse — it is what pi already forces for
+ * every relay-shaped provider it recognizes (zai, deepseek, moonshot, together, nvidia, xai,
+ * cerebras, cloudflare). A probe would also be answering the wrong question: a relay that
+ * load-balances across several upstreams accepts `developer` on some of them and rejects it on
+ * others, so asking once returns whichever backend happened to pick up the request.
+ */
+const CUSTOM_COMPAT_DEFAULTS = { supportsDeveloperRole: false } as const;
+
 /** Normalized model-id candidate for the add-model panel's dropdown. */
 export type CompatModelEntry = { id: string; contextWindow?: number };
 
@@ -2583,6 +2601,14 @@ export class PiHostBackend implements HostBackend {
         sessionsRoot: this.root,
         enforceProfile: this.profileMode === "isolated",
         env: { ...this.env, ...(this.piCommand.env ?? {}) },
+        // Resolved lazily per helper spawn: the helper process cannot discover
+        // user-installed (包外) providers from its own bundled tree, so the
+        // host hands down the current claims → provider module paths.
+        extensionAuthProviders: () =>
+          contributedAuthProviderModules({
+            claims: this.extensionLoader.contributionClaims(),
+            directoryOf: (id) => this.extensionLoader.directoryOf(id),
+          }),
       });
       this.authRuntimePromise = Promise.resolve(this.externalAuthRuntime);
     }
@@ -6417,6 +6443,23 @@ export class PiHostBackend implements HostBackend {
       if (typeof e.toolCallId === "string" && typeof e.toolName === "string") {
         live.toolNames.set(e.toolCallId, e.toolName);
       }
+    } else if (e.type === "tool_execution_update") {
+      // A tool's onUpdate partial is a cumulative snapshot; reduce it to its
+      // last non-empty line so the waiting bar shows fresh evidence of life
+      // instead of an ever-growing blob. Terminal projection stays with
+      // tool_execution_end; nothing here touches the transcript's tool card.
+      const partialContent = (e as { partialResult?: { content?: unknown } }).partialResult?.content;
+      const { text: partialText } = extractResult(partialContent);
+      const line = partialText.split("\n").filter((l) => l.trim()).pop()?.trim() ?? "";
+      if (line) {
+        this.stream({
+          type: "tool_update",
+          sessionId: id,
+          toolCallId: e.toolCallId,
+          name: typeof e.toolName === "string" ? e.toolName : live.toolNames.get(e.toolCallId),
+          text: line.slice(0, 120),
+        });
+      }
     } else if (e.type === "tool_execution_end") {
       this.touchTurnActivity(live);
       const { text: resultText, images } = extractResult(e.result?.content)
@@ -9872,9 +9915,17 @@ export class PiHostBackend implements HostBackend {
           name: modelId,
           reasoning: true,
           ...(contextWindow !== undefined ? { contextWindow } : {}),
+          compat: { ...CUSTOM_COMPAT_DEFAULTS },
         });
-      } else if (contextWindow !== undefined && parsePositiveInt(models[existingIndex]?.contextWindow) === undefined) {
-        models[existingIndex] = { ...models[existingIndex], contextWindow };
+      } else {
+        const previous = models[existingIndex] ?? {};
+        const fillContext = contextWindow !== undefined && parsePositiveInt(previous.contextWindow) === undefined;
+        // Anything already on the entry wins: a hand-edited compat block is the user's override.
+        models[existingIndex] = {
+          ...previous,
+          ...(fillContext ? { contextWindow } : {}),
+          compat: { ...CUSTOM_COMPAT_DEFAULTS, ...(previous.compat ?? {}) },
+        };
       }
       providers[uniqueId] = {
         ...existing,
@@ -9985,7 +10036,13 @@ export class PiHostBackend implements HostBackend {
       const apiKey = this.resolveLiteralApiKey(entry.apiKey);
       if (!apiKey) continue;
       const models = Array.isArray(entry.models) ? entry.models : [];
-      if (!models.some((m: any) => m && typeof m.id === "string" && parsePositiveInt(m.contextWindow) === undefined)) continue;
+      const wantsContext = models.some((m: any) => m && typeof m.id === "string" && parsePositiveInt(m.contextWindow) === undefined);
+      // A reasoning model with no `compat` key was saved before the capability probe existed, so
+      // pi is still guessing the request shape from the hostname. That guess is what makes an
+      // otherwise-reachable relay fail on the first real turn. Non-reasoning models never take
+      // the developer-role branch, so probing them would spend requests to learn nothing.
+      const wantsCompat = models.some((m: any) => m && typeof m.id === "string" && !m.compat && m.reasoning);
+      if (!wantsContext && !wantsCompat) continue;
       needs.push({ providerId, baseUrl, apiKey, models });
     }
     if (needs.length === 0) return;
@@ -10003,16 +10060,29 @@ export class PiHostBackend implements HostBackend {
       if (this.probedCompatBaseUrls.has(normalized)) continue;
       this.probedCompatBaseUrls.add(normalized);
       const { baseUrl, apiKey } = group[0];
-      const list = await fetchCompatModelsCatalog(baseUrl, apiKey);
-      if (list.length === 0) continue;
+      const needsCatalog = group.some((need) =>
+        need.models.some((m: any) => m && typeof m.id === "string" && parsePositiveInt(m.contextWindow) === undefined));
+      const list = needsCatalog ? await fetchCompatModelsCatalog(baseUrl, apiKey) : [];
       for (const need of group) {
         const nextModels = need.models.map((model: any) => {
           if (!model || typeof model !== "object" || typeof model.id !== "string") return model;
-          if (parsePositiveInt(model.contextWindow) !== undefined) return model;
-          const window = contextWindowFromCompatList(list, model.id);
-          if (window === undefined) return model;
-          wrote = true;
-          return { ...model, contextWindow: window };
+          let next = model;
+          if (parsePositiveInt(model.contextWindow) === undefined) {
+            const window = contextWindowFromCompatList(list, model.id);
+            if (window !== undefined) {
+              next = { ...next, contextWindow: window };
+              wrote = true;
+            }
+          }
+          // A reasoning model with no compat block predates this pin, so pi is still guessing the
+          // request shape from the hostname — the guess that makes an otherwise-reachable relay
+          // fail on its first real turn. Non-reasoning models never take the developer-role
+          // branch, and an existing block is the user's own override.
+          if (!model.compat && model.reasoning) {
+            next = { ...next, compat: { ...CUSTOM_COMPAT_DEFAULTS } };
+            wrote = true;
+          }
+          return next;
         });
         providers[need.providerId] = { ...(providers[need.providerId] as object), models: nextModels };
       }

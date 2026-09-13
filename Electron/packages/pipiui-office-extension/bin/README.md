@@ -15,4 +15,4 @@ DirectOfficeAdapter resolves the binary in this order only:
 Never PATH, never `~/.local/bin`, never network download, never user MCP config.
 The receipt file is never treated as the executable.
 
-Pinned release: iOfficeAI/OfficeCLI v1.0.144 (see `Electron/officecli-assets.json`).
+Pinned release: iOfficeAI/OfficeCLI v1.0.147 (see `Electron/officecli-assets.json`).

@@ -12,11 +12,11 @@
  * composer uses it only when no stored credential exists.
  */
 
+import { effectiveCatalog } from "./catalog-runtime.js";
 import { resolveDeepSeekConfig } from "./config.js";
 import { conversationProviderTransport } from "./conversation.js";
 import {
   AUTH_PROVIDER_ID,
-  DEEPSEEK_CONVERSATION_MODELS,
   DEEPSEEK_PROVIDER_ID,
   DEEPSEEK_PROVIDER_NAME,
   type DeepSeekConversationModel,
@@ -28,9 +28,18 @@ export {
   DEEPSEEK_CHAT_API,
   DEEPSEEK_CONVERSATION_MODEL_IDS,
   DEEPSEEK_CONVERSATION_MODELS,
+  DEEPSEEK_CURATED_MODELS,
+  DEEPSEEK_FLASH_MODEL_ID,
+  DEEPSEEK_PRO_MODEL_ID,
+  DEEPSEEK_RETIRED_MODEL_IDS,
   DEEPSEEK_VISION_MODEL_ID,
   deepseekManifestModels,
 } from "./models.js";
+export {
+  effectiveCatalog,
+  refreshDeepSeekCatalog,
+  scheduleCatalogRefresh,
+} from "./catalog-runtime.js";
 export {
   apiKeyFromCredentials,
   buildConversationRequest,
@@ -42,6 +51,8 @@ export type DeepSeekProviderOptions = {
   baseUrl?: string;
   /** Test / explicit settings fallback. Never read from ~/.pi. */
   apiKey?: string;
+  /** Test seam: read the catalog cache from here instead of the shared path. */
+  cachePath?: string;
 };
 
 /**
@@ -59,19 +70,16 @@ export function createDeepSeekProvider(options: DeepSeekProviderOptions = {}): {
 } {
   const cfg = resolveDeepSeekConfig(options);
   const transport = conversationProviderTransport();
+  const baseUrl = options.baseUrl?.trim() ? cfg.baseUrl : transport.baseUrl;
   return {
     name: DEEPSEEK_PROVIDER_NAME,
     api: transport.api,
-    baseUrl: options.baseUrl?.trim() ? cfg.baseUrl : transport.baseUrl,
+    baseUrl,
     authHeader: transport.authHeader,
     ...(cfg.apiKey ? { apiKey: cfg.apiKey } : {}),
-    models: DEEPSEEK_CONVERSATION_MODELS.map((model) => ({
-      ...model,
-      input: [...model.input],
-      cost: { ...model.cost },
-      ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
-      ...(model.compat ? { compat: { ...model.compat } } : {}),
-    })),
+    // Synchronous by contract: the host loader does not await this factory, so
+    // the catalog comes from the cache a background refresh left behind.
+    models: effectiveCatalog({ baseUrl, ...(options.cachePath ? { cachePath: options.cachePath } : {}) }),
   };
 }
 

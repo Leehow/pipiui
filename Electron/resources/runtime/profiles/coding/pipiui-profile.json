@@ -18,6 +18,7 @@
       { "id": "deepseek", "version": "^0.1.0" },
       { "id": "document-workbench", "version": "^1.0.0" },
       { "id": "external-session-scan", "version": "^0.1.0" },
+      { "id": "flapcode", "version": "^0.1.0" },
       { "id": "goal-extension", "version": "^1.0.0" },
       { "id": "git-capability", "version": "^1.0.0" },
       { "id": "grok-build-oauth", "version": "^0.2.0" },

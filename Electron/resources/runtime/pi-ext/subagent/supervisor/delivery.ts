@@ -450,6 +450,26 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		heldByWave.set(waveId, [...existing, report]);
 	}
 
+	function forgetHeldCompletion(request: SupervisorDeliveryRequest): void {
+		const waveId = waveIdOf(request);
+		if (!waveId) return;
+		const kept = (heldByWave.get(waveId) ?? [])
+			.filter((item) => item.agentId !== request.agentId || item.runId !== request.runId);
+		if (kept.length > 0) heldByWave.set(waveId, kept);
+		else heldByWave.delete(waveId);
+	}
+
+	/** Put back what a flush took but could not deliver; a held report must outlive a failed envelope. */
+	function restoreHeldReports(waveId: string, reports: readonly SupervisorTerminalReport[]): void {
+		if (reports.length === 0) return;
+		const merged = [...reports, ...(heldByWave.get(waveId) ?? [])];
+		heldByWave.set(
+			waveId,
+			merged.filter((item, index) =>
+				merged.findIndex((other) => other.agentId === item.agentId && other.runId === item.runId) === index),
+		);
+	}
+
 	function heldKeysFromStore(waveId: string): Set<string> {
 		if (!deps.store) return new Set();
 		const waveRef = `artifact://wave/${waveId}`;
@@ -465,6 +485,18 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		} catch {
 			return new Set();
 		}
+	}
+
+	/** Siblings already absorbed for this wave, not counting the request itself. */
+	function heldSiblingCount(request: SupervisorDeliveryRequest): number {
+		const waveId = waveIdOf(request);
+		if (!waveId) return 0;
+		const keys = new Set([
+			...(heldByWave.get(waveId) ?? []).map((item) => `${item.agentId}\0${item.runId}`),
+			...heldKeysFromStore(waveId),
+		]);
+		keys.delete(`${request.agentId}\0${request.runId}`);
+		return keys.size;
 	}
 
 	function takeHeldReports(request: SupervisorDeliveryRequest): SupervisorTerminalReport[] {
@@ -517,10 +549,16 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 		return formatSupervisorEscalationText(envelope);
 	}
 
-	async function flushHeldCompletions(source: SupervisorDeliveryRequest): Promise<void> {
+	async function flushHeldCompletions(
+		source: SupervisorDeliveryRequest,
+	): Promise<SupervisorDeliveryResult | undefined> {
 		const reports = takeHeldReports(source);
 		const waveId = waveIdOf(source);
-		if (reports.length === 0 || !waveId) return;
+		if (reports.length === 0 || !waveId) return undefined;
+		const restoreAndFail = (): undefined => {
+			restoreHeldReports(waveId, reports);
+			return undefined;
+		};
 		const identity = waveReceiptIdentity(waveId);
 		const coords = identity.ok
 			? identity.value
@@ -558,12 +596,12 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			wave: waveRequest.wave,
 			evidenceRefs: waveRequest.evidenceRefs,
 		});
-		if (built.ok === false) return;
+		if (built.ok === false) return restoreAndFail();
 		const envelope = boundedEnvelope(built.value, terminalReport(waveRequest), waveRequest.evidenceRefs);
-		if (!envelope) return;
+		if (!envelope) return restoreAndFail();
 		const text = boundedText(envelope);
-		if (!text) return;
-		await acceptBossWake(
+		if (!text) return restoreAndFail();
+		return acceptBossWake(
 			waveRequest,
 			built.value,
 			built.value.identity.eventId,
@@ -746,6 +784,25 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 
 		if (active <= 0 && packetActive <= 0 && !abnormalTerminal) {
 			if (isSuccessfulSupervisorCompletion(request)) {
+				// The worker that closes a wave used to cost the Boss two turns: its
+				// own receipt, and then the flush of every sibling the Supervisor had
+				// absorbed while it was still running. Nothing separates those two
+				// facts — they describe the same finished wave — so when siblings are
+				// waiting, this receipt joins them and the whole wave lands as one wake.
+				if (heldSiblingCount(request) > 0) {
+					rememberHeldCompletion(request);
+					const merged = await flushHeldCompletions(request);
+					if (merged) {
+						// Delivered inside the wave envelope: a later replay of this same
+						// completion is a duplicate, not a second thing to say.
+						remember(receiptId);
+						return merged;
+					}
+					// The merged envelope could not be built and the siblings went back on
+					// the held queue. This receipt goes out on its own below, so it must
+					// not also sit there waiting to be reported a second time.
+					forgetHeldCompletion(request);
+				}
 				const delivered = await acceptBossWake(
 					request,
 					event,

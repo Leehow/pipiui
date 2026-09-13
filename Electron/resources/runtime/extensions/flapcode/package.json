@@ -1,0 +1,27 @@
+{
+  "name": "@pipiui/flapcode-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Flapcode (Codex relay) Responses provider — API key lives in the extension secret vault, never in settings JSON / models.json",
+  "exports": {
+    "./package.json": "./package.json",
+    "./agent/provider": "./agent/dist/provider.js",
+    "./agent/host": "./agent/dist/host.js",
+    "./agent/models": "./agent/dist/models.js"
+  },
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json",
+    "postbuild": "node scripts/postbuild.mjs",
+    "test": "vitest run",
+    "clean": "rm -rf agent/dist"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@pipiui/extension-api": "*",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@pipiui/extension-api": "*"
+  }
+}

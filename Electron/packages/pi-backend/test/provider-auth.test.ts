@@ -50,6 +50,16 @@ async function tempAgent(): Promise<string> {
   return agent;
 }
 
+/** Catalog endpoint double for `/models`; nothing else should ever be requested. */
+function catalogMock(catalog: unknown[] = []) {
+  return vi.fn(async () => ({ ok: true, json: async () => ({ data: catalog }) }));
+}
+
+/** Every request the backend made that was not the `/models` catalog lookup. */
+function nonCatalogRequests(fetchMock: { mock: { calls: any[][] } }): string[] {
+  return fetchMock.mock.calls.map(([url]) => String(url)).filter(url => !url.endsWith("/models"));
+}
+
 describe("provider auth via pi ModelRuntime bridge", () => {
   let root = "";
   afterEach(async () => {
@@ -281,7 +291,13 @@ describe("provider auth via pi ModelRuntime bridge", () => {
       modelId: "qwen3.7-plus",
     }]);
     const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
-    expect(disk.providers.jelly.models[0]).toEqual({ id: "qwen3.7-plus", name: "qwen3.7-plus", reasoning: true });
+    // The compat pin needs no network, so it lands even when the catalog lookup is offline.
+    expect(disk.providers.jelly.models[0]).toEqual({
+      id: "qwen3.7-plus",
+      name: "qwen3.7-plus",
+      reasoning: true,
+      compat: { supportsDeveloperRole: false },
+    });
     expect(disk.providers.jelly.models[0].contextWindow).toBeUndefined();
   });
 
@@ -300,9 +316,138 @@ describe("provider auth via pi ModelRuntime bridge", () => {
       modelId: "qwen3.7-plus",
       contextWindow: 131072,
     }]);
-    expect(fetchMock).not.toHaveBeenCalled();
+    // The capability probe still runs; only the catalog lookup is skipped.
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/models"))).toHaveLength(0);
     const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
     expect(disk.providers.jelly.models[0].contextWindow).toBe(131072);
+  });
+
+  it("pins supportsDeveloperRole:false on a newly added compat provider", async () => {
+    root = await tempAgent();
+    vi.stubGlobal("fetch", catalogMock());
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Openlux",
+      baseUrl: "https://relay.example/v1",
+      apiKey: "sk-literal",
+      modelId: "gemini-3.8-flash",
+    }]);
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    // Without this pin pi sends the system prompt as role:"developer" on the first real turn and
+    // a Gemini-backed relay answers 400 — while the plain-user connectivity test passes.
+    expect(disk.providers.openlux.models[0].compat).toEqual({ supportsDeveloperRole: false });
+  });
+
+  it("costs no extra request to pin the compat block", async () => {
+    root = await tempAgent();
+    const fetchMock = catalogMock([{ id: "gemini-3.8-flash", context_length: 1000000 }]);
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Openlux",
+      baseUrl: "https://relay.example/v1",
+      apiKey: "sk-literal",
+      modelId: "gemini-3.8-flash",
+    }]);
+    expect(nonCatalogRequests(fetchMock)).toEqual([]);
+  });
+
+  it("keeps a hand-edited compat flag when the same provider is re-added", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        openlux: {
+          api: "openai-completions",
+          baseUrl: "https://relay.example/v1",
+          apiKey: "sk-literal",
+          models: [{
+            id: "gemini-3.8-flash",
+            name: "gemini-3.8-flash",
+            reasoning: true,
+            compat: { supportsDeveloperRole: true, supportsReasoningEffort: false },
+          }],
+        },
+      },
+    }));
+    vi.stubGlobal("fetch", catalogMock());
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() });
+    await backend.handle("addOpenAICompatibleProvider", [{
+      name: "Openlux",
+      baseUrl: "https://relay.example/v1",
+      apiKey: "sk-literal",
+      modelId: "gemini-3.8-flash",
+    }]);
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.openlux.models[0].compat).toEqual({ supportsDeveloperRole: true, supportsReasoningEffort: false });
+  });
+
+  it("backfills compat on a provider that was added before the pin existed", async () => {
+    root = await tempAgent();
+    await writeFile(join(root, "models.json"), JSON.stringify({
+      providers: {
+        openlux: {
+          api: "openai-completions",
+          baseUrl: "https://relay.example/v1",
+          apiKey: "sk-literal",
+          models: [{ id: "gemini-3.8-flash", name: "gemini-3.8-flash", reasoning: true, contextWindow: 1000000 }],
+        },
+      },
+    }));
+    const fetchMock = catalogMock();
+    vi.stubGlobal("fetch", fetchMock);
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.openlux.models[0].compat).toEqual({ supportsDeveloperRole: false });
+    // Nothing on disk needed a context window, so the backfill touched the network at all.
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a non-reasoning model alone; it never takes the developer-role branch", async () => {
+    root = await tempAgent();
+    const original = {
+      providers: {
+        openlux: {
+          api: "openai-completions",
+          baseUrl: "https://relay.example/v1",
+          apiKey: "sk-literal",
+          models: [{ id: "text-embed", name: "text-embed", reasoning: false, contextWindow: 8192 }],
+        },
+      },
+    };
+    await writeFile(join(root, "models.json"), JSON.stringify(original));
+    vi.stubGlobal("fetch", catalogMock());
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    expect(JSON.parse(await readFile(join(root, "models.json"), "utf8"))).toEqual(original);
+  });
+
+  it("never overwrites a compat block that is already on disk", async () => {
+    root = await tempAgent();
+    const original = {
+      providers: {
+        openlux: {
+          api: "openai-completions",
+          baseUrl: "https://relay.example/v1",
+          apiKey: "sk-literal",
+          models: [{
+            id: "gemini-3.8-flash",
+            name: "gemini-3.8-flash",
+            reasoning: true,
+            contextWindow: 1000000,
+            compat: { supportsDeveloperRole: true },
+          }],
+        },
+      },
+    };
+    await writeFile(join(root, "models.json"), JSON.stringify(original));
+    vi.stubGlobal("fetch", catalogMock());
+    const backend = createPiHostBackend({ agentDir: root, authRuntime: fakeAuthRuntime() }) as any;
+    await backend.handle("listModels", []);
+    await backend.compatContextBackfill;
+    expect(JSON.parse(await readFile(join(root, "models.json"), "utf8"))).toEqual(original);
   });
 
   it("removing credentials deletes the models.json provider definition; the referenced .env key itself is untouched", async () => {
@@ -378,7 +523,7 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     expect(disk.providers.jellytoken.models[0].contextWindow).toBe(262144);
   });
 
-  it("leaves models.json untouched when the backfill probe fails and still loads the catalog", async () => {
+  it("writes no contextWindow when the backfill probe fails and still loads the catalog", async () => {
     root = await tempAgent();
     const original = {
       providers: {
@@ -396,7 +541,11 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     const models = await backend.handle("listModels", []) as { provider: string; id: string }[];
     await backend.compatContextBackfill;
     expect(models.map(m => `${m.provider}/${m.id}`)).toContain("jellytoken/qwen3.7-plus");
-    expect(JSON.parse(await readFile(join(root, "models.json"), "utf8"))).toEqual(original);
+    // A dead catalog endpoint invents no context window; the network-free compat pin still lands.
+    const disk = JSON.parse(await readFile(join(root, "models.json"), "utf8"));
+    expect(disk.providers.jellytoken.models).toEqual([
+      { ...original.providers.jellytoken.models[0], compat: { supportsDeveloperRole: false } },
+    ]);
   });
 
   it("probes each baseUrl only once per backend lifetime", async () => {
@@ -428,7 +577,7 @@ describe("provider auth via pi ModelRuntime bridge", () => {
     await backend.handle("listModels", []);
     await backend.refreshModelCatalog();
     await backend.compatContextBackfill;
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/models"))).toHaveLength(1);
   });
 
   it("never overwrites an existing contextWindow during backfill", async () => {

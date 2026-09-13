@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { describeFailure, scanCommandLines } from './scan-command-lines.mjs'
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const buildDir = resolve(repoRoot, 'build')
@@ -32,8 +33,22 @@ function assertSized(path, minBytes = 1024) {
   return size
 }
 
-function listDeb(path) {
-  return execFileSync('dpkg-deb', ['-c', path], { encoding: 'utf8' })
+/**
+ * Stream `dpkg-deb -c` and record which needles the listing mentions. A real
+ * package lists ~31,500 entries (~3 MB), well past execFileSync's 1 MB
+ * maxBuffer — buffering it killed this check with ENOBUFS before any assertion
+ * ran. Every needle is a path fragment inside one entry line, so a line-by-line
+ * scan sees exactly what a whole-listing `includes` would.
+ */
+async function listedNames(path, needles) {
+  const found = new Set()
+  const result = await scanCommandLines('dpkg-deb', ['-c', path], line => {
+    for (const needle of needles) {
+      if (!found.has(needle) && line.includes(needle)) found.add(needle)
+    }
+  })
+  if (result.code !== 0) fail(`dpkg-deb -c failed on ${path}: ${describeFailure('dpkg-deb', result)}`)
+  return found
 }
 
 const debs = artifacts('.deb')
@@ -41,14 +56,14 @@ if (debs.length === 0) fail('linux deb artifact missing')
 const deb = debs.find(path => /amd64|x64|x86_64/.test(path)) ?? debs[0]
 if (!/amd64|x64|x86_64/.test(deb)) fail(`deb is not x64: ${deb}`)
 console.log(`deb OK: ${deb} (${assertSized(deb)} bytes)`)
-const listing = listDeb(deb)
+const listed = await listedNames(deb, [...requiredRuntimeFiles, ...forbiddenPlaintext, 'pipiui-runtime'])
 for (const name of requiredRuntimeFiles) {
-  if (!listing.includes(name)) fail(`deb missing vault runtime file: ${name}`)
+  if (!listed.has(name)) fail(`deb missing vault runtime file: ${name}`)
 }
 for (const name of forbiddenPlaintext) {
-  if (listing.includes(name)) fail(`deb contains sibling plaintext key: ${name}`)
+  if (listed.has(name)) fail(`deb contains sibling plaintext key: ${name}`)
 }
-if (!listing.includes('pipiui-runtime')) fail('deb missing pipiui-runtime tree')
+if (!listed.has('pipiui-runtime')) fail('deb missing pipiui-runtime tree')
 
 const appImages = artifacts('.AppImage')
 if (appImages.length === 0) fail('linux AppImage artifact missing')

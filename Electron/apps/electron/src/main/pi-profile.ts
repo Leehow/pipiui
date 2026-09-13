@@ -286,6 +286,29 @@ export function resolveStableElectronUserDataPath(appData: string): string {
   return join(appData, ELECTRON_USER_DATA_DIRNAME)
 }
 
+/**
+ * True when the launcher explicitly picked a userData directory, e.g.
+ * `scripts/electron-cleanroom.sh` passing `--user-data-dir=<sandbox>`.
+ *
+ * The stable pin exists to keep `app.setName('PipiUI')` from moving the profile; it must
+ * not also defeat a deliberate relocation. On macOS this switch is the only lever a caller
+ * has: `app.getPath('appData')` resolves through NSSearchPathForDirectoriesInDomains and
+ * ignores `$HOME`, so an `env -i HOME=<sandbox>` launch still pins into the developer's
+ * real profile. (On Linux `appData` follows `$XDG_CONFIG_HOME`/`$HOME`, so a fresh `HOME`
+ * isolates on its own — the pin lands inside the sandbox either way.) When the switch is
+ * present the caller keeps whatever Electron itself resolved, rather than a path we
+ * recompute, so userData can never disagree with Chromium's own DIR_USER_DATA.
+ */
+export function hasExplicitUserDataDirSwitch(argv: readonly string[]): boolean {
+  for (const argument of argv) {
+    // Chromium stops treating arguments as switches after a bare `--`.
+    if (argument === '--') return false
+    // Only the `--switch=value` form carries a value; a valueless switch is not a choice.
+    if (/^--?user-data-dir=./.test(argument)) return true
+  }
+  return false
+}
+
 function isContinuityEntry(name: string): boolean {
   return CONTINUITY_ENTRIES.has(name) || name.startsWith('pipiui-')
 }

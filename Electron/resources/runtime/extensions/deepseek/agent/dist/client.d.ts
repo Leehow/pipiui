@@ -47,6 +47,22 @@ export declare const DEEPSEEK_WEB_SEARCH_BUILTIN: Readonly<{
  */
 export declare function mergeHostedWebSearchTool<T>(payload: T, supported: boolean): T;
 export declare function rewriteDeepSeekPayload<T>(payload: T): T;
+/**
+ * Measured against the live API (2026-09-12, n=9 per cell): effort "low" alone
+ * does NOT shorten DeepSeek's chain-of-thought (3.1-4.1k reasoning tokens on a
+ * keeper-style turn, statistically identical to "high"), while this directive
+ * caps it at ~250 (worst 824) with none-level latency — and reasoning keeps
+ * flowing, so the tool-call `reasoning_content` contract stays intact, unlike
+ * effort "none", which disables thinking outright.
+ */
+export declare const THINKING_CAP_DIRECTIVE: string;
+/**
+ * Prepend the thinking-cap developer message unless the caller made an
+ * explicit thinking choice: "none" needs no cap, and "high"/"max" are the
+ * deliberate escape hatches for hard turns. Low or unset effort gets the cap.
+ * Idempotent: a payload already carrying the directive is returned unchanged.
+ */
+export declare function applyThinkingCap<T>(payload: T): T;
 export declare function rewriteDeepSeekPayloadAsync<T>(payload: T, options?: FilesRewriteOptions & {
     apiKey?: string;
     baseUrl?: string;

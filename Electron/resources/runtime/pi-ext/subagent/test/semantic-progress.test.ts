@@ -113,23 +113,97 @@ test("node --test — the repo's mandated worker verify command — counts as va
 	}
 });
 
-test("inspection shell commands earn no validation credit, and repeating them spins out", () => {
-	const call = (id: string) => ({ id, name: "bash", arguments: { command: "NODE_OPTIONS=x git status --short" } });
-	// First occurrence: novel recon — no validation credit, but also no stall increment.
+test("inspection shell commands earn no validation credit, and only sustained repetition spins out", () => {
+	const call = (id: string, command: string) => ({ id, name: "bash", arguments: { command } });
+	// A novel recon command clears the counter: the cap counts consecutive spinning, and a
+	// command aimed somewhere new is not spinning however high the counter had climbed.
 	let decision = advanceSemanticProgress(createSemanticProgressState({ inspectOnlyStreak: 11 }), {
 		type: "assistant-turn",
-		toolCalls: [call("status-1")],
+		toolCalls: [call("status-1", "NODE_OPTIONS=x git status --short")],
 	});
 	assert.equal(decision.terminate, false, "one novel recon command is not a stall");
 	assert.equal(decision.state.progressEvents, 0, "git status is not validation evidence");
-	assert.equal(decision.state.inspectOnlyStreak, 11);
+	assert.equal(decision.state.inspectOnlyStreak, 0, "novel recon resets the consecutive counter");
 	// Repeating the identical command is the stall the cap exists for.
-	decision = advanceSemanticProgress(decision.state, {
-		type: "assistant-turn",
-		toolCalls: [call("status-2")],
-	});
-	assert.equal(decision.terminate, true, "repeating the identical inspection command hits the spin cap");
+	for (let repeat = 1; repeat <= GENERAL_PURPOSE_SEMANTIC_TURN_CAP; repeat++) {
+		decision = advanceSemanticProgress(decision.state, {
+			type: "assistant-turn",
+			toolCalls: [call(`status-${repeat + 1}`, "NODE_OPTIONS=x git status --short")],
+		});
+		assert.equal(
+			decision.terminate,
+			repeat === GENERAL_PURPOSE_SEMANTIC_TURN_CAP,
+			`repeat ${repeat} terminates only at the cap`,
+		);
+	}
 	assert.equal(decision.state.progressEvents, 0);
+});
+
+test("the stall counter is consecutive, not a lifetime tally", () => {
+	// The shape that used to kill long workers: repeats scattered through real work. Eleven
+	// repeat turns spread across a long run must leave the worker alive, because each one is
+	// followed by recon that reaches somewhere new.
+	let state = createSemanticProgressState();
+	for (let round = 1; round <= 11; round++) {
+		state = advanceSemanticProgress(state, {
+			type: "assistant-turn",
+			toolCalls: [{ id: `novel-${round}`, name: "read", arguments: { path: `src/file-${round}.ts` } }],
+		}).state;
+		const repeat = advanceSemanticProgress(state, {
+			type: "assistant-turn",
+			toolCalls: [{ id: `repeat-${round}`, name: "read", arguments: { path: `src/file-${round}.ts` } }],
+		});
+		assert.equal(repeat.terminate, false, `round ${round} must not terminate`);
+		assert.equal(repeat.state.inspectOnlyStreak, 1, `round ${round} spin does not accumulate`);
+		state = repeat.state;
+	}
+});
+
+test("a signature is the whole argument set, so a changed argument is a changed target", () => {
+	// Each of these pairs shares the field the old signature keyed on and differs elsewhere:
+	// same grep root with a different pattern, same file at a different offset, same document
+	// read section by section. All three used to collapse into one target and read as spinning.
+	const pairs: Array<[Record<string, unknown>, Record<string, unknown>, string]> = [
+		[{ pattern: "alpha", path: "Electron" }, { pattern: "beta", path: "Electron" }, "grep"],
+		[{ path: "src/big.ts", offset: 1, limit: 500 }, { path: "src/big.ts", offset: 501, limit: 500 }, "read"],
+		[{ paperId: "doc-1", section: "intro" }, { paperId: "doc-1", section: "methods" }, "paper_read"],
+	];
+	for (const [first, second, name] of pairs) {
+		let decision = advanceSemanticProgress(createSemanticProgressState(), {
+			type: "assistant-turn",
+			toolCalls: [{ id: "a", name, arguments: first }],
+		});
+		decision = advanceSemanticProgress(decision.state, {
+			type: "assistant-turn",
+			toolCalls: [{ id: "b", name, arguments: second }],
+		});
+		assert.equal(decision.state.inspectOnlyStreak, 0, `${name}: a changed argument is new recon`);
+		// The identical call, though, is still the spin the guard exists to catch.
+		const identical = advanceSemanticProgress(decision.state, {
+			type: "assistant-turn",
+			toolCalls: [{ id: "c", name, arguments: second }],
+		});
+		assert.equal(identical.state.inspectOnlyStreak, 1, `${name}: an identical repeat still spins`);
+	}
+});
+
+test("a changed worktree clears the stall however the worker wrote", () => {
+	// The worker whose only writes go through an extension tool or a shell redirect: no
+	// recognised mutation tool ever fires, so tool names alone can only ever say "no progress".
+	const spin = createSemanticProgressState({ inspectOnlyStreak: 11 });
+	const baseline = advanceSemanticProgress(spin, { type: "write-evidence", fingerprint: "files:2:abc" });
+	assert.equal(baseline.state.inspectOnlyStreak, 11, "the first sample is only a baseline");
+	assert.equal(baseline.state.writeFingerprint, "files:2:abc");
+
+	const unchanged = advanceSemanticProgress(baseline.state, { type: "write-evidence", fingerprint: "files:2:abc" });
+	assert.equal(unchanged.state.inspectOnlyStreak, 11, "an unchanged tree leaves the verdict standing");
+	assert.equal(unchanged.state.progressEvents, 0);
+
+	const changed = advanceSemanticProgress(baseline.state, { type: "write-evidence", fingerprint: "files:3:xyz" });
+	assert.equal(changed.state.inspectOnlyStreak, 0, "a changed tree is progress, whatever tool made it");
+	assert.equal(changed.state.progressEvents, 1);
+	assert.equal(changed.state.writeFingerprint, "files:3:xyz");
+	assert.deepEqual(changed.state.recentInspectSignatures, [], "after a write, re-reading is legitimate");
 });
 
 test("id-less semantic calls pair only by tool name and missing results settle boundedly", () => {
@@ -170,7 +244,10 @@ test("production event and closeout seams remain wired to semantic progress", ()
 	const source = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
 	assert.match(source, /type: "assistant-turn"[\s\S]{0,300}?toolCalls: semanticToolCalls/);
 	assert.match(source, /onResult: observeSemanticToolResult/);
-	assert.match(source, /advanceSemanticProgress\(semanticProgress, \{ type: "settle" \}\)/);
+	assert.match(source, /applySemanticProgress\(\{ type: "settle" \}\)/);
+	// The stall verdict must consult the tree, not just the tool names it happens to know.
+	assert.match(source, /inspectOnlyStreak > streakBefore[\s\S]{0,400}?workerWriteFingerprint\(/);
+	assert.match(source, /type: "write-evidence"/);
 	assert.match(source, /currentResult\.stopReason = "semantic_no_progress"/);
 	assert.match(source, /if \(!semanticNoProgress\) \{[\s\S]{0,120}?applyWorktreeRecovery/);
 });

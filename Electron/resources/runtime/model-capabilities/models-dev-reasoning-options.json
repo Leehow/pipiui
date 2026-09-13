@@ -258,6 +258,28 @@
         }
       }
     },
+    "opencode-go": {
+      "models": {
+        "deepseek-v4.1-flash": {
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "max": "max"
+          },
+          "compat": { "thinkingFormat": "deepseek" },
+          "verification": {
+            "method": "Hand-curated against two independent sources: models.dev lists deepseek-v4.1-flash effort values low|high|max, and the official DeepSeek thinking-mode contract (api-docs.deepseek.com/guides/thinking_mode) accepts reasoning_effort low|high|max. The pi.dev remote catalog marks low: null for this exact model while its sibling deepseek-v4-flash on the same relay carries low: \"low\" — a stale/erroneous upstream entry this override flips back. Map mirrors the upstream deepseek-v4-flash entry verbatim; off stays absent so it remains selectable and sends no reasoning param.",
+            "verifiedAt": "2026-09-24T00:00:00Z",
+            "acceptedValues": ["low", "high", "max"],
+            "rejectedValues": ["minimal", "medium", "xhigh"],
+            "result": "Vocabulary is documented (models.dev reasoning_options + DeepSeek official contract), not probed against the zen/go relay; the relay forwards the request body to DeepSeek, same assumption as the jellytoken deepseek entries."
+          }
+        }
+      }
+    },
     "openai-codex": {
       "models": {
         "gpt-5.6-sol": {

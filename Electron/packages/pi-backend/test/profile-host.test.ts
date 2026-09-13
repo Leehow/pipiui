@@ -208,6 +208,7 @@ describe("Product Profile host interface", () => {
       "built-in-skills",
       "grok-build-oauth",
       "deepseek",
+      "flapcode",
       "memory-extension",
       "office-extension",
       "pdf-extension",

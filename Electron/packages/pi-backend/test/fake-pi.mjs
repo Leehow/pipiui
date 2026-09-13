@@ -345,6 +345,20 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
       send({ type: "agent_settled" });
       return;
     }
+    if (command.message === "__tool_update__") {
+      // Mid-execution progress: the host must forward onUpdate partials as
+      // tool_update stream events (last non-empty line, truncated to 120), or
+      // a long tool run reads as a dead wait in the UI.
+      ok();
+      send({ type: "agent_start" });
+      send({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "narrate", args: {} });
+      send({ type: "tool_execution_update", toolCallId: "tool-1", toolName: "narrate", partialResult: { content: [{ type: "text", text: "first line\nsecond line" }] } });
+      send({ type: "tool_execution_update", toolCallId: "tool-1", toolName: "narrate", partialResult: { content: [{ type: "text", text: "x".repeat(200) }] } });
+      send({ type: "tool_execution_update", toolCallId: "tool-1", toolName: "narrate", partialResult: { content: [{ type: "text", text: "   \n\n" }] } });
+      send({ type: "tool_execution_end", toolCallId: "tool-1", result: { content: [{ type: "text", text: "done" }] }, isError: false });
+      send({ type: "agent_settled" });
+      return;
+    }
     if (command.message === "__auto_retry__") {
       // Provider hiccup inside the turn: pi auto-retries with backoff, then
       // recovers. The host must forward auto_retry_start/end so the UI can

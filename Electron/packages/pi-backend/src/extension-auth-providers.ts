@@ -24,6 +24,33 @@ export function contributedProviderModulePath(directory: string): string | undef
   return undefined;
 }
 
+/**
+ * The host-side truth the external auth helper cannot see: which enabled
+ * extensions contribute an auth provider, and where their provider module
+ * lives. Serialized into the helper child environment so login/list commands
+ * register the same providers the in-process path would — bundled or
+ * user-installed, the helper cannot discover either on its own beyond
+ * its own sibling extensions/ dir.
+ */
+export function contributedAuthProviderModules(input: {
+  claims: readonly ContributionClaim[];
+  directoryOf: (extensionId: string) => string | undefined;
+}): Array<{ id: string; module: string }> {
+  const seen = new Set<string>();
+  const result: Array<{ id: string; module: string }> = [];
+  for (const claim of input.claims) {
+    const id = claim.contribution.provider.id?.trim();
+    if (!id || seen.has(id)) continue;
+    const directory = input.directoryOf(claim.extensionId);
+    if (!directory) continue;
+    const module = contributedProviderModulePath(directory);
+    if (!module) continue;
+    seen.add(id);
+    result.push({ id, module });
+  }
+  return result;
+}
+
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }

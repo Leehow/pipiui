@@ -94,7 +94,7 @@ campaign-starter/
 
 侧栏底部 `desktopcomputer` 按钮打开「Computer Use（桌面控制）」面板，其中的总开关是唯一的产品授权开关（默认关闭）。关闭时不导出桌面能力，工具不存在、没有前缀成本。打开后，内置扩展 `cua-extension`（`Electron/resources/runtime/extensions/cua-extension/`，默认启用）在**主会话**直接注册两个工具：`open_application` 按 bundle id 或应用名钉住精确 App 窗口，`computer` 执行有序动作批（`screenshot/click/type/key/scroll/wait/invoke_menu` 等 13 个动作；整批预校验、首个失败即停、逐动作返回 `outcomes` receipt）。没有 `computer_task`，也没有独立的 Computer Use agent——worker/subagent 拿不到任何桌面能力，桌面工作只发生在主会话。
 
-调用链路：扩展 → loopback Host Capability broker（`native.cua` op + 一次性 token）→ Electron 主进程 `CuaDriverHost` → 内嵌 Rust cua-driver v0.22.0（MCP over stdio）。截图降采样到长边 ≤1568px 交付模型，观察携带 `screenshot: {width, height, scaleX, scaleY}`，模型坐标按交付截图像素空间解释，由宿主做边界检查并映射回 driver 像素；图像字节只保存在进程内存的 3 项 FIFO 中，写进会话历史的只有 opaque marker。驱动以 `--permission-mode unrestricted` embedded 运行，权限闸门在 App 层：macOS Screen Recording/Accessibility TCC（面板内可跳转授权）加目标 PID/窗口绑定、坐标边界、取消与 driver generation 清理等技术校验。不做逐会话、逐应用或逐操作确认。
+调用链路：扩展 → loopback Host Capability broker（`native.cua` op + 一次性 token）→ Electron 主进程 `CuaDriverHost` → 内嵌 Rust cua-driver v0.23.2（MCP over stdio）。截图降采样到长边 ≤1568px 交付模型，观察携带 `screenshot: {width, height, scaleX, scaleY}`，模型坐标按交付截图像素空间解释，由宿主做边界检查并映射回 driver 像素；图像字节只保存在进程内存的 3 项 FIFO 中，写进会话历史的只有 opaque marker。驱动以 `--permission-mode unrestricted` embedded 运行，权限闸门在 App 层：macOS Screen Recording/Accessibility TCC（面板内可跳转授权）加目标 PID/窗口绑定、坐标边界、取消与 driver generation 清理等技术校验。不做逐会话、逐应用或逐操作确认。
 
 Anthropic 白名单模型会把 `computer` 替换为官方 typed tool `computer_20251124` 并合并 beta header；其它 provider 使用通用 `actions:[...]` 自定义 schema，不声称支持 OpenAI 原生 `computer_call` 循环。
 

@@ -11,7 +11,7 @@ agent half 只是把它作为独立扩展包分发的薄封装。
 - 数据路径不变：`{projectRoot}/.pi/agent`（pi home）与 `{projectRoot}/.pi/pipiui-memory`（V2 Catalog）。
 - V1 queue（`pipiui-memory-broker-experience-v1.jsonl`）→ V2 Catalog 导入保持幂等。
 - Hermes 原生目录解析不变：宿主注入 `PIPIUI_HERMES_PACKAGE_ROOT` /
-  `PIPIUI_HERMES_NODE_MODULES_ROOT`（managed `pi-hermes-memory` 0.9.6）；
+  `PIPIUI_HERMES_NODE_MODULES_ROOT`（managed `pi-hermes-memory` 0.9.8）；
   Hermes 适配器是扩展内部兼容层，不是扩展 API 契约。
 - JSONL/snapshot 格式与历史会话注入（advisory/untrusted `memory_context`）不变。
 

@@ -17,12 +17,12 @@ describe("managed Headroom lifecycle receipt", () => {
     await writeFile(path, JSON.stringify({
       schemaVersion: 1,
       state: "ready",
-      engineVersion: "0.36.5",
+      engineVersion: "0.37.0",
       baseUrl: "http://127.0.0.1:43123",
     }));
     await expect(readManagedServiceState(path)).resolves.toEqual({
       state: "ready",
-      engineVersion: "0.36.5",
+      engineVersion: "0.37.0",
       baseUrl: "http://127.0.0.1:43123",
     });
   });

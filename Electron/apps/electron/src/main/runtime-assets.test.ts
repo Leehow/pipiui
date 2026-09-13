@@ -42,11 +42,11 @@ describe('resolveRuntimeAssets', () => {
       writeFile(launcher, ''),
       writeFile(join(nodeModules, '@earendil-works', 'pi-coding-agent', 'package.json'), JSON.stringify({ version: '0.84.2' })),
       mkdir(join(nodeModules, 'pi-hermes-memory'), { recursive: true }).then(() =>
-        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.6' }))),
+        writeFile(join(nodeModules, 'pi-hermes-memory', 'package.json'), JSON.stringify({ version: '0.9.8' }))),
       mkdir(join(nodeModules, 'better-sqlite3'), { recursive: true }).then(() =>
         writeFile(join(nodeModules, 'better-sqlite3', 'package.json'), JSON.stringify({ version: '12.11.1' })))
     ])
-    for (const [name, version] of [['pi-web-access', '0.23.0'], ['pi-mcp-extension', '1.5.0']]) {
+    for (const [name, version] of [['pi-web-access', '0.28.0'], ['pi-mcp-extension', '1.5.0']]) {
       const packageRoot = join(nodeModules, name)
       await mkdir(join(packageRoot, 'dist'), { recursive: true })
       await writeFile(join(packageRoot, 'dist', 'index.js'), '// extension\n')
@@ -64,9 +64,9 @@ describe('resolveRuntimeAssets', () => {
       nodeModules: 'pi/lib/node_modules',
       packages: {
         '@earendil-works/pi-coding-agent': '0.84.2',
-        'pi-web-access': '0.23.0',
+        'pi-web-access': '0.28.0',
         'pi-mcp-extension': '1.5.0',
-        'pi-hermes-memory': '0.9.6',
+        'pi-hermes-memory': '0.9.8',
         'better-sqlite3': '12.11.1'
       }
     }))
@@ -146,7 +146,7 @@ describe('resolveRuntimeAssets', () => {
       }
     })
     expect(assets.managedNodeModulesRoot).toBe(join(resourcesPath, 'pipiui-embedded/pi/lib/node_modules'))
-    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.6')
+    expect(JSON.parse(await readFile(join(assets.managedNodeModulesRoot!, 'pi-hermes-memory/package.json'), 'utf8')).version).toBe('0.9.8')
   })
 
   it('spawns the Electron host, never the unspawnable Windows .cmd shim', async () => {

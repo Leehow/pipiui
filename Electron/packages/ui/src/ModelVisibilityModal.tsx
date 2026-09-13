@@ -66,6 +66,7 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
   const { host, visibility, current, onModelState, view, setView } = ctx
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [showRemoved, setShowRemoved] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const groups = useMemo(() => groupByProvider(visibility.models), [visibility.models])
@@ -142,7 +143,7 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
               </div>
               {confirmDelete === group.provider && (
                 <div className="model-provider-confirm" data-testid={`delete-confirm-${group.provider}`}>
-                  <span>删除将移除 {group.provider} 的 Pi 凭据，其下模型将不可用。</span>
+                  <span>将删除 {group.provider} 的 Pi 凭据并把它移出列表。内置供应商可在下方「已移除」中恢复。</span>
                   <div className="model-provider-confirm-actions">
                     <button className="provider-login-cancel" disabled={deleting} data-testid={`delete-cancel-${group.provider}`} onClick={() => setConfirmDelete(null)}>取消</button>
                     <button className="confirm-delete" disabled={deleting} data-testid={`delete-confirm-btn-${group.provider}`} onClick={() => void doDelete(group.provider)}>{deleting ? '删除中…' : '确认删除'}</button>
@@ -171,6 +172,35 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
             </section>
           )
         })}
+    {/* Sibling of the branch above on purpose: removing every provider empties
+        the catalog, and a restore affordance that renders only next to a
+        non-empty list would be gone exactly when it is needed. */}
+    {visibility.removedProviders.length > 0 && (
+          <section className="model-provider model-provider-removed" data-testid="removed-providers">
+            <button
+              className="model-provider-toggle"
+              aria-expanded={showRemoved}
+              onClick={() => setShowRemoved(value => !value)}
+            >
+              <span aria-hidden="true">{showRemoved ? '▾' : '▸'}</span>
+              <span className="model-provider-name">已移除的供应商</span>
+              <span className="model-provider-count" data-testid="removed-providers-count">{visibility.removedProviders.length}</span>
+            </button>
+            {showRemoved && visibility.removedProviders.map(provider => (
+              <div key={provider} className="model-row model-row-removed" data-testid={`removed-provider-${provider}`}>
+                <ProviderLogo provider={provider} size={14} />
+                <span className="model-row-name">{provider}</span>
+                <button
+                  className="provider-login-cancel"
+                  data-testid={`restore-provider-${provider}`}
+                  onClick={() => void visibility.restoreProvider(provider)}
+                >
+                  恢复
+                </button>
+              </div>
+            ))}
+      </section>
+    )}
   </>
 }
 
@@ -180,9 +210,12 @@ function ModelsSettingsBody({ ctx }: { ctx: SettingsSectionContext }) {
  * tab), 扩展 (extension packages incl. the host-feature builtin panes, add
  * MCP / Pi extensions via main chat), and 更新中心. Provider headers carry a
  * tri-state checkbox (all/none/partial visible), a per-provider delete action
- * (pi logout with confirmation) and an "添加模型" flow driving pi's native
- * OAuth/api-key login. Visibility state is persisted through the host
- * (hiddenModelIds, atomic); vision routing through getVisionEnabled/
+ * (credential logout + removal, with confirmation) and an "添加模型" flow
+ * driving pi's native OAuth/api-key login. A provider pi supplies on its own
+ * (a compiled-in builtin) cannot be deleted outright, so removal suppresses it
+ * and it comes back through the "已移除的供应商" section. Visibility state is
+ * persisted through the host (hiddenModelIds / removedProviderIds, atomic);
+ * vision routing through getVisionEnabled/
  * setVisionEnabled + getVisionModel/setVisionModel.
  */
 export function ModelVisibilityModal({ host, visibility, vision, scan, updates, current, onModelState, onRequestUpdate, onClose, initialView = 'manage', projectId }: {

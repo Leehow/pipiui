@@ -1,12 +1,111 @@
 import { describe, expect, it } from 'vitest'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { serializeAvailableModel } from './pi-auth-helper.mjs'
 
 const execFileAsync = promisify(execFile)
+
+describe('Pi auth helper bundled provider registration', () => {
+  async function fixtureTree() {
+    const root = await mkdtemp(join(tmpdir(), 'pipi-auth-helper-register-'))
+    const piRoot = join(root, 'pi-runtime')
+    const binDir = join(root, 'bin')
+    await mkdir(join(piRoot, 'dist'), { recursive: true })
+    await mkdir(join(binDir, 'node_modules', '@earendil-works'), { recursive: true })
+    await mkdir(join(root, 'auth'), { recursive: true })
+    await mkdir(join(root, 'extensions', 'fakext', 'agent', 'dist'), { recursive: true })
+    await writeFile(join(piRoot, 'package.json'), JSON.stringify({ type: 'module' }))
+    await writeFile(join(piRoot, 'dist', 'index.js'), `
+const registered = new Map()
+export const ModelRuntime = {
+  async create() {
+    return {
+      registerProvider(id, config) { registered.set(id, config) },
+      getProvider(id) { return registered.get(id) },
+      getProviders() { return [...registered.keys()].map(id => ({ id, name: id, auth: { apiKey: {} } })) },
+      async getAvailable() { return [] }
+    }
+  }
+}
+`)
+    await symlink(piRoot, join(binDir, 'node_modules', '@earendil-works', 'pi-coding-agent'), 'dir')
+    await writeFile(join(binDir, 'pi'), '')
+    await writeFile(join(root, 'extensions', 'fakext', 'agent', 'dist', 'provider.js'), `
+export const AUTH_PROVIDER_ID = 'fake-ext'
+export const createAuthProvider = () => ({ name: 'Fake Ext', api: 'openai-completions', baseUrl: 'https://example.invalid', models: [] })
+`)
+    const helper = await readFile(resolve('resources/runtime/auth/pi-auth-helper.mjs'), 'utf8')
+    await writeFile(join(root, 'auth', 'pi-auth-helper.mjs'), helper)
+    // macOS /var -> /private/var: the helper's entry guard compares
+    // import.meta.url against argv[1], so spawn the realpath'd copy or the
+    // child loads silently without running main().
+    const helperPath = await realpath(join(root, 'auth', 'pi-auth-helper.mjs'))
+    return { root, helperPath, piPath: join(binDir, 'pi') }
+  }
+
+  it('registers bundled auth providers when a profile home is pinned', async () => {
+    const { root, helperPath, piPath } = await fixtureTree()
+    try {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [helperPath, 'list-providers'], {
+        env: { PATH: process.env.PATH, HOME: root, PIPIUI_PI_PATH: piPath, PI_CODING_AGENT_DIR: join(root, 'agent') }
+      })
+      const response = JSON.parse(stdout.trim())
+      expect(response.ok).toBe(true)
+      expect(response.providers.map((provider: any) => provider.id)).toContain('fake-ext')
+      expect(stderr).not.toContain('will not be registered')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('registers host-supplied provider modules from outside the bundled tree', async () => {
+    // User-installed providers: the bundled extensions/ dir cannot contain
+    // them, so the host hands the module path down via env.
+    const { root, helperPath, piPath } = await fixtureTree()
+    try {
+      const outside = join(root, 'installed', 'deepseekx', 'agent', 'dist')
+      await mkdir(outside, { recursive: true })
+      await writeFile(join(outside, 'provider.js'), `
+export const AUTH_PROVIDER_ID = 'fake-outside'
+export const createAuthProvider = () => ({ name: 'Fake Outside', api: 'openai-completions', baseUrl: 'https://example.invalid', models: [] })
+`)
+      const { stdout } = await execFileAsync(process.execPath, [helperPath, 'list-providers'], {
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          PIPIUI_PI_PATH: piPath,
+          PI_CODING_AGENT_DIR: join(root, 'agent'),
+          PIPIUI_EXTENSION_AUTH_PROVIDERS: JSON.stringify([{ id: 'fake-outside', module: join(outside, 'provider.js') }])
+        }
+      })
+      const response = JSON.parse(stdout.trim())
+      expect(response.ok).toBe(true)
+      const ids = response.providers.map((provider: any) => provider.id)
+      expect(ids).toContain('fake-outside')
+      expect(ids).toContain('fake-ext')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('warns and skips registration when no profile home is resolved', async () => {
+    const { root, helperPath, piPath } = await fixtureTree()
+    try {
+      const { stdout, stderr } = await execFileAsync(process.execPath, [helperPath, 'list-providers'], {
+        env: { PATH: process.env.PATH, HOME: root, PIPIUI_PI_PATH: piPath }
+      })
+      const response = JSON.parse(stdout.trim())
+      expect(response.ok).toBe(true)
+      expect(response.providers.map((provider: any) => provider.id)).not.toContain('fake-ext')
+      expect(stderr).toContain('bundled auth providers will not be registered')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('Pi auth helper model serialization', () => {
   it('bounds online model-catalog refresh while keeping network refresh enabled', async () => {

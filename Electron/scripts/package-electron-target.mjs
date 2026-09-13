@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { assertEmbeddedRuntimeTree, assertFreshWindowsInstallerBudget } from './runtime-package-contract.mjs'
+import { editionBuilderArgs, resolveEdition } from './edition-config.mjs'
 
 const electronRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -173,9 +174,12 @@ async function main() {
     if (delayimpDir) console.log(`Windows native rebuild append delayimp LIB ${delayimpDir} spectre-props=${written.length}`)
   }
   const packageStartedAt = Date.now()
+  const edition = resolveEdition(releaseEnv)
+  if (edition === 'base') console.log('Packaging the base edition: optional extension packs are excluded')
   run(process.execPath, [
     join(electronRoot, 'node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),
     ...options.builderArgs,
+    ...editionBuilderArgs(electronRoot, releaseEnv),
     ...unsignedBuilderArgs(options.platform, releaseEnv)
   ], {
     cwd: join(electronRoot, 'apps', 'electron'),

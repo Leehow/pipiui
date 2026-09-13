@@ -424,7 +424,7 @@ describe("main-only Hermes runtime ownership", () => {
       const nodeModules = join(root, "node_modules");
       const hermes = join(nodeModules, "pi-hermes-memory");
       await mkdir(hermes, { recursive: true });
-      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.6" }));
+      await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.8" }));
       expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBe(hermes);
       await writeFile(join(hermes, "package.json"), JSON.stringify({ name: "pi-hermes-memory", version: "0.9.3" }));
       expect(resolveSpawnPaths("/runtime", { managedNodeModulesRoot: nodeModules }).hermesMemory).toBeUndefined();
@@ -781,7 +781,7 @@ describe("installed runtime tree", () => {
     root = await mkdtemp(join(tmpdir(), "pipi-bundled-managed-"));
     const runtimeRoot = join(root, "runtime");
     const nodeModules = join(root, "embedded", "node_modules");
-    for (const [name, version] of [["pi-web-access", "0.23.0"], ["pi-mcp-extension", "1.5.0"]]) {
+    for (const [name, version] of [["pi-web-access", "0.28.0"], ["pi-mcp-extension", "1.5.0"]]) {
       const packageRoot = join(nodeModules, name);
       await mkdir(join(packageRoot, "dist"), { recursive: true });
       await writeFile(join(packageRoot, "dist", "index.js"), "//\n");
