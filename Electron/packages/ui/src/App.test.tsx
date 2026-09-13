@@ -2418,6 +2418,7 @@ describe('PipiUI main layout', () => {
       { agentId: 'a-failed', runId: '2', name: 'fail', task: '', state: 'failed', sessionId: 'failed' },
       { agentId: 'a-stalled', runId: '3', name: 'stall', task: '', state: 'stalled', sessionId: 'stalled' },
       { agentId: 'a-interrupted', runId: '4', name: 'interrupt', task: '', state: 'interrupted', sessionId: 'interrupted' },
+      { agentId: 'a-aborted', runId: '6', name: 'abort', task: '', state: 'aborted', sessionId: 'aborted' },
       { agentId: 'a-ok', runId: '5', name: 'ok', task: '', state: 'ok', sessionId: 'completed' }
     ]
     expect(sidebarStatusForSession('selected', 'selected', true, undefined, agents).status).toBe('running')
@@ -2435,6 +2436,10 @@ describe('PipiUI main layout', () => {
     expect(sidebarStatusForSession('failed', 'selected', false, undefined, agents).status).toBe('failed')
     expect(sidebarStatusForSession('stalled', 'selected', false, undefined, agents).status).toBe('stalled')
     expect(sidebarStatusForSession('interrupted', 'selected', false, undefined, agents).status).toBe('interrupted')
+    // A deliberately aborted worker is not an attention item: the row falls back to
+    // its real terminal state instead of carrying a red ring nobody can clear.
+    expect(sidebarStatusForSession('aborted', 'selected', false, undefined, agents).status).toBe('idle')
+    expect(sidebarStatusForSession('aborted', 'selected', false, 'completed', agents).status).toBe('completed')
     expect(sidebarStatusForSession('completed', 'selected', false, undefined, agents).status).toBe('completed')
     expect(sidebarStatusForSession('unrelated-history', 'selected', false, undefined, agents).status).toBe('idle')
     // Selected session: terminal-status notifications (red dot) are consumed —

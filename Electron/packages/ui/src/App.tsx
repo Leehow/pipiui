@@ -338,7 +338,10 @@ export function sidebarStatusForSession(sessionId: string, selectedSessionId: st
   if (selected) return { status: 'idle' }
   if (linked.some(agent => agent.state === 'failed')) return { status: 'failed' }
   if (linked.some(agent => agent.stalled || agent.state === 'stalled')) return { status: 'stalled' }
-  if (linked.some(agent => agent.state === 'interrupted' || agent.state === 'aborted')) return { status: 'interrupted' }
+  // `aborted` is a stop somebody decided on (the user, or the Boss retiring a
+  // duplicate dispatch), not something left to attend to: only an unexpected
+  // cut-off keeps the ring on the row.
+  if (linked.some(agent => agent.state === 'interrupted')) return { status: 'interrupted' }
   if (observedStatus && observedStatus !== 'idle') return { status: observedStatus }
   if (linked.some(agent => agent.state === 'ok')) return { status: 'completed' }
   return { status: 'idle' }
