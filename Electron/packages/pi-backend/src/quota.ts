@@ -15,12 +15,12 @@ import {
 } from "@pipi/account-usage-core";
 import type { AccountBalance, QuotaSnapshot, QuotaWindow } from "@pipi/host-api";
 
-export type QuotaProviderKind = "grok" | "glm" | "claude" | "codex" | "cursor" | "kimi" | "qoder" | "qwenTokenPlan" | "opencodeGo";
+export type QuotaProviderKind = "grok" | "glm" | "claude" | "codex" | "cursor" | "kimi" | "qoder" | "qwenTokenPlan" | "opencodeGo" | "flapcode";
 export type BalanceProviderKind = "deepseek" | "moonshot" | "siliconflow" | "openrouter";
 
 export const QUOTA_ACCOUNT_LABELS: Record<QuotaProviderKind, string> = {
   grok: "Grok 账号额度", glm: "GLM 账号额度", claude: "Claude 账号额度", codex: "Codex 账号额度",
-  cursor: "Cursor 账号额度", kimi: "Kimi 账号额度", qoder: "Qoder 账号额度", qwenTokenPlan: "Qwen Token Plan 额度", opencodeGo: "OpenCode Go 本机用量",
+  cursor: "Cursor 账号额度", kimi: "Kimi 账号额度", qoder: "Qoder 账号额度", qwenTokenPlan: "Qwen Token Plan 额度", opencodeGo: "OpenCode Go 本机用量", flapcode: "Flapcode 账号额度",
 };
 export const BALANCE_ACCOUNT_LABEL = "账户余额";
 export const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
@@ -82,6 +82,8 @@ export type QuotaFetchDeps = {
   readOpenCodeAuth?: () => Promise<string | undefined>;
   openCodeDatabasePath?: string;
   readGrokRateLimits?: () => Promise<string | undefined>;
+  readFlapcodeRateLimits?: () => Promise<string | undefined>;
+  readFlapcodeAccount?: () => Promise<string | undefined>;
   readCookie?: AccountUsageCapabilities["readCookie"];
   readCursorAuth?: AccountUsageCapabilities["readCursorAuth"];
   persistCookie?: AccountUsageCapabilities["persistCookie"];
@@ -201,6 +203,10 @@ async function capabilities(env: NodeJS.ProcessEnv, deps: QuotaFetchDeps): Promi
     },
     // Written by the pipiui-xai-server-tools extension from live api.x.ai response headers.
     readGrokRateLimits: () => (deps.readGrokRateLimits ?? (() => optionalFile(join(agentDir, "grok-rate-limits.json"))))(),
+    // Written by the flapcode extension from live relay x-codex-* response headers.
+    readFlapcodeRateLimits: () => (deps.readFlapcodeRateLimits ?? (() => optionalFile(join(agentDir, "flapcode-rate-limits.json"))))(),
+    // Written by the flapcode extension from flapcode.com/api/cli/accounts (plan name + expiry).
+    readFlapcodeAccount: () => (deps.readFlapcodeAccount ?? (() => optionalFile(join(agentDir, "flapcode-account.json"))))(),
   };
 }
 

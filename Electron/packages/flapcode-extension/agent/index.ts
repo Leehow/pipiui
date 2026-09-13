@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { fetchFlapcodeAccount, writeFlapcodeAccountSnapshot } from "./accounts.js";
 import { stripUnsupportedFlapcodeParams } from "./client.js";
 import { resolveFlapcodeApiKey, settingsSnapshot, SETTINGS_BASE_URL } from "./config.js";
 import { discoverFlapcodeBaseUrl } from "./discovery.js";
@@ -42,6 +43,11 @@ export default function (pi: ExtensionAPI): void {
   // A user-set ext.flapcode.baseUrl always wins, so discovery is skipped then.
   const apiKey = resolveFlapcodeApiKey();
   if (!apiKey) return;
+  // Subscription surface for the quota pill (plan name + expiry); the relay
+  // headers only carry the Codex plan type, not the flapcode 套餐/到期时间.
+  void fetchFlapcodeAccount(apiKey).then((info) => {
+    if (info) writeFlapcodeAccountSnapshot(info, Date.now());
+  });
   if (settingsSnapshot()?.[SETTINGS_BASE_URL]) return;
   void discoverFlapcodeBaseUrl(apiKey).then((discovered) => {
     if (!discovered || discovered === registration.baseUrl) return;

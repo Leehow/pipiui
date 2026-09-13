@@ -39,6 +39,10 @@ export type AccountUsageCapabilities = {
   readLocalUsage?: (provider: "opencode-go") => Promise<LocalUsageRow[] | undefined>;
   /** Optional rate-limit snapshot captured from live xAI traffic by the host's pi extension. */
   readGrokRateLimits?: () => Promise<unknown>;
+  /** Optional rate-limit snapshot captured from live Flapcode relay traffic by the flapcode pi extension. */
+  readFlapcodeRateLimits?: () => Promise<unknown>;
+  /** Optional flapcode subscription info (plan name + expiry) fetched by the flapcode pi extension. */
+  readFlapcodeAccount?: () => Promise<unknown>;
   now?: () => number;
   timeoutMs?: number;
 };
@@ -368,6 +372,56 @@ export function parseGrokRateLimitSnapshot(value: unknown): UsageWindow[] {
   return grokRateLimitWindows(root?.limitRequests, root?.remainingRequests, root?.limitTokens, root?.remainingTokens);
 }
 
+/**
+ * Snapshot file written by the flapcode extension from live relay `x-codex-*`
+ * response headers (the relay forwards the ChatGPT Codex rate-limit header
+ * set; live-probed 2026-09). Shape: `{ capturedAt, planType?,
+ * primary: { usedPercent, windowMinutes, resetAtSeconds? }, secondary? }`.
+ * The secondary window only counts when the relay reports a real window for
+ * it (observed: `secondary-window-minutes: 0` with an empty reset when the
+ * plan has no secondary limit).
+ */
+export function parseFlapcodeRateLimitSnapshot(value: unknown): UsageWindow[] {
+  const root = record(json(value));
+  const out: UsageWindow[] = [];
+  for (const [id, raw] of [["primary_window", root?.primary], ["secondary_window", root?.secondary]] as const) {
+    const entry = record(raw); const used = number(entry?.usedPercent); if (used === undefined) continue;
+    const minutes = number(entry?.windowMinutes) ?? 0;
+    if (id === "secondary_window" && minutes <= 0) continue;
+    const label = codexWindowLabel(minutes * 60);
+    out.push(window(id, used, label, label === "额度" ? "额度" : `${label}额度`, resetMs(entry?.resetAtSeconds)));
+  }
+  return out.map((item, index) => out.length > 1 ? { ...item, id: `window${index}` } : item);
+}
+
+/**
+ * Subscription info snapshot written by the flapcode extension from
+ * `flapcode.com/api/cli/accounts` (`{ fetchedAt, accountEmail?, planName?,
+ * expiresAt? }`). flapcode 独享账号 plans carry no "remaining reset count" —
+ * plan name and expiry are the whole subscription surface.
+ */
+export function parseFlapcodeAccount(value: unknown): { planName?: string; expiresAtMs?: number } | undefined {
+  const root = record(json(value));
+  if (!root) return undefined;
+  const planName = clean(root.planName);
+  const expiresAtMs = resetMs(root.expiresAt);
+  if (!planName && expiresAtMs === undefined) return undefined;
+  return { ...(planName ? { planName } : {}), ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) };
+}
+
+/** Quota-pill heading, e.g. "Flapcode 账号额度（尊享版 · 10-13 到期）". */
+export function flapcodeAccountLabel(account: { planName?: string; expiresAtMs?: number } | undefined): string {
+  const base = "Flapcode 账号额度";
+  if (!account) return base;
+  const parts: string[] = [];
+  if (account.planName) parts.push(account.planName);
+  if (account.expiresAtMs !== undefined) {
+    const date = new Date(account.expiresAtMs);
+    parts.push(`${date.getUTCMonth() + 1}-${date.getUTCDate()} 到期`);
+  }
+  return parts.length ? `${base}（${parts.join(" · ")}）` : base;
+}
+
 export function openCodeGoWindows(rows: LocalUsageRow[], now: number): UsageWindow[] {
   const fiveStart = now - 5 * 3600_000;
   const date = new Date(now); const day = (date.getUTCDay() + 6) % 7;
@@ -558,6 +612,15 @@ export const builtinAccountUsageAdapters: AccountUsageAdapter[] = [
       const headers = bearer(access); if (accountId) headers["ChatGPT-Account-Id"] = accountId;
       const windows = parseCodexWindows(await fetchJson(ctx, "https://chatgpt.com/backend-api/wham/usage", { method: "GET", headers }));
       return windows.length ? { provider: "codex", accountLabel: "Codex 账号额度", windows, source: "subscription" } : undefined;
+    },
+  },
+  {
+    id: "flapcode", kind: "subscription", matches: includes("flapcode"), async load(ctx) {
+      // No credential probe exists for the relay (its /responses is the only
+      // quota surface), so the captured-headers snapshot is the whole story.
+      const windows = parseFlapcodeRateLimitSnapshot(await ctx.readFlapcodeRateLimits?.());
+      const accountLabel = flapcodeAccountLabel(parseFlapcodeAccount(await ctx.readFlapcodeAccount?.()));
+      return windows.length ? { provider: "flapcode", accountLabel, windows, source: "subscription" } : undefined;
     },
   },
   {

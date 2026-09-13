@@ -11,6 +11,9 @@ import {
   parseCodexWindows,
   parseCursorWindows,
   parseDeepSeekBalance,
+  parseFlapcodeAccount,
+  flapcodeAccountLabel,
+  parseFlapcodeRateLimitSnapshot,
   parseGlmWindows,
   parseGrokRateLimitSnapshot,
   parseGrokWindows,
@@ -422,6 +425,98 @@ describe("monitor caching and failures", () => {
 
 it("exports an explicit, unique provider registry", () => {
   expect(new Set(builtinAccountUsageAdapters.map(adapter => adapter.id)).size).toBe(builtinAccountUsageAdapters.length);
+});
+
+describe("Flapcode quota via captured x-codex-* relay headers", () => {
+  const now = Date.UTC(2026, 8, 13, 12);
+
+  it("derives the primary weekly window from a captured snapshot", () => {
+    // Shape mirrors what the flapcode extension writes from live relay headers
+    // (live-probed: x-codex-primary-window-minutes 10080 = 7d → 周).
+    const windows = parseFlapcodeRateLimitSnapshot({
+      capturedAt: now,
+      planType: "pro",
+      primary: { usedPercent: 12, windowMinutes: 10080, resetAtSeconds: 1789885922 },
+      secondary: { usedPercent: 0, windowMinutes: 0 },
+    });
+    expect(windows).toEqual([
+      { id: "primary_window", usedPercent: 12, label: "周", title: "周额度", resetsAt: 1789885922000 },
+    ]);
+  });
+
+  it("includes a real secondary window and renames ids positionally", () => {
+    const windows = parseFlapcodeRateLimitSnapshot({
+      primary: { usedPercent: 40, windowMinutes: 10080, resetAtSeconds: 1789885922 },
+      secondary: { usedPercent: 5, windowMinutes: 300, resetAtSeconds: 1789300880 },
+    });
+    expect(windows.map(w => [w.id, w.label, w.usedPercent, w.resetsAt])).toEqual([
+      ["window0", "周", 40, 1789885922000],
+      ["window1", "5h", 5, 1789300880000],
+    ]);
+  });
+
+  it("tolerates raw string numbers, JSON text, and garbage", () => {
+    expect(parseFlapcodeRateLimitSnapshot(JSON.stringify({
+      primary: { usedPercent: "7", windowMinutes: "10080", resetAtSeconds: "1789885922" },
+    })).map(w => [w.label, w.usedPercent])).toEqual([["周", 7]]);
+    expect(parseFlapcodeRateLimitSnapshot(undefined)).toEqual([]);
+    expect(parseFlapcodeRateLimitSnapshot({})).toEqual([]);
+    expect(parseFlapcodeRateLimitSnapshot("not json")).toEqual([]);
+    expect(parseFlapcodeRateLimitSnapshot({ primary: { usedPercent: "abc" } })).toEqual([]);
+  });
+
+  it("reads the captured file through the flapcode adapter and never probes the network", async () => {
+    const fetcher = vi.fn() as unknown as typeof fetch;
+    const monitor = new AccountUsageMonitor({
+      fetch: fetcher, now: () => now,
+      readFlapcodeRateLimits: async () => JSON.stringify({
+        capturedAt: now, planType: "pro",
+        primary: { usedPercent: 25, windowMinutes: 10080, resetAtSeconds: 1789885922 },
+        secondary: { usedPercent: 0, windowMinutes: 0 },
+      }),
+    });
+    const result = await monitor.snapshot("flapcode");
+    expect(result).toMatchObject({
+      status: "ready",
+      snapshot: { provider: "flapcode", accountLabel: "Flapcode 账号额度", windows: [{ label: "周", usedPercent: 25 }] },
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("resolves the flapcode adapter in the registry and reports no-data without a snapshot", async () => {
+    const registry = new AccountUsageRegistry(builtinAccountUsageAdapters);
+    expect(registry.resolve("flapcode")?.id).toBe("flapcode");
+    const monitor = new AccountUsageMonitor({ fetch: vi.fn() as unknown as typeof fetch, now: () => now });
+    await expect(monitor.snapshot("flapcode")).resolves.toMatchObject({ status: "no-data" });
+  });
+
+  it("parses the subscription snapshot and composes the plan label", () => {
+    expect(parseFlapcodeAccount({ fetchedAt: now, accountEmail: "a@b.c", planName: "尊享版", expiresAt: "2026-10-13T09:16:00.000Z" }))
+      .toEqual({ planName: "尊享版", expiresAtMs: Date.parse("2026-10-13T09:16:00.000Z") });
+    expect(parseFlapcodeAccount({ planName: "基础版" })).toEqual({ planName: "基础版" });
+    expect(parseFlapcodeAccount(undefined)).toBeUndefined();
+    expect(parseFlapcodeAccount({ fetchedAt: 1 })).toBeUndefined();
+    expect(parseFlapcodeAccount("not json")).toBeUndefined();
+    expect(flapcodeAccountLabel(undefined)).toBe("Flapcode 账号额度");
+    expect(flapcodeAccountLabel({ planName: "尊享版", expiresAtMs: Date.parse("2026-10-13T09:16:00.000Z") }))
+      .toBe("Flapcode 账号额度（尊享版 · 10-13 到期）");
+    expect(flapcodeAccountLabel({ expiresAtMs: Date.parse("2026-10-13T09:16:00.000Z") })).toBe("Flapcode 账号额度（10-13 到期）");
+  });
+
+  it("shows plan name and expiry in the snapshot label when the account file exists", async () => {
+    const monitor = new AccountUsageMonitor({
+      fetch: vi.fn() as unknown as typeof fetch, now: () => now,
+      readFlapcodeRateLimits: async () => JSON.stringify({
+        capturedAt: now, primary: { usedPercent: 25, windowMinutes: 10080, resetAtSeconds: 1789885922 },
+      }),
+      readFlapcodeAccount: async () => JSON.stringify({ fetchedAt: now, planName: "尊享版", expiresAt: "2026-10-13T09:16:00.000Z" }),
+    });
+    const result = await monitor.snapshot("flapcode");
+    expect(result).toMatchObject({
+      status: "ready",
+      snapshot: { accountLabel: "Flapcode 账号额度（尊享版 · 10-13 到期）" },
+    });
+  });
 });
 
 describe("Grok quota via api.x.ai rate-limit headers", () => {
