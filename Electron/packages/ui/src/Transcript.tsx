@@ -11,7 +11,7 @@ import { buildRailPrompts, isNavigationEligibleUserPrompt } from './prompt-rail'
 import { parseSubagentNotice } from './subagent-notice'
 import { parseInternalUserSignal } from './subagent-signal'
 import { TruncatedText } from './TruncatedText'
-import type { ChatMessage } from './transcript-model'
+import { visibleTranscriptMessages, type ChatMessage } from './transcript-model'
 import { nextTranscriptFirstItemIndex, TRANSCRIPT_FIRST_ITEM_BASE, TRANSCRIPT_PIN_MAX_ATTEMPTS, transcriptDataIndex, transcriptMessageIdentity } from './transcript-scroll'
 
 export type MessageActionHandlers = { onCopy: (message: ChatMessage) => Promise<void>; onResend: (message: ChatMessage) => void; resendDisabled: boolean; copiedId: string | null }
@@ -68,7 +68,7 @@ function assignVirtuosoRef(ref: React.RefObject<VirtuosoHandle> | undefined, val
   if (ref) (ref as React.MutableRefObject<VirtuosoHandle | null>).current = value
 }
 
-export function Transcript({ stateKey, messages, transcriptRef, waiting, active = true, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
+export function Transcript({ stateKey, messages: sourceMessages, transcriptRef, waiting, active = true, onLoadOlder, documentBasePath, onOpenDocument, onOpenSubagents, onCopy, onResend, resendDisabled, copiedId }: {
   /** Stable session identity used to restore Virtuoso measurements after remounting. */
   stateKey?: string
   messages: ChatMessage[]
@@ -78,6 +78,7 @@ export function Transcript({ stateKey, messages, transcriptRef, waiting, active 
   active?: boolean
   onLoadOlder?: () => void
 } & DocumentOpenProps & SubagentOpenProps & MessageActionHandlers) {
+  const messages = useMemo(() => visibleTranscriptMessages(sourceMessages), [sourceMessages])
   const [atBottom, setAtBottom] = useState(true)
   const [seekingId, setSeekingId] = useState<string | null>(null)
   const activeRef = useRef(active)

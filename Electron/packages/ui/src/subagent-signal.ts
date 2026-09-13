@@ -1,7 +1,7 @@
 /** Shared shape for user-role internal runtime signals rendered as compact
  *  cards instead of human bubbles: `[subagent-*]` families and
  *  `[browser-watch]` follow-up wakes (pipiui-browser-watch-v1). */
-export type SubagentSignalKind = 'done' | 'heartbeat' | 'stalled' | 'interrupted-reminder' | 'blocked' | 'browser-watch' | 'unknown'
+export type SubagentSignalKind = 'done' | 'heartbeat' | 'stalled' | 'interrupted-reminder' | 'blocked' | 'watch' | 'browser-watch' | 'unknown'
 export type SubagentSignalTone = 'success' | 'running' | 'warning' | 'error' | 'neutral'
 export type SubagentSignalDelivery = 'retry' | 'recovered'
 
@@ -72,11 +72,26 @@ export function parseSubagentSignal(content: string): SubagentSignal | null {
   const lines = payload.split('\n')
   const header = lines[0]
   const family = header.match(/^\[subagent-([^\]]+)\]/)?.[1]?.toLowerCase()
-  const kind: SubagentSignalKind = family === 'done' || family === 'heartbeat' || family === 'stalled' || family === 'interrupted-reminder' || family === 'blocked' ? family : 'unknown'
+  const kind: SubagentSignalKind = family === 'done' || family === 'heartbeat' || family === 'stalled' || family === 'interrupted-reminder' || family === 'blocked' || family === 'watch' ? family : 'unknown'
   const prefix = family ? `[subagent-${family}]` : '[subagent-'
   const fields = parseFields(header, prefix)
   if (kind === 'blocked') fields.title = header.match(/\btitle=(.*?)\s+is held:/)?.[1]?.trim() || fields.title
   const deliveryMeta = delivery === 'retry' ? '重投' : delivery === 'recovered' ? '恢复送达' : undefined
+
+  if (kind === 'watch') {
+    // The runtime header carries a positional title; the exact run is on line 2.
+    const named = header.match(/^\[subagent-watch\] ([A-Za-z0-9_-]+) \((.*)\) — (.*)$/)
+    if (named) Object.assign(fields, parseFields(named[3], ''), { agentId: named[1], title: named[2] })
+    const receipt = lines[1]?.match(/^runId=(\S+) seq=(\d+)\./)
+    if (receipt) Object.assign(fields, { runId: receipt[1], seq: receipt[2] })
+    const state = fields.state ?? fields.status
+    const stateLabel = state === 'running' ? '运行中' : state === 'stalled' ? '停滞' : state === 'resident-idle' ? '等待中' : state === 'finalizing' ? '收尾中' : '状态更新'
+    return {
+      kind, tone: state === 'stalled' || fields.verify === 'failed' ? 'warning' : 'neutral',
+      label: '子任务', summary: `状态更新 · ${readableName(fields, lines)}`,
+      meta: compactMeta([`采样时：${stateLabel}`, deliveryMeta]), detail: raw, raw, delivery, fields,
+    }
+  }
 
   if (kind === 'done') {
     const aborted = fields.aborted === 'true' || /\baborted\b/i.test(fields.state ?? '')

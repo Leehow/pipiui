@@ -5,7 +5,26 @@ import {
 	admitSignal,
 	classifyRuntimeSignal,
 	sessionActivity,
+	runtimeSignalKey,
+	watchSignalIdentity,
 } from "../signal-admission.ts";
+
+test("watch samples use busy/quiet admission and coalesce only the same exact run", () => {
+	const sample = (agentId: string, runId: string, seq: number) => `[subagent-watch] ${agentId} (Map title) — state=running\nrunId=${runId} seq=${seq}.`;
+	const first = sample("maps-baseline", "run-one", 1);
+	assert.equal(classifyRuntimeSignal(first), "watch");
+	assert.deepEqual(watchSignalIdentity(first), { agentId: "maps-baseline", runId: "run-one" });
+	assert.equal(admitSignal({ kind: "watch", activity: "busy", workerRunning: true }), "hold");
+	assert.equal(admitSignal({ kind: "watch", activity: "quiet", workerRunning: true }), "drop");
+	assert.equal(admitSignal({ kind: "watch", activity: "idle", workerRunning: true }), "send");
+	assert.equal(admitSignal({ kind: "watch", activity: "idle", workerRunning: false }), "drop");
+	assert.equal(runtimeSignalKey(first), runtimeSignalKey(sample("maps-baseline", "run-one", 11)));
+	assert.notEqual(runtimeSignalKey(first), runtimeSignalKey(sample("maps-baseline", "run-two", 11)));
+	assert.notEqual(runtimeSignalKey(first), runtimeSignalKey(sample("maps-pdf", "run-one", 11)));
+	assert.equal(watchSignalIdentity("[subagent-watch] malformed"), undefined);
+	const done = "[subagent-done] agentId=maps-baseline runId=run-one ok=true";
+	assert.equal(runtimeSignalKey(done), done, "completion identity/delivery stays unchanged");
+});
 
 test("stale stall or heartbeat is dropped even when the session is idle", () => {
 	assert.equal(

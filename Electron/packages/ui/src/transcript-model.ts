@@ -1,6 +1,7 @@
 import type { HistoryEntry, HistoryTool, StreamEvent, TranscriptCitation, TranscriptFileSource } from '@pipi/host-api'
 import { stripAttachmentPathsForDisplay } from './attachments'
 import { displaySecretPlaceholders } from './secret-display'
+import { parseSubagentSignal } from './subagent-signal'
 
 export type TranscriptTool = {
   id: string
@@ -51,6 +52,31 @@ export type ChatMessage = {
   fileSources?: TranscriptFileSource[]
   /** assistant only: provider server-side tool usage counts, when present. */
   serverSideToolUsage?: Record<string, number>
+}
+
+/** Display projection only: keep the durable/live transcript intact for reconciliation.
+ *  A burst of watch snapshots separated by empty aborted replies shows the latest
+ *  snapshot per exact run. Human messages, useful assistant output and other signals
+ *  keep their boundaries, so a later watch cannot erase an earlier conversation. */
+export function visibleTranscriptMessages(messages: readonly ChatMessage[]): ChatMessage[] {
+  const visible: Array<ChatMessage | null> = []
+  const watches = new Map<string, number>()
+  for (const message of messages) {
+    if (message.role === 'assistant' && !message.streaming && !message.content.trim() && !message.thinking?.trim()
+      && !message.error && !message.tools?.length && !message.images?.length && !message.citations?.length && !message.fileSources?.length
+      && !message.activities?.some(activity => activity.type === 'tool' || activity.content.trim() || (activity.type === 'thinking' && activity.charCount))) continue
+    const signal = message.role === 'user' ? parseSubagentSignal(message.content) : null
+    if (signal?.kind === 'watch' && signal.fields.agentId && signal.fields.runId) {
+      const key = `${signal.fields.agentId}\0${signal.fields.runId}`
+      const previous = watches.get(key)
+      if (previous !== undefined) visible[previous] = null
+      watches.set(key, visible.length)
+    } else {
+      watches.clear()
+    }
+    visible.push(message)
+  }
+  return visible.filter((message): message is ChatMessage => message !== null)
 }
 
 function isBackgroundSubagentAck(content: string): boolean {

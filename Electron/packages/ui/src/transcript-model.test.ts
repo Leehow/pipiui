@@ -1,7 +1,36 @@
 import { describe, expect, it, vi } from 'vitest'
+import { visibleTranscriptMessages } from './transcript-model'
 import { appendLiveUserMessage, applySecretRedact, applyStreamEvent, assistantEndedAwaitingModel, assistantLooksSettled, finalizeOpenTools, finishStreamingMessage, historyMessages, historySnapshotAheadOfLive, PENDING_THINKING_ID, planTranscriptSegments, reconcileHistorySnapshot, reopenAssistantForNextCompletion, safeHttpsFileUrl, type ChatMessage } from './transcript-model'
 
 describe('transcript model', () => {
+  it('compacts a persisted watch storm without changing history or crossing conversation boundaries', () => {
+    const watch = (id: string, runId: string, seq: number): ChatMessage => ({ id: `${id}-${runId}-${seq}`, role: 'user', content: `[subagent-watch] ${id} (${id}) — state=running\nrunId=${runId} seq=${seq}.` })
+    const burst: ChatMessage[] = []
+    for (let seq = 1; seq <= 11; seq++) {
+      for (const id of ['baseline', 'knowledge', 'pdf', 'viewer']) {
+        if ((id === 'pdf' && seq > 10) || (id === 'viewer' && seq > 9)) continue
+        burst.push(watch(id, 'run-1', seq), { id: `empty-${id}-${seq}`, role: 'assistant', content: '' })
+      }
+    }
+    const snapshot = JSON.stringify(burst)
+    expect(visibleTranscriptMessages(burst).map(message => message.id)).toEqual(['viewer-run-1-9', 'pdf-run-1-10', 'baseline-run-1-11', 'knowledge-run-1-11'])
+    expect(JSON.stringify(burst)).toBe(snapshot)
+    const boundaries: ChatMessage[] = [watch('baseline', 'run-1', 1), { id: 'human', role: 'user', content: '继续' }, watch('baseline', 'run-1', 2), { id: 'error', role: 'assistant', content: '', error: 'Connection failed' }, watch('baseline', 'run-1', 3), watch('baseline', 'run-2', 1), { id: 'done', role: 'user', content: '[subagent-done] agentId=baseline ok=true' }, watch('baseline', 'run-1', 4)]
+    expect(visibleTranscriptMessages(boundaries)).toEqual(boundaries)
+  })
+
+  it('keeps streaming placeholders, failures, thinking and tools when filtering empty settled replies', () => {
+    const messages: ChatMessage[] = [
+      { id: 'empty', role: 'assistant', content: ' ' },
+      { id: 'live', role: 'assistant', content: '', streaming: true },
+      { id: 'error', role: 'assistant', content: '', error: 'Request failed' },
+      { id: 'thinking', role: 'assistant', content: '', thinking: '检查中' },
+      { id: 'tool', role: 'assistant', content: '', tools: [{ id: 't', name: 'read', input: '{}', startedAt: 1 }] },
+      { id: 'text-activity', role: 'assistant', content: '', activities: [{ type: 'text', id: 'text', contentIndex: 0, content: '保留输出' }] },
+    ]
+    expect(visibleTranscriptMessages(messages).map(message => message.id)).toEqual(['live', 'error', 'thinking', 'tool', 'text-activity'])
+  })
+
   it('copies user history images onto ChatMessage without rewriting content', () => {
     const messages = historyMessages([
       { id: 'user-img', role: 'user', content: '看图', timestamp: 1, images: [{ data: 'abc123', mimeType: 'image/png' }] },

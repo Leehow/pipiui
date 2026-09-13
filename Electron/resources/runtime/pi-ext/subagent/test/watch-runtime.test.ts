@@ -273,7 +273,121 @@ test("watchObservationFor reports unknown runs as gone without throwing", () => 
 	assert.equal(watchObservationFor("no-such-worker", "mtfa1b2-3c4d5e6f7a8b", Date.now()), undefined);
 });
 
-test("activity change on running worker emits once, unchanged ticks stay silent, and log bytes are not exposed", () => {
+test("41 busy-session samples stay outside Pi and coalesce to the latest of four runs", async () => {
+	const runtime = __watchRuntimeForTests;
+	const now = Date.now();
+	const ids = ["watch-baseline", "watch-knowledge", "watch-pdf", "watch-viewer"];
+	const sent: string[] = [];
+	const pi = { sendUserMessage: async (text: string) => { sent.push(text); runtime.bossTurnBusy = true; } } as any;
+	try {
+		runtime.bossTurnBusy = true;
+		for (const agentId of ids) {
+			runtime.runningAgents.set(agentId, {
+				runId: "run-watch", controller: new AbortController(), name: "general-purpose", title: agentId,
+				task: "watch fixture", lastActivityAt: now, startedAt: now, lastStallNotifyAt: 0, stallNotifyCount: 0,
+				diagnostics: { eventSeq: 0, supervisorPid: process.pid, processGeneration: "watch-test", stdoutBytes: 0, stderrBytes: 0 },
+			} as any);
+			runtime.registry.start({ agentId, runId: "run-watch", now, fingerprint: watchObservationFor(agentId, "run-watch", now)! });
+		}
+		for (let seq = 1; seq <= 11; seq++) {
+			const tick = now + seq * 60_000;
+			for (const [index, agentId] of ids.entries()) {
+				const handle = runtime.runningAgents.get(agentId)!;
+				handle.lastActivityAt = tick;
+				if ((index === 2 && seq > 10) || (index === 3 && seq > 9)) continue;
+				handle.diagnostics.finalizationPhase = seq % 2 ? "tool-active" : "generating";
+			}
+			for (const event of runtime.registry.tick({ now: tick, observe: target => watchObservationFor(target.agentId, target.runId, tick) })) {
+				await runtime.deliverWatchSample(pi, event);
+			}
+		}
+		assert.equal(sent.length, 0, "no sample may enter Pi's follow-up queue while busy");
+		assert.equal(runtime.heldSignals.length, 4, "one replaceable slot per exact run");
+		for (const [index, seq] of [11, 11, 10, 9].entries()) {
+			assert.ok(runtime.heldSignals.some(entry => entry.text.startsWith(`[subagent-watch] ${ids[index]} `) && entry.text.includes(`seq=${seq}.`)));
+		}
+		for (let count = 1; count <= 4; count++) {
+			runtime.bossTurnBusy = false;
+			runtime.flushHeldSignals(pi);
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(sent.length, count, "one latest status per settle, never a backlog burst");
+		}
+		assert.equal(runtime.heldSignals.length, 0);
+	} finally {
+		runtime.bossTurnBusy = false;
+		runtime.heldSignals.length = 0;
+		runtime.registry.clear();
+		for (const agentId of ids) runtime.runningAgents.delete(agentId);
+	}
+});
+
+test("held watch forwards are dropped when their run or session expires", async () => {
+	const runtime = __watchRuntimeForTests;
+	const agentId = "watch-expired";
+	const runId = "run-expired";
+	const now = Date.now();
+	const handle = { runId, controller: new AbortController(), name: "general-purpose", task: "fixture", lastActivityAt: now, startedAt: now, lastStallNotifyAt: 0, stallNotifyCount: 0, diagnostics: { eventSeq: 0 } } as any;
+	const sent: string[] = [];
+	const pi = { sendUserMessage: async (text: string) => { sent.push(text); } } as any;
+	const text = `[subagent-watch] ${agentId} (Expired) — state=running\nrunId=${runId} seq=1.`;
+	try {
+		for (const expire of [() => runtime.runningAgents.delete(agentId), () => { runtime.generation += 1; }]) {
+			runtime.runningAgents.set(agentId, handle);
+			runtime.registry.start({ agentId, runId, now, fingerprint: "state=running" });
+			runtime.bossTurnBusy = true;
+			await runtime.sendUserMessage(pi, text);
+			assert.equal(runtime.heldSignals.length, 1);
+			expire();
+			runtime.bossTurnBusy = false;
+			runtime.flushHeldSignals(pi);
+			await new Promise(resolve => setImmediate(resolve));
+			assert.equal(runtime.heldSignals.length, 0);
+			assert.equal(sent.length, 0);
+		}
+	} finally {
+		runtime.bossTurnBusy = false;
+		runtime.heldSignals.length = 0;
+		runtime.registry.clear();
+		runtime.runningAgents.delete(agentId);
+	}
+});
+
+test("the void extension sender reserves admission until Pi starts the turn", async () => {
+	const runtime = __watchRuntimeForTests;
+	const now = Date.now();
+	const sent: string[] = [];
+	const pi = { sendUserMessage: (text: string) => { sent.push(text); } } as any;
+	const ids = ["watch-first", "watch-second"];
+	const sample = (id: string, seq: number) => `[subagent-watch] ${id} (${id}) — state=running\nrunId=run-race seq=${seq}.`;
+	try {
+		runtime.bossTurnBusy = false;
+		for (const agentId of ids) {
+			runtime.runningAgents.set(agentId, { runId: "run-race", controller: new AbortController(), diagnostics: {}, name: "general-purpose" } as any);
+			runtime.registry.start({ agentId, runId: "run-race", now, fingerprint: "state=running" });
+		}
+		assert.equal(await runtime.sendUserMessage(pi, sample(ids[0], 1)), true);
+		assert.equal(await runtime.sendUserMessage(pi, sample(ids[1], 1)), false);
+		assert.equal(await runtime.sendUserMessage(pi, sample(ids[1], 2)), false);
+		assert.equal(sent.length, 1, "void return is not a delivery acknowledgement");
+		assert.equal(runtime.heldSignals.length, 1);
+		assert.ok(runtime.heldSignals[0].text.includes("seq=2."));
+		runtime.bossTurnBusy = true; // before_agent_start takes over the reservation
+		runtime.flushHeldSignals(pi);
+		assert.equal(sent.length, 1);
+		runtime.bossTurnBusy = false; // agent_settled releases the next current snapshot
+		runtime.flushHeldSignals(pi);
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(sent.length, 2);
+		assert.ok(sent[1].includes("seq=2."));
+	} finally {
+		runtime.bossTurnBusy = false;
+		runtime.heldSignals.length = 0;
+		runtime.registry.clear();
+		for (const id of ids) runtime.runningAgents.delete(id);
+	}
+});
+
+test("activity counters stay silent while semantic state changes emit once", () => {
 	const agentId = "worker-activity-test";
 	const runId = "run-act-100";
 	const t0 = 1_000_000;
@@ -301,7 +415,7 @@ test("activity change on running worker emits once, unchanged ticks stay silent,
 	try {
 		const baseline = watchObservationFor(agentId, runId, t0);
 		assert.ok(baseline !== undefined);
-		assert.match(baseline, /lastActivityAt=1000000/);
+		assert.doesNotMatch(baseline, /lastActivityAt|eventSeq/);
 		assert.match(baseline, /state=running/);
 		// No transcript/raw log bytes exposed
 		assert.ok(!baseline.includes("stdout"));
@@ -324,17 +438,12 @@ test("activity change on running worker emits once, unchanged ticks stay silent,
 		handle.lastActivityAt = t0 + 75_000;
 		handle.diagnostics.eventSeq += 1;
 
-		// Tick 2 at t0 + 120s: observation detects activity change
+		// Tick 2: ordinary output/telemetry does not wake the Boss.
 		const tick2 = registry.tick({
 			now: t0 + 120_000,
 			observe: (target) => watchObservationFor(target.agentId, target.runId, t0 + 120_000),
 		});
-		assert.equal(tick2.length, 1);
-		assert.equal(tick2[0].sequence, 1);
-		assert.match(tick2[0].fingerprint, /lastActivityAt=1075000/);
-
-		// Settle delivery ack
-		assert.deepEqual(registry.ack({ agentId, runId, sequence: 1 }), { ok: true, pending: false });
+		assert.deepEqual(tick2, []);
 
 		// Tick 3 at t0 + 150s: no new worker activity occurred (idle 75s < stall threshold)
 		const tick3 = registry.tick({
@@ -357,7 +466,7 @@ test("activity change on running worker emits once, unchanged ticks stay silent,
 			observe: (target) => watchObservationFor(target.agentId, target.runId, t0 + 240_000),
 		});
 		assert.equal(tick5.length, 1);
-		assert.equal(tick5[0].sequence, 2);
+		assert.equal(tick5[0].sequence, 1);
 		assert.match(tick5[0].fingerprint, /state=stalled/);
 	} finally {
 		__watchRuntimeForTests.runningAgents.delete(agentId);
@@ -397,6 +506,7 @@ test("a held watch delivery cannot route after terminal removal and ack does not
 	// Worker activity happens
 	handle.lastActivityAt = t0 + 30_000;
 	handle.diagnostics.eventSeq += 1;
+	(handle.diagnostics as any).finalizationPhase = "tool-active";
 
 	// Tick fires and produces an event in flight (seq 1)
 	const events = __watchRuntimeForTests.registry.tick({
@@ -476,6 +586,7 @@ test("a held watch delivery cannot route after session shutdown or generation ch
 
 	handle.lastActivityAt = t0 + 30_000;
 	handle.diagnostics.eventSeq += 1;
+	(handle.diagnostics as any).finalizationPhase = "tool-active";
 
 	const events = __watchRuntimeForTests.registry.tick({
 		now: t0 + 60_000,
@@ -537,9 +648,10 @@ test("isWatchDeliveryValid gates every terminal, shutdown, and sequence boundary
 		const baseline = watchObservationFor(agentId, runId, t0)!;
 		__watchRuntimeForTests.registry.start({ agentId, runId, now: t0, fingerprint: baseline });
 
-		// Bumping activity emits event seq 1
+		// A semantic phase change emits event seq 1.
 		handle.lastActivityAt = t0 + 10_000;
 		handle.diagnostics.eventSeq += 1;
+		(handle.diagnostics as any).finalizationPhase = "tool-active";
 		const events = __watchRuntimeForTests.registry.tick({
 			now: t0 + 60_000,
 			observe: (target) => watchObservationFor(target.agentId, target.runId, t0 + 60_000),

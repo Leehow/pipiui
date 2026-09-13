@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest'
 import { parseBrowserWatchSignal, parseInternalUserSignal, parseSubagentSignal } from './subagent-signal'
 
 describe('parseSubagentSignal', () => {
+  it('reads the production watch header and exact run without claiming completion', () => {
+    const signal = parseSubagentSignal('[subagent-watch] maps-baseline (Audit built-in baseline) — eventSeq=5772 lastActivityAt=1789308958863 phase=tool-active state=running tool=bash\nrunId=run-baseline seq=11. Periodic watch sample.')!
+    expect(signal).toMatchObject({ kind: 'watch', tone: 'neutral', summary: '状态更新 · Audit built-in baseline', meta: '采样时：运行中', fields: { agentId: 'maps-baseline', runId: 'run-baseline', seq: '11', state: 'running' } })
+    expect(signal.summary + signal.meta).not.toContain('已完成')
+    expect(parseSubagentSignal('[subagent-watch] maps-pdf (PDF) — state=stalled\nrunId=run-pdf seq=2.')).toMatchObject({ kind: 'watch', tone: 'warning', meta: '采样时：停滞' })
+    expect(parseSubagentSignal('(recovered delivery: old snapshot)\n[subagent-watch] maps-pdf (PDF) — state=resident-idle\nrunId=run-pdf seq=3.')).toMatchObject({ kind: 'watch', delivery: 'recovered', meta: '采样时：等待中 · 恢复送达' })
+  })
+
   it('parses done outcome, title, verification and metadata without exposing the header as summary', () => {
     const signal = parseSubagentSignal('[subagent-done] agentId=a1 runId=r1 name=general-purpose ok=true verified=fail cost=0.1659 turns=9 resumed=true\nTitle: 修复列表\nVerify: $ npm test → exit 1 (attested)\nResult:\n完成 src/report.md')!
     expect(signal).toMatchObject({ kind: 'done', tone: 'warning', summary: '已完成 · 修复列表' })

@@ -21,6 +21,7 @@ export type RuntimeSignalKind =
 	| "done"
 	| "reminder"
 	| "blocked"
+	| "watch"
 	/**
 	 * Advisory facts about a worker that is still running and still believed healthy: a tool
 	 * call that has run a long time, a closeout that is taking a long time. They are worth
@@ -46,6 +47,7 @@ export function sessionActivity(state: { quiet: boolean; busy: boolean }): Sessi
 }
 
 export function classifyRuntimeSignal(text: string): RuntimeSignalKind | undefined {
+	if (text.startsWith("[subagent-watch]")) return "watch";
 	if (text.startsWith("[subagent-stalled]")) return "stall";
 	if (text.startsWith("[subagent-heartbeat]")) return "heartbeat";
 	if (text.startsWith("[subagent-done]")) return "done";
@@ -53,6 +55,19 @@ export function classifyRuntimeSignal(text: string): RuntimeSignalKind | undefin
 	if (text.startsWith("[subagent-blocked]")) return "blocked";
 	if (text.startsWith("[subagent-long-tool]") || text.startsWith("[subagent-finalizing]")) return "notice";
 	return undefined;
+}
+
+/** Exact identity in the production watch header/trailer (not a title substring). */
+export function watchSignalIdentity(text: string): { agentId: string; runId: string } | undefined {
+	const agentId = /^\[subagent-watch\] ([A-Za-z0-9_-]+) \(/.exec(text)?.[1];
+	const runId = /\nrunId=(\S+) seq=\d+\./.exec(text)?.[1];
+	return agentId && runId ? { agentId, runId } : undefined;
+}
+
+/** Status snapshots replace older snapshots of that run; other signals retain exact-text deduplication. */
+export function runtimeSignalKey(text: string): string {
+	const watch = watchSignalIdentity(text);
+	return watch ? `watch\0${watch.agentId}\0${watch.runId}` : text;
 }
 
 export function admitSignal(input: SignalAdmissionInput): Admission {
@@ -64,6 +79,7 @@ export function admitSignal(input: SignalAdmissionInput): Admission {
 		case "heartbeat":
 		case "stall":
 		case "notice":
+		case "watch":
 			return input.workerRunning ? "send" : "drop";
 		case "reminder":
 			return input.episodeOpen ? "send" : "drop";

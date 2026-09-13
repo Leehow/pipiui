@@ -67,6 +67,17 @@ const messages: ChatMessage[] = [
   { id: 'a1', role: 'assistant', content: '上一轮已经写完。', timestamp: Date.parse('2026-08-14T22:07:00') }
 ]
 
+it('renders only the latest watch card in a burst and no empty assistant spacing', () => {
+  const watch = (seq: number): ChatMessage => ({ id: `watch-${seq}`, role: 'user', content: `[subagent-watch] maps-baseline (地图基线) — state=running\nrunId=baseline-run seq=${seq}.`, timestamp: seq })
+  const view = render(<Transcript messages={[watch(1), { id: 'aborted', role: 'assistant', content: '', timestamp: 2 }, watch(2)]} {...handlers} />)
+  expect(view.container.querySelectorAll('[data-signal-kind="watch"]')).toHaveLength(1)
+  expect(view.container.querySelectorAll('.assistant-message')).toHaveLength(0)
+  expect(view.container.textContent).toContain('状态更新 · 地图基线')
+  expect(view.container.textContent).toContain('采样时：运行中')
+  expect(view.container.textContent).not.toContain('已完成')
+  expect(virtuosoInstances.at(-1)?.data).toHaveLength(1)
+})
+
 function makeMessages(count: number, start = 0): ChatMessage[] {
   return Array.from({ length: count }, (_, index) => ({
     id: `m${start + index}`,

@@ -181,6 +181,8 @@ import {
 import {
 	admitSignal,
 	classifyRuntimeSignal,
+	runtimeSignalKey,
+	watchSignalIdentity,
 	sessionActivity,
 	type SessionActivity,
 } from "./signal-admission.ts";
@@ -3439,7 +3441,7 @@ export function runSubagentWatch(input: {
 		ok: true,
 		message: [
 			`Watch ${started.created ? "started" : "re-armed"}: agentId=${pair.agentId} runId=${pair.runId} samples every ${started.subscription.intervalSecs}s.`,
-			"Baseline recorded; you are told only on a state change (status/activity/tool/finalization/verify), routed through Supervisor — unchanged ticks stay silent, and the run's normal completion receipt remains the only terminal notification.",
+			"Baseline recorded; you are told only on a state change (status/tool/finalization/verify), routed through Supervisor — ordinary output/activity counters stay silent, busy-session snapshots coalesce to the latest per run, and the normal completion receipt remains the only terminal notification.",
 			...(resolvedLog && "path" in resolvedLog ? [`Progress channel aimed at ${resolvedLog.path} (only appends from now are forwarded).`] : []),
 		].join("\n"),
 	};
@@ -5463,6 +5465,14 @@ async function sendUserMessageAfterCutIn(
 	text: string,
 	shouldSend?: () => boolean,
 ): Promise<boolean> {
+	const watch = watchSignalIdentity(text);
+	const generation = watchSessionGeneration;
+	if (watch) {
+		const priorCheck = shouldSend;
+		shouldSend = () => generation === watchSessionGeneration
+			&& isWatchDeliveryValidForAgent(watch.agentId, watch.runId)
+			&& (!priorCheck || priorCheck());
+	}
 	// Host-stop quiet: reminders/heartbeats/escalations must not restart a stopped
 	// session. They are dropped for this cycle; the boss can still see every job
 	// state through subagent_status and the Subagents panel.
@@ -5471,25 +5481,36 @@ async function sendUserMessageAfterCutIn(
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
 	if (shouldSend && !shouldSend()) return false;
+	// Reserve synchronously: another sample can arrive before before_agent_start.
+	// Keep it in our replaceable held queue, never in Pi's per-turn follow-up queue.
+	if (watch) watchBossSendInFlight = true;
+	let accepted = false;
 	try {
-		await pi.sendUserMessage(text, { deliverAs: "followUp" });
-		return true;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		// A live turn without deliverAs is the exact Pi error the host must never
-		// surface. Only fall back when this Pi build does not understand deliverAs.
-		if (message.includes("already processing") || !/unknown|unexpected|deliverAs|options/i.test(message)) {
+		try {
+			await pi.sendUserMessage(text, { deliverAs: "followUp" });
+			accepted = true;
+			return true;
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			// Only older Pi builds that do not understand deliverAs get a fallback.
+			if (message.includes("already processing") || !/unknown|unexpected|deliverAs|options/i.test(message)) {
+				console.error("[pipiui-subagent] failed to deliver message:", err);
+				return false;
+			}
+		}
+		if (shouldSend && !shouldSend()) return false;
+		try {
+			await pi.sendUserMessage(text);
+			accepted = true;
+			return true;
+		} catch (err) {
 			console.error("[pipiui-subagent] failed to deliver message:", err);
 			return false;
 		}
-	}
-	if (shouldSend && !shouldSend()) return false;
-	try {
-		await pi.sendUserMessage(text);
-		return true;
-	} catch (err) {
-		console.error("[pipiui-subagent] failed to deliver message:", err);
-		return false;
+	} finally {
+		// ExtensionAPI returns void, not the underlying prompt Promise. Successful
+		// admission stays reserved until before_agent_start/agent_settled observes it.
+		if (watch && !accepted && generation === watchSessionGeneration) watchBossSendInFlight = false;
 	}
 }
 
@@ -5818,6 +5839,11 @@ export const __doneLifecycleForTests = {
 	deliverToBoss: deliverConfirmedDoneToBossAsync,
 };
 export const __watchRuntimeForTests = {
+	get bossTurnBusy(): boolean { return bossTurnBusy; },
+	set bossTurnBusy(value: boolean) { bossTurnBusy = value; watchBossSendInFlight = false; },
+	get heldSignals() { return heldRuntimeSignals; },
+	flushHeldSignals: flushHeldRuntimeSignals,
+	sendUserMessage: sendUserMessageAfterCutIn,
 	get generation(): number {
 		return watchSessionGeneration;
 	},
@@ -5885,6 +5911,7 @@ let doneDeliveryBranchProvider: (() => readonly unknown[]) | undefined;
 let hostStopQuiet = false;
 /** True between before_agent_start and agent_settled. Signals must not enter Pi's follow-up queue while this is set. */
 let bossTurnBusy = false;
+let watchBossSendInFlight = false;
 
 /**
  * True while a wake this extension queued still sits unconsumed in Pi's
@@ -5920,6 +5947,8 @@ function releaseHostStopQuiet(pi: ExtensionAPI | undefined): void {
 }
 
 function workerRunningForSignal(text: string): boolean {
+	const watch = watchSignalIdentity(text);
+	if (watch) return isWatchDeliveryValidForAgent(watch.agentId, watch.runId);
 	const named = /(?:^|\s)agentId=([A-Za-z0-9_-]+)/.exec(text)?.[1];
 	if (named) {
 		const exactRun = /(?:^|\s)runId=([^\s]+)/.exec(text)?.[1];
@@ -5943,16 +5972,25 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boo
 	if (shouldSend && !shouldSend()) return false;
 	const kind = classifyRuntimeSignal(text);
 	if (!kind) return true;
+	const activity = bossDeliveryActivity();
 	const decision = admitSignal({
 		kind,
-		activity: bossDeliveryActivity(),
+		activity: kind === "watch" && watchBossSendInFlight && activity === "idle" ? "busy" : activity,
 		workerRunning: workerRunningForSignal(text),
 		episodeOpen: reminderOpenForSignal(text),
 		alreadyDelivered: false,
 	});
 	if (decision === "send") return true;
-	if (decision === "hold" && !heldRuntimeSignals.some((entry) => entry.text === text)) {
-		heldRuntimeSignals.push({ text, shouldSend });
+	if (decision === "hold") {
+		// Completed/stopped runs must not occupy slots through a long Boss turn.
+		for (let index = heldRuntimeSignals.length - 1; index >= 0; index--) {
+			const entry = heldRuntimeSignals[index];
+			if (watchSignalIdentity(entry.text) && entry.shouldSend && !entry.shouldSend()) heldRuntimeSignals.splice(index, 1);
+		}
+		const key = runtimeSignalKey(text);
+		const index = heldRuntimeSignals.findIndex(entry => runtimeSignalKey(entry.text) === key);
+		if (index >= 0) heldRuntimeSignals[index] = { text, shouldSend };
+		else heldRuntimeSignals.push({ text, shouldSend });
 	}
 	return false;
 }
@@ -6749,8 +6787,6 @@ export function watchObservationFor(agentId: string, runId: string, now: number)
 		...(handle.diagnostics.finalizationPhase ? { phase: handle.diagnostics.finalizationPhase } : {}),
 		...(handle.toolWaitNames?.[0] ? { tool: handle.toolWaitNames[0] } : {}),
 		...(verify ? { verify } : {}),
-		...(handle.lastActivityAt !== undefined ? { lastActivityAt: handle.lastActivityAt } : {}),
-		...(handle.diagnostics?.eventSeq !== undefined ? { eventSeq: handle.diagnostics.eventSeq } : {}),
 	});
 }
 
@@ -10295,6 +10331,7 @@ export default function (pi: ExtensionAPI) {
 		watchSessionGeneration += 1;
 		watchSessionShutdownAbort = new AbortController();
 		watchRegistry.clear();
+		watchBossSendInFlight = false;
 		const residentRpcWakeToken = PIPIUI_RESIDENT_RPC_WAKE_TOKEN;
 		if (nestedBackgroundLifecycle && residentRpcWakeToken) {
 			residentParentShutdown = () => {
@@ -10371,6 +10408,7 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.on("agent_settled", (_event, ctx) => {
 		bossTurnBusy = false;
+		watchBossSendInFlight = false;
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
@@ -10539,6 +10577,7 @@ export default function (pi: ExtensionAPI) {
 	// snapshot actually changed.
 	pi.on("before_agent_start", (event) => {
 		bossTurnBusy = true;
+		watchBossSendInFlight = false;
 		nestedBackgroundLifecycle?.noteActive();
 		// A new turn is a new wave: last turn's briefs are not the ones this one repeats.
 		turnDispatchedBriefs.length = 0;
@@ -10776,7 +10815,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// (2b*3) watch 订阅采样：subagent_watch 的到期订阅在同一拍各采样一次紧凑状态
-		// （status/activity/tool/finalization/verify）。指纹不变 → 什么都不发；变化 → Supervisor
+		// （status/tool/finalization/verify）。指纹不变 → 什么都不发；变化 → Supervisor
 		// kind=watch 判定（wait/status 静默，forward/escalate 才唤醒 Boss）。订阅的 exact run
 		// 消失或进入 done-await-host 时被静默丢弃——完成回执永远只由既有投递发一次。
 		// 无新 timer：这里就是唯一的调度源（共享 30s watchdog tick）。
@@ -13221,7 +13260,7 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_watch",
 		label: "Subagent Watch",
 		description: [
-			"Periodically observe one running worker without polling subagent_status. start arms a bounded sampling subscription on the exact run: the shared 30s watchdog takes one compact sample per due tick (status/activity/tool/finalization/verify), and only a CHANGE since the previous sample is routed as a Supervisor watch event — wait/status stay silent, forward/escalate wake you. Unchanged ticks emit nothing.",
+			"Periodically observe one running worker without polling subagent_status. start arms a bounded sampling subscription on the exact run: the shared 30s watchdog samples status/tool/finalization/verify transitions. Ordinary output/activity counters emit nothing. Supervisor wait/status stay silent; forward/escalate wake you. While Boss is busy, normal watch forwards coalesce to the latest snapshot per exact run instead of entering its follow-up queue.",
 			"Required for start/update/stop: agentId and the exact runId (from the dispatch receipt or subagent_status); a stale runId is rejected, never re-targeted at a newer run. list shows every subscription, or one exact pair when both agentId and runId are given.",
 			"intervalSecs (30–3600, default 60) only sets the sampling cadence — it is not a new timer. Optional progressLog on start/update re-aims the run's progress channel first, under the same path containment, general-purpose eligibility, and single-flight delivery as subagent_progress.",
 			"The registry is process-local and cleared on session start/shutdown. A terminal run drops its subscription silently: the run's normal completion receipt stays the only terminal notification, and watch never re-runs verify.",
