@@ -89,6 +89,44 @@ export function readToolDescription(base: string): string {
 	return `${withGrep} If path is a directory, lists its entries instead of failing. Prefer the ls tool for directories.`;
 }
 
+/** Diagnostic candidates only: relaxed comparison must never authorize a write. */
+export function editMismatchHint(content: string, oldText: string): string | undefined {
+	if (content.length > 2 * 1024 * 1024 || oldText.length > 16 * 1024) return undefined;
+	const expected = oldText.replace(/\r\n?/g, "\n").split("\n");
+	if (expected[0] === "") expected.shift();
+	if (expected.at(-1) === "") expected.pop();
+	if (!expected.length || expected.length > 60) return undefined;
+	const lines = content.replace(/\r\n?/g, "\n").split("\n");
+	const comparable = (line: string) => line.replace(/[\t '"\u2018\u2019\u201c\u201d]/g, "");
+	const wanted = expected.map(comparable);
+	if (!wanted.some(Boolean)) return undefined;
+	let start: number | undefined;
+	for (let i = 0; i <= lines.length - expected.length; i++) {
+		if (!wanted.every((line, j) => comparable(lines[i + j]) === line)) continue;
+		if (start !== undefined) return undefined; // Ambiguous: require an explicit read.
+		start = i;
+	}
+	if (start === undefined) return undefined;
+	const actual = lines.slice(start, start + expected.length);
+	const differentLine = expected.findIndex((line, i) => line !== actual[i]);
+	if (differentLine < 0) return undefined;
+	let column = 0;
+	const before = expected[differentLine], current = actual[differentLine];
+	while (column < before.length && column < current.length && before[column] === current[column]) column++;
+	const quote = (value: string | undefined) => value === undefined ? "end of line" : JSON.stringify(value);
+	const difference = `First difference at file line ${start + differentLine + 1}, column ${column + 1}: ` +
+		`oldText has ${quote(before[column])}; the file has ${quote(current[column])}.`;
+	const block = actual.join("\n") + (oldText.endsWith("\n") ? "\n" : "");
+	const encoded = JSON.stringify(block);
+	return [
+		`A unique candidate at lines ${start + 1}-${start + actual.length} differs in quote characters or whitespace. It was NOT applied.`,
+		difference,
+		encoded.length <= 4000
+			? `Current block as a JSON string (decode once; preserve its exact characters in oldText):\n${encoded}`
+			: `Read that line range to obtain the complete current block before rebuilding the edit.`,
+	].join("\n");
+}
+
 /* ------------------------------------------------------------------ */
 /* Composite search helpers: let one grep/read/ls call absorb the      */
 /* `cd X && grep/ls/cat` chains models otherwise assemble in bash.     */
@@ -230,4 +268,3 @@ export function capCompositeOutput(text: string): string {
 	if (text.length <= COMPOSITE_MAX_BYTES) return text;
 	return `${text.slice(0, COMPOSITE_MAX_BYTES)}\n\n[Composite output truncated to ${COMPOSITE_MAX_BYTES / 1024}KB. Narrow paths, add exclude, or lower limit.]`;
 }
-

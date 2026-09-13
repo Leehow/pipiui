@@ -1,19 +1,23 @@
 import {
+	createEditToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
 	createReadToolDefinition,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { readFile, stat } from "node:fs/promises";
 import { Type } from "typebox";
 
 import {
 	capCompositeOutput,
+	editMismatchHint,
 	filterGrepLines,
 	grepCountSummary,
 	grepFilesSummary,
 	parseGrepOutput,
 	readPathIfDirectory,
 	readToolDescription,
+	resolveReadTarget,
 	rewriteReadToolText,
 } from "./coding-tools.ts";
 
@@ -37,6 +41,37 @@ function resultText(result: unknown): string {
 function asStringArray(value: unknown): string[] {
 	if (!Array.isArray(value)) return [];
 	return value.filter((item): item is string => typeof item === "string" && item.trim() !== "");
+}
+
+function registerEditRecovery(pi: ExtensionAPI) {
+	const prototype = createEditToolDefinition(".");
+	const recovery = "Do not resend an unchanged failed edit. Copy oldText verbatim from the current file, including quotes and whitespace. " +
+		"Rebuild the complete intended code block; do not shorten a replacement into a syntactically incomplete fragment just to make it match.";
+	pi.registerTool({
+		...prototype,
+		promptGuidelines: [...(prototype.promptGuidelines ?? []), recovery],
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const cwd = ctxCwd(ctx);
+			try {
+				return await createEditToolDefinition(cwd).execute(toolCallId, params, signal, onUpdate, ctx);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				const mismatch = /^Could not find (?:edits\[(\d+)\]|the exact text) in /.exec(message);
+				if (!mismatch || signal?.aborted) throw error;
+				let hint: string | undefined;
+				try {
+					const oldText = params.edits?.[Number(mismatch[1] ?? 0)]?.oldText;
+					const path = resolveReadTarget(params.path, cwd);
+					const info = await stat(path);
+					if (typeof oldText === "string" && info.isFile() && info.size <= 2 * 1024 * 1024) {
+						hint = editMismatchHint(await readFile(path, "utf8"), oldText);
+					}
+				} catch { /* Preserve the original failure if the current file cannot be inspected. */ }
+				throw new Error([message, "No changes were written by this edit call.",
+					hint ?? "Read the target range again to obtain its exact current text.", recovery].join("\n\n"), { cause: error });
+			}
+		},
+	});
 }
 
 /* ------------------------------------------------------------------ */
@@ -275,4 +310,5 @@ export default function (pi: ExtensionAPI) {
 	});
 	registerCompositeGrep(pi);
 	registerCompositeLs(pi);
+	registerEditRecovery(pi);
 }

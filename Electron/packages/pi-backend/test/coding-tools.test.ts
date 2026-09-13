@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   capCompositeOutput,
+  editMismatchHint,
   filterGrepLines,
   globToRegExp,
   grepCountSummary,
@@ -190,7 +191,7 @@ describe("pipiui-coding-tools extension", () => {
   // snapshot raced with worker tool registration and locked subagent sessions read-only.
   // Inspection tools come from --tools now, so this extension must never touch the
   // active tool set — not during loading, and not from a lifecycle hook afterwards.
-  it("never touches the active tool set — it only replaces read/grep/ls", () => {
+  it("never touches the active tool set — it only replaces existing coding tools", () => {
     const loadingError = new Error(
       "Failed to load extension: Extension runtime not initialized. Action methods cannot be called during extension loading. Hint: Start without extensions using \"pi -ne\".",
     );
@@ -204,9 +205,65 @@ describe("pipiui-coding-tools extension", () => {
     expect(pi.setActiveTools).not.toHaveBeenCalled();
     expect(pi.getActiveTools).not.toHaveBeenCalled();
     expect(pi.on).not.toHaveBeenCalled();
-    expect(pi.registerTool).toHaveBeenCalledTimes(3);
+    expect(pi.registerTool).toHaveBeenCalledTimes(4);
     const names = (pi.registerTool as ReturnType<typeof vi.fn>).mock.calls.map((c) => c[0].name);
-    expect(names).toEqual(["read", "grep", "ls"]);
+    expect(names).toEqual(["read", "grep", "ls", "edit"]);
+  });
+
+  describe("edit mismatch recovery", () => {
+    it("shows the actual quote difference, keeps a failed batch atomic, and accepts a corrected retry", async () => {
+      const cwd = await fixture();
+      const path = join(cwd, "example.ts");
+      const original = 'const version = 1;\nconst visible = ["player-safe", "revealable"];\n';
+      await writeFile(path, original);
+      const { tools } = await loadExtension();
+      const edit = tools.get("edit")!;
+      const edits = [
+        { oldText: "const version = 1;", newText: "const version = 2;" },
+        { oldText: "const visible = ['player-safe', 'revealable'];\n", newText: "const visible = ['public'];\n" },
+      ];
+      let failure: Error | undefined;
+      try {
+        await edit.execute("failed-edit", { path: "example.ts", edits }, undefined, undefined, { cwd });
+      } catch (error) { failure = error as Error; }
+      expect(failure?.message).toContain("Could not find edits[1]");
+      expect(failure?.message).toContain("No changes were written by this edit call.");
+      expect(failure?.message).toContain("First difference at file line 2");
+      expect(failure?.message).toContain("Do not resend an unchanged failed edit.");
+      expect(await readFile(path, "utf8")).toBe(original);
+
+      // Recover from the returned source text, as an agent would, without
+      // asking the executor to normalize quotes or guess a replacement.
+      const encoded = failure!.message.split("preserve its exact characters in oldText):\n")[1].split("\n")[0];
+      const currentText = JSON.parse(encoded);
+      expect(currentText).toBe('const visible = ["player-safe", "revealable"];\n');
+      const result = await edit.execute("corrected-edit", {
+        path: "example.ts", edits: [edits[0], { ...edits[1], oldText: currentText }],
+      }, undefined, undefined, { cwd });
+      expect(result.content[0].text).toMatch(/Successfully/);
+      expect(await readFile(path, "utf8")).toBe("const version = 2;\nconst visible = ['public'];\n");
+    });
+
+    it("requires a new read when quote-normalized candidates are ambiguous", () => {
+      expect(editMismatchHint('const x = "value";\n  const x = "value";\n', "const x = 'value';")).toBeUndefined();
+    });
+
+    it("keeps missing-file and cancellation failures separate from text mismatches", async () => {
+      const cwd = await fixture();
+      const { tools } = await loadExtension();
+      const edit = tools.get("edit")!;
+      const input = { path: "absent.ts", edits: [{ oldText: "old", newText: "new" }] };
+      await expect(edit.execute("missing", input, undefined, undefined, { cwd })).rejects.toThrow(/Could not edit file/);
+      const signal = AbortSignal.abort();
+      await expect(edit.execute("aborted", input, signal, undefined, { cwd })).rejects.toThrow("Operation aborted");
+    });
+
+    it("bounds diagnostic source output and points large blocks back to read", () => {
+      const actual = `const value = "${"x".repeat(5000)}";`;
+      const hint = editMismatchHint(actual, actual.replaceAll('"', "'"))!;
+      expect(hint).toContain("Read that line range");
+      expect(hint.length).toBeLessThan(1000);
+    });
   });
 
   describe("composite grep", () => {
