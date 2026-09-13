@@ -82,7 +82,7 @@ test("missing elapsed and pid stay missing; snapshots omit secrets", () => {
 	assert.equal("prompt" in snap, false);
 });
 
-test("generating and tool-active may swap; final-received is the closeout gate", () => {
+test("a new tool turn clears a provisional final while post-exit verification stays monotonic", () => {
 	const state: FinalizationFields = {};
 	applyFinalizationTransition(state, "generating", 1);
 	applyFinalizationTransition(state, "tool-active", 2);
@@ -92,7 +92,13 @@ test("generating and tool-active may swap; final-received is the closeout gate",
 	assert.equal(isTerminalFinalizingPhase("tool-active"), false);
 	assert.equal(isTerminalFinalizingPhase("final-received"), true);
 	applyFinalizationTransition(state, "final-received", 4);
-	assert.equal(applyFinalizationTransition(state, "tool-active", 5), false);
+	assert.equal(applyFinalizationTransition(state, "tool-active", 5), true);
+	assert.equal(isTerminalFinalizingPhase(state.finalizationPhase), false);
+	assert.equal(state.phaseSince, 5);
+	applyFinalizationTransition(state, "final-received", 6);
+	assert.equal(applyFinalizationTransition(state, "generating", 7), true);
+	applyFinalizationTransition(state, "verifying", 8);
+	assert.equal(applyFinalizationTransition(state, "tool-active", 9), false);
 });
 
 test("runtime emits phases at real verify/worktree/done boundaries", () => {

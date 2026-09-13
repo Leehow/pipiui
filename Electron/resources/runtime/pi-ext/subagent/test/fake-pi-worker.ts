@@ -68,7 +68,12 @@ async function runPrintWorker(text: string, rpcCommandId?: string): Promise<neve
 	line({ type: "session_start", cwd: process.cwd() });
 	if (rpcCommandId) line({ id: rpcCommandId, type: "response", command: "prompt", success: true });
 	if (behavior === "final-hold") {
-		line({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: assistantText(agentId) }] } });
+		line({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: assistantText(agentId) }] } });
+		line({ type: "agent_settled" });
+		return parkResident(agentId, false);
+	}
+	if (behavior === "interim-hold") {
+		line({ type: "message_end", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Checking the last result before continuing." }] } });
 		return parkResident(agentId, false);
 	}
 	if (behavior === "hang") {

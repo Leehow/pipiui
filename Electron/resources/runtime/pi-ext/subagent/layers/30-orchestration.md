@@ -140,6 +140,11 @@ acceptance criteria. Too long beats vague.
 
 - Implementation briefs MUST fill the structured `verify` field, so the runtime can run it
   after the worker ends and attest the exit code.
+- Match `verify` to the slice: name the relevant test files and required build/setup steps.
+  The default runtime deadline is 120 seconds. Full repository suites belong to final
+  integration, with a suitable host `PIPIUI_VERIFY_TIMEOUT_MS` if they need longer.
+  Workers test while iterating; do not ask them to repeat a passing full suite just before
+  the runtime executes the same command. A changed integration tree still needs verification.
 - Read-only tasks (plan / explore / reviewer) and research or discussion tasks MUST omit
   `verify` — they deliver a report, and the runtime drops any verify given to them. Never
   re-dispatch a read-only worker to make a shell command pass.

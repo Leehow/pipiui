@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { applyTerminalHostReceipt, enrichHostDiagnostics, explicitNullDiagnosticKeys, markPersistedRunningReconciliation, sanitizeAgentDiagnostics } from "../src/agent-diagnostics.js";
 
 describe("agent diagnostics host projection", () => {
+  it("accepts a resumed tool turn after a provisional final, but rejects stale replay", () => {
+    const previous = {
+      processGeneration: "11:100", eventSeq: 20,
+      finalizationPhase: "final-received" as const, phaseSince: 100,
+    };
+    const active = enrichHostDiagnostics({
+      processGeneration: "11:100", eventSeq: 21,
+      finalizationPhase: "tool-active", phaseSince: 200,
+    }, previous, { receivedAt: 201, generation: "host" });
+    expect(active).toMatchObject({ finalizationPhase: "tool-active", phaseSince: 200, eventSeq: 21 });
+    const stale = enrichHostDiagnostics({
+      ...previous, eventSeq: 19,
+    }, active, { receivedAt: 300, generation: "host" });
+    expect(stale).toEqual(active);
+  });
+
   it("keeps runtime metadata and records receive/seq continuity", () => {
     const incoming = sanitizeAgentDiagnostics({
       agentId: "builder",

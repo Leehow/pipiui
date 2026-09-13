@@ -1370,7 +1370,7 @@ test("RPC general-purpose cooperative exit after shutdown-ready clears the timer
 	assert.equal(readChildState("capexit").sigterm, undefined);
 });
 
-test("non-RPC explore still arms on first assistant final", { timeout: 40_000 }, async (t) => {
+test("non-RPC explore arms after agent_settled", { timeout: 40_000 }, async (t) => {
 	const cleanup = setupSuiteEnv();
 	delete process.env.PIPIUI_FANOUT_ACTIVE;
 	const previousGrace = process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
@@ -1394,7 +1394,32 @@ test("non-RPC explore still arms on first assistant final", { timeout: 40_000 },
 	const pid = await waitChildPid("capprint");
 	const deadline = Date.now() + 3_000;
 	while (alive(pid) && Date.now() < deadline) await delay(20);
-	assert.equal(alive(pid), false, "print-mode workers must still arm on first assistant final");
+	assert.equal(alive(pid), false, "settled print workers retain their bounded exit fallback");
+});
+
+test("a print worker's intermediate message does not start closeout or terminate its next turn", async (t) => {
+	const previousGrace = process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
+	process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS = "80";
+	t.after(() => {
+		if (previousGrace === undefined) delete process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS;
+		else process.env.PIPIUI_READONLY_CHILD_EXIT_GRACE_MS = previousGrace;
+	});
+	const { api, tools } = createFakePi();
+	await loadExtension(api);
+	const subagent = tools.get("subagent")!;
+	const dispatched = await subagent.execute("interim", prepared(subagent, {
+		prompt: "Continue after the update. [seam:interim:interim-hold].",
+		description: "intermediate reply", subagent_type: "explore", agentId: "interim", run_in_background: true,
+	}), undefined, undefined, EXEC_CTX) as { content: Array<{ text: string }> };
+	const runId = dispatched.content[0].text.match(/runId=([^\s]+)/)?.[1];
+	assert.ok(runId);
+	try {
+		const pid = await waitChildFinal("interim");
+		await delay(250);
+		assert.equal(alive(pid), true, "an intermediate reply is not a shutdown boundary");
+	} finally {
+		await tools.get("subagent_abort")!.execute("interim-abort", { agentId: "interim", runId }, undefined, undefined, EXEC_CTX);
+	}
 });
 // ── Routing advisories: continuity, findings handoff, fork availability ─────────────────
 

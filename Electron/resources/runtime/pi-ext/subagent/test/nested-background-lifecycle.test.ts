@@ -22,7 +22,7 @@ import {
 } from "../resident-rpc-wake.ts";
 import { scrubSubagentRuntimeTestHostEnvironment } from "./test-environment.ts";
 
-type Scenario = "print" | "single" | "parallel" | "abort";
+type Scenario = "print" | "single" | "parallel" | "abort" | "leaf";
 type PiEvent = { type?: string; message?: { role?: string; content?: Array<{ type?: string; text?: string }> }; [key: string]: unknown };
 
 type MockState = {
@@ -47,6 +47,10 @@ function writeFixtureProvider(baseUrl: string): void {
 	}), "utf8");
 	writeFileSync(providerPath, `
 export default function (pi) {
+  if (process.env.PIPIUI_TEST_LEAF_KEEPALIVE === "1") {
+    pi.on("session_start", () => { setInterval(() => {}, 1000); });
+    pi.on("session_shutdown", () => { process.stderr.write("fixture shutdown completed\\n"); });
+  }
   const noiseStatusKey = process.env.PIPIUI_TEST_NOISE_WAKE_STATUS_KEY;
   if (noiseStatusKey) {
     // The outer RPC interceptor becomes idle only after its agent_settled event
@@ -131,6 +135,10 @@ async function startMockServer(): Promise<{ server: Server; port: number; state:
 			const nonSystem = messages.filter((message) => (message as { role?: unknown }).role !== "system" && (message as { role?: unknown }).role !== "developer");
 			const transcript = nonSystem.map(textOf).join("\n");
 			state.requests.push(JSON.stringify(nonSystem.map((message) => ({ role: (message as { role?: unknown }).role, text: textOf(message) }))).slice(-1_500));
+			if (transcript.includes("Task: parent-leaf")) {
+				sse(res, textResponse("leaf completed"));
+				return;
+			}
 			const leaf = /Task: slow-([a-z-]+)/.exec(transcript)?.[1];
 			if (leaf) {
 				state.leafStarted.add(leaf);
@@ -221,7 +229,7 @@ function spawnBundledParent(
 	mode: "rpc" | "json",
 	scenario: Scenario,
 	port: number,
-	options: { noiseStatusKey?: string } = {},
+	options: { noiseStatusKey?: string; leafRole?: string } = {},
 ): {
 	proc: ChildProcess;
 	events: PiEvent[];
@@ -239,7 +247,8 @@ function spawnBundledParent(
 		PIPIUI_AGENT_DEPTH: "1",
 		PIPIUI_AGENT_ID: `parent-${scenario}`,
 		PIPIUI_AGENT_RUN_ID: `run-${scenario}`,
-		PIPIUI_AGENT_ROLE: "worker",
+		PIPIUI_AGENT_ROLE: options.leafRole ?? "worker",
+		PIPIUI_TEST_LEAF_KEEPALIVE: options.leafRole ? "1" : undefined,
 		PIPIUI_AGENT_MAX_DEPTH: "2",
 		PIPIUI_WORKTREE: "0",
 		PIPIUI_NODE_PATH: process.execPath,
@@ -326,6 +335,30 @@ test("resident leases are exact-run idempotent and every terminal transition re-
 	lifecycle.noteTerminal("running", "run-b", true);
 	assert.equal(lifecycle.shouldShutdown(), true);
 	assert.ok(changes >= 6, "every accepted/terminal/consumption transition calls the common shutdown seam");
+});
+
+test("leaf RPC runs shutdown hooks then exits without the print-mode grace even with a live timer", async () => {
+	const { server, port, state } = await startMockServer();
+	writeFixtureProvider(`http://127.0.0.1:${port}/v1`);
+	try {
+		for (const leafRole of ["worker", "closeout-secretary"]) {
+			const leaf = spawnBundledParent("rpc", "leaf", port, { leafRole });
+			try {
+				await waitFor(() => assistantText(leaf.events).includes("leaf completed"), "leaf did not produce its final");
+				const exit = await exitWithin(leaf.exit, 2_000, "leaf waited for the print-mode exit watchdog");
+				assert.equal(exit.code, 0, exit.stderr);
+				assert.equal(exit.signal, null);
+				assert.match(exit.stderr, /fixture shutdown completed/);
+				assert.deepEqual(assistantText(leaf.events), ["leaf completed"]);
+			} finally {
+				if (leaf.proc.exitCode === null && !leaf.proc.killed) leaf.proc.kill("SIGKILL");
+				await leaf.exit.catch(() => undefined);
+			}
+		}
+		assert.equal(state.requests.length, 2, "shutdown must not add provider turns");
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
 });
 
 test("resident RPC waker accepts only the current idle attempt token once", () => {

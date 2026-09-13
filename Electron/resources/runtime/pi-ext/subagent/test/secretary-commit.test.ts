@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
 	runSecretaryCommit,
+	resolveSecretaryCwd,
 	type SecretaryCommitInput,
 } from "../secretary-commit.ts";
 
@@ -26,7 +27,7 @@ function makeRepo(): string {
 	writeFileSync(join(root, "README.md"), "base\n");
 	git(root, ["add", "README.md"]);
 	git(root, ["commit", "-m", "base"]);
-	return root;
+	return realpathSync(root);
 }
 
 function dirty(root: string, name = "docs.md"): void {
@@ -48,6 +49,46 @@ function input(overrides: Partial<SecretaryCommitInput> = {}): SecretaryCommitIn
 function context(root: string) {
 	return { processRole: "closeout-secretary", mainCwd: root };
 }
+
+test("secretary follows the canonical root only after its session worktree is retired", () => {
+	const root = makeRepo();
+	try {
+		const session = join(root, ".pi", "worktrees", "session-closeout");
+		git(root, ["worktree", "add", "-b", "pipiui/session-closeout", session]);
+		assert.equal(resolveSecretaryCwd(session, root), session, "a live session tree keeps its own target");
+		git(root, ["worktree", "remove", session]);
+		// Runtime bookkeeping can recreate the directory after Git removes it.
+		mkdirSync(join(session, ".pi"), { recursive: true });
+		assert.equal(resolveSecretaryCwd(session, root), root);
+		writeFileSync(join(session, "unfinished.ts"), "unexplained leftover\n");
+		assert.equal(resolveSecretaryCwd(session, root), undefined, "unknown residual work must not be bypassed");
+		rmSync(join(session, "unfinished.ts"));
+		assert.equal(resolveSecretaryCwd(join(root, "missing"), root), undefined);
+		assert.equal(resolveSecretaryCwd(session), undefined, "no guessed project identity");
+		dirty(root);
+		const result = runSecretaryCommit(input(), context(resolveSecretaryCwd(session, root)!));
+		assert.match(result.commit, /^created:/);
+		assert.deepEqual(result.committedPaths, ["docs.md"]);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("an unregistered session branch with unique work must not redirect a secretary", () => {
+	const root = makeRepo();
+	try {
+		const session = join(root, ".pi", "worktrees", "session-unmerged");
+		git(root, ["worktree", "add", "-b", "pipiui/session-unmerged", session]);
+		dirty(session);
+		git(session, ["add", "docs.md"]);
+		git(session, ["commit", "-m", "unique session work"]);
+		git(root, ["worktree", "remove", session]);
+		assert.equal(resolveSecretaryCwd(session, root), undefined);
+		assert.equal(resolveSecretaryCwd(root, root), root);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
 
 test("a passing verification commits exactly the manifest", () => {
 	const root = makeRepo();

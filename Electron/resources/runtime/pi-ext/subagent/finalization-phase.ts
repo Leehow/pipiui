@@ -80,7 +80,9 @@ export function canTransitionFinalizationPhase(
 	const fromRank = finalizationPhaseRank(from);
 	const toRank = finalizationPhaseRank(to);
 	const finalRank = finalizationPhaseRank("final-received");
-	if (fromRank < finalRank && toRank < finalRank) return true;
+	// A settled turn may be followed by another turn while the child is still alive.
+	// Once verification starts the child is gone and closeout remains monotonic.
+	if (fromRank <= finalRank && toRank < finalRank) return true;
 	return toRank > fromRank;
 }
 

@@ -109,6 +109,35 @@ function canonicalGitRoot(mainCwd: string | undefined): string | null {
 	}
 }
 
+/** Recover only a retired runtime session tree, never an arbitrary caller cwd. */
+export function resolveSecretaryCwd(mainCwd: string | undefined, projectRoot?: string): string | undefined {
+	const current = canonicalGitRoot(mainCwd);
+	if (current) return current;
+	if (!mainCwd || !projectRoot) return undefined;
+	const root = canonicalGitRoot(projectRoot);
+	if (!root) return undefined;
+	const retired = path.resolve(root, path.relative(path.resolve(projectRoot), path.resolve(mainCwd)));
+	if (path.dirname(retired) !== path.join(root, ".pi", "worktrees")) return undefined;
+	const name = path.basename(retired);
+	if (!/^session-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) return undefined;
+	// A leftover .pi directory is common after cleanup; a git marker, symlink,
+	// registration or unique branch still denotes owned work and cannot be redirected.
+	try {
+		if (fs.realpathSync.native(path.dirname(retired)) !== path.dirname(retired)) return undefined;
+		if (fs.lstatSync(retired).isSymbolicLink() || fs.existsSync(path.join(retired, ".git"))) return undefined;
+		if (fs.readdirSync(retired).some((entry) => entry !== ".pi")) return undefined;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined;
+	}
+	const listed = git(root, ["worktree", "list", "--porcelain"]);
+	if (!listed.ok || listed.stdout.split(/\r?\n/).includes(`worktree ${retired}`)) return undefined;
+	const branch = `refs/heads/pipiui/${name}`;
+	const exists = git(root, ["show-ref", "--verify", "--quiet", branch]);
+	if (exists.status !== 0 && exists.status !== 1) return undefined;
+	if (exists.ok && !git(root, ["merge-base", "--is-ancestor", branch, "HEAD"]).ok) return undefined;
+	return root;
+}
+
 /** One trimmed line, short enough for a commit message or a ledger declaration, no control characters. */
 function safeOneLine(value: unknown): string | null {
 	if (typeof value !== "string") return null;

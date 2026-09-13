@@ -246,6 +246,7 @@ import {
 import {
 	formatSecretaryCommitResult,
 	runSecretaryCommit,
+	resolveSecretaryCwd,
 } from "./secretary-commit.ts";
 import { secretaryToolCallBlock } from "./secretary-policy.ts";
 import {
@@ -817,8 +818,8 @@ const PIPIUI_DEPTH = resolveEffectiveSubagentDepth(
 	process.env.PIPIUI_AGENT_TREE_DEPTH,
 );
 const PIPIUI_PARENT = process.env.PIPIUI_AGENT_ID || null;
-// Only a spawned worker that can itself delegate uses the resident RPC lifecycle.
-// Leaf workers stay on the established one-shot JSON print path.
+// Mounted workers share an explicit RPC shutdown lifecycle. Leaf roles have no
+// descendant obligations; delegation capability is enforced separately.
 const PIPIUI_NESTED_RPC_PARENT = process.env.PIPIUI_NESTED_RPC_PARENT === "1";
 /** Attempt-private transport token; never enters a prompt, report, or persisted state. */
 const PIPIUI_RESIDENT_RPC_WAKE_TOKEN = process.env.PIPIUI_RESIDENT_RPC_WAKE_TOKEN || undefined;
@@ -7554,6 +7555,12 @@ async function runSingleAgent(
 		policy: placementPolicy,
 		allowEnvironmentOptOut: executionPolicy?.worktree === "isolated" ? false : undefined,
 	});
+	if (runtimePolicy.worktree === "main-session" && PIPIUI_PROJECT_ROOT
+		&& path.resolve(PIPIUI_MAIN_CWD ?? defaultCwd) !== path.resolve(PIPIUI_PROJECT_ROOT)) {
+		const secretaryCwd = resolveSecretaryCwd(PIPIUI_MAIN_CWD ?? defaultCwd, PIPIUI_PROJECT_ROOT);
+		if (secretaryCwd) placement.cwd = secretaryCwd;
+		else placement.worktreeError = "Secretary workspace is unavailable or no longer the registered Git root. Rebind the session to its accepted integration checkout before retrying; changing the prompt cannot repair this binding.";
+	}
 	// ── Branded-pin contract ─────────────────────────────────────────────────────────
 	// Only a host-validated pin may pass this point (see requireValidatedModelPin).
 	const modelPin = requireValidatedModelPin(options?.model, options?.modelPin);
@@ -7752,13 +7759,14 @@ async function runSingleAgent(
 	// Resume would otherwise inherit the stale session header cwd (possibly the main checkout) via
 	// SessionManager.open's `header.cwd` fallback; pin the resumed session to this dispatch's
 	// worktree so child writes and our post-verify share the same cwd. Writable + worktree only.
-	if (sessionDir && resumingSession && placement.worktreePath) {
+	if (sessionDir && resumingSession && (placement.worktreePath || runtimePolicy.worktree === "main-session")) {
 		alignResumedSessionCwd(sessionDir, sessionId, spawnCwd);
 	}
-	// A depth>0 worker that still receives delegation tools may return an immediate
-	// background receipt. It must remain resident long enough to consume its child's
-	// completion follow-up; Pi RPC is the supported stdin/stdout lifecycle for that.
-	const useNestedRpc = childDepth > 0 && allowRecursiveDelegation;
+	// Every mounted worker uses the existing RPC shutdown handshake. Leaf roles
+	// have no descendant obligations and close immediately on agent_settled;
+	// delegating roles additionally wait for their accepted children. Print mode
+	// relies on event-loop quiescence and used to hit the 5s/15s exit watchdog.
+	const useNestedRpc = childDepth > 0 && (allowRecursiveDelegation || Boolean(PIPIUI_SUBAGENT_EXT));
 	const promptDebugPath = promptDebugFile(pipiuiAgentId, runId);
 	const args: string[] = useNestedRpc ? ["--mode", "rpc"] : ["--mode", "json", "-p"];
 	if (sessionDir) {
@@ -8136,6 +8144,9 @@ async function runSingleAgent(
 		// placement or bundled private-skill suffixes.
 		const promptParts: string[] = [];
 		if (agent.systemPrompt.trim()) promptParts.push(agent.systemPrompt);
+		if (!agent.traits.readOnly && options?.verify?.trim()) {
+			promptParts.push(`Runtime verification after you finish: ${options.verify.trim()}\nThe runtime runs this command in your workspace and records its exit code. Run focused tests while implementing or diagnosing failures. Once the relevant checks pass and no further files change, return your result; do not repeat the full verification command merely to finish.`);
+		}
 		if (executionPolicy?.worktree === "none" && executionPolicy.noWorktreeReason) {
 			promptParts.push(
 				`[Runtime placement: shared cwd]\nThe Boss explicitly disabled worktree isolation for this dispatch. Reason: ${executionPolicy.noWorktreeReason}\nOperate directly in the assigned cwd. Do not assume automatic merge, cleanup, or isolation from concurrent work.`,
@@ -8268,6 +8279,7 @@ async function runSingleAgent(
 				const invocation = getPiInvocation(args);
 				const childEnvironmentInput = {
 					PIPIUI_AGENT_ID: pipiuiAgentId,
+					...(runtimePolicy.worktree === "main-session" ? { PIPIUI_MAIN_CWD: spawnCwd } : {}),
 					PIPIUI_AGENT_RUN_ID: runId,
 					...(questionDir ? { [QUESTION_DIR_ENV]: questionDir } : {}),
 					...(toolBudget ? { [TOOL_BUDGET_ENV]: encodeToolBudgetEnv(toolBudget) } : {}),
@@ -8679,16 +8691,23 @@ async function runSingleAgent(
 						// Authenticated shutdown-ready: descendants/queued RPC are terminal,
 						// ctx.shutdown() was requested, and this attempt accepted the wake.
 						// No further tools will run. Arm here — never on the first assistant final.
+						projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
 						childExitCloseout.arm();
 						childExitProbe.markFinal();
 						return;
 					}
-					if (useNestedRpc && event.type === "agent_settled") {
-						setResidentRpcIdle(true);
+					if (event.type === "agent_settled") {
+						if (useNestedRpc) setResidentRpcIdle(true);
+						else if (currentResult.stopReason === "stop") {
+							projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
+							childExitCloseout.arm();
+							childExitProbe.markFinal();
+						}
 						return;
 					}
-					if (useNestedRpc && (event.type === "agent_start" || event.type === "turn_start")) {
-						setResidentRpcIdle(false);
+					if (event.type === "agent_start" || event.type === "turn_start") {
+						if (useNestedRpc) setResidentRpcIdle(false);
+						projectFinalizationPhase(pipiuiAgentId, runId, "generating");
 					}
 
 					// Live deltas (pi 0.84+). Do not wait for message_end.
@@ -8971,17 +8990,9 @@ async function runSingleAgent(
 						// tools running, not a wedge. Claimed here rather than on stopReason so a
 						// provider that omits `toolUse` still gets the same explained window.
 						if (toolNames.length > 0) noteAgentToolWait(pipiuiAgentId, runId, toolNames);
-						else {
-							projectFinalizationPhase(pipiuiAgentId, runId, "final-received");
-							// A resident RPC parent may emit its first assistant final while
-							// accepted descendants still run. Its extension calls ctx.shutdown()
-							// only after their completion follow-up has been consumed, so the
-							// print-mode final-exit grace must not kill it in between.
-							if (!useNestedRpc) {
-								childExitCloseout.arm();
-								childExitProbe.markFinal();
-							}
-						}
+						// A message can finish before retry/compaction/follow-up work.
+						// Print workers enter closeout on agent_settled; resident RPC
+						// workers wait for their authenticated shutdown-ready event.
 							// Always emit log when we streamed text/thinking so Swift resets
 							// contentIndex→row slots even if tools array is empty (otherwise the
 							// next turn would overwrite the previous message's live rows).
@@ -9749,7 +9760,7 @@ async function runSingleAgent(
 }
 
 const VERIFY_PARAM_DESCRIPTION =
-	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Boss must fill this for implementation tasks. Omit it for read-only agents — they deliver a report, not files, and the runtime drops any verify they are given.";
+	"Shell command run by the runtime in the agent's cwd after the agent process ends, before worktree merge/removal; exit code and tail output are attested into the done message. Required for implementation tasks. Select explicit test files for this slice, including necessary setup/build steps; do not assign a full repository suite to every worker. Default deadline: 120s (host PIPIUI_VERIFY_TIMEOUT_MS can override it). Reserve full suites for final integration with a suitable deadline. Omit for read-only agents; the runtime drops their verify.";
 
 const AGENT_ID_DESCRIPTION =
 	"Short semantic name you choose for this worker, e.g. \"quota-pill\": 2-24 chars of lowercase letters, digits, \"-\" or \"_\", starting with a letter or digit. Required on every dispatch — no id is generated for you. Re-dispatching the same agentId continues that worker with its previous conversation, worktree and branch pipiui/<agentId>: use one agentId per vertical slice (implement, verify, debug, fix, re-verify), and pass fresh:true only to start the same id cold. Also the target id for action=\"abort\" or action=\"resolve\".";

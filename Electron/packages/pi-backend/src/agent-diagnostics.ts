@@ -53,6 +53,10 @@ function incomingPhaseRollback(
 ): boolean {
   const incomingRank = finalizationPhaseRank(incoming.finalizationPhase);
   const previousRank = finalizationPhaseRank(previous.finalizationPhase);
+  // A new tool turn can follow a provisional final while the child is alive.
+  // Sequence checks reject stale events; post-exit verification stays monotonic.
+  if (incomingRank >= 0 && incomingRank < finalizationPhaseRank("final-received")
+    && previousRank <= finalizationPhaseRank("final-received")) return false;
   // Missing phase is not a rollback: legacy cpu-only updates and explicit-null
   // phase clears must still apply. A named lower rank is a rewind.
   return incomingRank >= 0 && previousRank >= 0 && incomingRank < previousRank;
@@ -81,7 +85,7 @@ function shouldKeepPreviousPhase(incoming: AgentDiagnostics, previous: AgentDiag
   const incomingRank = finalizationPhaseRank(incoming.finalizationPhase);
   const previousRank = finalizationPhaseRank(previous.finalizationPhase);
   if (incomingRank < 0 || previousRank < 0) return false;
-  if (incomingRank < previousRank) return true;
+  if (incomingRank < previousRank) return incomingPhaseRollback(incoming, previous);
   return incomingRank === previousRank
     && incoming.phaseSince !== undefined
     && previous.phaseSince !== undefined

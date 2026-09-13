@@ -822,7 +822,7 @@ test("index wires closeout helpers onto the live finalization path", () => {
 	assert.match(source, /from "\.\/closeout\.ts"/);
 	assert.match(source, /childExitCloseout\.arm\(\)/);
 	assert.match(source, /childExitCloseout\.accepted\(\)/);
-	assert.match(source, /if \(!useNestedRpc\) \{[\s\S]*?childExitCloseout\.arm\(\)/);
+	assert.match(source, /event\.type === "agent_settled"[\s\S]{0,400}childExitCloseout\.arm\(\)/);
 	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitCloseout\.arm\(\)/);
 	assert.match(source, /residentRpcShutdownWaker\?\.consume\(event\)[\s\S]{0,500}childExitProbe\.markFinal\(\)/);
 	assert.match(source, /settleCloseoutWait\(flight, DEFAULT_TERMINAL_REPORT_BUDGET_MS/);
