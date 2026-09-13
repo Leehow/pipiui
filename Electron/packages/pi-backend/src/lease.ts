@@ -74,6 +74,8 @@ export class LeaseManager {
   private owned = false;
   private acquisitionGeneration = 0;
   private acquireChain: Promise<void> = Promise.resolve();
+  private heartbeatChain: Promise<void> = Promise.resolve();
+  private temporarySerial = 0;
 
   constructor(options: LeaseManagerOptions) {
     this.sessionId = options.sessionId;
@@ -121,7 +123,7 @@ export class LeaseManager {
     trackLeaseForExit(this);
     return { sessionId: this.sessionId, writable: true, holder: record };
   }
-  private startHeartbeat(): void { if (!this.timer) this.timer = setInterval(() => { void this.heartbeat(); }, this.heartbeatMs); this.timer.unref?.(); }
+  private startHeartbeat(): void { if (!this.timer) this.timer = setInterval(() => { void this.heartbeat().catch(() => undefined); }, this.heartbeatMs); this.timer.unref?.(); }
   private stopHeartbeat(): void { if (this.timer) clearInterval(this.timer); this.timer = undefined; }
 
   async query(): Promise<LeaseStatus> {
@@ -190,14 +192,33 @@ export class LeaseManager {
     }
   }
 
+  /**
+   * Serialized: the interval timer and an acquire() that reuses an owned lease
+   * both refresh the same file. Overlapping runs used to share one temporary
+   * path, so the loser renamed a file the winner had already moved and failed
+   * with ENOENT — surfacing as a failed send in the UI.
+   */
   async heartbeat(): Promise<LeaseStatus> {
+    const run = () => this.heartbeatUnlocked();
+    const next = this.heartbeatChain.then(run, run);
+    this.heartbeatChain = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  private async heartbeatUnlocked(): Promise<LeaseStatus> {
     if (!this.owned) return this.query();
     const current = await this.read();
     if (!current || !this.same(current)) { this.owned = false; this.stopHeartbeat(); untrackLeaseForExit(this); return this.query(); }
     const next: LeaseRecord = { ...current, heartbeatAt: new Date(this.now()).toISOString(), expiresAt: new Date(this.now() + this.ttlMs).toISOString() };
-    const temporary = `${this.leasePath}.${this.instanceId}.tmp`;
-    await fs.writeFile(temporary, JSON.stringify(next));
-    await fs.rename(temporary, this.leasePath);
+    this.temporarySerial += 1;
+    const temporary = `${this.leasePath}.${this.instanceId}.${this.temporarySerial}.tmp`;
+    try {
+      await fs.writeFile(temporary, JSON.stringify(next));
+      await fs.rename(temporary, this.leasePath);
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
     return { sessionId: this.sessionId, writable: true, holder: next };
   }
 

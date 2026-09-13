@@ -82,6 +82,19 @@ describe("LeaseManager", () => {
     expect((await first.acquire()).writable).toBe(true);
     await first.release();
   });
+  it("survives heartbeats that overlap an acquire without a lost temporary rename", async () => {
+    const { readdir } = await import("node:fs/promises");
+    const [first] = await managers();
+    await first.acquire();
+    const refreshes = await Promise.all([
+      ...Array.from({ length: 12 }, () => first.heartbeat()),
+      ...Array.from({ length: 4 }, () => first.acquire()),
+    ]);
+    expect(refreshes.every((status) => status.writable)).toBe(true);
+    expect(first.isOwned).toBe(true);
+    expect((await readdir(root)).filter((entry) => entry.endsWith(".tmp"))).toEqual([]);
+    await first.release();
+  });
   it("uses one exit hook for many leases and removes it after every release", async () => {
     const [first] = await managers();
     const sessionPath = join(root, "session.jsonl");
