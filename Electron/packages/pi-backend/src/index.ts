@@ -47,6 +47,7 @@ import {
   type SessionPreloadSnapshot,
   type SessionStats,
   type SubagentDebugInfo,
+  type SubagentModelAutoSelection,
   type SubagentModelSetting,
   type ThinkingLevel,
   type ThinkingLevelMap,
@@ -102,6 +103,7 @@ import { attachCatalogDiagnostics, buildAgentCatalog } from "./agent-catalog.js"
 import { readSubagentDebugInfo, removeSubagentDebugInfo } from "./subagent-debug-info.js";
 import { nativeSearchRuntimeCatalog } from "./generic-search-filter.js";
 import { enrichCapabilitiesForOfficialHostedSearch } from "./hosted-search-capabilities.js";
+import { supportsImagesFor } from "./supports-images.js";
 import { extractHistoryCitations, extractHistoryCodeInterpreter, extractHistoryFileSources, isHostedAssistantEvent, projectHostedAssistantEvent } from "./hosted-search-stream.js";
 import { installRuntimeTree, type RuntimeAssets } from "./runtime-install.js";
 import { registerContributedAuthProviders as registerExtensionAuthProviders, contributedAuthProviderModules } from "./extension-auth-providers.js";
@@ -147,6 +149,7 @@ import {
   type QueuedMessage,
 } from "./message-queue.js";
 import { FileQueueStore, type QueueStore } from "./queue-store.js";
+import { UserInputPriority } from "./user-input-priority.js";
 import {
   StopEscalationScheduler,
   defaultStopEscalationHooks,
@@ -1778,33 +1781,7 @@ const providerOf = (ref?: string): string | undefined => {
 };
 const isRecord = (value: any): value is Record<string, any> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
-/** Mirrors Swift ModelInfo.supportsImages: pi `input` array when present, else heuristic. */
-function supportsImagesFor(
-  modelId: string,
-  provider: string,
-  input?: unknown,
-): boolean {
-  if (Array.isArray(input)) return input.some((x) => x === "image");
-  const p = provider.toLowerCase(),
-    m = modelId.toLowerCase();
-  if (p.includes("deepseek") || m.includes("deepseek")) return false;
-  const visionHints = [
-    "gpt-4o",
-    "claude-3",
-    "claude-4",
-    "claude-5",
-    "gemini",
-    "qwen-vl",
-    "glm-4v",
-    "glm-5v",
-    "llava",
-    "moondream",
-    "vision",
-  ];
-  if (visionHints.some((h) => p.includes(h) || m.includes(h))) return true;
-  if (m.includes("vl") || p.includes("vl")) return true;
-  return true;
-}
+
 function thinkingLevelMapFrom(value: unknown): ThinkingLevelMap | undefined {
   if (!isRecord(value)) return undefined;
   const result: ThinkingLevelMap = {};
@@ -2372,7 +2349,8 @@ export class PiHostBackend implements HostBackend {
   /** Steer payloads pi acknowledged but never echoed back as a user message.
    * pi's ack only proves the text entered its in-memory steering queue, which
    * an aborted/compacted turn can drop; settle recycles them to the FIFO head. */
-  private unconfirmedSteers = new Map<string, QueuedDispatchPayload[]>();
+  private readonly userInputPriority = new UserInputPriority();
+  private unconfirmedSteers = new Map<string, (QueuedDispatchPayload & { queueMessageId?: string })[]>();
   private turnWatchdogTimer?: NodeJS.Timeout;
   private closed = false;
   private agentTerminalWaiters = new Set<() => void>();
@@ -2918,6 +2896,7 @@ export class PiHostBackend implements HostBackend {
     // still receives a token before the tombstone is installed.
     const token = this.sessionRuntimeToken(id) ?? ++sessionRuntimeTokenSerial;
     this.sessionRuntimeTokens.set(id, token);
+    this.userInputPriority.dispose(id, token);
     this.sessionRuntimeTombstones.add(id);
     this.turnTelemetry.fenceSession(id);
     return token;
@@ -2930,6 +2909,7 @@ export class PiHostBackend implements HostBackend {
       || this.sessionRuntimeTeardowns.has(id)
       || this.live.has(id)
     ) return;
+    this.userInputPriority.dispose(id, this.sessionRuntimeToken(id));
     this.sessionRuntimeTombstones.delete(id);
     // Absence is intentional: a continuation carrying this token must fail
     // closed rather than become implicit generation zero.
@@ -3215,6 +3195,7 @@ export class PiHostBackend implements HostBackend {
     if (this.closed || this.sessionRuntimeTearingDown.has(id)
       || this.sessionDeletionInProgress.has(id)
       || this.sessionRuntimeTombstones.has(id)) return;
+    this.userInputPriority.update(id, lifecycleToken ?? this.sessionRuntimeToken(id), items);
     const publicItems = this.publicQueueItems(items);
     this.persistQueue(id, publicItems);
     this.stream({
@@ -4495,6 +4476,10 @@ export class PiHostBackend implements HostBackend {
         return this.loadAndMaterializeSubagentModels(true);
       case "setSubagentModel":
         return this.saveSubagentModel(params[0], params[1]);
+      case "getSubagentModelAutoSelection":
+        return this.loadSubagentModelAutoSelection();
+      case "setSubagentModelAutoSelection":
+        return this.saveSubagentModelAutoSelection(params[0], params[1]);
       case "getSubagentDebugInfo":
         return this.getSubagentDebugInfo(params[0]);
       case "getMemoryReviewModel":
@@ -5750,6 +5735,16 @@ export class PiHostBackend implements HostBackend {
       this.assertSessionGeneration(id, generation);
       const dotEnv = await this.readDotEnv();
       this.assertSessionGeneration(id, generation);
+      const spawnEnv = withToolPath(
+        applySessionMountsToMainEnv(
+          mergedSpawnEnvironment(this.env, dotEnv, { ...output.env, ...(this.piCommand.env ?? {}) }),
+          workerEnvFromVault(this.vaultDir, id),
+        ),
+        this.piCommand.executable,
+      );
+      this.userInputPriority.bind(id, generation, spawnEnv.PIPIUI_SESSION_KEY);
+      this.userInputPriority.update(id, generation, this.queue.listQueue(id));
+      rollback.push(() => this.userInputPriority.dispose(id, generation));
       const child = this.proc(this.piCommand.executable, [
         ...(this.piCommand.prefixArgs ?? []),
         "--mode",
@@ -5760,17 +5755,7 @@ export class PiHostBackend implements HostBackend {
         // T17 parity: the configured agent profile's .env is layered under the internal host contract
         // (and wins over the host process env), so env-key providers like DeepSeek/Kimi
         // that `listModels` sees via the auth runtime resolve in the RPC session too.
-        env: withToolPath(
-          // Main Pi and UI share the host in-memory vault. Workers only inherit mounted env vars.
-          applySessionMountsToMainEnv(
-            mergedSpawnEnvironment(this.env, dotEnv, {
-              ...output.env,
-              ...(this.piCommand.env ?? {}),
-            }),
-            workerEnvFromVault(this.vaultDir, id),
-          ),
-          this.piCommand.executable,
-        ),
+        env: spawnEnv,
         stdio: ["pipe", "pipe", "pipe"],
       });
       spawnedChild = child;
@@ -7408,16 +7393,36 @@ export class PiHostBackend implements HostBackend {
     await fs.writeFile(tmp, JSON.stringify(catalog, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     await fs.rename(tmp, target);
   }
-  private async materializeSubagentModels(value: Record<string, SubagentModelSetting[]>): Promise<void> {
+  private checkedSubagentModelAutoSelection(value: unknown): SubagentModelAutoSelection {
+    if (value === undefined) return {};
+    if (!isRecord(value)) throw new Error("subagentModelAutoSelection 必须是 object");
+    return Object.fromEntries(Object.entries(value).flatMap(([name, enabled]) => {
+      if (!name.trim()) throw new Error("subagentModelAutoSelection agent name 不能为空");
+      if (typeof enabled !== "boolean") throw new Error("subagentModelAutoSelection 每项必须是 boolean");
+      if (this.isRetiredSubagentModelKey(name)) return [];
+      return [[name, enabled]];
+    }));
+  }
+  private async loadSubagentModelAutoSelection(): Promise<SubagentModelAutoSelection> {
+    return this.checkedSubagentModelAutoSelection((await this.readSettings()).subagentModelAutoSelection);
+  }
+  private async materializeSubagentModels(
+    value: Record<string, SubagentModelSetting[]>,
+    automatic: SubagentModelAutoSelection,
+  ): Promise<void> {
+    const runtime = Object.fromEntries(Object.entries(value).map(([name, models]) => [name, {
+      models,
+      automatic: automatic[name] !== false,
+    }]));
     const target = this.subagentModelsRuntimeFile();
     await fs.mkdir(dirname(target), { recursive: true });
     const tmp = `${target}.tmp-${process.pid}-${Date.now()}-${crypto.randomUUID()}`;
-    await fs.writeFile(tmp, JSON.stringify(value, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+    await fs.writeFile(tmp, JSON.stringify(runtime, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
     await fs.rename(tmp, target);
   }
   private async loadAndMaterializeSubagentModels(waitForCatalog = false): Promise<Record<string, SubagentModelSetting[]>> {
     const value = await this.loadSubagentModels(waitForCatalog);
-    await this.materializeSubagentModels(value);
+    await this.materializeSubagentModels(value, await this.loadSubagentModelAutoSelection());
     await this.materializeNativeSearchCatalog();
     // NO dispatch gate here anymore: pin acceptance is decided in-memory by
     // PinCatalogAuthority (validateSubagentModelPins). The display cache converges via the
@@ -7443,7 +7448,27 @@ export class PiHostBackend implements HostBackend {
       settings.subagentModels = all;
       return all;
     });
-    await this.materializeSubagentModels(all);
+    await this.materializeSubagentModels(all, await this.loadSubagentModelAutoSelection());
+    return all;
+  }
+  private async saveSubagentModelAutoSelection(agentName: unknown, enabled: unknown): Promise<SubagentModelAutoSelection> {
+    if (typeof agentName !== "string" || !agentName.trim())
+      throw new Error("subagent agentName 必须是非空 string");
+    if (typeof enabled !== "boolean")
+      throw new Error("subagent 自动选模开关必须是 boolean");
+    const name = agentName.trim();
+    const retired = this.isRetiredSubagentModelKey(name);
+    const all = await this.updateSettings((settings) => {
+      const current = this.checkedSubagentModelAutoSelection(settings.subagentModelAutoSelection);
+      if (!retired) {
+        if (enabled) delete current[name];
+        else current[name] = false;
+      }
+      if (Object.keys(current).length > 0) settings.subagentModelAutoSelection = current;
+      else delete settings.subagentModelAutoSelection;
+      return current;
+    });
+    await this.materializeSubagentModels(await this.loadSubagentModels(), all);
     return all;
   }
   private checkedMemoryReviewModel(value: unknown): string | null {
@@ -10413,12 +10438,27 @@ export class PiHostBackend implements HostBackend {
           if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
           throw error;
         }
-        // Queue thought the session was idle (stale settle, follow-up already
-        // running). Pi is the authority: re-send with the behavior it asked for
-        // instead of surfacing the raw RPC error to the composer.
+        // A machine follow-up won the idle race. Only this rejected-prompt
+        // path steers; ordinary busy enqueue remains host FIFO.
         this.assertSessionGeneration(id, generation);
-        await this.command(id, { ...body, streamingBehavior: "followUp" }, false, runtimeToken);
-        this.assertSessionGeneration(id, generation);
+        if (live.pendingDrainPrompt === payload.text) live.pendingDrainPrompt = undefined;
+        // No agent_start accompanies an accepted steer. Reconcile the stale
+        // host-idle observation with Pi's running turn, including its epoch.
+        live.turnEpoch = this.queue.markBusy(id, runtimeToken);
+        const source = this.queue.listQueue(id).find(item => item.state === "sending");
+        // Register before writing: a user echo can arrive before the RPC ack.
+        const receipt = this.noteUnconfirmedSteer(id, payload, source?.id);
+        try {
+          await this.command(id, { ...body, streamingBehavior: "steer" }, false, runtimeToken);
+          this.assertSessionGeneration(id, generation);
+        } catch (fallbackError) {
+          if (this.sessionRuntimeTokenIsCurrent(id, runtimeToken)) {
+            const remaining = this.unconfirmedSteers.get(id)?.filter(item => item !== receipt);
+            if (remaining?.length) this.unconfirmedSteers.set(id, remaining);
+            else this.unconfirmedSteers.delete(id);
+          }
+          throw fallbackError;
+        }
       }
       this.assertSessionGeneration(id, generation);
       if (recordTurn) this.turnTelemetry.dispatchAccepted(id);
@@ -10440,11 +10480,13 @@ export class PiHostBackend implements HostBackend {
   // the queue item. Track every acknowledged steer until pi echoes it back as
   // a user message; anything still unacknowledged at settle is requeued.
 
-  private noteUnconfirmedSteer(id: string, payload: QueuedDispatchPayload): void {
+  private noteUnconfirmedSteer(id: string, payload: QueuedDispatchPayload, queueMessageId?: string) {
     const pending = this.unconfirmedSteers.get(id) ?? [];
-    pending.push({ text: payload.text, attachments: snapshotAttachments(payload.attachments) });
+    const receipt = { text: payload.text, attachments: snapshotAttachments(payload.attachments), queueMessageId };
+    pending.push(receipt);
     this.unconfirmedSteers.set(id, pending);
     console.warn(`[pipi-backend] steer pending session=${id} count=${pending.length} text=${previewSteerText(payload.text)}`);
+    return receipt;
   }
 
   private confirmUnconfirmedSteer(id: string, content: string): void {
@@ -10462,8 +10504,23 @@ export class PiHostBackend implements HostBackend {
   private recycleUnconfirmedSteers(id: string): void {
     const pending = this.unconfirmedSteers.get(id);
     if (!pending?.length) return;
-    this.unconfirmedSteers.delete(id);
-    const restored = this.queue.requeueAtHead(id, pending.map(item => ({ text: item.text, attachments: item.attachments })), this.sessionRuntimeToken(id));
+    const queue = this.queue.listQueue(id);
+    // Never insert ahead of an in-flight queue.send: its acceptance still owns
+    // that row. Revisit after its ack; Stop may already have restored it.
+    const inflight = pending.filter(item => item.queueMessageId && queue.some(row => row.id === item.queueMessageId && row.state === "sending"));
+    if (inflight.length) {
+      this.unconfirmedSteers.set(id, inflight);
+      const token = this.sessionRuntimeToken(id);
+      void this.queue.waitForDispatch(id, token).then(() => {
+        // The dispatch settled, so the host may declare idle: an epoch captured
+        // here can be stale-stranded by a concurrent turn's agent_start, and no
+        // later event would re-drain the requeued head. If a real turn is
+        // streaming, the drain re-enters the steer fallback by design.
+        if (this.sessionRuntimeTokenIsCurrent(id, token)) void this.queueIdle(id, undefined, token);
+      });
+    } else this.unconfirmedSteers.delete(id);
+    const missing = pending.filter(item => !inflight.includes(item) && (!item.queueMessageId || !queue.some(row => row.id === item.queueMessageId)));
+    const restored = this.queue.requeueAtHead(id, missing.map(item => ({ text: item.text, attachments: item.attachments })), this.sessionRuntimeToken(id));
     for (const item of restored) {
       console.warn(`[pipi-backend] steer requeued session=${id} id=${item.id} text=${previewSteerText(item.text)}`);
     }
@@ -10909,7 +10966,20 @@ export class PiHostBackend implements HostBackend {
       : quotaProviderFor(state.model.id)
         ? state.model.id
         : state.model.provider;
-    return this.quotaStore.snapshot(provider);
+    // Extension-written snapshots (grok/flapcode) land in the agent dir this
+    // session's Pi child was spawned with, which under the isolated profile is
+    // the project home rather than the app profile. Point the readers there,
+    // and refresh when the directory changes so one project's numbers are
+    // never re-served from cache for another.
+    const changed = this.quotaStore.useSessionAgentDir(this.quotaSnapshotAgentDir(sessionId));
+    return this.quotaStore.snapshot(provider, changed);
+  }
+  /** Agent dir of this session's Pi child; undefined outside isolated profile mode. */
+  private quotaSnapshotAgentDir(sessionId?: string): string | undefined {
+    if (!sessionId) return undefined;
+    const live = this.live.get(sessionId);
+    const root = live?.projectRoot ?? live?.cwd;
+    return root ? this.isolatedProjectPaths(root).agentDir : undefined;
   }
   private async sessionStatsData(id: string): Promise<SessionStats> {
     await this.loadSessionContextLedger();

@@ -159,6 +159,7 @@ process.env.PIPIUI_SESSION_CAPABILITY = "dispatch-model-fixture-capability";
 const {
 	default: loadExtension,
 	resolveAgentModel,
+	formatSubagentModelRoutingBlock,
 	chainAdvanceEntryFor,
 	dispatchModelPinSyntaxProblem,
 	validateDispatchModelPinsViaHost,
@@ -278,26 +279,101 @@ test("resolveAgentModel priority: pin > role override > session model > frontmat
 	}
 });
 
+test("role runtime formats remain compatible and missing automatic defaults on", () => {
+	const file = join(suiteMainCwd, "role-formats.json");
+	const models = [{ model: CATALOG_A, thinking: "low" }, { model: CATALOG_B }];
+	const cases = [
+		{ value: CATALOG_A, multiple: false },
+		{ value: models[0], multiple: false },
+		{ value: models, multiple: true },
+		{ value: { models }, multiple: true },
+		{ value: { models, automatic: true }, multiple: true },
+		{ value: { models, automatic: false }, multiple: true, disabled: true },
+		{ value: { models: [models[0]], automatic: true }, multiple: false },
+		{ value: { models: [models[0]], automatic: false }, multiple: false, disabled: true },
+	];
+	process.env.PIPIUI_SUBAGENT_MODELS_FILE = file;
+	try {
+		for (const { value, multiple, disabled } of cases) {
+			writeFileSync(file, JSON.stringify({ explore: value }));
+			assert.equal(resolveAgentModel("explore", "front/fm", "sess/sm"), CATALOG_A);
+			assert.equal(chainAdvanceEntryFor(undefined, "explore", 1)?.model, multiple ? CATALOG_B : undefined);
+			const route = formatSubagentModelRoutingBlock()!.split("\n").find((line) => line.startsWith("- explore"))!;
+			assert.ok(route.includes(CATALOG_A));
+			if (multiple && !disabled) {
+				assert.match(route, /\(automatic\).*MUST choose one model ONLY from this role's candidates/);
+				assert.match(route, /task complexity, capability needs, and speed\/cost/);
+				assert.match(route, /pass its exact provider\/modelId as dispatch `model`/);
+				assert.match(route, /indistinguishable, choose candidate 1/);
+				assert.ok(route.indexOf(`1. ${CATALOG_A}`) < route.indexOf(`2. ${CATALOG_B}`));
+				assert.doesNotMatch(route, /omit `model`| -> /);
+			} else {
+				assert.match(route, /omit `model`.*ordered primary\/fallback/);
+				assert.doesNotMatch(route, /MUST choose/);
+				if (multiple) assert.match(route, / -> /);
+			}
+		}
+	} finally {
+		rmSync(file, { force: true });
+		resetSuiteEnv()();
+	}
+});
+
+test("boss hot-reads automatic toggles and keeps the catalog separate from role candidates", async () => {
+	const file = join(suiteMainCwd, "automatic-toggle.json");
+	const catalogFile = writeCatalogFile();
+	process.env.PIPIUI_SUBAGENT_MODELS_FILE = file;
+	process.env.PIPIUI_SUBAGENT_MODEL_CATALOG_FILE = catalogFile;
+	try {
+		const { api, tools, hooks } = createFakePi();
+		await loadExtension(api);
+		const handler = lastHandler(hooks, "before_agent_start")!;
+		for (const automatic of [true, false, true]) {
+			writeFileSync(file, JSON.stringify({ explore: {
+				models: [{ model: CATALOG_A }, { model: "role/other-candidate" }], automatic,
+			} }));
+			const { systemPrompt } = handler({ systemPrompt: "BASE" }) as { systemPrompt: string };
+			const route = systemPrompt.split("\n").find((line) => line.startsWith("- explore"))!;
+			assert.equal(route.includes("MUST choose"), automatic);
+			assert.ok(route.includes("role/other-candidate"));
+			assert.equal(route.includes(CATALOG_B), false, "catalog-only model is not a role candidate");
+			assert.ok(systemPrompt.includes(CATALOG_B), "full catalog still available for explicit pins");
+			assert.match(systemPrompt, /NOT the full Available models catalog/);
+			assert.match(systemPrompt, /do not output formal difficulty labels to the user/);
+			assert.match(systemPrompt, /pin never advances the role fallback chain on failure/);
+		}
+		const props = (tools.get("subagent")!.parameters as { properties: Record<string, { description?: string }> }).properties;
+		assert.match(props.model!.description!, /automatic multi-candidate role/);
+		assert.match(props.model!.description!, /ONLY from that role's candidates/);
+		assert.match(props.model!.description!, /automatic is off or there is only one candidate, omit model/);
+		assert.match(props.model!.description!, /never advances the fallback chain on failure/);
+	} finally {
+		rmSync(file, { force: true });
+		rmSync(catalogFile, { force: true });
+		resetSuiteEnv()();
+	}
+});
+
 test("chainAdvanceEntryFor: a pinned dispatch never advances the persisted fallback chain", () => {
 	const overridesFile = join(suiteMainCwd, "chain-overrides-fixture.json");
-	writeFileSync(overridesFile, JSON.stringify({
-		generalPurposeChainProbe: {
-			models: [
-				{ model: "primary/one" },
-				{ model: "fallback/two" },
-			],
-		},
-	}));
 	process.env.PIPIUI_SUBAGENT_MODELS_FILE = overridesFile;
 	try {
-		const unpinned = chainAdvanceEntryFor(undefined, "generalPurposeChainProbe", 1);
-		assert.ok(unpinned, "unpinned dispatch keeps the documented chain fallback");
-		assert.equal(unpinned!.model, "fallback/two");
-		assert.equal(chainAdvanceEntryFor(undefined, "generalPurposeChainProbe", 2), undefined, "past-the-end stays undefined");
+		for (const automatic of [undefined, true, false]) {
+			writeFileSync(overridesFile, JSON.stringify({
+				generalPurposeChainProbe: {
+					models: [{ model: "primary/one" }, { model: "fallback/two" }],
+					automatic,
+				},
+			}));
+			const unpinned = chainAdvanceEntryFor(undefined, "generalPurposeChainProbe", 1);
+			assert.ok(unpinned, "unpinned dispatch keeps the documented chain fallback");
+			assert.equal(unpinned!.model, "fallback/two");
+			assert.equal(chainAdvanceEntryFor(undefined, "generalPurposeChainProbe", 2), undefined, "past-the-end stays undefined");
 
-		// Pinned: quota/stall paths must NOT switch models — same pinned model retried within
-		// resume budgets, then a loud failure. Never a silent downgrade to another model.
-		assert.equal(chainAdvanceEntryFor(CATALOG_A, "generalPurposeChainProbe", 1), undefined);
+			// Pinned: quota/stall paths must NOT switch models — same pinned model retried within
+			// resume budgets, then a loud failure. Never a silent downgrade to another model.
+			assert.equal(chainAdvanceEntryFor(CATALOG_A, "generalPurposeChainProbe", 1), undefined);
+		}
 	} finally {
 		rmSync(overridesFile, { force: true });
 		resetSuiteEnv()();
@@ -322,7 +398,7 @@ test("boss routing block lists the canonical available models and drops the sect
 		assert.ok(result.systemPrompt!.includes(CATALOG_A), "catalog ref A visible to the Boss");
 		assert.ok(result.systemPrompt!.includes(CATALOG_B), "catalog ref B visible to the Boss");
 		assert.doesNotMatch(result.systemPrompt!, /no per-task model/, "stale v1 contract text is gone");
-		assert.match(result.systemPrompt!, /per-dispatch `model`|per-dispatch model/);
+		assert.match(result.systemPrompt!, /per-dispatch `model`|per-dispatch model/i);
 	} finally {
 		rmSync(catalogFile, { force: true });
 		delete process.env.PIPIUI_SUBAGENT_MODEL_CATALOG_FILE;
@@ -505,8 +581,9 @@ test("bare tasks[] wave with NO single fields clears the REAL schema and both it
 	// root-agentId fix this call died in schema validation and never reached execute().
 	const raw = {
 		tasks: [
-			{ task: "Wave left. [dm:bare-left]", agentId: "bare-left", model: CATALOG_A },
-			{ task: "Wave right. [dm:bare-right]", agentId: "bare-right", model: CATALOG_B },
+			// This suite tests pins, not writable worktree placement; use a read-only role.
+			{ agent: "explore", task: "Wave left. [dm:bare-left]", agentId: "bare-left", model: CATALOG_A },
+			{ agent: "explore", task: "Wave right. [dm:bare-right]", agentId: "bare-right", model: CATALOG_B },
 		],
 		run_in_background: false,
 	};

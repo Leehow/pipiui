@@ -468,6 +468,115 @@ describe('SubagentModelModal dynamic catalog', () => {
   })
 })
 
+describe('SubagentModelModal automatic selection', () => {
+  const chain: SubagentModelSetting[] = [
+    { model: 'openai/gpt-5', thinking: 'high' },
+    { model: 'anthropic/claude-sonnet-4', thinking: 'medium' },
+  ]
+
+  it('defaults multi-model roles to on, uses candidate labels, and preserves drag ordering', async () => {
+    const host = catalogHost([{ name: 'explore', description: 'Research' }], { explore: chain })
+    const load = vi.spyOn(host, 'getSubagentModelAutoSelection')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const toggle = await screen.findByRole('switch', { name: 'explore 自动选择' }) as HTMLInputElement
+    expect(load).toHaveBeenCalledOnce()
+    expect(toggle.checked).toBe(true)
+    const row = screen.getByTestId('subagent-agent-explore')
+    expect(within(row).getByText('候选 1')).toBeTruthy()
+    expect(within(row).getByText('候选 2')).toBeTruthy()
+    expect(within(row).queryByText('主选')).toBeNull()
+    expect(within(row).getByText(/Boss.*单次任务.*pin 失败不会静默换模/)).toBeTruthy()
+    fireEvent.dragStart(within(row).getByTestId('subagent-drag-explore-0'))
+    fireEvent.dragOver(within(row).getByTestId('subagent-chain-explore-1'))
+    fireEvent.drop(within(row).getByTestId('subagent-chain-explore-1'))
+    await waitFor(() => expect(within(row).getByRole('button', { name: 'explore 0 模型' }).textContent).toContain('claude-sonnet-4'))
+    expect(host.setSubagentModel).toHaveBeenLastCalledWith('explore', [chain[1], chain[0]])
+    expect(within(row).getByText('候选 1')).toBeTruthy()
+  })
+
+  it('persists toggles, restores an explicit off on reopen, and updates candidate/fallback labels', async () => {
+    const host = catalogHost([{ name: 'explore', description: 'Research' }], { explore: chain })
+    const save = vi.spyOn(host, 'setSubagentModelAutoSelection')
+    const first = render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    fireEvent.click(await screen.findByRole('switch', { name: 'explore 自动选择' }))
+    await waitFor(() => expect(screen.getByText('主选')).toBeTruthy())
+    expect(screen.getByText('备用 1')).toBeTruthy()
+    expect(screen.queryByText('候选 1')).toBeNull()
+    expect(save).toHaveBeenLastCalledWith('explore', false)
+    expect(await host.getSubagentModelAutoSelection?.()).toEqual({ explore: false })
+    first.unmount()
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const toggle = await screen.findByRole('switch', { name: 'explore 自动选择' }) as HTMLInputElement
+    expect(toggle.checked).toBe(false)
+    fireEvent.click(toggle)
+    await waitFor(() => expect(screen.getByText('候选 1')).toBeTruthy())
+    expect(save).toHaveBeenLastCalledWith('explore', true)
+    expect(await host.getSubagentModelAutoSelection?.()).toEqual({})
+    expect(await host.getSubagentModels?.()).toEqual({ explore: chain })
+  })
+
+  it('hides the switch for follow, single-model, Supervisor and memory roles, but shows it after adding a second model', async () => {
+    const host = catalogHost([
+      { name: 'explore', description: 'Research' },
+      { name: 'reviewer', description: 'Review' },
+    ], { explore: [chain[0]], supervisor: chain })
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const row = await screen.findByTestId('subagent-agent-explore')
+    expect(screen.queryByRole('switch')).toBeNull()
+    expect(within(screen.getByTestId('supervisor-model-row')).queryByRole('switch')).toBeNull()
+    expect(within(screen.getByTestId('memory-review-model-row')).queryByRole('switch')).toBeNull()
+    fireEvent.click(within(row).getByRole('button', { name: /添加备用模型/ }))
+    expect((await screen.findByRole('switch', { name: 'explore 自动选择' }) as HTMLInputElement).checked).toBe(true)
+  })
+
+  it('persists the preference independently for project subagents', async () => {
+    const host = catalogHost([
+      { name: 'project-helper', description: 'Project helper', origin: 'project', source: 'project' },
+    ], { 'project-helper': chain })
+    const save = vi.spyOn(host, 'setSubagentModelAutoSelection')
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    fireEvent.click(await screen.findByTestId('project-subagent-toggle'))
+    const toggle = await screen.findByRole('switch', { name: 'project-helper 自动选择' }) as HTMLInputElement
+    expect(toggle.checked).toBe(true)
+    fireEvent.click(toggle)
+    await waitFor(() => expect(toggle.checked).toBe(false))
+    expect(save).toHaveBeenLastCalledWith('project-helper', false)
+  })
+
+  it.each(['missing', 'unsupported'] as const)('keeps chain editing available with %s automatic-selection methods', async mode => {
+    const host = catalogHost([{ name: 'explore', description: 'Research' }], { explore: chain })
+    if (mode === 'missing') {
+      host.getSubagentModelAutoSelection = undefined
+      host.setSubagentModelAutoSelection = undefined
+    } else {
+      host.getSubagentModelAutoSelection = vi.fn(async () => { throw new Error('unknown method: getSubagentModelAutoSelection') })
+    }
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const row = await screen.findByTestId('subagent-agent-explore')
+    expect(within(row).queryByRole('switch')).toBeNull()
+    expect(within(row).getByText('主选')).toBeTruthy()
+    fireEvent.click(within(row).getByRole('button', { name: '下移 explore 主选' }))
+    await waitFor(() => expect(within(row).getByRole('button', { name: 'explore 0 模型' }).textContent).toContain('claude-sonnet-4'))
+    expect(host.setSubagentModel).toHaveBeenLastCalledWith('explore', [chain[1], chain[0]])
+  })
+
+  it('keeps the previous preference after a failed save and permits dismissing the error and retrying', async () => {
+    const host = catalogHost([{ name: 'explore', description: 'Research' }], { explore: chain })
+    const save = vi.spyOn(host, 'setSubagentModelAutoSelection').mockRejectedValueOnce(new Error('disk write failed'))
+    render(<SubagentModelModal host={host} current={gpt} visibility={visibility()} onClose={() => undefined} />)
+    const toggle = await screen.findByRole('switch', { name: 'explore 自动选择' }) as HTMLInputElement
+    fireEvent.click(toggle)
+    expect((await screen.findByRole('alert')).textContent).toContain('保存失败：disk write failed')
+    expect(toggle.checked).toBe(true)
+    expect(toggle.disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: '关闭 Subagent 模型错误' }))
+    expect(screen.queryByRole('alert')).toBeNull()
+    fireEvent.click(toggle)
+    await waitFor(() => expect(toggle.checked).toBe(false))
+    expect(save).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('SubagentModelModal model chain reorder', () => {
   const grok: Model = { provider: 'xai', id: 'grok-4.5', name: 'Grok 4.5', reasoning: true }
   const initialChain: SubagentModelSetting[] = [
@@ -482,6 +591,7 @@ describe('SubagentModelModal model chain reorder', () => {
 
   it('reorders a whole {model, thinking} entry via the drag handle, saves the exact new order, and recomputes primary/fallback labels', async () => {
     const host = catalogHost([{ name: 'reviewer', description: 'Review' }], { reviewer: initialChain })
+    await host.setSubagentModelAutoSelection?.('reviewer', false)
     const save = vi.spyOn(host, 'setSubagentModel')
     render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
     const reviewer = await screen.findByTestId('subagent-agent-reviewer')
@@ -528,6 +638,7 @@ describe('SubagentModelModal model chain reorder', () => {
 
   it('moves entries with up/down buttons, recomputes labels, and disables boundary moves', async () => {
     const host = catalogHost([{ name: 'reviewer', description: 'Review' }], { reviewer: initialChain })
+    await host.setSubagentModelAutoSelection?.('reviewer', false)
     const save = vi.spyOn(host, 'setSubagentModel')
     render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
     const reviewer = await screen.findByTestId('subagent-agent-reviewer')
@@ -575,6 +686,7 @@ describe('SubagentModelModal model chain reorder', () => {
         }
       }))
     host.setSubagentModel = save
+    await host.setSubagentModelAutoSelection?.('reviewer', false)
     render(<SubagentModelModal host={host} current={gpt} visibility={reorderVisibility()} onClose={() => undefined} />)
     const reviewer = await screen.findByTestId('subagent-agent-reviewer')
 

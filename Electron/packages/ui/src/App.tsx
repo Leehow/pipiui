@@ -723,16 +723,17 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
     { agentId: 'closeout', runId: 'mock-4', sessionId: 'agent-run', name: 'secretary', role: 'secretary', title: '收尾审计', task: '核对 worktree 与残留产物', state: 'ok', depth: 1, createdAt: Date.now() - 15_000, endedAt: Date.now() - 3_000, cost: 0.01, costUnit: 'CNY', exchangeRate: 7.2, turns: 1, provider: 'anthropic', model: 'anthropic/claude-sonnet-4', closeout: '已确认无残留', listSubtitle: '无未合并分支' }
   ]
   // Realistic multi-provider catalog so the picker exercises provider grouping.
-  // supportsImages mirrors Swift ModelInfo.supportsImages (deepseek → false).
+  // Image support is opt-out: only GLM text models before 5.3 are marked false.
   let mockModels: Model[] = [
     { provider: 'anthropic', id: 'claude-sonnet-4', name: 'Claude Sonnet 4', reasoning: true, supportsImages: true },
     { provider: 'anthropic', id: 'claude-opus-4-1', name: 'Claude Opus 4.1', reasoning: true, supportsImages: true },
     { provider: 'openai', id: 'gpt-5', name: 'GPT-5', reasoning: true, supportsImages: true },
-    { provider: 'openai', id: 'openai-codex', name: 'OpenAI Codex', reasoning: true, supportsImages: false },
-    { provider: 'deepseek', id: 'deepseek-v3', name: 'DeepSeek V3', reasoning: false, supportsImages: false },
-    { provider: 'moonshot', id: 'moonshot-v8-32k', name: 'Moonshot v8 32k', reasoning: false, supportsImages: false },
+    { provider: 'openai', id: 'openai-codex', name: 'OpenAI Codex', reasoning: true, supportsImages: true },
+    { provider: 'deepseek', id: 'deepseek-v3', name: 'DeepSeek V3', reasoning: false, supportsImages: true },
+    { provider: 'moonshot', id: 'moonshot-v8-32k', name: 'Moonshot v8 32k', reasoning: false, supportsImages: true },
     { provider: 'xai', id: 'grok-4', name: 'Grok 4', reasoning: true, supportsImages: true },
     { provider: 'zai', id: 'glm-4v-plus', name: 'GLM-4V-Plus', reasoning: true, supportsImages: true },
+    { provider: 'zai', id: 'glm-4.6', name: 'GLM-4.6', reasoning: true, supportsImages: false },
     { provider: 'volcengine', id: 'doubao-1-5-pro', name: 'Doubao 1.5 Pro', reasoning: true, supportsImages: true },
     { provider: 'qwen', id: 'qwen-vl-max', name: 'Qwen-VL-Max', reasoning: true, supportsImages: true },
     { provider: 'acme', id: 'mystery-1', name: 'Mystery One', reasoning: false, supportsImages: true }
@@ -857,7 +858,7 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
       state: 'available',
       source: 'builtin',
       requiredExtensionIds: ['skill-loader-extension', 'built-in-skills'],
-      recommendedExtensionIds: [],
+      recommendedExtensionIds: ['vision-routing'],
       layout: { primarySidebar: 'pipi.sessions', center: 'pipi.conversation', activity: ['pipi.sessions'] },
     },
     {
@@ -886,6 +887,7 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
   let mockProductActivation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
   let scanExternalSessions = true
   let subagentModels: Record<string, SubagentModelSetting[]> = {}
+  const subagentModelAutoSelection: Record<string, boolean> = {}
   let memoryReviewModel: string | null = null
   const agentDefinitions: AgentDefinition[] = [
     { name: 'explore', description: 'Grok-style research agent. Searches the web and the repository, reads, greps, and runs shell, but does not edit files.', origin: 'bundled', source: 'bundled', mode: 'read-only', available: true, availability: 'available' },
@@ -1095,6 +1097,12 @@ export function createMockHost(options: { productProfiles?: boolean } = {}): Pip
     setScanExternalSessions: async enabled => { scanExternalSessions = enabled; return scanExternalSessions },
     getSubagentModels: async () => Object.fromEntries(Object.entries(subagentModels).map(([name, chain]) => [name, chain.map(entry => ({ ...entry }))])),
     setSubagentModel: async (agentName, chain) => { if (chain.length) subagentModels[agentName] = chain.map(entry => ({ ...entry })); else delete subagentModels[agentName]; return Object.fromEntries(Object.entries(subagentModels).map(([name, saved]) => [name, saved.map(entry => ({ ...entry }))])) },
+    getSubagentModelAutoSelection: async () => ({ ...subagentModelAutoSelection }),
+    setSubagentModelAutoSelection: async (agentName, enabled) => {
+      if (enabled) delete subagentModelAutoSelection[agentName]
+      else subagentModelAutoSelection[agentName] = false
+      return { ...subagentModelAutoSelection }
+    },
     getSubagentDebugInfo: async sessionId => sessionId ? {
       available: true,
       source: 'demo',
@@ -3139,6 +3147,11 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       throw error
     }
   }
+  const continueSubagent = (agentId: string) => {
+    if (!selectedSession || !agentId || leaseReadOnly || isExternalSelected) return
+    const prompt = `请续跑之前的 subagent：使用同一 agentId「${agentId}」重新 dispatch，继续同一会话/worktree。不要使用 fresh，不要使用旧 runId，也不要创建新的 agentId。`
+    void send(prompt).catch(error => setProjectError(`续跑失败：${error instanceof Error ? error.message : String(error)}`))
+  }
   const requestUpdate = (prompt: string) => {
     closeModelManager()
     void send(prompt).catch(error => setProjectError(`发送失败：${error instanceof Error ? error.message : String(error)}`))
@@ -3757,7 +3770,7 @@ function AppContent({ host: injectedHost }: { host?: PipiHostAPI }) {
       </div> : null}
     </section>
     {productPanels.length > 0 && <ResizeHandle label="调整工具栏宽度" side="right" onPointerDown={resizeTools} />}
-    {productPanels.length > 0 && <ToolPanel activeTab={activeTab} collapsed={productToolsCollapsed} onToggleCollapsed={toggleTools} rail={!productToolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={themeScheme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />}
+    {productPanels.length > 0 && <ToolPanel activeTab={activeTab} collapsed={productToolsCollapsed} onToggleCollapsed={toggleTools} rail={!productToolsCollapsed ? <ToolQuickRail variant="header" activeTab={activeTab} toolsCollapsed={productToolsCollapsed} onSelect={selectTool} host={host} browserAvailable={browserAvailable} terminalAvailable={terminalAvailable} planTabVisible={planTabVisible} planProgress={planProgressBadge} subagentsRunningCount={subagentsRunningCount} /> : null} canGoBack={activeTab !== DEFAULT_PANEL_TAB} onBack={goBackTool} host={preloadedHost} theme={themeScheme} sessionId={selectedSession} announcedTerminal={selectedSession ? announcedTerminals[selectedSession] : undefined} revealedTerminalId={selectedSession ? revealedTerminalIds[selectedSession] : undefined} onSubagentsRunningCountChange={setSubagentsRunningCount} onSubagentStarted={revealSubagentsForNewRun} onManualSubagentStatusCheck={agentIDs => { void send(makeSubagentStatusCheckPrompt(agentIDs)) }} onContinueSubagent={continueSubagent} browserAvailable={browserAvailable} browserOccluded={browserOccluded} terminalAvailable={terminalAvailable} planAvailable={planAvailable} onPlanProgressChange={setPlanProgressBadge} onHasPlansChange={handleHasPlansChange} retainedWorktreeDispositionAvailable={retainedWorktreeDispositionAvailable} projectId={selectedProject} projectPath={selectedProjectPath} openedDocumentPath={selectedSession ? openedDocumentPaths[selectedSession] ?? null : null} onOpenDocument={openDocument} onDropDocuments={openDroppedDocuments} workspaceFullscreen={browserWorkspaceFullscreen} onToggleWorkspaceFullscreen={() => setBrowserWorkspaceFullscreen(value => !value)} />}
     {modalOpen && <ModelVisibilityModal host={host} visibility={modalVisibility} vision={vision} scan={scanExternal} updates={updates} current={modelState?.model ?? null} onModelState={applySelectedModelState} onRequestUpdate={requestUpdate} onClose={closeModelManager} initialView={modalInitialView} projectId={selectedProject} />}
     {computerUseOpen && <ComputerUsePanel host={host} onClose={() => setComputerUseOpen(false)} />}
     {remoteOpen && <RemoteConnectionPanel onClose={() => setRemoteOpen(false)} onAskPipiui={text => { setRemoteOpen(false); void send(text) }} onOpenDebugUrl={url => {
@@ -4274,7 +4287,7 @@ function ToolQuickRail({ variant, collapsible = false, activeTab, toolsCollapsed
     {variant === 'float' && collapsible && <button type="button" className="tool-rail-button tool-rail-collapse" aria-label={compact ? '展开工具快捷栏' : '收起工具快捷栏'} aria-expanded={!compact} title={compact ? '展开工具快捷栏' : '收起工具快捷栏'} onClick={toggleCompact}><span aria-hidden="true">{compact ? '‹' : '›'}</span></button>}
   </nav>
 }
-function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void; workspaceFullscreen?: boolean; onToggleWorkspaceFullscreen?: () => void }) {
+function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, onBack, host, theme, sessionId, announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted, onManualSubagentStatusCheck, onContinueSubagent, browserAvailable, browserOccluded, terminalAvailable, planAvailable, onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath, openedDocumentPath, onOpenDocument, onDropDocuments, workspaceFullscreen = false, onToggleWorkspaceFullscreen }: { activeTab: PanelTab; collapsed: boolean; onToggleCollapsed: () => void; rail?: ReactNode; canGoBack: boolean; onBack: () => void; host: PipiHostAPI; theme: 'light' | 'dark'; sessionId?: string; announcedTerminal?: TerminalSession; revealedTerminalId?: string; onSubagentsRunningCountChange: (count: number) => void; onSubagentStarted: () => void; onManualSubagentStatusCheck: (agentIDs: string[]) => void; onContinueSubagent?: (agentId: string) => void; browserAvailable: boolean | undefined; browserOccluded: boolean; terminalAvailable: boolean | undefined; planAvailable: boolean | undefined; onPlanProgressChange: (progress: { completed: number; total: number } | null) => void; onHasPlansChange: (sessionId: string, hasPlans: boolean) => void; retainedWorktreeDispositionAvailable: boolean; projectId?: string; projectPath?: string; openedDocumentPath?: string | null; onOpenDocument: (path: string) => void; onDropDocuments: (paths: string[]) => void; workspaceFullscreen?: boolean; onToggleWorkspaceFullscreen?: () => void }) {
   const panels = usePanels()
   const [headerSlot, setHeaderSlot] = useState<HTMLElement | null>(null)
   const [mountedIds, setMountedIds] = useState<Set<string>>(() => {
@@ -4323,7 +4336,7 @@ function ToolPanel({ activeTab, collapsed, onToggleCollapsed, rail, canGoBack, o
         return <Fragment key={panel.id}>{panel.render({
           host, theme, sessionId, collapsed, active: activeTab === panel.id, headerSlot,
           announcedTerminal, revealedTerminalId, onSubagentsRunningCountChange, onSubagentStarted,
-          onManualSubagentStatusCheck, browserAvailable, browserOccluded, terminalAvailable, planAvailable,
+          onManualSubagentStatusCheck, onContinueSubagent, browserAvailable, browserOccluded, terminalAvailable, planAvailable,
           onPlanProgressChange, onHasPlansChange, retainedWorktreeDispositionAvailable, projectId, projectPath,
           openedDocumentPath, onOpenDocument, workspaceFullscreen, onToggleWorkspaceFullscreen,
         })}</Fragment>

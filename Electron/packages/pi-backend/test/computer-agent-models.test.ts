@@ -35,6 +35,7 @@ describe('Subagent role model settings', () => {
     expect(roles.every(role => typeof role.name === 'string' && typeof role.description === 'string')).toBe(true)
     expect(roles.find(role => role.canonicalRole === 'computer')).toBeUndefined()
     await backend.handle('setSubagentModel', ['computer-use', [{ model: 'xai/grok-4.5', thinking: 'high' }]])
+    expect(await backend.handle('setSubagentModelAutoSelection', ['computer-use', false])).toEqual({})
     expect(await backend.handle('getSubagentModels', [])).toEqual({})
     const runtime = JSON.parse(await readFile(join(root, 'agent/pipiui-subagent-models-runtime.json'), 'utf8'))
     expect(runtime['computer-use']).toBeUndefined()
@@ -63,12 +64,12 @@ describe('Subagent role model settings', () => {
     expect(settings.subagentModels).toEqual({ explore: [{ model: 'xai/grok-4.5', thinking: 'high' }] })
     for (const name of RETIRED_SUBAGENT_MODEL_KEYS) expect(settings.subagentModels[name]).toBeUndefined()
     const runtime = JSON.parse(await readFile(join(agentDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(runtime).toEqual({ explore: [{ model: 'xai/grok-4.5', thinking: 'high' }] })
+    expect(runtime).toEqual({ explore: { models: [{ model: 'xai/grok-4.5', thinking: 'high' }], automatic: true } })
     await rm(join(agentDir, 'pipiui-subagent-models-runtime.json'))
     const restarted = createPiHostBackend({ agentDir, env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'xai', id: 'grok-4.5' }]) })
     await restarted.handle('getSubagentModels', [])
     const rematerialized = JSON.parse(await readFile(join(agentDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(rematerialized).toEqual({ explore: [{ model: 'xai/grok-4.5', thinking: 'high' }] })
+    expect(rematerialized).toEqual({ explore: { models: [{ model: 'xai/grok-4.5', thinking: 'high' }], automatic: true } })
     for (const name of RETIRED_SUBAGENT_MODEL_KEYS) expect(rematerialized[name]).toBeUndefined()
   })
   it('persists the Supervisor Luna override across backend recreation and rematerializes it', async () => {
@@ -87,7 +88,7 @@ describe('Subagent role model settings', () => {
       supervisor: [{ model: 'openai-codex/gpt-5.6-luna' }],
     })
     const rematerialized = JSON.parse(await readFile(join(agentDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))
-    expect(rematerialized.supervisor).toEqual([{ model: 'openai-codex/gpt-5.6-luna' }])
+    expect(rematerialized.supervisor).toEqual({ models: [{ model: 'openai-codex/gpt-5.6-luna' }], automatic: true })
   })
   it('migrates a uniquely owned legacy bare id but never chooses between duplicate providers', async () => {
     root = await mkdtemp(join(tmpdir(), 'pipi-computer-models-'))
@@ -96,7 +97,7 @@ describe('Subagent role model settings', () => {
     await writeFile(join(uniqueDir, 'pipiui-settings.json'), JSON.stringify({ subagentModels: { explore: [{ model: 'gpt-5' }] } }))
     const unique = createPiHostBackend({ agentDir: uniqueDir, env: { ...process.env, HOME: root }, authRuntime: authRuntime([{ provider: 'openai', id: 'gpt-5' }]) })
     expect(await unique.handle('getSubagentModels', [])).toEqual({ explore: [{ model: 'openai/gpt-5' }] })
-    expect(JSON.parse(await readFile(join(uniqueDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))).toEqual({ explore: [{ model: 'openai/gpt-5' }] })
+    expect(JSON.parse(await readFile(join(uniqueDir, 'pipiui-subagent-models-runtime.json'), 'utf8'))).toEqual({ explore: { models: [{ model: 'openai/gpt-5' }], automatic: true } })
 
     const ambiguousDir = join(root, 'ambiguous')
     await mkdir(ambiguousDir, { recursive: true })

@@ -75,6 +75,7 @@ import {
 	claimProgressLogReport,
 	consumeProgressLogExcerpt,
 	formatProgressLogReport,
+	formatProgressLogEvidence,
 	formatProgressLogRetargetReceipt,
 	describeProgressChannelForStall,
 	progressIdleMs,
@@ -229,7 +230,9 @@ import {
 	formatStallAbortReason,
 	formatStallMessage,
 	planHeldSignalFlush,
+	queueHeldSignalNotification,
 } from "./stall-notification.ts";
+import { cutInHoldActive as readCutInHoldActive, releaseCutInHold as releaseLegacyCutInHold } from "./cut-in-hold.ts";
 import {
 	contextAboveIdleFoldWatermark,
 	createIdleFoldRegistry,
@@ -1179,47 +1182,26 @@ async function awaitTerminalPipiuiReports(
 	if (outcome.status === "timeout") abandonPipiuiReports(agentId, meta?.run);
 }
 
-// ---- Cut-in hold：GUI「插队」后，批量 join 的用户消息必须先进入 turn ----
-// Swift（ChatSession.cutInQueueHead）在插队时写 marker 文件，joined prompt 发出后删除。
-// 扩展见到新鲜 marker 时暂缓所有自动 followUp 投递（done/stall/heartbeat 都经
-// trySendUserMessage），让 cut-in prompt 先赢下一个 turn；信号只晚一个 turn，绝不丢。
-// 兜底释放：marker 超过 15s（Swift 崩溃 / 未发出）自动失效，或 input 事件见到真实
-// 用户消息进 turn 时提前删除。
-const PIPIUI_CUTIN_HOLD_MS = 15_000;
+// Electron projects pending user input here before queue delivery. Automatic
+// notifications wait outside Pi until the host FIFO drains. Legacy timestamp-only
+// cut-in markers still expire after 15s; host-owned markers last for the live queue.
 const PIPIUI_CUTIN_HOLD_FILE = PIPIUI_SESSION
 	? path.join(os.tmpdir(), `pipiui-cutin-${PIPIUI_SESSION}.json`)
 	: null;
 
 function cutInHoldActive(): boolean {
-	if (!PIPIUI_CUTIN_HOLD_FILE) return false;
-	try {
-		const raw = JSON.parse(fs.readFileSync(PIPIUI_CUTIN_HOLD_FILE, "utf-8")) as { at?: unknown };
-		if (typeof raw.at !== "number") return false;
-		return Date.now() - raw.at < PIPIUI_CUTIN_HOLD_MS;
-	} catch {
-		return false;
-	}
+	return readCutInHoldActive(PIPIUI_CUTIN_HOLD_FILE);
 }
 
-/** Release the hold: called on a real user turn start; also clears stale markers. */
 function releaseCutInHold(): void {
-	if (!PIPIUI_CUTIN_HOLD_FILE) return;
-	try {
-		fs.unlinkSync(PIPIUI_CUTIN_HOLD_FILE);
-	} catch {
-		/* already gone */
-	}
+	releaseLegacyCutInHold(PIPIUI_CUTIN_HOLD_FILE);
 }
 
-/** Block automatic delivery while a fresh cut-in hold marker exists (≤15s fallback). */
+/** Never time out a live host queue; shutdown/stop must still cancel pending waits. */
 async function awaitCutInHoldRelease(): Promise<void> {
-	if (!PIPIUI_CUTIN_HOLD_FILE || !cutInHoldActive()) return;
-	const deadline = Date.now() + PIPIUI_CUTIN_HOLD_MS + 2_000;
+	const generation = watchSessionGeneration;
 	while (cutInHoldActive()) {
-		if (Date.now() >= deadline) {
-			releaseCutInHold();
-			return;
-		}
+		if (hostStopQuiet || generation !== watchSessionGeneration) return;
 		await new Promise((resolve) => setTimeout(resolve, 200));
 	}
 }
@@ -1566,14 +1548,16 @@ interface SubagentModelOverride {
 interface SubagentModelChain {
 	/** Ordered fallback chain; index 0 is the primary model. Never empty. */
 	models: SubagentModelOverride[];
+	/** Boss selects a per-dispatch pin from multi-model candidates; absent settings default on. */
+	automatic: boolean;
 }
 
 /**
- * Parse one agent override value into an ordered model chain. All three shapes are
- * compatible (must stay parse-compatible with the Swift side):
+ * Parse one agent override value into an ordered model chain. Legacy shapes remain
+ * compatible with the runtime wrapper:
  * 1. legacy string `"provider/id"` → chain = [{ model }]
  * 2. `{ model, thinking? }` → chain = [{ model, thinking? }]
- * 3. `{ models: [{ model, thinking? }, ...] }` → ordered chain (invalid entries skipped)
+ * 3. `{ models: [{ model, thinking? }, ...], automatic? }` or an entry array → ordered chain (invalid entries skipped)
  * Returns an empty array when nothing parseable — caller falls back to the main model.
  */
 function parseSubagentModelChain(value: unknown): SubagentModelOverride[] {
@@ -1590,8 +1574,7 @@ function parseSubagentModelChain(value: unknown): SubagentModelOverride[] {
 	if (typeof value === "string" && value.trim()) {
 		return [{ model: value.trim() }];
 	}
-	// Electron persists each role as the ordered chain itself. Keep this canonical
-	// shape alongside Swift's legacy single entry and `{ models: [...] }` wrapper.
+	// Keep legacy entry arrays alongside single entries and the runtime `{ models }` wrapper.
 	if (Array.isArray(value)) {
 		return value.flatMap((item) => {
 			if (!item || typeof item !== "object" || Array.isArray(item)) return [];
@@ -1617,11 +1600,11 @@ function parseSubagentModelChain(value: unknown): SubagentModelOverride[] {
 	return [];
 }
 
-/** Hot-read PipiUI settings JSON (UserDefaults mirror). Missing / empty = follow main.
+/** Hot-read PipiUI runtime settings JSON. Missing / empty = follow main.
  *
- * Legacy values are model strings; newer values are `{ model, thinking? }` or an ordered
- * fallback chain `{ models: [...] }`. Normalizing all shapes here lets a running extension
- * immediately see settings saved by the app.
+ * Legacy values are model strings, `{ model, thinking? }`, arrays or `{ models: [...] }`.
+ * The current wrapper adds `automatic`; only explicit false disables Boss selection.
+ * Normalizing here lets a running extension immediately see settings saved by the app.
  */
 function loadSubagentModelOverrides(): Record<string, SubagentModelChain> {
 	const files = Array.from(new Set([
@@ -1637,7 +1620,11 @@ function loadSubagentModelOverrides(): Record<string, SubagentModelChain> {
 			const result: Record<string, SubagentModelChain> = {};
 			for (const [agentName, value] of Object.entries(parsed)) {
 				const chain = parseSubagentModelChain(value);
-				if (chain.length > 0) result[agentName] = { models: chain };
+				if (chain.length > 0) result[agentName] = {
+					models: chain,
+					automatic: !(value && typeof value === "object" && !Array.isArray(value)
+						&& (value as { automatic?: unknown }).automatic === false),
+				};
 			}
 			return result;
 		}
@@ -2145,16 +2132,21 @@ export function formatSubagentModelRoutingBlock(): string | null {
 
 	const followMain = loadMainModelFile() || process.env.PIPIUI_MAIN_MODEL;
 	const routes = names.map((name) => {
-		const configured = overrides[name]?.models;
+		const override = overrides[name];
+		const configured = override?.models;
 		const agent = byName.get(name);
 		const fallbackModel = followMain || agent?.model;
 		const entries = configured ?? (fallbackModel
 			? [{ model: fallbackModel, thinking: undefined }]
 			: []);
+		if (override?.automatic && entries.length > 1) {
+			const candidates = entries.map((entry, index) => `${index + 1}. ${formatRoutingCandidate(entry, catalog)}`).join("; ");
+			return `- ${name} (automatic): MUST choose one model ONLY from this role's candidates based on task complexity, capability needs, and speed/cost; pass its exact provider/modelId as dispatch \`model\`. If suitability is indistinguishable, choose candidate 1. Candidates: ${candidates}`;
+		}
 		const chain = entries.length > 0
 			? entries.map((entry) => formatRoutingCandidate(entry, catalog)).join(" -> ")
 			: "unresolved";
-		return `- ${name}${configured ? "" : " (follow-main)"}: ${chain}`;
+		return `- ${name}${configured ? (override?.automatic === false ? " (automatic off)" : "") : " (follow-main)"}: omit \`model\` to use normal ordered primary/fallback resolution: ${chain}`;
 	});
 	// Boss-visible model pins must come from the one canonical host catalog (already filtered
 	// by the user's hidden-model choices). Bounded so the per-turn prompt stays affordable.
@@ -2169,7 +2161,8 @@ export function formatSubagentModelRoutingBlock(): string | null {
 		: [];
 	return [
 		"[Subagent model routing — hot-read]",
-		"Optional task `thinking` is available on single, tasks[], and chain. Optional per-dispatch `model` overrides only that ONE dispatch and never changes user/role settings; omit `model` to follow the normal resolution above. A pinned model is checked against the Host's authoritative catalog at dispatch time — unavailable models are rejected loudly, never silently replaced. This list is a display cache and may briefly lag that authority.",
+		"Optional task `thinking` is available on single, tasks[], and chain. Per-dispatch `model` overrides only that ONE dispatch and never changes user/role settings. Automatic multi-candidate roles require a pin as directed below; otherwise omit `model` to follow normal resolution. A pinned model is checked against the Host's authoritative catalog at dispatch time — unavailable models are rejected loudly, never silently replaced. This list is a display cache and may briefly lag that authority.",
+		"Automatic selection uses only the selected role's candidates, NOT the full Available models catalog. Keep task complexity judgments internal; do not output formal difficulty labels to the user. A pin never advances the role fallback chain on failure: only existing same-model recovery retries apply, then report failure.",
 		"Priority without `model`: role settings primary/fallback chain → current session/main model → agent frontmatter. Never inherit Boss thinking.",
 		...modelLines,
 		"Priority for task thinking > current candidate set thinking > omit --thinking. On fallback, carry task thinking only when catalog explicitly allows it; otherwise use that fallback set thinking/default. `allow=?` or a trailing `?` means capability unknown.",
@@ -2835,8 +2828,12 @@ function deliverPendingBossQuestions(agentId: string, runId: string, dir: string
 		if (!handle) continue;
 		deliveredBossQuestions.add(key);
 		const text = formatQuestionForBoss(question, { workerName: handle.name, timeoutMs: resolveAskBossTimeoutMs() });
-		void sendUserMessageAfterCutIn(pi, text).then((ok) => {
-			// Not delivered (host-stop quiet, cut-in hold): let the watchdog tick try again.
+		void awaitCutInHoldRelease().then(() => {
+			// Keep questions separate, but never let them overtake queued user input.
+			// The worker may have timed out or received a reply while the host queue drained.
+			if (!handleForRun(agentId, runId) || !pendingQuestions(dir).some(item => item.id === question.id)) return false;
+			return sendUserMessageAfterCutIn(pi, text);
+		}).then((ok) => {
 			if (!ok) deliveredBossQuestions.delete(key);
 		});
 	}
@@ -4671,6 +4668,12 @@ function formatJobsStatus(opts: { agentId?: string; onlyRunning?: boolean; full?
 							? `last grew ${formatElapsedMs(now - live.lastProgressLogAt)} ago`
 							: "no growth seen yet"
 					}`,
+					formatProgressLogEvidence({
+						path: live.progressLogPath,
+						now,
+						...(live.lastProgressLogAt !== undefined ? { lastProgressLogAt: live.lastProgressLogAt } : {}),
+						tail: readProgressLogTail({ path: live.progressLogPath }),
+					}),
 				);
 			} else if (live?.progressLogEligible) {
 				lines.push(
@@ -5477,7 +5480,7 @@ async function sendUserMessageAfterCutIn(
 	// session. They are dropped for this cycle; the boss can still see every job
 	// state through subagent_status and the Subagents panel.
 	if (hostStopQuiet) return false;
-	if (!admitOrHoldRuntimeSignal(text, shouldSend)) return false;
+	if (!admitOrHoldRuntimeSignal(text, shouldSend, pi)) return false;
 	// A resolved episode may have been queued behind the cut-in hold. Re-check immediately
 	// before each actual send so resolve can suppress that stale reminder.
 	if (shouldSend && !shouldSend()) return false;
@@ -5840,7 +5843,7 @@ export const __doneLifecycleForTests = {
 };
 export const __watchRuntimeForTests = {
 	get bossTurnBusy(): boolean { return bossTurnBusy; },
-	set bossTurnBusy(value: boolean) { bossTurnBusy = value; watchBossSendInFlight = false; },
+	set bossTurnBusy(value: boolean) { bossTurnBusy = value; watchBossSendInFlight = false; runtimeSignalBatchInFlight = false; clearHeldRuntimeRetry(); },
 	get heldSignals() { return heldRuntimeSignals; },
 	flushHeldSignals: flushHeldRuntimeSignals,
 	sendUserMessage: sendUserMessageAfterCutIn,
@@ -5912,6 +5915,7 @@ let hostStopQuiet = false;
 /** True between before_agent_start and agent_settled. Signals must not enter Pi's follow-up queue while this is set. */
 let bossTurnBusy = false;
 let watchBossSendInFlight = false;
+let runtimeSignalBatchInFlight = false;
 
 /**
  * True while a wake this extension queued still sits unconsumed in Pi's
@@ -5931,11 +5935,31 @@ function bossWakeQueued(exceptObligationId?: string): boolean {
 
 /** Any Boss-facing automatic message is blocked by a live turn and by an unconsumed wake alike. */
 function bossDeliveryActivity(): SessionActivity {
-	return sessionActivity({ quiet: hostStopQuiet, busy: bossTurnBusy || bossWakeQueued() });
+	return sessionActivity({ quiet: hostStopQuiet, busy: bossTurnBusy || bossWakeQueued() || runtimeSignalBatchInFlight || cutInHoldActive() });
 }
 
 type HeldRuntimeSignal = { text: string; shouldSend?: () => boolean };
 const heldRuntimeSignals: HeldRuntimeSignal[] = [];
+let heldRuntimeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clearHeldRuntimeRetry(): void {
+	if (heldRuntimeRetryTimer) clearTimeout(heldRuntimeRetryTimer);
+	heldRuntimeRetryTimer = undefined;
+}
+
+/** Marker removal and rejected sends need a wake source even when no new turn settles. */
+function scheduleHeldRuntimeRetry(pi: ExtensionAPI): void {
+	if (heldRuntimeRetryTimer || hostStopQuiet || bossTurnBusy || runtimeSignalBatchInFlight) return;
+	if (heldRuntimeSignals.length === 0 && ![...pendingDone.values()].some(entry => entry.holdSince !== undefined)) return;
+	const generation = watchSessionGeneration;
+	heldRuntimeRetryTimer = setTimeout(() => {
+		heldRuntimeRetryTimer = undefined;
+		if (generation !== watchSessionGeneration) return;
+		retryPendingDoneAfterSessionSettled(pi);
+		flushHeldRuntimeSignals(pi);
+	}, 250);
+	heldRuntimeRetryTimer.unref?.();
+}
 
 function releaseHostStopQuiet(pi: ExtensionAPI | undefined): void {
 	if (!hostStopQuiet) return;
@@ -5968,7 +5992,7 @@ function reminderOpenForSignal(text: string): boolean {
 	return Boolean(job && !isHandledJob(job) && isInterruptedReminderState(job.state));
 }
 
-function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boolean {
+function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean, pi?: ExtensionAPI): boolean {
 	if (shouldSend && !shouldSend()) return false;
 	const kind = classifyRuntimeSignal(text);
 	if (!kind) return true;
@@ -5991,12 +6015,16 @@ function admitOrHoldRuntimeSignal(text: string, shouldSend?: () => boolean): boo
 		const index = heldRuntimeSignals.findIndex(entry => runtimeSignalKey(entry.text) === key);
 		if (index >= 0) heldRuntimeSignals[index] = { text, shouldSend };
 		else heldRuntimeSignals.push({ text, shouldSend });
+		if (pi) scheduleHeldRuntimeRetry(pi);
 	}
 	return false;
 }
 
 function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
-	if (bossDeliveryActivity() !== "idle") return;
+	if (bossDeliveryActivity() !== "idle") {
+		scheduleHeldRuntimeRetry(pi);
+		return;
+	}
 	const held = heldRuntimeSignals.splice(0).filter((entry) => !entry.shouldSend || entry.shouldSend());
 	const byText = new Map(held.map((entry) => [entry.text, entry]));
 	const plan = planHeldSignalFlush({
@@ -6017,16 +6045,27 @@ function flushHeldRuntimeSignals(pi: ExtensionAPI): void {
 		}
 	}
 	const deliver = plan.deliver;
-	if (!deliver) return;
-	const shouldSend = byText.get(deliver.text)?.shouldSend;
-	if (shouldSend && !shouldSend()) return;
-	if (deliver.channel === "stall-wake") {
-		void deliverStallWake(pi, deliver.text).then((ok) => {
-			if (deliver.confirmsStallDelivery) confirmStallDelivery(deliver.text, ok);
-		});
+	if (!deliver) {
+		scheduleHeldRuntimeRetry(pi);
 		return;
 	}
-	void trySendUserMessage(pi, deliver.text, shouldSend);
+	// Every held signal already passed Supervisor admission. Re-routing a joined
+	// string would classify only its first member and lose the others' identities.
+	// Reserve before the fire-and-forget API: a sibling flush must not claim a turn.
+	runtimeSignalBatchInFlight = true;
+	const queued = queueHeldSignalNotification(pi, deliver);
+	if (deliver.confirmsStallDelivery) confirmStallDelivery(deliver.text, queued);
+	if (!queued) {
+		runtimeSignalBatchInFlight = false;
+		for (const signal of deliver.signals) {
+			const entry = byText.get(signal.text);
+			if (entry && (!entry.shouldSend || entry.shouldSend())
+				&& !heldRuntimeSignals.some(item => runtimeSignalKey(item.text) === runtimeSignalKey(entry.text))) {
+				heldRuntimeSignals.push(entry);
+			}
+		}
+		scheduleHeldRuntimeRetry(pi);
+	}
 }
 
 /** Stall/recovery must wake a settled Boss; sendUserMessage(followUp) only queues. */
@@ -6043,7 +6082,7 @@ async function deliverStallWakeToBoss(pi: ExtensionAPI, text: string): Promise<b
 	return deliverStallWakeThrough(pi, text, {
 		quiet: () => hostStopQuiet,
 		waitForCutIn: awaitCutInHoldRelease,
-		admit: admitOrHoldRuntimeSignal,
+		admit: (signal) => admitOrHoldRuntimeSignal(signal, undefined, pi),
 	});
 }
 
@@ -6125,7 +6164,7 @@ function sendDoneWithConfirmation(
 	// just-idle settle flush which must send every sibling before the first
 	// receipt flips bossTurnBusy and would otherwise stall the rest.
 	const held = holdConfirmedDoneDelivery(
-		{ quiet: hostStopQuiet, busy: bossTurnBusy, wakeOutstanding: bossWakeQueued(obligation.id) },
+		{ quiet: hostStopQuiet, busy: bossTurnBusy, wakeOutstanding: bossWakeQueued(obligation.id) || runtimeSignalBatchInFlight || cutInHoldActive() },
 		options,
 	);
 	if (held) {
@@ -6139,6 +6178,7 @@ function sendDoneWithConfirmation(
 				elapsedMs: 0,
 			});
 		}
+		scheduleHeldRuntimeRetry(pi);
 		return Promise.resolve(false);
 	}
 	if (entry.holdSince !== undefined) {
@@ -6222,7 +6262,7 @@ function sendDoneWithConfirmation(
 			waitForCutIn: doneDeliverCutInOverride ?? awaitCutInHoldRelease,
 			currentSessionId: () => doneDeliveryPiSessionId,
 			shouldSend: () => {
-				if (pendingDone.get(obligation.id) !== entry) return false;
+				if (hostStopQuiet || pendingDone.get(obligation.id) !== entry) return false;
 				const current = obligation.id.startsWith("volatile-")
 					? volatileBossAlarmStore.read(obligation.id)
 					: doneDeliveryStore?.read(obligation.id);
@@ -9805,7 +9845,7 @@ const FRESH_DESCRIPTION =
 const FORK_DESCRIPTION =
 	"Start this worker from a copy of THIS session's conversation instead of cold, so it already knows what you know and the prompt can be a directive rather than a briefing. A fork runs your own model. Use it when restating the background would take more than a paragraph, or when the worker must judge what the user actually wants. Do NOT use it for reviewer/explore/plan (their value is the cold start, and it is refused), nor when you can already write a complete brief — a cold worker with precise file:line anchors is cheaper and no less correct.";
 const MODEL_PARAM_DESCRIPTION =
-	'Optional exact model for THIS dispatch only, as a stable `provider/modelId` string (e.g. "openai/gpt-5", never a bare model id). It must exactly match one entry of the Available models list in your system prompt — unavailable or user-hidden models are rejected with an error, never silently replaced by a default. Omit it to follow the normal resolution (user role settings → current session/main model → agent frontmatter). A pin is never persisted and does not affect any later dispatch.';
+	'Exact model pin for THIS dispatch only, as a stable `provider/modelId` string (e.g. "openai/gpt-5", never a bare model id). For an automatic multi-candidate role in the hot-read routing block, choose ONLY from that role\'s candidates by task complexity, capability needs, and speed/cost; pass the chosen model here (candidate 1 if indistinguishable). Do not use the full Available models catalog as the automatic candidate pool. When automatic is off or there is only one candidate, omit model for normal resolution (user role settings primary/fallback → current session/main model → agent frontmatter). Pins are checked against the Host authoritative catalog; unavailable or user-hidden models are rejected, never silently replaced. A pin is never persisted, affects no later dispatch, and never advances the fallback chain on failure; only existing same-model recovery retries apply.';
 const BLOCKED_BY_DESCRIPTION =
 	'Optional dependency tags (task/agentId short names this task depends on), e.g. ["tldr-done-report"]. The runtime queue holds this task until every named agent succeeds; a failed or never-dispatched dependency holds the item and reports [subagent-blocked] instead of starting it.';
 const SCOPE_DESCRIPTION =
@@ -10332,6 +10372,8 @@ export default function (pi: ExtensionAPI) {
 		watchSessionShutdownAbort = new AbortController();
 		watchRegistry.clear();
 		watchBossSendInFlight = false;
+		runtimeSignalBatchInFlight = false;
+		clearHeldRuntimeRetry();
 		const residentRpcWakeToken = PIPIUI_RESIDENT_RPC_WAKE_TOKEN;
 		if (nestedBackgroundLifecycle && residentRpcWakeToken) {
 			residentParentShutdown = () => {
@@ -10409,6 +10451,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_settled", (_event, ctx) => {
 		bossTurnBusy = false;
 		watchBossSendInFlight = false;
+		runtimeSignalBatchInFlight = false;
 		const piSessionId = ctx.sessionManager.getSessionId().trim();
 		reconcilePersistedDone(piSessionId, ctx.sessionManager.getBranch());
 		retryPendingDoneAfterSessionSettled(pi);
@@ -10578,6 +10621,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("before_agent_start", (event) => {
 		bossTurnBusy = true;
 		watchBossSendInFlight = false;
+		runtimeSignalBatchInFlight = false;
+		clearHeldRuntimeRetry();
 		nestedBackgroundLifecycle?.noteActive();
 		// A new turn is a new wave: last turn's briefs are not the ones this one repeats.
 		turnDispatchedBriefs.length = 0;

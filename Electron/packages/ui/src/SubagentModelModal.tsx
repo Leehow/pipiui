@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { thinkingLevelsForModel } from '@pipi/host-api'
-import type { AgentDefinition, Model, PipiHostAPI, SubagentDebugInfo, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
+import type { AgentDefinition, Model, PipiHostAPI, SubagentDebugInfo, SubagentModelAutoSelection, SubagentModelSetting, ThinkingLevel } from '@pipi/host-api'
 import {
   agentAvailabilityLabel,
   agentSourceLabel,
@@ -19,7 +19,7 @@ import { SubagentDebugView } from './SubagentDebugView'
 import type { ModelVisibilityController } from './useModelVisibility'
 import './subagent-models.css'
 
-/** Per-role ordered model fallback editor, mirroring Swift Settings > Subagent. */
+/** Per-role automatic candidates or ordered model fallback editor. */
 export function SubagentModelModal({ host, current, visibility, onClose, projectId, sessionId }: {
   host: PipiHostAPI
   current: Model | null
@@ -34,6 +34,8 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   const [available, setAvailable] = useState(hostMethodsPresent)
   const [agents, setAgents] = useState<AgentDefinition[]>([])
   const [settings, setSettings] = useState<Record<string, SubagentModelSetting[]>>({})
+  const [autoSelection, setAutoSelection] = useState<SubagentModelAutoSelection>({})
+  const [autoAvailable, setAutoAvailable] = useState(false)
   const [memoryReviewModel, setMemoryReviewModel] = useState<string | null>(null)
   const [memoryAvailable, setMemoryAvailable] = useState(memoryMethodsPresent)
   const [loading, setLoading] = useState(hostMethodsPresent)
@@ -92,6 +94,22 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
   }, [host, projectId])
 
   useEffect(() => {
+    setAutoAvailable(false)
+    if (!host.getSubagentModelAutoSelection || !host.setSubagentModelAutoSelection) return
+    let active = true
+    void host.getSubagentModelAutoSelection().then(value => {
+      if (!active) return
+      setAutoSelection(value)
+      setAutoAvailable(true)
+    }).catch(() => {
+      // Older IPC hosts can expose the optional method but reject its invocation.
+      // Keep the existing model-chain editor usable in that case.
+      if (active) setAutoAvailable(false)
+    })
+    return () => { active = false }
+  }, [host])
+
+  useEffect(() => {
     if (!host.getMemoryReviewModel || !host.setMemoryReviewModel) return
     let active = true
     void host.getMemoryReviewModel().then(value => {
@@ -135,6 +153,19 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
     }
   }
 
+  const saveAutoSelection = async (agentName: string, enabled: boolean) => {
+    if (!host.setSubagentModelAutoSelection) return
+    setSaving(agentName)
+    setError(null)
+    try {
+      setAutoSelection(await host.setSubagentModelAutoSelection(agentName, enabled))
+    } catch (err) {
+      setError(`保存失败：${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setSaving(null)
+    }
+  }
+
   const saveMemoryReview = async (model: string) => {
     if (!host.setMemoryReviewModel) return
     setSaving('memory-review')
@@ -154,7 +185,7 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
         <header className="subagent-modal-header">
           <div>
             <h2>{mode === 'debug' ? 'Subagent Debug' : 'Subagent 模型'}</h2>
-            <p>{mode === 'debug' ? '查看 Boss 与各个 Subagent 实际可见的工具、Skills 和中文说明。' : '默认「跟随主 Agent」= 底栏当前模型；可为每类 subagent 指定模型、思考强度与有序 fallback 链。'}</p>
+            <p>{mode === 'debug' ? '查看 Boss 与各个 Subagent 实际可见的工具、Skills 和中文说明。' : '默认「跟随主 Agent」= 底栏当前模型；可为每类 subagent 指定模型、思考强度，以及多模型自动选择或有序 fallback。'}</p>
           </div>
           <button type="button" className="subagent-debug-toggle" aria-pressed={mode === 'debug'} onClick={() => setMode(value => value === 'debug' ? 'models' : 'debug')}>{mode === 'debug' ? '模型设置' : 'Debug'}</button>
           <button className="subagent-modal-close" aria-label={mode === 'debug' ? '关闭 Subagent Debug' : '关闭 Subagent 模型'} onClick={onClose}>×</button>
@@ -218,9 +249,9 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
             </div>}
             {generalAgents.length > 0 && <section className="subagent-agent-group" aria-labelledby="general-subagent-models-heading">
               <div className="subagent-agent-group-heading"><h3 id="general-subagent-models-heading">通用 Subagents</h3><span>PipiUI 内置与用户安装</span></div>
-              {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
+              {generalAgents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} automatic={autoSelection[agent.name] !== false} onSaveAutomatic={autoAvailable ? saveAutoSelection : undefined} models={candidateModels} saving={saving === agent.name} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />)}
             </section>}
-            <ProjectSubagentGroup agents={projectAgents} settings={settings} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
+            <ProjectSubagentGroup agents={projectAgents} settings={settings} autoSelection={autoSelection} onSaveAutomatic={autoAvailable ? saveAutoSelection : undefined} models={candidateModels} saving={saving} dismissed={dismissedDiagnostics} onDismiss={setDismissedDiagnostics} onSave={save} />
             {error && <div className="subagent-modal-error" role="alert"><span>{error}</span><button type="button" aria-label="关闭 Subagent 模型错误" onClick={() => setError(null)}>×</button></div>}
           </div>
         )}
@@ -232,6 +263,8 @@ export function SubagentModelModal({ host, current, visibility, onClose, project
 function ProjectSubagentGroup({
   agents,
   settings,
+  autoSelection,
+  onSaveAutomatic,
   models,
   saving,
   dismissed,
@@ -240,6 +273,8 @@ function ProjectSubagentGroup({
 }: {
   agents: AgentDefinition[]
   settings: Record<string, SubagentModelSetting[]>
+  autoSelection: SubagentModelAutoSelection
+  onSaveAutomatic?: (agentName: string, enabled: boolean) => Promise<void>
   models: Model[]
   saving: string | null
   dismissed: Set<string>
@@ -266,15 +301,17 @@ function ProjectSubagentGroup({
         <b aria-hidden="true">{open ? '⌃' : '⌄'}</b>
       </button>
       {open && <div id="project-subagent-models">
-        {agents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} models={models} saving={saving === agent.name} dismissed={dismissed} onDismiss={onDismiss} onSave={onSave} hideProjectSource />)}
+        {agents.map(agent => <AgentRow key={agent.name} agent={agent} chain={settings[agent.name] ?? []} automatic={autoSelection[agent.name] !== false} onSaveAutomatic={onSaveAutomatic} models={models} saving={saving === agent.name} dismissed={dismissed} onDismiss={onDismiss} onSave={onSave} hideProjectSource />)}
       </div>}
     </section>
   )
 }
 
-function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, hideProjectSource }: {
+function AgentRow({ agent, chain, automatic, onSaveAutomatic, models, saving, dismissed, onDismiss, onSave, hideProjectSource }: {
   agent: AgentDefinition
   chain: SubagentModelSetting[]
+  automatic: boolean
+  onSaveAutomatic?: (agentName: string, enabled: boolean) => Promise<void>
   models: Model[]
   saving: boolean
   dismissed: Set<string>
@@ -340,11 +377,13 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
   }
   const clearDrag = () => { setDragging(null); setDragOver(null) }
   const reorderable = chain.length > 1
+  const automaticMode = reorderable && !!onSaveAutomatic && automatic
 
   return (
     <article className={`subagent-agent-row${unavailable ? ' subagent-agent-unavailable' : ''}`} data-testid={`subagent-agent-${agent.name}`}>
-      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{sourceLabel && <span data-testid={`subagent-source-${agent.name}`}>{sourceLabel}</span>}{availabilityLabel && <span className="subagent-agent-status" data-testid={`subagent-status-${agent.name}`}>{availabilityLabel}</span>}{chain.length > 1 && <span>fallback ×{chain.length}</span>}</div>
+      <div className="subagent-agent-heading"><strong>{agent.name}</strong>{sourceLabel && <span data-testid={`subagent-source-${agent.name}`}>{sourceLabel}</span>}{availabilityLabel && <span className="subagent-agent-status" data-testid={`subagent-status-${agent.name}`}>{availabilityLabel}</span>}{reorderable && <span>{automaticMode ? '候选' : 'fallback'} ×{chain.length}</span>}{reorderable && onSaveAutomatic && <label className="subagent-auto-selection"><input type="checkbox" role="switch" aria-label={`${agent.name} 自动选择`} checked={automatic} disabled={saving} onChange={event => { void onSaveAutomatic(agent.name, event.target.checked) }} />自动选择</label>}</div>
       <p>{agent.description}</p>
+      {reorderable && onSaveAutomatic && <p className="subagent-auto-help">自动模式由 Boss 按任务复杂度与能力需求，为单次任务固定一个候选（model pin）；pin 失败不会静默换模。关闭自动后才使用主选 → 备用的顺序 fallback。可拖拽调整顺序；适配度相同时优先候选 1。</p>}
       {agent.permissionSummary && <p className="subagent-agent-permissions" data-testid={`subagent-permissions-${agent.name}`}>{agent.permissionSummary}</p>}
       {agent.patches && agent.patches.length > 0 && <p className="subagent-agent-patches" data-testid={`subagent-patches-${agent.name}`}>{agent.patches.map(patch => `${patch.extensionId} · ${formatPatchOperations(patch)}`).join('; ')}</p>}
       {ownDiagnostics.length > 0 && <div className="subagent-agent-diagnostics" data-testid={`subagent-diagnostics-${agent.name}`}>
@@ -360,7 +399,7 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
         const selected = findModel(entry.model)
         const thinkingLevels = selected ? thinkingLevelsForModel(selected) : []
         const selectedThinking = thinkingLevels.includes(entry.thinking as ThinkingLevel) ? entry.thinking : ''
-        const entryLabel = index === 0 ? '主选' : `备用 ${index}`
+        const entryLabel = automaticMode ? `候选 ${index + 1}` : index === 0 ? '主选' : `备用 ${index}`
         return (
           <div
             className={`subagent-chain-row${reorderable ? ' reorderable' : ''}${dragging === index ? ' dragging' : ''}${dragOver === index && dragging !== null && dragging !== index ? ' drag-over' : ''}`}
@@ -382,7 +421,7 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
             {(index > 0 || chain.length > 1) && <div className="subagent-chain-label"><span>{entryLabel}</span><span className="subagent-chain-actions">{reorderable && <>
               <button type="button" className="subagent-move-btn" aria-label={`上移 ${agent.name} ${entryLabel}`} title={`上移 ${agent.name} ${entryLabel}`} disabled={saving || index === 0} onClick={() => move(index, index - 1)}>↑</button>
               <button type="button" className="subagent-move-btn" aria-label={`下移 ${agent.name} ${entryLabel}`} title={`下移 ${agent.name} ${entryLabel}`} disabled={saving || index === chain.length - 1} onClick={() => move(index, index + 1)}>↓</button>
-            </>}{reorderable && <button type="button" aria-label={`移除 ${agent.name} 备用模型 ${index}`} disabled={saving} onClick={() => remove(index)}>删除</button>}</span></div>}
+            </>}{reorderable && <button type="button" aria-label={automaticMode ? `移除 ${agent.name} 候选模型 ${index + 1}` : `移除 ${agent.name} 备用模型 ${index}`} disabled={saving} onClick={() => remove(index)}>删除</button>}</span></div>}
             {reorderable && <span
               className="subagent-drag-handle"
               draggable={!saving}
@@ -409,7 +448,7 @@ function AgentRow({ agent, chain, models, saving, dismissed, onDismiss, onSave, 
           </div>
         )
       })}
-      <button type="button" className="subagent-add-fallback" disabled={saving || !models.length} onClick={addFallback}>＋ 添加备用模型</button>
+      <button type="button" className="subagent-add-fallback" disabled={saving || !models.length} onClick={addFallback}>{automaticMode ? '＋ 添加候选模型' : '＋ 添加备用模型'}</button>
     </article>
   )
 }

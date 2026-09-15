@@ -142,7 +142,7 @@ describe("explicit sidebar project persistence", () => {
     });
   });
 
-  it("persists Computer Use and ordered subagent model chains without replacing other settings", async () => {
+  it("persists Computer Use, ordered subagent model chains, and automatic selection without replacing other settings", async () => {
     const fixture = await setup();
     const first = backend(fixture.agent, fixture.sessions);
     expect(await first.handle("getComputerUseState", [])).toEqual({ enabled: false });
@@ -150,6 +150,8 @@ describe("explicit sidebar project persistence", () => {
     expect(await first.handle("setSubagentModel", ["explore", [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }]])).toEqual({
       explore: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
+    expect(await first.handle("getSubagentModelAutoSelection", [])).toEqual({});
+    expect(await first.handle("setSubagentModelAutoSelection", ["explore", false])).toEqual({ explore: false });
     expect(await first.handle("listAgentDefinitions", [])).toEqual(expect.arrayContaining([
       expect.objectContaining({ name: "explore" }),
     ]));
@@ -163,6 +165,10 @@ describe("explicit sidebar project persistence", () => {
     expect(await fresh.handle("getSubagentModels", [])).toEqual({
       explore: [{ model: "openai/gpt-5", thinking: "high" }, { model: "anthropic/claude-sonnet-4", thinking: "medium" }],
     });
+    expect(await fresh.handle("getSubagentModelAutoSelection", [])).toEqual({ explore: false });
+    expect(await fresh.handle("setSubagentModelAutoSelection", ["explore", true])).toEqual({});
+    const settings = JSON.parse(await readFile(join(fixture.agent, "pipiui-settings.json"), "utf8"));
+    expect(settings.subagentModelAutoSelection).toBeUndefined();
   });
 
   it("persists a provider-qualified Hermes review model and clears back to follow-main", async () => {

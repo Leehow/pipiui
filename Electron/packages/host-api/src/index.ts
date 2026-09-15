@@ -227,7 +227,7 @@ export type Model = {
   thinkingLevelMap?: ThinkingLevelMap;
   /** Semantic result of Pi API/compat metadata. Absent means configurability is unknown. */
   thinkingConfigurable?: boolean;
-  /** Mirrors Swift ModelInfo.supportsImages (pi input array or heuristic). Absent = unknown (defaults to supported). */
+  /** Image attachments. Absent = unknown (defaults to supported). Opt-out: only known text-only SKUs are false. */
   supportsImages?: boolean;
   /** Declared hosted-tool capabilities. Absent = none declared. */
   capabilities?: ModelCapabilities;
@@ -285,6 +285,8 @@ export function resolveThinkingLevel(
 }
 /** Ordered subagent fallback entry. New selections persist `model` as full `provider/modelId`; an empty chain means “follow main Agent”. */
 export type SubagentModelSetting = { model: string; thinking?: string };
+/** Per-role automatic model-selection overrides. Missing means enabled for backward compatibility. */
+export type SubagentModelAutoSelection = Record<string, boolean>;
 /** Cross-renderer semantic sidebar state. Device-only disclosure/layout stays local. */
 export type SidebarSessionPreferences = {
   pinnedSessionIds: string[];
@@ -1314,6 +1316,9 @@ export interface PipiHostAPI {
   /** Optional per-role model fallback chains. Empty chain follows the main Agent model. */
   getSubagentModels?(): Promise<Record<string, SubagentModelSetting[]>>;
   setSubagentModel?(agentName: string, chain: SubagentModelSetting[]): Promise<Record<string, SubagentModelSetting[]>>;
+  /** Optional per-role automatic selection preference. Missing role entries mean enabled. */
+  getSubagentModelAutoSelection?(): Promise<SubagentModelAutoSelection>;
+  setSubagentModelAutoSelection?(agentName: string, enabled: boolean): Promise<SubagentModelAutoSelection>;
   /** Safe live Boss tool/Skill snapshot used by the Subagent Debug surface. */
   getSubagentDebugInfo?(sessionId?: string): Promise<SubagentDebugInfo>;
   /** Missing/null means Hermes resolves the active main model at review time. */
@@ -1658,6 +1663,8 @@ function apiFrom(
     setComputerUseEnabled: enabled => invoke("setComputerUseEnabled", enabled),
     getSubagentModels: () => invoke("getSubagentModels"),
     setSubagentModel: (agentName, chain) => invoke("setSubagentModel", agentName, chain),
+    getSubagentModelAutoSelection: () => invoke("getSubagentModelAutoSelection"),
+    setSubagentModelAutoSelection: (agentName, enabled) => invoke("setSubagentModelAutoSelection", agentName, enabled),
     getSubagentDebugInfo: sessionId => sessionId ? invoke("getSubagentDebugInfo", sessionId) : invoke("getSubagentDebugInfo"),
     getMemoryReviewModel: () => invoke("getMemoryReviewModel"),
     setMemoryReviewModel: (modelRef) => invoke("setMemoryReviewModel", modelRef),
