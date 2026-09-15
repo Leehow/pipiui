@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,17 +53,59 @@ async function fixture() {
   for (const id of ["s1", "s2"]) {
     await writeFile(join(directory, `${id}.jsonl`), JSON.stringify({ type: "session", version: 3, id, timestamp: "2026-08-10T00:00:00.000Z", cwd }) + "\n");
   }
+  const spawnKeys: string[] = [];
+  const commands: any[] = [];
   const create = () => createPiHostBackend({
     agentDir,
     sessionsRoot,
     runtimeRoot: root,
     piPath: process.execPath,
-    spawn: (_bin, _args, options) => spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as any,
+    spawn: (_bin, _args, options) => {
+      const sessionKey = options.env?.PIPIUI_SESSION_KEY;
+      if (sessionKey && !spawnKeys.includes(sessionKey)) spawnKeys.push(sessionKey);
+      const child = spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options);
+      const write = child.stdin!.write.bind(child.stdin!);
+      child.stdin!.write = ((chunk: any, ...args: any[]) => {
+        commands.push(JSON.parse(String(chunk)));
+        return (write as any)(chunk, ...args);
+      }) as any;
+      return child as any;
+    },
   });
-  return { agentDir, sessionsRoot, cwd, create };
+  const marker = (index = 0) => join(tmpdir(), `pipiui-cutin-${spawnKeys[index]}.json`);
+  return { agentDir, sessionsRoot, cwd, create, marker, commands };
 }
 
 describe("PiHostBackend message queue integration", () => {
+  it("projects real spawn keys synchronously, isolates sessions, and cleans reclaim/close", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    try {
+      await backend.handle("sendPrompt", ["s1", "__hold__"]);
+      const first = await backend.handle("enqueueMessage", ["s1", "user waiting"]) as any;
+      expect(JSON.parse(readFileSync(setup.marker(), "utf8"))).toMatchObject({ pendingUserInput: true, ownerPid: process.pid });
+      await backend.handle("sendPrompt", ["s2", "__hold__"]);
+      await backend.handle("enqueueMessage", ["s2", "other session"]);
+      expect(setup.marker(1)).not.toBe(setup.marker());
+      await backend.handle("removeQueuedMessage", ["s1", first.message.id]);
+      expect(existsSync(setup.marker())).toBe(false);
+      expect(existsSync(setup.marker(1))).toBe(true);
+      await backend.handle("enqueueMessage", ["s1", "__queue_fail__"]);
+      await (backend as any).queueIdle("s1");
+      await eventually(() => (backend as any).queue.listQueue("s1")[0]?.state === "failed");
+      expect(existsSync(setup.marker())).toBe(false);
+      // The failure left host-idle; first send reconciles the still-held Pi
+      // turn through steer, then the next ordinary send remains host-queued.
+      await backend.handle("enqueueMessage", ["s1", "reconcile live turn"]);
+      expect(await backend.handle("enqueueMessage", ["s1", "pending before reclaim"])).toMatchObject({ outcome: "queued" });
+      expect(existsSync(setup.marker())).toBe(true);
+      await (backend as any).teardownSessionRuntime("s1");
+      expect(existsSync(setup.marker())).toBe(false);
+      expect(existsSync(setup.marker(1))).toBe(true);
+    } finally { await backend.close(); }
+    expect(existsSync(setup.marker(1))).toBe(false);
+  });
+
   it("queues busy sends, emits snapshots, preserves attachments, and drains FIFO only after settle", async () => {
     const setup = await fixture();
     const backend = setup.create();
@@ -286,23 +329,56 @@ describe("PiHostBackend message queue integration", () => {
     await backend.close();
   });
 
-  it("does not surface already-processing when a stale settle drains into a live turn", async () => {
+  it.each(["lost", "echo", "fail", "slow"])("stale idle uses steer with receipt/requeue protection: %s", async mode => {
     const setup = await fixture();
     const backend = setup.create();
-    expect(await backend.handle("sendPrompt", ["s1", "__hold__"])).toMatchObject({ outcome: "direct" });
-    const queued = await backend.handle("enqueueMessage", ["s1", "hello after settle"]) as any;
-    expect(queued).toMatchObject({ outcome: "queued", message: { state: "queued" } });
+    const text = `__race_steer_${mode}__`;
+    const echoes: any[] = [];
+    backend.subscribe(event => { if (event.channel === "stream" && event.event.type === "user_message") echoes.push(event.event); });
+    try {
+      await backend.handle("sendPrompt", ["s1", "__hold__"]);
+      const queued = await backend.handle("enqueueMessage", ["s1", text]) as any;
+      expect(queued.outcome).toBe("queued");
+      expect(setup.commands.filter(command => command.message === text)).toEqual([]); // busy stays FIFO
+      const idle = (backend as any).queueIdle("s1");
+      await eventually(() => setup.commands.some(command => command.message === text && command.streamingBehavior === "steer"));
+      if (mode === "slow") {
+        expect(existsSync(setup.marker())).toBe(true); // sending holds too
+        await backend.handle("stop", ["s1"]); // restores source before late ack
+      }
+      await idle;
+      const attempts = setup.commands.filter(command => command.message === text);
+      expect(attempts).toHaveLength(2); // one rejected prompt, one steer; no followUp
+      expect(attempts[0]).toMatchObject({ type: "prompt" });
+      expect(attempts[0].streamingBehavior).toBeUndefined();
+      expect(attempts[1]).toMatchObject({ type: "prompt", streamingBehavior: "steer" });
+      if (mode === "echo") {
+        await eventually(() => echoes.some(event => event.content === text));
+        expect((backend as any).unconfirmedSteers.has("s1")).toBe(false);
+      }
+      if (mode !== "slow") await backend.handle("stop", ["s1"]);
+      await eventually(() => !(backend as any).queue.isBusy("s1"));
+      expect(await backend.handle("listQueue", ["s1"])).toEqual(mode === "echo" ? [] : [
+        expect.objectContaining({ text, state: mode === "fail" ? "failed" : "queued" }),
+      ]);
+      expect((backend as any).unconfirmedSteers.has("s1")).toBe(false);
+    } finally { await backend.close(); }
+  });
 
-    await (backend as any).queueIdle("s1");
-    await eventually(() => {
-      const items = (backend as any).queue.listQueue("s1");
-      return items.length === 0 || items.some((item: any) => item.state === "failed");
-    });
-
-    const items = await backend.handle("listQueue", ["s1"]) as any[];
-    expect(items.some(item => String(item.error ?? "").includes("already processing"))).toBe(false);
-    expect(items).toEqual([]);
-    await backend.close();
+  it("recycles a fallback that settles before its ack only after the source row leaves", async () => {
+    const setup = await fixture();
+    const backend = setup.create();
+    const text = "__race_steer_settle__";
+    try {
+      await backend.handle("sendPrompt", ["s1", "__hold__"]);
+      await backend.handle("enqueueMessage", ["s1", text]);
+      await (backend as any).queueIdle("s1");
+      await eventually(() => setup.commands.filter(command => command.message === text).length >= 3);
+      await eventually(() => !(backend as any).queue.isBusy("s1"));
+      expect(await backend.handle("listQueue", ["s1"])).toEqual([]);
+      expect(setup.commands.filter(command => command.message === text).map(command => command.streamingBehavior)).toEqual([undefined, "steer", undefined]);
+      expect((backend as any).unconfirmedSteers.has("s1")).toBe(false);
+    } finally { await backend.close(); }
   });
 
   it("streams a hidden-display subagent completion custom_message as user_message", async () => {

@@ -15,6 +15,7 @@ import {
 	formatBlockedMessage,
 	formatStallMessage,
 	planHeldSignalFlush,
+	queueHeldSignalNotification,
 } from "../stall-notification.ts";
 
 function emptyClaim(): StallNotifyState {
@@ -159,7 +160,48 @@ test("a stall signal takes the wake channel; anything else takes the user-messag
 	assert.equal(other.deliver?.channel, "user-message");
 });
 
-test("one flush delivers at most one signal and re-holds the rest in order", () => {
+test("ordinary backlog enters Pi as one message while keeping each signal intact", () => {
+	const held = ["[subagent-heartbeat] outstanding=2", "[subagent-watch] maps (地图)\nrunId=run-maps seq=2.", "[subagent-long-tool] agentId=search runId=run-search tool=bash"];
+	const plan = planHeldSignalFlush({ held, classify: text => text.includes("heartbeat") ? "heartbeat" : text.includes("watch") ? "watch" : "notice", admit: () => "send" });
+	assert.deepEqual(plan.rehold, []);
+	assert.deepEqual(plan.deliver?.signals.map(item => item.text), held);
+	const { pi, calls } = sender();
+	assert.equal(queueHeldSignalNotification(pi, plan.deliver!), true);
+	assert.equal(calls.length, 1);
+	const message = calls[0]![0] as { content: string; details: { signals: unknown[] } };
+	assert.equal(message.content, held.join("\n\n---\n\n"));
+	assert.equal(message.details.signals.length, 3);
+	assert.deepEqual(calls[0]![1], { triggerTurn: true, deliverAs: "followUp" });
+});
+
+test("actionable signals overtake ordinary backlog without being merged or dropped", () => {
+	const plan = planHeldSignalFlush({
+		held: ["progress-a", "stall-a", "progress-b", "blocked-b"],
+		classify: text => text.startsWith("progress") ? "watch" : text.startsWith("stall") ? "stall" : "blocked",
+		admit: () => "send",
+	});
+	assert.equal(plan.deliver?.text, "stall-a");
+	assert.deepEqual(plan.deliver?.signals, [{ text: "stall-a", kind: "stall" }]);
+	assert.deepEqual(plan.rehold, ["progress-a", "progress-b", "blocked-b"]);
+});
+
+test("ordinary batches are bounded and invalid signals are excluded individually", () => {
+	const held = Array.from({ length: 20 }, (_, index) => `notice-${index}`);
+	const plan = planHeldSignalFlush({ held, classify: () => "notice", admit: ({ text }) => text === "notice-0" ? "drop" : text === "notice-1" ? "hold" : "send" });
+	assert.equal(plan.deliver?.signals.length, 16);
+	assert.deepEqual(plan.rehold, ["notice-1", "notice-18", "notice-19"]);
+	const large = planHeldSignalFlush({ held: ["a".repeat(30_000), "b".repeat(30_000)], classify: () => "notice", admit: () => "send" });
+	assert.equal(large.deliver?.signals.length, 1);
+	assert.deepEqual(large.rehold, ["b".repeat(30_000)]);
+});
+
+test("a rejected ordinary batch reports failure for the caller to rehold", (t) => {
+	t.mock.method(console, "error", () => {});
+	const plan = planHeldSignalFlush({ held: ["notice-a", "notice-b"], classify: () => "notice", admit: () => "send" });
+	assert.equal(queueHeldSignalNotification({ sendMessage: () => { throw new Error("busy"); } }, plan.deliver!), false);
+});
+
+test("one flush delivers at most one actionable signal and re-holds the rest in order", () => {
 	const plan = planHeldSignalFlush({
 		held: ["first", "second", "third"],
 		classify: () => "stall",

@@ -132,6 +132,21 @@ readline.createInterface({ input: process.stdin }).on("line", line => {
     if (heldTurn && !command.streamingBehavior) {
       return response(command.type, command.id, false, undefined, "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
     }
+    if (heldTurn && command.streamingBehavior === "steer") {
+      // Stale host-idle fallback: acknowledge only, like Pi's steering queue.
+      if (command.message === "__race_steer_fail__") return response(command.type, command.id, false, undefined, "steer rejected");
+      if (command.message.startsWith("__race_steer_echo__")) {
+        // Receipt deliberately precedes ack to exercise the host registration race.
+        send({ type: "message_end", message: { id: "race-echo", role: "user", content: [{ type: "text", text: command.message }] } });
+      }
+      if (command.message === "__race_steer_settle__") {
+        heldTurn = false;
+        send({ type: "agent_settled" });
+        setTimeout(() => ok(), 120);
+      } else if (command.message === "__race_steer_slow__") setTimeout(() => ok(), 120);
+      else ok();
+      return;
+    }
     if (command.message === "__slow_abort__") slowAbort = true;
     prompted = true;
     if (command.message === "no-usage") omitUsage = true;

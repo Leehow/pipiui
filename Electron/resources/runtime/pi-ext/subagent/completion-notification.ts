@@ -38,6 +38,7 @@ interface PendingCompletion {
 	input: CompletionNotificationInput;
 	currentSessionId: () => string | undefined;
 	shouldSend?: () => boolean;
+	waitForCutIn: () => Promise<void>;
 	resolve: (queued: boolean) => void;
 }
 
@@ -124,6 +125,7 @@ function chunkCompletionWave(wave: readonly PendingCompletion[], options: Comple
 class CompletionWaveBroker {
 	private pending: PendingCompletion[] = [];
 	private timer: ReturnType<typeof setTimeout> | undefined;
+	private flushing = false;
 	private readonly pi: CompletionMessageSender;
 	private readonly options: CompletionWaveOptions;
 
@@ -135,17 +137,31 @@ class CompletionWaveBroker {
 	enqueue(
 		input: CompletionNotificationInput,
 		currentSessionId: () => string | undefined,
-		shouldSend?: () => boolean,
+		shouldSend: (() => boolean) | undefined,
+		waitForCutIn: () => Promise<void>,
 	): Promise<boolean> {
 		return new Promise((resolve) => {
-			this.pending.push({ input, currentSessionId, shouldSend, resolve });
-			if (this.timer) return;
+			this.pending.push({ input, currentSessionId, shouldSend, waitForCutIn, resolve });
+			if (this.timer || this.flushing) return;
 			this.timer = setTimeout(() => this.flush(), Math.max(0, this.options.batchWindowMs ?? DEFAULT_COMPLETION_BATCH_WINDOW_MS));
 		});
 	}
 
-	private flush(): void {
+	private async flush(): Promise<void> {
 		this.timer = undefined;
+		this.flushing = true;
+		// A user may enqueue during the batch window. Wait again at the actual
+		// delivery boundary, keeping receipts in this batch instead of spending
+		// a failed-delivery attempt just to yield to the user.
+		try {
+			await Promise.all(this.pending.map(item => item.waitForCutIn()));
+		} catch (error) {
+			console.error("[pipiui-subagent] completion cut-in wait rejected:", error);
+			for (const item of this.pending.splice(0)) item.resolve(false);
+			this.flushing = false;
+			return;
+		}
+		this.flushing = false;
 		const wave = this.pending.splice(0);
 		const current = wave.filter(({ input, currentSessionId, shouldSend }) =>
 			Boolean(input.sessionId) && currentSessionId() === input.sessionId && (!shouldSend || shouldSend()),
@@ -229,7 +245,7 @@ export async function queueCompletionAfterCutIn(
 	await hooks.waitForCutIn();
 	if (!input.sessionId || hooks.currentSessionId() !== input.sessionId) return false;
 	if (hooks.shouldSend && !hooks.shouldSend()) return false;
-	return completionWaveBroker(pi, waveOptions).enqueue(input, hooks.currentSessionId, hooks.shouldSend);
+	return completionWaveBroker(pi, waveOptions).enqueue(input, hooks.currentSessionId, hooks.shouldSend, hooks.waitForCutIn);
 }
 
 /** Parse either a live custom message or its persisted CustomMessageEntry form. */

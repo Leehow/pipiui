@@ -98,6 +98,30 @@ test("a short completion wave is combined and wakes the Boss only once", async (
 	assert.deepEqual(calls[0]?.[1], { triggerTurn: true, deliverAs: "followUp" });
 });
 
+test("user input arriving inside the batch window delays the whole wave without rejecting receipts", async () => {
+	const calls: unknown[][] = [];
+	const pi = { sendMessage: (...args: unknown[]) => calls.push(args) };
+	let hold = false;
+	let release!: () => void;
+	const userInput = new Promise<void>(resolve => { release = resolve; });
+	const hooks = { currentSessionId: () => "session-a", waitForCutIn: async () => { if (hold) await userInput; } };
+	const receipts = ["a", "b"].map(id => queueCompletionAfterCutIn(pi, {
+		sessionId: "session-a", agentId: `agent-${id}`, runId: `run-${id}`, obligationId: `row-${id}`, text: `done-${id}`,
+	}, hooks, { batchWindowMs: 10 }));
+	await new Promise(resolve => setImmediate(resolve));
+	hold = true;
+	let settled = false;
+	void Promise.all(receipts).then(() => { settled = true; });
+	await new Promise(resolve => setTimeout(resolve, 30));
+	assert.equal(calls.length, 0, "the final sender must re-check user priority, not just enqueue time");
+	assert.equal(settled, false, "yielding must not consume retries as a failed delivery");
+	hold = false;
+	release();
+	assert.deepEqual(await Promise.all(receipts), [true, true]);
+	assert.equal(calls.length, 1);
+	assert.equal((calls[0]![0] as { content: string }).content, "done-a\n\n---\n\ndone-b");
+});
+
 test("one later assistant fulfills every exact obligation in a batch envelope", () => {
 	const batch = {
 		type: "custom_message",

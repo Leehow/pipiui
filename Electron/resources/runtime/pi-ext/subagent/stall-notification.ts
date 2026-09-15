@@ -212,8 +212,8 @@ export type SignalAdmission = "send" | "hold" | "drop";
  * checking — the routing would still work, and a mistyped kind would stop being caught.
  */
 export interface HeldSignalPlan<K extends string = string> {
-	/** At most one signal is delivered per flush; the rest wait for the next one. */
-	deliver?: { text: string; kind: K; channel: RuntimeSignalChannel; confirmsStallDelivery: boolean };
+	/** One envelope per flush; ordinary notices share it, actionable signals stay separate. */
+	deliver?: { text: string; kind: K; channel: RuntimeSignalChannel; confirmsStallDelivery: boolean; signals: Array<{ text: string; kind: K }> };
 	/** Signals to put back on the held queue, in their original order. */
 	rehold: string[];
 }
@@ -225,32 +225,57 @@ export interface HeldSignalFlushInput<K extends string = string> {
 	admit: (input: { kind: K; text: string }) => SignalAdmission;
 }
 
-/**
- * Decide what one flush of the held queue does.
- *
- * One delivery per flush is the load-bearing rule: several stalls coming due together must
- * not fire a burst of turns at the Boss. Everything after the first admitted signal goes back
- * on the queue and gets its turn at the next flush.
- */
+/** Batch replaceable progress, never bury an actionable stall/reminder behind progress. */
 export function planHeldSignalFlush<K extends string>(input: HeldSignalFlushInput<K>): HeldSignalPlan<K> {
-	const plan: HeldSignalPlan<K> = { rehold: [] };
-	for (const text of input.held) {
+	const ordinary = (kind: K) => kind === "watch" || kind === "heartbeat" || kind === "notice";
+	const candidates: Array<{ text: string; kind: K; decision: SignalAdmission }> = [];
+	for (const text of new Set(input.held)) {
 		const kind = input.classify(text);
 		if (!kind) continue;
 		const decision = input.admit({ kind, text });
-		if (decision === "drop") continue;
-		if (decision === "hold" || plan.deliver) {
-			if (!plan.rehold.includes(text)) plan.rehold.push(text);
-			continue;
+		if (decision !== "drop") candidates.push({ text, kind, decision });
+	}
+	const ready = candidates.filter(item => item.decision === "send");
+	const actionable = ready.find(item => !ordinary(item.kind));
+	const selected = actionable ? [actionable] : [];
+	let bytes = 0;
+	if (!actionable) {
+		for (const item of ready) {
+			const size = Buffer.byteLength(item.text, "utf8") + 7;
+			if (selected.length > 0 && (selected.length >= 16 || bytes + size > 48 * 1024)) break;
+			selected.push(item);
+			bytes += size;
 		}
+	}
+	const plan: HeldSignalPlan<K> = { rehold: candidates.filter(item => !selected.includes(item)).map(item => item.text) };
+	const first = selected[0];
+	if (first) {
 		plan.deliver = {
-			text,
-			kind,
-			channel: isStallWakeSignal(kind) ? "stall-wake" : "user-message",
-			confirmsStallDelivery: kind === "stall",
+			text: selected.map(item => item.text).join("\n\n---\n\n"),
+			kind: first.kind,
+			channel: isStallWakeSignal(first.kind) ? "stall-wake" : "user-message",
+			confirmsStallDelivery: first.kind === "stall",
+			signals: selected.map(({ text, kind }) => ({ text, kind })),
 		};
 	}
 	return plan;
+}
+
+/** Already Supervisor-admitted signals enter Pi in one message and one turn. */
+export function queueHeldSignalNotification(pi: StallMessageSender, delivery: NonNullable<HeldSignalPlan["deliver"]>): boolean {
+	if (delivery.channel === "stall-wake") return queueStallNotification(pi, delivery.text);
+	try {
+		pi.sendMessage({
+			customType: "pipiui-subagent-notification-batch-v1",
+			content: delivery.text,
+			display: true,
+			details: { version: 1, signals: delivery.signals },
+		}, { triggerTurn: true, deliverAs: "followUp" });
+		return true;
+	} catch (error) {
+		console.error("[pipiui-subagent] held notification batch rejected:", error);
+		return false;
+	}
 }
 
 export interface StallMessageInput {

@@ -278,7 +278,10 @@ test("41 busy-session samples stay outside Pi and coalesce to the latest of four
 	const now = Date.now();
 	const ids = ["watch-baseline", "watch-knowledge", "watch-pdf", "watch-viewer"];
 	const sent: string[] = [];
-	const pi = { sendUserMessage: async (text: string) => { sent.push(text); runtime.bossTurnBusy = true; } } as any;
+	const pi = {
+		sendUserMessage: async (text: string) => { sent.push(text); runtime.bossTurnBusy = true; },
+		sendMessage: (message: { content: string }) => { sent.push(message.content); runtime.bossTurnBusy = true; },
+	} as any;
 	try {
 		runtime.bossTurnBusy = true;
 		for (const agentId of ids) {
@@ -306,11 +309,13 @@ test("41 busy-session samples stay outside Pi and coalesce to the latest of four
 		for (const [index, seq] of [11, 11, 10, 9].entries()) {
 			assert.ok(runtime.heldSignals.some(entry => entry.text.startsWith(`[subagent-watch] ${ids[index]} `) && entry.text.includes(`seq=${seq}.`)));
 		}
-		for (let count = 1; count <= 4; count++) {
-			runtime.bossTurnBusy = false;
-			runtime.flushHeldSignals(pi);
-			await new Promise(resolve => setImmediate(resolve));
-			assert.equal(sent.length, count, "one latest status per settle, never a backlog burst");
+		runtime.bossTurnBusy = false;
+		runtime.flushHeldSignals(pi);
+		await new Promise(resolve => setImmediate(resolve));
+		assert.equal(sent.length, 1, "all latest statuses share one message, not four Boss turns");
+		for (const [index, seq] of [11, 11, 10, 9].entries()) {
+			assert.ok(sent[0].includes(`[subagent-watch] ${ids[index]} `));
+			assert.ok(sent[0].includes(`seq=${seq}.`));
 		}
 		assert.equal(runtime.heldSignals.length, 0);
 	} finally {
@@ -356,7 +361,10 @@ test("the void extension sender reserves admission until Pi starts the turn", as
 	const runtime = __watchRuntimeForTests;
 	const now = Date.now();
 	const sent: string[] = [];
-	const pi = { sendUserMessage: (text: string) => { sent.push(text); } } as any;
+	const pi = {
+		sendUserMessage: (text: string) => { sent.push(text); },
+		sendMessage: (message: { content: string }) => { sent.push(message.content); },
+	} as any;
 	const ids = ["watch-first", "watch-second"];
 	const sample = (id: string, seq: number) => `[subagent-watch] ${id} (${id}) — state=running\nrunId=run-race seq=${seq}.`;
 	try {
