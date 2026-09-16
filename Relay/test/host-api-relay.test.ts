@@ -499,6 +499,57 @@ test("two rooms stay isolated", async () => {
   }
 });
 
+test("a streaming host spends its own frame budget, never the browser's", async () => {
+  // The limiter was keyed by room, so the host's stream and the browser's
+  // requests shared one bucket and the peer that got closed was whichever sent
+  // next. An ordinary turn is ~129 frames in a second: the browser was killed
+  // at 1008 seven times for traffic the host produced. Here the host fills the
+  // window exactly -- it never overruns its own budget -- and then the browser
+  // speaks once. With one bucket per room that single request is the frame that
+  // trips the limit and the browser dies for it.
+  const roomID = randomUUID();
+  const limit = 8;
+  const relay = await fixture({ v2Limits: { maxFramesPerWindow: limit } });
+  const host = await openHost(relay.hostURL, roomID, hostTokenA, secretA);
+  const cookie = cookieHeader((await claim(relay.origin, roomID, secretA)).headers.get("set-cookie"));
+  const browser = await connect(relay.browserURL, cookie);
+  await nextFrame(host);
+  try {
+    let browserClosed: number | null = null;
+    browser.on("close", (code: number) => { browserClosed = code; });
+    let hostClosed: number | null = null;
+    host.on("close", (code: number) => { hostClosed = code; });
+
+    for (let i = 0; i < limit; i++) {
+      host.send(JSON.stringify({
+        protocolVersion: 2,
+        type: "event",
+        event: { type: "stream", sessionId: "s", delta: `chunk-${i}` },
+      }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(hostClosed, null, "a host at its own limit is not closed");
+
+    const answered = nextFrame(host);
+    browser.send(JSON.stringify({
+      protocolVersion: 2,
+      id: "after-the-stream",
+      type: "request",
+      method: "listProjects",
+      params: [],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(browserClosed, null, "the browser must not pay for the host's stream");
+    // And its request actually reached the host, rather than dying in the limiter.
+    const forwarded = await answered as { id?: string };
+    assert.equal(forwarded.id, "after-the-stream");
+  } finally {
+    browser.close();
+    host.close();
+    await relay.close();
+  }
+});
+
 test("wrong direction, version, and over-limit frames are rejected", async () => {
   const roomID = randomUUID();
   const relay = await fixture({

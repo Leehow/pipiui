@@ -41,6 +41,9 @@ export interface HostAPIRelayOptions {
 
 type Peer = {
   socket: WebSocket;
+  /** Unique per connection: the frame limiter charges the peer that sent, not
+   * the room it happens to share with the other side. */
+  id: number;
   role: "host" | "browser";
   roomID: string | null;
   alive: boolean;
@@ -192,6 +195,16 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     limits.maxClients * 4,
     now,
   );
+  let nextPeerId = 1;
+  let droppedNoBrowser = 0;
+  /**
+   * One bucket per connection. Keying this by `roomID` made the host's stream
+   * and the browser's requests share a single budget, and the peer that got
+   * closed was whichever one sent next -- so a browser was killed at 1008 for
+   * traffic the host produced, seven times inside one streaming turn.
+   */
+  const peerKey = (peer: Peer): string =>
+    `${peer.roomID ?? "-"}:${peer.role}:${peer.id}`;
   const frameLimiter = new FixedWindowRateLimiter(
     limits.frameWindowMs,
     limits.maxFramesPerWindow,
@@ -464,7 +477,15 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     ) {
       return;
     }
-    if (!room.browser || room.browser.socket.readyState !== WebSocket.OPEN) return;
+    if (!room.browser || room.browser.socket.readyState !== WebSocket.OPEN) {
+      // Dropped on the floor: nobody is listening. Counted so a stalled
+      // transcript can be told apart from a host that never spoke.
+      droppedNoBrowser += 1;
+      if (droppedNoBrowser % 200 === 1) {
+        console.warn(`[relay] dropped ${droppedNoBrowser} host frames with no open browser (room ${room.roomID})`);
+      }
+      return;
+    }
     if (overQueued(room.browser, Buffer.byteLength(raw))) {
       closePeer(room.browser, 1008, "limit exceeded");
       return;
@@ -485,7 +506,12 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       closePeer(peer, 1009, "frame too large");
       return;
     }
-    if (!frameLimiter.take(peer.roomID ?? clientKey(peer))) {
+    if (!frameLimiter.take(peerKey(peer))) {
+      // Say which side blew its own budget: this used to surface at the far end
+      // as a browser that mysteriously dropped its connection.
+      console.warn(
+        `[relay] frame limit exceeded by ${peer.role} in room ${peer.roomID ?? "-"}; closing that peer`,
+      );
       sendControl(peer, { v: 2, type: "error", reason: "limit_exceeded" });
       closePeer(peer, 1008, "limit exceeded");
       return;
@@ -577,6 +603,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
   hostWSS.on("connection", (socket) => {
     const peer: Peer = {
       socket,
+      id: nextPeerId++,
       role: "host",
       roomID: null,
       alive: true,
@@ -597,6 +624,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     }
     const peer: Peer = {
       socket,
+      id: nextPeerId++,
       role: "browser",
       roomID: room.roomID,
       alive: true,

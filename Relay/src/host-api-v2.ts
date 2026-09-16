@@ -28,7 +28,11 @@ export const DEFAULT_V2_LIMITS = {
   claimWindowMs: 60_000,
   maxClaimAttemptsPerIP: 30,
   frameWindowMs: 1_000,
-  maxFramesPerWindow: 120,
+  // A streaming turn is one frame per delta: 129/s was measured on an ordinary
+  // one. 120 was a chat-shaped number and it closed live sockets mid-turn.
+  // Abuse is bounded by bytes (maxQueuedBytes, maxRequestBytes) and by
+  // maxInflight, which caps a browser at 32 outstanding requests regardless.
+  maxFramesPerWindow: 600,
   // Any inbound WS frame (including app ping) refreshes liveness; pong still counts.
   heartbeatMs: 25_000,
 } as const;
