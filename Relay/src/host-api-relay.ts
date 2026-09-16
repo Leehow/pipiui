@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 import { FixedWindowRateLimiter } from "./limits.js";
 import {
+  HOST_API_PROTOCOL_VERSION,
   BROWSER_WS_PATH,
   CLAIM_BODY_MAX_BYTES,
   DEFAULT_ROOM_TTL_MS,
@@ -414,6 +415,18 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
   const overQueued = (peer: Peer, bytes: number): boolean =>
     peer.socket.bufferedAmount + bytes > limits.maxQueuedBytes;
 
+  /** Answer one request with a failure, leaving the connection up. */
+  const refuseRequest = (peer: Peer, id: string, error: string): void => {
+    sendRaw(peer, JSON.stringify({
+      protocolVersion: HOST_API_PROTOCOL_VERSION,
+      id,
+      type: "response",
+      ok: false,
+      error,
+      errorCode: "limit_exceeded",
+    }));
+  };
+
   const forwardData = (
     peer: Peer,
     raw: string,
@@ -427,7 +440,9 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
     if (peer.role === "browser") {
       if (room.browser !== peer) return;
       if (frame.kind !== "request") {
-        closePeer(peer, 1008, "wrong direction");
+        console.warn(`[relay] closing ${peer.role} in room ${peer.roomID ?? "-"}: wrong direction`);
+        console.warn(`[relay] closing ${peer.role} in room ${peer.roomID ?? "-"}: wrong direction`);
+      closePeer(peer, 1008, "wrong direction");
         return;
       }
       if (
@@ -440,14 +455,27 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
         sendControl(peer, { v: 2, type: "error", reason: "host_offline" });
         return;
       }
-      if (room.inflight.size >= limits.maxInflight || room.inflight.has(frame.id)) {
+      // A concurrency cap is backpressure, not a reason to destroy the link. A
+      // long streaming turn leaves the host slow to answer the browser's ordinary
+      // periodic reads -- stats, quota, balance, panels -- so they pile up and
+      // crossed 32; closing the socket there threw away every frame in flight and
+      // stranded the turn. Refuse the one request instead and let the client
+      // retry it. A duplicate id is different: answering it would resolve the
+      // request already in flight, so that one still closes.
+      if (room.inflight.has(frame.id)) {
+        console.warn(`[relay] closing browser in room ${room.roomID}: duplicate request id`);
         sendControl(peer, { v: 2, type: "error", reason: "limit_exceeded" });
         closePeer(peer, 1008, "limit exceeded");
         return;
       }
+      if (room.inflight.size >= limits.maxInflight) {
+        console.warn(`[relay] refusing one request in room ${room.roomID}: inflight ${room.inflight.size}/${limits.maxInflight}`);
+        refuseRequest(peer, frame.id, `too many requests in flight (${limits.maxInflight})`);
+        return;
+      }
       if (overQueued(room.host, Buffer.byteLength(raw))) {
-        sendControl(peer, { v: 2, type: "error", reason: "limit_exceeded" });
-        closePeer(peer, 1008, "limit exceeded");
+        console.warn(`[relay] refusing one request in room ${room.roomID}: host send buffer over ${limits.maxQueuedBytes} bytes`);
+        refuseRequest(peer, frame.id, "the host is not keeping up with its send buffer");
         return;
       }
       room.inflight.add(frame.id);
@@ -470,6 +498,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       }
       room.inflight.delete(frame.id);
     } else if (frame.kind !== "event") {
+      console.warn(`[relay] closing ${peer.role} in room ${peer.roomID ?? "-"}: wrong direction`);
       closePeer(peer, 1008, "wrong direction");
       return;
     } else if (
@@ -487,6 +516,7 @@ export function createHostAPIRelay(options: HostAPIRelayOptions) {
       return;
     }
     if (overQueued(room.browser, Buffer.byteLength(raw))) {
+      console.warn(`[relay] closing browser in room ${room.roomID}: browser send buffer over ${limits.maxQueuedBytes} bytes`);
       closePeer(room.browser, 1008, "limit exceeded");
       return;
     }

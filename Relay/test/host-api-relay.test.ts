@@ -600,7 +600,14 @@ test("wrong direction, version, and over-limit frames are rejected", async () =>
     const forwarded = nextFrame(host);
     browser3.send(JSON.stringify(first));
     assert.deepEqual(await forwarded, first);
-    const limited = once(browser3, "close");
+    // Backpressure, not execution: the request over the cap is refused and the
+    // connection stays up, because closing it threw away every frame in flight
+    // and stranded the turn that was streaming through it.
+    const refused = new Promise<Record<string, unknown>>((resolve) => {
+      browser3.once("message", (data: Buffer | string) => resolve(JSON.parse(String(data))));
+    });
+    let closedAfterOverflow = false;
+    browser3.on("close", () => { closedAfterOverflow = true; });
     browser3.send(JSON.stringify({
       protocolVersion: 2,
       id: "overflow",
@@ -608,7 +615,14 @@ test("wrong direction, version, and over-limit frames are rejected", async () =>
       method: "listProjects",
       params: [],
     }));
-    await limited;
+    const answer = await refused;
+    assert.equal(answer.id, "overflow");
+    assert.equal(answer.type, "response");
+    assert.equal(answer.ok, false);
+    assert.equal(answer.errorCode, "limit_exceeded");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(closedAfterOverflow, false, "超过在途上限只拒这一个请求，不关连接");
+    browser3.close();
 
     const browser4 = await connect(relay.browserURL, cookie);
     await nextFrame(host);
