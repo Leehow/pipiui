@@ -483,3 +483,99 @@ describe("session model recovery after Pi exits", () => {
     expect(fixture.spawnCount()).toBe(2);
   });
 });
+
+/**
+ * Adding a custom provider rewrites models.json and reloads the host catalog,
+ * but every pi child already running keeps the catalog it read at spawn. The
+ * picker offers the new ref; the child answers "Model not found".
+ */
+describe("session model recovery after the child catalog goes stale", () => {
+  let root = "";
+  let backend: ReturnType<typeof createPiHostBackend> | undefined;
+
+  afterEach(async () => {
+    await backend?.close().catch(() => undefined);
+    backend = undefined;
+    if (root) await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
+    root = "";
+  });
+
+  const catalog = (ids: string[]) => JSON.stringify({
+    providers: { relay: { apiKey: "literal-key", models: ids.map((id) => ({ id, name: id, reasoning: true })) } },
+  });
+
+  /**
+   * Replays the real sequence: a session spawns against the old models.json,
+   * then a custom-provider write lands and only the HOST catalog reloads.
+   */
+  async function makeBackend(knownIdsPerSpawn: (spawnIndex: number) => string, emptySnapshot = false) {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-stale-"));
+    const agent = join(root, "agent");
+    const cwd = join(root, "project");
+    const dir = join(root, "sessions", "--project--");
+    await mkdir(agent, { recursive: true });
+    await mkdir(cwd, { recursive: true });
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(agent, "models.json"), catalog(["base"]));
+    await writeFile(
+      join(dir, "session.jsonl"),
+      JSON.stringify({ type: "session", version: 3, id: "session-1", timestamp: "2026-08-11T00:00:00.000Z", cwd }) + "\n",
+    );
+    let spawnCount = 0;
+    backend = createPiHostBackend({
+      agentDir: agent,
+      sessionsRoot: join(root, "sessions"),
+      runtimeRoot: join(root, "runtime"),
+      piPath: process.execPath,
+      spawn: (_bin: any, _args: any, options: any) => {
+        spawnCount += 1;
+        return spawn(process.execPath, [new URL("./fake-pi-stale-models.mjs", import.meta.url).pathname], {
+          ...options,
+          env: {
+            ...options.env,
+            PIPIUI_TEST_KNOWN_MODEL_IDS: knownIdsPerSpawn(spawnCount),
+            PIPIUI_TEST_EMPTY_SNAPSHOT: emptySnapshot ? "1" : "0",
+          },
+        }) as any;
+      },
+    });
+    await (backend as any).ensure("session-1");
+    return {
+      backend,
+      spawnCount: () => spawnCount,
+      addModel: async (id: string) => {
+        await writeFile(join(agent, "models.json"), catalog(["base", id]));
+        await (backend as any).refreshModelCatalog();
+      },
+    };
+  }
+
+  it("recycles the child once so it re-reads models.json, then applies the ref", async () => {
+    const fixture = await makeBackend((spawnIndex) => (spawnIndex === 1 ? "base" : "base,added"));
+    await fixture.addModel("added");
+
+    const state = await fixture.backend.handle("setModel", ["session-1", "relay", "added"]);
+
+    expect(state).toMatchObject({ model: { provider: "relay", id: "added" } });
+    expect(fixture.spawnCount()).toBe(2);
+  });
+
+  it("keeps the host catalog when the child reports an empty availability snapshot", async () => {
+    // A child whose availability refresh threw answers `get_available_models`
+    // with []. Adopting that would leave the picker with nothing to show.
+    const fixture = await makeBackend(() => "base", true);
+
+    const models = await fixture.backend.handle("listModels", []) as any[];
+
+    expect(models.map((model) => `${model.provider}/${model.id}`)).toEqual(["relay/base"]);
+  });
+
+  it("does not recycle for a ref the host catalog does not have either", async () => {
+    const fixture = await makeBackend(() => "base");
+
+    await expect(
+      fixture.backend.handle("setModel", ["session-1", "relay", "never-configured"]),
+    ).rejects.toThrow(/Model not found: relay\/never-configured/);
+    expect(fixture.spawnCount()).toBe(1);
+  });
+});

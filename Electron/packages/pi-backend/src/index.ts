@@ -305,6 +305,7 @@ import {
   ensureProjectPiHome,
   migrateSharedProjectModels,
   projectPiAgentDir,
+  refreshProjectModelMirrors,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
 import {
@@ -325,6 +326,7 @@ export {
   migrateSharedProjectModels,
   projectPiAgentDir,
   projectPiSessionsDir,
+  refreshProjectModelMirrors,
   sanitizePiSettings,
   sanitizePiSettingsFile,
 } from "./project-pi-home.js";
@@ -5267,6 +5269,27 @@ export class PiHostBackend implements HostBackend {
     if (this.profileMode !== "isolated") return displayOrCwd;
     return this.lookupIsolatedHome(displayOrCwd)?.realProjectRoot ?? displayOrCwd;
   }
+  /**
+   * Push a canonical catalog write out to every project replica.
+   *
+   * Where the OS refuses to share one file (Windows without Developer Mode, and
+   * a project on a different volume), a project holds a copy instead of a link.
+   * A copy that is never refreshed is the whole hazard of that fallback: the
+   * project would keep serving the catalog as it looked the day it was created.
+   *
+   * Runs INSIDE the caller's modelsWrite job — never enqueues, or it would wait
+   * on itself. Presentation-level failures must not fail the write that already
+   * landed: the next canonical write, or the next project open, re-converges.
+   */
+  private async publishCanonicalModels(modelsPath: string, contents: string): Promise<void> {
+    await writeCanonicalModelsFile(modelsPath, contents);
+    if (this.profileMode !== "isolated") return;
+    try {
+      await refreshProjectModelMirrors({ canonicalAgentDir: this.agentDir });
+    } catch (error) {
+      console.warn(`[pipi-backend] project models replica refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   private migrateSharedModels(projectRoots: string[]): Promise<void> {
     return this.modelsWrite.enqueue(async () => {
       await migrateSharedProjectModels({ canonicalAgentDir: this.agentDir, projectRoots });
@@ -6888,6 +6911,20 @@ export class PiHostBackend implements HostBackend {
     }
     return this.writeCommand(live, body);
   }
+  /**
+   * Did the child reject this ref because its own model catalog is older than ours?
+   *
+   * A pi child reads models.json once, at spawn, and builds its availability
+   * snapshot from that. Adding a custom provider (or a model under one) only
+   * rewrites the file and reloads the HOST catalog — every session already
+   * running keeps the pre-write view and answers `set_model` with
+   * "Model not found", for a ref the picker legitimately offered.
+   */
+  private staleChildModelCatalog(error: unknown, provider: string, modelId: string): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes(`Model not found: ${provider}/${modelId}`)) return false;
+    return this.models.some((model) => model.provider === provider && model.id === modelId);
+  }
   /** Pi model ids are not provider-unique. Never silently accept a same-id sibling. */
   private async selectExactModel(live: Live, provider: string, modelId: string) {
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -6937,7 +6974,17 @@ export class PiHostBackend implements HostBackend {
         type: "get_available_models",
       });
       const catalogModels = this.models;
-      this.models = (models.models ?? []).map((raw: any) => {
+      const reportedModels = (models.models ?? []) as any[];
+      // An EMPTY snapshot is never news about the catalog, only about the child.
+      // pi builds `available` by Promise.all-ing every provider's auth check, so
+      // one provider that throws (an OAuth refresh behind a flaky proxy, a relay
+      // answering 5xx) rejects the whole availability refresh and leaves the
+      // snapshot at its constructor value: []. Adopting that would empty the
+      // picker app-wide over one unrelated provider.
+      if (reportedModels.length === 0 && catalogModels.length > 0) {
+        console.warn(`[pipi-backend] ${live.session.id}: pi reported no available models; keeping the host catalog (${catalogModels.length} rows)`);
+      }
+      const adoptedModels = reportedModels.map((raw: any) => {
         const reported = hostModelFromPi(raw);
         const catalog = catalogModels.find(item => item.provider === reported.provider && item.id === reported.id);
         if (!catalog) return reported;
@@ -6953,6 +7000,8 @@ export class PiHostBackend implements HostBackend {
           ...(capabilities === undefined ? {} : { capabilities }),
         };
       });
+      const adoptedCatalog = adoptedModels.length > 0;
+      if (adoptedCatalog) this.models = adoptedModels;
       const state = await this.command(live.session.id, { type: "get_state" });
       const levels = await this.command(live.session.id, {
         type: "get_available_thinking_levels",
@@ -6960,7 +7009,10 @@ export class PiHostBackend implements HostBackend {
       const reportedModel = state.model ? hostModelFromPi(state.model) : undefined;
       const model = reportedModel
         ? (this.models.find(item => item.provider === reportedModel.provider && item.id === reportedModel.id) ?? reportedModel)
-        : (this.models[0] ?? this.modelState.model);
+        // A kept catalog must not become this session's model: the child that
+        // reported nothing usable is the one this state describes. Fall back the
+        // way an adopted-empty catalog used to, to the host's current model.
+        : ((adoptedCatalog ? this.models[0] : undefined) ?? this.modelState.model);
       const availableThinkingLevels = thinkingLevelsForModel(model, levels.levels);
       const previous = this.sessionModelSnapshots.get(live.session.id);
       const reportedThinkingLevel = state.thinkingLevel as ThinkingLevel | undefined;
@@ -9960,7 +10012,7 @@ export class PiHostBackend implements HostBackend {
         models,
       };
       catalog.providers = providers;
-      await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
+      await this.publishCanonicalModels(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
       return uniqueId;
     });
     await this.unsuppressProvider(providerIdCommitted);
@@ -10117,7 +10169,7 @@ export class PiHostBackend implements HostBackend {
       return;
     }
     try {
-      await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
+      await this.publishCanonicalModels(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
     } catch (error) {
       if (!this.modelsJsonUnwritableWarned) {
         this.modelsJsonUnwritableWarned = true;
@@ -10172,7 +10224,7 @@ export class PiHostBackend implements HostBackend {
         if (!entry || typeof entry !== "object") return;
         if (typeof entry.api !== "string" && typeof entry.apiKey !== "string") return;
         delete providers[providerId];
-        await writeCanonicalModelsFile(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
+        await this.publishCanonicalModels(modelsPath, `${JSON.stringify(catalog, null, 2)}\n`);
       });
     } catch (error) {
       // Same authoritative-window semantics as a failed logout: surface the error with the
@@ -10736,10 +10788,24 @@ export class PiHostBackend implements HostBackend {
       try {
         await this.selectExactModel(live, provider, modelId);
       } catch (error) {
-        if (!(error instanceof PiExitedError)) throw error;
-        await live.exit;
-        live = await this.ensure(sessionId);
-        await this.selectExactModel(live, provider, modelId);
+        if (error instanceof PiExitedError) {
+          await live.exit;
+          live = await this.ensure(sessionId);
+          await this.selectExactModel(live, provider, modelId);
+        } else if (this.staleChildModelCatalog(error, provider, modelId)) {
+          // Recycle the child so it re-reads models.json. Only a quiet session
+          // with no live workers is recycled; a busy one keeps the raw error
+          // rather than losing a turn to a restart the user did not ask for.
+          if (!(await this.closeQuietSessionWriter(sessionId))) {
+            throw new Error(
+              `${provider}/${modelId} 是本次会话启动后新增的模型，当前会话进程还看不到它。请等这轮跑完再切换，或新建一个会话。`,
+            );
+          }
+          live = await this.ensure(sessionId);
+          await this.selectExactModel(live, provider, modelId);
+        } else {
+          throw error;
+        }
       }
       await this.refreshState(live);
       const state = this.sessionModelStates.get(sessionId)!;

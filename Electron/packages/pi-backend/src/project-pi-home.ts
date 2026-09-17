@@ -15,6 +15,7 @@ import {
   lstat,
   mkdir,
   open,
+  readFile,
   readlink,
   realpath,
   rename,
@@ -36,6 +37,21 @@ const AMBIENT_RESOURCE_SETTINGS = [
 const SHARED_CREDENTIAL_FILES = [".env", "auth.json"] as const;
 const COPIED_PROJECT_FILES = ["models-store.json"] as const;
 const SHARED_MODELS_MANIFEST = ".pipiui-shared-models-migration-v1.json";
+/**
+ * Ledger of project models.json files this host WROTE as copies of the canonical
+ * catalog, because the OS refused a link (Windows without Developer Mode, and a
+ * project on another volume where a hard link is EXDEV too).
+ *
+ * It exists to answer one question the bytes cannot: is this project file the
+ * user's own catalog, or our replica? Without that, a provider deleted from the
+ * canonical catalog is re-merged out of every stale replica on the next open and
+ * comes back from the dead. A replica is recognised by its recorded digest, never
+ * merged, and refreshed from canonical; anything else is the user's and is left
+ * untouched for the merge to pick up.
+ *
+ * Keyed by the project models.json path so a refresh needs no project list.
+ */
+const MODEL_MIRROR_LEDGER = ".pipiui-model-mirrors-v1.json";
 
 type JsonObject = Record<string, unknown>;
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -407,6 +423,43 @@ async function atomicWrite(path: string, source: Buffer | string, mode = 0o600):
   }
 }
 
+/** {projectModelsPath: sha256 of the canonical bytes we last wrote there}. */
+type ModelMirrorLedger = { version: 1; mirrors: Record<string, string> };
+
+function ledgerPath(canonicalAgentDir: string): string {
+  return join(canonicalAgentDir, MODEL_MIRROR_LEDGER);
+}
+
+/** A malformed or missing ledger reads as empty: replicas then look like user files. */
+async function readMirrorLedger(canonicalAgentDir: string): Promise<ModelMirrorLedger> {
+  try {
+    const source = await readFile(ledgerPath(canonicalAgentDir));
+    const parsed: unknown = JSON.parse(source.toString("utf8"));
+    if (
+      !parsed || typeof parsed !== "object" || Array.isArray(parsed)
+      || (parsed as { version?: unknown }).version !== 1
+    ) return { version: 1, mirrors: {} };
+    const raw = (parsed as { mirrors?: unknown }).mirrors;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { version: 1, mirrors: {} };
+    const mirrors: Record<string, string> = {};
+    for (const [path, digest] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof digest === "string" && /^[0-9a-f]{64}$/.test(digest)) mirrors[path] = digest;
+    }
+    return { version: 1, mirrors };
+  } catch {
+    return { version: 1, mirrors: {} };
+  }
+}
+
+async function writeMirrorLedger(canonicalAgentDir: string, ledger: ModelMirrorLedger): Promise<void> {
+  const path = ledgerPath(canonicalAgentDir);
+  if (Object.keys(ledger.mirrors).length === 0) {
+    await rm(path, { force: true }).catch(() => undefined);
+    return;
+  }
+  await atomicWrite(path, `${JSON.stringify(ledger, null, 2)}\n`);
+}
+
 interface RegularFileSnapshot {
   path: string;
   source: Buffer;
@@ -416,7 +469,16 @@ interface RegularFileSnapshot {
   mode: number;
 }
 
-type ProjectModelsKind = "regular" | "missing" | "already-linked" | "alias-link" | "stale-temp-link";
+type ProjectModelsKind =
+  | "regular"
+  | "missing"
+  | "already-linked"
+  | "alias-link"
+  | "stale-temp-link"
+  /** Our replica, recorded in the ledger, whose content is already the canonical result. */
+  | "already-mirrored"
+  /** Our replica, but stale: it needs rewriting from canonical. Never merged. */
+  | "mirror";
 
 function resolveLinkTarget(linkPath: string, target: string): string {
   return resolve(dirname(linkPath), target);
@@ -481,7 +543,28 @@ async function exclusiveSymlink(target: string, path: string): Promise<void> {
     if (errnoCode(error) === "EEXIST") {
       throw new Error(`Refusing to overwrite concurrent models.json at ${path}`);
     }
+    if (symlinkDenied(error)) throw new SymlinkPrivilegeError(target, path, error);
     throw error;
+  }
+}
+
+/**
+ * The one failure a user can act on themselves.
+ *
+ * Windows hands an ordinary account EPERM for every symlink unless the process
+ * is elevated or Developer Mode is on — and this link is what makes a project
+ * share the profile's model catalog, so without it opening the project dies and
+ * takes the whole project list with it. The raw errno says none of that.
+ */
+export class SymlinkPrivilegeError extends Error {
+  readonly code = "EPERM_SYMLINK";
+  constructor(readonly target: string, readonly path: string, readonly cause: unknown) {
+    super(
+      `无法为项目创建 models.json 链接（${path} -> ${target}）：`
+      + `Windows 只允许管理员或开启「开发人员模式」的账户创建符号链接。`
+      + `请在 设置 → 系统 → 开发者选项 中打开「开发人员模式」后重试，或以管理员身份运行 PipiUI。`,
+    );
+    this.name = "SymlinkPrivilegeError";
   }
 }
 
@@ -617,6 +700,9 @@ interface ProjectModelsSource {
   backupPath: string | null;
   symlinkQuarantinePath: string | null;
   linked: boolean;
+  /** This project got a replica instead of a link; the file is ours to manage. */
+  mirrored: boolean;
+  mirrorSha256: string | null;
 }
 
 type SharedModelsMigrationStep =
@@ -654,6 +740,8 @@ function emptyProjectSource(
     backupPath: null,
     symlinkQuarantinePath: null,
     linked: false,
+    mirrored: false,
+    mirrorSha256: null,
     ...extra,
   };
 }
@@ -670,7 +758,7 @@ function isStaleCanonicalTemp(
 }
 
 async function assertProjectUnchanged(project: ProjectModelsSource): Promise<void> {
-  if (project.kind === "regular" && project.snapshot) {
+  if ((project.kind === "regular" || project.kind === "mirror") && project.snapshot) {
     await assertSnapshotUnchanged(project.snapshot, "project models.json");
     return;
   }
@@ -691,12 +779,47 @@ async function assertProjectUnchanged(project: ProjectModelsSource): Promise<voi
   }
 }
 
+/**
+ * Install the replica this project gets when the OS will not give it the file.
+ *
+ * Written to a temporary name and renamed in, so a project is never left with a
+ * half-written catalog; `mirrored` is set only once the rename lands, which is
+ * what lets rollback know the file is ours to remove.
+ */
+async function installProjectMirror(
+  project: ProjectModelsSource,
+  result: Buffer,
+  resultSha: string,
+): Promise<void> {
+  await atomicWrite(project.path, result);
+  project.mirrored = true;
+  project.mirrorSha256 = resultSha;
+}
+
 async function installProjectCanonicalLink(
   project: ProjectModelsSource,
   canonicalPath: string,
+  result: Buffer,
+  resultSha: string,
 ): Promise<void> {
-  if (project.kind === "regular" || project.kind === "missing") {
-    await exclusiveSymlink(canonicalPath, project.path);
+  if (project.kind === "regular" || project.kind === "missing" || project.kind === "mirror") {
+    try {
+      await exclusiveSymlink(canonicalPath, project.path);
+    } catch (error) {
+      if (!(error instanceof SymlinkPrivilegeError)) throw error;
+      // A hard link carries the same one-file guarantee with no privilege, but
+      // only within one volume; the profile on C: and the project on D: is the
+      // case that leaves a replica as the only option.
+      try {
+        await exclusiveLink(canonicalPath, project.path);
+        project.linked = true;
+        return;
+      } catch (linkError) {
+        if (errnoCode(linkError) !== "EXDEV" && !symlinkDenied(linkError)) throw linkError;
+      }
+      await installProjectMirror(project, result, resultSha);
+      return;
+    }
     project.linked = true;
     return;
   }
@@ -743,8 +866,16 @@ async function rollbackProjectModels(
   if (project.linked && current?.isSymbolicLink() && currentTarget === canonicalPath) {
     await unlink(project.path);
   }
+  // Our replica is derived content, so removing it loses nothing; the backup
+  // below puts back whatever the project had before this migration touched it.
+  // Recognise it by digest first: between the failed step and here, another
+  // process may have put its own file at this path, and that is not ours.
+  if (project.mirrored && current?.isFile() && project.mirrorSha256) {
+    const present = await readStableRegularFile(project.path, "project models.json replica", { allowMissing: true });
+    if (present && sha256(present.source) === project.mirrorSha256) await unlink(project.path);
+  }
 
-  if (project.kind === "regular" && project.backupPath) {
+  if ((project.kind === "regular" || project.kind === "mirror") && project.backupPath) {
     if (await pathExists(project.path)) return;
     await exclusiveRestoreRegular(project.backupPath, project.path);
     return;
@@ -794,6 +925,7 @@ export async function migrateSharedProjectModels(options: {
   const roots = [...new Set(canonicalRoots)].sort();
   const projects: ProjectModelsSource[] = [];
   const conflicts = new Set<string>();
+  const ledger = await readMirrorLedger(canonicalAgentDir);
 
   for (const projectRoot of roots) {
     const home = await prepareProjectHome(projectRoot);
@@ -825,8 +957,11 @@ export async function migrateSharedProjectModels(options: {
       }
       const regular = await readStableRegularFile(path, "project models.json", { expectedStat: stat });
       const snapshot = snapshotFromRegular(path, regular!);
-      merged = mergeMissing(merged, parseModels(snapshot.source, path), [], conflicts);
-      projects.push(emptyProjectSource(projectRoot, home, path, "regular", {
+      // Our own replica is NOT a source. Merging it back would resurrect every
+      // provider the user has since deleted from the canonical catalog.
+      const isMirror = ledger.mirrors[path] === snapshot.sourceSha256;
+      if (!isMirror) merged = mergeMissing(merged, parseModels(snapshot.source, path), [], conflicts);
+      projects.push(emptyProjectSource(projectRoot, home, path, isMirror ? "mirror" : "regular", {
         source: snapshot.source,
         sourceSha256: snapshot.sourceSha256,
         snapshot,
@@ -842,7 +977,13 @@ export async function migrateSharedProjectModels(options: {
     ? Buffer.from(`${JSON.stringify(merged, null, 2)}\n`)
     : canonicalSource!;
   const resultSha = sha256(result);
-  const projectsToLink = projects.filter((project) => project.kind !== "already-linked");
+  // A replica that already holds the result needs no work — otherwise every
+  // open would redo the whole dance on a machine that can never symlink.
+  for (const project of projects) {
+    if (project.kind === "mirror" && project.sourceSha256 === resultSha) project.kind = "already-mirrored";
+  }
+  const settled = new Set<ProjectModelsKind>(["already-linked", "already-mirrored"]);
+  const projectsToLink = projects.filter((project) => !settled.has(project.kind));
   if (!canonicalNeedsWrite && projectsToLink.length === 0) {
     if (canonicalRegular) await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
     return null;
@@ -889,7 +1030,7 @@ export async function migrateSharedProjectModels(options: {
     for (const project of projectsToLink) {
       await assertPreparedProjectHome(project.home);
       await assertProjectUnchanged(project);
-      if (project.kind === "regular" && project.snapshot) {
+      if ((project.kind === "regular" || project.kind === "mirror") && project.snapshot) {
         project.backupPath = await quarantineRegularFile(project.snapshot, "project models.json");
       }
     }
@@ -941,7 +1082,7 @@ export async function migrateSharedProjectModels(options: {
       const project = projectsToLink[index];
       await assertPreparedProjectHome(project.home);
       await options.onMigrationStep?.({ name: "before-project-link", projectModelsPath: project.path, index });
-      await installProjectCanonicalLink(project, canonicalPath);
+      await installProjectCanonicalLink(project, canonicalPath, result, resultSha);
       await options.onMigrationStep?.({ name: "project-link-installed", projectModelsPath: project.path, index });
     }
     const manifest: SharedModelsMigrationManifest = {
@@ -960,6 +1101,16 @@ export async function migrateSharedProjectModels(options: {
       })),
       conflictJsonPaths: [...conflicts].sort(),
     };
+    // Record which projects hold a replica BEFORE the manifest lands: an
+    // unrecorded replica reads as a user file on the next open and gets merged
+    // back into canonical, which is the resurrection this ledger exists to stop.
+    const nextMirrors = { ...ledger.mirrors };
+    for (const project of projects) {
+      if (project.mirrored && project.mirrorSha256) nextMirrors[project.path] = project.mirrorSha256;
+      else if (project.kind === "already-mirrored" && project.sourceSha256) nextMirrors[project.path] = project.sourceSha256;
+      else if (project.linked || project.kind === "already-linked") delete nextMirrors[project.path];
+    }
+    await writeMirrorLedger(canonicalAgentDir, { version: 1, mirrors: nextMirrors });
     await options.onMigrationStep?.({ name: "before-manifest-write" });
     await atomicWrite(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
     await ensureRegularFileMode(canonicalPath, 0o600, "canonical models.json");
@@ -991,6 +1142,68 @@ export async function migrateSharedProjectModels(options: {
     await discardPublishTemp();
     throw wrapMigrationError(error, rollbackErrors);
   }
+}
+
+/**
+ * Push the canonical catalog into every project replica. Call after each write
+ * to the canonical models.json — that write is the only thing replicas are
+ * behind on, and without this they are a one-time copy that silently diverges.
+ *
+ * Self-contained: the ledger holds the paths, so no project list is needed and a
+ * host with no replicas pays one ENOENT. Self-correcting too — a path that has
+ * since become a link, or vanished with its project, drops out of the ledger.
+ *
+ * A replica whose digest no longer matches the ledger was changed by someone
+ * else. It is left exactly as it is: overwriting would destroy a hand edit, and
+ * the next project open merges it into canonical and re-records it.
+ */
+export async function refreshProjectModelMirrors(options: {
+  canonicalAgentDir: string;
+}): Promise<{ refreshed: string[]; dropped: string[]; skipped: string[] }> {
+  const refreshed: string[] = [];
+  const dropped: string[] = [];
+  const skipped: string[] = [];
+  const canonicalAgentDir = await realpath(resolve(options.canonicalAgentDir)).catch(() => resolve(options.canonicalAgentDir));
+  const ledger = await readMirrorLedger(canonicalAgentDir);
+  const paths = Object.keys(ledger.mirrors);
+  if (paths.length === 0) return { refreshed, dropped, skipped };
+
+  const canonicalPath = join(canonicalAgentDir, "models.json");
+  const canonical = await readStableRegularFile(canonicalPath, "canonical models.json", { allowMissing: true });
+  if (!canonical) return { refreshed, dropped, skipped };
+  const canonicalSha = sha256(canonical.source);
+
+  const mirrors = { ...ledger.mirrors };
+  for (const path of paths) {
+    let stat: Stats;
+    try {
+      stat = await lstat(path);
+    } catch (error) {
+      if (errnoCode(error) !== "ENOENT") throw error;
+      delete mirrors[path];
+      dropped.push(path);
+      continue;
+    }
+    if (!stat.isFile()) {
+      // A symlink here means a later run got the privilege it needed; the file
+      // is shared for real now and the ledger should stop claiming it.
+      delete mirrors[path];
+      dropped.push(path);
+      continue;
+    }
+    const present = await readStableRegularFile(path, "project models.json replica", { expectedStat: stat });
+    const presentSha = sha256(present!.source);
+    if (presentSha !== mirrors[path]) {
+      skipped.push(path);
+      continue;
+    }
+    if (presentSha === canonicalSha) continue;
+    await atomicWrite(path, canonical.source);
+    mirrors[path] = canonicalSha;
+    refreshed.push(path);
+  }
+  if (refreshed.length || dropped.length) await writeMirrorLedger(canonicalAgentDir, { version: 1, mirrors });
+  return { refreshed, dropped, skipped };
 }
 
 /**

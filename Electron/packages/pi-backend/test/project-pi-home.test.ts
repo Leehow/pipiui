@@ -4,6 +4,46 @@ import { join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
+ * The project models.json link goes through `node:fs/promises`, so denying it
+ * needs its own pass-through mock. Same shape as the `node:fs` one below: a
+ * toggle that makes only that one path EPERM, which is Windows without
+ * Developer Mode.
+ */
+const promiseSymlinkDenial = vi.hoisted(() => ({ active: false, crossVolume: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const isProjectModels = (path: unknown) => String(path).includes(".pi") && String(path).includes("models.json");
+  return {
+    ...actual,
+    default: actual,
+    symlink: async (target: Parameters<typeof actual.symlink>[0], path: Parameters<typeof actual.symlink>[1], type?: Parameters<typeof actual.symlink>[2]) => {
+      if (promiseSymlinkDenial.active && String(path).includes("models.json")) {
+        throw Object.assign(new Error("EPERM: operation not permitted, symlink"), { code: "EPERM" });
+      }
+      return actual.symlink(target, path, type);
+    },
+    // Profile on C:, project on D: — the case where the hard-link fallback
+    // cannot help either, so a replica is the only thing left.
+    link: async (existing: Parameters<typeof actual.link>[0], path: Parameters<typeof actual.link>[1]) => {
+      if (promiseSymlinkDenial.crossVolume && isProjectModels(path)) {
+        throw Object.assign(new Error("EXDEV: cross-device link not permitted, link"), { code: "EXDEV" });
+      }
+      return actual.link(existing, path);
+    },
+  };
+});
+
+/** Windows without Developer Mode, project on another volume. */
+function withoutLinks<T>(run: () => Promise<T>): Promise<T> {
+  promiseSymlinkDenial.active = true;
+  promiseSymlinkDenial.crossVolume = true;
+  return run().finally(() => {
+    promiseSymlinkDenial.active = false;
+    promiseSymlinkDenial.crossVolume = false;
+  });
+}
+
+/**
  * ESM exports cannot be spied on, so `node:fs` is mocked with a pass-through that
  * only refuses the two shared-credential symlinks while the toggle is on — exactly
  * what Windows does to an unprivileged account.
@@ -28,6 +68,7 @@ import {
   ensureProjectPiHome,
   migrateSharedProjectModels,
   projectPiAgentDir,
+  refreshProjectModelMirrors,
   projectPiSessionsDir,
   sanitizePiSettings,
   sanitizePiSettingsFile,
@@ -116,6 +157,133 @@ describe("project Pi home", () => {
     expect(JSON.parse(await readFile(join(projectPiAgentDir(project), "settings.json"), "utf8"))).toEqual({ theme: "dark" });
     expect(await readFile(join(projectPiAgentDir(project), "trust.json"), "utf8")).toBe('{"trusted":false}');
     expect(await readFile(join(projectPiAgentDir(project), "models-store.json"), "utf8")).toBe('{"project":true}');
+  });
+
+  it("gives the project a replica when neither a symlink nor a hard link is possible", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-replica-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    await mkdir(seed, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await writeFile(join(seed, "models.json"), JSON.stringify({ providers: { alpha: { apiKey: "k" } } }));
+
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] }));
+
+    const projectModels = join(projectPiAgentDir(await realpath(project)), "models.json");
+    expect((await lstat(projectModels)).isSymbolicLink()).toBe(false);
+    const canonical = join(await realpath(seed), "models.json");
+    expect(await readFile(projectModels, "utf8")).toBe(await readFile(canonical, "utf8"));
+    const ledger = JSON.parse(await readFile(join(await realpath(seed), ".pipiui-model-mirrors-v1.json"), "utf8"));
+    expect(Object.keys(ledger.mirrors)).toEqual([projectModels]);
+  });
+
+  it("never resurrects a provider deleted from canonical out of a stale replica", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-no-resurrect-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    await mkdir(seed, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await writeFile(join(seed, "models.json"), JSON.stringify({ providers: { alpha: { apiKey: "k" }, doomed: { apiKey: "d" } } }));
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] }));
+
+    const canonical = join(await realpath(seed), "models.json");
+    const projectModels = join(projectPiAgentDir(await realpath(project)), "models.json");
+    expect(JSON.parse(await readFile(projectModels, "utf8")).providers.doomed).toBeDefined();
+
+    // The user deletes a provider in the app. The replica is now stale and
+    // still carries it — and is exactly what a merge would read back.
+    await writeFile(canonical, `${JSON.stringify({ providers: { alpha: { apiKey: "k" } } }, null, 2)}\n`);
+
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] }));
+
+    expect(JSON.parse(await readFile(canonical, "utf8")).providers.doomed).toBeUndefined();
+    expect(JSON.parse(await readFile(projectModels, "utf8")).providers.doomed).toBeUndefined();
+  });
+
+  it("refreshes replicas from canonical, drops vanished ones, and keeps a hand edit", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-refresh-"));
+    const seed = join(root, "profile");
+    const tracked = join(root, "tracked");
+    const edited = join(root, "edited");
+    await mkdir(seed, { recursive: true });
+    await mkdir(tracked, { recursive: true });
+    await mkdir(edited, { recursive: true });
+    await writeFile(join(seed, "models.json"), JSON.stringify({ providers: { alpha: { apiKey: "k" } } }));
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [tracked, edited] }));
+
+    const canonical = join(await realpath(seed), "models.json");
+    const trackedModels = join(projectPiAgentDir(await realpath(tracked)), "models.json");
+    const editedModels = join(projectPiAgentDir(await realpath(edited)), "models.json");
+    const handEdit = `${JSON.stringify({ providers: { mine: { apiKey: "local" } } }, null, 2)}\n`;
+    await writeFile(editedModels, handEdit);
+
+    await writeFile(canonical, `${JSON.stringify({ providers: { alpha: { apiKey: "k" }, beta: { apiKey: "b" } } }, null, 2)}\n`);
+    const result = await refreshProjectModelMirrors({ canonicalAgentDir: seed });
+
+    expect(result.refreshed).toEqual([trackedModels]);
+    expect(result.skipped).toEqual([editedModels]);
+    expect(JSON.parse(await readFile(trackedModels, "utf8")).providers.beta).toBeDefined();
+    // Someone else's bytes are never overwritten; the next open merges them.
+    expect(await readFile(editedModels, "utf8")).toBe(handEdit);
+  });
+
+  it("merges a replica back into canonical once something else writes to it", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-writeback-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    await mkdir(seed, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await writeFile(join(seed, "models.json"), JSON.stringify({ providers: { alpha: { apiKey: "k" } } }));
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] }));
+
+    // With a link, a provider added inside a session would land on canonical.
+    // With a replica it lands here, and the digest stops matching the ledger —
+    // which is precisely what makes the next open treat it as a source again.
+    const projectModels = join(projectPiAgentDir(await realpath(project)), "models.json");
+    await writeFile(projectModels, `${JSON.stringify({ providers: { alpha: { apiKey: "k" }, added: { apiKey: "n" } } }, null, 2)}\n`);
+
+    await withoutLinks(() => migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] }));
+
+    const canonical = JSON.parse(await readFile(join(await realpath(seed), "models.json"), "utf8"));
+    expect(canonical.providers.added).toBeDefined();
+    // And it is a recognised replica again, so it will not be merged twice.
+    const ledger = JSON.parse(await readFile(join(await realpath(seed), ".pipiui-model-mirrors-v1.json"), "utf8"));
+    expect(ledger.mirrors[projectModels]).toBeDefined();
+  });
+
+  it("is a no-op for a host with no replicas", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-no-replicas-"));
+    const seed = join(root, "profile");
+    await mkdir(seed, { recursive: true });
+    await expect(refreshProjectModelMirrors({ canonicalAgentDir: seed })).resolves.toEqual({
+      refreshed: [], dropped: [], skipped: [],
+    });
+  });
+
+  it("falls back to a hard link when only the symlink privilege is missing", async () => {
+    root = await mkdtemp(join(tmpdir(), "pipi-model-hardlink-"));
+    const seed = join(root, "profile");
+    const project = join(root, "project");
+    await mkdir(seed, { recursive: true });
+    await mkdir(project, { recursive: true });
+    await writeFile(join(seed, "models.json"), JSON.stringify({ providers: { alpha: { apiKey: "k" } } }));
+
+    // Developer Mode off, but the project is on the same volume: a hard link
+    // still gives the one-file guarantee, so no replica and no ledger entry.
+    promiseSymlinkDenial.active = true;
+    try {
+      await migrateSharedProjectModels({ canonicalAgentDir: seed, projectRoots: [project] });
+    } finally {
+      promiseSymlinkDenial.active = false;
+    }
+
+    const canonical = join(await realpath(seed), "models.json");
+    const projectModels = join(projectPiAgentDir(await realpath(project)), "models.json");
+    const [canonicalStat, projectStat] = [await lstat(canonical), await lstat(projectModels)];
+    expect(projectStat.isSymbolicLink()).toBe(false);
+    expect(projectStat.ino).toBe(canonicalStat.ino);
+    expect(projectStat.dev).toBe(canonicalStat.dev);
+    await expect(readFile(join(await realpath(seed), ".pipiui-model-mirrors-v1.json"), "utf8")).rejects.toThrow();
   });
 
   it("creates a minimal stable canonical when neither App nor project has a models source", async () => {
