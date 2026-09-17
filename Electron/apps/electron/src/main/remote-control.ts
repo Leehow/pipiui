@@ -47,11 +47,23 @@ export type RemoteControlStored = {
   relayOrigin: string
 }
 
+/**
+ * The renderer end of one remote-control subscription. `isDestroyed`/`once` are
+ * the Electron `WebContents` extras the real main process supplies and test
+ * doubles omit; they let a closed window be dropped from the fan-out instead of
+ * throwing `Object has been destroyed` out of a relay heartbeat.
+ */
+export type RemoteControlSender = {
+  send(channel: string, state: RemoteControlState): void
+  isDestroyed?(): boolean
+  once?(event: 'destroyed', listener: () => void): void
+}
+
 export type RemoteControlIpcMainLike = {
   handle(
     channel: string,
     listener: (
-      event: { sender: { send(channel: string, state: RemoteControlState): void } },
+      event: { sender: RemoteControlSender },
       command: RemoteControlCommand
     ) => Promise<RemoteControlState>
   ): void
@@ -653,14 +665,22 @@ export function registerRemoteControlIpc(
   eventChannel = PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
   debug?: RemoteDebugService
 ): void {
-  const renderers = new Set<{ send(channel: string, state: RemoteControlState): void }>()
+  const renderers = new Set<RemoteControlSender>()
   const publish = (state: RemoteControlState) => {
-    for (const renderer of renderers) renderer.send(eventChannel, state)
+    for (const renderer of renderers) {
+      if (renderer.isDestroyed?.()) { renderers.delete(renderer); continue }
+      // Relay heartbeats publish from a timer, so a throw here would be an
+      // uncaught main-process exception rather than a rejected promise.
+      try { renderer.send(eventChannel, state) } catch { renderers.delete(renderer) }
+    }
   }
   service.subscribe(state => publish(mergeRemoteState(state, debug?.getState())))
   debug?.subscribe(debugState => publish(mergeRemoteState(service.getState(), debugState)))
   ipc.handle(channel, async (event, command) => {
-    renderers.add(event.sender)
+    if (!renderers.has(event.sender)) {
+      renderers.add(event.sender)
+      event.sender.once?.('destroyed', () => { renderers.delete(event.sender) })
+    }
     const type = command?.type
     if (type === 'start') return mergeRemoteState(await service.start(command.relayOrigin), debug?.getState())
     if (type === 'stop') return mergeRemoteState(await service.stop(), debug?.getState())

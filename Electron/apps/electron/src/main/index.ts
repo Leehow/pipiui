@@ -44,10 +44,24 @@ export interface IpcMainLike {
   handle(
     channel: string,
     listener: (
-      event: { sender: { send(channel: string, frame: HostWireFrame): void } },
+      event: { sender: RendererSender },
       request: HostRequest
     ) => Promise<HostResponse>
   ): void
+}
+
+/**
+ * The renderer end of one IPC subscription.
+ *
+ * `send` is all the contract needs; `isDestroyed`/`once` are the Electron
+ * `WebContents` extras the real main process supplies and test doubles omit.
+ * They exist so a closed window can be dropped from the fan-out instead of
+ * throwing `Object has been destroyed` out of an event emit.
+ */
+export type RendererSender = {
+  send(channel: string, frame: HostWireFrame): void
+  isDestroyed?(): boolean
+  once?(event: 'destroyed', listener: () => void): void
 }
 
 /** Registers main-process IPC without coupling the reusable contract to Electron runtime types. */
@@ -56,16 +70,29 @@ export function registerPipiHostIpc(
   backend: HostBackend,
   channel = PIPI_HOST_IPC_CHANNEL
 ): void {
-  type RendererSender = { send(channel: string, frame: HostWireFrame): void }
   const renderers = new Map<RendererSender, string | undefined>()
   backend.subscribe((frame) => {
     if (process.env.PIPIUI_STREAM_DEBUG) console.log(`[stream-debug] ipc-send ch=${(frame as { channel?: string }).channel} t=${Date.now()}`)
     for (const [renderer, selectedSession] of renderers) {
-      if (shouldForwardRendererEvent(frame, selectedSession)) renderer.send(channel, { type: 'event', ...frame })
+      if (!shouldForwardRendererEvent(frame, selectedSession)) continue
+      if (renderer.isDestroyed?.()) { renderers.delete(renderer); continue }
+      try {
+        renderer.send(channel, { type: 'event', ...frame })
+      } catch {
+        // A WebContents can die between that check and this send — a window
+        // closing while a pty timer flushes terminal output is the usual race.
+        // Dropping the subscriber IS the recovery: this emit runs on a timer,
+        // outside any promise chain, so a throw here is an uncaught exception
+        // that takes down the whole main process.
+        renderers.delete(renderer)
+      }
     }
   })
   ipc.handle(channel, async (event, request) => {
-    if (!renderers.has(event.sender)) renderers.set(event.sender, undefined)
+    if (!renderers.has(event.sender)) {
+      renderers.set(event.sender, undefined)
+      event.sender.once?.('destroyed', () => { renderers.delete(event.sender) })
+    }
     if (request.protocolVersion !== PIPI_HOST_PROTOCOL_VERSION || request.type !== 'request') {
       return { protocolVersion: PIPI_HOST_PROTOCOL_VERSION, id: request.id ?? '', type: 'response', ok: false, error: 'unsupported protocol' }
     }
