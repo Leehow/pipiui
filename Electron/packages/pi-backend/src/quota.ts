@@ -74,6 +74,15 @@ export function parseCodexUsageWindows(body: unknown): QuotaWindow[] { return pa
 export type QuotaFetchDeps = {
   fetch?: typeof fetch;
   agentDir?: string;
+  /**
+   * Where the *active session's* pi child writes its extension snapshots, i.e.
+   * the `PI_CODING_AGENT_DIR` that spawn-assembly handed it. Under the isolated
+   * profile mode that is `<project>/.pi/agent`, not the app-profile agent dir,
+   * so extension-written snapshot files (grok/flapcode) never appeared where
+   * this module looked and their quota pills stayed empty. Consulted first for
+   * those files, with `agentDir` as the fallback.
+   */
+  sessionAgentDir?: () => string | undefined;
   readCodexAuth?: () => Promise<string | undefined>;
   readDeepSeekEnvFile?: () => Promise<string | undefined>;
   readDeepSeekAuth?: () => Promise<string | undefined>;
@@ -95,6 +104,21 @@ export type QuotaFetchDeps = {
 
 async function optionalFile(path: string): Promise<string | undefined> {
   try { return await fs.readFile(path, "utf8"); } catch { return undefined; }
+}
+
+/**
+ * Read one extension-written snapshot file. The active session's own agent dir
+ * is authoritative — that child is what wrote the file — and the app-profile
+ * agent dir is the fallback for non-isolated profiles and for sessions that
+ * have not produced a snapshot yet.
+ */
+async function extensionSnapshot(agentDir: string, deps: QuotaFetchDeps, filename: string): Promise<string | undefined> {
+  const scoped = deps.sessionAgentDir?.();
+  if (scoped && scoped !== agentDir) {
+    const found = await optionalFile(join(scoped, filename));
+    if (found !== undefined) return found;
+  }
+  return optionalFile(join(agentDir, filename));
 }
 
 const OPEN_CODE_MESSAGE_USAGE_SQL = `
@@ -202,11 +226,11 @@ async function capabilities(env: NodeJS.ProcessEnv, deps: QuotaFetchDeps): Promi
       return parsed(raw);
     },
     // Written by the pipiui-xai-server-tools extension from live api.x.ai response headers.
-    readGrokRateLimits: () => (deps.readGrokRateLimits ?? (() => optionalFile(join(agentDir, "grok-rate-limits.json"))))(),
+    readGrokRateLimits: () => (deps.readGrokRateLimits ?? (() => extensionSnapshot(agentDir, deps, "grok-rate-limits.json")))(),
     // Written by the flapcode extension from live relay x-codex-* response headers.
-    readFlapcodeRateLimits: () => (deps.readFlapcodeRateLimits ?? (() => optionalFile(join(agentDir, "flapcode-rate-limits.json"))))(),
+    readFlapcodeRateLimits: () => (deps.readFlapcodeRateLimits ?? (() => extensionSnapshot(agentDir, deps, "flapcode-rate-limits.json")))(),
     // Written by the flapcode extension from flapcode.com/api/cli/accounts (plan name + expiry).
-    readFlapcodeAccount: () => (deps.readFlapcodeAccount ?? (() => optionalFile(join(agentDir, "flapcode-account.json"))))(),
+    readFlapcodeAccount: () => (deps.readFlapcodeAccount ?? (() => extensionSnapshot(agentDir, deps, "flapcode-account.json")))(),
   };
 }
 
@@ -236,9 +260,25 @@ export async function fetchDeepSeekBalance(env: NodeJS.ProcessEnv = process.env,
 export class QuotaStore {
   private monitor?: Promise<AccountUsageMonitor>;
   private readonly hostSnapshots = new WeakMap<AccountUsageSnapshot, QuotaSnapshot>();
-  constructor(private readonly env: NodeJS.ProcessEnv = process.env, private readonly deps: QuotaFetchDeps = {}) {}
+  /** Agent dir of the session whose pill is being rendered; see QuotaFetchDeps.sessionAgentDir. */
+  private sessionAgentDir?: string;
+  private readonly resolvedDeps: QuotaFetchDeps;
+  constructor(private readonly env: NodeJS.ProcessEnv = process.env, deps: QuotaFetchDeps = {}) {
+    this.resolvedDeps = { ...deps, sessionAgentDir: deps.sessionAgentDir ?? (() => this.sessionAgentDir) };
+  }
   private core(): Promise<AccountUsageMonitor> {
-    return this.monitor ??= capabilities(this.env, this.deps).then(value => new AccountUsageMonitor(value));
+    return this.monitor ??= capabilities(this.env, this.resolvedDeps).then(value => new AccountUsageMonitor(value));
+  }
+  /**
+   * Point the extension-snapshot readers at one session's agent dir. The
+   * monitor caches per provider without knowing about directories, so a change
+   * has to bypass that cache or the previous project's numbers would be
+   * re-served for this one.
+   */
+  useSessionAgentDir(dir: string | undefined): boolean {
+    if (dir === this.sessionAgentDir) return false;
+    this.sessionAgentDir = dir;
+    return true;
   }
   async snapshot(modelProvider: string, force = false): Promise<QuotaSnapshot | null> {
     const result = await (await this.core()).snapshot(modelProvider, force);

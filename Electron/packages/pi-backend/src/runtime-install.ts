@@ -66,9 +66,16 @@ function readRuntimeBundleSelection(sourceRoot: string, report: InstallReport): 
     }
     const known = new Set(BUNDLED_MANIFEST_EXTENSIONS);
     const unknown = parsed.bundledExtensions.filter(id => !known.has(id));
-    if (unknown.length) throw new Error(`bundledExtensions contains unknown ids: ${unknown.join(", ")}`);
+    if (unknown.length) {
+      // An older host reading a newer manifest must not lose the whole
+      // keepDist selection — 2026-09: one unknown id ("flapcode") threw here,
+      // the catch zeroed bundledExtensions, and every bundled extension had
+      // its dist stripped with no way back. Skip what we do not know and keep
+      // the rest; the skip is still reported, never silent.
+      report.failures.push(`${manifestPath}: skipping unknown bundledExtensions ids: ${unknown.join(", ")}`);
+    }
     return {
-      bundledExtensions: [...new Set(parsed.bundledExtensions)].sort(),
+      bundledExtensions: [...new Set(parsed.bundledExtensions.filter(id => known.has(id)))].sort(),
       includeAnydoc: parsed.includeAnydoc,
     };
   } catch (error) {

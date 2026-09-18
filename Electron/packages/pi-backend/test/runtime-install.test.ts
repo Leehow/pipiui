@@ -91,6 +91,36 @@ describe("installRuntimeTree", () => {
     } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
   });
 
+  it("skips unknown bundledExtensions ids instead of zeroing the whole keepDist selection", async () => {
+    // Regression: an older host reading a newer manifest that names an
+    // extension it does not know must still restore dist for the ones it does.
+    const root = await temp();
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      for (const name of ["pi-core-prompt", "pi-ext", "pi-philosophy", "extensions", "built-in-skills", "pi-goal", "profiles"]) {
+        await mkdir(join(source, name), { recursive: true });
+      }
+      await mkdir(join(source, "extensions", "deepseek", "agent", "dist"), { recursive: true });
+      await writeFile(join(source, "extensions", "deepseek", "agent", "dist", "index.js"), "export default function(){}", "utf8");
+      await writeFile(join(source, "extensions", "deepseek", "pipiui-extension.json"), "{}", "utf8");
+      await mkdir(join(source, "extensions", "future-ext"), { recursive: true });
+      await writeFile(join(source, "extensions", "future-ext", "pipiui-extension.json"), "{}", "utf8");
+      await writeFile(join(source, "pipiui-runtime-manifest.json"), JSON.stringify({
+        schemaVersion: 1,
+        bundledExtensions: ["deepseek", "future-ext"],
+        includeAnydoc: false,
+      }));
+
+      const report = installRuntimeTree({ sourceRoot: source }, destination);
+      expect(report.failures).toEqual([expect.stringContaining("skipping unknown bundledExtensions ids: future-ext")]);
+      // The known id still gets the keepDist second pass; the unknown one is
+      // left as the generic pass copied it (metadata only), never restored.
+      expect(existsSync(join(destination, "extensions", "deepseek", "agent", "dist", "index.js"))).toBe(true);
+      expect(report.installed).toContain(join(destination, "extensions", "deepseek"));
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
   it("installs the whole shipped tree the way resolveSpawnPaths expects to find it", async () => {
     const root = await temp();
     try {

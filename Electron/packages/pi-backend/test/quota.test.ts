@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -223,7 +223,7 @@ describe("fetchCodexQuota", () => {
 describe("PiHostBackend quota bridge", () => {
   it("uses the requested session's Codex provider instead of the configured default", async () => {
     const snapshot = { provider: "codex", accountLabel: "Codex 账号额度", windows: [{ id: "primary", usedPercent: 63, label: "5h", title: "5小时额度" }, { id: "secondary", usedPercent: 12, label: "周", title: "周额度" }] };
-    const quotaStore = { snapshot: vi.fn(async () => snapshot) };
+    const quotaStore = { snapshot: vi.fn(async () => snapshot), useSessionAgentDir: vi.fn(() => false) };
     const backend = createPiHostBackend({ quotaStore: quotaStore as any });
     const privateBackend = backend as unknown as { sessionModelSnapshots: Map<string, unknown> };
     privateBackend.sessionModelSnapshots.set("codex-session", {
@@ -233,12 +233,12 @@ describe("PiHostBackend quota bridge", () => {
     });
 
     await expect(backend.handle("getQuotaSnapshot", ["codex-session"])).resolves.toEqual(snapshot);
-    expect(quotaStore.snapshot).toHaveBeenCalledWith("openai-codex");
+    expect(quotaStore.snapshot).toHaveBeenCalledWith("openai-codex", false);
   });
 
   it("uses an OpenCode Go model id when OpenCode groups it under its generic provider", async () => {
     const snapshot = { provider: "opencodeGo", accountLabel: "OpenCode Go 本机用量", windows: [{ id: "fiveHour", usedPercent: 50, label: "5h", title: "5小时本机用量" }] };
-    const quotaStore = { snapshot: vi.fn(async () => snapshot) };
+    const quotaStore = { snapshot: vi.fn(async () => snapshot), useSessionAgentDir: vi.fn(() => false) };
     const backend = createPiHostBackend({ quotaStore: quotaStore as any });
     const privateBackend = backend as unknown as { sessionModelSnapshots: Map<string, unknown> };
     privateBackend.sessionModelSnapshots.set("opencode-go-session", {
@@ -248,7 +248,7 @@ describe("PiHostBackend quota bridge", () => {
     });
 
     await expect(backend.handle("getQuotaSnapshot", ["opencode-go-session"])).resolves.toEqual(snapshot);
-    expect(quotaStore.snapshot).toHaveBeenCalledWith("opencode-go");
+    expect(quotaStore.snapshot).toHaveBeenCalledWith("opencode-go", false);
   });
 });
 
@@ -393,5 +393,72 @@ describe("QuotaStore", () => {
     time += QUOTA_STALE_AFTER_MS + 1;
     fail = true;
     expect(await store.snapshot("openai-codex")).toBe(good);
+  });
+});
+
+describe("extension-written quota snapshots follow the session's agent dir", () => {
+  /** The flapcode/grok snapshots are written by the session's Pi child, which under
+   *  the isolated profile uses the project home rather than the app profile dir. */
+  async function dirs() {
+    const profile = await mkdtemp(join(tmpdir(), "quota-profile-"));
+    const project = await mkdtemp(join(tmpdir(), "quota-project-"));
+    return { profile, project };
+  }
+  const rateLimits = (usedPercent: number) => JSON.stringify({
+    capturedAt: 1, planType: "pro",
+    primary: { usedPercent, windowMinutes: 10080, resetAtSeconds: 2 },
+    secondary: { usedPercent: 0, windowMinutes: 0 },
+  });
+  const account = (planName: string) => JSON.stringify({ fetchedAt: 1, planName, expiresAt: "2026-10-13T09:16:00.000Z" });
+
+  it("reads the project agent dir the child actually wrote to", async () => {
+    const { profile, project } = await dirs();
+    try {
+      await writeFile(join(project, "flapcode-rate-limits.json"), rateLimits(37));
+      await writeFile(join(project, "flapcode-account.json"), account("尊享版"));
+      const store = new QuotaStore({}, { agentDir: profile, sessionAgentDir: () => project });
+      const snapshot = await store.snapshot("flapcode");
+      expect(snapshot?.windows[0].usedPercent).toBe(37);
+      expect(snapshot?.accountLabel).toContain("尊享版");
+    } finally {
+      await rm(profile, { recursive: true, force: true });
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the app profile dir when the session dir has no snapshot", async () => {
+    const { profile, project } = await dirs();
+    try {
+      await writeFile(join(profile, "flapcode-rate-limits.json"), rateLimits(12));
+      const store = new QuotaStore({}, { agentDir: profile, sessionAgentDir: () => project });
+      expect((await store.snapshot("flapcode"))?.windows[0].usedPercent).toBe(12);
+    } finally {
+      await rm(profile, { recursive: true, force: true });
+      await rm(project, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a changed session dir so the caller can bypass the provider cache", async () => {
+    const store = new QuotaStore({}, { agentDir: "/profile" });
+    expect(store.useSessionAgentDir("/a")).toBe(true);
+    expect(store.useSessionAgentDir("/a")).toBe(false);
+    expect(store.useSessionAgentDir("/b")).toBe(true);
+    expect(store.useSessionAgentDir(undefined)).toBe(true);
+  });
+
+  it("serves the new project's numbers after a switch, not the cached ones", async () => {
+    const { profile, project } = await dirs();
+    const other = await mkdtemp(join(tmpdir(), "quota-project2-"));
+    try {
+      await writeFile(join(project, "flapcode-rate-limits.json"), rateLimits(37));
+      await writeFile(join(other, "flapcode-rate-limits.json"), rateLimits(81));
+      let active: string = project;
+      const store = new QuotaStore({}, { agentDir: profile, sessionAgentDir: () => active });
+      expect((await store.snapshot("flapcode"))?.windows[0].usedPercent).toBe(37);
+      active = other;
+      expect((await store.snapshot("flapcode", true))?.windows[0].usedPercent).toBe(81);
+    } finally {
+      for (const dir of [profile, project, other]) await rm(dir, { recursive: true, force: true });
+    }
   });
 });
