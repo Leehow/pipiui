@@ -576,6 +576,17 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
     return getState()
   }
 
+  const requestReconnect = () => {
+    // macOS can leave a WebSocket looking OPEN across lock-screen / wake
+    // transitions while packets are no longer delivered. Closing it here lets
+    // the existing run loop perform a fresh hello without rotating the room
+    // or disturbing the paired browser.
+    if (!stored?.enabled) return
+    if (socket && socket.readyState < 2) {
+      try { socket.close(4000, 'power state changed') } catch { /* close race */ }
+    }
+  }
+
   const getState = () => state
 
   const restore = async () => {
@@ -607,6 +618,8 @@ export function createRemoteControlService(options: RemoteControlServiceOptions)
       listeners.add(listener)
       return () => { listeners.delete(listener) }
     },
+    /** Reconnect after a macOS lock-screen / wake transition. */
+    requestReconnect,
     /** Test hook: drop the outbound host socket without disabling the room. */
     dropConnection() {
       if (socket && socket.readyState < 2) {
@@ -621,6 +634,11 @@ export type RemoteControlService = ReturnType<typeof createRemoteControlService>
 export type SleepPreventerLike = {
   start(type: 'prevent-app-suspension' | 'prevent-display-sleep'): number
   stop(id: number): void
+}
+
+export type RemoteControlPowerMonitorLike = {
+  on(event: 'lock-screen' | 'unlock-screen' | 'resume', listener: () => void): unknown
+  removeListener?(event: 'lock-screen' | 'unlock-screen' | 'resume', listener: () => void): unknown
 }
 
 /**
@@ -647,6 +665,28 @@ export function bindRemoteControlSleepPrevention(
   }
   sync(service.getState().enabled)
   return service.subscribe(state => sync(state.enabled))
+}
+
+/**
+ * Force the relay transport through a new hello across macOS lock and wake
+ * transitions.
+ * The app-suspension assertion keeps normal idle sleep from suspending the
+ * host, but it cannot repair a socket that the OS silently stranded during a
+ * lock transition.
+ */
+export function bindRemoteControlPowerLifecycle(
+  service: Pick<RemoteControlService, 'requestReconnect'>,
+  powerMonitor: RemoteControlPowerMonitorLike
+): () => void {
+  const reconnect = () => service.requestReconnect()
+  powerMonitor.on('lock-screen', reconnect)
+  powerMonitor.on('unlock-screen', reconnect)
+  powerMonitor.on('resume', reconnect)
+  return () => {
+    powerMonitor.removeListener?.('lock-screen', reconnect)
+    powerMonitor.removeListener?.('unlock-screen', reconnect)
+    powerMonitor.removeListener?.('resume', reconnect)
+  }
 }
 
 function mergeRemoteState(relay: RemoteControlState, debug?: RemoteDebugState): RemoteControlState {

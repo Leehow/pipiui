@@ -130,6 +130,16 @@
         ]
       },
       {
+        "from": "../../resources/runtime/extensions/flapcode",
+        "to": "pipiui-runtime/extensions/flapcode",
+        "filter": [
+          "**/*",
+          "!**/node_modules/**",
+          "!**/.git/**",
+          "!**/*.tsbuildinfo"
+        ]
+      },
+      {
         "from": "../../resources/runtime/extensions/qoder",
         "to": "pipiui-runtime/extensions/qoder",
         "filter": [

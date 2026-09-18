@@ -1,4 +1,4 @@
-import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, powerSaveBlocker, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
+import { app, BaseWindow, desktopCapturer, dialog, ipcMain, nativeImage, powerMonitor, powerSaveBlocker, screen, shell, systemPreferences, WebContentsView, type OpenDialogOptions, type SaveDialogOptions } from 'electron'
 import { basename, join } from 'node:path'
 import { appendFileSync, writeFileSync } from 'node:fs'
 import { BrowserWatchCallbackRegistry, createCanonicalModelsWriteQueue, createPiHostBackend, handleBrowserWatchEvent, installRuntimeTree, projectPiAgentDir, readProjectExtensionGrants, QuotaStore, FREEZE_PROBE_FILE, FREEZE_PROBE_PREFIX, HEADROOM_ENGINE_VERSION } from '@pipi/pi-backend'
@@ -30,6 +30,7 @@ import { createElectronComputerUsePermissionHost, withComputerUsePermissions } f
 import { createPtyTerminalBackend, TerminalSessionHost } from './terminal-host.js'
 import { createElectronHostCapabilityBroker } from './host-capability-host.js'
 import {
+  bindRemoteControlPowerLifecycle,
   bindRemoteControlSleepPrevention,
   createRemoteControlService,
   PIPI_REMOTE_CONTROL_EVENT_CHANNEL,
@@ -432,6 +433,9 @@ if (app) {
     // the socket dies and the machine becomes unreachable. Hold an idle-sleep
     // assertion while the room is enabled (the display may still sleep).
     bindRemoteControlSleepPrevention(remoteControl, powerSaveBlocker)
+    // A locked Mac can strand an otherwise OPEN WebSocket. Reconnect after
+    // unlock/wake so the paired browser gets a fresh host hello immediately.
+    bindRemoteControlPowerLifecycle(remoteControl, powerMonitor)
     const remoteDebug = createRemoteDebugService({
       backend,
       staticDir: resolveRemoteDebugStaticDir({

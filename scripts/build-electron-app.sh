@@ -383,9 +383,17 @@ sha256_file() {
 # Root CodeDirectory hash. CDHash is computed by codesign over the sealed
 # bundle resources, so it binds the whole signed App, not just one file.
 extract_codesign_cdhash() {
-  local app="$1" line
-  line="$(codesign -d --verbose=4 "$app" 2>&1 | /usr/bin/awk -F= '/^CDHash=/ {print $2; exit}')"
-  [[ "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
+  # codesign prints the 20-byte truncated identity as `CDHash=<40 hex>` and the
+  # untruncated digest as `CandidateCDHashFull sha256=<64 hex>`. Prefer the full
+  # hash, fall back to the truncated one; requiring 64 hex from the `CDHash=`
+  # line alone can never match on a current macOS.
+  local app="$1" out line
+  out="$(codesign -d --verbose=4 "$app" 2>&1)"
+  line="$(printf '%s\n' "$out" | /usr/bin/awk '/^CandidateCDHashFull sha256=/ {sub(/^.*sha256=/, ""); print; exit}')"
+  if [[ ! "$line" =~ ^[0-9a-f]{64}$ ]]; then
+    line="$(printf '%s\n' "$out" | /usr/bin/awk -F= '/^CDHash=/ {print $2; exit}')"
+  fi
+  [[ "$line" =~ ^[0-9a-f]{40}$ || "$line" =~ ^[0-9a-f]{64}$ ]] || return 1
   printf '%s' "$line"
 }
 

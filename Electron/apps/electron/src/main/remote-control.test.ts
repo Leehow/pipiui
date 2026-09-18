@@ -7,6 +7,7 @@ import WebSocket from 'ws'
 import type { HostBackend, HostEvent } from '@pipi/host-api'
 import { createHostAPIRelay } from '../../../../../Relay/src/host-api-relay.js'
 import {
+  bindRemoteControlPowerLifecycle,
   bindRemoteControlSleepPrevention,
   createRemoteControlService,
   pairUrlFor,
@@ -486,6 +487,30 @@ describe('createRemoteControlService', () => {
     expect(service.getState().rotationNotice).toBeUndefined()
   })
 
+  it('closes a stale host socket when power state requests a reconnect', async () => {
+    const dir = await userData()
+    const sockets: FakeSocket[] = []
+    const service = createRemoteControlService({
+      backend: mockBackend(),
+      userDataDir: dir,
+      relayOrigin: 'http://relay.test',
+      backoffMs: () => 5,
+      connect: () => {
+        const socket = makeFakeSocket()
+        sockets.push(socket)
+        return socket
+      },
+    })
+    services.push(service)
+
+    await service.start()
+    const first = sockets[0]
+    first.fireOpen()
+    await waitFor(() => first.sent.some(text => text.includes('"hello"')), 'hello not sent')
+    service.requestReconnect()
+    await waitFor(() => first.readyState === 3, 'stale socket was not closed')
+  })
+
   it('does not close the shared backend when the remote socket drops', async () => {
     const relay = await startRelay()
     relays.push(relay)
@@ -793,6 +818,33 @@ describe('remote pair link check', () => {
     const checked = await handler?.({ sender: { send() {} } }, { type: 'checkLink' })
     expect(checked?.linkCheck?.status).toBe('ok')
   }, 15_000)
+})
+
+describe('bindRemoteControlPowerLifecycle', () => {
+  it('reconnects on unlock and resume, and removes both listeners', () => {
+    const listeners = new Map<string, () => void>()
+    const on = vi.fn((event: string, listener: () => void) => { listeners.set(event, listener) })
+    const removeListener = vi.fn((event: string) => { listeners.delete(event) })
+    const requestReconnect = vi.fn()
+    const unbind = bindRemoteControlPowerLifecycle(
+      { requestReconnect },
+      { on, removeListener } as never,
+    )
+
+    expect(on).toHaveBeenNthCalledWith(1, 'lock-screen', expect.any(Function))
+    expect(on).toHaveBeenNthCalledWith(2, 'unlock-screen', expect.any(Function))
+    expect(on).toHaveBeenNthCalledWith(3, 'resume', expect.any(Function))
+    listeners.get('lock-screen')?.()
+    listeners.get('unlock-screen')?.()
+    listeners.get('resume')?.()
+    expect(requestReconnect).toHaveBeenCalledTimes(3)
+
+    unbind()
+    expect(removeListener).toHaveBeenNthCalledWith(1, 'lock-screen', expect.any(Function))
+    expect(removeListener).toHaveBeenNthCalledWith(2, 'unlock-screen', expect.any(Function))
+    expect(removeListener).toHaveBeenNthCalledWith(3, 'resume', expect.any(Function))
+    expect(listeners).toHaveLength(0)
+  })
 })
 
 describe('bindRemoteControlSleepPrevention', () => {
