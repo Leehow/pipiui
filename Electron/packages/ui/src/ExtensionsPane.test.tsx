@@ -279,7 +279,7 @@ function extensionPackHost(extra: ExtensionDescriptor[] = []) {
   ])
   let activation: ProjectProductActivation = { schemaVersion: 2, profile: 'coding', overrides: {} }
   let profiles: ProductProfileDescriptor[] = [
-    { id: 'base', name: '基础版', state: 'available', source: 'builtin', requiredExtensionIds: ['skill-loader-extension', 'built-in-skills'], recommendedExtensionIds: [] },
+    { id: 'base', name: '基础版', state: 'available', source: 'builtin', requiredExtensionIds: ['skill-loader-extension', 'built-in-skills'], recommendedExtensionIds: ['vision-routing'] },
     {
       id: 'coding',
       name: 'Coding 优化版',

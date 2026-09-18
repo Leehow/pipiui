@@ -47,7 +47,7 @@ export interface ProviderModelGroup {
   models: Model[]
 }
 
-/** GLM 家族：主线虽非多模态，但会话走内置视觉 MCP，不经过通用识图模型。 */
+/** GLM 5.3 之前的文字模型：主线非多模态，会话走内置视觉 MCP，不经过通用识图模型。 */
 const GLM_VISION_MCP_PROVIDERS = new Set(['zai-coding-cn', 'zai', 'glm'])
 
 export function usesBuiltInVisionMcp(provider: string): boolean {

@@ -165,6 +165,7 @@ describe("Product Profile host interface", () => {
         id: "base",
         name: "基础版",
         requiredExtensionIds: ["skill-loader-extension", "built-in-skills"],
+        recommendedExtensionIds: ["vision-routing"],
       }),
       expect.objectContaining({ id: "coding", name: "Coding 优化版" }),
     ]);
@@ -179,6 +180,7 @@ describe("Product Profile host interface", () => {
     const baseExtensions = await backend.handle("listExtensions" as never, [added.id]) as Array<{ id: string; state: string; category?: string }>;
     expect(baseExtensions.find(item => item.id === "skill-loader-extension")).toMatchObject({ state: "enabled", category: "foundation" });
     expect(baseExtensions.find(item => item.id === "built-in-skills")).toMatchObject({ state: "enabled", category: "foundation" });
+    expect(baseExtensions.find(item => item.id === "vision-routing")?.state).toBe("enabled");
     expect(baseExtensions.filter(item => item.id.startsWith("coding-") && item.state === "enabled")).toEqual([]);
     expect(baseExtensions.find(item => item.id === "git-capability")?.state).not.toBe("enabled");
     for (const id of ["web-access-extension", "webview-browser-extension", "cua-extension", "memory-extension"]) {

@@ -2851,7 +2851,7 @@ var DEEPSEEK_CAPABILITIES = {
 var DEEPSEEK_FAMILY_DEFAULTS = {
   api: DEEPSEEK_CHAT_API,
   reasoning: true,
-  input: ["text"],
+  input: ["text", "image"],
   contextWindow: 1e6,
   maxTokens: 384e3,
   thinkingLevelMap: { ...V4_THINKING },
@@ -2886,13 +2886,11 @@ var DEEPSEEK_CURATED_MODELS = [
     cost: { ...FLASH_COST }
   }),
   model(DEEPSEEK_PRO_MODEL_ID, "DeepSeek V4 Pro", {
-    // Vision is explicitly unsupported on Pro; from 2026-09-14 its requests are
-    // routed to V4.1 Flash and billed at the Flash price, but the id stays.
-    input: ["text"],
+    input: ["text", "image"],
     cost: { ...PRO_COST }
   }),
   model("deepseek-v4-flash", "DeepSeek V4 Flash (retired alias)", {
-    input: ["text"],
+    input: ["text", "image"],
     cost: { ...FLASH_COST }
   }),
   model("deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision (retired alias)", {

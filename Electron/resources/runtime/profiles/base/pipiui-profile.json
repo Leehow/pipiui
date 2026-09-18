@@ -8,7 +8,9 @@
       { "id": "skill-loader-extension", "version": "^1.0.0" },
       { "id": "built-in-skills", "version": "^1.0.0" }
     ],
-    "recommended": []
+    "recommended": [
+      { "id": "vision-routing", "version": "^0.1.0" }
+    ]
   },
   "layout": {
     "primarySidebar": "pipi.sessions",

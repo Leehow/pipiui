@@ -65,7 +65,8 @@
           "name": "DeepSeek V4 Pro",
           "api": "openai-responses",
           "input": [
-            "text"
+            "text",
+            "image"
           ],
           "reasoning": true,
           "contextWindow": 1000000,

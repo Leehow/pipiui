@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createPiHostBackend } from "../src/index.js";
+import { DEFAULT_FEATURES } from "../src/features.js";
 import { IMAGE_DESCRIBE_PROMPT_FINGERPRINT } from "../src/vision-describe.js";
 
 let root = "";
@@ -28,6 +29,8 @@ async function fixture(failDescribe = false) {
     agentDir,
     sessionsRoot,
     runtimeRoot: root,
+    // GLM 5.3 之前走内置视觉 MCP；本套测的是通用识图侧路，关掉 MCP 以免 npx 挂起。
+    features: { ...DEFAULT_FEATURES, glmVisionMcp: false },
     piPath: process.execPath,
     spawn: (_bin, args, options) => {
       if (failDescribe && args.includes("--no-session")) {
@@ -71,7 +74,7 @@ describe("vision-model describe routing", () => {
     const setup = await fixture();
     const backend = setup.create();
     await enableVisionRouting(backend);
-    await backend.handle("setModel", ["s1", "deepseek", "deepseek-chat"]);
+    await backend.handle("setModel", ["s1", "zai", "glm-4.6"]);
     const send = await backend.handle("sendPrompt", ["s1", "what does this show", [{ dataBase64: PNG_1x1, mimeType: "image/png", name: "shot.png" }]]) as any;
     expect(send).toMatchObject({ outcome: "direct" });
 
@@ -120,7 +123,7 @@ describe("vision-model describe routing", () => {
   it("keeps today's multimodal embedding when vision routing is disabled or no vision model is selected", async () => {
     const setup = await fixture();
     const backend = setup.create();
-    await backend.handle("setModel", ["s1", "deepseek", "deepseek-chat"]);
+    await backend.handle("setModel", ["s1", "zai", "glm-4.6"]);
 
     // Vision enabled but no model selected → today's behavior.
     await backend.handle("setVisionEnabled", [true]);
@@ -141,7 +144,7 @@ describe("vision-model describe routing", () => {
     const setup = await fixture(true);
     const backend = setup.create();
     await enableVisionRouting(backend);
-    await backend.handle("setModel", ["s1", "deepseek", "deepseek-chat"]);
+    await backend.handle("setModel", ["s1", "zai", "glm-4.6"]);
     // The describe spawn dies without assistant text → description undefined →
     // images embedded, message still sent (never fails the user's send).
     await backend.handle("sendPrompt", ["s1", "look", [{ dataBase64: PNG_1x1, mimeType: "image/png", name: "d.png" }]]);

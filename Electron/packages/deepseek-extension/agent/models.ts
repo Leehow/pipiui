@@ -23,7 +23,7 @@ export const DEEPSEEK_CHAT_API = "openai-responses" as const;
 export const DEEPSEEK_RESPONSES_API = DEEPSEEK_CHAT_API;
 export const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 
-/** Current flagship. Vision-capable, so it is also the multimodal id. */
+/** Current flagship. All current DeepSeek conversation models are multimodal. */
 export const DEEPSEEK_FLASH_MODEL_ID = "deepseek-flash";
 export const DEEPSEEK_VISION_MODEL_ID = DEEPSEEK_FLASH_MODEL_ID;
 export const DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro";
@@ -119,7 +119,7 @@ export const DEEPSEEK_CAPABILITIES: DeepSeekModelCapabilities = {
 export const DEEPSEEK_FAMILY_DEFAULTS = {
   api: DEEPSEEK_CHAT_API,
   reasoning: true,
-  input: ["text"] as Array<"text" | "image">,
+  input: ["text", "image"] as Array<"text" | "image">,
   contextWindow: 1_000_000,
   maxTokens: 384_000,
   thinkingLevelMap: { ...V4_THINKING },
@@ -170,13 +170,11 @@ export const DEEPSEEK_CURATED_MODELS: readonly DeepSeekConversationModel[] = [
     cost: { ...FLASH_COST },
   }),
   model(DEEPSEEK_PRO_MODEL_ID, "DeepSeek V4 Pro", {
-    // Vision is explicitly unsupported on Pro; from 2026-09-14 its requests are
-    // routed to V4.1 Flash and billed at the Flash price, but the id stays.
-    input: ["text"],
+    input: ["text", "image"],
     cost: { ...PRO_COST },
   }),
   model("deepseek-v4-flash", "DeepSeek V4 Flash (retired alias)", {
-    input: ["text"],
+    input: ["text", "image"],
     cost: { ...FLASH_COST },
   }),
   model("deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision (retired alias)", {

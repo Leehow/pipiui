@@ -20,7 +20,7 @@ export declare const DEEPSEEK_PROVIDER_NAME = "DeepSeek Extended";
 export declare const DEEPSEEK_CHAT_API: "openai-responses";
 export declare const DEEPSEEK_RESPONSES_API: "openai-responses";
 export declare const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
-/** Current flagship. Vision-capable, so it is also the multimodal id. */
+/** Current flagship. All current DeepSeek conversation models are multimodal. */
 export declare const DEEPSEEK_FLASH_MODEL_ID = "deepseek-flash";
 export declare const DEEPSEEK_VISION_MODEL_ID = "deepseek-flash";
 export declare const DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro";

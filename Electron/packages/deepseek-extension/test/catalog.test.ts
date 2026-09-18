@@ -111,6 +111,7 @@ describe("catalog merge precedence", () => {
     // visible guess rather than a number presented as verified.
     expect(merged[0]?.metadataSource).toBe("family-default");
     expect(merged[0]?.cost).toEqual(DEEPSEEK_CURATED_MODELS[0]?.cost);
+    expect(merged[0]?.input).toEqual(["text", "image"]);
   });
 
   it("never lets the network move a transport field", () => {

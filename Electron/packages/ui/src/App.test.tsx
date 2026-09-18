@@ -4028,13 +4028,13 @@ describe('composer image attachments', () => {
     const { container } = render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.click(await screen.findByTestId('model-chip'))
-    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
-    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    fireEvent.click(await screen.findByTestId('quick-row-zai-glm-4.6'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GLM-4.6'))
     const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
     pasteImage(composer, makeImageFile('img.png'))
     await screen.findByTestId('composer-thumb-0')
     fireEvent.click(screen.getByLabelText('发送消息'))
-    expect(await screen.findByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeTruthy()
+    expect(await screen.findByText(/当前模型 GLM-4.6 不支持图片附件/)).toBeTruthy()
     expect(sendPrompt).not.toHaveBeenCalled()
     expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
   })
@@ -4286,8 +4286,8 @@ describe('vision routing (扩展 tab)', () => {
     const values = Array.from(select.options).map(option => option.value)
     expect(values).toContain('anthropic/claude-sonnet-4')
     expect(values).toContain('openai/gpt-5')
-    expect(values).not.toContain('openai/openai-codex') // supportsImages === false
-    expect(values).not.toContain('deepseek/deepseek-v3') // supportsImages === false
+    expect(values).toContain('deepseek/deepseek-v3')
+    expect(values).not.toContain('zai/glm-4.6') // supportsImages === false
     expect(values).not.toContain('xai/grok-4') // unchecked in 模型管理
     // 选择后持久化到主机，并显示「已选」提示
     fireEvent.change(select, { target: { value: 'anthropic/claude-sonnet-4' } })
@@ -4342,14 +4342,14 @@ describe('vision routing (扩展 tab)', () => {
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.click(await screen.findByTestId('model-chip'))
-    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
-    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    fireEvent.click(await screen.findByTestId('quick-row-zai-glm-4.6'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GLM-4.6'))
     const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
     pasteImage(composer, makeImageFile('img.png'))
     await screen.findByTestId('composer-thumb-0')
     fireEvent.click(screen.getByLabelText('发送消息'))
     await waitFor(() => expect(sendPrompt).toHaveBeenCalled())
-    expect(screen.queryByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeNull()
+    expect(screen.queryByText(/当前模型 GLM-4.6 不支持图片附件/)).toBeNull()
   })
 
   it('still blocks image sends with a non-multimodal main model when vision routing is disabled', async () => {
@@ -4361,13 +4361,13 @@ describe('vision routing (扩展 tab)', () => {
     render(<App host={host} />)
     await screen.findAllByText('Electron 三栏界面')
     fireEvent.click(await screen.findByTestId('model-chip'))
-    fireEvent.click(await screen.findByTestId('quick-row-deepseek-deepseek-v3'))
-    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('DeepSeek V3'))
+    fireEvent.click(await screen.findByTestId('quick-row-zai-glm-4.6'))
+    await waitFor(() => expect(screen.getByTestId('model-chip').textContent).toContain('GLM-4.6'))
     const composer = screen.getByLabelText('消息输入框') as HTMLTextAreaElement
     pasteImage(composer, makeImageFile('img.png'))
     await screen.findByTestId('composer-thumb-0')
     fireEvent.click(screen.getByLabelText('发送消息'))
-    expect(await screen.findByText(/当前模型 DeepSeek V3 不支持图片附件/)).toBeTruthy()
+    expect(await screen.findByText(/当前模型 GLM-4.6 不支持图片附件/)).toBeTruthy()
     expect(sendPrompt).not.toHaveBeenCalled()
     expect(screen.getByTestId('composer-thumb-0')).toBeTruthy()
   })
@@ -4385,10 +4385,11 @@ describe('vision routing (扩展 tab)', () => {
     fireEvent.click(fold)
     const list = await screen.findByTestId('non-multimodal-list')
     expect(fold.getAttribute('aria-expanded')).toBe('true')
-    expect(list.textContent).toContain('deepseek')
-    expect(list.textContent).toContain('DeepSeek V3')
-    expect(list.textContent).toContain('openai')
-    expect(list.textContent).toContain('OpenAI Codex')
+    expect(list.textContent).toContain('zai')
+    expect(list.textContent).toContain('GLM-4.6')
+    expect(list.textContent).not.toContain('deepseek')
+    expect(list.textContent).not.toContain('DeepSeek V3')
+    expect(list.textContent).not.toContain('OpenAI Codex')
     expect(list.textContent).not.toContain('moonshot')
     expect(list.textContent).not.toContain('Moonshot')
     expect(list.textContent).not.toContain('Claude Sonnet')
