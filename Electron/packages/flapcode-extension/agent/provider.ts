@@ -29,7 +29,6 @@ export {
   type FlapcodeModel,
 } from "./models.js";
 export { API_KEY_ENV, resolveFlapcodeApiKey, resolveFlapcodeConfig } from "./config.js";
-export { FLAPCODE_CONFIG_URL, discoverFlapcodeBaseUrl } from "./discovery.js";
 export { stripUnsupportedFlapcodeParams } from "./client.js";
 
 export type FlapcodeProviderOptions = {

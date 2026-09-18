@@ -6,11 +6,9 @@
  * Run from this package directory with a real key:
  *   FLAPCODE_KEY=sk-flapcode-… node e2e-flapcode.mjs
  */
-import { createRequire } from "node:module";
 import { createFlapcodeProvider, stripUnsupportedFlapcodeParams } from "./agent/dist/provider.js";
 
-const require = createRequire(import.meta.url);
-const { streamSimple } = await import(require.resolve("@earendil-works/pi-ai/dist/api/openai-responses.js"));
+const { streamSimple } = await import("@earendil-works/pi-ai/api/openai-responses");
 
 const apiKey = process.env.FLAPCODE_KEY;
 if (!apiKey) throw new Error("FLAPCODE_KEY env required");

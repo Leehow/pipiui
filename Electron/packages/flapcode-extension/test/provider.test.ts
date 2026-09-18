@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { streamSimple } from "@earendil-works/pi-ai/api/openai-responses";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import agent from "../agent/index.js";
 import { stripUnsupportedFlapcodeParams } from "../agent/client.js";
@@ -11,7 +13,6 @@ import {
   resolveFlapcodeConfig,
   SETTINGS_BASE_URL,
 } from "../agent/config.js";
-import { discoverFlapcodeBaseUrl, FLAPCODE_CONFIG_URL } from "../agent/discovery.js";
 import {
   AUTH_PROVIDER_ID,
   createAuthProvider,
@@ -123,6 +124,48 @@ describe("flapcode extension entry", () => {
     expect(manifest.auth.provider.models).toEqual(JSON.parse(JSON.stringify(flapcodeManifestModels())));
   });
 
+  it.each(flapcodeManifestModels().map((model) => model.id))(
+    "sends explicit non-strict function schemas through pi for %s",
+    async (modelId) => {
+      const provider = createFlapcodeProvider({ apiKey: "sk-flapcode-test" });
+      const model = {
+        ...provider.models.find((entry) => entry.id === modelId)!,
+        provider: FLAPCODE_PROVIDER_ID,
+        baseUrl: provider.baseUrl,
+        headers: provider.headers,
+      };
+      const parameters = Type.Object({
+        command: Type.String(),
+        timeout: Type.Optional(Type.Number()),
+      });
+      let payload: { tools?: unknown[] } | undefined;
+      const response = streamSimple(model, {
+        messages: [{ role: "user", content: "Run pwd with bash.", timestamp: 0 }],
+        tools: [{ name: "bash", description: "Run a shell command.", parameters }],
+      }, {
+        apiKey: "sk-flapcode-test",
+        fetch: async (_url, init) => {
+          payload = JSON.parse(String(init?.body));
+          return new Response(`data: ${JSON.stringify({
+            type: "response.completed",
+            response: { status: "completed", output: [] },
+          })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+        },
+      });
+      const result = await response.result();
+      expect(result.stopReason).toBe("stop");
+      // Omission is not equivalent to false on the relay. Keep optional
+      // fields unchanged while opting out of implicit strict normalization.
+      expect(payload?.tools).toEqual([{
+        type: "function",
+        name: "bash",
+        description: "Run a shell command.",
+        parameters: JSON.parse(JSON.stringify(parameters)),
+        strict: false,
+      }]);
+    },
+  );
+
   it("declares the API key as a namespaced secret setting, never plain settings", () => {
     const manifest = JSON.parse(
       readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "pipiui-extension.json"), "utf8"),
@@ -201,38 +244,5 @@ describe("flapcode wire sanitizer", () => {
       { model: { provider: "flapcode" } },
     );
     expect(rewritten).toEqual({ store: false });
-  });
-});
-
-describe("flapcode gateway discovery", () => {
-  afterEach(cleanEnv);
-
-  it("returns the account base_url from the Flapcode account API", async () => {
-    const seen: Array<{ url: unknown; auth: unknown }> = [];
-    const fetchImpl = (async (url: unknown, init: { headers?: Record<string, string> }) => {
-      seen.push({ url, auth: init?.headers?.Authorization });
-      return { ok: true, json: async () => ({ base_url: "https://codex.takemoon.com/v1", model: "gpt-5.6-sol" }) };
-    }) as unknown as typeof fetch;
-    const found = await discoverFlapcodeBaseUrl("sk-flapcode-key", fetchImpl);
-    expect(found).toBe("https://codex.takemoon.com/v1");
-    expect(seen[0]?.url).toBe(FLAPCODE_CONFIG_URL);
-    expect(seen[0]?.auth).toBe("Bearer sk-flapcode-key");
-  });
-
-  it("normalizes trailing slashes and rejects non-HTTPS discovered URLs", async () => {
-    await expect(
-      discoverFlapcodeBaseUrl("k", mockFetch({ base_url: "https://relay.example.com/v1///" })),
-    ).resolves.toBe("https://relay.example.com/v1");
-    await expect(discoverFlapcodeBaseUrl("k", mockFetch({ base_url: "http://insecure.example.com" }))).resolves.toBeUndefined();
-  });
-
-  it("returns undefined on HTTP errors, bad payloads and network failure", async () => {
-    await expect(discoverFlapcodeBaseUrl("k", mockFetch({}, false))).resolves.toBeUndefined();
-    await expect(discoverFlapcodeBaseUrl("k", mockFetch({}))).resolves.toBeUndefined();
-    await expect(discoverFlapcodeBaseUrl("k", mockFetch({ base_url: 42 }))).resolves.toBeUndefined();
-    const failing = (async () => {
-      throw new Error("offline");
-    }) as unknown as typeof fetch;
-    await expect(discoverFlapcodeBaseUrl("k", failing)).resolves.toBeUndefined();
   });
 });

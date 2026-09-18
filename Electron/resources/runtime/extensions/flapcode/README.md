@@ -15,7 +15,7 @@ API Key 是 `format: secret` 的扩展设置 `ext.flapcode.apiKey`：
 
 ## 实测结论（2026-09，真实 key 探测）
 
-- **网关地址按账号下发**：文档写的 `codex.flapcode.com` 当前 TLS 握手即被拒（`unrecognized_name`）。每个账号的真实网关由 `https://flapcode.com/api/cli/config?provider=codex`（同一个 key 做 Bearer 认证，与官方 CLI 同一端点）返回，实测账号为 `https://codex.takemoon.com/v1`。插件默认该地址，并在启动时用 key 自动发现、不一致则以发现值重注册；`ext.flapcode.baseUrl` 用户设置永远优先。
+- **网关地址固定为 `https://codex.takemoon.com/v1`**：文档写的 `codex.flapcode.com` TLS 握手即被拒（`unrecognized_name`）。曾经用 `https://flapcode.com/api/cli/config?provider=codex` 按账号发现网关，现已移除：该控制面会对正在正常服务的账号返回 409「Codex 账号已过期」，留着它只可能把可用的 provider 指歪。`ext.flapcode.baseUrl` 用户设置仍然优先。
 - **`session-id` 请求头必需**：缺失时 400 `Missing or invalid session-id header`；pi 自带的 `session_id` / `x-session-id` affinity 头不被接受，所以插件固定注入一个每实例随机 UUID 的 `session-id` 头。
 - **payload 要求**：`store:false`、`stream:true`、结构化 list `input` 缺一不可（分别 400）——pi 的 openai-responses streamer 原生全部满足。但中转站**拒绝未知参数**：pi 总会发送的 `max_output_tokens`（无 compat 开关）和 `prompt_cache_retention`（retention=long 时）都会 400 `Unsupported parameter`，插件用 `before_provider_request` 钩子剥离这两个（及防御性的 `prompt_cache_options`），并在模型 compat 里关掉 `supportsLongCacheRetention`。其余字段（`instructions`、`reasoning{effort,summary}`、`include[reasoning.encrypted_content]`、`prompt_cache_key`）均实测接受。
 - **`GET /v1/models` 不存在（404）**：模型无法枚举；目录里五个模型（`gpt-5.6-sol` / `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-6-astra` / `gpt-5.5`）已逐个实测 `response.completed`。
