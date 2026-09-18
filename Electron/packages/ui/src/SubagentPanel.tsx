@@ -54,6 +54,14 @@ function isActive(agent: Pick<Agent, 'state'>) {
   return agent.state === 'running'
 }
 
+const resumableStates: AgentState[] = ['ok', 'failed', 'aborted', 'interrupted']
+
+export function canContinueAgent(agent: Pick<AgentSummary, 'state' | 'sessionId' | 'runId' | 'diagnostics'>) {
+  return resumableStates.includes(agent.state)
+    && Boolean(agent.sessionId && agent.runId)
+    && agent.diagnostics?.finalizationPhase !== 'done-await-host'
+}
+
 /**
  * Terminal rows settled this long ago are history material, not active list
  * content. Freshly-completed rows never match, so a record the user just
@@ -702,7 +710,7 @@ function treeOrder(agents: Agent[]) {
   return order
 }
 
-export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, headerSlot, onRunningChange, onRunningCountChange, onAgentStarted, onManualStatusCheck }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; headerSlot?: HTMLElement | null; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void; onManualStatusCheck?: (agentIDs: string[]) => void }) {
+export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, onContinue, retainedWorktreeDispositionAvailable = false, visible: paneVisible = true, headerSlot, onRunningChange, onRunningCountChange, onAgentStarted, onManualStatusCheck }: { host: PipiHostAPI; sessionId?: string; projectPath?: string; onOpenDocument?: (path: string) => void; onContinue?: (agentId: string) => void | Promise<void>; retainedWorktreeDispositionAvailable?: boolean; visible?: boolean; headerSlot?: HTMLElement | null; onRunningChange?: (running: boolean) => void; onRunningCountChange?: (count: number) => void; onAgentStarted?: () => void; onManualStatusCheck?: (agentIDs: string[]) => void }) {
   const terminalAvailable = Boolean(host.terminal?.open)
   const [agents, setAgents] = useState<Agent[]>([])
   // Selection is a ROW key (agentId+runId), never the bare agentId: two runs of
@@ -1107,6 +1115,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
                 onSelect={() => setSelectedKey(agentRowKey(agent))}
 				onAbort={() => void abort(agent)}
                 onResolve={() => void resolve(agent)}
+                onContinue={onContinue}
               />)}
               {ordered.length > pageSize && <div className="agent-pager">
                 <button disabled={activePage === 0} onClick={() => setPage(value => value - 1)}>较新</button>
@@ -1130,6 +1139,7 @@ export function SubagentPanel({ host, sessionId, projectPath, onOpenDocument, re
                     onSelect={() => setSelectedKey(agentRowKey(agent))}
                     onAbort={() => void abort(agent)}
                     onResolve={() => void resolve(agent)}
+                    onContinue={onContinue}
                   />)}
                 </div>
               )}
@@ -1448,7 +1458,7 @@ function SubagentHeader({ total, running, runningTokens, succeeded, failed, clea
   </header>
 }
 
-function AgentRow({ agent, testId, childCount, activeChildCount, selected, aborting, now, onSelect, onAbort, onResolve }: {
+function AgentRow({ agent, testId, childCount, activeChildCount, selected, aborting, now, onSelect, onAbort, onResolve, onContinue }: {
   agent: Agent
   /** Per-row testid: the bare agentId when unique in this tree, `agentId--runId` when one slug owns several displayed runs. */
   testId?: string
@@ -1460,6 +1470,7 @@ function AgentRow({ agent, testId, childCount, activeChildCount, selected, abort
   onSelect: () => void
   onAbort: () => void
   onResolve: () => void
+  onContinue?: (agentId: string) => void | Promise<void>
 }) {
   const active = isActive(agent)
   const worktree = worktreeBadge(agent.worktree, active)
@@ -1470,6 +1481,8 @@ function AgentRow({ agent, testId, childCount, activeChildCount, selected, abort
   const identity = episodeIdentity(agent)
   const controlsInert = !identity
   const handled = !active && !agent.handled && ['failed', 'aborted', 'interrupted'].includes(agent.state)
+  const continuationEligible = canContinueAgent(agent)
+  const continuationDisabled = !continuationEligible || !onContinue
   const stalled = agent.stalled || agent.state === 'stalled'
   const closing = liveRunningProgressLine({
     state: agent.state,
@@ -1509,6 +1522,14 @@ function AgentRow({ agent, testId, childCount, activeChildCount, selected, abort
     </button>
     {active && <button aria-label={`${aborting ? '正在中止' : '中止'} ${agent.name}`} title={controlsInert ? '缺少会话/运行标识，无法精确停止' : aborting ? '正在中止 agent' : '中止 agent'} className="agent-control abort" disabled={aborting || controlsInert} onClick={onAbort}>{aborting ? <span className="agent-spinner" aria-hidden="true" /> : '■'}</button>}
     {handled && <button aria-label={`标记 ${agent.name} 已处理`} title={controlsInert ? '缺少会话/运行标识，无法精确标记' : '标记已处理'} className="agent-control resolve" disabled={controlsInert} onClick={onResolve}>标记已处理</button>}
+    {canContinueAgent(agent) && <button
+      type="button"
+      className="agent-control continue"
+      aria-label={`续跑 ${agent.name}`}
+      title={continuationDisabled ? (!identity ? '缺少会话/运行标识，无法续跑' : !onContinue ? '当前连接不支持续跑' : '该会话不可续跑') : '使用同一 agent 会话继续；不会复用旧 run'}
+      disabled={continuationDisabled}
+      onClick={() => { if (continuationEligible && onContinue) void onContinue(agent.agentId) }}
+    >续跑 · 同会话</button>}
   </article>
 }
 

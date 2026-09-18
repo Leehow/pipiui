@@ -161,6 +161,7 @@ export type PanelRenderContext = {
   onSubagentsRunningCountChange: (count: number) => void
   onSubagentStarted: () => void
   onManualSubagentStatusCheck: (agentIDs: string[]) => void
+  onContinueSubagent?: (agentId: string) => void
   browserAvailable: boolean | undefined
   browserOccluded: boolean
   terminalAvailable: boolean | undefined

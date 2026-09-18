@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { useState, type ComponentProps } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentEvent, AgentSummary, PipiHostAPI } from '@pipi/host-api'
-import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, parseCloseoutSummary, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
+import { agentDetailUsage, agentDisplayName, agentEventSupersedes, agentRunLineageSizeForTest, canContinueAgent, parseCloseoutSummary, resetAgentRunLineageForTest, resolveAgentStalled, SubagentPanel } from './SubagentPanel'
 
 afterEach(() => {
   cleanup()
@@ -149,6 +149,35 @@ describe('agentEventSupersedes', () => {
     }
     // Same run id but no timestamps still follows the terminal-stickiness rule.
     expect(agentEventSupersedes({ ...displayed }, { state: 'ok', runId: 'r1' })).toBe(true)
+  })
+})
+
+describe('continuation eligibility', () => {
+  it('only permits stored terminal episodes and excludes done-await-host', () => {
+    for (const state of ['ok', 'failed', 'aborted', 'interrupted'] as const) {
+      expect(canContinueAgent({ state, sessionId: 's', runId: 'old-run' })).toBe(true)
+    }
+    expect(canContinueAgent({ state: 'running', sessionId: 's', runId: 'old-run' })).toBe(false)
+    expect(canContinueAgent({ state: 'ok', sessionId: 's', runId: 'old-run', diagnostics: { finalizationPhase: 'done-await-host' } })).toBe(false)
+    expect(canContinueAgent({ state: 'ok', sessionId: 's', runId: '' })).toBe(false)
+  })
+
+  it('renders a terminal continuation action and passes only the stable agent id', async () => {
+    const harness = hostHarness()
+    harness.host.listAgents = async () => [{
+      agentId: 'same-worker', runId: 'old-run', sessionId: 'session-1', name: 'explore',
+      task: '继续检查', state: 'failed', createdAt: Date.now() - 1_000, endedAt: Date.now(),
+    }]
+    const onContinue = vi.fn()
+    renderSubagentPanel({ host: harness.host, sessionId: 'session-1', onContinue })
+
+    const button = await screen.findByRole('button', { name: '续跑 explore' })
+    fireEvent.click(button)
+    expect(onContinue).toHaveBeenCalledTimes(1)
+    expect(onContinue).toHaveBeenCalledWith('same-worker')
+    expect(onContinue.mock.calls[0]).toHaveLength(1)
+    expect(JSON.stringify(onContinue.mock.calls[0])).not.toContain('old-run')
+    expect(JSON.stringify(onContinue.mock.calls[0])).not.toContain('fresh')
   })
 })
 

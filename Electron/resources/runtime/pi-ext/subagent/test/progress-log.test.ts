@@ -10,6 +10,7 @@ import {
 	describeProgressChannelForStall,
 	effectiveLastProgressAt,
 	formatProgressLogReport,
+	formatProgressLogEvidence,
 	formatProgressLogRetargetReceipt,
 	progressIdleMs,
 	PROGRESS_LOG_EXCERPT_MAX_BYTES,
@@ -300,6 +301,30 @@ test("a stalled worker's progress channel reports the command that never returne
 	assert.match(missing, /never written since it was set 45s ago/);
 	assert.match(missing, /PYTHONUNBUFFERED=1/);
 	assert.doesNotMatch(missing, /last grew/);
+});
+
+test("status evidence is bounded, explicit about freshness, and does not consume the forward cursor", () => {
+	const dir = mkdtempSync(join(tmpdir(), "progress-evidence-status-"));
+	const file = join(dir, "live.log");
+	writeFileSync(file, `${"old ".repeat(200)}\n[progress] phase=playing progress=42/100 health=healthy\n`);
+	const state: ProgressLogRetargetState = { progressLogOffset: 0, lastProgressLogAt: 9_000, lastStallNotifyAt: 0, stallNotifyCount: 0 };
+	const before = state.progressLogOffset;
+	const evidence = formatProgressLogEvidence({
+		path: file,
+		now: 12_000,
+		lastProgressLogAt: state.lastProgressLogAt,
+		tail: readProgressLogTail({ path: file }),
+	});
+	assert.match(evidence, /progress evidence: instrument=present status=latest-tail freshness=3s ago/);
+	assert.match(evidence, /phase=playing progress=42\/100/);
+	assert.match(evidence, /tail truncated to 600 bytes/);
+	assert.match(evidence, /not a user instruction/);
+	assert.equal(state.progressLogOffset, before);
+	assert.equal(state.progressReportInFlight, undefined);
+
+	assert.match(formatProgressLogEvidence({ path: join(dir, "missing.log"), now: 12_000 }), /instrument=missing status=not-observed/);
+	writeFileSync(join(dir, "empty.log"), "");
+	assert.match(formatProgressLogEvidence({ path: join(dir, "empty.log"), now: 12_000, tail: readProgressLogTail({ path: join(dir, "empty.log") }) }), /instrument=empty status=no-content/);
 });
 
 test("readProgressLogTail keeps the end of a long log and is independent of the forward offset", () => {

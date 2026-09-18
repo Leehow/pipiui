@@ -32,6 +32,7 @@ registerPanel('coding-orchestration', {
         onRunningCountChange={ctx.onSubagentsRunningCountChange}
         onAgentStarted={ctx.onSubagentStarted}
         onManualStatusCheck={ctx.onManualSubagentStatusCheck}
+        onContinue={ctx.onContinueSubagent}
       />
     </div>
   ),
