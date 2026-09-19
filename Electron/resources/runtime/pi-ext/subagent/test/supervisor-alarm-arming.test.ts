@@ -6,7 +6,16 @@ import type { BossEscalationEnvelope } from "../supervisor/contract.ts";
 
 const escalation = { kind: "escalate" } as BossEscalationEnvelope;
 
-test("a terminal episode stays armed until the Boss acknowledges it", () => {
+test("a successful completion is consumed after the Boss sees it, while abnormal terminals stay armed", () => {
+  assert.equal(supervisorDeliveryArmsAlarm({
+    kind: "completion",
+    job: { status: "completed", verify: "passed" },
+  }), false);
+  assert.equal(supervisorDeliveryArmsAlarm({
+    kind: "completion",
+    job: { status: "failed", verify: "failed" },
+  }), true);
+  // Missing job evidence remains fail-closed and keeps the old alarm behavior.
   assert.equal(supervisorDeliveryArmsAlarm({ kind: "completion" }), true);
   assert.equal(supervisorDeliveryArmsAlarm({ kind: "upgrade_failure" }), true);
 });

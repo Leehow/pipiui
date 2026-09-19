@@ -118,7 +118,10 @@ export interface BossAlarmAckResult {
 }
 
 export function shouldArmBossAlarmForJobState(state: string | undefined): boolean {
-	return state === "ok" || state === "failed" || state === "aborted" || state === "interrupted";
+	// A successful completion is ordinary information: once the Boss has seen it,
+	// the normal assistant-fulfillment path settles the delivery. Only an abnormal
+	// terminal episode needs a recurring alarm until the Boss explicitly closes it.
+	return state === "failed" || state === "aborted" || state === "interrupted";
 }
 
 export function formatBossAlarmMessage(input: {

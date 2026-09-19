@@ -115,6 +115,8 @@ export interface SupervisorCurrentDelivery {
 		agentId: string;
 		runId: string;
 		receiptId: string;
+		/** Terminal status lets the host avoid arming ordinary successful completions. */
+		job?: SupervisorJobSnapshot;
 		envelope?: BossEscalationEnvelope;
 	}): Promise<boolean | void> | boolean | void;
 }
@@ -317,6 +319,7 @@ export function createSupervisorDelivery(deps: SupervisorDeliveryDeps): Supervis
 			agentId: request.agentId,
 			runId: request.runId,
 			receiptId,
+			job: request.job,
 			...(envelope ? { envelope } : {}),
 		});
 		return accepted !== false;

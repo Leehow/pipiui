@@ -3,7 +3,11 @@ import type {
 	SupervisorDeliveryRequest,
 	SupervisorDeliveryResult,
 } from "./delivery.ts";
-import type { BossEscalationEnvelope, SupervisorEventKind } from "./contract.ts";
+import type {
+	BossEscalationEnvelope,
+	SupervisorEventKind,
+	SupervisorJobSnapshot,
+} from "./contract.ts";
 
 /** What the host must do after the Supervisor has inspected a runtime signal. */
 /**
@@ -92,8 +96,10 @@ export async function routeHostSupervisorDelivery(
  * acknowledged.
  *
  * That relentlessness is right for something the Boss must act on and would
- * otherwise drop: a terminal episode, or an escalation asking for a decision.
- * It is wrong for a periodic status summary. A `wave` line reports what is
+ * otherwise drop: an abnormal terminal episode, or an escalation asking for a
+ * decision. A successful completion is ordinary information; once the Boss has
+ * seen it, the normal assistant-fulfillment path settles it without another wake.
+ * It is also wrong for a periodic status summary. A `wave` line reports what is
  * running; the correct response to it is often "nothing, keep waiting", and
  * there is no acknowledgement that fits — so arming it produced a notice that
  * re-woke the Boss every minute forever, and, because a confirmed delivery is
@@ -102,9 +108,14 @@ export async function routeHostSupervisorDelivery(
 export function supervisorDeliveryArmsAlarm(input: {
 	kind: SupervisorEventKind;
 	envelope?: BossEscalationEnvelope;
+	job?: Pick<SupervisorJobSnapshot, "status" | "verify">;
 }): boolean {
 	if (input.envelope) return true;
-	return input.kind !== "wave";
+	if (input.kind === "wave") return false;
+	if (input.kind === "completion" && input.job) {
+		return input.job.status !== "completed" || input.job.verify === "failed";
+	}
+	return true;
 }
 
 /** Stable namespaces keep a Supervisor escalation from consuming a worker's final receipt. */

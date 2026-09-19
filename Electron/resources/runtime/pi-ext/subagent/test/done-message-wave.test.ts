@@ -36,7 +36,7 @@ test("wave with 2 running workers renders the Wave line right after Title", () =
 	);
 	assert.match(
 		text,
-		/The Wave line above is the runtime snapshot of still-running workers taken at this completion; use it to decide whether the whole related goal is terminal yet\./,
+		/Handling: worker event, not a user request\. Use the Wave line to decide whether related work is terminal/,
 	);
 });
 
@@ -52,14 +52,10 @@ test("waiting instructions gate the final closeout, never impose total silence",
 	assert.doesNotMatch(text, /do NOT give the user any conclusion, summary, or progress update/);
 	assert.doesNotMatch(text, /do NOT give the user a status update, progress report/);
 	assert.match(text, /do not give the final closeout or claim completion/);
-	assert.match(text, /do not give a final closeout or present the goal as complete/);
-	assert.match(text, /If the user directly asks what is going on, answer briefly and factually/);
-	assert.match(text, /never send an empty assistant message/i);
-	assert.match(text, /never fabricate results/i);
-	assert.match(text, /never emit one update per done event/i);
-	// The terminal gate itself stays: exactly one final closeout, only after terminal.
-	assert.match(text, /ONLY after status confirms every related worker is terminal/);
-	assert.match(text, /exactly one complete final closeout in their language/);
+	// The compact handling line preserves the only gate this per-worker message needs;
+	// the rest of the orchestration policy already lives in the system extension.
+	assert.match(text, /Do not claim final completion until every related worker is terminal\./);
+	assert.ok(text.length < 4000, "a completion receipt must not repeat the full orchestration policy");
 });
 
 test("empty wave renders the 0-workers directive line", () => {

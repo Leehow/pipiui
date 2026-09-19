@@ -164,6 +164,7 @@ import {
 import {
 	acknowledgeBossAlarm,
 	formatBossAlarmMessage,
+	shouldArmBossAlarmForJobState,
 	VolatileBossAlarmStore,
 } from "./boss-alarm.ts";
 import {
@@ -7087,7 +7088,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 					if (!serialized.ok) throw new Error(serialized.error);
 				},
 			},
-			deliverCurrent: async ({ kind, publicText, agentId, runId, envelope }) => {
+			deliverCurrent: async ({ kind, publicText, agentId, runId, envelope, job }) => {
 				if (envelope || kind === "completion" || kind === "wave" || kind === "upgrade_failure") {
 					return deliverConfirmedDoneToBossAsync(
 						pi,
@@ -7095,7 +7096,7 @@ function bindHostSupervisor(pi: ExtensionAPI): void {
 						runId,
 						publicText,
 						supervisorBossObligationNamespace({ kind, envelope }),
-						supervisorDeliveryArmsAlarm({ kind, envelope }),
+						supervisorDeliveryArmsAlarm({ kind, envelope, job }),
 					);
 				}
 				if (kind === "stall") {
@@ -7209,9 +7210,15 @@ function notifySubagentDone(
 		...(findings.ok && findings.file ? { findingsFile: findings.file } : {}),
 	};
 	const text = formatSubagentDoneMessage(result, runId ? { ...extraWithWave, runId } : extraWithWave);
+	// Successful completions are informational: a clean Boss turn fulfills them and
+	// removes the obligation. Abnormal terminal episodes keep the explicit alarm door.
+	const terminalState = terminalAgentId ? jobRegistry.get(terminalAgentId)?.state : undefined;
+	const armAlarm = shouldArmBossAlarmForJobState(
+		terminalState ?? (extra?.error ? "failed" : "ok"),
+	);
 	// 前台 job 可能没有 bridge agentId；那种情况下投递确认无从挂起，退化为一次性投递。
 	if (result.agentId && runId) {
-		deliverConfirmedDone(pi, result.agentId, runId, text);
+		void deliverConfirmedDoneToBossAsync(pi, result.agentId, runId, text, undefined, armAlarm);
 	} else {
 		deliverSubagentDone(pi, text);
 	}

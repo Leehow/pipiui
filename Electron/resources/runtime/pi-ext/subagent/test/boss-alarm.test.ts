@@ -286,7 +286,8 @@ test("alarm message and terminal-state gate carry the explicit semantic alarm co
 	assert.match(text, /subagent_alarm_ack\(\{alarmId:"worker-a\.1"/);
 	assert.doesNotMatch(text, /runId/);
 	assert.match(text, /text-only reply does not stop/i);
-	for (const state of ["ok", "failed", "aborted", "interrupted"]) {
+	assert.equal(shouldArmBossAlarmForJobState("ok"), false);
+	for (const state of ["failed", "aborted", "interrupted"]) {
 		assert.equal(shouldArmBossAlarmForJobState(state), true, state);
 	}
 	assert.equal(shouldArmBossAlarmForJobState("running"), false);
