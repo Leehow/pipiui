@@ -584,6 +584,9 @@ describe("extension provider contribution host lifecycle", () => {
     expect(JSON.stringify(status)).not.toContain("ref-secret");
     await writeFile(join(agent, "auth.json"), "{}\n");
 
+    // logoutExtension refuses while the extension still claims the provider; disable first.
+    await expect(host.handle("logoutExtension" as never, ["acme"])).rejects.toThrow(/由「acme」扩展提供/);
+    await host.handle("setExtensionEnabled" as never, ["acme", false, "app"]);
     const state = await host.handle("logoutExtension" as never, ["acme"]) as { model: { provider: string; id: string } };
     expect(runtime.logouts).toEqual(["acme-chat"]);
     expect((await host.handle("listModels", []) as { provider: string; id: string }[])

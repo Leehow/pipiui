@@ -10186,8 +10186,9 @@ export class PiHostBackend implements HostBackend {
     // An extension re-registers its provider on every mount, so removing it here
     // would only produce "extension enabled, provider invisible". Point at the
     // one control that actually owns it instead of faking a deletion.
+    const overlay = await this.currentExtensionOverlay();
     const claim = this.extensionLoader
-      .contributionClaims()
+      .contributionClaims(overlay)
       .find((entry) => entry.enabled && entry.contribution.provider?.id === providerId);
     if (claim)
       throw new Error(

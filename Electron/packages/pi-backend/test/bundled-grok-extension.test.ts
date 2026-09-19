@@ -236,6 +236,9 @@ describe("bundled grok-build-oauth host integration", () => {
     expect((await backend.handle("listModels", []) as { provider: string; id: string }[])
       .map((model) => `${model.provider}/${model.id}`)).toContain("grok-build/grok-4.6");
 
+    // logoutExtension refuses while the extension still claims the provider; disable first.
+    await expect(backend.handle("logoutExtension" as never, [GROK_EXTENSION_ID])).rejects.toThrow(/由「grok-build-oauth」扩展提供/);
+    await backend.handle("setExtensionEnabled" as never, [GROK_EXTENSION_ID, false, "app"]);
     const state = await backend.handle("logoutExtension" as never, [GROK_EXTENSION_ID]) as { model: { provider: string; id: string } };
     expect(authRuntime.logouts).toEqual(["grok-build"]);
     expect((await backend.handle("listModels", []) as { provider: string; id: string }[])
