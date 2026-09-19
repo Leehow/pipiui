@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile, appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiHostBackend, TURN_WATCHDOG_TIMEOUT_MS } from "../src/index.js";
 
 let root = "";
@@ -28,19 +28,26 @@ async function fixture() {
   await mkdir(directory, { recursive: true });
   const sessionPath = join(directory, "s1.jsonl");
   await writeFile(sessionPath, JSON.stringify({ type: "session", version: 3, id: "s1", timestamp: "2026-08-17T00:00:00.000Z", cwd }) + "\n");
+  const commandWrites: { mock: { calls: any[][] } }[] = [];
   const backend = createPiHostBackend({
     agentDir,
     sessionsRoot,
     runtimeRoot: root,
     piPath: process.execPath,
-    spawn: (_bin, _args, options) => spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options) as any,
+    spawn: (_bin, _args, options) => {
+      const child = spawn(process.execPath, [new URL("./fake-pi.mjs", import.meta.url).pathname], options);
+      commandWrites.push(vi.spyOn(child.stdin!, "write"));
+      return child as any;
+    },
   });
-  return { backend, sessionPath };
+  const sentCommands = () => commandWrites.flatMap(spy => spy.mock.calls.flatMap(([chunk]) =>
+    String(chunk).trim().split("\n").map(line => JSON.parse(line))));
+  return { backend, sessionPath, sentCommands };
 }
 
 describe("turn watchdog (fix 3)", () => {
   it("triggers settle+drain when tail is assistant stop and turn silent >120s", async () => {
-    const { backend, sessionPath } = await fixture();
+    const { backend, sessionPath, sentCommands } = await fixture();
     const statuses: string[] = [];
     const off = backend.subscribe(e => { if (e.channel === "stream" && e.event.type === "status") statuses.push(e.event.status); });
 
@@ -70,7 +77,12 @@ describe("turn watchdog (fix 3)", () => {
     await eventually(() => statuses.includes("settled"));
     // After watchdog settle, queue should be drained (FIFO auto-drain, no age check)
     await eventually(async () => ((await backend.handle("listQueue", ["s1"]) as any[]).length === 0));
-    expect(statuses.filter(s => s === "started").length).toBeGreaterThanOrEqual(2); // watchdog drain started next turn
+    // Pi still holds the turn: the rejected plain prompt falls back to an
+    // acknowledged steer, which does not emit a second agent_start.
+    expect(sentCommands()).toContainEqual(expect.objectContaining({
+      type: "prompt", message: "from-watchdog", streamingBehavior: "steer",
+    }));
+    expect(statuses.filter(s => s === "started")).toHaveLength(1);
 
     off();
     await backend.close();

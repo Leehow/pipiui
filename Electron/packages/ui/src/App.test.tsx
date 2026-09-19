@@ -1725,13 +1725,23 @@ describe('PipiUI main layout', () => {
   })
 
   it('shows the project git branch in the chat header and hides it without the capability', async () => {
-    render(<App host={createMockHost()} />)
+    const host = createMockHost({ productProfiles: true })
+    host.listExtensions = vi.fn(async () => [{
+      id: 'git-capability',
+      name: 'PipiUI Git',
+      version: '1.0.0',
+      state: 'enabled' as const,
+      source: 'app' as const,
+      directory: join(process.cwd(), 'resources/runtime/extensions/git-capability'),
+      // Load the real source entry without requiring a packaged extension build.
+      ui: { headerActions: [{ id: 'git.branch', order: 20, entry: 'app/branch-menu.tsx' }] },
+    }])
+    render(<App host={host} />)
     const branch = await screen.findByTestId('git-branch-button')
     expect(branch.textContent).toContain('pipiui/electron-git-bran')
     expect(branch.closest('.chat-header')).not.toBeNull()
     cleanup()
-    const base = createMockHost()
-    render(<App host={{ ...base, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: true, git: false, plan: false, retainedWorktreeDisposition: false }) }} />)
+    render(<App host={{ ...host, capabilities: async () => ({ computerUse: false, revealInFinder: true, terminal: true, browser: true, git: false, plan: false, retainedWorktreeDisposition: false }) }} />)
     await screen.findAllByText('Electron 三栏界面')
     await waitFor(() => expect(screen.queryByTestId('git-branch-button')).toBeNull())
   })

@@ -35,21 +35,26 @@ describe("model catalog load reuse", () => {
       authRuntime: {
         getProviders: async () => [],
         getAvailable: async () => {
-          getAvailableCalls += 1;
+          const call = ++getAvailableCalls;
+          // Constructor provider prefetch is separate from the catalog load.
+          if (call === 1) return firstCatalog;
           await catalogGate;
-          return getAvailableCalls === 1 ? firstCatalog : refreshedCatalog;
+          return call === 2 ? firstCatalog : refreshedCatalog;
         },
         login: async () => undefined,
         logout: async () => undefined,
       },
     });
 
+    // Construction starts provider prefetch and a gated catalog preload.
+    // Concurrent reads must join that preload rather than start another load.
+    await vi.waitFor(() => expect(getAvailableCalls).toBe(2));
     const pending = [
       backend.handle("listModels", []),
       backend.handle("listModels", []),
       backend.handle("getSubagentModels", []),
     ];
-    await vi.waitFor(() => expect(getAvailableCalls).toBe(1));
+    await vi.waitFor(() => expect(getAvailableCalls).toBe(2));
     releaseCatalog();
     const [first, second] = await Promise.all(pending) as [any[], any[], unknown];
     expect(first).toEqual(second);
@@ -57,20 +62,20 @@ describe("model catalog load reuse", () => {
       name: "GPT-5.6 Sol",
       thinkingLevelMap: { minimal: "low", max: "max" },
     });
-    expect(getAvailableCalls).toBe(1);
+    expect(getAvailableCalls).toBe(2);
 
     await backend.handle("listModels", []);
     await backend.handle("getSubagentModels", []);
-    expect(getAvailableCalls).toBe(1);
+    expect(getAvailableCalls).toBe(2);
 
     const refreshed = await backend.refreshModelCatalog();
-    expect(getAvailableCalls).toBe(2);
+    expect(getAvailableCalls).toBe(3);
     expect(refreshed.find(model => model.id === "gpt-5.6-sol")).toMatchObject({
       name: "GPT-5.6 Sol refreshed",
       thinkingLevelMap: { minimal: "low", xhigh: "xhigh", max: "max" },
     });
     expect(await backend.handle("listModels", [])).toEqual(refreshed);
-    expect(getAvailableCalls).toBe(2);
+    expect(getAvailableCalls).toBe(3);
     await backend.close();
   });
 });

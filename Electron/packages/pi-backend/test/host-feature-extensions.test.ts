@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createPiHostBackend } from "../src/index.js";
+import { DEFAULT_FEATURES } from "../src/features.js";
 import { validateExtensionManifest } from "../src/extension-manifest.js";
 import { EXTERNAL_SESSION_SCAN_EXTENSION_ID, VISION_ROUTING_EXTENSION_ID, WEB_SEARCH_KEYS_EXTENSION_ID } from "../src/host-feature-extensions.js";
 import { encodeClaudeProjectDir } from "../src/external-sessions.js";
@@ -61,6 +62,8 @@ describe("host-feature builtin extensions", () => {
       sessionsRoot: sessions,
       runtimeRoot: runtime,
       profileMode: options.profileMode ?? "isolated",
+      // GLM 5.3 之前走内置视觉 MCP；本套测的是通用识图侧路，关掉 MCP 以免 npx 挂起。
+      features: { ...DEFAULT_FEATURES, glmVisionMcp: false },
       canonicalProjectPaths: async () => undefined,
       ...(externalHome
         ? { externalSessionRoots: { home: externalHome }, env: { ...process.env, HOME: externalHome } }
@@ -166,7 +169,7 @@ describe("host-feature builtin extensions", () => {
 
     await backend.handle("setVisionModel", ["anthropic/claude-sonnet-4"]);
     await backend.handle("setVisionEnabled", [true]);
-    await backend.handle("setModel", ["s1", "deepseek", "deepseek-chat"]);
+    await backend.handle("setModel", ["s1", "zai", "glm-4.6"]);
     const describePrompts = () => rpcs.filter((rpc) => rpc.id === "describe-prompt");
     const mainPrompts = () => rpcs.filter((rpc) => rpc.type === "prompt" && rpc.id !== "describe-prompt" && rpc.id !== "title-prompt");
 

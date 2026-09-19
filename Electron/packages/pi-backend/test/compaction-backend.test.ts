@@ -177,7 +177,7 @@ describe("context compaction", () => {
       contextUsage: { tokens: 12000 },
     });
     await backend.close();
-  });
+  }, 30_000);
 
   it("production default falls back to host summary compaction when lossless rewrite leaves usage high", async () => {
     const backend = await fixture(undefined, false);

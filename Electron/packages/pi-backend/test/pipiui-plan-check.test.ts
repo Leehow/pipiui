@@ -14,6 +14,8 @@ type Tool = {
 async function loadExtension(sessionId = "") {
   vi.resetModules();
   vi.stubEnv("PIPIUI_SESSION_ID", sessionId);
+  vi.stubEnv("PIPIUI_PROJECT_ROOT", "");
+  vi.stubEnv("PIPIUI_MAIN_CWD", "");
   vi.stubEnv("PIPIUI_BRIDGE_PORT", "");
   vi.stubEnv("PIPIUI_HOST_PROTOCOL", "");
   vi.stubEnv("PIPIUI_SESSION_KEY", "");

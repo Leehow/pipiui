@@ -22,6 +22,8 @@ type LoadedTools = Record<string, Tool> & { __handlers: Map<string, EventHandler
 async function loadExtension(sessionId = "", options: { allowBridge?: boolean } = {}) {
   vi.resetModules();
   vi.stubEnv("PIPIUI_SESSION_ID", sessionId);
+  vi.stubEnv("PIPIUI_PROJECT_ROOT", "");
+  vi.stubEnv("PIPIUI_MAIN_CWD", "");
   if (!options.allowBridge) {
     vi.stubEnv("PIPIUI_BRIDGE_PORT", "");
     vi.stubEnv("PIPIUI_HOST_PROTOCOL", "");

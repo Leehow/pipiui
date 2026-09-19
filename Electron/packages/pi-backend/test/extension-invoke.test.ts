@@ -246,6 +246,7 @@ describe("invokeExtension and spawn settings snapshot", () => {
     };
     const backend = backendFor({ agent, sessions, runtime, capture, headroomRuntime });
     await backend.handle("listExtensions" as never, []);
+    await backend.handle("setExtensionEnabled" as never, ["pipiui-headroom", true, "app"]);
     await backend.handle("addProject", [cwd]);
     await backend.handle("sendPrompt", ["session-1", "go"]);
     await vi.waitFor(() => expect(capture.env?.[extensionSettingsEnvName("pipiui-headroom")]).toBeTruthy());

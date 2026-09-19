@@ -45,7 +45,7 @@ describe("agent prompts do not steer around the retrieval tools", () => {
     // Only general-purpose reaches code it was not handed a file list for, and its prompt had
     // no sentence about locating code at all — the gap `grep` filled by default.
     const gp = body("general-purpose");
-    expect(gp).toMatch(/`code_search` is right for an intent you\s*\n?cannot spell/);
+    expect(gp).toMatch(/`code_search` is the\s*\n?first tool for locating by description/);
     expect(gp).toMatch(/read_spans/);
     // The rule itself stays in the philosophy layer; these prompts point, they do not restate.
     expect(gp).not.toMatch(/second keyword is the tell/);

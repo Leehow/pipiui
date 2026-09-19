@@ -538,6 +538,7 @@ describe("session model recovery after the child catalog goes stale", () => {
           },
         }) as any;
       },
+      authRuntime: { getProviders: async () => [], getAvailable: async () => [], login: async () => undefined, logout: async () => undefined },
     });
     await (backend as any).ensure("session-1");
     return {

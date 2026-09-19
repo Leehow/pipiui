@@ -25,8 +25,8 @@ afterEach(() => {
 
 describe('dogfood lists match the pre-registry hardcoded sets', () => {
   it('slash commands', () => {
-    expect(listSlashCommands().map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal'])
-    expect(slashCommands.map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal'])
+    expect(listSlashCommands().map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal', 'selfdev'])
+    expect(slashCommands.map(command => command.name)).toEqual(['model', 'compact', 'plan', 'goal', 'selfdev'])
   })
 
   it('tool renderer names (summarizeArgs switch + live cards)', () => {

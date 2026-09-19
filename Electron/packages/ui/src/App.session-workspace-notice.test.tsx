@@ -1,8 +1,16 @@
-import { render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+// @vitest-environment jsdom
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App, createMockHost } from './App'
 import type { ExtEvent } from './subscribe-ext'
 import type { PipiHostAPI } from '@pipi/host-api'
+
+vi.mock('@xterm/addon-fit', () => ({ FitAddon: class { fit = vi.fn(); dispose = vi.fn() } }))
+
+afterEach(() => {
+  cleanup()
+  localStorage.clear()
+})
 
 /**
  * Bind/unbind lands mid-session (boss's first write). The host announces it on the
