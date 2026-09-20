@@ -1,0 +1,30 @@
+{
+  "id": "jev-optimizer",
+  "name": "Jev 优化",
+  "version": "1.0.0",
+  "category": "knowledge",
+  "description": "可选 TypeSafe Jev 检索重排。默认关闭；无 key 时基础检索不受影响。",
+  "defaultEnabled": false,
+  "capabilities": [],
+  "agent": {
+    "extension": "agent/dist/index.js"
+  },
+  "app": {
+    "settings": {
+      "scope": "project",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "ext.jev-optimizer.apiKey": {
+            "type": "string",
+            "format": "secret",
+            "title": "TypeSafe API Key",
+            "description": "启用后会将查询、相对路径/符号和受限源码片段发送给 TypeSafe 云端评价。未配置 key 时基础检索仍可使用。更换或刷新 key 后需开启新会话才会生效。"
+          }
+        }
+      }
+    }
+  },
+  "settingsVersion": 1,
+  "migrations": []
+}
