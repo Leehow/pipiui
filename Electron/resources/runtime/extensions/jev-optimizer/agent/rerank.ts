@@ -33,6 +33,140 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** Scan valid JSON text for duplicate object keys. JSON.parse cannot see them. */
+function jsonHasDuplicateKeys(text: string): boolean {
+  let i = 0;
+  const n = text.length;
+  const skipWs = () => {
+    while (i < n) {
+      const c = text[i];
+      if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") break;
+      i += 1;
+    }
+  };
+  const parseString = (): string => {
+    const start = i;
+    i += 1;
+    while (i < n) {
+      const c = text[i];
+      if (c === "\\") {
+        i += 1;
+        if (text[i] === "u") i += 5;
+        else i += 1;
+        continue;
+      }
+      if (c === '"') {
+        const raw = text.slice(start, i + 1);
+        i += 1;
+        return JSON.parse(raw) as string;
+      }
+      i += 1;
+    }
+    throw new Error("unterminated string");
+  };
+  const parseValue = (): boolean => {
+    skipWs();
+    const c = text[i];
+    if (c === '"') {
+      parseString();
+      return false;
+    }
+    if (c === "{") return parseObject();
+    if (c === "[") return parseArray();
+    if (c === "t") {
+      i += 4;
+      return false;
+    }
+    if (c === "f") {
+      i += 5;
+      return false;
+    }
+    if (c === "n") {
+      i += 4;
+      return false;
+    }
+    if (c === "-" || (c !== undefined && c >= "0" && c <= "9")) {
+      i += 1;
+      while (i < n) {
+        const d = text[i]!;
+        if (
+          (d >= "0" && d <= "9") ||
+          d === "." ||
+          d === "e" ||
+          d === "E" ||
+          d === "+" ||
+          d === "-"
+        ) {
+          i += 1;
+          continue;
+        }
+        break;
+      }
+      return false;
+    }
+    throw new Error("bad value");
+  };
+  const parseObject = (): boolean => {
+    i += 1;
+    const keys = new Set<string>();
+    skipWs();
+    if (text[i] === "}") {
+      i += 1;
+      return false;
+    }
+    while (i < n) {
+      skipWs();
+      if (text[i] !== '"') throw new Error("object key");
+      const key = parseString();
+      if (keys.has(key)) return true;
+      keys.add(key);
+      skipWs();
+      if (text[i] !== ":") throw new Error("colon");
+      i += 1;
+      if (parseValue()) return true;
+      skipWs();
+      if (text[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (text[i] === "}") {
+        i += 1;
+        return false;
+      }
+      throw new Error("object end");
+    }
+    throw new Error("unclosed object");
+  };
+  const parseArray = (): boolean => {
+    i += 1;
+    skipWs();
+    if (text[i] === "]") {
+      i += 1;
+      return false;
+    }
+    while (i < n) {
+      if (parseValue()) return true;
+      skipWs();
+      if (text[i] === ",") {
+        i += 1;
+        continue;
+      }
+      if (text[i] === "]") {
+        i += 1;
+        return false;
+      }
+      throw new Error("array end");
+    }
+    throw new Error("unclosed array");
+  };
+  try {
+    skipWs();
+    return parseValue();
+  } catch {
+    return true;
+  }
+}
+
 function parseApplied(payload: unknown, ids: readonly string[]): RerankOutcome {
   if (!isRecord(payload)) return { status: "fallback", reason: "invalid-response" };
   const answers = payload.answers;
@@ -170,6 +304,9 @@ export async function executeRerank(
     try {
       parsed = JSON.parse(text);
     } catch {
+      return { status: "fallback", reason: "invalid-response" };
+    }
+    if (jsonHasDuplicateKeys(text)) {
       return { status: "fallback", reason: "invalid-response" };
     }
 

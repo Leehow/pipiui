@@ -167,6 +167,53 @@ test("missing, extra, non-score, or non-finite scores fall back", async () => {
   }
 });
 
+test("raw JSON duplicate keys fall back without scores", async () => {
+  const escapedEquiv =
+    '{"answers":{"candidate-1":{"type":"score","score":3},"candidat' +
+    "\\u0065" +
+    '-1":{"type":"score","score":0},"candidate-2":{"type":"score","score":3}}}';
+  const cases = [
+    '{"answers":{"candidate-1":{"type":"score","score":3},"candidate-1":{"type":"score","score":0},"candidate-2":{"type":"score","score":3}}}',
+    escapedEquiv,
+    '{"answers":{"candidate-1":{"type":"score","score":3},"candidate-2":{"type":"score","score":1}},"answers":{"candidate-1":{"type":"score","score":0},"candidate-2":{"type":"score","score":3}}}',
+    '{"answers":{"candidate-1":{"type":"score","score":3,"score":0},"candidate-2":{"type":"score","score":1}}}',
+  ];
+  assert.match(escapedEquiv, /candidat\\u0065-1/);
+  assert.doesNotMatch(escapedEquiv.split("candidat")[2] ?? "", /^e-1/);
+  for (const body of cases) {
+    const outcome = await executeRerank(
+      input(),
+      readyDeps({ fetch: async () => jsonResponse(200, body) }),
+    );
+    assert.equal(outcome.status, "fallback", body);
+    assert.equal(outcome.reason, "invalid-response", body);
+    assert.equal(outcome.scores, undefined, body);
+  }
+});
+
+test("independent objects and JSON-looking strings do not false-positive duplicate keys", async () => {
+  const body = JSON.stringify({
+    answers: {
+      "candidate-1": {
+        type: "score",
+        score: 3,
+        note: '{"candidate-1":{"type":"score","score":0}}',
+      },
+      "candidate-2": { type: "score", score: 1 },
+    },
+  });
+  assert.match(body, /candidate-1/);
+  const outcome = await executeRerank(
+    input(),
+    readyDeps({ fetch: async () => jsonResponse(200, body) }),
+  );
+  assert.equal(outcome.status, "applied");
+  assert.deepEqual(outcome.scores, [
+    { id: "candidate-1", score: 3 },
+    { id: "candidate-2", score: 1 },
+  ]);
+});
+
 test("401 429 5xx network timeout and bad JSON each fail closed once", async () => {
   const counts: number[] = [];
   const once = (fetch: JevFetch): JevFetch => async (url, init) => {
