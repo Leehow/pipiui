@@ -58,7 +58,7 @@ test("per-result budget violation ⇒ FAIL with counted violations", () => {
   assert.ok(g.reasons[0].includes("exceeds"));
 });
 
-test("behavioral + skipped + errored cases shrink the scored denominator honestly", () => {
+test("incomplete cases shrink the denominator honestly but cannot produce PASS", () => {
   const g = evaluateGates({
     goldChecked: 2,
     goldValid: 2,
@@ -67,13 +67,14 @@ test("behavioral + skipped + errored cases shrink the scored denominator honestl
       okCase("g1"),
       { id: "b1", budgetViolations: [] },
       { id: "g2", skipped: true },
-      { id: "g2", error: "timeout" }, // duplicate id is allowed here; still filtered
+      { id: "g2", error: "timeout" }, // duplicate/error is filtered from recall, and now fails validity
     ],
     caseDefs: DEFS,
   });
   assert.equal(g.denominators.executedCases, 3);
   assert.equal(g.denominators.recallScoredCases, 1);
-  assert.equal(g.verdict, "PASS");
+  assert.equal(g.verdict, "FAIL");
+  assert.ok(g.failedGates.includes("execution-incomplete"));
 });
 
 test("--require-map-previews flips informational count into a hard gate", () => {

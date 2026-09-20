@@ -32,6 +32,7 @@ import type { SidecarConnection, ToolResult } from "./types.js";
 import { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
 import { installSymbolLayer } from "./symbol/hooks-adapter.js";
 import { rebuildZvecIndex } from "./zvec-semantic.js";
+import { connectReranker, throwIfCancelled, type RerankerBus } from "./reranker.js";
 
 export { symbolLayer, setSymbolLayer, getSymbolLayer } from "./hooks.js";
 export { GrepTellBudget, alternationArms } from "./grep-tell.js";
@@ -41,6 +42,7 @@ export { ensureTreeSitter, startSymbolWarmup } from "./warmup.js";
 export { executeRepoMap } from "./map-tool.js";
 
 type ExtensionAPI = {
+  events?: RerankerBus;
   registerTool(tool: {
     name: string;
     label?: string;
@@ -263,6 +265,7 @@ export default function (pi: ExtensionAPI): void {
 
   const runtime = new SessionRuntime();
   const grepTell = new GrepTellBudget();
+  const reranker = connectReranker(pi.events);
 
   pi.on?.("session_start", async (_event, ctx) => {
     grepTell.reset();
@@ -272,6 +275,7 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.on?.("session_shutdown", async () => {
+    reranker.dispose();
     await runtime.shutdown();
   });
 
@@ -324,13 +328,15 @@ export default function (pi: ExtensionAPI): void {
     promptGuidelines: [
       "An open location question starts here even when a keyword guess is available — a guess is not a name.",
       "When a grep pattern would carry several alternative keywords, that alternation is the weighing code_search does properly — send the description instead of the arms.",
+      "For an open query, optionally include up to three short queryVariants in this same call to broaden local recall; keep the original question in query and preserve the explicit scope. No extra model call is needed to generate variants.",
     ],
     description:
-      "Locate code from a description — \"where the session token gets refreshed\", \"what handles retry on a 429\". First tool for that question, even if you can guess a keyword; grep is for an exact identifier you already know. Open queries go through a local zvec BM25+vector index under the project .pi/agent home, then fall back to weighted term match if that index is down. Returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap); never full file bodies — pull those with read_spans. An empty result means those words are not in the tree: change vocabulary, not tool.",
+      "Locate code from a description — \"where the session token gets refreshed\", \"what handles retry on a 429\". First tool for that question, even if you can guess a keyword; grep is for an exact identifier you already know. Open queries go through a local zvec BM25+vector index under the project .pi/agent home, then fall back to weighted term match if that index is down. An explicitly enabled optional optimizer may rerank bounded candidate snippets; without it search stays local. Returns ranked compressed R# refs (top 12 inline) with a bounded source preview under the top refs (~6 lines each, strict aggregate cap); never full file bodies — pull those with read_spans. An empty result means no hits for those expressions in the selected scope: change vocabulary rather than repeating the identical request.",
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Search query" },
+        query: { type: "string", description: "Search query and original intent" },
+        queryVariants: { type: "array", maxItems: 3, items: { type: "string", minLength: 1, maxLength: 512 }, description: "Optional additional expressions of the same open query; local recall only, with the same path/glob scope" },
         mode: {
           type: "string",
           enum: ["auto", "exact", "symbol", "semantic"],
@@ -347,8 +353,10 @@ export default function (pi: ExtensionAPI): void {
       try {
         await runtime.ensure(ctx?.cwd);
         const settings = await loadRetrievalSettings(runtime.projectRoot);
+        const optimizer = reranker.current();
         return await executeCodeSearch({
           query: asString(params.query) ?? "",
+          queryVariants: params.queryVariants as string[] | undefined,
           mode: asString(params.mode) as "auto" | "exact" | "symbol" | "semantic" | undefined,
           path: asString(params.path),
           glob: asString(params.glob),
@@ -364,8 +372,11 @@ export default function (pi: ExtensionAPI): void {
           },
           tokenBudget: settings.tokenBudget,
           ledger: runtime.ledger,
+          reranker: optimizer,
+          isRerankerCurrent: () => reranker.current()?.instanceId === optimizer?.instanceId,
         });
       } catch (error) {
+        throwIfCancelled(signal);
         const message = error instanceof Error ? error.message : String(error);
         return emptyDegraded(
           "code-retrieval.search",

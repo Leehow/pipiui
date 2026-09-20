@@ -14,13 +14,19 @@ import {
 import { sidecarSearch } from "./sidecar-lifecycle.js";
 import type { RetrievalHit, SidecarConnection, ToolResult, UnassignedHit } from "./types.js";
 import { searchSemantic } from "./zvec-semantic.js";
+import { applyOptionalRerank, isProtectedHit, probeOptionalReranker, throwIfCancelled, type Reranker } from "./reranker.js";
+import { filterScopedHits, relativeSearchPath } from "./search-scope.js";
+import { fuseRecall, queryVariants as normalizeVariants, recallQueries, resultLimit, type RecallSource } from "./wide-recall.js";
 
 export type CodeSearchArgs = {
   query: string;
+  queryVariants?: string[];
   mode?: SearchMode;
   path?: string;
   glob?: string;
   topK?: number;
+  /** Internal collection budget; never exposed as a tool parameter. */
+  wideRecall?: boolean;
   projectRoot: string;
   registry: RefRegistry;
   excludeGlobs: string[];
@@ -32,17 +38,20 @@ export type CodeSearchArgs = {
   tokenBudget?: number;
   /** Session seen-range ledger; inline previews mark their exact shown window. */
   ledger?: SeenRangeLedger;
+  /** Optional in-process optimizer; absent means the original local-only path. */
+  reranker?: Reranker;
+  isRerankerCurrent?: () => boolean;
 };
 
 const DEFAULT_TOP_K = 20;
 
-export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResult> {
-  const query = args.query.trim();
-  if (!query) {
-    return emptyDegraded("code-retrieval.search", "code_search requires a non-empty query.");
-  }
+type LocalSearch = { hits: UnassignedHit[]; notes: string[]; degraded: boolean; provider?: string; emptyMessage?: string; failed?: boolean };
 
+/** One existing local route; collection never assigns refs, marks reads or persists results. */
+async function collectLocalQuery(args: CodeSearchArgs): Promise<LocalSearch> {
+  const query = args.query.trim();
   try {
+    throwIfCancelled(args.signal);
     const routed = routeQuery(query, args.mode);
     // Provider honesty: report the layer that ACTUALLY serves the returned
     // hits (sidecar identity or "rg" for the local path), never a stale
@@ -70,6 +79,7 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
         path: args.path,
         glob: args.glob,
         topK: args.topK,
+        wideRecall: args.wideRecall,
         excludeGlobs: args.excludeGlobs,
         signal: args.signal,
       });
@@ -99,7 +109,9 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
             notes.push(SEMANTIC_UNAVAILABLE_NOTE);
           }
         }
-        return emptySearchResult(args, query, routed, notes, degraded || !semanticAvailable);
+        return { hits: [], notes, degraded: degraded || !semanticAvailable,
+          emptyMessage: [`No hits for ${JSON.stringify(query)} (mode ${routed}).`, ...notes,
+            degraded ? "Not pretending this was a successful empty index result." : ""].filter(Boolean).join("\n") };
       }
       const lexical = await runLexicalSymbol(args, terms);
       hits = lexical.hits;
@@ -153,85 +165,89 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
       ]
         .filter(Boolean)
         .join("\n");
-      return buildToolResult({
-        projectRoot: args.projectRoot,
-        kind: "code-retrieval.search",
-        hits: [],
-        degraded,
-        content: message,
-        query,
-        degradeReason: notes[0],
-        // No hits were served by any layer, so no serving-provider claim exists.
-      });
+      return { hits: [], notes, degraded, emptyMessage: message };
     }
 
-    const assigned = args.registry.assignAll(hits);
-    const resultHits: RetrievalHit[] = assigned.map((record, i) => ({
-      ...record,
-      ...(hits[i]?.text ? { text: hits[i]!.text } : {}),
-    }));
-    const previews = await buildInlinePreviews(resultHits, {
-      projectRoot: args.projectRoot,
-      ledger: args.ledger,
-      budgetTokens: args.tokenBudget,
-    });
     const note = providerNote();
-    const content = [
-      formatCompressedContent(resultHits, previews.note, previews.previews),
-      ...notes,
-      ...(note ? [note] : []),
-    ]
-      .filter(Boolean)
-      .join("\n");
-    return buildToolResult({
-      projectRoot: args.projectRoot,
-      kind: "code-retrieval.search",
-      hits: resultHits,
-      degraded,
-      content,
-      query,
-      degradeReason: notes[0],
-      ...(servingProvider ? { provider: servingProvider } : {}),
-    });
+    if (note) notes.push(note);
+    return { hits, notes, degraded, ...(servingProvider ? { provider: servingProvider } : {}) };
   } catch (error) {
+    throwIfCancelled(args.signal);
     const message = error instanceof Error ? error.message : String(error);
     try {
-      const fallback = await exactSearch({
-        query,
-        projectRoot: args.projectRoot,
-        path: args.path,
-        glob: args.glob,
-        topK: args.topK,
-        excludeGlobs: args.excludeGlobs,
-        signal: args.signal,
-      });
-      const assigned = args.registry.assignAll(fallback);
-      // Degraded rg/node paths carry the same previews: a fallback that only names
-      // files would undo exactly the friction this feature removes.
-      const previews = await buildInlinePreviews(assigned, {
-        projectRoot: args.projectRoot,
-        ledger: args.ledger,
-        budgetTokens: args.tokenBudget,
-      });
-      return buildToolResult({
-        projectRoot: args.projectRoot,
-        kind: "code-retrieval.search",
-        hits: assigned,
-        degraded: true,
-        content: [
-          formatCompressedContent(assigned, previews.note, previews.previews),
-          `code_search recovered via grep after error: ${message} (details.degraded=true).`,
-        ].join("\n"),
-        query,
-        degradeReason: message,
-        provider: "rg",
-      });
+      const hits = await exactSearch({ ...args, query });
+      const recovered = `code_search recovered via grep after error: ${message} (details.degraded=true).`;
+      return { hits, notes: [recovered], degraded: true, provider: "rg", emptyMessage: recovered };
     } catch {
-      return emptyDegraded(
-        "code-retrieval.search",
-        `code_search failed (${message}). Use the existing grep / read tools.`,
-      );
+      throwIfCancelled(args.signal);
+      return { hits: [], notes: [], degraded: true, failed: true,
+        emptyMessage: `code_search failed (${message}). Use the existing grep / read tools.` };
     }
+  }
+}
+
+export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResult> {
+  const query = args.query.trim();
+  if (!query) return emptyDegraded("code-retrieval.search", "code_search requires a non-empty query.");
+  try {
+    throwIfCancelled(args.signal);
+    const variants = normalizeVariants(query, args.queryVariants);
+    const routed = routeQuery(query, args.mode);
+    const eligible = routed === "hybrid" || routed === "semantic";
+    if (args.queryVariants?.length && !eligible) return emptyDegraded("code-retrieval.search", "queryVariants requires an open auto/semantic query, not an exact/symbol route.");
+    if (args.path && relativeSearchPath(args.projectRoot, args.path) === undefined) {
+      return emptyDegraded("code-retrieval.search", "code_search path must remain inside the current project.");
+    }
+    const probe = eligible && args.reranker
+      ? await probeOptionalReranker(args.reranker, args.projectRoot, args.signal) : undefined;
+    const wide = variants.length > 0 || probe?.ready === true;
+    const limit = resultLimit(args.topK);
+    let local: LocalSearch;
+    let sources: RecallSource[] | undefined;
+    if (wide) {
+      const poolLimit = Math.min(100, limit * 3);
+      const batches = await recallQueries([query, ...variants], async (variant) => {
+        const batch = await collectLocalQuery({ ...args, query: variant, topK: poolLimit, wideRecall: true });
+        batch.hits = await filterScopedHits(batch.hits, args);
+        return batch;
+      }, args.signal);
+      const fused = fuseRecall(batches, poolLimit, (hit) => isProtectedHit(query, hit));
+      sources = fused.sources;
+      const serving = batches.filter((batch) => batch.hits.length);
+      const providers = new Set(serving.map((batch) => batch.provider));
+      local = { hits: fused.hits, notes: [...new Set(batches.flatMap((batch) => batch.notes))],
+        degraded: batches.some((batch) => batch.degraded),
+        provider: providers.size === 1 ? serving[0]?.provider : undefined,
+        emptyMessage: `No hits inside the requested scope after ${batches.length} local query(s).` };
+      local.notes.push(`Broad recall: ${batches.length} local query(s), ${fused.hits.length} candidates; returning at most ${limit}.`);
+      if (batches.some((batch) => batch.failed)) local.notes.push("A local query failed; retained the other query results.");
+    } else {
+      local = await collectLocalQuery({ ...args, query });
+    }
+    throwIfCancelled(args.signal);
+    if (local.failed) return emptyDegraded("code-retrieval.search", local.emptyMessage!);
+    const reranked = eligible && probe?.ready
+      ? await applyOptionalRerank({ ...args, query, hits: local.hits, timeoutMs: probe.remainingMs })
+      : { hits: local.hits, details: probe?.details };
+    if (reranked.details && probe?.ready) reranked.details.elapsedMs += probe.elapsedMs;
+    const hits = wide ? reranked.hits.slice(0, limit) : reranked.hits;
+    throwIfCancelled(args.signal);
+    const assigned = args.registry.assignAll(hits);
+    const resultHits: RetrievalHit[] = assigned.map((record, i) => ({ ...record, ...(hits[i]?.text ? { text: hits[i]!.text } : {}) }));
+    const previews = await buildInlinePreviews(resultHits, { projectRoot: args.projectRoot, ledger: args.ledger, budgetTokens: args.tokenBudget });
+    const content = [
+      hits.length ? formatCompressedContent(resultHits, previews.note, previews.previews) : local.emptyMessage,
+      ...(hits.length || wide ? local.notes : []),
+      ...(reranked.details ? [`Optional Jev reranker: ${reranked.details.status}${reranked.details.reason ? ` (${reranked.details.reason})` : ""}; local provider and score unchanged.`] : []),
+    ].filter(Boolean).join("\n");
+    return buildToolResult({ projectRoot: args.projectRoot, kind: "code-retrieval.search", hits: resultHits,
+      degraded: local.degraded, content, query, degradeReason: local.notes[0],
+      ...(local.provider && hits.length ? { provider: local.provider } : {}),
+      ...(reranked.details ? { reranker: reranked.details } : {}), ...(sources ? { sources } : {}),
+    });
+  } catch (error) {
+    throwIfCancelled(args.signal);
+    return emptyDegraded("code-retrieval.search", `code_search failed (${error instanceof Error ? error.message : String(error)}). Use the existing grep / read tools.`);
   }
 }
 
@@ -239,6 +255,7 @@ async function runLexicalSymbol(
   args: CodeSearchArgs,
   terms: string[],
 ): Promise<{ hits: UnassignedHit[]; notes: string[]; degraded: boolean; provider?: string }> {
+  throwIfCancelled(args.signal);
   const notes: string[] = [];
   let degraded = false;
   const identTerms = terms.filter(isIdentifierLike);
@@ -260,6 +277,7 @@ async function runLexicalSymbol(
     notes.push("Symbol layer unavailable; hybrid search used exact only (details.degraded=true).");
   }
 
+  throwIfCancelled(args.signal);
   const exactBatches = await Promise.all(
     terms.map(async (term) => ({
       term,
@@ -364,6 +382,7 @@ async function trySymbolSearch(args: CodeSearchArgs, queries: string[]): Promise
   const merged: UnassignedHit[] = [];
   let any = false;
   for (const query of queries) {
+    throwIfCancelled(args.signal);
     try {
       const hits = await fn({
         query,
@@ -372,10 +391,12 @@ async function trySymbolSearch(args: CodeSearchArgs, queries: string[]): Promise
         topK: args.topK,
         projectRoot: args.projectRoot,
       });
+      throwIfCancelled(args.signal);
       if (!Array.isArray(hits)) continue;
       any = true;
       for (const hit of hits) merged.push(hit);
     } catch {
+      throwIfCancelled(args.signal);
       // one term failing must not abort the rest
     }
   }
@@ -395,6 +416,7 @@ export type ExactOutcome = {
 };
 
 async function runExact(args: CodeSearchArgs, query: string): Promise<ExactOutcome> {
+  throwIfCancelled(args.signal);
   if (args.sidecar) {
     const remote = await sidecarSearch(args.sidecar, {
       query,
@@ -402,7 +424,9 @@ async function runExact(args: CodeSearchArgs, query: string): Promise<ExactOutco
       glob: args.glob,
       topK: args.topK,
       excludeGlobs: args.excludeGlobs,
+      signal: args.signal,
     });
+    throwIfCancelled(args.signal);
     if (remote) {
       // Provider honesty: report only the identity the sidecar itself declares.
       // A legacy sidecar predating provider reporting stays UNKNOWN — never
@@ -504,29 +528,4 @@ function mergeHits(left: UnassignedHit[], right: UnassignedHit[]): UnassignedHit
     out.push(hit);
   }
   return out;
-}
-
-function emptySearchResult(
-  args: CodeSearchArgs,
-  query: string,
-  routed: string,
-  notes: string[],
-  degraded: boolean,
-): Promise<ToolResult> {
-  const message = [
-    `No hits for ${JSON.stringify(query)} (mode ${routed}).`,
-    ...notes,
-    degraded ? "Not pretending this was a successful empty index result." : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return buildToolResult({
-    projectRoot: args.projectRoot,
-    kind: "code-retrieval.search",
-    hits: [],
-    degraded,
-    content: message,
-    query,
-    degradeReason: notes[0],
-  });
 }

@@ -214,16 +214,19 @@ export async function heartbeatSidecar(projectRoot: string, sessionId: string): 
 
 export async function sidecarSearch(
   conn: SidecarConnection,
-  args: { query: string; path?: string; glob?: string; topK?: number; excludeGlobs?: string[] },
+  args: { query: string; path?: string; glob?: string; topK?: number; excludeGlobs?: string[]; signal?: AbortSignal },
 ): Promise<{ hits: unknown[]; degraded: boolean } | undefined> {
+  args.signal?.throwIfAborted();
   try {
-    const resp = await sidecarRequest(conn, "POST", "/search", args, 8000);
+    const { signal, ...request } = args;
+    const resp = await sidecarRequest(conn, "POST", "/search", request, 8000, signal);
     if (!resp || resp.body.ok !== true) return undefined;
     return {
       hits: Array.isArray(resp.body.hits) ? resp.body.hits : [],
       degraded: resp.body.degraded === true,
     };
   } catch {
+    args.signal?.throwIfAborted();
     return undefined;
   }
 }
@@ -303,8 +306,12 @@ async function sidecarRequest(
   path: string,
   body?: unknown,
   timeoutMs = 2000,
+  signal?: AbortSignal,
 ): Promise<{ status: number; body: Record<string, unknown> } | undefined> {
+  signal?.throwIfAborted();
   const ac = new AbortController();
+  const abort = () => ac.abort(signal?.reason);
+  signal?.addEventListener("abort", abort, { once: true });
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   try {
     const res = await fetch(`http://127.0.0.1:${snapshot.port}${path}`, {
@@ -321,6 +328,7 @@ async function sidecarRequest(
     return { status: res.status, body: parsed };
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
 }
 

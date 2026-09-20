@@ -21,12 +21,45 @@ export class ResultFileTracker {
     this.preExisting = new Set([...preExistingNames].map((n) => basename(n)));
     /** @type {Set<string>} relative resultsPaths like `.pi/agent/code-retrieval/results/<hash>.jsonl` */
     this.tracked = new Set();
+    this.tasks = new Map();
+    this.cleanupTarget = null;
+    this.lateCleanups = new Set();
+  }
+
+  /** Register the original task, not just its timeout race. Late receipts still belong to this run. */
+  trackTask(promise, cancel = () => {}) {
+    const tracked = Promise.resolve(promise).then((result) => {
+      this.trackResultPath(result?.details?.resultsPath);
+      return result;
+    });
+    this.tasks.set(tracked, cancel);
+    tracked.then(() => this.tasks.delete(tracked), () => this.tasks.delete(tracked));
+    return tracked;
+  }
+
+  async settleTasks(graceMs = 2000) {
+    if (!this.tasks.size) return 0;
+    for (const cancel of this.tasks.values()) { try { cancel(); } catch { /* still clean other tasks */ } }
+    let timer;
+    try {
+      await Promise.race([Promise.allSettled([...this.tasks.keys()]), new Promise(resolve => { timer = setTimeout(resolve, graceMs); })]);
+    } finally { clearTimeout(timer); }
+    return this.tasks.size;
   }
 
   /** Track a ToolResult-style details.resultsPath (empty string ⇒ nothing). */
   trackResultPath(resultsPath) {
     if (typeof resultsPath !== "string" || resultsPath === "") return false;
-    this.tracked.add(resultsPath.replace(/\\/g, "/"));
+    const normalized = resultsPath.replace(/\\/g, "/");
+    const fresh = !this.tracked.has(normalized);
+    this.tracked.add(normalized);
+    const name = basename(normalized);
+    if (fresh && this.cleanupTarget && !this.preExisting.has(name)) {
+      const { resolveAbsolute, rmFile } = this.cleanupTarget;
+      const pending = Promise.resolve().then(() => rmFile(resolveAbsolute(name))).catch(() => {});
+      this.lateCleanups.add(pending);
+      pending.then(() => this.lateCleanups.delete(pending));
+    }
     return true;
   }
 
@@ -48,6 +81,8 @@ export class ResultFileTracker {
   /** Delete exactly this run's files. `rmFile(absPath)` is injected for tests. */
   async cleanup(resolveAbsolute, rmFile) {
     const plan = this.deletionPlan();
+    // Install the late-receipt reaper before the first await. It only sees explicitly returned names.
+    this.cleanupTarget = { resolveAbsolute, rmFile };
     let deleted = 0;
     for (const name of plan.deletable) {
       try {
@@ -57,8 +92,25 @@ export class ResultFileTracker {
         // best-effort: missing file is fine
       }
     }
-    return { ...plan, deleted };
+    await Promise.allSettled([...this.lateCleanups]);
+    return { ...plan, deleted, pendingTasks: this.tasks.size };
   }
+}
+
+/** Both evaluator entry points use one idempotent finalizer stack, including exceptional exits. */
+export function createCleanupStack() {
+  const callbacks = [];
+  return {
+    add(action) {
+      let pending;
+      const once = () => pending ??= Promise.resolve().then(action);
+      callbacks.push(once);
+      return once;
+    },
+    async close() {
+      for (const callback of [...callbacks].reverse()) { try { await callback(); } catch { /* attempt every cleanup */ } }
+    },
+  };
 }
 
 /**
@@ -114,6 +166,10 @@ export function toBoundedCaseMetric(rec) {
       : 0,
     previewTokensTotal: rec.previewTokensTotal ?? 0,
     budgetViolationCount: Array.isArray(rec.budgetViolations) ? rec.budgetViolations.length : 0,
+    honestyViolationCount: Array.isArray(rec.honestyViolations) ? rec.honestyViolations.length : 0,
+    outputTokenEstimate: rec.outputTokenEstimate ?? null,
+    requiredCount: rec.requiredCount ?? 0,
+    requiredFound: rec.requiredFound ?? 0,
     anchorShown: rec.anchorShown === true,
     avoidedFetchTokens: rec.avoidedFetchTokens ?? 0,
   };

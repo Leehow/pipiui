@@ -1,4 +1,6 @@
-/** Shared result-protocol types (spec D5). Field names are frozen. */
+/** Shared result-protocol types (spec D5). Existing field names are frozen. */
+import type { RerankerDetails } from "./reranker.js";
+import type { RecallSource } from "./wide-recall.js";
 
 export type RetrievalKind =
   | "code-retrieval.search"
@@ -15,6 +17,7 @@ export type RetrievalHit = {
   score?: number;
   alreadyRead?: boolean;
   text?: string;
+  queryIndices?: number[];
 };
 
 export type UnassignedHit = {
@@ -24,6 +27,7 @@ export type UnassignedHit = {
   symbol?: string;
   score?: number;
   text?: string;
+  queryIndices?: number[];
 };
 
 export type RetrievalDetails = {
@@ -34,6 +38,10 @@ export type RetrievalDetails = {
   degraded: boolean;
   /** Provider that actually served indexed hits ("rg" | "tantivy" | "zvec"). */
   provider?: string;
+  /** Optional optimization metadata, separate from local-index availability. */
+  reranker?: RerankerDetails;
+  /** Actual local serving layers for each explicit/optimizer-expanded query. */
+  sources?: RecallSource[];
 };
 
 export type TextContent = { type: "text"; text: string };
@@ -58,6 +66,7 @@ export type SpanRecord = {
   symbol?: string;
   score?: number;
   contentHash?: string;
+  queryIndices?: number[];
 };
 
 export type SidecarSnapshot = {

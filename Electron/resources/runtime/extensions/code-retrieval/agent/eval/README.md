@@ -32,8 +32,38 @@ node resources/runtime/extensions/code-retrieval/agent/eval/run-retrieval-eval.m
 Deterministic unit coverage (no network, no sidecars, no symbol extraction):
 
 ```bash
-node --test resources/runtime/extensions/code-retrieval/agent/eval/eval-tests/
+node --test resources/runtime/extensions/code-retrieval/agent/eval/eval-tests/*.test.mjs
 ```
+
+## Jev 对照入口
+
+真实仓库的本地 A/B（30 个金标，默认重复 3 次）：
+
+```bash
+cd Electron/
+node resources/runtime/extensions/code-retrieval/agent/eval/run-retrieval-eval.mjs \
+  --jev-contrast --repetitions 3 --json /tmp/jev-offline.json
+```
+
+该入口始终只运行本地检索，即使环境中已有 key 也不会加载 Jev。A 为单查询，B 为同范围宽召回；两者使用同样的最终 topK 与输出预算。描述型案例明确使用 semantic 模式，精确／符号控制组不加变体。C 和单查询+Jev 明确标为 `not-run`，不能填模拟分数。初次观测不冒充冷索引，A/B 顺序按轮次交替；PASS 只表示金标、预算、来源和测量完整性有效，不表示更快。
+
+真实 API 的安全合成对照（仅在明确授权后运行）：
+
+```bash
+# TYPESAFE_API_KEY 必须通过保险库/安全环境挂载；不要把值写进命令或文件。
+npm run build:jev-optimizer
+node resources/runtime/extensions/code-retrieval/agent/eval/run-jev-synthetic.mjs \
+  --live-synthetic --json /tmp/jev-synthetic.json
+```
+
+- 只在新建临时目录生成 10 个任务、40 份代码文件；不接受 `--project/--source`，不读取真实仓库作为候选。
+- 3 次重复，最多 60 次 API 请求，无重试；不加 `--live-synthetic` 时不使用 key、不请求网络。
+- A/B 使用生产检索核心，候选预算为 100；C 重排 B 的同一批返回候选，单查询+Jev 重排 A 的同一批候选。逐对断言路径/行范围集合不变。
+- C/单查询+Jev 的时间是对应本地阶段加重排阶段的分段累计，不是完整 Agent 耗时；不会把其它组耗时夹进来。
+- 这些是人工构造的近似词干扰场景，不是代表性真实仓库或 LLM 基线。报告 Top1、Recall@3/@12、P50/P95、回退和输入用量；新增 Top12 漏检会使进程失败。
+- API 单价和真实账单未核对，不伪造总费用；任务级成功率、LLM 轮次和整体加速仍需另测。
+
+金标旧路径会继续硬失败；provider 来源检查独立于 preview-budget。zvec 是本地语义层，不要求等于同时运行的 exact sidecar。纯问题词若在当前索引有真实命中，或产生有解释的普通未命中，不强迫其标记降级。
 
 ## Safety contract while running
 

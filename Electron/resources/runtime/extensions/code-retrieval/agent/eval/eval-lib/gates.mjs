@@ -126,6 +126,12 @@ export function evaluateGates(input) {
     reasons.push(`${budgetViolations.length} preview-budget violation(s): ${budgetViolations.slice(0, 10).map((v) => `${v.case}: ${v.violation}`).join("; ")}`);
   }
 
+  const honestyViolations = executed.flatMap((c) => (c.honestyViolations ?? []).map((violation) => ({ case: c.id, violation })));
+  if (honestyViolations.length) {
+    failed.push("retrieval-honesty");
+    reasons.push(`${honestyViolations.length} retrieval-honesty violation(s): ${honestyViolations.slice(0, 10).map((v) => `${v.case}: ${v.violation}`).join("; ")}`);
+  }
+
   // ---- Optional integration gate: repo_map must render real previews once the
   // core fix lands in the registered tool. Off by default so this evaluator can
   // be run before/without that slice; integration flips it on. ----
@@ -135,6 +141,15 @@ export function evaluateGates(input) {
   }
 
   const executionErrors = executed.filter((c) => c.error).map((c) => ({ id: c.id, error: c.error }));
+  const allCases = input.cases ?? [];
+  const counts = new Map();
+  for (const c of allCases) counts.set(c.id, (counts.get(c.id) ?? 0) + 1);
+  const incomplete = allCases.some((c) => c.skipped) || [...defById.keys()].some((id) => counts.get(id) !== 1)
+    || allCases.some((c) => !defById.has(c.id));
+  if (executionErrors.length || incomplete) {
+    failed.push("execution-incomplete");
+    reasons.push(`${executionErrors.length} execution error(s); skipped/missing/duplicate cases=${incomplete}. Failed measurements cannot produce PASS.`);
+  }
 
   return {
     verdict: failed.length > 0 ? "FAIL" : "PASS",
@@ -152,8 +167,10 @@ export function evaluateGates(input) {
       executedCases: executed.length,
       totalCases: (input.cases ?? []).length,
       budgetViolationCount: budgetViolations.length,
+      honestyViolationCount: honestyViolations.length,
     },
     budgetViolations,
+    honestyViolations,
     executionErrors,
   };
 }

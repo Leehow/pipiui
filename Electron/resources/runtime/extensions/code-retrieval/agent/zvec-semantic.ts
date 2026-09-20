@@ -134,6 +134,8 @@ export type SemanticSearchArgs = {
   path?: string;
   glob?: string;
   topK?: number;
+  /** Internal opt-in only; ordinary calls retain the historical 50-hit ceiling. */
+  wideRecall?: boolean;
   excludeGlobs?: string[];
   signal?: AbortSignal;
 };
@@ -514,14 +516,22 @@ function openCollection(mod: ZvecModule, projectRoot: string): ZvecCollection | 
   }
 }
 
+export function semanticCandidateLimit(args: Pick<SemanticSearchArgs, "topK" | "wideRecall">): number {
+  const requested = Number.isFinite(args.topK) ? Math.floor(args.topK!) : 20;
+  return Math.max(1, Math.min(requested, args.wideRecall ? 100 : 50));
+}
+
 async function searchZvec(args: SemanticSearchArgs): Promise<SemanticOutcome> {
+  args.signal?.throwIfAborted();
   const mod = await loadZvec();
+  args.signal?.throwIfAborted();
   if (!mod) return { available: false, hits: [], reason: "@zvec/zvec native bindings are not loaded" };
   const ready = await ensureIndex(args.projectRoot, args.excludeGlobs ?? [], args.signal);
+  args.signal?.throwIfAborted();
   if (!ready) return { available: false, hits: [], reason: "zvec index failed to build" };
   const collection = openCollection(mod, args.projectRoot);
   if (!collection) return { available: false, hits: [], reason: "zvec collection missing" };
-  const topK = Math.max(1, Math.min(args.topK ?? 20, 50));
+  const topK = semanticCandidateLimit(args);
   try {
     const ftsDocs = collection.querySync({
       fieldName: "text",
@@ -569,6 +579,7 @@ async function searchZvec(args: SemanticSearchArgs): Promise<SemanticOutcome> {
 }
 
 export async function searchSemantic(args: SemanticSearchArgs): Promise<SemanticOutcome> {
+  args.signal?.throwIfAborted();
   if (testOverride) return testOverride(args);
   try {
     return await searchZvec(args);

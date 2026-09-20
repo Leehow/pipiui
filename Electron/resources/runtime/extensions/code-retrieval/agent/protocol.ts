@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resultsDir, resultsRelPath } from "./paths.js";
+import type { RerankerDetails } from "./reranker.js";
+import type { RecallSource } from "./wide-recall.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, truncateLine } from "./truncate.js";
 import type {
   RetrievalDetails,
@@ -27,6 +29,7 @@ export class RefRegistry {
       endLine: hit.endLine,
       ...(hit.symbol ? { symbol: hit.symbol } : {}),
       ...(hit.score !== undefined ? { score: hit.score } : {}),
+      ...(hit.queryIndices ? { queryIndices: [...hit.queryIndices] } : {}),
     };
     this.byRef.set(ref, record);
     return record;
@@ -152,6 +155,8 @@ export async function buildToolResult(args: {
   degradeReason?: string;
   /** Actual serving provider for indexed results; omitted for non-index kinds. */
   provider?: string;
+  reranker?: RerankerDetails;
+  sources?: RecallSource[];
 }): Promise<ToolResult> {
   const persisted = await persistResults(args.projectRoot, {
     kind: args.kind,
@@ -178,6 +183,8 @@ export async function buildToolResult(args: {
     resultsPath: persisted.resultsPath,
     degraded: args.degraded,
     ...(args.provider ? { provider: args.provider } : {}),
+    ...(args.reranker ? { reranker: args.reranker } : {}),
+    ...(args.sources ? { sources: args.sources } : {}),
   };
   return {
     content: [{ type: "text", text: body }],

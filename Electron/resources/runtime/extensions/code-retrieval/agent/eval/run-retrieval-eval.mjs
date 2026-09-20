@@ -44,7 +44,8 @@ import { writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
-import { ResultFileTracker, toBoundedJson } from "./eval-lib/result-files.mjs";
+import { ResultFileTracker, createCleanupStack, toBoundedJson, toBoundedCaseMetric, sanitizeValue } from "./eval-lib/result-files.mjs";
+import { caseParams, providerHonestyViolations, routingExplained, contrastSummary, contrastMarkdown } from "./eval-lib/jev-contrast.mjs";
 import { classifyTrace } from "./eval-lib/trace-classify.mjs";
 import {
   evaluateGates,
@@ -71,24 +72,25 @@ function findProjectRoot() {
   return process.cwd();
 }
 
-const PROJECT_ROOT = resolve(
-  process.argv.find((a) => a.startsWith("--project="))?.slice(10) ?? findProjectRoot(),
-);
+const PROJECT_ROOT = resolve(argValue("--project") ?? findProjectRoot());
 
 // ---------- args ----------
-const argValue = (name) => {
+function argValue(name) {
   const eq = process.argv.find((a) => a.startsWith(`${name}=`));
   if (eq) return eq.slice(name.length + 1);
   const idx = process.argv.indexOf(name);
   return idx >= 0 ? process.argv[idx + 1] : undefined;
-};
+}
 const hasFlag = (name) => process.argv.includes(name);
 const JSON_OUT = argValue("--json");
+const JEV_CONTRAST = hasFlag("--jev-contrast");
+const REPETITIONS = Number(argValue("--repetitions") ?? 3);
 const ATTRIBUTION_SINCE = argValue("--attribution-since");
 const REQUIRE_MAP_PREVIEWS = hasFlag("--require-map-previews");
 const CALL_TIMEOUT_MS = Number(argValue("--call-timeout-ms") ?? 45_000);
 const OVERALL_BUDGET_MS = 240_000;
 const startedAtMs = Date.now();
+const cleanupStack = createCleanupStack();
 
 function failExit(code, message) {
   process.stderr.write(`retrieval-eval: ${message}\n`);
@@ -137,16 +139,16 @@ function captureTools() {
   for (const expected of ["code_search", "code_nav", "repo_map", "read_spans"]) {
     if (!tools[expected]) failExit(2, `extension did not register ${expected} — dist/index.js changed shape`);
   }
-  return { tools, shutdownSession: () => eventHandlers["session_shutdown"]?.({}, { cwd: PROJECT_ROOT }) };
+  return { tools, shutdownSession: cleanupStack.add(() => eventHandlers["session_shutdown"]?.({}, { cwd: PROJECT_ROOT })) };
 }
 
-async function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`timeout after ${ms}ms: ${label}`)), ms),
-    ),
-  ]);
+async function withTimeout(promise, ms, label, cancel) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => { cancel?.(); reject(new Error(`timeout after ${ms}ms: ${label}`)); }, ms);
+    })]);
+  } finally { clearTimeout(timer); }
 }
 
 const fileCache = new Map();
@@ -168,12 +170,10 @@ async function projectFileLines(relPath) {
  *  not silent noise. Suffixes are REPO-ROOT-relative. */
 async function verifyGold(caseDef) {
   if (caseDef.behavioralOnly || !caseDef.snippets?.length) return true;
-  for (const suffix of caseDef.expectPathSuffixes ?? []) {
-    const lines = await projectFileLines(suffix);
-    if (!lines) continue;
-    if (lines.some((l) => l.includes(caseDef.snippets[0]))) return true;
-  }
-  return false;
+  const files = await Promise.all((caseDef.expectPathSuffixes ?? []).map(projectFileLines));
+  if (!caseDef.snippets.every((needle) => files.some((lines) => lines?.some((line) => line.includes(needle))))) return false;
+  for (const required of caseDef.requiredPathSuffixes ?? []) if (!await projectFileLines(required)) return false;
+  return files.some(Boolean);
 }
 
 function matchHit(expect, relPath) {
@@ -184,17 +184,23 @@ function matchHit(expect, relPath) {
 
 async function runTool(tools, name, params, caseId, tracker) {
   const t0 = performance.now();
+  const controller = new AbortController();
+  const pending = tracker.trackTask(
+    Promise.resolve().then(() => tools[name].execute(`eval-${caseId}`, params, controller.signal, undefined, { cwd: PROJECT_ROOT })),
+    () => controller.abort(new Error("evaluation cleanup")),
+  );
   const result = await withTimeout(
-    tools[name].execute(`eval-${caseId}`, params, undefined, undefined, { cwd: PROJECT_ROOT }),
+    pending,
     CALL_TIMEOUT_MS,
     `${name}/${caseId}`,
+    () => controller.abort(new Error("evaluation timeout")),
   );
   const details = result.details ?? {};
   tracker.trackResultPath(details.resultsPath);
   return { result, latencyMs: Math.round(performance.now() - t0) };
 }
 
-async function measureCase(caseDef, tools, ctx, tracker) {
+async function measureCase(caseDef, tools, ctx, tracker, arm = "A") {
   const rec = {
     id: caseDef.id,
     kind: caseDef.kind,
@@ -214,16 +220,16 @@ async function measureCase(caseDef, tools, ctx, tracker) {
     anchorShownRef: null,
     avoidedFetchTokens: 0,
     budgetViolations: [],
+    honestyViolations: [],
+    outputTokenEstimate: 0,
+    requiredCount: caseDef.requiredPathSuffixes?.length ?? 0,
+    requiredFound: 0,
   };
   try {
     const { result, latencyMs } = await runTool(
       tools,
       caseDef.kind === "nav" ? "code_nav" : caseDef.kind === "map" ? "repo_map" : "code_search",
-      caseDef.kind === "nav"
-        ? { operation: caseDef.operation, symbol: caseDef.symbol }
-        : caseDef.kind === "map"
-          ? {}
-          : { query: caseDef.query, ...(caseDef.mode ? { mode: caseDef.mode } : {}) },
+      caseParams(caseDef, arm),
       caseDef.id,
       tracker,
     );
@@ -240,27 +246,16 @@ async function measureCase(caseDef, tools, ctx, tracker) {
       endLine: h.endLine,
     }));
 
-    // Provider honesty invariant (soft-honesty telemetry): a non-degraded result
-    // that names a provider must match the sidecar actually serving the project.
-    if (!rec.degraded && rec.provider !== null && ctx.observedLiveProvider && rec.provider !== ctx.observedLiveProvider) {
-      rec.budgetViolations.push(
-        `details.provider "${rec.provider}" != live sidecar "${ctx.observedLiveProvider}"`,
-      );
+    rec.outputTokenEstimate = estimateTokens(text);
+    rec.honestyViolations.push(...providerHonestyViolations(details, ctx.observedLiveProvider));
+    // A live semantic layer can legitimately return a hit OR a non-degraded miss.
+    // The old behavioral probe incorrectly required every question word to degrade.
+    if (caseDef.expectHonestDegraded || caseDef.expectHonestOutcome) {
+      rec.honestDegraded = routingExplained(details, text);
+      if (!rec.honestDegraded) rec.honestyViolations.push("empty result has no honest explanation");
     }
-
-    // Expected honest degradation (behavioral case): truly degraded, visibly noted.
-    if (caseDef.expectHonestDegraded) {
-      const realMiss =
-        text.includes("semantic unavailable") ||
-        text.includes("real miss") ||
-        text.includes("Not pretending");
-      rec.honestDegraded = rec.degraded && realMiss;
-      if (!rec.honestDegraded) {
-        rec.budgetViolations.push(
-          `expected honest degradation note; degraded=${rec.degraded}, notesMatch=${realMiss}`,
-        );
-      }
-    }
+    if (/^(?:code_search|code_nav|repo_map) failed\b/.test(text)) rec.error = "registered tool reported a failure";
+    rec.requiredFound = (caseDef.requiredPathSuffixes ?? []).filter((path) => rec.hits.slice(0, 12).some((hit) => hit.path.endsWith(path))).length;
 
     // Recall on ranked refs.
     const rank = rec.hits.findIndex((h) => matchHit(caseDef, h.path));
@@ -323,10 +318,80 @@ async function measureCase(caseDef, tools, ctx, tracker) {
   return rec;
 }
 
+// Same handler, gold checker, metrics, and exact-file cleanup as the legacy run.
+async function runJevContrast() {
+  if (!Number.isInteger(REPETITIONS) || REPETITIONS < 3 || REPETITIONS > 10) failExit(2, "--repetitions must be an integer from 3 to 10");
+  const { JEV_CASES } = await import(`${EVAL_DIR}/jev-eval-cases.mjs`);
+  const settings = await loadRetrievalSettings(PROJECT_ROOT);
+  const pre = await readSidecarSnapshot(PROJECT_ROOT);
+  const live = pre ? await pingSidecar(pre) : undefined;
+  const ctx = { observedLiveProvider: live?.provider ?? null };
+  const resultsDirAbs = join(PROJECT_ROOT, ".pi", "agent", "code-retrieval", "results");
+  let before = [];
+  try { before = readdirSync(resultsDirAbs); } catch { /* not created yet */ }
+  const tracker = new ResultFileTracker(before);
+  const finalizeResults = cleanupStack.add(async () => {
+    await tracker.settleTasks();
+    return tracker.cleanup((name) => join(resultsDirAbs, name), (file) => rm(file, { force: true }));
+  });
+  const invalidGoldIds = [];
+  for (const def of JEV_CASES) if (!await verifyGold(def)) invalidGoldIds.push(def.id);
+  const records = [];
+  let cleanup;
+  try {
+    for (let repetition = 0; repetition < REPETITIONS; repetition++) {
+      // Separate registries/ledgers for A and B, reset for each repetition.
+      // captureTools deliberately installs NO optimizer, regardless of env keys.
+      const captures = { A: captureTools(), B: captureTools() };
+      try {
+        for (const def of JEV_CASES) {
+          for (const arm of repetition % 2 ? ["B", "A"] : ["A", "B"]) {
+            const rec = Date.now() - startedAtMs > OVERALL_BUDGET_MS
+              ? { id: def.id, kind: def.kind, firstGoldRank: null, error: "overall time budget exceeded", skipped: true }
+              : await measureCase(def, captures[arm].tools, ctx, tracker, arm);
+            records.push({ ...rec, arm, repetition });
+          }
+        }
+      } finally {
+        await Promise.allSettled(Object.values(captures).map((capture) => capture.shutdownSession()));
+      }
+    }
+  } finally {
+    const outcome = await finalizeResults();
+    cleanup = { tracked: outcome.trackedCount, deleted: outcome.deleted, refusedPreExisting: outcome.refusedPreExisting.length, pendingTasks: outcome.pendingTasks, sidecarsTerminated: 0 };
+  }
+  const summary = contrastSummary(JEV_CASES, records, invalidGoldIds, REPETITIONS);
+  const settingsAfter = await loadRetrievalSettings(PROJECT_ROOT);
+  if (JSON.stringify(settings) !== JSON.stringify(settingsAfter)) {
+    summary.verdict = "FAIL"; summary.failedGates.push("settings-changed-during-run");
+  }
+  const report = {
+    schemaVersion: 1, kind: "jev-offline-contrast", ranAt: new Date().toISOString(),
+    repetitions: REPETITIONS, elapsedMs: Date.now() - startedAtMs,
+    indexObservation: { preExistingSidecar: Boolean(live), forcedCold: false, firstObservedRepetition: 0, warmedRepetitions: "1+; not a forced cold/warm benchmark" },
+    settings: { tokenBudget: settings.tokenBudget, exactProvider: settings.exactProvider, excludeGlobCount: settings.excludeGlobs.length },
+    summary, cleanup,
+    cases: JEV_CASES.map((def) => ({ id: def.id, kind: def.kind, shape: def.shape,
+      A: records.filter(r => r.id === def.id && r.arm === "A").map((r) => ({ ...toBoundedCaseMetric(r), repetition: r.repetition })),
+      B: records.filter(r => r.id === def.id && r.arm === "B").map((r) => ({ ...toBoundedCaseMetric(r), repetition: r.repetition })),
+    })),
+  };
+  const markdown = contrastMarkdown(report);
+  process.stdout.write(markdown);
+  if (JSON_OUT) {
+    await writeFile(resolve(JSON_OUT), `${JSON.stringify(sanitizeValue(report), null, 2)}\n`, "utf8");
+    await writeFile(`${resolve(JSON_OUT)}.md`, markdown, "utf8");
+  }
+  process.exitCode = summary.verdict === "PASS" ? 0 : 1;
+}
+
 // =====================================================================
 // main
 // =====================================================================
 async function main() {
+  if (hasFlag("--live-jev") || hasFlag("--live")) failExit(2, "this entry is local-only; repository upload requires a separately authorized experiment");
+  if (!Number.isFinite(CALL_TIMEOUT_MS) || CALL_TIMEOUT_MS < 1 || CALL_TIMEOUT_MS > 120000) failExit(2, "--call-timeout-ms must be between 1 and 120000");
+  if (JEV_CONTRAST) return runJevContrast();
   const settings = await loadRetrievalSettings(PROJECT_ROOT);
 
   // ---- Pre-state: observe any existing sidecar WITHOUT leasing it. ----
@@ -345,6 +410,11 @@ async function main() {
     /* dir may not exist yet */
   }
   const tracker = new ResultFileTracker(preListing);
+  const finalizeResults = cleanupStack.add(async () => {
+    await tracker.settleTasks();
+    await detachSidecar(PROJECT_ROOT, `retrieval-eval-b2-${startedAtMs}`).catch(() => {});
+    return tracker.cleanup((name) => join(resultsDirAbs, name), (file) => rm(file, { force: true }));
+  });
 
   // ---- Gold verification pass (hard gate). ----
   let goldChecked = 0;
@@ -362,14 +432,15 @@ async function main() {
   const deadline = startedAtMs + OVERALL_BUDGET_MS;
   for (const c of CASES) {
     if (Date.now() > deadline) {
-      cases.push({ id: c.id, kind: c.kind, tag: c.tag, latencyMs: null, error: "skipped: overall time budget exceeded", skipped: true });
+      cases.push({ id: c.id, kind: c.kind, tag: c.tag, latencyMs: null, error: "skipped: overall time budget exceeded", skipped: true,
+        hits: [], previewBlocks: [], previewTokensTotal: 0, budgetViolations: [], honestyViolations: [], firstGoldRank: null });
       continue;
     }
     cases.push(await measureCase(c, tools, ctx, tracker));
   }
   const mapPreviewBlockCount = cases
     .filter((r) => r.kind === "map")
-    .reduce((n, r) => n + r.previewBlocks.length, 0);
+    .reduce((n, r) => n + (r.previewBlocks?.length ?? 0), 0);
 
   // Refresh live observation for honesty gating after the case sweep.
   const postSnapshot = await readSidecarSnapshot(PROJECT_ROOT);
@@ -533,9 +604,9 @@ async function main() {
   // ---- Aggregates over valid denominators (for prose/report). ----
   const d = gates.denominators;
   const pct = (n, x) => (x === 0 ? "-" : `${Math.round((n / x) * 100)}%`);
-  const casesWithPreviews = cases.filter((r) => !r.skipped && r.previewBlocks.length > 0).length;
+  const casesWithPreviews = cases.filter((r) => !r.skipped && (r.previewBlocks?.length ?? 0) > 0).length;
   const previewTotals = cases.reduce(
-    (acc, r) => ({ blocks: acc.blocks + r.previewBlocks.length, tokens: acc.tokens + r.previewTokensTotal }),
+    (acc, r) => ({ blocks: acc.blocks + (r.previewBlocks?.length ?? 0), tokens: acc.tokens + (r.previewTokensTotal ?? 0) }),
     { blocks: 0, tokens: 0 },
   );
 
@@ -553,10 +624,7 @@ async function main() {
     await detachSidecar(PROJECT_ROOT, sessionId).catch(() => {});
     detachedLeases.push(sessionId);
   }
-  const cleanup = await tracker.cleanup(
-    (name) => join(resultsDirAbs, name),
-    (abs) => rm(abs, { force: true }),
-  );
+  const cleanup = await finalizeResults();
 
   // ---------------- report ----------------
   const L = [];
@@ -577,7 +645,7 @@ async function main() {
   for (const r of cases) {
     const def = CASES.find((c) => c.id === r.id);
     const recall = r.skipped ? "skip" : r.error ? "err" : r.firstGoldRank ? `@${r.firstGoldRank}` : "miss";
-    const preview = r.previewBlocks.length ? `${r.previewBlocks.length}blk/~${r.previewTokensTotal}tok` : "-";
+    const preview = r.previewBlocks?.length ? `${r.previewBlocks.length}blk/~${r.previewTokensTotal}tok` : "-";
     const anchor = r.anchorShown ? "shown" : r.goldInTop3 ? "top3-not-shown" : "-";
     const served = r.degraded ? "degraded" : r.provider ?? "-";
     L.push(`| ${r.id} | ${def?.shape ?? "?"} | ${recall} | ${preview} | ${anchor} | ${r.avoidedFetchTokens || "-"} | ${r.latencyMs ?? "-"}ms | ${served} |`);
@@ -681,6 +749,8 @@ async function main() {
   process.exitCode = gates.verdict === "FAIL" ? 1 : 0;
 }
 
-main().catch((e) => {
-  failExit(1, e instanceof Error ? e.stack ?? e.message : String(e));
+main().finally(() => cleanupStack.close()).catch((e) => {
+  // Do not force-exit while a signal-ignoring handler may still deliver a tracked late receipt.
+  process.stderr.write(`retrieval-eval: ${e instanceof Error ? e.stack ?? e.message : String(e)}\n`);
+  process.exitCode = 1;
 });

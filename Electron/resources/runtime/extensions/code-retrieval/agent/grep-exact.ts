@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { lstat, readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { truncateLine } from "./truncate.js";
 import type { UnassignedHit } from "./types.js";
+import { resolveProjectFile } from "./read-spans.js";
 
 const DEFAULT_TOP_K = 20;
 const CONTEXT_RADIUS = 8;
@@ -47,6 +48,9 @@ export function clearExactCache(): void {
 }
 
 export async function exactSearch(args: ExactSearchArgs): Promise<UnassignedHit[]> {
+  args.signal?.throwIfAborted();
+  if (!await resolveProjectFile(args.projectRoot, args.path ?? ".")) return [];
+  args.signal?.throwIfAborted();
   const key = cacheKey(args);
   const cached = queryCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.hits.map((hit) => ({ ...hit }));
@@ -56,8 +60,10 @@ export async function exactSearch(args: ExactSearchArgs): Promise<UnassignedHit[
   try {
     hits = await rgSearch(args, topK);
   } catch {
+    args.signal?.throwIfAborted();
     hits = await nodeGrep(args, topK);
   }
+  args.signal?.throwIfAborted();
   queryCache.set(key, { at: Date.now(), hits });
   return hits.map((hit) => ({ ...hit }));
 }
@@ -123,6 +129,7 @@ async function rgSearch(args: ExactSearchArgs, topK: number): Promise<Unassigned
 }
 
 function runCapture(cmd: string, argv: string[], cwd: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, argv, { cwd, stdio: ["ignore", "pipe", "pipe"] });
     const chunks: Buffer[] = [];
@@ -143,6 +150,7 @@ function runCapture(cmd: string, argv: string[], cwd: string, signal?: AbortSign
 }
 
 async function nodeGrep(args: ExactSearchArgs, topK: number): Promise<UnassignedHit[]> {
+  args.signal?.throwIfAborted();
   let regex: RegExp;
   try {
     regex = new RegExp(args.query);
@@ -152,15 +160,18 @@ async function nodeGrep(args: ExactSearchArgs, topK: number): Promise<Unassigned
   const searchRoot = args.path ? join(args.projectRoot, args.path) : args.projectRoot;
   const hits: UnassignedHit[] = [];
   await walk(searchRoot, args.projectRoot, async (abs, rel) => {
+    args.signal?.throwIfAborted();
     if (hits.length >= topK) return;
     if (args.glob && !globMatch(rel, args.glob)) return;
     if ((args.excludeGlobs ?? []).some((g) => globMatch(rel, g.replace(/^!/, "")))) return;
     let text: string;
     try {
-      text = await readFile(abs, "utf8");
+      text = await readFile(abs, { encoding: "utf8", signal: args.signal });
     } catch {
+      args.signal?.throwIfAborted();
       return;
     }
+    args.signal?.throwIfAborted();
     if (text.includes("\0")) return;
     const lines = text.split("\n");
     for (let i = 0; i < lines.length && hits.length < topK; i++) {
@@ -173,7 +184,7 @@ async function nodeGrep(args: ExactSearchArgs, topK: number): Promise<Unassigned
         text: truncateLine(lines[i]!).text,
       });
     }
-  });
+  }, args.signal, () => hits.length < topK);
   return hits;
 }
 
@@ -181,28 +192,40 @@ async function walk(
   dir: string,
   projectRoot: string,
   visit: (abs: string, rel: string) => Promise<void>,
+  signal?: AbortSignal,
+  keepGoing: () => boolean = () => true,
 ): Promise<void> {
+  signal?.throwIfAborted();
+  if (!keepGoing()) return;
+  const canonical = await resolveProjectFile(projectRoot, dir);
+  if (!canonical) return;
   let entries: string[];
   try {
-    entries = await readdir(dir);
+    if ((await lstat(canonical)).isFile()) {
+      signal?.throwIfAborted();
+      await visit(canonical, toProjectPath(projectRoot, dir));
+      return;
+    }
+    entries = await readdir(canonical);
   } catch {
+    signal?.throwIfAborted();
     return;
   }
   for (const name of entries) {
+    signal?.throwIfAborted();
+    if (!keepGoing()) break;
     if (SKIP_DIRS.has(name)) continue;
     const abs = join(dir, name);
     let info;
-    try {
-      info = await stat(abs);
-    } catch {
-      continue;
-    }
+    try { info = await lstat(abs); } catch { continue; }
+    // Match rg's default: do not traverse child symlinks, including cycles and escapes.
+    if (info.isSymbolicLink()) continue;
     if (info.isDirectory()) {
-      await walk(abs, projectRoot, visit);
-      continue;
+      await walk(abs, projectRoot, visit, signal, keepGoing);
+    } else if (info.isFile()) {
+      const file = await resolveProjectFile(projectRoot, abs);
+      if (file) await visit(file, toProjectPath(projectRoot, abs));
     }
-    if (!info.isFile()) continue;
-    await visit(abs, toProjectPath(projectRoot, abs));
   }
 }
 
@@ -215,7 +238,7 @@ function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function globMatch(rel: string, glob: string): boolean {
+export function globMatch(rel: string, glob: string): boolean {
   const escaped = glob
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
     .replace(/\*\*/g, "{{GLOBSTAR}}")

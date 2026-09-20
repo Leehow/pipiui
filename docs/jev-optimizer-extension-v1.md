@@ -1,10 +1,10 @@
 # PipiUI Jev 优化扩展规格 v1
 
-- 状态：规格草案，尚未实施；批准范围仅为本文的检索优化首版。
+- 状态：已按批准计划实现检索首版；workspace 功能验证已通过。真实仓库的 Jev 评分与完整 Agent 提速仍未证明，不能将功能完成写成性能目标达成。
 - 日期：2026-09-20。
 - 扩展身份：`jev-optimizer`，显示名「Jev 优化」。
 - 决策来源：用户要求用 `to-spec` 综合既有讨论，并明确要求独立可选扩展，避免没有 TypeSafe key 的用户承担依赖。
-- 本轮交付只有规格，不安装扩展、不发送项目代码到 Jev、不调用收费 API、不打包或重启 PipiUI。
+- 交付范围：源码、可复现评测入口与结果报告；没有打包或重启 PipiUI。用户随后提供 key 并要求对比，真实 API 仅使用生成的合成代码，没有上传工作区源码。
 
 ## 问题陈述
 
@@ -131,7 +131,7 @@
 - 运行时从宿主投送的 `EXT_JEV_OPTIMIZER_APIKEY` 读取并作为显式 API key 交给薄适配器。key 不写入项目设置 JSON，不加入模型目录，不进查询、候选、结果卡或日志。
 - 扩展启用本身就是优化开关，不再增加一个默认关闭、容易漏开的第二开关。启用且配置有效 key 后，适用查询自动使用优化。
 - 无 key 时设置页给出可关闭的说明「未配置 TypeSafe key，基础检索仍可使用」，不阻塞 Composer，不强制跳转注册，不重复弹出授权仪式。
-- 凭据继续遵守 App-profile vault 例外；项目启用态、检索数据和结果仍按当前项目隔离。不写全局 `~/.pi`。
+- 凭据复用当前宿主的 project-scope 扩展 secret namespace：项目之间隔离，当前为内存保管、宿主退出后清空；不新建持久化存储或把项目 key 特判成跨项目共享。项目启用态、检索数据和结果仍按项目隔离，不写全局 `~/.pi`。
 - 不新增可任意重定向携带凭据请求的 endpoint 设置。首版使用官方 API，记录实际返回模型身份用于评测；主模型不变。
 
 ### D8. 数据边界
@@ -221,7 +221,7 @@
 
 ## 实施切片
 
-这些是未来实现的完整切片，不是本轮已经开始的工作。每条都包含其产品路径与测试，不按纯 schema／逻辑／UI 横向拆分。
+以下保留批准时的完整切片约束；实际验证结果见计划记录及评测报告。每条包含其产品路径与测试，不按纯 schema／逻辑／UI 横向拆分。
 
 | ID | 阻塞于 | 交付与验收 |
 | --- | --- | --- |
@@ -261,16 +261,18 @@
 | 检索工具已有测试 | 同检索 agent 下的 `code-search.test.ts`、`code-search-provider.test.ts`、`degrade.test.ts`、`containment.test.ts` |
 | 既有 eval 入口、fixture 和测试 | 同检索 agent 下的 `eval/README.md`、`eval/run-retrieval-eval.mjs`、`eval/retrieval-eval-cases.mjs`、`eval/eval-tests/` |
 
-已有命令（列作未来验收入口，本轮未执行）：
+可复现的基础验收入口（优先使用已安装的 tsc，避免为验收重复安装依赖）：
 
 ```bash
 cd Electron
-npm run build:code-retrieval
+./node_modules/.bin/tsc -p resources/runtime/extensions/code-retrieval/agent/tsconfig.json
 node resources/runtime/extensions/code-retrieval/agent/eval/run-retrieval-eval.mjs
-node --test resources/runtime/extensions/code-retrieval/agent/eval/eval-tests/
+node --test resources/runtime/extensions/code-retrieval/agent/eval/eval-tests/*.test.mjs
 ```
 
 运行时扩展测试不应只依赖仓库默认 `npm test`，其覆盖范围不包含全部 `resources/runtime`。新增扩展须提供自己的定向测试／构建入口，并在第一条切片的报告里给出实际命令和结果。
+
+实际 A/B 与合成真实 API 结果见 [评测报告](research/jev-retrieval-evaluation-2026-09-20.md)：覆盖／排序改善，但单次延迟增加；没有据此宣称端到端提速或普遍正确性保证。
 
 ### 文档与外部证据边界
 
