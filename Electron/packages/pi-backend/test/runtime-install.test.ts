@@ -70,6 +70,20 @@ describe("treeSignature", () => {
 });
 
 describe("installRuntimeTree", () => {
+  it("selects optional Jev in the actual shipped manifest without auto-enabling it", async () => {
+    const selection = JSON.parse(await readFile(join(runtimeSource, "pipiui-runtime-manifest.json"), "utf8"));
+    expect(selection.bundledExtensions).toContain("jev-optimizer");
+    const manifest = JSON.parse(await readFile(join(runtimeSource, "extensions", "jev-optimizer", "pipiui-extension.json"), "utf8"));
+    expect(manifest.defaultEnabled).toBe(false);
+    expect(manifest.agent.extension).toBe("agent/dist/index.js");
+    for (const profileId of ["base", "coding"]) {
+      const profile = JSON.parse(await readFile(join(runtimeSource, "profiles", profileId, "pipiui-profile.json"), "utf8"));
+      for (const group of ["required", "recommended"]) {
+        expect(profile.extensions[group].map((item: { id: string }) => item.id)).not.toContain("jev-optimizer");
+      }
+    }
+  });
+
   it("keeps the optional Jev compiled entry when selected without requiring dependencies", async () => {
     const root = await temp();
     try {
@@ -199,6 +213,13 @@ describe("installRuntimeTree", () => {
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("qoder");
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("pipiui-headroom");
       expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("office-extension");
+      // Test the installed real package, not just a fixture selection: the shipped
+      // runtime manifest overrides the fallback keepDist list.
+      const jevDir = join(root, "extensions", "jev-optimizer");
+      const jevManifest = JSON.parse(await readFile(join(jevDir, "pipiui-extension.json"), "utf8"));
+      expect(jevManifest.defaultEnabled).toBe(false);
+      expect(jevManifest.agent.extension).toBe("agent/dist/index.js");
+      expect(existsSync(join(jevDir, jevManifest.agent.extension)), "shipped Jev compiled agent survives installation").toBe(true);
       const grokDir = join(root, "extensions", "grok-build-oauth");
       const grokManifest = JSON.parse(await readFile(join(grokDir, "pipiui-extension.json"), "utf8")) as {
         agent?: { extension?: string };
