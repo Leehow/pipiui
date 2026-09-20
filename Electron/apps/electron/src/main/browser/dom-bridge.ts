@@ -27,6 +27,8 @@ export function untaggedRequest(request: Record<string, unknown>, kind: BrowserV
   const snapshot = parseBrowserSnapshotTarget(typeof request.snapshot_id === 'string' ? request.snapshot_id : undefined)
   const token = parseBrowserSnapshotTarget(typeof request.element_token === 'string' ? request.element_token : undefined)
   const next = { ...request }
+  const preparation = parseBrowserSnapshotTarget(typeof request.preparation_id === 'string' ? request.preparation_id : undefined)
+  if (preparation.kind === kind) next.preparation_id = preparation.id
   if (snapshot.kind === kind) next.snapshot_id = snapshot.id
   if (token.kind === kind) next.element_token = token.id
   if (Array.isArray(request.fields)) {
@@ -57,6 +59,7 @@ export function observePayload(request: Record<string, unknown> | { scope?: stri
   return {
     action: 'observe',
     scope: typeof record.scope === 'string' ? record.scope : 'viewport',
+    ...(record.intent !== undefined ? { intent: record.intent } : {}),
     ...(typeof record.region === 'string' ? { region: record.region } : {}),
     ...(typeof record.role === 'string' ? { role: record.role } : {}),
     ...(typeof record.name === 'string' ? { name: record.name } : {}),
@@ -67,7 +70,10 @@ export function observePayload(request: Record<string, unknown> | { scope?: stri
 export function tagObservation(result: BrowserToolResult, kind: BrowserViewportKind): BrowserToolResult {
   const tagged = tagObservationTokens(result, kind) as BrowserToolResult
   const snapshotID = typeof tagged.snapshotID === 'string' ? tagBrowserSnapshotId(tagged.snapshotID, kind) : tagged.snapshotID
-  return { ...tagged, snapshotID, viewportTarget: kind }
+  return {
+    ...tagged, snapshotID, viewportTarget: kind,
+    ...(typeof tagged.preparationID === 'string' ? { preparationID: tagBrowserSnapshotId(tagged.preparationID, kind) } : {}),
+  }
 }
 
 export function controllerPrelude(): string {

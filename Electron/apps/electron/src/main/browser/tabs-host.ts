@@ -372,6 +372,13 @@ export class BrowserTabsHost {
           return failed
         }
       }
+      if (request.intent !== undefined && !['observe', 'prepare_intent_observation'].includes(request.action)) {
+        return { ok: false, code: 'invalid_browser_intent', error: 'intent is only supported for observe' }
+      }
+      if (['prepare_intent_observation', 'finalize_intent_observation'].includes(request.action)) {
+        if (resolved.kinds.length !== 1) return { ok: false, code: 'invalid_browser_target', error: 'prepared observation requires one viewport' }
+        return this.domActionOn(request, resolved.kinds[0])
+      }
       if (request.action === 'navigate') {
         if (!request.url) return { ok: false, error: 'browser navigate requires url' }
         await this.loadURLForTool(request.url)
@@ -470,7 +477,11 @@ export class BrowserTabsHost {
     if (snapshot.kind && token.kind && snapshot.kind !== token.kind) {
       return { error: `browser snapshot belongs to ${snapshot.kind} and cannot be used on ${token.kind}` }
     }
-    const inferred = snapshot.kind ?? token.kind
+    const preparation = parseBrowserSnapshotTarget(request.preparation_id)
+    if (preparation.kind && ((snapshot.kind && snapshot.kind !== preparation.kind) || (token.kind && token.kind !== preparation.kind))) {
+      return { error: 'browser preparation and snapshot belong to different viewports' }
+    }
+    const inferred = snapshot.kind ?? token.kind ?? preparation.kind
     if (target === 'both' && unsafeBothActions.has(request.action)) {
       return { error: `browser ${request.action} cannot target both viewports; specify target=desktop or target=mobile` }
     }
@@ -495,6 +506,13 @@ export class BrowserTabsHost {
     if (kinds.length === 1) return this.domActionOn(payload, kinds[0])
     const desktop = tagObservation(await this.domActionOn(payload, 'desktop'), 'desktop')
     const mobile = tagObservation(await this.domActionOn(payload, 'mobile'), 'mobile')
+    if (payload.intent !== undefined) {
+      for (const result of [desktop, mobile]) {
+        if (result.observationOptimization && typeof result.observationOptimization === 'object') {
+          Object.assign(result.observationOptimization, { reason: 'multi-target-local' })
+        }
+      }
+    }
     const ok = desktop.ok === true && mobile.ok === true
     return {
       ok,

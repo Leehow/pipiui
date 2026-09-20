@@ -44,6 +44,7 @@
 
   const state = {
     activeSnapshot: null,
+    pendingIntent: null,
     pendingFrameClick: null,
     redactionValues: [],
     redactionTotalUnits: 0,
@@ -221,7 +222,13 @@
     return envelope;
   }
 
+  function clearPendingIntent() {
+    state.pendingIntent?.observer?.disconnect();
+    state.pendingIntent = null;
+  }
+
   function invalidateSnapshot() {
+    clearPendingIntent();
     state.activeSnapshot = null;
   }
 
@@ -339,41 +346,41 @@
     return truncateUTF16(described, STRING_LIMITS.description);
   }
 
-  function accessibleName(element) {
+  function accessibleName(element, limit = STRING_LIMITS.name) {
     const labelled = referencedText(element, "aria-labelledby");
-    if (labelled) return truncateUTF16(labelled, STRING_LIMITS.name);
+    if (labelled) return truncateUTF16(labelled, limit);
     const aria = normalizedText(element.getAttribute("aria-label"));
-    if (aria) return truncateUTF16(aria, STRING_LIMITS.name);
+    if (aria) return truncateUTF16(aria, limit);
     const labelText = normalizedText(associatedLabels(element).map((label) => label.textContent || "").join(" "));
-    if (labelText) return truncateUTF16(labelText, STRING_LIMITS.name);
+    if (labelText) return truncateUTF16(labelText, limit);
     if (element.localName === "fieldset") {
       const legend = Array.from(element.children || []).find((child) => child.localName === "legend");
       const legendText = normalizedText(legend?.textContent);
-      if (legendText) return truncateUTF16(legendText, STRING_LIMITS.name);
+      if (legendText) return truncateUTF16(legendText, limit);
     }
     if (element.localName === "input") {
       const type = (element.getAttribute("type") || "text").toLowerCase();
       if (["button", "submit", "reset"].includes(type)) {
         const value = normalizedText(element.value);
-        if (value) return truncateUTF16(value, STRING_LIMITS.name);
+        if (value) return truncateUTF16(value, limit);
       }
       if (type === "image") {
         const alt = normalizedText(element.getAttribute("alt"));
-        if (alt) return truncateUTF16(alt, STRING_LIMITS.name);
+        if (alt) return truncateUTF16(alt, limit);
       }
     }
     for (const attribute of ["alt", "title", "placeholder"]) {
       const value = normalizedText(element.getAttribute(attribute));
-      if (value) return truncateUTF16(value, STRING_LIMITS.name);
+      if (value) return truncateUTF16(value, limit);
     }
     const elementRole = role(element);
     if (["button", "a", "summary", "label", "option"].includes(element.localName)
       || ["button", "link", "menuitem", "option", "tab"].includes(elementRole)
       || element.isContentEditable) {
       const text = ownVisibleText(element);
-      if (text) return truncateUTF16(text, STRING_LIMITS.name);
+      if (text) return truncateUTF16(text, limit);
     }
-    return truncateUTF16(normalizedText(element.textContent), STRING_LIMITS.name);
+    return truncateUTF16(normalizedText(element.textContent), limit);
   }
 
   function semanticFieldText(element) {
@@ -859,8 +866,13 @@
     ].join("\u001f");
   }
 
-  function collect(scope) {
+  function collect(scope, budget) {
     const candidates = [];
+    let collectedBytes = 0;
+    let incompleteReason;
+    const identityCounts = new Map();
+    const maxCandidates = budget?.maxCandidates ?? Infinity;
+    const maxBytes = budget?.maxBytes ?? Infinity;
     const limitations = [
       "closed_shadow_roots_not_structured; use screenshot or Computer Use",
       // Platform gaps: declared so the model falls back to screenshot/user handoff.
@@ -881,7 +893,7 @@
           const rect = frameRect(current, offsetX, offsetY);
           if ((scope === "page" || inViewport(rect)) && (isInteractive(current, currentRole) || isContext(current, currentRole))) {
             const name = accessibleName(current);
-            candidates.push({
+            const candidate = {
               element: current,
               ownerDocument: current.ownerDocument,
               rootNode: current.getRootNode(),
@@ -898,7 +910,27 @@
                 frame,
                 rect,
               },
-            });
+            };
+            if (budget) {
+              // Match unfiltered collect("page") identity: region filtering must
+              // not renumber same-name controls used by safe relocation.
+              const key = `${currentRole}\u001f${name}`;
+              candidate.ordinal = (identityCounts.get(key) || 0) + 1;
+              if (!incompleteReason || identityCounts.has(key)) identityCounts.set(key, candidate.ordinal);
+              candidate.identityKey = `${key}\u001f${candidate.ordinal}`;
+              candidate.semanticFingerprint = `${candidate.domPath}\u001f${candidate.identityKey}`;
+            }
+            if (budget?.regionFor) candidate.region = budget.regionFor(candidate.element);
+            const accepted = !budget?.accept || budget.accept(candidate);
+            if (accepted) {
+              const bytes = budget ? utf8Length(JSON.stringify(candidate.public)) : 0;
+              if (incompleteReason || candidates.length >= maxCandidates || collectedBytes + bytes > maxBytes) {
+                incompleteReason ||= candidates.length >= maxCandidates ? "candidate-limit" : "candidate-bytes";
+              } else {
+                collectedBytes += bytes;
+                candidates.push(candidate);
+              }
+            }
           }
         }
 
@@ -935,9 +967,9 @@
     if (sawFileInput) {
       limitations.push("file_input_present; structured browser cannot set file paths — use user handoff or Computer Use");
     }
-    assignIdentity(candidates);
-    assignRegions(candidates);
-    return { candidates, limitations };
+    if (!budget) assignIdentity(candidates);
+    if (!budget?.regionFor) assignRegions(candidates);
+    return { candidates, limitations, incompleteReason };
   }
 
   function viewportInfo() {
@@ -985,7 +1017,214 @@
     };
   }
 
+  function utf8Length(value) {
+    // JSON strings escape lone surrogates; this also works in our DOM test realm.
+    return encodeURIComponent(value).replace(/%[A-F\d]{2}/gi, "x").length;
+  }
+
+  function validateIntent(params) {
+    if (typeof params.intent !== "string" || !params.intent.trim()
+      || Array.from(params.intent.trim()).length > 512
+      || (params.cursor !== undefined && params.cursor !== null && params.cursor !== "")) {
+      return failure("observe intent must be 1–512 characters and cannot be combined with cursor; omit intent for ordinary paging.", "invalid_browser_intent");
+    }
+    return null;
+  }
+
+  function intentTerms(value) {
+    const parts = value.match(/[\p{Script=Han}]+|[\p{L}\p{N}]+/gu) || [];
+    return [...new Set(parts.flatMap(part => {
+      if (!/\p{Script=Han}/u.test(part)) return [part];
+      const chars = Array.from(part);
+      return chars.length < 2 ? chars : chars.slice(0, -1).map((char, i) => char + chars[i + 1]);
+    }))];
+  }
+
+  // Explicit region ids must be assigned before filtering; keeping just one
+  // representative per region avoids retaining all of its excluded controls.
+  function intentRegionLookup(scope) {
+    const representatives = new Map();
+    forEachElement(element => {
+      const currentRole = role(element);
+      if (isHiddenComposed(element) || isDisabled(element) || !hasVisibleBox(element)
+        || !(isInteractive(element, currentRole) || isContext(element, currentRole))) return;
+      const frame = owningFrameElement(element.ownerDocument);
+      const offset = frame?.getBoundingClientRect();
+      if (scope !== "page" && !inViewport(frameRect(element, offset?.left || 0, offset?.top || 0))) return;
+      const host = nearestLandmark(element) || fallbackRegionHost(element);
+      if (!representatives.has(host)) representatives.set(host, { element, count: 0 });
+      representatives.get(host).count += 1;
+    });
+    assignRegions([...representatives.values()]);
+    const regions = new Map();
+    for (const representative of representatives.values()) {
+      const region = representative.region;
+      const summary = regions.get(region.id) || { id: region.id, name: region.name, role: region.role, count: 0, more: true };
+      summary.count += representative.count;
+      regions.set(region.id, summary);
+    }
+    return {
+      regionFor: element => representatives.get(nearestLandmark(element) || fallbackRegionHost(element))?.region,
+      regions: [...regions.values()],
+    };
+  }
+
+  function prepareIntentObservation(params) {
+    clearPendingIntent();
+    const invalid = validateIntent(params);
+    if (invalid) return invalid;
+    if (!retainCurrentSensitiveValues()) return redactionCapacityFailure();
+    const started = Date.now();
+    const variants = activeRedactionVariants();
+    const intent = redactString(params.intent.trim(), variants);
+    const needle = normalizedText(intent).toLowerCase();
+    const terms = intentTerms(needle);
+    const scope = params.scope === "page" ? "page" : "viewport";
+    const roleFilter = String(params.role || "").trim().toLowerCase();
+    const nameFilter = String(params.name || "").trim().toLowerCase();
+    const regionFilter = String(params.region || "").trim();
+    const structure = intentRegionLookup(scope);
+    const collected = collect(scope, {
+      maxCandidates: 256, maxBytes: 64 * 1024, regionFor: structure.regionFor,
+      accept: candidate => matchesRoleName(candidate, roleFilter, nameFilter)
+        && matchesRegionFilter(candidate.region || {}, regionFilter),
+    });
+    const scored = collected.candidates.map((candidate, ordinal) => {
+      const name = normalizedText(redactString(candidate.public.name, variants)).toLowerCase();
+      const region = normalizedText(redactString(candidate.region?.name || "", variants)).toLowerCase();
+      const covers = (text) => terms.filter(term => /\p{Script=Han}/u.test(term)
+        ? text.includes(term) : intentTerms(text).includes(term)).length;
+      return { candidate, ordinal, score: [name === needle ? 2 : name.includes(needle) ? 1 : 0, covers(name), covers(region)] };
+    });
+    scored.sort((a, b) => b.score[0] - a.score[0] || b.score[1] - a.score[1] || b.score[2] - a.score[2] || a.ordinal - b.ordinal);
+    const ordered = scored.map((item, index) => ({ ...item.candidate, candidateID: `candidate-${index + 1}` }));
+    // A label/region can echo an ordinary form value (not only passwords).
+    // Keep these redactions request-local: a full form must not poison future
+    // local observations or turn browser cloud consent into form-value consent.
+    const formValues = new Set();
+    let formUnits = 0;
+    let cloudOverflow = false;
+    forEachElement(element => {
+      if (cloudOverflow || !element.matches?.('input,textarea,select,[contenteditable]')) return;
+      const value = String(element.hasAttribute('contenteditable') ? element.textContent || '' : element.value || '');
+      if (!value || formValues.has(value)) return;
+      formUnits += value.length;
+      if (value.length > MAX_REDACTION_VALUE_UNITS || formValues.size >= MAX_REDACTION_ENTRIES || formUnits > MAX_REDACTION_TOTAL_UNITS) cloudOverflow = true;
+      else formValues.add(value);
+    });
+    const cloudVariants = activeRedactionVariants([...formValues]);
+    const cloudText = value => redactString(value, cloudVariants).replace(/https?:\/\/[^\s<>"']+/gi, "[url]");
+    const candidates = cloudOverflow ? [] : ordered.slice(0, 64).filter(candidate => !isSensitive(candidate.element)).map(candidate => ({
+      // Identity is runtime data, never subject to page-text redaction.
+      id: candidate.candidateID,
+      ...sanitizePublic({
+        role: candidate.public.role,
+        // Redact the original text BEFORE applying the public string budget.
+        name: cloudText(accessibleName(candidate.element, Infinity)),
+        region: cloudText(candidate.region?.element ? accessibleName(candidate.region.element, Infinity) || candidate.region.name : "page"),
+      }, cloudVariants),
+    }));
+    const pending = {
+      id: opaqueID("observation"), url: String(location.href), scope, ordered, candidates,
+      viewport: JSON.stringify(viewportInfo()), scroll: JSON.stringify(scrollInfo()),
+      collectedCount: collected.candidates.length, incompleteReason: collected.incompleteReason,
+      limitations: collected.limitations, regions: structure.regions, expires: Date.now() + 5000,
+      collectionMs: Date.now() - started, changed: false, observer: null,
+    };
+    // Observe composed roots too: a document MutationObserver does not see into
+    // open shadow roots or same-origin iframe documents.
+    if (typeof MutationObserver === "function") {
+      pending.observer = new MutationObserver(() => { pending.changed = true; });
+      const roots = new Set([document, ...collected.candidates.map(candidate => candidate.rootNode)]);
+      for (const root of roots) pending.observer.observe(root, { subtree: true, childList: true, attributes: true, characterData: true });
+    }
+    state.pendingIntent = pending;
+    return {
+      ok: true, preparationID: pending.id, intent: cloudText(intent), candidates,
+      ...(cloudOverflow ? { cloudReason: "redaction-capacity" } : {}),
+      collectedCount: pending.collectedCount, collectionMs: pending.collectionMs,
+    };
+  }
+
+  function finalizeIntentObservation(params) {
+    const pending = state.pendingIntent;
+    const changed = () => {
+      clearPendingIntent();
+      return failure("The prepared browser observation changed; observe again.", "browser_observation_changed", true, { retryable: true });
+    };
+    if (!pending || pending.id !== params.preparation_id || pending.expires <= Date.now()
+      || pending.url !== String(location.href) || pending.changed || pending.observer?.takeRecords().length
+      || pending.viewport !== JSON.stringify(viewportInfo()) || pending.scroll !== JSON.stringify(scrollInfo())) return changed();
+    let ordered = pending.ordered;
+    if (params.candidate_ids !== undefined) {
+      const ids = params.candidate_ids;
+      const allowed = new Set(pending.candidates.map(candidate => candidate.id));
+      if (!Array.isArray(ids) || ids.length > 64 || new Set(ids).size !== ids.length
+        || ids.some(id => typeof id !== "string" || !allowed.has(id) || !ordered.some(candidate => candidate.candidateID === id))) {
+        clearPendingIntent();
+        return failure("Invalid prepared candidate ordering.", "invalid_browser_candidates");
+      }
+      const byID = new Map(ordered.map(candidate => [candidate.candidateID, candidate]));
+      const selected = new Set(ids);
+      ordered = [...ids.map(id => byID.get(id)), ...ordered.filter(candidate => !selected.has(candidate.candidateID))];
+    }
+    // Validate every collected candidate, not just the selected prefix. Changes in
+    // the unshown tail must not turn a stale ranking into a new valid snapshot.
+    for (const candidate of pending.ordered) {
+      const element = candidate.element;
+      const offset = owningFrameElement(element.ownerDocument)?.getBoundingClientRect();
+      const currentRect = frameRect(element, offset?.left || 0, offset?.top || 0);
+      if (JSON.stringify(currentRect) !== JSON.stringify(candidate.public.rect)
+        || (pending.scope === "viewport" && !inViewport(currentRect))) return changed();
+      if (!element.isConnected || element.ownerDocument !== candidate.ownerDocument
+        || element.getRootNode() !== candidate.rootNode
+        || owningFrameElement(element.ownerDocument) !== candidate.owningFrameElement || isHiddenComposed(element)
+        || isDisabled(element) || !hasVisibleBox(element)
+        || stateDescription(element) !== candidate.public.state || valueHint(element) !== candidate.public.valueHint
+        || fingerprint(element, candidate.frame, role(element), accessibleName(element)) !== candidate.fingerprint) return changed();
+    }
+    if (!retainCurrentSensitiveValues()) return redactionCapacityFailure();
+    const started = Date.now();
+    const variants = activeRedactionVariants();
+    const snapshotID = opaqueID("snapshot");
+    const map = new Map();
+    // Structure collection is independent of candidate budgets and hard filters.
+    // A late dialog must not disappear just because earlier controls filled a cap.
+    const regionList = pending.regions.slice().sort((a, b) => Number(["dialog", "alertdialog"].includes(b.role)) - Number(["dialog", "alertdialog"].includes(a.role)));
+    const elements = ordered.slice(0, 12).map((candidate, index) => {
+      const published = publishElement(candidate, index, variants);
+      map.set(published.token, published.record);
+      return published.publicElement;
+    });
+    const observation = enforceEnvelopeBudget({
+      ok: true, snapshotID, url: redactURLForObservation(String(location.href)), title: String(document.title || ""),
+      loading: document.readyState !== "complete", viewport: viewportInfo(), scroll: scrollInfo(),
+      regions: regionList, elements,
+      limitations: [...pending.limitations, "intent_selection_is_bounded; omit intent and use ordinary observe with region/role/name/cursor to inspect other candidates"],
+      truncated: Boolean(pending.incompleteReason) || pending.ordered.length > elements.length,
+      observationOptimization: {
+        status: "local", reason: pending.incompleteReason || "intent-local", collectedCount: pending.collectedCount,
+        candidateCount: pending.ordered.length, evaluationWindowCount: pending.candidates.length, evaluatedCount: 0, displayedCount: elements.length,
+        incomplete: Boolean(pending.incompleteReason), budgetReason: pending.incompleteReason,
+        collectionMs: pending.collectionMs, publishMs: Date.now() - started,
+      },
+    }, variants);
+    clearPendingIntent();
+    if (observation.ok) {
+      observation.observationOptimization.displayedCount = observation.elements.length;
+      const visible = new Set(observation.elements.map(element => element.token));
+      state.activeSnapshot = { id: snapshotID, url: String(location.href), map: new Map([...map].filter(([token]) => visible.has(token))) };
+      clearPendingFrameClick();
+    }
+    return observation;
+  }
+
   function observe(scope, action, secretValues, query = {}) {
+    clearPendingIntent();
+    if (query.intent !== undefined) {
+      const prepared = prepareIntentObservation({ ...query, scope });
+      return prepared.ok ? finalizeIntentObservation({ preparation_id: prepared.preparationID }) : prepared;
+    }
     const normalizedScope = scope === "page" ? "page" : "viewport";
     if (!retainRedactions(secretValues) || !retainCurrentSensitiveValues()) {
       return redactionCapacityFailure();
@@ -2159,6 +2398,8 @@
     const scope = params?.scope === "page" ? "page" : "viewport";
     ensureMutationObserver();
     if (action === "sanitize") return sanitizeBypassOutput(params.value);
+    if (action === "prepare_intent_observation") return prepareIntentObservation(params);
+    if (action === "finalize_intent_observation") return finalizeIntentObservation(params);
     if (action === "observe") return observe(scope, params.action_metadata || null, [], params);
     if (action === "fill_form") return fillForm(params);
     if (action === "wait_check") return waitCheck(params, scope);

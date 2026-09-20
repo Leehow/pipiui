@@ -238,7 +238,7 @@ import {
 import { handleExtEmit, toolResultDetailsField } from "./extension-channels.js";
 import { ExtensionUiChannel, EXTUI_TIMEOUT_MS } from "./extension-ui-channel.js";
 import type { ExtInvokeResult } from "./extension-settings.js";
-import { JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
+import { JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_SECRET_ENV, JEV_SECRET_KEY, JevRuntimeStateStore } from "./jev-runtime-state.js";
 import {
   clearExtensionSecrets,
   extensionSecretEnvs,
@@ -8596,6 +8596,9 @@ export class PiHostBackend implements HostBackend {
       if (!root) return settingsDenied("no_session", "project-scoped settings require a project");
       // This project's namespace is isolated; revoke all its live consumers via one file.
       if (jevKeyChanged) this.jevRuntimeState.revoke(root);
+      else if (id === JEV_EXTENSION_ID && validated.values[JEV_BROWSER_ENABLED_KEY] === false) {
+        this.jevRuntimeState.revokeBrowser(root);
+      }
       const namespace = this.extensionVaultNamespace(scope, root);
       // Durable projection first: paddleocr.json is authoritative across restarts.
       await this.projectPdfLegacyStore(id, root, { saved: validated.secrets, cleared: validated.cleared });
@@ -8623,8 +8626,13 @@ export class PiHostBackend implements HostBackend {
     }
     // An app-scoped credential really is shared: never reuse one project's enablement
     // for its peers, and never write a project that is not open or consuming it live.
-    const jevRoots = jevKeyChanged ? await this.openJevProjectRoots() : [];
-    for (const root of jevRoots) this.jevRuntimeState.revoke(root);
+    const jevBrowserChanged = id === JEV_EXTENSION_ID
+      && Object.prototype.hasOwnProperty.call(validated.values, JEV_BROWSER_ENABLED_KEY);
+    const jevRoots = (jevKeyChanged || jevBrowserChanged) ? await this.openJevProjectRoots() : [];
+    if (jevKeyChanged) for (const root of jevRoots) this.jevRuntimeState.revoke(root);
+    else if (validated.values[JEV_BROWSER_ENABLED_KEY] === false) {
+      for (const root of jevRoots) this.jevRuntimeState.revokeBrowser(root);
+    }
     if (Object.keys(validated.secrets).length > 0) {
       try {
         await putExtensionSecrets(this.vaultDir, validated.secrets);
@@ -8884,9 +8892,20 @@ export class PiHostBackend implements HostBackend {
     const overlay = await this.mergedExtensionOverlay(projectRoot);
     const pkg = this.extensionLoader.spawnPackages(overlay).find((item) => item.id === JEV_EXTENSION_ID);
     const secretEnv = await this.spawnSecretEnvFor(JEV_EXTENSION_ID, projectRoot);
+    const enabled = Boolean(pkg?.enabled && pkg.extensionPath);
+    let browserEnabled = false;
+    if (enabled) {
+      try {
+        const settings = await this.readExtensionSettingsSnapshot(JEV_EXTENSION_ID, projectRoot);
+        browserEnabled = settings[JEV_BROWSER_ENABLED_KEY] === true;
+      } catch {
+        browserEnabled = false;
+      }
+    }
     this.jevRuntimeState.ensure(projectRoot, {
-      enabled: Boolean(pkg?.enabled && pkg.extensionPath),
+      enabled,
       hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()),
+      browserEnabled,
     });
   }
   private async registeredExtensionsForSpawn(projectRoot: string): Promise<SpawnRegisteredExtension[]> {
@@ -8931,7 +8950,11 @@ export class PiHostBackend implements HostBackend {
         console.warn(`[${pkg.id}] spawn secret resolution failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       const jevRuntimeState = pkg.id === JEV_EXTENSION_ID
-        ? this.jevRuntimeState.ensure(projectRoot, { enabled: true, hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()) })
+        ? this.jevRuntimeState.ensure(projectRoot, {
+          enabled: true,
+          hasKey: Boolean(secretEnv[JEV_SECRET_ENV]?.trim()),
+          browserEnabled: settings[JEV_BROWSER_ENABLED_KEY] === true,
+        })
         : undefined;
       out.push({ ...pkg, settings, ...(Object.keys(secretEnv).length ? { secretEnv } : {}), ...(jevRuntimeState ? { jevRuntimeState } : {}) });
     }

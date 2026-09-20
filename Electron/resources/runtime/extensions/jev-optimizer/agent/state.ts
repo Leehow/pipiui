@@ -31,6 +31,9 @@ export function parseHostState(raw: string): JevHostState | undefined {
     enabled: parsed.enabled,
     hasKey: parsed.hasKey,
     generation: parsed.generation,
+    browserEnabled: parsed.browserEnabled === true,
+    browserGeneration: typeof parsed.browserGeneration === "string" && parsed.browserGeneration
+      ? parsed.browserGeneration : undefined,
   };
 }
 
@@ -70,6 +73,22 @@ export function evaluateReadiness(
   const apiKey = envValue(env, API_KEY_ENV);
   if (!state.hasKey || !apiKey) return { ready: false, reason: "no-key" };
   return { ready: true, apiKey };
+}
+
+export async function checkBrowserAvailability(
+  deps: JevDeps,
+  signal?: AbortSignal,
+): Promise<AvailabilityResult & { apiKey?: string; browserGeneration?: string }> {
+  if (signal?.aborted) return { ready: false, reason: "aborted" };
+  if (!envValue(deps.env ?? process.env, API_KEY_ENV)) return { ready: false, reason: "no-key" };
+  const loaded = await loadHostState(deps, signal);
+  if (signal?.aborted) return { ready: false, reason: "aborted" };
+  const code = evaluateReadiness(loaded.state, deps.env ?? process.env, loaded.reason);
+  if (!code.ready) return code;
+  if (!loaded.state?.browserEnabled || !loaded.state.browserGeneration) {
+    return { ready: false, reason: "browser-disabled" };
+  }
+  return { ...code, browserGeneration: loaded.state.browserGeneration };
 }
 
 export async function checkAvailability(

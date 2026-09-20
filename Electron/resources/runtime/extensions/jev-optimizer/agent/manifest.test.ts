@@ -10,7 +10,7 @@ function manifestPath(): string {
   return resolve(here, up, "pipiui-extension.json");
 }
 
-test("manifest is an optional secret-only extension with no tools or models", async () => {
+test("manifest is optional with separate default-off browser cloud consent and no tools or models", async () => {
   const manifest = JSON.parse(await readFile(manifestPath(), "utf8")) as Record<string, unknown>;
   assert.equal(manifest.id, "jev-optimizer");
   assert.equal(manifest.name, "Jev 优化");
@@ -30,5 +30,12 @@ test("manifest is an optional secret-only extension with no tools or models", as
   assert.match(description, /TypeSafe/);
   assert.match(description, /未配置 key|基础检索/);
   assert.match(description, /新会话/);
+  const browser = app.settings?.schema?.properties?.["ext.jev-optimizer.browserEnabled"];
+  assert.equal(browser?.type, "boolean");
+  assert.equal(browser?.default, false);
+  assert.equal(browser?.title, "允许浏览器候选云端评分");
+  assert.match(String(browser?.description), /TypeSafe/);
+  assert.match(String(browser?.description), /收费/);
+  assert.match(String(browser?.description), /不会发送截图或整个页面/);
   assert.equal(app.ui, undefined);
 });

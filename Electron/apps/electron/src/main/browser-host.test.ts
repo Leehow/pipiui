@@ -129,6 +129,41 @@ function browserHarness() {
   return { host, contents, view, createView, attach }
 }
 
+describe('intent observation host routing', () => {
+  it('preserves intent and hard filters in a single page dispatch', async () => {
+    const { host, contents } = browserHarness()
+    await host.toolAction({ action: 'navigate', url: 'https://fixture.invalid' })
+    contents.executeJavaScript.mockClear()
+    await host.toolAction({ action: 'observe', intent: 'invoice', role: 'button', region: 'main' })
+    expect(contents.executeJavaScript).toHaveBeenCalledTimes(1)
+    expect(contents.executeJavaScript.mock.calls[0][0]).toContain('"intent":"invoice"')
+    expect(contents.executeJavaScript.mock.calls[0][0]).toContain('"region":"main"')
+  })
+
+  it('namespaces prepared handles and rejects viewport crossings', async () => {
+    const { host, contents } = browserHarness()
+    await host.toolAction({ action: 'navigate', url: 'https://fixture.invalid' })
+    contents.executeJavaScript.mockResolvedValueOnce({ ok: true, preparationID: 'prepared-one', candidates: [] })
+    const prepared = await host.toolAction({ action: 'prepare_intent_observation', intent: 'invoice', target: 'desktop' })
+    expect(prepared.preparationID).toBe('desktop:prepared-one')
+    await expect(host.toolAction({ action: 'finalize_intent_observation', preparation_id: String(prepared.preparationID), target: 'mobile' }))
+      .resolves.toMatchObject({ ok: false, error: expect.stringContaining('belongs to desktop') })
+    await host.toolAction({ action: 'finalize_intent_observation', preparation_id: String(prepared.preparationID), candidate_ids: ['candidate-1'] })
+    expect(contents.executeJavaScript.mock.calls.at(-1)?.[0]).toContain('"preparation_id":"prepared-one"')
+    await expect(host.toolAction({ action: 'prepare_intent_observation', intent: 'invoice', target: 'both' }))
+      .resolves.toMatchObject({ ok: false })
+  })
+
+  it('rejects intent on mutations at the host boundary', async () => {
+    const { host, contents } = browserHarness()
+    await host.toolAction({ action: 'navigate', url: 'https://fixture.invalid' })
+    contents.executeJavaScript.mockClear()
+    await expect(host.toolAction({ action: 'click', intent: 'invoice' }))
+      .resolves.toMatchObject({ ok: false, code: 'invalid_browser_intent' })
+    expect(contents.executeJavaScript).not.toHaveBeenCalled()
+  })
+})
+
 describe('awaitLoadURL', () => {
   it('resolves loaded when the promise settles before the bound', async () => {
     await expect(awaitLoadURL(Promise.resolve('ok'), 50)).resolves.toBe('loaded')

@@ -7,6 +7,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { capabilityCall } from "./capability-bridge.ts";
 import { isTrivialBrowserEval } from "./browser-eval-guard.ts";
+import { connectBrowserReranker, observeWithOptionalRerank, type BrowserRerankerConnection } from "./browser-reranker.ts";
+type BrowserOptimization = { connection: BrowserRerankerConnection; projectRoot: string };
 
 const REQUEST_TIMEOUT_MS = 35_000;
 // Whole-batch ceiling: per-item timeouts alone would allow 8 × 35s ≈ 280s, which
@@ -106,6 +108,7 @@ function formatObservation(r: any): string {
   if (r.nextCursor) lines.push(`Next cursor: ${r.nextCursor}`);
   lines.push("Elements:");
   for (const element of r.elements || []) lines.push(JSON.stringify(element));
+  if (r.observationOptimization) lines.push(`Observation optimization: ${JSON.stringify(r.observationOptimization)}`);
   if (r.truncated) lines.push("[observation truncated: refine region, role, name, cursor, or scroll]");
   if (Array.isArray(r.limitations) && r.limitations.length) {
     lines.push("Limitations:", ...r.limitations.map((item: string) => `- ${item}`));
@@ -142,7 +145,11 @@ const HELP = [
   "navigate {url}          Open a URL in the panel and wait for load. Scheme optional;",
   "                        localhost defaults to http. Settles on didFinish + a short network-idle",
   "                        window (resource timing heuristic). Returns a fresh observation.",
-  "observe {scope?,target?,region?,role?,name?,cursor?}",
+  "observe {scope?,target?,region?,role?,name?,cursor?,intent?}",
+  "                        intent: current lookup goal (1–512 characters); ranks bounded candidates",
+  "                        before display. Local without Jev; cannot combine with cursor. Omit",
+  "                        intent for ordinary paging. target=both stays local. Known locators",
+  "                        and saved flows need no extra observation or scoring step.",
   "                        Snapshot interactive DOM. Default returns region summaries",
   "                        (region name, element count, first items). region expands one",
   "                        region; role/name filter elements; cursor pages the current view.",
@@ -285,7 +292,7 @@ const BATCH_DETAILS_KEEP = [
   "error", "code", "requiresObservation", "requiresUserInput", "candidates",
   "ok", "action", "mutation", "relocated", "url", "title", "snapshotID",
   "loading", "viewport", "scroll", "note", "truncated", "deferObservation",
-  "filled", "failed", "target", "nextCursor", "retryable", "limitations",
+  "filled", "failed", "target", "nextCursor", "retryable", "limitations", "observationOptimization",
 ] as const;
 
 /** UTF-16 surrogate-safe truncation: never splits an astral character pair. */
@@ -334,9 +341,14 @@ function formatCompactDomResult(details: any): string {
   return lines.length ? lines.join("\n") : "ok";
 }
 
+function hasIntentViewports(details: any): boolean {
+  return details?.target === "both" && Boolean(details.desktop?.observationOptimization || details.mobile?.observationOptimization);
+}
+
 function isSubstantialObservationDetails(details: any): boolean {
   if (!details || typeof details !== "object") return false;
   if (details.deferObservation === true) return false;
+  if (hasIntentViewports(details)) return isSubstantialObservationDetails(details.desktop) || isSubstantialObservationDetails(details.mobile);
   if (Array.isArray(details.elements) && details.elements.length > 0) return true;
   if (Array.isArray(details.regions) && details.regions.length > 0) return true;
   return Boolean(details.snapshotID && details.url);
@@ -354,6 +366,11 @@ function pickKeptDetailFields(details: Record<string, unknown>): Record<string, 
 function summarizeObservationDetails(details: any, mode: "summary" | "final" | "error"): Record<string, unknown> {
   if (!details || typeof details !== "object") return {};
   const out = pickKeptDetailFields(details);
+  // New intent metadata is pane-local. Do not change legacy no-intent batch shapes.
+  if (hasIntentViewports(details)) {
+    out.desktop = summarizeObservationDetails(details.desktop, mode);
+    out.mobile = summarizeObservationDetails(details.mobile, mode);
+  }
   if (Array.isArray(details.images)) out.imageCount = details.images.length;
   if (mode === "final") {
     if (Array.isArray(details.elements)) out.elements = details.elements;
@@ -524,7 +541,7 @@ function formatBrowserActionBatch(
   };
 }
 
-async function executeBrowserActionBatch(items: any[], signal?: AbortSignal) {
+async function executeBrowserActionBatch(items: any[], signal?: AbortSignal, optimization?: BrowserOptimization) {
   if (!Array.isArray(items) || items.length < 1 || items.length > 8) {
     return usage("browser actions must be an array of 1..8 items.\n\n" + HELP);
   }
@@ -576,7 +593,7 @@ async function executeBrowserActionBatch(items: any[], signal?: AbortSignal) {
     }
     let result;
     try {
-      result = await executeBrowserAction(item, signal);
+      result = await executeBrowserAction(item, signal, optimization);
     } catch (error) {
       // bridge() throws instead of returning isError on timeout, external cancellation,
       // connection failure, or JSON parse failure. The batch contract still owes the model
@@ -602,6 +619,8 @@ async function executeBrowserActionBatch(items: any[], signal?: AbortSignal) {
  * callback-server subscribe) belongs to the package entry `index.ts`.
  */
 export default function (pi: ExtensionAPI) {
+  const connection = connectBrowserReranker(pi.events);
+  if (typeof pi.on === "function") pi.on("session_shutdown", () => connection.dispose());
   // One stable tool instead of five browser_* tools. The tool set never changes, so the
   // prompt prefix stays cached, and the per-request schema cost drops ~400 tokens.
   pi.registerTool({
@@ -615,6 +634,7 @@ export default function (pi: ExtensionAPI) {
       "watch/unwatch/watches register a long wait (use watch when waiting more than 25s): watch returns watchId immediately; a [browser-watch] follow-up arrives when the condition matches, times out, or the page is disposed. " +
       "eval is page-DOM only (no literals/keep-alive). content/eval/script output is sanitized with the same redaction as observe. screenshot pixels are not redacted — avoid capturing auth/checkout UI. " +
       "observe defaults to region summaries; pass region/role/name/cursor to expand or page. " +
+      "For a complex page, observe intent names the current lookup goal and prioritizes bounded candidates; omit it for ordinary paging, and never combine it with cursor. Known locators/flows need no scoring. " +
       "click/input/select/scroll accept locator {role,name}|{label}|{text}|{css} without a snapshot. " +
       "scroll locator targets the matched element or its nearest scrollable ancestor; 0/ambiguous/hidden matches error instead of scrolling the page. " +
       "Same-page stale refs relocate on a unique in-viewport DOM path+role+name+ordinal match. Actions include a mutation summary. " +
@@ -676,6 +696,7 @@ export default function (pi: ExtensionAPI) {
         role: Type.Optional(Type.String()),
         name: Type.Optional(Type.String()),
         cursor: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+        intent: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "observe only: current lookup goal; incompatible with cursor. target=both stays local." })),
         fields: Type.Optional(Type.Array(Type.Object({
           value: Type.String(),
           element_token: Type.Optional(Type.String()),
@@ -747,6 +768,7 @@ export default function (pi: ExtensionAPI) {
       role: Type.Optional(Type.String()),
       name: Type.Optional(Type.String()),
       cursor: Type.Optional(Type.Union([Type.String(), Type.Number()])),
+      intent: Type.Optional(Type.String({ minLength: 1, maxLength: 512, description: "observe only: current lookup goal; incompatible with cursor. target=both stays local." })),
       fields: Type.Optional(Type.Array(Type.Object({
         value: Type.String(),
         element_token: Type.Optional(Type.String()),
@@ -767,8 +789,8 @@ export default function (pi: ExtensionAPI) {
         type: Type.Optional(Type.String()),
       }))),
     }),
-    async execute(_id, params, signal) {
-      return executeBrowserTool(params, signal);
+    async execute(_id, params, signal, _update, ctx) {
+      return executeBrowserTool(params, signal, { connection, projectRoot: ctx?.cwd ?? process.cwd() });
     },
   });
 }
@@ -776,19 +798,26 @@ export default function (pi: ExtensionAPI) {
 // Tool entry point, exported for behavioral tests. Kept below the registerTool call so
 // the first `actions: ...` text in this file stays the tool description (browser-host
 // contract tests parse it positionally).
-export async function executeBrowserTool(params: any, signal?: AbortSignal) {
+export async function executeBrowserTool(params: any, signal?: AbortSignal, optimization?: BrowserOptimization) {
   const hasAction = typeof params.action === "string";
   const hasActions = Array.isArray((params as { actions?: unknown }).actions);
   if (hasAction === hasActions) {
     return usage('browser requires exactly one of "action" or "actions".\n\n' + HELP);
   }
   if (hasActions) {
-    return executeBrowserActionBatch((params as { actions: unknown[] }).actions, signal);
+    return executeBrowserActionBatch((params as { actions: unknown[] }).actions, signal, optimization);
   }
-  return executeBrowserAction(params, signal);
+  return executeBrowserAction(params, signal, optimization);
 }
 
-async function executeBrowserAction(params: any, signal?: AbortSignal) {
+async function executeBrowserAction(params: any, signal?: AbortSignal, optimization?: BrowserOptimization) {
+      if (signal?.aborted && params.intent !== undefined) return usage("Browser action cancelled.");
+      if (params.intent !== undefined && (params.action !== "observe"
+        || typeof params.intent !== "string" || !params.intent.trim()
+        || Array.from(params.intent.trim()).length > 512
+        || (params.cursor !== undefined && params.cursor !== null && params.cursor !== ""))) {
+        return usage("intent requires observe, a 1–512 character lookup goal, and no cursor; omit intent for ordinary paging.");
+      }
       const target = params.target;
       const targetParams = target ? { target } : {};
       if (target === "both" && ["click", "input", "type", "select", "fill_form", "scroll", "eval", "content", "console", "wait"].includes(params.action)) {
@@ -801,14 +830,18 @@ async function executeBrowserAction(params: any, signal?: AbortSignal) {
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "observe": {
-          const r = await bridge("observe", {
+          const observeParams = {
             scope: params.scope ?? "viewport",
             ...targetParams,
             ...(typeof params.region === "string" ? { region: params.region } : {}),
             ...(typeof params.role === "string" ? { role: params.role } : {}),
             ...(typeof params.name === "string" ? { name: params.name } : {}),
             ...(params.cursor !== undefined ? { cursor: params.cursor } : {}),
-          }, signal);
+            ...(params.intent !== undefined ? { intent: params.intent.trim() } : {}),
+          };
+          const r = params.intent !== undefined
+            ? await observeWithOptionalRerank(observeParams, optimization?.projectRoot ?? process.cwd(), signal, optimization?.connection, bridge)
+            : await bridge("observe", observeParams, signal);
           return r.ok ? text(formatObservation(r), r) : bridgeFailure(r);
         }
         case "wait": {

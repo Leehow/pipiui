@@ -3,7 +3,7 @@
   "name": "Jev 优化",
   "version": "1.0.0",
   "category": "knowledge",
-  "description": "可选 TypeSafe Jev 检索重排。默认关闭；无 key 时基础检索不受影响。",
+  "description": "可选 TypeSafe Jev 检索重排及独立授权的浏览器候选评分。默认关闭；无 key 时基础检索与浏览器观察不受影响。",
   "defaultEnabled": false,
   "capabilities": [],
   "agent": {
@@ -15,6 +15,12 @@
       "schema": {
         "type": "object",
         "properties": {
+          "ext.jev-optimizer.browserEnabled": {
+            "type": "boolean",
+            "default": false,
+            "title": "允许浏览器候选云端评分",
+            "description": "另行允许将当前目标和脱敏控件/区域描述发送给 TypeSafe，可能收费；不会发送截图或整个页面。控件描述仍可能含业务数据。关闭后立即撤销浏览器评分，不影响代码检索；未挂载扩展或更换 key 需开启新会话。"
+          },
           "ext.jev-optimizer.apiKey": {
             "type": "string",
             "format": "secret",

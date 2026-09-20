@@ -372,6 +372,23 @@ let extensionSearchTools: Mounted;
 
 let scripted: ScriptedHost = makeScriptedHost();
 
+// The optional intent feature extends only this documented surface. Keep all
+// legacy behavior comparisons, removing exactly the new documentation (not errors
+// or result fields); current intent behavior has its own real-DOM contract suite.
+const INTENT_DESCRIPTION = 'For a complex page, observe intent names the current lookup goal and prioritizes bounded candidates; omit it for ordinary paging, and never combine it with cursor. Known locators/flows need no scoring. ';
+const INTENT_HELP = [
+  'observe {scope?,target?,region?,role?,name?,cursor?,intent?}',
+  '                        intent: current lookup goal (1–512 characters); ranks bounded candidates',
+  '                        before display. Local without Jev; cannot combine with cursor. Omit',
+  '                        intent for ordinary paging. target=both stays local. Known locators',
+  '                        and saved flows need no extra observation or scoring step.',
+].join('\n');
+function legacyDocumentation(result: ToolResult): ToolResult {
+  return { ...result, content: result.content.map(part => part.type === 'text' && part.text
+    ? { ...part, text: part.text.replace(INTENT_HELP, 'observe {scope?,target?,region?,role?,name?,cursor?}') }
+    : part) };
+}
+
 /** Runs one browser-tool case through both transports and returns both results. */
 async function runBoth(
   params: Record<string, unknown>,
@@ -382,7 +399,7 @@ async function runBoth(
   lastEnvelope = undefined;
   const legacy = (await legacyWebview.executeBrowserTool(structuredClone(params))) as ToolResult;
   const extension = (await extensionWebviewTools.byName.get("browser")!.execute!("probe", structuredClone(params))) as ToolResult;
-  return { legacy, extension };
+  return { legacy, extension: legacyDocumentation(extension) };
 }
 
 async function runSearchBoth(
@@ -448,7 +465,7 @@ describe("webview-browser-extension manifest", () => {
 });
 
 describe("schema: names, labels, descriptions, parameters", () => {
-  it("mounts exactly the three frozen tools, identical to the legacy mounts", () => {
+  it("retains all legacy schema fields and adds only the optional browser intent surface", () => {
     expect(extensionWebviewTools.tools.map((tool) => tool.name)).toEqual(["browser"]);
     expect(extensionSearchTools.tools.map((tool) => tool.name).sort()).toEqual(["browser_fetch", "browser_search"]);
     for (const name of FROZEN_TOOLS) {
@@ -456,8 +473,16 @@ describe("schema: names, labels, descriptions, parameters", () => {
       const extensionTool = name === "browser" ? extensionWebviewTools.byName.get(name) : extensionSearchTools.byName.get(name);
       expect(extensionTool, `tool ${name} mounted`).toBeDefined();
       expect(extensionTool!.label).toBe(legacyTool!.label);
-      expect(extensionTool!.description).toBe(legacyTool!.description);
-      expect(extensionTool!.parameters).toEqual(legacyTool!.parameters);
+      expect(extensionTool!.description?.replace(INTENT_DESCRIPTION, '')).toBe(legacyTool!.description);
+      const parameters = JSON.parse(JSON.stringify(extensionTool!.parameters));
+      if (name === 'browser') {
+        expect(extensionTool!.description).toContain(INTENT_DESCRIPTION);
+        expect(parameters.properties.intent).toMatchObject({ type: 'string', minLength: 1, maxLength: 512 });
+        expect(parameters.properties.actions.items.properties.intent).toEqual(parameters.properties.intent);
+        delete parameters.properties.intent;
+        delete parameters.properties.actions.items.properties.intent;
+      }
+      expect(parameters).toEqual(JSON.parse(JSON.stringify(legacyTool!.parameters)));
     }
   });
 

@@ -228,10 +228,24 @@ export async function executeRerank(
   deps: JevDeps,
   gate?: RerankGate,
 ): Promise<RerankOutcome> {
+  return executeScore(input, deps, (key) => buildPayload(input.query, input.candidates, key),
+    (signal) => checkAvailability(deps, signal), gate);
+}
+
+/** Shared Score transport, not a candidate schema. Browser data never becomes a code span. */
+export async function executeScore(
+  input: { signal?: AbortSignal },
+  deps: JevDeps,
+  build: (key: string) => { status: "ok"; json: string; ids: string[] } | { status: "skipped"; reason: string },
+  availability: (signal?: AbortSignal) => Promise<{ ready: boolean; reason?: string; apiKey?: string }>,
+  gate?: RerankGate,
+  onSubmitted?: (count: number) => void,
+): Promise<RerankOutcome> {
   if (gate?.withdrawn()) return { status: "skipped", reason: "withdrawn" };
   if (input.signal?.aborted || gate?.signal.aborted) return { status: "skipped", reason: "aborted" };
 
   const deadlineMs = deps.deadlineMs ?? JEV_DEADLINE_MS;
+  const deadline = Date.now() + deadlineMs;
   const pollMs = deps.pollMs ?? JEV_POLL_MS;
   const ac = new AbortController();
   let stop: StopReason | undefined;
@@ -249,7 +263,7 @@ export async function executeRerank(
   const timeout = setTimeout(() => stopWith("timeout"), deadlineMs);
   timeout.unref?.();
   const poll = setInterval(() => {
-    void checkAvailability(deps, ac.signal).then((result) => {
+    void availability(ac.signal).then((result) => {
       if (!result.ready) stopWith("generation-mismatch");
     });
   }, pollMs);
@@ -270,18 +284,24 @@ export async function executeRerank(
   try {
     if (stop) return { status: "fallback", reason: stop };
 
-    const ready = await race(checkAvailability(deps, ac.signal));
+    const ready = await race(availability(ac.signal));
     if (stop) return { status: "fallback", reason: stop };
     if (!ready.ready || !ready.apiKey) {
       return { status: "skipped", reason: ready.reason ?? "no-key" };
     }
 
-    const built = buildPayload(input.query, input.candidates, ready.apiKey);
+    const built = build(ready.apiKey);
     if (built.status === "skipped") return { status: "skipped", reason: built.reason };
 
     const fetchImpl = resolveFetch(deps);
     if (!fetchImpl) return { status: "fallback", reason: "network" };
 
+    // Recheck immediately before upload; authorization can change during preparation.
+    const beforeSend = await race(availability(ac.signal));
+    if (stop) return { status: "fallback", reason: stop };
+    if (!beforeSend.ready) return { status: "skipped", reason: beforeSend.reason ?? "generation-mismatch" };
+    if (Date.now() >= deadline) return { status: "fallback", reason: "timeout" };
+    onSubmitted?.(built.ids.length);
     const response = await race(
       fetchImpl(JEV_API_URL, {
         method: "POST",
@@ -310,11 +330,12 @@ export async function executeRerank(
       return { status: "fallback", reason: "invalid-response" };
     }
 
-    const still = await race(checkAvailability(deps, ac.signal));
+    const still = await race(availability(ac.signal));
     if (stop) return { status: "fallback", reason: stop };
     if (gate?.withdrawn()) return { status: "fallback", reason: "withdrawn" };
     if (input.signal?.aborted) return { status: "fallback", reason: "aborted" };
     if (!still.ready) return { status: "fallback", reason: still.reason ?? "generation-mismatch" };
+    if (Date.now() >= deadline) return { status: "fallback", reason: "timeout" };
     return parseApplied(parsed, built.ids);
   } catch (error) {
     if (stop) return { status: "fallback", reason: stop };

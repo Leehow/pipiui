@@ -8,7 +8,7 @@ import { projectPiAgentDir } from "../src/project-pi-home.js";
 import { resetInMemoryVault } from "../src/secret-vault.js";
 import * as extensionSettings from "../src/extension-settings.js";
 import {
-  JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
+  JEV_BROWSER_ENABLED_KEY, JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_SECRET_KEY, JEV_STATE_FILE_ENV,
   JevRuntimeStateStore, jevRuntimeStateFile, type JevRuntimeState,
 } from "../src/jev-runtime-state.js";
 import { assemblePiSpawn, mergedSpawnEnvironment, workerRegisteredExtensionArgs, type SpawnRegisteredExtension } from "../src/spawn-assembly.js";
@@ -40,6 +40,7 @@ async function fixture(scope: "project" | "app" = "project") {
     capabilities: ["settings.read", "settings.write"], agent: { extension: "agent/index.js" },
     app: { settings: { scope, schema: { type: "object", properties: {
       [JEV_SECRET_KEY]: { type: "string", format: "secret" },
+      [JEV_BROWSER_ENABLED_KEY]: { type: "boolean" },
     } } } },
   }));
   const agentDir = join(root, "host-agent");
@@ -61,11 +62,12 @@ async function fixture(scope: "project" | "app" = "project") {
   await mkdir(unopened);
   const enable = (id: string, value: boolean) => backend.handle("setExtensionEnabled" as never, [JEV_EXTENSION_ID, value, "project", id]);
   const key = (id: string, value: string | null) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_SECRET_KEY]: value }, id]);
+  const browser = (id: string, value: boolean) => backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_BROWSER_ENABLED_KEY]: value }, id]);
   async function spawn(path: string) {
     const packages = await probe.registeredExtensionsForSpawn(path);
     return { packages, ...assemblePiSpawn({ cwd: path, paths: {}, registeredExtensions: packages }) };
   }
-  return { backend, probe, a, b, unopened, enable, key, spawn, agentDir };
+  return { backend, probe, a, b, unopened, enable, key, browser, spawn, agentDir };
 }
 
 describe("Jev host state projection", () => {
@@ -73,19 +75,24 @@ describe("Jev host state projection", () => {
     const root = await temporary();
     const store = new JevRuntimeStateStore();
     const first = store.ensure(root, { enabled: true, hasKey: true });
+    const firstState = state(root);
+    expect(firstState).toMatchObject({ schemaVersion: 1, enabled: true, hasKey: true, browserEnabled: false, generation: first.generation });
+    expect(firstState.browserGeneration).toEqual(expect.any(String));
+    expect(firstState.browserGeneration.length).toBeGreaterThan(0);
     const fd = openSync(first.file, "r");
     try {
       expect(store.ensure(root, { enabled: true, hasKey: true })).toEqual(first);
       store.revoke(root);
       const revoked = state(root);
-      expect(revoked).toMatchObject({ schemaVersion: 1, enabled: false, hasKey: true });
+      expect(revoked).toMatchObject({ schemaVersion: 1, enabled: false, hasKey: true, browserEnabled: false });
       expect(revoked.generation).not.toBe(first.generation);
+      expect(revoked.browserGeneration).not.toBe(firstState.browserGeneration);
       // An already-open reader still sees its complete old inode, never a truncated write.
-      expect(JSON.parse(readFileSync(fd, "utf8"))).toEqual({ schemaVersion: 1, enabled: true, hasKey: true, generation: first.generation });
+      expect(JSON.parse(readFileSync(fd, "utf8"))).toEqual(firstState);
       const again = store.ensure(root, { enabled: true, hasKey: true });
       expect(again.generation).not.toBe(first.generation);
       expect(again.generation).not.toBe(revoked.generation);
-      expect(Object.keys(state(root)).sort()).toEqual(["enabled", "generation", "hasKey", "schemaVersion"]);
+      expect(Object.keys(state(root)).sort()).toEqual(["browserEnabled", "browserGeneration", "enabled", "generation", "hasKey", "schemaVersion"]);
       expect(readdirSync(join(projectPiAgentDir(root), JEV_EXTENSION_ID))).toEqual(["runtime-state.json"]);
     } finally { closeSync(fd); }
   });
@@ -103,6 +110,51 @@ describe("Jev host state projection", () => {
     new JevRuntimeStateStore().ensure(root, { enabled: true, hasKey: false });
     expect(state(root).hasKey).toBe(false);
     expect(state(root).generation).not.toBe(old.generation);
+  });
+
+  it("rejects browser when fields are missing and rotates only browserGeneration on browserEnabled", async () => {
+    const root = await temporary();
+    const store = new JevRuntimeStateStore();
+    const first = store.ensure(root, { enabled: true, hasKey: true });
+    const initial = state(root);
+    expect(initial.browserEnabled).toBe(false);
+    writeFileSync(first.file, `${JSON.stringify({ schemaVersion: 1, enabled: true, hasKey: true, generation: first.generation })}\n`);
+    const legacy = JSON.parse(readFileSync(first.file, "utf8")) as Partial<JevRuntimeState>;
+    expect(legacy.browserEnabled === true).toBe(false);
+    expect(legacy.browserGeneration).toBeUndefined();
+    expect(legacy).toMatchObject({ enabled: true, hasKey: true, generation: first.generation });
+    const repaired = store.ensure(root, { enabled: true, hasKey: true });
+    expect(repaired).toEqual(first);
+    expect(state(root)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: false, generation: first.generation });
+    expect(state(root).browserGeneration).toBe(initial.browserGeneration);
+    const enabledBrowser = store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true });
+    expect(enabledBrowser).toEqual(first);
+    expect(state(root).browserEnabled).toBe(true);
+    expect(state(root).browserGeneration).not.toBe(initial.browserGeneration);
+    const browserGen = state(root).browserGeneration;
+    expect(store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true }).generation).toBe(first.generation);
+    expect(state(root).browserGeneration).toBe(browserGen);
+    store.ensure(root, { enabled: true, hasKey: true, browserEnabled: false });
+    expect(state(root).generation).toBe(first.generation);
+    expect(state(root).browserEnabled).toBe(false);
+    expect(state(root).browserGeneration).not.toBe(browserGen);
+    const alreadyOff = state(root);
+    store.revokeBrowser(root);
+    expect(state(root)).toEqual(alreadyOff);
+    store.ensure(root, { enabled: true, hasKey: true, browserEnabled: true });
+    const on = state(root);
+    store.revokeBrowser(root);
+    expect(state(root)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: false, generation: on.generation });
+    expect(state(root).browserGeneration).not.toBe(on.browserGeneration);
+    store.revoke(root);
+    const revoked = state(root);
+    expect(revoked.generation).not.toBe(first.generation);
+    expect(revoked.browserGeneration).not.toBe(browserGen);
+    expect(revoked.browserEnabled).toBe(false);
+    store.ensure(root, { enabled: true, hasKey: false, browserEnabled: true });
+    expect(state(root).generation).not.toBe(revoked.generation);
+    expect(state(root).browserGeneration).not.toBe(revoked.browserGeneration);
+    expect(state(root).browserEnabled).toBe(true);
   });
 
   it("projects before spawn, delivers only enabled mounts, and revokes old main/worker snapshots", async () => {
@@ -218,6 +270,91 @@ describe("Jev host state projection", () => {
     expect(state(a.path).hasKey).toBe(false);
     expect(state(b.path).hasKey).toBe(false);
     expect(existsSync(jevRuntimeStateFile(unopened))).toBe(false);
+  });
+
+  it("projects strict browserEnabled immediately without rotating code generation", async () => {
+    const { backend, a, b, enable, key, browser, spawn } = await fixture();
+    await enable(a.id, true);
+    await key(a.id, "jev-test-secret-a");
+    const mounted = await spawn(a.path);
+    await spawn(b.path);
+    const initial = state(a.path);
+    const bBefore = state(b.path);
+    expect(initial).toMatchObject({ enabled: true, hasKey: true, browserEnabled: false });
+    expect(mounted.env[JEV_GENERATION_ENV]).toBe(initial.generation);
+    await expect(backend.handle("updateExtensionSettings" as never, [JEV_EXTENSION_ID, { [JEV_BROWSER_ENABLED_KEY]: 1 }, a.id])).resolves.toMatchObject({ ok: false });
+    expect(state(a.path)).toEqual(initial);
+    expect(await browser(a.id, true)).toMatchObject({ ok: true });
+    expect(state(a.path)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: true, generation: initial.generation });
+    expect(state(a.path).browserGeneration).not.toBe(initial.browserGeneration);
+    expect(state(b.path)).toEqual(bBefore);
+    const onGen = state(a.path).browserGeneration;
+    const remounted = await spawn(a.path);
+    expect(remounted.env[JEV_GENERATION_ENV]).toBe(initial.generation);
+    expect(state(a.path)).toMatchObject({ browserEnabled: true, generation: initial.generation, browserGeneration: onGen });
+    expect(await browser(a.id, false)).toMatchObject({ ok: true });
+    expect(state(a.path).generation).toBe(initial.generation);
+    expect(state(a.path).browserEnabled).toBe(false);
+    expect(state(a.path).browserGeneration).not.toBe(onGen);
+    expect(await browser(a.id, true)).toMatchObject({ ok: true });
+    const authorized = state(a.path);
+    await enable(a.id, false);
+    expect(state(a.path).generation).not.toBe(authorized.generation);
+    expect(state(a.path).browserGeneration).not.toBe(authorized.browserGeneration);
+    expect(state(a.path).browserEnabled).toBe(false);
+    await enable(a.id, true);
+    const reenabled = state(a.path);
+    expect(reenabled.browserEnabled).toBe(true);
+    expect(reenabled.generation).not.toBe(authorized.generation);
+    await key(a.id, "jev-test-replacement-key");
+    expect(state(a.path).generation).not.toBe(reenabled.generation);
+    expect(state(a.path).browserGeneration).not.toBe(reenabled.browserGeneration);
+    expect(state(a.path)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: true });
+    await key(a.id, null);
+    expect(state(a.path).generation).not.toBe(reenabled.generation);
+    expect(state(a.path).hasKey).toBe(false);
+    expect(state(a.path).browserEnabled).toBe(true);
+    expect(state(b.path)).toEqual(bBefore);
+  });
+
+  it("revokes browser before settings I/O without rotating code generation", async () => {
+    const { a, enable, key, browser } = await fixture();
+    await enable(a.id, true);
+    await key(a.id, "jev-test-secret-a");
+    expect(await browser(a.id, true)).toMatchObject({ ok: true });
+    const authorized = state(a.path);
+    expect(authorized.browserEnabled).toBe(true);
+    const write = extensionSettings.writeProjectExtensionSettingsValues;
+    let release!: () => void;
+    let entered!: () => void;
+    const inWrite = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(extensionSettings, "writeProjectExtensionSettingsValues").mockImplementationOnce(async (...args) => {
+      expect(state(a.path).browserEnabled).toBe(false);
+      expect(state(a.path).generation).toBe(authorized.generation);
+      expect(state(a.path)).toMatchObject({ enabled: true, hasKey: true });
+      expect(state(a.path).browserGeneration).not.toBe(authorized.browserGeneration);
+      entered();
+      await gate;
+      return write(...args);
+    });
+    const disable = browser(a.id, false);
+    await inWrite;
+    expect(state(a.path).browserEnabled).toBe(false);
+    expect(state(a.path).generation).toBe(authorized.generation);
+    release();
+    expect(await disable).toMatchObject({ ok: true });
+    expect(state(a.path)).toMatchObject({ enabled: true, hasKey: true, browserEnabled: false, generation: authorized.generation });
+    const offGen = state(a.path).browserGeneration;
+    expect(await browser(a.id, true)).toMatchObject({ ok: true });
+    expect(state(a.path).generation).toBe(authorized.generation);
+    expect(state(a.path).browserEnabled).toBe(true);
+    expect(state(a.path).browserGeneration).not.toBe(offGen);
+    const onGen = state(a.path).browserGeneration;
+    expect(await browser(a.id, false)).toMatchObject({ ok: true });
+    expect(state(a.path).generation).toBe(authorized.generation);
+    expect(state(a.path).browserEnabled).toBe(false);
+    expect(state(a.path).browserGeneration).not.toBe(onGen);
   });
 
   it("does not deliver authority for disabled, absent, invalid, or differently identified mounts", async () => {

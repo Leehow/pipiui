@@ -1,4 +1,6 @@
 import { CHANNEL_DISCOVER, CHANNEL_PROVIDE, CHANNEL_WITHDRAW, JEV_PROVIDER } from "./protocol.js";
+import { BROWSER_DISCOVER, BROWSER_PROVIDE, BROWSER_WITHDRAW, executeBrowserAvailability, executeBrowserRerank, type BrowserRerankOffer } from "./browser-rerank.js";
+export { executeBrowserRerank } from "./browser-rerank.js";
 import { executeAvailability, executeRerank } from "./rerank.js";
 import type { JevDeps, JevExtensionAPI, RerankOffer, RerankWithdraw } from "./types.js";
 
@@ -52,6 +54,15 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     if (withdrawn) return;
     pi.events?.emit(CHANNEL_PROVIDE, offer());
   };
+  const emitBrowserOffer = () => {
+    if (withdrawn) return;
+    const browser: BrowserRerankOffer = {
+      version: 1, provider: JEV_PROVIDER, instanceId,
+      availability: (root, signal) => executeBrowserAvailability(root, deps, gate, signal),
+      rerank: (input) => executeBrowserRerank(input, deps, gate),
+    };
+    pi.events?.emit(BROWSER_PROVIDE, browser);
+  };
 
   const dispose = () => {
     if (withdrawn) return;
@@ -67,6 +78,7 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
     const payload: RerankWithdraw = { version: 1, provider: JEV_PROVIDER, instanceId };
     try {
       pi.events?.emit(CHANNEL_WITHDRAW, payload);
+      pi.events?.emit(BROWSER_WITHDRAW, payload);
     } catch {
       /* ignore */
     }
@@ -78,7 +90,10 @@ export function createJevOptimizer(pi: JevExtensionAPI, deps: JevDeps = {}): Jev
       emitOffer();
     });
     if (typeof unsub === "function") unsubscribers.push(unsub);
+    const browserUnsub = bus.on(BROWSER_DISCOVER, emitBrowserOffer);
+    if (typeof browserUnsub === "function") unsubscribers.push(browserUnsub);
     emitOffer();
+    emitBrowserOffer();
   }
 
   if (typeof pi.on === "function") {

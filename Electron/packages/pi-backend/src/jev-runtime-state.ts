@@ -5,6 +5,7 @@ import { projectPiAgentDir } from "./project-pi-home.js";
 
 export const JEV_EXTENSION_ID = "jev-optimizer";
 export const JEV_SECRET_KEY = "ext.jev-optimizer.apiKey";
+export const JEV_BROWSER_ENABLED_KEY = "ext.jev-optimizer.browserEnabled";
 export const JEV_SECRET_ENV = "EXT_JEV_OPTIMIZER_APIKEY";
 export const JEV_STATE_FILE_ENV = "PIPIUI_JEV_STATE_FILE";
 export const JEV_GENERATION_ENV = "PIPIUI_JEV_GENERATION";
@@ -14,6 +15,8 @@ export type JevRuntimeState = {
   enabled: boolean;
   hasKey: boolean;
   generation: string;
+  browserEnabled: boolean;
+  browserGeneration: string;
 };
 export type JevRuntimeSnapshot = { file: string; generation: string };
 
@@ -42,12 +45,23 @@ export class JevRuntimeStateStore {
   }
 
   /** A new host never trusts a prior host's generation (its memory vault may be empty). */
-  ensure(projectRoot: string, input: { enabled: boolean; hasKey: boolean }, rotate = false): JevRuntimeSnapshot {
+  ensure(projectRoot: string, input: { enabled: boolean; hasKey: boolean; browserEnabled?: boolean }, rotate = false): JevRuntimeSnapshot {
     const root = this.root(projectRoot);
     const previous = this.states.get(root);
+    const browserEnabled = input.browserEnabled === true;
     const generation = !rotate && previous?.enabled === input.enabled && previous.hasKey === input.hasKey
       ? previous.generation : randomUUID();
-    const state: JevRuntimeState = { schemaVersion: 1, enabled: input.enabled, hasKey: input.hasKey, generation };
+    const browserGeneration = !rotate
+      && previous
+      && generation === previous.generation
+      && (previous.browserEnabled === true) === browserEnabled
+      && typeof previous.browserGeneration === "string"
+      && previous.browserGeneration.length > 0
+      ? previous.browserGeneration
+      : randomUUID();
+    const state: JevRuntimeState = {
+      schemaVersion: 1, enabled: input.enabled, hasKey: input.hasKey, generation, browserEnabled, browserGeneration,
+    };
     const file = jevRuntimeStateFile(root);
     mkdirSync(dirname(file), { recursive: true });
     const temporary = `${file}.${randomUUID()}.tmp`;
@@ -66,5 +80,12 @@ export class JevRuntimeStateStore {
   revoke(projectRoot: string): void {
     const previous = this.states.get(this.root(projectRoot));
     this.ensure(projectRoot, { enabled: false, hasKey: previous?.hasKey ?? false }, true);
+  }
+
+  /** Browser-only: keep code authority; no-op when browser is already false. */
+  revokeBrowser(projectRoot: string): void {
+    const previous = this.states.get(this.root(projectRoot));
+    if (previous?.browserEnabled !== true) return;
+    this.ensure(projectRoot, { enabled: previous.enabled, hasKey: previous.hasKey, browserEnabled: false });
   }
 }
