@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { resultsDir, resultsRelPath } from "./paths.js";
 import type { RerankerDetails } from "./reranker.js";
+import type { DeepSearchDetails } from "./deep-search.js";
 import type { RecallSource } from "./wide-recall.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead, truncateLine } from "./truncate.js";
 import type {
@@ -124,6 +125,7 @@ export async function persistResults(
     degraded: boolean;
     hits: RetrievalHit[];
     content: string;
+    deep?: DeepSearchDetails;
   },
 ): Promise<{ hash: string; resultsPath: string }> {
   const dir = resultsDir(projectRoot);
@@ -139,6 +141,7 @@ export async function persistResults(
     query: payload.query,
     degraded: payload.degraded,
     hitCount: payload.hits.length,
+    ...(payload.deep ? { deep: payload.deep } : {}),
   });
   const lines = [header, ...payload.hits.map((hit) => JSON.stringify(hit))];
   await writeFile(abs, `${lines.join("\n")}\n`, "utf8");
@@ -157,6 +160,7 @@ export async function buildToolResult(args: {
   provider?: string;
   reranker?: RerankerDetails;
   sources?: RecallSource[];
+  deep?: DeepSearchDetails;
 }): Promise<ToolResult> {
   const persisted = await persistResults(args.projectRoot, {
     kind: args.kind,
@@ -164,6 +168,7 @@ export async function buildToolResult(args: {
     degraded: args.degraded,
     hits: args.hits,
     content: args.content,
+    ...(args.deep ? { deep: args.deep } : {}),
   });
   const noteParts: string[] = [];
   if (args.degraded) {
@@ -185,6 +190,7 @@ export async function buildToolResult(args: {
     ...(args.provider ? { provider: args.provider } : {}),
     ...(args.reranker ? { reranker: args.reranker } : {}),
     ...(args.sources ? { sources: args.sources } : {}),
+    ...(args.deep ? { deep: args.deep } : {}),
   };
   return {
     content: [{ type: "text", text: body }],

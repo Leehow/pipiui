@@ -1,5 +1,6 @@
 /** Shared result-protocol types (spec D5). Existing field names are frozen. */
 import type { RerankerDetails } from "./reranker.js";
+import type { DeepSearchDetails } from "./deep-search.js";
 import type { RecallSource } from "./wide-recall.js";
 
 export type RetrievalKind =
@@ -42,6 +43,7 @@ export type RetrievalDetails = {
   reranker?: RerankerDetails;
   /** Actual local serving layers for each explicit/optimizer-expanded query. */
   sources?: RecallSource[];
+  deep?: DeepSearchDetails;
 };
 
 export type TextContent = { type: "text"; text: string };

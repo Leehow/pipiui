@@ -165,7 +165,8 @@ function parseDirty(
 
 /**
  * Incremental extract: hash each source file, reuse cache, parse only dirty files.
- * Yields the event loop between parse batches so a first full scan cannot pin Node.
+ * Yields the event loop every PARSE_BATCH processed entries (cache hits and misses)
+ * so a hot full scan cannot pin Node. Does not make sync fs hard-interruptible.
  * Concurrent callers for the same projectRoot wait on one in-flight run (no double parse).
  */
 export async function extractProjectCached(
@@ -203,28 +204,30 @@ async function runExtractProjectCached(
   const entries: SourceEntry[] = collectSourceEntries(root, opts.excludeGlobs ?? [], opts.maxFiles ?? 4000);
   stats.files = entries.length;
   const all: SymbolInfo[] = [];
-  let dirtyInBatch = 0;
+  let processedInBatch = 0;
 
   for (const entry of entries) {
-    let buf: Buffer;
+    processedInBatch += 1;
+    let buf: Buffer | null = null;
     try {
       buf = readFileSync(entry.absPath);
     } catch {
-      continue;
+      // Unreadable entries still count toward the yield batch.
     }
-    const sha = sha256Bytes(buf);
-    const cached = lookup(root, cacheDir, entry.path, sha, stats);
-    if (cached) {
-      all.push(...cached);
-      continue;
+    if (buf) {
+      const sha = sha256Bytes(buf);
+      const cached = lookup(root, cacheDir, entry.path, sha, stats);
+      if (cached) {
+        all.push(...cached);
+      } else {
+        const source = buf.toString("utf8");
+        const symbols = parseDirty(root, cacheDir, { path: entry.path, source, lang: entry.lang }, sha);
+        stats.cacheMisses += 1;
+        all.push(...symbols);
+      }
     }
-    const source = buf.toString("utf8");
-    const symbols = parseDirty(root, cacheDir, { path: entry.path, source, lang: entry.lang }, sha);
-    stats.cacheMisses += 1;
-    all.push(...symbols);
-    dirtyInBatch += 1;
-    if (dirtyInBatch >= PARSE_BATCH) {
-      dirtyInBatch = 0;
+    if (processedInBatch >= PARSE_BATCH) {
+      processedInBatch = 0;
       await yieldEventLoop();
     }
   }

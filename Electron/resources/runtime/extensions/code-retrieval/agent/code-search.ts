@@ -1,4 +1,5 @@
 import { exactSearch } from "./grep-exact.js";
+import { evidenceKey, expandDeepSearch } from "./deep-search.js";
 import { getSymbolLayer } from "./hooks.js";
 import type { SeenRangeLedger } from "./ledger.js";
 import { buildInlinePreviews } from "./previews.js";
@@ -21,6 +22,7 @@ import { fuseRecall, queryVariants as normalizeVariants, recallQueries, resultLi
 export type CodeSearchArgs = {
   query: string;
   queryVariants?: string[];
+  deep?: boolean;
   mode?: SearchMode;
   path?: string;
   glob?: string;
@@ -195,12 +197,13 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     const routed = routeQuery(query, args.mode);
     const eligible = routed === "hybrid" || routed === "semantic";
     if (args.queryVariants?.length && !eligible) return emptyDegraded("code-retrieval.search", "queryVariants requires an open auto/semantic query, not an exact/symbol route.");
+    if (args.deep && !eligible) return emptyDegraded("code-retrieval.search", "deep requires an open auto/semantic query, not an exact/symbol route.");
     if (args.path && relativeSearchPath(args.projectRoot, args.path) === undefined) {
       return emptyDegraded("code-retrieval.search", "code_search path must remain inside the current project.");
     }
-    const probe = eligible && args.reranker
+    const probe = !args.deep && eligible && args.reranker
       ? await probeOptionalReranker(args.reranker, args.projectRoot, args.signal) : undefined;
-    const wide = variants.length > 0 || probe?.ready === true;
+    const wide = args.deep === true || variants.length > 0 || probe?.ready === true;
     const limit = resultLimit(args.topK);
     let local: LocalSearch;
     let sources: RecallSource[] | undefined;
@@ -226,24 +229,31 @@ export async function executeCodeSearch(args: CodeSearchArgs): Promise<ToolResul
     }
     throwIfCancelled(args.signal);
     if (local.failed) return emptyDegraded("code-retrieval.search", local.emptyMessage!);
-    const reranked = eligible && probe?.ready
-      ? await applyOptionalRerank({ ...args, query, hits: local.hits, timeoutMs: probe.remainingMs })
-      : { hits: local.hits, details: probe?.details };
+    const deep = args.deep ? await expandDeepSearch({ ...args, query, hits: local.hits, limit }) : undefined;
+    const reranked = deep ? { hits: deep.hits, details: deep.reranker }
+      : eligible && probe?.ready
+        ? await applyOptionalRerank({ ...args, query, hits: local.hits, timeoutMs: probe.remainingMs })
+        : { hits: local.hits, details: probe?.details };
     if (reranked.details && probe?.ready) reranked.details.elapsedMs += probe.elapsedMs;
     const hits = wide ? reranked.hits.slice(0, limit) : reranked.hits;
     throwIfCancelled(args.signal);
     const assigned = args.registry.assignAll(hits);
     const resultHits: RetrievalHit[] = assigned.map((record, i) => ({ ...record, ...(hits[i]?.text ? { text: hits[i]!.text } : {}) }));
     const previews = await buildInlinePreviews(resultHits, { projectRoot: args.projectRoot, ledger: args.ledger, budgetTokens: args.tokenBudget });
+    const refsBySpan = new Map(assigned.map(hit => [evidenceKey(hit), hit.ref]));
+    const relations = deep?.details.links.slice(0, 8).map(link => `${refsBySpan.get(link.from)} --${link.kind}--> ${refsBySpan.get(link.to)}`);
     const content = [
       hits.length ? formatCompressedContent(resultHits, previews.note, previews.previews) : local.emptyMessage,
       ...(hits.length || wide ? local.notes : []),
+      ...(deep ? [`Deep search: ${deep.details.expanded} expansions, ${deep.details.filesRead} files, ${deep.details.links.length} retained relations; ${deep.details.stopReason}. Bounded evidence, not proof of completeness.`,
+        ...(relations?.length ? [`Relations: ${relations.join("; ")}${deep.details.links.length > 8 ? "; more in results metadata" : ""}.`] : []), ...deep.details.notes] : []),
       ...(reranked.details ? [`Optional Jev reranker: ${reranked.details.status}${reranked.details.reason ? ` (${reranked.details.reason})` : ""}; local provider and score unchanged.`] : []),
     ].filter(Boolean).join("\n");
     return buildToolResult({ projectRoot: args.projectRoot, kind: "code-retrieval.search", hits: resultHits,
       degraded: local.degraded, content, query, degradeReason: local.notes[0],
       ...(local.provider && hits.length ? { provider: local.provider } : {}),
       ...(reranked.details ? { reranker: reranked.details } : {}), ...(sources ? { sources } : {}),
+      ...(deep ? { deep: deep.details } : {}),
     });
   } catch (error) {
     throwIfCancelled(args.signal);
