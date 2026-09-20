@@ -16,7 +16,7 @@
  *   npm-proxy-deadlock       — root-cause hunting on install stalls (.npmrc)
  *   packaging-invariants     — fast-app runtime-target packaging scripts
  *   stable-id-policy         — semantic-slug ID constitution rule lookups
- *   recon-stopping-guidance  — CJK philosophy-layer recon discipline text
+ *   project-isolation-policy — CJK constitution §6 project isolation rule
  *   telemetry                — attribution classifier/summary surfaces
  *   worker-closeout-timing   — symbol-graph questions over deadline helpers
  *   honesty-contract         — pure question words must degrade honestly
@@ -37,7 +37,7 @@ export const CASES = [
     id: "exact-verify-deadline",
     kind: "exact",
     query: "PIPIUI_VERIFY_TIMEOUT_MS",
-    expectPathSuffixes: ["Electron/resources/runtime/pi-ext/subagent-host/worktree/deadlines.ts"],
+    expectPathSuffixes: ["Electron/resources/runtime/extensions/git-capability/host/worktree/deadlines.ts"],
     snippets: ["process.env.PIPIUI_VERIFY_TIMEOUT_MS"],
     shape: "worker-closeout-timing",
     tag: "known-token env override",
@@ -70,13 +70,13 @@ export const CASES = [
     tag: "packaging env token",
   },
   {
-    id: "exact-cjk-recon-layer",
+    id: "exact-cjk-project-isolation",
     kind: "exact",
-    query: "侦察收敛纪律",
-    expectPathSuffixes: ["Electron/resources/runtime/pi-philosophy/layers/23-recon-stopping.md"],
-    snippets: ["侦察收敛纪律"],
-    shape: "recon-stopping-guidance",
-    tag: "CJK literal in philosophy layer",
+    query: "禁止跨写其他项目",
+    expectPathSuffixes: ["CONSTITUTION.md"],
+    snippets: ["项目隔离：每个打开项目的 sessions、skills、memory、resources、settings.json、trust.json、models-store.json 只存在于 `{projectRoot}/.pi/agent`，禁止跨写其他项目"],
+    shape: "project-isolation-policy",
+    tag: "CJK constitution project-isolation rule",
   },
   {
     id: "exact-attribution-classifier",
@@ -166,7 +166,7 @@ export const CASES = [
     id: "symdef-verify-timeout",
     kind: "symbol-hint",
     query: "resolveVerifyTimeoutMs 定义在哪",
-    expectPathSuffixes: ["Electron/resources/runtime/pi-ext/subagent-host/worktree/deadlines.ts"],
+    expectPathSuffixes: ["Electron/resources/runtime/extensions/git-capability/host/worktree/deadlines.ts"],
     snippets: ["export function resolveVerifyTimeoutMs"],
     shape: "worker-closeout-timing",
     tag: "CJK definition question routes to symbol layer",
@@ -188,7 +188,7 @@ export const CASES = [
     kind: "nav",
     operation: "definition",
     symbol: "resolveVerifyTimeoutMs",
-    expectPathSuffixes: ["Electron/resources/runtime/pi-ext/subagent-host/worktree/deadlines.ts"],
+    expectPathSuffixes: ["Electron/resources/runtime/extensions/git-capability/host/worktree/deadlines.ts"],
     snippets: ["export function resolveVerifyTimeoutMs"],
     shape: "worker-closeout-timing",
     tag: "code_nav definition probe outside code-retrieval area",
