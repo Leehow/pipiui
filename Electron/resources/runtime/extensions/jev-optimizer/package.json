@@ -1,0 +1,11 @@
+{
+  "name": "@pipiui/jev-optimizer-extension",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional TypeSafe Jev retrieval reranker",
+  "scripts": {
+    "build": "tsc -p agent/tsconfig.json",
+    "clean": "rm -rf agent/dist"
+  }
+}
