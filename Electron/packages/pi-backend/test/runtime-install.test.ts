@@ -70,6 +70,29 @@ describe("treeSignature", () => {
 });
 
 describe("installRuntimeTree", () => {
+  it("keeps the optional Jev compiled entry when selected without requiring dependencies", async () => {
+    const root = await temp();
+    try {
+      const source = join(root, "source");
+      const destination = join(root, "destination");
+      for (const name of ["pi-core-prompt", "pi-ext", "pi-philosophy", "built-in-skills", "pi-goal", "profiles", "extensions/jev-optimizer/agent/dist"]) {
+        await mkdir(join(source, name), { recursive: true });
+      }
+      await writeFile(join(source, "extensions/jev-optimizer/agent/dist/index.js"), "export default () => {};\n");
+      await writeFile(join(source, "extensions/jev-optimizer/pipiui-extension.json"), JSON.stringify({
+        id: "jev-optimizer", name: "Jev", version: "1.0.0", defaultEnabled: false,
+        agent: { extension: "agent/dist/index.js" }, capabilities: [],
+      }));
+      await writeFile(join(source, "pipiui-runtime-manifest.json"), JSON.stringify({
+        schemaVersion: 1, bundledExtensions: ["jev-optimizer"], includeAnydoc: false,
+      }));
+      expect(BUNDLED_MANIFEST_EXTENSIONS).toContain("jev-optimizer");
+      expect(installRuntimeTree({ sourceRoot: source }, destination).failures).toEqual([]);
+      expect(existsSync(join(destination, "extensions/jev-optimizer/agent/dist/index.js"))).toBe(true);
+      expect(existsSync(join(destination, "extensions/jev-optimizer/node_modules"))).toBe(false);
+    } finally { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 }) }
+  });
+
   it("honors an empty runtime bundle manifest without demanding omitted optional packages", async () => {
     const root = await temp();
     try {

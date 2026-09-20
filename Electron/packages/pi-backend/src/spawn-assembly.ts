@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { mainSessionExcludeToolArgs } from "./main-tool-policy.js";
+import { JEV_EXTENSION_ID, JEV_GENERATION_ENV, JEV_SECRET_ENV, JEV_STATE_FILE_ENV, type JevRuntimeSnapshot } from "./jev-runtime-state.js";
 
 export type Feature = "philosophy"|"plan"|"goal"|"generateImage"|"git"|"reload"|"webSearch"|"browserSearch"|"browserMemory"|"arxivFetch"|"mcp"|"skillLoader"|"searchScope"|"memoryBroker"|"contextFold"|"codexServerTools"|"claudeServerTools"|"openaiServerTools"|"geminiServerTools"|"xaiServerTools"|"deepseekServerTools"|"glmSearchMcp"|"glmVisionMcp"|"computerUse"|"browser"|"terminal"|"subagent";
 export type SpawnFeatures = Partial<Record<Feature, boolean>>;
@@ -48,6 +49,8 @@ export type SpawnRegisteredExtension = {
    * agent half is actually mounted, and never serialized into settings snapshots,
    * IPC payloads or transcript redaction sources. */
   secretEnv?: Record<string, string>;
+  /** Host-owned revocation snapshot; only delivered with the enabled Jev agent mount. */
+  jevRuntimeState?: JevRuntimeSnapshot;
   /** Validated, path-confined contribution metadata. Omitted when disabled/invalid/refused/empty. */
   agentContribution?: SpawnAgentContribution;
   /** Contribution path/size issues for an otherwise usable extension. Omitted when disabled/refused. */
@@ -89,7 +92,7 @@ function legacyCoreFallbackAllowed(packages:readonly SpawnRegisteredExtension[]|
  * finalizer: a bridge credential inherited from an outer shell would let another process address
  * this session's agent tree. Only the value this host mints for this spawn survives.
  */
-export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set(["PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_CORE_PROMPT","PIPIUI_PROMPT_OBSERVER_EXT","PIPIUI_SKILLLOADER_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_MEDIA_COMPAT_FALLBACK","PIPIUI_PROJECT_ROOT","PIPIUI_MOUNTED_EXTENSIONS","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL",GOAL_AUTO_RESUME_ENV,"PIPIUI_SKILL_READ_BLOCK","PIPIUI_SKILL_ROOTS","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_ANYDOC_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_","PIPIUI_EXT_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
+export function sanitizeEnvironment(env: NodeJS.ProcessEnv): Record<string,string> { const exact=new Set([JEV_STATE_FILE_ENV,JEV_GENERATION_ENV,JEV_SECRET_ENV,"PIPIUI_ACTIVE_PROJECT_PI_HOME","PIPIUI_AGENTS_DIR","PIPIUI_BOSS_READ_ONLY","PIPIUI_BRIDGE_PORT","PIPIUI_BUILT_IN_SKILL_ROOT","PIPIUI_CODING_TOOLS_EXT","PIPIUI_CORE_PROMPT","PIPIUI_PROMPT_OBSERVER_EXT","PIPIUI_SKILLLOADER_EXT","PIPIUI_OFFICE_DOC_SHOT_GATE_EXT","PIPIUI_MAIN_CWD","PIPIUI_MAIN_MODEL","PIPIUI_MAIN_MODEL_FILE","PIPIUI_MEDIA_COMPAT_FALLBACK","PIPIUI_PROJECT_ROOT","PIPIUI_MOUNTED_EXTENSIONS","PIPIUI_NODE_PATH","PIPIUI_PI_PATH","PIPIUI_RUNTIME_SOURCE_ROOT","PIPIUI_SUBAGENT_MODEL_CAPABILITIES_FILE","PIPIUI_SESSION_KEY","PIPIUI_SESSION_CAPABILITY","PIPIUI_SESSION_ID","PIPIUI_HOST_PROTOCOL",GOAL_AUTO_RESUME_ENV,"PIPIUI_SKILL_READ_BLOCK","PIPIUI_SKILL_ROOTS","PIPIUI_TOOL_SKILL_SETTINGS_FILE","PIPIUI_WEB_ACCESS_EXT","PIPIUI_WEBVIEW_EXT","PIPIUI_ARXIV_EXT","PIPIUI_WORKTREE","PIPIUI_PDF_INSPECTOR_ROOT","PIPIUI_ANYDOC_ROOT","PIPIUI_SECRET_VAULT_DIR","PIPIUI_VAULT_DEK"]); return Object.fromEntries(Object.entries(env).filter(([key,value])=>value!==undefined&&!exact.has(key)&&!["PIPIUI_AGENT_","PIPIUI_MEMORY_","PIPIUI_COMPUTER_","PIPIUI_CUA_","PIPIUI_TERMINAL_","PIPIUI_SEARCH_","PIPIUI_SUBAGENT_","PIPIUI_WORKTREE_","PIPIUI_HERMES_","PIPIUI_EXT_"].some(prefix=>key.startsWith(prefix))) as [string,string][]); }
 /**
  * Layered spawn environment, mirroring Swift `ChatSession.mergedSpawnEnv` + `PiProcess`
  * (T17): every configured `<agentDir>/.env` key is injected into the spawned pi process so
@@ -628,6 +631,10 @@ function appendRegisteredExtensions(args:string[], env:Record<string,string>, pa
     if ((keyCount.get(key) ?? 0) > 1 || !pkg.extensionPath) continue;
     ext(args, pkg.extensionPath);
     if (pkg.secretEnv) Object.assign(env, pkg.secretEnv);
+    if (pkg.id === JEV_EXTENSION_ID && pkg.jevRuntimeState) {
+      env[JEV_STATE_FILE_ENV] = pkg.jevRuntimeState.file;
+      env[JEV_GENERATION_ENV] = pkg.jevRuntimeState.generation;
+    }
     mountedIds.push(pkg.id);
     mountedPaths.push(pkg.extensionPath);
     mounted.push({ id: pkg.id, path: pkg.extensionPath });

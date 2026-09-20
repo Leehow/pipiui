@@ -523,7 +523,7 @@ function descriptorFrom(
     // Project-origin packages (scaffold-install bridge) default to enabled; the
     // enable overlay (writeAppExtensionEnabled / project activation) still wins
     // whenever an explicit record exists (extension-registry effectiveEnabled).
-    defaultEnabled: pkg.origin === "builtin" || pkg.origin === "project",
+    defaultEnabled: manifest?.defaultEnabled ?? (pkg.origin === "builtin" || pkg.origin === "project"),
     capabilities: manifest?.capabilities ?? [],
     settings: manifest?.settings,
     dependencies: manifest?.dependencies,
